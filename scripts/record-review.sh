@@ -805,6 +805,36 @@ for path in paths:
         continue
     landing = read_blob(lspec)
     if landing is None:
+        # NOT A READABLE BLOB. A TREE can legitimately hold content from BOTH inputs: when the
+        # base tip and `reviewed` each turn the same file `x` into a directory, git merges the two
+        # directories cleanly and the landing `x` is a THIRD tree unlike either input's. Refusing
+        # that is a MEASURED FALSE REFUSAL (round 33) on a pure base-only move — the class this arm
+        # exists to carry. So verify a landing tree's LEAVES by object id: every leaf that equals
+        # the tip's or `reviewed`'s leaf at the same path is known-good, and anything matching
+        # neither still FAILS CLOSED exactly as before. A gitlink (or anything else non-blob,
+        # non-tree) also still fails closed: a gitlink taking a third value needs a conflict.
+        t_rc, t_out = git([b"cat-file", b"-t", lspec])
+        if t_rc == 0 and t_out.strip() == b"tree":
+            l_rc, l_out = git([b"ls-tree", b"-r", b"-z", b"--full-tree", ltree, b"--", path])
+            if l_rc != 0:
+                sys.stderr.write("(C4) landing tree listing failed: %r\n" % path)
+                sys.exit(1)
+            for entry in l_out.split(b"\0"):
+                if not entry:
+                    continue
+                hdr, sep, lpath = entry.partition(b"\t")
+                fields = hdr.split()
+                if sep != b"\t" or len(fields) < 3:
+                    sys.stderr.write("(C4) unparseable landing entry under: %r\n" % path)
+                    sys.exit(1)
+                loid = fields[2]
+                if oid(base_sha.encode() + b":" + lpath) == loid:
+                    continue
+                if oid(reviewed.encode() + b":" + lpath) == loid:
+                    continue
+                sys.stderr.write("(C4) landing leaf unlike both inputs: %r\n" % lpath)
+                sys.exit(1)
+            continue
         sys.stderr.write("(C4) landing entry unreadable and unlike both inputs: %r\n" % path)
         sys.exit(1)
     tip = rev = None

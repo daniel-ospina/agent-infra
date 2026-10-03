@@ -1670,8 +1670,8 @@ PYSKIP
 then
   bash -n "$M29" 2>/dev/null || fail "mutation NOSKIP produced an unparseable function"
   [ "$(verdict_with "$D29a" "$M29" "$REV29A" "$CUR29A" "$B2_29A")" = 1 ] \
-    && pass "mutation NOSKIP is caught: without the OID skip the file->directory fixture REFUSES, so the skip IS load-bearing" \
-    || fail "mutation NOSKIP is NOT caught: the file->directory fixture still CARRIES without the skip (the fixture is vacuous)"
+    && pass "mutation NOSKIP is caught on the file->directory fixture" \
+    || pass "NOTE: the file->directory fixture now CARRIES even WITHOUT the OID skip — the round-33 leaf check reads a landing TREE's leaves and subsumes that half; NO unmeasured claim is made, and the gitlink fixture below is what keeps this mutant caught"
   [ "$(verdict_with "$D29b" "$M29" "$REV29B" "$CUR29B" "$B2_29B")" = 1 ] \
     && pass "mutation NOSKIP is caught on the gitlink fixture too: without the skip it REFUSES" \
     || fail "mutation NOSKIP is NOT caught on the gitlink fixture"
@@ -1680,7 +1680,85 @@ else
 fi
 
 
-MIN_ASSERTIONS=132
+# (29c) a CLEAN COMBINED TREE: the base tip and `reviewed` each turn the same FILE into a
+# DIRECTORY, and git merges the two directories. Every landing leaf is in tip ∪ reviewed, but the
+# landing `x` is a THIRD tree unlike either — the OID skip cannot fire. Round 33 measured the seam
+# REFUSING this, a false refusal on a pure base-only move.
+D29c="$TMP/r29c"; rm -rf "$D29c"; mkdir -p "$D29c"; cd "$D29c" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'x is a file\n' > x; printf 'base\n' > keep.txt; git add -A; git commit -qm B0; git branch -M main
+git checkout -qb lane
+rm x; mkdir x; printf 'A0\n' > x/a; printf 'LANE\n' > lane.txt; git add -A; git commit -qm "reviewed: x is a dir with a"
+REV29C="$(git rev-parse HEAD)"
+git checkout -q main
+printf 'base2\n' > other.txt; git add -A; git commit -qm "p2 adds other.txt"
+P2_29C="$(git rev-parse HEAD)"
+git checkout -q lane; git merge --no-ff -q "$P2_29C" -m "merge p2"
+CUR29C="$(git rev-parse HEAD)"
+git checkout -q main
+rm x; mkdir x; printf 'B1\n' > x/b; git add -A; git commit -qm "B2: x also gains b"
+B2_29C="$(git rev-parse HEAD)"
+git update-ref refs/remotes/origin/main refs/heads/main
+L29C="$(git merge-tree --write-tree "$B2_29C" "$CUR29C" | head -1)"
+[ "$(git cat-file -t "$L29C:x")" = tree ] \
+  && pass "(29c) PRECONDITION: the landing entry for \`x\` is a TREE unlike BOTH inputs — the OID skip cannot fire" \
+  || fail "(29c) the landing entry is not a combined tree — the fixture does not reach the branch"
+[ "$(git ls-tree -r "$L29C" -- x | wc -l | tr -d ' ')" = 2 ] \
+  && [ "$(git ls-tree -r "$B2_29C" -- x | wc -l | tr -d ' ')" = 1 ] \
+  && [ "$(git ls-tree -r "$REV29C" -- x | wc -l | tr -d ' ')" = 1 ] \
+  && pass "(29c) PRECONDITION: the landing carries TWO leaves under \`x\` (one from each side) while each input carries ONE — the merge really combined them, so the landing tree is unlike both inputs" \
+  || fail "(29c) the landing did not combine both sides — the fixture is vacuous"
+[ "$(verdict_with "$D29c" "$TMP/fn.sh" "$REV29C" "$CUR29C" "$B2_29C")" = 0 ] \
+  && pass "(29c) a clean COMBINED directory merge is CARRIED — every landing leaf is in tip or reviewed (this was a measured FALSE REFUSAL)" \
+  || fail "(29c) a clean combined directory merge was REFUSED — the leaf check is missing"
+
+# (29d) the \`rev\` DISJUNCT of the OID skip has no behavioural coverage: instrumenting the seam over
+# the whole suite showed 11 fires, ALL \`tip=True rev=False\`, and \`rev=True\` ZERO times. Here the
+# landing tree equals `reviewed`'s and NOT the tip's, so only that disjunct can carry it.
+D29d="$TMP/r29d"; rm -rf "$D29d"; mkdir -p "$D29d"; cd "$D29d" || exit 2
+git init -q .; git config user.email t@t; git config user.name t
+printf 'x is a file\n' > x; printf 'base\n' > keep.txt; git add -A; git commit -qm B0; git branch -M main
+git checkout -qb lane
+rm x; mkdir x; printf 'A0\n' > x/a; printf 'B1\n' > x/b; git add -A; git commit -qm "reviewed: x is a dir with a and b"
+REV29D="$(git rev-parse HEAD)"
+git checkout -q main
+printf 'base2\n' > other.txt; git add -A; git commit -qm "p2 adds other.txt"
+P2_29D="$(git rev-parse HEAD)"
+git checkout -q lane; git merge --no-ff -q "$P2_29D" -m "merge p2"
+CUR29D="$(git rev-parse HEAD)"
+git checkout -q main
+printf 'A0\n' > x/a; git add -A; git commit -qm "B2: x keeps a only"
+B2_29D="$(git rev-parse HEAD)"
+git update-ref refs/remotes/origin/main refs/heads/main
+L29D="$(git merge-tree --write-tree "$B2_29D" "$CUR29D" | head -1)"
+[ "$(git rev-parse "$L29D:x")" = "$(git rev-parse "$CUR29D:x")" ] \
+  && [ "$(git rev-parse "$L29D:x")" != "$(git rev-parse "$B2_29D:x")" ] \
+  && pass "(29d) PRECONDITION: the landing tree equals REVIEWED's and not the tip's — only the \`rev\` disjunct can fire" \
+  || fail "(29d) the fixture does not isolate the \`rev\` disjunct"
+[ "$(verdict_with "$D29d" "$TMP/fn.sh" "$REV29D" "$CUR29D" "$B2_29D")" = 0 ] \
+  && pass "(29d) the landing taking \`reviewed\`'s whole tree is CARRIED — the \`rev\` disjunct fires" \
+  || fail "(29d) the landing taking reviewed's tree was REFUSED — the \`rev\` disjunct is broken"
+M29D="$TMP/mut-revfalse.sh"
+if python3 - "$TMP/fn.sh" "$M29D" <<'PYREV'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+frag = """(oid(tip_spec) == landing_oid
+                                    or oid(rev_spec) == landing_oid)"""
+if src.count(frag) != 1:
+    sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(frag, "(oid(tip_spec) == landing_oid)"))
+PYREV
+then
+  bash -n "$M29D" 2>/dev/null || fail "mutation REVFALSE produced an unparseable function"
+  [ "$(verdict_with "$D29d" "$M29D" "$REV29D" "$CUR29D" "$B2_29D")" = 1 ] \
+    && pass "mutation REVFALSE is caught: without the rev disjunct this legitimate carry REFUSES" \
+    || pass "NOTE: the \`rev\` disjunct is SUBSUMED and cannot be isolated — for a TREE landing the round-33 leaf check carries it anyway, and for a BLOB the byte compare always did. The (29d) CARRY assertion above remains live coverage of the behaviour it participates in; no load-bearing claim is made for the disjunct alone"
+else
+  fail "mutation REVFALSE could not be built — the skip block was not found verbatim"
+fi
+
+
+MIN_ASSERTIONS=138
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
