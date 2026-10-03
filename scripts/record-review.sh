@@ -813,27 +813,56 @@ for path in paths:
         # the tip's or `reviewed`'s leaf at the same path is known-good, and anything matching
         # neither still FAILS CLOSED exactly as before. A gitlink (or anything else non-blob,
         # non-tree) also still fails closed: a gitlink taking a third value needs a conflict.
+        # TWO ROUND-34 CORRECTIONS TO THIS BRANCH, both measured:
+        #  (P0) `ls-tree … -- <path>` treats <path> as a PATHSPEC. `:magic` is a legal directory
+        #       name, and pathspec MAGIC parses it away, so `ls-tree -- ':magic'` returns rc=0 with
+        #       NO OUTPUT: the loop never ran, nothing was verified, and the head CARRIED where the
+        #       previous code refused. `':x'` was worse — it enumerated the SIBLING `x` and
+        #       validated the wrong tree. So the whole tree is listed and the leaves are SELECTED
+        #       IN PYTHON. No pathspec is ever built from a path that came out of the repository.
+        #  (P1) comparing object IDs here re-introduced the "a merged blob must be a verbatim copy
+        #       of an input" guard that §17/§22 record as MEASURED AND REJECTED, because it refuses
+        #       a LEGITIMATELY union-merged leaf — the append-only-registry class this arm exists to
+        #       carry. The criterion is the blob arm's, applied at leaf level: LINE SETS.
         t_rc, t_out = git([b"cat-file", b"-t", lspec])
         if t_rc == 0 and t_out.strip() == b"tree":
-            l_rc, l_out = git([b"ls-tree", b"-r", b"-z", b"--full-tree", ltree, b"--", path])
+            l_rc, l_out = git([b"ls-tree", b"-r", b"-z", b"--full-tree", ltree])
             if l_rc != 0:
                 sys.stderr.write("(C4) landing tree listing failed: %r\n" % path)
                 sys.exit(1)
+            lprefix = path + b"/"
             for entry in l_out.split(b"\0"):
                 if not entry:
                     continue
                 hdr, sep, lpath = entry.partition(b"\t")
                 fields = hdr.split()
                 if sep != b"\t" or len(fields) < 3:
-                    sys.stderr.write("(C4) unparseable landing entry under: %r\n" % path)
+                    sys.stderr.write("(C4) unparseable landing entry: %r\n" % entry[:80])
                     sys.exit(1)
+                if lpath != path and not lpath.startswith(lprefix):
+                    continue
                 loid = fields[2]
-                if oid(base_sha.encode() + b":" + lpath) == loid:
+                lspec2 = ltree + b":" + lpath
+                tip_l = base_sha.encode() + b":" + lpath
+                rev_l = reviewed.encode() + b":" + lpath
+                if oid(tip_l) == loid or oid(rev_l) == loid:
                     continue
-                if oid(reviewed.encode() + b":" + lpath) == loid:
-                    continue
-                sys.stderr.write("(C4) landing leaf unlike both inputs: %r\n" % lpath)
-                sys.exit(1)
+                lb = read_blob(lspec2)
+                if lb is None:
+                    sys.stderr.write("(C4) landing leaf unreadable and unlike both inputs: %r\n" % lpath)
+                    sys.exit(1)
+                known = set()
+                for spec in (tip_l, rev_l):
+                    if exists(spec):
+                        b = read_blob(spec)
+                        if b is None:
+                            sys.stderr.write("(C4) leaf unreadable: %r\n" % lpath)
+                            sys.exit(1)
+                        known |= lines(b)
+                lnew = lines(lb) - known
+                if lnew:
+                    sys.stderr.write("(C4) LEAK %r -> %r\n" % (lpath, sorted(lnew)[:5]))
+                    sys.exit(1)
             continue
         sys.stderr.write("(C4) landing entry unreadable and unlike both inputs: %r\n" % path)
         sys.exit(1)
