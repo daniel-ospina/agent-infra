@@ -490,6 +490,20 @@
 #                                         lane cannot run a shard main's push
 #                                         lane runs (#1349). Any other value is
 #                                         refused at startup.
+#   ADMIN_MERGE_SELECTOR_PYTHON          explicit interpreter for the target
+#                                         repo's diff selector, whose declined
+#                                         legs the parity gate forgives (#6928).
+#                                         Default: resolve
+#                                         `$PWD/.venv/bin/python3`, `python3.12`,
+#                                         `python3.13`, then `python3`, keeping
+#                                         the first that PROVES ≥3.12. When SET
+#                                         it is the whole answer: a set-but-
+#                                         unusable override fails closed
+#                                         (forgiving nothing) instead of falling
+#                                         through to another interpreter, so a
+#                                         named interpreter that cannot run the
+#                                         selector is REPORTED rather than
+#                                         silently ignored.
 
 set -uo pipefail
 
@@ -1451,6 +1465,240 @@ lane_has_test_shard() {
   grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" | grep -q '[^[:space:]]'
 }
 
+# ── #6928: A SHARD THE DIFF SELECTOR *DECLINED* IS NOT A COVERAGE GAP ─────
+# The lane-parity gate demands the PR lane execute every shard main's lane
+# executed. For a repo whose PR lane is DIFF-SELECTED that is unsatisfiable BY
+# CONSTRUCTION: the target's `tools/ci_selection.py` turns `slow_run` /
+# `carve_out_run` off for a docs-only diff, so the `test-slow (a)`,
+# `test-slow (b)` and `test-carve-out` jobs skip on their own `if:` triggers,
+# while main is ALWAYS FULL (`_full_selection()` runs the whole matrix plus both
+# diff-gated legs, so the trunk can never lose that coverage). Every docs-only /
+# website-only PR was therefore unlandable behind a refusal no re-run can clear
+# (measured: 0 docs-only commits in the last 60 of tortoise main). The blast
+# radius is docs/website-only diffs — NOT `config/**`: the selector's own comment
+# says `config/* is NOT a docs-only path`, and measured at tortoise 6bd2f41 a
+# `config/ci-surfaces.yml` diff selects BOTH legs (`slow_run=true,
+# carve_out_run=true`), so a config-only PR never had this shape.
+#
+# THE RULE IS FORGIVENESS, NOT EXEMPTION — and it is the CI's own rule, pinned by
+# tortoise's `tests/test_ci_selection.py`: "a `skipped` leg is forgiven only when
+# the selector DECLINED it". This removes ONLY the shards the target's selector
+# declined for THIS head's diff; every other shard main executed is still
+# demanded, which is why a non-declined leg deliberately carries no event filter.
+#
+# lane_declined_shards <head> <out-file> — ask the TARGET repo's selector which
+# of the two diff-gated legs it declined for <head>'s diff, and write those shard
+# names (one per line) to <out-file>. Returns 0 when the selector ANSWERED (the
+# file may then be empty), non-zero when it did not, setting LANE_DECLINED_REASON.
+#
+# ⛔ FAIL CLOSED. No runnable ≥3.12 interpreter, an unreadable changed-file list,
+# a selector that could not be FETCHED AT THIS HEAD, a non-zero exit, empty output,
+# or an answer that does not carry BOTH booleans AS BOOLEANS forgives NOTHING, and
+# the caller then refuses the raw gap exactly as it does today. A missing selector
+# answer is NOT a declined leg: "I could not ask" is the opposite of "the selector
+# declined it", and a PARTIAL answer is treated as no answer, because a leg whose
+# boolean is missing was never shown to be declined.
+#
+# ── #6928 P1-1: WHICH INTERPRETER RUNS THE SELECTOR ───────────────────────
+# The rail's own `$PYTHON_BIN` is whatever `python3` is first on PATH. On this
+# fleet that is 3.9.6, and a DIFF-GATED target's selector REFUSES an interpreter
+# below 3.12 at its own module level (tortoise `tools/ci_selection.py:44-49`
+# exits 1 with "requires Python >= 3.12 … run it as `uv run python …`"). Its
+# workflow only succeeds because `actions/setup-python` pins 3.12; the rail pins
+# nothing, so running the selector under `$PYTHON_BIN` made the whole forgiveness
+# path refuse on the INTERPRETER — safe, and useless (measured on this machine:
+# the rail exited 1 with "the target-repo diff selector failed (exit 1 …)").
+#
+# `lane_selector_python` resolves one and sets the global `LANE_SELECTOR_PYTHON`,
+# in this order:
+#   1. `$ADMIN_MERGE_SELECTOR_PYTHON` — an explicit override. When set it is the
+#      WHOLE answer: a set-but-unusable override fails closed rather than silently
+#      falling through to a different interpreter, so an operator who named one is
+#      TOLD it was wrong. (This is also the suite's hermetic test seam.)
+#   2. `$PWD/.venv/bin/python3` — a project venv at the rail's INVOCATION
+#      directory, where a repo that runs `uv run python tools/ci_selection.py`
+#      keeps its 3.12. ⛔ `$PWD` is the directory the RAIL was invoked from, NOT
+#      the `--repo` target's checkout (the rail is routinely invoked from
+#      elsewhere). That is safe precisely because this candidate is used ONLY as
+#      an INTERPRETER, never as evidence about the head: the selector ENGINE and
+#      the RULES it reads are both fetched PINNED TO THE HEAD (see below), so
+#      which checkout `$PWD` happens to be cannot influence the answer.
+#   3. `python3.12`, then `python3.13` — an explicitly versioned interpreter.
+#   4. `python3` — ONLY when it actually reports ≥3.12 (it usually does not).
+# EVERY candidate must PROVE ≥3.12 by EXECUTING and asking the interpreter ITSELF
+# for `sys.version_info` — never by parsing a `--version` banner, which a wrapper
+# or shim prints and which names a version the process need not be. If none
+# qualifies the answer is UNAVAILABLE and the reason NAMES the ≥3.12 requirement,
+# so the operator is told what to install rather than merely that a step failed.
+LANE_SELECTOR_PYTHON=""
+lane_selector_python_ok() {
+  local cand="${1:-}"
+  [ -n "$cand" ] || return 1
+  if [ ! -x "$cand" ]; then
+    command -v "$cand" >/dev/null 2>&1 || return 1
+  fi
+  "$cand" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)' \
+    >/dev/null 2>&1
+}
+lane_selector_python() {
+  LANE_SELECTOR_PYTHON=""
+  local cand
+  if [ -n "${ADMIN_MERGE_SELECTOR_PYTHON:-}" ]; then
+    if lane_selector_python_ok "$ADMIN_MERGE_SELECTOR_PYTHON"; then
+      LANE_SELECTOR_PYTHON="$ADMIN_MERGE_SELECTOR_PYTHON"
+      return 0
+    fi
+    return 1
+  fi
+  for cand in "$PWD/.venv/bin/python3" python3.12 python3.13 python3; do
+    if lane_selector_python_ok "$cand"; then
+      LANE_SELECTOR_PYTHON="$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+lane_declined_shards() {
+  local head="$1" out="$2"
+  local slug changed changed_names json verdict rc=0 sp cp
+  local selector_root selector_body manifest_body
+  LANE_DECLINED_REASON=""
+  LANE_PARITY_SELECTOR_VERDICT=""
+  : > "$out"
+  # 1. An interpreter that can actually run the target's selector (P1-1).
+  if ! lane_selector_python; then
+    if [ -n "${ADMIN_MERGE_SELECTOR_PYTHON:-}" ]; then
+      LANE_DECLINED_REASON="the interpreter named by ADMIN_MERGE_SELECTOR_PYTHON ($ADMIN_MERGE_SELECTOR_PYTHON) is not a Python >= 3.12, which the target repo's diff selector requires — so the selector cannot be run"
+    else
+      LANE_DECLINED_REASON="no Python >= 3.12 interpreter was found for the target repo's diff selector, which refuses to run below 3.12 (tried ADMIN_MERGE_SELECTOR_PYTHON, ./.venv/bin/python3, python3.12, python3.13, python3)"
+    fi
+    return 1
+  fi
+  # The changed-file list is fetched HERE rather than read from
+  # WF_PR_CHANGED_PATHS. That global is populated only as a LAZY SIDE EFFECT of
+  # the base-surface probe's workflow fetch (#1542), so it is empty whenever no
+  # base red needed a PR-evaluability verdict — the common case — and reading it
+  # would then fail closed on most merges for a reason unrelated to the diff.
+  # This fetch is written in that site's own style.
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  changed="$($GH api "$slug/pulls/$PR/files?per_page=100" --paginate --jq '.[].filename' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    LANE_DECLINED_REASON="the PR's changed-file list could not be read ($slug/pulls/$PR/files)"
+    return 1
+  fi
+  # AN EMPTY LIST IS UNAVAILABLE — and #6928 P2: so is a WHITESPACE-ONLY one.
+  # `[ -z ]` catches only a zero-byte answer; a SUCCESSFUL read whose body holds
+  # no filename but some spaces passes it, and the real tortoise selector MEASURED
+  # on such input answers `slow_run=false carve_out_run=false` — i.e. it would
+  # forgive ALL THREE diff-gated legs on a read that returned no filename at all.
+  # A PR always has at least one changed file, so "no real filename" is an
+  # unavailable answer, never "no files changed". This is `lane_count`'s own
+  # idiom (a set with no names counts ZERO) AND its `${n:-0}` normalisation,
+  # applied to a string: `grep -c` prints `0` on no-match and the preceding rc
+  # check already excludes the empty case, so this read is DEFENSIVE — but the
+  # direction it protects is the fail-open one, so it is guarded rather than
+  # reasoned about.
+  changed_names="$(printf '%s' "$changed" | grep -c '[^[:space:]]')"
+  if [ "${changed_names:-0}" -eq 0 ]; then
+    LANE_DECLINED_REASON="the PR's changed-file list came back EMPTY ($slug/pulls/$PR/files) — an unavailable answer, not a diff with no files"
+    return 1
+  fi
+  # 2. THE SELECTOR AND ITS MANIFEST, FETCHED PINNED TO THIS HEAD (#6928 P1-2).
+  # Reading the selector from the CALLER'S working tree — which is what this did —
+  # has no revision pin and no check that the checkout is the `--repo` target at
+  # this head: it would forgive against rules that never governed this head, and a
+  # same-contract copy in a different repo would be believed. The codebase's own
+  # precedent is `workflow_pr_evaluable`, which pins its file BY REF THROUGH THE
+  # API for exactly this fail-open. The manifest is fetched at the same ref for
+  # the same reason: the selector derives its data root from `__file__` and reads
+  # `config/ci-surfaces.yml` from there, so pinning the engine while reading the
+  # rules off the local disk would leave the same hole one level down. The only
+  # thing `$PWD` contributes here is an INTERPRETER (candidate 2 above); the
+  # selector ENGINE and its RULES both come from these head-pinned fetches, so a
+  # `$PWD` that is not the target checkout — even one that is an unrelated repo —
+  # cannot influence the selector's answer.
+  selector_body="$($GH api "$slug/contents/tools/ci_selection.py" -X GET -f "ref=$head" \
+                     -H 'Accept: application/vnd.github.raw' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$selector_body" ]; then
+    LANE_DECLINED_REASON="the target repo's diff selector could not be FETCHED AT THIS HEAD ($slug/contents/tools/ci_selection.py?ref=$head) — a selector read from the caller's tree is not evidence about this head"
+    return 1
+  fi
+  manifest_body="$($GH api "$slug/contents/config/ci-surfaces.yml" -X GET -f "ref=$head" \
+                     -H 'Accept: application/vnd.github.raw' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$manifest_body" ]; then
+    LANE_DECLINED_REASON="the target repo's CI surface manifest could not be FETCHED AT THIS HEAD ($slug/contents/config/ci-surfaces.yml?ref=$head), which its diff selector reads"
+    return 1
+  fi
+  # The selector runs EXACTLY as the workflow runs it
+  # (`.github/workflows/python-ci.yml:234`):
+  #   printf '%s\n' "$CHANGED" | python3 tools/ci_selection.py --changed-files - --event pull_request
+  # It resolves its repo root from `__file__` (`REPO = Path(__file__).resolve().parent.parent`),
+  # so the fetched pair is laid out in the shape the selector expects, under the
+  # rail's own TMP — the caller's tree is never touched.
+  selector_root="$(mktemp -d "${TMP:-/tmp}/admin-merge-selector.XXXXXX" 2>/dev/null || true)"
+  if [ -z "$selector_root" ] || ! mkdir -p "$selector_root/tools" "$selector_root/config"; then
+    LANE_DECLINED_REASON="could not stage the fetched diff selector for execution (no writable temp directory)"
+    return 1
+  fi
+  if ! printf '%s\n' "$selector_body" > "$selector_root/tools/ci_selection.py" \
+     || ! printf '%s\n' "$manifest_body" > "$selector_root/config/ci-surfaces.yml"; then
+    LANE_DECLINED_REASON="could not stage the fetched diff selector for execution (write failed under ${TMP:-/tmp})"
+    return 1
+  fi
+  json="$(printf '%s\n' "$changed" | "$LANE_SELECTOR_PYTHON" \
+            "$selector_root/tools/ci_selection.py" --changed-files - --event pull_request 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    LANE_DECLINED_REASON="the target repo's diff selector failed (exit $rc running it under $LANE_SELECTOR_PYTHON)"
+    return 1
+  fi
+  if [ -z "$json" ]; then
+    LANE_DECLINED_REASON="the target repo's diff selector emitted nothing ($selector_root/tools/ci_selection.py)"
+    return 1
+  fi
+  # BOTH booleans, as BOOLEANS. `json.loads` accepts anything, so the isinstance
+  # check is what makes a partial or mistyped answer a REFUSAL rather than a
+  # silent "true": a MISSING key would otherwise read as falsy and FORGIVE the
+  # leg — the one direction that must never happen.
+  verdict="$(printf '%s' "$json" | "$PYTHON_BIN" -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    s = d.get("slow_run"); c = d.get("carve_out_run")
+    ok = isinstance(s, bool) and isinstance(c, bool)
+except Exception:
+    ok = False
+if not ok:
+    sys.exit(1)
+print("true" if s else "false")
+print("true" if c else "false")
+' 2>/dev/null)"
+  rc=$?
+  sp="$(printf '%s\n' "$verdict" | sed -n '1p')"
+  cp="$(printf '%s\n' "$verdict" | sed -n '2p')"
+  if [ "$rc" -ne 0 ] || [ -z "$verdict" ] \
+     || { [ "$sp" != "true" ] && [ "$sp" != "false" ]; } \
+     || { [ "$cp" != "true" ] && [ "$cp" != "false" ]; }; then
+    LANE_DECLINED_REASON="the target repo's diff selector's answer carried no parseable slow_run/carve_out_run"
+    return 1
+  fi
+  LANE_PARITY_SELECTOR_VERDICT="slow_run=$sp, carve_out_run=$cp"
+  # The workflow's OWN shard names for the two diff-gated legs. Forgiving by EXACT
+  # name (never by pattern) keeps the rule narrow: a repo whose legs are named
+  # differently simply is not forgiven, which is the fail-closed direction.
+  if [ "$sp" = "false" ]; then
+    printf '%s\n' 'test-slow (a)' 'test-slow (b)' >> "$out"
+  fi
+  if [ "$cp" = "false" ]; then
+    printf '%s\n' 'test-carve-out' >> "$out"
+  fi
+  return 0
+}
+
 # lane_parity_check <head> <main-run-limit> — decide whether the two sides are
 # comparable AT ALL, and leave both named shard sets behind so the evidence and
 # the refusal can state the lanes instead of asserting a bare `0 | 0`.
@@ -1468,6 +1716,13 @@ lane_has_test_shard() {
 #                        an unobserved reference certifies nothing, and an empty
 #                        set means EVERY shard is missing — never "no difference".
 LANE_PARITY_REASON=""
+# #6928: the diff-gated shards the target's selector DECLINED for this head, and
+# the verdict it answered. Set by lane_parity_check on the forgiveness path; read
+# by the evidence builder so a certified `PR ⊇ main` line is DISCLOSED as resting
+# on the selector's own decision rather than standing as a bare assertion. Empty
+# when nothing was forgiven.
+LANE_PARITY_FORGIVEN=""
+LANE_PARITY_SELECTOR_VERDICT=""
 # The window MAIN's reference was actually drawn from (#4844). Set by
 # lane_parity_check so the evidence can DISCLOSE a widened reference rather than
 # let `--main-runs` describe a window the gate did not read. The reader defaults
@@ -1544,6 +1799,53 @@ lane_parity_check() {
     fi
   else
     cp "$TMP/lane-main.txt" "$TMP/lane-missing.txt"
+  fi
+  # ── #6928: FORGIVE THE LEGS THE TARGET'S DIFF SELECTOR *DECLINED* ──────
+  # Computed ONLY when the raw subtraction left a shard to explain, so a repo
+  # with no diff-gated legs and no selector pays nothing and refuses exactly as
+  # it did before. See the block above `lane_declined_shards` for the rule and its
+  # fail-closed boundary.
+  LANE_PARITY_FORGIVEN=""
+  LANE_PARITY_SELECTOR_VERDICT=""
+  if [ "$(lane_count "$TMP/lane-missing.txt")" -gt 0 ]; then
+    if lane_declined_shards "$head" "$TMP/lane-declined.txt"; then
+      if [ "$(lane_count "$TMP/lane-declined.txt")" -gt 0 ]; then
+        # The shards ACTUALLY in this head's gap that the selector DECLINED — the
+        # INTERSECTION, so the disclosure names only legs this head really did not
+        # run. Same subtraction shape as the coverage gap above, same fail-CLOSED
+        # reading of grep's status: 0 = some matched, 1 = none (nothing to
+        # forgive), >1 = a grep ERROR, which is never "nothing to forgive".
+        grep -xF -f "$TMP/lane-declined.txt" "$TMP/lane-missing.txt" > "$TMP/lane-forgiven.txt"
+        rc=$?
+        if [ "$rc" -gt 1 ]; then
+          say_err "admin-merge: ✗ the declined-leg subtraction failed (grep rc $rc) — lane coverage unverifiable"
+          LANE_PARITY_REASON="the declined-leg subtraction itself failed (grep rc $rc)"
+          return 2
+        fi
+        if [ "$rc" -eq 0 ]; then
+          # The declined shards are IN the gap, so removing them is exactly the
+          # change; `lane-forgiven.txt` is what the disclosure names.
+          grep -vxF -f "$TMP/lane-forgiven.txt" "$TMP/lane-missing.txt" > "$TMP/lane-kept.txt"
+          rc=$?
+          if [ "$rc" -gt 1 ]; then
+            say_err "admin-merge: ✗ the declined-leg subtraction failed (grep rc $rc) — lane coverage unverifiable"
+            LANE_PARITY_REASON="the declined-leg subtraction itself failed (grep rc $rc)"
+            return 2
+          fi
+          mv "$TMP/lane-kept.txt" "$TMP/lane-missing.txt"
+          LANE_PARITY_FORGIVEN="$(cat "$TMP/lane-forgiven.txt")"
+          # DISCLOSE, on the path that CERTIFIES and on the path that still
+          # refuses: an operator reading either one must be able to see why a
+          # shard was not required.
+          say_err "admin-merge: ⚠️  lane-coverage forgiveness (#6928) — $(lane_count "$TMP/lane-forgiven.txt") shard(s) this head did not run were DECLINED by its diff selector and are NOT required of it: $(tr '\n' ' ' < "$TMP/lane-forgiven.txt")[selector: ${LANE_PARITY_SELECTOR_VERDICT}]"
+        fi
+      fi
+    else
+      # FAIL CLOSED: an unavailable answer forgives NOTHING, and the raw gap is
+      # refused exactly as it is today — with the reason the selector was not
+      # consulted to close it, so a missing answer is never read as a declined leg.
+      say_err "admin-merge: ⚠️  lane-coverage forgiveness (#6928) NOT applied — ${LANE_DECLINED_REASON}; refusing on the raw gap (a missing selector answer is not a declined leg)"
+    fi
   fi
   [ -s "$TMP/lane-missing.txt" ] && return 1
   return 0
@@ -3928,11 +4230,29 @@ $attribution_line"
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
   # is what the parity line reports.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0 parity_note parity_evidence parity_window_note=""
+    local parity_rc=0 parity_note parity_evidence parity_window_note="" parity_forgiven_note=""
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
     if [ "$parity_rc" -eq 0 ]; then
-      parity_note="it certifies ONLY because LANE PARITY holds: the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main). A shard main ran that this head skipped would have made this a REFUSAL (NOT COMPARABLE)."
+      # #6928 P3b: NO `parity_note` here. It used to be set on this branch with the
+      # sentence below, but its ONLY reader is the non-zero branch's `declared-off`
+      # disclosure, so on this branch it was dead — and it asserted "the PR executed
+      # every test shard main's lane executed", which the #6928 forgiveness makes
+      # FALSE. A dead false claim is one refactor from being printed, so it is
+      # deleted rather than parked. The truth lives in `$parity_evidence` (and, when
+      # shards were forgiven, in the override immediately below).
       parity_evidence="PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main)"
+      # #6928 P3a: ON THE FORGIVING PATH THAT LINE IS FALSE AS WRITTEN — the PR did
+      # NOT execute every shard main ran; it executed every shard main ran that its
+      # diff selector did NOT decline. The machine-checked `lane parity:` line
+      # therefore STATES THE TRUTH ITSELF instead of leaving the correction to
+      # unchecked prose on the next line. It stays ONE line, still starts with
+      # `lane parity:`, and still carries at most one `parity family:` — the three
+      # properties the evidence gate (`verify-admin-merge-evidence.sh`) anchors on.
+      # The per-shard detail and the selector verdict remain on the disclosure line
+      # appended below.
+      if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+        parity_evidence="PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the $(lane_count "$TMP/lane-forgiven.txt") shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main)"
+      fi
       # DISCLOSE a widened reference (#4844). A reference drawn from further back
       # than the operator asked for is a different window, and the evidence must
       # say so rather than let `--main-runs` describe a window it did not read.
@@ -3954,6 +4274,21 @@ $attribution_line"
     else
       parity_note="lane parity FAILS: this head did NOT execute $(lane_count "$TMP/lane-missing.txt") test shard(s) main's lane executes (parity family: ${LANE_JOB_PREFIX}*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457)."
       parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
+    fi
+    # ── DISCLOSE THE #6928 FORGIVENESS ON EVERY PATH IT TOUCHED ──────────────
+    # Built HERE, after the branch, and not only on the certifying (`rc 0`) path.
+    # The `declared-off` refusal path (#6928 P3-1) reports a missing-shard count
+    # that is ALREADY net of the forgiven shards, so without this the posted
+    # certificate states a number and never says why the other shards were not
+    # required — the stderr warning discloses it, the certificate did not. The
+    # rule is one rule for both paths: a `PR ⊇ main` line must state the one case
+    # where the PR did NOT execute every shard main did, and a FAILS line must
+    # state that its count EXCLUDES shards the selector declined. Its OWN line,
+    # appended after the literal block below, and never carrying `lane parity:`
+    # (that line is matched to its END by the evidence gate, and carries at most
+    # one `parity family:`).
+    if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+      parity_forgiven_note="   lane-coverage forgiveness (#6928): these shard(s) main's lane executed were DECLINED by this head's diff selector and are therefore NOT required of it: $(printf '%s' "$LANE_PARITY_FORGIVEN" | tr '\n' ' ') Selector verdict: ${LANE_PARITY_SELECTOR_VERDICT}. This is the SELECTOR's own decision — the same rule the CI aggregate applies to a selector-declined leg — not a blanket exemption: every shard the selector did not decline still had to be executed, and was."
     fi
     if [ "$parity_rc" -ne 0 ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
       if [ "$parity_rc" -eq 2 ]; then
@@ -4017,6 +4352,10 @@ $attribution_line"
     if [ -n "$parity_window_note" ]; then
       analyzed="${analyzed}
 ${parity_window_note}"
+    fi
+    if [ -n "$parity_forgiven_note" ]; then
+      analyzed="${analyzed}
+${parity_forgiven_note}"
     fi
     info "admin-merge: ⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lane: $lane); lane parity: $parity_evidence; PR tree: $TREE_STATUS ($TREE_RED failing of $TREE_TOTAL measured); main check surface: $BASE_STATUS ($BASE_RED failing of $BASE_TOTAL measured, context only)"
   fi
