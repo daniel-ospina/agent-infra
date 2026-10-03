@@ -490,6 +490,20 @@
 #                                         lane cannot run a shard main's push
 #                                         lane runs (#1349). Any other value is
 #                                         refused at startup.
+#   ADMIN_MERGE_SELECTOR_PYTHON          explicit interpreter for the target
+#                                         repo's diff selector, whose declined
+#                                         legs the parity gate forgives (#6928).
+#                                         Default: resolve
+#                                         `$PWD/.venv/bin/python3`, `python3.12`,
+#                                         `python3.13`, then `python3`, keeping
+#                                         the first that PROVES ≥3.12. When SET
+#                                         it is the whole answer: a set-but-
+#                                         unusable override fails closed
+#                                         (forgiving nothing) instead of falling
+#                                         through to another interpreter, so a
+#                                         named interpreter that cannot run the
+#                                         selector is REPORTED rather than
+#                                         silently ignored.
 
 set -uo pipefail
 
@@ -1459,8 +1473,12 @@ lane_has_test_shard() {
 # `test-slow (b)` and `test-carve-out` jobs skip on their own `if:` triggers,
 # while main is ALWAYS FULL (`_full_selection()` runs the whole matrix plus both
 # diff-gated legs, so the trunk can never lose that coverage). Every docs-only /
-# config-only PR was therefore unlandable behind a refusal no re-run can clear
-# (measured: 0 docs-only commits in the last 60 of tortoise main).
+# website-only PR was therefore unlandable behind a refusal no re-run can clear
+# (measured: 0 docs-only commits in the last 60 of tortoise main). The blast
+# radius is docs/website-only diffs — NOT `config/**`: the selector's own comment
+# says `config/* is NOT a docs-only path`, and measured at tortoise 6bd2f41 a
+# `config/ci-surfaces.yml` diff selects BOTH legs (`slow_run=true,
+# carve_out_run=true`), so a config-only PR never had this shape.
 #
 # THE RULE IS FORGIVENESS, NOT EXEMPTION — and it is the CI's own rule, pinned by
 # tortoise's `tests/test_ci_selection.py`: "a `skipped` leg is forgiven only when
@@ -1497,8 +1515,14 @@ lane_has_test_shard() {
 #      WHOLE answer: a set-but-unusable override fails closed rather than silently
 #      falling through to a different interpreter, so an operator who named one is
 #      TOLD it was wrong. (This is also the suite's hermetic test seam.)
-#   2. `$PWD/.venv/bin/python3` — the target checkout's own environment, where a
-#      repo that runs `uv run python tools/ci_selection.py` keeps its 3.12.
+#   2. `$PWD/.venv/bin/python3` — a project venv at the rail's INVOCATION
+#      directory, where a repo that runs `uv run python tools/ci_selection.py`
+#      keeps its 3.12. ⛔ `$PWD` is the directory the RAIL was invoked from, NOT
+#      the `--repo` target's checkout (the rail is routinely invoked from
+#      elsewhere). That is safe precisely because this candidate is used ONLY as
+#      an INTERPRETER, never as evidence about the head: the selector ENGINE and
+#      the RULES it reads are both fetched PINNED TO THE HEAD (see below), so
+#      which checkout `$PWD` happens to be cannot influence the answer.
 #   3. `python3.12`, then `python3.13` — an explicitly versioned interpreter.
 #   4. `python3` — ONLY when it actually reports ≥3.12 (it usually does not).
 # EVERY candidate must PROVE ≥3.12 by EXECUTING and asking the interpreter ITSELF
@@ -1537,7 +1561,7 @@ lane_selector_python() {
 
 lane_declined_shards() {
   local head="$1" out="$2"
-  local slug changed json verdict rc=0 sp cp
+  local slug changed changed_names json verdict rc=0 sp cp
   local selector_root selector_body manifest_body
   LANE_DECLINED_REASON=""
   LANE_PARITY_SELECTOR_VERDICT=""
@@ -1571,8 +1595,13 @@ lane_declined_shards() {
   # forgive ALL THREE diff-gated legs on a read that returned no filename at all.
   # A PR always has at least one changed file, so "no real filename" is an
   # unavailable answer, never "no files changed". This is `lane_count`'s own
-  # idiom (a set with no names counts ZERO), applied to a string.
-  if [ "$(printf '%s' "$changed" | grep -c '[^[:space:]]')" -eq 0 ]; then
+  # idiom (a set with no names counts ZERO) AND its `${n:-0}` normalisation,
+  # applied to a string: `grep -c` prints `0` on no-match and the preceding rc
+  # check already excludes the empty case, so this read is DEFENSIVE — but the
+  # direction it protects is the fail-open one, so it is guarded rather than
+  # reasoned about.
+  changed_names="$(printf '%s' "$changed" | grep -c '[^[:space:]]')"
+  if [ "${changed_names:-0}" -eq 0 ]; then
     LANE_DECLINED_REASON="the PR's changed-file list came back EMPTY ($slug/pulls/$PR/files) — an unavailable answer, not a diff with no files"
     return 1
   fi
@@ -1585,8 +1614,11 @@ lane_declined_shards() {
   # API for exactly this fail-open. The manifest is fetched at the same ref for
   # the same reason: the selector derives its data root from `__file__` and reads
   # `config/ci-surfaces.yml` from there, so pinning the engine while reading the
-  # rules off the local disk would leave the same hole one level down. The two
-  # fetches are the reason nothing here touches `$PWD`.
+  # rules off the local disk would leave the same hole one level down. The only
+  # thing `$PWD` contributes here is an INTERPRETER (candidate 2 above); the
+  # selector ENGINE and its RULES both come from these head-pinned fetches, so a
+  # `$PWD` that is not the target checkout — even one that is an unrelated repo —
+  # cannot influence the selector's answer.
   selector_body="$($GH api "$slug/contents/tools/ci_selection.py" -X GET -f "ref=$head" \
                      -H 'Accept: application/vnd.github.raw' 2>/dev/null)"
   rc=$?
@@ -4236,20 +4268,27 @@ $attribution_line"
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
         parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
       fi
-      # DISCLOSE the #6928 forgiveness the SAME way, and for the same reason: a
-      # certificate that says `PR ⊇ main` must state the one case where the PR did
-      # NOT execute every shard main did, or the line overstates what was measured.
-      # Its OWN line, appended after the literal block below, and never carrying
-      # `lane parity:` (that line is matched to its END by the evidence gate).
-      if [ -n "$LANE_PARITY_FORGIVEN" ]; then
-        parity_forgiven_note="   lane-coverage forgiveness (#6928): these shard(s) main's lane executed were DECLINED by this head's diff selector and are therefore NOT required of it: $(printf '%s' "$LANE_PARITY_FORGIVEN" | tr '\n' ' ')Selector verdict: ${LANE_PARITY_SELECTOR_VERDICT}. This is the SELECTOR's own decision — the same rule the CI aggregate applies to a selector-declined leg — not a blanket exemption: every shard the selector did not decline still had to be executed, and was."
-      fi
     elif [ "$parity_rc" -eq 2 ]; then
       parity_note="lane parity was NOT ESTABLISHED: ${LANE_PARITY_REASON}."
       parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
     else
       parity_note="lane parity FAILS: this head did NOT execute $(lane_count "$TMP/lane-missing.txt") test shard(s) main's lane executes (parity family: ${LANE_JOB_PREFIX}*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457)."
       parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
+    fi
+    # ── DISCLOSE THE #6928 FORGIVENESS ON EVERY PATH IT TOUCHED ──────────────
+    # Built HERE, after the branch, and not only on the certifying (`rc 0`) path.
+    # The `declared-off` refusal path (#6928 P3-1) reports a missing-shard count
+    # that is ALREADY net of the forgiven shards, so without this the posted
+    # certificate states a number and never says why the other shards were not
+    # required — the stderr warning discloses it, the certificate did not. The
+    # rule is one rule for both paths: a `PR ⊇ main` line must state the one case
+    # where the PR did NOT execute every shard main did, and a FAILS line must
+    # state that its count EXCLUDES shards the selector declined. Its OWN line,
+    # appended after the literal block below, and never carrying `lane parity:`
+    # (that line is matched to its END by the evidence gate, and carries at most
+    # one `parity family:`).
+    if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+      parity_forgiven_note="   lane-coverage forgiveness (#6928): these shard(s) main's lane executed were DECLINED by this head's diff selector and are therefore NOT required of it: $(printf '%s' "$LANE_PARITY_FORGIVEN" | tr '\n' ' ') Selector verdict: ${LANE_PARITY_SELECTOR_VERDICT}. This is the SELECTOR's own decision — the same rule the CI aggregate applies to a selector-declined leg — not a blanket exemption: every shard the selector did not decline still had to be executed, and was."
     fi
     if [ "$parity_rc" -ne 0 ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
       if [ "$parity_rc" -eq 2 ]; then

@@ -811,13 +811,42 @@ pr_changed_files() {
   for p in "$@"; do printf '%s\n' "$p" >> "$SCEN/pr-changed-files"; done
 }
 
+# ── THE RESOLVED-INTERPRETER PROOF (the pin that makes M6 go RED) ────────
+# ⛔ A selector that will run under ANY interpreter is BLIND to the defect this
+# whole change exists to fix. Mutation M6 — running the selector under the rail's
+# own `$PYTHON_BIN` instead of the resolved `$LANE_SELECTOR_PYTHON` — left the
+# FULL suite green at 1057/1057, because every staged selector was 3.9-compatible
+# and every `selector_interp_*` wrapper ended in `exec python3` (the host's 3.9).
+# The stubbed decision and the stubbed interpreter cancelled out, so nothing ever
+# observed WHICH interpreter the rail reached for — and "which interpreter" IS the
+# bug (tortoise's selector refuses < 3.12 at its module level, so the first cut was
+# inert).
+#
+# Every selector `selector_write` stages therefore REFUSES TO RUN unless
+# `$SELECTOR_PROOF_ENV` is set, and ONLY `selector_interp_312`'s wrapper sets it
+# (immediately before it execs). The resolved-interpreter path carries the marker
+# and succeeds; M6 — which names `$PYTHON_BIN` and never runs the wrapper — reaches
+# the selector WITHOUT it, the selector FAILS, the rail refuses the raw gap, and
+# the scenario that asserts forgiveness PASSES goes red. The wrapper is no longer
+# a bare version-banner lie that anything can bypass: it is the ONLY route to a
+# selector that runs at all, and the fixture proves it by refusing every other
+# route. This stays HERMETIC — nothing here requires a real ≥3.12 on the host.
+SELECTOR_PROOF_ENV="ADMIN_MERGE_SELECTOR_INTERPRETER_PROOF"
+
 # selector_write <body> → stage the HEAD's selector, plus the manifest the
 # selector reads from its own repo root (`REPO = Path(__file__).parent.parent`),
-# in the contents fixtures for the head `$SCEN/head` names.
+# in the contents fixtures for the head `$SCEN/head` names. The resolved-
+# interpreter proof preamble above is prepended to EVERY staged selector, so no
+# fixture can accidentally model a selector that runs without the wrapper.
 selector_write() {
   local head; head="$(cat "$SCEN/head")"
   mkdir -p "$SCEN/wf-contents/$head/tools" "$SCEN/wf-contents/$head/config"
-  printf '%s\n' "$1" > "$SCEN/wf-contents/$head/tools/ci_selection.py"
+  { printf 'import os, sys\n'
+    printf 'if os.environ.get("%s") != "1":\n' "$SELECTOR_PROOF_ENV"
+    printf '    sys.stderr.write("ci_selection.py: refusing to run outside the resolved-interpreter seam\\n")\n'
+    printf '    raise SystemExit(1)\n'
+    printf '%s\n' "$1"
+  } > "$SCEN/wf-contents/$head/tools/ci_selection.py"
   printf 'surfaces: {}\n' > "$SCEN/wf-contents/$head/config/ci-surfaces.yml"
 }
 
@@ -850,18 +879,32 @@ selector_on_disk() {
 }
 
 # selector_interp_312 — supply an interpreter that PASSES the rail's ≥3.12 probe
-# and then runs the fixture with the host's `python3`. A WRAPPER, so the probe is
-# answered by the wrapper (it must be — that is the contract) while the fixture
-# itself stays 3.9-compatible. Sets SEL_PY for `run_admin_cwd`; hermetic, because
-# nothing here depends on a ≥3.12 interpreter actually existing on the host.
+# and then runs the fixture with the host's `python3`.
+#
+# ⛔ THIS IS A CAPABILITY SHIM, NOT A VERSION CLAIM, and it is written so it
+# cannot be mistaken for one. The probe answer is the wrapper's; what makes the
+# fixture SOUND is the marker protocol: this wrapper is the ONLY thing that sets
+# `$SELECTOR_PROOF_ENV`, and every staged selector REFUSES to run without it. So
+# the shim can no longer "claim ≥3.12 and execute a pre-3.12 interpreter" in the
+# direction that matters — a selector run that did NOT come from this wrapper FAILS
+# rather than being certified, which the M6 pin in the #6928 block exercises. The
+# fixture selector itself stays 3.9-compatible on purpose, so the failure M6
+# produces is the rail's own refusal ("the diff selector failed") and not a
+# `SyntaxError` that could mask the path under test. Sets SEL_PY for
+# `run_admin_cwd`; hermetic, because nothing here depends on a ≥3.12 interpreter
+# actually existing on the host.
 selector_interp_312() {
   cat > "$SCEN/fake-python" <<'EOF'
 #!/bin/sh
+# The ≥3.12 provider seam: answer ONLY the rail's own version probe, then prove
+# the resolved-interpreter path by handing the selector the marker it demands.
 if [ "$1" = "-c" ]; then
   case "$2" in
     *version_info*) exit 0 ;;
   esac
 fi
+ADMIN_MERGE_SELECTOR_INTERPRETER_PROOF=1
+export ADMIN_MERGE_SELECTOR_INTERPRETER_PROOF
 exec python3 "$@"
 EOF
   chmod +x "$SCEN/fake-python"
@@ -5528,6 +5571,58 @@ if bash "$ROOT/scripts/verify-admin-merge-evidence.sh" --body-file "$SCEN/commen
 else
   fail "the forgiveness disclosure makes the posted evidence unmatchable — the rail would refuse its own merge"
 fi
+
+# (a2) #6928 P3-1 — THE FORGIVENESS IS DISCLOSED ON THE `declared-off` REFUSAL
+# PATH TOO. When the selector forgives the declined legs but a NON-declined shard
+# is STILL missing, parity FAILS; under the audited `declared-off` escape the rail
+# certifies anyway, and the posted body's count is ALREADY net of forgiveness
+# (`did NOT execute 1 test shard`) — but the first cut built the disclosure ONLY on
+# the `rc 0` branch, so that certificate left the reader with a shard count and no
+# statement of why the other three were not required. A certificate must state why
+# a shard was not required. Its own line (never carrying `lane parity:`), so the
+# `lane parity:` line stays one line and keeps at most one `parity family:`.
+new_scen lane6928-declaredoff
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 6936 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6937 6935 > "$SCEN/runs-main"
+lane_jobset 6935 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+# The PR ran ONLY `test (a)`: `test (b)` is a NON-declined shard that stays missing.
+lane_jobset 6936 success 'test (a)'
+pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
+selector_stub False False
+ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "#6928 P3-1: declared-off still certifies with the declined legs + one real gap (exit 0)" \
+  || fail "#6928 P3-1: expected exit 0 under declared-off, got $rc"
+grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
+  && pass "…and the POSTED evidence STATES the forgiveness on the declared-off path" \
+  || fail "the declared-off certificate omits the forgiveness disclosure (P3-1)"
+lane6928_do_note="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/comment")"
+if printf '%s' "$lane6928_do_note" | grep -q 'test-slow (a)' \
+   && printf '%s' "$lane6928_do_note" | grep -q 'test-slow (b)' \
+   && printf '%s' "$lane6928_do_note" | grep -q 'test-carve-out' \
+   && printf '%s' "$lane6928_do_note" | grep -q 'Selector verdict: slow_run=false, carve_out_run=false'; then
+  pass "…naming every forgiven shard and the selector verdict it rests on"
+else
+  fail "the declared-off disclosure does not name the shards and verdict: $lane6928_do_note"
+fi
+grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
+  && pass "…while still stating the parity was NOT established (the escape is not silenced)" \
+  || fail "the declared-off certificate no longer states the escape"
+grep -q "did NOT execute 1 test shard" "$SCEN/comment" \
+  && pass "…and counting exactly the one NON-declined shard missing (the count is net of forgiveness)" \
+  || fail "the declared-off count is not net of the forgiven shards"
+# The `lane parity:` line stays ONE line, still starts with `lane parity:`, and
+# carries at most one `parity family:` — the three properties the gate anchors on.
+[ "$(grep -c 'lane parity:' "$SCEN/comment")" -eq 1 ] \
+  && pass "…on exactly one \`lane parity:\` line (the disclosure rides its OWN line)" \
+  || fail "the declared-off certificate carries $(grep -c 'lane parity:' "$SCEN/comment") \`lane parity:\` lines"
+[ "$(grep -m1 'parity family:' "$SCEN/comment" | grep -o 'parity family:' | wc -l | tr -d ' ')" -eq 1 ] \
+  && pass "…with at most one \`parity family:\`" \
+  || fail "the declared-off parity line carries more than one \`parity family:\`"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
+  || fail "declared-off refused the merge"
 
 # (b) NOTHING DECLINED → NOTHING FORGIVEN. A diff the selector says selects both
 # legs leaves the raw gap intact: the three legs stay missing and the refusal is
