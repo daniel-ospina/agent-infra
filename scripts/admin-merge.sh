@@ -3303,13 +3303,38 @@ reproduce_residual_on_base() {
 #       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
 #       redislite/GRAPH.COPY race while the embedded lane reproduces it — the old
 #       wording asserted uniqueness with nothing to compare against.)
-# main_measured_files <mainfails> — the FILE set main's failure-only baseline
-# measured. A sibling failure in the file (or a guard-step identity for it) is
-# proof main's lane RAN that file and did not show THIS id red — MEASURED-ABSENT
-# — which the rail must keep distinct from NOT-MEASURABLE (no measurement of the
-# file at all). `attribute_residual` and the #3715 candidate set read the SAME
-# derivation, so the rail's words and its clearance cannot drift apart.
+# main_measured_files <mainfails> — the FILES main's failure-only baseline
+# actually MEASURED, i.e. a real test failure in the file (or a guard-step
+# identity for it). A sibling failure in the file is proof main's lane RAN it and
+# did not show THIS id red — MEASURED-ABSENT — which the rail must keep distinct
+# from NOT-MEASURABLE.
+#
+# A `collect-error::<file>` is deliberately NOT in this set, and that is the whole
+# reason this function is not `main_baseline_units`: pytest could not COLLECT the
+# file, so NO test in it ran and main's baseline says NOTHING about the file's
+# tests. It is a unit the rail can NAME, not a measurement it can rely on.
+# Conflating the two makes the base reproduction refuse an id the base itself
+# reproduces as FAILED — the false block #3715 exists to remove (a real
+# regression when this set was widened; caught in review).
 main_measured_files() {
+  local mainfails="$1"
+  [ -s "$mainfails" ] || return 0
+  {
+    sed '/^guard-step::/d; s/::.*//' "$mainfails"
+    sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+  } | sort -u
+}
+
+# main_baseline_units <mainfails> — the UNIT each of main's baseline rows is
+# keyed by, for MATCHING a residual and for PRINTING it. Wider than
+# `main_measured_files` by exactly the rows that name no test: `collect-error::`
+# groups by FILE (#6798 — a different file on main must not read as a
+# pre-existing failure in the same unit) and an environmental kill groups by the
+# MECHANISM. Read by `attribute_residual` (the rail's WORDS); deliberately NOT
+# read by `repro_candidates` (its CLEARANCE), because a unit is not a
+# measurement. The two coincide for every id that names a test, which is why one
+# function looked sufficient.
+main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
@@ -3404,10 +3429,11 @@ repro_candidates() {
 
 attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
-  # main's side is kept: the file set is the WIDE one (main's #6798 families).
-  # Its own inline block is now the shared helper, so the two readers of this
-  # derivation cannot drift — see `failure_file_key`.
-  main_files="$(main_measured_files "$mainfails")"
+  # main's side is kept: the file set is the WIDE one (main's #6798 families),
+  # because this function MATCHES a residual id to the unit main's baseline
+  # names. Its own inline block is now `main_baseline_units`, so the two readers
+  # of a shared key derivation cannot drift — see `failure_file_key`.
+  main_files="$(main_baseline_units "$mainfails")"
   while IFS= read -r nodeid; do
     [ -n "$nodeid" ] || continue
     file="$(failure_file_key "$nodeid")"

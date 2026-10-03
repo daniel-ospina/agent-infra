@@ -1642,6 +1642,44 @@ grep -q -- '--admin' "$SCEN/calls" \
   && fail "#3715: a merge was attempted over a rotated identity" \
   || pass "#3715: no merge over a rotated identity"
 
+# --- 4c (bis). a collect-error on main for the residual's FILE is a UNIT, not a
+# MEASUREMENT (#3715) -------------------------------------------------------
+# The clearance exists to stop FALSE BLOCKS. `collect-error::<file>` means pytest
+# could not COLLECT the file, so NO test in it ran and main's baseline says
+# NOTHING about the file's tests. Read it as "main measured this file" and the
+# file-level candidate filter refuses a base reproduction that DID reproduce —
+# blocking a genuinely pre-existing failure, i.e. the exact bug #3715 exists to
+# fix. The two readings are `main_baseline_units` (the unit a baseline row is
+# keyed by, for what the rail PRINTS) and `main_measured_files` (the files whose
+# tests main really RAN, for what it CLEARS). They agree for every id that names
+# a test, which is why one function looked sufficient; this pins the one family
+# where they must not be the same set.
+new_scen repro-base-collect-error
+repro_base_sha
+HEAD_CE="e5e500000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_CE" > "$SCEN/head"
+PRE_CE='tests/test_pre_existing.py::test_fails_on_main_too'
+lane_fail "$HEAD_CE" 981 > "$SCEN/runs-$HEAD_CE"
+log_failed "$PRE_CE" > "$SCEN/log-981"
+# main's baseline names the SAME FILE — but only as a COLLECTION ERROR, which
+# names no test id. So main never measured this file's tests.
+lane_fail maince2 989 > "$SCEN/runs-main"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/test_pre_existing.py - ImportError: no module named z\n' > "$SCEN/log-989"
+printf '3\n' > "$SCEN/jobs-count-989"
+cp "$SCEN/log-981" "$SCEN/log-after-981"   # the PR's retry FAILS again
+repro_script "$SCEN/repro.sh"
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 44 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "#3715: a same-file COLLECT-ERROR on main does not block a base reproduction (exit 0)" \
+  || { fail "#3715: main's collect-error for the SAME file was read as a measurement, so a pre-existing failure FALSE-BLOCKED (exit $rc) — a UNIT is not a MEASUREMENT"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing: $PRE_CE" "$SCEN/err" \
+  && pass "#3715: …the reproduced id is reported pre-existing despite the same-file collect-error" \
+  || fail "#3715: the reproduced id was not reported pre-existing"
+grep -q "pr merge 44 --admin" "$SCEN/calls" \
+  && pass "#3715: …and the merge proceeds" \
+  || fail "#3715: no merge after a clearance that should have happened"
+
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ─────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="
 new_scen vacuous
