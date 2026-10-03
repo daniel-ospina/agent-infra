@@ -1727,7 +1727,7 @@ P2_29D="$(git rev-parse HEAD)"
 git checkout -q lane; git merge --no-ff -q "$P2_29D" -m "merge p2"
 CUR29D="$(git rev-parse HEAD)"
 git checkout -q main
-printf 'A0\n' > x/a; git add -A; git commit -qm "B2: x keeps a only"
+rm x; mkdir x; printf 'A0\n' > x/a; git add -A; git commit -qm "B2: x keeps a only"
 B2_29D="$(git rev-parse HEAD)"
 git update-ref refs/remotes/origin/main refs/heads/main
 L29D="$(git merge-tree --write-tree "$B2_29D" "$CUR29D" | head -1)"
