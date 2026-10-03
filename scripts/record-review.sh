@@ -859,6 +859,16 @@ for path in paths:
                             sys.stderr.write("(C4) leaf unreadable: %r\n" % lpath)
                             sys.exit(1)
                         known |= lines(b)
+                # REACHABILITY BOUND (round 35, MEASURED — state it, do not imply a guard): this
+                # arm fires ZERO times across the suite's 138 assertions, and replacing the whole
+                # tree branch with `continue` produces the SAME refusals from the blob arm below.
+                # A leak needs a LINE absent from both the base tip and `reviewed`; the only
+                # hermetic shape is a union merge driver re-admitting a line the tip DELETED
+                # (the §22 residual), which lives at a path the tip CHANGED, where the BLOB ARM
+                # decides it. So this is DEFENCE IN DEPTH over the declared residual, NOT a live
+                # guard. It is KEPT because a landing tree whose leaves come from neither input is
+                # precisely the class that must never carry if it becomes reachable, and it costs
+                # one comparison when it is not reachable.
                 lnew = lines(lb) - known
                 if lnew:
                     sys.stderr.write("(C4) LEAK %r -> %r\n" % (lpath, sorted(lnew)[:5]))
