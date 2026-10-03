@@ -3462,6 +3462,55 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
   ok(!isAdminMergeCommand("gh pr view $X"), "a non-merge gh call with a `$VAR` is NOT gated");
 });
 
+test("#1492: the merge question is asked per SEGMENT — an unrelated stage cannot grade a read-only command", () => {
+  // The reproduction (#1155 class, minimal): the two characters `$` + `'` used as a
+  // TAB separator in an unrelated pipeline stage. Nothing here merges, writes, or
+  // mentions admin. Before the fix this was refused as an unevidenced admin merge.
+  const listing =
+    "gh pr list --state open --limit 2 --json number,mergeStateStatus | sort -t$'\\t' -k2";
+  ok(!isAdminMergeCommand(listing), "another stage's ANSI-C quoting is NOT an admin merge (#1492)");
+  ok(!isGhPrMergeCommand(listing), "…nor a `gh pr merge` (#1492)");
+  ok(!isGitOp(listing), "…so the read-only listing is not gate-relevant at all (#1492)");
+  // The `$` that merely ENDS a quoted argument (#1425 round 4) — in another stage.
+  ok(!isGitOp('gh label list --repo o/r --json name | grep -E "bug$"'), "a trailing `$` in another stage");
+  ok(!isGitOp("gh issue list --limit 5 --json title | awk '{print $2}'"), "a brace/$ stage that could not hide a verb");
+  // NOT a blanket allow: the whole-command predicate is unchanged where it belongs.
+  ok(isGhPrMergeCommand("gh pr m$'erge' 999"), "a spliced verb in the gh segment is still a merge");
+  // SAFETY PINS — every spelling that HIDES the flag still reaches the admin gate.
+  // If co-location were the wrong cut, one of these would go red (that is the test).
+  const hidden = [
+    "gh pr merge 999 $'--admin'",
+    "gh p$'r' merge 999 $'--admin'",
+    "$'gh' p$'r' m$'erge' 999 $'\\x2d\\x2d\\x61dmin'",
+    "bash -c \"gh pr merge 999 $'\\x2d\\x2d\\x61dmin'\"",
+    "V=$'\\x2d\\x2d\\x61dmin'; gh pr merge 999 $V",
+    "V=pr; gh $V merge 999 --admin=true",
+    "gh pr merge 999 -${V:--}admin=true",
+    "D=--admin; gh pr merge 999 $D",
+    // Adversarial cycle 1 — the CONTINUATION family. bash deletes a backslash-newline
+    // before tokenizing, so these are ONE command whose verb is spliced across the
+    // continuation. Treating it as a segment boundary was a real FAIL-OPEN (this lane's
+    // own change, caught by the cycle-1 reviewer): both predicates returned false and no
+    // gate ran, where the shipped code had blocked. Pin all four forms.
+    "G=erge; gh pr m\\\n$G 999 --admin",
+    "G=erge; gh pr m\\\r\n$G 999 --admin",
+    "gh pr \\\n$(printf '\\x6d\\x65\\x72\\x67\\x65') 999 --admin",
+    "gh \\\n$(printf '\\x70\\x72') merge 999 --admin",
+    // Adversarial cycle 2 — the SPLICED-NAME family. bash re-joins the quoted/escaped
+    // pieces of the command name into `gh`; the word test must read the NORMALIZED text,
+    // or co-location is unobservable and no gate runs (a real fail-open, this lane's own
+    // change). Each form below was confirmed to run `gh pr merge 999 --admin` at bash.
+    "g\"h\" p$'r' merge 999 --admin",
+    "g'h' p$'r' merge 999 --admin",
+    "g\\h p$'r' merge 999 --admin",
+    "g\"\"h p$'r' merge 999 --admin",
+    "g'h' p$'r' m$'erge' 999 $'--admin'",
+  ];
+  for (const c of hidden) {
+    ok(isAdminMergeCommand(c), `a HIDDEN flag is still an admin merge: ${JSON.stringify(c)}`);
+  }
+});
+
 test("countMergeVerbs: a compound command must fail closed", () => {
   // Fresh review P1-1: `extractMergePrNumber` deliberately truncates at the first
   // separator and the gate evaluates ONE PR, so `gh pr merge 111 --admin; gh pr
