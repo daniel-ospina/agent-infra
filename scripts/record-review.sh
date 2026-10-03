@@ -102,8 +102,8 @@ closing_issue_refs() {
   while IFS= read -r m; do
     [ -z "$m" ] && continue
     local repo num
-    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | head -1 || true)"
-    num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | head -1 || true)"
+    repo="$(printf '%s' "$m" | tr 'A-Z' 'a-z' | grep -oE 'https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+' | sed -E 's#https://github.com/([^/]+/[^/]+)/issues/[0-9]+.*#\1#' | command head -1 || true)"
+    num="$(printf '%s' "$m" | grep -oE '/issues/[0-9]+$' | grep -oE '[0-9]+' | command head -1 || true)"
     if [ -n "$repo" ] && [ -n "$num" ]; then
       printf '%s#%s\n' "$repo" "$num"
     fi
@@ -338,7 +338,7 @@ if [ -z "$REPO" ]; then
   REPO="${GH_REPO:-}"
 fi
 if [ -z "$REPO" ]; then
-  REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  REPO="$(command gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
 fi
 if [ -n "$REPO" ] && ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "repo must be owner/name (got '$REPO'); refusing to record" >&2; exit 2
@@ -412,14 +412,14 @@ diff_hash_for_pr() { # <pr>
   norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
   # shellcheck disable=SC2064
   trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
-  if gh api -H "Accept: application/vnd.github.v3.diff" \
+  if command gh api -H "Accept: application/vnd.github.v3.diff" \
        "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
-    LEGACY_DIFF_HASH="$(openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
+    LEGACY_DIFF_HASH="$(command openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
        && [ -s "$DIFF_NORMALIZER" ] \
        && python3 "$DIFF_NORMALIZER" < "$tmp" > "$norm" 2>/dev/null \
        && [ -s "$norm" ]; then
-      DIFF_HASH="$(openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
+      DIFF_HASH="$(command openssl dgst -sha256 < "$norm" | awk '{print $NF}')"
     else
       # Fail OPEN to the pre-#1362 raw digest: the consumer still accepts it as
       # the legacy hash, so the marker stays verifiable — but a base-only update
@@ -470,6 +470,470 @@ fi
 # file/env key may carry stray whitespace).
 GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 
+# ── LANE-DIMENSION CARRY (#6072/#6213/#4823) ─────────────────────────────
+# The #2982 arm below asks whether the RENDERED patch is byte-identical. A base
+# move breaks that whenever main's landed commits OVERLAP the files the PR
+# touches, because the patch's "before" side then becomes main's new content while
+# the LANE's contribution is unchanged. Measured on three PRs, all with zero lane
+# commits between the reviewed head and the live head:
+#   #6072  two base merges  -> record dead (stored diff != live diff)
+#   #6213  one base merge   -> ai-review-gate SUCCESS at the reviewed head, then
+#                             FAILURE 7 SECONDS after the rail moved the head
+#   #4823  one base merge   -> a replacement record had to be produced (a fresh
+#                             review paid for work that did not change)
+# And one counter-example that fixes the boundary: #5421 also moved its head, but a
+# real lint fix (cfe2bad0afaa) landed in between, so the refusal was CORRECT, a
+# fresh review was owed, was produced, and the PR merged. This arm must fire on the
+# first three and NOT on that one.
+#
+# This does NOT relax the head binding: the carry is re-recorded against
+# CURRENT_HEAD, so the marker still names the head that merges. It widens WHEN a
+# carry is permitted, from "the rendered text is identical" to "the LANE's commits
+# are provably identical".
+#
+# FAIL-CLOSED: every clause below returns non-zero on any doubt (missing object,
+# unreadable base, merge-tree unavailable, conflict), so the existing refusal path
+# still governs. It DOES accept verdicts the #2982 arm rejected — that is its purpose,
+# and the call site prints the reason ("the rendered diff changed"). What it proves is
+# NARROWER than "the reviewed artifact unchanged": it proves the LANE's commits are
+# identical, i.e. the head's tree is exactly a clean merge of the reviewed tree with the
+# head's base parent. An earlier version of this line claimed the opposite and a reviewer
+# falsified it — the claim would have licensed reverting this to a no-op extension.
+# Replace refs and the grafts FILE, either of
+# which could present a different commit graph to this check, are neutralised for its
+# duration below — the two are DIFFERENT mechanisms and need different env vars.
+lane_dimension_carry() { # <reviewed-sha> <current-head> -> 0 = provably unchanged
+  local reviewed="$1" current="$2" base_sha="" p2="" merged="" mrc=0 ctree="" extra="" rc=0
+  # Replace refs AND the grafts FILE both rewrite what rev-list, rev-parse and
+  # rev-parse^{tree} SEE, so either one can present a different commit graph to this
+  # predicate than the one that is really there — reviewers built BOTH and turned a
+  # REFUSE fixture into a CARRY with unreviewed content in the head tree.
+  # `GIT_NO_REPLACE_OBJECTS` covers ONLY `refs/replace/*`. A reviewer measured that a
+  # `.git/info/grafts` line STILL carried under it (walk emptied, verdict CARRY), and that
+  # `GIT_GRAFT_FILE=/dev/null` is what actually disables the file mechanism — reproduced
+  # independently before this line was written, because the first version of this comment
+  # claimed "Replace/graft refs ... are neutralised" while only replace refs were.
+  # `local -x` scopes both exports to this function; the rest of the script is unaffected.
+  local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+  [ -n "$reviewed" ] && [ -n "$current" ] || return 1
+  [ "$reviewed" != "$current" ] || return 1
+
+  # (A) BOTH revisions must be present locally. Deliberately NO `git fetch` here:
+  # this is the trust boundary of the merge gate, and pulling objects from the
+  # remote inside it is a worse failure than a missed carry. Absent object =>
+  # refuse. (The base IDENTITY below still comes from the API — that is a read of
+  # the PR's declared base, not a fetch of content, and an earlier version of this
+  # comment wrongly implied the function made no network call at all.)
+  command git cat-file -e "$reviewed^{commit}" 2>/dev/null || return 1
+  command git cat-file -e "$current^{commit}" 2>/dev/null || return 1
+
+  # (B) THE HEAD MOVED FORWARD. A rewritten/rebased head is a DIFFERENT artifact
+  # even when its lane commits look equivalent, so it must never carry this way.
+  command git merge-base --is-ancestor "$reviewed" "$current" 2>/dev/null || return 1
+
+  # (C) THE BASE IS AN AUTHORITATIVE COMMIT FROM THE API — NOT A LOCAL REF.
+  # An earlier cut of this function asked `--not origin/$base`, trusting a LOCAL
+  # remote-tracking ref. That was a FAIL-OPEN: a stale or divergent `origin/main`
+  # makes everything reachable from IT count as "base content", so a commit the
+  # review never saw is classified as base and the verdict carries. Reproduced by
+  # pointing refs/remotes/origin/main at a branch containing an unreviewed file and
+  # merging that branch: (C) came out empty and the predicate CARRIED. The local ref
+  # was never fetched and never compared to the API, so it could not be trusted.
+  # The authority is `.base.sha` from the API. Two things must then hold:
+  #   - the head's SECOND PARENT (the base it actually merged) must be reachable
+  #     from that authoritative base, so the base the head merged is base LINEAGE.
+  #     This clause claims ONLY that much: it does not constrain the head's FIRST parent,
+  #     and a head whose first parent is itself a merge IS carried (MEASURED with the real
+  #     function — `current^1` was a merge, not the reviewed commit, and the verdict was
+  #     CARRY). Which side is base-derived is settled by (A)/(B)/(C2)/(D), never by the
+  #     shape of `current^1`.
+  #     Reachability does NOT bound the head by the base TIP's tree, and the reason is
+  #     NOT "lineage is safe" — that reason was FALSIFIED and is deleted: "it came from
+  #     the base" does not make a blob something a review saw. A head whose only
+  #     non-reviewed file exists in no reviewed commit and NOT in the base tip, but in a
+  #     base ANCESTOR, IS carried (MEASURED twice, independently). What makes that SOUND is
+  #     narrower: the reason is the LANE dimension, NOT the rendered patch. The rendered patch
+  #     is EXPECTED to change here — that is why this arm exists at all, since §2982's
+  #     byte-identity test cannot carry a base move that lands in a PR's hunk context (a
+  #     reviewer MEASURED a head in this very class whose three-dot patch DIFFERS while all
+  #     five clauses hold). The reason the carry is sound, stated as narrowly as it can be
+  #     justified: (D) pins the head to the AUTOMATIC merge of `reviewed` with a base-LINEAGE
+  #     commit, so the only content the head adds beyond that base lineage is `reviewed`'s own
+  #     contribution — the commit the review approved.
+  #     WHAT IS NOT CLAIMED HERE: no general theorem about landing — that is pinned by
+  #     MEASUREMENT in §20/§21 of the suite. A merge-base IDENTITY **is** required, by clause
+  #     (C3) below, and it is required precisely because an earlier revision asserted it in
+  #     prose, a reviewer falsified the prose, the prose was deleted, and the invariant was left
+  #     UNENFORCED — which is exactly how the round-23 leak existed. A head TREE exceeding
+  #     `reviewed + base
+  #     tip` is a DECLARED TOLERANCE, not a proof of safety, and §20 of the suite pins BOTH
+  #     halves — including a fixture where the patch CHANGES and the head is still carried, so
+  #     that a future tightening toward byte-identity reddens instead of landing; and
+  #   - the object must be present locally, so the walk below is meaningful.
+  # `.base.sha` is the CURRENT base tip, which is normally AHEAD of what the head merged,
+  # so the check runs `--is-ancestor <head's second parent> <base_sha>`: the SECOND PARENT
+  # must be an ancestor OF the authoritative base. The direction is NOT symmetric —
+  # MEASURED on a real pair: `--is-ancestor p2 base_sha` is TRUE while
+  # `--is-ancestor base_sha p2` is FALSE. Read the argument order, not the prose.
+  base_sha="$(command gh api "repos/$REPO/pulls/$PR" --jq .base.sha 2>/dev/null || true)"
+  # THE SHELL-FUNCTION VECTOR IS A CLASS, NOT THREE COMMANDS. An EXPORTED bash function is
+  # inherited by `bash record-review.sh`, and it can intercept ANY external this script runs.
+  # Reviewers PROVED three separate instances end-to-end, each minting a `clean` record for a
+  # revision nobody reviewed: a function named `gh` nominating the base; one named `git`
+  # forging `merge-tree`; and one named `head` reading the caller's `$current` through
+  # DYNAMIC SCOPING to satisfy the tree equality in (D). `command` closes a name; it does not
+  # close the class. This function therefore uses `command` for every external whose result
+  # it DECIDES on: `gh`, `git`, and `head`. The rest of the script additionally routes
+  # `openssl` (the diff hash and the prior-marker HMAC) through `command`, for the same
+  # reason.
+  # ⛔ THIS IS NOT A CLOSED CLASS, AND `command` DOES NOT CLOSE IT EITHER. `command` is a bash
+  # BUILTIN, so a FUNCTION named `command` shadows it — a reviewer PROVED that exported
+  # function minting a `clean` record for a head carrying unreviewed content, defeating every
+  # `command` in this file at once; `builtin` is shadowable the same way, so `builtin command`
+  # is no better. There is therefore NO shell-level way to guarantee an un-intercepted
+  # external from inside the script, and no list of names can make one.
+  # WHAT THE `command` PREFIXES ACTUALLY DO, stated without flattering them: `command X`
+  # REMOVES the FUNCTION-named shadow (that is what the builtin does); what survives it is a
+  # NON-function shadow — a binary earlier on PATH, or env/config redirection of the real
+  # binary. The recorded instance that added `command gh` was ADVERSARIAL, not an operator
+  # accident (a reviewer exported a `gh` function to mint a signed marker), so the prefixes
+  # did not stop that actor and would not stop another. Nor do they make it true that "a
+  # non-adversarial shadow cannot flip a verdict": only five names are qualified, while the
+  # rest of the script's externals are invoked bare, and a shadowed one of THOSE decides a
+  # verdict just as well. Defence in depth against a narrow accident, NOT a boundary.
+  # THE REAL TRUST BOUNDARY: the environment this script runs in. EVERY external it invokes,
+  # `$GATE_KEY` in this process's memory, and the review record itself are reachable by an
+  # actor who controls it, and such an actor can write the record directly.
+  # NO LIST OF THE REMAINING SURFACE IS GIVEN BELOW. Earlier versions enumerated "what is
+  # left" and were wrong EVERY time, then contradicted themselves in the same paragraph by
+  # naming names while denying the list. The surface is "everything the script runs", a list
+  # of it re-stales, and so none is written.
+  # `command gh` skips a shell FUNCTION named gh, which a reviewer used to nominate an
+  # arbitrary local commit as the base and carry unreviewed content (a shim can emit only
+  # 40-hex, so the shape check does not stop it).
+  # RESIDUAL — the vectors NOT covered, NAMED rather than implied: a hostile BINARY earlier
+  # on PATH, and ENV/CONFIG redirection of the real binary (GH_HOST, GH_CONFIG_DIR, or an
+  # `http_unix_socket` in its config) — a reviewer demonstrated the last carrying unreviewed
+  # content through the REAL gh. (A shell FUNCTION named gh is CLOSED, not residual: every
+  # gh invocation in this script uses `command gh`. An earlier version of this note listed
+  # the function under "NOT covered" AND claimed it closed in the same breath, and the claim
+  # was untrue for the HEAD read, which a reviewer used to mint a signed
+  # `@ <stale> diff=<live>` pair.)
+  # WHY THOSE ARE DECLARED OUT RATHER THAN CLOSED: this predicate's threat surface is REPO
+  # STATE — a stale ref, a replace ref, a grafts file, a lying remote-tracking ref: things
+  # wrong by accident or residue, which is what the rails actually met. An actor who controls
+  # THIS PROCESS'S ENVIRONMENT can already write the review record directly, since this same
+  # script authors it, so no boundary is left to defend at that point; sanitising the env
+  # would add machinery that closes one spelling while a config in the default location still
+  # works. That is theatre, not a guard.
+  # A MERGE DRIVER is a RESIDUAL, and it is declared rather than closed because closing it
+  # would REVERSE A RECORDED DECISION. `git merge-tree` obeys .gitattributes, so (D) inherits
+  # the repo's DECLARED merge semantics. tortoise#5373 deliberately sets `merge=union` on
+  # config/ci-surfaces.yml and config/surface-manifest.yml (tortoise/.gitattributes, measured
+  # 2026-09-26: 25 of 44 conflicted PRs conflicted on ci-surfaces.yml alone), and the SAME
+  # file rejects a custom driver. A guard requiring the merged tree's BLOBS to be verbatim
+  # copies of the inputs was proposed and MEASURED to REFUSE a legitimately union-merged
+  # head — i.e. it would break the carry on exactly the two append-only registries most
+  # lanes touch. So the fix would be worse than the vector. WHAT THE VECTOR ACTUALLY IS:
+  # `merge=union` DOES emit a blob present in NEITHER input (measured), and a custom driver
+  # (`.git/config`, or the equally local `.git/info/attributes`) can emit content from NO
+  # ancestor at all. WHAT IT IS NOT, for an actor who can only PUSH A BRANCH: the built-in
+  # drivers reachable from the WORKING TREE's attributes are text/union/binary, and, AS BUILT
+  # IN, none can invent a LINE — union keeps both sides' lines, binary conflicts (rc refused),
+  # text merges — so no built-in invents a LINE.`git merge-tree` reads attributes from the
+  # WORKING TREE, not from the merged trees, so a PR's pushed .gitattributes takes effect once
+  # its branch is checked out; and a config entry can SHADOW a built-in NAME
+  # (`merge.union.driver`). The inventing case therefore needs a write to git's LOCAL
+  # CONFIGURATION — the repo's .git/config or .git/info/attributes, OR the user's global config
+  # — which is this script's OWN trust surface: a local writer can forge the review body this
+  # function reads, so no boundary is left there to defend.
+  # CONSEQUENCE OF THE WORKING-TREE SOURCE, stated because it is not obvious: the verdict is a
+  # function of the CALLER's checkout, not only of the commits under review. MEASURED — for the
+  # SAME (reviewed, current, base_sha), an UNTRACKED working-tree .gitattributes flips it: with
+  # `f.txt merge=union` present the arm CARRYs (0), with it absent the merge conflicts and the
+  # arm REFUSES (1). Absent attributes therefore fail CLOSED, which is the safe direction, but
+  # anyone reading a verdict must know the checkout is an input to it.
+  # ALSO NAMED: `.base.sha` is trusted as the authority and is NOT checked against
+  # `.base.ref`, so a PR whose base has been REPOINTED to a branch carrying unreviewed content
+  # has that content classified as base and the verdict carries (MEASURED with the real
+  # function: a repointed base yields CARRY with the base branch's file in the head). That is a
+  # SYMPTOM of the known base-blindness already filed for the
+  # clean/clean-micro tiers — agent-infra#1362 — so it is NAMED here rather than re-filed as a
+  # peer. §17 of the suite pins the union tolerance so a future blob-level "fix" reddens
+  # instead of landing.
+  # Reject everything that is not a 40-hex sha, exactly as the head fetch above does.
+  # Empty/null/error-body already failed closed (measured), but any non-empty string
+  # that happens to resolve as a LOCAL revision was accepted as "the authoritative
+  # base" (a reviewer got `branch` through). A non-sha cannot come from the real API,
+  # so this is hardening — but this function calls itself the trust boundary, and a
+  # name is not an authority.
+  case "$base_sha" in *[!0-9a-f]*|"") return 1 ;; esac
+  [ "${#base_sha}" -eq 40 ] || return 1
+  command git cat-file -e "$base_sha^{commit}" 2>/dev/null || return 1
+  p2="$(command git rev-parse "$current^2" 2>/dev/null || true)"
+  [ -n "$p2" ] || return 1
+  command git merge-base --is-ancestor "$p2" "$base_sha" 2>/dev/null || return 1
+
+  # (C3) THE MERGE BASE MUST **BE** p2 — not merely lie somewhere in the base's lineage.
+  # THE LEAK THIS CLOSES, MEASURED with the real function: (C) admits ANY base-lineage
+  # ancestor, so a head can carry commits NEWER than p2 that are still base lineage, and the
+  # LANDING merge then takes that newer commit as its base — resurrecting content the base tip
+  # has since DELETED into the base. A round-23 reviewer built exactly that head: it passes
+  # (A), (B), (C), (C2) and (D), the verdict is CARRY, and `merge-tree(base_tip, current)`
+  # carries a `leaked.env` that is in NO reviewed commit and NOT in the base tip.
+  # THIS IS THE INVARIANT a previous revision ASSERTED IN PROSE AND THEN DELETED: it read "at
+  # landing time the merge base of the head and the base tip is that same base-lineage commit".
+  # A reviewer correctly falsified the sentence as written (it is false of the accepted set)
+  # and it was removed — but removing the SENTENCE while leaving the CLAUSE out is what turned
+  # a stated invariant into an unenforced one. The fix is the clause, not better prose.
+  # AMBIGUITY FAILS CLOSED, and it is the EQUALITY line below that does it: a criss-cross
+  # history makes `mb` a MULTI-LINE string, which can never equal the single-sha `p2`
+  # (MEASURED: `--all` prints 2 bases, the verdict is REFUSE, and deleting the count line below
+  # changes no verdict). The count line is RETAINED AS DEFENCE — one line, with no decider role
+  # today — because it would matter if `mb` were ever narrowed to its first line.
+  local mb=""
+  mb="$(command git merge-base --all "$current" "$base_sha" 2>/dev/null)" || return 1
+  [ "$(printf '%s\n' "$mb" | command grep -c .)" = 1 ] || return 1
+  [ "$mb" = "$p2" ] || return 1
+
+  # (C4) THE LANDING MERGE MUST NOT INTRODUCE CONTENT ABSENT FROM BOTH THE BASE TIP AND THE
+  # REVIEWED COMMIT. (C3) fixes the landing merge BASE; it does not constrain the landing RESULT.
+  #
+  # THIS IS A BYTE-EXACT SEAM, NOT A SHELL PIPELINE, and the reason is measured. Rounds 26-30 each
+  # found a DIFFERENT wrong-CARRY in the shell form — `core.quotePath` C-quoted path names,
+  # `diff.relative` + the caller's cwd, the locale making `sort` exit 2 with empty stdout, the
+  # `comm` exit status discarded inside `[ -z "$( ... )" ]`, and finally a shell FUNCTION named
+  # `printf` shadowing the bash BUILTIN that produced `comm`'s inputs. Six of those eight ambient
+  # inputs existed only because the comparison was expressed in the shell: command substitution
+  # strips NULs and trailing newlines, `sort`/`comm` are locale- and status-sensitive, and path
+  # names have to be quoted and unquoted. The comparison is therefore done in ONE place, in bytes,
+  # where none of those can apply.
+  #
+  # It was differentially tested against the shell form it replaced before that form was deleted;
+  # that comparison has no surviving artifact, so it is NOT cited here as evidence. The suite,
+  # which RUNS, is the specification.
+  # DELIBERATELY NO "fail closed on a binary blob" GUARD: the guard was measured to buy nothing —
+  # a leak IS a line absent from tip + reviewed, so byte-exact line comparison already catches the
+  # binary leak — and it produced the ONLY false refusal measured, on a legitimate binary union
+  # carry that the shell form CARRIES. `--no-renames` also retires `diff.renames` as an input.
+  #
+  # FAIL CLOSED everywhere the model cannot represent the state: python3 absent (the heredoc cannot
+  # run), `merge-tree` non-zero (a conflicted landing), a landing entry that is present but not a
+  # readable blob (gitlink/tree/error), or an unreadable tip/reviewed entry. An entry ABSENT from
+  # the landing is legitimate — the merge took a deletion.
+  command python3 - "$reviewed" "$current" "$base_sha" <<'PYC4' || return 1
+import os, subprocess, sys
+
+reviewed, current, base_sha = sys.argv[1], sys.argv[2], sys.argv[3]
+env = dict(os.environ)
+# The replace-ref and grafts-file pins are NOT duplicated here, because the calling shell
+# already exports them with `local -x` and python inherits them. Duplicating the pins was
+# measured (round 31) to make both of their mutants INERT — a replace-ref pin is presence-tested
+# rather than value-tested, and a nonexistent grafts file neutralises a graft exactly like an
+# empty one — so the suite reported a benign "retirement" while two load-bearing fail-open
+# guards went unproven. One pin, one owner.
+env["LC_ALL"] = "C"
+
+
+def git(bargs):
+    p = subprocess.run([b"git"] + bargs, cwd=".", env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return p.returncode, p.stdout
+
+
+def exists(spec):
+    return git([b"cat-file", b"-e", spec])[0] == 0
+
+
+def read_blob(spec):
+    rc, out = git([b"cat-file", b"blob", spec])
+    return out if rc == 0 else None
+
+
+def lines(b):
+    if not b:
+        return set()
+    parts = b.split(b"\n")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    return set(parts)
+
+
+rc, out = git([b"merge-tree", b"--write-tree", base_sha.encode(), current.encode()])
+if rc != 0:
+    sys.stderr.write("(C4) landing merge-tree failed (rc=%d)\n" % rc)
+    sys.exit(1)
+ltree = out.split(b"\n")[0]
+if not ltree:
+    sys.stderr.write("(C4) no landing tree\n")
+    sys.exit(1)
+
+# The path set: every path the base tip changed relative to the head's second parent. Read
+# NUL-separated so no name is ever quoted, and no name can be split or dropped by a shell.
+rc2, out = git([b"rev-parse", current.encode() + b"^2"])
+if rc2 != 0:
+    sys.stderr.write("(C4) no second parent\n")
+    sys.exit(1)
+p2 = out.strip()
+rc3, out = git([b"-c", b"diff.relative=false",
+                 b"diff", b"--name-only", b"-z", b"--no-renames", p2, base_sha.encode()])
+if rc3 != 0:
+    sys.stderr.write("(C4) path listing failed (rc=%d)\n" % rc3)
+    sys.exit(1)
+paths = [x for x in out.split(b"\0") if x]
+
+for path in paths:
+    lspec = ltree + b":" + path
+    if not exists(lspec):
+        continue
+    # OID FIRST, and by TYPE-AGNOSTIC object id: the landing taking one side verbatim is
+    # skipped on the OBJECT, not on the bytes. MEASURED (round 31) as two FALSE REFUSALS
+    # otherwise: a base tip that turns file `x` into directory `x/` (the landing entry is a
+    # TREE, `cat-file blob` fails) and a submodule pointer bump whose commit IS present
+    # locally (a GITLINK). Both are pure base moves — the class this arm exists to carry —
+    # and both were refused. `rev-parse` on a tree:path returns the entry's object id for a
+    # blob, a tree and a gitlink alike, so this one comparison covers all three.
+    def oid(spec):
+        rc, out = git([b"rev-parse", b"--verify", b"--quiet", spec])
+        return out.strip() if rc == 0 else None
+
+    landing_oid = oid(lspec)
+    tip_spec = base_sha.encode() + b":" + path
+    rev_spec = reviewed.encode() + b":" + path
+    if landing_oid is not None and (oid(tip_spec) == landing_oid
+                                    or oid(rev_spec) == landing_oid):
+        continue
+    landing = read_blob(lspec)
+    if landing is None:
+        # NOT A READABLE BLOB. A TREE can legitimately hold content from BOTH inputs: when the
+        # base tip and `reviewed` each turn the same file `x` into a directory, git merges the two
+        # directories cleanly and the landing `x` is a THIRD tree unlike either input's. Refusing
+        # that is a MEASURED FALSE REFUSAL (round 33) on a pure base-only move — the class this arm
+        # exists to carry. So verify a landing tree's LEAVES by object id: every leaf that equals
+        # the tip's or `reviewed`'s leaf at the same path is known-good, and anything matching
+        # neither still FAILS CLOSED exactly as before. A gitlink (or anything else non-blob,
+        # non-tree) also still fails closed: a gitlink taking a third value needs a conflict.
+        # TWO ROUND-34 CORRECTIONS TO THIS BRANCH, both measured:
+        #  (P0) `ls-tree … -- <path>` treats <path> as a PATHSPEC. `:magic` is a legal directory
+        #       name, and pathspec MAGIC parses it away, so `ls-tree -- ':magic'` returns rc=0 with
+        #       NO OUTPUT: the loop never ran, nothing was verified, and the head CARRIED where the
+        #       previous code refused. `':x'` was worse — it enumerated the SIBLING `x` and
+        #       validated the wrong tree. So the whole tree is listed and the leaves are SELECTED
+        #       IN PYTHON. No pathspec is ever built from a path that came out of the repository.
+        #  (P1) comparing object IDs here re-introduced the "a merged blob must be a verbatim copy
+        #       of an input" guard that §17/§22 record as MEASURED AND REJECTED, because it refuses
+        #       a LEGITIMATELY union-merged leaf — the append-only-registry class this arm exists to
+        #       carry. The criterion is the blob arm's, applied at leaf level: LINE SETS.
+        t_rc, t_out = git([b"cat-file", b"-t", lspec])
+        if t_rc == 0 and t_out.strip() == b"tree":
+            l_rc, l_out = git([b"ls-tree", b"-r", b"-z", b"--full-tree", ltree])
+            if l_rc != 0:
+                sys.stderr.write("(C4) landing tree listing failed: %r\n" % path)
+                sys.exit(1)
+            lprefix = path + b"/"
+            for entry in l_out.split(b"\0"):
+                if not entry:
+                    continue
+                hdr, sep, lpath = entry.partition(b"\t")
+                fields = hdr.split()
+                if sep != b"\t" or len(fields) < 3:
+                    sys.stderr.write("(C4) unparseable landing entry: %r\n" % entry[:80])
+                    sys.exit(1)
+                if lpath != path and not lpath.startswith(lprefix):
+                    continue
+                loid = fields[2]
+                lspec2 = ltree + b":" + lpath
+                tip_l = base_sha.encode() + b":" + lpath
+                rev_l = reviewed.encode() + b":" + lpath
+                if oid(tip_l) == loid or oid(rev_l) == loid:
+                    continue
+                lb = read_blob(lspec2)
+                if lb is None:
+                    sys.stderr.write("(C4) landing leaf unreadable and unlike both inputs: %r\n" % lpath)
+                    sys.exit(1)
+                known = set()
+                for spec in (tip_l, rev_l):
+                    if exists(spec):
+                        b = read_blob(spec)
+                        if b is None:
+                            sys.stderr.write("(C4) leaf unreadable: %r\n" % lpath)
+                            sys.exit(1)
+                        known |= lines(b)
+                # REACHABILITY BOUND (rounds 35-36, MEASURED — state it, do not imply a guard):
+                # the LEAK CHECK below fires ZERO times across the suite's 138 assertions, and
+                # replacing this TREE-VERIFICATION BODY alone (the l_rc...continue block, keeping
+                # the non-tree fallthrough) leaves the suite GREEN at the same count — so the leak
+                # comparison is DEFENCE IN DEPTH over the declared residual, not a live guard.
+                # Do NOT read that as "this branch is inert": the FALLTHROUGH REFUSAL at the end
+                # of this else-branch IS load-bearing and is pinned by section 29b's NOSKIP mutant
+                # — neutering the WHOLE non-blob branch reddens "mutation NOSKIP is NOT caught on
+                # the gitlink fixture". The mechanism: a leak needs a LINE absent from both the
+                # base tip and `reviewed`, and the only hermetic shape is a union merge driver
+                # re-admitting a line the tip DELETED (the section 22 residual), which lives at a
+                # path the tip CHANGED, where the BLOB ARM decides it. The leaf comparison is KEPT
+                # because a landing tree whose leaves come from neither input is precisely the
+                # class that must never carry if it becomes reachable, and it costs one
+                # comparison when it is not.
+                lnew = lines(lb) - known
+                if lnew:
+                    sys.stderr.write("(C4) LEAK %r -> %r\n" % (lpath, sorted(lnew)[:5]))
+                    sys.exit(1)
+            continue
+        sys.stderr.write("(C4) landing entry unreadable and unlike both inputs: %r\n" % path)
+        sys.exit(1)
+    tip = rev = None
+    for spec, which in ((tip_spec, "tip"), (rev_spec, "reviewed")):
+        if not exists(spec):
+            continue
+        blob = read_blob(spec)
+        if blob is None:
+            sys.stderr.write("(C4) %s entry unreadable: %r\n" % (which, path))
+            sys.exit(1)
+        if which == "tip":
+            tip = blob
+        else:
+            rev = blob
+    new_lines = lines(landing) - (lines(tip or b"") | lines(rev or b""))
+    if new_lines:
+        sys.stderr.write("(C4) LEAK %r -> %r\n" % (path, sorted(new_lines)[:5]))
+        sys.exit(1)
+
+sys.exit(0)
+PYC4
+
+  # (C2) NO LANE COMMITS IN BETWEEN: every intervening commit not reachable from the
+  # AUTHORITATIVE base must be a MERGE. A single non-merge commit is lane work and a
+  # fresh review is owed (that is the #5421 counter-example: cfe2bad0afaa is one).
+  # The walk's STATUS IS CHECKED EXPLICITLY: a failed walk prints nothing to stdout,
+  # and "nothing" here would read as "no lane commits" — the fail-open direction.
+  extra="$(command git rev-list --no-merges "$reviewed..$current" --not "$base_sha" 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -z "$extra" ] || return 1
+
+  # (D) NO CONFLICT RESOLUTION — the clause that makes the arm sound. (C2) alone is
+  # NOT sufficient: a lane can merge the base LOCALLY with conflict resolutions, and
+  # that merge is indistinguishable from a clean one by commit shape. So recompute
+  # the merge and compare TREES rather than patch text.
+  # rc IS CHECKED, AND THIS IS LOAD-BEARING: `git merge-tree --write-tree` PRINTS A
+  # TREE OID ON LINE 1 EVEN WHEN IT CONFLICTS (exit 1). An earlier cut discarded the
+  # status and piped through `head -1`, so a conflicted merge looked like a
+  # successful merge-tree and the guard rested on the tree inequality alone — which
+  # contradicts this function's own fail-closed claim and was refuted by a reviewer
+  # reproduction. Requiring rc=0 restores "conflict => refuse" as a real gate.
+  merged="$(command git merge-tree --write-tree "$reviewed" "$p2" 2>/dev/null)" || mrc=$?
+  [ "$mrc" -eq 0 ] || return 1
+  # `command head`, not bare head: an EXPORTED shell function named head can read the
+  # caller's `$current` (bash `local` is DYNAMICALLY scoped) and hand back the head's own
+  # tree, satisfying the equality below. A reviewer PROVED it against the real script:
+  # honest rc=3 with no record, hijacked rc=0 with a `clean` record minted at the live head.
+  merged="$(printf '%s' "$merged" | command head -1)"
+  [ -n "$merged" ] || return 1
+  ctree="$(command git rev-parse "$current^{tree}" 2>/dev/null || true)"
+  [ -n "$ctree" ] || return 1
+  [ "$merged" = "$ctree" ] || return 1
+  return 0
+}
+
 # #2982 — carry-forward arm: when the head has moved but the PR already carries
 # signed evidence for EXACTLY this diff (a marker whose diff= equals the live
 # diff hash), the head moved without the reviewed artifact changing (a
@@ -477,7 +941,7 @@ GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 # which is precisely what the gate needs — instead of refusing and deadlocking.
 # When no such marker exists the diff is genuinely unreviewed → still refuse.
 if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
-  CURRENT_HEAD="$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
+  CURRENT_HEAD="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.sha 2>/dev/null || true)"
   # gh api prints 4xx error bodies to stdout — only a well-formed 40-hex
   # sha counts as a successful fetch; anything else fails open.
   if ! [[ "$CURRENT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
@@ -498,7 +962,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     # exact diff? Only then is the head-move provably a no-op to the artifact.
     PRIOR_DIFF=""
     if [ -n "$DIFF_HASH" ]; then
-      PRIOR_BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+      PRIOR_BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
       [ "$PRIOR_BODY" = "null" ] && PRIOR_BODY=""
       # The prior marker is evidence ONLY if it is AUTHENTIC. The PR body is
       # attacker-writable, so matching `sig=[0-9a-f]{64}` is not enough: a forged
@@ -521,7 +985,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       if [ -n "$PRIOR_LINE" ] && [ -n "$GATE_KEY" ]; then
         PRIOR_TEXT="${PRIOR_LINE% sig=*}"
         PRIOR_SIG="${PRIOR_LINE##* sig=}"
-        PRIOR_EXPECT="$(printf '%s' "$PRIOR_TEXT" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+        PRIOR_EXPECT="$(printf '%s' "$PRIOR_TEXT" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
         if [ -n "$PRIOR_EXPECT" ] && [ "$PRIOR_SIG" = "$PRIOR_EXPECT" ]; then
           PRIOR_DIFF="$DIFF_HASH"
         else
@@ -533,9 +997,19 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
       echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
       SHA="$CURRENT_HEAD"
     elif [ "$FORCE_STALE" -ne 1 ]; then
-      echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
-      echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
-      exit 3
+      if lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
+        # The rendered patch moved (a base merge), but the LANE's artifact is
+        # provably unchanged: the head only moved forward, no lane commit is in
+        # between, and a clean re-merge of (reviewed, its base parent) reproduces
+        # the head's tree exactly. Re-record against the CURRENT head, exactly as
+        # the arm above does — the binding is to the head that will merge.
+        echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base commit in between; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
+        SHA="$CURRENT_HEAD"
+      else
+        echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
+        echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
+        exit 3
+      fi
     else
       # #784: a stale sha's diff CANNOT be shown to be the current diff — by
       # construction the two were never observed together. Emitting `diff=` here
@@ -581,7 +1055,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
   else
-    BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+    BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
     [ "$BODY" = "null" ] && BODY=""
     if [ -z "$BODY" ]; then
       echo "⚠️ clean-micro tier guard: could not read the PR body of $REPO#$PR (gh/API failure or empty body?) — tier attestation UNVERIFIED (record proceeds)" >&2
@@ -597,7 +1071,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
       # word boundary the unanchored scan did not.
       REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "\b${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
-        echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | head -c 200 || true))" >&2
+        echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | command head -c 200 || true))" >&2
       else
         # Per-ref label fetch. A fetch failure marks THAT ref undeterminable —
         # never refuse on a failed fetch (mirrors the stale-sha fail-open).
@@ -606,7 +1080,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
         while IFS= read -r ref; do
           [ -z "$ref" ] && continue
           num="${ref##*#}"
-          LABELS="$(gh api "repos/$REPO/issues/$num/labels" --jq '.[].name' 2>/dev/null || true)"
+          LABELS="$(command gh api "repos/$REPO/issues/$num/labels" --jq '.[].name' 2>/dev/null || true)"
           # A failed/filtered fetch yields nothing — undeterminable ref.
           if [ -z "$LABELS" ]; then
             echo "⚠️ clean-micro tier guard: could not fetch labels of $ref — that ref is undeterminable (record proceeds unless another ref is non-micro)" >&2
@@ -617,7 +1091,7 @@ if [ "$VERDICT" = "clean-micro" ]; then
             continue
           fi
           if grep -qE '^complexity:' <<<"$LABELS"; then
-            OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | head -1)"
+            OFFENDING_LABEL="$(printf '%s\n' "$LABELS" | grep -E '^complexity:' | command head -1)"
             REFUSED=1
             echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2
             echo "   → Run the code-review skill on the current head and record clean:" >&2
@@ -665,7 +1139,7 @@ if [ "$VERDICT" = "clean-low" ]; then
   fi
   # One read for head + base + the authoritative changed-file count (the count
   # is GitHub's own, so a truncated or forged file list cannot pass unnoticed).
-  META="$(gh api "repos/$REPO/pulls/$PR" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null || true)"
+  META="$(command gh api "repos/$REPO/pulls/$PR" --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv' 2>/dev/null || true)"
   META_HEAD="$(printf '%s' "$META" | cut -f1)"
   META_BASE="$(printf '%s' "$META" | cut -f2)"
   META_COUNT="$(printf '%s' "$META" | cut -f3)"
@@ -685,9 +1159,9 @@ if [ "$VERDICT" = "clean-low" ]; then
   # record pins the merge base, the consumer re-derives it, and the gate blocks
   # only when the content can actually differ. Pinning the tip instead would
   # false-block every clean-low PR on the next unrelated merge to main.
-  CMP="$(gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
-  MB="$(printf '%s\n' "$CMP" | head -1 | cut -f2)"
-  RAW="$(printf '%s\n' "$CMP" | tail -n +2)"
+  CMP="$(command gh api "repos/$REPO/compare/$META_BASE...$SHA" --jq '.merge_base_commit.sha as $mb | "mb\t\($mb)", (.files[]? | [.status, .filename, (.previous_filename // "")] | @tsv)' 2>/dev/null || true)"
+  MB="$(printf '%s\n' "$CMP" | command head -1 | cut -f2)"
+  RAW="$(printf '%s\n' "$CMP" | command tail -n +2)"
   if ! [[ "$MB" =~ ^[0-9a-f]{40}$ ]]; then
     # Empty diff, a compare/API failure, a fork head not reachable from the
     # base repo (compare 404s there), or a response with no merge base. All are
@@ -777,7 +1251,7 @@ mv "$TMP" "$FILE"
 # anything else (foreign repo, formatted JSON we can't parse, no field) is
 # LEFT ALONE — never delete a file that might be another repo's data.
 if [ -n "$LEGACY" ] && [ -f "$LEGACY" ]; then
-  LEGACY_REPO="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" | head -1)"
+  LEGACY_REPO="$(sed -n 's/.*"repo":"\([^"]*\)".*/\1/p' "$LEGACY" | command head -1)"
   if [ -n "$LEGACY_REPO" ] && [ "$LEGACY_REPO" = "$REPO" ]; then
     rm -f "$LEGACY"
   fi
@@ -812,7 +1286,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"
   fi
   if [ -n "$GATE_KEY" ]; then
-    SIG="$(printf '%s' "$MARKER" | openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+    SIG="$(printf '%s' "$MARKER" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
     if [ -n "$SIG" ]; then
       MARKER="${MARKER} sig=${SIG}"
     else
@@ -823,7 +1297,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   fi
   # Read the PR body — distinguish a genuinely EMPTY body (post marker-only)
   # from a GET FAILURE (skip the post loudly — never clobber the description).
-  if BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
+  if BODY="$(command gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
     [ "$BODY" = "null" ] && BODY=""
   else
     echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped; record still saved. Re-run record-review.sh to retry the post." >&2
@@ -844,7 +1318,7 @@ ${MISSING}"
       NEWBODY="$MISSING"
     fi
     jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
-      | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
+      | command gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
       && echo "review evidence posted to $REPO#$PR body" \
       || echo "note: could not post review evidence to PR body (record still saved)" >&2
   fi
