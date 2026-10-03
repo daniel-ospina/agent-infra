@@ -2051,6 +2051,14 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
             producerValue.trim().toLowerCase(),
             `${producerValue.trim()} gate_block audit carries the marker tier (same normalization as the production read)`
           );
+          // #1492: the NON-micro branch must record the refused command too. Only the
+          // micro cell pinned `command`, so deleting the field from this branch (or the
+          // admin-merge branch) left the suite green — the review caught that gap.
+          equal(
+            blockAudit?.command,
+            "git commit -m x",
+            `${producerValue.trim()} gate_block audit records WHICH command was refused (#1492)`
+          );
         }
         // unlabeled key: marker ABSENT → same generic block + message (the
         // pre-existing no-marker test pins block===true; this pins the reason).
@@ -3467,6 +3475,20 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(/truncated, 2500 chars/.test(bounded), "truncation is STATED, never silent");
   equal(auditCommand("abc", 3), "abc", "the boundary is inclusive");
   ok(auditCommand("abcd", 3).includes("truncated"), "one char over the bound truncates");
+  // REDACTION (#1492 review P1). Recording the command is new, and the audit files are
+  // world-readable, so persisting an inlined token would be a credential leak this gate
+  // introduced. The repo already owned this rule in verification-gate; the helper is now
+  // shared so the two gates writing `command` into the same JSONL stream cannot drift.
+  const leaky = "GH_TOKEN=ghp_SECRETvalue1234567890 git push https://x-access-token:ghp_SECRETvalue1234567890@github.com/o/r.git main";
+  const safe = auditCommand(leaky);
+  ok(!safe.includes("ghp_SECRETvalue1234567890"), "a gh token must NOT persist in the audit log");
+  ok(!safe.includes("GH_TOKEN="), "an inlined GH_TOKEN= assignment must NOT persist");
+  ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
+  ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
+  ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
+  // Truncation length is measured on the REDACTED text, so a redaction that shortens the
+  // command cannot mis-report the original length.
+  ok(auditCommand(leaky, 10).includes("truncated, "), "truncation stays stated after redaction");
   // The abort is the documented harm (a bundled child launch that silently never started),
   // so both remediation messages must say the command did not run — the agent cannot be
   // left to infer it.

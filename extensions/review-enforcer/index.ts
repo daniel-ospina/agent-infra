@@ -24,6 +24,7 @@ import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+import { redactCommand } from "../shared/redact-command.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -2149,11 +2150,17 @@ export { BLOCK_MESSAGE };
  *
  * Bounded so one pathological command cannot grow the log without limit: the head is
  * kept (it names the operation) and the truncation is stated rather than silent.
+ *
+ * REDACTED, because the audit files are world-readable — recording the command at all
+ * is new here, and persisting an inlined `GH_TOKEN=…` would be a credential leak this
+ * gate introduced (found by review, #1492). The redactor is the shared one both gates
+ * use, so the two `command` shapes in this stream cannot drift.
  */
 export function auditCommand(command: string, limit = 2000): string {
-  return command.length <= limit
-    ? command
-    : `${command.slice(0, limit)}… [truncated, ${command.length} chars]`;
+  const redacted = redactCommand(command);
+  return redacted.length <= limit
+    ? redacted
+    : `${redacted.slice(0, limit)}… [truncated, ${redacted.length} chars]`;
 }
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
