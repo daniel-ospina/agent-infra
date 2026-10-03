@@ -2160,7 +2160,10 @@ export function auditCommand(command: string, limit = 2000): string {
   const redacted = redactCommand(command);
   return redacted.length <= limit
     ? redacted
-    : `${redacted.slice(0, limit)}… [truncated, ${redacted.length} chars]`;
+    // The count is the REDACTED length and says so — redaction shortens the text, so an
+    // unlabelled count under-reports the refused command (review, #1492). Stating which
+    // length it is keeps the field honest without leaking the original size of a secret.
+    : `${redacted.slice(0, limit)}… [truncated, ${redacted.length} chars after redaction]`;
 }
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static

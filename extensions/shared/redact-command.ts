@@ -15,6 +15,9 @@
 export function redactCommand(command: string): string {
   return command
     .replace(/\b(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
-    .replace(/ghp_[A-Za-z0-9]+/g, "ghp_***")
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
+    // All six GitHub token families, not just `ghp_`/`github_pat_` (review, #1492):
+    // `ghs_` (server), `gho_` (OAuth), `ghu_` (user), `ghr_` (refresh) are equally live
+    // credentials and `ghp_`'s sibling spelling was passing straight through.
+    .replace(/\bgh[opusr]_[A-Za-z0-9]{20,}\b/g, (m) => `${m.slice(0, 4)}***`)
+    .replace(/\bgithub_pat_[A-Za-z0-9_]+/g, "github_pat_***");
 }

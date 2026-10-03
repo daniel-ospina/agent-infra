@@ -4393,6 +4393,15 @@ for (const [label, command] of [
         const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
         equal(blocked.length, 1, "exactly one audit entry");
         equal(blocked[0].reason, "admin_merge_no_evidence");
+        // #1492: the admin-merge block is the one THIS lane actually hit, and it must record
+        // the refused command too. Without this assertion the field could be deleted from
+        // this site with the suite green (review, #1492) — the same gap that was closed for
+        // the two dispatch-count branches.
+        equal(
+          blocked[0].command,
+          command,
+          "#1492: the admin-merge block records WHICH command was refused"
+        );
       } finally {
         _setRunGhOverride(null);
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
