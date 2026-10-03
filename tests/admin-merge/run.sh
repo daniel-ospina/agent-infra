@@ -173,12 +173,19 @@
 #      `test-slow (a)`/`test-slow (b)`/`test-carve-out`), while main is ALWAYS
 #      FULL — so demanding the PR lane equal main's lane refused every docs-only
 #      PR with a remedy no re-run could apply. The parity gate now removes exactly
-#      the shards the target selector DECLINED, and FAILS CLOSED on every way that
-#      answer can be unavailable (absent file, failed changed-file fetch, non-zero
+#      the shards the target selector DECLINED. The selector is FETCHED AT THE PR
+#      HEAD through the contents API (never read off the caller's working tree,
+#      where it is unpinned and need not even be the `--repo` target) and is run
+#      under a resolved ≥3.12 interpreter, because the target's own selector
+#      REFUSES anything older. It FAILS CLOSED on every way that answer can be
+#      unavailable: no runnable ≥3.12 interpreter, an unfetchable selector at this
+#      head, a changed-file list that is empty OR whitespace-only, a non-zero
 #      exit, empty output, or an answer missing EITHER boolean — a partial answer
-#      is no answer). It is forgiveness, not exemption: every shard the selector
+#      is no answer. It is forgiveness, not exemption: every shard the selector
 #      did NOT decline is still demanded, and the forgiveness is DISCLOSED on
-#      stderr and in the posted evidence.
+#      stderr and in the posted evidence — including in the machine-checked
+#      `lane parity:` line itself, which STATES the exception rather than the
+#      unconditional claim it can no longer support.
 #
 # Hermetic: every fixture lives under a temp root; a fake `gh` serves every call.
 
@@ -650,6 +657,13 @@ new_scen() {
   rm -rf "$SCEN"
   mkdir -p "$SCEN"
   : > "$SCEN/calls"
+  # The ≥3.12 interpreter the #6928 fixtures supply (see selector_interp_*). It is
+  # scenario-scoped STATE, so it is reset here: a scenario that forgot to set it
+  # must not silently inherit the previous scenario's interpreter and depend on
+  # the host's python. SEL_PATH is the same, for the "nothing on PATH qualifies"
+  # fixture.
+  SEL_PY=""
+  SEL_PATH=""
 }
 
 run_admin() {
@@ -774,16 +788,20 @@ lane_jobset() {
   lane_jobs "$id" ${pairs[@]+"${pairs[@]}"}
 }
 
-# ── #6928: the TARGET repo's diff selector, and the checkout it is read from ──
-# The rail reads `tools/ci_selection.py` from the directory it is INVOKED in (the
-# target repo's checkout) and runs it exactly as the workflow does. These fixtures
-# model that checkout: `run_admin_cwd` stands in it, and `selector_*` writes its
-# selector into it. NO `selector_*` call means the file is ABSENT — the fail-CLOSED
-# case, and the shape the suite's own CWD (agent-infra) has in reality.
+# ── #6928: the TARGET repo's diff selector, FETCHED AT THE HEAD ──────────
+# The rail does NOT read `tools/ci_selection.py` from its working directory: it
+# FETCHES the selector AND the manifest it reads at the PR head through the
+# contents API and runs them from a scratch root (#6928 P1-2). These fixtures
+# model the HEAD's contents (`$SCEN/wf-contents/<head>/…`, exactly what the fake's
+# `contents` arm serves). NO `selector_*` call means the file is ABSENT AT THIS
+# HEAD — the fail-CLOSED case. A ≥3.12 interpreter is SUPPLIED by
+# `selector_interp_312`, so the suite never depends on the host having one.
 run_admin_cwd() {  # <dir> <rail args...>
   local dir="$1"; shift
-  ( cd "$dir" && SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-      ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err" )
+  ( cd "$dir" && PATH="${SEL_PATH:-$PATH}" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" \
+      CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+      ADMIN_MERGE_SELECTOR_PYTHON="${SEL_PY:-}" \
+      bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err" )
 }
 
 # pr_changed_files <path>... → the fake's `pulls/<N>/files` fixture.
@@ -793,29 +811,95 @@ pr_changed_files() {
   for p in "$@"; do printf '%s\n' "$p" >> "$SCEN/pr-changed-files"; done
 }
 
-# selector_stub <slow_run> <carve_out_run> → install a stand-in for the target
-# repo's `tools/ci_selection.py` that consumes the changed files on stdin (as the
-# real one does) and emits the two booleans. The arguments are PYTHON literals
+# selector_write <body> → stage the HEAD's selector, plus the manifest the
+# selector reads from its own repo root (`REPO = Path(__file__).parent.parent`),
+# in the contents fixtures for the head `$SCEN/head` names.
+selector_write() {
+  local head; head="$(cat "$SCEN/head")"
+  mkdir -p "$SCEN/wf-contents/$head/tools" "$SCEN/wf-contents/$head/config"
+  printf '%s\n' "$1" > "$SCEN/wf-contents/$head/tools/ci_selection.py"
+  printf 'surfaces: {}\n' > "$SCEN/wf-contents/$head/config/ci-surfaces.yml"
+}
+
+# selector_stub <slow_run> <carve_out_run> → a stand-in for the target repo's
+# `tools/ci_selection.py` that consumes the changed files on stdin (as the real
+# one does) and emits the two booleans. The arguments are PYTHON literals
 # (`False`/`True`), because that is exactly the value the real selector reports.
 selector_stub() {
-  mkdir -p "$SCEN/tools"
-  cat > "$SCEN/tools/ci_selection.py" <<EOF
-import json, sys
+  selector_write "import json, sys
 sys.stdin.read()
-print(json.dumps({"slow_run": $1, "carve_out_run": $2}))
-EOF
+print(json.dumps({\"slow_run\": $1, \"carve_out_run\": $2}))"
 }
 
 # selector_raw <python-body> → a selector that ignores its input and runs
 # <python-body>. Used for the answers the rail must REFUSE: unparseable output, a
 # partial answer carrying only one boolean, a non-zero exit, and no output at all.
 selector_raw() {
-  mkdir -p "$SCEN/tools"
-  cat > "$SCEN/tools/ci_selection.py" <<EOF
-import sys
+  selector_write "import sys
 sys.stdin.read()
-$1
+$1"
+}
+
+# selector_on_disk <python-body> → a same-contract copy in the CHECKOUT the rail
+# is invoked from. The rail must NOT read it (#6928 P1-2): the answer it holds is
+# exactly the wrong-repo / unpinned-revision value the head-pinned fetch exists
+# to exclude.
+selector_on_disk() {
+  mkdir -p "$SCEN/tools"
+  printf '%s\n' "$1" > "$SCEN/tools/ci_selection.py"
+}
+
+# selector_interp_312 — supply an interpreter that PASSES the rail's ≥3.12 probe
+# and then runs the fixture with the host's `python3`. A WRAPPER, so the probe is
+# answered by the wrapper (it must be — that is the contract) while the fixture
+# itself stays 3.9-compatible. Sets SEL_PY for `run_admin_cwd`; hermetic, because
+# nothing here depends on a ≥3.12 interpreter actually existing on the host.
+selector_interp_312() {
+  cat > "$SCEN/fake-python" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-c" ]; then
+  case "$2" in
+    *version_info*) exit 0 ;;
+  esac
+fi
+exec python3 "$@"
 EOF
+  chmod +x "$SCEN/fake-python"
+  SEL_PY="$SCEN/fake-python"
+}
+
+# selector_interp_old — an interpreter that FAILS the ≥3.12 probe: the shape of a
+# host with no ≥3.12 python at all, which the rail must fail CLOSED on, naming the
+# requirement. Sets SEL_PY.
+selector_interp_old() {
+  cat > "$SCEN/fake-python-old" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$SCEN/fake-python-old"
+  SEL_PY="$SCEN/fake-python-old"
+}
+
+# selector_interp_none — NOTHING on PATH can satisfy ≥3.12, so the resolver's own
+# SEARCH fails. That is a DISTINCT branch from a failing override, and it is the
+# production shape. The stub dir is PREPENDED and a stub is written for EVERY name
+# the resolver searches, so the host's real interpreter is never reached — which
+# is what makes this hermetic even on a host whose `python3` IS ≥3.12. A stub
+# fails ONLY the ≥3.12 probe: every other `-c` call is delegated to the real
+# interpreter, so the scenario fails for the reason under test and not because
+# `$PYTHON_BIN` broke. Sets SEL_PATH.
+selector_interp_none() {
+  local real_py; real_py="$(command -v python3)"
+  mkdir -p "$SCEN/nopy"
+  local c
+  for c in python3 python3.12 python3.13; do
+    { printf '#!/bin/sh\n'
+      printf 'if [ "$1" = "-c" ]; then\n  case "$2" in\n    *version_info*) exit 1 ;;\n  esac\nfi\n'
+      printf 'exec "%s" "$@"\n' "$real_py"
+    } > "$SCEN/nopy/$c"
+    chmod +x "$SCEN/nopy/$c"
+  done
+  SEL_PATH="$SCEN/nopy:$PATH"
 }
 
 # ── #1261 main-health fixtures ──────────────────────────────────────────
@@ -5367,6 +5451,16 @@ grep -qE '^[[:space:]]*comm[[:space:]]+-23' "$ADM" \
 # refusal no re-run can clear (0 docs-only commits in the last 60 of tortoise
 # main). The rail now removes exactly the shards the target's selector DECLINED
 # for THIS head — and FAILS CLOSED on every way that answer can be unavailable.
+#
+# ⛔ TWO THINGS THIS BLOCK PINS THAT THE FIRST CUT GOT WRONG (#6928 P1-1/P1-2):
+#   1. The selector is run under a resolved ≥3.12 interpreter, NEVER under the
+#      rail's `$PYTHON_BIN` (3.9.6 here). The first cut ran it under `$PYTHON_BIN`
+#      and tortoise's real selector REFUSED, so the whole forgiveness path
+#      refused and the fix changed NOTHING. `selector_interp_312` supplies a
+#      passing interpreter; `selector_interp_old` supplies a failing one.
+#   2. The selector AND its manifest are FETCHED AT THE HEAD through the contents
+#      API. A same-contract copy in the caller's checkout is NOT evidence about
+#      this head, and scenario (h) proves it is ignored.
 
 # (a) THE REPRODUCTION. Main is FULL (the whole matrix plus both diff-gated
 # legs); the PR is a docs-only diff, so it ran only the matrix. The three
@@ -5378,6 +5472,7 @@ lane_pass main6938 6932 > "$SCEN/runs-main"
 lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6931 success 'test (a)' 'test (b)'
 pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
 selector_stub False False
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -5400,6 +5495,29 @@ fi
 grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
   && pass "…and the POSTED evidence carries the same disclosure" \
   || fail "the posted certificate does not disclose the forgiveness"
+# ── #6928 P3a: THE CERTIFIED LINE ITSELF MUST STATE THE TRUTH ─────────────
+# The unconditional sentence is the machine-checked claim (the evidence gate
+# anchors on `lane parity:` to end-of-line). On the forgiving path it is FALSE —
+# the PR did NOT execute every shard main ran — so the line itself must carry the
+# exception, not leave the correction to prose on the next line.
+lane6928_par="$(grep -m1 'lane parity:' "$SCEN/comment" | sed 's/^[[:space:]]*//')"
+expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 3 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 5 on main)"
+if [ "$lane6928_par" = "$expected6928_par" ]; then
+  pass "#6928 P3a: the certified \`lane parity:\` line itself STATES the exception"
+else
+  fail "the certified parity line does not state the exception: got [$lane6928_par]"
+fi
+grep -qF "lane executed (parity family" "$SCEN/comment" \
+  && fail "the UNCONDITIONAL (now false) claim is still in the certificate" \
+  || pass "…and the unconditional claim is NOT in the certificate"
+# ONE line, still starting `lane parity:`, at most one `parity family:` — the
+# three properties the evidence gate anchors on.
+[ "$(grep -c 'lane parity:' "$SCEN/comment")" -eq 1 ] \
+  && pass "…on exactly one \`lane parity:\` line" \
+  || fail "the certificate carries $(grep -c 'lane parity:' "$SCEN/comment") \`lane parity:\` lines"
+[ "$(grep -m1 'parity family:' "$SCEN/comment" | grep -o 'parity family:' | wc -l | tr -d ' ')" -eq 1 ] \
+  && pass "…with at most one \`parity family:\`" \
+  || fail "the parity line carries more than one \`parity family:\`"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the forgiven lane" \
   || fail "no merge issued although parity passed with only declined legs forgiven"
 # The disclosure must not cost the CERTIFICATE: a new evidence line the gate's
@@ -5421,6 +5539,7 @@ lane_pass main6939 6952 > "$SCEN/runs-main"
 lane_jobset 6952 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6951 success 'test (a)' 'test (b)'
 pr_changed_files src/deep/module.py
+selector_interp_312
 selector_stub True True
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -5445,6 +5564,7 @@ lane_pass main6940 6962 > "$SCEN/runs-main"
 lane_jobset 6962 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6961 success 'test (a)' 'test (b)'
 pr_changed_files docs/x.md
+selector_interp_312
 selector_stub False True
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -5458,9 +5578,10 @@ grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
   || fail "the refusal does not count only the non-declined shard: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran with a non-declined shard missing" || pass "no merge attempted"
 
-# (c) FAIL CLOSED — THE SELECTOR IS ABSENT. No `tools/ci_selection.py` in the
-# checkout: the rail must refuse the RAW gap exactly as before the fix, and say
-# the selector was unavailable. A missing answer is NOT a declined leg.
+# (c) FAIL CLOSED — THE SELECTOR CANNOT BE FETCHED AT THIS HEAD. Its contents are
+# absent at the head (the API answers nothing): the rail must refuse the RAW gap
+# exactly as before the fix, and say the selector was unavailable. A missing
+# answer is NOT a declined leg — and a copy on the local disk is not a substitute.
 new_scen lane6928-noselector
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6971 > "$SCEN/runs-$HEAD_VP"
@@ -5468,17 +5589,23 @@ lane_pass main6941 6972 > "$SCEN/runs-main"
 lane_jobset 6972 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6971 success 'test (a)' 'test (b)'
 pr_changed_files docs/x.md
-# DELIBERATELY no selector_stub: tools/ci_selection.py does not exist.
+selector_interp_312
+# DELIBERATELY no selector_stub: tools/ci_selection.py does not exist AT THIS HEAD.
+# A readable same-contract copy is placed in the checkout to prove the rail does
+# not fall back to the caller's tree.
+selector_on_disk 'import json, sys
+sys.stdin.read()
+print(json.dumps({"slow_run": False, "carve_out_run": False}))'
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "#6928: an ABSENT selector forgives nothing → BLOCK (exit $rc)" \
+[ "$rc" -ne 0 ] && pass "#6928: a selector UNFETCHABLE at this head forgives nothing → BLOCK (exit $rc)" \
   || fail "#6928: expected a non-zero exit, got 0 — a missing selector answer was read as a declined leg"
 grep -q "forgiveness (#6928) NOT applied" "$SCEN/err" \
   && pass "…stating the forgiveness was not applied" \
   || fail "the refusal does not say the forgiveness was skipped"
-grep -q "no readable target-repo diff selector" "$SCEN/err" \
-  && pass "…and naming the ABSENT selector as the reason" \
-  || fail "the reason does not name the missing selector"
+grep -q "could not be FETCHED AT THIS HEAD" "$SCEN/err" \
+  && pass "…and naming the head-pinned fetch as the reason" \
+  || fail "the reason does not name the failed head fetch: $(grep -m1 'NOT applied' "$SCEN/err")"
 grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
   && pass "…refusing the RAW gap (all three shards)" \
   || fail "the raw gap was not the refusal: expected 3 missing shards"
@@ -5502,6 +5629,7 @@ for lane6928_bad in 'print("not json")' \
   lane_jobset $((6990 + lane6928_bad_i)) success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
   lane_jobset $((6980 + lane6928_bad_i)) success 'test (a)' 'test (b)'
   pr_changed_files docs/x.md
+  selector_interp_312
   selector_raw "$lane6928_bad"
   run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
   rc=$?
@@ -5526,6 +5654,7 @@ lane_pass main6944 6999 > "$SCEN/runs-main"
 lane_jobset 6999 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6998 success 'test (a)' 'test (b)'
 pr_changed_files   # the fixture exists but is EMPTY — the answer is unavailable
+selector_interp_312
 selector_stub False False   # would forgive, and must never be reached
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -5549,6 +5678,7 @@ lane_pass main6943 6997 > "$SCEN/runs-main"
 lane_jobset 6997 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
 lane_jobset 6996 success 'test (a)'
 pr_changed_files docs/x.md
+selector_interp_312
 selector_stub False False
 run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
@@ -5558,6 +5688,131 @@ grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
   && pass "…counting exactly the one un-declined shard as missing" \
   || fail "the refusal does not count the un-declined shard: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran with an un-declined shard missing" || pass "no merge attempted"
+
+# (f) #6928 P2 — A WHITESPACE-ONLY CHANGED-FILE LIST IS UNAVAILABLE. `[ -z ]`
+# catches only a zero-byte answer; a SUCCESSFUL read whose body holds spaces/TABs
+# but no filename passes it, and the real tortoise selector MEASURED on that
+# input answers `slow_run=false carve_out_run=false` — forgiving ALL THREE legs
+# on a read that returned no filename at all. It must refuse instead.
+new_scen lane6928-spacechanged
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7003 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6946 7004 > "$SCEN/runs-main"
+lane_jobset 7004 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7003 success 'test (a)' 'test (b)'
+printf '   \n\t\n' > "$SCEN/pr-changed-files"   # whitespace-only: NOT zero-byte
+selector_interp_312
+selector_stub False False   # would forgive, and must never be reached
+run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#6928 P2: a WHITESPACE-ONLY changed-file list forgives nothing → BLOCK (exit $rc)" \
+  || fail "#6928 P2: expected a non-zero exit, got 0 — a whitespace-only read was fed to the selector as 'no files'"
+grep -q "came back EMPTY" "$SCEN/err" \
+  && pass "…naming it as an unavailable read" \
+  || fail "the refusal does not name the whitespace-only changed-file list"
+grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
+  && pass "…refusing the RAW gap (all three shards)" \
+  || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran on a whitespace-only changed-file list" || pass "no merge attempted"
+
+# (g) #6928 P1-1 — NO ≥3.12 INTERPRETER → FAIL CLOSED, NAMING THE REQUIREMENT.
+# This is the production defect: the rail's own python3 is 3.9.6 and tortoise's
+# selector refuses below 3.12, so the FIRST cut made the whole path refuse on the
+# interpreter and the fix changed nothing. The rail must now ANSWER the
+# interpreter question — and when no ≥3.12 exists it must still refuse, with a
+# reason that NAMES the requirement rather than a generic failure. It must NOT
+# reach the network: the interpreter is resolved FIRST.
+new_scen lane6928-nointerp
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7005 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6947 7006 > "$SCEN/runs-main"
+lane_jobset 7006 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7005 success 'test (a)' 'test (b)'
+pr_changed_files docs/x.md
+selector_stub False False   # must never be reached
+selector_interp_old
+run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#6928 P1-1: no ≥3.12 interpreter → BLOCK (exit $rc)" \
+  || fail "#6928 P1-1: expected a non-zero exit, got 0 — the selector was run without a usable interpreter"
+grep -q "forgiveness (#6928) NOT applied" "$SCEN/err" \
+  && pass "…stating the forgiveness was not applied" \
+  || fail "the refusal does not say the forgiveness was skipped"
+grep -q "Python >= 3.12" "$SCEN/err" \
+  && pass "…and NAMING the ≥3.12 interpreter requirement" \
+  || fail "the reason does not name the interpreter requirement: $(grep -m1 'NOT applied' "$SCEN/err")"
+grep -q "ADMIN_MERGE_SELECTOR_PYTHON" "$SCEN/err" \
+  && pass "…and naming the override an operator can set" \
+  || fail "the reason does not name the ADMIN_MERGE_SELECTOR_PYTHON override"
+grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
+  && pass "…refusing the RAW gap (all three shards)" \
+  || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "contents/tools/ci_selection.py" "$SCEN/calls" \
+  && fail "the selector was FETCHED even though no interpreter can run it — the guard is not fail-fast" \
+  || pass "…and the selector was NEVER fetched (the interpreter is resolved first)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran without an interpreter" || pass "no merge attempted"
+
+# (h) #6928 P1-2 — THE HEAD'S SELECTOR IS FETCHED, AND A COPY ON DISK IS IGNORED.
+# The head's selector (via the API) declines ONLY the carve-out leg. A readable
+# same-contract copy in the checkout — declaring BOTH legs declined, i.e. forgiving
+# everything — must be IGNORED: it is not evidence about this head. If the rail
+# read it, all three legs would be forgiven and this would certify.
+new_scen lane6928-diskcopy
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7007 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6948 7008 > "$SCEN/runs-main"
+lane_jobset 7008 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7007 success 'test (a)' 'test (b)'
+pr_changed_files docs/x.md
+selector_interp_312
+selector_stub False True
+selector_on_disk 'import json, sys
+sys.stdin.read()
+print(json.dumps({"slow_run": False, "carve_out_run": False}))'
+run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#6928 P1-2: a same-contract copy ON DISK is NOT read — the head's fetched selector governs (exit $rc)" \
+  || fail "#6928 P1-2: expected a non-zero exit, got 0 — the on-disk copy forgave shards the head's selector REQUIRED"
+grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
+  && pass "…and exactly the head-selector's one declined leg was forgiven (carve-out still required)" \
+  || fail "the head-selector's answer did not govern: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "ref=$HEAD_VP" "$SCEN/calls" \
+  && pass "…and the selector was FETCHED PINNED TO THIS HEAD (ref=$HEAD_VP)" \
+  || fail "the selector fetch is not pinned to this head"
+grep -q "contents/config/ci-surfaces.yml" "$SCEN/calls" \
+  && pass "…and its manifest was fetched at the same ref" \
+  || fail "the selector's manifest was not fetched at this head"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although a required shard was missing" || pass "no merge attempted"
+
+# (i) #6928 P1-1 — THE SEARCH ITSELF FAILS: nothing on PATH qualifies. This is a
+# DISTINCT branch from a failing override: the resolver searches and finds no
+# ≥3.12 at all, so the reason must say the SEARCH failed. `selector_interp_none`
+# prepends failing stubs for every name the resolver tries, so the host's real
+# python is never reached and the scenario stays hermetic on a host whose
+# `python3` IS ≥3.12.
+new_scen lane6928-nointerp-search
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7009 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6949 7010 > "$SCEN/runs-main"
+lane_jobset 7010 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7009 success 'test (a)' 'test (b)'
+pr_changed_files docs/x.md
+selector_stub False False   # must never be reached
+selector_interp_none
+run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#6928 P1-1: NO ≥3.12 anywhere on PATH → BLOCK (exit $rc)" \
+  || fail "#6928 P1-1: expected a non-zero exit, got 0 — the search found a ≥3.12 that is not there"
+grep -q "no Python >= 3.12 interpreter was found" "$SCEN/err" \
+  && pass "…naming the FAILED SEARCH (not an override) as the reason" \
+  || fail "the reason is not the search-failure branch: $(grep -m1 'NOT applied' "$SCEN/err")"
+grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
+  && pass "…refusing the RAW gap (all three shards)" \
+  || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "contents/tools/ci_selection.py" "$SCEN/calls" \
+  && fail "the selector was FETCHED even though no interpreter can run it — the guard is not fail-fast" \
+  || pass "…and the selector was NEVER fetched"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge ran without an interpreter" || pass "no merge attempted"
 
 # ── 50. IN-FLIGHT IS AN ALLOW-LIST — AN UNRECOGNISED STATUS IS RED (#1353) ──
 # The pending half of the classifier was a DENY-list: `status != "completed"` was
