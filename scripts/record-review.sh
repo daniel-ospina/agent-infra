@@ -1003,7 +1003,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         # between, and a clean re-merge of (reviewed, its base parent) reproduces
         # the head's tree exactly. Re-record against the CURRENT head, exactly as
         # the arm above does — the binding is to the head that will merge.
-        echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base commit in between; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
+        echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base NON-MERGE commit in between — an intervening merge is permitted, which is why the tree check below is load-bearing; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
         SHA="$CURRENT_HEAD"
       else
         echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2

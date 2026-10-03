@@ -1316,7 +1316,7 @@ B1="$(git rev-parse main~2)"
 git checkout -q pr
 CURRENT="$(git rev-parse HEAD)"
 [ "$(verdict_with "$D4b" "$TMP/fn.sh" "$REVIEWED" "$CURRENT")" = 0 ] \
-  && pass "(23) a CLEAN base-only move touching the quoted name is CARRIED — the counterweight to the leak assertion above (NOT a `core.quotePath` flag assertion: the seam pins no such flag, because `-z` is byte-transparent)" \
+  && pass "(23) a CLEAN base-only move touching the quoted name is CARRIED — the counterweight to the leak assertion above (NOT a \`core.quotePath\` flag assertion: the seam pins no such flag, because \`-z\` is byte-transparent)" \
   || fail "(23) a clean base-only move touching a quoted name was FALSELY REFUSED — a caller's git config is deciding the verdict"
 
 # ── 25. (C4)'s path set must not depend on the CALLER'S CWD or config. `diff.relative` is a
@@ -1366,7 +1366,7 @@ subdir_verdict() { # <fnfile>
   && pass "(25) REFUSED even though the function is called from a subdirectory with diff.relative=true — (C4) no longer depends on the caller's cwd or config" \
   || fail "(25) CARRIED the union leak: (C4) was skipped because the caller's cwd hid the path"
 M25="$TMP/mut-norel.sh"
-python3 - "$TMP/fn.sh" "$M25" <<'PY' || pass "NOTE (seam): mutation NOREL is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+python3 - "$TMP/fn.sh" "$M25" <<'PY' || true
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 frag = "-c core.quotePath=false -c diff.relative=false"
@@ -1418,7 +1418,7 @@ git show "$BASETIP:F" > "$TMP/c24-tip.txt" 2>/dev/null
   && pass "(24) the head is CARRIED — an unterminated blob no longer makes a known line look new" \
   || fail "(24) the head was FALSELY REFUSED: the two blobs are still being glued"
 M24="$TMP/mut-nosep.sh"
-python3 - "$TMP/fn.sh" "$M24" <<'PY' || pass "NOTE (seam): mutation NOSEP is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+python3 - "$TMP/fn.sh" "$M24" <<'PY' || true
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
 frag = '  lsep="\n"'
@@ -1495,7 +1495,7 @@ locale_verdict() { # <fnfile>
 # The pin is the STATUS CHECK, not the `LC_ALL=C` prefix (removing the prefix alone still refuses,
 # because the pipeline's exit status is now examined). This mutation restores the unchecked idiom.
 M26="$TMP/mut-nostatus.sh"
-python3 - "$TMP/fn.sh" "$M26" <<'PYX' || pass "NOTE (seam): mutation NOSTATUS is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+python3 - "$TMP/fn.sh" "$M26" <<'PYX' || true
 import sys
 lines = open(sys.argv[1], encoding="utf-8").read().split("\n")
 n = 0
@@ -1508,7 +1508,7 @@ if n != 2:
     sys.exit(1)
 open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines))
 PYX
-bash -n "$M26" 2>/dev/null || pass "NOTE (seam): mutation NOSTATUS is RETIRED — the mechanism it mutated moved into the byte-exact python seam, so no shell mutant can exercise it; the fixture's own behaviour assertion above is the live coverage, and this is recorded as a note rather than an unmeasured load-bearing claim"
+bash -n "$M26" 2>/dev/null || true
 # HONESTY NOTE, not a claim: this mutation restores the pre-fix unchecked idiom. Where `sort`
 # tolerates the bytes (this run) it does NOT carry, because the locale pin still makes the
 # comparison work — so the mutation is NOT an isolation proof of the status check here. It IS
@@ -1761,15 +1761,21 @@ else
 fi
 
 
-# 138 -> 137 (round 36, PR #1554). Section 25's retired-mutant tail printed the SAME "RETIRED"
-# note from TWO places — a bare `bash -n "$M25" || pass NOTE` and then the `[ ... ] || pass NOTE`
-# verdict — so a mutant that was never built (the python fragment no longer matches, so $M25 does
-# not exist) scored the note TWICE, sourced a missing file on EVERY run (a hard shell error on
-# stderr that no assertion could see), and still reported the section green. That is the round-35
-# defect class. The tail now mirrors section 24's single `if bash -n …; then … else … fi`, which
-# emits the note exactly once and never sources an unbuilt mutant. One duplicate assertion retired
-# with it, so this pin is EXACT: 137, not a floor.
-MIN_ASSERTIONS=137
+# 138 -> 137 (round 36) -> 133 (round 37, PR #1554). The retired-mutant tails printed the SAME
+# "RETIRED" note from more than one place: the mutant BUILDER line itself carried a
+# `|| pass "NOTE ..."` (sections 24, 25 and 26) and section 26 had a bare
+# `bash -n "$M26" || pass "NOTE ..."` as well. Each builder fails by design — its python
+# fragment no longer matches the refactored function, so the mutant file is never written — so
+# every one of those arms scored the note in ADDITION to the `if bash -n …; then … else … fi`
+# tail. Round 36 removed one duplicate for section 25 and claimed the tail "now mirrors section
+# 24's single if/else, which emits the note exactly once"; MEASURED in round 37 that claim was
+# FALSE — sections 24/25/26 each still emitted their note twice. The builder arms are now
+# `|| true` (no `set -e` in this file, so a failed builder is inert), leaving the if/else tail as
+# the single emitter. Round 37 also escaped the two backticked spans in the section-23 `pass`
+# message, which were running as command substitutions and printing two hard shell errors that no
+# assertion could see — the same round-35/36 defect class. Four duplicate passes were retired with
+# the builder arms, so this pin is EXACT: 133, not a floor.
+MIN_ASSERTIONS=133
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
