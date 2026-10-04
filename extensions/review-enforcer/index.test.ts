@@ -3486,6 +3486,14 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
   ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
   ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
+  // The fixtures that the anchored first attempt silently LOST. `origin/main` redacts
+  // both; an anchor on either side of the family pattern makes each survive, and the
+  // suite stayed green through two rounds of that (review, #1492). Pin them at the exact
+  // shapes that regressed: word-char-prefixed token, and `_`-suffixed token.
+  ok(!auditCommand("TOKEN_ghp_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "a WORD-CHAR-PREFIXED token must not survive");
+  ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
+  ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
+  ok(!auditCommand("ghs_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "the server family (ghs_) is covered too");
   // The label must say WHICH length it measures: redaction shortens the text, so an
   // unlabelled count reports a number that is not the refused command's length (the
   // first draft of this test asserted the opposite — caught by review, #1492).
