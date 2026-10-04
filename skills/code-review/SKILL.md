@@ -356,6 +356,84 @@ is detected, the merge step refreshes the branch against main and re-runs the af
 tests before merging — the safety net for cross-PR breakage without blocking on the signal itself.
 
 
+### Step 0.10 — Process-Weight Check (advisory by default; P1 only on the three triggers)
+
+Run this when the diff **ADDS MACHINERY** rather than changing behaviour: a new guard/checker
+script, a new test file, a new assertion family, a new config surface, or a new CI job. It answers
+ONE question — **is this the least machinery that makes the behaviour genuinely trustworthy, or is
+it accumulation?**
+
+This is **not** an anti-test step. "This adds too many tests" is NOT a valid finding: a test that
+proves a behaviour is product work. The judgement is about machinery *around* behaviour.
+
+**Measure first — raw size is the wrong number.** This repo is prose-heavy, so a 1,300-line file
+can be ~690 code lines and 629 comment/docstring lines. Count non-blank lines that are neither
+comments nor docstrings, then take three measurements:
+
+1. **Code size** — code lines added, and what family it joins (an existing guard's code lines).
+2. **CI cost** — is the new test registered in a surface, and what is its *measured* duration?
+   `rg -n "<new_test_file>" config/ci-surfaces.yml`
+3. **Duplication** — does machinery ALREADY own this invariant?
+   `rg -l "<the invariant's key symbol>" tools/ .github/scripts/ | sort`
+   Then check whether the new file even *names* what it overlaps. Zero mentions is a finding.
+
+**The three P1 triggers — only these block:**
+
+1. **A DUPLICATE OWNER exists.** Another guard/checker already asserts the same invariant,
+   especially when the new one does not name it. Cite the existing file **and its clause id**.
+   If you cannot name both, it is not a duplicate.
+2. **An anti-accumulation clause already fires.** RUN the existing guards this diff touches and
+   report their exit codes verbatim. If one goes red *because of the new machinery* — not because
+   of a missing re-cut — that clause IS this project's recorded decision not to accumulate, and
+   the diff is re-litigating a decision. Report it as such.
+3. **It lands on the binding constraint.** The machinery adds wall-clock to the critical CI path
+   (a shard's `max`, or a gate every merge waits on) beyond the stated budget. Cite the measured
+   delta and the budget. CI cost is a real cost — but it is NOT a pass/fail on speed alone.
+
+**Otherwise: advisory only.** Report the ratio and the measurements; the author decides. Never
+block on a lopsided ratio by itself.
+
+**What a GOOD finding cites (all three):**
+- The failure it prevents, **pointing at it having happened** (incident, red run, lost merge).
+  If there is no such failure, say so — that is a removal candidate, not a bug.
+- Whether deleting it tomorrow would harm the **product** or only the **process**.
+- The concrete overlap / complexity / CI number.
+
+**What a BAD finding looks like — do not write these:**
+- "This PR adds 2,000 lines of tests." (size alone is not a finding)
+- "We should not add more guards." (a stance, not an argument)
+- "CI is slow, so skip the test." Removed verification that prevents a real observed failure is
+  not simplification — it is removing a guard rail.
+
+**A lopsided ratio is a SMELL pointing at a missing seam, not a verdict.** When you report one,
+name the seam that would make the behaviour trustworthy **by construction** — a single authoritative
+source, a generated mirror, or a shared helper beats a second checker re-deriving the same
+invariant. That seam is usually the real fix; the second checker is the symptom.
+
+**Output when triggered:**
+
+```
+ISSUE:
+  check_type: process-weight
+  severity: P1   # only for the three triggers; otherwise P2, advisory: true
+  description: <the duplicate owner, or the firing clause, or the measured CI delta>
+  measurement: code_lines=<n> (of total=<n>); ci_surface=<name> measured=<s>s; overlap=<file + clause id>
+  suggestion: <the seam — or "fold into <existing file> and delete <new file>">
+```
+
+**Worked example (the case this step was written from, 2026-10-04).** A PR adding a
+"required-set sync" guard (+3,484/-8) measured: **1,886 code lines** added to an existing guard
+family of **2,619** (+72%, i.e. near-doubling a heavy family); `test_required_set_sync.py`
+measured **19.0s** on the `core` surface; and it **overlapped an existing owner** —
+`tools/mergify_config_guard.py`, whose `_settings_contexts()` already read `.github/settings.yml`
+branch-protection, i.e. the exact surface the new guard's docstring claimed "nothing read". It named
+that file **zero** times. Running the existing guard on the merged tree returned
+`STATIC RESULT: DIVERGED (exit 1)` — clause (viii)/I11, whose stated purpose is *"Any OTHER reader
+[of the declaration home] is the bug I11 exists to catch"* — and that command runs in
+`python-ci.yml`, so the tree was RED. Note the shape of the correct conclusion: the guard's
+**purpose passed the test** (a real recorded incident — a prior surface split silently dropped nine
+checks), and the finding was about **duplication and size**, not about the guard being unnecessary.
+
 ### Step 1 — Eligibility Check
 
 Dispatch a sub-agent via Pi `task` to check if the PR (a) is closed, (b) does not need review (automated, trivial, obvious), or (c) already has a code review. If ineligible, stop. **Draft PRs are eligible.** **Infrastructure files (skill files, ontology, templates, extensions, .mcp.json) are NEVER considered trivial — these are critical pipeline infrastructure that must always be reviewed.** If infrastructure files were detected in Step 0.8, the PR is always eligible regardless of triviality.
