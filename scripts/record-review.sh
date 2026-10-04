@@ -422,7 +422,26 @@ DIFF_FETCH_TRIES=0
 # idempotent GET, so retrying has no side effects. Both knobs are
 # env-overridable so the suite can pin the attempt count without paying for the
 # backoff.
-DIFF_FETCH_ATTEMPTS="${RECORD_REVIEW_DIFF_FETCH_ATTEMPTS:-3}"
+# The attempt budget is validated the same way the backoff is, and for the same
+# reason: `"${...:-3}"` accepts ANY run of digits. A huge in-range value made the
+# loop effectively unbounded on a persistently failing fetch (234 attempts in
+# ~6s at a zero backoff; one attempt per poll at the default), and a NON-numeric
+# value leaked a raw `[: abc: integer expression expected` into the rail's log
+# and produced a nonsense "1 of abc attempt(s) made" (#1577 review P3). An
+# unusable value falls back to the DEFAULT rather than to the cap, so a typo
+# reads as the documented behaviour instead of silently widening the budget.
+DIFF_FETCH_ATTEMPTS_MAX=10
+DIFF_FETCH_ATTEMPTS=3
+case "${RECORD_REVIEW_DIFF_FETCH_ATTEMPTS:-}" in
+  ''|*[!0-9]*) : ;;
+  *)
+    if [ "${#RECORD_REVIEW_DIFF_FETCH_ATTEMPTS}" -le 2 ] \
+       && [ "$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS" -ge 1 ] \
+       && [ "$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS" -le "$DIFF_FETCH_ATTEMPTS_MAX" ]; then
+      DIFF_FETCH_ATTEMPTS="$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS"
+    fi
+    ;;
+esac
 # The backoff is CLAMPED to a small non-negative integer, and that is NOT
 # belt-and-braces. The obvious guard (a `case` rejecting non-digits plus a
 # `-gt 0` test) accepts ANY run of digits, and an all-digit value past
@@ -469,8 +488,16 @@ diff_hash_for_pr() { # <pr>
   command -v openssl >/dev/null 2>&1 || return 0
   tmp="$(mktemp 2>/dev/null)" || return 0
   norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
+  # `EXIT`, deliberately NOT `RETURN` (#1577 review P1). A RETURN trap is
+  # INHERITED by nested functions under `set -T`/functrace, and SHELLOPTS is an
+  # exported bash variable, so an ancestor that ran `set -T` propagates it: the
+  # trap then fired when `diff_fetch_once` returned and deleted $tmp BEFORE the
+  # hash read it, so the record aborted rc 1 with NO record written -- on EVERY
+  # successful fetch. The parent had no nested call inside this window, so the
+  # abort was introduced by extracting the fetch into a function. The function's
+  # own `rm -f` at the end is the normal cleanup; EXIT is only the backstop.
   # shellcheck disable=SC2064
-  trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
+  trap "rm -f '$tmp' '$norm'" EXIT 2>/dev/null || true
   while :; do
     rc=0
     diff_fetch_once "$pr" "$tmp" || rc=$?

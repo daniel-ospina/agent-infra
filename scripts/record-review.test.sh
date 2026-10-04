@@ -735,10 +735,60 @@ for _v in 2147483648 999999999; do
     [ "$RECORD_RC" = "0" ] && ok "11.5d #1577 sleep=$_v does NOT abort the record (rc 0)" || bad "11.5d #1577 sleep=$_v aborted the record (rc=$RECORD_RC, err=$RECORD_ERR)"
     [ -f "$(Q2 424543)" ] && ok "11.5d #1577 sleep=$_v still writes the record" || bad "11.5d #1577 sleep=$_v wrote NO record"
     SLOG="$(cat "$T/sleeplog-11.5d" 2>/dev/null || true)"
-    if grep -qxF "$_v" <<<"$SLOG"; then bad "11.5d #1577 sleep=$_v REACHED sleep unclamped"; else ok "11.5d #1577 sleep=$_v never reaches sleep unclamped"; fi
+    # The NEGATIVE assertion is guarded on the log being non-empty: with no retry
+    # there is no sleep at all, and grepping an empty log passed vacuously
+    # (#1577 review P3). The vector still REDs via the clamp assertion below, but
+    # a negative assertion that cannot fail is not an assertion.
+    if [ -z "$SLOG" ]; then bad "11.5d #1577 sleep=$_v: NO sleep observed, so the clamp was never exercised"
+    elif grep -qxF "$_v" <<<"$SLOG"; then bad "11.5d #1577 sleep=$_v REACHED sleep unclamped"
+    else ok "11.5d #1577 sleep=$_v never reaches sleep unclamped"; fi
     if grep -qxF "30" <<<"$SLOG"; then ok "11.5d #1577 sleep=$_v is CLAMPED to 30"; else bad "11.5d #1577 sleep=$_v was not clamped (log: $(printf '%s' "$SLOG" | tr '\n' ' '))"; fi
 done
 unset RECORD_REVIEW_DIFF_FETCH_SLEEP SLEEP_LOG _v SLOG
+
+# 11.5e #1577 review P1 — the cleanup trap must survive `functrace`. A RETURN
+# trap is INHERITED by NESTED functions under `set -T`, and SHELLOPTS is an
+# exported bash variable, so an ancestor that ran `set -T` propagates it: the
+# trap then fired when diff_fetch_once returned and deleted the temp file BEFORE
+# the hash read it, aborting the record rc 1 with NO record written -- on every
+# SUCCESSFUL fetch. The trap is now EXIT (armed only after the early returns,
+# with the function's own rm -f as the normal cleanup). REGRESSION-SENSITIVE:
+# with the RETURN trap this records nothing. (No backticks in the assertion
+# strings below -- they would run as command substitution, which is the exact
+# defect fixed elsewhere in this file.)
+rm -f "$(Q2 424544)" "$T/cap-11.5e" "$T/err-11.5e" "$T/rc-11.5e"
+# SHELLOPTS is READONLY, so it cannot be used as an env-prefix to flip functrace;
+# the flag is passed to the child bash directly (`bash -T`), which is exactly the
+# environment the P1 reproduced under.
+(
+    export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+    export STUB_BODY="PR body" STUB_DIFF_FILE="$D_F" STUB_DIFF_FAIL=0 STUB_CAPTURE="$T/cap-11.5e"
+    unset STUB_DIFF_FAIL_TIMES STUB_DIFF_COUNT
+    export RECORD_REVIEW_DIFF_FETCH_SLEEP=0
+    rc=0
+    bash -T "$RECORD" 424544 "$SHA" clean "daniel-ospina/agent-infra" 2>"$T/err-11.5e" || rc=$?
+    printf '%s' "$rc" > "$T/rc-11.5e"
+) 2>/dev/null
+RECORD_RC="$(cat "$T/rc-11.5e" 2>/dev/null || echo 99)"
+RECORD_ERR="$(cat "$T/err-11.5e" 2>/dev/null || true)"
+RECORD_CAP="$(cat "$T/cap-11.5e" 2>/dev/null || true)"
+[ "$RECORD_RC" = "0" ] && ok "11.5e #1577 a functrace (set -T) ancestor still records (rc 0)" || bad "11.5e #1577 functrace aborted the record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' '))"
+[ -f "$(Q2 424544)" ] && ok "11.5e #1577 the record IS written under functrace" || bad "11.5e #1577 NO record written under functrace"
+grep -qF "diff=" <<<"$RECORD_CAP" && ok "11.5e #1577 the diff binding survives under functrace" || bad "11.5e #1577 no diff binding under functrace"
+
+# 11.5f #1577 review P3 — an unusable attempt budget degrades to the DEFAULT and
+# never leaks a raw `integer expression expected` or a nonsense count. A huge
+# in-range value used to leave the loop effectively unbounded (234 attempts in
+# ~6s at a zero backoff).
+for _a in abc 0 9223372036854775807; do
+    rm -f "$(Q2 424545)"
+    RECORD_REVIEW_DIFF_FETCH_ATTEMPTS="$_a" RECORD_REVIEW_DIFF_FETCH_SLEEP=0 \
+      run_record_diff 424545 "$SHA" "PR body" "$D_F" 1
+    if grep -qF "integer expression expected" <<<"$RECORD_ERR"; then bad "11.5f #1577 attempts=$_a leaked a raw bash error"; else ok "11.5f #1577 attempts=$_a leaks no raw bash error"; fi
+    assert_contains "$RECORD_ERR" "of 3 attempt(s) made" "11.5f #1577 attempts=$_a falls back to the default budget (3)"
+    [ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "3" ] && ok "11.5f #1577 attempts=$_a makes exactly 3 fetch attempts" || bad "11.5f #1577 attempts=$_a made $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 3)"
+done
+unset _a RECORD_REVIEW_DIFF_FETCH_ATTEMPTS
 
 # 11.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
 # diff cannot be shown unchanged, so emitting diff= would create a
