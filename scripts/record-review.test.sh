@@ -85,6 +85,14 @@ if [ "$1" = "api" ]; then
         cat "${STUB_DIFF_FILE:-/dev/null}"
         exit 0
     fi
+    # #1575 clause (E): the target head's check-runs. STUB_CHECKS carries the TSV
+    # rows the caller's --jq would emit (app.slug|name|id|status|conclusion), one
+    # per line; empty/absent = an empty surface.
+    if grep -qF -- "check-runs" <<<"$*"; then
+        [ "${STUB_CHECKS_FAIL:-0}" = "1" ] && exit 1
+        [ -n "${STUB_CHECKS:-}" ] && printf '%s\n' "${STUB_CHECKS}"
+        exit 0
+    fi
     if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
@@ -665,6 +673,73 @@ $PRIOR3" "$D_F"
 [ "$RECORD_RC" = "3" ] && ok "11.3 stale sha + CHANGED diff still refuses (rc 3)" || bad "11.3 changed-diff refusal (rc=$RECORD_RC)"
 [ ! -f "$(Q2 424502)" ] && ok "11.3 no record written when the diff changed" || bad "11.3 wrote a record for an unreviewed diff"
 assert_contains "$RECORD_ERR" "cannot be shown unchanged" "11.3 names the reason"
+
+# ── #1575 clause (E): a carry must not re-bind onto a MEASURABLY RED head ─────
+# Every arm below clones 11.2 EXACTLY (same stale sha, same unchanged diff, same
+# valid prior marker) and changes only the target head's check surface. 11.2
+# proves the carry succeeds without (E), so a refusal here is attributable to (E)
+# and to nothing else.
+prior_for() { # <pr> -> the signed clean marker line for $DH at $STALE
+  local t="review recorded: reviews/$1.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)"
+  printf '%s sig=%s' "$t" "$(printf '%s' "$t" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+}
+
+# 11.3a: a completed FAILURE at the target head refuses the carry. Without (E)
+# this is tortoise #4823 / #5395 / #5292 — a signed `clean` on a head whose own
+# checks are failing, which the merge gate cannot see once the record outlives
+# the run.
+rm -f "$(Q2 424510)"
+STUB_CHECKS='github-actions|ci / unit-test|11|completed|failure' \
+  run_record_diff 424510 "$STALE" "body
+
+$(prior_for 424510)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3a (E) a RED target head refuses the carry (rc 3)" || bad "11.3a (E) carried onto a red head! (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "TARGET HEAD IS MEASURABLY RED" "11.3a (E) names the refusal condition"
+[ ! -f "$(Q2 424510)" ] && ok "11.3a (E) no record written for a red head" || bad "11.3a (E) wrote a record onto a red head"
+if grep -qF "carry-forward" <<<"$RECORD_ERR"; then bad "11.3a (E) still printed the carry SUCCESS line"; else ok "11.3a (E) the carry success line is not printed"; fi
+
+# 11.3b: POLARITY CONTROL — a group whose OLDER attempt failed and whose NEWEST
+# passed is NOT red. This is what stops (E) being written as an ungrouped `any
+# failure`, which refuses a green head; this fleet produces re-runs routinely
+# (one job held 10 attempts carrying BOTH `failure` and `success`), and a guard
+# that fires on green heads gets deleted rather than fixed.
+rm -f "$(Q2 424511)"
+STUB_CHECKS='github-actions|ci / unit-test|11|completed|failure
+github-actions|ci / unit-test|12|completed|success' \
+  run_record_diff 424511 "$STALE" "body
+
+$(prior_for 424511)" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.3b (E) a re-run-green head still carries (rc 0) — the grouping is load-bearing" || bad "11.3b (E) refused a GREEN head (rc=$RECORD_RC) — the check is ungrouped"
+assert_contains "$RECORD_ERR" "carry-forward" "11.3b (E) the carry proceeded"
+
+# 11.3c: an UNDOCUMENTED conclusion is RED. The allow-list polarity is deliberate
+# (#1399 / tortoise #4877): a conclusion GitHub has not documented cannot be read
+# as green, and neither can a null one.
+for spec in "11.3c some_future_conclusion" "11.3d null"; do
+  tag="${spec%% *}"; concl="${spec#* }"; n="${tag#11.3}"
+  case "$n" in c) pr=424512 ;; d) pr=424513 ;; esac
+  rm -f "$(Q2 $pr)"
+  STUB_CHECKS="github-actions|ci / unit-test|11|completed|$concl" \
+    run_record_diff "$pr" "$STALE" "body
+
+$(prior_for "$pr")" "$D_F"
+  [ "$RECORD_RC" = "3" ] && ok "$tag (E) conclusion '$concl' is RED (rc 3)" || bad "$tag (E) treated '$concl' as green (rc=$RECORD_RC)"
+done
+
+# 11.3e: NOT-RED states must NOT refuse — in-flight, cancelled, and an EMPTY
+# surface. (E) may only ADD a refusal; an unmeasured head is the pre-existing
+# state of every carry, so refusing there would block carries fleet-wide.
+for spec in "11.3e 424514 github-actions|ci / unit-test|11|in_progress|null" \
+            "11.3f 424515 github-actions|ci / unit-test|11|completed|cancelled" \
+            "11.3g 424516 "; do
+  tag="${spec%% *}"; rest="${spec#* }"; pr="${rest%% *}"; rows="${rest#* }"
+  rm -f "$(Q2 $pr)"
+  STUB_CHECKS="$rows" \
+    run_record_diff "$pr" "$STALE" "body
+
+$(prior_for "$pr")" "$D_F"
+  [ "$RECORD_RC" = "0" ] && ok "$tag (E) a not-red surface still carries (rc 0)" || bad "$tag (E) refused a not-red surface (rc=$RECORD_RC)"
+done
 
 # 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"
