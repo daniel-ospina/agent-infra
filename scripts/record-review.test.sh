@@ -1010,10 +1010,12 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #  (1) PR NUMBERS. §10 (#1348) runs AFTER this section and its C1 vector asserts
 #      "writes no record" for PR 424600. Reusing any number up there would leave a
 #      record behind and make C1 fail for a reason that has nothing to do with C1.
-#      The range must ALSO be one no EARLIER section writes: A parses the record at
+#      The range must ALSO be one no EARLIER VECTOR writes — including vectors in
+#      other §11 blocks, since the collision this guards against is INTRA-§11:
+#      `11.3k`/`11.3l` briefly used the same two numbers as A/B. A parses the record at
 #      its own PR number, so a leftover record there would let the parse pass even
 #      if A's writer silently failed (the vacuity this block exists to close).
-#      424520-424523 is verified unused by every other section in this file.
+#      424520-424523 is verified unused by every other vector in this file.
 #  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
 #      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
 #      persist into §10 and make its code-bearing vectors see a docs-only diff.
