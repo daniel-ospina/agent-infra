@@ -790,6 +790,17 @@ STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completely_finished|null' \
 $(prior_for 424520)" "$D_F"
 [ "$RECORD_RC" = "3" ] && ok "11.3k (E) an unknown status with a NULL conclusion is red (rc 3) — in-flight is a named set" || bad "11.3k (E) #1353 fail-open: an unseen status read as pending (rc=$RECORD_RC)"
 
+# 11.3l: an UNPARSEABLE row must make the surface RED, not vanish. A check name
+# containing a `|` shifts every later field; dropping the row is the same #1353
+# fail-open, and the rail (which parses JSON) would have counted it red.
+rm -f "$(Q2 424521)"
+STUB_CHECKS_ROWS='github-actions|ci | shard 1|11|completed|failure' \
+  run_record_diff 424521 "$STALE" "body
+
+$(prior_for 424521)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3l (E) an unparseable row makes the surface RED, not absent (rc 3)" || bad "11.3l (E) a `|` in a check name silently vanished (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "unparseable check-run row" "11.3l (E) the drop is announced, not mute"
+
 # 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"
 run_record_diff 424503 "$STALE" "body with no markers" "$D_F"

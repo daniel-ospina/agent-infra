@@ -1092,9 +1092,16 @@ target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
            --jq '.check_runs[] | "\(.app.slug // "?")|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
   [ -n "$raw" ] || return 1
   printf '%s\n' "$raw" | awk -F'|' -v excl="$RECORD_REVIEW_RED_EXCLUDE" '
-    { # a `|` inside a check name shifts every later field — dropping the row is
-      # fail-open, but MIS-GROUPING it corrupts an unrelated group. Drop it loudly.
-      if (NF != 5) { skipped++; next }
+    { # A `|` inside a check name (a matrix job named `shard 1 | slow`) shifts every
+      # later field, so the row cannot be grouped. DISCARDING it is the #1353 fail-open
+      # again: an input this code cannot positively read as non-red would render the
+      # surface GREEN, and the rail — which parses JSON — would have counted it red.
+      # The allow-list polarity decides unknown input; it does not shrug. So an
+      # unparseable row makes the surface RED, and says so rather than dropping it mute.
+      if (NF != 5) {
+        print "record-review: ⚠️ unparseable check-run row (a `|` in app.slug or name) — treating the target head as RED rather than reading it green (#1575)" > "/dev/stderr"
+        red = 1; next
+      }
       k = $1 "|" $2
       if (!(k in id) || $3 + 0 > id[k]) { id[k] = $3 + 0; st[k] = $4; c[k] = $5 } }
     END {
