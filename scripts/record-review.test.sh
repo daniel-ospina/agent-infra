@@ -85,6 +85,14 @@ if [ "$1" = "api" ]; then
         cat "${STUB_DIFF_FILE:-/dev/null}"
         exit 0
     fi
+    # #1575 clause (E): the target head's check-runs. STUB_CHECKS_ROWS carries the TSV
+    # rows the caller's --jq would emit (app.slug|name|id|status|conclusion), one
+    # per line; empty/absent = an empty surface.
+    if grep -qF -- "check-runs" <<<"$*"; then
+        [ "${STUB_CHECKS_FAIL:-0}" = "1" ] && exit 1
+        [ -n "${STUB_CHECKS_ROWS:-}" ] && printf '%s\n' "${STUB_CHECKS_ROWS}"
+        exit 0
+    fi
     if grep -qF -- "--jq .head.sha" <<<"$*"; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
@@ -247,6 +255,14 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         # environment so a caller can opt a single vector into the transient path.
         export RECORD_REVIEW_DIFF_FETCH_SLEEP="${RECORD_REVIEW_DIFF_FETCH_SLEEP:-0}"
         export STUB_DIFF_FAIL_TIMES="${STUB_DIFF_FAIL_TIMES:-0}" STUB_DIFF_COUNT="${STUB_DIFF_COUNT:-}"
+        # NOTE (measured): the check surface is read by the stub from this env var,
+        # so the runner canNOT scrub an AMBIENT value — the per-invocation prefix
+        # works because it overrides, but a caller with the var already exported
+        # reaches the earlier carries too (verified: it reddens 11.2/12a/12d/12e/12f).
+        # No caller sets it, and the vectors that must be red pin it inline, so this
+        # is a declared limitation rather than a hermeticity claim. Fixing it properly
+        # means passing the surface as a file path, not as environment.
+        export STUB_CHECKS_ROWS="${STUB_CHECKS_ROWS:-}"
         rc=0
         bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
@@ -666,6 +682,128 @@ $PRIOR3" "$D_F"
 [ ! -f "$(Q2 424502)" ] && ok "11.3 no record written when the diff changed" || bad "11.3 wrote a record for an unreviewed diff"
 assert_contains "$RECORD_ERR" "cannot be shown unchanged" "11.3 names the reason"
 
+# ── #1575 clause (E): a carry must not re-bind onto a MEASURABLY RED head ─────
+# Every arm below clones 11.2 EXACTLY (same stale sha, same unchanged diff, same
+# valid prior marker) and changes only the target head's check surface. 11.2
+# proves the carry succeeds without (E), so a refusal here is attributable to (E)
+# and to nothing else.
+prior_for() { # <pr> -> the signed clean marker line for $DH at $STALE
+  local t="review recorded: reviews/$1.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)"
+  printf '%s sig=%s' "$t" "$(printf '%s' "$t" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+}
+
+# 11.3a: a completed FAILURE at the target head refuses the carry. Without (E)
+# this is tortoise #4823 / #5395 / #5292 — a signed `clean` on a head whose own
+# checks are failing, which the merge gate cannot see once the record outlives
+# the run.
+rm -f "$(Q2 424510)"
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completed|failure' \
+  run_record_diff 424510 "$STALE" "body
+
+$(prior_for 424510)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3a (E) a RED target head refuses the carry (rc 3)" || bad "11.3a (E) carried onto a red head! (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "TARGET HEAD IS MEASURABLY RED" "11.3a (E) names the refusal condition"
+[ ! -f "$(Q2 424510)" ] && ok "11.3a (E) no record written for a red head" || bad "11.3a (E) wrote a record onto a red head"
+if grep -qF "carry-forward" <<<"$RECORD_ERR"; then bad "11.3a (E) still printed the carry SUCCESS line"; else ok "11.3a (E) the carry success line is not printed"; fi
+
+# 11.3b: POLARITY CONTROL — a group whose OLDER attempt failed and whose NEWEST
+# passed is NOT red. This is what stops (E) being written as an ungrouped `any
+# failure`, which refuses a green head; this fleet produces re-runs routinely
+# (one job held 10 attempts carrying BOTH `failure` and `success`), and a guard
+# that fires on green heads gets deleted rather than fixed.
+rm -f "$(Q2 424511)"
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completed|failure
+github-actions|ci / unit-test|12|completed|success' \
+  run_record_diff 424511 "$STALE" "body
+
+$(prior_for 424511)" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.3b (E) a re-run-green head still carries (rc 0) — the grouping is load-bearing" || bad "11.3b (E) refused a GREEN head (rc=$RECORD_RC) — the check is ungrouped"
+assert_contains "$RECORD_ERR" "carry-forward" "11.3b (E) the carry proceeded"
+
+# 11.3c: an UNDOCUMENTED conclusion is RED. The allow-list polarity is deliberate
+# (#1399 / tortoise #4877): a conclusion GitHub has not documented cannot be read
+# as green, and neither can a null one.
+for spec in "11.3c some_future_conclusion" "11.3d null"; do
+  tag="${spec%% *}"; concl="${spec#* }"; n="${tag#11.3}"
+  case "$n" in c) pr=424512 ;; d) pr=424513 ;; esac
+  rm -f "$(Q2 $pr)"
+  STUB_CHECKS_ROWS="github-actions|ci / unit-test|11|completed|$concl" \
+    run_record_diff "$pr" "$STALE" "body
+
+$(prior_for "$pr")" "$D_F"
+  [ "$RECORD_RC" = "3" ] && ok "$tag (E) conclusion '$concl' is RED (rc 3)" || bad "$tag (E) treated '$concl' as green (rc=$RECORD_RC)"
+done
+
+# 11.3e: NOT-RED states must NOT refuse — in-flight, cancelled, and an EMPTY
+# surface. (E) may only ADD a refusal; an unmeasured head is the pre-existing
+# state of every carry, so refusing there would block carries fleet-wide.
+for spec in "11.3e 424514 github-actions|ci / unit-test|11|in_progress|null" \
+            "11.3f 424515 github-actions|ci / unit-test|11|completed|cancelled" \
+            "11.3g 424516 "; do
+  tag="${spec%% *}"; rest="${spec#* }"; pr="${rest%% *}"; rows="${rest#* }"
+  rm -f "$(Q2 $pr)"
+  STUB_CHECKS_ROWS="$rows" \
+    run_record_diff "$pr" "$STALE" "body
+
+$(prior_for "$pr")" "$D_F"
+  [ "$RECORD_RC" = "0" ] && ok "$tag (E) a not-red surface still carries (rc 0)" || bad "$tag (E) refused a not-red surface (rc=$RECORD_RC)"
+done
+
+# 11.3h: the ANTI-REGRESSION vector for the veto's surface. `ai-review-gate` sits on
+# the PR head and goes red BECAUSE the evidence is stale — the condition the carry
+# exists to remedy. Counting it refuses `lane_dimension_carry` BY CONSTRUCTION (#6213
+# measured the gate flipping SUCCESS -> FAILURE seven seconds after the rail moved the
+# head). A red the carry itself explains is not evidence about the tree.
+rm -f "$(Q2 424517)"
+STUB_CHECKS_ROWS='github-actions|ai-review-gate|11|completed|failure' \
+  run_record_diff 424517 "$STALE" "body
+
+$(prior_for 424517)" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.3h (E) a stale-ai-review-gate red alone still carries (rc 0)" || bad "11.3h (E) the veto fired on its OWN evidence gate (rc=$RECORD_RC) — the lane arm is refused by construction"
+
+# 11.3i: the exclusion is NARROW — the gate's redness must not mask a genuine red.
+rm -f "$(Q2 424518)"
+STUB_CHECKS_ROWS='github-actions|ai-review-gate|11|completed|failure
+github-actions|ci / unit-test|12|completed|failure' \
+  run_record_diff 424518 "$STALE" "body
+
+$(prior_for 424518)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3i (E) a genuine red beside the gate still refuses (rc 3)" || bad "11.3i (E) the gate exclusion masked a real red (rc=$RECORD_RC)"
+
+# 11.3j: an unrecognised STATUS spelling alongside a conclusion is judged by that
+# conclusion. `null` here means RED, not "in flight" — see 11.3k for the distinction.
+rm -f "$(Q2 424519)"
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completely_finished|failure' \
+  run_record_diff 424519 "$STALE" "body
+
+$(prior_for 424519)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3j (E) an unknown STATUS with a failure conclusion is red (rc 3)" || bad "11.3j (E) waved through an unknown status (rc=$RECORD_RC)"
+
+# 11.3k: and an unknown STATUS with a NULL conclusion is red too. This is the #1353
+# fail-open: gating "in flight" on the ABSENCE of a conclusion lets any status
+# spelling this code has not seen read as pending, and the surface read GREEN. In
+# flight is a NAMED set, not "anything that is not completed".
+rm -f "$(Q2 424560)"
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completely_finished|null' \
+  run_record_diff 424560 "$STALE" "body
+
+$(prior_for 424560)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3k (E) an unknown status with a NULL conclusion is red (rc 3) — in-flight is a named set" || bad "11.3k (E) #1353 fail-open: an unseen status read as pending (rc=$RECORD_RC)"
+
+# 11.3l: an UNPARSEABLE row must make the surface RED, not vanish. A check name
+# containing a literal pipe shifts every later field; DISCARDING the row is the same
+# #1353 fail-open, and MIS-GROUPING it (the reviewer's mutant: fields shift left, the
+# status `completed` lands in the conclusion slot, which is not in the allow-list)
+# would red the surface by ACCIDENT. The rc assertion alone cannot tell those apart —
+# the diagnostic assertion below is what pins the intended branch.
+rm -f "$(Q2 424561)"
+STUB_CHECKS_ROWS='github-actions|ci | shard 1|11|completed|failure' \
+  run_record_diff 424561 "$STALE" "body
+
+$(prior_for 424561)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3l (E) an unparseable row makes the surface RED, not absent (rc 3)" || bad "11.3l (E) a literal pipe in a check name silently vanished (rc=$RECORD_RC)"
+assert_contains "$RECORD_ERR" "unparseable check-run row" "11.3l (E) the drop is announced, not mute"
+
 # 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"
 run_record_diff 424503 "$STALE" "body with no markers" "$D_F"
@@ -872,10 +1010,12 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #  (1) PR NUMBERS. §10 (#1348) runs AFTER this section and its C1 vector asserts
 #      "writes no record" for PR 424600. Reusing any number up there would leave a
 #      record behind and make C1 fail for a reason that has nothing to do with C1.
-#      The range must ALSO be one no EARLIER section writes: A parses the record at
+#      The range must ALSO be one no EARLIER VECTOR writes — including vectors in
+#      other §11 blocks, since the collision this guards against is INTRA-§11:
+#      `11.3k`/`11.3l` briefly used the same two numbers as A/B. A parses the record at
 #      its own PR number, so a leftover record there would let the parse pass even
 #      if A's writer silently failed (the vacuity this block exists to close).
-#      424520-424523 is verified unused by every other section in this file.
+#      424520-424523 is verified unused by every other vector in this file.
 #  (2) The env-prefix assignments LEAK: `VAR=val func` does not restore VAR if it
 #      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
 #      persist into §10 and make its code-bearing vectors see a docs-only diff.
