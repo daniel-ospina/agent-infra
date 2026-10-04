@@ -500,18 +500,28 @@ run_job_count() {
 # is harmless here because the key asserts only "a job with this slug failed",
 # which is exactly the granularity the fallback claims.
 run_failed_job_ids() {
-  local run_id="$1" slug names
+  local run_id="$1" slug names out
   # Same slug resolution as run_job_count (`gh api` has no `--repo`; it resolves
   # from the CWD), so the fallback cannot silently read the wrong repository.
   if [ -n "${repo:-}" ]; then slug="repos/$repo"; else slug="repos/{owner}/{repo}"; fi
   names="$($GH api "$slug/actions/runs/${run_id}/jobs" --paginate \
     --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | .name' 2>/dev/null)" || return 1
   [ -n "$names" ] || return 1
-  printf '%s\n' "$names" | while IFS= read -r one; do
+  # ⛔ DEDUPE PER RUN — THIS IS LOAD-BEARING, NOT TIDINESS (review cycle 1, P0).
+  # `collect_union_rows` counts LINES per id against `runs` = the run count, so a
+  # second emission of the same key in ONE run yields `failures > runs`. Two
+  # distinct job names CAN slug alike by design (the comment on the slug below
+  # says so), and `parse_failure_rows` REJECTS a row whose failures exceed its
+  # runs — a rejected row is not a block, it is an ABSENCE, so `decide` would see
+  # an EMPTY set and emit CLEAN for a red PR. One run contributes each key at
+  # most once, exactly as the log path's `sorted(set(ids))` does.
+  out="$(printf '%s\n' "$names" | while IFS= read -r one; do
     local s
     s="$(printf '%s' "$one" | sed 's/[^A-Za-z0-9_.-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
     [ -n "$s" ] && printf 'job-unreadable::%s\n' "$s"
-  done
+  done | sort -u)"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
 }
 
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
