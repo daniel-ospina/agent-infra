@@ -401,19 +401,126 @@ DIFF_HASH=""
 # ONLY so the carry-forward arm can accept a marker minted before this change;
 # nothing else reads it. Both hashes come from ONE diff fetch.
 LEGACY_DIFF_HASH=""
+# #1577 — how the diff read ENDED, so the warning can name the condition instead
+# of implying a content change:
+#   "ok"          the body was read
+#   "empty"       a 2xx whose body was 0 bytes    (a property of the DIFF)
+#   "unavailable" a failed read, or no read at all (a property of the NETWORK)
+# Only the first two can mean "a fresh review is owed"; the third means "retry".
+# The stale-sha guard already states this policy for the HEAD read ("a transient
+# gh/API failure must not block a legitimate record", see the block below), but
+# the DIFF read is the one that actually refused: an empty DIFF_HASH leaves the
+# carry nothing to compare, and the refusal it produced -- "the reviewed diff
+# CHANGED" -- demands the MOST expensive remedy in the system.
+DIFF_FETCH="unavailable"
+DIFF_FETCH_TRIES=0
+# The fetch is RETRIED. A single attempt made a transient API blip
+# indistinguishable from a changed artifact. Measured on agent-infra #1554: a
+# full rail cycle ([1/4] base refresh + ~45 min of [2/4] terminal-CI wait +
+# [3/4]) was discarded on a diff that was BYTE-IDENTICAL (diff=72bd1a21 on both
+# heads); the same command succeeded on the next attempt. The read is an
+# idempotent GET, so retrying has no side effects. Both knobs are
+# env-overridable so the suite can pin the attempt count without paying for the
+# backoff.
+# The attempt budget is validated the same way the backoff is, and for the same
+# reason: `"${...:-3}"` accepts ANY run of digits. A huge in-range value made the
+# loop effectively unbounded on a persistently failing fetch (234 attempts in
+# ~6s at a zero backoff; one attempt per poll at the default), and a NON-numeric
+# value leaked a raw `[: abc: integer expression expected` into the rail's log
+# and produced a nonsense "1 of abc attempt(s) made" (#1577 review P3). An
+# unusable value falls back to the DEFAULT rather than to the cap, so a typo
+# reads as the documented behaviour instead of silently widening the budget.
+DIFF_FETCH_ATTEMPTS_MAX=10
+DIFF_FETCH_ATTEMPTS=3
+case "${RECORD_REVIEW_DIFF_FETCH_ATTEMPTS:-}" in
+  ''|*[!0-9]*) : ;;
+  *)
+    if [ "${#RECORD_REVIEW_DIFF_FETCH_ATTEMPTS}" -le 2 ] \
+       && [ "$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS" -ge 1 ] \
+       && [ "$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS" -le "$DIFF_FETCH_ATTEMPTS_MAX" ]; then
+      DIFF_FETCH_ATTEMPTS="$RECORD_REVIEW_DIFF_FETCH_ATTEMPTS"
+    fi
+    ;;
+esac
+# The backoff is CLAMPED to a small non-negative integer, and that is NOT
+# belt-and-braces. The obvious guard (a `case` rejecting non-digits plus a
+# `-gt 0` test) accepts ANY run of digits, and an all-digit value past
+# /bin/sleep's range (2147483648) makes sleep exit 1 -- under `set -e` that
+# aborted the ENTIRE record with no warning and NO record written, while an
+# in-range-but-huge value (999999999) hung it for years. Both were reproduced
+# end-to-end against a failing fetch. This repo closes the same class for the
+# rail poll intervals (atomic-land `--poll` 7e, admin-merge P2-12), but those
+# REFUSE rc 2: here the knob is pure politeness, and a mistyped backoff must
+# never cost the attestation, so it clamps instead of failing.
+DIFF_FETCH_SLEEP_MAX=30
+DIFF_FETCH_SLEEP_RAW="${RECORD_REVIEW_DIFF_FETCH_SLEEP:-2}"
+DIFF_FETCH_SLEEP=0
+case "$DIFF_FETCH_SLEEP_RAW" in
+  ''|*[!0-9]*) : ;;                       # non-numeric → no sleep at all
+  *)
+    # The LENGTH test guards the numeric one: `[ <20 digits> -le 30 ]` errors,
+    # and a shell that treated that as fatal would reintroduce the abort. Only
+    # short strings reach the comparison, so it is always well-formed.
+    if [ "${#DIFF_FETCH_SLEEP_RAW}" -le 2 ] \
+       && [ "$DIFF_FETCH_SLEEP_RAW" -le "$DIFF_FETCH_SLEEP_MAX" ]; then
+      DIFF_FETCH_SLEEP="$DIFF_FETCH_SLEEP_RAW"
+    else
+      DIFF_FETCH_SLEEP="$DIFF_FETCH_SLEEP_MAX"
+    fi
+    ;;
+esac
+# ONE diff read into <out>. The EXIT STATUS carries the reason, which the old
+# `cmd && [ -s ]` one-liner threw away: 0 = read, 1 = the call FAILED (retryable),
+# 2 = the call SUCCEEDED with a 0-byte body (NOT retryable -- an idempotent GET
+# answers the same thing twice, so re-asking cannot change the answer).
+diff_fetch_once() { # <pr> <out>
+  command gh api -H "Accept: application/vnd.github.v3.diff" \
+    "repos/$REPO/pulls/$1" > "$2" 2>/dev/null || return 1
+  [ -s "$2" ] || return 2
+  return 0
+}
 # Sets the globals DIFF_HASH (normalized) and LEGACY_DIFF_HASH (raw) from one
 # diff fetch. It deliberately sets GLOBALS rather than printing: a `$(...)`
 # capture would run the assignment in a subshell and lose LEGACY_DIFF_HASH.
 diff_hash_for_pr() { # <pr>
-  local pr="$1" tmp norm
+  local pr="$1" tmp norm attempt=1 rc=0
   command -v gh >/dev/null 2>&1 || return 0
   command -v openssl >/dev/null 2>&1 || return 0
   tmp="$(mktemp 2>/dev/null)" || return 0
   norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
+  # `EXIT`, deliberately NOT `RETURN` (#1577 review P1). A RETURN trap is
+  # INHERITED by nested functions under functrace, so the trap fired when
+  # `diff_fetch_once` returned and deleted $tmp BEFORE the hash read it: the
+  # record aborted rc 1 with NO record written, on EVERY successful fetch. The
+  # parent had no nested call inside this window, so the abort was introduced by
+  # extracting the fetch into a function. Functrace reaches this process only
+  # from an explicit `bash -T` or an ancestor that EXPORTED SHELLOPTS -- `set -T`
+  # alone does NOT export it (review P3: the first draft of this comment claimed
+  # it did, and that propagation mechanism was measurably false). The function's
+  # own `rm -f` at the end is the normal cleanup; EXIT is only the backstop.
   # shellcheck disable=SC2064
-  trap "rm -f '$tmp' '$norm'" RETURN 2>/dev/null || true
-  if command gh api -H "Accept: application/vnd.github.v3.diff" \
-       "repos/$REPO/pulls/$pr" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  trap "rm -f '$tmp' '$norm'" EXIT 2>/dev/null || true
+  while :; do
+    rc=0
+    diff_fetch_once "$pr" "$tmp" || rc=$?
+    DIFF_FETCH_TRIES="$attempt"
+    if [ "$rc" -eq 1 ] && [ "$attempt" -lt "$DIFF_FETCH_ATTEMPTS" ]; then
+      attempt=$(( attempt + 1 ))
+      if [ "$DIFF_FETCH_SLEEP" -gt 0 ]; then
+        # `|| true`: the DELAY is polite, the RECORD is not. A failing sleep
+        # must never abort the attestation under `set -e`.
+        sleep "$DIFF_FETCH_SLEEP" || true
+      fi
+      continue
+    fi
+    break
+  done
+  case "$rc" in
+    0) DIFF_FETCH="ok" ;;
+    2) DIFF_FETCH="empty" ;;
+    *) DIFF_FETCH="unavailable" ;;
+  esac
+  if [ "$DIFF_FETCH" = "ok" ]; then
     LEGACY_DIFF_HASH="$(command openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
        && [ -s "$DIFF_NORMALIZER" ] \
@@ -443,7 +550,14 @@ if [ -n "$REPO" ]; then
   [[ "$DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || DIFF_HASH=""
   [[ "$LEGACY_DIFF_HASH" =~ ^[0-9a-f]{64}$ ]] || LEGACY_DIFF_HASH=""
   if [ -z "$DIFF_HASH" ]; then
-    echo "⚠️ #2982: could not compute this PR's diff hash (gh/API/openssl unavailable?) — recording a legacy sha-only marker; it will NOT carry across a branch update" >&2
+    case "$DIFF_FETCH" in
+      empty)
+        # A 2xx with no bytes IS a statement about the diff, so it is neither
+        # retried nor described as a network failure (#1577).
+        echo "⚠️ #2982: could not compute this PR's diff hash — the API answered and the diff body was EMPTY (0 bytes). Recording a legacy sha-only marker; it will NOT carry across a branch update" >&2 ;;
+      *)
+        echo "⚠️ #2982: could not compute this PR's diff hash — the diff fetch FAILED (gh/API/openssl unavailable; ${DIFF_FETCH_TRIES} of ${DIFF_FETCH_ATTEMPTS} attempt(s) made). A FAILED FETCH IS NOT A CHANGED ARTIFACT: retry the record before paying for a fresh review. Recording a legacy sha-only marker, which will NOT carry across a branch update" >&2 ;;
+    esac
   fi
 fi
 
