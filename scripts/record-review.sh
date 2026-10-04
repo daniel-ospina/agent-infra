@@ -1060,9 +1060,9 @@ PYC4
 #
 # POLARITY — the rail's own rule (#1399 / tortoise #4877), and it is deliberately NOT
 # "any failure". Group by (app.slug, check name) and keep each group's NEWEST attempt
-# by `id`; a group is RED when its newest attempt is `completed` with a conclusion
-# outside the green/non-red allow-list — INCLUDING a conclusion GitHub has not
-# documented and a null one. An UNGROUPED `any failure` would refuse a head an older
+# by `id`; a group is RED when its NEWEST attempt's conclusion is outside the
+# green/non-red allow-list — INCLUDING a conclusion GitHub has not documented and a
+# null one. An UNGROUPED `any failure` would refuse a head an older
 # attempt of which was re-run green, which this fleet produces routinely (one job held
 # 10 attempts carrying both `failure` and `success`), and a guard that fires on green
 # heads gets deleted rather than fixed.
@@ -1084,7 +1084,7 @@ PYC4
 # legacy commit `/status`. This reads `/check-runs` only, so a red posted as a legacy
 # status is invisible here. Stated rather than implied — on agent-infra's own head
 # `statuses == 0`, and a false claim of parity is worse than a named gap.
-RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE:-ai-review-gate ai-review-gate-tests}"
+RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-gate-tests}"
 target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
   local raw
   raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
@@ -1102,10 +1102,13 @@ target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
       for (i = 1; i <= n; i++) if (ex[i] != "") skip[ex[i]] = 1
       for (k in st) {
         if (skip[substr(k, index(k, "|") + 1)]) continue
-        # Taken as in flight ONLY when it carries no conclusion at all. An
-        # unrecognised STATUS spelling alongside a conclusion is judged by that
-        # conclusion (the allow-list polarity), not waved through.
-        if (st[k] != "completed" && (c[k] == "null" || c[k] == "")) continue
+        # IN FLIGHT means a status the API NAMES as in flight. Every other status —
+        # including one whose spelling this code has never seen — is judged by its
+        # conclusion under the allow-list, so an unrecognised status with a null
+        # conclusion is RED. Gating on "no conclusion" instead is exactly the #1353
+        # fail-open the rail closed by switching to a named in-flight set: any
+        # spelling it had not seen read as pending, and the surface read GREEN.
+        if (st[k] != "completed" && st[k] ~ /^(queued|in_progress|waiting|requested|pending)$/) continue
         if (c[k] != "success" && c[k] != "neutral" && c[k] != "skipped" &&
             c[k] != "cancelled" && c[k] != "stale") { red = 1; break }
       }

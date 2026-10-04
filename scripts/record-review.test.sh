@@ -85,12 +85,12 @@ if [ "$1" = "api" ]; then
         cat "${STUB_DIFF_FILE:-/dev/null}"
         exit 0
     fi
-    # #1575 clause (E): the target head's check-runs. STUB_CHECKS carries the TSV
+    # #1575 clause (E): the target head's check-runs. STUB_CHECKS_ROWS carries the TSV
     # rows the caller's --jq would emit (app.slug|name|id|status|conclusion), one
     # per line; empty/absent = an empty surface.
     if grep -qF -- "check-runs" <<<"$*"; then
         [ "${STUB_CHECKS_FAIL:-0}" = "1" ] && exit 1
-        [ -n "${STUB_CHECKS:-}" ] && printf '%s\n' "${STUB_CHECKS}"
+        [ -n "${STUB_CHECKS_ROWS:-}" ] && printf '%s\n' "${STUB_CHECKS_ROWS}"
         exit 0
     fi
     if grep -qF -- "--jq .head.sha" <<<"$*"; then
@@ -255,12 +255,14 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         # environment so a caller can opt a single vector into the transient path.
         export RECORD_REVIEW_DIFF_FETCH_SLEEP="${RECORD_REVIEW_DIFF_FETCH_SLEEP:-0}"
         export STUB_DIFF_FAIL_TIMES="${STUB_DIFF_FAIL_TIMES:-0}" STUB_DIFF_COUNT="${STUB_DIFF_COUNT:-}"
-        # #1590 review: STUB_CHECKS must be CLEARED alongside the other STUB_* vars.
-        # The (E) vectors set it per-invocation, but an ambient value in the caller's
-        # environment would otherwise leak into the earlier 11.1/11.2 carries and
-        # redden them non-hermetically. Read the ambient value so a caller can still
-        # opt a vector in, but always export SOMETHING.
-        export STUB_CHECKS="${STUB_CHECKS:-}"
+        # NOTE (measured): the check surface is read by the stub from this env var,
+        # so the runner canNOT scrub an AMBIENT value — the per-invocation prefix
+        # works because it overrides, but a caller with the var already exported
+        # reaches the earlier carries too (verified: it reddens 11.2/12a/12d/12e/12f).
+        # No caller sets it, and the vectors that must be red pin it inline, so this
+        # is a declared limitation rather than a hermeticity claim. Fixing it properly
+        # means passing the surface as a file path, not as environment.
+        export STUB_CHECKS_ROWS="${STUB_CHECKS_ROWS:-}"
         rc=0
         bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
@@ -695,7 +697,7 @@ prior_for() { # <pr> -> the signed clean marker line for $DH at $STALE
 # checks are failing, which the merge gate cannot see once the record outlives
 # the run.
 rm -f "$(Q2 424510)"
-STUB_CHECKS='github-actions|ci / unit-test|11|completed|failure' \
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completed|failure' \
   run_record_diff 424510 "$STALE" "body
 
 $(prior_for 424510)" "$D_F"
@@ -710,7 +712,7 @@ if grep -qF "carry-forward" <<<"$RECORD_ERR"; then bad "11.3a (E) still printed 
 # (one job held 10 attempts carrying BOTH `failure` and `success`), and a guard
 # that fires on green heads gets deleted rather than fixed.
 rm -f "$(Q2 424511)"
-STUB_CHECKS='github-actions|ci / unit-test|11|completed|failure
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completed|failure
 github-actions|ci / unit-test|12|completed|success' \
   run_record_diff 424511 "$STALE" "body
 
@@ -725,7 +727,7 @@ for spec in "11.3c some_future_conclusion" "11.3d null"; do
   tag="${spec%% *}"; concl="${spec#* }"; n="${tag#11.3}"
   case "$n" in c) pr=424512 ;; d) pr=424513 ;; esac
   rm -f "$(Q2 $pr)"
-  STUB_CHECKS="github-actions|ci / unit-test|11|completed|$concl" \
+  STUB_CHECKS_ROWS="github-actions|ci / unit-test|11|completed|$concl" \
     run_record_diff "$pr" "$STALE" "body
 
 $(prior_for "$pr")" "$D_F"
@@ -740,7 +742,7 @@ for spec in "11.3e 424514 github-actions|ci / unit-test|11|in_progress|null" \
             "11.3g 424516 "; do
   tag="${spec%% *}"; rest="${spec#* }"; pr="${rest%% *}"; rows="${rest#* }"
   rm -f "$(Q2 $pr)"
-  STUB_CHECKS="$rows" \
+  STUB_CHECKS_ROWS="$rows" \
     run_record_diff "$pr" "$STALE" "body
 
 $(prior_for "$pr")" "$D_F"
@@ -753,7 +755,7 @@ done
 # measured the gate flipping SUCCESS -> FAILURE seven seconds after the rail moved the
 # head). A red the carry itself explains is not evidence about the tree.
 rm -f "$(Q2 424517)"
-STUB_CHECKS='github-actions|ai-review-gate|11|completed|failure' \
+STUB_CHECKS_ROWS='github-actions|ai-review-gate|11|completed|failure' \
   run_record_diff 424517 "$STALE" "body
 
 $(prior_for 424517)" "$D_F"
@@ -761,7 +763,7 @@ $(prior_for 424517)" "$D_F"
 
 # 11.3i: the exclusion is NARROW — the gate's redness must not mask a genuine red.
 rm -f "$(Q2 424518)"
-STUB_CHECKS='github-actions|ai-review-gate|11|completed|failure
+STUB_CHECKS_ROWS='github-actions|ai-review-gate|11|completed|failure
 github-actions|ci / unit-test|12|completed|failure' \
   run_record_diff 424518 "$STALE" "body
 
@@ -769,13 +771,24 @@ $(prior_for 424518)" "$D_F"
 [ "$RECORD_RC" = "3" ] && ok "11.3i (E) a genuine red beside the gate still refuses (rc 3)" || bad "11.3i (E) the gate exclusion masked a real red (rc=$RECORD_RC)"
 
 # 11.3j: an unrecognised STATUS spelling alongside a conclusion is judged by that
-# conclusion, not waved through as in-flight. Only a null/empty conclusion is in flight.
+# conclusion. `null` here means RED, not "in flight" — see 11.3k for the distinction.
 rm -f "$(Q2 424519)"
-STUB_CHECKS='github-actions|ci / unit-test|11|completely_finished|failure' \
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completely_finished|failure' \
   run_record_diff 424519 "$STALE" "body
 
 $(prior_for 424519)" "$D_F"
 [ "$RECORD_RC" = "3" ] && ok "11.3j (E) an unknown STATUS with a failure conclusion is red (rc 3)" || bad "11.3j (E) waved through an unknown status (rc=$RECORD_RC)"
+
+# 11.3k: and an unknown STATUS with a NULL conclusion is red too. This is the #1353
+# fail-open: gating "in flight" on the ABSENCE of a conclusion lets any status
+# spelling this code has not seen read as pending, and the surface read GREEN. In
+# flight is a NAMED set, not "anything that is not completed".
+rm -f "$(Q2 424520)"
+STUB_CHECKS_ROWS='github-actions|ci / unit-test|11|completely_finished|null' \
+  run_record_diff 424520 "$STALE" "body
+
+$(prior_for 424520)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3k (E) an unknown status with a NULL conclusion is red (rc 3) — in-flight is a named set" || bad "11.3k (E) #1353 fail-open: an unseen status read as pending (rc=$RECORD_RC)"
 
 # 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"
