@@ -1048,6 +1048,45 @@ PYC4
   return 0
 }
 
+# ── Clause (E) of the carry contract (#1575): THE TARGET HEAD IS NOT MEASURABLY RED ──
+# A carry re-binds a signed verdict to a NEW head. Clauses (A)-(D) and the #2982
+# byte-identity test are all COMMIT-TOPOLOGY tests: they prove the LANE's artifact is
+# unchanged, and they are right about that. But a base-only move IS a change to the
+# tree the verdict describes, so the attestation can say `clean` about a head whose own
+# checks are failing. MEASURED three times in one session: tortoise #4823 (the carry
+# laundered a refusal — re-bound FROM the head that had just been refused), #5395
+# (re-stamped onto two deterministic failures sitting on BOTH sides of the stamp), and
+# #5292 (the failing test measured five minutes after the stamp, same head, same tree).
+#
+# POLARITY — the rail's own rule (#1399 / tortoise #4877), and it is deliberately NOT
+# "any failure". Group by (app.slug, check name) and keep each group's NEWEST attempt
+# by `id`; a group is RED when its newest attempt is `completed` with a conclusion
+# outside the green/non-red allow-list — INCLUDING a conclusion GitHub has not
+# documented and a null one. An UNGROUPED `any failure` would refuse a head an older
+# attempt of which was re-run green, which this fleet produces routinely (one job held
+# 10 attempts carrying both `failure` and `success`), and a guard that fires on green
+# heads gets deleted rather than fixed.
+#
+# NOT RED, AT THIS STAGE, IS NOT A CERTIFICATE OF HEALTH: an absent, empty or in-flight
+# surface is simply not shown red, which is the pre-existing state of every carry. This
+# clause can only ADD a refusal; it can never authorise one.
+target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
+  local raw
+  raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
+           --paginate \
+           --jq '.check_runs[] | "\(.app.slug // "?" )|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
+  [ -n "$raw" ] || return 1
+  printf '%s\n' "$raw" | awk -F'|' '
+    { k = $1 "|" $2
+      if (!(k in id) || $3 + 0 > id[k]) { id[k] = $3 + 0; st[k] = $4; c[k] = $5 } }
+    END {
+      for (k in st)
+        if (st[k] == "completed" && c[k] != "success" && c[k] != "neutral" &&
+            c[k] != "skipped" && c[k] != "cancelled" && c[k] != "stale") { red = 1; break }
+      exit(red ? 0 : 1)
+    }'
+}
+
 # #2982 — carry-forward arm: when the head has moved but the PR already carries
 # signed evidence for EXACTLY this diff (a marker whose diff= equals the live
 # diff hash), the head moved without the reviewed artifact changing (a
@@ -1107,23 +1146,39 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         fi
       fi
     fi
+    # Which carry arm applies? Decided FIRST so that clause (E) can veto a carry that
+    # neither arm's own conditions can see: both arms prove the LANE's artifact is
+    # unchanged, and neither says anything about the health of the head it binds to.
+    CARRY_ARM=""
     if [ -n "$PRIOR_DIFF" ]; then
-      echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
-      SHA="$CURRENT_HEAD"
-    elif [ "$FORCE_STALE" -ne 1 ]; then
-      if lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
+      CARRY_ARM="diff"
+    elif [ "$FORCE_STALE" -ne 1 ] && lane_dimension_carry "$SHA" "$CURRENT_HEAD"; then
+      CARRY_ARM="lane"
+    fi
+    if [ -n "$CARRY_ARM" ]; then
+      # (E) (#1575) — the veto. Refuse BEFORE printing either arm's success line and
+      # before re-binding SHA, so a red target never produces a signed `clean`.
+      if target_head_red "$CURRENT_HEAD"; then
+        echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD IS MEASURABLY RED." >&2
+        echo "   A base-only move is still a change to the tree the verdict describes, so re-binding '$VERDICT' to it would put a SIGNED 'clean' on a head whose own checks are failing — an attestation that records a red tree as reviewed-green, and one the merge gate cannot see once the record outlives the run (#4823, #5395, #5292)." >&2
+        echo "   The LANE's artifact IS unchanged — that is what the carry proved. Only the head's health is unknown or bad. Re-review at ${CURRENT_HEAD:0:12}…, or re-run the failing checks and re-record." >&2
+        exit 3
+      fi
+      if [ "$CARRY_ARM" = "diff" ]; then
+        echo "#2982 carry-forward: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, but the reviewed diff is unchanged (diff=${DIFF_HASH}) and already carries signed evidence — recording against the CURRENT head" >&2
+      else
         # The rendered patch moved (a base merge), but the LANE's artifact is
         # provably unchanged: the head only moved forward, no lane commit is in
         # between, and a clean re-merge of (reviewed, its base parent) reproduces
         # the head's tree exactly. Re-record against the CURRENT head, exactly as
         # the arm above does — the binding is to the head that will merge.
         echo "#6072/#6213/#4823 lane-dimension carry: head moved ${SHA:0:12}… → ${CURRENT_HEAD:0:12}…, the rendered diff changed but the LANE's commits are provably identical (forward move; no non-base NON-MERGE commit in between — an intervening merge is permitted, which is why the tree check below is load-bearing; the head's tree is exactly a clean merge of reviewed and its base parent) — recording against the CURRENT head" >&2
-        SHA="$CURRENT_HEAD"
-      else
-        echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
-        echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
-        exit 3
       fi
+      SHA="$CURRENT_HEAD"
+    elif [ "$FORCE_STALE" -ne 1 ]; then
+      echo "   no prior evidence for this PR's current diff (diff=${DIFF_HASH:-unavailable}) — the reviewed artifact cannot be shown unchanged" >&2
+      echo "refusing to record stale sha $SHA for $REPO#$PR — re-record with the current head ${CURRENT_HEAD:0:12}… (or pass --force-stale to override)" >&2
+      exit 3
     else
       # #784: a stale sha's diff CANNOT be shown to be the current diff — by
       # construction the two were never observed together. Emitting `diff=` here
