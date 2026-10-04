@@ -67,6 +67,20 @@ if [ "$1" = "api" ]; then
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
+        # #1577: a STATEFUL transient failure — fail the first N calls, then serve
+        # the body, so a RETRY can be shown to RECOVER. A one-shot STUB_DIFF_FAIL
+        # proves only that the loop iterates; it cannot separate "retried" from
+        # "retried and still refused", which is the whole point of the retry.
+        if [ "${STUB_DIFF_FAIL_TIMES:-0}" != "0" ]; then
+            n=0
+            if [ -n "${STUB_DIFF_COUNT:-}" ] && [ -f "$STUB_DIFF_COUNT" ]; then
+                n="$(cat "$STUB_DIFF_COUNT" 2>/dev/null || echo 0)"
+                case "$n" in ''|*[!0-9]*) n=0 ;; esac
+            fi
+            n=$(( n + 1 ))
+            [ -n "${STUB_DIFF_COUNT:-}" ] && printf '%s' "$n" > "$STUB_DIFF_COUNT"
+            [ "$n" -le "$STUB_DIFF_FAIL_TIMES" ] && exit 1
+        fi
         [ "${STUB_DIFF_FAIL:-0}" = "1" ] && exit 1
         cat "${STUB_DIFF_FILE:-/dev/null}"
         exit 0
@@ -226,6 +240,13 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         export PATH="$T/bin:$PATH"
         export GH_STUB_LOG="$LOG"
         export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
+        # #1577: the suite must never SLEEP. The retry contract pinned below is the
+        # ATTEMPT COUNT (the stub log), not the backoff duration — the backoff is a
+        # production politeness knob with no assertion that could tell 1s from 30s
+        # without making the suite slow. These two are read from the ambient
+        # environment so a caller can opt a single vector into the transient path.
+        export RECORD_REVIEW_DIFF_FETCH_SLEEP="${RECORD_REVIEW_DIFF_FETCH_SLEEP:-0}"
+        export STUB_DIFF_FAIL_TIMES="${STUB_DIFF_FAIL_TIMES:-0}" STUB_DIFF_COUNT="${STUB_DIFF_COUNT:-}"
         rc=0
         bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
@@ -656,6 +677,118 @@ run_record_diff 424504 "$SHA" "PR body" "$D_F" "1"
 if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.5 legacy marker must not carry diff="; else ok "11.5 falls back to a legacy sha-only marker"; fi
 assert_contains "$RECORD_ERR" "could not compute this PR's diff hash" "11.5 warns that the marker cannot carry forward"
 if grep -q '"diff_sha256"' "$(Q2 424504)" 2>/dev/null; then bad "11.5 record must omit diff_sha256"; else ok "11.5 record omits diff_sha256"; fi
+
+# 11.5a #1577 — the diff fetch is RETRIED, and a TRANSIENT failure that CLEARS
+# carries the verdict. Before this fix the fetch was ONE attempt, so a network
+# blip emptied DIFF_HASH, the stale-sha guard refused the carry, and the rail
+# reported "the reviewed diff CHANGED" — the most expensive remedy in the system,
+# demanded for a diff that never moved. Measured on agent-infra #1554: a full
+# rail cycle ([1/4] + ~45 min of [2/4] + [3/4]) was discarded on a diff that was
+# BYTE-IDENTICAL. REGRESSION-SENSITIVE: with a single attempt this records a
+# legacy sha-only marker (no diff=) instead of carrying.
+rm -f "$(Q2 424540)" "$T/diffcount-11.5a"
+export STUB_DIFF_FAIL_TIMES=2 STUB_DIFF_COUNT="$T/diffcount-11.5a"
+run_record_diff 424540 "$SHA" "PR body" "$D_F" 0
+unset STUB_DIFF_FAIL_TIMES STUB_DIFF_COUNT
+[ "$RECORD_RC" = "0" ] && ok "11.5a #1577 a transient fetch failure that CLEARS still records (rc 0)" || bad "11.5a #1577 rc=$RECORD_RC (err=$RECORD_ERR)"
+grep -qF "diff=" <<<"$RECORD_CAP" && ok "11.5a #1577 the RETRIED fetch still carries the diff binding" || bad "11.5a #1577 fell back to a sha-only marker — the retry did not happen"
+grep -q '"diff_sha256"' "$(Q2 424540)" 2>/dev/null && ok "11.5a #1577 the record carries diff_sha256" || bad "11.5a #1577 record omits diff_sha256"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "3" ] && ok "11.5a #1577 the fetch was attempted 3x (2 failures, then the success)" || bad "11.5a #1577 expected 3 diff attempts, saw $(grep -cF 'application/vnd.github.v3.diff' "$LOG")"
+
+# 11.5b #1577 — the retry is BOUNDED, and the warning NAMES the condition as
+# transient instead of implying a content change (the attribution half of the
+# defect: a failed fetch and a changed diff call for opposite responses).
+rm -f "$(Q2 424541)"
+run_record_diff 424541 "$SHA" "PR body" "$D_F" 1
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "3" ] && ok "11.5b #1577 a permanent failure stops at 3 attempts (bounded)" || bad "11.5b #1577 saw $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 3)"
+assert_contains "$RECORD_ERR" "A FAILED FETCH IS NOT A CHANGED ARTIFACT" "11.5b #1577 the warning names the transient condition"
+assert_contains "$RECORD_ERR" "3 of 3 attempt(s)" "11.5b #1577 the warning reports the attempt count"
+
+# 11.5c #1577 — an EMPTY body is a property of the DIFF, not the network, so it
+# is NOT retried (an idempotent GET answers the same thing twice) and its
+# warning must not claim a fetch failure.
+rm -f "$(Q2 424542)"
+run_record_diff 424542 "$SHA" "PR body" /dev/null 0
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.5c #1577 an empty diff is NOT retried (1 attempt)" || bad "11.5c #1577 empty diff attempted $(grep -cF 'application/vnd.github.v3.diff' "$LOG")x (expected 1)"
+assert_contains "$RECORD_ERR" "diff body was EMPTY" "11.5c #1577 the empty-diff warning names the empty body"
+if grep -qF "FAILED" <<<"$RECORD_ERR"; then bad "11.5c #1577 the empty-diff warning must not claim a fetch FAILURE"; else ok "11.5c #1577 the empty-diff warning does not claim a fetch failure"; fi
+
+# 11.5d #1577 — an out-of-range SLEEP knob must not abort the record. The first
+# guard rejected only non-digits and 0, so an all-digit value past /bin/sleep's
+# range (2147483648) reached sleep, which exited 1 under `set -e` — aborting the
+# whole record with NO warning and NO record written (reproduced end-to-end by
+# the VGATE verifier); an in-range-but-huge value (999999999) hung it for years
+# instead. The knob is now CLAMPED to DIFF_FETCH_SLEEP_MAX, because a mistyped
+# POLITENESS knob must never cost the ATTESTATION. The clamp is observed on a
+# STUBBED sleep, so the suite pays none of the (bounded) real delay.
+mkdir -p "$T/binsleep"
+cat > "$T/binsleep/sleep" <<'SLEEPSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SLEEP_LOG:-/dev/null}"
+exit 0
+SLEEPSTUB
+chmod +x "$T/binsleep/sleep"
+for _v in 2147483648 999999999; do
+    rm -f "$(Q2 424543)" "$T/sleeplog-11.5d"
+    SLEEP_LOG="$T/sleeplog-11.5d" RECORD_REVIEW_DIFF_FETCH_SLEEP="$_v" \
+      PATH="$T/binsleep:$PATH" run_record_diff 424543 "$SHA" "PR body" "$D_F" 1
+    [ "$RECORD_RC" = "0" ] && ok "11.5d #1577 sleep=$_v does NOT abort the record (rc 0)" || bad "11.5d #1577 sleep=$_v aborted the record (rc=$RECORD_RC, err=$RECORD_ERR)"
+    [ -f "$(Q2 424543)" ] && ok "11.5d #1577 sleep=$_v still writes the record" || bad "11.5d #1577 sleep=$_v wrote NO record"
+    SLOG="$(cat "$T/sleeplog-11.5d" 2>/dev/null || true)"
+    # The NEGATIVE assertion is guarded on the log being non-empty: with no retry
+    # there is no sleep at all, and grepping an empty log passed vacuously
+    # (#1577 review P3). The vector still REDs via the clamp assertion below, but
+    # a negative assertion that cannot fail is not an assertion.
+    if [ -z "$SLOG" ]; then bad "11.5d #1577 sleep=$_v: NO sleep observed, so the clamp was never exercised"
+    elif grep -qxF "$_v" <<<"$SLOG"; then bad "11.5d #1577 sleep=$_v REACHED sleep unclamped"
+    else ok "11.5d #1577 sleep=$_v never reaches sleep unclamped"; fi
+    if grep -qxF "30" <<<"$SLOG"; then ok "11.5d #1577 sleep=$_v is CLAMPED to 30"; else bad "11.5d #1577 sleep=$_v was not clamped (log: $(printf '%s' "$SLOG" | tr '\n' ' '))"; fi
+done
+unset RECORD_REVIEW_DIFF_FETCH_SLEEP SLEEP_LOG _v SLOG
+
+# 11.5e #1577 review P1 — the cleanup trap must survive functrace. A RETURN
+# trap is INHERITED by NESTED functions, so it fired when diff_fetch_once
+# returned and deleted the temp file BEFORE the hash read it, aborting the
+# record rc 1 with NO record written -- on every SUCCESSFUL fetch. Functrace
+# arrives only via an explicit `bash -T` or an ancestor that EXPORTED SHELLOPTS
+# (`set -T` alone does NOT export it). The trap is now EXIT (armed only after the
+# early returns, with the function's own rm -f as the normal cleanup).
+# REGRESSION-SENSITIVE: with the RETURN trap this records nothing. (No backticks
+# in the assertion strings below -- they would run as command substitution,
+# which is the exact defect fixed elsewhere in this file.)
+rm -f "$(Q2 424544)" "$T/cap-11.5e" "$T/err-11.5e" "$T/rc-11.5e"
+# SHELLOPTS is READONLY, so it cannot be used as an env-prefix to flip functrace;
+# the flag is passed to the child bash directly (`bash -T`), which is exactly the
+# environment the P1 reproduced under.
+(
+    export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+    export STUB_BODY="PR body" STUB_DIFF_FILE="$D_F" STUB_DIFF_FAIL=0 STUB_CAPTURE="$T/cap-11.5e"
+    unset STUB_DIFF_FAIL_TIMES STUB_DIFF_COUNT
+    export RECORD_REVIEW_DIFF_FETCH_SLEEP=0
+    rc=0
+    bash -T "$RECORD" 424544 "$SHA" clean "daniel-ospina/agent-infra" 2>"$T/err-11.5e" || rc=$?
+    printf '%s' "$rc" > "$T/rc-11.5e"
+) 2>/dev/null
+RECORD_RC="$(cat "$T/rc-11.5e" 2>/dev/null || echo 99)"
+RECORD_ERR="$(cat "$T/err-11.5e" 2>/dev/null || true)"
+RECORD_CAP="$(cat "$T/cap-11.5e" 2>/dev/null || true)"
+[ "$RECORD_RC" = "0" ] && ok "11.5e #1577 a functrace (set -T) ancestor still records (rc 0)" || bad "11.5e #1577 functrace aborted the record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | tail -2 | tr '\n' ' '))"
+[ -f "$(Q2 424544)" ] && ok "11.5e #1577 the record IS written under functrace" || bad "11.5e #1577 NO record written under functrace"
+grep -qF "diff=" <<<"$RECORD_CAP" && ok "11.5e #1577 the diff binding survives under functrace" || bad "11.5e #1577 no diff binding under functrace"
+
+# 11.5f #1577 review P3 — an unusable attempt budget degrades to the DEFAULT and
+# never leaks a raw `integer expression expected` or a nonsense count. A huge
+# in-range value used to leave the loop effectively unbounded (234 attempts in
+# ~6s at a zero backoff).
+for _a in abc 0 9223372036854775807; do
+    rm -f "$(Q2 424545)"
+    RECORD_REVIEW_DIFF_FETCH_ATTEMPTS="$_a" RECORD_REVIEW_DIFF_FETCH_SLEEP=0 \
+      run_record_diff 424545 "$SHA" "PR body" "$D_F" 1
+    if grep -qF "integer expression expected" <<<"$RECORD_ERR"; then bad "11.5f #1577 attempts=$_a leaked a raw bash error"; else ok "11.5f #1577 attempts=$_a leaks no raw bash error"; fi
+    assert_contains "$RECORD_ERR" "of 3 attempt(s) made" "11.5f #1577 attempts=$_a falls back to the default budget (3)"
+    [ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "3" ] && ok "11.5f #1577 attempts=$_a makes exactly 3 fetch attempts" || bad "11.5f #1577 attempts=$_a made $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 3)"
+done
+unset _a RECORD_REVIEW_DIFF_FETCH_ATTEMPTS
 
 # 11.6 #784 — --force-stale must NOT mint a diff-binding marker. A stale sha's
 # diff cannot be shown unchanged, so emitting diff= would create a

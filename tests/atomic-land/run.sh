@@ -98,6 +98,17 @@ case "${1:-} ${2:-}" in
       prev="$x"
     done
     case "$json" in
+      *mergeable*)
+        # #1565: read ONLY when the live `strict` read positively said false.
+        # ⛔ The REAL `gh pr view --json mergeable` prints the GraphQL ENUM, not a
+        # boolean (MEASURED: `MERGEABLE`). This fixture must speak the CLI's language:
+        # when it spoke REST's (`true`) the suite certified a predicate that could
+        # never match in production — the #1565 review P0.
+        # The DEFAULT when the fixture is absent is deliberately the NON-matching token:
+        # defaulting to MERGEABLE would let a future scenario that sets strict=false and
+        # forgets the fixture silently take the SKIP path instead of reddening (round-2
+        # review). Absent ⇒ unreadable ⇒ refresh — the fail-closed direction.
+        cat "$SCEN/mergeable" 2>/dev/null || echo UNKNOWN; exit 0 ;;
       *isDraft*)
         printf '%s\t%s\t%s\t%s\n' "$(cur_head)" "$(cat "$SCEN/base" 2>/dev/null || echo main)" \
           "$(cur_state)" "$(cat "$SCEN/draft" 2>/dev/null || echo false)"
@@ -115,14 +126,33 @@ case "${1:-} ${2:-}" in
     prev=""
     for x in "$@"; do [ "$prev" = "--jq" ] && jqprog="$x"; prev="$x"; done
     case "$ep" in
-      */commits/*/check-runs)
+      */branches/*/protection*)
+        # #1565: the DECLARED live `strict` read. An ABSENT fixture models the real
+        # 404/403 (protection unconfigured, or a token without admin on the repo) —
+        # the fail-closed default that keeps every pre-existing scenario refreshing.
+        [ -f "$SCEN/strict" ] || exit 1
+        cat "$SCEN/strict"; exit 0 ;;
+      */commits/*/check-runs*)
+        # A read without --paginate sees ONE page only. The rail's terminal verdict
+        # must be computed over ALL pages, so the fake models the page boundary:
+        # the fixture is multi-line (one line per page), and only a paginated read
+        # is served every line. A single-line fixture is unaffected.
+        page() { local f="$1"; shift; if [[ " $* " == *" --paginate "* ]]; then cat "$SCEN/$f"; else head -1 "$SCEN/$f"; fi; }
         case "$jqprog" in
-          *'!= "completed"'*) cat "$SCEN/pending" 2>/dev/null || echo 0 ;;
-          *'== "completed"'*) cat "$SCEN/completed" 2>/dev/null || echo 1 ;;
+          *'!= "completed"'*) page pending "$@" 2>/dev/null || echo 0 ;;
+          *'== "completed"'*) page completed "$@" 2>/dev/null || echo 1 ;;
           *) echo 0 ;;
         esac
         exit 0 ;;
       */compare/*)
+        # the MEASURED distance (B13) — a DISTINCT field from the merge base, read
+        # by its own jq program. Without this arm the harness would answer the
+        # behind_by read with a merge-base sha (non-numeric), so behind_by_of would
+        # report "unreadable" in EVERY scenario and the drift-refresh path could
+        # never be exercised at all.
+        case "$jqprog" in
+          *behind_by*) cat "$SCEN/behind" 2>/dev/null || echo 0; exit 0 ;;
+        esac
         # model a base REWRITE inside the unit: the Nth compare returns the Nth line
         if [ -f "$SCEN/mb-seq" ]; then
           n=$(( $(cat "$SCEN/mb-count" 2>/dev/null || echo 0) + 1 ))
@@ -220,6 +250,9 @@ new_scen() {
   SCEN_RECORD_MOVES_HEAD=0; SCEN_RECORD_REPOINTS_BASE=0; HEAD_MOVED="cccccccccccccccccccccccccccccccccccccccc"
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
+  # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
+  # default) so every pre-existing scenario keeps refreshing exactly as before.
+  rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -232,6 +265,7 @@ new_scen() {
   printf 'MERGED\n' > "$SCEN/merged"
   printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
   printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
   # default fixture record: verdict clean at the OLD head
@@ -531,17 +565,98 @@ called "pr update-branch" && fail "updated a PR that was not BEHIND" || pass "no
 called "record-review" && fail "re-recorded an unchanged head (dilutes the evidence)" || pass "no re-record of a fresh head"
 called "admin-merge 42" && pass "landed directly" || fail "did not land"
 
+# ═══ 9b. B13 — a BLOCKED, MEASURABLY-behind PR is updated ═══════════════
+# The deadlock: a branch more than the drift-guard's 20 commits behind main has
+# its drift-guard check FAIL, so GitHub reports `BLOCKED`, not `BEHIND` — and an
+# update predicate keyed on the enum skipped the very update that would clear it
+# (tortoise #6210 behind 39, #6169 behind 42). The rail must MEASURE the distance
+# and update when it is non-zero, so the behind PR REACHES the B5 presence check.
+echo "── 9b. B13 — mergeStateStatus=BLOCKED with a measured lag is updated"
+new_scen blockedbehind
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '39\n' > "$SCEN/behind"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "the unit completes (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
+called "pr update-branch 42" && pass "B13: a BLOCKED, 39-behind PR was updated (the deadlock is closed)" \
+  || fail "B13: BLOCKED still skipped the update — the deadlock is intact"
+called "admin-merge 42" && pass "the unit landed" || fail "did not land"
+
+# ═══ 9c. B13 — a measured distance of 0 keeps the no-op under BLOCKED ═══
+# The other direction: the measurement must not become an excuse to refresh
+# everything. A BLOCKED head GitHub already reports as level with its base is a
+# genuine no-op, and re-cutting it would spend the attestation for nothing.
+echo "── 9c. B13 — a measured distance of 0 keeps the no-op even under BLOCKED"
+new_scen blockedclean
+printf 'BLOCKED\n' > "$SCEN/state"
+printf '0\n' > "$SCEN/behind"
+printf '%s\n' "$HEAD_NEW" > "$SCEN/head"
+printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_NEW" "$REPO" \
+  > "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "completes (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" && fail "updated despite a measured distance of 0" || pass "measured 0 → no update"
+called "admin-merge 42" && pass "landed directly (fresh head)" || fail "did not land"
+
+# ═══ 9d. B13 — an unmeasurable BLOCKED state fails closed ═════════════
+# An unreadable distance is not proof the head is current. `CLEAN` keeps its
+# no-op, but a state GitHub calls blocked must never be read as up to date.
+echo "── 9d. B13 — an unreadable distance under BLOCKED stops, not \"up to date\""
+new_scen blockedunmeasured
+printf 'BLOCKED\n' > "$SCEN/state"
+: > "$SCEN/behind"   # the compare read yields nothing usable (empty distance)
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "stopped (rc 1) — did not certify an unmeasured base relation" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "updated on an unmeasured distance" || pass "no update on an unmeasured distance"
+called "admin-merge" && fail "landed on an unmeasured base relation (B13 fail-open)" || pass "did NOT land unmeasured"
+grep -q "could not measure the head/base divergence" "$SCEN/err" && pass "the stop names the unmeasured divergence" || fail "the stop does not name the unmeasured divergence"
+
 # ═══ 10. the merge is never hand-rolled, and the rail never reads protection ═
-echo "── 10. the rail never issues a raw merge, and has no branch-protection dependency"
+echo "── 10. the merge is never hand-rolled; the protection read is DECLARED, LIVE and NARROW (#1565)"
 new_scen norewrite
 for s in "$TMP/scen-happy" "$TMP/scen-fresh" "$TMP/scen-dryrun"; do
   grep -qE '(^|[[:space:]])pr[[:space:]]+merge([[:space:]]|$)' "$s/calls" \
     && fail "a raw \`gh pr merge\` was issued from $(basename "$s")" \
     || pass "no raw \`gh pr merge\` in $(basename "$s")"
-  grep -qE 'protection|required_status_checks' "$s/calls" \
-    && fail "the rail read a branch-protection setting from $(basename "$s") (undeclared dependency on strict)" \
-    || pass "no branch-protection read in $(basename "$s") (no strict dependency)"
+  # #1565 NARROWED this pin rather than deleting it. The rail's protection
+  # dependency is now DECLARED, LIVE and NARROW, so the property to pin is no
+  # longer "never reads protection" but (a) below, plus the two post-loop checks.
+  # STRENGTHENED after review of #1565: the first cut allowed ANY field, ANY shape
+  # and ANY number of reads at the declared endpoint, so a new undeclared protection
+  # read could ship green — the very thing this pin exists to stop. The declaration is
+  # "ONE positive read of `strict` per invocation", so pin the FIELD, the SHAPE and
+  # the COUNT, not merely the endpoint.
+  # RESIDUAL (documented, deliberately not fixed): this greps the lowercase REST
+  # endpoint, so a differently-named route to the same datum (e.g. the GraphQL
+  # `branchProtectionRules`) would evade it — exactly as it evaded the pin before this
+  # change. Today the rail reads REST, so the pin covers every read that exists; a
+  # future GraphQL read must extend this pin with it.
+  if grep -E 'protection' "$s/calls" | grep -vE '/branches/[^/]+/protection[[:space:]]+--jq \.required_status_checks\.strict$' | grep -q .; then
+    fail "$(basename "$s") read a protection setting other than the declared \`strict\` field read"
+  else
+    pass "$(basename "$s") read no undeclared protection setting (field and shape pinned)"
+  fi
+  n_reads="$(grep -cE '/branches/[^/]+/protection' "$s/calls")"
+  [ "$n_reads" -le 1 ] \
+    && pass "$(basename "$s") read protection at most once ($n_reads)" \
+    || fail "$(basename "$s") read protection $n_reads times (the declaration says at most one)"
 done
+
+# (b) A CLEAN PR (no BEHIND decision point) must read NO protection at all. This is
+# the owner's explicit constraint on #1565: read `strict` LIVE per invocation, never
+# once-and-cached — a cached belief about branch protection cannot disagree with
+# GitHub, it can only be silently wrong. A global/startup read would show up here.
+grep -qE 'protection' "$TMP/scen-fresh/calls" \
+  && fail "scen-fresh (CLEAN) read protection — the read is not confined to the BEHIND decision point (cached/global read)" \
+  || pass "scen-fresh (CLEAN) reads no protection (per-decision, not cached)"
+# (c) FAIL-CLOSED DIRECTION: scen-happy's protection fixture is ABSENT, i.e. the
+# read came back unreadable (the real 404/403 shape). The refresh must still happen.
+grep -qF -- 'pr update-branch' "$TMP/scen-happy/calls" \
+  && pass "scen-happy (protection UNREADABLE) still refreshed — the gate fails CLOSED" \
+  || fail "scen-happy did not refresh with an unreadable protection (fail-OPEN)"
 
 # ═══ 11. B9 — the head must not move between the record and the land ════
 echo "── 11. the head moving between the record and the land stops the unit"
@@ -789,6 +904,139 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1) — no line verified under the current key" || fail "expected rc 1, got $rc"
 called "pr update-branch" && fail "spent the attestation under a rotated key (B5)" || pass "did NOT update"
 
+# 17k. the check-runs read spans PAGES — a partial page is not a verdict.
+# Measured 2026-09-29: a real head carried 47 check-runs and the bare endpoint
+# returned 30, so the rail was answering "are the checks terminal" from a
+# truncated surface. The dangerous direction is a FALSE TERMINAL: pending checks
+# beyond page 1 read as zero and are handed to the land step.
+echo "── 17k. multi-page check-runs: the pages are summed, not truncated"
+new_scen crpages
+printf '0\n3\n' > "$SCEN/pending"   # page 1: none pending · page 2: three
+printf '5\n2\n' > "$SCEN/completed"
+run_rail 42 --repo "$REPO" --poll 0 --wait-timeout 0
+rc=$?
+called "per_page=100" \
+  && pass "reads check-runs with per_page=100 — not the default 30-item page" \
+  || fail "check-runs read without per_page (the default page was 30 of 47 measured)"
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — page 2's pending checks were COUNTED" \
+               || fail "expected rc 1, got $rc — page 2's 3 pending checks were invisible (false terminal)"
+grep -q "not terminal" "$SCEN/err" \
+  && pass "the refusal names the wait" \
+  || fail "the refusal does not name the wait"
+called "admin-merge 42" && fail "LANDED on a truncated read" || pass "did not land"
+
+# ═══ 17g. #1565 — the base-drift refresh gate (read `strict` LIVE, fail closed) ═
+# The step-1 refresh is only worth its cost when something REQUIRES an up-to-date
+# branch. Its cost is measured: the head move invalidates the head-bound review
+# record (B5), forces a full CI run at the new head, and then makes the rail wait up
+# to 5400s for those checks to go terminal — while `strict: false` means the pin buys
+# no mergeability at all. So the rail reads `strict` LIVE and, when it is positively
+# false and the PR is positively mergeable, skips the refresh and lands at the head
+# it already has (the record for which was never invalidated).
+echo "── 17g-A. strict=false live + mergeable ⇒ the refresh is SKIPPED and it lands at the EXISTING head"
+new_scen skipbehind
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'false\n' > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+grep -qE '/branches/[^/]+/protection' "$SCEN/calls" \
+  && pass "read \`strict\` LIVE from branch protection" \
+  || fail "did not read strict (the gate cannot have fired)"
+called "pr update-branch" \
+  && fail "REFRESHED a mergeable PR under strict=false — this is the #1565 defect" \
+  || pass "did NOT refresh (so the record at this head survives)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was (no invalidation, no CI re-run, no 5400s wait)" \
+  || fail "the head moved"
+called "record-review" \
+  && fail "re-recorded after a skip (the head did not move — that would dilute the evidence)" \
+  || pass "no re-record: the existing record stayed valid"
+called "admin-merge 42" && pass "landed at the EXISTING head" || fail "did not land"
+grep -q "SKIPPING the refresh" "$SCEN/out" \
+  && pass "the skip is named in the log, with its reason (auditable, not silent)" \
+  || fail "the skip is not named in the log"
+
+# DIRECTION B — every case that genuinely needs the refresh must STILL refresh.
+echo "── 17g-B1. strict=true live ⇒ the refresh STILL HAPPENS (#1533: a required up-to-date head)"
+new_scen stricttrue
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'true\n' > "$SCEN/strict"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (strict=true still requires the head to be up to date)" \
+  || fail "did NOT refresh under strict=true"
+
+echo "── 17g-B2. strict=false live but NOT mergeable ⇒ the refresh STILL HAPPENS (fail-closed)"
+new_scen unmergeable
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'false\n' > "$SCEN/strict"
+printf 'CONFLICTING\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (the PR is not positively mergeable)" \
+  || fail "did NOT refresh an unmergeable PR under strict=false (fail-OPEN)"
+grep -q "not positively mergeable" "$SCEN/out" \
+  && pass "the refresh names the fail-closed reason" \
+  || fail "the fail-closed reason is not named"
+
+echo "── 17g-B3. protection UNREADABLE ⇒ the refresh STILL HAPPENS (fail-closed)"
+new_scen strictunreadable
+printf 'BEHIND\n' > "$SCEN/state"
+# NO $SCEN/strict fixture: the read 404s/403s, exactly as it does when protection is
+# unconfigured or the token has no admin on the repo.
+#
+# ⛔ THIS FIXTURE IS LOAD-BEARING FOR MUTATION B19 — do not remove it. With the
+# `mergeable` fixture ABSENT, the fake answers `UNKNOWN` (the fail-closed default), so a
+# rail that wrongly treated an unreadable `strict` as `false` would STILL not skip — and
+# B19 would silently stop reddening. MEASURED in CI (the `admin-merge` job): B19 reported
+# "did NOT redden the suite" for exactly this reason, because the fail-closed default was
+# introduced by the round-2 review and B19 was last verified BEFORE it. Pinning
+# `mergeable` to a mergeable token makes the `strict` read the ONLY thing that can decide
+# this scenario — which is what B3 claims to test and what B19 claims to cover.
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed with an unreadable protection read" \
+  || fail "did NOT refresh (fail-OPEN)"
+
+echo "── 17g-B4. mergeable=UNKNOWN (GitHub computes it lazily) ⇒ the refresh STILL HAPPENS"
+new_scen mergeunknown
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'false\n' > "$SCEN/strict"
+printf 'UNKNOWN\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (UNKNOWN is not a positive true)" \
+  || fail "did NOT refresh on mergeable=UNKNOWN (fail-OPEN)"
+# Contract pin (the #1565 review P0): the tokens the rail maps must be the CLI's enum
+# tokens. Scenario A exercises MERGEABLE, so a predicate that only accepted `true`
+# fails there; this states the contract once more in its own right.
+grep -q 'MERGEABLE' "$RAIL" && grep -q 'CONFLICTING' "$RAIL" \
+  && pass "the mergeable mapping names the CLI's enum tokens (MERGEABLE/CONFLICTING)" \
+  || fail "the mergeable mapping does not name the CLI's enum tokens"
+
+echo "── 17g-C. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh"
+new_scen refreshalways
+printf 'BEHIND\n' > "$SCEN/state"
+printf 'false\n' > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+ATOMIC_LAND_REFRESH_ALWAYS=1 run_rail 42 --repo "$REPO" --poll 0
+unset ATOMIC_LAND_REFRESH_ALWAYS
+called "pr update-branch" \
+  && pass "refreshed despite strict=false (the fail-safe restore works)" \
+  || fail "the restore did not refresh"
+grep -qE '/branches/[^/]+/protection' "$SCEN/calls" \
+  && fail "read protection although the restore short-circuits it" \
+  || pass "no protection read when the restore is set (the old behaviour is intact)"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -885,6 +1133,18 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # as DECIMAL — and `08` is not a valid octal literal, so the arithmetic error
   # unwinds the wait loop SILENTLY. Base 10 must be stated, not assumed.
   mutate_and_expect_fail B18  's/remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)/remaining=\044(( WAIT_TIMEOUT - elapsed ))/'
+  # B19 (#1565): make the live `strict` read FAIL OPEN — an UNREADABLE protection
+  # (404/403/absent) is then treated as `false` instead of unreadable, so the
+  # direction-B3 scenario (unreadable ⇒ MUST refresh) skips instead. This is the true
+  # fail-open: it is the fail-closed arm that the mutation removes. (The first cut of
+  # this mutation targeted the `true|false` arm instead and was mislabelled — dropping
+  # `false` fails CLOSED, i.e. it refreshes MORE — and its perl replacement was also
+  # corrupt. Caught by review.)
+  mutate_and_expect_fail B19  's/if \[ "\044strict" = false \]; then/if [ "\044strict" != true ]; then/'
+  # B20 (#1565): let the skip ignore `mergeable`, so an UNMERGEABLE PR (the #1533
+  # shape, which genuinely needs the refresh) is skipped instead. The direction-B2
+  # scenario must redden.
+  mutate_and_expect_fail B20  's/if \[ "\044mergeable" = true \]; then/if true; then/'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
@@ -902,11 +1162,22 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B12b: the CAPTURE read must fail closed — an empty capture must not silently
   # disable the pre-land comparison (the path the reviewer reproduced).
   mutate_and_expect_fail B12b 's/if \[ -z "\$CERT_BASE_TIP" \]; then/if false; then/'
+  # B13: neutralise the MEASUREMENT — trust `mergeStateStatus` alone. A FAILING
+  # required check masks a stale head as BLOCKED, so the measuring arm is the only
+  # thing that sees the lag; with the distance always reading 0 the >20-behind PR
+  # the drift-guard is blocking never gets the update that would clear it.
+  mutate_and_expect_fail B13 's/behind="\$\(behind_by_of "\$BASE" "\$HEAD"\)"/behind=0/'
   # B11: never take the per-PR lock
   mutate_and_expect_fail B11  's/\[ "\$DRY_RUN" -eq 0 \] && acquire_lock//'
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
+  # D2a (2026-09-29): the check-runs read must not use the default 30-item page —
+  # the terminal verdict is computed over a truncated surface otherwise.
+  mutate_and_expect_fail D2a  's/\?per_page=100//'
+  # D2b: --paginate emits ONE result per page; reading only the first page hides a
+  # later pending check and turns it into a false terminal verdict.
+  mutate_and_expect_fail D2b  's/ --paginate//g'
 fi
 
 if [ "$failures" -gt 0 ]; then

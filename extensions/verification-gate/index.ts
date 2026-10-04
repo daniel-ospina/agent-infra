@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
+import { redactCommand } from "../shared/redact-command.js";
 // #966: the command parsers are ONE copy shared with review-enforcer, in
 // extensions/shared/ — the two extensions carried private copies that silently
 // drifted (and asserted opposite answers for the same input). Kept in shared/
@@ -867,14 +868,10 @@ function isCrossRepo(cwdRepo: string | null, explicitRepo: string | null): boole
   return !!explicitRepoN && !!cwdRepoN && explicitRepoN !== cwdRepoN;
 }
 
-// Redact credentials from a command before it hits the audit log (the audit
-// files are world-readable — an inlined GH_TOKEN=… must never persist).
-function redactCommand(command: string): string {
-  return command
-    .replace(/\b(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
-    .replace(/ghp_[A-Za-z0-9]+/g, "ghp_***")
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
-}
+// Redaction moved to the shared seam when `review-enforcer` began writing the same
+// `command` field into the same JSONL stream (#1492) — one helper, so the two gates'
+// redaction cannot drift (#966). The rule it enforces: the audit files are
+// world-readable, so an inlined `GH_TOKEN=…` must never persist.
 
 // #472: shared gate_skip audit — field shape identical to the #204 merge-scope
 // skip (:1105) so all skip surfaces stay audit-synced (#60).
