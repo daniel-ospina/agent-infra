@@ -2964,14 +2964,17 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE, EVEN
 # WHEN THE CHANGED-PATHS ENV IS SET. The predicate reads PR_CHANGED_PATHS, and WITH IT
 # SET a `pull_request` + `paths:` filter the changed set does not match makes it answer
-# `no` (measured: `paths: src/**` under PR_CHANGED_PATHS=docs/readme.md → `no`; without
-# the env → `unknown`). `no` drives the branch whose sentence is "declares NO
-# pull_request / pull_request_target trigger", which would then be FALSE about this
-# file. The rail therefore SCRUBS the PR-context env at the call site, because it asks
-# about the FILE and not about one PR — and this vector exports the variable so that
-# scrub is load-bearing: `env -u PR_CHANGED_PATHS` removed from scripts/admin-merge.sh
-# makes it fail. (The separate predicate-level vector for a non-matching changed set
-# pins the predicate; this one pins the RAIL's use of it.)
+# `no` (measured on THIS fixture — `paths: docs/**` — under PR_CHANGED_PATHS=src/readme.md
+# → `no`; without the env → `unknown`). `no` drives the branch whose sentence is
+# "declares NO pull_request / pull_request_target trigger", which would then be FALSE
+# about this file. The exported path is therefore deliberately NON-matching: with a
+# MATCHING one the verdict is `yes`, branch (ii) fires, and the assertion below is
+# INERT because no branch ever emits the string it asserts absent.
+# The rail SCRUBS the PR-context env at the call site, because it asks about the FILE
+# and not about one PR, and this vector is what pins that scrub. `noprtrigger` is the
+# separate guard against re-introducing a body-grep diagnosis — its negative assertion
+# on "declares the workflow_call trigger" is the one that fails if a grep comes back.
+# The predicate's own non-matching-path behaviour is pinned by its own vector.
 new_scen noprwcpr
 HEAD_WP="f8f8000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_WP" > "$SCEN/head"
@@ -2992,7 +2995,7 @@ jobs:
 WFEOF
 lane_fail mainfeed 9107 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9107"
-export PR_CHANGED_PATHS="docs/readme.md"
+export PR_CHANGED_PATHS="src/readme.md"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 unset PR_CHANGED_PATHS
