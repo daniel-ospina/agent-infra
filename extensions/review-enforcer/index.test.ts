@@ -3494,6 +3494,13 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
   ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
   ok(!auditCommand("ghs_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "the server family (ghs_) is covered too");
+  // The `_TOKEN=` rule carried a leading `\b` until review caught it — the SAME anchor class
+  // as the two the previous commit removed, and byte-identical to origin/main, so it was
+  // pre-existing rather than a regression. The existing `MY_GITHUB_TOKEN=github_pat_…` fixture
+  // did NOT exercise this rule at all: it passed only because the VALUE was PAT-shaped and got
+  // caught by the family pattern. An opaque value is what actually tests it.
+  ok(!auditCommand("MY_GITHUB_TOKEN=opaquesecret999").includes("opaquesecret999"), "a word-char-prefixed *_TOKEN= assignment must redact its VALUE");
+  ok(!auditCommand("export MY_GH_TOKEN=opaquesecret999").includes("opaquesecret999"), "…and through an `export` prefix");
   // The label must say WHICH length it measures: redaction shortens the text, so an
   // unlabelled count reports a number that is not the refused command's length (the
   // first draft of this test asserted the opposite — caught by review, #1492).
