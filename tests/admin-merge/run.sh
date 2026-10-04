@@ -2962,19 +2962,17 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # still reds CI on the idiom itself.
 
 # (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE, EVEN
-# WHEN THE CHANGED-PATHS ENV IS SET. The predicate reads PR_CHANGED_PATHS, and WITH IT
-# SET a `pull_request` + `paths:` filter the changed set does not match makes it answer
-# `no` (measured on THIS fixture — `paths: docs/**` — under PR_CHANGED_PATHS=src/readme.md
-# → `no`; without the env → `unknown`). `no` drives the branch whose sentence is
-# "declares NO pull_request / pull_request_target trigger", which would then be FALSE
-# about this file. The exported path is therefore deliberately NON-matching: with a
-# MATCHING one the verdict is `yes`, branch (ii) fires, and the assertion below is
-# INERT because no branch ever emits the string it asserts absent.
-# The rail SCRUBS the PR-context env at the call site, because it asks about the FILE
-# and not about one PR, and this vector is what pins that scrub. `noprtrigger` is the
-# separate guard against re-introducing a body-grep diagnosis — its negative assertion
-# on "declares the workflow_call trigger" is the one that fails if a grep comes back.
-# The predicate's own non-matching-path behaviour is pinned by its own vector.
+# WHEN THE CHANGED-PATHS ENV IS SET. The predicate answers `no` for a `pull_request`
+# whose `paths:` filter the changed set does not match (measured on this fixture —
+# `paths: docs/**` — under PR_CHANGED_PATHS=src/readme.md → `no`; with the env scrubbed
+# → `unknown`). A `no` reached with that env would make branch (iii)'s "declares NO
+# pull_request / pull_request_target trigger" FALSE about this file, so the rail scrubs
+# the PR-context env at its own call site and this vector pins the scrub. The export is
+# NON-matching for this fixture's filter by design: it makes a removed scrub land on
+# branch (iii), whose sentence is the one asserted absent below.
+# `noprtrigger` separately guards against re-introducing a body-grep diagnosis — its
+# negative assertion on "declares the workflow_call trigger" is the one that fails if
+# a grep comes back.
 new_scen noprwcpr
 HEAD_WP="f8f8000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_WP" > "$SCEN/head"
