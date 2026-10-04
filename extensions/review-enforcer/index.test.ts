@@ -56,6 +56,7 @@ import {
   _setRunGhOverride,
   BLOCK_MESSAGE,
   MICRO_BLOCK_MESSAGE,
+  auditCommand,
   TIER_RULE,
   default as reviewEnforcerFactory,
   resolveGhShimDir,
@@ -1965,6 +1966,12 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         equal(microBlockAudits[0].reason, "no_reviewers_dispatch", "micro gate_block audit pins reason no_reviewers_dispatch");
         equal(microBlockAudits[0].tier, "micro", "micro gate_block audit carries tier micro (TIER_RULE vocabulary)");
         equal(microBlockAudits[0].extension, "review-enforcer", "micro gate_block audit carries the extension name");
+        // #1492: the audit line must carry the very command this cell fired.
+        equal(
+          microBlockAudits[0].command,
+          "git commit -m x",
+          "#1492: the gate_block audit records WHICH command was refused (field was absent before)"
+        );
         // Complement cell: micro marker + ≥1 dispatch → ALLOWED (the #485
         // uniform policy is ≥1-dispatch, not "micro always blocks"). The
         // dispatch-count early return must precede the marker read — a reorder
@@ -2040,6 +2047,12 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
             blockAudit?.tier,
             producerValue.trim().toLowerCase(),
             `${producerValue.trim()} gate_block audit carries the marker tier (same normalization as the production read)`
+          );
+          // #1492: the NON-micro branch must record the refused command too.
+          equal(
+            blockAudit?.command,
+            "git commit -m x",
+            `${producerValue.trim()} gate_block audit records WHICH command was refused (#1492)`
           );
         }
         // unlabeled key: marker ABSENT → same generic block + message (the
@@ -3444,6 +3457,56 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
   ok(!hasAdminMergeFlag("gh pr merge 123 --no-admin"), "`--no-admin` is not the flag");
 });
 
+test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
+  // The field #1492 asks for: a `gate_block` entry carried reason + tier, never WHICH
+  // command was refused.
+  const short = 'gh pr list --json number | sort';
+  equal(auditCommand(short), short, "a normal command is recorded verbatim");
+  const long = "x".repeat(2500);
+  const bounded = auditCommand(long);
+  ok(bounded.length < long.length, "a pathological command is bounded, not logged whole");
+  ok(bounded.startsWith("x".repeat(100)), "the HEAD is kept");
+  ok(bounded.endsWith("x".repeat(100)), "the TAIL is kept too (the bound must be at BOTH ends)");
+  const trailing = auditCommand(`echo ${"y".repeat(2100)} && gh pr merge 999 --admin`);
+  ok(trailing.includes("gh pr merge 999 --admin"), "…so an OPERATION past the bound still survives — a head-only bound can drop the one thing this field exists to show");
+  ok(/truncated, 2500 chars after redaction/.test(bounded), "truncation is STATED, and which length it measures is PINNED (a revert to the unlabelled text must go red)");
+  equal(auditCommand("abc", 3), "abc", "the boundary is inclusive");
+  ok(auditCommand("abcd", 3).includes("truncated"), "one char over the bound truncates");
+  // REDACTION (#1492 review P1). Recording the command is new, and the audit files are
+  // world-readable, so persisting an inlined token would be a credential leak this gate
+  // introduced. The repo already owned this rule in verification-gate; the helper is now
+  // shared so the two gates writing `command` into the same JSONL stream cannot drift.
+  const leaky = "GH_TOKEN=ghp_SECRETvalue1234567890 git push https://x-access-token:ghp_SECRETvalue1234567890@github.com/o/r.git main";
+  const safe = auditCommand(leaky);
+  ok(!safe.includes("ghp_SECRETvalue1234567890"), "a gh token must NOT persist in the audit log");
+  ok(!safe.includes("GH_TOKEN="), "an inlined GH_TOKEN= assignment must NOT persist");
+  ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
+  ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
+  ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
+  // `origin/main` redacts both of the next two shapes; a LEADING anchor on the family
+  // pattern makes each survive.
+  ok(!auditCommand("TOKEN_ghp_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "a WORD-CHAR-PREFIXED token must not survive");
+  ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
+  ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
+  ok(!auditCommand("ghp_abc_def").includes("_def"), "…including its TAIL — the label above claims this, so assert it");
+  ok(!auditCommand("ghs_AAAA_BBBB_CCCC").includes("_CCCC"), "…and the ghs_ family with an internal `_`");
+  ok(!auditCommand("ghs_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "the server family (ghs_) is covered too");
+  // The `_TOKEN=` rule is tested with an OPAQUE value: a PAT-shaped value would be caught
+  // by the token patterns instead and leave this rule unexercised.
+  ok(!auditCommand("MY_GITHUB_TOKEN=opaquesecret999").includes("opaquesecret999"), "a word-char-prefixed *_TOKEN= assignment must redact its VALUE");
+  ok(!auditCommand("export MY_GH_TOKEN=opaquesecret999").includes("opaquesecret999"), "…and through an `export` prefix");
+  // The label must say WHICH length it measures: redaction shortens the text, so an
+  // unlabelled count reports a number that is not the refused command's length.
+  ok(auditCommand(leaky, 10).includes("truncated, "), "truncation stays stated after redaction");
+  // The abort is the documented harm (a bundled child launch that silently never started),
+  // so both remediation messages must say the command did not run — the agent cannot be
+  // left to infer it.
+  for (const [name, msg] of [["BLOCK_MESSAGE", BLOCK_MESSAGE], ["MICRO_BLOCK_MESSAGE", MICRO_BLOCK_MESSAGE]] as const) {
+    ok(/NOTHING IN THE BLOCKED COMMAND RAN/.test(msg), `${name} states the call was a no-op (#1492)`);
+    ok(/DID NOT HAPPEN/.test(msg), `${name} names the dropped-launch hazard (#1492)`);
+  }
+});
+
 test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs", () => {
   // Cycle-4 review P2: the `$VAR`-supplied-flag BRANCH could be deleted with the
   // suite still green, because the only class-6 case in the table (`V=--admin; gh
@@ -4339,6 +4402,12 @@ for (const [label, command] of [
         const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
         equal(blocked.length, 1, "exactly one audit entry");
         equal(blocked[0].reason, "admin_merge_no_evidence");
+        // #1492: the admin-merge block must record the refused command too.
+        equal(
+          blocked[0].command,
+          command,
+          "#1492: the admin-merge block records WHICH command was refused"
+        );
       } finally {
         _setRunGhOverride(null);
         if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;

@@ -3047,10 +3047,14 @@ attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
   if [ -s "$mainfails" ]; then
     main_files="$(
-      sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; s/::.*//' "$mainfails"
+      sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
       sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
       sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
       sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
+      # #7131: the unit is the JOB SLUG. Without this arm the generic `s/::.*//`
+      # above is suppressed for the family and a main baseline red on a DIFFERENT
+      # job would read as pre-existing in this one.
+      sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
     )"
     main_files="$(printf '%s\n' "$main_files" | sort -u)"
   fi
@@ -3063,6 +3067,12 @@ attribute_residual() {
       collect-error::*) file="${nodeid#collect-error::}" ;;
       # #6798: an environmental kill has no file; group by the mechanism.
       watchdog-kill::*) file="watchdog-kill" ;;
+      # #7131: the fallback's unit is the JOB SLUG — the key asserts only "a job
+      # with this slug failed", so a different job on main must not read as a
+      # pre-existing failure in this one. (a)-(d) above pin the same rule for the
+      # other non-nodeid families; this arm exists because the generic default
+      # would collapse every job onto the literal `job-unreadable`.
+      job-unreadable::*) file="${nodeid#job-unreadable::}" ;;
       *) file="${nodeid%%::*}" ;;
     esac
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then

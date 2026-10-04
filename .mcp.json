@@ -63,7 +63,7 @@
       "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
       "env": {
         "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@localhost:16379/tortoise",
+        "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise",
         "TORTOISE_API_KEY": ""
       }
     }
