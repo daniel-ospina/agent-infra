@@ -402,6 +402,15 @@ case "$key" in
       if [ -f "$SCEN/partial-log-$id" ]; then
         cat "$SCEN/partial-log-$id"; exit 1
       fi
+      # #7131: the log is PROVEN ABSENT (GitHub pruned it). Real gh exits
+      # non-zero AND names the reason on stderr, and `fetch_failed_log`
+      # discriminates on exactly that text — so the fixture must carry it. An
+      # empty `fail-log-<id>` below models a TRANSPORT error instead, which keeps
+      # its refusal (and is what scenarios 5c/5d pin).
+      if [ -f "$SCEN/pruned-log-$id" ]; then
+        printf 'could not find the log for run %s: log not found\n' "$id" >&2
+        exit 1
+      fi
       [ -f "$SCEN/fail-log-$id" ] && exit 1
       [ -f "$SCEN/log-$id" ] && { cat "$SCEN/log-$id"; exit 0; }
       exit 0
@@ -641,6 +650,15 @@ case "$key" in
     # this seam the zero-job branch was UNREACHABLE from the whole suite: the fake
     # ignored `--jq` and `cat`ed raw JSON, so `run_job_count` saw a non-numeric
     # blob and fail-closed in EVERY scenario — the new branch was dead code.
+    # #7131: the JOB-LEVEL fallback projection. The helper asks for the failed
+    # jobs' NAMES, so the fixture answers the names directly, one per line —
+    # exactly the projection the real `--jq` would produce. Keyed on the jq
+    # expression so the `.total_count` seam below is untouched.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-failed-$id" ]; then
+      case "$(flag_val --jq "$@")" in
+        *'.jobs[]'*) cat "$SCEN/jobs-failed-$id"; exit 0 ;;
+      esac
+    fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then cat "$SCEN/jobs-count-$id"; exit 0; fi
     if [ -f "$SCEN/jobs-count" ]; then cat "$SCEN/jobs-count"; exit 0; fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
@@ -1716,6 +1734,87 @@ if [ "$kr_examined" = "1" ] && [ "$kr_extracted" = "0" ]; then
 else
   fail "expected examined=1 extracted=0 for an un-killed unattributable run, got '$kr_examined'/'$kr_extracted' — a hole is open"
 fi
+
+# ── #7131: a PRUNED log degrades to the JOB-LEVEL failure set ───────────────
+# The defect: `admin-merge` refuses with "the failure set is UNKNOWABLE" when
+# GitHub has pruned the failing run's log, and the §7a re-run remedy cannot clear
+# it (a re-run does not restore a pruned log), so a reviewed-clean, mergeable,
+# unheld PR is stranded with no path forward. The fix attributes the run at JOB
+# granularity from the jobs API instead of refusing.
+echo "== #7131. a PRUNED log falls back to the JOB-LEVEL failure set =="
+new_scen pruned
+sha_pr='aa7131000000000000000000000000000000000'
+printf '%s\n' "$sha_pr" > "$SCEN/head"
+lane_fail "$sha_pr" 7131 > "$SCEN/runs-$sha_pr"
+: > "$SCEN/pruned-log-7131"                  # the log is PROVEN absent
+printf 'test (d)\nmanifest-integrity\n' > "$SCEN/jobs-failed-7131"
+cfs_run --commit-rows "$sha_pr" --runs-report "$TMP/pl-rep.txt" --provenance "$TMP/pl-prov.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "#7131: a pruned log is EXTRACTED at job level, not a fatal extraction failure (exit 0)" \
+  || fail "#7131: --commit-rows exited $rc on a pruned log — the run is still refused as unknowable, so the PR is still stranded"
+# `--commit-rows` emits ROWS (`<key>\t<failures>\t<runs>\t<signature>`), not bare
+# keys — so anchor on the key and require the TAB, never an end-of-line.
+if grep -qE '^job-unreadable::test-d[[:space:]]' "$TMP/cfs-out"; then
+  pass "#7131: the fallback emits the job-level key job-unreadable::test-d"
+else
+  fail "#7131: the job-level key never reached the id set (stdout: $(tr '\n' ' ' < "$TMP/cfs-out"))"
+fi
+grep -qE '^job-unreadable::manifest-integrity[[:space:]]' "$TMP/cfs-out" \
+  && pass "#7131: every failed job is attributed, not just the first" \
+  || fail "#7131: manifest-integrity missing from the fallback set"
+pl_examined="$(sed -n 's/^examined=//p' "$TMP/pl-rep.txt" 2>/dev/null)"
+pl_extracted="$(sed -n 's/^extracted=//p' "$TMP/pl-rep.txt" 2>/dev/null)"
+if [ "$pl_examined" = "1" ] && [ "$pl_extracted" = "1" ]; then
+  pass "#7131: the pruned run counts as examined AND extracted (1/1) — the examined>extracted gate cannot refuse it forever"
+else
+  fail "#7131: expected examined=1 extracted=1, got '$pl_examined'/'$pl_extracted' (extracted < examined is the permanent refusal this fixes)"
+fi
+grep -q 'JOB-LEVEL' "$TMP/cfs-err" \
+  && pass "#7131: the degradation is STATED explicitly, never a silent substitution" \
+  || fail "#7131: the job-level degradation was not announced on stderr"
+
+# THE FAIL-CLOSED DIRECTION on the same path: if the jobs API cannot answer either,
+# there is no fallback surface left and the run must refuse exactly as before.
+echo "== #7131. pruned log AND unreadable job list → still fail-closed =="
+new_scen pruned-nojobs
+sha_pn='aa7132000000000000000000000000000000000'
+printf '%s\n' "$sha_pn" > "$SCEN/head"
+lane_fail "$sha_pn" 7132 > "$SCEN/runs-$sha_pn"
+: > "$SCEN/pruned-log-7132"                  # log pruned
+# ...and NO jobs-failed-7132 fixture: the fallback surface is gone too.
+cfs_run --commit-rows "$sha_pn" --runs-report "$TMP/pn-rep.txt"
+rc=$?
+[ "$rc" -ne 0 ] && pass "#7131: pruned log + unreadable job list still fails closed (exit $rc)" \
+  || fail "#7131: expected a non-zero exit when NO surface can attribute the run, got 0"
+
+# THE DECISION DOOR: no SILENT FALSE PASS (#7131). The job-level key must be
+# ADMITTED by both predicates, because a dropped PR row makes `decide` see an
+# EMPTY set and certify a red PR — strictly worse than the refusal it replaced.
+# Assert the VERDICT, not the parse.
+printf 'job-unreadable::test-d\t1\t3\t\n' > "$TMP/pl-dec-pr.txt"
+: > "$TMP/pl-empty-tbl.txt"
+python3 "$ROOT/scripts/ci_exemption.py" decide \
+  --pr-failures "$TMP/pl-dec-pr.txt" --main-rates "$TMP/pl-empty-tbl.txt" \
+  --main-signatures "$TMP/pl-empty-tbl.txt" --blocked-out "$TMP/pl-blocked.txt" \
+  > "$TMP/pl-dec.out" 2>"$TMP/pl-dec.err"
+grep -q 'CLEAN' "$TMP/pl-dec.out" \
+  && fail "#7131: decide certified a NON-EMPTY job-level failure set as CLEAN — the PR row was rejected at the decision door (silent false PASS)" \
+  || pass "#7131: a job-level failure is never certified CLEAN"
+grep -q '^job-unreadable::test-d$' "$TMP/pl-blocked.txt" 2>/dev/null \
+  && pass "#7131: it is blocked BY NAME — attributable, not merely refused" \
+  || fail "#7131: expected the job-level key in the blocked list; verdict='$(tr '\n' ' ' < "$TMP/pl-dec.out")'"
+# And the signature direction: main red on the SAME job must STILL block, because a
+# job-level key carries no signature and the signature gate fails CLOSED. If this
+# ever exempts, the fallback has become a fail-open vector.
+printf 'job-unreadable::test-d\t1\t3\n' > "$TMP/pl-main-rates.txt"
+printf 'job-unreadable::test-d\t\n' > "$TMP/pl-main-sigs.txt"
+python3 "$ROOT/scripts/ci_exemption.py" decide \
+  --pr-failures "$TMP/pl-dec-pr.txt" --main-rates "$TMP/pl-main-rates.txt" \
+  --main-signatures "$TMP/pl-main-sigs.txt" --blocked-out "$TMP/pl-blocked2.txt" \
+  > "$TMP/pl-dec2.out" 2>/dev/null
+grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/pl-dec2.out" \
+  && fail "#7131: a signature-less job-level key was EXEMPTED — the fallback is a fail-open vector, not a degradation" \
+  || pass "#7131: main red on the same job still BLOCKS (no signature => fails closed)"
 
 # ── the DECISION door: no SILENT FALSE PASS ───────────────────────────────
 # `is_failure_key_loose` gates `parse_failure_rows` (the PR's own row) and
