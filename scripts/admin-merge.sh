@@ -3505,33 +3505,36 @@ main() {
       # rather than asked of the predicate. The predicate cannot answer it: a
       # `workflow_call` workflow's jobs DO attach checks to a PR head — inside its
       # CALLER's run, under the caller's name — so whether it runs on pull_request
-      # depends on callers the file does not name, and the predicate correctly
-      # answers `unknown`. But THIS question is narrower and answerable: the lane
-      # has no run of its own, and a `workflow_call`-declaring workflow can never
-      # produce one, whatever its callers do.
+      # depends on callers the file does not name, and the predicate answers either
+      # `unknown` (the block form carrying an `inputs:` child) or `no` (a bare
+      # declaration). Neither names the reusable cause, so the rail reads it here.
       # ⛔ A HERE-STRING, NOT A PIPE. `printf … | grep -q` is the SIGPIPE trap this
       # repo bans (#841): grep exits at its FIRST match, printf takes SIGPIPE, and
-      # under this file's `set -uo pipefail` the pipeline returns non-zero — so for a
-      # body larger than the pipe buffer (measured: 65,572 bytes) the match is
+      # under this file's `set -uo pipefail` the pipeline returns non-zero. So when
+      # the match sits EARLY — before the point at which grep exits — the match is
       # DISCARDED and this branch silently does not fire, falling through to the
-      # UNMEASURED stanza instead. The repo's own guard
-      # (scripts/check-no-sigpipe-grep.sh) reds CI on the pipe form — it did, on
-      # `sigpipe-grep` and `bash-suites`.
+      # UNMEASURED stanza. It is the match's POSITION, not the body's size, that
+      # decides (measured on identical 99KB bodies: an early match is lost, a late one
+      # is fine) — a large body is just what makes an early match lose in practice.
+      # The repo's own guard (scripts/check-no-sigpipe-grep.sh) reds CI on the pipe
+      # form — it did, on `sigpipe-grep` and `bash-suites`.
       # The match is a property of the file we just read, so the claim is measured.
       # It matches the BLOCK spelling, which is what every workflow in this repo
-      # uses; the predicate answers `unknown` for the inline spellings either way,
-      # and the fall-through stanza below no longer asserts a cause for them.
+      # uses; the predicate answers `unknown` for the inline spellings too, and the
+      # fall-through stanza below no longer asserts a cause for them.
       lane_is_reusable=0
       if [ -n "$lane_body" ] && grep -qE '^[[:space:]]*workflow_call:' <<<"$lane_body"; then
         lane_is_reusable=1
       fi
       if [ -z "$lane_body" ]; then
-        # UNMEASURED, and it says so. The file could not be READ at that path — a
-        # 404 (the selector may be a display NAME, which `--workflow` allows) or an
-        # API failure. Naming a cause here would assert something unread.
-        say_err "   The lane '$lane' has NO run for this head at all, and its workflow file"
-        say_err "   could not be READ at .github/workflows/$lane — so whether a run of it can"
-        say_err "   even attach to a PR head is UNMEASURED here, not a coverage gap in this PR."
+        # UNMEASURED, and it says so. Either the fetch returned nothing — a 404 (the
+        # selector may be a display NAME, which `--workflow` allows) or an API
+        # failure — or the body was only whitespace, which `$( … )` strips to empty.
+        # Naming a cause here would assert something unread.
+        say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
+        say_err "   file came back EMPTY from .github/workflows/$lane (not found, not"
+        say_err "   readable, or a blank file) — so whether a run of it can even attach to a"
+        say_err "   PR head is UNMEASURED here, not a coverage gap in this PR."
         say_err "   Confirm the lane (--workflow takes a file OR a display name); if this"
         say_err "   repo splits its lanes by trigger, add --any-workflow."
       elif [ "$lane_verdict" = "yes" ]; then
@@ -3540,27 +3543,30 @@ main() {
         say_err "   'paths:' filter, or not yet started), or the selector names a different"
         say_err "   lane. Confirm the lane and that CI ran for this head; if this repo splits"
         say_err "   its lanes by trigger, add --any-workflow."
-      elif [ "$lane_is_reusable" = "1" ]; then
-        say_err "   The lane '$lane' is a REUSABLE workflow — it declares workflow_call, so"
-        say_err "   it is only ever invoked BY another workflow: its jobs run inside the"
-        say_err "   CALLER's run, under the CALLER's name, and no run of '$lane' itself can"
-        say_err "   attach to a PR head. This is not a main-only lane and not a wrong-name"
-        say_err "   problem, and picking a different lane cannot help in a trigger-split repo."
-        say_err "   Compare against the CALLER's lane, or use --any-workflow, which compares"
-        say_err "   against every lane that actually ran."
       elif [ "$lane_verdict" = "no" ]; then
         say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
         say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
-        say_err "   can EVER attach to a PR head. A push-only lane looks like this."
+        say_err "   can EVER attach to a PR head. A push-only or schedule-only lane looks"
+        say_err "   like this."
         say_err "   In a trigger-split repo no single lane spans both sides, so picking"
         say_err "   another lane cannot help: use --any-workflow, which compares against"
         say_err "   every lane that actually ran."
+      elif [ "$lane_is_reusable" = "1" ]; then
+        # Reached only when the predicate answered neither `yes` nor `no`. The claim is
+        # deliberately narrow, so every clause holds for ANY `workflow_call`-declaring
+        # file — including a hybrid that also declares push or schedule (a reusable
+        # workflow is still only ever INVOKED by a caller, so the assertion is not
+        # "this is not a main-only lane", which would be false for such a hybrid).
+        say_err "   The lane '$lane' declares the workflow_call trigger, so it is INVOKED"
+        say_err "   BY another workflow: its jobs run inside the CALLER's run, under the"
+        say_err "   CALLER's name, and no run of '$lane' itself can attach to a PR head."
+        say_err "   Compare against the CALLER's lane, or use --any-workflow, which compares"
+        say_err "   against every lane that actually ran."
       else
         say_err "   The lane '$lane' has NO run for this head at all. Its workflow file was"
         say_err "   READ, but the PR-evaluability predicate cannot DECIDE whether a run of it"
         say_err "   could ever attach to a PR head — so that question is UNMEASURED here (this"
-        say_err "   is NOT a coverage gap in this PR). A common reason: an inline `on:` form,"
-        say_err "   or a trigger the parser declines to interpret."
+        say_err "   is NOT a coverage gap in this PR, and no cause is asserted)."
         say_err "   Confirm the lane (--workflow); if this repo splits its lanes by trigger,"
         say_err "   add --any-workflow."
       fi

@@ -2809,7 +2809,7 @@ grep -q "MAIN-ONLY lane" "$TMP/err" \
 grep -q -- "--any-workflow" "$TMP/err" \
   && pass "the unreadable-workflow branch still names the trigger-split remedy" \
   || fail "the unreadable-workflow branch offers no remedy"
-grep -q "could not be READ at .github/workflows/" "$TMP/err" \
+grep -q "came back EMPTY from .github/workflows/" "$TMP/err" \
   && pass "with no readable workflow file the block says the condition is UNMEASURED (#1413)" \
   || fail "the unreadable-workflow branch does not name the unmeasured condition"
 
@@ -2863,15 +2863,15 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a REUSABLE-only lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "is a REUSABLE workflow" "$TMP/err" \
+grep -q "declares the workflow_call trigger" "$TMP/err" \
   && pass "the rail MEASURES the file and names the REUSABLE shape (#1413)" \
   || fail "the rail did not name the reusable condition on stderr"
-grep -q "it declares workflow_call" "$TMP/err" \
-  && pass "…naming the trigger that makes it reusable (the property it measured)" \
-  || fail "the reusable branch does not name the trigger it detected"
-grep -q "under the CALLER's name" "$TMP/err" \
-  && pass "…and says where a reusable lane's runs actually live" \
-  || fail "the reusable branch does not explain where the runs live"
+grep -q "CALLER's name" "$TMP/err" \
+  && pass "…naming the trigger it detected and where a reusable lane's runs live" \
+  || fail "the reusable branch does not name the trigger or where the runs live"
+grep -q "itself can attach to a PR head" "$TMP/err" \
+  && pass "…and states the one property that makes the lane empty" \
+  || fail "the reusable branch does not state the reusable property"
 grep -q -- "--any-workflow" "$TMP/err" \
   && pass "the reusable branch names the remedy that works in a trigger-split repo" \
   || fail "the reusable branch offers no workable remedy"
@@ -2972,9 +2972,34 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9106"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a large reusable workflow body → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "is a REUSABLE workflow" "$TMP/err" \
+grep -q "declares the workflow_call trigger" "$TMP/err" \
   && pass "a body LARGER THAN THE PIPE BUFFER still routes to the reusable branch (#1413 / #841)" \
   || fail "the match was discarded by SIGPIPE — the reusable branch did not fire for a large body"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c7) #1413 — A HYBRID MUST NOT GET THE REUSABLE STANZA. A file declaring BOTH
+# `workflow_call` and a standalone non-PR trigger (push) reads `no` from the
+# predicate, and the reusable remedy ("compare against the CALLER's lane") is WRONG
+# for it. The measured predicate verdict must therefore win over the text match —
+# which is why the `no` branch is ordered ABOVE the reusable branch. Without this
+# vector the order can be flipped back and the suite stays green.
+new_scen nophybrid
+HEAD_HY="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_HY" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_HY"
+wf_declares ".github/workflows/python-ci.yml" workflow_call push
+lane_fail mainfeed 9107 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9107"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a workflow_call+push lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && pass "a workflow_call+push hybrid gets the MEASURED no-trigger stanza (#1413)" \
+  || fail "the hybrid was misrouted away from the measured verdict"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && fail "the hybrid was routed to the REUSABLE stanza, whose remedy is wrong for it (#1413)" \
+  || pass "…and is NOT given the reusable remedy that does not apply to it"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
@@ -2995,7 +3020,7 @@ rc=$?
 grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
   && pass "the push-only branch fires and names the missing PR trigger (#1413)" \
   || fail "the push-only branch did not name the measured condition"
-grep -q "push-only lane" "$TMP/err" \
+grep -q "push-only or schedule-only lane" "$TMP/err" \
   && pass "…and names the push-only shape" \
   || fail "the push-only shape is not named"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
