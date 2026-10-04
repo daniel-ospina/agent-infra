@@ -255,6 +255,12 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
         # environment so a caller can opt a single vector into the transient path.
         export RECORD_REVIEW_DIFF_FETCH_SLEEP="${RECORD_REVIEW_DIFF_FETCH_SLEEP:-0}"
         export STUB_DIFF_FAIL_TIMES="${STUB_DIFF_FAIL_TIMES:-0}" STUB_DIFF_COUNT="${STUB_DIFF_COUNT:-}"
+        # #1590 review: STUB_CHECKS must be CLEARED alongside the other STUB_* vars.
+        # The (E) vectors set it per-invocation, but an ambient value in the caller's
+        # environment would otherwise leak into the earlier 11.1/11.2 carries and
+        # redden them non-hermetically. Read the ambient value so a caller can still
+        # opt a vector in, but always export SOMETHING.
+        export STUB_CHECKS="${STUB_CHECKS:-}"
         rc=0
         bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
@@ -740,6 +746,36 @@ for spec in "11.3e 424514 github-actions|ci / unit-test|11|in_progress|null" \
 $(prior_for "$pr")" "$D_F"
   [ "$RECORD_RC" = "0" ] && ok "$tag (E) a not-red surface still carries (rc 0)" || bad "$tag (E) refused a not-red surface (rc=$RECORD_RC)"
 done
+
+# 11.3h: the ANTI-REGRESSION vector for the veto's surface. `ai-review-gate` sits on
+# the PR head and goes red BECAUSE the evidence is stale — the condition the carry
+# exists to remedy. Counting it refuses `lane_dimension_carry` BY CONSTRUCTION (#6213
+# measured the gate flipping SUCCESS -> FAILURE seven seconds after the rail moved the
+# head). A red the carry itself explains is not evidence about the tree.
+rm -f "$(Q2 424517)"
+STUB_CHECKS='github-actions|ai-review-gate|11|completed|failure' \
+  run_record_diff 424517 "$STALE" "body
+
+$(prior_for 424517)" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "11.3h (E) a stale-ai-review-gate red alone still carries (rc 0)" || bad "11.3h (E) the veto fired on its OWN evidence gate (rc=$RECORD_RC) — the lane arm is refused by construction"
+
+# 11.3i: the exclusion is NARROW — the gate's redness must not mask a genuine red.
+rm -f "$(Q2 424518)"
+STUB_CHECKS='github-actions|ai-review-gate|11|completed|failure
+github-actions|ci / unit-test|12|completed|failure' \
+  run_record_diff 424518 "$STALE" "body
+
+$(prior_for 424518)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3i (E) a genuine red beside the gate still refuses (rc 3)" || bad "11.3i (E) the gate exclusion masked a real red (rc=$RECORD_RC)"
+
+# 11.3j: an unrecognised STATUS spelling alongside a conclusion is judged by that
+# conclusion, not waved through as in-flight. Only a null/empty conclusion is in flight.
+rm -f "$(Q2 424519)"
+STUB_CHECKS='github-actions|ci / unit-test|11|completely_finished|failure' \
+  run_record_diff 424519 "$STALE" "body
+
+$(prior_for 424519)" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "11.3j (E) an unknown STATUS with a failure conclusion is red (rc 3)" || bad "11.3j (E) waved through an unknown status (rc=$RECORD_RC)"
 
 # 11.4 stale sha, no prior evidence at all → refused (pre-#2982 behaviour kept).
 rm -f "$(Q2 424503)"

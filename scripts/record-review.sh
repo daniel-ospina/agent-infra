@@ -1070,19 +1070,45 @@ PYC4
 # NOT RED, AT THIS STAGE, IS NOT A CERTIFICATE OF HEALTH: an absent, empty or in-flight
 # surface is simply not shown red, which is the pre-existing state of every carry. This
 # clause can only ADD a refusal; it can never authorise one.
+#
+# THE SURFACE EXCLUDES THIS FLEET'S OWN EVIDENCE GATE (#1590 review). `ai-review-gate`
+# sits on the PR HEAD and goes red BECAUSE the evidence is stale — the very state the
+# carry exists to remedy. Counting it refuses `lane_dimension_carry` BY CONSTRUCTION,
+# since that arm fires precisely when the rendered diff moved and the gate's rule (b)
+# can therefore no longer match. #6213 measured exactly this transition: the gate went
+# SUCCESS -> FAILURE seven seconds after the rail moved the head. The veto asks whether
+# the TREE is independently red, so a red the carry itself explains is not evidence.
+# Override with RECORD_REVIEW_RED_EXCLUDE (space-separated check names).
+#
+# KNOWN, DELIBERATE DIVERGENCE from the rail's version of this rule: the rail also reads
+# legacy commit `/status`. This reads `/check-runs` only, so a red posted as a legacy
+# status is invisible here. Stated rather than implied — on agent-infra's own head
+# `statuses == 0`, and a false claim of parity is worse than a named gap.
+RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE:-ai-review-gate ai-review-gate-tests}"
 target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
   local raw
   raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
            --paginate \
-           --jq '.check_runs[] | "\(.app.slug // "?" )|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
+           --jq '.check_runs[] | "\(.app.slug // "?")|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
   [ -n "$raw" ] || return 1
-  printf '%s\n' "$raw" | awk -F'|' '
-    { k = $1 "|" $2
+  printf '%s\n' "$raw" | awk -F'|' -v excl="$RECORD_REVIEW_RED_EXCLUDE" '
+    { # a `|` inside a check name shifts every later field — dropping the row is
+      # fail-open, but MIS-GROUPING it corrupts an unrelated group. Drop it loudly.
+      if (NF != 5) { skipped++; next }
+      k = $1 "|" $2
       if (!(k in id) || $3 + 0 > id[k]) { id[k] = $3 + 0; st[k] = $4; c[k] = $5 } }
     END {
-      for (k in st)
-        if (st[k] == "completed" && c[k] != "success" && c[k] != "neutral" &&
-            c[k] != "skipped" && c[k] != "cancelled" && c[k] != "stale") { red = 1; break }
+      n = split(excl, ex, " ")
+      for (i = 1; i <= n; i++) if (ex[i] != "") skip[ex[i]] = 1
+      for (k in st) {
+        if (skip[substr(k, index(k, "|") + 1)]) continue
+        # Taken as in flight ONLY when it carries no conclusion at all. An
+        # unrecognised STATUS spelling alongside a conclusion is judged by that
+        # conclusion (the allow-list polarity), not waved through.
+        if (st[k] != "completed" && (c[k] == "null" || c[k] == "")) continue
+        if (c[k] != "success" && c[k] != "neutral" && c[k] != "skipped" &&
+            c[k] != "cancelled" && c[k] != "stale") { red = 1; break }
+      }
       exit(red ? 0 : 1)
     }'
 }

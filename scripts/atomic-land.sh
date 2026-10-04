@@ -674,17 +674,25 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
   rc=$?
   sed 's/^/atomic-land:     record-review: /' "$log" >&2
   if [ "$rc" -eq 3 ]; then
-    err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
-    # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
-    # producer computes its digest with the sibling normalizer
-    # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
-    # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
-    # so the message above would blame a diff that did not change. Name the
-    # missing file so the remedy is an install, not a re-review. Diagnostic only:
-    # the rail never re-derives the digest itself (see pr_has_carry_evidence).
-    DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
-    if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
-      err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
+    # #1575 clause (E) is a DISTINCT cause of the SAME exit code: the artifact was
+    # PROVEN unchanged and the re-bind was refused because the target head is
+    # measurably red. Blaming a changed diff would send the operator hunting for a
+    # change that does not exist — the same misdiagnosis class #1362 D1 fixes below.
+    if grep -qF '(#1575 clause E)' "$log"; then
+      err "atomic-land: the carry was REFUSED by (#1575 clause E) — the target head ${HEAD:0:12}… IS MEASURABLY RED. The lane artifact WAS proven unchanged; do NOT hunt for a diff change. Re-run the failing checks (or wait for them), then re-record."
+    else
+      err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
+      # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
+      # producer computes its digest with the sibling normalizer
+      # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
+      # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
+      # so the message above would blame a diff that did not change. Name the
+      # missing file so the remedy is an install, not a re-review. Diagnostic only:
+      # the rail never re-derives the digest itself (see pr_has_carry_evidence).
+      DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
+      if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
+        err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
+      fi
     fi
     err "atomic-land: a FRESH review of the new head is required; this rail cannot author one. Nothing was merged."
     rm -f "$log"
