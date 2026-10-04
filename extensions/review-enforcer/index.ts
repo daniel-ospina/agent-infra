@@ -2142,7 +2142,7 @@ export const TRUNCATION_TAIL = 200;
 /**
  * The command a block REFUSED, redacted and bounded, for the durable audit trail (#1492).
  *
- * A block entry otherwise records `reason` and `tier` — enough to COUNT blocks, not
+ * A `gate_block` entry records `reason` and `tier` — enough to COUNT blocks, not
  * enough to tell WHICH command was refused. This field answers that, and the
  * neighbouring hub-state gate carries a `command` field in the same stream, so the
  * shape is established.

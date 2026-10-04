@@ -1966,10 +1966,7 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         equal(microBlockAudits[0].reason, "no_reviewers_dispatch", "micro gate_block audit pins reason no_reviewers_dispatch");
         equal(microBlockAudits[0].tier, "micro", "micro gate_block audit carries tier micro (TIER_RULE vocabulary)");
         equal(microBlockAudits[0].extension, "review-enforcer", "micro gate_block audit carries the extension name");
-        // #1492: the entry must name the REFUSED COMMAND, not just the reason. Without it a
-        // false block cannot be reconstructed from the audit — the reporter had to rediscover
-        // which command tripped the gate by hand across several turns. End-to-end here:
-        // the audit line must carry the very command this cell fired.
+        // #1492: the audit line must carry the very command this cell fired.
         equal(
           microBlockAudits[0].command,
           "git commit -m x",
@@ -2051,9 +2048,7 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
             producerValue.trim().toLowerCase(),
             `${producerValue.trim()} gate_block audit carries the marker tier (same normalization as the production read)`
           );
-          // #1492: the NON-micro branch must record the refused command too. Only the
-          // micro cell pinned `command`, so deleting the field from this branch (or the
-          // admin-merge branch) left the suite green — the review caught that gap.
+          // #1492: the NON-micro branch must record the refused command too.
           equal(
             blockAudit?.command,
             "git commit -m x",
@@ -3463,8 +3458,8 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
 });
 
 test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
-  // The field #1492 asks for: `gate_block` carried reason + tier, never WHICH command was
-  // refused.
+  // The field #1492 asks for: a `gate_block` entry carried reason + tier, never WHICH
+  // command was refused.
   const short = 'gh pr list --json number | sort';
   equal(auditCommand(short), short, "a normal command is recorded verbatim");
   const long = "x".repeat(2500);
@@ -3488,8 +3483,8 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
   ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
   ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
-  // `origin/main` redacts both of the next two shapes; an anchor on either side of the
-  // family pattern makes each survive.
+  // `origin/main` redacts both of the next two shapes; a LEADING anchor on the family
+  // pattern makes each survive.
   ok(!auditCommand("TOKEN_ghp_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "a WORD-CHAR-PREFIXED token must not survive");
   ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
   ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
@@ -4407,10 +4402,7 @@ for (const [label, command] of [
         const blocked = tempAuditLines().filter((l) => l.event === "merge_gate_block");
         equal(blocked.length, 1, "exactly one audit entry");
         equal(blocked[0].reason, "admin_merge_no_evidence");
-        // #1492: the admin-merge block is the one THIS lane actually hit, and it must record
-        // the refused command too. Without this assertion the field could be deleted from
-        // this site with the suite green (review, #1492) — the same gap that was closed for
-        // the two dispatch-count branches.
+        // #1492: the admin-merge block must record the refused command too.
         equal(
           blocked[0].command,
           command,
