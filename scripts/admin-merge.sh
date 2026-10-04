@@ -3484,20 +3484,16 @@ main() {
       local lane_slug lane_body lane_verdict
       if [ -n "$REPO" ]; then lane_slug="repos/$REPO"; else lane_slug="repos/{owner}/{repo}"; fi
       # THE REF MATTERS. The contents API defaults to the repository's DEFAULT
-      # branch, and a workflow can DIFFER per branch — reading the default would
-      # attribute one revision's `on:` block to another (the same reason
-      # `workflow_pr_evaluable` pins its `ref=`). The question here is about the
-      # PR's OWN head — the revision whose checks would attach — so pin `$head`.
-      # ⛔ AND `-X GET` IS NOT OPTIONAL. `gh api` switches to POST as soon as ANY
-      # `-f`/`-F` parameter is added (documented, and measured against the live
-      # API), and this endpoint is GET/PUT only — so `-f "ref=..."` WITHOUT it
-      # answers `404 Not Found`. The first draft of this line omitted it, which
-      # would have left `lane_body` empty on EVERY call and made the measured
-      # branches below UNREACHABLE in production, while the suite stayed green
-      # (its fake `gh` modelled the ref but not the method: 1075 tests were a
-      # false PASS for this line — caught by fresh-context review, not by CI).
-      # The three sibling contents fetches in this file (1622/1629/2236) all pair
-      # the two; the fake now enforces the same contract so it cannot recur.
+      # branch, and a workflow can DIFFER per branch — so reading the default would
+      # attribute one revision's `on:` block to another. The question here is about
+      # the revision whose checks would attach, so pin `$head`.
+      # ⛔ AND `-X GET` IS NOT OPTIONAL: `gh api` switches to POST as soon as ANY
+      # `-f`/`-F` parameter is added, and this endpoint is GET/PUT only, so
+      # `-f "ref=..."` without it answers `404 Not Found` — which would empty
+      # `lane_body` on EVERY call and make the branches below unreachable. All three
+      # sibling fetches in this file (1622/1629/2236) pair the two; the suite's fake
+      # `gh` enforces the same contract, because a fake that models the ref but not
+      # the transport cannot see this class of defect at all.
       lane_body="$($GH api "$lane_slug/contents/.github/workflows/$lane" \
                     -X GET -f "ref=$head" -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)"
       lane_verdict="unknown"
@@ -3505,32 +3501,48 @@ main() {
         lane_verdict="$(printf '%s' "$lane_body" \
           | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
       fi
+      # REUSABLE is a property of the FILE WE JUST READ, so it is measured here
+      # rather than asked of the predicate. The predicate cannot answer it: a
+      # `workflow_call` workflow's jobs DO attach checks to a PR head — inside its
+      # CALLER's run, under the caller's name — so whether it runs on pull_request
+      # depends on callers the file does not name, and the predicate correctly
+      # answers `unknown`. But THIS question is narrower and answerable: the lane
+      # has no run of its own, and a `workflow_call`-declaring workflow can never
+      # produce one, whatever its callers do.
+      lane_is_reusable=0
+      if [ -n "$lane_body" ] && printf '%s' "$lane_body" | grep -qE '^[[:space:]]*workflow_call:'; then
+        lane_is_reusable=1
+      fi
       if [ -z "$lane_body" ]; then
-        # UNMEASURED, and it says so. The file could not be read at that path — a
-        # 404 (the selector may be a display NAME, which `--workflow` allows) or
-        # an API failure. NAMING A CAUSE HERE WOULD BE THE ORIGINAL DEFECT: the
-        # old text blamed the selector and the workflow's trigger shape without
-        # having read either.
+        # UNMEASURED, and it says so. The file could not be READ at that path — a
+        # 404 (the selector may be a display NAME, which `--workflow` allows) or an
+        # API failure. Naming a cause here would assert something unread.
         say_err "   The lane '$lane' has NO run for this head at all, and its workflow file"
         say_err "   could not be READ at .github/workflows/$lane — so whether a run of it can"
         say_err "   even attach to a PR head is UNMEASURED here, not a coverage gap in this PR."
         say_err "   Confirm the lane (--workflow takes a file OR a display name); if this"
         say_err "   repo splits its lanes by trigger, add --any-workflow."
-      elif [ "$lane_verdict" = "no" ]; then
-        say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
-        say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
-        say_err "   can EVER attach to a PR head. A push-only lane and a REUSABLE"
-        say_err "   (workflow_call-only) lane both look like this; a reusable lane's jobs"
-        say_err "   run inside its CALLER's run, under the caller's name."
-        say_err "   In a trigger-split repo no single lane spans both sides, so picking"
-        say_err "   another lane cannot help: use --any-workflow, which compares against"
-        say_err "   every lane that actually ran."
       elif [ "$lane_verdict" = "yes" ]; then
         say_err "   The lane '$lane' has NO run for this head at all, but its workflow DOES"
         say_err "   declare a PR trigger — so either no run of it landed on THIS head (a"
         say_err "   'paths:' filter, or not yet started), or the selector names a different"
         say_err "   lane. Confirm the lane and that CI ran for this head; if this repo splits"
         say_err "   its lanes by trigger, add --any-workflow."
+      elif [ "$lane_is_reusable" = "1" ]; then
+        say_err "   The lane '$lane' is a REUSABLE workflow — it declares workflow_call, so"
+        say_err "   it is only ever invoked BY another workflow: its jobs run inside the"
+        say_err "   CALLER's run, under the CALLER's name, and no run of '$lane' itself can"
+        say_err "   attach to a PR head. This is not a main-only lane and not a wrong-name"
+        say_err "   problem, and picking a different lane cannot help in a trigger-split repo."
+        say_err "   Compare against the CALLER's lane, or use --any-workflow, which compares"
+        say_err "   against every lane that actually ran."
+      elif [ "$lane_verdict" = "no" ]; then
+        say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
+        say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
+        say_err "   can EVER attach to a PR head. A push-only lane looks like this."
+        say_err "   In a trigger-split repo no single lane spans both sides, so picking"
+        say_err "   another lane cannot help: use --any-workflow, which compares against"
+        say_err "   every lane that actually ran."
       else
         say_err "   The lane '$lane' has NO run for this head at all. Its workflow file was"
         say_err "   read but could not be parsed confidently, so whether it can attach a run to"
