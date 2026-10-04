@@ -528,6 +528,53 @@ case "$key" in
         # FAIL CLOSED (the red stays blocking). There is no separate hard-error
         # marker: a non-2xx and a 404 both yield an empty body, which the rail
         # treats identically (`unknown`).
+        # ⛔ THE HTTP METHOD IS PART OF THE CONTRACT, and modelling only the ref
+        # was a REAL miss, not a hypothetical: `gh api` switches to POST as soon as
+        # ANY `-f`/`-F` parameter is added (documented, and verified against the
+        # live API), and this endpoint is GET/PUT only — so `-f "ref=..."` WITHOUT
+        # `-X GET` answers 404 "Not Found" rather than the file. The first draft of
+        # #1413's ref pin did exactly that. This server stayed green because it
+        # never looked at the method: 1075 passing tests were a FALSE PASS, and the
+        # measured branches would have been unreachable in production.
+        # Enforcing it here makes the `noprtrigger` vector LOAD-BEARING for the
+        # method: dropping `-X GET` empties the body, which moves the rail to its
+        # unmeasured branch, which fails that vector's measured-text assertion.
+        # ⛔ THE DEFAULT IS NOT "GET" — IT IS "POST IF ANY PARAMETER IS PRESENT",
+        # and getting that backwards made the FIRST version of this guard INERT:
+        # `wmethod` defaulted to "GET", so `-f ref=abc` with no `-X` PASSED the
+        # check and the fixture was SERVED — the guard failed to catch the exact
+        # omission it exists to catch. (Caught by VGATE, then reproduced by
+        # invoking this arm with the rail's argv: `-f ref=abc` -> rc=0 + body,
+        # while only an EXPLICIT `-X POST` was refused.) The two conditions below
+        # are therefore checked separately — absent-method is the real case.
+        wmethod=""
+        wmethod_explicit=0
+        whasparam=0
+        wnext=0
+        for x in "$@"; do
+          if [ "$wnext" = "1" ]; then wmethod="$x"; wmethod_explicit=1; wnext=0; continue; fi
+          case "$x" in
+            -X|--method) wnext=1 ;;
+            --method=*) wmethod="${x#--method=}"; wmethod_explicit=1 ;;
+            -f|--raw-field|-F|--field) whasparam=1 ;;
+            # The `--flag=value` forms count too, and NOT modelling them got the
+            # answer WRONG in both directions (measured against the live API, not
+            # asserted): `--raw-field=r=x` / `-f=r=x` with no `-X` were SERVED
+            # although real `gh` POSTs and the endpoint answers 404, while
+            # `--method=GET` was not read as explicit, so a legitimate explicit-GET
+            # call was REFUSED. No rail call uses these forms today — the model is
+            # completed so the fake cannot answer the wrong question later.
+            --raw-field=*|-f=*|-F=*|--field=*) whasparam=1 ;;
+          esac
+        done
+        # 1) A PARAMETER AND NO EXPLICIT METHOD -> `gh api` sends POST -> 404.
+        if [ "$whasparam" = "1" ] && [ "$wmethod_explicit" = "0" ]; then
+          exit 1
+        fi
+        # 2) An explicitly non-GET method -> 404 for this GET-only endpoint.
+        if [ "$wmethod_explicit" = "1" ] && [ "$wmethod" != "GET" ]; then
+          exit 1
+        fi
         wref=""
         wprev=""
         for x in "$@"; do
@@ -2762,6 +2809,9 @@ grep -q "MAIN-ONLY lane" "$TMP/err" \
 grep -q -- "--any-workflow" "$TMP/err" \
   && pass "the unreadable-workflow branch still names the trigger-split remedy" \
   || fail "the unreadable-workflow branch offers no remedy"
+grep -q "could not be READ at .github/workflows/" "$TMP/err" \
+  && pass "with no readable workflow file the block says the condition is UNMEASURED (#1413)" \
+  || fail "the unreadable-workflow branch does not name the unmeasured condition"
 
 # (c2) #1413 — THE MEASURED CASE: the lane's workflow declares NO PR trigger, so
 # no run of it can EVER attach to a head. This is agent-infra's ACTUAL shape (its
@@ -2774,7 +2824,25 @@ new_scen noprtrigger
 HEAD_NT="f3f3000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_NT" > "$SCEN/head"
 : > "$SCEN/runs-$HEAD_NT"
-wf_declares ".github/workflows/python-ci.yml" workflow_call
+# The fixture MUST mirror the REAL file's `on:` shape, not just its trigger name.
+# agent-infra's python-ci.yml is `workflow_call:` WITH an `inputs:` child, and
+# `collect_filters` refuses that child (a `type: string` scalar), which is what put
+# the whole mapping in the unattributed arm. A fixture of bare `workflow_call:`
+# would exercise a shape that does not exist in the repo — and it did: the first
+# draft of this vector passed on the bare shape while the REAL file fell through
+# to the generic branch, green for the wrong reason (fresh-context review, P1).
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+{
+  printf 'name: fixture\non:\n  workflow_call:\n    inputs:\n      python-version:\n        type: string\n        default: "3.11"\n'
+  printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+} > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
+# PRECONDITION, asserted directly: the predicate must answer `no` for THIS file.
+# Without it the vector could pass while the measured branch never fired.
+lane_fixture_verdict="$(bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" \
+  < "$SCEN/wf-contents/.github/workflows/python-ci.yml" 2>/dev/null || true)"
+[ "$lane_fixture_verdict" = "no" ] \
+  && pass "PRECONDITION (#1413): the predicate answers 'no' for a workflow_call+inputs file" \
+  || fail "PRECONDITION (#1413): expected 'no' for the realistic reusable fixture, got '$lane_fixture_verdict'"
 lane_fail mainfeed 9102 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
@@ -2791,6 +2859,32 @@ grep -q "use --any-workflow" "$TMP/err" \
   || fail "the measured branch offers no workable remedy"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# PIN THE GUARD ITSELF (#1413). The fake's method model is the ONLY thing that
+# makes the real-P1 regression detectable — a ref pin without `-X GET`, which the
+# real API answers 404 to, silently emptying `lane_body`. And the FIRST version of
+# that guard was INERT (`wmethod` defaulted to "GET", so a parameter-carrying call
+# with no `-X` was still SERVED). Nothing in the suite reached that branch, because
+# the rail always passes `-X GET` — so without this assertion a future edit that
+# re-inerts the guard leaves all 1075 tests green while the production defect comes
+# back. That is the exact false PASS this PR removes, so it gets a guard.
+pin_url="repos/fixture/example/contents/.github/workflows/python-ci.yml"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" -f ref=abc >/dev/null 2>&1 \
+  && fail "the fake SERVES a contents call carrying a parameter with no -X — the guard is INERT (real gh POSTs; the API 404s)" \
+  || pass "the fake rejects a parameter-carrying contents call with no -X, exactly as the real API 404s"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" -X GET -f ref=abc >/dev/null 2>&1 \
+  && pass "…and still serves the rail's own '-X GET -f ref=' shape" \
+  || fail "the fake rejects the rail's own '-X GET -f ref=' shape"
+# The `--flag=value` forms are the SAME contract, and the fake got them WRONG in
+# both directions before they were modelled: SERVED with no `-X` (real gh POSTs),
+# and REFUSED under an explicit `--method=GET` (real gh serves). Both expectations
+# were confirmed against the live API.
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" --raw-field=ref=abc >/dev/null 2>&1 \
+  && fail "the fake SERVES an '='-form parameter with no -X (real gh POSTs; the API 404s)" \
+  || pass "the fake rejects the '='-form parameter with no -X too"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" --method=GET --raw-field=ref=abc >/dev/null 2>&1 \
+  && pass "…and reads '--method=GET' as explicit, so an '='-form GET is still served" \
+  || fail "the fake does not read '--method=GET' as an explicit method"
 
 # (d) A main lane whose runs are all `cancelled`/`skipped` exercised NOTHING, so
 # it is not a baseline either. `completed` would ACCEPT it; only `tested` refuses.

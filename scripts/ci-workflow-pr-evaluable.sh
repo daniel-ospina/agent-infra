@@ -389,7 +389,27 @@ def trigger_measurable(trig, flt):
         # refused). A PR trigger is measurable whatever it filters on, so `yes`
         # keeps the pre-#1542 answer; a `push` may be unfiltered and measurable,
         # and we cannot tell — refuse rather than exempt.
-        return True if trig in PR_TRIGGERS else None
+        if trig in PR_TRIGGERS:
+            return True
+        if trig == "push":
+            return None
+        # #1413 — EVERY OTHER TRIGGER CANNOT ATTACH A CHECK TO A PR HEAD,
+        # whatever it filters on, so an unattributed filter set cannot make it
+        # measurable: `workflow_call` (a REUSABLE workflow — its jobs run inside
+        # the CALLER's run, under the caller's name), `workflow_dispatch`
+        # (manual only), `schedule`, `issues`, … This is the SAME answer the
+        # ATTRIBUTED path below already gives them (`return False`), so the two
+        # halves now agree instead of the unattributed one failing closed on a
+        # question with only one answer. The old `None` here had a measured
+        # cost: a real reusable workflow whose `workflow_call:` carries an
+        # `inputs:` child (which collect_filters refuses) read as `unknown`, so
+        # the PR-side refusal could not name the shape it exists to name, and
+        # fell through to hypotheses that are both false for such a repo (#1413).
+        # ⛔ `push` above is deliberately NOT folded into this: see the
+        # withdrawal notice on the attributed `push` limb — widening it
+        # regressed #6807's merged fix (9 of 979 tests). Verified against every
+        # pinned `pe_case` in tests/admin-merge/run.sh.
+        return False
     if trig in PR_TRIGGERS:
         if "paths" in flt and "paths-ignore" in flt:
             return None  # GitHub rejects both; never guess which wins
