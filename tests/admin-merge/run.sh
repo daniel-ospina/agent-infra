@@ -537,6 +537,53 @@ case "$key" in
         # FAIL CLOSED (the red stays blocking). There is no separate hard-error
         # marker: a non-2xx and a 404 both yield an empty body, which the rail
         # treats identically (`unknown`).
+        # ⛔ THE HTTP METHOD IS PART OF THE CONTRACT, and modelling only the ref
+        # was a REAL miss, not a hypothetical: `gh api` switches to POST as soon as
+        # ANY `-f`/`-F` parameter is added (documented, and verified against the
+        # live API), and this endpoint is GET/PUT only — so `-f "ref=..."` WITHOUT
+        # `-X GET` answers 404 "Not Found" rather than the file. The first draft of
+        # #1413's ref pin did exactly that. This server stayed green because it
+        # never looked at the method: 1075 passing tests were a FALSE PASS, and the
+        # measured branches would have been unreachable in production.
+        # Enforcing it here makes the `noprtrigger` vector LOAD-BEARING for the
+        # method: dropping `-X GET` empties the body, which moves the rail to its
+        # unmeasured branch, which fails that vector's measured-text assertion.
+        # ⛔ THE DEFAULT IS NOT "GET" — IT IS "POST IF ANY PARAMETER IS PRESENT",
+        # and getting that backwards made the FIRST version of this guard INERT:
+        # `wmethod` defaulted to "GET", so `-f ref=abc` with no `-X` PASSED the
+        # check and the fixture was SERVED — the guard failed to catch the exact
+        # omission it exists to catch. (Caught by VGATE, then reproduced by
+        # invoking this arm with the rail's argv: `-f ref=abc` -> rc=0 + body,
+        # while only an EXPLICIT `-X POST` was refused.) The two conditions below
+        # are therefore checked separately — absent-method is the real case.
+        wmethod=""
+        wmethod_explicit=0
+        whasparam=0
+        wnext=0
+        for x in "$@"; do
+          if [ "$wnext" = "1" ]; then wmethod="$x"; wmethod_explicit=1; wnext=0; continue; fi
+          case "$x" in
+            -X|--method) wnext=1 ;;
+            --method=*) wmethod="${x#--method=}"; wmethod_explicit=1 ;;
+            -f|--raw-field|-F|--field) whasparam=1 ;;
+            # The `--flag=value` forms count too, and NOT modelling them got the
+            # answer WRONG in both directions (measured against the live API, not
+            # asserted): `--raw-field=r=x` / `-f=r=x` with no `-X` were SERVED
+            # although real `gh` POSTs and the endpoint answers 404, while
+            # `--method=GET` was not read as explicit, so a legitimate explicit-GET
+            # call was REFUSED. No rail call uses these forms today — the model is
+            # completed so the fake cannot answer the wrong question later.
+            --raw-field=*|-f=*|-F=*|--field=*) whasparam=1 ;;
+          esac
+        done
+        # 1) A PARAMETER AND NO EXPLICIT METHOD -> `gh api` sends POST -> 404.
+        if [ "$whasparam" = "1" ] && [ "$wmethod_explicit" = "0" ]; then
+          exit 1
+        fi
+        # 2) An explicitly non-GET method -> 404 for this GET-only endpoint.
+        if [ "$wmethod_explicit" = "1" ] && [ "$wmethod" != "GET" ]; then
+          exit 1
+        fi
         wref=""
         wprev=""
         for x in "$@"; do
@@ -2420,12 +2467,14 @@ rc=$?
 grep -q "actually TESTED" "$TMP/err" && pass "the block says the run tested nothing" || fail "expected the not-tested reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a cancelled run" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
-# …and it must NOT be mislabelled as a lane that does not run on PRs. A cancelled
-# run DID run (terminal, tested=0) — that is the case the lines above describe,
-# and the main-only diagnosis is a different fault with a different fix (VGATE).
-grep -q "MAIN-ONLY lane" "$TMP/err" \
-  && fail "a cancelled run was mislabelled as a MAIN-ONLY lane — it had a run for this head" \
-  || pass "a cancelled-only head is not mislabelled as a main-only lane"
+# …and it must NOT be mislabelled with the NO-RUN-FOR-THIS-HEAD diagnosis. A
+# cancelled run DID run (terminal, tested=0) — that is the case the lines above
+# describe, and the no-run diagnosis is a different fault with a different fix
+# (VGATE). It also guards the converse: that block is reached only when completed
+# AND pending are BOTH zero, so a cancelled-only head must never get it.
+grep -q "has NO run for this head at all" "$TMP/err" \
+  && fail "a cancelled run was mislabelled as NO run for this head — it HAD one (terminal, tested=0)" \
+  || pass "a cancelled-only head is not mislabelled as a no-run-for-this-head lane"
 # ...but a cancelled run ALONGSIDE a run that did execute must NOT block: the real
 # run is the evidence. A fix that over-blocks gets the gate disabled.
 new_scen cancelled-plus
@@ -2946,9 +2995,272 @@ run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a lane with no runs for the head → BLOCK (exit $rc)" \
   || fail "expected a non-zero exit, got 0"
+# #1413: with NO readable workflow file the rail must NOT claim a cause. It names
+# the remaining possibilities (wrong lane selector / did not run for THIS head)
+# and still offers the trigger-split remedy, but it must not assert "main-only" —
+# that guess was measurably FALSE for the case that bit (a `workflow_call`-only
+# lane), and its old remedy ("pick a lane that runs on pull requests") is a dead
+# end in a trigger-split repo, where NO single lane spans both sides.
+grep -q "has NO run for this head at all" "$TMP/err" \
+  && pass "the block names the no-run-for-this-head condition instead of only 'nothing tested'" \
+  || fail "the block cannot distinguish a no-run lane from one that merely tested nothing"
 grep -q "MAIN-ONLY lane" "$TMP/err" \
-  && pass "the block names the split SHAPE (a main-only lane) instead of only 'nothing tested'" \
-  || fail "the block cannot distinguish a main-only lane from one that merely has not started"
+  && fail "the block still ASSERTS a cause it did not measure (main-only) — #1413" \
+  || pass "no unmeasured cause asserted when the workflow file is unreadable"
+grep -q -- "--any-workflow" "$TMP/err" \
+  && pass "the unreadable-workflow branch still names the trigger-split remedy" \
+  || fail "the unreadable-workflow branch offers no remedy"
+grep -q "came back EMPTY from .github/workflows/" "$TMP/err" \
+  && pass "with no readable workflow file the block says the condition is UNMEASURED (#1413)" \
+  || fail "the unreadable-workflow branch does not name the unmeasured condition"
+
+# (c2) #1413 — THE REUSABLE CASE. This is agent-infra's ACTUAL shape: its default
+# lane `python-ci.yml` declares `workflow_call` (0 standalone triggers, most recent
+# run 2026-08-24), and the block used to call it a "MAIN-ONLY lane" and tell the
+# operator to "pick a lane that runs on pull requests" — a dead end here.
+#
+# ⛔ THE PREDICATE CANNOT ANSWER THIS ONE, which is why the rail answers it from the
+# file it read. A reusable workflow's jobs DO attach checks to a PR head — inside
+# its CALLER's run, under the CALLER's NAME (measured: `.github/workflows/ci.yml` is
+# `on: pull_request` and calls `node-ci.yml@main`, and a PR head's check-runs carry
+# `ci / unit-test`, `ci / lint`, `ci / typecheck` — the caller's name, not
+# node-ci.yml's; the `extension-tests / *` jobs are ci-main.yml's, a POST-MERGE push
+# lane) — so whether it runs on pull_request depends on callers the FILE does not
+# name, and the predicate correctly says `unknown`. Making it say `no` would be
+# consumed downstream as an affirmative EXEMPTION (the base-side `no)
+# pr_evaluable=0`, which prints "no PR can attach its checks to a head sha") — a
+# false claim AND a fail-open in one line.
+new_scen noprtrigger
+HEAD_NT="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NT" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_NT"
+# The fixture MUST mirror the REAL file's `on:` shape, not just its trigger name.
+# agent-infra's python-ci.yml is `workflow_call:` WITH an `inputs:` child, and
+# `collect_filters` refuses that child (a `type: string` scalar), which is what put
+# the whole mapping in the unattributed arm. A fixture of bare `workflow_call:`
+# would exercise a shape that does not exist in the repo — and it did: the first
+# draft of this vector passed on the bare shape while the REAL file fell through
+# to the generic branch, green for the wrong reason (fresh-context review, P1).
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+{
+  printf 'name: fixture\non:\n  workflow_call:\n    inputs:\n      python-version:\n        type: string\n        default: "3.11"\n'
+  printf 'jobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
+} > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
+# PRECONDITION. It pins the FIXTURE, not the vector: it runs the predicate on the
+# file directly, bypassing the rail and its fetch, so it would pass even if the
+# fetch broke. It fixes WHY this fixture is the one that matters: the real
+# python-ci.yml is `workflow_call` + `inputs`, which the predicate answers `unknown`,
+# so the rail must report the question as UNMEASURED and reach the reusable guidance
+# only as the conditional hint. A fixture the predicate answered `no` for would take
+# the other branch and pin a different message.
+# `wf_eval` is the guard-safe wrapper: inlining `$(bash <path> …)` re-trips the #1484
+# classifier and makes the WHOLE suite unrunnable by an agent (see its definition).
+lane_fixture_verdict="$(wf_eval < "$SCEN/wf-contents/.github/workflows/python-ci.yml" 2>/dev/null || true)"
+[ "$lane_fixture_verdict" = "unknown" ] \
+  && pass "PRECONDITION (#1413): the predicate says 'unknown' for workflow_call+inputs, so the rail must report UNMEASURED" \
+  || fail "PRECONDITION (#1413): expected 'unknown' for the reusable fixture, got '$lane_fixture_verdict'"
+lane_fail mainfeed 9102 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a workflow_call+inputs lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "the reusable fixture is reported as UNMEASURED — the verdict, not a grep (#1413)" \
+  || fail "the rail did not report the undecidable verdict"
+grep -q "IF this lane is a reusable workflow" "$TMP/err" \
+  && pass "…with the reusable guidance as an explicit CONDITIONAL hint (#1413)" \
+  || fail "the reusable guidance is missing from the UNMEASURED path"
+grep -q "CALLER's name" "$TMP/err" \
+  && pass "…naming where a reusable lane's jobs actually run" \
+  || fail "the hint does not say where a reusable lane's jobs run"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && fail "the rail STILL diagnoses the body with a grep — the unsound claim is back (#1413)" \
+  || pass "no body-grep diagnosis is emitted — only the verdict and a conditional hint"
+grep -q -- "--any-workflow" "$TMP/err" \
+  && pass "the refusal names the remedy that works in a trigger-split repo" \
+  || fail "the refusal offers no workable remedy"
+grep -q "MAIN-ONLY" "$TMP/err" \
+  && fail "the refusal still asserts the old unmeasured MAIN-ONLY cause (#1413)" \
+  || pass "the old unmeasured MAIN-ONLY claim is gone from this path"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# PIN THE GUARD ITSELF. The fake's method model is the only thing that makes a
+# ref pin without `-X GET` detectable: real `gh` POSTs when any parameter is added
+# and this endpoint is GET/PUT only, so the fetch would 404 and empty `lane_body`
+# on every call. No rail call reaches the failing shape (it always passes
+# `-X GET`), so without these assertions the guard could be re-inerted in silence —
+# which is exactly what happened once: it first defaulted its method to "GET" and
+# served parameter-carrying calls. NOTE: the guard now rests on the SEPARATE
+# `wmethod_explicit` flag, not on that default — so changing the default back to
+# "GET" alone does NOT re-inert it. What the pin catches is a real re-inertion
+# (dropping the explicit-method condition), which is the mutation that matters.
+pin_url="repos/fixture/example/contents/.github/workflows/python-ci.yml"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" -f ref=abc >/dev/null 2>&1 \
+  && fail "the fake SERVES a contents call carrying a parameter with no -X — the guard is INERT (real gh POSTs; the API 404s)" \
+  || pass "the fake rejects a parameter-carrying contents call with no -X, exactly as the real API 404s"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" -X GET -f ref=abc >/dev/null 2>&1 \
+  && pass "…and still serves the rail's own '-X GET -f ref=' shape" \
+  || fail "the fake rejects the rail's own '-X GET -f ref=' shape"
+# The `--flag=value` forms are the SAME contract, and the fake got them WRONG in
+# both directions before they were modelled: SERVED with no `-X` (real gh POSTs),
+# and REFUSED under an explicit `--method=GET` (real gh serves). Both expectations
+# were confirmed against the live API.
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" --raw-field=ref=abc >/dev/null 2>&1 \
+  && fail "the fake SERVES an '='-form parameter with no -X (real gh POSTs; the API 404s)" \
+  || pass "the fake rejects the '='-form parameter with no -X too"
+SCEN="$SCEN" bash "$FAKE" api "$pin_url" --method=GET --raw-field=ref=abc >/dev/null 2>&1 \
+  && pass "…and reads '--method=GET' as explicit, so an '='-form GET is still served" \
+  || fail "the fake does not read '--method=GET' as an explicit method"
+
+# (c3) #1413 — THE `yes` BRANCH. Unpinned before this: nothing fired it, so it could
+# be deleted and the suite would stay green. It fires when the workflow DOES declare
+# a PR trigger yet no run of it landed on this head.
+new_scen nopryes
+HEAD_YS="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_YS" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_YS"
+wf_declares ".github/workflows/python-ci.yml" pull_request
+lane_fail mainfeed 9103 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9103"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a PR-trigger lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "but its workflow DOES" "$TMP/err" \
+  && pass "the declares-a-PR-trigger branch fires and says so (#1413)" \
+  || fail "the yes-branch did not name the measured PR trigger"
+grep -q -- "--any-workflow" "$TMP/err" \
+  && pass "…and still offers the trigger-split remedy" \
+  || fail "the yes-branch offers no remedy"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c4) #1413 — THE `unknown` BRANCH. Also unpinned: a READABLE file the predicate
+# cannot parse confidently must be reported as UNMEASURED, never as a cause.
+new_scen noprunparsed
+HEAD_UN="f5f5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_UN" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_UN"
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+printf 'name: fixture\njobs:\n  x:\n    runs-on: ubuntu-latest\n' > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
+lane_fail mainfeed 9104 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9104"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unparsable workflow file → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "an undecidable file is reported as UNMEASURED, without asserting a cause (#1413)" \
+  || fail "the parse-failure branch did not report the unmeasured condition"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c6) RETIRED — the body-grep it tested is GONE. This vector asserted that a 99KB
+# workflow body still reached the reusable branch, which is what the here-string (vs
+# `printf … | grep -q`, #841) protected. The rail no longer greps the body at all, so
+# there is nothing left to protect: keeping the vector would leave a permanent RED
+# assertion running against text that no longer exists (verified — its expected string
+# occurs nowhere in the rail). The repo-wide `scripts/check-no-sigpipe-grep.sh` guard
+# still reds CI on the idiom itself.
+
+# (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE, EVEN
+# WHEN THE CHANGED-PATHS ENV IS SET. The predicate answers `no` for a `pull_request`
+# whose `paths:` filter the changed set does not match (measured on this fixture —
+# `paths: docs/**` — under PR_CHANGED_PATHS=src/readme.md → `no`; with the env scrubbed
+# → `unknown`). A `no` reached with that env would make branch (iii)'s "declares NO
+# pull_request / pull_request_target trigger" FALSE about this file, so the rail scrubs
+# the PR-context env at its own call site and this vector pins the scrub. The export is
+# NON-matching for this fixture's filter by design: it makes a removed scrub land on
+# branch (iii), whose sentence is the one asserted absent below.
+# `noprtrigger` separately guards against re-introducing a body-grep diagnosis — its
+# negative assertion on "declares the workflow_call trigger" is the one that fails if
+# a grep comes back.
+new_scen noprwcpr
+HEAD_WP="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WP" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_WP"
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+cat > "$SCEN/wf-contents/.github/workflows/python-ci.yml" <<'WFEOF'
+name: fixture
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - "docs/**"
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+WFEOF
+lane_fail mainfeed 9107 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9107"
+export PR_CHANGED_PATHS="src/readme.md"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+unset PR_CHANGED_PATHS
+[ "$rc" -ne 0 ] && pass "a workflow_call+filtered-pull_request lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && fail "a file that DOES declare pull_request was told it declares none — the PR-context env leaked into the verdict (#1413)" \
+  || pass "the rail does NOT claim the file declares no PR trigger, even with PR_CHANGED_PATHS set"
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "it gets the UNMEASURED stanza — the honest answer for a filtered PR trigger (#1413)" \
+  || fail "the file was not reported as UNMEASURED"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && fail "a body-grep diagnosis is back — the deleted unsound claim has been reintroduced (#1413)" \
+  || pass "…and no body-grep diagnosis is emitted for it"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c8) #1413 — A REUSABLE-ONLY LANE STILL GETS THE REUSABLE GUIDANCE, EVEN THOUGH THE
+# PREDICATE SAYS `no`. A bare `on: workflow_call:` (no `inputs:`) returns `no`, because
+# the predicate collapses "declares workflow_call" into the same verdict as "declares no
+# PR trigger" — so the rail cannot tell them apart from the verdict, and instead of
+# guessing (which the greps did, and got wrong) it names the reusable shape in the
+# shape hint and delivers the caller-lane remedy conditionally.
+new_scen noprbarewc
+HEAD_BW="f9f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BW" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_BW"
+wf_declares ".github/workflows/python-ci.yml" workflow_call
+lane_fail mainfeed 9108 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9108"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a bare workflow_call lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && pass "a bare workflow_call lane (predicate says 'no') gets the measured no-trigger stanza (#1413)" \
+  || fail "the measured no-trigger stanza did not fire for a lane the predicate answered 'no' for"
+grep -q "reusable-only" "$TMP/err" \
+  && pass "…and the shape hint does not omit the reusable-only shape (#1413)" \
+  || fail "a reusable-only lane was described as push-only or schedule-only"
+grep -q "IF this lane is a reusable workflow" "$TMP/err" \
+  && pass "…with the reusable guidance still delivered for it (#1413)" \
+  || fail "the reusable guidance is missing from the no-trigger path"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c5) #1413 — THE `no` BRANCH (a push-only lane). This coverage EXISTED before the
+# reusable vector was written and was LOST when that vector took over the "no PR
+# trigger" fixture — the branch would now pass untested, which is exactly the
+# hazard the `yes` and `unknown` vectors above exist to close.
+new_scen nopushonly
+HEAD_PO="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PO" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_PO"
+wf_declares ".github/workflows/python-ci.yml" push
+lane_fail mainfeed 9105 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9105"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a push-only lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && pass "the push-only branch fires and names the missing PR trigger (#1413)" \
+  || fail "the push-only branch did not name the measured condition"
+grep -q "push-only, schedule-only, workflow_dispatch-only or reusable-only" "$TMP/err" \
+  && pass "…and names the push-only shape" \
+  || fail "the push-only shape is not named"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # (d) A main lane whose runs are all `cancelled`/`skipped` exercised NOTHING, so
 # it is not a baseline either. `completed` would ACCEPT it; only `tested` refuses.

@@ -389,6 +389,21 @@ def trigger_measurable(trig, flt):
         # refused). A PR trigger is measurable whatever it filters on, so `yes`
         # keeps the pre-#1542 answer; a `push` may be unfiltered and measurable,
         # and we cannot tell — refuse rather than exempt.
+        #
+        # ⛔ `workflow_call` STAYS `None` HERE — and that is a DECISION, not an
+        # omission (#1413). A REUSABLE workflow's jobs DO attach a check to a PR
+        # head: they run inside the CALLER's run, under the CALLER's NAME. Measured:
+        # .github/workflows/ci.yml is `on: pull_request` and calls
+        # node-ci.yml@main, and a PR head's check-runs carry `ci / unit-test`,
+        # `ci / lint`, `ci / typecheck` — the CALLER's workflow name, not
+        # node-ci.yml's. (The `extension-tests / *` jobs are ci-main.yml's, a
+        # POST-MERGE push lane — citing those as the PR evidence was wrong.)
+        # So this file CANNOT answer for it — whether
+        # any caller runs it on pull_request is unknowable from the file alone — and
+        # `None` (fail closed) is the only sound answer. Returning `False` would be
+        # consumed as an AFFIRMATIVE EXEMPTION downstream (admin-merge.sh's base-side
+        # `no) pr_evaluable=0`, which prints "no PR can attach its checks to a head
+        # sha") — a false claim and a FAIL-OPEN in the same line.
         return True if trig in PR_TRIGGERS else None
     if trig in PR_TRIGGERS:
         if "paths" in flt and "paths-ignore" in flt:
