@@ -1092,14 +1092,16 @@ target_head_red() { # <head> -> 0 = measurably red, 1 = not shown red
            --jq '.check_runs[] | "\(.app.slug // "?")|\(.name)|\(.id)|\(.status)|\(.conclusion // "null")"' 2>/dev/null || true)"
   [ -n "$raw" ] || return 1
   printf '%s\n' "$raw" | awk -F'|' -v excl="$RECORD_REVIEW_RED_EXCLUDE" '
-    { # A `|` inside a check name (a matrix job named `shard 1 | slow`) shifts every
-      # later field, so the row cannot be grouped. DISCARDING it is the #1353 fail-open
-      # again: an input this code cannot positively read as non-red would render the
-      # surface GREEN, and the rail — which parses JSON — would have counted it red.
-      # The allow-list polarity decides unknown input; it does not shrug. So an
-      # unparseable row makes the surface RED, and says so rather than dropping it mute.
+    { # A literal pipe inside a check name (a matrix job named `shard 1 | slow`) shifts
+      # every later field, so the row cannot be grouped. DISCARDING it is the #1353
+      # fail-open AGAIN: the row would vanish, its group never exists, and the surface
+      # reads GREEN. The rail parses JSON and counts such a check by its REAL
+      # conclusion, which is exactly what this code cannot read here — so this is a
+      # deliberate fail-CLOSED over-block relative to the rail, NOT parity with it. An
+      # input we cannot positively read as non-red is RED; the allow-list polarity
+      # decides unknown input rather than shrugging at it. Say so instead of dropping mute.
       if (NF != 5) {
-        print "record-review: ⚠️ unparseable check-run row (a `|` in app.slug or name) — treating the target head as RED rather than reading it green (#1575)" > "/dev/stderr"
+        print "record-review: ⚠️ unparseable check-run row (a pipe in app.slug or name) — treating the target head as RED rather than reading it green (#1575)" > "/dev/stderr"
         red = 1; next
       }
       k = $1 "|" $2
