@@ -489,12 +489,14 @@ diff_hash_for_pr() { # <pr>
   tmp="$(mktemp 2>/dev/null)" || return 0
   norm="$(mktemp 2>/dev/null)" || { rm -f "$tmp"; return 0; }
   # `EXIT`, deliberately NOT `RETURN` (#1577 review P1). A RETURN trap is
-  # INHERITED by nested functions under `set -T`/functrace, and SHELLOPTS is an
-  # exported bash variable, so an ancestor that ran `set -T` propagates it: the
-  # trap then fired when `diff_fetch_once` returned and deleted $tmp BEFORE the
-  # hash read it, so the record aborted rc 1 with NO record written -- on EVERY
-  # successful fetch. The parent had no nested call inside this window, so the
-  # abort was introduced by extracting the fetch into a function. The function's
+  # INHERITED by nested functions under functrace, so the trap fired when
+  # `diff_fetch_once` returned and deleted $tmp BEFORE the hash read it: the
+  # record aborted rc 1 with NO record written, on EVERY successful fetch. The
+  # parent had no nested call inside this window, so the abort was introduced by
+  # extracting the fetch into a function. Functrace reaches this process only
+  # from an explicit `bash -T` or an ancestor that EXPORTED SHELLOPTS -- `set -T`
+  # alone does NOT export it (review P3: the first draft of this comment claimed
+  # it did, and that propagation mechanism was measurably false). The function's
   # own `rm -f` at the end is the normal cleanup; EXIT is only the backstop.
   # shellcheck disable=SC2064
   trap "rm -f '$tmp' '$norm'" EXIT 2>/dev/null || true

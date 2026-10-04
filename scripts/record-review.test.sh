@@ -746,16 +746,16 @@ for _v in 2147483648 999999999; do
 done
 unset RECORD_REVIEW_DIFF_FETCH_SLEEP SLEEP_LOG _v SLOG
 
-# 11.5e #1577 review P1 — the cleanup trap must survive `functrace`. A RETURN
-# trap is INHERITED by NESTED functions under `set -T`, and SHELLOPTS is an
-# exported bash variable, so an ancestor that ran `set -T` propagates it: the
-# trap then fired when diff_fetch_once returned and deleted the temp file BEFORE
-# the hash read it, aborting the record rc 1 with NO record written -- on every
-# SUCCESSFUL fetch. The trap is now EXIT (armed only after the early returns,
-# with the function's own rm -f as the normal cleanup). REGRESSION-SENSITIVE:
-# with the RETURN trap this records nothing. (No backticks in the assertion
-# strings below -- they would run as command substitution, which is the exact
-# defect fixed elsewhere in this file.)
+# 11.5e #1577 review P1 — the cleanup trap must survive functrace. A RETURN
+# trap is INHERITED by NESTED functions, so it fired when diff_fetch_once
+# returned and deleted the temp file BEFORE the hash read it, aborting the
+# record rc 1 with NO record written -- on every SUCCESSFUL fetch. Functrace
+# arrives only via an explicit `bash -T` or an ancestor that EXPORTED SHELLOPTS
+# (`set -T` alone does NOT export it). The trap is now EXIT (armed only after the
+# early returns, with the function's own rm -f as the normal cleanup).
+# REGRESSION-SENSITIVE: with the RETURN trap this records nothing. (No backticks
+# in the assertion strings below -- they would run as command substitution,
+# which is the exact defect fixed elsewhere in this file.)
 rm -f "$(Q2 424544)" "$T/cap-11.5e" "$T/err-11.5e" "$T/rc-11.5e"
 # SHELLOPTS is READONLY, so it cannot be used as an env-prefix to flip functrace;
 # the flag is passed to the child bash directly (`bash -T`), which is exactly the
