@@ -2269,12 +2269,14 @@ rc=$?
 grep -q "actually TESTED" "$TMP/err" && pass "the block says the run tested nothing" || fail "expected the not-tested reason on stderr"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a cancelled run" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
-# …and it must NOT be mislabelled as a lane that does not run on PRs. A cancelled
-# run DID run (terminal, tested=0) — that is the case the lines above describe,
-# and the main-only diagnosis is a different fault with a different fix (VGATE).
-grep -q "MAIN-ONLY lane" "$TMP/err" \
-  && fail "a cancelled run was mislabelled as a MAIN-ONLY lane — it had a run for this head" \
-  || pass "a cancelled-only head is not mislabelled as a main-only lane"
+# …and it must NOT be mislabelled with the NO-RUN-FOR-THIS-HEAD diagnosis. A
+# cancelled run DID run (terminal, tested=0) — that is the case the lines above
+# describe, and the no-run diagnosis is a different fault with a different fix
+# (VGATE). It also guards the converse: that block is reached only when completed
+# AND pending are BOTH zero, so a cancelled-only head must never get it.
+grep -q "has NO run for this head at all" "$TMP/err" \
+  && fail "a cancelled run was mislabelled as NO run for this head — it HAD one (terminal, tested=0)" \
+  || pass "a cancelled-only head is not mislabelled as a no-run-for-this-head lane"
 # ...but a cancelled run ALONGSIDE a run that did execute must NOT block: the real
 # run is the evidence. A fix that over-blocks gets the gate disabled.
 new_scen cancelled-plus
@@ -2745,9 +2747,50 @@ run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a lane with no runs for the head → BLOCK (exit $rc)" \
   || fail "expected a non-zero exit, got 0"
+# #1413: with NO readable workflow file the rail must NOT claim a cause. It names
+# the remaining possibilities (wrong lane selector / did not run for THIS head)
+# and still offers the trigger-split remedy, but it must not assert "main-only" —
+# that guess was measurably FALSE for the case that bit (a `workflow_call`-only
+# lane), and its old remedy ("pick a lane that runs on pull requests") is a dead
+# end in a trigger-split repo, where NO single lane spans both sides.
+grep -q "has NO run for this head at all" "$TMP/err" \
+  && pass "the block names the no-run-for-this-head condition instead of only 'nothing tested'" \
+  || fail "the block cannot distinguish a no-run lane from one that merely tested nothing"
 grep -q "MAIN-ONLY lane" "$TMP/err" \
-  && pass "the block names the split SHAPE (a main-only lane) instead of only 'nothing tested'" \
-  || fail "the block cannot distinguish a main-only lane from one that merely has not started"
+  && fail "the block still ASSERTS a cause it did not measure (main-only) — #1413" \
+  || pass "no unmeasured cause asserted when the workflow file is unreadable"
+grep -q -- "--any-workflow" "$TMP/err" \
+  && pass "the unreadable-workflow branch still names the trigger-split remedy" \
+  || fail "the unreadable-workflow branch offers no remedy"
+
+# (c2) #1413 — THE MEASURED CASE: the lane's workflow declares NO PR trigger, so
+# no run of it can EVER attach to a head. This is agent-infra's ACTUAL shape (its
+# default lane `python-ci.yml` is `workflow_call`-only: 0 standalone triggers,
+# most recent run 2026-08-24), and the block used to call it a "MAIN-ONLY lane"
+# and tell the operator to "pick a lane that runs on pull requests" — a dead end
+# in a trigger-split repo. The condition is now MEASURED with the PR-evaluability
+# predicate against the workflow FILE, not inferred from the absence of runs.
+new_scen noprtrigger
+HEAD_NT="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NT" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_NT"
+wf_declares ".github/workflows/python-ci.yml" workflow_call
+lane_fail mainfeed 9102 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a REUSABLE-only lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && pass "the block MEASURES the workflow and names the missing PR trigger (#1413)" \
+  || fail "the block did not name the measured condition (no PR trigger) on stderr"
+grep -q "REUSABLE" "$TMP/err" \
+  && pass "the block names the reusable/workflow_call shape and where its runs live" \
+  || fail "the reusable shape is not named"
+grep -q "use --any-workflow" "$TMP/err" \
+  && pass "the measured branch names the remedy that works in a trigger-split repo" \
+  || fail "the measured branch offers no workable remedy"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # (d) A main lane whose runs are all `cancelled`/`skipped` exercised NOTHING, so
 # it is not a baseline either. `completed` would ACCEPT it; only `tested` refuses.

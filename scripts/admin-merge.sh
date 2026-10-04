@@ -3465,12 +3465,47 @@ main() {
     # CI cannot help — the lane must be changed (#1003).
     # "No runs at all" is completed AND pending BOTH zero — NOT `examined=0`,
     # which is equally true of a run that finished `cancelled`/`skipped`. Those
-    # are the "ran but proved nothing" case the lines above already describe, and
-    # calling them a main-only lane is simply false (VGATE, #1003).
+    # are the "ran but proved nothing" case the lines above already describe.
+    #
+    # #1413 — ASK THE WORKFLOW, DO NOT GUESS ITS SHAPE. This block used to assert
+    # "which is what a MAIN-ONLY lane looks like", and that guess is FALSE for the
+    # case that actually bit: agent-infra's default lane `python-ci.yml` is
+    # `workflow_call`-ONLY (a REUSABLE workflow — measured 2026-10-04: 0 standalone
+    # triggers, most recent run 2026-08-24), so its jobs execute inside its
+    # CALLER's run and no run OF IT can ever attach to a PR head. Its remedy,
+    # "pick a lane that runs on pull requests", is also a dead end in a
+    # trigger-split repo, where NO single lane spans both sides. So the condition
+    # is MEASURED with `ci-workflow-pr-evaluable.sh` — the one predicate for "can
+    # this workflow attach a check to a PR head sha" — instead of inferred from
+    # the absence of runs. An empty body (no such workflow, a display-name
+    # selector, or an API failure) stays `unknown` and takes the generic branch,
+    # which names the remaining possibilities WITHOUT claiming a cause.
     if counter_is_zero "$pr_completed" && counter_is_zero "$pr_pending"; then
-      say_err "   The lane '$lane' has NO runs for this head at all — which is what a"
-      say_err "   MAIN-ONLY lane looks like. If this repo splits its lanes by trigger,"
-      say_err "   pick a lane that runs on pull requests."
+      local lane_slug lane_body lane_verdict
+      if [ -n "$REPO" ]; then lane_slug="repos/$REPO"; else lane_slug="repos/{owner}/{repo}"; fi
+      lane_body="$($GH api "$lane_slug/contents/.github/workflows/$lane" \
+                    -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)"
+      lane_verdict="unknown"
+      if [ -n "$lane_body" ]; then
+        lane_verdict="$(printf '%s' "$lane_body" \
+          | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
+      fi
+      if [ "$lane_verdict" = "no" ]; then
+        say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
+        say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
+        say_err "   can EVER attach to a PR head. A push-only lane and a REUSABLE"
+        say_err "   (workflow_call-only) lane both look like this; a reusable lane's jobs"
+        say_err "   run inside its CALLER's run, under the caller's name."
+        say_err "   In a trigger-split repo no single lane spans both sides, so picking"
+        say_err "   another lane cannot help: use --any-workflow, which compares against"
+        say_err "   every lane that actually ran."
+      else
+        say_err "   The lane '$lane' has NO run for this head at all. Either the lane"
+        say_err "   selector names the wrong lane, or its workflow does run on pull requests"
+        say_err "   but no run of it landed on THIS head (a 'paths:' filter, or not yet"
+        say_err "   started). Confirm the lane (--workflow) and that CI ran for this head;"
+        say_err "   if this repo splits its lanes by trigger, add --any-workflow."
+      fi
     fi
     say_err "   Confirm the lane is the right one (--workflow) and that CI ran for this head."
     say_err "   If this repo splits its lanes by trigger, add --any-workflow BEFORE the -- separator"
