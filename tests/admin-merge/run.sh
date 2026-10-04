@@ -2956,19 +2956,22 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # (c6) RETIRED — the body-grep it tested is GONE. This vector asserted that a 99KB
 # workflow body still reached the reusable branch, which is what the here-string (vs
 # `printf … | grep -q`, #841) protected. The rail no longer greps the body at all, so
-# there is nothing left to protect and the vector was deleted rather than kept as a
-# green assertion over a branch that no longer exists. The repo-wide
-# `scripts/check-no-sigpipe-grep.sh` guard still reds CI on the idiom itself.
+# there is nothing left to protect: keeping the vector would leave a permanent RED
+# assertion running against text that no longer exists (verified — its expected string
+# occurs nowhere in the rail). The repo-wide `scripts/check-no-sigpipe-grep.sh` guard
+# still reds CI on the idiom itself.
 
-# (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE.
-# `workflow_call` + a `paths:`-filtered `pull_request` reads `unknown` from the
-# predicate — the PR-side call site never exports PR_CHANGED_PATHS, so a filtered PR
-# trigger is undecidable there BY CONSTRUCTION — and this vector pins that the rail
-# does not resolve that `unknown` into the `no` branch's "declares NO pull_request
-# trigger" claim, which would be FALSE for this file. It is also the standing guard
-# against re-introducing a body-grep shortcut for the reusable shape: any such grep
-# would have to see through the filter to be sound, and the predicate's own refusal is
-# why the rail asks it instead.
+# (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE, EVEN
+# WHEN THE CHANGED-PATHS ENV IS SET. The predicate reads PR_CHANGED_PATHS, and WITH IT
+# SET a `pull_request` + `paths:` filter the changed set does not match makes it answer
+# `no` (measured: `paths: src/**` under PR_CHANGED_PATHS=docs/readme.md → `no`; without
+# the env → `unknown`). `no` drives the branch whose sentence is "declares NO
+# pull_request / pull_request_target trigger", which would then be FALSE about this
+# file. The rail therefore SCRUBS the PR-context env at the call site, because it asks
+# about the FILE and not about one PR — and this vector exports the variable so that
+# scrub is load-bearing: `env -u PR_CHANGED_PATHS` removed from scripts/admin-merge.sh
+# makes it fail. (The separate predicate-level vector for a non-matching changed set
+# pins the predicate; this one pins the RAIL's use of it.)
 new_scen noprwcpr
 HEAD_WP="f8f8000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_WP" > "$SCEN/head"
@@ -2989,15 +2992,20 @@ jobs:
 WFEOF
 lane_fail mainfeed 9107 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9107"
+export PR_CHANGED_PATHS="docs/readme.md"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
+unset PR_CHANGED_PATHS
 [ "$rc" -ne 0 ] && pass "a workflow_call+filtered-pull_request lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "declares the workflow_call trigger" "$TMP/err" \
-  && fail "a file that also declares pull_request got the REUSABLE stanza — its premise is false for it (#1413)" \
-  || pass "…and is NOT given the reusable remedy, whose 'no PR trigger' premise it breaks"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && fail "a file that DOES declare pull_request was told it declares none — the PR-context env leaked into the verdict (#1413)" \
+  || pass "the rail does NOT claim the file declares no PR trigger, even with PR_CHANGED_PATHS set"
 grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
   && pass "it gets the UNMEASURED stanza — the honest answer for a filtered PR trigger (#1413)" \
-  || fail "the pull_request-declaring reusable file was not reported as UNMEASURED"
+  || fail "the file was not reported as UNMEASURED"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && fail "a body-grep diagnosis is back — the deleted unsound claim has been reintroduced (#1413)" \
+  || pass "…and no body-grep diagnosis is emitted for it"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
@@ -3046,7 +3054,7 @@ rc=$?
 grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
   && pass "the push-only branch fires and names the missing PR trigger (#1413)" \
   || fail "the push-only branch did not name the measured condition"
-grep -q "push-only, schedule-only or reusable-only" "$TMP/err" \
+grep -q "push-only, schedule-only, workflow_dispatch-only or reusable-only" "$TMP/err" \
   && pass "…and names the push-only shape" \
   || fail "the push-only shape is not named"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"

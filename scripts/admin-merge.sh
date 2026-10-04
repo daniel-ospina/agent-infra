@@ -3498,8 +3498,19 @@ main() {
                     -X GET -f "ref=$head" -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)"
       lane_verdict="unknown"
       if [ -n "$lane_body" ]; then
+        # ⛔ THE PR-CONTEXT ENV IS SCRUBBED, AND THAT IS LOAD-BEARING. The predicate
+        # reads PR_CHANGED_PATHS (and PR_HEAD_BRANCH): with changed paths present it
+        # answers `no` for a `pull_request` trigger whose `paths:` filter the changed
+        # set does not match — measured, a file declaring `pull_request` + `paths:
+        # src/**` returns `no` under PR_CHANGED_PATHS=docs/x.md and `unknown` without
+        # it. The rail is asking a question about the FILE, not about one PR, and
+        # PR_CHANGED_PATHS is an ambient export here, so an operator's shell could
+        # otherwise turn the `no` branch's "declares NO pull_request trigger" into a
+        # FALSE claim. Scrubbing it makes `no` mean what the message says: no declared
+        # trigger can attach to a PR head, whatever any single PR changed.
         lane_verdict="$(printf '%s' "$lane_body" \
-          | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
+          | env -u PR_CHANGED_PATHS -u PR_HEAD_BRANCH \
+              bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
       fi
       # ⛔ THE DIAGNOSIS IS KEYED ON THE PREDICATE'S VERDICT — NOT ON A GREP OF THE
       # FILE. Three review rounds in a row found that reading the reusable shape out
@@ -3513,11 +3524,12 @@ main() {
       # A grep can decide neither, and a wrong diagnosis on a refusing path is the very
       # defect #1413 exists to remove — so the greps are gone. The predicate IS sound
       # here: it parses, and it REFUSES (`unknown`) whenever it cannot attribute every
-      # declared trigger, so `no` is a MEASUREMENT ("every declared trigger was read,
-      # and none of them attaches to a PR head") rather than a guess. The verdict is
-      # therefore the primitive the rail uses, and the reusable guidance is delivered
-      # as a CONDITIONAL hint under the two branches that establish no PR trigger,
-      # instead of as a separate diagnosis the rail cannot soundly support.
+      # declared trigger, so — with the PR-context env scrubbed at this call site —
+      # `no` is a MEASUREMENT ("every declared trigger was read, and none of them can
+      # attach to a PR head") rather than a guess. The verdict is therefore the
+      # primitive the rail uses, and the reusable guidance is delivered as a
+      # CONDITIONAL hint under the two branches that establish no PR trigger, instead
+      # of as a separate diagnosis the rail cannot soundly support.
       # Measured with this predicate: `workflow_call` + `inputs` → `unknown`; a bare
       # `workflow_call` → `no`; `workflow_call` + a `paths:`-filtered `pull_request`
       # → `unknown` (the PR-side call site never exports PR_CHANGED_PATHS, so a
@@ -3542,8 +3554,9 @@ main() {
       elif [ "$lane_verdict" = "no" ]; then
         say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
         say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
-        say_err "   can EVER attach to a PR head. A push-only, schedule-only or reusable-only"
-        say_err "   lane looks like this."
+        say_err "   can EVER attach to a PR head. A lane whose triggers are all non-PR —"
+        say_err "   push-only, schedule-only, workflow_dispatch-only or reusable-only — looks"
+        say_err "   like this."
         say_err "   IF this lane is a reusable workflow (its file declares workflow_call), its"
         say_err "   jobs run inside its CALLER's run under the CALLER's name — compare against"
         say_err "   the CALLER's lane."
