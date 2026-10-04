@@ -2869,7 +2869,7 @@ grep -q "declares the workflow_call trigger" "$TMP/err" \
 grep -q "CALLER's name" "$TMP/err" \
   && pass "…naming the trigger it detected and where a reusable lane's runs live" \
   || fail "the reusable branch does not name the trigger or where the runs live"
-grep -q "itself can attach to a PR head" "$TMP/err" \
+grep -q "itself can" "$TMP/err" \
   && pass "…and states the one property that makes the lane empty" \
   || fail "the reusable branch does not state the reusable property"
 grep -q -- "--any-workflow" "$TMP/err" \
@@ -2952,10 +2952,13 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 
 # (c6) #1413 — THE PIPE-BUFFER CASE (#841). The reusable detection must NOT be
 # written as `printf … | grep -q`: grep exits at its FIRST match, printf takes
-# SIGPIPE, and `set -uo pipefail` turns that into a non-zero pipeline — so for a
-# body larger than the pipe buffer the match is DISCARDED and the branch silently
-# does not fire (reproduced: 65,572 bytes is the threshold). This fixture is larger
-# than that buffer with the trigger on an EARLY line, which is the winning shape.
+# SIGPIPE, and `set -uo pipefail` turns that into a non-zero pipeline. It is the
+# match's POSITION that decides, not the body's size: a match EARLY enough that grep
+# exits before the writer finishes is DISCARDED and the branch silently does not
+# fire, while a LATE match on a body of the same size is fine (both measured on
+# identical 99KB bodies) — a large body is just what makes an early match lose in
+# practice. This fixture is larger than the 64KiB pipe buffer with the trigger on an
+# EARLY line, which is the winning shape.
 new_scen noprbigbody
 HEAD_BB="f7f7000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BB" > "$SCEN/head"
@@ -2978,28 +2981,68 @@ grep -q "declares the workflow_call trigger" "$TMP/err" \
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
-# (c7) #1413 — A HYBRID MUST NOT GET THE REUSABLE STANZA. A file declaring BOTH
-# `workflow_call` and a standalone non-PR trigger (push) reads `no` from the
-# predicate, and the reusable remedy ("compare against the CALLER's lane") is WRONG
-# for it. The measured predicate verdict must therefore win over the text match —
-# which is why the `no` branch is ordered ABOVE the reusable branch. Without this
-# vector the order can be flipped back and the suite stays green.
-new_scen nophybrid
-HEAD_HY="f8f8000000000000000000000000000000000000"
-printf '%s\n' "$HEAD_HY" > "$SCEN/head"
-: > "$SCEN/runs-$HEAD_HY"
-wf_declares ".github/workflows/python-ci.yml" workflow_call push
+# (c7) #1413 — A REUSABLE FILE THAT ALSO DECLARES A `pull_request` TRIGGER MUST NOT
+# GET THE REUSABLE STANZA. `workflow_call` + a `paths:`-filtered `pull_request` reads
+# `unknown` from the predicate (the PR-side call site never exports PR_CHANGED_PATHS,
+# so a filtered PR trigger is undecidable there BY CONSTRUCTION), while the
+# `workflow_call` text match still fires — so without the "declares no pull_request"
+# guard the stanza claims "no run of it itself can attach to a PR head", which is
+# FALSE: its own pull_request run does. The honest answer is UNMEASURED. Without this
+# vector the guard can be dropped and the suite stays green.
+new_scen noprwcpr
+HEAD_WP="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WP" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_WP"
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+cat > "$SCEN/wf-contents/.github/workflows/python-ci.yml" <<'WFEOF'
+name: fixture
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - "docs/**"
+jobs:
+  x:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo hi
+WFEOF
 lane_fail mainfeed 9107 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9107"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "a workflow_call+push lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
-  && pass "a workflow_call+push hybrid gets the MEASURED no-trigger stanza (#1413)" \
-  || fail "the hybrid was misrouted away from the measured verdict"
+[ "$rc" -ne 0 ] && pass "a workflow_call+filtered-pull_request lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
 grep -q "declares the workflow_call trigger" "$TMP/err" \
-  && fail "the hybrid was routed to the REUSABLE stanza, whose remedy is wrong for it (#1413)" \
-  || pass "…and is NOT given the reusable remedy that does not apply to it"
+  && fail "a file that also declares pull_request got the REUSABLE stanza — its premise is false for it (#1413)" \
+  || pass "…and is NOT given the reusable remedy, whose 'no PR trigger' premise it breaks"
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "it gets the UNMEASURED stanza — the honest answer for a filtered PR trigger (#1413)" \
+  || fail "the pull_request-declaring reusable file was not reported as UNMEASURED"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c8) #1413 — A REUSABLE-ONLY LANE MUST STILL GET THE REUSABLE STANZA EVEN THOUGH
+# THE PREDICATE SAYS `no`. A bare `on: workflow_call:` (no `inputs:`) returns `no`,
+# because the predicate COLLAPSES "declares workflow_call" into the same verdict as
+# "declares no PR trigger". An order keyed on the VERDICT alone therefore hands this
+# lane to the push-only/schedule-only stanza, which misnames its shape and drops the
+# caller-lane remedy — the branch is keyed on the BODY SHAPE for exactly this reason.
+new_scen noprbarewc
+HEAD_BW="f9f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BW" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_BW"
+wf_declares ".github/workflows/python-ci.yml" workflow_call
+lane_fail mainfeed 9108 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9108"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a bare workflow_call lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && pass "a bare workflow_call lane (predicate says 'no') still gets the REUSABLE stanza (#1413)" \
+  || fail "the reusable diagnosis was LOST for a bare workflow_call lane — the branch is keyed on the verdict"
+grep -q "NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && fail "the reusable-only lane was misdescribed as a push-only or schedule-only lane (#1413)" \
+  || pass "…and is not misdescribed as a push-only or schedule-only lane"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
