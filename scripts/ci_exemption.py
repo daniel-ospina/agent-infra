@@ -1178,12 +1178,22 @@ _GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
 _GUARD_INT_RE = re.compile(r"\b\d+\b")
 
 
-#: A NON-NODEID failure key (#6798) — the third family the rate/row doors must
+#: A NON-NODEID failure key (#6798, #7131) — the families the rate/row doors must
 #: admit. ANCHORED and fully enumerated: this predicate is the gate on main's own
 #: rate table, so admitting a loose string here is a false-EXEMPTION vector, not
 #: a formatting nicety.
+#:
+#: `job-unreadable::<slug>` (#7131) is the JOB-LEVEL fallback the producer emits
+#: when GitHub has PRUNED a failing run's log — the test-level identity does not
+#: exist anywhere, so the run is attributed at job granularity instead of being
+#: refused as unknowable. It carries NO signature, which is what keeps it safe:
+#: the signature gate fails CLOSED on an empty overlap, so a job-level key can
+#: never buy an exemption — it converts an unreadable refusal into a named,
+#: attributable block. The slug charset is exactly `_slug`'s, so the key stays
+#: whitespace-free for the `uniq -c | awk` rate table.
 _NON_NODEID_KEY_RE = re.compile(
-    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py)$"
+    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+)$"
 )
 
 
