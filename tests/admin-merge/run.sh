@@ -2820,9 +2820,11 @@ grep -q "could not be READ at .github/workflows/" "$TMP/err" \
 #
 # ⛔ THE PREDICATE CANNOT ANSWER THIS ONE, which is why the rail answers it from the
 # file it read. A reusable workflow's jobs DO attach checks to a PR head — inside
-# its CALLER's run (measured: `.github/workflows/ci.yml` is `on: pull_request` and
-# calls `node-ci.yml@main`, whose jobs surface as `extension-tests / test*` on every
-# PR head) — so whether it runs on pull_request depends on callers the FILE does not
+# its CALLER's run, under the CALLER's NAME (measured: `.github/workflows/ci.yml` is
+# `on: pull_request` and calls `node-ci.yml@main`, and a PR head's check-runs carry
+# `ci / unit-test`, `ci / lint`, `ci / typecheck` — the caller's name, not
+# node-ci.yml's; the `extension-tests / *` jobs are ci-main.yml's, a POST-MERGE push
+# lane) — so whether it runs on pull_request depends on callers the FILE does not
 # name, and the predicate correctly says `unknown`. Making it say `no` would be
 # consumed downstream as an affirmative EXEMPTION (the base-side `no)
 # pr_evaluable=0`, which prints "no PR can attach its checks to a head sha") — a
@@ -2885,7 +2887,10 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # on every call. No rail call reaches the failing shape (it always passes
 # `-X GET`), so without these assertions the guard could be re-inerted in silence —
 # which is exactly what happened once: it first defaulted its method to "GET" and
-# served parameter-carrying calls.
+# served parameter-carrying calls. NOTE: the guard now rests on the SEPARATE
+# `wmethod_explicit` flag, not on that default — so changing the default back to
+# "GET" alone does NOT re-inert it. What the pin catches is a real re-inertion
+# (dropping the explicit-method condition), which is the mutation that matters.
 pin_url="repos/fixture/example/contents/.github/workflows/python-ci.yml"
 SCEN="$SCEN" bash "$FAKE" api "$pin_url" -f ref=abc >/dev/null 2>&1 \
   && fail "the fake SERVES a contents call carrying a parameter with no -X — the guard is INERT (real gh POSTs; the API 404s)" \
@@ -2939,9 +2944,37 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9104"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "an unparsable workflow file → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "could not be parsed confidently" "$TMP/err" \
-  && pass "a parser-refused file is reported as UNMEASURED, not as a cause (#1413)" \
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "an undecidable file is reported as UNMEASURED, without asserting a cause (#1413)" \
   || fail "the parse-failure branch did not report the unmeasured condition"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (c6) #1413 — THE PIPE-BUFFER CASE (#841). The reusable detection must NOT be
+# written as `printf … | grep -q`: grep exits at its FIRST match, printf takes
+# SIGPIPE, and `set -uo pipefail` turns that into a non-zero pipeline — so for a
+# body larger than the pipe buffer the match is DISCARDED and the branch silently
+# does not fire (reproduced: 65,572 bytes is the threshold). This fixture is larger
+# than that buffer with the trigger on an EARLY line, which is the winning shape.
+new_scen noprbigbody
+HEAD_BB="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BB" > "$SCEN/head"
+: > "$SCEN/runs-$HEAD_BB"
+mkdir -p "$SCEN/wf-contents/.github/workflows"
+awk 'BEGIN { print "name: fixture"; print "on:"; print "  workflow_call:"; print "    inputs:"; print "      python-version:"; print "        type: string"; print "jobs:"; print "  x:"; print "    runs-on: ubuntu-latest"; print "    steps:"; print "      - run: |"; for (i = 0; i < 1500; i++) print "        # padding padding padding padding padding padding padding" }' \
+  > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
+big=$(wc -c < "$SCEN/wf-contents/.github/workflows/python-ci.yml" | tr -d ' ')
+[ "$big" -gt 65572 ] \
+  && pass "PRECONDITION (#1413): the fixture exceeds the 64KiB pipe buffer ($big bytes)" \
+  || fail "PRECONDITION (#1413): fixture is only $big bytes — it cannot reproduce the truncation"
+lane_fail mainfeed 9106 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9106"
+run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a large reusable workflow body → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "is a REUSABLE workflow" "$TMP/err" \
+  && pass "a body LARGER THAN THE PIPE BUFFER still routes to the reusable branch (#1413 / #841)" \
+  || fail "the match was discarded by SIGPIPE — the reusable branch did not fire for a large body"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 

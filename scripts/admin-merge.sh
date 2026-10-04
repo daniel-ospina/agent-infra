@@ -3509,8 +3509,20 @@ main() {
       # answers `unknown`. But THIS question is narrower and answerable: the lane
       # has no run of its own, and a `workflow_call`-declaring workflow can never
       # produce one, whatever its callers do.
+      # ⛔ A HERE-STRING, NOT A PIPE. `printf … | grep -q` is the SIGPIPE trap this
+      # repo bans (#841): grep exits at its FIRST match, printf takes SIGPIPE, and
+      # under this file's `set -uo pipefail` the pipeline returns non-zero — so for a
+      # body larger than the pipe buffer (measured: 65,572 bytes) the match is
+      # DISCARDED and this branch silently does not fire, falling through to the
+      # UNMEASURED stanza instead. The repo's own guard
+      # (scripts/check-no-sigpipe-grep.sh) reds CI on the pipe form — it did, on
+      # `sigpipe-grep` and `bash-suites`.
+      # The match is a property of the file we just read, so the claim is measured.
+      # It matches the BLOCK spelling, which is what every workflow in this repo
+      # uses; the predicate answers `unknown` for the inline spellings either way,
+      # and the fall-through stanza below no longer asserts a cause for them.
       lane_is_reusable=0
-      if [ -n "$lane_body" ] && printf '%s' "$lane_body" | grep -qE '^[[:space:]]*workflow_call:'; then
+      if [ -n "$lane_body" ] && grep -qE '^[[:space:]]*workflow_call:' <<<"$lane_body"; then
         lane_is_reusable=1
       fi
       if [ -z "$lane_body" ]; then
@@ -3545,8 +3557,10 @@ main() {
         say_err "   every lane that actually ran."
       else
         say_err "   The lane '$lane' has NO run for this head at all. Its workflow file was"
-        say_err "   read but could not be parsed confidently, so whether it can attach a run to"
-        say_err "   a PR head is UNMEASURED (this is NOT a coverage gap in this PR)."
+        say_err "   READ, but the PR-evaluability predicate cannot DECIDE whether a run of it"
+        say_err "   could ever attach to a PR head — so that question is UNMEASURED here (this"
+        say_err "   is NOT a coverage gap in this PR). A common reason: an inline `on:` form,"
+        say_err "   or a trigger the parser declines to interpret."
         say_err "   Confirm the lane (--workflow); if this repo splits its lanes by trigger,"
         say_err "   add --any-workflow."
       fi

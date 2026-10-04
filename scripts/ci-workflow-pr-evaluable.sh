@@ -392,10 +392,13 @@ def trigger_measurable(trig, flt):
         #
         # ⛔ `workflow_call` STAYS `None` HERE — and that is a DECISION, not an
         # omission (#1413). A REUSABLE workflow's jobs DO attach a check to a PR
-        # head: they run inside the CALLER's run, under the caller's name (measured:
+        # head: they run inside the CALLER's run, under the CALLER's NAME. Measured:
         # .github/workflows/ci.yml is `on: pull_request` and calls
-        # node-ci.yml@main, whose jobs surface as `extension-tests / unit-test|lint|
-        # typecheck` on every PR head). So this file CANNOT answer for it — whether
+        # node-ci.yml@main, and a PR head's check-runs carry `ci / unit-test`,
+        # `ci / lint`, `ci / typecheck` — the CALLER's workflow name, not
+        # node-ci.yml's. (The `extension-tests / *` jobs are ci-main.yml's, a
+        # POST-MERGE push lane — citing those as the PR evidence was wrong.)
+        # So this file CANNOT answer for it — whether
         # any caller runs it on pull_request is unknowable from the file alone — and
         # `None` (fail closed) is the only sound answer. Returning `False` would be
         # consumed as an AFFIRMATIVE EXEMPTION downstream (admin-merge.sh's base-side
