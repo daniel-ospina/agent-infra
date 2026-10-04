@@ -12,17 +12,17 @@
  * Deliberately conservative — it over-redacts rather than under-redacts, because
  * a false redaction costs readability and a miss persists a live credential.
  *
- * NO pattern below carries a word anchor, on either side. This is the whole of the
- * rule, and it is deliberate: an anchor makes a credential that sits against a word
- * character survive (`MY_GITHUB_TOKEN=…`, `TOKEN_ghp_…`, `ghp_abc_def`), which is the
- * one direction this module must never err in. Every attempt to be cleverer than the
- * unanchored original lost coverage somewhere (review, #1492) — so the tolerant shape
- * is the shape, for all three patterns, including the `_TOKEN=` rule above.
+ * NO pattern below carries a word anchor. This is the whole of the rule, and it is
+ * deliberate: an anchor makes a credential that sits against a word character survive
+ * (`MY_GITHUB_TOKEN=…`, `TOKEN_ghp_…`), which is the one direction this module must
+ * never err in. The tolerant shape is the shape, for all three patterns.
  */
 export function redactCommand(command: string): string {
   return command
     .replace(/(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
-    // All six GitHub token families: ghp_ gho_ ghu_ ghs_ ghr_ github_pat_.
-    .replace(/gh[opusr]_[A-Za-z0-9]+/g, (m) => `${m.slice(0, 4)}***`)
+    // All six GitHub token families: ghp_ gho_ ghu_ ghs_ ghr_ github_pat_. Both token
+    // classes include `_`, so a body that contains one is redacted whole rather than up
+    // to the underscore — the same over-redaction trade-off stated above.
+    .replace(/gh[opusr]_[A-Za-z0-9_]+/g, (m) => `${m.slice(0, 4)}***`)
     .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
 }

@@ -3493,6 +3493,8 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(!auditCommand("TOKEN_ghp_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "a WORD-CHAR-PREFIXED token must not survive");
   ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
   ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
+  ok(!auditCommand("ghp_abc_def").includes("_def"), "…including its TAIL — the label above claims this, so assert it");
+  ok(!auditCommand("ghs_AAAA_BBBB_CCCC").includes("_CCCC"), "…and the ghs_ family with an internal `_`");
   ok(!auditCommand("ghs_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "the server family (ghs_) is covered too");
   // The `_TOKEN=` rule carried a leading `\b` until review caught it — the SAME anchor class
   // as the two the previous commit removed, and byte-identical to origin/main, so it was
