@@ -12,25 +12,41 @@
  *   the harness's own configured secrets: the config file was 0600 and everything
  *   that READ it was not.
  *
- * SCOPE, STATED ACCURATELY (a review corrected an earlier overclaim here): this hook
- * covers the RESULT of a tool — the surface that produced all 300 leaked copies. It
- * does NOT cover a secret typed literally into a tool CALL's arguments (those are
- * persisted as `arguments` on the assistant's toolCall entry), nor the bash tool's
- * own full-output temp log, nor anything a non-pi process writes (e.g. a script
- * writing /tmp/live.json). Those remain open and are tracked on #5109.
+ * SCOPE, STATED ACCURATELY: this hook covers the RESULT of a tool — the surface that
+ * produced all 300 leaked copies. It does NOT cover a secret typed literally into a
+ * tool CALL's arguments (persisted as `arguments` on the toolCall entry), the bash
+ * tool's full-output temp log, or anything a non-pi process writes (e.g. a script
+ * writing /tmp/live.json). Those are open and tracked on #5109.
+ *
+ * ⛔ KNOWN LIMITATIONS (deliberate, not oversights — read before "fixing" them):
+ *   Three review rounds found 23 defects in this file and each round found a shape
+ *   the previous one missed. That is the signature of the wrong seam: a perfect
+ *   in-process redactor would have to model every value an arbitrary tool can return.
+ *   Rather than grow the recognizer, the following are DOCUMENTED and left, with the
+ *   residual on #5109:
+ *     - a redacted non-plain instance is returned as PLAIN DATA (own enumerable
+ *       strings only): `#private` slots and non-enumerable/symbol props cannot be
+ *       reproduced, so a rebuild would hand back a half-initialised object whose
+ *       methods throw. Losing `instanceof` is the safer of the two failures;
+ *     - symbol-keyed and non-enumerable properties are not traversed;
+ *     - a secret in a Map KEY is redacted only when the key is a string; an object
+ *       key that contains a secret is redacted by value but the key identity changes;
+ *     - only exact configured values and the five credential shapes are caught; an
+ *       unknown-format secret in a store not under ~/.pi/agent is not.
+ *   The durable fix for the class is to redact at the point of PERSISTENCE (one
+ *   choke point) rather than recognise values in flight — and, for this incident,
+ *   ROTATION, which is what makes the 301 existing copies moot.
  *
  * Two detectors, deliberately:
- *   1. EXACT — the values themselves, read from the configured secret stores
- *      (so a value is caught even if its format is unknown).
- *   2. PATTERN — well-known credential shapes (tt_, ghp_, sk-, xox…), so a key is
- *      still caught AFTER ROTATION, when the exact-value store is stale.
+ *   1. EXACT — the values themselves, read from the configured secret stores.
+ *   2. PATTERN — credential shapes (tt_, ghp_, sk-, xox…), so a key is still caught
+ *      AFTER ROTATION, when the exact-value store is stale.
  * The value is never printed, logged, or returned; only a label and a count.
  *
- * Over-redaction is a real harm, not a safe default: a false positive rewrites the
- * text the model is reading and, on a read→write round trip, persists the marker
- * into the user's file. So every pattern is LEFT-ANCHORED to a non-identifier
- * boundary, and env-var REFERENCE templates ($VAR / ${VAR}) are never treated as
- * secrets — they are names, not credentials.
+ * Over-redaction is itself a harm: a false positive rewrites what the model is
+ * reading and, on a read→write round trip, persists the marker into the file. So the
+ * patterns are LEFT-ANCHORED, env REFERENCE templates ($VAR / ${VAR}) are never
+ * secrets, and a failure with no detected secret leaves the result untouched.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -42,22 +58,21 @@ type Secret = { label: string; value: string };
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const CACHE_MS = 30_000;
 const MIN_LEN = 12;
+/** Read regardless of readdir: the known fleet stores. */
+const FALLBACK_STORES = ["tortoise-config.json", "jev-config.json", ".mcp.json", "models.json"];
 
-/**
- * Config keys whose value is a credential. `(?:^|\.)token$` — the path handed in is
- * always prefixed with the store label, so a bare `^token$` never matched.
- * PUBLIC is excluded by the caller: GPG_KEY / SSH_PUBLIC_KEY / SIGNING_KEY are
- * public values, and redacting them is the same corruption harm as a false positive.
- */
-const SECRET_KEY_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|(?:^|\.)token$|secret|password|passwd|credential)/i;
-const PUBLIC_KEY_RE = /public|pub_key|gpg_key|signing_key/i;
+/** Secret-ish on the LEAF key (`authToken`, `apiKey`, `clientSecret`…) or on the path. */
+const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|secret|password|passwd|credential)/i;
+const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|passwd|token|api[_-]?key)/i;
+/** PUBLIC values are not secrets. Tested on the LEAF only — a `publicProfile.apiKey`
+ *  must still be collected (testing the whole path excluded the subtree). */
+const PUBLIC_RE = /^(public|pub[_-]?key|gpg[_-]?key|signing[_-]?key)$/i;
+const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key|signing_?key/i;
 
-/** A value that is a REFERENCE to an env var, not a credential. Tested on the
- *  TRIMMED value: a padded `"  $VAR\n"` used to slip through and be collected. */
+/** A value that is a REFERENCE to an env var, not a credential (tested trimmed). */
 const REFERENCE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
 
-/** Credential shapes that survive rotation. LEFT-ANCHORED: an unanchored `sk-`
- *  matched inside ordinary hyphenated words ("ta[sk-]management…") and corrupted them. */
+/** Credential shapes that survive rotation. LEFT-ANCHORED. */
 const PATTERNS: Array<[string, RegExp]> = [
   ["tt_api_key", /(?<![A-Za-z0-9_])tt_[A-Za-z0-9_-]{20,}/g],
   ["github_pat", /(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}/g],
@@ -66,9 +81,8 @@ const PATTERNS: Array<[string, RegExp]> = [
   ["slack_token", /(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9-]{10,}/g],
 ];
 
-function isReference(value: string): boolean {
-  return REFERENCE_RE.test(value.trim());
-}
+const leafOf = (path: string): string => path.split(".").pop() ?? path;
+const isReference = (v: string): boolean => REFERENCE_RE.test(v.trim());
 
 function collectFromJson(label: string, file: string, into: Secret[]): void {
   let raw: string;
@@ -85,12 +99,9 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
   }
   const walk = (node: unknown, path: string): void => {
     if (typeof node === "string") {
-      if (
-        node.length >= MIN_LEN &&
-        !isReference(node) &&
-        SECRET_KEY_RE.test(path) &&
-        !PUBLIC_KEY_RE.test(path)
-      ) {
+      const leaf = leafOf(path);
+      const secretKey = SECRET_LEAF_RE.test(leaf) || SECRET_PATH_RE.test(path);
+      if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
         into.push({ label: `${label}:${path.replace(/^\./, "")}`, value: node });
       }
       return;
@@ -106,11 +117,10 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
   walk(obj, label);
 }
 
-/**
- * Every top-level *.json in the agent dir, like the original, so a store added later
- * is covered — but this now runs OFF the hot path (see the cache below), which is
- * what made scanning all of them affordable in the first place.
- */
+/** Every top-level *.json in the agent dir (a store added later is covered), falling
+ *  back to the known stores when readdir itself fails — otherwise a readdir error
+ *  silently reduced the exact detector to nothing (review finding). Runs OFF the hot
+ *  path (see the cache below), which is what makes scanning all of them affordable. */
 function loadSecrets(): Secret[] {
   const out: Secret[] = [];
   let names: string[] = [];
@@ -119,6 +129,7 @@ function loadSecrets(): Secret[] {
   } catch {
     names = [];
   }
+  if (names.length === 0) names = FALLBACK_STORES;
   for (const fn of names) {
     const p = join(AGENT_DIR, fn);
     try {
@@ -128,23 +139,22 @@ function loadSecrets(): Secret[] {
     }
     collectFromJson(fn.replace(/\.json$/, ""), p, out);
   }
-  // Configured secrets in the process environment.
+  // Configured secrets in the process environment. `_KEY$` is included (SSH_PRIVATE_KEY,
+  // ENCRYPTION_KEY, MASTER_KEY… would otherwise be missed); PUBLIC ones are excluded.
   for (const [k, v] of Object.entries(process.env)) {
     if (
       typeof v === "string" &&
       v.length >= MIN_LEN &&
       !isReference(v) &&
-      /(API_KEY|ACCESS_KEY|SECRET_KEY|_TOKEN|_SECRET|_CREDENTIALS?|PASSWORD)$/i.test(k) &&
-      !PUBLIC_KEY_RE.test(k)
+      /(API_KEY|_KEY|_TOKEN|_SECRET|_CREDENTIALS?|PASSWORD)$/i.test(k) &&
+      !PUBLIC_ANY_RE.test(k)
     ) {
       out.push({ label: `env:${k}`, value: v });
     }
   }
-  // Longest first: a value that contains another must be replaced first.
   return out.filter((s) => s.value.length >= MIN_LEN).sort((a, b) => b.value.length - a.value.length);
 }
 
-/** Cached so the hot path NEVER does file I/O; the refresh happens off-path. */
 let cache: Secret[] = [];
 function refresh(): void {
   try {
@@ -175,16 +185,10 @@ function redactString(text: string, secrets: Secret[], hits: Set<string>): strin
 }
 
 /**
- * Redact every string reachable from a value.
- *
- * `memo` is the important part. A visited node is NOT returned as-is: an aliased or
- * cyclic value would then re-emit the UNREDACTED original through the second path
- * (found in review: `{a: leaf, b: leaf}` redacted only `a`). Instead each container
- * is seeded into the memo BEFORE its children are visited, so a back-edge resolves to
- * the redacted copy and aliases share one redacted result. The identity of the
- * ORIGINAL node is preserved whenever nothing changed, so Date/Buffer/Map/Set and
- * class instances are not mangled; a changed non-array container is rebuilt on its own
- * prototype so class instances keep their methods.
+ * Redact every string reachable from a value, with a memo so that an aliased or
+ * cyclic value cannot re-emit the UNREDACTED original through a second path (it did:
+ * `{a: leaf, b: leaf}` redacted only `a`). Each container is seeded into the memo
+ * BEFORE its children are visited, so a back-edge resolves to the redacted copy.
  */
 function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new WeakMap<object, unknown>()): T {
   if (typeof node === "string") return redactString(node, secrets, hits) as unknown as T;
@@ -205,7 +209,20 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
       memo.set(obj, node);
       return node;
     }
+    Object.setPrototypeOf(out, Object.getPrototypeOf(node)); // keep Array subclasses working
     return out as unknown as T;
+  }
+
+  // Byte containers: a secret encoded as UTF-8 bytes is data, not a string property.
+  if (ArrayBuffer.isView(node) && !(node instanceof DataView)) {
+    const bytes = node as unknown as Uint8Array;
+    const text = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8");
+    const redacted = redactString(text, secrets, hits);
+    if (redacted === text) {
+      memo.set(obj, node);
+      return node;
+    }
+    return new Uint8Array(Buffer.from(redacted, "utf8")) as unknown as T;
   }
 
   if (node instanceof Map) {
@@ -213,14 +230,16 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
     memo.set(obj, out);
     let changed = false;
     for (const [k, v] of node) {
-      const r = redactDeep(v, secrets, hits, memo);
-      if (r !== v) changed = true;
-      out.set(k, r);
+      const rk = typeof k === "string" ? redactString(k, secrets, hits) : k;
+      const rv = redactDeep(v, secrets, hits, memo);
+      if (rk !== k || rv !== v) changed = true;
+      out.set(rk, rv);
     }
     if (!changed) {
       memo.set(obj, node);
       return node;
     }
+    Object.setPrototypeOf(out, Object.getPrototypeOf(node));
     return out as unknown as T;
   }
 
@@ -237,18 +256,18 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
       memo.set(obj, node);
       return node;
     }
+    Object.setPrototypeOf(out, Object.getPrototypeOf(node));
     return out as unknown as T;
   }
 
-  // Every other object shape — INCLUDING class instances, whose own enumerable string
-  // fields are a real leak path (skipping them entirely was a review finding).
-  const proto = Object.getPrototypeOf(obj) as object | null;
+  // Every other object shape, including class instances (skipping them entirely was a
+  // leak path). A CHANGED non-plain instance becomes plain data — see KNOWN LIMITATIONS.
   const entries = Object.entries(obj as Record<string, unknown>);
   if (entries.length === 0) {
-    memo.set(obj, node); // Date, typed arrays with no enumerable own props, etc.
+    memo.set(obj, node); // Date, empty typed arrays, objects with only symbol props
     return node;
   }
-  const rebuilt = Object.create(proto) as Record<string, unknown>;
+  const rebuilt: Record<string, unknown> = {};
   memo.set(obj, rebuilt);
   let changed = false;
   for (const [k, v] of entries) {
@@ -264,27 +283,24 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
 }
 
 const WITHHELD =
-  "[secret-redactor] Redaction FAILED on this tool result, so its output is withheld: " +
-  "it may contain a configured credential. Read the value at its source and pass it directly " +
+  "[secret-redactor] Redaction could not complete on a result that contains a configured " +
+  "credential, so the output is withheld. Read the value at its source and pass it directly " +
   "to the consumer instead of printing it.";
 
 export default function (pi: ExtensionAPI): void {
   refresh();
   const timer = setInterval(refresh, CACHE_MS);
-  // Never hold the process open for the refresh.
   (timer as unknown as { unref?: () => void }).unref?.();
 
   pi.on("tool_result", async (event) => {
     const content = (event as { content?: unknown }).content;
-    // Contract: content is an array of parts. Anything else is not ours to touch —
-    // forwarding a redacted string here would break the pipeline downstream.
-    if (!Array.isArray(content)) return;
+    if (!Array.isArray(content)) return; // not ours to touch; a string here breaks downstream
 
     const hits = new Set<string>();
     try {
       const redactedContent = redactDeep(content, secrets(), hits, new WeakMap());
       const details = redactDeep((event as { details?: unknown }).details, secrets(), hits, new WeakMap());
-      if (hits.size === 0) return; // nothing to do: do not touch the result
+      if (hits.size === 0) return; // nothing secret: do not touch the result
 
       const labels = [...hits].join(", ");
       const name = (event as { toolName?: string }).toolName ?? "tool";
@@ -294,15 +310,13 @@ export default function (pi: ExtensionAPI): void {
         ` Read the value at its source and pass it directly to the consumer instead of printing it.`;
 
       const parts = (redactedContent as Array<Record<string, unknown>>).slice();
-      parts.push({ type: "text", text: warning }); // never mutate the original array in place
-      // Partial patch: omitted fields (isError, usage) keep their current values.
+      parts.push({ type: "text", text: warning });
       return { content: parts, details } as never;
     } catch {
-      // FAIL CLOSED. Returning undefined would mean "no change" and would pass the
-      // possibly-unredacted result — the secret — straight through to the model and to
-      // disk. `details` must be cleared EXPLICITLY: an omitted field keeps its current
-      // value, and details is where tool payloads (and their secrets) live — a review
-      // found the withheld path still handing the original details back.
+      if (hits.size === 0) return; // nothing was detected: a traversal error must not destroy the result
+      // A secret WAS detected, so fail closed rather than pass it through. `details` is
+      // cleared EXPLICITLY: an omitted field keeps its current value, and details is
+      // where tool payloads live.
       return { content: [{ type: "text", text: WITHHELD }], details: {}, isError: true } as never;
     }
   });
