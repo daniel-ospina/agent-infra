@@ -3472,7 +3472,7 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   const bounded = auditCommand(long);
   ok(bounded.length < long.length, "a pathological command is bounded, not logged whole");
   ok(bounded.startsWith("x".repeat(100)), "the HEAD is kept (it names the operation)");
-  ok(/truncated, 2500 chars/.test(bounded), "truncation is STATED, never silent");
+  ok(/truncated, 2500 chars after redaction/.test(bounded), "truncation is STATED, and which length it measures is PINNED (a revert to the unlabelled text must go red)");
   equal(auditCommand("abc", 3), "abc", "the boundary is inclusive");
   ok(auditCommand("abcd", 3).includes("truncated"), "one char over the bound truncates");
   // REDACTION (#1492 review P1). Recording the command is new, and the audit files are
@@ -3486,8 +3486,9 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
   ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
   ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
-  // Truncation length is measured on the REDACTED text, so a redaction that shortens the
-  // command cannot mis-report the original length.
+  // The label must say WHICH length it measures: redaction shortens the text, so an
+  // unlabelled count reports a number that is not the refused command's length (the
+  // first draft of this test asserted the opposite — caught by review, #1492).
   ok(auditCommand(leaky, 10).includes("truncated, "), "truncation stays stated after redaction");
   // The abort is the documented harm (a bundled child launch that silently never started),
   // so both remediation messages must say the command did not run — the agent cannot be
