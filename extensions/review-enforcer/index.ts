@@ -2136,34 +2136,33 @@ const BLOCK_MESSAGE = [
 ].join("\n");
 export { BLOCK_MESSAGE };
 
+/** Chars of the command's END retained past the bound, so a trailing operation survives. */
+export const TRUNCATION_TAIL = 200;
+
 /**
- * The command a block REFUSED, bounded, for the durable audit trail (#1492).
+ * The command a block REFUSED, redacted and bounded, for the durable audit trail (#1492).
  *
- * The #516 entry records `gate_block` + `reason` + `tier` — enough to COUNT blocks,
- * and not enough to tell WHICH command was blocked, or whether it contained a git
- * operation at all. On a gate whose reported failure mode is "blocked something that
- * was never a git op", that is the single field that settles it, and the neighbouring
- * hub-state gate already carries a `command` field in the same stream, so the shape is
- * established. Without it a false block cost an A/B hunt across several turns, because
- * the report could not be reconstructed from the audit and had to be rediscovered by
- * hand (#1492).
+ * A block entry otherwise records `reason` and `tier` — enough to COUNT blocks, not
+ * enough to tell WHICH command was refused. This field answers that, and the
+ * neighbouring hub-state gate carries a `command` field in the same stream, so the
+ * shape is established.
  *
- * Bounded so one pathological command cannot grow the log without limit: the head is
- * kept (it names the operation) and the truncation is stated rather than silent.
+ * BOUNDED at BOTH ends. A head-only bound can drop a trailing `&& git push`, which is
+ * the one thing this field exists to show, so the tail is kept as well (#1492).
  *
- * REDACTED, because the audit files are world-readable — recording the command at all
- * is new here, and persisting an inlined `GH_TOKEN=…` would be a credential leak this
- * gate introduced (found by review, #1492). The redactor is the shared one both gates
- * use, so the two `command` shapes in this stream cannot drift.
+ * REDACTED before bounding: the audit files are world-readable, and the redactor is the
+ * shared one both gates import, so the redaction rule cannot drift between them.
  */
 export function auditCommand(command: string, limit = 2000): string {
   const redacted = redactCommand(command);
-  return redacted.length <= limit
-    ? redacted
-    // The count is the REDACTED length and says so — redaction shortens the text, so an
-    // unlabelled count under-reports the refused command (review, #1492). Stating which
-    // length it is keeps the field honest without leaking the original size of a secret.
-    : `${redacted.slice(0, limit)}… [truncated, ${redacted.length} chars after redaction]`;
+  if (redacted.length <= limit) return redacted;
+  // The count is the REDACTED length and says so: redaction shortens the text, so an
+  // unlabelled count would not be the refused command's length (#1492).
+  return (
+    `${redacted.slice(0, limit)}` +
+    `… [truncated, ${redacted.length} chars after redaction] …` +
+    `${redacted.slice(-TRUNCATION_TAIL)}`
+  );
 }
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static

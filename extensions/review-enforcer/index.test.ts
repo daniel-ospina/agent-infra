@@ -3464,14 +3464,16 @@ test("hasAdminMergeFlag: every --admin shape a bypass can take", () => {
 
 test("#1492: a block is a NO-OP — the refused command is recorded, and the message says nothing ran", () => {
   // The field #1492 asks for: `gate_block` carried reason + tier, never WHICH command was
-  // refused, so a false block could not be reconstructed from the audit and had to be
-  // rediscovered by A/B by hand (four rounds, several turns).
+  // refused.
   const short = 'gh pr list --json number | sort';
   equal(auditCommand(short), short, "a normal command is recorded verbatim");
   const long = "x".repeat(2500);
   const bounded = auditCommand(long);
   ok(bounded.length < long.length, "a pathological command is bounded, not logged whole");
-  ok(bounded.startsWith("x".repeat(100)), "the HEAD is kept (it names the operation)");
+  ok(bounded.startsWith("x".repeat(100)), "the HEAD is kept");
+  ok(bounded.endsWith("x".repeat(100)), "the TAIL is kept too (the bound must be at BOTH ends)");
+  const trailing = auditCommand(`echo ${"y".repeat(2100)} && gh pr merge 999 --admin`);
+  ok(trailing.includes("gh pr merge 999 --admin"), "…so an OPERATION past the bound still survives — a head-only bound can drop the one thing this field exists to show");
   ok(/truncated, 2500 chars after redaction/.test(bounded), "truncation is STATED, and which length it measures is PINNED (a revert to the unlabelled text must go red)");
   equal(auditCommand("abc", 3), "abc", "the boundary is inclusive");
   ok(auditCommand("abcd", 3).includes("truncated"), "one char over the bound truncates");
@@ -3486,26 +3488,20 @@ test("#1492: a block is a NO-OP — the refused command is recorded, and the mes
   ok(safe.includes("ghp_***"), "the token is replaced with a marker, not dropped silently");
   ok(safe.includes("git push"), "…while the OPERATION is preserved (that is the field's purpose)");
   ok(!auditCommand("github_pat_abcdefghijklmnop").includes("github_pat_abcdefghijklmnop"), "a fine-grained PAT must NOT persist");
-  // The fixtures that the anchored first attempt silently LOST. `origin/main` redacts
-  // both; an anchor on either side of the family pattern makes each survive, and the
-  // suite stayed green through two rounds of that (review, #1492). Pin them at the exact
-  // shapes that regressed: word-char-prefixed token, and `_`-suffixed token.
+  // `origin/main` redacts both of the next two shapes; an anchor on either side of the
+  // family pattern makes each survive.
   ok(!auditCommand("TOKEN_ghp_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "a WORD-CHAR-PREFIXED token must not survive");
   ok(!auditCommand("TOKEN_github_pat_11ABCDEFG0abcdefghij").includes("11ABCDEFG0abcdefghij"), "…nor a word-char-prefixed fine-grained PAT");
   ok(!auditCommand("ghp_abc_def").includes("abc_def"), "a `_`-SUFFIXED token must not survive either");
   ok(!auditCommand("ghp_abc_def").includes("_def"), "…including its TAIL — the label above claims this, so assert it");
   ok(!auditCommand("ghs_AAAA_BBBB_CCCC").includes("_CCCC"), "…and the ghs_ family with an internal `_`");
   ok(!auditCommand("ghs_AAAAAAAAAAAAAAAAAAAA").includes("AAAAAAAAAAAAAAAAAAAA"), "the server family (ghs_) is covered too");
-  // The `_TOKEN=` rule carried a leading `\b` until review caught it — the SAME anchor class
-  // as the two the previous commit removed, and byte-identical to origin/main, so it was
-  // pre-existing rather than a regression. The existing `MY_GITHUB_TOKEN=github_pat_…` fixture
-  // did NOT exercise this rule at all: it passed only because the VALUE was PAT-shaped and got
-  // caught by the family pattern. An opaque value is what actually tests it.
+  // The `_TOKEN=` rule is tested with an OPAQUE value: a PAT-shaped value would be caught
+  // by the token patterns instead and leave this rule unexercised.
   ok(!auditCommand("MY_GITHUB_TOKEN=opaquesecret999").includes("opaquesecret999"), "a word-char-prefixed *_TOKEN= assignment must redact its VALUE");
   ok(!auditCommand("export MY_GH_TOKEN=opaquesecret999").includes("opaquesecret999"), "…and through an `export` prefix");
   // The label must say WHICH length it measures: redaction shortens the text, so an
-  // unlabelled count reports a number that is not the refused command's length (the
-  // first draft of this test asserted the opposite — caught by review, #1492).
+  // unlabelled count reports a number that is not the refused command's length.
   ok(auditCommand(leaky, 10).includes("truncated, "), "truncation stays stated after redaction");
   // The abort is the documented harm (a bundled child launch that silently never started),
   // so both remediation messages must say the command did not run — the agent cannot be
