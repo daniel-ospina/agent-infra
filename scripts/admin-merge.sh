@@ -3501,51 +3501,27 @@ main() {
         lane_verdict="$(printf '%s' "$lane_body" \
           | bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
       fi
-      # REUSABLE is a property of the FILE WE JUST READ, so it is measured here
-      # rather than asked of the predicate. The predicate cannot answer it: a
-      # `workflow_call` workflow's jobs DO attach checks to a PR head — inside its
-      # CALLER's run, under the caller's name — so whether it runs on pull_request
-      # depends on callers the file does not name, and the predicate answers either
-      # `unknown` (the block form carrying an `inputs:` child) or `no` (a bare
-      # declaration). Neither names the reusable cause, so the rail reads it here.
-      #
-      # ⛔ THE BRANCH IS KEYED ON THE BODY SHAPE, NOT ON THE VERDICT. `no` is a
-      # COLLAPSED verdict: the predicate returns it both for a push-only lane and for a
-      # reusable-only one, so an order keyed on the verdict alone MUST misroute one of
-      # the two (measured: `on: workflow_call:` with no `inputs:` reads `no`; ordered
-      # on the verdict it was handed to the push-only stanza, which misnames its shape
-      # and drops the caller-lane remedy). The reusable branch therefore fires on the
-      # MEASURED BODY — it declares `workflow_call` and declares no `pull_request`
-      # trigger of its own — and only then falls through to the verdict. That
-      # `pull_request` guard is load-bearing: `workflow_call` plus a `paths:`-filtered
-      # `pull_request` reads `unknown`, because the PR-side call site never exports
-      # PR_CHANGED_PATHS, so a filtered PR trigger is undecidable there BY
-      # CONSTRUCTION — and the reusable claim ("no run of it can attach to a PR head")
-      # would be FALSE for that file.
-      # ⛔ A HERE-STRING, NOT A PIPE. `printf … | grep -q` is the SIGPIPE trap this
-      # repo bans (#841): grep exits at its FIRST match, printf takes SIGPIPE, and
-      # under this file's `set -uo pipefail` the pipeline returns non-zero. So when
-      # the match sits EARLY — before the point at which grep exits — the match is
-      # DISCARDED and this branch silently does not fire, falling through to the
-      # UNMEASURED stanza. It is the match's POSITION, not the body's size, that
-      # decides (measured on identical 99KB bodies: an early match is lost, a late one
-      # is fine) — a large body is just what makes an early match lose in practice.
-      # The repo's own guard (scripts/check-no-sigpipe-grep.sh) reds CI on the pipe
-      # form — it did, on `sigpipe-grep` and `bash-suites`.
-      # The match is a property of the file we just read, so the claim is measured.
-      # It matches the BLOCK spelling, which is what every workflow in this repo
-      # uses; the predicate answers `unknown` for the inline spellings too, and the
-      # fall-through stanza below no longer asserts a cause for them.
-      lane_is_reusable=0
-      lane_declares_pr=0
-      if [ -n "$lane_body" ]; then
-        if grep -qE '^[[:space:]]*workflow_call:' <<<"$lane_body"; then
-          lane_is_reusable=1
-        fi
-        if grep -qE '^[[:space:]]*pull_request(_target)?:' <<<"$lane_body"; then
-          lane_declares_pr=1
-        fi
-      fi
+      # ⛔ THE DIAGNOSIS IS KEYED ON THE PREDICATE'S VERDICT — NOT ON A GREP OF THE
+      # FILE. Three review rounds in a row found that reading the reusable shape out
+      # of the body with a bash grep emits a claim that is FALSE for some legal input,
+      # and every instance is a real workflow shape:
+      #   • `workflow_call:` inside a `run: |` block, an `env:` key or a job id is a
+      #     line match but declares no trigger;
+      #   • a PR trigger spelled `"pull_request":`, `'pull_request':`,
+      #     `!!str pull_request:`, `pull_request :` or `? pull_request` is a real
+      #     trigger a line-anchored regex misses.
+      # A grep can decide neither, and a wrong diagnosis on a refusing path is the very
+      # defect #1413 exists to remove — so the greps are gone. The predicate IS sound
+      # here: it parses, and it REFUSES (`unknown`) whenever it cannot attribute every
+      # declared trigger, so `no` is a MEASUREMENT ("every declared trigger was read,
+      # and none of them attaches to a PR head") rather than a guess. The verdict is
+      # therefore the primitive the rail uses, and the reusable guidance is delivered
+      # as a CONDITIONAL hint under the two branches that establish no PR trigger,
+      # instead of as a separate diagnosis the rail cannot soundly support.
+      # Measured with this predicate: `workflow_call` + `inputs` → `unknown`; a bare
+      # `workflow_call` → `no`; `workflow_call` + a `paths:`-filtered `pull_request`
+      # → `unknown` (the PR-side call site never exports PR_CHANGED_PATHS, so a
+      # filtered PR trigger is undecidable there by construction).
       if [ -z "$lane_body" ]; then
         # UNMEASURED, and it says so. Either the fetch returned nothing — a 404 (the
         # selector may be a display NAME, which `--workflow` allows) or an API
@@ -3563,22 +3539,14 @@ main() {
         say_err "   'paths:' filter, or not yet started), or the selector names a different"
         say_err "   lane. Confirm the lane and that CI ran for this head; if this repo splits"
         say_err "   its lanes by trigger, add --any-workflow."
-      elif [ "$lane_is_reusable" = "1" ] && [ "$lane_declares_pr" = "0" ]; then
-        # The guard is the whole point: the file declares `workflow_call` AND no
-        # `pull_request` trigger of its own, so every clause below is true for it —
-        # including the hybrids (`workflow_call` + push/schedule), which reach here too
-        # and for which "no run of it itself can attach to a PR head" still holds.
-        say_err "   The lane '$lane' declares the workflow_call trigger and no pull_request"
-        say_err "   trigger of its own, so when it runs on a PR head it runs inside its"
-        say_err "   CALLER's run, under the CALLER's name — and no run of '$lane' itself can"
-        say_err "   attach to a PR head."
-        say_err "   Compare against the CALLER's lane, or use --any-workflow, which compares"
-        say_err "   against every lane that actually ran."
       elif [ "$lane_verdict" = "no" ]; then
         say_err "   The lane '$lane' has NO run for this head at all, and its workflow"
         say_err "   declares NO pull_request / pull_request_target trigger — so no run of it"
-        say_err "   can EVER attach to a PR head. A push-only or schedule-only lane looks"
-        say_err "   like this."
+        say_err "   can EVER attach to a PR head. A push-only, schedule-only or reusable-only"
+        say_err "   lane looks like this."
+        say_err "   IF this lane is a reusable workflow (its file declares workflow_call), its"
+        say_err "   jobs run inside its CALLER's run under the CALLER's name — compare against"
+        say_err "   the CALLER's lane."
         say_err "   In a trigger-split repo no single lane spans both sides, so picking"
         say_err "   another lane cannot help: use --any-workflow, which compares against"
         say_err "   every lane that actually ran."
@@ -3587,6 +3555,9 @@ main() {
         say_err "   READ, but the PR-evaluability predicate cannot DECIDE whether a run of it"
         say_err "   could ever attach to a PR head — so that question is UNMEASURED here (this"
         say_err "   is NOT a coverage gap in this PR, and no cause is asserted)."
+        say_err "   IF this lane is a reusable workflow (its file declares workflow_call), its"
+        say_err "   jobs run inside its CALLER's run under the CALLER's name — compare against"
+        say_err "   the CALLER's lane."
         say_err "   Confirm the lane (--workflow); if this repo splits its lanes by trigger,"
         say_err "   add --any-workflow."
       fi

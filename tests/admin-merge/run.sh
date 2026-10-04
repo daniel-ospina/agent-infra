@@ -2847,34 +2847,37 @@ mkdir -p "$SCEN/wf-contents/.github/workflows"
 } > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
 # PRECONDITION. It pins the FIXTURE, not the vector: it runs the predicate on the
 # file directly, bypassing the rail and its fetch, so it would pass even if the
-# fetch broke. What makes this vector load-bearing is the stderr assertions below,
-# which pass only when the RAIL emits the reusable stanza. (An earlier version of
-# this comment claimed the precondition was what made the vector load-bearing —
-# false: mutating the fetch to drop -X GET fails those assertions while this one
-# still passes.)
+# fetch broke. It fixes WHY this fixture is the one that matters: the real
+# python-ci.yml is `workflow_call` + `inputs`, which the predicate answers `unknown`,
+# so the rail must report the question as UNMEASURED and reach the reusable guidance
+# only as the conditional hint. A fixture the predicate answered `no` for would take
+# the other branch and pin a different message.
 # `wf_eval` is the guard-safe wrapper: inlining `$(bash <path> …)` re-trips the #1484
 # classifier and makes the WHOLE suite unrunnable by an agent (see its definition).
 lane_fixture_verdict="$(wf_eval < "$SCEN/wf-contents/.github/workflows/python-ci.yml" 2>/dev/null || true)"
 [ "$lane_fixture_verdict" = "unknown" ] \
-  && pass "PRECONDITION (#1413): the predicate says 'unknown' for workflow_call+inputs, so the REUSABLE branch must be the rail's own detection" \
+  && pass "PRECONDITION (#1413): the predicate says 'unknown' for workflow_call+inputs, so the rail must report UNMEASURED" \
   || fail "PRECONDITION (#1413): expected 'unknown' for the reusable fixture, got '$lane_fixture_verdict'"
 lane_fail mainfeed 9102 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9102"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && pass "a REUSABLE-only lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "declares the workflow_call trigger" "$TMP/err" \
-  && pass "the rail MEASURES the file and names the REUSABLE shape (#1413)" \
-  || fail "the rail did not name the reusable condition on stderr"
+[ "$rc" -ne 0 ] && pass "a workflow_call+inputs lane → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
+grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
+  && pass "the reusable fixture is reported as UNMEASURED — the verdict, not a grep (#1413)" \
+  || fail "the rail did not report the undecidable verdict"
+grep -q "IF this lane is a reusable workflow" "$TMP/err" \
+  && pass "…with the reusable guidance as an explicit CONDITIONAL hint (#1413)" \
+  || fail "the reusable guidance is missing from the UNMEASURED path"
 grep -q "CALLER's name" "$TMP/err" \
-  && pass "…naming the trigger it detected and where a reusable lane's runs live" \
-  || fail "the reusable branch does not name the trigger or where the runs live"
-grep -q "itself can" "$TMP/err" \
-  && pass "…and states the one property that makes the lane empty" \
-  || fail "the reusable branch does not state the reusable property"
+  && pass "…naming where a reusable lane's jobs actually run" \
+  || fail "the hint does not say where a reusable lane's jobs run"
+grep -q "declares the workflow_call trigger" "$TMP/err" \
+  && fail "the rail STILL diagnoses the body with a grep — the unsound claim is back (#1413)" \
+  || pass "no body-grep diagnosis is emitted — only the verdict and a conditional hint"
 grep -q -- "--any-workflow" "$TMP/err" \
-  && pass "the reusable branch names the remedy that works in a trigger-split repo" \
-  || fail "the reusable branch offers no workable remedy"
+  && pass "the refusal names the remedy that works in a trigger-split repo" \
+  || fail "the refusal offers no workable remedy"
 grep -q "MAIN-ONLY" "$TMP/err" \
   && fail "the refusal still asserts the old unmeasured MAIN-ONLY cause (#1413)" \
   || pass "the old unmeasured MAIN-ONLY claim is gone from this path"
@@ -2950,45 +2953,22 @@ grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
-# (c6) #1413 — THE PIPE-BUFFER CASE (#841). The reusable detection must NOT be
-# written as `printf … | grep -q`: grep exits at its FIRST match, printf takes
-# SIGPIPE, and `set -uo pipefail` turns that into a non-zero pipeline. It is the
-# match's POSITION that decides, not the body's size: a match EARLY enough that grep
-# exits before the writer finishes is DISCARDED and the branch silently does not
-# fire, while a LATE match on a body of the same size is fine (both measured on
-# identical 99KB bodies) — a large body is just what makes an early match lose in
-# practice. This fixture is larger than the 64KiB pipe buffer with the trigger on an
-# EARLY line, which is the winning shape.
-new_scen noprbigbody
-HEAD_BB="f7f7000000000000000000000000000000000000"
-printf '%s\n' "$HEAD_BB" > "$SCEN/head"
-: > "$SCEN/runs-$HEAD_BB"
-mkdir -p "$SCEN/wf-contents/.github/workflows"
-awk 'BEGIN { print "name: fixture"; print "on:"; print "  workflow_call:"; print "    inputs:"; print "      python-version:"; print "        type: string"; print "jobs:"; print "  x:"; print "    runs-on: ubuntu-latest"; print "    steps:"; print "      - run: |"; for (i = 0; i < 1500; i++) print "        # padding padding padding padding padding padding padding" }' \
-  > "$SCEN/wf-contents/.github/workflows/python-ci.yml"
-big=$(wc -c < "$SCEN/wf-contents/.github/workflows/python-ci.yml" | tr -d ' ')
-[ "$big" -gt 65572 ] \
-  && pass "PRECONDITION (#1413): the fixture exceeds the 64KiB pipe buffer ($big bytes)" \
-  || fail "PRECONDITION (#1413): fixture is only $big bytes — it cannot reproduce the truncation"
-lane_fail mainfeed 9106 > "$SCEN/runs-main"
-log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9106"
-run_admin 42 --main-runs 1 >/dev/null 2>&1
-rc=$?
-[ "$rc" -ne 0 ] && pass "a large reusable workflow body → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "declares the workflow_call trigger" "$TMP/err" \
-  && pass "a body LARGER THAN THE PIPE BUFFER still routes to the reusable branch (#1413 / #841)" \
-  || fail "the match was discarded by SIGPIPE — the reusable branch did not fire for a large body"
-[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
-grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+# (c6) RETIRED — the body-grep it tested is GONE. This vector asserted that a 99KB
+# workflow body still reached the reusable branch, which is what the here-string (vs
+# `printf … | grep -q`, #841) protected. The rail no longer greps the body at all, so
+# there is nothing left to protect and the vector was deleted rather than kept as a
+# green assertion over a branch that no longer exists. The repo-wide
+# `scripts/check-no-sigpipe-grep.sh` guard still reds CI on the idiom itself.
 
-# (c7) #1413 — A REUSABLE FILE THAT ALSO DECLARES A `pull_request` TRIGGER MUST NOT
-# GET THE REUSABLE STANZA. `workflow_call` + a `paths:`-filtered `pull_request` reads
-# `unknown` from the predicate (the PR-side call site never exports PR_CHANGED_PATHS,
-# so a filtered PR trigger is undecidable there BY CONSTRUCTION), while the
-# `workflow_call` text match still fires — so without the "declares no pull_request"
-# guard the stanza claims "no run of it itself can attach to a PR head", which is
-# FALSE: its own pull_request run does. The honest answer is UNMEASURED. Without this
-# vector the guard can be dropped and the suite stays green.
+# (c7) #1413 — A FILE THAT DECLARES A PR TRIGGER MUST NEVER BE TOLD IT HAS NONE.
+# `workflow_call` + a `paths:`-filtered `pull_request` reads `unknown` from the
+# predicate — the PR-side call site never exports PR_CHANGED_PATHS, so a filtered PR
+# trigger is undecidable there BY CONSTRUCTION — and this vector pins that the rail
+# does not resolve that `unknown` into the `no` branch's "declares NO pull_request
+# trigger" claim, which would be FALSE for this file. It is also the standing guard
+# against re-introducing a body-grep shortcut for the reusable shape: any such grep
+# would have to see through the filter to be sound, and the predicate's own refusal is
+# why the rail asks it instead.
 new_scen noprwcpr
 HEAD_WP="f8f8000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_WP" > "$SCEN/head"
@@ -3021,12 +3001,12 @@ grep -q "cannot DECIDE whether a run of it" "$TMP/err" \
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
-# (c8) #1413 — A REUSABLE-ONLY LANE MUST STILL GET THE REUSABLE STANZA EVEN THOUGH
-# THE PREDICATE SAYS `no`. A bare `on: workflow_call:` (no `inputs:`) returns `no`,
-# because the predicate COLLAPSES "declares workflow_call" into the same verdict as
-# "declares no PR trigger". An order keyed on the VERDICT alone therefore hands this
-# lane to the push-only/schedule-only stanza, which misnames its shape and drops the
-# caller-lane remedy — the branch is keyed on the BODY SHAPE for exactly this reason.
+# (c8) #1413 — A REUSABLE-ONLY LANE STILL GETS THE REUSABLE GUIDANCE, EVEN THOUGH THE
+# PREDICATE SAYS `no`. A bare `on: workflow_call:` (no `inputs:`) returns `no`, because
+# the predicate collapses "declares workflow_call" into the same verdict as "declares no
+# PR trigger" — so the rail cannot tell them apart from the verdict, and instead of
+# guessing (which the greps did, and got wrong) it names the reusable shape in the
+# shape hint and delivers the caller-lane remedy conditionally.
 new_scen noprbarewc
 HEAD_BW="f9f9000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BW" > "$SCEN/head"
@@ -3037,12 +3017,15 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9108"
 run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "a bare workflow_call lane with no run for this head → BLOCK (exit $rc)" || fail "expected a non-zero exit, got 0"
-grep -q "declares the workflow_call trigger" "$TMP/err" \
-  && pass "a bare workflow_call lane (predicate says 'no') still gets the REUSABLE stanza (#1413)" \
-  || fail "the reusable diagnosis was LOST for a bare workflow_call lane — the branch is keyed on the verdict"
-grep -q "NO pull_request / pull_request_target trigger" "$TMP/err" \
-  && fail "the reusable-only lane was misdescribed as a push-only or schedule-only lane (#1413)" \
-  || pass "…and is not misdescribed as a push-only or schedule-only lane"
+grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
+  && pass "a bare workflow_call lane (predicate says 'no') gets the measured no-trigger stanza (#1413)" \
+  || fail "the measured no-trigger stanza did not fire for a lane the predicate answered 'no' for"
+grep -q "reusable-only" "$TMP/err" \
+  && pass "…and the shape hint does not omit the reusable-only shape (#1413)" \
+  || fail "a reusable-only lane was described as push-only or schedule-only"
+grep -q "IF this lane is a reusable workflow" "$TMP/err" \
+  && pass "…with the reusable guidance still delivered for it (#1413)" \
+  || fail "the reusable guidance is missing from the no-trigger path"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
@@ -3063,7 +3046,7 @@ rc=$?
 grep -q "declares NO pull_request / pull_request_target trigger" "$TMP/err" \
   && pass "the push-only branch fires and names the missing PR trigger (#1413)" \
   || fail "the push-only branch did not name the measured condition"
-grep -q "push-only or schedule-only lane" "$TMP/err" \
+grep -q "push-only, schedule-only or reusable-only" "$TMP/err" \
   && pass "…and names the push-only shape" \
   || fail "the push-only shape is not named"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted when the lane never ran" || pass "no evidence comment posted"
