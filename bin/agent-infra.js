@@ -378,13 +378,24 @@ function cmdUpdate() {
  *  and measuring against a nested dir classified an in-repo target ABOVE it as
  *  "machine-local" and forgave it (#7412 — a regression against the previous
  *  behaviour, which failed that shape). Falls back to [dir] if git is absent or
- *  the directory is not inside a work tree, which preserves the previous
- *  behaviour exactly where the two coincide. */
+ *  the directory is not inside a work tree — which preserves the previous
+ *  CONTAINMENT REFERENCE where the two coincide. (It does not preserve every
+ *  verdict: the predicate changed too, deliberately — see #7412.) */
 function repoRootFor(dir) {
   try {
     const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    return top ? fs.realpathSync(top) : dir;
+    if (top) return fs.realpathSync(top);
+  } catch {
+    /* not a work tree, or git absent — fall through */
+  }
+  // Canonicalize on EVERY route, including the fallback. The target side is
+  // realpath'd, so returning a LEXICAL root here would put the two sides back in
+  // different namespaces — re-creating the exact mismatch this anchoring exists
+  // to remove (observed: it reddened the suite by classifying an in-repo target
+  // as machine-local whenever the checked dir was not a git work tree).
+  try {
+    return fs.realpathSync(dir);
   } catch {
     return dir;
   }
@@ -445,7 +456,9 @@ function cmdCheck(targetDir, ciMode) {
   targetDir = targetDir ? path.resolve(targetDir) : process.cwd();
   // Containment is measured against the work-tree root, NOT targetDir (#7412):
   // a nested targetDir made an in-repo target above it look machine-local.
-  const repoRoot = repoRootFor(targetDir);
+  // Computed only in CI mode — the carve-out that consumes it is `ciMode &&`,
+  // so local mode should not pay for a subprocess it never reads.
+  const repoRoot = ciMode ? repoRootFor(targetDir) : targetDir;
 
   const manifest = loadManifest();
   const version = manifest.version;
@@ -552,10 +565,25 @@ function cmdCheck(targetDir, ciMode) {
         }
       } else {
         const resolved = path.resolve(path.dirname(scriptsDest), linkTarget);
+        // Compare containment within ONE namespace. repoRoot is PHYSICAL
+        // (realpath'd), while `resolved` is lexical and inherits the caller's
+        // spelling of targetDir — so when targetDir reaches the repo through a
+        // symlink the two disagree, path.relative emits a `..`-chain, and an
+        // in-repo target was classified machine-local and forgiven (#7412, the
+        // fourth shape of the same false PASS). Canonicalize the target too.
+        // A DANGLING target has no realpath and must fall back to its lexical
+        // form: that is the GitHub-hosted production case (the committed
+        // machine-local link does not resolve on the runner).
+        let canonResolved = resolved;
+        try {
+          canonResolved = fs.realpathSync(resolved);
+        } catch {
+          /* dangling — keep the lexical form */
+        }
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
-        } else if (ciMode && classifyUnresolved(resolved, repoRoot) === 'machine-local'
+        } else if (ciMode && classifyUnresolved(canonResolved, repoRoot) === 'machine-local'
                    && (!fs.existsSync(resolved) || isAgentInfraScripts(resolved))) {
           // A committed link escaping the repo points at a machine-local
           // agent-infra checkout. Forgive it only when the runner cannot reach

@@ -21,6 +21,7 @@
 #  16. target is a regular FILE, not a dir    → drift FAIL, exit 1 (#7412)
 #  17. in-repo target ABOVE the checked dir    → drift FAIL, exit 1 (#7412)
 #  18. DANGLING machine-local target           → info, exit 0 (GitHub-hosted path, #7412)
+#  19. targetDir reached through a SYMLINK     → drift FAIL, not machine-local (#7412)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -56,7 +57,7 @@ cleanup() {
   # Case 14 creates an untracked dir INSIDE the tracked fixture; `git checkout`
   # restores tracked paths but never removes untracked ones, so remove it here
   # or an interrupted run leaves it behind.
-  rm -rf "$FIX/verify-inside-ai" "$FIX/..cache" "$FIX/../ai-shaped-above"
+  rm -rf "$FIX/verify-inside-ai" "$FIX/verify-inside-link" "$FIX/..cache" "$FIX/../ai-shaped-above"
   # #387: restore the live manifest.json (cp-back, NOT git checkout — uncommitted
   # manifest edits must survive an aborted run). Idempotent with the in-case restore.
   if [ -f "$MANIFEST_BAK" ]; then
@@ -308,31 +309,35 @@ rm -rf "$INSIDE"
 
 echo ""
 echo "15. in-repo dir whose NAME starts with '..' is drift, not machine-local (#7412)"
-# The containment test must require `..` as a WHOLE segment. `path.relative`
+# The containment test must require `..` as a WHOLE segment. path.relative
 # returns a plain `..`-chain for an external path but also `..cache/scripts` for
-# an in-repo dir literally named `..cache` — so `startsWith('..')` called an
-# in-repo target machine-local and forgave it (a false PASS, the very class this
-# change exists to remove). A rotted in-repo link must still fail.
-DOTDOT="$FIX/..cache"
-mkdir -p "$DOTDOT/scripts"
-: >"$DOTDOT/manifest.json"
-mkdir -p "$DOTDOT/bin"
-: >"$DOTDOT/bin/agent-infra.js"
-rm -f "$FIX/scripts"
-ln -sfn "..cache/scripts" "$FIX/scripts"   # RELATIVE and IN-REPO (name starts with '..')
-if [ -e "$FIX/..cache/scripts" ]; then
+# an in-repo dir literally named `..cache`.
+#
+# The target must sit at the ROOT the CLI measures from, or the guard is never
+# reached: containment is now measured from the work-tree root, so putting
+# `..cache` under the nested fixture yields `tests/fixtures/.../..cache/scripts`
+# — which starts with `t`, not `..`, and a naive startsWith('..') passes anyway.
+# A reviewer's mutation matrix showed exactly that: this case previously passed
+# under that mutation and pinned nothing. A non-git scratch dir is used so
+# repoRootFor's fallback makes it the measured root.
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/ai-root.XXXXXX")/repo"
+mkdir -p "$SCRATCH/..cache/scripts" "$SCRATCH/..cache/bin"
+: >"$SCRATCH/..cache/manifest.json"
+: >"$SCRATCH/..cache/bin/agent-infra.js"
+ln -sfn "..cache/scripts" "$SCRATCH/scripts"
+if [ -e "$SCRATCH/..cache/scripts" ]; then
   pass "case 15 fixture target exists"
 else
   fail "case 15 fixture target missing — it would pass for the wrong reason"
 fi
-run_check 1 "in-repo target under a '..'-prefixed directory (--ci)" --ci
+AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$SCRATCH" --ci >"$OUT" 2>&1 || true
 if grep -q "scripts: points to" "$OUT"; then
   pass "'..'-prefixed in-repo target reported as drift"
 else
   fail "an in-repo target under a '..'-prefixed dir was forgiven (#7412 false PASS)"
   tail -15 "$OUT"
 fi
-rm -rf "$DOTDOT"
+rm -rf "$(dirname "$SCRATCH")"
 
 echo ""
 echo "16. scripts link to a regular FILE (not a dir) → FAIL, exit 1 (#7412)"
@@ -360,6 +365,42 @@ else
   tail -15 "$OUT"
 fi
 rm -rf "$FILE_ROOT"
+
+echo ""
+echo "19. targetDir reached through a SYMLINK → in-repo target still drift (#7412)"
+# repoRoot is PHYSICAL (realpath'd by git / by the fallback) while the resolved
+# target is lexical and inherits the caller's spelling. If only ONE side is
+# canonicalized the two disagree, path.relative emits a `..`-chain, and an
+# in-repo target is classified machine-local and forgiven.
+#
+# HONEST SCOPE: this shape catches that class only where the LEXICAL and PHYSICAL
+# spellings of the path differ. On a host whose TMPDIR is already physical the
+# link resolves to a path equal to its realpath, the two namespaces coincide, and
+# this case passes under that mutation too — verified. It is a genuine end-to-end
+# guard for symlinked targetDirs, but it is NOT the case that pins the target
+# realpath; case 15 does that (it re-runs red when the realpath is dropped). Do
+# not cite this case as covering `canonResolved`.
+LINK="$(mktemp -d "${TMPDIR:-/tmp}/ai-link.XXXXXX")/via-link"
+ln -sfn "$ROOT" "$LINK"
+INSIDE_LINK="$FIX/verify-inside-link"
+mkdir -p "$INSIDE_LINK/bin" "$INSIDE_LINK/scripts"
+: >"$INSIDE_LINK/manifest.json"
+: >"$INSIDE_LINK/bin/agent-infra.js"
+rm -f "$FIX/scripts"
+ln -sfn "$INSIDE_LINK/scripts" "$FIX/scripts"
+if [ -e "$LINK/tests/fixtures/drift/current/scripts" ]; then
+  pass "case 19 target reachable through the symlink"
+else
+  fail "case 19 fixture not reachable through the link — would pass for the wrong reason"
+fi
+AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$LINK/tests/fixtures/drift/current" --ci >"$OUT" 2>&1 || true
+if grep -q "scripts: points to" "$OUT"; then
+  pass "in-repo target via a symlinked targetDir reported as drift"
+else
+  fail "a symlinked targetDir made an in-repo target look machine-local (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$(dirname "$LINK")" "$INSIDE_LINK"
 
 echo ""
 echo "17. in-repo target ABOVE the checked dir → FAIL, exit 1 (#7412)"
