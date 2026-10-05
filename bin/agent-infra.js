@@ -491,9 +491,21 @@ function cmdCheck(targetDir, ciMode) {
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
-        } else if (ciMode && !fs.existsSync(resolved) && classifyUnresolved(linkTarget, resolved, targetDir) === 'machine-local') {
+        } else if (ciMode && classifyUnresolved(linkTarget, resolved, targetDir) === 'machine-local') {
           // Committed absolute symlinks point at a machine-local agent-infra
           // checkout — unverifiable on the CI runner, not propagation drift.
+          //
+          // (#7412) Do NOT additionally require !fs.existsSync(resolved) here.
+          // The target being ABSENT is not what makes this unverifiable: on a
+          // self-hosted runner that shares the machine (or bind-mounts /Users),
+          // the machine-local path EXISTS, so an existsSync gate skipped this
+          // carve-out and a link the comment above calls "not propagation
+          // drift" was reported as a hard failure. Runners disagree on
+          // AGENT_INFRA_PATH (the real checkout vs .agent-infra), so the same
+          // commit passed on one runner and failed on another — the
+          // intermittency observed in #7412. `classifyUnresolved` already
+          // decides the intended question (is the target outside the repo?);
+          // whether it happens to resolve on this runner is irrelevant to it.
           issues.push({ type: 'scripts', tier: 'info', reason: `symlink target machine-local (${linkTarget}) — unverifiable on CI runner` });
           console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} (machine-local, unverifiable in CI)`);
         } else {

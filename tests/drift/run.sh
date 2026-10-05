@@ -14,6 +14,7 @@
 #   9. check.ci.ref ≠ ci.ref sync guard       → status FAIL, exit 1 (#387)
 #  10. inline generic test job (exemplar)      → status FAIL, exit 1 (#389)
 #  11. repo-specific inline jobs (boundary)    → status CLEAN, exit 0 (#389)
+#  12. machine-local scripts link that EXISTS   → info, NOT a drift FAIL (#7412)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -195,6 +196,37 @@ YAML
 run_check 0 "repo-specific inline jobs not flagged (--ci)" --ci
 if grep -q "inline test jobs — no generic" "$OUT"; then pass "inline jobs surface clean"; else fail "expected clean inline-jobs line"; tail -15 "$OUT"; fi
 rm -f "$FIX/.github/workflows/repo-specific-tests.yml"
+
+echo ""
+echo "12. Machine-local scripts link that EXISTS → info, not FAIL (#7412)"
+# The machine-local carve-out must classify by WHAT the target is, not by
+# whether it happens to resolve. On a self-hosted runner that shares the
+# machine (or bind-mounts /Users), the machine-local path EXISTS — so an
+# `!fs.existsSync(resolved)` gate skipped the carve-out and reported a link the
+# code itself calls "not propagation drift" as a hard failure. Runners disagree
+# on AGENT_INFRA_PATH (the real checkout vs .agent-infra), which is why the
+# SAME commit failed on one runner and passed on another.
+# Note this fixture needs a target that is BOTH external AND != $ROOT/scripts:
+# pointing at the real scripts/ would take the `resolved === SCRIPTS_SRC`
+# branch and never reach the machine-local one at all.
+rm -f "$FIX/scripts"
+ln -sfn "$ROOT/templates" "$FIX/scripts"   # absolute, external, and EXISTS
+run_check 0 "machine-local scripts link that exists (--ci)" --ci
+if grep -q "points to .*expected" "$OUT"; then
+  fail "machine-local link reported as propagation drift (#7412 regression)"
+  tail -15 "$OUT"
+else
+  pass "machine-local link not reported as drift"
+fi
+if grep -q "machine-local, unverifiable in CI" "$OUT"; then
+  pass "machine-local link classified info (unverifiable in CI)"
+else
+  fail "expected the machine-local info line"
+  tail -15 "$OUT"
+fi
+# The fixture is restored by the EXIT trap's cleanup(); no explicit checkout
+# here — a second git invocation inside this script trips the worktree
+# execution gate (#1484).
 
 echo ""
 if [ "$failures" -eq 0 ]; then
