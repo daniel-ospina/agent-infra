@@ -8967,10 +8967,22 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
   || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
 # ⛔ `<<<` AND NOT A PIPE. `printf … | grep -q` is the repo's banned #841
 # anti-pattern: `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
-# `set -uo pipefail` turns that into a NON-ZERO status — DISCARDING the match. It is a
-# match-POSITION effect, not a size effect, and the payload here is ~117 KB, past the
-# 64 KiB pipe buffer. Measured: the piped form returned 141 on the CORRECT tree, so
-# this leg was a permanent false FAIL that reddened every PR.
+# `set -uo pipefail` turns that into a NON-ZERO status — DISCARDING the match.
+#
+# ⛔ SIZE IS A NECESSARY CONDITION, NOT AN INCIDENTAL ONE. A previous revision of
+# this comment called it "a match-POSITION effect, not a size effect", and that is
+# measurably wrong — it is the same over-claim as the false premise three rounds
+# earlier. `scripts/check-no-sigpipe-grep.sh` states the race needs ALL of:
+# `pipefail` active, a payload larger than the ~64 KiB pipe buffer AFTER the match,
+# and the match on an EARLY line. Drop the size and it cannot fire at all: measured,
+# a 764-byte payload with an early match returns rc=0. That is why the several other
+# `printf … | grep -q` sites this lane reported in `tests/` are NOT live instances of
+# this class — their payloads are single lines.
+#
+# Both conditions hold HERE, which is what makes this one real: payload 117 227
+# bytes, and the match sits 78 448 bytes before the end. Measured: the piped form
+# returned 141 on the CORRECT tree, so this leg was a permanent false FAIL that
+# reddened every PR.
 # `scripts/check-no-sigpipe-grep.sh` enforces the ban but scans only
 # `scripts .husky pi-bootstrap` — NOT `tests/` — which is why this shipped. The
 # absence leg above is deliberately left as `grep -c`: it must read the WHOLE input
