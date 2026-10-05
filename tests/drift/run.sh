@@ -19,6 +19,8 @@
 #  14. absolute link resolving INSIDE the repo → drift FAIL, not machine-local (#7412)
 #  15. in-repo dir whose NAME starts with '..' → drift FAIL, not machine-local (#7412)
 #  16. target is a regular FILE, not a dir    → drift FAIL, exit 1 (#7412)
+#  17. in-repo target ABOVE the checked dir    → drift FAIL, exit 1 (#7412)
+#  18. DANGLING machine-local target           → info, exit 0 (GitHub-hosted path, #7412)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -54,7 +56,7 @@ cleanup() {
   # Case 14 creates an untracked dir INSIDE the tracked fixture; `git checkout`
   # restores tracked paths but never removes untracked ones, so remove it here
   # or an interrupted run leaves it behind.
-  rm -rf "$FIX/verify-inside-ai" "$FIX/..cache"
+  rm -rf "$FIX/verify-inside-ai" "$FIX/..cache" "$FIX/../ai-shaped-above"
   # #387: restore the live manifest.json (cp-back, NOT git checkout — uncommitted
   # manifest edits must survive an aborted run). Idempotent with the in-case restore.
   if [ -f "$MANIFEST_BAK" ]; then
@@ -358,6 +360,62 @@ else
   tail -15 "$OUT"
 fi
 rm -rf "$FILE_ROOT"
+
+echo ""
+echo "17. in-repo target ABOVE the checked dir → FAIL, exit 1 (#7412)"
+# Containment must be measured against the WORK-TREE ROOT, not targetDir.
+# `check <nested-dir>` is a supported invocation; measuring against the nested
+# dir classified an in-repo target ABOVE it as machine-local and forgave it
+# (exit 0), which `origin/main` correctly failed. The target here sits beside
+# the fixture, inside the same checkout, and is agent-infra-shaped so the
+# identification arm would otherwise accept it.
+ABOVE="$FIX/../ai-shaped-above"
+mkdir -p "$ABOVE/bin" "$ABOVE/scripts"
+: >"$ABOVE/manifest.json"
+: >"$ABOVE/bin/agent-infra.js"
+rm -f "$FIX/scripts"
+ln -sfn "../ai-shaped-above/scripts" "$FIX/scripts"   # RELATIVE, IN-REPO, ABOVE the checked dir
+if [ -e "$ABOVE/scripts" ]; then
+  pass "case 17 fixture target exists"
+else
+  fail "case 17 fixture target missing — it would pass for the wrong reason"
+fi
+run_check 1 "in-repo target above the checked dir (--ci)" --ci
+if grep -q "scripts: points to" "$OUT"; then
+  pass "in-repo target above the checked dir reported as drift"
+else
+  fail "an in-repo target above targetDir was forgiven (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$ABOVE"
+
+echo ""
+echo "18. DANGLING machine-local target → info, exit 0 (the GitHub-hosted path, #7412)"
+# This is the production path on ubuntu-latest: the consumer's committed
+# machine-local link does not resolve on the runner and MUST stay info/exit 0.
+# The change folded that arm into an `||`, making it load-bearing — and nothing
+# else covered it, so a regression here would redden every GitHub-hosted
+# consumer with no test standing in the way.
+rm -f "$FIX/scripts"
+ln -sfn "/nonexistent-7412-case18/scripts" "$FIX/scripts"
+if [ ! -e "$FIX/scripts" ]; then
+  pass "case 18 fixture target is dangling"
+else
+  fail "case 18 fixture target unexpectedly resolves"
+fi
+run_check 0 "dangling machine-local scripts link (--ci)" --ci
+if grep -q "points to .*expected" "$OUT"; then
+  fail "a dangling machine-local link was reported as drift (#7412 regression)"
+  tail -15 "$OUT"
+else
+  pass "dangling machine-local link not reported as drift"
+fi
+if grep -q "unverifiable in CI" "$OUT"; then
+  pass "dangling link classified info (unverifiable in CI)"
+else
+  fail "expected the absent-target info line"
+  tail -15 "$OUT"
+fi
 # The fixture is restored by the EXIT trap's cleanup(); no explicit checkout
 # here — a second git invocation inside this script trips the worktree
 # execution gate (#1484).

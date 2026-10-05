@@ -15,6 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFileSync } = require('child_process');
 const ciRefCheck = require('../scripts/ci-ref-check.cjs');
 
 // ─── Env / paths ────────────────────────────────────────────────────────────
@@ -370,10 +371,30 @@ function cmdUpdate() {
   }
 }
 
+/** The enclosing git work-tree root for [dir], or [dir] when there is none.
+ *
+ *  Containment must be measured against the REPO, not against whatever
+ *  directory the caller passed. `check <nested-dir>` is a supported invocation,
+ *  and measuring against a nested dir classified an in-repo target ABOVE it as
+ *  "machine-local" and forgave it (#7412 — a regression against the previous
+ *  behaviour, which failed that shape). Falls back to [dir] if git is absent or
+ *  the directory is not inside a work tree, which preserves the previous
+ *  behaviour exactly where the two coincide. */
+function repoRootFor(dir) {
+  try {
+    const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return top ? fs.realpathSync(top) : dir;
+  } catch {
+    return dir;
+  }
+}
+
 /** Classify a non-matching symlink target.
- *  'machine-local' — the target ESCAPES the repo tree, so it names a path on
- *  whatever machine is running (the normal state of a consumer's committed
- *  symlinks), as opposed to a link that rotted relative to this repo.
+ *  'machine-local' — the target ESCAPES the repo tree (measured against the
+ *  work-tree root), so it names a path on whatever machine is running (the
+ *  normal state of a consumer's committed symlinks), as opposed to a link that
+ *  rotted relative to this repo.
  *  'stale' — resolves inside the repo tree (a genuinely rotted link, or an
  *  absolute path that points back into the checkout).
  *
@@ -382,13 +403,13 @@ function cmdUpdate() {
  *  every absolute path as forgivable let a link to a wrong in-repo directory
  *  pass as `info`. Callers needing to know whether an existing target really
  *  is the expected surface must ask separately — see isAgentInfraScripts. */
-function classifyUnresolved(resolved, targetDir) {
+function classifyUnresolved(resolved, repoRoot) {
   // `startsWith('..')` alone is WRONG: path.relative returns a plain
   // `..`-prefixed segment chain for an external path, but it also returns
   // `..foo/scripts` for a path INSIDE the repo under a directory literally
   // named `..foo` — so an in-repo target was classified machine-local and
   // forgiven (a false PASS, #7412). Require `..` as a whole segment.
-  const rel = path.relative(targetDir, resolved);
+  const rel = path.relative(repoRoot, resolved);
   const external = rel === '..' || rel.startsWith(`..${path.sep}`);
   return external ? 'machine-local' : 'stale';
 }
@@ -422,6 +443,9 @@ function isAgentInfraScripts(resolvedScripts) {
 /** check [targetDir] — verify symlinks match manifest.json */
 function cmdCheck(targetDir, ciMode) {
   targetDir = targetDir ? path.resolve(targetDir) : process.cwd();
+  // Containment is measured against the work-tree root, NOT targetDir (#7412):
+  // a nested targetDir made an in-repo target above it look machine-local.
+  const repoRoot = repoRootFor(targetDir);
 
   const manifest = loadManifest();
   const version = manifest.version;
@@ -531,7 +555,7 @@ function cmdCheck(targetDir, ciMode) {
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
-        } else if (ciMode && classifyUnresolved(resolved, targetDir) === 'machine-local'
+        } else if (ciMode && classifyUnresolved(resolved, repoRoot) === 'machine-local'
                    && (!fs.existsSync(resolved) || isAgentInfraScripts(resolved))) {
           // A committed link escaping the repo points at a machine-local
           // agent-infra checkout. Forgive it only when the runner cannot reach
