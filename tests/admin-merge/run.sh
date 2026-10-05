@@ -8965,7 +8965,17 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 [ "$_dbl" = "0" ] \
   && pass "the rail never double-prefixes the slug in code — #1569" \
   || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
-printf '%s\n' "$_code" | grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' \
+# ⛔ `<<<` AND NOT A PIPE. `printf … | grep -q` is the repo's banned #841
+# anti-pattern: `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
+# `set -uo pipefail` turns that into a NON-ZERO status — DISCARDING the match. It is a
+# match-POSITION effect, not a size effect, and the payload here is ~117 KB, past the
+# 64 KiB pipe buffer. Measured: the piped form returned 141 on the CORRECT tree, so
+# this leg was a permanent false FAIL that reddened every PR.
+# `scripts/check-no-sigpipe-grep.sh` enforces the ban but scans only
+# `scripts .husky pi-bootstrap` — NOT `tests/` — which is why this shipped. The
+# absence leg above is deliberately left as `grep -c`: it must read the WHOLE input
+# to count, so it can never exit early and cannot take SIGPIPE.
+grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
   && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
   || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
 
