@@ -1186,6 +1186,13 @@ Dispatch a sub-agent to re-check eligibility (same as Step 1).
 
 Use `gh pr comment` to post the review. **ALL surviving issues must be included** — even when the fixer loop exited with remaining issues.
 
+**Capture the comment's URL** — `gh pr comment` PRINTS it on success, and Step 10 must NAME it as the review artifact (`--evidence comment:<id>`). Without the capture, Step 10 has no artifact to name and the record is not written:
+
+```bash
+REVIEW_URL="$(gh pr comment <PR_NUMBER> --body-file <review-comment-file>)"
+echo "review comment: $REVIEW_URL"   # keep this URL — Step 10 names its id
+```
+
 **If fixer loop stalled or fixer failed (issues remain):**
 
 ```
@@ -1296,9 +1303,48 @@ fi
 if [ -n "$RECORD_SH" ]; then
   # REST head resolution (GraphQL-exhaustion resilience, per #192).
   HEAD_SHA="$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>" --jq .head.sha 2>/dev/null || true)"
-  [ -n "$HEAD_SHA" ] && "$RECORD_SH" <PR_NUMBER> "$HEAD_SHA" clean
+  # The review artifact this record NAMES (REQUIRED for `clean` — see the bullet
+  # below): the comment Step 8 posted, whose URL Step 8 tells you to capture.
+  # This block RESOLVES the id itself rather than assuming the capture happened —
+  # an unset EV_ID silently short-circuited the record (the `&&` chain below did
+  # nothing and printed nothing), which is a quiet no-op on the one path that
+  # must keep working.
+  EV_ID="${REVIEW_URL##*#issuecomment-}"
+  [ "$EV_ID" = "${REVIEW_URL:-}" ] && EV_ID=""   # no fragment in $REVIEW_URL ⇒ nothing was captured
+  if [ -z "$EV_ID" ]; then
+    # Newest comment on the PR. `--paginate` matters: without it this returns the
+    # 30th comment on any PR with more than 30, i.e. an artifact older than the
+    # head, which the evidence check then refuses.
+    EV_ID="$(gh api --paginate "repos/{owner}/{repo}/issues/<PR_NUMBER>/comments" --jq '.[-1].id' 2>/dev/null | tail -1 || true)"
+  fi
+  if [ -z "$HEAD_SHA" ] || [ -z "$EV_ID" ]; then
+    echo "⚠️ record-review: no review artifact could be resolved (HEAD_SHA='${HEAD_SHA:-}', EV_ID='${EV_ID:-}') — NOT recording. Post the review comment, then name it: record-review.sh <PR> <head-sha> clean --evidence 'comment:<id>'" >&2
+  else
+    "$RECORD_SH" <PR_NUMBER> "$HEAD_SHA" clean --evidence "comment:$EV_ID"
+  fi
 fi
 ```
+
+- **`--evidence <artifact>` is REQUIRED for `clean`** (tortoise#7391): naming the
+  PR's current head is not evidence that anything was reviewed, so
+  `record-review.sh` demands a named review artifact and VERIFIES it — it must
+  exist, belong to THIS PR, POSTDATE the recorded head's commit, and not assert an
+  UNRESOLVED outcome — NOT-CLEAN, or this skill's own stalled/failed/cap exit
+  markers ("Auto-fix stalled", "Auto-fix failed", "require human attention",
+  "N issues remain"); the clean template ("Found N issues", all fixed) passes.
+  Anything unverifiable, including an unreachable API, REFUSES
+  (exit 3) and prints the remedy. Accepted forms: `comment:<id>` (an issue
+  comment — what Step 8 posts), `review:<id>` (a PR review),
+  `review-comment:<id>` (an inline review comment), or the GitHub URL of one of
+  those. This is an auditability and friction boundary, not proof of review:
+  there is no reviewer-identity check, and the gate does not check that the
+  artifact IS a review — a bot or CI comment satisfies it when it postdates the
+  head, so naming a non-review is a deliberate act rather than an accident (the
+  path this guard closes is the silent one: naming the head itself took no
+  argument at all). `clean-micro`, `clean-low` and a genuine
+  carry-forward are unaffected — a carry records `"mint":"carried"` and carries
+  no evidence field, because its evidence is the prior signed marker it
+  re-verified.
 
 - `record-review.sh` auto-resolves `<owner/repo>`; pass it explicitly as the 4th
   arg when run outside the git repo.

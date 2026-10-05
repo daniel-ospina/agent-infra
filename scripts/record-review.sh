@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# record-review.sh <pr> <head_sha> [verdict] [repo]
+# record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <artifact>]
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
@@ -17,6 +17,69 @@
 # --force-stale (any position): record a head_sha that is NOT the PR's
 # current head. Off by default — the stale-sha guard (#2133) refuses such
 # records with exit 3 because the ai-review-gate rejects them anyway.
+#
+# --evidence <artifact> — REQUIRED to mint a `clean` record (issue tortoise#7391).
+# Names the review artifact this verdict rests on, one of:
+#   comment:<id>            a PR issue comment        (this fleet's convention)
+#   review:<id>             a PR review
+#   review-comment:<id>     an inline review comment
+#   <a GitHub URL>          any of the three, pasted (…/pull/N#issuecomment-ID,
+#                           #discussion_rID, #pullrequestreview-ID)
+# The script then VERIFIES it: it must exist, belong to THIS PR, POSTDATE the
+# recorded head's commit, and NOT assert an UNRESOLVED outcome — NOT-CLEAN, or
+# the review skills' own exit markers ("Auto-fix stalled/failed/reached … cap",
+# "N issues remain", "requires human attention/input"). Anything it
+# cannot verify — including an unreachable API — REFUSES (exit 3). Until
+# tortoise#7391 this script asked that question on NO path: passing the PR's current
+# head recorded unconditionally, so the most natural invocation there is
+# ("record this PR at its current head") minted a validly-signed, head-bound
+# `verdict=clean` with no review behind it. tortoise#3549 merged on exactly
+# such a record (every review artifact on that PR said NOT CLEAN).
+#
+# WHAT THE CHECK IS AND IS NOT. It makes an unfounded record require a PUBLIC,
+# NAMED, TIMESTAMPED claim, and stores that claim in the record so it is
+# auditable afterwards. It does NOT make forgery impossible, and it does NOT
+# check that the artifact it accepts IS a review: it verifies existence, PR
+# membership, age and the absence of an UNRESOLVED assertion, so a bot or CI
+# comment that describes no review satisfies it as well. The recording lane can
+# therefore author the comment it names, or name one that is no review at all.
+#
+# The age test is ONE-DIRECTIONAL and this is a declared residual, not an
+# oversight: `created_at >= head_commit_date` proves the artifact postdates the
+# recorded revision, but NOT that the artifact reviewed THAT revision. After a
+# force-push BACKWARD onto an older commit, a genuine clean review of the newer
+# head still postdates the older one and is therefore accepted at it. Closing it
+# needs the PR's force-push/pushed_at timeline (or a content binding, which the
+# carry path deliberately does not do — recorded decision #1362 D1), so it is a
+# named gap: a consumer-side content binding is the successor, home agent-infra
+# #1224.
+# Neither is an accident — each takes an explicit argument — and closing them
+# needs a reviewer identity boundary this fleet cannot supply (every session
+# authenticates as the same GitHub account, and the reviewer is a sub-agent of
+# the recording lane). It is an auditability and friction boundary, not a proof
+# of review: what it removes is the SILENT path, where naming the PR's current
+# head minted `clean` with no argument at all.
+#
+# A CARRY does not need --evidence. A carry is not a fresh attestation: the
+# DIFF carry rides a prior signed marker it verified, and the record says so via
+# `"mint":"carried"`. The LANE carry (a base-only move) verifies the git graph,
+# not a record — its freshness argument is inherited from the pre-#7391 design
+# and it is the one carry arm with no marker behind it; it is a named residual
+# rather than a closed one, and tests/record-review/run.sh covers its predicate.
+# clean-micro and clean-low are also not covered, and that is deliberate —
+# clean-micro certifies the micro PROCESS (tier guard + pre-flight + the #485
+# dispatch floor), which is a review-free attestation of a different kind, and
+# clean-low's content-shape guard is fail-closed and re-reads the head itself.
+# A `clean` record is the only one that claims a full review happened and cannot
+# otherwise be verified.
+#
+# Mint provenance (tortoise#7391). Every record now carries `"mint":"fresh"|"carried"`.
+# A carried record additionally carries `"carried_from":<prior head>` and
+# `"carried_at"`, and its `reviewed_at` is the ORIGINAL mint time recovered
+# from the record it superseded — not the carry time, which used to overwrite
+# it and made the mint time unrecoverable after the fact. When the original
+# cannot be recovered the script says so loudly on stderr and `mint` marks the
+# record as carried, so `reviewed_at` is never silently a carry time.
 #
 # Verdicts (issue #513; clean-low added by #1348):
 #   clean       — a code-review skill convergence recorded its clean verdict
@@ -260,6 +323,196 @@ clean_low_shape_ok() {
   return 0
 }
 
+# ── tortoise#7391 — the review-artifact evidence gate (fresh `clean` records) ────
+# A `clean` record is the only verdict that asserts a review HAPPENED and
+# cannot be cross-checked from anything else on disk, so the caller must name
+# the artifact it rests on and this script must be able to read it back.
+# Everything here is FAIL-CLOSED: an unparseable ref, an unreadable artifact,
+# an unreadable commit date, or a REST call that failed all refuse. A
+# verification that degraded to a pass would be this same defect one layer up.
+
+# Accepted reference shapes → "<kind>\t<id>". Nothing else is guessed at.
+evidence_ref_split() { # <ref> -> "<kind>\t<id>"; rc 1 = not a recognisable artifact ref
+  local ref="$1" kind="" id=""
+  # A ref carrying a quote, a backslash or ANY control character could break
+  # the record's JSON framing further down, and no legitimate ref contains one
+  # — refuse rather than escape (the same fail-closed posture as clean_low_path_ok).
+  # The whole C0 range is refused, not an enumerated list: a raw CR / BEL / escape
+  # slipped past the earlier `\n`/`\t`-only case and reached the record as
+  # `"evidence":"…\r…"`, which BOTH jq and Python json then reject as an invalid
+  # control character (review-enforcer: JSON.parse throws -> no record read).
+  # The backslash arm must match ONE backslash. `*'\\'*` is the two-character
+  # string `\\` (quoted pattern characters are literal), so it only ever fired on
+  # a pair — and a single-backslash ref slipped through to the record as
+  # `"evidence":"…\#…"`, an invalid JSON escape that BOTH jq and Python json
+  # reject (the record then reads as absent, which fails closed at the merge gate
+  # but silently: the lane was told the evidence verified). `*"\\"*` is one
+  # literal backslash (reviewer B, cycle 2).
+  if [[ "$ref" == *'"'* || "$ref" == *"\\"* || "$ref" =~ [[:cntrl:]] ]]; then return 1; fi
+  case "$ref" in
+    *"/pull/"*"#issuecomment-"*)      kind="comment";        id="${ref##*#issuecomment-}" ;;
+    *"/issues/"*"#issuecomment-"*)    kind="comment";        id="${ref##*#issuecomment-}" ;;
+    *"/pull/"*"#discussion_r"*)       kind="review-comment"; id="${ref##*#discussion_r}" ;;
+    *"/pull/"*"#pullrequestreview-"*) kind="review";         id="${ref##*#pullrequestreview-}" ;;
+    comment:*|issuecomment:*)          kind="comment";        id="${ref#*:}" ;;
+    review:*)                          kind="review";         id="${ref#*:}" ;;
+    review-comment:*|discussion:*)     kind="review-comment"; id="${ref#*:}" ;;
+    *) return 1 ;;
+  esac
+  # The id must be purely numeric AND the whole tail: `comment:12x` is not a
+  # ref, and neither is a URL fragment with trailing junk.
+  [[ "$id" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\t%s' "$kind" "$id"
+}
+
+# One gh read per artifact, emitting "<created_at>\t<parent_url>\t<body>\t<state>".
+# `@tsv` keeps the body on ONE line (newlines escaped), so the caller reads
+# four fields with a single `read` and never needs an external jq. Only the
+# review arm has a `state`; the other arms emit three fields and `read` leaves
+# the fourth empty.
+evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
+  case "$1" in
+    comment)
+      command gh api "repos/$REPO/issues/comments/$2" \
+        --jq '[(.created_at // ""), (.issue_url // ""), (.body // "")] | @tsv' 2>/dev/null ;;
+    review)
+      # `.state` is GitHub's OWN machine-readable verdict on the review
+      # (APPROVED | CHANGES_REQUESTED | COMMENTED | DISMISSED | PENDING) and is
+      # carried out for the explicit check below: a CHANGES_REQUESTED review
+      # whose body happens to veto-match nothing is still not clean evidence,
+      # and no body-text widen can close that (reviewer B, P2).
+      command gh api "repos/$REPO/pulls/$PR/reviews/$2" \
+        --jq '[(.submitted_at // .created_at // ""), (.pull_request_url // ""), (.body // ""), (.state // "")] | @tsv' 2>/dev/null ;;
+    review-comment)
+      command gh api "repos/$REPO/pulls/comments/$2" \
+        --jq '[(.created_at // ""), (.pull_request_url // ""), (.body // "")] | @tsv' 2>/dev/null ;;
+    *) return 1 ;;
+  esac
+}
+
+# Verify that <ref> is a review artifact attesting THIS PR at <head>.
+# Prints one confirmation line on success; prints WHY on stderr and returns 1.
+verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
+  local ref="$1" head="$2" split kind id row created parent body state head_date _rest
+  if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
+    echo "   cannot verify review evidence without a repo and the gh CLI (repo='${REPO:-<none>}') — pass <owner/repo> explicitly so the artifact can be read." >&2
+    return 1
+  fi
+  if ! split="$(evidence_ref_split "$ref")"; then
+    echo "   not a recognisable review-artifact reference: '$ref'" >&2
+    echo "   accepted: comment:<id>, review:<id>, review-comment:<id>, or the GitHub URL of one of those." >&2
+    return 1
+  fi
+  kind="${split%%$'\t'*}"
+  id="${split##*$'\t'}"
+  if ! row="$(evidence_fetch "$kind" "$id")" || [ -z "$row" ]; then
+    echo "   could not read $kind $id from $REPO — it does not exist, or the API is unreachable. A FAILED READ IS NOT EVIDENCE: retry rather than record." >&2
+    return 1
+  fi
+  # Fields are split MANUALLY, never with `IFS=$'\t' read`: tab is an IFS
+  # WHITESPACE character, so `read` collapses an empty field. A review whose body
+  # is empty (`TS\tPARENT\t\tCHANGES_REQUESTED`) then parsed as
+  # body="CHANGES_REQUESTED", state="" — the state guard below short-circuited on
+  # an empty `state` and a changes-requested review with inline comments and no
+  # prose was ACCEPTED, minting `clean` (reviewer B, cycle 2: reproduced against
+  # this function with real `jq @tsv` framing). The `%%`/`#` splits preserve empty
+  # fields wherever they fall.
+  created="${row%%$'\t'*}"; _rest="${row#*$'\t'}"
+  parent="${_rest%%$'\t'*}"; _rest="${_rest#*$'\t'}"
+  body="${_rest%%$'\t'*}"; state="${_rest#*$'\t'}"
+  # The comment / review-comment arms emit three fields and carry no state; when
+  # the split left `_rest` intact there was no 4th field to take.
+  [ "$state" = "$_rest" ] && state=""
+  # ON THIS PR: a comment on some other PR is not this PR's evidence.
+  case "$kind" in
+    comment)
+      case "$parent" in */issues/"$PR") ;; *) echo "   $kind $id does not belong to $REPO#$PR (parent: ${parent:-unknown})" >&2; return 1 ;; esac ;;
+    *)
+      case "$parent" in */pulls/"$PR") ;; *) echo "   $kind $id does not belong to $REPO#$PR (parent: ${parent:-unknown})" >&2; return 1 ;; esac ;;
+  esac
+  # NOT the attestation itself: a record MARKER is not a review of the code.
+  # Anchored to a LINE START, not to position 0: the body arrives @tsv-escaped,
+  # so its newlines are the two characters `\n` and the whole comment is ONE
+  # line — `^` alone matched only a body that was nothing BUT a marker, and a
+  # marker introduced by any preceding line was accepted (reviewer B, P2).
+  if grep -qE '(^|\\n)review recorded: reviews/' <<<"$body"; then
+    echo "   $kind $id is a record marker, not a review artifact — it attests that a verdict was recorded, which is the very thing this check exists to stop taking on trust." >&2
+    return 1
+  fi
+  # GITHUB'S OWN VERDICT ON A REVIEW. PR reviews carry a machine-readable state;
+  # anything but APPROVED/COMMENTED (i.e. CHANGES_REQUESTED, DISMISSED, PENDING)
+  # is not evidence of a clean review whatever its body says.
+  if [ -n "$state" ] && [[ ! "$state" =~ ^(APPROVED|COMMENTED)$ ]]; then
+    echo "   $kind $id is a $state review — a review that requested changes, was dismissed, or never concluded is not evidence of a clean review." >&2
+    return 1
+  fi
+  # POSTDATES THE RECORDED REVISION. Without this the lane can name a clean
+  # artifact from an earlier head, which is how an unreviewed head gets a
+  # verdict minted on it (tortoise#7391's own reproduction: two PRs whose
+  # current diffs were never reviewed, recorded clean via their current head).
+  head_date="$(command gh api "repos/$REPO/commits/$head" --jq '.commit.committer.date // ""' 2>/dev/null || true)"
+  if ! [[ "$head_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    echo "   could not read the commit date of the recorded head ${head:0:12}… — cannot show the artifact postdates the revision it would attest." >&2
+    return 1
+  fi
+  if ! [[ "$created" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+    echo "   $kind $id carries no readable created_at timestamp." >&2
+    return 1
+  fi
+  # Same ISO-8601 Z format on both sides, so the string compare IS the time compare.
+  if [[ "$created" < "$head_date" ]]; then
+    echo "   $kind $id was created $created, BEFORE the recorded head's commit date $head_date — it cannot attest a revision that did not exist yet." >&2
+    return 1
+  fi
+  # A NOT-CLEAN artifact is evidence a review FAILED. tortoise#3549 carried six
+  # comments and every one of them said NOT CLEAN, so existence alone would let
+  # a lane name one of them and still mint `clean`.
+  #
+  # A LITERAL "not clean" match is NOT enough — found by the tortoise#7391 scoping
+  # verifier, reproduced against the review skills' OWN templates. The
+  # `code-review` skill's Step 8 header for a review that ends with UN-FIXED
+  # issues is
+  #     "⚠️ Auto-fix [stalled after N cycles | failed: <reason>] — M issues
+  #      require human attention"
+  # which contains no `not…clean` substring at all, yet is exactly the
+  # documentation of a failed review this arm exists to reject. The veto
+  # therefore also matches the unresolved-exit vocabulary the review skills
+  # emit: the stalled/failed auto-fix header, "require(s) human attention", and
+  # "N issues remain" (the cap markers).
+  #
+  # The veto names the UNRESOLVED-exit vocabulary the review skills actually
+  # emit, plus the digits-guarded remain form. It deliberately does NOT match
+  # "Found N issues" (the CLEAN template lists issues that were FIXED) or the
+  # bare phrase "issues remain" (a clean review reports "No issues remain after
+  # the fixes"): either would false-refuse a legitimate clean record and deadlock
+  # the lane, which is why the remain form requires a leading COUNT and the
+  # unresolved form requires the word "unresolved". Exact emissions covered:
+  #   "## Review — NOT CLEAN"                                  (13f)
+  #   "⚠️ Auto-fix stalled after N cycles … requires human review"
+  #   "⚠️ Auto-fix made no changes for 2 consecutive cycles (zero-progress) …"
+  #   "⚠️ Auto-fix converged with issues unresolved — requires human review"
+  #   "⚠️ Auto-fix stuck (honest-stuck …) — requires human review"
+  #   "⚠️ Auto-fix aborted (tool-unavailable|push-failed|git-error|pr-closed) …"
+  #   "⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain"
+  #   "⚠️ Test review capped at 10 cycles — N issues remain:"   (literal N)
+  #   "Requires Human Input / Requires Human Attention"        (plan-review block)
+  #   "[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…"
+  # Every prefix above is quoted from `skills/code-review/references/fixer-loop.md
+  # §"PR comment prefix"` — the file that OWNS the vocabulary — because an earlier
+  # revision of this arm hard-coded a PARAPHRASE ("human attention") of the skill's
+  # actual marker ("requires human review") and therefore admitted four of the
+  # seven unresolved prefixes verbatim, reproducing the tortoise#3549 shape:
+  # a lane whose review ABORTED could name its own Step-8 comment and mint clean.
+  # An unresolved-exit prefix that this list does not name is a fail-open, so
+  # extend it from fixer-loop.md, never from memory.
+  if grep -qiE 'not[[:space:]_-]*clean|auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]' <<<"$body"; then
+    echo "   $kind $id asserts an UNRESOLVED outcome (NOT-CLEAN, or a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
+    return 1
+  fi
+  printf '%s %s on %s#%s, created %s, postdates head %s\n' "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
+  return 0
+}
+
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # ── #980: the second-model subsystem was removed ────────────────────────
@@ -278,6 +531,12 @@ done
 # Only $1..$4 are read, so a dropped trailing flag used to shift the repo
 # position and still write a record with rc=0.
 FORCE_STALE=0
+EVIDENCE=""
+# tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
+# record claims `evidence` only when this run actually read and accepted that
+# artifact — passing --evidence on a path the gate does not cover (a carry, a
+# non-clean verdict) cannot put an unverified claim in the record.
+EVIDENCE_VERIFIED=""
 POSITIONAL=()
 _argv=("$@")
 _i=0
@@ -285,17 +544,25 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   _arg="${_argv[$_i]}"
   case "$_arg" in
     --force-stale) FORCE_STALE=1 ;;
+    --evidence)
+      # tortoise#7391: consumes the NEXT argument (the review-artifact reference).
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --evidence needs a value — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale]" >&2
+        exit 2
+      fi
+      EVIDENCE="${_argv[$_i]}" ;;
     --second-model|--second-model-independent)
       echo "record-review.sh: '$_arg' was removed with the second-model subsystem (#980/#979) — this repo is single-model; refusing to record. Drop it from the invocation." >&2
       exit 2 ;;
-    -*) echo "record-review.sh: unknown option '$_arg' — the second-model gate was removed (#980/#979). usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+    -*) echo "record-review.sh: unknown option '$_arg' — the second-model gate was removed (#980/#979). usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale]" >&2
         exit 2 ;;
     *) POSITIONAL+=("$_arg") ;;
   esac
   _i=$((_i + 1))
 done
 if [ "${#POSITIONAL[@]}" -gt 4 ]; then
-  echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]" >&2
+  echo "record-review.sh: too many arguments (${#POSITIONAL[@]}) — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale]" >&2
   exit 2
 fi
 if [ "${#POSITIONAL[@]}" -gt 0 ]; then
@@ -303,7 +570,7 @@ if [ "${#POSITIONAL[@]}" -gt 0 ]; then
 else
   set --
 fi
-PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale]}"
+PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale] [--evidence <artifact>]}"
 SHA="${2:?missing head_sha}"
 VERDICT="${3:-clean}"
 REPO="${4:-}"
@@ -331,6 +598,13 @@ fi
 if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
+# tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
+# current head. A carried record's `carried_from` (and the head the recovered
+# mint time belongs to) is this one, not the head it is carried onto.
+ORIG_SHA="$SHA"
+# Set by the carry arms below; initialised here so the tortoise#7391 evidence gate can
+# read it unconditionally under `set -u`.
+CARRY_ARM=""
 # Auto-detect repo (owner/name) when not passed explicitly. Detect BEFORE
 # format-checking: an omitted repo is legal here (auto-detected), and when
 # nothing is detectable the record proceeds repo-less for backward compat.
@@ -1233,6 +1507,31 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
   fi
 fi
 
+# ── tortoise#7391 — a FRESH `clean` record must name a review artifact ───────────
+# This is the branch the defect lived on. CARRY_ARM is set ONLY when a verified
+# carry re-bound the verdict to the live head, so an empty CARRY_ARM means this
+# invocation is minting a NEW `clean` attestation at the head it names — the
+# case that, before this guard, recorded unconditionally with no evidence
+# question asked on any path. NOTE this runs OUTSIDE the REPO/gh block above,
+# so an invocation that cannot reach GitHub at all (no repo, missing gh) is
+# refused rather than silently un-asked: verification is the point.
+if [ "$VERDICT" = "clean" ] && [ -z "$CARRY_ARM" ]; then
+  if [ -z "$EVIDENCE" ]; then
+    echo "⛔ tortoise#7391: refusing to mint a 'clean' record for ${SHA:0:12}… with NO review evidence." >&2
+    echo "   A 'clean' verdict is a full-review attestation, and this invocation is a FRESH one: it is not a carry (no prior signed marker was verified for this diff), so nothing here shows a review happened." >&2
+    echo "   Naming the PR's CURRENT head is not evidence — that is precisely the invocation that recorded an unreviewed diff before this guard existed (tortoise#7391; tortoise#3549 merged on exactly such a record while every review comment on it said NOT CLEAN)." >&2
+    echo "   → Run the review, then name its artifact: record-review.sh $PR $SHA clean ${REPO:-<owner/repo>} --evidence <comment:<id> | review:<id> | review-comment:<id> | <its URL>>" >&2
+    echo "   → If a verdict is ALREADY recorded at an earlier head and only the base moved, land via the rail (scripts/atomic-land.sh): it carries the verified record and needs no --evidence." >&2
+    exit 3
+  fi
+  if ! verify_review_evidence "$EVIDENCE" "$SHA" >/dev/null; then
+    echo "⛔ tortoise#7391: refusing to mint a 'clean' record for ${SHA:0:12}… — the named review evidence could not be verified (reason above)." >&2
+    exit 3
+  fi
+  EVIDENCE_VERIFIED="$EVIDENCE"
+  echo "✅ tortoise#7391 review evidence verified: $EVIDENCE" >&2
+fi
+
 # ── Clean-micro tier guard (#513) ──────────────────────────────────────────
 # clean-micro certifies the MICRO process: the linked same-repo issue must
 # carry the complexity:micro label at record time. Standard/complex/complexity
@@ -1302,7 +1601,8 @@ if [ "$VERDICT" = "clean-micro" ]; then
             REFUSED=1
             echo "❌ clean-micro tier guard: $REPO#$PR closes $ref, whose complexity label is \"$OFFENDING_LABEL\" — clean-micro certifies the MICRO process only and is REFUSED for a non-micro linked issue." >&2
             echo "   → Run the code-review skill on the current head and record clean:" >&2
-            echo "   →   record-review.sh $PR <head-sha> clean $REPO" >&2
+            echo "   →   record-review.sh $PR <head-sha> clean $REPO --evidence <artifact>" >&2
+            echo "   →   (<artifact> = the review comment the skill posted, e.g. comment:<id>; see the --evidence rules above.)" >&2
             echo "   → If the issue's tier is genuinely micro, correct its label (issue-creation: relabel complexity:micro), then re-record clean-micro." >&2
             break
           fi
@@ -1390,7 +1690,8 @@ if [ "$VERDICT" = "clean-low" ]; then
     echo "   Changed paths:" >&2
     printf '%s\n' "$ROWS" | LC_ALL=C awk -F '\t' '{ print "     " $1 " " $2 }' >&2
     echo "   → Run the code-review skill on the current head, then record clean:" >&2
-    echo "   →   record-review.sh $PR $SHA clean $REPO" >&2
+    echo "   →   record-review.sh $PR $SHA clean $REPO --evidence <artifact>" >&2
+    echo "   →   (<artifact> = the review comment the skill posted, e.g. comment:<id>; see the --evidence rules above.)" >&2
     echo "   → A docs change that ALSO adds a non-prose file (an image, a data or" >&2
     echo "     config file under docs/, .html, .mdx) is refused the same way: only" >&2
     echo "     the prose/stylesheet extensions are in class, so it has no Low verdict." >&2
@@ -1443,12 +1744,45 @@ DIFF_FIELD=""
 if [ -n "${DIFF_HASH:-}" ]; then
   DIFF_FIELD="\"diff_sha256\":\"$DIFF_HASH\","
 fi
+# tortoise#7391 — MINT PROVENANCE, and the end of the carry overwriting the mint time.
+# A carried record used to be byte-identical in shape to a freshly-minted one
+# and showed the CARRY (≈ merge) time in reviewed_at, so the time the review
+# actually happened was unrecoverable after the fact — the record this issue's
+# live instance rests on reads reviewed_at 03:35:39Z while its reviews are from
+# the previous day. `mint` makes the two distinguishable; `carried_from` and
+# `carried_at` say what was carried and when; reviewed_at is restored to the
+# ORIGINAL mint time recovered from the record this carry supersedes.
+MINT_FIELDS="\"mint\":\"fresh\","
+if [ -n "$CARRY_ARM" ]; then
+  MINT_FIELDS="\"mint\":\"carried\",\"carried_from\":\"$ORIG_SHA\",\"carried_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+fi
+EVIDENCE_FIELD=""
+if [ -n "$EVIDENCE_VERIFIED" ]; then
+  EVIDENCE_FIELD="\"evidence\":\"$EVIDENCE_VERIFIED\","
+fi
+REVIEWED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ -n "$CARRY_ARM" ]; then
+  # $FILE is read BEFORE the mv below, so it still holds the record this carry
+  # supersedes; that record names the head the verdict was minted at, so its
+  # reviewed_at IS the mint time.
+  PRIOR_HEAD=""; PRIOR_AT=""
+  if [ -f "$FILE" ]; then
+    PRIOR_HEAD="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
+    PRIOR_AT="$(sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p' "$FILE" | command head -1)"
+  fi
+  if [ -n "$PRIOR_AT" ] && [ "$PRIOR_HEAD" = "$ORIG_SHA" ]; then
+    REVIEWED_AT="$PRIOR_AT"
+    echo "tortoise#7391 carry provenance: reviewed_at preserved as the original mint time $PRIOR_AT (mint=carried, carried_from=${ORIG_SHA:0:12}…)" >&2
+  else
+    echo "⚠️ tortoise#7391: CARRIED record for ${REPO:-<no-repo>}#$PR and the ORIGINAL mint time is not recoverable (no record on disk names ${ORIG_SHA:0:12}… with a reviewed_at) — reviewed_at is the CARRY time, not the mint time; \`mint\`/\`carried_at\` say so." >&2
+  fi
+fi
 if [ -n "$REPO" ]; then
-  printf '{"pr":%d,"head_sha":"%s",%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$VERDICT" "$REPO" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
 else
-  printf '{"pr":%d,"head_sha":"%s",%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
-    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$VERDICT" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$TMP"
+  printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
+    "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
 mv "$TMP" "$FILE"
 # Migration (#426): a legacy <pr>.json that belongs to THIS repo is

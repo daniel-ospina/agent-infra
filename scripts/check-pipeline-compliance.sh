@@ -914,7 +914,7 @@ run_checks() {
       # prose mentioning the marker text (this PR's own description tripped
       # the bare-substring grep on the first pipeline-compliance run).
       if has_clean_micro_marker "$EVID_TEXT"; then
-        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
+        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
       else
         pass c "code-review evidence in PR body/commits (review dispatch marker)"
       fi
