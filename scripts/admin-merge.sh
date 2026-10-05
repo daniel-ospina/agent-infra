@@ -2245,7 +2245,15 @@ workflow_pr_evaluable() {
     # produce (an over-block with a remedy no rebase satisfies).
     if [ "$WF_PR_PATHS_READ" -eq 0 ]; then
       WF_PR_PATHS_READ=1
-      WF_PR_CHANGED_PATHS="$($GH api "repos/$slug/pulls/$PR/files?per_page=100" --paginate \
+      # ⛔ `$slug` ALREADY CARRIES the `repos/` prefix — every binding site passes
+      # `repos/<owner>/<repo>`, which is why the line above reads `$slug/contents/…`.
+      # Writing `repos/$slug/…` here composes `repos/repos/<owner>/<repo>/…`, which
+      # 404s, so `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it.
+      # Empty is not neutral: `ci-workflow-pr-evaluable.sh` then answers `unknown`,
+      # and the base-side red stays BLOCKING — a false block whose remedy no rebase
+      # satisfies — while the #1542 filter comparison this fetch exists to feed is
+      # silently disabled for the common case (#1569).
+      WF_PR_CHANGED_PATHS="$($GH api "$slug/pulls/$PR/files?per_page=100" --paginate \
                                  --jq '.[].filename' 2>/dev/null || true)"
     fi
     verdict="$(printf '%s' "$body" | PR_CHANGED_PATHS="$WF_PR_CHANGED_PATHS" \

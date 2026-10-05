@@ -8907,6 +8907,57 @@ pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_r
 pe_paths "push + branches still exempt" no 'src/a.c'             $'on:\n  push:\n    branches: [main]\n'
 pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\n'
 
+# #1569 — `$slug` IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
+#
+# `workflow_pr_evaluable()` receives `repos/<owner>/<repo>`. The changed-file fetch
+# read `repos/$slug/pulls/…`, composing `repos/repos/…` → 404 → `WF_PR_CHANGED_PATHS`
+# EMPTY → the predicate answers `unknown` → the base-side red stays BLOCKING. Empty
+# is not neutral here; an unavailable answer is read as a blocking one.
+#
+# Two legs, and both are needed. The ABSENCE leg catches the double prefix. The
+# PRESENCE leg is anchored on the ASSIGNMENT `WF_PR_CHANGED_PATHS=`, NOT on the bare
+# path: the bare path occurs at four sites in the scanned rail (`scripts/admin-merge.sh`)
+# — the #1569 fetch, another function's lane-parity fetch, and two
+# `LANE_DECLINED_REASON="…"` message strings — so a bare-text leg stayed GREEN with
+# the fetch deleted. Anchoring on the assignment is what makes it behavioural.
+#
+# Both legs read `sed -E 's/(^|[[:space:]])#.*//'` of the rail, i.e. EXECUTABLE text.
+# The facts that pin the two fragile details, so nobody has to rediscover them:
+#   * `sed -E`, not a BRE alternation — `\|` is a GNU extension and BSD/macOS `sed`
+#     silently no-ops it, leaving the strip inert (measured: that form counts 1 here).
+#   * The strip is HEURISTIC and fails BOTH ways — a trailing comment is a loud false
+#     FAIL, and a `#` inside a quoted string truncates the line. No line today combines
+#     the latter with a later `repos/$slug`, so the count is right; re-check that first
+#     if this ever reads a surprising zero.
+#
+# Failure it prevents (#1569): a false block on every PR whose changed-file list is
+# needed. Product, not process — it guards a fail-closed predicate's INPUT.
+_code="$(sed -E 's/(^|[[:space:]])#.*//' "$ADM" || true)"
+_dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
+[ "$_dbl" = "0" ] \
+  && pass "the rail never double-prefixes the slug in code — #1569" \
+  || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
+# `<<<` AND NOT A PIPE: `printf … | grep -q` is the repo's banned #841 anti-pattern.
+# `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
+# `set -uo pipefail` (run.sh:192) makes that a non-zero pipeline status — DISCARDING
+# the match. Measured here: payload 117 227 bytes, match 78 448 bytes before the end,
+# rc=141 on the CORRECT tree, i.e. a permanent false FAIL reddening every PR.
+#
+# The race needs ALL of: `pipefail`, a payload past the ~64 KiB pipe buffer AFTER the
+# match, and the match on an EARLY line (see `scripts/check-no-sigpipe-grep.sh`).
+# SIZE IS ONE OF THEM — a 764-byte payload with an early match returns rc=0 — so the
+# other `printf … | grep -q` sites in `tests/` are safe for their SIZE, not their
+# line count (`tests/admin-merge/run.sh:5993` pipes a 121-line, ~8 KB body).
+#
+# The absence leg above is deliberately `grep -c`: it must read the WHOLE input to
+# count, so it cannot exit early and cannot take SIGPIPE.
+#
+# That guard did not catch this one because its `SCAN_DIRS` is
+# `(scripts .husky pi-bootstrap)` — `tests/` is NOT scanned.
+grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
+  && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
+  || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
