@@ -8921,10 +8921,13 @@ pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\
 # The pair below is what makes the check meaningful — the absence alone would also
 # pass if the fetch were deleted outright, and the presence leg is therefore pinned
 # to the ASSIGNMENT (`WF_PR_CHANGED_PATHS=…`), not to the path text. That precision
-# is not decoration: the bare path occurs at FOUR sites in this file — the #1569
-# fetch, a different function's lane-parity fetch, and TWO
-# `LANE_DECLINED_REASON="…"` message strings — so a bare-text presence leg stayed
-# GREEN with the #1569 fetch deleted (measured). It pinned prose, not behaviour.
+# is not decoration: the bare path occurs at FOUR sites in the SCANNED RAIL
+# (`scripts/admin-merge.sh`) — the #1569 fetch, a different function's lane-parity
+# fetch, and TWO `LANE_DECLINED_REASON="…"` message strings. The rail is named
+# explicitly because this comment lives in `tests/admin-merge/run.sh`, where the
+# bare path occurs ZERO times; "this file" would point an auditor at the wrong one.
+# MEASURED: with the bare-text leg, deleting the #1569 fetch still left that
+# assertion GREEN — it pinned prose, not behaviour.
 #
 # ⛔ WHAT THIS CHECK IS NOT. It is NOT here because the `$GH` stub is blind to the
 # URL — it is not (measured: the stub reads the URL from argv and matches it by
@@ -8949,9 +8952,11 @@ pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\
 # previous revision of this comment claimed the safe direction was the only one,
 # and that was measured FALSE. Too little stripping — a TRAILING comment naming the
 # form — is a loud false FAIL (measured: the naive whole-file grep returned 1,
-# from the comment). TOO MUCH stripping is also live: this file carries ~20 lines
-# with a `#` inside a quoted string (e.g. `say_err "   vocabulary, #1319). …"`),
-# which the strip truncates, and a truncated line loses anything after the `#`.
+# from the comment). TOO MUCH stripping is also live: the SCANNED RAIL
+# (`scripts/admin-merge.sh`) carries ~20 lines with a `#` inside a quoted string
+# (e.g. `say_err "   vocabulary, #1319). …"`), which the strip truncates, and a
+# truncated line loses anything after the `#`. This count is of the rail, not of
+# `tests/admin-merge/run.sh`, which carries 34 such lines.
 # No line today combines such a string with a later `repos/$slug`, so the count is
 # correct — but that is a property of the CURRENT TEXT, not of the stripper, and it
 # is the thing to re-check first if this assertion ever reads a surprising zero.
@@ -8975,9 +8980,13 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 # earlier. `scripts/check-no-sigpipe-grep.sh` states the race needs ALL of:
 # `pipefail` active, a payload larger than the ~64 KiB pipe buffer AFTER the match,
 # and the match on an EARLY line. Drop the size and it cannot fire at all: measured,
-# a 764-byte payload with an early match returns rc=0. That is why the several other
-# `printf … | grep -q` sites this lane reported in `tests/` are NOT live instances of
-# this class — their payloads are single lines.
+# a 764-byte payload with an early match returns rc=0. That is why the other
+# `printf … | grep -q` sites this lane reported in `tests/` cannot fire the race —
+# their payloads are BELOW THE PIPE BUFFER. Say it that way, because an earlier
+# revision of this sentence said "their payloads are single lines" and that is
+# FALSE: `tests/admin-merge/run.sh:5993` pipes a 121-LINE, 7 992-byte function body.
+# It is safe for its SIZE, not its line count — and naming the wrong criterion is
+# how a maintainer concludes a multi-line payload is safe without comparing sizes.
 #
 # Both conditions hold HERE, which is what makes this one real: payload 117 227
 # bytes, and the match sits 78 448 bytes before the end. Measured: the piped form
