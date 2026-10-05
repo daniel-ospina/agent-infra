@@ -8910,29 +8910,52 @@ pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\
 # #1569 — THE SLUG IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
 #
 # `workflow_pr_evaluable()` receives `repos/<owner>/<repo>` — every binding site in
-# the rail passes the prefixed form, which is why the line above reads
-# `$slug/contents/…`. The changed-file fetch read `repos/$slug/pulls/…` instead,
-# composing `repos/repos/<owner>/<repo>/pulls/…`. That 404s, so
-# `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it — and empty is
-# not neutral: the predicate then answers `unknown`, the base-side red stays
-# BLOCKING (a false block whose remedy no rebase satisfies), and the #1542 filter
-# comparison this fetch exists to feed is silently disabled for the common case.
+# the rail passes the prefixed form. The changed-file fetch read
+# `repos/$slug/pulls/…` instead, composing `repos/repos/<owner>/<repo>/pulls/…`.
+# That 404s, so `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it —
+# and empty is not neutral: the predicate then answers `unknown`, the base-side red
+# stays BLOCKING (a false block whose remedy no rebase satisfies), and the #1542
+# filter comparison this fetch exists to feed is silently disabled for the common
+# case.
 #
-# This is asserted STATICALLY, on purpose, rather than through the fetch stub: the
-# defect is a malformed URL LITERAL, and a stub that intercepts `$GH` before the
-# URL is built cannot see it. The pair below is what makes the check meaningful —
-# the absence alone would also pass if the fetch were deleted outright.
+# The pair below is what makes the check meaningful — the absence alone would also
+# pass if the fetch were deleted outright.
+#
+# ⛔ WHAT THIS CHECK IS NOT. It is NOT here because the `$GH` stub is blind to the
+# URL — it is not (measured: the stub reads the URL from argv and matches it by
+# SUFFIX, `*/pulls/*` then `*/files*`). It is here because making that stub
+# PREFIX-STRICT is the larger change: the suffix arms also serve every "changed
+# files" scenario in this suite, so tightening them is a separate edit with its own
+# blast radius. Until someone does that, this is the cheap pin. A reviewer measured
+# that an honest stub would have failed #1569 — so if the suffix arms are ever
+# tightened, delete this block rather than keeping both.
 #
 # ⛔ COMMENTS ARE STRIPPED FIRST, and that is load-bearing rather than tidiness: the
 # comment above this fetch NAMES the malformed form to explain it, so a raw grep
-# would fail on the file's own documentation and push the next author to delete the
-# explanation instead of the defect. The check is about EXECUTABLE text.
+# would false-FAIL on the file's own documentation — and the cheapest way out of
+# that is to delete the explanation instead of the defect.
+#
+# ⛔ `sed -E`, NOT a BRE alternation. `sed 's/\(^\|[[:space:]]\)#/…/'` is a GNU
+# extension: on BSD/macOS `sed` (this suite runs on macOS) `\|` silently does not
+# match, so the strip is a no-op. Measured: the BRE form returns 1 on the file this
+# assertion must pass, i.e. it would have shipped as a permanently red check.
+#
+# ⛔ THE STRIP IS HEURISTIC, AND IT FAILS IN BOTH DIRECTIONS. Stated because a
+# previous revision of this comment claimed the safe direction was the only one,
+# and that was measured FALSE. Too little stripping — a TRAILING comment naming the
+# form — is a loud false FAIL (measured: the naive whole-file grep returned 1,
+# from the comment). TOO MUCH stripping is also live: this file carries ~20 lines
+# with a `#` inside a quoted string (e.g. `say_err "   vocabulary, #1319). …"`),
+# which the strip truncates, and a truncated line loses anything after the `#`.
+# No line today combines such a string with a later `repos/$slug`, so the count is
+# correct — but that is a property of the CURRENT TEXT, not of the stripper, and it
+# is the thing to re-check first if this assertion ever reads a surprising zero.
 #
 # Failure it prevents: this exact bug (#1569), which shipped and only surfaced when
 # a lane traced an unexplained false block. Deleting the check tomorrow would harm
 # the PRODUCT, not the process: it guards a fail-closed predicate's INPUT, and a
 # silent empty input reads as `unknown` rather than as an error.
-_code="$(grep -v '^[[:space:]]*#' "$ADM" || true)"
+_code="$(sed -E 's/(^|[[:space:]])#.*//' "$ADM" || true)"
 _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 [ "$_dbl" = "0" ] \
   && pass "the rail never double-prefixes the slug in code — #1569" \
