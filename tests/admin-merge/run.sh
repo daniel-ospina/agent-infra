@@ -8919,7 +8919,12 @@ pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\
 # case.
 #
 # The pair below is what makes the check meaningful — the absence alone would also
-# pass if the fetch were deleted outright.
+# pass if the fetch were deleted outright, and the presence leg is therefore pinned
+# to the ASSIGNMENT (`WF_PR_CHANGED_PATHS=…`), not to the path text. That precision
+# is not decoration: the bare path occurs at FOUR sites in this file — the #1569
+# fetch, a different function's lane-parity fetch, and TWO
+# `LANE_DECLINED_REASON="…"` message strings — so a bare-text presence leg stayed
+# GREEN with the #1569 fetch deleted (measured). It pinned prose, not behaviour.
 #
 # ⛔ WHAT THIS CHECK IS NOT. It is NOT here because the `$GH` stub is blind to the
 # URL — it is not (measured: the stub reads the URL from argv and matches it by
@@ -8960,9 +8965,9 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 [ "$_dbl" = "0" ] \
   && pass "the rail never double-prefixes the slug in code — #1569" \
   || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
-printf '%s\n' "$_code" | grep -q '\$slug/pulls/\$PR/files' \
-  && pass "the changed-file fetch still builds a single-prefix pulls/ URL — #1569" \
-  || fail "the changed-file fetch is gone or did not keep the single-prefix \$slug/pulls/ form — the #1542 filter input has no source (#1569)"
+printf '%s\n' "$_code" | grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' \
+  && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
+  || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
