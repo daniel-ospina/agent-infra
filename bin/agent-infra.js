@@ -383,7 +383,13 @@ function cmdUpdate() {
  *  pass as `info`. Callers needing to know whether an existing target really
  *  is the expected surface must ask separately — see isAgentInfraScripts. */
 function classifyUnresolved(resolved, targetDir) {
-  const external = path.relative(targetDir, resolved).startsWith('..');
+  // `startsWith('..')` alone is WRONG: path.relative returns a plain
+  // `..`-prefixed segment chain for an external path, but it also returns
+  // `..foo/scripts` for a path INSIDE the repo under a directory literally
+  // named `..foo` — so an in-repo target was classified machine-local and
+  // forgiven (a false PASS, #7412). Require `..` as a whole segment.
+  const rel = path.relative(targetDir, resolved);
+  const external = rel === '..' || rel.startsWith(`..${path.sep}`);
   return external ? 'machine-local' : 'stale';
 }
 
@@ -394,9 +400,20 @@ function classifyUnresolved(resolved, targetDir) {
  *  The basename test is load-bearing: without it any subdirectory under an
  *  agent-infra checkout (templates/, docs/, …) satisfies the marker check and a
  *  plainly wrong link is reported as `info` — a false PASS. Verified: a link to
- *  <agent-infra>/templates was forgiven until this check was added. */
+ *  <agent-infra>/templates was forgiven until this check was added.
+ *
+ *  The isDirectory() test matches the stated contract (this is a `scripts/`
+ *  DIR); without it a regular file named `scripts` under a shaped parent was
+ *  forgiven. */
 function isAgentInfraScripts(resolvedScripts) {
   if (path.basename(resolvedScripts) !== path.basename(SCRIPTS_SRC)) return false;
+  let st;
+  try {
+    st = fs.statSync(resolvedScripts);
+  } catch {
+    return false;
+  }
+  if (!st.isDirectory()) return false;
   const root = path.dirname(resolvedScripts);
   return fs.existsSync(path.join(root, 'manifest.json'))
     && fs.existsSync(path.join(root, 'bin', 'agent-infra.js'));
@@ -530,8 +547,14 @@ function cmdCheck(targetDir, ciMode) {
           // forgiving every reaching target would turn a real drift FAIL into
           // a false PASS. Hence positive identification: unverifiable OR
           // genuinely agent-infra; anything else stays drift.
-          issues.push({ type: 'scripts', tier: 'info', reason: `symlink target machine-local (${linkTarget}) — unverifiable on CI runner` });
-          console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} (machine-local, unverifiable in CI)`);
+          // Word the finding by branch: the two arms are opposite facts, and
+          // collapsing them into "unverifiable" cost real triage time on #7412,
+          // where the log could not distinguish the shapes.
+          const why = fs.existsSync(resolved)
+            ? 'machine-local agent-infra checkout'
+            : 'machine-local, unverifiable in CI (target absent on this runner)';
+          issues.push({ type: 'scripts', tier: 'info', reason: `symlink target ${why} — ${linkTarget}` });
+          console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} — ${why}`);
         } else {
           issues.push({ type: 'scripts', tier: 'fail', reason: `points to ${resolved}, expected ${SCRIPTS_SRC}` });
           console.log(`   ⚠️  scripts/ — stale (→ ${linkTarget})`);

@@ -17,6 +17,8 @@
 #  12. machine-local agent-infra link, target EXISTS → info, NOT a drift FAIL (#7412)
 #  13. external link to a WRONG target that EXISTS → drift FAIL, exit 1 (#7412)
 #  14. absolute link resolving INSIDE the repo → drift FAIL, not machine-local (#7412)
+#  15. in-repo dir whose NAME starts with '..' → drift FAIL, not machine-local (#7412)
+#  16. target is a regular FILE, not a dir    → drift FAIL, exit 1 (#7412)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -49,6 +51,10 @@ MANIFEST_BAK="$(mktemp "${TMPDIR:-/tmp}/manifest.json.387.XXXXXX")"
 cleanup() {
   git -C "$ROOT" checkout -- tests/fixtures/drift/current 2>/dev/null || true
   rm -f "$FIX/.agent-infra-version" "$FIX/.github/workflows/docs-ci.yml.bak" "$OUT"
+  # Case 14 creates an untracked dir INSIDE the tracked fixture; `git checkout`
+  # restores tracked paths but never removes untracked ones, so remove it here
+  # or an interrupted run leaves it behind.
+  rm -rf "$FIX/verify-inside-ai" "$FIX/..cache"
   # #387: restore the live manifest.json (cp-back, NOT git checkout — uncommitted
   # manifest edits must survive an aborted run). Idempotent with the in-case restore.
   if [ -f "$MANIFEST_BAK" ]; then
@@ -233,8 +239,8 @@ if grep -q "points to .*expected" "$OUT"; then
 else
   pass "machine-local link not reported as drift"
 fi
-if grep -q "machine-local, unverifiable in CI" "$OUT"; then
-  pass "machine-local link classified info (unverifiable in CI)"
+if grep -q "machine-local agent-infra checkout" "$OUT"; then
+  pass "machine-local link classified info (identified as agent-infra)"
 else
   fail "expected the machine-local info line"
   tail -15 "$OUT"
@@ -280,6 +286,15 @@ mkdir -p "$INSIDE/bin" "$INSIDE/scripts"
 : >"$INSIDE/bin/agent-infra.js"
 rm -f "$FIX/scripts"
 ln -sfn "$INSIDE/scripts" "$FIX/scripts"   # absolute, agent-infra-shaped, but IN-REPO
+# Assert the precondition (as case 12 does): without it a MISSING target would
+# be an in-repo DANGLING link — which classifies 'stale' and exits 1 anyway, so
+# both assertions would pass while the case never exercised the reachable
+# in-repo path it exists to pin.
+if [ -e "$INSIDE/scripts" ]; then
+  pass "case 14 fixture target exists"
+else
+  fail "case 14 fixture target missing — it would pass for the wrong reason"
+fi
 run_check 1 "absolute in-repo agent-infra-shaped link (--ci)" --ci
 if grep -q "scripts: points to" "$OUT"; then
   pass "in-repo absolute target reported as drift"
@@ -288,6 +303,61 @@ else
   tail -15 "$OUT"
 fi
 rm -rf "$INSIDE"
+
+echo ""
+echo "15. in-repo dir whose NAME starts with '..' is drift, not machine-local (#7412)"
+# The containment test must require `..` as a WHOLE segment. `path.relative`
+# returns a plain `..`-chain for an external path but also `..cache/scripts` for
+# an in-repo dir literally named `..cache` — so `startsWith('..')` called an
+# in-repo target machine-local and forgave it (a false PASS, the very class this
+# change exists to remove). A rotted in-repo link must still fail.
+DOTDOT="$FIX/..cache"
+mkdir -p "$DOTDOT/scripts"
+: >"$DOTDOT/manifest.json"
+mkdir -p "$DOTDOT/bin"
+: >"$DOTDOT/bin/agent-infra.js"
+rm -f "$FIX/scripts"
+ln -sfn "..cache/scripts" "$FIX/scripts"   # RELATIVE and IN-REPO (name starts with '..')
+if [ -e "$FIX/..cache/scripts" ]; then
+  pass "case 15 fixture target exists"
+else
+  fail "case 15 fixture target missing — it would pass for the wrong reason"
+fi
+run_check 1 "in-repo target under a '..'-prefixed directory (--ci)" --ci
+if grep -q "scripts: points to" "$OUT"; then
+  pass "'..'-prefixed in-repo target reported as drift"
+else
+  fail "an in-repo target under a '..'-prefixed dir was forgiven (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$DOTDOT"
+
+echo ""
+echo "16. scripts link to a regular FILE (not a dir) → FAIL, exit 1 (#7412)"
+# `isAgentInfraScripts` is documented as "the scripts/ DIR of a real agent-infra
+# checkout", so a regular file named `scripts` under a shaped parent must not be
+# forgiven. Without the isDirectory() arm it IS forgiven (exit 0, status CLEAN) —
+# verified by mutation — and no other case pins that arm.
+FILE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-file.XXXXXX")"
+mkdir -p "$FILE_ROOT/bin"
+: >"$FILE_ROOT/manifest.json"
+: >"$FILE_ROOT/bin/agent-infra.js"
+: >"$FILE_ROOT/scripts"            # a FILE, not a directory
+rm -f "$FIX/scripts"
+ln -sfn "$FILE_ROOT/scripts" "$FIX/scripts"
+if [ -f "$FILE_ROOT/scripts" ] && [ ! -d "$FILE_ROOT/scripts" ]; then
+  pass "case 16 fixture target is a regular file"
+else
+  fail "case 16 fixture is not a regular file — it would pass for the wrong reason"
+fi
+run_check 1 "agent-infra-shaped parent but scripts is a FILE (--ci)" --ci
+if grep -q "scripts: points to" "$OUT"; then
+  pass "a non-directory target still reported as drift"
+else
+  fail "a regular file named scripts was forgiven (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$FILE_ROOT"
 # The fixture is restored by the EXIT trap's cleanup(); no explicit checkout
 # here — a second git invocation inside this script trips the worktree
 # execution gate (#1484).
