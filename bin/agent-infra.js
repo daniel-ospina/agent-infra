@@ -381,6 +381,33 @@ function cmdUpdate() {
  *  the directory is not inside a work tree — which preserves the previous
  *  CONTAINMENT REFERENCE where the two coincide. (It does not preserve every
  *  verdict: the predicate changed too, deliberately — see #7412.) */
+/**
+ * Canonicalize a path into the PHYSICAL namespace even when the leaf does not
+ * exist: realpath the deepest existing ancestor and re-append the rest.
+ *
+ * The containment test compares the target against a realpath'd repo root, so a
+ * lexical target is only equivalent when no component of the path is a symlink.
+ * A dangling leaf cannot be realpath'd at all, so falling back to its lexical
+ * form (the obvious fix, and the one this change shipped first) leaves the two
+ * sides in different namespaces exactly on the arm the carve-out adds — a false
+ * PASS for an in-repo broken link. Returns `p` unchanged if nothing resolves.
+ */
+function canonicalizeExisting(p) {
+  let head = p;
+  const tail = [];
+  for (;;) {
+    try {
+      const real = fs.realpathSync(head);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(head);
+      if (parent === head) return p; // no existing ancestor — give up gracefully
+      tail.unshift(path.basename(head));
+      head = parent;
+    }
+  }
+}
+
 function repoRootFor(dir) {
   try {
     const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'],
@@ -567,24 +594,25 @@ function cmdCheck(targetDir, ciMode) {
         const resolved = path.resolve(path.dirname(scriptsDest), linkTarget);
         // Compare containment within ONE namespace. repoRoot is PHYSICAL
         // (realpath'd), while `resolved` is lexical and inherits the caller's
-        // spelling of targetDir — so when targetDir reaches the repo through a
-        // symlink the two disagree, path.relative emits a `..`-chain, and an
-        // in-repo target was classified machine-local and forgiven (#7412, the
-        // fourth shape of the same false PASS). Canonicalize the target too.
-        // A DANGLING target has no realpath and must fall back to its lexical
-        // form: that is the GitHub-hosted production case (the committed
-        // machine-local link does not resolve on the runner).
-        let canonResolved = resolved;
-        try {
-          canonResolved = fs.realpathSync(resolved);
-        } catch {
-          /* dangling — keep the lexical form */
-        }
+        // spelling of targetDir. Canonicalizing ONLY a resolvable target is not
+        // enough: a DANGLING leaf has no realpath, so it must still be carried
+        // into the physical namespace by canonicalizing its deepest EXISTING
+        // ancestor and re-appending the remainder. Otherwise the carve-out's own
+        // arm — `!fs.existsSync(resolved)`, i.e. a broken IN-REPO link — compares
+        // a lexical path to a physical root, path.relative emits a `..`-chain,
+        // and the in-repo link is forgiven where origin/main fails it: a false
+        // PASS introduced by the fix itself (regression, cycle 5).
+        const canonResolved = canonicalizeExisting(resolved);
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
         } else if (ciMode && classifyUnresolved(canonResolved, repoRoot) === 'machine-local'
-                   && (!fs.existsSync(resolved) || isAgentInfraScripts(resolved))) {
+                   // isAgentInfraScripts takes canonResolved, NOT resolved: reading
+                   // the lexical spelling here while classification used the
+                   // physical one let a link whose target was itself a symlink to a
+                   // WRONG subdir pass on the lexical basename `scripts` and be
+                   // forgiven (false PASS, cycle 5). One namespace for both.
+                   && (!fs.existsSync(canonResolved) || isAgentInfraScripts(canonResolved))) {
           // A committed link escaping the repo points at a machine-local
           // agent-infra checkout. Forgive it only when the runner cannot reach
           // it at all (absent — the usual GitHub-hosted case), or when the

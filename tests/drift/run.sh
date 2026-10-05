@@ -22,6 +22,9 @@
 #  17. in-repo target ABOVE the checked dir    → drift FAIL, exit 1 (#7412)
 #  18. DANGLING machine-local target           → info, exit 0 (GitHub-hosted path, #7412)
 #  19. targetDir reached through a SYMLINK     → drift FAIL, not machine-local (#7412)
+#  20. DANGLING in-repo target + symlinked dir → drift FAIL (the carve-out's own arm)
+#  21. link whose TARGET is a symlink to a WRONG subdir → drift FAIL
+#  22. link via a symlink TO a real scripts dir → forgiven (no false FAIL)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -373,13 +376,12 @@ echo "19. targetDir reached through a SYMLINK → in-repo target still drift (#7
 # canonicalized the two disagree, path.relative emits a `..`-chain, and an
 # in-repo target is classified machine-local and forgiven.
 #
-# HONEST SCOPE: this shape catches that class only where the LEXICAL and PHYSICAL
-# spellings of the path differ. On a host whose TMPDIR is already physical the
-# link resolves to a path equal to its realpath, the two namespaces coincide, and
-# this case passes under that mutation too — verified. It is a genuine end-to-end
-# guard for symlinked targetDirs, but it is NOT the case that pins the target
-# realpath; case 15 does that (it re-runs red when the realpath is dropped). Do
-# not cite this case as covering `canonResolved`.
+# HONEST SCOPE: this case does NOT pin the target canonicalization, and the
+# reason is NOT that lexical and physical can coincide. Its link target is
+# ABSOLUTE (`$INSIDE_LINK/scripts`), so `resolved` is already physical whatever
+# TMPDIR is — the spelling never differs, so no mutation of the canonicalization
+# can change this case's verdict. A RELATIVE-link variant of the same shape does
+# redden. Case 15 remains the case that pins it; do not cite this one for that.
 LINK="$(mktemp -d "${TMPDIR:-/tmp}/ai-link.XXXXXX")/via-link"
 ln -sfn "$ROOT" "$LINK"
 INSIDE_LINK="$FIX/verify-inside-link"
@@ -401,6 +403,78 @@ else
   tail -15 "$OUT"
 fi
 rm -rf "$(dirname "$LINK")" "$INSIDE_LINK"
+
+echo ""
+echo "20. DANGLING in-repo target + symlinked targetDir → drift, not machine-local (#7412)"
+# The carve-out's OWN arm (`!fs.existsSync`) is exactly where a lexical target
+# cannot be realpath'd. If that arm falls back to the lexical spelling while
+# repoRoot is physical, an IN-REPO broken link is forgiven where origin/main
+# fails it. That was a regression introduced by the first cut of the class fix.
+LINK2="$(mktemp -d "${TMPDIR:-/tmp}/ai-dl.XXXXXX")/via"
+ln -sfn "$ROOT" "$LINK2"
+rm -f "$FIX/scripts"
+ln -sfn "inside-dangling/scripts" "$FIX/scripts"   # RELATIVE, IN-REPO, ABSENT
+if [ -e "$FIX/inside-dangling/scripts" ]; then
+  fail "case 20 target exists — this case would not exercise the dangling arm"
+else
+  pass "case 20 target is genuinely dangling"
+fi
+AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$LINK2/tests/fixtures/drift/current" --ci >"$OUT" 2>&1 || true
+if grep -q "scripts: points to" "$OUT"; then
+  pass "dangling in-repo link via a symlinked targetDir reported as drift"
+else
+  fail "a dangling in-repo link was forgiven when targetDir was symlinked (#7412 regression)"
+  tail -15 "$OUT"
+fi
+rm -rf "$(dirname "$LINK2")"
+
+echo ""
+echo "21. link whose TARGET is a symlink to a WRONG subdir → drift (#7412)"
+# The identification helper must read the CANONICAL target: on the lexical
+# spelling it sees the link's own name (`scripts`) and markers under the link's
+# parent, so a target that physically resolves to `templates` passes on a name it
+# does not have — the wrong-subdir drift case 13 exists to catch.
+SHAPED_OUT="$(mktemp -d "${TMPDIR:-/tmp}/ai-shaped.XXXXXX")/R0"
+mkdir -p "$SHAPED_OUT/bin" "$SHAPED_OUT/templates" "$SHAPED_OUT/scripts"
+: >"$SHAPED_OUT/manifest.json"
+: >"$SHAPED_OUT/bin/agent-infra.js"
+XROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-x.XXXXXX")/X"
+mkdir -p "$XROOT/bin"
+: >"$XROOT/manifest.json"
+: >"$XROOT/bin/agent-infra.js"
+ln -sfn "$SHAPED_OUT/templates" "$XROOT/scripts"   # shaped parent, WRONG physical target
+rm -f "$FIX/scripts"
+ln -sfn "$XROOT/scripts" "$FIX/scripts"
+AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$FIX" --ci >"$OUT" 2>&1 || true
+if grep -q "scripts: points to" "$OUT"; then
+  pass "a link to a wrong physical subdir reported as drift"
+else
+  fail "a target resolving to the wrong subdir was forgiven on the lexical basename (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$(dirname "$SHAPED_OUT")" "$(dirname "$XROOT")"
+
+echo ""
+echo "22. link via a symlink TO a real agent-infra scripts dir → forgiven (#7412)"
+# The counterpart: canonicalizing must not turn a genuine machine-local
+# agent-infra checkout into a failure just because it is reached through a link.
+SHAPED_REAL="$(mktemp -d "${TMPDIR:-/tmp}/ai-real.XXXXXX")/R1"
+mkdir -p "$SHAPED_REAL/bin" "$SHAPED_REAL/scripts"
+: >"$SHAPED_REAL/manifest.json"
+: >"$SHAPED_REAL/bin/agent-infra.js"
+XREAL="$(mktemp -d "${TMPDIR:-/tmp}/ai-xr.XXXXXX")/X"
+mkdir -p "$XREAL"
+ln -sfn "$SHAPED_REAL/scripts" "$XREAL/foo"   # basename differs, target is genuine
+rm -f "$FIX/scripts"
+ln -sfn "$XREAL/foo" "$FIX/scripts"
+AGENT_INFRA_PATH="$ROOT" node "$CLI" check "$FIX" --ci >"$OUT" 2>&1 || true
+if grep -q "scripts: points to" "$OUT"; then
+  fail "a genuine machine-local agent-infra scripts dir was failed (false FAIL, #7412)"
+  tail -15 "$OUT"
+else
+  pass "a symlink to a real agent-infra scripts dir is forgiven"
+fi
+rm -rf "$(dirname "$SHAPED_REAL")" "$(dirname "$XREAL")"
 
 echo ""
 echo "17. in-repo target ABOVE the checked dir → FAIL, exit 1 (#7412)"
