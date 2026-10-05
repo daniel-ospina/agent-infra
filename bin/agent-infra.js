@@ -371,12 +371,35 @@ function cmdUpdate() {
 }
 
 /** Classify a non-matching symlink target.
- *  'machine-local' — committed absolute/escaping path, unverifiable on a CI
- *  runner (the normal state of a consumer's committed symlinks).
- *  'stale' — resolves inside the repo tree (a genuinely rotted relative link). */
-function classifyUnresolved(linkTarget, resolved, targetDir) {
-  const external = path.isAbsolute(linkTarget) || path.relative(targetDir, resolved).startsWith('..');
+ *  'machine-local' — the target ESCAPES the repo tree, so it names a path on
+ *  whatever machine is running (the normal state of a consumer's committed
+ *  symlinks), as opposed to a link that rotted relative to this repo.
+ *  'stale' — resolves inside the repo tree (a genuinely rotted link, or an
+ *  absolute path that points back into the checkout).
+ *
+ *  This asks WHERE the target is, never WHAT it is. An absolute link that
+ *  resolves inside the repo is 'stale', not 'machine-local' (#7412) — treating
+ *  every absolute path as forgivable let a link to a wrong in-repo directory
+ *  pass as `info`. Callers needing to know whether an existing target really
+ *  is the expected surface must ask separately — see isAgentInfraScripts. */
+function classifyUnresolved(resolved, targetDir) {
+  const external = path.relative(targetDir, resolved).startsWith('..');
   return external ? 'machine-local' : 'stale';
+}
+
+/** Is [resolvedScripts] the scripts/ dir of a real agent-infra checkout?
+ *  Positive identification, so a target that EXISTS but is not the expected
+ *  surface is never forgiven merely for being external (#7412).
+ *
+ *  The basename test is load-bearing: without it any subdirectory under an
+ *  agent-infra checkout (templates/, docs/, …) satisfies the marker check and a
+ *  plainly wrong link is reported as `info` — a false PASS. Verified: a link to
+ *  <agent-infra>/templates was forgiven until this check was added. */
+function isAgentInfraScripts(resolvedScripts) {
+  if (path.basename(resolvedScripts) !== path.basename(SCRIPTS_SRC)) return false;
+  const root = path.dirname(resolvedScripts);
+  return fs.existsSync(path.join(root, 'manifest.json'))
+    && fs.existsSync(path.join(root, 'bin', 'agent-infra.js'));
 }
 
 /** check [targetDir] — verify symlinks match manifest.json */
@@ -491,21 +514,22 @@ function cmdCheck(targetDir, ciMode) {
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
-        } else if (ciMode && classifyUnresolved(linkTarget, resolved, targetDir) === 'machine-local') {
-          // Committed absolute symlinks point at a machine-local agent-infra
-          // checkout — unverifiable on the CI runner, not propagation drift.
+        } else if (ciMode && classifyUnresolved(resolved, targetDir) === 'machine-local'
+                   && (!fs.existsSync(resolved) || isAgentInfraScripts(resolved))) {
+          // A committed link escaping the repo points at a machine-local
+          // agent-infra checkout. Forgive it only when the runner cannot reach
+          // it at all (absent — the usual GitHub-hosted case), or when the
+          // target demonstrably IS an agent-infra checkout.
           //
-          // (#7412) Do NOT additionally require !fs.existsSync(resolved) here.
-          // The target being ABSENT is not what makes this unverifiable: on a
-          // self-hosted runner that shares the machine (or bind-mounts /Users),
-          // the machine-local path EXISTS, so an existsSync gate skipped this
-          // carve-out and a link the comment above calls "not propagation
-          // drift" was reported as a hard failure. Runners disagree on
-          // AGENT_INFRA_PATH (the real checkout vs .agent-infra), so the same
-          // commit passed on one runner and failed on another — the
-          // intermittency observed in #7412. `classifyUnresolved` already
-          // decides the intended question (is the target outside the repo?);
-          // whether it happens to resolve on this runner is irrelevant to it.
+          // (#7412) Gating on !fs.existsSync alone was wrong in the other
+          // direction: on a self-hosted runner the machine-local path EXISTS,
+          // so the gate skipped this carve-out and a link the code calls "not
+          // propagation drift" became a hard failure that refused a merge
+          // (same commit, opposite verdicts across runners that disagree on
+          // AGENT_INFRA_PATH). But presence alone must not be enough either —
+          // forgiving every reaching target would turn a real drift FAIL into
+          // a false PASS. Hence positive identification: unverifiable OR
+          // genuinely agent-infra; anything else stays drift.
           issues.push({ type: 'scripts', tier: 'info', reason: `symlink target machine-local (${linkTarget}) — unverifiable on CI runner` });
           console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} (machine-local, unverifiable in CI)`);
         } else {

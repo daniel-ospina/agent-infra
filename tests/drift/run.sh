@@ -14,7 +14,9 @@
 #   9. check.ci.ref ≠ ci.ref sync guard       → status FAIL, exit 1 (#387)
 #  10. inline generic test job (exemplar)      → status FAIL, exit 1 (#389)
 #  11. repo-specific inline jobs (boundary)    → status CLEAN, exit 0 (#389)
-#  12. machine-local scripts link that EXISTS   → info, NOT a drift FAIL (#7412)
+#  12. machine-local agent-infra link, target EXISTS → info, NOT a drift FAIL (#7412)
+#  13. external link to a WRONG target that EXISTS → drift FAIL, exit 1 (#7412)
+#  14. absolute link resolving INSIDE the repo → drift FAIL, not machine-local (#7412)
 #
 # Fixture: tests/fixtures/drift/current/ simulates a consumer repo. Its
 # scripts/ is a RELATIVE symlink into the agent-infra checkout; its
@@ -199,19 +201,32 @@ rm -f "$FIX/.github/workflows/repo-specific-tests.yml"
 
 echo ""
 echo "12. Machine-local scripts link that EXISTS → info, not FAIL (#7412)"
-# The machine-local carve-out must classify by WHAT the target is, not by
-# whether it happens to resolve. On a self-hosted runner that shares the
-# machine (or bind-mounts /Users), the machine-local path EXISTS — so an
-# `!fs.existsSync(resolved)` gate skipped the carve-out and reported a link the
-# code itself calls "not propagation drift" as a hard failure. Runners disagree
-# on AGENT_INFRA_PATH (the real checkout vs .agent-infra), which is why the
-# SAME commit failed on one runner and passed on another.
-# Note this fixture needs a target that is BOTH external AND != $ROOT/scripts:
-# pointing at the real scripts/ would take the `resolved === SCRIPTS_SRC`
-# branch and never reach the machine-local one at all.
+# The carve-out must forgive a target the runner CAN reach only when the target
+# really is an agent-infra checkout. Gating on !fs.existsSync alone made it
+# unreachable on a self-hosted runner, where the machine-local path EXISTS — so
+# a link the code calls "not propagation drift" became a hard failure that
+# refused a merge (same commit, opposite verdicts across runners that disagree
+# on AGENT_INFRA_PATH).
+#
+# The target is BOTH external AND agent-infra-SHAPED. That matters: merely using
+# some other existing directory (e.g. $ROOT/templates) would pin "any external
+# path is forgiven", which is the over-permissive reading — and would obstruct
+# tightening this branch later. Pointing at $ROOT/scripts cannot be used either,
+# as that takes the `resolved === SCRIPTS_SRC` branch and never reaches here.
+MACHINE_LOCAL="$(mktemp -d "${TMPDIR:-/tmp}/ai-machine-local.XXXXXX")"
+mkdir -p "$MACHINE_LOCAL/bin" "$MACHINE_LOCAL/scripts"
+: >"$MACHINE_LOCAL/manifest.json"
+: >"$MACHINE_LOCAL/bin/agent-infra.js"
 rm -f "$FIX/scripts"
-ln -sfn "$ROOT/templates" "$FIX/scripts"   # absolute, external, and EXISTS
-run_check 0 "machine-local scripts link that exists (--ci)" --ci
+ln -sfn "$MACHINE_LOCAL/scripts" "$FIX/scripts"
+# Assert the precondition: a DANGLING link was already forgiven by the old
+# code, so without this the case would pass on the very bug it exists to catch.
+if [ -e "$FIX/scripts/../manifest.json" ]; then
+  pass "case 12 fixture target exists"
+else
+  fail "case 12 fixture dangles — it would pass under the OLD code too (#7412)"
+fi
+run_check 0 "machine-local agent-infra scripts link that exists (--ci)" --ci
 if grep -q "points to .*expected" "$OUT"; then
   fail "machine-local link reported as propagation drift (#7412 regression)"
   tail -15 "$OUT"
@@ -224,6 +239,55 @@ else
   fail "expected the machine-local info line"
   tail -15 "$OUT"
 fi
+rm -rf "$MACHINE_LOCAL"
+
+echo ""
+echo "13. scripts link to a WRONG target that EXISTS → FAIL, exit 1 (#7412)"
+# The other half of case 12, and the reason dropping the existsSync gate outright
+# is not enough: a reachable target that is not the agent-infra scripts/ dir is
+# real drift. Forgiving it turns a genuine FAIL into status: CLEAN / exit 0 — a
+# false PASS that drift-check.yml would gate on.
+#
+# The target is deliberately AGENT-INFRA-SHAPED but the WRONG SUBDIR (templates/)
+# under a fake agent-infra root. A merely-neutral temp dir would be weaker: it is
+# rejected by the parent markers alone, so it would not catch someone relaxing
+# the identification to "any subdirectory under an agent-infra checkout".
+WRONG_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/ai-wrong.XXXXXX")"
+mkdir -p "$WRONG_ROOT/bin" "$WRONG_ROOT/templates"
+: >"$WRONG_ROOT/manifest.json"
+: >"$WRONG_ROOT/bin/agent-infra.js"
+rm -f "$FIX/scripts"
+ln -sfn "$WRONG_ROOT/templates" "$FIX/scripts"
+run_check 1 "agent-infra-shaped but wrong subdir (--ci)" --ci
+if grep -q "scripts: points to" "$OUT"; then
+  pass "wrong subdir under an agent-infra root still reported as drift"
+else
+  fail "a wrong subdir under an agent-infra root was forgiven (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$WRONG_ROOT"
+
+echo ""
+echo "14. absolute link resolving INSIDE the repo is drift, not machine-local (#7412)"
+# `classifyUnresolved` must ask whether the target ESCAPES the repo, not whether
+# the link text was absolute. An absolute path that resolves inside the checkout
+# is present on every runner and is unambiguously wrong; the old
+# `path.isAbsolute(linkTarget)` disjunct called it machine-local and, combined
+# with the identification helper, forgave it — a false PASS.
+INSIDE="$FIX/verify-inside-ai"
+mkdir -p "$INSIDE/bin" "$INSIDE/scripts"
+: >"$INSIDE/manifest.json"
+: >"$INSIDE/bin/agent-infra.js"
+rm -f "$FIX/scripts"
+ln -sfn "$INSIDE/scripts" "$FIX/scripts"   # absolute, agent-infra-shaped, but IN-REPO
+run_check 1 "absolute in-repo agent-infra-shaped link (--ci)" --ci
+if grep -q "scripts: points to" "$OUT"; then
+  pass "in-repo absolute target reported as drift"
+else
+  fail "an in-repo absolute target was forgiven as machine-local (#7412 false PASS)"
+  tail -15 "$OUT"
+fi
+rm -rf "$INSIDE"
 # The fixture is restored by the EXIT trap's cleanup(); no explicit checkout
 # here — a second git invocation inside this script trips the worktree
 # execution gate (#1484).
