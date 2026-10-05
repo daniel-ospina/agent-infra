@@ -8907,95 +8907,53 @@ pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_r
 pe_paths "push + branches still exempt" no 'src/a.c'             $'on:\n  push:\n    branches: [main]\n'
 pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\n'
 
-# #1569 — THE SLUG IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
+# #1569 — `$slug` IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
 #
-# `workflow_pr_evaluable()` receives `repos/<owner>/<repo>` — every binding site in
-# the rail passes the prefixed form. The changed-file fetch read
-# `repos/$slug/pulls/…` instead, composing `repos/repos/<owner>/<repo>/pulls/…`.
-# That 404s, so `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it —
-# and empty is not neutral: the predicate then answers `unknown`, the base-side red
-# stays BLOCKING (a false block whose remedy no rebase satisfies), and the #1542
-# filter comparison this fetch exists to feed is silently disabled for the common
-# case.
+# `workflow_pr_evaluable()` receives `repos/<owner>/<repo>`. The changed-file fetch
+# read `repos/$slug/pulls/…`, composing `repos/repos/…` → 404 → `WF_PR_CHANGED_PATHS`
+# EMPTY → the predicate answers `unknown` → the base-side red stays BLOCKING. Empty
+# is not neutral here; an unavailable answer is read as a blocking one.
 #
-# The pair below is what makes the check meaningful — the absence alone would also
-# pass if the fetch were deleted outright, and the presence leg is therefore pinned
-# to the ASSIGNMENT (`WF_PR_CHANGED_PATHS=…`), not to the path text. That precision
-# is not decoration: the bare path occurs at FOUR sites in the SCANNED RAIL
-# (`scripts/admin-merge.sh`) — the #1569 fetch, a different function's lane-parity
-# fetch, and TWO `LANE_DECLINED_REASON="…"` message strings. The rail is named
-# explicitly because this comment lives in `tests/admin-merge/run.sh`, where the
-# bare path occurs ZERO times; "this file" would point an auditor at the wrong one.
-# MEASURED: with the bare-text leg, deleting the #1569 fetch still left that
-# assertion GREEN — it pinned prose, not behaviour.
+# Two legs, and both are needed. The ABSENCE leg catches the double prefix. The
+# PRESENCE leg is anchored on the ASSIGNMENT `WF_PR_CHANGED_PATHS=`, NOT on the bare
+# path: the bare path occurs at four sites in the scanned rail (`scripts/admin-merge.sh`)
+# — the #1569 fetch, another function's lane-parity fetch, and two
+# `LANE_DECLINED_REASON="…"` message strings — so a bare-text leg stayed GREEN with
+# the fetch deleted. Anchoring on the assignment is what makes it behavioural.
 #
-# ⛔ WHAT THIS CHECK IS NOT. It is NOT here because the `$GH` stub is blind to the
-# URL — it is not (measured: the stub reads the URL from argv and matches it by
-# SUFFIX, `*/pulls/*` then `*/files*`). It is here because making that stub
-# PREFIX-STRICT is the larger change: the suffix arms also serve every "changed
-# files" scenario in this suite, so tightening them is a separate edit with its own
-# blast radius. Until someone does that, this is the cheap pin. A reviewer measured
-# that an honest stub would have failed #1569 — so if the suffix arms are ever
-# tightened, delete this block rather than keeping both.
+# Both legs read `sed -E 's/(^|[[:space:]])#.*//'` of the rail, i.e. EXECUTABLE text.
+# The facts that pin the two fragile details, so nobody has to rediscover them:
+#   * `sed -E`, not a BRE alternation — `\|` is a GNU extension and BSD/macOS `sed`
+#     silently no-ops it, leaving the strip inert (measured: that form counts 1 here).
+#   * The strip is HEURISTIC and fails BOTH ways — a trailing comment is a loud false
+#     FAIL, and a `#` inside a quoted string truncates the line. No line today combines
+#     the latter with a later `repos/$slug`, so the count is right; re-check that first
+#     if this ever reads a surprising zero.
 #
-# ⛔ COMMENTS ARE STRIPPED FIRST, and that is load-bearing rather than tidiness: the
-# comment above this fetch NAMES the malformed form to explain it, so a raw grep
-# would false-FAIL on the file's own documentation — and the cheapest way out of
-# that is to delete the explanation instead of the defect.
-#
-# ⛔ `sed -E`, NOT a BRE alternation. `sed 's/\(^\|[[:space:]]\)#/…/'` is a GNU
-# extension: on BSD/macOS `sed` (this suite runs on macOS) `\|` silently does not
-# match, so the strip is a no-op. Measured: the BRE form returns 1 on the file this
-# assertion must pass, i.e. it would have shipped as a permanently red check.
-#
-# ⛔ THE STRIP IS HEURISTIC, AND IT FAILS IN BOTH DIRECTIONS. Stated because a
-# previous revision of this comment claimed the safe direction was the only one,
-# and that was measured FALSE. Too little stripping — a TRAILING comment naming the
-# form — is a loud false FAIL (measured: the naive whole-file grep returned 1,
-# from the comment). TOO MUCH stripping is also live: the SCANNED RAIL
-# (`scripts/admin-merge.sh`) carries ~20 lines with a `#` inside a quoted string
-# (e.g. `say_err "   vocabulary, #1319). …"`), which the strip truncates, and a
-# truncated line loses anything after the `#`. This count is of the rail, not of
-# `tests/admin-merge/run.sh`, which carries 34 such lines.
-# No line today combines such a string with a later `repos/$slug`, so the count is
-# correct — but that is a property of the CURRENT TEXT, not of the stripper, and it
-# is the thing to re-check first if this assertion ever reads a surprising zero.
-#
-# Failure it prevents: this exact bug (#1569), which shipped and only surfaced when
-# a lane traced an unexplained false block. Deleting the check tomorrow would harm
-# the PRODUCT, not the process: it guards a fail-closed predicate's INPUT, and a
-# silent empty input reads as `unknown` rather than as an error.
+# Failure it prevents (#1569): a false block on every PR whose changed-file list is
+# needed. Product, not process — it guards a fail-closed predicate's INPUT.
 _code="$(sed -E 's/(^|[[:space:]])#.*//' "$ADM" || true)"
 _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 [ "$_dbl" = "0" ] \
   && pass "the rail never double-prefixes the slug in code — #1569" \
   || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
-# ⛔ `<<<` AND NOT A PIPE. `printf … | grep -q` is the repo's banned #841
-# anti-pattern: `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
-# `set -uo pipefail` turns that into a NON-ZERO status — DISCARDING the match.
+# `<<<` AND NOT A PIPE: `printf … | grep -q` is the repo's banned #841 anti-pattern.
+# `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
+# `set -uo pipefail` (run.sh:192) makes that a non-zero pipeline status — DISCARDING
+# the match. Measured here: payload 117 227 bytes, match 78 448 bytes before the end,
+# rc=141 on the CORRECT tree, i.e. a permanent false FAIL reddening every PR.
 #
-# ⛔ SIZE IS A NECESSARY CONDITION, NOT AN INCIDENTAL ONE. A previous revision of
-# this comment called it "a match-POSITION effect, not a size effect", and that is
-# measurably wrong — it is the same over-claim as the false premise three rounds
-# earlier. `scripts/check-no-sigpipe-grep.sh` states the race needs ALL of:
-# `pipefail` active, a payload larger than the ~64 KiB pipe buffer AFTER the match,
-# and the match on an EARLY line. Drop the size and it cannot fire at all: measured,
-# a 764-byte payload with an early match returns rc=0. That is why the other
-# `printf … | grep -q` sites this lane reported in `tests/` cannot fire the race —
-# their payloads are BELOW THE PIPE BUFFER. Say it that way, because an earlier
-# revision of this sentence said "their payloads are single lines" and that is
-# FALSE: `tests/admin-merge/run.sh:5993` pipes a 121-LINE, 7 992-byte function body.
-# It is safe for its SIZE, not its line count — and naming the wrong criterion is
-# how a maintainer concludes a multi-line payload is safe without comparing sizes.
+# The race needs ALL of: `pipefail`, a payload past the ~64 KiB pipe buffer AFTER the
+# match, and the match on an EARLY line (see `scripts/check-no-sigpipe-grep.sh`).
+# SIZE IS ONE OF THEM — a 764-byte payload with an early match returns rc=0 — so the
+# other `printf … | grep -q` sites in `tests/` are safe for their SIZE, not their
+# line count (`tests/admin-merge/run.sh:5993` pipes a 121-line, ~8 KB body).
 #
-# Both conditions hold HERE, which is what makes this one real: payload 117 227
-# bytes, and the match sits 78 448 bytes before the end. Measured: the piped form
-# returned 141 on the CORRECT tree, so this leg was a permanent false FAIL that
-# reddened every PR.
-# `scripts/check-no-sigpipe-grep.sh` enforces the ban but scans only
-# `scripts .husky pi-bootstrap` — NOT `tests/` — which is why this shipped. The
-# absence leg above is deliberately left as `grep -c`: it must read the WHOLE input
-# to count, so it can never exit early and cannot take SIGPIPE.
+# The absence leg above is deliberately `grep -c`: it must read the WHOLE input to
+# count, so it cannot exit early and cannot take SIGPIPE.
+#
+# That guard did not catch this one because its `SCAN_DIRS` is
+# `(scripts .husky pi-bootstrap)` — `tests/` is NOT scanned.
 grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
   && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
   || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
