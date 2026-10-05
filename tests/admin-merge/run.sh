@@ -8907,6 +8907,40 @@ pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_r
 pe_paths "push + branches still exempt" no 'src/a.c'             $'on:\n  push:\n    branches: [main]\n'
 pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\n'
 
+# #1569 — THE SLUG IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
+#
+# `workflow_pr_evaluable()` receives `repos/<owner>/<repo>` — every binding site in
+# the rail passes the prefixed form, which is why the line above reads
+# `$slug/contents/…`. The changed-file fetch read `repos/$slug/pulls/…` instead,
+# composing `repos/repos/<owner>/<repo>/pulls/…`. That 404s, so
+# `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it — and empty is
+# not neutral: the predicate then answers `unknown`, the base-side red stays
+# BLOCKING (a false block whose remedy no rebase satisfies), and the #1542 filter
+# comparison this fetch exists to feed is silently disabled for the common case.
+#
+# This is asserted STATICALLY, on purpose, rather than through the fetch stub: the
+# defect is a malformed URL LITERAL, and a stub that intercepts `$GH` before the
+# URL is built cannot see it. The pair below is what makes the check meaningful —
+# the absence alone would also pass if the fetch were deleted outright.
+#
+# ⛔ COMMENTS ARE STRIPPED FIRST, and that is load-bearing rather than tidiness: the
+# comment above this fetch NAMES the malformed form to explain it, so a raw grep
+# would fail on the file's own documentation and push the next author to delete the
+# explanation instead of the defect. The check is about EXECUTABLE text.
+#
+# Failure it prevents: this exact bug (#1569), which shipped and only surfaced when
+# a lane traced an unexplained false block. Deleting the check tomorrow would harm
+# the PRODUCT, not the process: it guards a fail-closed predicate's INPUT, and a
+# silent empty input reads as `unknown` rather than as an error.
+_code="$(grep -v '^[[:space:]]*#' "$ADM" || true)"
+_dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
+[ "$_dbl" = "0" ] \
+  && pass "the rail never double-prefixes the slug in code — #1569" \
+  || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
+printf '%s\n' "$_code" | grep -q '\$slug/pulls/\$PR/files' \
+  && pass "the changed-file fetch still builds a single-prefix pulls/ URL — #1569" \
+  || fail "the changed-file fetch is gone or did not keep the single-prefix \$slug/pulls/ form — the #1542 filter input has no source (#1569)"
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
