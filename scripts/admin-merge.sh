@@ -1806,7 +1806,21 @@ lane_parity_check() {
       return 2
     fi
   else
-    cp "$TMP/lane-main.txt" "$TMP/lane-missing.txt"
+    # The PR executed NOTHING while main's lane is real, so the whole of main's
+    # lane IS the gap. This copy is the same class of step as the `grep`
+    # subtractions above, and it is checked for the same reason: `lane-missing.txt`
+    # is created EMPTY at function entry, so an unchecked failure here leaves it
+    # empty, the `[ -s … ]` test below reads that as "no shard is missing", and the
+    # function returns 0 — parity "established" for a head that compared NOTHING.
+    # Unlike every other route into that state, the resulting certificate is one the
+    # evidence gate ACCEPTS (`PR ⊇ main … 0 shard(s) on the PR side, N on main`), so
+    # it reaches a real merge: a failed write is not an empty gap. Reproduced by
+    # shadowing `cp` on PATH — scenario (j3) in tests/admin-merge/run.sh.
+    if ! cp "$TMP/lane-main.txt" "$TMP/lane-missing.txt"; then
+      say_err "admin-merge: ✗ the lane-coverage copy failed — lane coverage unverifiable"
+      LANE_PARITY_REASON="the lane-coverage listing could not be copied into the gap (the lane-coverage copy failed)"
+      return 2
+    fi
   fi
   # ── #6928: FORGIVE THE LEGS THE TARGET'S DIFF SELECTOR *DECLINED* ──────
   # Computed ONLY when the raw subtraction left a shard to explain, so a repo

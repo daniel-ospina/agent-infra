@@ -5634,6 +5634,48 @@ else
   pass "the REAL verifier refuses the declared-off shape, so producer and verifier now agree"
 fi
 
+# (j3) ✗ AN UNWRITABLE GAP FILE MUST NOT READ AS "NO GAP". In `lane_parity_check`,
+# the `cp` that fills the gap when the PR executed NOTHING was the only UNCHECKED
+# step: `lane-missing.txt` is created EMPTY at function entry, so a failed copy left
+# the empty file in place, the `[ -s … ]` test read that as "no shard is missing",
+# and the function returned 0 — parity "established" for a head that compared
+# NOTHING. This one is worse than the declared-off defect it sits beside: the body it
+# produces carries a POSITIVE `lane parity: PR ⊇ main` line (with `0 shard(s) on the
+# PR side, 2 on main`), so the REAL evidence gate ACCEPTS it and the rail MERGES. It
+# was found by an adversarial review and reproduced before the fix (rc 0, comment
+# posted, `pr merge` called). Every sibling subtraction in the same function already
+# fails CLOSED on its own status; this one did not. Reproduced here by shadowing `cp`
+# on PATH so ONLY the lane-coverage copy fails.
+new_scen lanegapcopyfail
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9885 > "$SCEN/runs-$HEAD_VP"
+lane_pass maindd55 9886 > "$SCEN/runs-main"
+lane_jobset 9885 skipped 'test (a)' 'test (b)'   # the PR executed NOTHING
+lane_jobset 9886 success 'test (a)' 'test (b)'   # main's lane is real
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/cp" <<'CPSTUB'
+#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+  */lane-missing.txt) echo "cp: simulated write failure" >&2; exit 1 ;;
+esac
+exec /bin/cp "$@"
+CPSTUB
+chmod +x "$SCEN/bin/cp"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unwritable gap file REFUSES (exit $rc) — it is not read as 'no gap'" \
+  || fail "a FAILED lane-coverage copy CERTIFIED the comparison (exit 0) with 0 shards compared — the evidence gate accepts that body and the merge proceeds"
+grep -q "lane-coverage copy failed" "$SCEN/err" \
+  && pass "…naming the failed copy as the reason, rather than reporting a coverage result" \
+  || fail "the refusal does not name the failed copy"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a comparison that could not be written" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be written" \
+  || pass "…and no merge was attempted"
+
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
 # branch and certify WITHOUT the disclosure — a typo is not a declaration.
