@@ -19,8 +19,9 @@
 #                          labels (tier) and scoping comments (checks b–e) are
 #                          fetched from the issue's OWN repo, not the PR's.
 #                          A PR whose diff is ENTIRELY an artifact under docs/,
-#                          instruction-layer Markdown (skills/**/*.md,
-#                          AGENTS.md), or .github/CODEOWNERS may
+#                          instruction-layer Markdown (AGENTS.md,
+#                          skills/**/*.md, templates/**/*.md), or
+#                          .github/CODEOWNERS may
 #                          instead use a NON-closing traceability keyword
 #                          (Refs / Part of / Advances / Tracks / Relates to).
 #                          Rationale: a planning/instruction-artifact PR
@@ -668,8 +669,8 @@ files_rows() {
 }
 
 # pr_is_artifact_only <files> — true when the PR's diff is ENTIRELY an artifact:
-# under docs/, instruction-layer Markdown (skills/**/*.md, AGENTS.md), or the
-# review-routing config .github/CODEOWNERS.
+# under docs/, instruction-layer Markdown (AGENTS.md, skills/**/*.md,
+# templates/**/*.md), or the review-routing config .github/CODEOWNERS.
 # `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
 # fetch. Fails CLOSED on anything it cannot prove, because this predicate is
 # what unlocks check (a)'s non-closing keyword — a false `true` would let a
@@ -684,8 +685,12 @@ files_rows() {
 # wrong direction for a closure gate. This is why a CODE PR (any
 # .ts/.js/.mjs/script/workflow path) still cannot use the traceability keyword:
 # it is simply not on the list. `docs/` is a PREFIX (any file under it); the
-# other two are EXACT/pattern paths, so e.g. `.github/workflows/*.yml` and
-# `.github/CODEOWNERS.d/x` are NOT artifacts.
+# other entries are EXACT/pattern paths, so e.g. `.github/workflows/*.yml`,
+# `.github/CODEOWNERS.d/x` and `templates/.github/workflows/pipeline-compliance.yml`
+# are NOT artifacts. The `templates/` entry is Markdown-only (#1409) for exactly
+# that reason: 18 of the 21 tracked files under templates/ are executable
+# (workflows, launchd plists, husky hooks, JSON config), so a directory-wide
+# entry would have handed check (a)'s traceability keyword to a workflow edit.
 # Four ways to be untrustworthy, all → NOT artifact-only:
 #   1. Empty/unreadable list (a broken fetch must never weaken closure).
 #   2. Any row the shared validator rejects — malformed framing or an empty
@@ -725,7 +730,17 @@ pr_is_artifact_only() {
   # dangerous site of the family: a raced pipeline INVERTS to "artifact-only"
   # (fail-OPEN), which unlocks check (a)'s non-closing traceability keyword for
   # a PR that touches code.
-  ! grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|\.github/CODEOWNERS$)' <<<"$paths"
+  # templates/**/*.md is instruction-layer Markdown in the SAME sense as
+  # AGENTS.md and skills/**/*.md (#1409): it ships governance prose, implements
+  # no runtime work, and — being the source that materializes into every repo's
+  # AGENTS.md — is the file the base⊆AGENTS.md pin FORCES every instruction-layer
+  # rule change to touch. Leaving it off the allowlist made the class
+  # unreachable for exactly those PRs: artifact-only read false, the
+  # traceability alternative is gated on it (resolve_issue_ref), so the only
+  # remaining keyword was a closing one — a FALSE close or a blocked PR.
+  # The `.md` restriction is load-bearing, not decorative: see the 18/21 note
+  # above.
+  ! grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|templates/.*\.md$|\.github/CODEOWNERS$)' <<<"$paths"
 }
 
 # resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
@@ -1435,6 +1450,22 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'instruction-layer + code' $'modified\tAGENTS.md\t\nmodified\tscripts/z.sh\t' false
   expect_artifact_only 'skills non-.md (skill payload)' $'modified\tskills/foo/run.sh\t' false
   expect_artifact_only 'nested AGENTS.md is NOT the instruction layer' $'modified\tsub/AGENTS.md\t' false
+  # #1409 — templates/**/*.md joins the instruction-layer class. Two live
+  # instances before this: #1400 reached MERGED only by taking the false close,
+  # and #1461 sat red 11 days on check (a) alone (checks b–e are SKIPPED when
+  # (a) fails, so its substantive artifacts were never examined).
+  expect_artifact_only 'templates/AGENTS.base.md only (the #1461 case)' $'modified\ttemplates/AGENTS.base.md\t' true
+  expect_artifact_only 'the MANDATORY twin edit (AGENTS.md + base)' $'modified\tAGENTS.md\t\nmodified\ttemplates/AGENTS.base.md\t' true
+  expect_artifact_only 'nested templates .md' $'modified\ttemplates/.github/workflows/README.md\t' true
+  # ...and the `.md` restriction is what keeps the class narrow. Measured on
+  # main 2026-10-06: 18 of the 21 tracked files under templates/ are executable.
+  # Every one of these reads `true` if the entry is widened to `templates/`.
+  expect_artifact_only 'templates executable workflow (NOT .md)' $'modified\ttemplates/.github/workflows/pipeline-compliance.yml\t' false
+  expect_artifact_only 'templates husky hook (NOT .md)' $'modified\ttemplates/.husky/pre-commit\t' false
+  expect_artifact_only 'templates launchd plist (NOT .md)' $'modified\ttemplates/launchd/com.tortoise.worktree-reaper.plist\t' false
+  expect_artifact_only 'templates .gitignore (NOT .md)' $'modified\ttemplates/.gitignore\t' false
+  # Anti-vacuous: the twin edit buys no immunity for a code path beside it.
+  expect_artifact_only 'twin edit + code' $'modified\ttemplates/AGENTS.base.md\t\nmodified\tscripts/z.sh\t' false
   # #786's headline case: `.github/CODEOWNERS` is review-routing config with no
   # executable logic — the same artifact class (the live #674 diff is CODEOWNERS
   # + docs/). Only that exact path is in the class; a workflow file next to it,
