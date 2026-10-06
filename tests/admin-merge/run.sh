@@ -5676,51 +5676,71 @@ grep -q "lane-coverage copy failed" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be written" \
   || pass "…and no merge was attempted"
 
-# (j4) ✗ THE SUBTRACTION'S EMPTINESS IS A CLAIM, NOT A MEASUREMENT (#1439 cycle-2).
-# The sibling of (j3): the `grep` subtraction's own write can fail, and a failed
-# REDIRECT reports grep's "no differences" status (1) — indistinguishable, by any
-# status test, from a genuine empty gap. `[ -s … ]` on the empty file then read "nothing
-# is missing", and the rail certified `lane parity: PR ⊇ main … 1 shard(s) on the PR
-# side, 2 on main` — a body the REAL evidence gate ACCEPTS — for a head with a real
-# 1-shard gap. The guard pins the ARITHMETIC instead (main's lane is a DEDUPED set, so
-# an empty gap REQUIRES the PR's set to be at least as large), so it closes every
-# mechanism that empties the file, not just this one. The PATH shim here is only the
-# means of producing the inconsistent state; the finding was originally reproduced both
-# this way and with a non-regular destination.
-new_scen lanesubtractempty
+# (j4) ✗ A GAP FILE THAT CANNOT RECORD THE GAP MUST NOT READ AS "NO GAP" (#1439
+# cycle-2/3). The decision was read off `lane-missing.txt`, whose emptiness a failed
+# write produces just as surely as a genuinely empty gap does: the `grep` subtraction's
+# REDIRECT reports grep's OWN "no differences" status (1), and a destination that is not
+# a regular file swallows the write. `[ -s … ]` then said "nothing is missing" and the
+# rail certified `lane parity: PR ⊇ main` — a body the REAL evidence gate ACCEPTS — for
+# a head that compared nothing. The check now asks the MEMBERSHIP question itself (of
+# the two lists, writing to /dev/null so its own redirect cannot fail) and refuses when
+# the gap FILE is empty although a shard is missing. Two fixtures: the lost write that
+# empties a real gap, and — the cycle-3 route that a SIZE comparison could not catch —
+# EQUAL counts with no overlap at all. The `mktemp` shim hijacks only the gap file's
+# DESTINATION: it models a failed WRITE, not a lying tool. (The gate trusts the tools it
+# calls — a PATH `grep` that lied about the answer would defeat any check that consults
+# it, and that is out of the threat model: a bad PR and a failed write, not a hostile
+# host.)
+new_scen lanegapnotwritable
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "${SCEN}/planted-gap" "$d/lane-missing.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB
+chmod +x "$SCEN/bin/mktemp"
+# The planted target absorbs every write, so the gap file reads back EMPTY.
+ln -sf /dev/null "$SCEN/planted-gap"
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
 lane_pass maindd77 9888 > "$SCEN/runs-main"
 lane_jobset 9887 success 'test (a)'              # the PR ran ONE shard…
-lane_jobset 9888 success 'test (a)' 'test (b)'   # …and main ran TWO: a real 1-shard gap
-mkdir -p "$SCEN/bin"
-# Key on the PATTERN FILE, not on the flags: `lane-pr.txt` is a `-f` pattern file at
-# exactly one site (the coverage subtraction), whereas a flag+last-arg signature also
-# matches `lane_has_test_shard`'s `grep -vxF -f lane-lifecycle.txt "$f"` — which is how
-# the first cut of this shim made main's lane look lifecycle-only and refused a step too
-# early, leaving the assertion below unfired.
-cat > "$SCEN/bin/grep" <<'GREPSTUB'
-#!/bin/sh
-pat=""; prev=""
-for a in "$@"; do
-  if [ "$prev" = "-f" ]; then pat="$a"; fi
-  prev="$a"
-done
-case "$pat" in */lane-pr.txt) exit 1 ;; esac
-exec /usr/bin/grep "$@"
-GREPSTUB
-chmod +x "$SCEN/bin/grep"
+lane_jobset 9888 success 'test (a)' 'test (b)'   # …main ran TWO: a real 1-shard gap
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
   PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
 rc=$?
-[ "$rc" -ne 0 ] && pass "an EMPTY gap beside a real 1-shard gap REFUSES (exit $rc) — emptiness is checked against the lists" \
+[ "$rc" -ne 0 ] && pass "a gap file that cannot record a REAL 1-shard gap REFUSES (exit $rc)" \
   || fail "the rail CERTIFIED 'PR ⊇ main' with 1 shard on the PR side and 2 on main — the evidence gate ACCEPTS that body and the merge proceeds"
-grep -q "lane-coverage subtraction is INCONSISTENT" "$SCEN/err" \
-  && pass "…naming the inconsistency, so the operator sees the arithmetic rather than a verdict" \
-  || fail "the refusal does not name the inconsistent subtraction"
-[ -f "$SCEN/comment" ] && fail "evidence was posted for an inconsistent comparison" \
+grep -q "came back EMPTY although main's lane holds a shard" "$SCEN/err" \
+  && pass "…naming the lost listing, rather than reporting a coverage result" \
+  || fail "the refusal does not name the empty-gap-against-the-lists disagreement"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a gap that could not be recorded" \
   || pass "…and no evidence was posted"
-grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an inconsistent comparison" \
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be recorded" \
+  || pass "…and no merge was attempted"
+# …and the same hollow gap with EQUAL counts and NO overlap: a size comparison cannot
+# see this one (1 shard on each side), so the membership test is what refuses it.
+rm -f "$SCEN/comment"; : > "$SCEN/calls"
+lane_jobset 9887 success 'test (c)'    # the PR ran a shard main did NOT
+lane_jobset 9888 success 'test (d)'    # main ran a shard the PR did NOT
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "…and the same hollow gap with EQUAL counts and NO overlap REFUSES (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' with 1 shard on each side and NO overlap — a size comparison cannot catch that, and the merge proceeds"
+grep -q "came back EMPTY although main's lane holds a shard" "$SCEN/err" \
+  && pass "…by the same membership test, not by a count" \
+  || fail "the equal-count case was refused for some other reason, so membership is not what decided it"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a disjoint comparison" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a disjoint comparison" \
   || pass "…and no merge was attempted"
 
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
