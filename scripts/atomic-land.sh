@@ -46,7 +46,13 @@
 #     strict, and strict is only what makes it block.
 #     OVERRIDES: the former "the rail never reads a protection setting, and is
 #     correct with strict ON or OFF" invariant — narrowed to ONE positive read of
-#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY.
+#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY, in
+#     BOTH step-1 arms: the BEHIND enum arm, AND the base-drift arm for the
+#     landable states `CLEAN|UNSTABLE` only. #1565's ruling that the drift arm must
+#     stay ungated ("a BLOCKED PR is still mergeable: true", so gating it would
+#     skip the refresh #1533 needed) is NARROWED, not reversed — `BLOCKED`, every
+#     other or unknown state, and any unreadable read still refresh. The record
+#     lives on agent-infra#1565, whose own text carries the matching marker.
 #     Rationale, measured (#1565): the refresh's cost is a head move, which
 #     invalidates the head-bound review record (clause B5), forces a full CI run at
 #     the new head (critical path 17.1m median / 19.8m max), and then makes the rail
@@ -57,13 +63,17 @@
 #     silently wrong) and it FAILS CLOSED — anything but a positive `false`
 #     (404/403/`null`/empty: protection unconfigured, or a token without admin on
 #     the repo) keeps the refresh exactly as it was. The merge and the record never
-#     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh.
-#     The gate applies to the BEHIND arm ONLY: the base-drift arm below remains
-#     conditional on behind_by > 0 and is NOT gated on this predicate, because it
-#     exists for the #1533 case — a BLOCKED branch whose drift red could never
-#     resolve without an update — and a BLOCKED PR is still `mergeable: true` (no
-#     conflicts; it has a red required leg). Gating that arm would skip exactly the
-#     refresh #1533 needed.
+#     consult it. ATOMIC_LAND_REFRESH_ALWAYS=1 restores the unconditional refresh
+#     in BOTH arms.
+#     The gate applies to the BEHIND arm AND to the base-drift arm below, for the
+#     states that are ALREADY LANDABLE — `CLEAN` (every check passed) and `UNSTABLE`
+#     (the REQUIRED checks passed; only non-required ones fail or pend), both
+#     landable under `strict: false`, which is the #7230 non-termination. The drift
+#     arm stays conditional on `behind_by > 0` and is NOT gated for `BLOCKED`,
+#     because it exists for the #1533 case — a BLOCKED branch whose drift red could
+#     never resolve without an update — and a BLOCKED PR is still `mergeable: true`
+#     (no conflicts; it has a red required leg). Gating that state would skip exactly
+#     the refresh #1533 needed.
 #   * No accepted-verdict review record → refuse before any mutation.
 #   * A draft → refuse before any CI work (`gh` refuses to merge a draft).
 #   * A changed/unprovable diff → the record step refuses (exit 3) → STOP.
@@ -112,7 +122,8 @@
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
-#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a BEHIND head, ignoring the live
+#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
+#                               base drift on a landable state), ignoring the live
 #                               `strict` read (the #1565 fail-safe restore)
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
@@ -510,6 +521,34 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # predicate there would skip precisely the refresh #1533 needed. This arm is
       # where the update is UNCONDITIONAL — it fires on the enum alone — and that is
       # the blast radius measured in #1565.
+      #
+      # ⚠️ THE DRIFT ARM NEEDS THE SAME PREDICATE — FOR EVERY LANDABLE STATE (#7230).
+      # For `CLEAN` and `UNSTABLE` every REQUIRED leg is satisfied, and `strict: false`
+      # means the distance to the base is not one of them: the only thing left between
+      # that PR and a merge is the drift, which nothing requires it to close. (Do NOT
+      # widen this to "anything but BLOCKED" — that set carries states that are not
+      # landable, which is what the fail-closed enumeration below and mutation B22
+      # exist to keep out.) The drift arm refreshed there anyway, so a green,
+      # correctly-attested
+      # PR had its head moved for nothing — the record then died at step 3 (#1575
+      # clause E, correctly) and the rail could never land it. That is the O3 shape
+      # (22 updated, 17 attestations invalidated, 0 landed) and the live repro is
+      # #7462 / tortoise #7230. So the landable states are held below under the same
+      # positive-false `strict` + positive-`mergeable` read as the BEHIND arm.
+      #
+      # TWO states are landable and both are named EXPLICITLY (fail-closed: any other
+      # state refreshes): `CLEAN` — every check passed — and `UNSTABLE` — the REQUIRED
+      # checks passed while only NON-required ones fail or pend, which GitHub defines
+      # as mergeable and which this file's own drift sweep measures at 10 of its
+      # population. Holding `CLEAN` alone would have left those 10 with the same
+      # non-termination. `BLOCKED` is deliberately NOT held: that is #1533, and its
+      # refresh still fires — as does a conflicting (unmergeable) head, on the
+      # fail-closed `mergeable` read rather than on its state name.
+      #
+      # ⛔ THE FAIL-SAFE GOVERNS HERE TOO. `ATOMIC_LAND_REFRESH_ALWAYS=1` restores the
+      # unconditional refresh and must be checked in THIS arm as well as the BEHIND
+      # one; a state-gated skip it could not override would be an un-disableable
+      # misfire.
       if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
       else
@@ -528,7 +567,32 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       fi ;;
     *)
       behind="$(behind_by_of "$BASE" "$HEAD")"
-      if [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+      local drift_landable=0
+      case "$MERGE_STATE" in CLEAN|UNSTABLE) drift_landable=1 ;; esac
+      if [ "$drift_landable" = 1 ] && [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
+        # #7230 — A LANDABLE HEAD MUST NOT BE PRE-EMPTED BY THE DRIFT TRIGGER.
+        # Without this arm the `elif CLEAN` no-op below is UNREACHABLE whenever the
+        # head is behind, so the state that is already landable is the one state
+        # guaranteed to be refreshed. Same predicate, same fail-closed direction as
+        # the BEHIND arm: skip only on a POSITIVE `false` strict AND a POSITIVE
+        # `true` mergeable.
+        if [ "${ATOMIC_LAND_REFRESH_ALWAYS:-0}" = 1 ]; then
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, and ATOMIC_LAND_REFRESH_ALWAYS=1 — refreshing"
+        else
+          local strict mergeable
+          strict="$(strict_of)"
+          if [ "$strict" = false ]; then
+            mergeable="$(mergeable_of)"
+            if [ "$mergeable" = true ]; then
+              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
+              return 3
+            fi
+            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
+          else
+            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
+          fi
+        fi
+      elif [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
@@ -536,8 +600,28 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
-        # exists to close. `CLEAN` was checked above and already asserts there is no
-        # divergence, so it keeps its no-op; any OTHER state means GitHub has told
+        # exists to close.
+        #
+        # ⚠️ The reason once given here — "`CLEAN` was checked above and already
+        # asserts there is no divergence" — is FALSE, and #7230 is the proof: under
+        # `strict: false` a head that is genuinely behind reports `CLEAN`, which is
+        # the very state the drift arm above exists to catch. `CLEAN` is a statement
+        # about checks and conflicts, never about distance to the base. (Pre-fix,
+        # that false premise hid the drift arm entirely: `CLEAN`+`behind>0` fell
+        # through to it and had its head moved for nothing.) `CLEAN` keeps its no-op
+        # for the CORRECT reason, not that one: the drift arm has already decided
+        # the distance for every landable state whose compare read succeeded, and
+        # where it did NOT succeed a landable head still needs no refresh — under
+        # `strict: false` the distance is not a requirement, and under `strict:
+        # true` a stale branch is never reported `CLEAN`.
+        #
+        # (Do NOT name `BEHIND` or `BLOCKED` as what strict produces here — this file
+        # already records at :45-47 and :282-285 that `BEHIND` occurs WITH OR WITHOUT
+        # strict and that strict is only what makes it BLOCK a merge, so which of the two
+        # a stale head reports is not this comment's subject. An earlier draft of this
+        # parenthetical asserted `BLOCKED` and contradicted those lines.)
+        #
+        # Any OTHER state means GitHub has told
         # us something is wrong with this head and the compare API could not tell us
         # how stale it is. Stop and name it rather than proceeding on an unmeasured
         # base relation (tortoise #6210 / #6169 are the measured population).
@@ -892,7 +976,15 @@ while :; do
         say "atomic-land: the base ADVANCED after verification (${CERT_BASE_TIP:0:12}… → ${now_tip:0:12}…) — the checks did not cover the new base"
         resolve_state
         if [ "$round" -lt "$MAX_ROUNDS" ]; then
-          say "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged; the review is reused, the CHECK is re-run)"
+          # The next round re-enters the whole unit, but it does NOT necessarily
+          # re-run the CHECKS: round 2 goes back through do_update, and wherever the
+          # drift arm HOLDS the head (a landable state on a positive `strict` false
+          # — #7230) no `gh pr update-branch` happens, so the check surface is never
+          # re-evaluated. What IS re-established is the base BINDING: round 2
+          # re-captures CERT_BASE_TIP at the advanced tip and the pre-land re-read
+          # compares against THAT. Saying "the CHECK is re-run" here would assert a
+          # measurement nobody took.
+          say "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged and the review is reused; the base BINDING is re-established — the checks are re-run only if the head is actually moved)"
           round=$((round + 1))
           continue
         fi
