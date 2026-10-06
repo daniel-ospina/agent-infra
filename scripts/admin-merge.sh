@@ -4621,7 +4621,34 @@ ${parity_forgiven_note}"
       "$TMP/merge.err" "gh pr merge said:"
     exit 1
   fi
-  info "admin-merge: ✅ merged PR #$PR at $head (state=$merge_state confirmed via the API)"
+  # THE SHA THAT LANDED, NOT THE SHA WE SENT (#7504). `$head` is the BRANCH head, and
+  # under the DEFAULT `--squash` (see the MERGE_ARGS note above) the commit that lands
+  # on main is a NEW commit that shares no sha with it — so printing `$head` here
+  # recorded a sha that is not on main at all. Measured on three landings (#5434,
+  # #7460, #7417): the printed sha failed `git merge-base --is-ancestor <sha>
+  # origin/main`, and for #7417 it was not even a valid commit name in the repo
+  # (`fatal: Not a valid commit name`). A PRE-merge value read from this PR is the
+  # PREDICTED merge ref `refs/pull/N/merge` — a synthetic commit GitHub creates to
+  # test mergeability and DELETES after the merge — which is precisely why the
+  # recorded sha could not be resolved afterwards. Read the landed commit from the
+  # REST PR object AFTER the merge: the same source `resolve_merge_ref` trusts, for
+  # the same reason it states (REST `merge_commit_sha` is populated once merged,
+  # the GraphQL field is not).
+  local landed_sha=""
+  if [ -n "${REPO:-}" ]; then
+    landed_sha="$($GH api "repos/$REPO/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null || true)"
+  fi
+  case "$landed_sha" in
+    ""|null)
+      # No sha is better than a WRONG sha: the whole defect was a figure that looked
+      # like the artifact and was not. Name the head for diagnosis, and say plainly
+      # that it is not the landing.
+      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was $head, which under a squash is NOT on main. Read the artifact with: gh pr view $PR --json mergeCommit"
+      ;;
+    *)
+      info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was $head)"
+      ;;
+  esac
 }
 
 main "$@"
