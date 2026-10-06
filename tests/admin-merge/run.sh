@@ -5743,6 +5743,60 @@ grep -q "came back EMPTY although main's lane holds a shard" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a disjoint comparison" \
   || pass "…and no merge was attempted"
 
+# (j5) ✗ THE FORGIVENESS REWRITE CAN BE SWALLOWED TOO (#1439 cycle-4). The check above
+# guards the state BEFORE forgiveness; the forgiveness step then REWRITES the gap
+# (`grep -vxF -f lane-forgiven.txt lane-missing.txt > lane-kept.txt`, then `mv`), so a
+# swallowed write there empties the gap AFTER the check has passed. Reproduced by an
+# adversarial review: rc 0, evidence posted, `pr merge` called, and the REAL evidence
+# gate ACCEPTED the body — which claimed `EXCEPT the N shard(s) its diff selector
+# DECLINED … every shard the selector did not decline still had to be executed, and
+# was`, while `test (b)` was neither declined nor run. The membership test therefore
+# runs on the FINAL state, against `pr ∪ declined` — the claim the certificate actually
+# makes — and only credits the declined set when forgiveness was applied.
+new_scen laneforgivenwrite
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 6936 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6937 6935 > "$SCEN/runs-main"
+lane_jobset 6935 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6936 success 'test (a)'
+pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
+selector_stub False False
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB2'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf /dev/null "$d/lane-kept.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB2
+chmod +x "$SCEN/bin/mktemp"
+# The selector must SUCCEED here so forgiveness is APPLIED and the shim's swallowed
+# write lands AFTER it (the cycle-4 route) — `run_admin_cwd` is the invocation that
+# carries the resolved interpreter (`ADMIN_MERGE_SELECTOR_PYTHON`). A hand-rolled
+# `bash "$ADM"` loses it, the selector fails, forgiveness is NOT applied, and the
+# scenario silently re-tests the raw-gap refusal the #6928 fixture already covers; the
+# assertion below pins that, so the wrong fixture cannot pass as the right one.
+SEL_PATH="$SCEN/bin:$PATH" ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a swallowed FORGIVENESS write REFUSES (exit $rc) — the check runs on the FINAL state" \
+  || fail "the rail CERTIFIED 'EXCEPT the shards its selector DECLINED' while a NON-declined shard was never run — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "lane-coverage forgiveness (#6928) —" "$SCEN/err" \
+  && pass "…and forgiveness WAS applied, so the swallowed write is the route under test" \
+  || fail "forgiveness was not applied — the scenario tested the raw-gap refusal instead of the cycle-4 route"
+grep -q "came back EMPTY although main's lane holds a shard that is neither in the PR's executed set nor among the shards" "$SCEN/err" \
+  && pass "…refused by the membership test on the FINAL state (main's lane vs pr ∪ declined)" \
+  || fail "the refusal does not name the empty-gap-against-the-claim disagreement"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although the gap could not be recorded" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the gap could not be recorded" \
+  || pass "…and no merge was attempted"
+
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
 # branch and certify WITHOUT the disclosure — a typo is not a declaration.

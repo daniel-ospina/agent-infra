@@ -1822,35 +1822,6 @@ lane_parity_check() {
       return 2
     fi
   fi
-  # ── THE DECISION IS THE MEMBERSHIP TEST, ASKED OF THE LISTS (#1439 cycle-2/3) ──
-  # "Is main's lane a subset of the PR's executed set?" is the question the empty-gap
-  # test MEANT, so it is asked DIRECTLY against the two lists, and the gap FILE is
-  # required not to contradict the answer. Reading the answer off the file is what
-  # failed: a failed subtraction REDIRECT reports grep's own "no differences" status
-  # (1), which no status test can tell from a genuine empty gap, and a destination that
-  # cannot be written — or is not a regular file — swallows the write entirely. Either
-  # way the file is EMPTY while the truth is "a shard is missing", and the rail
-  # certifies `PR ⊇ main` for a head that compared nothing: a body the evidence gate
-  # ACCEPTS. A COUNT is not a substitute for membership — an equal-size guard certified
-  # `PR={test (a)}` against `main={test (b)}` once the file was emptied (cycle-3
-  # review). This pass writes to /dev/null, so its redirect cannot fail and the status
-  # is grep's ALONE; both lane files are DEDUPED SETS (`lane_shard_set` ends with
-  # `sort -u`), so "nothing was printed" ⟺ main's lane ⊆ the PR's set, EXACTLY.
-  # (Out of scope, and deliberately: the gate trusts the TOOLS. A PATH `grep` that lies
-  # about the answer would defeat any check that consults it — the threat model is a bad
-  # PR and a failed write, not a hostile host; the suite's shims model failed WRITES.)
-  local gap_recheck=0
-  grep -vxF -f "$TMP/lane-pr.txt" "$TMP/lane-main.txt" > /dev/null || gap_recheck=$?
-  if [ "$gap_recheck" -gt 1 ]; then
-    say_err "admin-merge: ✗ the lane-coverage re-check failed (grep rc $gap_recheck) — lane coverage unverifiable"
-    LANE_PARITY_REASON="the lane-coverage membership re-check itself failed (grep rc $gap_recheck)"
-    return 2
-  fi
-  if [ "$gap_recheck" -eq 0 ] && [ "$(lane_count "$TMP/lane-missing.txt")" -eq 0 ]; then
-    say_err "admin-merge: ✗ the lane-coverage gap came back EMPTY although main's lane holds a shard the PR's executed set does not. An empty gap would mean the PR ran every shard main ran, and the lists say it did not — so the listing that records the gap could not be written."
-    LANE_PARITY_REASON="the lane-coverage gap came back EMPTY although main's lane holds a shard the PR did not run, so the gap listing could not be written"
-    return 2
-  fi
   # ── #6928: FORGIVE THE LEGS THE TARGET'S DIFF SELECTOR *DECLINED* ──────
   # Computed ONLY when the raw subtraction left a shard to explain, so a repo
   # with no diff-gated legs and no selector pays nothing and refuses exactly as
@@ -1897,6 +1868,53 @@ lane_parity_check() {
       # consulted to close it, so a missing answer is never read as a declined leg.
       say_err "admin-merge: ⚠️  lane-coverage forgiveness (#6928) NOT applied — ${LANE_DECLINED_REASON}; refusing on the raw gap (a missing selector answer is not a declined leg)"
     fi
+  fi
+  # ── THE DECISION IS THE CLAIM, RE-DERIVED FROM THE INPUT LISTS (#1439) ──────
+  # The certificate asserts exactly one claim — "main's lane ⊆ the PR's executed set",
+  # or, when forgiveness was applied, "… ⊆ the PR's set ∪ the shards the selector
+  # DECLINED" — so that claim is re-derived from the INPUTS here, at the single point
+  # that decides, and the gap FILE is required not to contradict it. Reading the answer
+  # off the file is what failed, three times over: a failed subtraction REDIRECT reports
+  # grep's own "no differences" status (1), which no status test can tell from a
+  # genuinely empty gap; a destination that is not a regular file swallows the write;
+  # and the FORGIVENESS rewrite (`> lane-kept.txt` then `mv`) can be swallowed the same
+  # way AFTER any earlier check has passed. Each left the file EMPTY while a shard was
+  # missing, and the rail certified `PR ⊇ main` — once with `EXCEPT the N shard(s) its
+  # diff selector DECLINED … every shard the selector did not decline still had to be
+  # executed, and was`, which was FALSE — for a head that compared nothing: a body the
+  # evidence gate ACCEPTS. A COUNT is not a substitute either: equal counts with
+  # disjoint members certified (cycle-3 review).
+  # WHY THE UNION IS CONDITIONAL: the declined set may only be credited when
+  # forgiveness was ACTUALLY applied, because that is what the certificate then says.
+  # Crediting it otherwise would accept `main={a,b}` against `pr={a}` with `b` merely
+  # declined — a claim no certificate on that path makes. Both passes write to
+  # /dev/null, so their redirects cannot fail and the status is grep's ALONE; lane files
+  # are DEDUPED SETS (`lane_shard_set` ends with `sort -u`), so "nothing was printed"
+  # ⟺ the claim above holds, EXACTLY.
+  # (The gate trusts the TOOLS it calls. A PATH `grep` that lied about the answer, or a
+  # planted destination whose CONTENT is crafted, would defeat a check that consults
+  # them — a hostile host, out of the threat model, which is a bad PR and a FAILED
+  # WRITE. The suite's shims model failed writes.)
+  local covered_rc=0
+  if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+    grep -vxF -f "$TMP/lane-pr.txt" -f "$TMP/lane-declined.txt" "$TMP/lane-main.txt" > /dev/null || covered_rc=$?
+  else
+    grep -vxF -f "$TMP/lane-pr.txt" "$TMP/lane-main.txt" > /dev/null || covered_rc=$?
+  fi
+  if [ "$covered_rc" -gt 1 ]; then
+    say_err "admin-merge: ✗ the lane-coverage re-check failed (grep rc $covered_rc) — lane coverage unverifiable"
+    LANE_PARITY_REASON="the lane-coverage membership re-check itself failed (grep rc $covered_rc)"
+    return 2
+  fi
+  if [ "$covered_rc" -eq 0 ] && [ "$(lane_count "$TMP/lane-missing.txt")" -eq 0 ]; then
+    if [ -n "$LANE_PARITY_FORGIVEN" ]; then
+      say_err "admin-merge: ✗ the lane-coverage gap came back EMPTY although main's lane holds a shard that is neither in the PR's executed set nor among the shards this head's diff selector DECLINED. An empty gap would mean main's lane was fully covered, and the lists say it was not — so the listing that records the gap could not be written."
+      LANE_PARITY_REASON="the lane-coverage gap came back EMPTY although main's lane holds a shard the PR did not run and its diff selector did not decline, so the gap listing could not be written"
+    else
+      say_err "admin-merge: ✗ the lane-coverage gap came back EMPTY although main's lane holds a shard the PR's executed set does not. An empty gap would mean the PR ran every shard main ran, and the lists say it did not — so the listing that records the gap could not be written."
+      LANE_PARITY_REASON="the lane-coverage gap came back EMPTY although main's lane holds a shard the PR did not run, so the gap listing could not be written"
+    fi
+    return 2
   fi
   [ -s "$TMP/lane-missing.txt" ] && return 1
   return 0
