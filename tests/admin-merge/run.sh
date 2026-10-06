@@ -131,10 +131,13 @@
 #      validated (positive, ≤ 200) before any CI work, and the widening stops once
 #      that many MEASURING runs are consulted: the window is the Jobs-API call
 #      budget for the ordinary path, and a wider one reads more job lists only
-#      where the requested window found no shard at all. `ADMIN_MERGE_LANE_PARITY=declared-off` is the
-#      AUDITED escape (a trigger-split repo, #1349): it certifies while STATING in
-#      the evidence and on stderr that parity was NOT established, and any other
-#      value is refused at startup. Declared OUT of scope: a repo that varies the
+#      where the requested window found no shard at all.
+#      `ADMIN_MERGE_LANE_PARITY=declared-off` is accepted for the trigger-split
+#      case (#1349) but NO LONGER CERTIFIES (#1439): the evidence gate refuses a
+#      vacuous certificate that lacks the positive `lane parity: PR ⊇ main` line,
+#      so the producer used to post evidence its own consumer rejected. Both modes
+#      now refuse here, naming AGENT_ADMIN_MERGE_OVERRIDE=1; an unrecognised value
+#      is still refused at startup. Declared OUT of scope: a repo that varies the
 #      test SELECTION within one shard name (files chosen per-diff inside
 #      `test (a)`), which a job list cannot show — filed as #1350.
 #  22. THE LANE-PARITY GATE'S OWN FAIL-OPEN PATHS (#1319 cycle-1/2 review): the
@@ -5575,12 +5578,19 @@ rc=$?
 grep -q "test (b)" "$SCEN/err" && pass "…and the window-boundary shard is the one named" \
   || fail "the shard that exists only in an older window run is not reported"
 
-# (j) THE AUDITED ESCAPE. A repo whose PR lane legitimately cannot run a shard
-# main's push lane runs (a trigger-split repo — this one, #1349) needs a way to
-# merge; it does NOT need a SILENT way. `declared-off` still RUNS the comparison,
-# still reports the divergence on stderr and in the POSTED evidence, and states
-# `NOT ESTABLISHED — declared off` — a certificate that says out loud what it did
-# not check.
+# (j) THE TRIGGER-SPLIT CASE IS NOW A REFUSAL, NOT A CERTIFICATE (#1439). A repo
+# whose PR lane legitimately cannot run a shard main's push lane runs (a
+# trigger-split repo — this one, #1349) needs a way to merge;
+# `ADMIN_MERGE_LANE_PARITY=declared-off` USED to provide one, certifying a vacuous
+# comparison while stating the divergence. It could never work: the evidence gate
+# refuses a vacuous certificate that does not carry the positive `lane parity: PR ⊇
+# main` line (verify-admin-merge-evidence.sh clause 5 — #1319's own rule, and the
+# case #1388's decision scoped clause 5 to), so the producer posted evidence,
+# announced a merge, and the shim then refused it and retracted the evidence
+# (#3549). This scenario drives a FAKE gh and so cannot observe that layer — its
+# old assertions certified the false PASS. It now asserts the producer refuses
+# WHERE IT USED TO CERTIFY: no evidence posted, no merge attempted, and the route
+# that does work named on stderr.
 new_scen vacuousdeclaredoff
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9881 > "$SCEN/runs-$HEAD_VP"
@@ -5590,17 +5600,39 @@ lane_jobset 9882 success 'test (a)' 'test-slow (a)'
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_LANE_PARITY=declared-off bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
 rc=$?
-[ "$rc" -eq 0 ] && pass "declared-off certifies the vacuous comparison (exit 0) — the escape works" \
-  || fail "declared-off did not certify (exit $rc); the escape is unusable"
-grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
-  && pass "…and the POSTED evidence STATES the parity was not established" \
-  || fail "the escape certified SILENTLY: the evidence does not disclose it"
-grep -q "LANE PARITY NOT ESTABLISHED" "$SCEN/err" && pass "…as does stderr, before the merge" \
-  || fail "the escape did not warn on stderr"
-grep -q "test-slow (a)" "$SCEN/err" && pass "…and the DIVERGENCE is still reported, so the escape is not a blindfold" \
+[ "$rc" -ne 0 ] && pass "declared-off REFUSES the vacuous comparison (exit $rc) — it is not a certificate" \
+  || fail "declared-off certified (exit 0); a certificate the shim then rejects is back"
+grep -q "NOT COMPARABLE" "$SCEN/err" && pass "…on the same NOT COMPARABLE verdict the default mode gives" \
+  || fail "the refusal does not carry the NOT COMPARABLE verdict"
+grep -q "ADMIN_MERGE_LANE_PARITY=declared-off is set" "$SCEN/err" \
+  && pass "…NAMING the knob as set, so a declared-off operator is told it is not the remedy" \
+  || fail "the refusal never mentions the declared-off setting, so the operator is left guessing"
+grep -q "AGENT_ADMIN_MERGE_OVERRIDE=1" "$SCEN/err" \
+  && pass "…and naming AGENT_ADMIN_MERGE_OVERRIDE=1 — the audited route that does work" \
+  || fail "the refusal does not name the audited override"
+grep -q "test-slow (a)" "$SCEN/err" && pass "…while still reporting the DIVERGENCE (a refusal is not a blindfold)" \
   || fail "declared-off suppressed the divergence report"
-grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
-  || fail "declared-off still refused the merge"
+[ -f "$SCEN/comment" ] && fail "declared-off POSTED evidence the evidence gate refuses — nothing may be posted" \
+  || pass "…and posts NO evidence (nothing for the shim to refuse and retract)"
+grep -q "pr merge" "$SCEN/calls" && fail "declared-off still attempted a merge" || pass "…and attempts NO merge"
+
+# (j2) THE TWO LAYERS AGREE (#1439). The producer's suite checks the producer and
+# the certificate-contract suite checks the verifier, so each could stay green
+# while the two disagree — which IS the defect. This runs the REAL verifier over
+# the real capture of a declared-off certificate and requires it to REFUSE: if a
+# certifying path is ever re-added to the producer, this fails beside (j)'s
+# refusal assertions. The capture is the byte-for-byte body the producer posted at
+# #1406; the contract suite owns it and it is read here, never copied.
+VAC_CAPTURE="$ROOT/tests/admin-merge-evidence-contract/captured-1406-vacuous-parity-not-established.md"
+VAC_VERIFIER="${VERIFIER_UNDER_TEST:-$ROOT/scripts/verify-admin-merge-evidence.sh}"
+VAC_HEAD="$(sed -n 's/^PR head: \(.*\)$/\1/p' "$VAC_CAPTURE" 2>/dev/null | head -1)"
+if [ ! -f "$VAC_CAPTURE" ] || [ -z "$VAC_HEAD" ]; then
+  fail "the declared-off capture is missing or carries no head line, so the agreement cannot be pinned: $VAC_CAPTURE"
+elif bash "$VAC_VERIFIER" --body-file "$VAC_CAPTURE" --head "$VAC_HEAD" >/dev/null 2>&1; then
+  fail "the REAL verifier CERTIFIED a declared-off certificate — it must refuse (that is WHY the producer now refuses)"
+else
+  pass "the REAL verifier refuses the declared-off shape, so producer and verifier now agree"
+fi
 
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
@@ -6085,15 +6117,17 @@ else
   fail "the forgiveness disclosure makes the posted evidence unmatchable — the rail would refuse its own merge"
 fi
 
-# (a2) #6928 P3-1 — THE FORGIVENESS IS DISCLOSED ON THE `declared-off` REFUSAL
-# PATH TOO. When the selector forgives the declined legs but a NON-declined shard
-# is STILL missing, parity FAILS; under the audited `declared-off` escape the rail
-# certifies anyway, and the posted body's count is ALREADY net of forgiveness
-# (`did NOT execute 1 test shard`) — but the first cut built the disclosure ONLY on
-# the `rc 0` branch, so that certificate left the reader with a shard count and no
-# statement of why the other three were not required. A certificate must state why
-# a shard was not required. Its own line (never carrying `lane parity:`), so the
-# `lane parity:` line stays one line and keeps at most one `parity family:`.
+# (a2) #6928 P3-1 — THE FORGIVENESS IS STILL DISCLOSED WHEN THE OUTCOME IS A REFUSAL
+# (#1439). When the selector forgives the declined legs but a NON-declined shard is
+# STILL missing, parity FAILS. `ADMIN_MERGE_LANE_PARITY=declared-off` used to certify
+# anyway, and the posted body's count was ALREADY net of forgiveness (`did NOT execute
+# 1 test shard`) — but the first cut built that disclosure ONLY on the certifying
+# branch, so the OTHER outcome left the reader with a shard count and no statement of
+# why the other three were not required. The P3-1 lesson is that an operator must not
+# be sent chasing a shard their own selector legitimately declined, and the refusal is
+# now the ONLY outcome this scenario can reach. The disclosure rides `lane_parity_check`'s
+# OWN stderr warning — emitted whenever forgiveness is applied, on whichever path
+# follows — which is why the refusal does not restate it in a second spelling.
 new_scen lane6928-declaredoff
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6936 > "$SCEN/runs-$HEAD_VP"
@@ -6106,36 +6140,27 @@ selector_interp_312
 selector_stub False False
 ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && pass "#6928 P3-1: declared-off still certifies with the declined legs + one real gap (exit 0)" \
-  || fail "#6928 P3-1: expected exit 0 under declared-off, got $rc"
-grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
-  && pass "…and the POSTED evidence STATES the forgiveness on the declared-off path" \
-  || fail "the declared-off certificate omits the forgiveness disclosure (P3-1)"
-lane6928_do_note="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/comment")"
+[ "$rc" -ne 0 ] && pass "#6928 P3-1: declared-off REFUSES when a real (non-declined) shard is missing (exit $rc)" \
+  || fail "#6928 P3-1: expected a refusal under declared-off, got exit 0"
+grep -q "lane-coverage forgiveness (#6928)" "$SCEN/err" \
+  && pass "…and the REFUSAL states the forgiveness, so the operator is not sent after a declined shard" \
+  || fail "the refusal omits the forgiveness disclosure (P3-1, now on the refusal path)"
+lane6928_do_note="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/err")"
 if printf '%s' "$lane6928_do_note" | grep -q 'test-slow (a)' \
    && printf '%s' "$lane6928_do_note" | grep -q 'test-slow (b)' \
    && printf '%s' "$lane6928_do_note" | grep -q 'test-carve-out' \
-   && printf '%s' "$lane6928_do_note" | grep -q 'Selector verdict: slow_run=false, carve_out_run=false'; then
+   && printf '%s' "$lane6928_do_note" | grep -q 'selector: slow_run=false, carve_out_run=false'; then
   pass "…naming every forgiven shard and the selector verdict it rests on"
 else
-  fail "the declared-off disclosure does not name the shards and verdict: $lane6928_do_note"
+  fail "the refusal's forgiveness disclosure does not name the shards and verdict: $lane6928_do_note"
 fi
-grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
-  && pass "…while still stating the parity was NOT established (the escape is not silenced)" \
-  || fail "the declared-off certificate no longer states the escape"
-grep -q "did NOT execute 1 test shard" "$SCEN/comment" \
+grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
   && pass "…and counting exactly the one NON-declined shard missing (the count is net of forgiveness)" \
-  || fail "the declared-off count is not net of the forgiven shards"
-# The `lane parity:` line stays ONE line, still starts with `lane parity:`, and
-# carries at most one `parity family:` — the three properties the gate anchors on.
-[ "$(grep -c 'lane parity:' "$SCEN/comment")" -eq 1 ] \
-  && pass "…on exactly one \`lane parity:\` line (the disclosure rides its OWN line)" \
-  || fail "the declared-off certificate carries $(grep -c 'lane parity:' "$SCEN/comment") \`lane parity:\` lines"
-[ "$(grep -m1 'parity family:' "$SCEN/comment" | grep -o 'parity family:' | wc -l | tr -d ' ')" -eq 1 ] \
-  && pass "…with at most one \`parity family:\`" \
-  || fail "the declared-off parity line carries more than one \`parity family:\`"
-grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
-  || fail "declared-off refused the merge"
+  || fail "the refusal's count is not net of the forgiven shards"
+[ -f "$SCEN/comment" ] && fail "…and posts NO evidence for the refused comparison" \
+  || pass "…and posts NO evidence for the refused comparison (nothing the shim would retract)"
+grep -q "pr merge" "$SCEN/calls" && fail "declared-off attempted the merge after refusing" \
+  || pass "…and attempts no merge"
 
 # (b) NOTHING DECLINED → NOTHING FORGIVEN. A diff the selector says selects both
 # legs leaves the raw gap intact: the three legs stay missing and the refusal is

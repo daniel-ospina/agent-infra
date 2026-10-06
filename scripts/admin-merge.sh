@@ -482,14 +482,17 @@
 #                                         comparison — narrowing it disables the
 #                                         gate for the excluded family.
 #   ADMIN_MERGE_LANE_PARITY              `require` (default) or `declared-off`.
-#                                         `declared-off` certifies a vacuous
-#                                         comparison while STATING, in the
-#                                         evidence and on stderr, that lane
-#                                         parity was NOT established — the
-#                                         audited escape for a repo whose PR
-#                                         lane cannot run a shard main's push
-#                                         lane runs (#1349). Any other value is
-#                                         refused at startup.
+#                                         BOTH refuse a vacuous comparison whose
+#                                         lane parity was not established.
+#                                         `declared-off` is retained only so the
+#                                         refusal can name the trigger-split case
+#                                         precisely (#1349 → #1439): it used to
+#                                         certify, but the evidence gate refuses
+#                                         a vacuous certificate that lacks
+#                                         positive parity, so the certificate
+#                                         could never be consumed — see
+#                                         AGENT_ADMIN_MERGE_OVERRIDE below. Any
+#                                         other value is refused at startup.
 #   ADMIN_MERGE_SELECTOR_PYTHON          explicit interpreter for the target
 #                                         repo's diff selector, whose declined
 #                                         legs the parity gate forgives (#6928).
@@ -873,15 +876,16 @@ validate_timing_knobs() {
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
   # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
-  # been read as "not require" and certified the vacuous comparison WITHOUT the
-  # disclosure — a typo is not a declaration. Compare literally, refuse the rest.
+  # been read as the `declared-off` branch and its refusal message would then
+  # describe a trigger-split repo that made no such declaration. Compare
+  # literally, refuse the rest.
   if [ "$LANE_PARITY_MODE" != "require" ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_LANE_PARITY='${LANE_PARITY_MODE}' — the lane-coverage"
-    say_err "   gate accepts exactly 'require' (default) or 'declared-off' (the audited escape for a"
-    say_err "   repo whose PR lane cannot run the shards main's push lane runs — see #1349)."
-    say_err "   Any other value would silently read as 'off' and certify a comparison that was never"
-    say_err "   established."
+    say_err "   gate accepts exactly 'require' (default) or 'declared-off' (a trigger-split repo's"
+    say_err "   spelling for the SAME refusal, named so the message can say why — see #1349, #1439)."
+    say_err "   Any other value would silently read as a recognised mode and carry its meaning into"
+    say_err "   a refusal that never diagnosed the situation."
   fi
   [ "$bad" -eq 0 ] || { say_err "   These are operator knobs; fix the value and re-run the rail."; return 1; }
   return 0
@@ -1137,13 +1141,17 @@ canary-streak
 drift-check
 setup-suite
 actionlint-gate"
-# require (default) | declared-off. `declared-off` is the AUDITED escape for a
-# repo whose PR lane legitimately CANNOT run a shard main's push lane runs (a
-# trigger-split repo — agent-infra itself: main's push calls the reusable
-# python-ci.yml and no PR lane does; see #1349). It never hides: the evidence and
-# stderr both carry "lane parity: NOT ESTABLISHED — declared off", and the parity
-# check still RUNS so the divergence is reported. There is no silent third value
-# — any other value is refused at startup.
+# require (default) | declared-off. BOTH refuse a vacuous comparison without
+# positive lane parity; `declared-off` exists ONLY to name that refusal precisely.
+# It was the audited escape for a repo whose PR lane legitimately CANNOT run a
+# shard main's push lane runs (a trigger-split repo — agent-infra itself: main's
+# push calls the reusable python-ci.yml and no PR lane does; see #1349), but it
+# certified evidence the gate refuses (#1439): a vacuous body needs the positive
+# `lane parity: PR ⊇ main` line, which a comparison that established no parity
+# cannot honestly state. Rather than post evidence the next layer refuses, the rail
+# stops here and names AGENT_ADMIN_MERGE_OVERRIDE=1 — the route that bypasses the
+# certificate instead of faking one. There is no silent third value: any other
+# value is refused at startup.
 LANE_PARITY_MODE="${ADMIN_MERGE_LANE_PARITY:-require}"
 
 # green_run_ids — recent COMPLETED SUCCESSFUL run ids for the selected lane, one
@@ -4351,16 +4359,14 @@ $attribution_line"
   # #1319 adds the third: the two sides must also have run the SAME LANE, which
   # is what the parity line reports.
   if [ "$pr_count" -eq 0 ] && [ "$main_count" -eq 0 ]; then
-    local parity_rc=0 parity_note parity_evidence parity_window_note="" parity_forgiven_note=""
+    local parity_rc=0 parity_evidence parity_window_note="" parity_forgiven_note=""
     lane_parity_check "$head" "$MAIN_RUNS" || parity_rc=$?
     if [ "$parity_rc" -eq 0 ]; then
-      # #6928 P3b: NO `parity_note` here. It used to be set on this branch with the
-      # sentence below, but its ONLY reader is the non-zero branch's `declared-off`
-      # disclosure, so on this branch it was dead — and it asserted "the PR executed
-      # every test shard main's lane executed", which the #6928 forgiveness makes
-      # FALSE. A dead false claim is one refactor from being printed, so it is
-      # deleted rather than parked. The truth lives in `$parity_evidence` (and, when
-      # shards were forgiven, in the override immediately below).
+      # #6928 P3b: NO separate `parity_note` variable. The old one was set on this
+      # branch with the sentence below, but its only reader was the non-zero branch
+      # — which now REFUSES outright (#1439) — so it is deleted rather than parked.
+      # The truth lives in `$parity_evidence` (and, when shards were forgiven, in
+      # the override immediately below).
       parity_evidence="PR ⊇ main — the PR executed every test shard main's lane executed (parity family: ${LANE_JOB_PREFIX}*; $(lane_count "$TMP/lane-pr.txt") shard(s) on the PR side, $(lane_count "$TMP/lane-main.txt") on main)"
       # #6928 P3a: ON THE FORGIVING PATH THAT LINE IS FALSE AS WRITTEN — the PR did
       # NOT execute every shard main ran; it executed every shard main ran that its
@@ -4389,71 +4395,75 @@ $attribution_line"
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
         parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
       fi
-    elif [ "$parity_rc" -eq 2 ]; then
-      parity_note="lane parity was NOT ESTABLISHED: ${LANE_PARITY_REASON}."
-      parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
-    else
-      parity_note="lane parity FAILS: this head did NOT execute $(lane_count "$TMP/lane-missing.txt") test shard(s) main's lane executes (parity family: ${LANE_JOB_PREFIX}*), so 'PR failing: 0 | main failing: 0' compares TWO DIFFERENT LANES (tortoise #4263 → #4457)."
-      parity_evidence="NOT ESTABLISHED — declared off; ${parity_note}"
     fi
-    # ── DISCLOSE THE #6928 FORGIVENESS ON EVERY PATH IT TOUCHED ──────────────
-    # Built HERE, after the branch, and not only on the certifying (`rc 0`) path.
-    # The `declared-off` refusal path (#6928 P3-1) reports a missing-shard count
-    # that is ALREADY net of the forgiven shards, so without this the posted
-    # certificate states a number and never says why the other shards were not
-    # required — the stderr warning discloses it, the certificate did not. The
-    # rule is one rule for both paths: a `PR ⊇ main` line must state the one case
-    # where the PR did NOT execute every shard main did, and a FAILS line must
-    # state that its count EXCLUDES shards the selector declined. Its OWN line,
-    # appended after the literal block below, and never carrying `lane parity:`
-    # (that line is matched to its END by the evidence gate, and carries at most
-    # one `parity family:`).
+    # ── THE #6928 FORGIVENESS LINE, ON THE CERTIFICATE ──────────────────────
+    # `lane_parity_check` already warns on stderr with the forgiven shard list and
+    # the selector verdict, on whatever path follows; this is the same fact for the
+    # EVIDENCE, which a PR reader sees and the stderr warning never reaches. It must
+    # be its OWN line, appended after the literal block below, and never carry
+    # `lane parity:` — that line is matched to its END by the evidence gate, and
+    # carries at most one `parity family:`.
     if [ -n "$LANE_PARITY_FORGIVEN" ]; then
       parity_forgiven_note="   lane-coverage forgiveness (#6928): these shard(s) main's lane executed were DECLINED by this head's diff selector and are therefore NOT required of it: $(printf '%s' "$LANE_PARITY_FORGIVEN" | tr '\n' ' ') Selector verdict: ${LANE_PARITY_SELECTOR_VERDICT}. This is the SELECTOR's own decision — the same rule the CI aggregate applies to a selector-declined leg — not a blanket exemption: every shard the selector did not decline still had to be executed, and was."
     fi
-    if [ "$parity_rc" -ne 0 ] && [ "$LANE_PARITY_MODE" != "declared-off" ]; then
+    if [ "$parity_rc" -ne 0 ]; then
+      # ── ONE REFUSAL FOR BOTH FAILURE MODES (#1439) ──────────────────────────
+      # `ADMIN_MERGE_LANE_PARITY=declared-off` USED TO certify here and then call
+      # the merge. It cannot: the evidence gate refuses a vacuous certificate that
+      # does not carry the positive `lane parity: PR ⊇ main` line
+      # (verify-admin-merge-evidence.sh clause 5 — #1319's own rule, and the case
+      # #1388's decision scoped clause 5 to). So the escape advertised a
+      # certificate its consumer rejects: the producer posted evidence, announced
+      # a merge, and the shim then refused it and retracted the evidence (#3549).
+      # A rail that cannot tell "certified" from "refused one layer down" is a
+      # FALSE PASS, so the producer now fails CLOSED where it used to certify —
+      # and names the route that does work, instead of one that cannot.
       if [ "$parity_rc" -eq 2 ]; then
         say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY and the"
         say_err "   lane coverage could not be established (lane: $lane). 'Nothing was compared'"
         say_err "   cannot be told from 'both sides were clean' when the shard lists are not"
         say_err "   readable — and an unreadable shard list is NOT an empty one."
         say_err "   WHY: ${LANE_PARITY_REASON}."
-        say_err "   This is a refusal, not a comparison. No merge."
-        say_err "   If this lane's test shards are not named '${LANE_JOB_PREFIX}*', set"
-        say_err "   ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they do use. If this repo's PR"
-        say_err "   lane CANNOT run the shards main's push lane runs (a trigger-split repo,"
-        say_err "   see #1349), the audited escape is ADMIN_MERGE_LANE_PARITY=declared-off:"
-        say_err "   it certifies only while STATING in the evidence that parity was not"
-        say_err "   established."
-        exit 1
+      else
+        say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY, and the"
+        say_err "   PR's lane did NOT EXECUTE $(lane_count "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
+        say_err "   'PR failing: 0 | main failing: 0' therefore compares TWO DIFFERENT LANES: a"
+        say_err "   failure in a shard this head never ran can appear in NEITHER set, so the"
+        say_err "   zeros certify nothing (tortoise #4263 → #4457)."
+        say_err "   parity family: ${LANE_JOB_PREFIX}* (a job OUTSIDE this family leaves the comparison)"
+        say_err "   shard(s) main EXECUTED and this head did not:"
+        sed 's/^/      /' "$TMP/lane-missing.txt" >&2
+        say_err "   PR lane — executed $(lane_count "$TMP/lane-pr.txt") test shard(s):"
+        sed 's/^/      /' "$TMP/lane-pr.txt" >&2
+        say_err "   main lane — executed $(lane_count "$TMP/lane-main.txt") test shard(s):"
+        sed 's/^/      /' "$TMP/lane-main.txt" >&2
       fi
-      say_err "⛔ admin-merge: BLOCK — NOT COMPARABLE: both failing sets are EMPTY, and the"
-      say_err "   PR's lane did NOT EXECUTE $(lane_count "$TMP/lane-missing.txt") test shard(s) that main's lane executes."
-      say_err "   'PR failing: 0 | main failing: 0' therefore compares TWO DIFFERENT LANES: a"
-      say_err "   failure in a shard this head never ran can appear in NEITHER set, so the"
-      say_err "   zeros certify nothing (tortoise #4263 → #4457). No merge."
-      say_err "   parity family: ${LANE_JOB_PREFIX}* (a job OUTSIDE this family leaves the comparison)"
-      say_err "   shard(s) main EXECUTED and this head did not:"
-      sed 's/^/      /' "$TMP/lane-missing.txt" >&2
-      say_err "   PR lane — executed $(lane_count "$TMP/lane-pr.txt") test shard(s):"
-      sed 's/^/      /' "$TMP/lane-pr.txt" >&2
-      say_err "   main lane — executed $(lane_count "$TMP/lane-main.txt") test shard(s):"
-      sed 's/^/      /' "$TMP/lane-main.txt" >&2
-      say_err "   Remedy: run the FULL lane for this head (the shards above are what main"
-      say_err "   measures), then re-run the rail. If this repo's PR lane CANNOT run them by"
-      say_err "   design (a trigger-split repo, see #1349), the audited escape is"
-      say_err "   ADMIN_MERGE_LANE_PARITY=declared-off — it certifies only while STATING in"
-      say_err "   the evidence that parity was not established."
+      # WHY A SHARD WAS NOT REQUIRED is disclosed on stderr by `lane_parity_check`
+      # ITSELF (#6928 P3-1): whenever forgiveness is applied it warns with the
+      # forgiven shard list and the selector verdict, on the path that certifies AND
+      # on the path that refuses. So this refusal does not restate it in a second
+      # spelling — the count above is ALREADY net of the forgiven shards, and that
+      # warning is what says so.
+      if [ "$LANE_PARITY_MODE" = "declared-off" ]; then
+        say_err "   ⛔ ADMIN_MERGE_LANE_PARITY=declared-off is set, and it does NOT rescue this:"
+        say_err "      the evidence gate refuses a vacuous certificate that does not state"
+        say_err "      'lane parity: PR ⊇ main' (verify-admin-merge-evidence.sh clause 5), so"
+        say_err "      certifying here would post evidence the merge shim then refuses. The escape"
+        say_err "      was removed as a certifier because it could never survive that gate."
+        say_err "      Run the FULL lane for this head, or — if this repo's PR lane cannot run"
+        say_err "      these shards by design (a trigger-split repo, see #1349) — the audited"
+        say_err "      route is AGENT_ADMIN_MERGE_OVERRIDE=1, which is logged as"
+        say_err "      admin_merge_override and bypasses the certificate rather than faking one."
+      else
+        say_err "   Remedy: run the FULL lane for this head (the shards above are what main"
+        say_err "   measures), then re-run the rail. If this lane's test shards are not named"
+        say_err "   '${LANE_JOB_PREFIX}*', set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use."
+        say_err "   If this repo's PR lane CANNOT run them by design (a trigger-split repo,"
+        say_err "   see #1349), the audited route is AGENT_ADMIN_MERGE_OVERRIDE=1, which is"
+        say_err "   logged as admin_merge_override."
+      fi
+      say_err "   This is a refusal, not a comparison. No evidence was posted and no merge attempted."
       exit 1
-    fi
-    if [ "$parity_rc" -ne 0 ]; then
-      # `declared-off`: the operator has taken the audited escape (#1349). The
-      # comparison still RAN and its outcome is still REPORTED, here and in the
-      # posted evidence — the escape buys a certificate, never silence.
-      say_err "⚠️  admin-merge: LANE PARITY NOT ESTABLISHED (lane: $lane) — certifying the"
-      say_err "   vacuous comparison because ADMIN_MERGE_LANE_PARITY=declared-off."
-      say_err "   $parity_note"
-      [ -s "$TMP/lane-missing.txt" ] && sed 's/^/      /' "$TMP/lane-missing.txt" >&2
     fi
     # The vacuous outcome is STATED, never implied — and it states WHAT it rests
     # on: the comparison, its coverage, and per side WHY each set is empty. The
