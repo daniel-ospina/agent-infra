@@ -613,8 +613,13 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # the distance for every landable state whose compare read succeeded, and
         # where it did NOT succeed a landable head still needs no refresh — under
         # `strict: false` the distance is not a requirement, and under `strict:
-        # true` GitHub cannot report `CLEAN` for a stale branch (it reports
-        # `BLOCKED`).
+        # true` a stale branch is never reported `CLEAN`.
+        #
+        # (Do NOT name `BEHIND` or `BLOCKED` as what strict produces here — this file
+        # already records at :45-47 and :282-285 that `BEHIND` occurs WITH OR WITHOUT
+        # strict and that strict is only what makes it BLOCK a merge, so which of the two
+        # a stale head reports is not this comment's subject. An earlier draft of this
+        # parenthetical asserted `BLOCKED` and contradicted those lines.)
         #
         # Any OTHER state means GitHub has told
         # us something is wrong with this head and the compare API could not tell us

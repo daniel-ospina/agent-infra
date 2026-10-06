@@ -1272,8 +1272,10 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # would have shipped UNPINNED while both mutations still "reddened" via B3: the
   # change that extends the adversarial set quietly narrowed it. Anchoring each pattern
   # to its own arm is self-policing — re-indent the arm out from under the pattern and
-  # nothing is replaced, the suite does not redden, and mutate_and_expect_fail reports
-  # "did NOT redden" LOUDLY.
+  # nothing is replaced, so the mutated copy is byte-identical and mutate_and_expect_fail
+  # reports "reddened nothing — the mutation did not apply" (run.sh:1183) LOUDLY. Note that
+  # is the did-not-APPLY branch, not "did NOT redden the suite" (run.sh:1198), which is
+  # taken when the mutation DID apply and the suite stayed green.
   # The arms are distinguishable by indentation alone (verified: strict at 8 vs 10
   # spaces, mergeable at 10 vs 12), and each anchored pattern matches exactly one site.
   # B19b must redden 17g-D3 (unreadable protection ⇒ refresh); B20b must redden 17g-D4
