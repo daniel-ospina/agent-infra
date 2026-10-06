@@ -4909,6 +4909,15 @@ try {
   expectBool("#1129: the mandated preflight + the recovery helper are the listed scripts",
     pinSrc.includes('"scripts/check-pipeline-compliance.sh"') &&
     pinSrc.includes('"scripts/checkout-hygiene/hub-worktree.sh"'), true);
+  // #1484, second instance (the #1141 class): the review RECORDER. Pinned for the
+  // same reason the two above are — the list must stay NAMED and explicit, so a
+  // later tidy-up cannot silently drop the entry and re-block every hub-rooted
+  // lane from recording a completed review. Note the pin is intentionally on the
+  // CHECKOUT spelling only: the farm copy at ~/.pi/agent/scripts/record-review.sh
+  // is a realpath-keyed miss and is tracked separately (agent-infra #1603) — do
+  // NOT "fix" that here by widening this list to a directory or a name pattern.
+  expectBool("#1484 (2nd instance): the review RECORDER is the listed script",
+    pinSrc.includes('"scripts/record-review.sh"'), true);
   expectBool("#1129 P0 boundary: no DIRECTORY-wide exemption (destructive helpers stay gated)",
     !pinSrc.includes("cleanup-worktree.sh") &&
     !pinSrc.includes("cleanup-stale-branches.sh") &&
