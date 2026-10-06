@@ -1119,6 +1119,43 @@ called "pr update-branch 42" \
   && pass "refreshed (a BLOCKED branch's drift red can only clear with an update — #1533)" \
   || fail "the CLEAN arm swallowed #1533: a BLOCKED, 39-behind branch was skipped"
 
+echo "── 17g-D6. UNSTABLE + behind>0 + strict=false + mergeable ⇒ the head is ALSO kept"
+# `UNSTABLE` is the second landable state: the REQUIRED checks passed and only
+# NON-required ones fail or pend, so GitHub reports it mergeable and `strict: false`
+# does not require the head to close the distance. Holding only `CLEAN` would have
+# left this population with the same #7230 non-termination.
+new_scen unstabledrift
+printf 'UNSTABLE\n'  > "$SCEN/state"
+printf '4\n'         > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a landable UNSTABLE head on base drift — the #7230 non-termination, one state over" \
+  || pass "did NOT refresh (UNSTABLE is held with CLEAN)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was" \
+  || fail "the head moved"
+
+# ── THE FAIL-SAFE — the documented override must reach THIS arm too ──────────
+echo "── 17g-D7. ATOMIC_LAND_REFRESH_ALWAYS=1 forces the refresh from the CLEAN arm as well"
+# Without this, the one documented way to disable an over-eager skip would silently
+# no-op for exactly the state this fix gates — an un-disableable misfire.
+new_scen cleandriftalways
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '1\n'         > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+ATOMIC_LAND_REFRESH_ALWAYS=1 run_rail 42 --repo "$REPO" --poll 0
+unset ATOMIC_LAND_REFRESH_ALWAYS
+called "pr update-branch" \
+  && pass "refreshed despite the landable state (the fail-safe reaches the drift arm)" \
+  || fail "the fail-safe did NOT restore the refresh — the skip is un-disableable"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -1227,16 +1264,20 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # shape, which genuinely needs the refresh) is skipped instead. The direction-B2
   # scenario must redden.
   mutate_and_expect_fail B20  's/if \[ "\044mergeable" = true \]; then/if true; then/'
-  # B21 (#7230): make the CLEAN arm INERT — the drift trigger pre-empts CLEAN again,
-  # i.e. the revision before this fix. The failure it prevents: the head of a green,
-  # attested PR being moved for nothing and the record dying at step 3 (the O3 shape,
-  # 22 updated / 17 invalidated / 0 landed). 17g-D1 must redden.
-  mutate_and_expect_fail B21  's/if \[ "\044MERGE_STATE" = "CLEAN" \] && \[ -n "\044behind" \]/if false \&\& [ -n "\044behind" ]/'
-  # B22 (#7230, the opposite direction): DROP the CLEAN qualification, so the arm
-  # over-reaches and swallows `BLOCKED` too. The failure it prevents: a fix that closes
-  # #7230 by re-opening #1533 — a BLOCKED branch's drift red can only clear with an
-  # update, and skipping it re-deadlocks the >20-behind population. 17g-D5 must redden.
-  mutate_and_expect_fail B22  's/if \[ "\044MERGE_STATE" = "CLEAN" \] && \[ -n "\044behind" \]/if [ true ] \&\& [ -n "\044behind" ]/'
+  # B21 (#7230): make the landable-state arm INERT — the drift trigger pre-empts it
+  # again, i.e. the revision before this fix. The failure it prevents: the head of a
+  # green, attested PR being moved for nothing and the record dying at step 3 (the O3
+  # shape, 22 updated / 17 invalidated / 0 landed). 17g-D1 must redden.
+  mutate_and_expect_fail B21  's/if \[ "\044drift_landable" = 1 \]/if false/'
+  # B22 (#7230, the opposite direction): add BLOCKED to the landable set, so the arm
+  # over-reaches and swallows #1533 — a BLOCKED branch's drift red can only clear with
+  # an update, and skipping it re-deadlocks the >20-behind population. 17g-D5 must
+  # redden.
+  mutate_and_expect_fail B22  's/case "\044MERGE_STATE" in CLEAN\|UNSTABLE\)/case "\044MERGE_STATE" in CLEAN\|UNSTABLE\|BLOCKED\)/'
+  # B23 (#7230): gate the landable-state arm on `CLEAN` alone, dropping UNSTABLE. The
+  # failure it prevents: closing #7230 for one landable state and leaving the other's
+  # population (measured at 10 heads) with the same non-termination. 17g-D6 must redden.
+  mutate_and_expect_fail B23  's/in CLEAN\|UNSTABLE\) drift_landable=1/in CLEAN\) drift_landable=1/'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
