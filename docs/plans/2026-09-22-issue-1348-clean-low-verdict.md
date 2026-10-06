@@ -16,14 +16,14 @@ aboutObjects: agent-infra, issue-1348, record-review, review-enforcer, proportio
 
 ## Confirmed problem
 
-`record-review.sh` accepts exactly two verdicts (`scripts/record-review.sh:166-168`). A PR whose diff
+`record-review.sh` accepts exactly two verdicts (`scripts/record-review.sh`). A PR whose diff
 is genuinely content-only (prose / stylesheet) but whose linked same-repo issue is
 `complexity:standard` or `complexity:complex` can record **neither honestly**:
 
 - `clean` records fine but attests *"a code-review skill convergence recorded its clean verdict"* —
   a review that, per `proportional-gates`' Low tier (§Review Cycles: 1 reviewer, no cycle loop), did not happen.
   Recording it is a false attestation, not merely a shortcut.
-- `clean-micro` is refused (exit 4) by the #513 tier guard (`:245-320`), because the guard reads the
+- `clean-micro` is refused (exit 4) by the #513 tier guard (`scripts/record-review.sh`), because the guard reads the
   *linked issue's* tier, not the *diff's* shape.
 
 So `proportional-gates`' Low code-impact class has **no representation in the gate**. That is a real correctness
@@ -54,7 +54,7 @@ Measurement command:
 
 - **[validated]** *"the linked same-repo issue must carry `complexity:low`"* — **no `complexity:low`
   label exists** in `daniel-ospina/agent-infra` or `daniel-ospina/tortoise` (`gh label list` → only
-  `complexity:micro|standard|complex`). The crosswalk in `skills/proportional-gates/SKILL.md:91` maps
+  `complexity:micro|standard|complex`). The crosswalk in `skills/proportional-gates/SKILL.md` maps
   `micro → Low`, so a *label* arm is dead on arrival — and labels are agent-writable, so it would
   also be attacker-controlled. The operative arm is **content shape**.
 - **[validated]** the blocked population is mostly **code-bearing** (PR `#4747` 6 non-doc files,
@@ -86,7 +86,7 @@ micro flow that already ran its own pre-flight and dispatch floor.
 - **Make `clean-micro` read the diff shape instead of the issue label (no new verdict).** Genuinely
   attractive — no remote-regex change needed. Rejected because a content-only PR on a non-micro
   issue recording `clean-micro` is refused *downstream* by the #513 binding
-  (`scripts/check-pipeline-compliance.sh:916` → `fail c`), so this "no new verdict" option in fact
+  (`scripts/check-pipeline-compliance.sh` → the `fail c` path), so this "no new verdict" option in fact
   requires weakening a separate deliberate fail-closed guard. Recorded so a later lane does not
   "simplify" `clean-low` back into `clean-micro`.
 - **Widen `clean`'s documented attestation to cover the Low code-impact class (one verdict, no companion change).**
@@ -94,7 +94,7 @@ micro flow that already ran its own pre-flight and dispatch floor.
   collapsing two different attestations into one token destroys the ability to audit *which* review
   happened, and re-creates exactly the false-attestation defect this issue is about.
 - **`complexity:low` label arm.** Label does not exist; labels are agent-writable. Dead + unsafe.
-- **Reusing `pr_is_artifact_only` (check a, `:709`) or `isShapeExemptFile` (VGATE, `:759`) as the
+- **Reusing `pr_is_artifact_only` (check a) or `isShapeExemptFile` (VGATE) as the
   class.** Reusing another gate's class changes that gate's semantics; copying its regex creates a
   second writer of that contract that drifts silently. `clean-low` declares its own, deliberately
   narrower, positive allowlist, and the divergence is documented at the definition.
@@ -164,7 +164,7 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 | `complexity:low` label arm | Label does not exist (verified) and labels are agent-writable. |
 | Config / i18n-strings under `proportional-gates`' Low change-classification cell | Deliberate departure; see the `OVERRIDES:` line. |
 | Remote re-verification of content shape in the GitHub workflow | The workflow must never check out or execute PR code; it verifies marker shape + HMAC + head only. |
-| `check-pipeline-compliance.sh` check (c) re-deriving the clean-low shape | Check (c) is a **presence-of-evidence** check, not an authenticity check: `has_review_evidence` (`:291`) matches `review recorded` generically, and that file contains no HMAC/key verification at all. A hand-pasted `verdict=clean` line already passes it. The #513 clean-micro binding (`:916`) exists for a *different* reason — micro skips checks b–e, so that binding protects a **tier exemption**; `clean-low` grants no exemption (a standard/complex issue still runs b–e). Re-deriving the shape at check (c) means a second writer of the class contract. **Residual recorded: check (c) accepts a `verdict=clean-low` body line on a code-bearing diff, unverified. Filed: agent-infra #1356.** |
+| `check-pipeline-compliance.sh` check (c) re-deriving the clean-low shape | Check (c) is a **presence-of-evidence** check, not an authenticity check: `has_review_evidence` matches `review recorded` generically, and that file contains no HMAC/key verification at all. A hand-pasted `verdict=clean` line already passes it. The #513 clean-micro binding (the `fail c` path) exists for a *different* reason — micro skips checks b–e, so that binding protects a **tier exemption**; `clean-low` grants no exemption (a standard/complex issue still runs b–e). Re-deriving the shape at check (c) means a second writer of the class contract. **Residual recorded: check (c) accepts a `verdict=clean-low` body line on a code-bearing diff, unverified. Filed: agent-infra #1356.** |
 | Unifying the three existing content-shape classes | Pre-existing divergence, documented at the new definition. Not a fail-open; folded into #1356. |
 | Draining the queue | Operational, not this unit. |
 
@@ -210,7 +210,7 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 2. `scripts/record-review.test.sh` — one vector per class C1–C6 (RED pre-change), the positive
    (GREEN) vectors, and a **mutation harness** proving the guard is load-bearing.
    **Harness work required:** stub arms for `.base.sha`/`.changed_files` and for `compare/…`, plus
-   env-keyed file-list / changed_files / failure controls. The existing stub (`:44-84`) had only
+   env-keyed file-list / changed_files / failure controls. The existing stub had only
    `.head.sha`, `.body`, `.[].name` and a catch-all, so the compare read fell through; it now carries
    `.base.sha` / `.changed_files` / `compare/...` arms.
    `@tsv` is a STRONGER row source than the sibling gate's raw jq template: it ESCAPES `\t`/`\n`,
@@ -245,9 +245,9 @@ shape guard refused, **no record written** (neither `<owner>-<repo>-<pr>.json` n
 
 > **Trigger assessment:** axes all low-to-medium with in-repo precedent for every mechanism; no
 > third-party dependencies; no novel pattern. Precedent: the `clean-micro` verdict + its tier guard
-> (`scripts/record-review.sh:241-320`), the `files_rows` row validator and `pr_is_artifact_only`
-> positive-allowlist pattern (`scripts/check-pipeline-compliance.sh:644-730`), `isShapeExemptFile`'s
-> build-output-segment idea (`extensions/verification-gate/index.ts:759-769`), and the source-reachable
+> (`scripts/record-review.sh`), the `files_rows` row validator and `pr_is_artifact_only`
+> positive-allowlist pattern (`scripts/check-pipeline-compliance.sh`), `isShapeExemptFile`'s
+> build-output-segment idea (`extensions/verification-gate/index.ts`), and the source-reachable
 > guarded-main pattern already used for cross-script pins (`scripts/record-review.test.sh` §8.13).
 > No external research demonstrated — skipped per the activation rule.
 

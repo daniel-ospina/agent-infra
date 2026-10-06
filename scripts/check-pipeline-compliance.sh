@@ -1454,9 +1454,14 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # #1409 — templates/**/*.md joins the instruction-layer class. Two live
   # instances before this: #1400 reached MERGED only by taking the false close,
   # and #1461 sat red 11 days on check (a) alone (checks b–e are SKIPPED when
-  # (a) fails, so its substantive artifacts were never examined).
-  expect_artifact_only 'templates/AGENTS.base.md only (the #1461 case)' $'modified\ttemplates/AGENTS.base.md\t' true
-  expect_artifact_only 'the MANDATORY twin edit (AGENTS.md + base)' $'modified\tAGENTS.md\t\nmodified\ttemplates/AGENTS.base.md\t' true
+  # (a) fails, so its substantive artifacts were never examined). BOTH are the
+  # TWIN shape below — `AGENTS.md` + `templates/AGENTS.base.md` — because the
+  # base⊆AGENTS.md pin forces the second file.
+  # NOTE: this makes the CLASS reachable for such PRs; it does NOT by itself turn
+  # any of them green. #1461's body carries no line-leading `Refs`/`Closes`
+  # reference at all, so it stays red on (a) until one is added.
+  expect_artifact_only 'templates/AGENTS.base.md alone (single-file shape)' $'modified\ttemplates/AGENTS.base.md\t' true
+  expect_artifact_only 'the MANDATORY twin edit — the #1400/#1461 shape' $'modified\tAGENTS.md\t\nmodified\ttemplates/AGENTS.base.md\t' true
   expect_artifact_only 'nested templates .md' $'modified\ttemplates/.github/workflows/README.md\t' true
   # ...and the `.md` restriction is what keeps the class narrow. Measured on
   # main 2026-10-06: 18 of the 21 tracked files under templates/ are executable.

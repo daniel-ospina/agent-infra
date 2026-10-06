@@ -223,8 +223,9 @@ closing_issue_refs() {
 #     (agent-executable instructions — the template is the source that
 #     materializes into every repo's AGENTS.md) and .github/CODEOWNERS (review
 #     routing — enforcement input). No line numbers cited for either class:
-#     both had rotted (the sibling was 5 lines out on 2026-10-06), so
-#     `file::function` is the stable citation.
+#     the sibling was already 5 lines out when checked (2026-10-06), and the
+#     other is moved by any edit above it — as this very change demonstrates —
+#     so `file::function` is the stable citation.
 #   * extensions/verification-gate::isShapeExemptFile is a LOCAL
 #     pre-flight skip; it admits .md/.css/.html ANYWHERE, including build
 #     inputs such as templates/AGENTS.base.md. (After #1409 the closure class
