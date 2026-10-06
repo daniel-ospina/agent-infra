@@ -116,7 +116,8 @@
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
-#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a BEHIND head, ignoring the live
+#   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
+#                               base drift on a landable state), ignoring the live
 #                               `strict` read (the #1565 fail-safe restore)
 #
 # The accepted-verdict list mirrors `ACCEPTED_VERDICTS` in
@@ -516,10 +517,13 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # the blast radius measured in #1565.
       #
       # ⚠️ THE DRIFT ARM NEEDS THE SAME PREDICATE — FOR EVERY LANDABLE STATE (#7230).
-      # A state GitHub does NOT call `BLOCKED` has every REQUIRED leg satisfied, and
-      # `strict: false` means the distance to the base is not one of them: the only
-      # thing left between that PR and a merge is the drift, which nothing requires it
-      # to close. The drift arm refreshed there anyway, so a green, correctly-attested
+      # For `CLEAN` and `UNSTABLE` every REQUIRED leg is satisfied, and `strict: false`
+      # means the distance to the base is not one of them: the only thing left between
+      # that PR and a merge is the drift, which nothing requires it to close. (Do NOT
+      # widen this to "anything but BLOCKED" — that set carries states that are not
+      # landable, which is what the fail-closed enumeration below and mutation B22
+      # exist to keep out.) The drift arm refreshed there anyway, so a green,
+      # correctly-attested
       # PR had its head moved for nothing — the record then died at step 3 (#1575
       # clause E, correctly) and the rail could never land it. That is the O3 shape
       # (22 updated, 17 attestations invalidated, 0 landed) and the live repro is
