@@ -1467,6 +1467,15 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'templates .gitignore (NOT .md)' $'modified\ttemplates/.gitignore\t' false
   # Anti-vacuous: the twin edit buys no immunity for a code path beside it.
   expect_artifact_only 'twin edit + code' $'modified\ttemplates/AGENTS.base.md\t\nmodified\tscripts/z.sh\t' false
+  # The `^templates/` anchor, pinned — `templates/` is a DIRECTORY PREFIX, so
+  # adjacency is a real bypass shape for a new entry and must not match.
+  expect_artifact_only 'templates-adjacent path is not the templates class' $'modified\ttemplates-adjacent/AGENTS.base.md\t' false
+  expect_artifact_only 'templatesX prefix is not the templates class' $'modified\ttemplatesx/AGENTS.base.md\t' false
+  # A rename carries BOTH ends through this predicate: moving executable content
+  # OUT of code and INTO a `templates/*.md` name must still read NOT
+  # artifact-only, or the entry becomes an exfiltration route for a code diff.
+  expect_artifact_only 'renamed code to templates .md (old end wins)' $'renamed\ttemplates/x.md\tscripts/x.sh' false
+  expect_artifact_only 'renamed templates .md inside templates' $'renamed\ttemplates/b.md\ttemplates/a.md' true
   # #786's headline case: `.github/CODEOWNERS` is review-routing config with no
   # executable logic — the same artifact class (the live #674 diff is CODEOWNERS
   # + docs/). Only that exact path is in the class; a workflow file next to it,
