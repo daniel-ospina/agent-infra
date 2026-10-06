@@ -6025,7 +6025,7 @@ new_scen lane6928-docsonly
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6931 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6938 6932 > "$SCEN/runs-main"
-lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6931 success 'test (a)' 'test (b)'
 pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
 selector_interp_312
@@ -6043,8 +6043,10 @@ lane6928_disc="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/err")"
 if printf '%s' "$lane6928_disc" | grep -q 'test-slow (a)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-slow (b)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (b)' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (c)' \
    && printf '%s' "$lane6928_disc" | grep -q 'selector: slow_run=false, carve_out_run=false'; then
-  pass "…naming all three forgiven shards AND the selector verdict it rests on"
+  pass "…naming all five forgiven shards AND the selector verdict it rests on"
 else
   fail "the disclosure does not name the shards and verdict: $lane6928_disc"
 fi
@@ -6057,7 +6059,7 @@ grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
 # the PR did NOT execute every shard main ran — so the line itself must carry the
 # exception, not leave the correction to prose on the next line.
 lane6928_par="$(grep -m1 'lane parity:' "$SCEN/comment" | sed 's/^[[:space:]]*//')"
-expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 3 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 5 on main)"
+expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 5 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 7 on main)"
 if [ "$lane6928_par" = "$expected6928_par" ]; then
   pass "#6928 P3a: the certified \`lane parity:\` line itself STATES the exception"
 else
