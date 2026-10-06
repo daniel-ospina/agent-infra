@@ -5676,6 +5676,53 @@ grep -q "lane-coverage copy failed" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be written" \
   || pass "…and no merge was attempted"
 
+# (j4) ✗ THE SUBTRACTION'S EMPTINESS IS A CLAIM, NOT A MEASUREMENT (#1439 cycle-2).
+# The sibling of (j3): the `grep` subtraction's own write can fail, and a failed
+# REDIRECT reports grep's "no differences" status (1) — indistinguishable, by any
+# status test, from a genuine empty gap. `[ -s … ]` on the empty file then read "nothing
+# is missing", and the rail certified `lane parity: PR ⊇ main … 1 shard(s) on the PR
+# side, 2 on main` — a body the REAL evidence gate ACCEPTS — for a head with a real
+# 1-shard gap. The guard pins the ARITHMETIC instead (main's lane is a DEDUPED set, so
+# an empty gap REQUIRES the PR's set to be at least as large), so it closes every
+# mechanism that empties the file, not just this one. The PATH shim here is only the
+# means of producing the inconsistent state; the finding was originally reproduced both
+# this way and with a non-regular destination.
+new_scen lanesubtractempty
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass maindd77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'              # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)'   # …and main ran TWO: a real 1-shard gap
+mkdir -p "$SCEN/bin"
+# Key on the PATTERN FILE, not on the flags: `lane-pr.txt` is a `-f` pattern file at
+# exactly one site (the coverage subtraction), whereas a flag+last-arg signature also
+# matches `lane_has_test_shard`'s `grep -vxF -f lane-lifecycle.txt "$f"` — which is how
+# the first cut of this shim made main's lane look lifecycle-only and refused a step too
+# early, leaving the assertion below unfired.
+cat > "$SCEN/bin/grep" <<'GREPSTUB'
+#!/bin/sh
+pat=""; prev=""
+for a in "$@"; do
+  if [ "$prev" = "-f" ]; then pat="$a"; fi
+  prev="$a"
+done
+case "$pat" in */lane-pr.txt) exit 1 ;; esac
+exec /usr/bin/grep "$@"
+GREPSTUB
+chmod +x "$SCEN/bin/grep"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an EMPTY gap beside a real 1-shard gap REFUSES (exit $rc) — emptiness is checked against the lists" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' with 1 shard on the PR side and 2 on main — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "lane-coverage subtraction is INCONSISTENT" "$SCEN/err" \
+  && pass "…naming the inconsistency, so the operator sees the arithmetic rather than a verdict" \
+  || fail "the refusal does not name the inconsistent subtraction"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for an inconsistent comparison" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an inconsistent comparison" \
+  || pass "…and no merge was attempted"
+
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
 # branch and certify WITHOUT the disclosure — a typo is not a declaration.

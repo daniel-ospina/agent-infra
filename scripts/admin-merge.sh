@@ -1822,6 +1822,27 @@ lane_parity_check() {
       return 2
     fi
   fi
+  # ── THE SUBTRACTION'S EMPTINESS IS CHECKED, NOT TRUSTED (#1439 cycle-2) ──
+  # An empty gap asserts "the PR executed every shard main's lane executed" — a claim
+  # about the TWO LISTS — so it is verified against them rather than inferred from a
+  # FILE that a failed write can leave empty. That distinction is load-bearing: a
+  # failed `grep` REDIRECT reports grep's own "no differences" status (1), which no
+  # status test can tell from a genuine empty gap, and a destination that cannot be
+  # written (or is not a regular file) can swallow every write. `[ -s … ]` on an empty
+  # file answers "is the file empty", which is not the question. Both lane files are
+  # DEDUPED SETS (`lane_shard_set` ends with `sort -u`), so the implication is EXACT:
+  # an empty gap means main's lane ⊆ the PR's, which REQUIRES the PR's set to be at
+  # least as large. An empty gap with a SMALLER PR set is therefore a lost
+  # measurement, and it is refused — whatever emptied the file. (An adversarial review
+  # reproduced both mechanisms: a failed subtraction write, and a non-regular
+  # destination; and it certified `PR ⊇ main … 1 shard(s) on the PR side, 2 on main`,
+  # a body the evidence gate ACCEPTS.)
+  if [ "$(lane_count "$TMP/lane-missing.txt")" -eq 0 ] \
+     && [ "$(lane_count "$TMP/lane-pr.txt")" -lt "$(lane_count "$TMP/lane-main.txt")" ]; then
+    say_err "admin-merge: ✗ the lane-coverage subtraction is INCONSISTENT — main's lane holds $(lane_count "$TMP/lane-main.txt") distinct shard(s) and the PR's executed set holds $(lane_count "$TMP/lane-pr.txt"), so the gap CANNOT be empty, yet it came back empty. An empty gap would mean the PR ran every shard main ran; the listing that says so could not be written."
+    LANE_PARITY_REASON="the lane-coverage gap came back EMPTY although main's lane holds more shards than the PR's executed set, so the gap listing could not be written"
+    return 2
+  fi
   # ── #6928: FORGIVE THE LEGS THE TARGET'S DIFF SELECTOR *DECLINED* ──────
   # Computed ONLY when the raw subtraction left a shard to explain, so a repo
   # with no diff-gated legs and no selector pays nothing and refuses exactly as
