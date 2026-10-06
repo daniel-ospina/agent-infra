@@ -371,6 +371,65 @@ function cmdUpdate() {
   }
 }
 
+/** Resolve [p] in the PHYSICAL namespace — symlinks first, then `..`.
+ *
+ *  THE CONVENTION, STATED (it was never stated, which is why six review cycles
+ *  moved the mismatch from one side to the other instead of removing it):
+ *  containment is measured PHYSICALLY, because the kernel resolves a symlink
+ *  and only THEN applies `..` (Linux path-lookup: a link component "is replaced
+ *  by the link body and path processing continues"), and POSIX `cd -P` does the
+ *  same. Any file the OS actually opens is reached that way, so a LEXICAL
+ *  comparison reads "inside" while the OS reaches OUTSIDE — the symlink escape.
+ *  Lexical is the unsafe direction to be permissive in.
+ *
+ *  `fs.realpathSync` (JS) promises exactly that and does not keep it: it
+ *  normalises `..` textually, so `repo/linkdir/../scripts` resolves to
+ *  `repo/scripts` even when `linkdir` points elsewhere. `.native` delegates to
+ *  the platform resolver and gives the physical answer (ENOENT for that path).
+ *  Measured on Node v22.23.2 — swapping to `.native` does NOT merely tighten
+ *  this: it FLIPS the asymmetry, turning a false PASS into a false FAIL (#7412).
+ *  That is why the SWAP ALONE is not the fix and must not ship alone: what makes
+ *  it correct is that BOTH sides use this function AND the unresolvable case
+ *  below stops being absorbed into a verdict. */
+function physical(p) {
+  return fs.realpathSync.native(p);
+}
+
+/** Canonicalize a path into the PHYSICAL namespace even when the leaf does not
+ *  exist: realpath the deepest existing ancestor and re-append the rest.
+ *
+ *  The containment test compares the target against a physical repo root, so a
+ *  lexical target is only equivalent when no component of the path is a symlink.
+ *  A dangling leaf cannot be realpath'd at all, so it must still be carried into
+ *  the physical namespace by canonicalizing its deepest EXISTING ancestor and
+ *  re-appending the remainder. Otherwise the carve-out's own arm —
+ *  `!fs.existsSync(resolved)`, i.e. a broken IN-REPO link — compares a lexical
+ *  path to a physical root, path.relative emits a `..`-chain, and the in-repo
+ *  link is forgiven where origin/main fails it (false PASS, cycle 5).
+ *
+ *  Returns null when NOTHING on the path resolves. That is deliberately NOT a
+ *  fallback to `p`: an unresolvable path cannot be shown to escape the repo, and
+ *  silently substituting its lexical form would let the comparison render a
+ *  verdict from a path whose namespace is unknown. Both failures seen on #7412 —
+ *  cycle 6's false PASS and the `.native` experiment's false FAIL — were failures
+ *  of ABSORPTION, not of arithmetic. Callers must treat null as "cannot prove
+ *  machine-local" and must NOT forgive the target. */
+function canonicalizeExisting(p) {
+  let head = p;
+  const tail = [];
+  for (;;) {
+    try {
+      const real = physical(head);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(head);
+      if (parent === head) return null; // unresolvable — NOT a lexical fallback
+      tail.unshift(path.basename(head));
+      head = parent;
+    }
+  }
+}
+
 /** The enclosing git work-tree root for [dir], or [dir] when there is none.
  *
  *  Containment must be measured against the REPO, not against whatever
@@ -381,38 +440,11 @@ function cmdUpdate() {
  *  the directory is not inside a work tree — which preserves the previous
  *  CONTAINMENT REFERENCE where the two coincide. (It does not preserve every
  *  verdict: the predicate changed too, deliberately — see #7412.) */
-/**
- * Canonicalize a path into the PHYSICAL namespace even when the leaf does not
- * exist: realpath the deepest existing ancestor and re-append the rest.
- *
- * The containment test compares the target against a realpath'd repo root, so a
- * lexical target is only equivalent when no component of the path is a symlink.
- * A dangling leaf cannot be realpath'd at all, so falling back to its lexical
- * form (the obvious fix, and the one this change shipped first) leaves the two
- * sides in different namespaces exactly on the arm the carve-out adds — a false
- * PASS for an in-repo broken link. Returns `p` unchanged if nothing resolves.
- */
-function canonicalizeExisting(p) {
-  let head = p;
-  const tail = [];
-  for (;;) {
-    try {
-      const real = fs.realpathSync(head);
-      return tail.length ? path.join(real, ...tail) : real;
-    } catch {
-      const parent = path.dirname(head);
-      if (parent === head) return p; // no existing ancestor — give up gracefully
-      tail.unshift(path.basename(head));
-      head = parent;
-    }
-  }
-}
-
 function repoRootFor(dir) {
   try {
     const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    if (top) return fs.realpathSync(top);
+    if (top) return physical(top);
   } catch {
     /* not a work tree, or git absent — fall through */
   }
@@ -422,7 +454,7 @@ function repoRootFor(dir) {
   // to remove (observed: it reddened the suite by classifying an in-repo target
   // as machine-local whenever the checked dir was not a git work tree).
   try {
-    return fs.realpathSync(dir);
+    return physical(dir);
   } catch {
     return dir;
   }
@@ -606,6 +638,18 @@ function cmdCheck(targetDir, ciMode) {
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
+        } else if (canonResolved === null) {
+          // UNRESOLVABLE — see canonicalizeExisting. No component of the path
+          // exists, so no physical namespace can be established and the target
+          // can therefore NOT be shown to escape the repo. Fail CLOSED rather
+          // than forgiving it: an unanswerable case must not be absorbed into a
+          // verdict (#7412 — both the cycle-6 false PASS and the `.native`
+          // false FAIL were failures of ABSORPTION, not of arithmetic). The
+          // finding states what is actually known — that the comparison could
+          // not be made — instead of asserting either branch's conclusion.
+          issues.push({ type: 'scripts', tier: 'fail',
+            reason: `unresolvable: no component of ${resolved} exists, so containment against ${repoRoot} cannot be measured — cannot be shown machine-local` });
+          console.log(`   ⚠️  scripts/ — UNRESOLVABLE (→ ${linkTarget}) — cannot prove machine-local; failing closed`);
         } else if (ciMode && classifyUnresolved(canonResolved, repoRoot) === 'machine-local'
                    // isAgentInfraScripts takes canonResolved, NOT resolved: reading
                    // the lexical spelling here while classification used the
