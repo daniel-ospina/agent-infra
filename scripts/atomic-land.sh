@@ -46,7 +46,13 @@
 #     strict, and strict is only what makes it block.
 #     OVERRIDES: the former "the rail never reads a protection setting, and is
 #     correct with strict ON or OFF" invariant — narrowed to ONE positive read of
-#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY.
+#     `strict` per invocation (strict_of()), at the step-1 decision point ONLY, in
+#     BOTH step-1 arms: the BEHIND enum arm, AND the base-drift arm for the
+#     landable states `CLEAN|UNSTABLE` only. #1565's ruling that the drift arm must
+#     stay ungated ("a BLOCKED PR is still mergeable: true", so gating it would
+#     skip the refresh #1533 needed) is NARROWED, not reversed — `BLOCKED`, every
+#     other or unknown state, and any unreadable read still refresh. The record
+#     lives on agent-infra#1565, whose own text carries the matching marker.
 #     Rationale, measured (#1565): the refresh's cost is a head move, which
 #     invalidates the head-bound review record (clause B5), forces a full CI run at
 #     the new head (critical path 17.1m median / 19.8m max), and then makes the rail
@@ -594,8 +600,23 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
-        # exists to close. `CLEAN` was checked above and already asserts there is no
-        # divergence, so it keeps its no-op; any OTHER state means GitHub has told
+        # exists to close.
+        #
+        # ⚠️ The reason once given here — "`CLEAN` was checked above and already
+        # asserts there is no divergence" — is FALSE, and #7230 is the proof: under
+        # `strict: false` a head that is genuinely behind reports `CLEAN`, which is
+        # the very state the drift arm above exists to catch. `CLEAN` is a statement
+        # about checks and conflicts, never about distance to the base. (Pre-fix,
+        # that false premise hid the drift arm entirely: `CLEAN`+`behind>0` fell
+        # through to it and had its head moved for nothing.) `CLEAN` keeps its no-op
+        # for the CORRECT reason, not that one: the drift arm has already decided
+        # the distance for every landable state whose compare read succeeded, and
+        # where it did NOT succeed a landable head still needs no refresh — under
+        # `strict: false` the distance is not a requirement, and under `strict:
+        # true` GitHub cannot report `CLEAN` for a stale branch (it reports
+        # `BLOCKED`).
+        #
+        # Any OTHER state means GitHub has told
         # us something is wrong with this head and the compare API could not tell us
         # how stale it is. Stop and name it rather than proceeding on an unmeasured
         # base relation (tortoise #6210 / #6169 are the measured population).
@@ -950,7 +971,15 @@ while :; do
         say "atomic-land: the base ADVANCED after verification (${CERT_BASE_TIP:0:12}… → ${now_tip:0:12}…) — the checks did not cover the new base"
         resolve_state
         if [ "$round" -lt "$MAX_ROUNDS" ]; then
-          say "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged; the review is reused, the CHECK is re-run)"
+          # The next round re-enters the whole unit, but it does NOT necessarily
+          # re-run the CHECKS: round 2 goes back through do_update, and wherever the
+          # drift arm HOLDS the head (a landable state on a positive `strict` false
+          # — #7230) no `gh pr update-branch` happens, so the check surface is never
+          # re-evaluated. What IS re-established is the base BINDING: round 2
+          # re-captures CERT_BASE_TIP at the advanced tip and the pre-land re-read
+          # compares against THAT. Saying "the CHECK is re-run" here would assert a
+          # measurement nobody took.
+          say "atomic-land: re-verifying against the advanced base — another round (the reviewed diff is unchanged and the review is reused; the base BINDING is re-established — the checks are re-run only if the head is actually moved)"
           round=$((round + 1))
           continue
         fi

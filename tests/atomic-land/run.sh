@@ -1264,6 +1264,24 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # shape, which genuinely needs the refresh) is skipped instead. The direction-B2
   # scenario must redden.
   mutate_and_expect_fail B20  's/if \[ "\044mergeable" = true \]; then/if true; then/'
+  # B19b/B20b (#7230): the SAME two fail-closed reads, in the base-DRIFT arm. The
+  # indentation anchor is the point, not a style choice. `mutate_and_expect_fail` runs
+  # `perl -0pi`, so an UNANCHORED `s///` with no `/g` replaces only the FIRST
+  # occurrence in the file — and that was the BEHIND arm. When #7230 added a SECOND
+  # `strict`/`mergeable` read, B19/B20 kept mutating the first one, so the new reads
+  # would have shipped UNPINNED while both mutations still "reddened" via B3: the
+  # change that extends the adversarial set quietly narrowed it. Anchoring each pattern
+  # to its own arm is self-policing — re-indent the arm out from under the pattern and
+  # nothing is replaced, the suite does not redden, and mutate_and_expect_fail reports
+  # "did NOT redden" LOUDLY.
+  # The arms are distinguishable by indentation alone (verified: strict at 8 vs 10
+  # spaces, mergeable at 10 vs 12), and each anchored pattern matches exactly one site.
+  # B19b must redden 17g-D3 (unreadable protection ⇒ refresh); B20b must redden 17g-D4
+  # (strict=false but NOT mergeable ⇒ refresh). Both scenarios already pin the OTHER
+  # read to a decisive fixture, so each mutation is the only thing that can decide its
+  # scenario — the same trap that made B19 inert once before, avoided here.
+  mutate_and_expect_fail B19b 's/^          if \[ "\044strict" = false \]; then/          if [ "\044strict" != true ]; then/m'
+  mutate_and_expect_fail B20b 's/^            if \[ "\044mergeable" = true \]; then/            if true; then/m'
   # B21 (#7230): make the landable-state arm INERT — the drift trigger pre-empts it
   # again, i.e. the revision before this fix. The failure it prevents: the head of a
   # green, attested PR being moved for nothing and the record dying at step 3 (the O3
