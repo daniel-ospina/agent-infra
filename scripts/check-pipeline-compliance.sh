@@ -167,7 +167,8 @@ Check (a) scope:
   emphasis/bold/backtick marker. A mid-sentence mention does NOT
   count, because it can auto-close an issue on merge (#1012).
   A diff that is ENTIRELY an artifact — under docs/, instruction-layer Markdown
-  (skills/**/*.md, AGENTS.md), or .github/CODEOWNERS — may instead use a
+  (AGENTS.md, skills/**/*.md, templates/**/*.md), or .github/CODEOWNERS — may
+  instead use a
   NON-closing traceability keyword (Refs / Part of / Advances / Tracks /
   Relates to #N); closure is not implied. Any .ts/.js/.mjs/script/workflow path
   makes that fallback unreachable (#786).
@@ -879,7 +880,7 @@ run_checks() {
       fi
     fi
   else
-    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
+    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
@@ -1066,7 +1067,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
   echo "Would check, in order:"
-  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
+  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
@@ -1935,6 +1936,10 @@ $big_filler"
   # cannot race, so the site has its own large-input behavioural pin: a >64 KB
   # row list whose FIRST row is a non-artifact path must read NOT artifact-only, on
   # EVERY run.
+  # (The regex in that quote is the SHAPE AT THE TIME — `printf | grep`, before
+  # the here-string rewrite, and before #1409 added `templates/.*\.md$`. It is a
+  # historical quotation, deliberately NOT kept in sync with the live allowlist;
+  # do not "fix" it.)
   # ~84 KB: the guard below asserts >65536, and a row is ~32 bytes, so the row
   # count must clear 2028 with margin.
   big_paths="$(printf 'added\tscripts/evil.sh\t\n'; i=0; while [[ $i -lt 2600 ]]; do printf 'added\tdocs/lorem-filler-%s.md\t\n' "$i"; i=$((i+1)); done)"
