@@ -1470,6 +1470,14 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'templates husky hook (NOT .md)' $'modified\ttemplates/.husky/pre-commit\t' false
   expect_artifact_only 'templates launchd plist (NOT .md)' $'modified\ttemplates/launchd/com.tortoise.worktree-reaper.plist\t' false
   expect_artifact_only 'templates .gitignore (NOT .md)' $'modified\ttemplates/.gitignore\t' false
+  # The `$` end-anchor is what makes the `.md` restriction NARROW rather than
+  # notational, and nothing pinned it: dropping only the trailing `$` leaves all
+  # 203 fixtures green while `templates/x.md/evil.sh` — a SCRIPT inside a
+  # directory whose name merely ends in `.md` — reads artifact-only. That is a
+  # fail-open, so the anchor gets its own pin. The `skills/` entry is included
+  # because it is unpinned in exactly the same way and predates this change.
+  expect_artifact_only 'templates .md-named DIRECTORY is not the class (end-anchor)' $'modified\ttemplates/x.md/evil.sh\t' false
+  expect_artifact_only 'skills .md-named DIRECTORY is not the class (end-anchor)' $'modified\tskills/x.md/run.sh\t' false
   # Anti-vacuous: the twin edit buys no immunity for a code path beside it.
   expect_artifact_only 'twin edit + code' $'modified\ttemplates/AGENTS.base.md\t\nmodified\tscripts/z.sh\t' false
   # The `^templates/` anchor, pinned — `templates/` is a DIRECTORY PREFIX, so

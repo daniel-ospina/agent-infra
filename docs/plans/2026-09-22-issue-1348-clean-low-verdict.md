@@ -16,7 +16,8 @@ aboutObjects: agent-infra, issue-1348, record-review, review-enforcer, proportio
 
 ## Confirmed problem
 
-`record-review.sh` accepts exactly two verdicts (`scripts/record-review.sh`). A PR whose diff
+`record-review.sh` accepted exactly two verdicts before this change — `clean` and `clean-micro`
+(`scripts/record-review.sh`; with `clean-low` it accepts three). A PR whose diff
 is genuinely content-only (prose / stylesheet) but whose linked same-repo issue is
 `complexity:standard` or `complexity:complex` can record **neither honestly**:
 
