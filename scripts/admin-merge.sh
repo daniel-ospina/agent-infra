@@ -1694,7 +1694,12 @@ print("true" if c else "false")
     printf '%s\n' 'test-slow (a)' 'test-slow (b)' >> "$out"
   fi
   if [ "$cp" = "false" ]; then
-    printf '%s\n' 'test-carve-out' >> "$out"
+    # The carve-out job's name template is `test-carve-out${{ matrix.suffix }}`
+    # (tortoise `.github/workflows/python-ci.yml`), and shard 0's suffix is EMPTY,
+    # so ONE declined leg yields THREE job names. Listing only the bare one forgave
+    # a third of the leg and left the other two permanently demanded (#1584). The
+    # slow leg above lists both of its expansions for the same reason.
+    printf '%s\n' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)' >> "$out"
   fi
   return 0
 }
