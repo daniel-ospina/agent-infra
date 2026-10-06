@@ -5808,6 +5808,20 @@ grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the gap
 # with the line `… (parity family: test*; 1 shard(s) on the PR side, 0 on main)` for a
 # fixture whose main ran TWO shards. Both references are therefore FROZEN before any
 # write in this function, and the decision refuses when a write moved one.
+#
+# WHICH ARM REFUSES IS PLATFORM-DEPENDENT, and both are correct refusals, so the
+# assertion below pins the INVARIANT (refused as unverifiable — never read as a
+# coverage result) rather than one arm. On BSD grep the redirect truncates the
+# aliased reference first, and the input-integrity check names the MOVED reference.
+# On GNU grep the subtraction itself ERRORS — `grep: <file>: input file is also the
+# output` (rc 2) — because the input and the redirect's destination are the same
+# inode, so the rc>1 arm names the failed subtraction. MEASURED: the GitHub ubuntu
+# runner takes the GNU route — this single assertion failed the whole `bash-suites`
+# shard there (#1369's class: green on the PR lane's mental model, red in the lane
+# that actually runs it) while passing on macOS. Both routes `return 2` BEFORE any
+# certificate, which is the property under test. What the scenario therefore does NOT
+# cover on GNU is the input-integrity check itself: the aliased write never reaches it
+# there, because grep refuses the write first. That check is covered by (j5) and (j7).
 new_scen lanealiasgap
 mkdir -p "$SCEN/bin"
 cat > "$SCEN/bin/mktemp" <<'MTSTUB3'
@@ -5833,9 +5847,24 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_I
 rc=$?
 [ "$rc" -ne 0 ] && pass "a lane reference ALIASED onto the gap destination REFUSES (exit $rc)" \
   || fail "the rail CERTIFIED 'PR ⊇ main' from a reference its own redirect had truncated — the evidence gate ACCEPTS that body and the merge proceeds"
-grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err" \
-  && pass "…named as a MOVED input, not read as a coverage result" \
-  || fail "the refusal does not name the changed lane reference"
+if grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err"; then
+  pass "…named as a MOVED input, not read as a coverage result (BSD grep route)"
+elif grep -q "the lane-coverage subtraction failed (grep rc 2)" "$SCEN/err"; then
+  pass "…named as an unverifiable subtraction, not read as a coverage result (GNU grep route)"
+else
+  # Print the arm that ACTUALLY FIRED: a third route is not "one of the two", and a bare
+  # ❌ in a CI log cannot distinguish a regression from a new platform delta. The fired arm
+  # is the `admin-merge: ✗ …` line — the LAST lines of that file are a remedy trailer shared
+  # by EVERY refusal (measured on both routes), so a `tail` here would print only
+  # boilerplate and report nothing. The head of the file is printed instead when a third
+  # route refuses without the `✗` shape at all.
+  if grep -q 'admin-merge: ✗' "$SCEN/err"; then
+    grep 'admin-merge: ✗' "$SCEN/err" | head -3 | sed 's/^/      rail stderr: /'
+  else
+    head -3 "$SCEN/err" | sed 's/^/      rail stderr: /'
+  fi
+  fail "the refusal names neither the moved reference nor the failed subtraction"
+fi
 [ -f "$SCEN/comment" ] && fail "evidence was posted although an input moved under the decision" \
   || pass "…and no evidence was posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although an input moved under the decision" \
