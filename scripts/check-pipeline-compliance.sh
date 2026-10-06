@@ -19,8 +19,9 @@
 #                          labels (tier) and scoping comments (checks b–e) are
 #                          fetched from the issue's OWN repo, not the PR's.
 #                          A PR whose diff is ENTIRELY an artifact under docs/,
-#                          instruction-layer Markdown (skills/**/*.md,
-#                          AGENTS.md), or .github/CODEOWNERS may
+#                          instruction-layer Markdown (AGENTS.md,
+#                          skills/**/*.md, templates/**/*.md), or
+#                          .github/CODEOWNERS may
 #                          instead use a NON-closing traceability keyword
 #                          (Refs / Part of / Advances / Tracks / Relates to).
 #                          Rationale: a planning/instruction-artifact PR
@@ -166,7 +167,8 @@ Check (a) scope:
   emphasis/bold/backtick marker. A mid-sentence mention does NOT
   count, because it can auto-close an issue on merge (#1012).
   A diff that is ENTIRELY an artifact — under docs/, instruction-layer Markdown
-  (skills/**/*.md, AGENTS.md), or .github/CODEOWNERS — may instead use a
+  (AGENTS.md, skills/**/*.md, templates/**/*.md), or .github/CODEOWNERS — may
+  instead use a
   NON-closing traceability keyword (Refs / Part of / Advances / Tracks /
   Relates to #N); closure is not implied. Any .ts/.js/.mjs/script/workflow path
   makes that fallback unreachable (#786).
@@ -668,8 +670,8 @@ files_rows() {
 }
 
 # pr_is_artifact_only <files> — true when the PR's diff is ENTIRELY an artifact:
-# under docs/, instruction-layer Markdown (skills/**/*.md, AGENTS.md), or the
-# review-routing config .github/CODEOWNERS.
+# under docs/, instruction-layer Markdown (AGENTS.md, skills/**/*.md,
+# templates/**/*.md), or the review-routing config .github/CODEOWNERS.
 # `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
 # fetch. Fails CLOSED on anything it cannot prove, because this predicate is
 # what unlocks check (a)'s non-closing keyword — a false `true` would let a
@@ -684,8 +686,12 @@ files_rows() {
 # wrong direction for a closure gate. This is why a CODE PR (any
 # .ts/.js/.mjs/script/workflow path) still cannot use the traceability keyword:
 # it is simply not on the list. `docs/` is a PREFIX (any file under it); the
-# other two are EXACT/pattern paths, so e.g. `.github/workflows/*.yml` and
-# `.github/CODEOWNERS.d/x` are NOT artifacts.
+# other entries are EXACT/pattern paths, so e.g. `.github/workflows/*.yml`,
+# `.github/CODEOWNERS.d/x` and `templates/.github/workflows/pipeline-compliance.yml`
+# are NOT artifacts. The `templates/` entry is Markdown-only (#1409) for exactly
+# that reason: 18 of the 21 tracked files under templates/ are executable
+# (workflows, launchd plists, husky hooks, JSON config), so a directory-wide
+# entry would have handed check (a)'s traceability keyword to a workflow edit.
 # Four ways to be untrustworthy, all → NOT artifact-only:
 #   1. Empty/unreadable list (a broken fetch must never weaken closure).
 #   2. Any row the shared validator rejects — malformed framing or an empty
@@ -725,7 +731,17 @@ pr_is_artifact_only() {
   # dangerous site of the family: a raced pipeline INVERTS to "artifact-only"
   # (fail-OPEN), which unlocks check (a)'s non-closing traceability keyword for
   # a PR that touches code.
-  ! grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|\.github/CODEOWNERS$)' <<<"$paths"
+  # templates/**/*.md is instruction-layer Markdown in the SAME sense as
+  # AGENTS.md and skills/**/*.md (#1409): it ships governance prose, implements
+  # no runtime work, and — being the source that materializes into every repo's
+  # AGENTS.md — is the file the base⊆AGENTS.md pin FORCES every instruction-layer
+  # rule change to touch. Leaving it off the allowlist made the class
+  # unreachable for exactly those PRs: artifact-only read false, the
+  # traceability alternative is gated on it (resolve_issue_ref), so the only
+  # remaining keyword was a closing one — a FALSE close or a blocked PR.
+  # The `.md` restriction is load-bearing, not decorative: see the 18/21 note
+  # above.
+  ! grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|templates/.*\.md$|\.github/CODEOWNERS$)' <<<"$paths"
 }
 
 # resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
@@ -864,7 +880,7 @@ run_checks() {
       fi
     fi
   else
-    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
+    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
@@ -1051,7 +1067,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
   echo "Would check, in order:"
-  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
+  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
@@ -1435,6 +1451,44 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'instruction-layer + code' $'modified\tAGENTS.md\t\nmodified\tscripts/z.sh\t' false
   expect_artifact_only 'skills non-.md (skill payload)' $'modified\tskills/foo/run.sh\t' false
   expect_artifact_only 'nested AGENTS.md is NOT the instruction layer' $'modified\tsub/AGENTS.md\t' false
+  # #1409 — templates/**/*.md joins the instruction-layer class. Two live
+  # instances before this: #1400 reached MERGED only by taking the false close,
+  # and #1461 sat red 11 days on check (a) alone (checks b–e are SKIPPED when
+  # (a) fails, so its substantive artifacts were never examined). BOTH are the
+  # TWIN shape below — `AGENTS.md` + `templates/AGENTS.base.md` — because the
+  # base⊆AGENTS.md pin forces the second file.
+  # NOTE: this makes the CLASS reachable for such PRs; it does NOT by itself turn
+  # any of them green. #1461's body carries no line-leading `Refs`/`Closes`
+  # reference at all, so it stays red on (a) until one is added.
+  expect_artifact_only 'templates/AGENTS.base.md alone (single-file shape)' $'modified\ttemplates/AGENTS.base.md\t' true
+  expect_artifact_only 'the MANDATORY twin edit — the #1400/#1461 shape' $'modified\tAGENTS.md\t\nmodified\ttemplates/AGENTS.base.md\t' true
+  expect_artifact_only 'nested templates .md' $'modified\ttemplates/.github/workflows/README.md\t' true
+  # ...and the `.md` restriction is what keeps the class narrow. Measured on
+  # main 2026-10-06: 18 of the 21 tracked files under templates/ are executable.
+  # Every one of these reads `true` if the entry is widened to `templates/`.
+  expect_artifact_only 'templates executable workflow (NOT .md)' $'modified\ttemplates/.github/workflows/pipeline-compliance.yml\t' false
+  expect_artifact_only 'templates husky hook (NOT .md)' $'modified\ttemplates/.husky/pre-commit\t' false
+  expect_artifact_only 'templates launchd plist (NOT .md)' $'modified\ttemplates/launchd/com.tortoise.worktree-reaper.plist\t' false
+  expect_artifact_only 'templates .gitignore (NOT .md)' $'modified\ttemplates/.gitignore\t' false
+  # The `$` end-anchor is what makes the `.md` restriction NARROW rather than
+  # notational, and nothing pinned it: dropping only the trailing `$` leaves all
+  # 203 fixtures green while `templates/x.md/evil.sh` — a SCRIPT inside a
+  # directory whose name merely ends in `.md` — reads artifact-only. That is a
+  # fail-open, so the anchor gets its own pin. The `skills/` entry is included
+  # because it is unpinned in exactly the same way and predates this change.
+  expect_artifact_only 'templates .md-named DIRECTORY is not the class (end-anchor)' $'modified\ttemplates/x.md/evil.sh\t' false
+  expect_artifact_only 'skills .md-named DIRECTORY is not the class (end-anchor)' $'modified\tskills/x.md/run.sh\t' false
+  # Anti-vacuous: the twin edit buys no immunity for a code path beside it.
+  expect_artifact_only 'twin edit + code' $'modified\ttemplates/AGENTS.base.md\t\nmodified\tscripts/z.sh\t' false
+  # The `^templates/` anchor, pinned — `templates/` is a DIRECTORY PREFIX, so
+  # adjacency is a real bypass shape for a new entry and must not match.
+  expect_artifact_only 'templates-adjacent path is not the templates class' $'modified\ttemplates-adjacent/AGENTS.base.md\t' false
+  expect_artifact_only 'templatesX prefix is not the templates class' $'modified\ttemplatesx/AGENTS.base.md\t' false
+  # A rename carries BOTH ends through this predicate: moving executable content
+  # OUT of code and INTO a `templates/*.md` name must still read NOT
+  # artifact-only, or the entry becomes an exfiltration route for a code diff.
+  expect_artifact_only 'renamed code to templates .md (old end wins)' $'renamed\ttemplates/x.md\tscripts/x.sh' false
+  expect_artifact_only 'renamed templates .md inside templates' $'renamed\ttemplates/b.md\ttemplates/a.md' true
   # #786's headline case: `.github/CODEOWNERS` is review-routing config with no
   # executable logic — the same artifact class (the live #674 diff is CODEOWNERS
   # + docs/). Only that exact path is in the class; a workflow file next to it,
@@ -1904,6 +1958,10 @@ $big_filler"
   # cannot race, so the site has its own large-input behavioural pin: a >64 KB
   # row list whose FIRST row is a non-artifact path must read NOT artifact-only, on
   # EVERY run.
+  # (The regex in that quote is the SHAPE AT THE TIME — `printf | grep`, before
+  # the here-string rewrite, and before #1409 added `templates/.*\.md$`. It is a
+  # historical quotation, deliberately NOT kept in sync with the live allowlist;
+  # do not "fix" it.)
   # ~84 KB: the guard below asserts >65536, and a row is ~32 bytes, so the row
   # count must clear 2028 with margin.
   big_paths="$(printf 'added\tscripts/evil.sh\t\n'; i=0; while [[ $i -lt 2600 ]]; do printf 'added\tdocs/lorem-filler-%s.md\t\n' "$i"; i=$((i+1)); done)"

@@ -131,10 +131,13 @@
 #      validated (positive, ≤ 200) before any CI work, and the widening stops once
 #      that many MEASURING runs are consulted: the window is the Jobs-API call
 #      budget for the ordinary path, and a wider one reads more job lists only
-#      where the requested window found no shard at all. `ADMIN_MERGE_LANE_PARITY=declared-off` is the
-#      AUDITED escape (a trigger-split repo, #1349): it certifies while STATING in
-#      the evidence and on stderr that parity was NOT established, and any other
-#      value is refused at startup. Declared OUT of scope: a repo that varies the
+#      where the requested window found no shard at all.
+#      `ADMIN_MERGE_LANE_PARITY=declared-off` is accepted for the trigger-split
+#      case (#1349) but NO LONGER CERTIFIES (#1439): the evidence gate refuses a
+#      vacuous certificate that lacks the positive `lane parity: PR ⊇ main` line,
+#      so the producer used to post evidence its own consumer rejected. Both modes
+#      now refuse here, naming AGENT_ADMIN_MERGE_OVERRIDE=1; an unrecognised value
+#      is still refused at startup. Declared OUT of scope: a repo that varies the
 #      test SELECTION within one shard name (files chosen per-diff inside
 #      `test (a)`), which a job list cannot show — filed as #1350.
 #  22. THE LANE-PARITY GATE'S OWN FAIL-OPEN PATHS (#1319 cycle-1/2 review): the
@@ -5575,12 +5578,19 @@ rc=$?
 grep -q "test (b)" "$SCEN/err" && pass "…and the window-boundary shard is the one named" \
   || fail "the shard that exists only in an older window run is not reported"
 
-# (j) THE AUDITED ESCAPE. A repo whose PR lane legitimately cannot run a shard
-# main's push lane runs (a trigger-split repo — this one, #1349) needs a way to
-# merge; it does NOT need a SILENT way. `declared-off` still RUNS the comparison,
-# still reports the divergence on stderr and in the POSTED evidence, and states
-# `NOT ESTABLISHED — declared off` — a certificate that says out loud what it did
-# not check.
+# (j) THE TRIGGER-SPLIT CASE IS NOW A REFUSAL, NOT A CERTIFICATE (#1439). A repo
+# whose PR lane legitimately cannot run a shard main's push lane runs (a
+# trigger-split repo — this one, #1349) needs a way to merge;
+# `ADMIN_MERGE_LANE_PARITY=declared-off` USED to provide one, certifying a vacuous
+# comparison while stating the divergence. It could never work: the evidence gate
+# refuses a vacuous certificate that does not carry the positive `lane parity: PR ⊇
+# main` line (verify-admin-merge-evidence.sh clause 5 — #1319's own rule, and the
+# case #1388's decision scoped clause 5 to), so the producer posted evidence,
+# announced a merge, and the shim then refused it and retracted the evidence
+# (#3549). This scenario drives a FAKE gh and so cannot observe that layer — its
+# old assertions certified the false PASS. It now asserts the producer refuses
+# WHERE IT USED TO CERTIFY: no evidence posted, no merge attempted, and the route
+# that does work named on stderr.
 new_scen vacuousdeclaredoff
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9881 > "$SCEN/runs-$HEAD_VP"
@@ -5590,17 +5600,370 @@ lane_jobset 9882 success 'test (a)' 'test-slow (a)'
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_LANE_PARITY=declared-off bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
 rc=$?
-[ "$rc" -eq 0 ] && pass "declared-off certifies the vacuous comparison (exit 0) — the escape works" \
-  || fail "declared-off did not certify (exit $rc); the escape is unusable"
-grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
-  && pass "…and the POSTED evidence STATES the parity was not established" \
-  || fail "the escape certified SILENTLY: the evidence does not disclose it"
-grep -q "LANE PARITY NOT ESTABLISHED" "$SCEN/err" && pass "…as does stderr, before the merge" \
-  || fail "the escape did not warn on stderr"
-grep -q "test-slow (a)" "$SCEN/err" && pass "…and the DIVERGENCE is still reported, so the escape is not a blindfold" \
+[ "$rc" -ne 0 ] && pass "declared-off REFUSES the vacuous comparison (exit $rc) — it is not a certificate" \
+  || fail "declared-off certified (exit 0); a certificate the shim then rejects is back"
+grep -q "NOT COMPARABLE" "$SCEN/err" && pass "…on the same NOT COMPARABLE verdict the default mode gives" \
+  || fail "the refusal does not carry the NOT COMPARABLE verdict"
+grep -q "ADMIN_MERGE_LANE_PARITY=declared-off is set" "$SCEN/err" \
+  && pass "…NAMING the knob as set, so a declared-off operator is told it is not the remedy" \
+  || fail "the refusal never mentions the declared-off setting, so the operator is left guessing"
+grep -q "AGENT_ADMIN_MERGE_OVERRIDE=1" "$SCEN/err" \
+  && pass "…and naming AGENT_ADMIN_MERGE_OVERRIDE=1 — the audited route that does work" \
+  || fail "the refusal does not name the audited override"
+grep -q "test-slow (a)" "$SCEN/err" && pass "…while still reporting the DIVERGENCE (a refusal is not a blindfold)" \
   || fail "declared-off suppressed the divergence report"
-grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
-  || fail "declared-off still refused the merge"
+[ -f "$SCEN/comment" ] && fail "declared-off POSTED evidence the evidence gate refuses — nothing may be posted" \
+  || pass "…and posts NO evidence (nothing for the shim to refuse and retract)"
+grep -q "pr merge" "$SCEN/calls" && fail "declared-off still attempted a merge" || pass "…and attempts NO merge"
+
+# (j2) THE TWO LAYERS AGREE (#1439). The producer's suite checks the producer and
+# the certificate-contract suite checks the verifier, so each could stay green
+# while the two disagree — which IS the defect. This runs the REAL verifier over
+# the real capture of a declared-off certificate and requires it to REFUSE: if a
+# certifying path is ever re-added to the producer, this fails beside (j)'s
+# refusal assertions. The capture is the byte-for-byte body the producer posted at
+# #1406; the contract suite owns it and it is read here, never copied.
+VAC_CAPTURE="$ROOT/tests/admin-merge-evidence-contract/captured-1406-vacuous-parity-not-established.md"
+VAC_VERIFIER="${VERIFIER_UNDER_TEST:-$ROOT/scripts/verify-admin-merge-evidence.sh}"
+VAC_HEAD="$(sed -n 's/^PR head: \(.*\)$/\1/p' "$VAC_CAPTURE" 2>/dev/null | head -1)"
+if [ ! -f "$VAC_CAPTURE" ] || [ -z "$VAC_HEAD" ]; then
+  fail "the declared-off capture is missing or carries no head line, so the agreement cannot be pinned: $VAC_CAPTURE"
+elif bash "$VAC_VERIFIER" --body-file "$VAC_CAPTURE" --head "$VAC_HEAD" >/dev/null 2>&1; then
+  fail "the REAL verifier CERTIFIED a declared-off certificate — it must refuse (that is WHY the producer now refuses)"
+else
+  pass "the REAL verifier refuses the declared-off shape, so producer and verifier now agree"
+fi
+
+# (j3) ✗ AN UNWRITABLE GAP FILE MUST NOT READ AS "NO GAP". In `lane_parity_check`,
+# the `cp` that fills the gap when the PR executed NOTHING was the only UNCHECKED
+# step: `lane-missing.txt` is created EMPTY at function entry, so a failed copy left
+# the empty file in place, the `[ -s … ]` test read that as "no shard is missing",
+# and the function returned 0 — parity "established" for a head that compared
+# NOTHING. This one is worse than the declared-off defect it sits beside: the body it
+# produces carries a POSITIVE `lane parity: PR ⊇ main` line (with `0 shard(s) on the
+# PR side, 2 on main`), so the REAL evidence gate ACCEPTS it and the rail MERGES. It
+# was found by an adversarial review and reproduced before the fix (rc 0, comment
+# posted, `pr merge` called). Every sibling subtraction in the same function already
+# fails CLOSED on its own status; this one did not. Reproduced here by shadowing `cp`
+# on PATH so ONLY the lane-coverage copy fails.
+new_scen lanegapcopyfail
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9885 > "$SCEN/runs-$HEAD_VP"
+lane_pass maindd55 9886 > "$SCEN/runs-main"
+lane_jobset 9885 skipped 'test (a)' 'test (b)'   # the PR executed NOTHING
+lane_jobset 9886 success 'test (a)' 'test (b)'   # main's lane is real
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/cp" <<'CPSTUB'
+#!/bin/sh
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+  */lane-missing.txt) echo "cp: simulated write failure" >&2; exit 1 ;;
+esac
+exec /bin/cp "$@"
+CPSTUB
+chmod +x "$SCEN/bin/cp"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "an unwritable gap file REFUSES (exit $rc) — it is not read as 'no gap'" \
+  || fail "a FAILED lane-coverage copy CERTIFIED the comparison (exit 0) with 0 shards compared — the evidence gate accepts that body and the merge proceeds"
+grep -q "lane-coverage copy failed" "$SCEN/err" \
+  && pass "…naming the failed copy as the reason, rather than reporting a coverage result" \
+  || fail "the refusal does not name the failed copy"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a comparison that could not be written" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be written" \
+  || pass "…and no merge was attempted"
+
+# (j4) ✗ A GAP FILE THAT CANNOT RECORD THE GAP MUST NOT READ AS "NO GAP" (#1439
+# cycle-2/3). The decision was read off `lane-missing.txt`, whose emptiness a failed
+# write produces just as surely as a genuinely empty gap does: the `grep` subtraction's
+# REDIRECT reports grep's OWN "no differences" status (1), and a destination that is not
+# a regular file swallows the write. `[ -s … ]` then said "nothing is missing" and the
+# rail certified `lane parity: PR ⊇ main` — a body the REAL evidence gate ACCEPTS — for
+# a head that compared nothing. The check now asks the MEMBERSHIP question itself (of
+# the two lists, writing to /dev/null so its own redirect cannot fail) and refuses when
+# the gap FILE is empty although a shard is missing. Two fixtures: the lost write that
+# empties a real gap, and — the cycle-3 route that a SIZE comparison could not catch —
+# EQUAL counts with no overlap at all. The `mktemp` shim hijacks only the gap file's
+# DESTINATION: it models a failed WRITE, not a lying tool. (The gate trusts the tools it
+# calls — a PATH `grep` that lied about the answer would defeat any check that consults
+# it, and that is out of the threat model: a bad PR and a failed write, not a hostile
+# host.)
+new_scen lanegapnotwritable
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "${SCEN}/planted-gap" "$d/lane-missing.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB
+chmod +x "$SCEN/bin/mktemp"
+# The planted target absorbs every write, so the gap file reads back EMPTY.
+ln -sf /dev/null "$SCEN/planted-gap"
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass maindd77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'              # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)'   # …main ran TWO: a real 1-shard gap
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a gap file that cannot record a REAL 1-shard gap REFUSES (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' with 1 shard on the PR side and 2 on main — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "came back EMPTY although main's lane holds a shard" "$SCEN/err" \
+  && pass "…naming the lost listing, rather than reporting a coverage result" \
+  || fail "the refusal does not name the empty-gap-against-the-lists disagreement"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a gap that could not be recorded" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a gap that could not be recorded" \
+  || pass "…and no merge was attempted"
+# …and the same hollow gap with EQUAL counts and NO overlap: a size comparison cannot
+# see this one (1 shard on each side), so the membership test is what refuses it.
+rm -f "$SCEN/comment"; : > "$SCEN/calls"
+lane_jobset 9887 success 'test (c)'    # the PR ran a shard main did NOT
+lane_jobset 9888 success 'test (d)'    # main ran a shard the PR did NOT
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "…and the same hollow gap with EQUAL counts and NO overlap REFUSES (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' with 1 shard on each side and NO overlap — a size comparison cannot catch that, and the merge proceeds"
+grep -q "came back EMPTY although main's lane holds a shard" "$SCEN/err" \
+  && pass "…by the same membership test, not by a count" \
+  || fail "the equal-count case was refused for some other reason, so membership is not what decided it"
+[ -f "$SCEN/comment" ] && fail "evidence was posted for a disjoint comparison" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on a disjoint comparison" \
+  || pass "…and no merge was attempted"
+
+# (j5) ✗ THE FORGIVENESS REWRITE CAN BE SWALLOWED TOO (#1439 cycle-4). The check above
+# guards the state BEFORE forgiveness; the forgiveness step then REWRITES the gap
+# (`grep -vxF -f lane-forgiven.txt lane-missing.txt > lane-kept.txt`, then `mv`), so a
+# swallowed write there empties the gap AFTER the check has passed. Reproduced by an
+# adversarial review: rc 0, evidence posted, `pr merge` called, and the REAL evidence
+# gate ACCEPTED the body — which claimed `EXCEPT the N shard(s) its diff selector
+# DECLINED … every shard the selector did not decline still had to be executed, and
+# was`, while `test (b)` was neither declined nor run. The membership test therefore
+# runs on the FINAL state, against `pr ∪ declined` — the claim the certificate actually
+# makes — and only credits the declined set when forgiveness was applied.
+new_scen laneforgivenwrite
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 6936 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6937 6935 > "$SCEN/runs-main"
+lane_jobset 6935 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6936 success 'test (a)'
+pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
+selector_stub False False
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB2'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf /dev/null "$d/lane-kept.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB2
+chmod +x "$SCEN/bin/mktemp"
+# The selector must SUCCEED here so forgiveness is APPLIED and the shim's swallowed
+# write lands AFTER it (the cycle-4 route) — `run_admin_cwd` is the invocation that
+# carries the resolved interpreter (`ADMIN_MERGE_SELECTOR_PYTHON`). A hand-rolled
+# `bash "$ADM"` loses it, the selector fails, forgiveness is NOT applied, and the
+# scenario silently re-tests the raw-gap refusal the #6928 fixture already covers; the
+# assertion below pins that, so the wrong fixture cannot pass as the right one.
+SEL_PATH="$SCEN/bin:$PATH" ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a swallowed FORGIVENESS write REFUSES (exit $rc) — the check runs on the FINAL state" \
+  || fail "the rail CERTIFIED 'EXCEPT the shards its selector DECLINED' while a NON-declined shard was never run — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "lane-coverage forgiveness (#6928) —" "$SCEN/err" \
+  && pass "…and forgiveness WAS applied, so the swallowed write is the route under test" \
+  || fail "forgiveness was not applied — the scenario tested the raw-gap refusal instead of the cycle-4 route"
+grep -q "came back EMPTY although main's lane holds a shard that is neither in the PR's executed set nor among the shards" "$SCEN/err" \
+  && pass "…refused by the membership test on the FINAL state (main's lane vs pr ∪ declined)" \
+  || fail "the refusal does not name the empty-gap-against-the-claim disagreement"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although the gap could not be recorded" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the gap could not be recorded" \
+  || pass "…and no merge was attempted"
+
+# (j6) ✗ THE GAP DESTINATION CAN BE ALIASED ONTO AN INPUT (#1439 cycle-5). The
+# subtraction is `grep -vxF -f lane-pr.txt lane-main.txt > lane-missing.txt`. When
+# `lane-missing.txt` IS `lane-main.txt`, that redirect TRUNCATES THE REFERENCE before
+# grep opens its inputs, so the subtraction compares an EMPTY main, selects nothing and
+# exits 1 — the "no differences" status the rc>1 guard accepts — the gap reads EMPTY so
+# the forgiveness block is skipped, and a membership test re-reads the same now-empty
+# file and agrees with it. Reproduced end-to-end by the cycle-5 adversarial review:
+# rc 0, evidence posted, the REAL evidence gate ACCEPTS the body, `pr merge` called,
+# with the line `… (parity family: test*; 1 shard(s) on the PR side, 0 on main)` for a
+# fixture whose main ran TWO shards. Both references are therefore FROZEN before any
+# write in this function, and the decision refuses when a write moved one.
+#
+# WHICH ARM REFUSES IS PLATFORM-DEPENDENT, and both are correct refusals, so the
+# assertion below pins the INVARIANT (refused as unverifiable — never read as a
+# coverage result) rather than one arm. On BSD grep the redirect truncates the
+# aliased reference first, and the input-integrity check names the MOVED reference.
+# On GNU grep the subtraction itself ERRORS — `grep: <file>: input file is also the
+# output` (rc 2) — because the input and the redirect's destination are the same
+# inode, so the rc>1 arm names the failed subtraction. MEASURED: the GitHub ubuntu
+# runner takes the GNU route — this single assertion failed the whole `bash-suites`
+# shard there (#1369's class: green on the PR lane's mental model, red in the lane
+# that actually runs it) while passing on macOS. Both routes `return 2` BEFORE any
+# certificate, which is the property under test. What the scenario therefore does NOT
+# cover on GNU is the input-integrity check itself: the aliased write never reaches it
+# there, because grep refuses the write first. That check IS exercised on BOTH platforms
+# by (j8) below, whose alias points at an input that is NOT the destination of the write
+# that corrupts it (`lane-kept.txt` → `lane-declined.txt`), so grep has nothing to refuse
+# and only the integrity check can catch it.
+new_scen lanealiasgap
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB3'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-main.txt" "$d/lane-missing.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB3
+chmod +x "$SCEN/bin/mktemp"
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainee77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'              # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)'   # …main ran TWO: a real 1-shard gap
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a lane reference ALIASED onto the gap destination REFUSES (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' from a reference its own redirect had truncated — the evidence gate ACCEPTS that body and the merge proceeds"
+if grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err"; then
+  pass "…named as a MOVED input, not read as a coverage result (BSD grep route)"
+elif grep -q "the lane-coverage subtraction failed (grep rc 2)" "$SCEN/err"; then
+  pass "…named as an unverifiable subtraction, not read as a coverage result (GNU grep route)"
+else
+  # Print the arm that ACTUALLY FIRED: a third route is not "one of the two", and a bare
+  # ❌ in a CI log cannot distinguish a regression from a new platform delta. The fired arm
+  # is the `admin-merge: ✗ …` line — the LAST lines of that file are a remedy trailer shared
+  # by EVERY refusal (measured on both routes), so a `tail` here would print only
+  # boilerplate and report nothing. The head of the file is printed instead when a third
+  # route refuses without the `✗` shape at all.
+  if grep -q 'admin-merge: ✗' "$SCEN/err"; then
+    grep 'admin-merge: ✗' "$SCEN/err" | head -3 | sed 's/^/      rail stderr: /'
+  else
+    head -3 "$SCEN/err" | sed 's/^/      rail stderr: /'
+  fi
+  fail "the refusal names neither the moved reference nor the failed subtraction"
+fi
+[ -f "$SCEN/comment" ] && fail "evidence was posted although an input moved under the decision" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although an input moved under the decision" \
+  || pass "…and no merge was attempted"
+
+# (j7) ✗ AN INPUT-TO-INPUT ALIAS CORRUPTS A REFERENCE BEFORE IT CAN BE FROZEN
+# (#1439 cycle-6). With `lane-main.txt` a symlink to `lane-pr.txt`, main's fetch
+# (`: > "$out"` then append) TRUNCATES AND REFILLS the PR file, so a freeze taken after
+# both fetches recorded MAIN's set as BOTH references — the subtraction then compared
+# main WITH ITSELF and the rail certified `PR ⊇ main … (3 shard(s))` for a head that
+# ran 1 of main's 3 shards (reproduced by the cycle-6 review: rc 0, evidence posted,
+# the REAL evidence gate ACCEPTS the body, `pr merge` called). The two references must
+# be DISTINCT regular files, and each is frozen the moment its OWN fetch returns.
+new_scen lanealiasrefs
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB4'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-pr.txt" "$d/lane-main.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB4
+chmod +x "$SCEN/bin/mktemp"
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainff77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'                        # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)' 'test (c)' # …main ran THREE
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "two lane references that are the SAME file REFUSE (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' by comparing main WITH ITSELF — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "lane references are not two distinct regular files" "$SCEN/err" \
+  && pass "…named as an aliased scratch path, not read as a coverage result" \
+  || fail "the refusal does not name the aliased lane reference"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although the references were aliased" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the references were aliased" \
+  || pass "…and no merge was attempted"
+
+# (j8) ✗ A FORGIVENESS WRITE ALIASED ONTO A FROZEN INPUT MOVES IT. (j6) covers the alias
+# whose write DESTINATION is also grep's input — on GNU grep that write is refused by grep
+# ITSELF (`input file is also the output`, rc 2), so the input-integrity check is never
+# reached there and the platform that runs CI could not tell if it were deleted. This
+# scenario aliases the same class of write onto an input grep is NOT looking at:
+# `lane-kept.txt` → `lane-declined.txt`, so the forgiveness leg's write (`> lane-kept.txt`)
+# rewrites the DECLINED listing after it was frozen and before the membership test reads
+# it — while the subtraction's inputs and destination are all distinct, so grep has
+# nothing to refuse and the integrity check is the ONLY arm that can catch it.
+new_scen lanekeptaliasdeclined
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 6938 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6939 6939 > "$SCEN/runs-main"
+lane_jobset 6939 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6938 success 'test (a)'
+pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
+selector_stub False False
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB5'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-declined.txt" "$d/lane-kept.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB5
+chmod +x "$SCEN/bin/mktemp"
+# `run_admin_cwd` (not a hand-rolled `bash "$ADM"`) because it carries the resolved
+# selector interpreter — without it the selector fails, forgiveness is NOT applied, and
+# this scenario would silently re-test the raw-gap refusal. The assertion below pins
+# that, so the wrong fixture cannot pass as the right one.
+SEL_PATH="$SCEN/bin:$PATH" ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a forgiveness write ALIASED onto a frozen input REFUSES (exit $rc)" \
+  || fail "the rail decided on a lane reference its own forgiveness write had rewritten — the evidence gate ACCEPTS the resulting body and the merge proceeds"
+grep -q "lane-coverage forgiveness (#6928) —" "$SCEN/err" \
+  && pass "…and forgiveness WAS applied, so the aliased forgiveness write is the route under test" \
+  || fail "forgiveness was not applied — the scenario tested the raw-gap refusal instead of the aliased-input route"
+grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err" \
+  && pass "…named as a MOVED input, not read as a coverage result" \
+  || fail "the refusal does not name the changed lane reference (the only arm that can catch this route on any platform)"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although a forgiveness write moved an input" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although a forgiveness write moved an input" \
+  || pass "…and no merge was attempted"
 
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
@@ -6025,7 +6388,7 @@ new_scen lane6928-docsonly
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6931 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6938 6932 > "$SCEN/runs-main"
-lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6931 success 'test (a)' 'test (b)'
 pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
 selector_interp_312
@@ -6043,8 +6406,10 @@ lane6928_disc="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/err")"
 if printf '%s' "$lane6928_disc" | grep -q 'test-slow (a)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-slow (b)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (b)' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (c)' \
    && printf '%s' "$lane6928_disc" | grep -q 'selector: slow_run=false, carve_out_run=false'; then
-  pass "…naming all three forgiven shards AND the selector verdict it rests on"
+  pass "…naming all five forgiven shards AND the selector verdict it rests on"
 else
   fail "the disclosure does not name the shards and verdict: $lane6928_disc"
 fi
@@ -6057,7 +6422,7 @@ grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
 # the PR did NOT execute every shard main ran — so the line itself must carry the
 # exception, not leave the correction to prose on the next line.
 lane6928_par="$(grep -m1 'lane parity:' "$SCEN/comment" | sed 's/^[[:space:]]*//')"
-expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 3 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 5 on main)"
+expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 5 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 7 on main)"
 if [ "$lane6928_par" = "$expected6928_par" ]; then
   pass "#6928 P3a: the certified \`lane parity:\` line itself STATES the exception"
 else
@@ -6085,15 +6450,17 @@ else
   fail "the forgiveness disclosure makes the posted evidence unmatchable — the rail would refuse its own merge"
 fi
 
-# (a2) #6928 P3-1 — THE FORGIVENESS IS DISCLOSED ON THE `declared-off` REFUSAL
-# PATH TOO. When the selector forgives the declined legs but a NON-declined shard
-# is STILL missing, parity FAILS; under the audited `declared-off` escape the rail
-# certifies anyway, and the posted body's count is ALREADY net of forgiveness
-# (`did NOT execute 1 test shard`) — but the first cut built the disclosure ONLY on
-# the `rc 0` branch, so that certificate left the reader with a shard count and no
-# statement of why the other three were not required. A certificate must state why
-# a shard was not required. Its own line (never carrying `lane parity:`), so the
-# `lane parity:` line stays one line and keeps at most one `parity family:`.
+# (a2) #6928 P3-1 — THE FORGIVENESS IS STILL DISCLOSED WHEN THE OUTCOME IS A REFUSAL
+# (#1439). When the selector forgives the declined legs but a NON-declined shard is
+# STILL missing, parity FAILS. `ADMIN_MERGE_LANE_PARITY=declared-off` used to certify
+# anyway, and the posted body's count was ALREADY net of forgiveness (`did NOT execute
+# 1 test shard`) — but the first cut built that disclosure ONLY on the certifying
+# branch, so the OTHER outcome left the reader with a shard count and no statement of
+# why the other three were not required. The P3-1 lesson is that an operator must not
+# be sent chasing a shard their own selector legitimately declined, and the refusal is
+# now the ONLY outcome this scenario can reach. The disclosure rides `lane_parity_check`'s
+# OWN stderr warning — emitted whenever forgiveness is applied, on whichever path
+# follows — which is why the refusal does not restate it in a second spelling.
 new_scen lane6928-declaredoff
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6936 > "$SCEN/runs-$HEAD_VP"
@@ -6106,45 +6473,56 @@ selector_interp_312
 selector_stub False False
 ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && pass "#6928 P3-1: declared-off still certifies with the declined legs + one real gap (exit 0)" \
-  || fail "#6928 P3-1: expected exit 0 under declared-off, got $rc"
-grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
-  && pass "…and the POSTED evidence STATES the forgiveness on the declared-off path" \
-  || fail "the declared-off certificate omits the forgiveness disclosure (P3-1)"
-lane6928_do_note="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/comment")"
+[ "$rc" -ne 0 ] && pass "#6928 P3-1: declared-off REFUSES when a real (non-declined) shard is missing (exit $rc)" \
+  || fail "#6928 P3-1: expected a refusal under declared-off, got exit 0"
+grep -q "lane-coverage forgiveness (#6928)" "$SCEN/err" \
+  && pass "…and the REFUSAL states the forgiveness, so the operator is not sent after a declined shard" \
+  || fail "the refusal omits the forgiveness disclosure (P3-1, now on the refusal path)"
+lane6928_do_note="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/err")"
 if printf '%s' "$lane6928_do_note" | grep -q 'test-slow (a)' \
    && printf '%s' "$lane6928_do_note" | grep -q 'test-slow (b)' \
    && printf '%s' "$lane6928_do_note" | grep -q 'test-carve-out' \
-   && printf '%s' "$lane6928_do_note" | grep -q 'Selector verdict: slow_run=false, carve_out_run=false'; then
+   && printf '%s' "$lane6928_do_note" | grep -q 'selector: slow_run=false, carve_out_run=false'; then
   pass "…naming every forgiven shard and the selector verdict it rests on"
 else
-  fail "the declared-off disclosure does not name the shards and verdict: $lane6928_do_note"
+  fail "the refusal's forgiveness disclosure does not name the shards and verdict: $lane6928_do_note"
 fi
-grep -q "NOT ESTABLISHED — declared off" "$SCEN/comment" \
-  && pass "…while still stating the parity was NOT established (the escape is not silenced)" \
-  || fail "the declared-off certificate no longer states the escape"
-grep -q "did NOT execute 1 test shard" "$SCEN/comment" \
+grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
   && pass "…and counting exactly the one NON-declined shard missing (the count is net of forgiveness)" \
-  || fail "the declared-off count is not net of the forgiven shards"
-# The `lane parity:` line stays ONE line, still starts with `lane parity:`, and
-# carries at most one `parity family:` — the three properties the gate anchors on.
-[ "$(grep -c 'lane parity:' "$SCEN/comment")" -eq 1 ] \
-  && pass "…on exactly one \`lane parity:\` line (the disclosure rides its OWN line)" \
-  || fail "the declared-off certificate carries $(grep -c 'lane parity:' "$SCEN/comment") \`lane parity:\` lines"
-[ "$(grep -m1 'parity family:' "$SCEN/comment" | grep -o 'parity family:' | wc -l | tr -d ' ')" -eq 1 ] \
-  && pass "…with at most one \`parity family:\`" \
-  || fail "the declared-off parity line carries more than one \`parity family:\`"
-grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds under the declared escape" \
-  || fail "declared-off refused the merge"
+  || fail "the refusal's count is not net of the forgiven shards"
+[ -f "$SCEN/comment" ] && fail "…and posts NO evidence for the refused comparison" \
+  || pass "…and posts NO evidence for the refused comparison (nothing the shim would retract)"
+grep -q "pr merge" "$SCEN/calls" && fail "declared-off attempted the merge after refusing" \
+  || pass "…and attempts no merge"
+
+# lane_missing_shards <err-file> — print ONLY the "shard(s) main EXECUTED and
+# this head did not" block. The assertions below must be scoped to it: the
+# forgiveness DISCLOSURE carries shard names too, so a whole-file `grep` cannot
+# tell "counted missing" from "named as forgiven" and an ungated emit satisfies
+# it while actually forgiving the shard (measured — the whole-file form passed a
+# suffix-ungated mutant). The block the count introduces is the only place that
+# means "still missing".
+lane_missing_shards() {
+  awk '/shard\(s\) main EXECUTED and this head did not:/{f=1;next} f && /^   [A-Za-z]/{exit} f' "$1"
+}
 
 # (b) NOTHING DECLINED → NOTHING FORGIVEN. A diff the selector says selects both
-# legs leaves the raw gap intact: the three legs stay missing and the refusal is
-# the one the rail issued before the fix.
+# legs leaves the raw gap intact: the five gated shards stay missing and the
+# refusal is the one the rail issued before the fix.
+#
+# MAIN'S LANE CARRIES ALL THREE CARVE-OUT NAMES ON PURPOSE. The forgiveness arm
+# emits the carve names only inside `if [ "$cp" = "false" ]`; a regression that
+# emitted them UNGATED would forgive a shard the selector did NOT decline. That
+# regression is only OBSERVABLE if main's lane actually contains the suffixed
+# names — they have to be in the gap for a bogus forgiveness to shrink it. With
+# a bare-name-only lane the two new entries are never intersectable, so the
+# unguarding bug would pass this scenario while failing in production (where
+# main's lane is the real 7-name shape). This scenario is the trap for it.
 new_scen lane6928-bothselected
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6951 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6939 6952 > "$SCEN/runs-main"
-lane_jobset 6952 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6952 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6951 success 'test (a)' 'test (b)'
 pr_changed_files src/deep/module.py
 selector_interp_312
@@ -6156,20 +6534,30 @@ rc=$?
 grep -q "lane-coverage forgiveness (#6928)" "$SCEN/err" \
   && fail "the rail disclosed a forgiveness it did not make" \
   || pass "…and no forgiveness is disclosed"
-grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
-  && pass "…with all three never-declined shards still missing" \
-  || fail "the never-declined shards are no longer counted missing"
+grep -q "did NOT EXECUTE 5 test shard" "$SCEN/err" \
+  && pass "…with all five never-declined shards still missing" \
+  || fail "the never-declined shards are no longer counted missing: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+if lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (b)' \
+   && lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (c)'; then
+  pass "…the SUFFIXED carve names among them, so their forgiveness gate is observable"
+else
+  fail "the suffixed carve shards are missing from the MISSING list — their forgiveness gate is unobserved (an UNGATED emit would pass)"
+fi
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although nothing was forgiven" || pass "no merge attempted"
 
 # (b2) PER LEG, NOT ALL-OR-NOTHING. `slow_run=false` forgives the two slow shards
 # ONLY; the carve-out leg is NOT declined here, so its absence still refuses —
-# and it is the shard still counted missing. This is the clause that stops the
-# forgiveness from becoming a general bypass of the carve-out leg.
+# and ALL THREE of its shards are still counted missing. This is the clause that
+# stops the forgiveness from becoming a general bypass of the carve-out leg, and
+# (with main's lane at its real 7-name shape) it is the clause that proves the
+# newly-listed suffixed names are NOT forgiven when the selector did not decline
+# the leg that owns them. Per-leg, per-name: the forgiveness follows the
+# selector's boolean, not the name's membership in the emitted list.
 new_scen lane6928-carveonly
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6961 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6940 6962 > "$SCEN/runs-main"
-lane_jobset 6962 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6962 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6961 success 'test (a)' 'test (b)'
 pr_changed_files docs/x.md
 selector_interp_312
@@ -6181,9 +6569,15 @@ rc=$?
 grep -q "test-slow (a) test-slow (b) \[selector: slow_run=false, carve_out_run=true\]" "$SCEN/err" \
   && pass "…forgiving exactly the two slow legs, and disclosing only those" \
   || fail "the per-leg disclosure is wrong: $(grep -m1 'forgiveness' "$SCEN/err")"
-grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
-  && pass "…and counting exactly the one non-declined shard missing" \
-  || fail "the refusal does not count only the non-declined shard: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
+  && pass "…and counting exactly the three non-declined shards missing" \
+  || fail "the refusal does not count only the non-declined shards: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+if lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (b)' \
+   && lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (c)'; then
+  pass "…naming the suffixed carve shards: a non-declined leg's names are never forgiven"
+else
+  fail "the suffixed carve shards of the NON-declined leg were forgiven — the emit gate is bypassable"
+fi
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran with a non-declined shard missing" || pass "no merge attempted"
 
 # (c) FAIL CLOSED — THE SELECTOR CANNOT BE FETCHED AT THIS HEAD. Its contents are
@@ -8906,6 +9300,57 @@ pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_r
 # it and regressed #6807's own fixture.)
 pe_paths "push + branches still exempt" no 'src/a.c'             $'on:\n  push:\n    branches: [main]\n'
 pe_paths "unfiltered push still exempt" no 'src/a.c'             $'on:\n  push:\n'
+
+# #1569 — `$slug` IS ALREADY PREFIXED, SO NO CALL SITE MAY PREFIX IT AGAIN.
+#
+# `workflow_pr_evaluable()` receives `repos/<owner>/<repo>`. The changed-file fetch
+# read `repos/$slug/pulls/…`, composing `repos/repos/…` → 404 → `WF_PR_CHANGED_PATHS`
+# EMPTY → the predicate answers `unknown` → the base-side red stays BLOCKING. Empty
+# is not neutral here; an unavailable answer is read as a blocking one.
+#
+# Two legs, and both are needed. The ABSENCE leg catches the double prefix. The
+# PRESENCE leg is anchored on the ASSIGNMENT `WF_PR_CHANGED_PATHS=`, NOT on the bare
+# path: the bare path occurs at four sites in the scanned rail (`scripts/admin-merge.sh`)
+# — the #1569 fetch, another function's lane-parity fetch, and two
+# `LANE_DECLINED_REASON="…"` message strings — so a bare-text leg stayed GREEN with
+# the fetch deleted. Anchoring on the assignment is what makes it behavioural.
+#
+# Both legs read `sed -E 's/(^|[[:space:]])#.*//'` of the rail, i.e. EXECUTABLE text.
+# The facts that pin the two fragile details, so nobody has to rediscover them:
+#   * `sed -E`, not a BRE alternation — `\|` is a GNU extension and BSD/macOS `sed`
+#     silently no-ops it, leaving the strip inert (measured: that form counts 1 here).
+#   * The strip is HEURISTIC and fails BOTH ways — a trailing comment is a loud false
+#     FAIL, and a `#` inside a quoted string truncates the line. No line today combines
+#     the latter with a later `repos/$slug`, so the count is right; re-check that first
+#     if this ever reads a surprising zero.
+#
+# Failure it prevents (#1569): a false block on every PR whose changed-file list is
+# needed. Product, not process — it guards a fail-closed predicate's INPUT.
+_code="$(sed -E 's/(^|[[:space:]])#.*//' "$ADM" || true)"
+_dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
+[ "$_dbl" = "0" ] \
+  && pass "the rail never double-prefixes the slug in code — #1569" \
+  || fail "$ADM composes repos/\$slug at $_dbl executable site(s); \$slug already carries the prefix — repos/repos/… 404s and the fetch returns nothing (#1569)"
+# `<<<` AND NOT A PIPE: `printf … | grep -q` is the repo's banned #841 anti-pattern.
+# `grep -q` exits at its FIRST match, `printf` takes SIGPIPE (141), and
+# `set -uo pipefail` (run.sh:192) makes that a non-zero pipeline status — DISCARDING
+# the match. Measured here: payload 117 227 bytes, match 78 448 bytes before the end,
+# rc=141 on the CORRECT tree, i.e. a permanent false FAIL reddening every PR.
+#
+# The race needs ALL of: `pipefail`, a payload past the ~64 KiB pipe buffer AFTER the
+# match, and the match on an EARLY line (see `scripts/check-no-sigpipe-grep.sh`).
+# SIZE IS ONE OF THEM — a 764-byte payload with an early match returns rc=0 — so the
+# other `printf … | grep -q` sites in `tests/` are safe for their SIZE, not their
+# line count (`tests/admin-merge/run.sh:5993` pipes a 121-line, ~8 KB body).
+#
+# The absence leg above is deliberately `grep -c`: it must read the WHOLE input to
+# count, so it cannot exit early and cannot take SIGPIPE.
+#
+# That guard did not catch this one because its `SCAN_DIRS` is
+# `(scripts .husky pi-bootstrap)` — `tests/` is NOT scanned.
+grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
+  && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
+  || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

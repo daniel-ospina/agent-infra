@@ -217,13 +217,22 @@ closing_issue_refs() {
 #
 # It is also deliberately narrower than the other two content-shape classes in
 # this repo, and it must NOT be replaced by either:
-#   * check-pipeline-compliance.sh::pr_is_artifact_only (:709) is check (a)'s
+#   * check-pipeline-compliance.sh::pr_is_artifact_only is check (a)'s
 #     closure fallback: it admits ANY file under docs/ (so `docs/evil.sh` would
-#     be an "artifact"), skills/**/*.md (agent-executable instructions) and
-#     .github/CODEOWNERS (review routing — enforcement input).
-#   * extensions/verification-gate::isShapeExemptFile (:759) is a LOCAL
+#     be an "artifact"), AGENTS.md and skills/**/*.md / templates/**/*.md
+#     (agent-executable instructions — the template is the source that
+#     materializes into every repo's AGENTS.md) and .github/CODEOWNERS (review
+#     routing — enforcement input). No line numbers cited for either class:
+#     the sibling was already 5 lines out when checked (2026-10-06), and the
+#     other is moved by any edit above it — as this very change demonstrates —
+#     so `file::function` is the stable citation.
+#   * extensions/verification-gate::isShapeExemptFile is a LOCAL
 #     pre-flight skip; it admits .md/.css/.html ANYWHERE, including build
-#     inputs such as templates/AGENTS.base.md.
+#     inputs such as templates/AGENTS.base.md. (After #1409 the closure class
+#     admits that path too, but for a different reason and a different job:
+#     check (a) asks "does this PR close an issue", the attestation class asks
+#     "is this diff inert enough to carry a merge attestation". The divergence
+#     stands and is deliberate.)
 # A class is only as trustworthy as the gate it protects, and this one protects
 # a merge attestation — hence the tightest of the three. The divergence is
 # deliberate; sharing or copying one of the others here would make this guard
