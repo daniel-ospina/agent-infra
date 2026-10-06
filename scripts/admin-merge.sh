@@ -1738,6 +1738,7 @@ LANE_PARITY_SELECTOR_VERDICT=""
 # a rc==0 parity result.
 lane_parity_check() {
   local head="$1" main_runs="$2" rc=0
+  local LANE_PR_FROZEN="" LANE_MAIN_FROZEN="" LANE_DECLINED_FROZEN=""
   LANE_PARITY_REASON=""
   if [ -z "${TMP:-}" ] || [ ! -d "${TMP:-}" ]; then
     say_err "admin-merge: ✗ internal error — lane parity called without a TMP directory"
@@ -1747,14 +1748,40 @@ lane_parity_check() {
   : > "$TMP/lane-pr.txt"
   : > "$TMP/lane-main.txt"
   : > "$TMP/lane-missing.txt"
+  # ── THE TWO REFERENCES MUST BE DISTINCT FILES THIS GATE CREATED (#1439) ────
+  # Everything below, and the certificate itself, reads these two files, and this
+  # function writes them. If one is a symlink/hard link onto the other (or onto
+  # any other scratch file), the gate's OWN writes corrupt the references the
+  # comparison is made of, and no comparison of the files can detect it. So state
+  # the invariant instead of discovering it: both must be regular files, and they
+  # must not be the same file.
+  if [ -L "$TMP/lane-pr.txt" ] || [ -L "$TMP/lane-main.txt" ] \
+     || [ "$TMP/lane-pr.txt" -ef "$TMP/lane-main.txt" ]; then
+    say_err "admin-merge: ✗ the lane references are not two distinct regular files — lane coverage unverifiable (a scratch path is a symlink or is aliased onto another)"
+    LANE_PARITY_REASON="the lane references are aliased onto each other, so this gate's own writes would corrupt what it compares"
+    return 2
+  fi
   if ! lane_shard_set --commit "$head" 100 "$TMP/lane-pr.txt"; then
     LANE_PARITY_REASON="the PR head's lane runs could not be listed or read"
     return 2
   fi
+  # ── FREEZE EACH REFERENCE AS SOON AS ITS OWN FETCH RETURNS (#1439) ──────────
+  # freezing BOTH after both fetches is not enough, because a cross-alias makes the
+  # second fetch OVERWRITE the first reference: with `lane-main.txt` a symlink to
+  # `lane-pr.txt`, main's fetch (`: > "$out"` + append) truncates and refills the PR
+  # file, so a freeze taken afterwards records MAIN's set as BOTH references — the
+  # integrity check below then has nothing to catch, the subtraction compares main
+  # with itself, and the rail certifies `PR ⊇ main` for a head that ran a fraction of
+  # main's lane. Freezing each side the moment it is fetched keeps the two snapshots
+  # the two different lanes, so any such overwrite shows up as a MOVED input.
+  # (The identity check above catches the alias directly; this catches the class of
+  # writes that arrive through any OTHER scratch name.)
+  LANE_PR_FROZEN="$(cat "$TMP/lane-pr.txt")"
   if ! lane_shard_set --branch main "$main_runs" "$TMP/lane-main.txt"; then
     LANE_PARITY_REASON="main's lane runs could not be listed or read"
     return 2
   fi
+  LANE_MAIN_FROZEN="$(cat "$TMP/lane-main.txt")"
   # Capture MAIN's window accounting NOW: the LANE_SET_* globals are overwritten
   # by every lane_shard_set call, and the reason below is a claim about MAIN.
   local main_listed="$LANE_SET_LISTED" main_window="$LANE_SET_WINDOW"
@@ -1832,6 +1859,10 @@ lane_parity_check() {
   if [ "$(lane_count "$TMP/lane-missing.txt")" -gt 0 ]; then
     if lane_declined_shards "$head" "$TMP/lane-declined.txt"; then
       if [ "$(lane_count "$TMP/lane-declined.txt")" -gt 0 ]; then
+        # Freeze the DECLINED listing too, before the forgiveness writes below: it
+        # is an INPUT of the union claim, and one of those writes could otherwise be
+        # redirected onto it (a symlink on `lane-kept.txt` is enough to rewrite it).
+        LANE_DECLINED_FROZEN="$(cat "$TMP/lane-declined.txt")"
         # The shards ACTUALLY in this head's gap that the selector DECLINED — the
         # INTERSECTION, so the disclosure names only legs this head really did not
         # run. Same subtraction shape as the coverage gap above, same fail-CLOSED
@@ -1895,6 +1926,24 @@ lane_parity_check() {
   # planted destination whose CONTENT is crafted, would defeat a check that consults
   # them — a hostile host, out of the threat model, which is a bad PR and a FAILED
   # WRITE. The suite's shims model failed writes.)
+  # ── THE INPUTS THE DECISION READS MUST NOT HAVE MOVED (#1439 cycle-5) ───────
+  # The claim below is a claim about the frozen lists, so it is only sound if the
+  # FILES still hold them. This function writes into its own scratch directory, and
+  # a write that is ALIASED onto an input rewrites that input — the subtraction's
+  # redirect onto `lane-main.txt` is the cheapest form (see the freeze above). It is
+  # caught here, before anything is decided, and refused as unverifiable rather than
+  # compared. (`cat` of a dangling symlink yields the empty string, which differs
+  # from any non-empty frozen list, so a DELETED reference is caught too.)
+  local inputs_moved=0
+  if [ "$(cat "$TMP/lane-pr.txt" 2>/dev/null)" != "$LANE_PR_FROZEN" ]; then inputs_moved=1; fi
+  if [ "$(cat "$TMP/lane-main.txt" 2>/dev/null)" != "$LANE_MAIN_FROZEN" ]; then inputs_moved=1; fi
+  if [ -n "$LANE_PARITY_FORGIVEN" ] \
+     && [ "$(cat "$TMP/lane-declined.txt" 2>/dev/null)" != "$LANE_DECLINED_FROZEN" ]; then inputs_moved=1; fi
+  if [ "$inputs_moved" -eq 1 ]; then
+    say_err "admin-merge: ✗ a lane reference CHANGED while parity was being decided — lane coverage unverifiable (a write in this gate's own scratch directory was aliased onto an input the decision reads)"
+    LANE_PARITY_REASON="a lane reference changed while parity was being decided, so the comparison cannot be trusted"
+    return 2
+  fi
   local covered_rc=0
   if [ -n "$LANE_PARITY_FORGIVEN" ]; then
     grep -vxF -f "$TMP/lane-pr.txt" -f "$TMP/lane-declined.txt" "$TMP/lane-main.txt" > /dev/null || covered_rc=$?

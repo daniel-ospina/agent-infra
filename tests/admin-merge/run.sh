@@ -5797,6 +5797,91 @@ grep -q "came back EMPTY although main's lane holds a shard that is neither in t
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the gap could not be recorded" \
   || pass "…and no merge was attempted"
 
+# (j6) ✗ THE GAP DESTINATION CAN BE ALIASED ONTO AN INPUT (#1439 cycle-5). The
+# subtraction is `grep -vxF -f lane-pr.txt lane-main.txt > lane-missing.txt`. When
+# `lane-missing.txt` IS `lane-main.txt`, that redirect TRUNCATES THE REFERENCE before
+# grep opens its inputs, so the subtraction compares an EMPTY main, selects nothing and
+# exits 1 — the "no differences" status the rc>1 guard accepts — the gap reads EMPTY so
+# the forgiveness block is skipped, and a membership test re-reads the same now-empty
+# file and agrees with it. Reproduced end-to-end by the cycle-5 adversarial review:
+# rc 0, evidence posted, the REAL evidence gate ACCEPTS the body, `pr merge` called,
+# with the line `… (parity family: test*; 1 shard(s) on the PR side, 0 on main)` for a
+# fixture whose main ran TWO shards. Both references are therefore FROZEN before any
+# write in this function, and the decision refuses when a write moved one.
+new_scen lanealiasgap
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB3'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-main.txt" "$d/lane-missing.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB3
+chmod +x "$SCEN/bin/mktemp"
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainee77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'              # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)'   # …main ran TWO: a real 1-shard gap
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "a lane reference ALIASED onto the gap destination REFUSES (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' from a reference its own redirect had truncated — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err" \
+  && pass "…named as a MOVED input, not read as a coverage result" \
+  || fail "the refusal does not name the changed lane reference"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although an input moved under the decision" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although an input moved under the decision" \
+  || pass "…and no merge was attempted"
+
+# (j7) ✗ AN INPUT-TO-INPUT ALIAS CORRUPTS A REFERENCE BEFORE IT CAN BE FROZEN
+# (#1439 cycle-6). With `lane-main.txt` a symlink to `lane-pr.txt`, main's fetch
+# (`: > "$out"` then append) TRUNCATES AND REFILLS the PR file, so a freeze taken after
+# both fetches recorded MAIN's set as BOTH references — the subtraction then compared
+# main WITH ITSELF and the rail certified `PR ⊇ main … (3 shard(s))` for a head that
+# ran 1 of main's 3 shards (reproduced by the cycle-6 review: rc 0, evidence posted,
+# the REAL evidence gate ACCEPTS the body, `pr merge` called). The two references must
+# be DISTINCT regular files, and each is frozen the moment its OWN fetch returns.
+new_scen lanealiasrefs
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB4'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-pr.txt" "$d/lane-main.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB4
+chmod +x "$SCEN/bin/mktemp"
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9887 > "$SCEN/runs-$HEAD_VP"
+lane_pass mainff77 9888 > "$SCEN/runs-main"
+lane_jobset 9887 success 'test (a)'                        # the PR ran ONE shard…
+lane_jobset 9888 success 'test (a)' 'test (b)' 'test (c)' # …main ran THREE
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SCEN/bin:$PATH" bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "two lane references that are the SAME file REFUSE (exit $rc)" \
+  || fail "the rail CERTIFIED 'PR ⊇ main' by comparing main WITH ITSELF — the evidence gate ACCEPTS that body and the merge proceeds"
+grep -q "lane references are not two distinct regular files" "$SCEN/err" \
+  && pass "…named as an aliased scratch path, not read as a coverage result" \
+  || fail "the refusal does not name the aliased lane reference"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although the references were aliased" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the references were aliased" \
+  || pass "…and no merge was attempted"
+
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
 # (`declared_of`) or a casing variant would otherwise take the "not require"
 # branch and certify WITHOUT the disclosure — a typo is not a declaration.
