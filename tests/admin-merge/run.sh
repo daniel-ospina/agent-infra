@@ -6305,7 +6305,7 @@ new_scen lane6928-docsonly
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6931 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6938 6932 > "$SCEN/runs-main"
-lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6932 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6931 success 'test (a)' 'test (b)'
 pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
 selector_interp_312
@@ -6323,8 +6323,10 @@ lane6928_disc="$(grep -m1 'lane-coverage forgiveness (#6928)' "$SCEN/err")"
 if printf '%s' "$lane6928_disc" | grep -q 'test-slow (a)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-slow (b)' \
    && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (b)' \
+   && printf '%s' "$lane6928_disc" | grep -q 'test-carve-out (c)' \
    && printf '%s' "$lane6928_disc" | grep -q 'selector: slow_run=false, carve_out_run=false'; then
-  pass "…naming all three forgiven shards AND the selector verdict it rests on"
+  pass "…naming all five forgiven shards AND the selector verdict it rests on"
 else
   fail "the disclosure does not name the shards and verdict: $lane6928_disc"
 fi
@@ -6337,7 +6339,7 @@ grep -q "lane-coverage forgiveness (#6928)" "$SCEN/comment" \
 # the PR did NOT execute every shard main ran — so the line itself must carry the
 # exception, not leave the correction to prose on the next line.
 lane6928_par="$(grep -m1 'lane parity:' "$SCEN/comment" | sed 's/^[[:space:]]*//')"
-expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 3 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 5 on main)"
+expected6928_par="lane parity: PR ⊇ main — the PR executed every test shard main's lane executed EXCEPT the 5 shard(s) its diff selector DECLINED for this head, which are forgiven (parity family: test*; 2 shard(s) on the PR side, 7 on main)"
 if [ "$lane6928_par" = "$expected6928_par" ]; then
   pass "#6928 P3a: the certified \`lane parity:\` line itself STATES the exception"
 else
@@ -6410,14 +6412,34 @@ grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "declared-off attempted the merge after refusing" \
   || pass "…and attempts no merge"
 
+# lane_missing_shards <err-file> — print ONLY the "shard(s) main EXECUTED and
+# this head did not" block. The assertions below must be scoped to it: the
+# forgiveness DISCLOSURE carries shard names too, so a whole-file `grep` cannot
+# tell "counted missing" from "named as forgiven" and an ungated emit satisfies
+# it while actually forgiving the shard (measured — the whole-file form passed a
+# suffix-ungated mutant). The block the count introduces is the only place that
+# means "still missing".
+lane_missing_shards() {
+  awk '/shard\(s\) main EXECUTED and this head did not:/{f=1;next} f && /^   [A-Za-z]/{exit} f' "$1"
+}
+
 # (b) NOTHING DECLINED → NOTHING FORGIVEN. A diff the selector says selects both
-# legs leaves the raw gap intact: the three legs stay missing and the refusal is
-# the one the rail issued before the fix.
+# legs leaves the raw gap intact: the five gated shards stay missing and the
+# refusal is the one the rail issued before the fix.
+#
+# MAIN'S LANE CARRIES ALL THREE CARVE-OUT NAMES ON PURPOSE. The forgiveness arm
+# emits the carve names only inside `if [ "$cp" = "false" ]`; a regression that
+# emitted them UNGATED would forgive a shard the selector did NOT decline. That
+# regression is only OBSERVABLE if main's lane actually contains the suffixed
+# names — they have to be in the gap for a bogus forgiveness to shrink it. With
+# a bare-name-only lane the two new entries are never intersectable, so the
+# unguarding bug would pass this scenario while failing in production (where
+# main's lane is the real 7-name shape). This scenario is the trap for it.
 new_scen lane6928-bothselected
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6951 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6939 6952 > "$SCEN/runs-main"
-lane_jobset 6952 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6952 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6951 success 'test (a)' 'test (b)'
 pr_changed_files src/deep/module.py
 selector_interp_312
@@ -6429,20 +6451,30 @@ rc=$?
 grep -q "lane-coverage forgiveness (#6928)" "$SCEN/err" \
   && fail "the rail disclosed a forgiveness it did not make" \
   || pass "…and no forgiveness is disclosed"
-grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
-  && pass "…with all three never-declined shards still missing" \
-  || fail "the never-declined shards are no longer counted missing"
+grep -q "did NOT EXECUTE 5 test shard" "$SCEN/err" \
+  && pass "…with all five never-declined shards still missing" \
+  || fail "the never-declined shards are no longer counted missing: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+if lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (b)' \
+   && lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (c)'; then
+  pass "…the SUFFIXED carve names among them, so their forgiveness gate is observable"
+else
+  fail "the suffixed carve shards are missing from the MISSING list — their forgiveness gate is unobserved (an UNGATED emit would pass)"
+fi
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran although nothing was forgiven" || pass "no merge attempted"
 
 # (b2) PER LEG, NOT ALL-OR-NOTHING. `slow_run=false` forgives the two slow shards
 # ONLY; the carve-out leg is NOT declined here, so its absence still refuses —
-# and it is the shard still counted missing. This is the clause that stops the
-# forgiveness from becoming a general bypass of the carve-out leg.
+# and ALL THREE of its shards are still counted missing. This is the clause that
+# stops the forgiveness from becoming a general bypass of the carve-out leg, and
+# (with main's lane at its real 7-name shape) it is the clause that proves the
+# newly-listed suffixed names are NOT forgiven when the selector did not decline
+# the leg that owns them. Per-leg, per-name: the forgiveness follows the
+# selector's boolean, not the name's membership in the emitted list.
 new_scen lane6928-carveonly
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 6961 > "$SCEN/runs-$HEAD_VP"
 lane_pass main6940 6962 > "$SCEN/runs-main"
-lane_jobset 6962 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6962 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out' 'test-carve-out (b)' 'test-carve-out (c)'
 lane_jobset 6961 success 'test (a)' 'test (b)'
 pr_changed_files docs/x.md
 selector_interp_312
@@ -6454,9 +6486,15 @@ rc=$?
 grep -q "test-slow (a) test-slow (b) \[selector: slow_run=false, carve_out_run=true\]" "$SCEN/err" \
   && pass "…forgiving exactly the two slow legs, and disclosing only those" \
   || fail "the per-leg disclosure is wrong: $(grep -m1 'forgiveness' "$SCEN/err")"
-grep -q "did NOT EXECUTE 1 test shard" "$SCEN/err" \
-  && pass "…and counting exactly the one non-declined shard missing" \
-  || fail "the refusal does not count only the non-declined shard: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
+  && pass "…and counting exactly the three non-declined shards missing" \
+  || fail "the refusal does not count only the non-declined shards: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
+if lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (b)' \
+   && lane_missing_shards "$SCEN/err" | grep -q 'test-carve-out (c)'; then
+  pass "…naming the suffixed carve shards: a non-declined leg's names are never forgiven"
+else
+  fail "the suffixed carve shards of the NON-declined leg were forgiven — the emit gate is bypassable"
+fi
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran with a non-declined shard missing" || pass "no merge attempted"
 
 # (c) FAIL CLOSED — THE SELECTOR CANNOT BE FETCHED AT THIS HEAD. Its contents are
