@@ -2632,6 +2632,12 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     union.files.push(...subbed.files);
     union.renameOldPaths.push(...subbed.renameOldPaths);
     union.clean = union.clean && subbed.clean;
+    // #7526: thread the deletion projection through the manual multi-refspec
+    // union — `combineScopes` owns the mixed-arm rule, but this arm rebuilds
+    // its own object below, so the field must be carried explicitly.
+    if (subbed.deleted !== undefined) {
+      union.deleted = [...(union.deleted ?? []), ...subbed.deleted];
+    }
     if (subbed.subtractions !== undefined) {
       union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
     }
@@ -2686,12 +2692,17 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
   // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
-  // is therefore carried explicitly and null-safely.
+  // and the #7526 `deleted` projection are therefore carried explicitly and
+  // null-safely (a rebuilt object that forgot `deleted` would re-open the
+  // deletion-block this change closes, silently).
   emitPendingRewrites();
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
     clean: union.clean,
+    ...(union.deleted !== undefined && union.deleted.length > 0
+      ? { deleted: Array.from(new Set(union.deleted)) }
+      : {}),
     ...(union.subtractions !== undefined && union.subtractions.length > 0
       ? { subtractions: union.subtractions }
       : {}),
@@ -2720,6 +2731,16 @@ export interface DiffScope {
    *  nothing was subtracted. `combineScopes` concatenates it and reads nothing
    *  else, so `DiffScope`-shaped literals without the key stay valid. */
   subtractions?: SubAudit[];
+  /** #7526: paths whose row letter is `D` — the verify path's DELETION
+   *  exclusion. A `D` row has no post-commit content, so "verify this path"
+   *  has no referent: the verify path subtracts this set from `files` before
+   *  hashing (a deletion-only change therefore verifies nothing and is
+   *  allowed). This is a SEPARATE projection, NOT a filter of the parser's
+   *  faithful output — `files` still carries every `D` path (the G1 pin
+   *  requires it). ABSENT (never `[]`) when nothing was deleted, so the
+   *  whole-object `deepEqual` pins on `parseDiffNameStatus...` are unchanged;
+   *  `combineScopes`/the push union it the same way `renameOldPaths` is. */
+  deleted?: string[];
 }
 
 // Pure `--name-status -z` parser. Row grammar (byte-exact, verified against
@@ -2739,9 +2760,12 @@ export interface DiffScope {
 // semantics (documented residual, #559 plan §1); only a NUL-stream anomaly is
 // newly fail-closed.
 export function parseDiffNameStatus(output: string): DiffScope {
-  // Thin wrapper — the seven G1 full-object deepEqual pins compare `.scope`, so
-  // splitting the parser must not change the returned object's shape.
-  return parseDiffNameStatusDetailed(output).scope;
+  // Thin wrapper — the G1 full-object deepEqual pins compare the WHOLE returned
+  // object, so this wrapper keeps its exact pre-#7526 shape: the #7526 `deleted`
+  // projection is a DETAILED-parse extra and is dropped here. Splitting the
+  // parser must never change this object's shape.
+  const { deleted: _deleted, ...scope } = parseDiffNameStatusDetailed(output).scope;
+  return scope;
 }
 
 /** #755 — the same parse, plus the per-path STATUS map the eligibility rule
@@ -2806,7 +2830,18 @@ export function parseDiffNameStatusDetailed(output: string): {
       i++;
     }
   }
-  return { scope: { files, renameOldPaths, clean }, statuses };
+  // #7526: the deletion projection, derived from the SAME status map the
+  // subtraction rule reads (never re-derived from the raw stream — a second
+  // parse could drift). Keyed off the map, so a repeated path is reported once
+  // and an anomaly's partial map yields a partial (never fabricated) set; the
+  // parse-block runs first, so a partial set is never consulted.
+  const deleted = [...statuses.entries()].filter(([, letter]) => letter === "D").map(([path]) => path);
+  return {
+    scope: deleted.length > 0
+      ? { files, renameOldPaths, clean, deleted }
+      : { files, renameOldPaths, clean },
+    statuses,
+  };
 }
 
 function execDiffStatusZ(cwd: string, cmd: string): string | null {
@@ -2835,7 +2870,12 @@ export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
   // falsify the "absent, never []" contract the emit site keys on.
   // Reads NOTHING else on `a`/`b`, so the G4 pins stay green.
   const subs = [...(a.subtractions ?? []), ...(b.subtractions ?? [])];
-  return subs.length > 0 ? { ...core, subtractions: subs } : core;
+  const withSubs = subs.length > 0 ? { ...core, subtractions: subs } : core;
+  // #7526: union the deletion projection like `renameOldPaths` (dedupe), and
+  // absence-preserving like `subtractions` — the G4 whole-object literals carry
+  // no `deleted`, so an always-materialised `[]` would falsify the contract.
+  const deleted = Array.from(new Set([...(a.deleted ?? []), ...(b.deleted ?? [])]));
+  return deleted.length > 0 ? { ...withSubs, deleted } : withSubs;
 }
 
 function resolveGitRoot(cwd: string): string {
@@ -3077,6 +3117,30 @@ export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeG
     case "verify":
       return { action: "verify", files };
   }
+}
+
+/** #7526 — the verify path's candidate set: the routed `files` MINUS the
+ *  scope's `deleted` projection. A `D` row has no post-commit content, so
+ *  there is nothing for a verifier to hash; asking for one would make the gate's
+ *  cost scale with the number of files a change REMOVES (the report: 2,259
+ *  untracked vendored files → 2,259 "unverified" entries). A deletion-only
+ *  change filters to EMPTY — nothing to verify, so the caller allows it via the
+ *  same empty-allow posture as a genuinely empty diff.
+ *
+ *  This is the DECISION point, deliberately downstream of `applyScopeGate`:
+ *  the parser and the gate's parse-block / empty / exemption / rename-source
+ *  routing still see every path, and `A`/`M`/`R`/`T`/`U`/`X`/`B` pass through
+ *  untouched. Pure + exported so the decision is unit-pinned — a regression
+ *  cannot silently re-add a deleted path to the candidate set.
+ *
+ *  Note: for a plain staged deletion (`git rm`) the worktree path is already
+ *  absent, so the loop's #920 ENOENT skip reached the same outcome; this
+ *  exclusion is what also covers the UNTRACK case (`git rm --cached`), where
+ *  the file is still on disk but no longer committed. */
+export function verificationCandidates(files: string[], deleted: readonly string[] | undefined): string[] {
+  if (deleted === undefined || deleted.length === 0) return files;
+  const deletedSet = new Set(deleted);
+  return files.filter((f) => !deletedSet.has(f));
 }
 
 /**
@@ -3969,9 +4033,20 @@ export default function (pi: ExtensionAPI) {
 
     // verify path — renameOldPaths never reach verify/hash/naming (consumed
     // only by the gate); changedFiles stays the new-path projection.
-    const changedFiles = route.files;
+    //
+    // #7526: DELETED paths are subtracted HERE — the DECISION point — never in
+    // the parser (`files` must remain the faithful projection; the G1 pin
+    // requires a `D` path to stay in it) and never in the parse-block / empty /
+    // exemption routing above (all of which still see every path). A `D` row has
+    // no post-commit content: an untracked file is no longer committed, so
+    // requiring a verifier hash for it has no referent. A deletion-only change
+    // filters to empty and is allowed exactly like the empty-allow route —
+    // nothing to verify.
+    const changedFiles = verificationCandidates(route.files, scope.deleted);
     if (changedFiles.length === 0) {
-      // (unreachable — empty-allow handled above; defensive)
+      // #7526: reachable when EVERY candidate is deleted (deletion-only
+      // change) — nothing to verify, allow. (Also the defensive empty case for
+      // the verify route: empty-allow was handled above.)
       return undefined;
     }
 

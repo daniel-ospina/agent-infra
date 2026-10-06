@@ -7,7 +7,7 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.js";
 import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
@@ -3425,6 +3425,78 @@ test("#755 E: empty output is clean with an empty map (vacuous, not an anomaly)"
   deepEqual(e.scope, { files: [], renameOldPaths: [], clean: true });
   equal(e.statuses.size, 0);
 });
+
+// ── #7526: deletion-aware verification candidates ──────
+// The gate was deletion-blind: a `D` row was treated exactly like a modified
+// path, so untracking N files produced N "Unverified files" entries demanding a
+// sha256 of content the commit no longer contains. The fix is ADDITIVE and lives
+// at the DECISION point (`verificationCandidates`), never in the parser: `files`
+// must stay a faithful projection (the G1 pin owns it), and the parse-block /
+// empty / exemption routing must still see every path.
+section("#7526: deleted paths are excluded from the verification candidate set");
+
+test("#7526: contract pin — `D` still lands in `files` and the wrapper shape is unchanged", () => {
+  // The parser must NOT be where deletion is dropped: this exact object is the
+  // G1 pin, and `files` is the faithful projection of what git emitted. If this
+  // fails, the change was made in the wrong layer — re-read the #7526 spec.
+  deepEqual(parseDiffNameStatus("D\0src/old.ts\0"), { files: ["src/old.ts"], renameOldPaths: [], clean: true });
+});
+
+test("#7526: the DETAILED parse carries the deleted projection, files untouched", () => {
+  const { scope } = parseDiffNameStatusDetailed("D\0src/old.ts\0");
+  deepEqual(scope.deleted, ["src/old.ts"]);
+  deepEqual(scope.files, ["src/old.ts"], "files keeps the D path — the projection is separate");
+});
+
+test("#7526: a MIXED diff lists the deleted path AND keeps both paths in files", () => {
+  const { scope } = parseDiffNameStatusDetailed("A\0docs/new.md\0D\0src/old.ts\0");
+  deepEqual(scope.deleted, ["src/old.ts"]);
+  deepEqual(scope.files.sort(), ["docs/new.md", "src/old.ts"].sort());
+});
+
+test("#7526: no deletions → `deleted` is ABSENT (not `[]`)", () => {
+  const { scope } = parseDiffNameStatusDetailed("A\0docs/new.md\0M\0src/app.ts\0");
+  equal(scope.deleted, undefined, "absent, mirroring the subtractions absence contract");
+  deepEqual(scope, { files: ["docs/new.md", "src/app.ts"], renameOldPaths: [], clean: true });
+});
+
+test("#7526: combineScopes unions the deleted projection (dedupe, absence-preserving)", () => {
+  const a = { files: ["a.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["b.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts", "other.ts"] };
+  deepEqual(combineScopes(a, b).deleted, ["gone.ts", "other.ts"]);
+  const none = combineScopes(
+    { files: ["x.ts"], renameOldPaths: [], clean: true },
+    { files: ["y.ts"], renameOldPaths: [], clean: true },
+  );
+  equal(none.deleted, undefined, "no deletions on either arm → absent, never []");
+  deepEqual(combineScopes(a, { files: ["b.ts"], renameOldPaths: [], clean: true }).deleted, ["gone.ts"],
+    "present on one arm survives the union");
+});
+
+test("#7526 DECISION: verificationCandidates subtracts deleted; a deletion-only set is EMPTY", () => {
+  // The verify path lives inside the `pi.on("tool_call")` handler and is NOT
+  // reachable from this unit suite — this pure function IS the decision it makes.
+  deepEqual(verificationCandidates(["docs/new.md", "src/old.ts"], ["src/old.ts"]), ["docs/new.md"],
+    "a mixed set keeps only the non-deleted candidate");
+  deepEqual(verificationCandidates(["src/old.ts"], ["src/old.ts"]), [],
+    "deletion-only ⇒ EMPTY candidate set ⇒ nothing to verify ⇒ allowed (not blocked)");
+  deepEqual(verificationCandidates(["a.ts"], undefined), ["a.ts"], "no projection ⇒ identity");
+  deepEqual(verificationCandidates(["a.ts"], []), ["a.ts"], "empty projection ⇒ identity");
+});
+
+test("#7526 DECISION: only `D` is excluded — A/M/R/T/U/X/B all remain candidates", () => {
+  const { scope } = parseDiffNameStatusDetailed(
+    "A\0a.ts\0M\0m.ts\0R100\0old.ts\0r.ts\0T\0t.ts\0U\0u.ts\0X\0x.ts\0B\0b.ts\0",
+  );
+  equal(scope.deleted, undefined, "no D row ⇒ no deleted projection");
+  deepEqual(scope.files.sort(), ["a.ts", "b.ts", "m.ts", "r.ts", "t.ts", "u.ts", "x.ts"].sort());
+  deepEqual(
+    verificationCandidates(scope.files, scope.deleted).sort(),
+    ["a.ts", "b.ts", "m.ts", "r.ts", "t.ts", "u.ts", "x.ts"].sort(),
+    "every non-D letter is still verified",
+  );
+});
+
 // ── #3255: worktree-aware root resolution ─────────────
 // The cwd's git root is the HUB when the change lives in a linked worktree,
 // while the bridge's compound keys are keyed on the WORKTREE (verification is
