@@ -388,8 +388,9 @@ function cmdUpdate() {
  *  a symlink body discovered while walking the path — a link whose body is
  *  `sub/../other` with `sub` itself a link (measured, Node v22.23.2: `.native`
  *  -> <target>/other, `fs.realpathSync` -> ENOENT). Note that a `..` in the LINK
- *  TARGET cannot exercise this: `path.resolve` at the call site (:626) collapses
- *  it before resolution, so this function only ever sees a `..`-free path. */
+ *  TARGET cannot exercise this: `path.resolve`, at the site that builds
+ *  `resolved`, collapses it before resolution — so this function only ever sees
+ *  a `..`-free path. */
 function physical(p) {
   return fs.realpathSync.native(p);
 }
@@ -414,7 +415,8 @@ function physical(p) {
  *  verdict rather than guard one: an absent machine-local link is deliberately
  *  `info`/exit 0 on GitHub-hosted runners (pinned by tests/drift/run.sh case 18),
  *  so failing it would redden every consumer's dangling link. `repoRootFor`
- *  falls back the same way, so both sides degrade together. */
+ *  falls back to the caller's spelling too, though on a DIFFERENT condition (any
+ *  unresolvable `dir`, not only an unresolvable root) — see its comment. */
 function canonicalizeExisting(p) {
   let head = p;
   const tail = [];
@@ -454,10 +456,16 @@ function repoRootFor(dir) {
   // different namespaces — re-creating the exact mismatch this anchoring exists
   // to remove (observed: it reddened the suite by classifying an in-repo target
   // as machine-local whenever the checked dir was not a git work tree).
-  // The final `return dir` IS lexical, deliberately: it fires only when `dir`
-  // itself does not resolve — the same degenerate case canonicalizeExisting
-  // falls back on — so both sides degrade to the caller's spelling together
-  // rather than one side silently keeping a namespace the other has left.
+  // The final `return dir` IS lexical, deliberately. It is NOT the same
+  // condition as canonicalizeExisting's fallback, and an earlier revision of
+  // this comment wrongly said so: that one fires only when the upward walk
+  // reaches an unresolvable ROOT, whereas this fires whenever `physical(dir)`
+  // throws for ANY reason — a missing leaf or a missing component is enough.
+  // So when `dir` is missing but the root resolves, THIS side stays lexical
+  // while the target side is canonicalized; the two are not equivalent.
+  // The mismatch cannot reach a verdict: the carve-out is only reached after
+  // readlinkSafe(targetDir/scripts) succeeds, which requires targetDir to be a
+  // resolvable directory, so physical(dir) does not throw on the classify path.
   try {
     return physical(dir);
   } catch {

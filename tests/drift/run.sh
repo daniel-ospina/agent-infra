@@ -381,7 +381,14 @@ echo "19. targetDir reached through a SYMLINK → in-repo target still drift (#7
 # ABSOLUTE (`$INSIDE_LINK/scripts`), so `resolved` is already physical whatever
 # TMPDIR is — the spelling never differs, so no mutation of the canonicalization
 # can change this case's verdict. A RELATIVE-link variant of the same shape does
-# redden. Case 15 remains the case that pins it; do not cite this one for that.
+# redden. The cases that DO pin it are 20, 21 and 22 (a dangling relative
+# target reached through a symlinked targetDir; a target that is itself a
+# symlink to a wrong subdir; and a link via a symlink to a real scripts dir).
+# Do NOT cite case 15 for that: verified by mutation (forcing the canonical
+# target to be the lexical `resolved`) with a symlink-free ROOT and TMPDIR —
+# the runner shape — case 15 stays GREEN while 20/21/22 redden. Case 15 reddens
+# only when TMPDIR/ROOT themselves sit behind a symlink (macOS /tmp, /var),
+# which is why it can look sensitive on a dev box yet is not on the runner.
 LINK="$(mktemp -d "${TMPDIR:-/tmp}/ai-link.XXXXXX")/via-link"
 ln -sfn "$ROOT" "$LINK"
 INSIDE_LINK="$FIX/verify-inside-link"
