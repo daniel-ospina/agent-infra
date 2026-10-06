@@ -1037,6 +1037,88 @@ grep -qE '/branches/[^/]+/protection' "$SCEN/calls" \
   && fail "read protection although the restore short-circuits it" \
   || pass "no protection read when the restore is set (the old behaviour is intact)"
 
+# ═══ 17g-D. #7230 — the drift trigger must NOT pre-empt CLEAN ═════════════
+# The defect: `mergeStateStatus=CLEAN` + a head that is behind the base went down the
+# BASE-DRIFT arm, which fires BEFORE the `elif CLEAN` no-op — so the one state that is
+# already landable was the one state guaranteed to be refreshed. The head moved, the
+# head-bound record died at step 3 (#1575 clause E, correctly), and the rail could
+# never land the PR. The live repro is #7462 (head `b6bbd415e131…`, 1 commit behind,
+# CLEAN, strict=false): this scenario is that read, reconstructed.
+echo "── 17g-D1. CLEAN + behind>0 + strict=false + mergeable ⇒ the head is KEPT and it lands"
+new_scen cleandrift
+printf 'CLEAN\n'    > "$SCEN/state"
+printf '1\n'        > "$SCEN/behind"
+printf 'false\n'    > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a CLEAN, mergeable PR under strict=false — the #7230 defect (head moved for nothing, record invalidated)" \
+  || pass "did NOT refresh (the drift trigger no longer pre-empts CLEAN)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was — the artifact this fix exists to produce" \
+  || fail "the head moved"
+called "record-review" \
+  && fail "re-recorded after a skip (the head did not move)" \
+  || pass "no re-record: the record at this head stayed valid"
+called "admin-merge 42" && pass "landed at the EXISTING head" || fail "did not land"
+grep -q "SKIPPING the refresh" "$SCEN/out" \
+  && pass "the skip is named in the log, with its reason" \
+  || fail "the skip is not named in the log"
+
+# ── DIRECTION B — every CLEAN case that still NEEDS the refresh must refresh ────
+echo "── 17g-D2. CLEAN + behind>0 + strict=true ⇒ the refresh STILL HAPPENS"
+new_scen cleandriftstrict
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '3\n'         > "$SCEN/behind"
+printf 'true\n'      > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (strict=true requires an up-to-date head, whatever the merge state)" \
+  || fail "did NOT refresh under strict=true — the arm is over-broad"
+
+echo "── 17g-D3. CLEAN + behind>0 + protection UNREADABLE ⇒ the refresh STILL HAPPENS (fail-closed)"
+new_scen cleandriftunreadable
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '1\n'         > "$SCEN/behind"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+# NO $SCEN/strict fixture: 404/403, exactly as when protection is unconfigured or the
+# token lacks admin. An unreadable `strict` must never be read as `false`.
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed with an unreadable protection read (fail-closed direction intact)" \
+  || fail "did NOT refresh — the CLEAN arm made the `strict` read fail OPEN"
+
+echo "── 17g-D4. CLEAN + behind>0 + strict=false but NOT mergeable ⇒ the refresh STILL HAPPENS"
+new_scen cleandriftunmergeable
+printf 'CLEAN\n'       > "$SCEN/state"
+printf '1\n'           > "$SCEN/behind"
+printf 'false\n'       > "$SCEN/strict"
+printf 'CONFLICTING\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (the PR is not positively mergeable)" \
+  || fail "did NOT refresh a non-mergeable PR under strict=false (fail-OPEN)"
+
+# ── THE PRESERVED CASE — the CLEAN arm must NOT swallow #1533 ──────────────────
+echo "── 17g-D5. BLOCKED + measured-behind + strict=false ⇒ the refresh STILL HAPPENS (#1533 preserved)"
+new_scen blockeddriftstrictfalse
+printf 'BLOCKED\n'   > "$SCEN/state"
+printf '39\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch 42" \
+  && pass "refreshed (a BLOCKED branch's drift red can only clear with an update — #1533)" \
+  || fail "the CLEAN arm swallowed #1533: a BLOCKED, 39-behind branch was skipped"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -1145,6 +1227,16 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # shape, which genuinely needs the refresh) is skipped instead. The direction-B2
   # scenario must redden.
   mutate_and_expect_fail B20  's/if \[ "\044mergeable" = true \]; then/if true; then/'
+  # B21 (#7230): make the CLEAN arm INERT — the drift trigger pre-empts CLEAN again,
+  # i.e. the revision before this fix. The failure it prevents: the head of a green,
+  # attested PR being moved for nothing and the record dying at step 3 (the O3 shape,
+  # 22 updated / 17 invalidated / 0 landed). 17g-D1 must redden.
+  mutate_and_expect_fail B21  's/if \[ "\044MERGE_STATE" = "CLEAN" \] && \[ -n "\044behind" \]/if false \&\& [ -n "\044behind" ]/'
+  # B22 (#7230, the opposite direction): DROP the CLEAN qualification, so the arm
+  # over-reaches and swallows `BLOCKED` too. The failure it prevents: a fix that closes
+  # #7230 by re-opening #1533 — a BLOCKED branch's drift red can only clear with an
+  # update, and skipping it re-deadlocks the >20-behind population. 17g-D5 must redden.
+  mutate_and_expect_fail B22  's/if \[ "\044MERGE_STATE" = "CLEAN" \] && \[ -n "\044behind" \]/if [ true ] \&\& [ -n "\044behind" ]/'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
