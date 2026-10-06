@@ -5821,7 +5821,10 @@ grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the gap
 # that actually runs it) while passing on macOS. Both routes `return 2` BEFORE any
 # certificate, which is the property under test. What the scenario therefore does NOT
 # cover on GNU is the input-integrity check itself: the aliased write never reaches it
-# there, because grep refuses the write first. That check is covered by (j5) and (j7).
+# there, because grep refuses the write first. That check IS exercised on BOTH platforms
+# by (j8) below, whose alias points at an input that is NOT the destination of the write
+# that corrupts it (`lane-kept.txt` → `lane-declined.txt`), so grep has nothing to refuse
+# and only the integrity check can catch it.
 new_scen lanealiasgap
 mkdir -p "$SCEN/bin"
 cat > "$SCEN/bin/mktemp" <<'MTSTUB3'
@@ -5909,6 +5912,57 @@ grep -q "lane references are not two distinct regular files" "$SCEN/err" \
 [ -f "$SCEN/comment" ] && fail "evidence was posted although the references were aliased" \
   || pass "…and no evidence was posted"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although the references were aliased" \
+  || pass "…and no merge was attempted"
+
+# (j8) ✗ A FORGIVENESS WRITE ALIASED ONTO A FROZEN INPUT MOVES IT. (j6) covers the alias
+# whose write DESTINATION is also grep's input — on GNU grep that write is refused by grep
+# ITSELF (`input file is also the output`, rc 2), so the input-integrity check is never
+# reached there and the platform that runs CI could not tell if it were deleted. This
+# scenario aliases the same class of write onto an input grep is NOT looking at:
+# `lane-kept.txt` → `lane-declined.txt`, so the forgiveness leg's write (`> lane-kept.txt`)
+# rewrites the DECLINED listing after it was frozen and before the membership test reads
+# it — while the subtraction's inputs and destination are all distinct, so grep has
+# nothing to refuse and the integrity check is the ONLY arm that can catch it.
+new_scen lanekeptaliasdeclined
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 6938 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6939 6939 > "$SCEN/runs-main"
+lane_jobset 6939 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 6938 success 'test (a)'
+pr_changed_files docs/architecture/STORAGE-ARCHITECTURE.md
+selector_interp_312
+selector_stub False False
+mkdir -p "$SCEN/bin"
+cat > "$SCEN/bin/mktemp" <<'MTSTUB5'
+#!/bin/sh
+case "$*" in
+  *-d*admin-merge.XXXXXX)
+    d="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")" || exit 1
+    ln -sf "$d/lane-declined.txt" "$d/lane-kept.txt" 2>/dev/null || true
+    printf '%s\n' "$d"
+    exit 0
+    ;;
+esac
+exec /usr/bin/mktemp "$@"
+MTSTUB5
+chmod +x "$SCEN/bin/mktemp"
+# `run_admin_cwd` (not a hand-rolled `bash "$ADM"`) because it carries the resolved
+# selector interpreter — without it the selector fails, forgiveness is NOT applied, and
+# this scenario would silently re-test the raw-gap refusal. The assertion below pins
+# that, so the wrong fixture cannot pass as the right one.
+SEL_PATH="$SCEN/bin:$PATH" ADMIN_MERGE_LANE_PARITY=declared-off run_admin_cwd "$SCEN" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a forgiveness write ALIASED onto a frozen input REFUSES (exit $rc)" \
+  || fail "the rail decided on a lane reference its own forgiveness write had rewritten — the evidence gate ACCEPTS the resulting body and the merge proceeds"
+grep -q "lane-coverage forgiveness (#6928) —" "$SCEN/err" \
+  && pass "…and forgiveness WAS applied, so the aliased forgiveness write is the route under test" \
+  || fail "forgiveness was not applied — the scenario tested the raw-gap refusal instead of the aliased-input route"
+grep -q "a lane reference CHANGED while parity was being decided" "$SCEN/err" \
+  && pass "…named as a MOVED input, not read as a coverage result" \
+  || fail "the refusal does not name the changed lane reference (the only arm that can catch this route on any platform)"
+[ -f "$SCEN/comment" ] && fail "evidence was posted although a forgiveness write moved an input" \
+  || pass "…and no evidence was posted"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted although a forgiveness write moved an input" \
   || pass "…and no merge was attempted"
 
 # (k) AN UNRECOGNISED MODE IS REFUSED AT STARTUP, never read as 'off'. A typo
