@@ -3460,17 +3460,66 @@ test("#7526: no deletions → `deleted` is ABSENT (not `[]`)", () => {
   deepEqual(scope, { files: ["docs/new.md", "src/app.ts"], renameOldPaths: [], clean: true });
 });
 
-test("#7526: combineScopes unions the deleted projection (dedupe, absence-preserving)", () => {
+test("#7526: combineScopes applies the deletion exclusion PER ARM — no unioned `deleted`", () => {
+  // The pre-fix version of this test pinned `combineScopes(a, b).deleted` to the
+  // UNION of both arms' deletions and never fed the result through
+  // `verificationCandidates`. That is exactly why the P0 shipped: the consumer
+  // then subtracted the union from the unioned `files`, so one arm's deletion
+  // erased another arm's live path. The result now carries no `deleted` at all.
   const a = { files: ["a.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
   const b = { files: ["b.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts", "other.ts"] };
-  deepEqual(combineScopes(a, b).deleted, ["gone.ts", "other.ts"]);
+  equal(combineScopes(a, b).deleted, undefined, "per-arm exclusion ⇒ no result-level `deleted`");
+  // gone.ts is deleted in BOTH arms ⇒ excluded before the union; other.ts is
+  // deleted in b but never listed in b.files, so it contributes nothing.
+  deepEqual(verificationCandidates(combineScopes(a, b).files, combineScopes(a, b).deleted),
+    ["a.ts", "b.ts"],
+    "a path deleted on every arm never reaches the candidate set");
   const none = combineScopes(
     { files: ["x.ts"], renameOldPaths: [], clean: true },
     { files: ["y.ts"], renameOldPaths: [], clean: true },
   );
   equal(none.deleted, undefined, "no deletions on either arm → absent, never []");
-  deepEqual(combineScopes(a, { files: ["b.ts"], renameOldPaths: [], clean: true }).deleted, ["gone.ts"],
-    "present on one arm survives the union");
+});
+
+test("#7526 P0: a path deleted in ONE arm but live in ANOTHER stays a candidate (per-arm exclusion)", () => {
+  // THE REGRESSION. Reachable with no malice: the branch arm deletes f.ts while
+  // the staged/record arm (re-)adds it (`D f.ts` + `A f.ts`, the bare-commit +
+  // `gh pr create` composition). Pre-fix `combineScopes` → { files: [f.ts],
+  // deleted: [f.ts] }, the consumer → [], and an unverified rewrite was ALLOWED;
+  // at 2d9ec45^ it blocked as unverified.
+  const a = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["gone.ts"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(a, b);
+  // State it behaviourally: the ACTUAL composition the verify path performs must
+  // still name gone.ts, i.e. it must reach the hash loop and block when
+  // unverified. (The pre-fix test asserted the object shape instead and could not
+  // see this.)
+  deepEqual(verificationCandidates(combined.files, combined.deleted), ["gone.ts"],
+    "deleted in one arm, present in another ⇒ still a verification candidate");
+  equal(combined.deleted, undefined, "no unioned `deleted` for the consumer to subtract globally");
+  // Mirror arm ordering — the union must be order-independent.
+  deepEqual(verificationCandidates(combineScopes(b, a).files, combineScopes(b, a).deleted), ["gone.ts"]);
+});
+
+test("#7526 P0: a path deleted in BOTH arms is excluded (the intended behaviour)", () => {
+  const a = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  deepEqual(verificationCandidates(combineScopes(a, b).files, combineScopes(a, b).deleted), [],
+    "deleted on every arm ⇒ nothing to verify ⇒ allowed");
+});
+
+test("#7526 P0: a SINGLE arm still excludes its own deletion (the single-scope seam)", () => {
+  const a = { files: ["gone.ts", "kept.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  deepEqual(verificationCandidates(a.files, a.deleted), ["kept.ts"],
+    "a lone scope keeps carrying `deleted` and the consumer subtracts it");
+});
+
+test("#7526: renameOldPaths keeps unioning unchanged (an R/C-source conjunction, not a `files` projection)", () => {
+  // One path carries one row letter, so a `D` path can never be an R/C source;
+  // there is no per-arm exclusion to apply here and the union semantics stay.
+  const a = { files: ["new-a.ts"], renameOldPaths: ["old-a.ts"], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["new-b.ts"], renameOldPaths: ["old-b.ts"], clean: true };
+  deepEqual(combineScopes(a, b).renameOldPaths, ["old-a.ts", "old-b.ts"]);
 });
 
 test("#7526 DECISION: verificationCandidates subtracts deleted; a deletion-only set is EMPTY", () => {
