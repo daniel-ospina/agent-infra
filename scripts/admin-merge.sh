@@ -4624,13 +4624,24 @@ ${parity_forgiven_note}"
   # THE SHA THAT LANDED, NOT THE SHA WE SENT (#7504). `$head` is the BRANCH head, and
   # under the DEFAULT `--squash` (see the MERGE_ARGS note above) the commit that lands
   # on main is a NEW commit that shares no sha with it — so printing `$head` here
-  # recorded a sha that is not on main at all. Measured on three landings (#5434,
-  # #7460, #7417): the printed sha failed `git merge-base --is-ancestor <sha>
-  # origin/main`, and for #7417 it was not even a valid commit name in the repo
-  # (`fatal: Not a valid commit name`). A PRE-merge value read from this PR is the
-  # PREDICTED merge ref `refs/pull/N/merge` — a synthetic commit GitHub creates to
-  # test mergeability and DELETES after the merge — which is precisely why the
-  # recorded sha could not be resolved afterwards. Read the landed commit from the
+  # recorded a sha that is not on main at all. Measured on three landings, and the
+  # printed value was `head.sha`: verified against the API on #7537 (printed
+  # fbdcddb1… = head.sha, while its `merge_commit_sha` is daab0afe…) and on #7417
+  # (printed 9df5bd21… = head.sha, `merge_commit_sha` 39f92e37…). So it failed
+  # `git merge-base --is-ancestor <sha> origin/main` because a squash creates a NEW
+  # commit, and it was "not a valid commit name" because the PR-HEAD object was never
+  # fetched into the clone that was asked to resolve it — NOT because anything was
+  # deleted on GitHub.
+  #
+  # CORRECTION (review round 2, and it is worth keeping visible): an earlier version
+  # of this comment blamed the PREDICTED merge ref `refs/pull/N/merge`. That was
+  # WRONG. The old line read `$head` — it never touched `merge_commit_sha` at all. The
+  # general fact that a PRE-merge `merge_commit_sha` holds the predicted
+  # `refs/pull/N/merge` ref is true (see the note above `resolve_merge_ref`), but it
+  # explains nothing about this defect, and a reader who believed it would go and
+  # look for a deleted ref instead of at the line that printed the head.
+  #
+  # Read the landed commit from the
   # REST PR object AFTER the merge: the same source `resolve_merge_ref` trusts, for
   # the same reason it states (REST `merge_commit_sha` is populated while the PR is
   # still OPEN, where GraphQL `mergeCommit` is NULL — see the note above
@@ -4646,7 +4657,7 @@ ${parity_forgiven_note}"
       # second full 40-hex token on this line is machine-reachable — anything reading
       # "the sha off the success line" would recover the head, which is the #7504
       # defect reintroduced (review round 1, P2-3).
-      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was ${head:0:12}…, which under a squash is NOT on main. Read the artifact with: gh pr view $PR --json mergeCommit"
+      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was ${head:0:12}…, which under a squash is NOT on main. Read the artifact with: gh pr view $PR ${REPO:+--repo $REPO} --json mergeCommit"
       ;;
     *)
       info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was ${head:0:12}…)"

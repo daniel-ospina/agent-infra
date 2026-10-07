@@ -637,8 +637,20 @@ case "$key" in
         case "$(flag_val --jq "$@")" in
           *mergeable*) ;;
           *merge_commit_sha*)
+            # The landed (post-merge) commit is a DIFFERENT value from the PRE-merge
+            # `merge_commit_sha` — which holds the PREDICTED `refs/pull/N/merge` ref — so
+            # it gets its OWN fixture, served only once the merge has happened.
+            # Sharing one fixture was a real gap (review round 2, P2-1): with both reads
+            # fed the same value, an implementation that printed the ALREADY-READ merge
+            # ref passed §62 unchanged, so the assertion proved "not $head" rather than
+            # "the commit that landed".
+            [ -f "$SCEN/pr-landed-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
             s=mergefeed00000000000000000000000000000000
             [ -f "$SCEN/pr-merge-sha" ] && s="$(cat "$SCEN/pr-merge-sha")"
+            if [ -f "$SCEN/merged" ]; then
+              s=landedfeed000000000000000000000000000000
+              [ -f "$SCEN/pr-landed-sha" ] && s="$(cat "$SCEN/pr-landed-sha")"
+            fi
             printf '%s\n' "$s"; exit 0 ;;
         esac
         [ -f "$SCEN/pr-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
@@ -8019,15 +8031,26 @@ grep -q 'confirmed via the API' "$SCEN/out" \
   || fail "the success line does not state the confirmation"
 # ── #7504: the line must name the LANDED commit, not the branch head ──
 # The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
-# via the API)`), so it certified nothing about this fix. The fixture's landed sha
-# is `mergefeed000…` and the scenario's head is a DIFFERENT sha, so: the merge sha
-# must be present, and the head must NOT be — which is exactly what fails if the
-# rail goes back to printing `$head`. (Round 1 of the #7504 review found this
-# assertion missing AND the fake answering the new projection with the old shape;
-# both are fixed together, so this assertion is the regression guard.)
-grep -q 'at mergefeed00000000000000000000000000000000' "$SCEN/out" \
-  && pass "#7504: the success line names the LANDED merge commit" \
-  || fail "#7504: the success line does not name the merge commit — it may still be printing the branch head"
+# via the API)`), so it certified nothing about this fix. Scope every check below to
+# the SUCCESS LINE itself: the run output legitimately carries the pre-merge
+# `merge ref refs/pull/42/merge = mergefeed…` line earlier, so a whole-file grep for
+# that value would pass even when the success line is wrong.
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+case "$success_line" in
+  *landedfeed000000000000000000000000000000*)
+    pass "#7504: the success line names the LANDED (post-merge) commit" ;;
+  *)
+    fail "#7504: the success line does not name the landed commit: $success_line" ;;
+esac
+# The PRE-merge fixture is a DIFFERENT sha (`mergefeed…`) by construction, so this is
+# what fails if the rail echoes the merge ref it already read instead of re-reading
+# `merge_commit_sha` after the merge — the exact shape the shared fixture used to hide.
+case "$success_line" in
+  *mergefeed00000000000000000000000000000000*)
+    fail "#7504: the success line carries the PRE-merge merge ref — the post-merge read is not happening" ;;
+  *)
+    pass "#7504: the pre-merge merge ref is not presented as the landing" ;;
+esac
 if grep -q "at $HEAD_MN" "$SCEN/out"; then
   fail "#7504: the success line still names the branch head as the landing"
 else
