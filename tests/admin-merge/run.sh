@@ -618,6 +618,44 @@ case "$key" in
         esac
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
+        #
+        # #7504 review round 1 (P1): the rail reads this SAME endpoint with TWO
+        # different projections — the mergeable/merge-ref PAIR above, and (since
+        # #7504) the landed commit ALONE. A fake that ignores `--jq` answers the
+        # second with the first projection's shape, so `landed_sha` came back as
+        # "true\t<sha>" and the success line printed a value that is visibly not a
+        # sha — while §62's `grep 'confirmed via the API'` passed for BOTH the fixed
+        # and the unfixed line, so the fix was certified by nothing. Project on
+        # request, exactly as real `gh api` does.
+        #
+        # THE ORDER OF THESE ARMS IS LOAD-BEARING, and getting it wrong is not a test
+        # nit: the PAIR expression at scripts/admin-merge.sh:955 is
+        # `'"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'` — it CONTAINS
+        # `merge_commit_sha`, so a `*merge_commit_sha*` arm placed first swallows it,
+        # hands `resolve_merge_ref` a bare sha as its `state`, which the
+        # `[ "$state" = "$line" ]` guard clears as unrecognised, and the rail refuses
+        # every mergeable PR — measured: 334 of 1088 assertions failed, 56 of them
+        # the explicit `mergeable=<sha>` refusal block. So match the PAIR first and
+        # let it fall through to the pair projection below.
+        case "$(flag_val --jq "$@")" in
+          *mergeable*) ;;
+          *merge_commit_sha*)
+            # The landed (post-merge) commit is a DIFFERENT value from the PRE-merge
+            # `merge_commit_sha` — which holds the PREDICTED `refs/pull/N/merge` ref — so
+            # it gets its OWN fixture, served only once the merge has happened.
+            # Sharing one fixture was a real gap (review round 2, P2-1): with both reads
+            # fed the same value, an implementation that printed the ALREADY-READ merge
+            # ref passed §62 unchanged, so the assertion proved "not $head" rather than
+            # "the commit that landed".
+            [ -f "$SCEN/pr-landed-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+            s=mergefeed00000000000000000000000000000000
+            [ -f "$SCEN/pr-merge-sha" ] && s="$(cat "$SCEN/pr-merge-sha")"
+            if [ -f "$SCEN/merged" ]; then
+              s=landedfeed000000000000000000000000000000
+              [ -f "$SCEN/pr-landed-sha" ] && s="$(cat "$SCEN/pr-landed-sha")"
+            fi
+            printf '%s\n' "$s"; exit 0 ;;
+        esac
         [ -f "$SCEN/pr-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
         m=true; [ -f "$SCEN/pr-mergeable" ] && m="$(cat "$SCEN/pr-mergeable")"
         s=mergefeed00000000000000000000000000000000
@@ -8347,7 +8385,93 @@ rc=$?
 grep -q 'confirmed via the API' "$SCEN/out" \
   && pass "the success line STATES the API-confirmed state" \
   || fail "the success line does not state the confirmation"
+# ── #7504: the line must name the LANDED commit, not the branch head ──
+# The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
+# via the API)`), so it certified nothing about this fix. Scope the HEAD-NAME checks
+# below to the SUCCESS LINE itself: the run output legitimately carries the pre-merge
+# `merge ref refs/pull/42/merge = mergefeed…` line earlier, so a whole-file grep for
+# that value would pass even when the success line is wrong. The FINAL check is the
+# deliberate exception — it scans the WHOLE run output, which is STRICTER (the head
+# must not appear as a landing anywhere), so its message says which it is.
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+case "$success_line" in
+  *landedfeed000000000000000000000000000000*)
+    pass "#7504: the success line names the LANDED (post-merge) commit" ;;
+  *)
+    fail "#7504: the success line does not name the landed commit: $success_line" ;;
+esac
+# The PRE-merge fixture is a DIFFERENT sha (`mergefeed…`) by construction, so this is
+# what fails if the rail echoes the merge ref it already read instead of re-reading
+# `merge_commit_sha` after the merge — the exact shape the shared fixture used to hide.
+case "$success_line" in
+  *mergefeed00000000000000000000000000000000*)
+    fail "#7504: the success line carries the PRE-merge merge ref — the post-merge read is not happening" ;;
+  *)
+    pass "#7504: the pre-merge merge ref is not presented as the landing" ;;
+esac
+# Deliberately a WHOLE-RUN scan rather than a success-line one, and the only check
+# here that is: a 40-hex head presented as a landing on ANY line is the #7504 shape.
+# Stricter than the checks above, so the message must not blame the success line when
+# it is in fact failing on some other line of the run.
+if grep -q "at $HEAD_MN" "$SCEN/out"; then
+  fail "#7504: the run output presents the branch head as the landing"
+else
+  pass "#7504: the branch head appears nowhere as a landing (whole-run scan)"
+fi
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 62b. #7504: an UNREADABLE landed commit must name NO sha — never the head ──
+# The `""` branch of the landed read was REACHABLE but UNTESTED (review round 3,
+# P2-1): the fake could serve `$SCEN/pr-landed-unreadable`, but no scenario set it —
+# so the branch, and the `${REPO:+--repo $REPO}` remedy that round 2 added to that
+# exact line, shipped unverified. This is not bureaucracy to delete: "print no sha
+# rather than a wrong one" IS the guard, and a wrong sha that LOOKS like the landed
+# artifact is the entire defect, so this is the only thing that tests it.
+echo "== 62b. #7504: an unreadable landed commit prints NO sha (never the head) =="
+new_scen merge-landed-unreadable
+printf '%s\n' "$HEAD_MN" > "$SCEN/head"
+lane_fail "$HEAD_MN" 931 > "$SCEN/runs-$HEAD_MN"
+log_failed "$MNX" > "$SCEN/log-931"
+{ lane_fail main1111 932; lane_fail main2222 933; lane_fail main3333 934; } > "$SCEN/runs-main"
+log_failed "$MNY" > "$SCEN/log-932"
+log_failed "$MNX" > "$SCEN/log-933"
+log_failed "$MNX" > "$SCEN/log-934"
+# The API call that reads the LANDED commit fails, while the merge itself is confirmed.
+touch "$SCEN/pr-landed-unreadable"
+run_admin_here 42 --repo acme/widgets --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "an unreadable landed sha does not fail a merge the API CONFIRMED" \
+  || fail "the merge was refused because the landed sha was unreadable (exit $rc): $(tr '\n' ' ' < "$SCEN/err" | head -c 200)"
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+[ -n "$success_line" ] \
+  && pass "the success line is still printed when the landed sha cannot be read" \
+  || fail "no success line at all when the landed read failed: $(tr '\n' ' ' < "$SCEN/out" | head -c 200)"
+case "$success_line" in
+  *"NOT readable"*)
+    pass "#7504: the fallback SAYS why no sha is printed" ;;
+  *)
+    fail "#7504: the fallback did not say the merge commit was unreadable: $success_line" ;;
+esac
+# A FULL 40-hex token on this line is machine-reachable as "the landed sha" — the
+# exact shape #7504 shipped. The branch head is printed TRUNCATED (12 chars) so that
+# cannot happen; a full head here is therefore the defect whatever the wording says.
+if printf '%s' "$success_line" | grep -Eq '[0-9a-f]{40}'; then
+  fail "#7504: the fallback line carries a full 40-hex sha, readable as the landed commit: $success_line"
+else
+  pass "#7504: the fallback line carries NO full 40-hex sha"
+fi
+if printf '%s' "$success_line" | grep -qF "$HEAD_MN"; then
+  fail "#7504: the fallback line presents the BRANCH HEAD as the landing"
+else
+  pass "#7504: the branch head is not presented as the landed commit"
+fi
+# …and it must stay ACTIONABLE. Round 2 added --repo to this very remedy because
+# without it the reader is pointed back at the wrong repository; scoped to the
+# SUCCESS LINE so a stray `--repo` elsewhere in the run cannot satisfy it.
+printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
+  && pass "#7504: the fallback remediation carries the --repo the run was given" \
+  || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
@@ -9585,6 +9709,108 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
+
+# ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
+# GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
+# it (measured on PR #1615: three such runs, `status=queued`, `conclusion=null`,
+# jobs API EMPTY, `cancel` refusing with "has not been queued yet", no delete API).
+# Counting it as `pending` blocks a reviewed head PERMANENTLY — the printed remedy
+# ("wait for CI, then re-run the rail") can never clear it. The discriminator is
+# the jobs count (`run_job_count`, the same Jobs API #1482 already reads): ZERO jobs
+# means GitHub never expanded the run, so it cannot be in flight. An unreadable
+# count is NOT zero (fail closed), so the #3420 ratchet — a run that HAS jobs must
+# still count as pending — is not weakened; and a run that has merely not expanded
+# YET cannot enter `tested` either, so a listing holding only such runs is refused
+# by the `tested > 0` precondition (§1b / check-lane-tested.sh) regardless.
+echo "== 68. #1623: an unexpanded run does not hold the merge; a run WITH jobs still does =="
+
+# (a) THE MEASURED SHAPE: a tested sibling + three `queued` runs GitHub never
+# expanded (measured on PR #1615: 37642335832, 37642336639, 37642336755).
+new_scen unexpanded
+HEAD_UX="1623000000000000000000000000000000000000"
+lane_pass "$HEAD_UX" 31001 > "$SCEN/runs-$HEAD_UX"
+{ lane_line queued - "$HEAD_UX" 37642335832
+  lane_line queued - "$HEAD_UX" 37642336639
+  lane_line queued - "$HEAD_UX" 37642336755
+} >> "$SCEN/runs-$HEAD_UX"
+for id in 37642335832 37642336639 37642336755; do printf '0\n' > "$SCEN/jobs-count-$id"; done
+cfs_run --commit-rows "$HEAD_UX" --repo test-org/test-repo --runs-report "$TMP/ux-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) the commit-rows extraction succeeds" || { fail "(a) expected exit 0, got $rc"; sed 's/^/      /' "$TMP/cfs-err" | head -10; }
+v="$(sed -n 's/^pending=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "0" ] && pass "(a) three never-expanded runs yield pending=0 (does NOT block)" \
+  || fail "(a) expected pending=0, got '$v' — the permanent false block is back"
+v="$(sed -n 's/^tested=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "1" ] && pass "(a) the tested run is still counted (tested=1)" \
+  || fail "(a) expected tested=1, got '$v'"
+c="$(grep -c "has ZERO jobs" "$TMP/cfs-err" || true)"
+[ "$c" = "3" ] && pass "(a) each suppressed run is NAMED on stderr (3 notes)" \
+  || fail "(a) expected 3 suppression notes, got '$c'"
+lane_tested "$TMP/ux-rep.txt" python-ci.yml "$HEAD_UX" >"$TMP/ux-guard.txt" 2>&1
+[ $? -eq 0 ] && pass "(a) the shipped gate (check-lane-tested.sh) now certifies the head" \
+  || { fail "(a) the shipped gate still refuses"; sed 's/^/      /' "$TMP/ux-guard.txt" | head -5; }
+
+# (b) NEGATIVE CONTROL — the ratchet. A queued/in-progress run that HAS jobs may
+# still be running, so it MUST keep counting as pending (#3420).
+new_scen unexpandedhasjobs
+HEAD_UY="2623000000000000000000000000000000000000"
+lane_pass "$HEAD_UY" 32001 > "$SCEN/runs-$HEAD_UY"
+lane_line in_progress - "$HEAD_UY" 32002 >> "$SCEN/runs-$HEAD_UY"
+printf '3\n' > "$SCEN/jobs-count-32002"
+cfs_run --commit-rows "$HEAD_UY" --repo test-org/test-repo --runs-report "$TMP/uy-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(b) the extraction succeeds" || fail "(b) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uy-rep.txt")"
+[ "$v" = "1" ] && pass "(b) an in-progress run WITH 3 jobs still yields pending=1 (still blocks)" \
+  || fail "(b) expected pending=1, got '$v' — the #3420 ratchet was WEAKENED"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(b) a run that has jobs was suppressed" \
+  || pass "(b) no suppression for a run that has jobs"
+lane_tested "$TMP/uy-rep.txt" python-ci.yml "$HEAD_UY" >"/dev/null" 2>&1 \
+  && fail "(b) the gate certified a head with a live run" \
+  || pass "(b) the shipped gate still refuses a head with a live run"
+
+# (c) FAIL CLOSED on an unreadable probe: no `jobs-count-<id>` fixture at all.
+new_scen unexpandedunknown
+HEAD_UZ="3623000000000000000000000000000000000000"
+lane_pass "$HEAD_UZ" 33001 > "$SCEN/runs-$HEAD_UZ"
+lane_line queued - "$HEAD_UZ" 33002 >> "$SCEN/runs-$HEAD_UZ"
+cfs_run --commit-rows "$HEAD_UZ" --repo test-org/test-repo --runs-report "$TMP/uz-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(c) the extraction succeeds" || fail "(c) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uz-rep.txt")"
+[ "$v" = "1" ] && pass "(c) an UNESTABLISHABLE job count still yields pending=1 (fail closed)" \
+  || fail "(c) expected pending=1, got '$v' — an unreadable probe was read as zero jobs"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(c) an unknown count was read as zero" \
+  || pass "(c) no suppression without a PROVEN zero count"
+
+# (d) THE RACE — a run created moments ago has no jobs YET. `jobs == 0` cannot by
+# itself tell "not expanded yet" from "never will be", and NO age bound is applied
+# (see the header note in `run_is_unexpanded`). The exposure is closed by the SAME
+# property the run has: a run whose jobs do not exist is not testing the revision,
+# so it cannot enter `tested` — and a listing holding ONLY such runs leaves
+# tested=0, which §1b and the shipped gate refuse on. The counter may read 0; the
+# MERGE is still refused.
+new_scen unexpandedalone
+HEAD_UW="4623000000000000000000000000000000000000"
+{ lane_line queued - "$HEAD_UW" 34001
+  lane_line in_progress - "$HEAD_UW" 34002
+} > "$SCEN/runs-$HEAD_UW"
+printf '0\n' > "$SCEN/jobs-count-34001"
+printf '0\n' > "$SCEN/jobs-count-34002"
+cfs_run --commit-rows "$HEAD_UW" --repo test-org/test-repo --runs-report "$TMP/uw-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(d) the extraction succeeds" || fail "(d) expected exit 0, got $rc"
+[ "$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) an all-unexpanded listing yields pending=0" \
+  || fail "(d) expected pending=0, got '$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")'"
+[ "$(sed -n 's/^tested=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) …and tested=0 — nothing was exercised" \
+  || fail "(d) an unexpanded run was credited as TESTED"
+lane_tested "$TMP/uw-rep.txt" python-ci.yml "$HEAD_UW" >"$TMP/uw-guard.txt" 2>&1
+[ $? -ne 0 ] && pass "(d) …so the shipped gate REFUSES the head (the race cannot merge)" \
+  || fail "(d) a head with NO tested run was certified"
+grep -q "NO tested run" "$TMP/uw-guard.txt" && pass "(d) …refusing on tested=0, not on the pending counter" \
+  || { fail "(d) the refusal reason is not 'NO tested run'"; sed 's/^/      /' "$TMP/uw-guard.txt" | head -5; }
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
