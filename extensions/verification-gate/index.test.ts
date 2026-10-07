@@ -3460,18 +3460,24 @@ test("#7526: no deletions → `deleted` is ABSENT (not `[]`)", () => {
   deepEqual(scope, { files: ["docs/new.md", "src/app.ts"], renameOldPaths: [], clean: true });
 });
 
-test("#7526: combineScopes applies the deletion exclusion PER ARM — no unioned `deleted`", () => {
+test("#7526: combineScopes keeps `files` the PLAIN union and excludes only paths no arm contributes live", () => {
   // The pre-fix version of this test pinned `combineScopes(a, b).deleted` to the
   // UNION of both arms' deletions and never fed the result through
   // `verificationCandidates`. That is exactly why the P0 shipped: the consumer
   // then subtracted the union from the unioned `files`, so one arm's deletion
-  // erased another arm's live path. The result now carries no `deleted` at all.
+  // erased another arm's live path. The rule is now: `files` is the plain union
+  // (so routing sees every path), and `deleted` is the union of arms' deletions
+  // MINUS the paths any arm contributes live.
   const a = { files: ["a.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
   const b = { files: ["b.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts", "other.ts"] };
-  equal(combineScopes(a, b).deleted, undefined, "per-arm exclusion ⇒ no result-level `deleted`");
-  // gone.ts is deleted in BOTH arms ⇒ excluded before the union; other.ts is
-  // deleted in b but never listed in b.files, so it contributes nothing.
-  deepEqual(verificationCandidates(combineScopes(a, b).files, combineScopes(a, b).deleted),
+  const combined = combineScopes(a, b);
+  // (4) `files` is the PLAIN union — the `D` path is NOT dropped here.
+  deepEqual(combined.files, ["a.ts", "gone.ts", "b.ts"], "plain union: D rows stay in `files`");
+  // gone.ts is in BOTH arms' `files` and BOTH arms' `deleted` ⇒ excluded.
+  // other.ts is deleted in b but never listed in b.files, so no arm contributes
+  // it live (vacuously deleted).
+  deepEqual(combined.deleted, ["gone.ts", "other.ts"]);
+  deepEqual(verificationCandidates(combined.files, combined.deleted),
     ["a.ts", "b.ts"],
     "a path deleted on every arm never reaches the candidate set");
   const none = combineScopes(
@@ -3479,6 +3485,56 @@ test("#7526: combineScopes applies the deletion exclusion PER ARM — no unioned
     { files: ["y.ts"], renameOldPaths: [], clean: true },
   );
   equal(none.deleted, undefined, "no deletions on either arm → absent, never []");
+  deepEqual(none.files, ["x.ts", "y.ts"], "plain union");
+});
+
+test("#7526 P1: a combined scope keeps the deleted path in `files` so the exemption does NOT widen", () => {
+  // THE FAIL-OPEN THE PER-ARM EXCLUSION INTRODUCED (532ee59). The reviewer's
+  // case, built from the arms the bare-commit + `gh pr create` composition
+  // produces:
+  //   branch/commit arm: `D src/app.ts`   (non-exempt code, deleted)
+  //   gh-record arm:     `A docs/code.md` (exempt path, holds the moved code)
+  // Git detects no rename (dissimilar content), so nothing carries the
+  // rename-source guard. At 532ee59 `combineScopes` dropped src/app.ts from
+  // `files` — UPSTREAM of `applyScopeGate` — so the gate saw only the exempt
+  // path and routed `exempt-allow`; the code shipped unverified. Verified
+  // against a scratch copy of 2d9ec45^ (`main`): files included src/app.ts and
+  // `applyScopeGate` returned `verify`. This test pins that routing back.
+  const armD = { files: ["src/app.ts"], deleted: ["src/app.ts"], renameOldPaths: [], clean: true };
+  const armA = { files: ["docs/code.md"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(armD, armA);
+  // (4) the `D` path REMAINS in `files` — the property that keeps routing honest.
+  deepEqual(combined.files, ["src/app.ts", "docs/code.md"], "D path stays in `files` (plain union)");
+  const gate = applyScopeGate(combined.files, combined.renameOldPaths, combined.clean, true, isShapeExemptFile);
+  equal(gate.kind, "verify", "a deleted non-exempt path must force verify, never exempt-allow");
+  deepEqual(routeScopeGate(gate, combined.files),
+    { action: "verify", files: ["src/app.ts", "docs/code.md"] },
+    "#559 T1 routing: the deleted non-exempt path keeps the gate ON");
+  // The exclusion still runs at the consumer, so only docs/code.md is hashed —
+  // and it IS hashed (this is what the fail-open skipped).
+  deepEqual(combined.deleted, ["src/app.ts"]);
+  deepEqual(verificationCandidates(combined.files, combined.deleted), ["docs/code.md"],
+    "the code moved into docs/code.md is the verification candidate");
+});
+
+test("#7526 P1: a combined deletion-only scope still reaches `verify` with non-empty `route.files` (audit precondition)", () => {
+  // The `deletion_only_no_content` audit fires only when `route.files.length > 0`
+  // at the verify path. Restoring `files` to the plain union restores exactly
+  // that: both arms delete the same non-exempt path, so `applyScopeGate` sees a
+  // non-empty, non-exempt set and routes `verify` (previously the per-arm
+  // exclusion emptied `files` upstream, so the scope took `empty-allow` and no
+  // audit line was emitted). The emission itself lives in the unexported
+  // `pi.on("tool_call")` handler (e2e-only); this pins its precondition.
+  const a = { files: ["src/gone.ts"], deleted: ["src/gone.ts"], renameOldPaths: [], clean: true };
+  const b = { files: ["src/gone.ts"], deleted: ["src/gone.ts"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(a, b);
+  deepEqual(combined.files, ["src/gone.ts"], "plain union keeps the D path in `files`");
+  const gate = applyScopeGate(combined.files, combined.renameOldPaths, combined.clean, true, isShapeExemptFile);
+  equal(gate.kind, "verify", "non-empty D set routes verify (not empty-allow) so the skip is audited");
+  const route = routeScopeGate(gate, combined.files);
+  deepEqual(route, { action: "verify", files: ["src/gone.ts"] });
+  deepEqual(verificationCandidates(route.files, combined.deleted), [],
+    "every candidate is deleted ⇒ the handler's non-empty-route audit branch is taken");
 });
 
 test("#7526 P0: a path deleted in ONE arm but live in ANOTHER stays a candidate (per-arm exclusion)", () => {

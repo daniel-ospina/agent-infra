@@ -2433,6 +2433,11 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
   // Multi-refspec union: files dedup, renameOldPaths dedup, clean = AND over
   // the refspec parses (mixed-union rule).
   const union: DiffScope = { files: [], renameOldPaths: [], clean: true };
+  // #7526: the union of per-refspec LIVE files (`files` minus that refspec's
+  // `deleted`). The rebuild below excludes a deletion from the result only when
+  // no refspec contributes the path live — see `combineScopes` for the rule and
+  // the P0/P1 it settles.
+  const unionLiveFiles: string[] = [];
   let sawTierA = false;
   // #3716 — op-level provenance for the empty-range audit below: a rewrite push
   // whose narrowed range is empty is NOT an up-to-date push, and must not be
@@ -2632,14 +2637,20 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
       srcRef: srcRef ?? undefined,
       trackingRef: tracking,
     });
-    // #7526 (P0 fix): the deletion exclusion is PER REFSPEC, before the union —
-    // same rule and same reachable collapse as `combineScopes` (origin/A..A
-    // deletes `f.ts`, origin/B..B modifies it ⇒ a unioned `deleted` would erase
-    // the modified path). The rebuilt object below therefore carries no
-    // `deleted` (a consumer re-subtracting it globally would re-open the bug).
-    union.files.push(...verificationCandidates(subbed.files, subbed.deleted));
+    // #7526: `files` unions the refspecs' files PLAINLY — the deletion exclusion
+    // must NOT be subtracted here, or `applyScopeGate` (fed the rebuilt `files`
+    // below) stops seeing a deleted non-exempt path and the content-shape
+    // exemption widens (#7526 P1). The exclusion rides on the rebuilt `deleted`
+    // instead, filtered to paths no refspec contributes live: origin/A..A
+    // deletes `f.ts` while origin/B..B modifies it ⇒ `f.ts` stays a candidate
+    // (the #7526 P0).
+    union.files.push(...subbed.files);
     union.renameOldPaths.push(...subbed.renameOldPaths);
     union.clean = union.clean && subbed.clean;
+    if (subbed.deleted !== undefined) {
+      union.deleted = [...(union.deleted ?? []), ...subbed.deleted];
+    }
+    unionLiveFiles.push(...verificationCandidates(subbed.files, subbed.deleted));
     if (subbed.subtractions !== undefined) {
       union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
     }
@@ -2694,14 +2705,17 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
   // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
-  // is therefore carried explicitly and null-safely. `deleted` is deliberately
-  // NOT rebuilt: the #7526 exclusion already ran per refspec above, and a
-  // unioned `deleted` would let the consumer subtract it globally.
+  // and the #7526 `deleted` projection are therefore carried explicitly and
+  // null-safely. `deleted` is the union of the refspecs' deletions MINUS the
+  // paths any refspec contributes live (absent, never `[]`, when it is empty).
+  const unionLive = new Set(unionLiveFiles);
+  const deleted = Array.from(new Set(union.deleted ?? [])).filter((p) => !unionLive.has(p));
   emitPendingRewrites();
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
     clean: union.clean,
+    ...(deleted.length > 0 ? { deleted } : {}),
     ...(union.subtractions !== undefined && union.subtractions.length > 0
       ? { subtractions: union.subtractions }
       : {}),
@@ -2738,10 +2752,11 @@ export interface DiffScope {
    *  faithful output — `files` still carries every `D` path (the G1 pin
    *  requires it). ABSENT (never `[]`) when nothing was deleted, so the
    *  whole-object `deepEqual` pins on `parseDiffNameStatus...` are unchanged.
-   *  A COMBINED scope (`combineScopes`, the push union) applies the exclusion
-   *  PER ARM before unioning and emits NO `deleted` — a unioned set subtracted
-   *  globally would let one arm's `D` erase another arm's live path (the #7526
-   *  P0). Consumers subtract `deleted` only for a SINGLE-arm scope. */
+   *  A COMBINED scope (`combineScopes`, the push union) keeps `files` as the
+   *  PLAIN union (so `applyScopeGate` still sees every `D` path) and carries
+   *  only the deletions NO arm/refspec contributes as a live file — subtracting
+   *  the union globally would let one arm's `D` erase another arm's live path
+   *  (the #7526 P0). */
   deleted?: string[];
 }
 
@@ -2860,26 +2875,43 @@ function execDiffStatusZ(cwd: string, cmd: string): string | null {
 // clean AND over the members). Pure + exported (unit-pinned — the mixed arm's
 // combination rule is otherwise comment-only).
 export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
-  // #7526 (P0 fix): the deletion exclusion is applied PER ARM, BEFORE the
-  // union. `files` is a union over arms, so its subtraction must be applied to
-  // the arm that PRODUCED the path, never globally to the union — a union-level
-  // `files \\ union(deleted)` lets one arm's deletion erase a path another arm
-  // changed. That is reachable with no malice: branch arm `D f.ts` + staged arm
-  // `A f.ts` ⇒ `files=[f.ts]`, `deleted=[f.ts]` ⇒ candidates `[]` ⇒ an
-  // unverified rewrite rides the deletion allow (it blocked at 2d9ec45^).
+  // #7526: `files` is the PLAIN union of the arms' `files` — deliberately NOT
+  // pre-filtered by each arm's `deleted`. `applyScopeGate` (the content-shape
+  // exemption and the rename-source conjunction) consumes this set and must see
+  // every path, including `D` rows, exactly as a single-arm scope does. Dropping
+  // a deleted path HERE widens the exemption: a `D src/app.ts` (non-exempt code)
+  // + `A docs/code.md` change would present only the exempt path and route
+  // `exempt-allow` instead of `verify` — code moved into a docs-shaped path ships
+  // unverified (#7526 P1, introduced by subtracting per arm in 532ee59).
+  //
+  // The deletion exclusion is instead carried on the result's `deleted`, and
+  // ONLY for paths that no arm contributes as a LIVE file:
+  //   deleted_combined = (a.deleted ∪ b.deleted) \\ (live(a) ∪ live(b))
+  // where live(x) = x.files \\ x.deleted. A path may be excluded from
+  // verification only if EVERY arm that lists it in `files` also lists it in
+  // `deleted`; if any arm contributes it live, it must stay a candidate (the
+  // #7526 P0: `D f.ts` on one arm + `A f.ts` on another must still verify).
+  // Subtraction is then safe at the consumer, because no arm contributes the
+  // path as live content.
   //
   // `renameOldPaths` is deliberately NOT treated this way: it is an auxiliary
   // R/C-SOURCE set consumed by the shape-exemption CONJUNCTION, not a projection
   // subtracted from `files`, and one path carries one row letter — a `D` path can
   // never be an R/C source — so unioning it unchanged is the existing (and
   // correct) semantics.
+  const live = new Set([
+    ...verificationCandidates(a.files, a.deleted),
+    ...verificationCandidates(b.files, b.deleted),
+  ]);
+  const deleted = Array.from(new Set([...(a.deleted ?? []), ...(b.deleted ?? [])]))
+    .filter((p) => !live.has(p));
   const core: DiffScope = {
-    files: Array.from(new Set([
-      ...verificationCandidates(a.files, a.deleted),
-      ...verificationCandidates(b.files, b.deleted),
-    ])),
+    files: Array.from(new Set([...a.files, ...b.files])),
     renameOldPaths: Array.from(new Set([...a.renameOldPaths, ...b.renameOldPaths])),
     clean: a.clean && b.clean,
+    // Absence-preserving (never `[]`) — the G4 whole-object literals carry no
+    // `deleted`, mirroring the `subtractions` contract.
+    ...(deleted.length > 0 ? { deleted } : {}),
   };
   // #755: concatenate the per-arm subtraction audits, null-safely AND
   // absence-preservingly — `[...a.subtractions, ...]` would throw
@@ -2888,9 +2920,6 @@ export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
   // falsify the "absent, never []" contract the emit site keys on.
   // Reads NOTHING else on `a`/`b`, so the G4 pins stay green.
   const subs = [...(a.subtractions ?? []), ...(b.subtractions ?? [])];
-  // The result carries NO `deleted`: the exclusion is already applied per arm
-  // above, so re-emitting a unioned set would make the consumer subtract it
-  // GLOBALLY and re-open the collapse this fixes.
   return subs.length > 0 ? { ...core, subtractions: subs } : core;
 }
 
@@ -3147,9 +3176,10 @@ export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeG
  *  the parser and the gate's parse-block / empty / exemption / rename-source
  *  routing still see every path, and `A`/`M`/`R`/`T`/`U`/`X`/`B` pass through
  *  untouched. Pure + exported so the decision is unit-pinned — a regression
- *  cannot silently re-add a deleted path to the candidate set. It is ALSO the
- *  per-arm subtractor `combineScopes`/the push union apply BEFORE unioning, so
- *  a combined scope carries no `deleted` for the consumer to re-subtract.
+ *  cannot silently re-add a deleted path to the candidate set. `combineScopes`
+ *  and the push union also call it to compute an arm's LIVE files (that arm's
+ *  `files` minus its `deleted`), which is what lets them keep `files` a plain
+ *  union while still excluding a path every arm deleted.
  *
  *  Note: for a plain staged deletion (`git rm`) the worktree path is already
  *  absent, so the loop's #920 ENOENT skip reached the same outcome; this
