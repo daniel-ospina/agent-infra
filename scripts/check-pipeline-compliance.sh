@@ -139,9 +139,12 @@ FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
 FILES_EXPECTED=""
 
 # The artifact-only CLASS, declared ONCE (#1611) and declared HERE — above
-# `usage()` — because the early CLI parse calls `usage` (lines ~187/200/209)
-# long before the evidence-patterns block below; declaring it further down left
+# `usage()` — because the early CLI parse calls `usage` long before the
+# evidence-patterns block below; declaring it further down left
 # `ARTIFACT_CLASS_DESC` unbound under `set -u` on every bad-argument path.
+# (No line numbers are cited here on purpose: the first version of this comment
+# named three, and the block above made all three wrong — which is this PR's own
+# thesis. Numbers stale by construction; name the position instead.)
 #
 # The matcher uses ARTIFACT_CLASS_RE; every message that NAMES the class
 # interpolates ARTIFACT_CLASS_DESC. Do NOT restate either inline. The #1409
@@ -2213,6 +2216,22 @@ $big_filler"
         selffail=$((selffail + 1))
         continue
       fi
+      # Boundary-aware, not a bare substring: `…CODEOWNERSS` keeps the real
+      # token as a substring and would pass a substring test while the prose the
+      # user reads is wrong. The rule: a member must be followed by `,`, `)` or
+      # end-of-string. It therefore closes garbling by a TRAILING character, but
+      # NOT the delimiter-only kind (`CODEOWNERS)` passes, since `)` is itself an
+      # allowed follower for `templates/**/*.md)`) — and NOT EXTENSION, because
+      # an appended `, or scripts/**` leaves `.github/CODEOWNERS` followed by a
+      # legitimate `,`. Extension is closed by the member count below. Two
+      # earlier versions of this comment each claimed a case this test does not
+      # catch; a falsification found both. State the rule, not the promise.
+      local after="${ARTIFACT_CLASS_DESC#*"$name"}"
+      if [[ -n "$after" && "${after:0:1}" != "," && "${after:0:1}" != ")" ]]; then
+        printf '❌ the class description contains %s only inside a longer token (followed by %q) — it is not a member\n' "$name" "${after:0:1}" >&2
+        selffail=$((selffail + 1))
+        continue
+      fi
       if grep -qE "$ARTIFACT_CLASS_RE" <<<"$path"; then
         printf '✅ class wording and matcher agree on %s\n' "$name"
       else
@@ -2220,6 +2239,18 @@ $big_filler"
         selffail=$((selffail + 1))
       fi
     done
+    # EXTENSION of the description — a member appended that the class does not
+    # have (`…, or scripts/**`), or one silently dropped. Counting comma-
+    # delimited members catches both; the boundary test above cannot see either.
+    local n_desc_members
+    n_desc_members="$(tr ',' '\n' <<<"$ARTIFACT_CLASS_DESC" | wc -l | tr -d ' ')"
+    if [[ "$n_desc_members" -eq "${#pairs[@]}" ]]; then
+      printf '✅ the class description has exactly %s member(s)\n' "$n_desc_members"
+    else
+      printf '❌ the class description has %s comma-delimited member(s) but this guard pairs %s — a member was added to or dropped from the description\n' "$n_desc_members" "${#pairs[@]}" >&2
+      selffail=$((selffail + 1))
+    fi
+
     # REVERSE direction — the one #1409 actually failed: the matcher gained an
     # alternative (`templates/**/*.md`) that no wording named. The loop above is
     # one-directional and cannot see that, so require the matcher to have exactly
@@ -2239,8 +2270,13 @@ $big_filler"
   }
 
   check_artifact_class_reaches_the_help_text() {
-    # The --help text is the first surface a blocked author reads. It must RENDER
-    # the class from the declaration; a restated copy is what went stale in #1409.
+    # Binds the RENDERED --help text to the declaration. It is deliberately NOT
+    # the guard that catches a restated copy: a one-line restatement that
+    # contains the declaration verbatim (e.g. hidden inside a longer line) is
+    # still a substring match here. The restatement scan in
+    # check_artifact_class_reaches_every_message is what catches that; this guard
+    # catches only the #1409 shape, where the prose was SPLIT differently, and a
+    # lost or broken interpolation.
     local help
     help="$(usage 2>&1 || true)"
     if [[ "$help" == *"$ARTIFACT_CLASS_DESC"* ]]; then
