@@ -370,6 +370,37 @@
 #                        call. (`--workflow` is recovered the same way, but it needs
 #                        a real value — a missing one, or a flag as the value, is
 #                        refused rather than silently widening the lane.)
+#                        ⛔ THIS IS AN OPT-OUT, NOT THE DEFAULT. The rail does not
+#                        widen the lane to make a PR land — #1439 refused exactly
+#                        that, because a lane green on both sides while the REAL
+#                        red sits on another workflow is the #1261 false PASS. The
+#                        ONE case that falls back is measured and printed: if the
+#                        watched lane's own `on:` block cannot fire for this PR's
+#                        changed set (#1614), the lane is INAPPLICABLE, not
+#                        missing, and the rail drops the filter for that run AFTER
+#                        saying so — see LANE APPLICABILITY below.
+#
+#   ── LANE APPLICABILITY (#1614) — the ONE measured fallback ──────────────
+#   Precondition 1 requires a TESTED run of the watched lane on the head. A PR
+#   that touches no path the lane can trigger on can never satisfy it, so the
+#   sanctioned path was a DEAD END for a whole class of diffs (`bin/`,
+#   `scripts/`, `extensions/`, `.github/workflows/`, `templates/`, `docs/` —
+#   measured live on PR #1596, whose only changed files are non-Python). The two
+#   situations the rail used to treat identically are separated by MEASUREMENT:
+#     * the lane SHOULD have run and produced no run  -> a real gap  -> REFUSE
+#       (steps 1/1b, unchanged — this keeps #1261's protection);
+#     * the lane CANNOT run for this diff (no PR trigger, or a `paths:` /
+#       `paths-ignore:` filter that excludes every changed file) AND it has no run
+#       for the head -> INAPPLICABLE dead end -> drop the lane filter for this run
+#       and COMPARE THE EVALUATED SURFACE. Both grounds are required: a lane that
+#       matched no trigger path but DID run for the head is not a dead end, so the
+#       rail leaves it alone (no gratuitous widening).
+#   The fallback is LOUD (stderr block + a line on the evidence) and it is
+#   fail-CLOSED: a workflow file that cannot be read, a changed set that cannot
+#   be read, or a trigger block the predicate cannot decide leaves applicability
+#   UNMEASURED, and the rail then refuses exactly as it did before. The PR's
+#   evaluated-tree gate (§4.5) still runs on every path, so the fallback cannot
+#   merge a red tree — it removes a refusal, it does not remove a gate.
 #   --rerun-timeout S    bound (seconds) on the RE-RUN wait — the wait for a
 #                        re-run run to finish. This is an EXPLICIT override;
 #                        when absent the bound is DERIVED at rail runtime from a
@@ -2343,6 +2374,24 @@ WPE_VERDICT="unknown"
 # could have measured.
 WF_PR_CHANGED_PATHS=""
 WF_PR_PATHS_READ=0
+# read_pr_changed_paths — populate WF_PR_CHANGED_PATHS once per invocation. The
+# diff input for BOTH the #1542 base-red filter comparison and the #1614
+# lane-applicability check, so the two can never disagree about what changed.
+#
+# ⛔ `$slug` ALREADY CARRIES the `repos/` prefix — writing `repos/$slug/…` here
+# composes `repos/repos/<owner>/<repo>/…`, which 404s, so WF_PR_CHANGED_PATHS came
+# back EMPTY for every PR that needed it (#1569). Empty is not neutral:
+# ci-workflow-pr-evaluable.sh then answers `unknown`, and the base-side red stays
+# BLOCKING — a false block whose remedy no rebase satisfies — while the filter
+# comparison this fetch feeds is silently disabled for the common case.
+read_pr_changed_paths() {
+  [ "${WF_PR_PATHS_READ:-0}" -eq 1 ] && return 0
+  WF_PR_PATHS_READ=1
+  local slug
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  WF_PR_CHANGED_PATHS="$($GH api "$slug/pulls/$PR/files?per_page=100" --paginate \
+                             --jq '.[].filename' 2>/dev/null || true)"
+}
 workflow_pr_evaluable() {
   local slug="$1" wf_path="$2" wf_ref="$3" cached body verdict
   WPE_VERDICT="unknown"
@@ -2366,20 +2415,18 @@ workflow_pr_evaluable() {
     # Without that filter the predicate could only answer `yes` for every
     # filtered workflow — comparing the PR against a base red it can never
     # produce (an over-block with a remedy no rebase satisfies).
-    if [ "$WF_PR_PATHS_READ" -eq 0 ]; then
-      WF_PR_PATHS_READ=1
-      # ⛔ `$slug` ALREADY CARRIES the `repos/` prefix — every binding site passes
-      # `repos/<owner>/<repo>`, which is why the line above reads `$slug/contents/…`.
-      # Writing `repos/$slug/…` here composes `repos/repos/<owner>/<repo>/…`, which
-      # 404s, so `WF_PR_CHANGED_PATHS` came back EMPTY for every PR that needed it.
-      # Empty is not neutral: `ci-workflow-pr-evaluable.sh` then answers `unknown`,
-      # and the base-side red stays BLOCKING — a false block whose remedy no rebase
-      # satisfies — while the #1542 filter comparison this fetch exists to feed is
-      # silently disabled for the common case (#1569).
-      WF_PR_CHANGED_PATHS="$($GH api "$slug/pulls/$PR/files?per_page=100" --paginate \
-                                 --jq '.[].filename' 2>/dev/null || true)"
-    fi
-    verdict="$(printf '%s' "$body" | PR_CHANGED_PATHS="$WF_PR_CHANGED_PATHS" \
+    read_pr_changed_paths
+    # ⛔ `env -u CI_WF_PR_EVALUABLE_QUESTION` (#1614 review): this call asks the
+    # DEFAULT question — "can this FILE attach a check to a PR head?". The
+    # question selector is a command-scoped variable at the ONE lane selector
+    # below, but it is also an ordinary exported name, so an operator's (or an
+    # agent's) shell that exports `lane-applicable` would silently re-ask a
+    # different question here and flip a `workflow_call`-only lane from `unknown`
+    # to `no`. `no` is consumed below as an affirmative exemption (`no)
+    # pr_evaluable=0`), so that flip exempts a base red from the very surface
+    # §4.6 gates the merge on — a fail-open reachable by ambient env.
+    verdict="$(printf '%s' "$body" | env -u CI_WF_PR_EVALUABLE_QUESTION \
+                 PR_CHANGED_PATHS="$WF_PR_CHANGED_PATHS" \
                  bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
   fi
   case "$verdict" in
@@ -2391,6 +2438,91 @@ workflow_pr_evaluable() {
   fi
   printf '%s\t%s\n' "$wf_path" "$verdict" >> "$WF_PR_EVAL_CACHE"
   WPE_VERDICT="$verdict"
+}
+
+# ── #1614: IS THE WATCHED LANE APPLICABLE TO THIS DIFF? ─────────────────────
+# The merge rail watches ONE lane (default `python-ci.yml`) and precondition 1
+# requires a TESTED run of that lane on the PR head. A PR that touches nothing
+# the lane can trigger on can NEVER satisfy it, so the sanctioned merge path is a
+# DEAD END for the whole non-Python surface (`bin/`, `scripts/`, `extensions/`,
+# `.github/workflows/`, `templates/`, `docs/`) — the run does not exist and
+# waiting cannot create it.
+#
+# Two situations that look identical are NOT:
+#   * the lane SHOULD have run and produced no run  -> a real gap -> REFUSE
+#     (steps 1/1b, unchanged);
+#   * the lane CANNOT run for this diff            -> INAPPLICABLE, not missing
+#     -> fall back to the evaluated surface, LOUDLY (the caller's job).
+#
+# The rail holds both facts: the watched workflow's `on:` block (fetched at this
+# head) and this PR's changed set. The parse is delegated to the SAME predicate
+# the rest of the rail uses, asked the LANE-SELECTOR question — a second parser
+# would be a second authority on what a trigger is (scripts/
+# ci-workflow-pr-evaluable.sh, `CI_WF_PR_EVALUABLE_QUESTION=lane-applicable`).
+#
+# FAIL CLOSED. A missing path/ref, a failed fetch, an empty changed set, or an
+# undecidable trigger block leaves LANE_APPLICABILITY=`unknown`, and the caller
+# keeps the lane filter and refuses exactly as before. Only a MEASURED
+# `inapplicable` falls back — an applicability that could not be read is never an
+# exemption.
+LANE_APPLICABILITY=""
+LANE_APPLICABILITY_REASON=""
+lane_applicable() {
+  local wf_path="$1" wf_ref="$2" slug body verdict
+  LANE_APPLICABILITY="unknown"
+  LANE_APPLICABILITY_REASON=""
+  [ -n "$wf_path" ] || { LANE_APPLICABILITY_REASON="no lane was named"; return 0; }
+  [ -n "$wf_ref" ] || { LANE_APPLICABILITY_REASON="the head sha could not be resolved"; return 0; }
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  # The raw body (`Accept: …vnd.github.raw`) is what the predicate parses, and the
+  # fetch is pinned to THIS head (the revision whose run the precondition is
+  # about) — a workflow can differ per branch, so reading the default branch would
+  # measure a different revision. An empty body is never parsed: a failed fetch is
+  # `unknown`, not "declares no trigger".
+  body="$($GH api "$slug/contents/$wf_path" -X GET -f "ref=$wf_ref" \
+            -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)"
+  if [ -z "$body" ]; then
+    LANE_APPLICABILITY_REASON="the lane's workflow file ('$wf_path') could not be READ at head $wf_ref"
+    return 0
+  fi
+  read_pr_changed_paths
+  # `//[[:space:]]/` and not a bare `-z`: a WHITESPACE-ONLY value passes `-z` but
+  # is not a changed set, and the predicate reads an empty list as "matches
+  # nothing" — the two together would file an unmeasured lane as INAPPLICABLE.
+  # The predicate collapses an all-blank list to undecidable too (#1614 review);
+  # this leg keeps the rail's own reason line honest as well.
+  if [ -z "${WF_PR_CHANGED_PATHS//[[:space:]]/}" ]; then
+    LANE_APPLICABILITY_REASON="the PR's changed-file list could not be READ, so the lane's applicability is UNMEASURED"
+    return 0
+  fi
+  printf '%s' "$body" | PR_CHANGED_PATHS="$WF_PR_CHANGED_PATHS" \
+      CI_WF_PR_EVALUABLE_QUESTION=lane-applicable \
+      bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" \
+      > "$TMP/lane-applicable.verdict" 2> "$TMP/lane-applicable.reason" || true
+  verdict="$(cat "$TMP/lane-applicable.verdict" 2>/dev/null || true)"
+  LANE_APPLICABILITY_REASON="$(cat "$TMP/lane-applicable.reason" 2>/dev/null || true)"
+  case "$verdict" in
+    yes) LANE_APPLICABILITY="applicable" ;;
+    no)  LANE_APPLICABILITY="inapplicable" ;;
+    *)   LANE_APPLICABILITY="unknown" ;;
+  esac
+  return 0
+}
+
+# lane_has_no_head_run <head> — TRUE (0) only when the watched lane PROVABLY has
+# NO run for <head>. This is what keeps the #1614 fallback a DEAD-END repair
+# rather than a trigger-shape repair: a lane that matched no trigger path but DID
+# run for the head is not a dead end (precondition 1 is satisfiable), and widening
+# there would be gratuitous. An UNREADABLE listing is NOT "no run" — fail closed,
+# no widening.
+lane_has_no_head_run() {
+  local head="$1" args=() out rc=0
+  [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+  out="$($GH run list --commit "$head" --limit 1 --workflow "$WORKFLOW" \
+           ${args[@]+"${args[@]}"} --json databaseId --jq '.[].databaseId' 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  [ -z "$out" ] || return 1
+  return 0
 }
 
 # check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
@@ -3510,6 +3642,72 @@ main() {
     exit 1
   fi
 
+  # ── 0b. IS THE WATCHED LANE APPLICABLE TO THIS DIFF? (#1614) ──────────────
+  # Measured BEFORE the lane is read: if the watched workflow's own `on:` block
+  # cannot fire for this PR's changed set, then no run OF that lane can ever
+  # attach to this head, and the lane filter is not "unavailable" but
+  # INAPPLICABLE. #1439 refused rather than SILENTLY widening the lane; this is
+  # not that. The widening is (a) MEASURED from the workflow file and the diff,
+  # (b) SCOPED to the measured-inapplicable case, and (c) PRINTED. The #1261
+  # protection is untouched: the fallback is a STRICTER surface (every lane that
+  # ran) AND the PR's evaluated-tree gate (§4.5, every workflow and app) still
+  # runs. An UNDECIDABLE applicability does NOT fall back — the rail refuses
+  # exactly as before, and a lane that SHOULD have run still refuses at §1b.
+  local LANE_FALLBACK_FROM=""
+  local lane_reason=""
+  if [ "$ANY_WORKFLOW" -ne 1 ] && [ -n "$WORKFLOW" ]; then
+    lane_applicable ".github/workflows/$WORKFLOW" "$head"
+    case "$LANE_APPLICABILITY" in
+      inapplicable)
+        # ⛔ THE FALLBACK IS FOR THE DEAD END, NOT FOR THE TRIGGER SHAPE. An
+        # inapplicable lane only DEAD-ENDS the rail when it has NO run for this
+        # head (that is what makes precondition 1 unsatisfiable). A lane that
+        # matched no trigger path but DID run for the head is not a dead end, and
+        # widening there would be gratuitous — so the probe decides, and an
+        # UNREADABLE probe fails closed (no widening).
+        if lane_has_no_head_run "$head"; then
+          LANE_FALLBACK_FROM="$WORKFLOW"
+          # ⛔ NEVER embed the fallback text in a `${VAR:-word}` default here. An
+          # apostrophe inside the `word` of a parameter expansion opens a QUOTE that
+          # bash does not close on this line — it swallows the rest of the branch as
+          # one command, `bash -n` still passes, and the whole fallback silently
+          # becomes a no-op. Caught by the suite (the message printed, the lane did
+          # not change). Assign first, then expand.
+          lane_reason="$LANE_APPLICABILITY_REASON"
+          [ -n "$lane_reason" ] || lane_reason="the lane workflow declares no PR trigger that can fire for this changed set"
+          say_err "admin-merge: ⚠️  LANE INAPPLICABLE — falling back to the evaluated surface (this is NOT a silent widening)."
+          say_err "   watched lane: '$WORKFLOW'  (workflow file: .github/workflows/$WORKFLOW at head $head)"
+          say_err "   $lane_reason"
+          say_err "   Why: the lane's own 'on:' block cannot fire for THIS PR's changed set, and the"
+          say_err "   lane has NO run for head $head — waiting for CI cannot clear it. The lane is"
+          say_err "   INAPPLICABLE here, not missing."
+          if [ -n "$WF_PR_CHANGED_PATHS" ]; then
+            say_err "   changed file(s) consulted ($(printf '%s' "$WF_PR_CHANGED_PATHS" | grep -c '[^[:space:]]') total):"
+            printf '%s\n' "$WF_PR_CHANGED_PATHS" | sed -n '1,10p' | sed 's/^/      /' >&2
+          fi
+          say_err "   FALLING BACK to the evaluated surface: the lane filter is DROPPED for this run, so"
+          say_err "   the PR's failures are compared against EVERY workflow on main that ran, and the"
+          say_err "   PR's own evaluated tree (all workflows, all apps) still gates the merge at §4.5."
+          say_err "   The #1261 guard is NOT weakened: a lane that SHOULD have run and produced no run"
+          say_err "   still REFUSES at §1b — only a lane that CANNOT run is skipped."
+          # Set the SAME state the parser flag sets, so every downstream consumer
+          # (wf_args, lane_run_ids, lane coverage, the certificate) sees ONE path.
+          ANY_WORKFLOW=1
+          wf_args=(--any-workflow)
+          lane="any workflow"
+        fi
+        ;;
+      unknown)
+        # Fail closed: an applicability that could not be MEASURED is not an
+        # exemption. Keep the lane filter; §1b refuses exactly as before. Quiet by
+        # design: the refusal below is the loud part, and this fires on every
+        # unreadable map (including the common case where the lane simply has no
+        # PR-relevant trigger and the file could not be fetched).
+        :
+        ;;
+    esac
+  fi
+
   # ── 1. the PR's failing set, with provenance for the flake re-run ────────
   # Selected by COMMIT, not by PR: the analyzed set must be provably the SHA the
   # evidence marker names. `--pr` would re-resolve the head internally, so a push
@@ -3650,7 +3848,7 @@ main() {
         # FALSE claim. Scrubbing it makes `no` mean what the message says: no declared
         # trigger can attach to a PR head, whatever any single PR changed.
         lane_verdict="$(printf '%s' "$lane_body" \
-          | env -u PR_CHANGED_PATHS -u PR_HEAD_BRANCH \
+          | env -u PR_CHANGED_PATHS -u PR_HEAD_BRANCH -u CI_WF_PR_EVALUABLE_QUESTION \
               bash "$SELF_DIR/ci-workflow-pr-evaluable.sh" 2>/dev/null || true)"
       fi
       # ⛔ THE DIAGNOSIS IS KEYED ON THE PREDICATE'S VERDICT — NOT ON A GREP OF THE
@@ -4618,6 +4816,15 @@ ${parity_forgiven_note}"
   # that actually authorised the merge, not the pre-rerun one.
   local final_exempt="$TMP/unique.exempt"
   if [ -f "$TMP/unique2.verdict" ]; then final_exempt="$TMP/unique2.exempt"; fi
+  # ── #1614: THE LANE-APPLICABILITY FALLBACK, ON THE CERTIFICATE ────
+  # The stderr block above says WHY the fallback fired; a reader of the posted
+  # evidence never sees stderr, so the same fact is stated here. APPENDED, after
+  # the literal parity lines — never spliced into them.
+  if [ -n "$LANE_FALLBACK_FROM" ]; then
+    analyzed="${analyzed}
+   lane applicability fallback (#1614): the watched lane '${LANE_FALLBACK_FROM}' is INAPPLICABLE to this diff — its workflow's 'on:' block declares no pull_request / pull_request_target trigger that can fire for this PR's changed set, so no run OF that lane can attach to head $head. The lane filter was DROPPED for this run (the full evaluated surface was compared) — a MEASURED fallback, never a silent widening. A lane that SHOULD have run and produced no run still refuses at step 1b; only a lane that CANNOT run is skipped."
+  fi
+
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
@@ -4741,7 +4948,48 @@ ${parity_forgiven_note}"
       "$TMP/merge.err" "gh pr merge said:"
     exit 1
   fi
-  info "admin-merge: ✅ merged PR #$PR at $head (state=$merge_state confirmed via the API)"
+  # THE SHA THAT LANDED, NOT THE SHA WE SENT (#7504). `$head` is the BRANCH head, and
+  # under the DEFAULT `--squash` (see the MERGE_ARGS note above) the commit that lands
+  # on main is a NEW commit that shares no sha with it — so printing `$head` here
+  # recorded a sha that is not on main at all. Measured on three landings, and the
+  # printed value was `head.sha`: verified against the API on #7537 (printed
+  # fbdcddb1… = head.sha, while its `merge_commit_sha` is daab0afe…) and on #7417
+  # (printed 9df5bd21… = head.sha, `merge_commit_sha` 39f92e37…). So it failed
+  # `git merge-base --is-ancestor <sha> origin/main` because a squash creates a NEW
+  # commit, and it was "not a valid commit name" because the PR-HEAD object was never
+  # fetched into the clone that was asked to resolve it — NOT because anything was
+  # deleted on GitHub.
+  #
+  # CORRECTION (review round 2, and it is worth keeping visible): an earlier version
+  # of this comment blamed the PREDICTED merge ref `refs/pull/N/merge`. That was
+  # WRONG. The old line read `$head` — it never touched `merge_commit_sha` at all. The
+  # general fact that a PRE-merge `merge_commit_sha` holds the predicted
+  # `refs/pull/N/merge` ref is true (see the note above `resolve_merge_ref`), but it
+  # explains nothing about this defect, and a reader who believed it would go and
+  # look for a deleted ref instead of at the line that printed the head.
+  #
+  # Read the landed commit from the
+  # REST PR object AFTER the merge: the same source `resolve_merge_ref` trusts, for
+  # the same reason it states (REST `merge_commit_sha` is populated while the PR is
+  # still OPEN, where GraphQL `mergeCommit` is NULL — see the note above
+  # `resolve_merge_ref`; the same REST object is re-read here, AFTER the merge,
+  # where the field holds the landed commit).
+  local landed_sha="" slug
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  landed_sha="$($GH api "$slug/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null || true)"
+  case "$landed_sha" in
+    ""|null)
+      # No sha is better than a WRONG sha: the whole defect was a figure that looked
+      # like the artifact and was not. The head is printed SHORT (12 chars) because a
+      # second full 40-hex token on this line is machine-reachable — anything reading
+      # "the sha off the success line" would recover the head, which is the #7504
+      # defect reintroduced (review round 1, P2-3).
+      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was ${head:0:12}…, which under a squash is NOT on main. Read the artifact with: gh pr view $PR ${REPO:+--repo $REPO} --json mergeCommit"
+      ;;
+    *)
+      info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was ${head:0:12}…)"
+      ;;
+  esac
 }
 
 main "$@"
