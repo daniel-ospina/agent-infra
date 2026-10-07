@@ -18,10 +18,9 @@
 #                          For cross-repo refs the
 #                          labels (tier) and scoping comments (checks b–e) are
 #                          fetched from the issue's OWN repo, not the PR's.
-#                          A PR whose diff is ENTIRELY an artifact under docs/,
-#                          instruction-layer Markdown (AGENTS.md,
-#                          skills/**/*.md, templates/**/*.md), or
-#                          .github/CODEOWNERS may
+#                          A PR whose diff is ENTIRELY an artifact — the class
+#                          named once in ARTIFACT_CLASS_DESC below, never
+#                          restated here — may
 #                          instead use a NON-closing traceability keyword
 #                          (Refs / Part of / Advances / Tracks / Relates to).
 #                          Rationale: a planning/instruction-artifact PR
@@ -139,15 +138,31 @@ FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
 # enforced — offline simulations construct the list in-process.
 FILES_EXPECTED=""
 
+# The artifact-only CLASS, declared ONCE (#1611) and declared HERE — above
+# `usage()` — because the early CLI parse calls `usage` (lines ~187/200/209)
+# long before the evidence-patterns block below; declaring it further down left
+# `ARTIFACT_CLASS_DESC` unbound under `set -u` on every bad-argument path.
+#
+# The matcher uses ARTIFACT_CLASS_RE; every message that NAMES the class
+# interpolates ARTIFACT_CLASS_DESC. Do NOT restate either inline. The #1409
+# change added `templates/**/*.md` and left four independent restatements
+# stale — two of them USER-FACING (this script's --help and the check-(a)
+# refusal), so the gate explained a refusal with a rule it had just relaxed,
+# found only by exhaustively grepping the family afterwards. The self-test's
+# three check_artifact_class_* guards keep the wording, the --help text and the
+# refusal message bound to this one declaration.
+ARTIFACT_CLASS_RE='^(docs/|AGENTS\.md$|skills/.*\.md$|templates/.*\.md$|\.github/CODEOWNERS$)'
+ARTIFACT_CLASS_DESC='docs/, instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or .github/CODEOWNERS'
+
 usage() {
-  cat >&2 <<'EOF'
+  cat >&2 <<EOF
 Usage:
   bash scripts/check-pipeline-compliance.sh <PR_NUMBER>
   PR_NUMBER=123 GH_REPO=owner/repo bash scripts/check-pipeline-compliance.sh
 
   #792 pre-PR mode — issue-side artifacts only (b + d-via-Wiring):
   bash scripts/check-pipeline-compliance.sh --issue-only <N|owner/repo#N>
-  PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N|owner/repo#N> \
+  PIPELINE_COMPLIANCE_ISSUE_ONLY=1 PIPELINE_COMPLIANCE_ISSUE=<N|owner/repo#N> \\
     bash scripts/check-pipeline-compliance.sh
 
 Env:
@@ -166,8 +181,7 @@ Check (a) scope:
   or task-list checkbox (compound/nested prefixes included) — and/or an
   emphasis/bold/backtick marker. A mid-sentence mention does NOT
   count, because it can auto-close an issue on merge (#1012).
-  A diff that is ENTIRELY an artifact — under docs/, instruction-layer Markdown
-  (AGENTS.md, skills/**/*.md, templates/**/*.md), or .github/CODEOWNERS — may
+  A diff that is ENTIRELY an artifact — $ARTIFACT_CLASS_DESC — may
   instead use a
   NON-closing traceability keyword (Refs / Part of / Advances / Tracks /
   Relates to #N); closure is not implied. Any .ts/.js/.mjs/script/workflow path
@@ -670,8 +684,8 @@ files_rows() {
 }
 
 # pr_is_artifact_only <files> — true when the PR's diff is ENTIRELY an artifact:
-# under docs/, instruction-layer Markdown (AGENTS.md, skills/**/*.md,
-# templates/**/*.md), or the review-routing config .github/CODEOWNERS.
+# the class declared once as ARTIFACT_CLASS_RE / ARTIFACT_CLASS_DESC above.
+# This comment deliberately does NOT re-list the class (#1611).
 # `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
 # fetch. Fails CLOSED on anything it cannot prove, because this predicate is
 # what unlocks check (a)'s non-closing keyword — a false `true` would let a
@@ -741,7 +755,7 @@ pr_is_artifact_only() {
   # remaining keyword was a closing one — a FALSE close or a blocked PR.
   # The `.md` restriction is load-bearing, not decorative: see the 18/21 note
   # above.
-  ! grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|templates/.*\.md$|\.github/CODEOWNERS$)' <<<"$paths"
+  ! grep -qvE "$ARTIFACT_CLASS_RE" <<<"$paths"
 }
 
 # resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
@@ -829,7 +843,9 @@ run_checks() {
   # point, shared with the live issue lookup below, so check (a)'s verdict and
   # the issue that b–e actually run against can never drift apart.
   #
-  # Artifact-only PRs (docs/, instruction-layer Markdown, .github/CODEOWNERS)
+  # Artifact-only PRs (the class declared once as ARTIFACT_CLASS_DESC below —
+  # deliberately not re-listed here, because a prose copy is what went stale in
+  # #1409: this comment omitted templates/**/*.md for a week)
   # may fall back to a non-closing traceability keyword — such a PR closes no
   # runtime work, so requiring a closing keyword would force a FALSE close of
   # the linked issue. The closing form always wins when both are present, and
@@ -880,7 +896,7 @@ run_checks() {
       fi
     fi
   else
-    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
+    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under $ARTIFACT_CLASS_DESC may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
@@ -1067,7 +1083,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
   echo "Would check, in order:"
-  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
+  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under $ARTIFACT_CLASS_DESC may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
@@ -2173,11 +2189,129 @@ $big_filler"
   unset IO_LOG IO_FAILURES IO_SKIPS IO_REMEDY IO_LISTCAUSE IO_B 2>/dev/null || true
 
 
+  # ── #1611: the artifact class is DECLARED ONCE, and both user-facing
+  # surfaces RENDER it from the declaration. #1409 added one regex alternative
+  # and left four restatements stale — two of them user-facing (the --help text
+  # and the check-(a) refusal), so the gate explained a refusal with a rule it
+  # had just relaxed. These three checks are what makes that un-repeatable.
+  check_artifact_class_wording_tracks_the_matcher() {
+    # Each member named in the human description must be MATCHED by the matcher.
+    # Catches a relaxed regex whose wording still promises the token, and a
+    # description left naming something the class no longer accepts.
+    local -a pairs=(
+      'docs/|docs/a.md'
+      'AGENTS.md|AGENTS.md'
+      'skills/**/*.md|skills/a/SKILL.md'
+      'templates/**/*.md|templates/a.md'
+      '.github/CODEOWNERS|.github/CODEOWNERS'
+    )
+    local pair name path
+    for pair in "${pairs[@]}"; do
+      name="${pair%%|*}"; path="${pair##*|}"
+      if [[ "$ARTIFACT_CLASS_DESC" != *"$name"* ]]; then
+        printf '❌ the class description does not name %s\n' "$name" >&2
+        selffail=$((selffail + 1))
+        continue
+      fi
+      if grep -qE "$ARTIFACT_CLASS_RE" <<<"$path"; then
+        printf '✅ class wording and matcher agree on %s\n' "$name"
+      else
+        printf '❌ the description names %s but the matcher rejects %s\n' "$name" "$path" >&2
+        selffail=$((selffail + 1))
+      fi
+    done
+    # REVERSE direction — the one #1409 actually failed: the matcher gained an
+    # alternative (`templates/**/*.md`) that no wording named. The loop above is
+    # one-directional and cannot see that, so require the matcher to have exactly
+    # as many alternatives as this guard's member table. That table is what keeps
+    # the forward check exhaustive, so a new class member must extend BOTH the
+    # table and the description — which is the point, not a false red. The
+    # diagnostic names the TABLE, not the description: it counts table entries,
+    # and saying "the description enumerates N" would overclaim.
+    local n_alts
+    n_alts="$(sed -E 's/^\^\(//; s/\)$//' <<<"$ARTIFACT_CLASS_RE" | tr '|' '\n' | wc -l | tr -d ' ')"
+    if [[ "$n_alts" -eq "${#pairs[@]}" ]]; then
+      printf '✅ the matcher has exactly %s alternative(s), one per member table entry\n' "$n_alts"
+    else
+      printf '❌ the matcher has %s alternative(s) but this guard pairs %s — a class member was added or removed; extend the member table AND the description together\n' "$n_alts" "${#pairs[@]}" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+
+  check_artifact_class_reaches_the_help_text() {
+    # The --help text is the first surface a blocked author reads. It must RENDER
+    # the class from the declaration; a restated copy is what went stale in #1409.
+    local help
+    help="$(usage 2>&1 || true)"
+    if [[ "$help" == *"$ARTIFACT_CLASS_DESC"* ]]; then
+      printf '✅ --help renders the artifact class from the declaration\n'
+    else
+      printf '❌ --help does not carry ARTIFACT_CLASS_DESC — a restated copy is stale, or the interpolation was lost\n' >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+
+  check_artifact_class_reaches_every_message() {
+    # The invariant is "declared ONCE": the class prose may appear in the
+    # DECLARATION, in a COMMENT (which merely quotes it), and in this guard —
+    # nowhere else, in any verb, in any heredoc. That is what #1409 broke: one
+    # added alternative and four live restatements went stale, two user-facing.
+    # Scanning for restatements (rather than counting interpolations) is what
+    # makes this non-vacuous on a FIXED tree — a fixed tree has ZERO restatements
+    # by construction, so a guard requiring a positive count is a permanent
+    # false red (the first cut of this check was exactly that).
+    #
+    # Invariant (2) below keeps it from passing by DELETION: every user-facing
+    # surface that names the class must still render it from the declaration.
+    #
+    # The prose is held in a variable so this guard's own source cannot satisfy
+    # the pattern it greps for. A previous cut grepped the whole file for
+    # `fail a "no linked issue.*\$ARTIFACT_CLASS_DESC`, whose own line matched it
+    # unconditionally — a tautology that could never go red (falsified by
+    # de-interpolating both messages and watching it pass).
+    local prose_re='docs/, instruction-layer Markdown'
+    local line bad=0
+    while IFS= read -r raw; do
+      # `grep -n` prefixes `NNN:`; strip it, or the comment exemption below can
+      # never match (and the number leaks into the diagnostic).
+      line="${raw#*:}"
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue          # comments may quote it
+      [[ "$line" == *"$prose_re"* ]] || continue
+      [[ "$line" == *ARTIFACT_CLASS_DESC=* ]] && continue   # the declaration
+      [[ "$line" == *prose_re=* ]] && continue              # this guard's variable
+      bad=$((bad + 1))
+      printf '❌ a surface spells the class out instead of interpolating $ARTIFACT_CLASS_DESC: %s\n' "${line:0:110}" >&2
+    done < <(grep -nF "$prose_re" "$SELF_SRC" || true)
+
+    local -a surfaces=('fail a "no linked issue' 'echo "  a. LINKED ISSUE')
+    local surface missing=0
+    for surface in "${surfaces[@]}"; do
+      if ! grep -qE "^ *${surface}.*\\\$ARTIFACT_CLASS_DESC" "$SELF_SRC"; then
+        missing=$((missing + 1))
+        printf '❌ the user-facing surface (%s) no longer renders the class from the declaration\n' "$surface" >&2
+      fi
+    done
+
+    if [[ "$bad" -eq 0 && "$missing" -eq 0 ]]; then
+      printf '✅ the class prose appears only in the declaration/comment/this guard (%s user-facing surface(s) render it)\n' "${#surfaces[@]}"
+    else
+      selffail=$((selffail + 1))
+    fi
+  }
+
+  check_artifact_class_wording_tracks_the_matcher
+  check_artifact_class_reaches_the_help_text
+  check_artifact_class_reaches_every_message
+
+  # Run the exit check AFTER the #1611 guards, so a failure there is reported
+  # on the same run instead of masking them (this is how the unbound-variable
+  # regression above stayed hidden on the first attempt).
   if [[ "$selffail" -gt 0 ]]; then
     echo "❌ SELF-TEST FAILED ($selffail assertion(s))." >&2
     exit 2
   fi
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the artifact-only traceability form; pr_is_artifact_only gates the fallback over docs/ + instruction-layer Markdown + .github/CODEOWNERS and fails closed on any code path; resolve_issue_ref prefers closure."
+
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the artifact-only traceability form; pr_is_artifact_only gates the fallback over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path; the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); resolve_issue_ref prefers closure."
   exit 0
 fi
 
