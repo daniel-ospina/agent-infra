@@ -503,8 +503,12 @@ run_job_count() {
 # it cannot enter `tested`; a listing whose only non-completed runs are unexpanded
 # therefore has `tested=0` and is REFUSED by the `tested > 0` precondition in
 # admin-merge.sh §1b and by `check-lane-tested.sh` at the detector — independently
-# of this counter. The suppression can never be the thing that lets a merge
-# proceed; it can only stop a never-expanded run from being reported as pending.
+# of this counter. That holds for the LANE-FILTERED listing. It is qualified under
+# `--any-workflow`, where `tested` counts ANY workflow's completed run at the head:
+# there a suppressed test-lane run can be paired with an unrelated green workflow,
+# so suppression CAN be the thing that lets a merge proceed. The net is therefore
+# `tested > 0`, not this counter — see the qualification at the `any_workflow`
+# branch below.
 # (b) The only clock reachable here is a run-listing `createdAt`, which this file's
 # projection deliberately does not carry: the canonical three fields ARE the whole
 # of admin-merge.sh's mirrored `LANE_RUN_JQ`, and `drop_superseded_runs` fails
