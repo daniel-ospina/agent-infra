@@ -3552,7 +3552,25 @@ test("#7526 P0: a path deleted in ONE arm but live in ANOTHER stays a candidate 
   // see this.)
   deepEqual(verificationCandidates(combined.files, combined.deleted), ["gone.ts"],
     "deleted in one arm, present in another ⇒ still a verification candidate");
-  equal(combined.deleted, undefined, "no unioned `deleted` for the consumer to subtract globally");
+  // `undefined` here is the RESULT OF THE FILTER, not a general "combineScopes
+  // never emits a unioned `deleted`" contract. Arm b lists gone.ts in `files`
+  // and NOT in its `deleted`, so b contributes it LIVE and the union filter
+  // ERASES a's deletion — ABSENT, never `[]`. d9924ed deliberately keeps
+  // `deleted` a live projection (the exact-value positive control below), so
+  // reading this as "the `deleted` computation is dead code" is the mistake
+  // this message now guards against.
+  equal(combined.deleted, undefined,
+    "the deleting arm's deletion is erased by the other arm's live copy ⇒ `deleted` absent for THIS input");
+  // Positive control for the line above: with NO arm contributing the path live,
+  // the SAME call DOES emit a concrete unioned `deleted`. Without it, a no-op
+  // `deleted` (or a dropped filter input) would satisfy the assertion above.
+  deepEqual(
+    combineScopes(
+      { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] },
+      { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] },
+    ).deleted,
+    ["gone.ts"],
+    "no arm contributes gone.ts live ⇒ the unioned `deleted` IS emitted (exact value)");
   // Mirror arm ordering — the union must be order-independent.
   deepEqual(verificationCandidates(combineScopes(b, a).files, combineScopes(b, a).deleted), ["gone.ts"]);
 });
@@ -3600,6 +3618,104 @@ test("#7526 DECISION: only `D` is excluded — A/M/R/T/U/X/B all remain candidat
     ["a.ts", "b.ts", "m.ts", "r.ts", "t.ts", "u.ts", "x.ts"].sort(),
     "every non-D letter is still verified",
   );
+});
+
+// ── #7526 P2-1: the PUSH path's OWN per-refspec deletion union ──
+// `resolvePushRangeScope` implements the SAME rule as `combineScopes` a second
+// time (the `unionLiveFiles` accumulator + the `unionLive` filter). Only
+// `combineScopes` was pinned, so a refactor that filtered the push union's
+// `deleted` against `union.files` instead of the live accumulator — or dropped
+// the accumulator — could re-open the P0 with every other suite green. These
+// tests drive the real resolver against a real repo with REAL remote-tracking
+// refs. Unit route (not e2e): `resolvePushRangeScope` is exported and already
+// unit-driven against real git in this file (the #3716 kill-switch pin above).
+section("#7526 P2-1: the PUSH union applies the per-refspec live rule (real git)");
+
+test("#7526 P2-1: one refspec DELETES a path another keeps LIVE ⇒ still a candidate (route verify)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-7526-push-"));
+  const remote = join(root, "origin.git");
+  const repo = join(root, "repo");
+  try {
+    const g = (a: string) => execSync(`git ${a}`, { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim();
+    mkdirSync(remote, { recursive: true });
+    execSync("git init -q --bare -b main", { cwd: remote, timeout: 20000 });
+    mkdirSync(repo, { recursive: true });
+    execSync("git init -q -b main", { cwd: repo, timeout: 20000 });
+    g("config user.email 7526@test");
+    g("config user.name 7526");
+    g(`remote add origin ${remote}`);
+    writeFileSync(join(repo, "seed.ts"), "s\n");
+    g("add seed.ts");
+    g("commit -q -m seed");
+    const seedOid = g("rev-parse HEAD");
+    writeFileSync(join(repo, "shared.ts"), "v1\n");
+    g("add shared.ts");
+    g("commit -q -m add-shared");
+    g("push -q origin main");
+
+    // delete refspec — tracking at v1, tip deletes shared.ts (range: D shared.ts)
+    g("checkout -q -b delarm");
+    g("push -q -u origin delarm");
+    g("rm -q shared.ts");
+    g("commit -q -m delete-shared");
+
+    // modify refspec — tracking at v1, tip modifies shared.ts (range: M shared.ts)
+    g("checkout -q main");
+    g("checkout -q -b modarm");
+    g("push -q -u origin modarm");
+    writeFileSync(join(repo, "shared.ts"), "v2\n");
+    g("add shared.ts");
+    g("commit -q -m modify-shared");
+
+    // add refspec — tracking at seed (no shared.ts), tip adds it (range: A shared.ts)
+    g(`checkout -q -b addarm ${seedOid}`);
+    g("push -q -u origin addarm");
+    writeFileSync(join(repo, "shared.ts"), "new\n");
+    g("add shared.ts");
+    g("commit -q -m add-shared-2");
+
+    // a SECOND delete refspec for the both-delete case
+    g("checkout -q main");
+    g("checkout -q -b delarm2");
+    g("push -q -u origin delarm2");
+    g("rm -q shared.ts");
+    g("commit -q -m delete-shared-2");
+
+    // ── one DELETES, the other MODIFIES: shared.ts must stay a candidate ──
+    const modify = resolvePushRangeScope("git push origin delarm:delarm modarm:modarm", repo, null, true);
+    ok(modify !== null, "the two-refspec push must resolve (tier A on both)");
+    deepEqual(modify!.files, ["shared.ts"], "plain union: the D path stays in `files`");
+    equal(modify!.deleted, undefined,
+      "the modify refspec contributes shared.ts live ⇒ the deletion is erased, never a unioned `deleted`");
+    deepEqual(verificationCandidates(modify!.files, modify!.deleted), ["shared.ts"],
+      "P0: deleted on one refspec + live on another ⇒ STILL a verification candidate");
+    deepEqual(
+      routeScopeGate(
+        applyScopeGate(modify!.files, modify!.renameOldPaths, modify!.clean, true, isShapeExemptFile),
+        modify!.files,
+      ),
+      { action: "verify", files: ["shared.ts"] },
+      "the shared path is routed `verify`, not exempted and not emptied",
+    );
+
+    // ── one DELETES, the other ADDS: shared.ts must stay a candidate ──
+    const add = resolvePushRangeScope("git push origin delarm:delarm addarm:addarm", repo, null, true);
+    ok(add !== null, "the delete+add push must resolve");
+    equal(add!.deleted, undefined, "the add refspec contributes shared.ts live ⇒ erased");
+    deepEqual(verificationCandidates(add!.files, add!.deleted), ["shared.ts"],
+      "P0: deleted on one refspec + ADDED on another ⇒ still a candidate");
+
+    // ── BOTH refspecs delete the same path: it must be excluded ──
+    const both = resolvePushRangeScope("git push origin delarm:delarm delarm2:delarm2", repo, null, true);
+    ok(both !== null, "the two-delete push must resolve");
+    deepEqual(both!.files, ["shared.ts"], "no refspec is live ⇒ the path is still listed (plain union)");
+    deepEqual(both!.deleted, ["shared.ts"],
+      "no refspec contributes shared.ts live ⇒ the unioned `deleted` DOES carry it");
+    deepEqual(verificationCandidates(both!.files, both!.deleted), [],
+      "deleted on every refspec ⇒ nothing left to verify");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 // ── #3255: worktree-aware root resolution ─────────────

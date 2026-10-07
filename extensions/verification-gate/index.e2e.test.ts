@@ -15,7 +15,7 @@
  *   npx tsx index.e2e.test.ts
  */
 
-import { ok, equal } from "node:assert/strict";
+import { ok, equal, deepEqual } from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync, symlinkSync } from "node:fs";
@@ -5071,6 +5071,48 @@ async function main() {
     git(repo, "commit -m sym1");
     equal(git(repo, "cat-file -p HEAD:farm-entry"), "ext-real-2",
       "git records the link TARGET as the committed content (mode-120000 semantics)");
+  });
+
+  // ── #7526 P2-2: the deletion-only ALLOW must be AUDITED, never silent ──
+  // `deletion_only_no_content` is the ONLY thing that keeps the deletion-only
+  // allow from being a silent allow. Its emission site is the unexported
+  // `pi.on("tool_call")` handler, so THIS suite is the only surface that can
+  // observe it directly: a BARE commit whose ONLY staged change is
+  // `git rm --cached <non-exempt>` (the original #7526 trigger — untracking a
+  // vendored file) routes `verify` with a non-empty `route.files`, filters the
+  // candidate set to EMPTY, and must emit the audit line.
+  test("scenario 7526-P2-2: a bare deletion-only commit is ALLOWED but AUDITED (deletion_only_no_content)", async () => {
+    const repo = join(TEST_ROOT, "repo-7526-p2");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "vendored.ts"), "export const v = 1;\n");
+    git(repo, "add vendored.ts");
+    git(repo, "commit -m baseline");
+    // The #7526 trigger: untrack the file (index deletion; worktree copy kept).
+    git(repo, "rm --cached -q vendored.ts");
+    // Fixture self-check: the staged diff really is a lone non-exempt D row.
+    const z = execSync("git diff --cached --name-status -z", { cwd: repo, encoding: "utf-8" });
+    ok(z.includes("D\0vendored.ts\0"), `7526-P2-2: fixture must stage a lone D row (got ${JSON.stringify(z)})`);
+
+    await fire("session_start", {});
+    const before = readAuditLines().filter(
+      (l) => l.event === "gate_skip" && l.reason === "deletion_only_no_content",
+    ).length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m untrack-vendored", cwd: repo },
+    });
+    equal(res, undefined, "7526-P2-2: a deletion-only change has no post-commit content to verify ⇒ ALLOWED");
+    const after = readAuditLines().filter(
+      (l) => l.event === "gate_skip" && l.reason === "deletion_only_no_content",
+    );
+    ok(after.length > before,
+      "7526-P2-2: the allow must NOT be silent — a deletion_only_no_content audit line is emitted");
+    deepEqual(after[after.length - 1].files, ["vendored.ts"],
+      "7526-P2-2: the audit names the routed D path the allow swallowed");
+    git(repo, "commit -m untrack-vendored");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()
