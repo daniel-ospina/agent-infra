@@ -618,6 +618,44 @@ case "$key" in
         esac
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
+        #
+        # #7504 review round 1 (P1): the rail reads this SAME endpoint with TWO
+        # different projections — the mergeable/merge-ref PAIR above, and (since
+        # #7504) the landed commit ALONE. A fake that ignores `--jq` answers the
+        # second with the first projection's shape, so `landed_sha` came back as
+        # "true\t<sha>" and the success line printed a value that is visibly not a
+        # sha — while §62's `grep 'confirmed via the API'` passed for BOTH the fixed
+        # and the unfixed line, so the fix was certified by nothing. Project on
+        # request, exactly as real `gh api` does.
+        #
+        # THE ORDER OF THESE ARMS IS LOAD-BEARING, and getting it wrong is not a test
+        # nit: the PAIR expression at scripts/admin-merge.sh:955 is
+        # `'"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'` — it CONTAINS
+        # `merge_commit_sha`, so a `*merge_commit_sha*` arm placed first swallows it,
+        # hands `resolve_merge_ref` a bare sha as its `state`, which the
+        # `[ "$state" = "$line" ]` guard clears as unrecognised, and the rail refuses
+        # every mergeable PR — measured: 334 of 1088 assertions failed, 56 of them
+        # the explicit `mergeable=<sha>` refusal block. So match the PAIR first and
+        # let it fall through to the pair projection below.
+        case "$(flag_val --jq "$@")" in
+          *mergeable*) ;;
+          *merge_commit_sha*)
+            # The landed (post-merge) commit is a DIFFERENT value from the PRE-merge
+            # `merge_commit_sha` — which holds the PREDICTED `refs/pull/N/merge` ref — so
+            # it gets its OWN fixture, served only once the merge has happened.
+            # Sharing one fixture was a real gap (review round 2, P2-1): with both reads
+            # fed the same value, an implementation that printed the ALREADY-READ merge
+            # ref passed §62 unchanged, so the assertion proved "not $head" rather than
+            # "the commit that landed".
+            [ -f "$SCEN/pr-landed-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+            s=mergefeed00000000000000000000000000000000
+            [ -f "$SCEN/pr-merge-sha" ] && s="$(cat "$SCEN/pr-merge-sha")"
+            if [ -f "$SCEN/merged" ]; then
+              s=landedfeed000000000000000000000000000000
+              [ -f "$SCEN/pr-landed-sha" ] && s="$(cat "$SCEN/pr-landed-sha")"
+            fi
+            printf '%s\n' "$s"; exit 0 ;;
+        esac
         [ -f "$SCEN/pr-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
         m=true; [ -f "$SCEN/pr-mergeable" ] && m="$(cat "$SCEN/pr-mergeable")"
         s=mergefeed00000000000000000000000000000000
@@ -8347,7 +8385,93 @@ rc=$?
 grep -q 'confirmed via the API' "$SCEN/out" \
   && pass "the success line STATES the API-confirmed state" \
   || fail "the success line does not state the confirmation"
+# ── #7504: the line must name the LANDED commit, not the branch head ──
+# The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
+# via the API)`), so it certified nothing about this fix. Scope the HEAD-NAME checks
+# below to the SUCCESS LINE itself: the run output legitimately carries the pre-merge
+# `merge ref refs/pull/42/merge = mergefeed…` line earlier, so a whole-file grep for
+# that value would pass even when the success line is wrong. The FINAL check is the
+# deliberate exception — it scans the WHOLE run output, which is STRICTER (the head
+# must not appear as a landing anywhere), so its message says which it is.
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+case "$success_line" in
+  *landedfeed000000000000000000000000000000*)
+    pass "#7504: the success line names the LANDED (post-merge) commit" ;;
+  *)
+    fail "#7504: the success line does not name the landed commit: $success_line" ;;
+esac
+# The PRE-merge fixture is a DIFFERENT sha (`mergefeed…`) by construction, so this is
+# what fails if the rail echoes the merge ref it already read instead of re-reading
+# `merge_commit_sha` after the merge — the exact shape the shared fixture used to hide.
+case "$success_line" in
+  *mergefeed00000000000000000000000000000000*)
+    fail "#7504: the success line carries the PRE-merge merge ref — the post-merge read is not happening" ;;
+  *)
+    pass "#7504: the pre-merge merge ref is not presented as the landing" ;;
+esac
+# Deliberately a WHOLE-RUN scan rather than a success-line one, and the only check
+# here that is: a 40-hex head presented as a landing on ANY line is the #7504 shape.
+# Stricter than the checks above, so the message must not blame the success line when
+# it is in fact failing on some other line of the run.
+if grep -q "at $HEAD_MN" "$SCEN/out"; then
+  fail "#7504: the run output presents the branch head as the landing"
+else
+  pass "#7504: the branch head appears nowhere as a landing (whole-run scan)"
+fi
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 62b. #7504: an UNREADABLE landed commit must name NO sha — never the head ──
+# The `""` branch of the landed read was REACHABLE but UNTESTED (review round 3,
+# P2-1): the fake could serve `$SCEN/pr-landed-unreadable`, but no scenario set it —
+# so the branch, and the `${REPO:+--repo $REPO}` remedy that round 2 added to that
+# exact line, shipped unverified. This is not bureaucracy to delete: "print no sha
+# rather than a wrong one" IS the guard, and a wrong sha that LOOKS like the landed
+# artifact is the entire defect, so this is the only thing that tests it.
+echo "== 62b. #7504: an unreadable landed commit prints NO sha (never the head) =="
+new_scen merge-landed-unreadable
+printf '%s\n' "$HEAD_MN" > "$SCEN/head"
+lane_fail "$HEAD_MN" 931 > "$SCEN/runs-$HEAD_MN"
+log_failed "$MNX" > "$SCEN/log-931"
+{ lane_fail main1111 932; lane_fail main2222 933; lane_fail main3333 934; } > "$SCEN/runs-main"
+log_failed "$MNY" > "$SCEN/log-932"
+log_failed "$MNX" > "$SCEN/log-933"
+log_failed "$MNX" > "$SCEN/log-934"
+# The API call that reads the LANDED commit fails, while the merge itself is confirmed.
+touch "$SCEN/pr-landed-unreadable"
+run_admin_here 42 --repo acme/widgets --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "an unreadable landed sha does not fail a merge the API CONFIRMED" \
+  || fail "the merge was refused because the landed sha was unreadable (exit $rc): $(tr '\n' ' ' < "$SCEN/err" | head -c 200)"
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+[ -n "$success_line" ] \
+  && pass "the success line is still printed when the landed sha cannot be read" \
+  || fail "no success line at all when the landed read failed: $(tr '\n' ' ' < "$SCEN/out" | head -c 200)"
+case "$success_line" in
+  *"NOT readable"*)
+    pass "#7504: the fallback SAYS why no sha is printed" ;;
+  *)
+    fail "#7504: the fallback did not say the merge commit was unreadable: $success_line" ;;
+esac
+# A FULL 40-hex token on this line is machine-reachable as "the landed sha" — the
+# exact shape #7504 shipped. The branch head is printed TRUNCATED (12 chars) so that
+# cannot happen; a full head here is therefore the defect whatever the wording says.
+if printf '%s' "$success_line" | grep -Eq '[0-9a-f]{40}'; then
+  fail "#7504: the fallback line carries a full 40-hex sha, readable as the landed commit: $success_line"
+else
+  pass "#7504: the fallback line carries NO full 40-hex sha"
+fi
+if printf '%s' "$success_line" | grep -qF "$HEAD_MN"; then
+  fail "#7504: the fallback line presents the BRANCH HEAD as the landing"
+else
+  pass "#7504: the branch head is not presented as the landed commit"
+fi
+# …and it must stay ACTIONABLE. Round 2 added --repo to this very remedy because
+# without it the reader is pointed back at the wrong repository; scoped to the
+# SUCCESS LINE so a stray `--repo` elsewhere in the run cannot satisfy it.
+printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
+  && pass "#7504: the fallback remediation carries the --repo the run was given" \
+  || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
