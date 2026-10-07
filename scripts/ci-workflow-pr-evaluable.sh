@@ -29,6 +29,36 @@
 # workflow stays blocking, exactly like an unresolved run; defaulting it to `no`
 # would convert a fail-closed guard into a fail-open one.
 #
+# ── THE QUESTION IS SELECTABLE (#1614), AND THE DEFAULT IS THE #6807 ONE ─────
+# `CI_WF_PR_EVALUABLE_QUESTION` selects WHICH question the one token answers:
+#   check-attachable   (DEFAULT) — "can this workflow's checks attach to a PR
+#                      head sha, so that its base red is a red the PR could have
+#                      measured?" This is the #6807/#1542 contract and is
+#                      UNCHANGED. For a REUSABLE (`workflow_call`) workflow it
+#                      must stay `unknown`, because its jobs DO attach — inside
+#                      its CALLER's run, under the CALLER's name — and answering
+#                      `no` here would be consumed downstream as an affirmative
+#                      exemption of a red a PR may well have measured (the #1413
+#                      decision; see `trigger_measurable`).
+#   lane-applicable    — "does this workflow declare a pull_request /
+#                      pull_request_target that can FIRE for THIS PR's changed
+#                      set?" This is the LANE-SELECTOR question the merge rail
+#                      needs (#1614): a workflow with no PR trigger at all
+#                      cannot produce a run of ITSELF on a PR head, so a lane
+#                      pointed at it is INAPPLICABLE to the diff, not missing.
+#                      Unlike the default question, a workflow whose only
+#                      triggers are non-PR answers `no` — MEASURED, not guessed,
+#                      because the trigger set was parsed in full (the #6807
+#                      safety net still turns an undecidable document into
+#                      `unknown`). The `no` here is NOT an exemption and is not
+#                      consumed as one: the rail's caller falls back to a
+#                      STRICTER surface (every lane that ran), never to "nothing".
+# In `lane-applicable` mode a one-line `lane-applicable: …` REASON is written to
+# stderr naming the ground (no PR trigger declared / the path filter excluded
+# every changed path, with the patterns). stdout stays ONE token either way.
+# PR_CHANGED_PATHS must be SET in either mode for a `paths:`-filtered PR trigger
+# to be decidable; absent means undecidable, never "matches nothing".
+#
 # PARSE STRATEGY. PyYAML is not assumed present (the rail must run wherever it is
 # invoked, and a YAML import failure must not silently decide a merge). The `on:`
 # block is a narrow, well-formed slice of YAML — a top-level key whose value is
@@ -63,6 +93,13 @@ import re
 import sys
 
 UNKNOWN, YES, NO = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# #1614: which question this invocation answers. An unknown value is treated as
+# the DEFAULT, which is the fail-closed direction for BOTH callers: the default
+# can only answer `no` for a document whose triggers are all non-PR, and the
+# lane-applicable caller is the only one that consumes `no` as a fallback.
+QUESTION = os.environ.get("CI_WF_PR_EVALUABLE_QUESTION", "check-attachable")
+LANE_APPLICABLE = QUESTION == "lane-applicable"
 
 # The whole question. Not a list to maintain: these are the only two events that
 # attach a check to a pull-request head sha.
@@ -260,7 +297,12 @@ def scan_flow_state(text_part, depth, quote):
 # blocking), never `no`. Only an affirmative, *measured* mismatch exempts.
 PR_HEAD_BRANCH = os.environ.get("PR_HEAD_BRANCH") or None
 _raw_paths = os.environ.get("PR_CHANGED_PATHS")
-PR_CHANGED_PATHS = [p for p in _raw_paths.split("\n") if p.strip()] if _raw_paths else None
+# ⛔ A WHITESPACE-ONLY VALUE IS UNREADABLE, NOT EMPTY. `[ -z ]` in the calling
+# shell does not catch `"   "`, and an EMPTY path list makes `matches_multi`
+# answer "matches nothing" — which a filtered trigger reads as an AFFIRMATIVE
+# EXEMPTION. So an all-blank list collapses to None (undecidable) here, at the
+# one place every caller's input passes through.
+PR_CHANGED_PATHS = ([p for p in _raw_paths.split("\n") if p.strip()] or None) if _raw_paths else None
 
 _FILTER_KEYS = {"paths", "paths-ignore", "branches", "branches-ignore",
                 "tags", "tags-ignore"}
@@ -382,6 +424,28 @@ def matches_multi(values, patterns):
     return False
 
 
+def any_unmatched(values, patterns):
+    """True iff SOME value does NOT match — GitHub's `paths-ignore` rule.
+
+    `paths-ignore` is NOT the mirror of `paths:`. GitHub: "When ALL the path names
+    match patterns in `paths-ignore`, the workflow will not run. If ANY path names
+    do not match patterns in `paths-ignore`, even if some path names match the
+    patterns, the workflow will run." So the workflow runs iff some changed path is
+    NOT ignored — `not all`, never `not any` (#1614 review: the `not any` form
+    reported a workflow GitHub WILL run as unable-to-run, and that answer is
+    consumed as an affirmative exemption by the rail's base-side `no)
+    pr_evaluable=0` and by the #1614 lane-inapplicable fallback). `None` whenever
+    any single match is undecidable.
+    """
+    for v in values:
+        m = matches_any(v, patterns)
+        if m is None:
+            return None
+        if not m:
+            return True
+    return False
+
+
 def trigger_measurable(trig, flt):
     """True = measurable (blocks) / False = never attaches (exempt) / None = fail closed."""
     if flt is None:
@@ -413,8 +477,7 @@ def trigger_measurable(trig, flt):
         if "paths-ignore" in flt:
             if PR_CHANGED_PATHS is None:
                 return None
-            m = matches_multi(PR_CHANGED_PATHS, flt["paths-ignore"])
-            return None if m is None else (not m)
+            return any_unmatched(PR_CHANGED_PATHS, flt["paths-ignore"])
         return True
     if trig == "push":
         # ⛔ NOT PR-EVALUABLE, FILTERED OR NOT — and this is a DECISION, not an
@@ -536,11 +599,53 @@ if not (triggers & PR_TRIGGERS):
             sys.stdout.write(UNKNOWN + "\n")
             sys.exit(0)
 
+# ── #1614: THE LANE-SELECTOR QUESTION. A workflow whose `on:` block declares no
+# pull_request / pull_request_target can never produce a run of ITSELF on a PR
+# head, whatever the diff — so no path can "trigger" it and a lane pointed at it
+# is INAPPLICABLE. This is ANSWERED BEFORE `trigger_measurable`, because that
+# function's `None` for a non-PR trigger is the #1413 decision for the OTHER
+# question (a reusable workflow's checks DO attach, via a caller). Here the
+# trigger set was parsed in full and the #6807 safety net above has already
+# promoted any unnameable PR key to `unknown`, so this `no` is MEASURED.
+pr_triggers = triggers & PR_TRIGGERS
+if LANE_APPLICABLE and not pr_triggers:
+    sys.stderr.write(
+        "lane-applicable: no-pr-trigger — the workflow's on: block declares no "
+        "pull_request / pull_request_target, so no run of it can attach to a PR head "
+        "(declared triggers: %s)\n" % ", ".join(sorted(triggers)))
+    sys.stdout.write(NO + "\n")
+    sys.exit(0)
+
 # ── #1542: decide PER TRIGGER, and refuse rather than exempt ──────────────
+# In lane-applicable mode only the PR triggers are consulted: a non-PR sibling
+# (`push`, `schedule`, `workflow_call`) cannot fire a PR run, so its
+# undecidability must not turn an otherwise-decided PR trigger into `unknown`.
 verdicts = [trigger_measurable(t, (filters or {}).get(t) if filters is not None else None)
-            for t in triggers]
-sys.stdout.write(
-    (YES if any(v is True for v in verdicts)
-     else UNKNOWN if any(v is None for v in verdicts)
-     else NO) + "\n")
+            for t in (pr_triggers if LANE_APPLICABLE else triggers)]
+verdict = (YES if any(v is True for v in verdicts)
+           else UNKNOWN if any(v is None for v in verdicts)
+           else NO)
+if LANE_APPLICABLE and verdict == NO:
+    detail = []
+    for t in sorted(pr_triggers):
+        flt = (filters or {}).get(t) if filters is not None else None
+        if not flt:
+            continue
+        for key in ("paths", "paths-ignore"):
+            if key in flt:
+                detail.append("%s %s: %s" % (t, key, ", ".join(flt[key])))
+    if detail:
+        sys.stderr.write(
+            "lane-applicable: paths-excluded — the declared PR trigger's path "
+            "filter matches none of this PR's changed files (%s)\n" % "; ".join(detail))
+    else:
+        sys.stderr.write(
+            "lane-applicable: paths-excluded — no declared PR trigger can fire for "
+            "this changed set\n")
+elif LANE_APPLICABLE and verdict == UNKNOWN:
+    sys.stderr.write(
+        "lane-applicable: undecidable — the workflow's PR triggers or their filters "
+        "could not be fully attributed, so the lane's applicability is UNMEASURED "
+        "here (fail closed: the rail must refuse)\n")
+sys.stdout.write(verdict + "\n")
 PYEOF
