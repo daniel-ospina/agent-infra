@@ -219,9 +219,9 @@ closing_issue_refs() {
 # this repo, and it must NOT be replaced by either:
 #   * check-pipeline-compliance.sh::pr_is_artifact_only is check (a)'s
 #     closure fallback: it admits ANY file under docs/ (so `docs/evil.sh` would
-#     be an "artifact"), AGENTS.md and skills/**/*.md / templates/**/*.md
-#     (agent-executable instructions — the template is the source that
-#     materializes into every repo's AGENTS.md) and .github/CODEOWNERS (review
+#     be an "artifact"), the instruction-layer Markdown class (agent-executable
+#     instructions — the template is the source that
+#     materializes into every repo's AGENTS.md) and the review-routing config (review
 #     routing — enforcement input). No line numbers cited for either class:
 #     the sibling was already 5 lines out when checked (2026-10-06), and the
 #     other is moved by any edit above it — as this very change demonstrates —
