@@ -8031,10 +8031,12 @@ grep -q 'confirmed via the API' "$SCEN/out" \
   || fail "the success line does not state the confirmation"
 # ── #7504: the line must name the LANDED commit, not the branch head ──
 # The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
-# via the API)`), so it certified nothing about this fix. Scope every check below to
-# the SUCCESS LINE itself: the run output legitimately carries the pre-merge
+# via the API)`), so it certified nothing about this fix. Scope the HEAD-NAME checks
+# below to the SUCCESS LINE itself: the run output legitimately carries the pre-merge
 # `merge ref refs/pull/42/merge = mergefeed…` line earlier, so a whole-file grep for
-# that value would pass even when the success line is wrong.
+# that value would pass even when the success line is wrong. The FINAL check is the
+# deliberate exception — it scans the WHOLE run output, which is STRICTER (the head
+# must not appear as a landing anywhere), so its message says which it is.
 success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
 case "$success_line" in
   *landedfeed000000000000000000000000000000*)
@@ -8051,12 +8053,69 @@ case "$success_line" in
   *)
     pass "#7504: the pre-merge merge ref is not presented as the landing" ;;
 esac
+# Deliberately a WHOLE-RUN scan rather than a success-line one, and the only check
+# here that is: a 40-hex head presented as a landing on ANY line is the #7504 shape.
+# Stricter than the checks above, so the message must not blame the success line when
+# it is in fact failing on some other line of the run.
 if grep -q "at $HEAD_MN" "$SCEN/out"; then
-  fail "#7504: the success line still names the branch head as the landing"
+  fail "#7504: the run output presents the branch head as the landing"
+else
+  pass "#7504: the branch head appears nowhere as a landing (whole-run scan)"
+fi
+unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 62b. #7504: an UNREADABLE landed commit must name NO sha — never the head ──
+# The `""` branch of the landed read was REACHABLE but UNTESTED (review round 3,
+# P2-1): the fake could serve `$SCEN/pr-landed-unreadable`, but no scenario set it —
+# so the branch, and the `${REPO:+--repo $REPO}` remedy that round 2 added to that
+# exact line, shipped unverified. This is not bureaucracy to delete: "print no sha
+# rather than a wrong one" IS the guard, and a wrong sha that LOOKS like the landed
+# artifact is the entire defect, so this is the only thing that tests it.
+echo "== 62b. #7504: an unreadable landed commit prints NO sha (never the head) =="
+new_scen merge-landed-unreadable
+printf '%s\n' "$HEAD_MN" > "$SCEN/head"
+lane_fail "$HEAD_MN" 931 > "$SCEN/runs-$HEAD_MN"
+log_failed "$MNX" > "$SCEN/log-931"
+{ lane_fail main1111 932; lane_fail main2222 933; lane_fail main3333 934; } > "$SCEN/runs-main"
+log_failed "$MNY" > "$SCEN/log-932"
+log_failed "$MNX" > "$SCEN/log-933"
+log_failed "$MNX" > "$SCEN/log-934"
+# The API call that reads the LANDED commit fails, while the merge itself is confirmed.
+touch "$SCEN/pr-landed-unreadable"
+run_admin_here 42 --repo acme/widgets --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "an unreadable landed sha does not fail a merge the API CONFIRMED" \
+  || fail "the merge was refused because the landed sha was unreadable (exit $rc): $(tr '\n' ' ' < "$SCEN/err" | head -c 200)"
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+[ -n "$success_line" ] \
+  && pass "the success line is still printed when the landed sha cannot be read" \
+  || fail "no success line at all when the landed read failed: $(tr '\n' ' ' < "$SCEN/out" | head -c 200)"
+case "$success_line" in
+  *"NOT readable"*)
+    pass "#7504: the fallback SAYS why no sha is printed" ;;
+  *)
+    fail "#7504: the fallback did not say the merge commit was unreadable: $success_line" ;;
+esac
+# A FULL 40-hex token on this line is machine-reachable as "the landed sha" — the
+# exact shape #7504 shipped. The branch head is printed TRUNCATED (12 chars) so that
+# cannot happen; a full head here is therefore the defect whatever the wording says.
+if printf '%s' "$success_line" | grep -Eq '[0-9a-f]{40}'; then
+  fail "#7504: the fallback line carries a full 40-hex sha, readable as the landed commit: $success_line"
+else
+  pass "#7504: the fallback line carries NO full 40-hex sha"
+fi
+if printf '%s' "$success_line" | grep -qF "$HEAD_MN"; then
+  fail "#7504: the fallback line presents the BRANCH HEAD as the landing"
 else
   pass "#7504: the branch head is not presented as the landed commit"
 fi
-unset ADMIN_MERGE_VERIFY_ATTEMPTS
+# …and it must stay ACTIONABLE. Round 2 added --repo to this very remedy because
+# without it the reader is pointed back at the wrong repository; scoped to the
+# SUCCESS LINE so a stray `--repo` elsewhere in the run cannot satisfy it.
+printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
+  && pass "#7504: the fallback remediation carries the --repo the run was given" \
+  || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
