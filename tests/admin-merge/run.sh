@@ -615,6 +615,32 @@ case "$key" in
         esac
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
+        #
+        # #7504 review round 1 (P1): the rail reads this SAME endpoint with TWO
+        # different projections — the mergeable/merge-ref PAIR above, and (since
+        # #7504) the landed commit ALONE. A fake that ignores `--jq` answers the
+        # second with the first projection's shape, so `landed_sha` came back as
+        # "true\t<sha>" and the success line printed a value that is visibly not a
+        # sha — while §62's `grep 'confirmed via the API'` passed for BOTH the fixed
+        # and the unfixed line, so the fix was certified by nothing. Project on
+        # request, exactly as real `gh api` does.
+        #
+        # THE ORDER OF THESE ARMS IS LOAD-BEARING, and getting it wrong is not a test
+        # nit: the PAIR expression at scripts/admin-merge.sh:955 is
+        # `'"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'` — it CONTAINS
+        # `merge_commit_sha`, so a `*merge_commit_sha*` arm placed first swallows it,
+        # hands `resolve_merge_ref` a bare sha as its `state`, which the
+        # `[ "$state" = "$line" ]` guard clears as unrecognised, and the rail refuses
+        # every mergeable PR — measured: 334 of 1088 assertions failed, 56 of them
+        # the explicit `mergeable=<sha>` refusal block. So match the PAIR first and
+        # let it fall through to the pair projection below.
+        case "$(flag_val --jq "$@")" in
+          *mergeable*) ;;
+          *merge_commit_sha*)
+            s=mergefeed00000000000000000000000000000000
+            [ -f "$SCEN/pr-merge-sha" ] && s="$(cat "$SCEN/pr-merge-sha")"
+            printf '%s\n' "$s"; exit 0 ;;
+        esac
         [ -f "$SCEN/pr-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
         m=true; [ -f "$SCEN/pr-mergeable" ] && m="$(cat "$SCEN/pr-mergeable")"
         s=mergefeed00000000000000000000000000000000
@@ -7991,6 +8017,22 @@ rc=$?
 grep -q 'confirmed via the API' "$SCEN/out" \
   && pass "the success line STATES the API-confirmed state" \
   || fail "the success line does not state the confirmation"
+# ── #7504: the line must name the LANDED commit, not the branch head ──
+# The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
+# via the API)`), so it certified nothing about this fix. The fixture's landed sha
+# is `mergefeed000…` and the scenario's head is a DIFFERENT sha, so: the merge sha
+# must be present, and the head must NOT be — which is exactly what fails if the
+# rail goes back to printing `$head`. (Round 1 of the #7504 review found this
+# assertion missing AND the fake answering the new projection with the old shape;
+# both are fixed together, so this assertion is the regression guard.)
+grep -q 'at mergefeed00000000000000000000000000000000' "$SCEN/out" \
+  && pass "#7504: the success line names the LANDED merge commit" \
+  || fail "#7504: the success line does not name the merge commit — it may still be printing the branch head"
+if grep -q "at $HEAD_MN" "$SCEN/out"; then
+  fail "#7504: the success line still names the branch head as the landing"
+else
+  pass "#7504: the branch head is not presented as the landed commit"
+fi
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──

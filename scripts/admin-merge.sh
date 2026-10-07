@@ -4632,21 +4632,24 @@ ${parity_forgiven_note}"
   # test mergeability and DELETES after the merge — which is precisely why the
   # recorded sha could not be resolved afterwards. Read the landed commit from the
   # REST PR object AFTER the merge: the same source `resolve_merge_ref` trusts, for
-  # the same reason it states (REST `merge_commit_sha` is populated once merged,
-  # the GraphQL field is not).
-  local landed_sha=""
-  if [ -n "${REPO:-}" ]; then
-    landed_sha="$($GH api "repos/$REPO/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null || true)"
-  fi
+  # the same reason it states (REST `merge_commit_sha` is populated while the PR is
+  # still OPEN, where GraphQL `mergeCommit` is NULL — see the note above
+  # `resolve_merge_ref`; the same REST object is re-read here, AFTER the merge,
+  # where the field holds the landed commit).
+  local landed_sha="" slug
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  landed_sha="$($GH api "$slug/pulls/$PR" --jq '.merge_commit_sha // ""' 2>/dev/null || true)"
   case "$landed_sha" in
     ""|null)
       # No sha is better than a WRONG sha: the whole defect was a figure that looked
-      # like the artifact and was not. Name the head for diagnosis, and say plainly
-      # that it is not the landing.
-      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was $head, which under a squash is NOT on main. Read the artifact with: gh pr view $PR --json mergeCommit"
+      # like the artifact and was not. The head is printed SHORT (12 chars) because a
+      # second full 40-hex token on this line is machine-reachable — anything reading
+      # "the sha off the success line" would recover the head, which is the #7504
+      # defect reintroduced (review round 1, P2-3).
+      info "admin-merge: ✅ merged PR #$PR (state=$merge_state confirmed via the API) — the merge commit was NOT readable, so it is deliberately NOT printed; branch head was ${head:0:12}…, which under a squash is NOT on main. Read the artifact with: gh pr view $PR --json mergeCommit"
       ;;
     *)
-      info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was $head)"
+      info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was ${head:0:12}…)"
       ;;
   esac
 }
