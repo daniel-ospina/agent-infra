@@ -9294,6 +9294,18 @@ pe_paths "inline flow paths match"      yes 'src/a.c'             $'on:\n  pull_
 pe_paths "inline flow paths no match"   no  'README.md'           $'on:\n  pull_request:\n    paths: [src/**]\n'
 pe_paths "paths-ignore excludes"        no  'docs/a.md'           $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
 pe_paths "paths-ignore non-matching"    yes 'src/a.c'             $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P0. GitHub's `paths-ignore` rule is "run iff SOME changed path is
+# NOT ignored" — `not all`, never `not any`. The mixed set is the ONLY case that
+# separates them, and it is the case the pre-fix code got WRONG: it answered `no`
+# ("cannot attach") for a workflow GitHub runs, and `no` is consumed as an
+# affirmative exemption. Both endpoints (all-ignored / none-ignored) agree under
+# either reading, which is why the two vectors above stayed green.
+pe_paths "paths-ignore one of several ignored" yes $'docs/a.md\nsrc/b.c' $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P2. A whitespace-only value is UNREADABLE, not empty. It passes a
+# bare `[ -z ]` and, without the collapse, an empty path list reads as "matches
+# nothing" → `no` → an affirmative exemption from an input nobody could read.
+pe_paths "whitespace-only set fails closed" unknown '   '          $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+pe_paths "whitespace-only set, paths-ignore" unknown $'  \n\t '   $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
 pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_request:\n    paths:\n      - src/**\n    paths-ignore:\n      - docs/**\n'
 # The push exemptions must be UNTOUCHED by this: a `push` is never PR-evaluable,
 # filtered or not. (This is the #6807 contract; a draft of #1542 briefly widened
@@ -9351,6 +9363,228 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
   && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
   || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1614 — THE WATCHED LANE IS INAPPLICABLE TO THIS DIFF: FALL BACK LOUDLY
+# ═══════════════════════════════════════════════════════════════════════════
+# `admin-merge.sh` defaults its lane to `python-ci.yml`, and precondition 1 needs
+# a TESTED run of it on the head. A diff that cannot trigger that lane can never
+# satisfy it, so the sanctioned merge path was a DEAD END for a whole class of
+# changes (`bin/`, `scripts/`, `extensions/`, `.github/workflows/`, `templates/`,
+# `docs/`) — measured live on PR #1596, whose only changed files are
+# `bin/agent-infra.js` and `tests/drift/run.sh`. `#1439` forbade a SILENT
+# widening (that re-opens #1261's vacuous green), so the fix MEASURES
+# applicability and falls back LOUDLY — and keeps the refusal for a lane that
+# SHOULD have run.
+echo "== #1614. lane applicability: measured fallback, loud, fail-closed =="
+
+# The predicate's LANE-SELECTOR question, distinct from its default #6807
+# check-attachment question. The SAME document must answer differently in the two
+# modes for a REUSABLE workflow — that difference IS this mode's reason to exist.
+lae() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | CI_WF_PR_EVALUABLE_QUESTION=lane-applicable PR_CHANGED_PATHS="$3" bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+  [ "$got" = "$2" ] && pass "lane-applicable[$1]: -> $2" || fail "lane-applicable[$1]: expected $2, got '$got'"
+}
+REUSABLE_YAML=$'name: fixture\non:\n  workflow_call:\n    inputs:\n      v:\n        type: string\n'
+lae "workflow_call only"        no      'bin/x.js'   "$REUSABLE_YAML"
+lae "pr trigger unfiltered"     yes     'bin/x.js'   $'on:\n  pull_request:\n'
+lae "pr paths match"            yes     'src/a.c'    $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "pr paths exclude"          no      'bin/x.js'   $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "paths-ignore excludes all" no      'docs/a.md'  $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+lae "paths-ignore keeps a file" yes     'bin/x.js'   $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P0 — the MIXED set. GitHub runs the workflow iff SOME changed
+# path is not ignored, so this is `yes` (→ `applicable`). The pre-fix `not any`
+# reading answered `no`, i.e. the rail filed a lane GitHub WILL run as
+# inapplicable, dropped the lane filter, and stopped requiring its run.
+lae "paths-ignore one of several ignored" yes $'docs/a.md\nbin/x.js' $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P2 — a whitespace-only changed set is unreadable, so the mode must
+# fail closed rather than answer `no` from an empty path list.
+lae "whitespace-only set fails closed" unknown '   '        $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+lae "NO changed set fails closed" unknown ''          $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "push only"                 no      'bin/x.js'   $'on:\n  push:\n'
+lae "unparsable"                unknown 'bin/x.js'   $'name: fixture\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
+# THE ANTI-REGRESSION FOR THE WHOLE MODE: the DEFAULT question must still answer
+# `unknown` for a reusable workflow. A reusable workflow's jobs DO attach to a PR
+# head (inside its CALLER's run, under the CALLER's name), so `no` there would be
+# consumed downstream as a false exemption (#1413). If a future edit makes the
+# mode the default, this reds.
+got="$(printf '%s' "$REUSABLE_YAML" | PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh")"
+[ "$got" = "unknown" ] \
+  && pass "the DEFAULT question still answers 'unknown' for a reusable workflow (#1413 preserved)" \
+  || fail "the default predicate now answers '$got' for a reusable workflow — a fail-open exemption was introduced"
+
+# #1614 review, P1 — `CI_WF_PR_EVALUABLE_QUESTION` MUST BE SCRUBBED at every call
+# site that is asking the DEFAULT question. It is an ordinary exported name, so an
+# operator's or an agent's shell that exports `lane-applicable` re-asks a different
+# question at the base-side call: a `workflow_call`-only lane flips `unknown` →
+# `no`, and `no` is consumed as an affirmative exemption (`no) pr_evaluable=0`) —
+# the ambient-env fail-open the A/B test names outright.
+#
+# MEASURED, both directions: with the var exported the predicate returns `no` for
+# `$REUSABLE_YAML`; with `env -u` it returns `unknown`. So this is behavioural, not a
+# comment. (The lane selector is the ONE site allowed to set it, and it does so
+# command-scoped, so it can never leak into a sibling call.)
+_amb="$(printf '%s' "$REUSABLE_YAML" | CI_WF_PR_EVALUABLE_QUESTION=lane-applicable PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+_scr="$(printf '%s' "$REUSABLE_YAML" | env -u CI_WF_PR_EVALUABLE_QUESTION PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+[ "$_amb" = "no" ] && [ "$_scr" = "unknown" ] \
+  && pass "the ambient question selector is inert once scrubbed ($_amb → $_scr) — #1614" \
+  || fail "the scrub vector is no longer meaningful: ambient='$_amb' scrubbed='$_scr' (expected no/unknown)"
+_amb_sites="$(printf '%s\n' "$_code" | grep -c 'CI_WF_PR_EVALUABLE_QUESTION' || true)"
+_scr_sites="$(printf '%s\n' "$_code" | grep -c -- '-u CI_WF_PR_EVALUABLE_QUESTION' || true)"
+# `-ge 2`, not `-ge 1`: there are exactly TWO default-question call sites (the
+# base-side `workflow_pr_evaluable` fetch and the lane-diagnosis fetch), and a
+# scrub deleted from EITHER one is an ambient-env fail-open on the surface that
+# call feeds. `-ge 1` stayed green with one of them stripped — measured, which is
+# why this counts the per-site `-u` token rather than the `env -u` spelling (the
+# second site's `-u` is mid-chain, so the `env -u` literal appears only once).
+[ "$_scr_sites" -ge 2 ] \
+  && pass "the rail scrubs CI_WF_PR_EVALUABLE_QUESTION at both default-question call sites ($_scr_sites) — #1614" \
+  || fail "only $_scr_sites `-u CI_WF_PR_EVALUABLE_QUESTION` site(s) in the rail (found $_amb_sites reference(s)); a scrub is missing, so an ambient export can flip that call's answer — an exemption the gate should never grant"
+
+# The raw content fixture, for on:-block shapes `wf_declares` cannot express.
+wf_declares_body() {  # <path> <yaml>
+  mkdir -p "$SCEN/wf-contents/$(dirname "$1")"
+  printf '%s' "$2" > "$SCEN/wf-contents/$1"
+}
+
+# ── (a) THE #1596 SHAPE: the watched lane declares no PR trigger at all ─────
+# `workflow_call`-only cannot produce a run of ITSELF on a PR head, so with no
+# run for the head the precondition is unsatisfiable. Refusing would be a DEAD
+# END; the rail must fall back to the evaluated surface and SAY SO.
+new_scen laneinapp
+HEAD_LA="a4a4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LA" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml "$REUSABLE_YAML"
+pr_changed_files bin/agent-infra.js tests/drift/run.sh
+# The lane has NO run for this head — the dead end. The other workflows DID run.
+: > "$SCEN/runs-$HEAD_LA.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LA" 20001 > "$SCEN/runs-$HEAD_LA"
+lane_pass mainlane 20002 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(a) an INAPPLICABLE lane dead end is repaired: the rail falls back and proceeds (exit $rc)" \
+  || { fail "(a) the rail still refuses a diff its watched lane cannot trigger (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && pass "(a) …and the fallback is LOUD on stderr (#1614)" \
+  || fail "(a) the fallback happened SILENTLY — the exact failure mode #1439 refused"
+grep -q "watched lane: 'python-ci.yml'" "$SCEN/err" \
+  && pass "(a) …naming the lane it could not use" \
+  || fail "(a) the message does not name the watched lane"
+grep -q "no-pr-trigger" "$SCEN/err" \
+  && pass "(a) …and WHY — the consulted trigger evidence, not a bare assertion" \
+  || fail "(a) the message does not say which trigger evidence was consulted"
+grep -q "bin/agent-infra.js" "$SCEN/err" \
+  && pass "(a) …and which changed files were consulted" \
+  || fail "(a) the changed set is not shown"
+grep -q "FALLING BACK to the evaluated surface" "$SCEN/err" \
+  && pass "(a) …and which surface was evaluated instead" \
+  || fail "(a) the fallback surface is not named"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(a) …and the comparison really used the full surface (the certificate says so)" \
+  || fail "(a) the certificate still claims the inapplicable lane"
+grep -q "lane applicability fallback (#1614)" "$SCEN/out" \
+  && pass "(a) …disclosed on the evidence too, not only on stderr" \
+  || fail "(a) the evidence does not disclose the fallback"
+grep -q "pr merge" "$SCEN/calls" && fail "(a) --dry-run attempted a merge" || pass "(a) dry-run attempted no merge"
+
+# ── (b) THE #1261 ANTI-REGRESSION: a lane that SHOULD have run ──────────────
+# The lane declares `pull_request` with a `paths:` filter that MATCHES the diff,
+# so it SHOULD have run. With no run for the head the rail must REFUSE exactly as
+# before. If the fallback swallowed this, #1261's vacuous green would be back.
+new_scen laneapp_norun
+HEAD_LB="b4b4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LB" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  pull_request:\n    paths:\n      - src/**\n'
+pr_changed_files src/app.py
+: > "$SCEN/runs-$HEAD_LB"
+lane_fail mainfeed 20011 > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(b) a lane that SHOULD have run and did not still REFUSES (exit $rc)" \
+  || fail "(b) the applicability fallback swallowed the #1261 refusal — a real gap certified"
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(b) …for the not-tested reason, with the lane still the watched one" \
+  || fail "(b) the refusal is not the lane-not-tested one"
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(b) an APPLICABLE lane was declared inapplicable — the trigger match is wrong" \
+  || pass "(b) …and it was NOT declared inapplicable (the trigger filter matched)"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted" || pass "(b) no merge attempted"
+
+# ── (c) FAIL CLOSED: an applicability that cannot be MEASURED ───────────────
+# No workflow file is readable at the head, so the trigger map is UNMEASURED.
+# That is never an exemption: the rail keeps the lane filter and refuses.
+new_scen laneapp_unknown
+HEAD_LC="c4c4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LC" > "$SCEN/head"
+pr_changed_files bin/agent-infra.js
+: > "$SCEN/runs-$HEAD_LC"
+lane_fail mainfeed 20021 > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(c) an UNREADABLE workflow file fails closed (exit $rc)" \
+  || fail "(c) an unmeasured applicability was read as an exemption — a fail-open"
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(c) the rail fell back on an UNMEASURED applicability — the map must be read reliably" \
+  || pass "(c) …and it did NOT fall back on an unmeasured map"
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(c) …refusing with the original lane-not-tested reason" \
+  || fail "(c) the refusal reason changed on the fail-closed path"
+
+# ── (d) THE PATH-FILTER SHAPE: a PR trigger whose filter excludes the diff ──
+# Same fallback, different measured ground (the `paths:` filter), and the message
+# must name the patterns it consulted.
+new_scen lanepaths
+HEAD_LD="d4d4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LD" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  pull_request:\n    paths:\n      - src/**\n      - tools/x.py\n'
+pr_changed_files bin/agent-infra.js
+: > "$SCEN/runs-$HEAD_LD.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LD" 20031 > "$SCEN/runs-$HEAD_LD"
+lane_pass mainlane 20032 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(d) a 'paths:' filter that excludes the diff also falls back (exit $rc)" \
+  || { fail "(d) a path-excluded lane still dead-ends the rail (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "paths-excluded" "$SCEN/err" \
+  && pass "(d) …naming the path-filter ground" || fail "(d) the ground is not the path filter"
+grep -q "src/\*\*" "$SCEN/err" \
+  && pass "(d) …and the exact patterns it consulted" || fail "(d) the consulted patterns are not shown"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(d) …falling back to the full evaluated surface" || fail "(d) the certificate still claims the lane"
+
+# ── (e) THE DEAD-END GATE: inapplicable BUT the lane DID run ────────────────
+# The fallback repairs a DEAD END, not a trigger shape. A lane that matched no
+# trigger path yet produced a run for the head is usable, so the rail must NOT
+# widen — otherwise every trigger-split repo silently becomes `--any-workflow`.
+new_scen lanehasrun
+HEAD_LE="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LE" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  push:\n'
+pr_changed_files bin/agent-infra.js
+lane_pass "$HEAD_LE" 20041 > "$SCEN/runs-$HEAD_LE.by-workflow.python-ci.yml"
+lane_pass mainlane 20042 > "$SCEN/runs-main.by-workflow.python-ci.yml"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(e) an inapplicable lane that DID run is left alone (exit $rc)" \
+  || { fail "(e) the rail widened instead of using the lane that ran (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(e) the rail widened gratuitously — the lane had a run for this head" \
+  || pass "(e) …no gratuitous widening (the dead-end gate held)"
+grep -q "lane: python-ci.yml" "$SCEN/out" \
+  && pass "(e) …and the certificate still names the requested lane" \
+  || fail "(e) the certificate no longer names the lane that was actually used"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
