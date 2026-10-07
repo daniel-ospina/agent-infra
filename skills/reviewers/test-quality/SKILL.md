@@ -12,14 +12,14 @@ allowed-tools: read bash grep find web_search web_fetch todo_write task
 
 > **Skill type:** Modular — independently invocable, reusable across Workflows.
 > **Continuity:** none — fresh session per invocation, no state carried between calls.
-> **Boundary:** Reviewer #1 (Correctness & Quality) in test-review checks HOW tests are written (determinism, AAA pattern, descriptive naming, false positives). This reviewer checks WHAT tests verify — whether the test actually proves the feature works. A test can pass Reviewer #1 and still be a weak test that provides zero confidence.
+> **Boundary:** in `test-review`, Reviewer A's **pass 1** checks HOW tests are written (determinism, AAA pattern, descriptive naming, false positives); this catalog is **pass 2** of that same reviewer and checks WHAT tests verify — whether the test actually proves the feature works. The two are **ordered passes of one dispatch, never collapsed into one judgement**: a test can pass pass 1 and still be a weak test that provides zero confidence.
 
 Weak tests pass all mechanical quality gates but provide zero confidence that the feature works. They test implementation details instead of behavior, mock everything so nothing real is verified, and pass when the outcome is wrong but the implementation is "correct." This reviewer catches those tests before they ship.
 
 ## When Used
 
 Dispatched by:
-- **test-review** — as 4th parallel reviewer (alongside correctness, coverage+surface, journey-alignment)
+- **test-review** — as **pass 2 of Reviewer A** (pass 1 is mechanical correctness; Reviewer B covers coverage/surface/journey)
 - **epic-plan Detailed E2E substep** — as 3rd reviewer (alongside e2e-coverage, e2e-reproducibility)
 - **verification-before-completion** — lightweight behavioral assertion check at commit time
 
