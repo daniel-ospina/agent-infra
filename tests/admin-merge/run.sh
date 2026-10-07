@@ -9710,6 +9710,108 @@ grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
 
+# ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
+# GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
+# it (measured on PR #1615: three such runs, `status=queued`, `conclusion=null`,
+# jobs API EMPTY, `cancel` refusing with "has not been queued yet", no delete API).
+# Counting it as `pending` blocks a reviewed head PERMANENTLY — the printed remedy
+# ("wait for CI, then re-run the rail") can never clear it. The discriminator is
+# the jobs count (`run_job_count`, the same Jobs API #1482 already reads): ZERO jobs
+# means GitHub never expanded the run, so it cannot be in flight. An unreadable
+# count is NOT zero (fail closed), so the #3420 ratchet — a run that HAS jobs must
+# still count as pending — is not weakened; and a run that has merely not expanded
+# YET cannot enter `tested` either, so a listing holding only such runs is refused
+# by the `tested > 0` precondition (§1b / check-lane-tested.sh) regardless.
+echo "== 68. #1623: an unexpanded run does not hold the merge; a run WITH jobs still does =="
+
+# (a) THE MEASURED SHAPE: a tested sibling + three `queued` runs GitHub never
+# expanded (measured on PR #1615: 37642335832, 37642336639, 37642336755).
+new_scen unexpanded
+HEAD_UX="1623000000000000000000000000000000000000"
+lane_pass "$HEAD_UX" 31001 > "$SCEN/runs-$HEAD_UX"
+{ lane_line queued - "$HEAD_UX" 37642335832
+  lane_line queued - "$HEAD_UX" 37642336639
+  lane_line queued - "$HEAD_UX" 37642336755
+} >> "$SCEN/runs-$HEAD_UX"
+for id in 37642335832 37642336639 37642336755; do printf '0\n' > "$SCEN/jobs-count-$id"; done
+cfs_run --commit-rows "$HEAD_UX" --repo test-org/test-repo --runs-report "$TMP/ux-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) the commit-rows extraction succeeds" || { fail "(a) expected exit 0, got $rc"; sed 's/^/      /' "$TMP/cfs-err" | head -10; }
+v="$(sed -n 's/^pending=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "0" ] && pass "(a) three never-expanded runs yield pending=0 (does NOT block)" \
+  || fail "(a) expected pending=0, got '$v' — the permanent false block is back"
+v="$(sed -n 's/^tested=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "1" ] && pass "(a) the tested run is still counted (tested=1)" \
+  || fail "(a) expected tested=1, got '$v'"
+c="$(grep -c "has ZERO jobs" "$TMP/cfs-err" || true)"
+[ "$c" = "3" ] && pass "(a) each suppressed run is NAMED on stderr (3 notes)" \
+  || fail "(a) expected 3 suppression notes, got '$c'"
+lane_tested "$TMP/ux-rep.txt" python-ci.yml "$HEAD_UX" >"$TMP/ux-guard.txt" 2>&1
+[ $? -eq 0 ] && pass "(a) the shipped gate (check-lane-tested.sh) now certifies the head" \
+  || { fail "(a) the shipped gate still refuses"; sed 's/^/      /' "$TMP/ux-guard.txt" | head -5; }
+
+# (b) NEGATIVE CONTROL — the ratchet. A queued/in-progress run that HAS jobs may
+# still be running, so it MUST keep counting as pending (#3420).
+new_scen unexpandedhasjobs
+HEAD_UY="2623000000000000000000000000000000000000"
+lane_pass "$HEAD_UY" 32001 > "$SCEN/runs-$HEAD_UY"
+lane_line in_progress - "$HEAD_UY" 32002 >> "$SCEN/runs-$HEAD_UY"
+printf '3\n' > "$SCEN/jobs-count-32002"
+cfs_run --commit-rows "$HEAD_UY" --repo test-org/test-repo --runs-report "$TMP/uy-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(b) the extraction succeeds" || fail "(b) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uy-rep.txt")"
+[ "$v" = "1" ] && pass "(b) an in-progress run WITH 3 jobs still yields pending=1 (still blocks)" \
+  || fail "(b) expected pending=1, got '$v' — the #3420 ratchet was WEAKENED"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(b) a run that has jobs was suppressed" \
+  || pass "(b) no suppression for a run that has jobs"
+lane_tested "$TMP/uy-rep.txt" python-ci.yml "$HEAD_UY" >"/dev/null" 2>&1 \
+  && fail "(b) the gate certified a head with a live run" \
+  || pass "(b) the shipped gate still refuses a head with a live run"
+
+# (c) FAIL CLOSED on an unreadable probe: no `jobs-count-<id>` fixture at all.
+new_scen unexpandedunknown
+HEAD_UZ="3623000000000000000000000000000000000000"
+lane_pass "$HEAD_UZ" 33001 > "$SCEN/runs-$HEAD_UZ"
+lane_line queued - "$HEAD_UZ" 33002 >> "$SCEN/runs-$HEAD_UZ"
+cfs_run --commit-rows "$HEAD_UZ" --repo test-org/test-repo --runs-report "$TMP/uz-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(c) the extraction succeeds" || fail "(c) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uz-rep.txt")"
+[ "$v" = "1" ] && pass "(c) an UNESTABLISHABLE job count still yields pending=1 (fail closed)" \
+  || fail "(c) expected pending=1, got '$v' — an unreadable probe was read as zero jobs"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(c) an unknown count was read as zero" \
+  || pass "(c) no suppression without a PROVEN zero count"
+
+# (d) THE RACE — a run created moments ago has no jobs YET. `jobs == 0` cannot by
+# itself tell "not expanded yet" from "never will be", and NO age bound is applied
+# (see the header note in `run_is_unexpanded`). The exposure is closed by the SAME
+# property the run has: a run whose jobs do not exist is not testing the revision,
+# so it cannot enter `tested` — and a listing holding ONLY such runs leaves
+# tested=0, which §1b and the shipped gate refuse on. The counter may read 0; the
+# MERGE is still refused.
+new_scen unexpandedalone
+HEAD_UW="4623000000000000000000000000000000000000"
+{ lane_line queued - "$HEAD_UW" 34001
+  lane_line in_progress - "$HEAD_UW" 34002
+} > "$SCEN/runs-$HEAD_UW"
+printf '0\n' > "$SCEN/jobs-count-34001"
+printf '0\n' > "$SCEN/jobs-count-34002"
+cfs_run --commit-rows "$HEAD_UW" --repo test-org/test-repo --runs-report "$TMP/uw-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(d) the extraction succeeds" || fail "(d) expected exit 0, got $rc"
+[ "$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) an all-unexpanded listing yields pending=0" \
+  || fail "(d) expected pending=0, got '$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")'"
+[ "$(sed -n 's/^tested=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) …and tested=0 — nothing was exercised" \
+  || fail "(d) an unexpanded run was credited as TESTED"
+lane_tested "$TMP/uw-rep.txt" python-ci.yml "$HEAD_UW" >"$TMP/uw-guard.txt" 2>&1
+[ $? -ne 0 ] && pass "(d) …so the shipped gate REFUSES the head (the race cannot merge)" \
+  || fail "(d) a head with NO tested run was certified"
+grep -q "NO tested run" "$TMP/uw-guard.txt" && pass "(d) …refusing on tested=0, not on the pending counter" \
+  || { fail "(d) the refusal reason is not 'NO tested run'"; sed 's/^/      /' "$TMP/uw-guard.txt" | head -5; }
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
