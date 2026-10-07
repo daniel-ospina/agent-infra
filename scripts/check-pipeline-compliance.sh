@@ -138,24 +138,55 @@ FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
 # enforced — offline simulations construct the list in-process.
 FILES_EXPECTED=""
 
-# The artifact-only CLASS, declared ONCE (#1611) and declared HERE — above
-# `usage()` — because the early CLI parse calls `usage` long before the
-# evidence-patterns block below; declaring it further down left
-# `ARTIFACT_CLASS_DESC` unbound under `set -u` on every bad-argument path.
-# (No line numbers are cited here on purpose: the first version of this comment
-# named three, and the block above made all three wrong — which is this PR's own
-# thesis. Numbers stale by construction; name the position instead.)
+# ── The artifact-only CLASS: ONE table, both artifacts RENDERED from it ──────
+# Declared HERE — above `usage()` — because the early CLI parse calls `usage`
+# long before the evidence-patterns block below; declaring it further down left
+# the rendered description unbound under `set -u` on every bad-argument path.
 #
-# The matcher uses ARTIFACT_CLASS_RE; every message that NAMES the class
-# interpolates ARTIFACT_CLASS_DESC. Do NOT restate either inline. The #1409
-# change added `templates/**/*.md` and left four independent restatements
-# stale — two of them USER-FACING (this script's --help and the check-(a)
-# refusal), so the gate explained a refusal with a rule it had just relaxed,
-# found only by exhaustively grepping the family afterwards. The self-test's
-# three check_artifact_class_* guards keep the wording, the --help text and the
-# refusal message bound to this one declaration.
-ARTIFACT_CLASS_RE='^(docs/|AGENTS\.md$|skills/.*\.md$|templates/.*\.md$|\.github/CODEOWNERS$)'
-ARTIFACT_CLASS_DESC='docs/, instruction-layer Markdown (AGENTS.md, skills/**/*.md, templates/**/*.md), or .github/CODEOWNERS'
+# Each row is `<human name>|<path regex fragment>`. ARTIFACT_CLASS_RE (what the
+# gate MATCHES) and ARTIFACT_CLASS_DESC (what the user is TOLD) are BOTH rendered
+# from this table, so the #1409 defect — one token added to the matcher and four
+# prose restatements left stale, two of them user-facing — is impossible by
+# construction rather than guarded against.
+#
+# That rendering IS the seam, and it is why the guards this replaced were
+# DELETED rather than sharpened. The previous design scanned the DESCRIPTION for
+# path-shaped tokens that were not members; eight falsification rounds each
+# closed one spelling and opened another (`CODEOWNERSS`, `, or scripts/**`,
+# `pyproject.toml;`, `.github/CODEOWNERS*`, `i.e.`, `AGENTS.md*`), because a
+# whitespace tokenizer cannot soundly tell a path from a prose word. Rendering
+# removes the thing being scanned. Do NOT reintroduce a scanner — add a row.
+ARTIFACT_CLASS_MEMBERS=(
+  'docs/|docs/'
+  'AGENTS.md|AGENTS\.md$'
+  'skills/**/*.md|skills/.*\.md$'
+  'templates/**/*.md|templates/.*\.md$'
+  '.github/CODEOWNERS|\.github/CODEOWNERS$'
+)
+# NO trailing `$` on this frame: it would distribute over the group, turning the
+# `docs/` PREFIX member into the literal `docs/$` and killing it for every real
+# path pull requests actually return. A falsification caught exactly that, and
+# the suite went 12 assertions red. Each fragment carries its own anchor where
+# one is wanted; the frame contributes only `^(` and `)`.
+# Refuse an empty table loudly. On bash 3.2 an empty array aborts under `set -u`,
+# but bash >= 4.4 (what CI runs) expands it and renders `^()`, which matches
+# EVERY path — the artifact-only fallback would then fire for a code-only diff.
+# A silent fail-open is the one outcome this must never have.
+if [[ "${#ARTIFACT_CLASS_MEMBERS[@]}" -eq 0 ]]; then
+  echo "❌ ARTIFACT_CLASS_MEMBERS is empty — the artifact-only class would match EVERYTHING. Refusing to start." >&2
+  exit 2
+fi
+ARTIFACT_CLASS_RE="^($(printf '%s\n' "${ARTIFACT_CLASS_MEMBERS[@]}" | cut -d'|' -f2- | paste -sd'|' -))"
+# The description is a PURE JOIN of the member names — no prose frame. A frame is
+# decoration that CANNOT be validated: it lets a row claim a name by sitting on
+# any boundary-delimited span of the sentence (`OWNERS` inside `.github/CODEOWNERS`,
+# `Markdown (AGENTS.md` inside the parenthetical), and each spelling needs its own
+# heuristic. Ten falsification rounds each closed one spelling and opened another,
+# and two of the guards written along the way introduced P0s of their own. Joining
+# the names removes the thing being scanned, so there is nothing left to validate.
+# The information the old `instruction-layer Markdown` phrase carried — WHY those
+# members qualify — belongs in the surrounding help text, which is not the class.
+ARTIFACT_CLASS_DESC="$(printf '%s\n' "${ARTIFACT_CLASS_MEMBERS[@]}" | cut -d'|' -f1 | paste -sd, - | sed 's/,/, /g')"
 
 usage() {
   cat >&2 <<EOF
@@ -1503,6 +1534,16 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # adjacency is a real bypass shape for a new entry and must not match.
   expect_artifact_only 'templates-adjacent path is not the templates class' $'modified\ttemplates-adjacent/AGENTS.base.md\t' false
   expect_artifact_only 'templatesX prefix is not the templates class' $'modified\ttemplatesx/AGENTS.base.md\t' false
+  # (F3, cycle 3) The two members the new name/fragment binding could RELAX
+  # without reddening anything: `docs/` losing its slash, and `AGENTS\\.md$`
+  # losing its end anchor. Both are prefix/suffix bypasses with no other vector
+  # covering them, and the new guard cannot see a LOOSER fragment (its probe is
+  # one-directional: name -> fragment accepts). Falsified: with `docs/` -> `docs`
+  # the whole suite stayed green and `docsite/deploy.sh` became artifact-only.
+  expect_artifact_only 'docs prefix adjacency is not the docs class' $'modified\tdocsite/deploy.sh\t' false
+  expect_artifact_only 'AGENTS.md with a suffix is not the exact artifact' $'modified\tAGENTS.md.bak\t' false
+  # End anchors carry the same weight as prefixes: `AGENTS\\.md$` must not accept
+  # a name that merely STARTS that way, or a stray backup joins the class.
   # A rename carries BOTH ends through this predicate: moving executable content
   # OUT of code and INTO a `templates/*.md` name must still read NOT
   # artifact-only, or the entry becomes an exfiltration route for a code diff.
@@ -2197,74 +2238,53 @@ $big_filler"
   # and left four restatements stale — two of them user-facing (the --help text
   # and the check-(a) refusal), so the gate explained a refusal with a rule it
   # had just relaxed. These three checks are what makes that un-repeatable.
-  check_artifact_class_wording_tracks_the_matcher() {
-    # Each member named in the human description must be MATCHED by the matcher.
-    # Catches a relaxed regex whose wording still promises the token, and a
-    # description left naming something the class no longer accepts.
-    local -a pairs=(
-      'docs/|docs/a.md'
-      'AGENTS.md|AGENTS.md'
-      'skills/**/*.md|skills/a/SKILL.md'
-      'templates/**/*.md|templates/a.md'
-      '.github/CODEOWNERS|.github/CODEOWNERS'
-    )
-    local pair name path
-    for pair in "${pairs[@]}"; do
-      name="${pair%%|*}"; path="${pair##*|}"
-      if [[ "$ARTIFACT_CLASS_DESC" != *"$name"* ]]; then
-        printf '❌ the class description does not name %s\n' "$name" >&2
-        selffail=$((selffail + 1))
-        continue
+
+  check_artifact_class_table_is_well_formed() {
+    # Every check here is EXACT and non-tautological. The description half of the
+    # retired guard is deliberately NOT restored: the description is a pure render
+    # of the name column, so comparing the two only restates the render — that is
+    # what made the guard a tautology, and the reason it could not be patched into
+    # soundness (`OWNERS`, then `Markdown (AGENTS.md`, then a frame-span name).
+    # These checks cover what a render CANNOT: a malformed row, a name and its
+    # fragment disagreeing, and an alternation that adds matcher alternatives
+    # without adding names — `cut -d'|' -f2-` preserves `|`, so alternation
+    # survives rendering and only a count can see it.
+    local row name frag probe bad=0 n_rows=${#ARTIFACT_CLASS_MEMBERS[@]} n_alts
+    for row in "${ARTIFACT_CLASS_MEMBERS[@]}"; do
+      name="${row%%|*}"; frag="${row#*|}"
+      if [[ -z "$name" ]]; then
+        printf '❌ a member row has an EMPTY name — its fragment would widen the class with nothing named to the user\n' >&2
+        bad=$((bad + 1))
       fi
-      # Boundary-aware, not a bare substring: `…CODEOWNERSS` keeps the real
-      # token as a substring and would pass a substring test while the prose the
-      # user reads is wrong. The rule: a member must be followed by `,`, `)` or
-      # end-of-string. It therefore closes garbling by a TRAILING character, but
-      # NOT the delimiter-only kind (`CODEOWNERS)` passes, since `)` is itself an
-      # allowed follower for `templates/**/*.md)`) — and NOT EXTENSION, because
-      # an appended `, or scripts/**` leaves `.github/CODEOWNERS` followed by a
-      # legitimate `,`. Extension is closed by the member count below. Two
-      # earlier versions of this comment each claimed a case this test does not
-      # catch; a falsification found both. State the rule, not the promise.
-      local after="${ARTIFACT_CLASS_DESC#*"$name"}"
-      if [[ -n "$after" && "${after:0:1}" != "," && "${after:0:1}" != ")" ]]; then
-        printf '❌ the class description contains %s only inside a longer token (followed by %q) — it is not a member\n' "$name" "${after:0:1}" >&2
-        selffail=$((selffail + 1))
-        continue
+      if [[ -z "$frag" ]]; then
+        printf '❌ the member %s has an EMPTY fragment — it matches nothing, so the rendered class silently drops it\n' "$name" >&2
+        bad=$((bad + 1))
       fi
-      if grep -qE "$ARTIFACT_CLASS_RE" <<<"$path"; then
-        printf '✅ class wording and matcher agree on %s\n' "$name"
-      else
-        printf '❌ the description names %s but the matcher rejects %s\n' "$name" "$path" >&2
-        selffail=$((selffail + 1))
+      if [[ "$frag" == *'|'* ]]; then
+        printf '❌ the member %s has an ALTERNATION in its fragment — that adds matcher alternatives without adding a name the user is told about\n' "$name" >&2
+        bad=$((bad + 1))
+      fi
+      # The human name is itself the glob, so a concrete path derived from it must
+      # be accepted by that row's fragment. Catches one column moving alone, and a
+      # name that is a substring/suffix of another.
+      probe="$(sed -E 's#\*\*/#sub/#g; s#\*#x#g' <<<"$name")"
+      if ! grep -qE "^${frag}" <<<"$probe"; then
+        printf '❌ the member name %s and its matcher fragment %s disagree — the path derived from the NAME (%s) is not accepted by the FRAGMENT\n' "$name" "$frag" "$probe" >&2
+        bad=$((bad + 1))
       fi
     done
-    # EXTENSION of the description — a member appended that the class does not
-    # have (`…, or scripts/**`), or one silently dropped. Counting comma-
-    # delimited members catches both; the boundary test above cannot see either.
-    local n_desc_members
-    n_desc_members="$(tr ',' '\n' <<<"$ARTIFACT_CLASS_DESC" | wc -l | tr -d ' ')"
-    if [[ "$n_desc_members" -eq "${#pairs[@]}" ]]; then
-      printf '✅ the class description has exactly %s member(s)\n' "$n_desc_members"
-    else
-      printf '❌ the class description has %s comma-delimited member(s) but this guard pairs %s — a member was added to or dropped from the description\n' "$n_desc_members" "${#pairs[@]}" >&2
-      selffail=$((selffail + 1))
-    fi
-
-    # REVERSE direction — the one #1409 actually failed: the matcher gained an
-    # alternative (`templates/**/*.md`) that no wording named. The loop above is
-    # one-directional and cannot see that, so require the matcher to have exactly
-    # as many alternatives as this guard's member table. That table is what keeps
-    # the forward check exhaustive, so a new class member must extend BOTH the
-    # table and the description — which is the point, not a false red. The
-    # diagnostic names the TABLE, not the description: it counts table entries,
-    # and saying "the description enumerates N" would overclaim.
-    local n_alts
     n_alts="$(sed -E 's/^\^\(//; s/\)$//' <<<"$ARTIFACT_CLASS_RE" | tr '|' '\n' | wc -l | tr -d ' ')"
-    if [[ "$n_alts" -eq "${#pairs[@]}" ]]; then
-      printf '✅ the matcher has exactly %s alternative(s), one per member table entry\n' "$n_alts"
+    if [[ "$n_alts" -ne "$n_rows" ]]; then
+      printf '❌ the matcher has %s alternative(s) but the member table has %s row(s) — an alternative exists that no row names\n' "$n_alts" "$n_rows" >&2
+      bad=$((bad + 1))
+    fi
+    if [[ "$bad" -eq 0 ]]; then
+      # Says only what is checked. "distinct" was here and is NOT checked (a
+      # duplicate row with the same fragment is harmless and passes); claiming it
+      # would be this PR's own defect — a message describing a rule the code does
+      # not implement.
+      printf '✅ the member table is well formed: %s row(s), each with a non-empty name and fragment in agreement, and no unmatched alternative\n' "$n_rows"
     else
-      printf '❌ the matcher has %s alternative(s) but this guard pairs %s — a class member was added or removed; extend the member table AND the description together\n' "$n_alts" "${#pairs[@]}" >&2
       selffail=$((selffail + 1))
     fi
   }
@@ -2305,7 +2325,11 @@ $big_filler"
     # `fail a "no linked issue.*\$ARTIFACT_CLASS_DESC`, whose own line matched it
     # unconditionally — a tautology that could never go red (falsified by
     # de-interpolating both messages and watching it pass).
-    local prose_re='docs/, instruction-layer Markdown'
+    # Derived from the declaration, not a second copy of it: a literal needle
+    # here would be a restatement exempted from its own scan, so rewording the
+    # frame would silently disarm this guard while it still reported green. The
+    # leading segment (up to the first `(`) is the part a restatement repeats.
+    local prose_re="${ARTIFACT_CLASS_DESC%%(*}"
     local line bad=0
     while IFS= read -r raw; do
       # `grep -n` prefixes `NNN:`; strip it, or the comment exemption below can
@@ -2335,7 +2359,7 @@ $big_filler"
     fi
   }
 
-  check_artifact_class_wording_tracks_the_matcher
+  check_artifact_class_table_is_well_formed
   check_artifact_class_reaches_the_help_text
   check_artifact_class_reaches_every_message
 
