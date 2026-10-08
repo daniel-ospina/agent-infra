@@ -222,6 +222,54 @@ gh_() { "$GH" "$@"; }
 # lock makes the unit exclusive. `mkdir` is the atomic primitive (macOS has no
 # flock); a crashed holder is reclaimed by PID liveness, bounded to one reclaim.
 LOCKDIR=""
+
+# ── B11b — is a LIVE pid a working rail, or an orphan nobody will collect? ─────
+#
+# `kill -0` answers "is this pid alive". That is NOT the question the lock needs,
+# which is "is a rail still working on this PR". The gap was named as the
+# *consequence* half of #1395 item 1 — "the B11 lock reclaim requires a DEAD PID,
+# so a wedged rail holds the PR's lock for as long as it lives" — while the fix
+# that closed that issue (PR #1532) addressed only the `--poll 0` door. The clause
+# therefore stayed true, and it has now bitten with a live specimen.
+#
+# MEASURED, 2026-10-08, tortoise#7653: `atomic-land 7653` pid 41953 sat for 3h51m
+# — 2.6x this script's own WAIT_TIMEOUT — with ppid 1 (orphaned; the lane that
+# started it was gone), no controlling terminal, and 0.16s of CPU unchanged
+# across a 45s sample. It held a fully-green MERGEABLE/CLEAN PR, carrying a clean
+# review bound to the exact head, permanently unlandable: no age bound, no CPU
+# bound, and no flag to release it.
+#
+# WHY CPU DELTA ALONE WOULD ITSELF BE A BUG: this rail LEGITIMATELY sits at zero
+# CPU for up to WAIT_TIMEOUT while its verify step waits on checks. A parked rail
+# is the NORMAL state, not a symptom. So the door must be narrow, and ALL FOUR
+# conditions are required — any doubt leaves the lock LIVE (fail-closed):
+#   1. the pid is alive;
+#   2. it is ORPHANED (ppid 1) — nothing will ever collect its result;
+#   3. the lock is older than a ceiling well past the rail's own maximum life;
+#   4. its CPU time does not advance across a sample — it cannot be mid-merge.
+# A live, working rail fails at least one of these, so it is never displaced. The
+# steal stays the existing atomic `mv` (exactly one contender can win).
+cpu_time_of() { # <pid> -> its CPU-time field, or empty if unreadable
+  local t
+  t="$(ps -o time= -p "$1" 2>/dev/null | tr -d ' ')" || return 1
+  [ -n "$t" ] || return 1
+  case "$t" in *-*) t="${t##*-}" ;; esac   # drop a leading "Nd-" days field
+  printf '%s' "$t"
+}
+holder_is_abandoned() { # <pid> <lock-age-s> -> 0 = abandoned, 1 = treat as LIVE
+  local pid="$1" age_s="$2" ceiling cpu_before cpu_after
+  ceiling="${ATOMIC_LAND_LOCK_STALE_AFTER:-$(( WAIT_TIMEOUT * 2 + 1800 ))}"
+  [ "$age_s" -ge "$ceiling" ] 2>/dev/null || return 1
+  [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] || return 1
+  cpu_before="$(cpu_time_of "$pid")" || return 1
+  sleep "${ATOMIC_LAND_LOCK_STALE_SAMPLE:-2}"
+  kill -0 "$pid" 2>/dev/null || return 1
+  cpu_after="$(cpu_time_of "$pid")" || return 1
+  [ "$cpu_before" = "$cpu_after" ] || return 1
+  ABANDON_PID="$pid"; ABANDON_AGE="$age_s"; ABANDON_CEILING="$ceiling"
+  return 0
+}
+
 acquire_lock() {
   # B11 — the lock base is NOT derived from TMPDIR. TMPDIR is caller-controlled,
   # so a second rail with a different TMPDIR would use a different lock path and
@@ -240,21 +288,24 @@ acquire_lock() {
     tries=$((tries + 1))
     if mkdir "$LOCKDIR" 2>/dev/null; then break; fi
     other="$(cat "$LOCKDIR/pid" 2>/dev/null || true)"
+    # B11b needs the age on BOTH branches now, so it is read once. Portable mtime
+    # (GNU first, BSD second); a missing/unreadable mtime is age 0 (LIVE), so the
+    # failure direction stays fail-closed.
+    now_s="$(date +%s)"
+    mt="$({ stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null; } || true)"
+    case "$mt" in ''|*[!0-9]*) age=0 ;; *) age=$(( now_s - mt )) ;; esac
     if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
-      stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
+      if holder_is_abandoned "$other" "$age"; then
+        err "atomic-land: RECLAIMING an abandoned per-PR lock for $REPO#$PR — pid $ABANDON_PID is orphaned (ppid 1), its lock is ${ABANDON_AGE}s old (ceiling ${ABANDON_CEILING}s) and its CPU time did not advance across ${ATOMIC_LAND_LOCK_STALE_SAMPLE:-2}s. The lane that started it is gone (#1395); a live rail always fails one of these tests."
+      else
+        stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
+      fi
     fi
     # An ABSENT pid is not proof of a dead holder (the directory exists before the
     # pid is written), so a young pid-less lock is LIVE and refuses; only one older
     # than the grace is a reclaim candidate.
-    if [ -z "$other" ]; then
-      now_s="$(date +%s)"
-      # Portable mtime read: GNU first, BSD second. A missing/unreadable mtime is
-      # treated as age 0 (i.e. LIVE) so the failure direction stays fail-closed.
-      mt="$({ stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null; } || true)"
-      case "$mt" in ''|*[!0-9]*) age=0 ;; *) age=$(( now_s - mt )) ;; esac
-      if [ "$age" -lt "${ATOMIC_LAND_LOCK_GRACE:-60}" ]; then
-        stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
-      fi
+    if [ -z "$other" ] && [ "$age" -lt "${ATOMIC_LAND_LOCK_GRACE:-60}" ]; then
+      stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
     fi
     # Stale: claim it by rename (atomic; at most one rail can win), then retry mkdir.
     stolen="$LOCKDIR.reclaim.$$"
