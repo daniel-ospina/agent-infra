@@ -674,25 +674,66 @@ fi
 # consumer (tortoise .github/workflows/ai-review-gate.yml): both sides must
 # normalize IDENTICALLY or every freshly-signed marker stops matching.
 #
-# The bytes MUST come from the GitHub REST API, exactly as the workflow does —
-# a local `git diff` would not byte-match and every diff= marker would fail
-# closed. Hash the FILE, not a command substitution: `x="$(cmd)"` strips
-# trailing newlines and would change the digest.
+# The bytes come from the GitHub REST API, exactly as the workflow does. Fall
+# back to a LOCAL `git diff` ONLY when the API REFUSES the diff (#1398).
+# The API's `.diff` media type is capped at 300 files: a larger PR answers HTTP
+# 406 with a `too_large` error body (measured on tortoise#7653, 2,265 files:
+# 337 bytes of JSON on stdout, exit 1), so no digest — and therefore no `diff=`
+# identity — could be minted for it. That made such a PR structurally
+# unlandable once `main` drifted: a base-refresh moves the head, and there is
+# no content identity for the carry to match. The fallback computes
+# `git diff <base>...<head>` in a local checkout and pushes it through the SAME
+# `diff-normalize.py`, so the local and API renderings stay comparable.
 #
-# Empty when gh/API/openssl is unavailable → the marker falls back to the
-# legacy sha-only shape, and the gate's sha-match path still governs.
+# WHAT THE FALLBACK DOES AND DOES NOT GUARANTEE. The normalizer erases the
+# fields that legitimately move between renderings it was designed for — the
+# `index` abbreviation line and the hunk-header START line — so an under-cap API
+# rendering and the local `git diff` of the SAME content normalize to the SAME
+# digest (MEASURED: agent-infra PRs #1626/#1620/#1619/#1615/#1612/#1609/#1606/
+# #1600/#1599/#1598/#1596/#1595/#1594/#1590/#1583/#1579/#1576/#1568/#1566/#1561/
+# #1555/#1554 all agree byte-for-byte after normalization while their RAW
+# digests differ). It does NOT erase the hunk SECTION HEADING, and GitHub's
+# heading heuristic is not always git's: even `gh:python` renders
+# `@@ … @@ def _signature_from(…)` where a default local `git diff` renders
+# `@@ … @@ _GUARD_KEY_RE = re.compile(…)` (MEASURED on PR #1582/#1570/#1548).
+# That divergence is FAIL-CLOSED: it can only refuse a carry (a fresh review
+# is demanded), never accept one — the two renderings never collide onto one
+# digest for DIFFERENT content. Within one path the digest is deterministic, so
+# an over-cap PR re-recorded after a base refresh at the same head still
+# carries. Binary entries are the same shape of residual: their `index` line is
+# kept verbatim (the 2026-09-23 amendment), so a different abbreviation width
+# diverges there too — again fail-closed.
+#
+# Hash the FILE, not a command substitution: `x="$(cmd)"` strips trailing
+# newlines and would change the digest.
+#
+# Empty when gh/API/openssl is unavailable AND no local checkout can mint a
+# digest → the marker falls back to the legacy sha-only shape, and the gate's
+# sha-match path still governs.
 DIFF_NORMALIZER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/diff-normalize.py"
 DIFF_HASH=""
 # #1362 D1 — the sha256 over the RAW diff (the pre-normalization binding). Kept
 # ONLY so the carry-forward arm can accept a marker minted before this change;
 # nothing else reads it. Both hashes come from ONE diff fetch.
 LEGACY_DIFF_HASH=""
-# #1577 — how the diff read ENDED, so the warning can name the condition instead
-# of implying a content change:
-#   "ok"          the body was read
+# #1577/#1398 — how the diff read ENDED, so the warning can name the condition
+# instead of implying a content change:
+#   "ok"          the body was read (API, or the local #1398 fallback)
 #   "empty"       a 2xx whose body was 0 bytes    (a property of the DIFF)
+#   "too_large"   the API refused the diff at its 300-file cap (#1398)
+#                 (a property of the PR's SIZE — STRUCTURAL, not retryable)
+#   "nondiff"     a 2xx whose body carried no `diff --git` entry boundary
+#                 (an error body, or any 2xx that is not a diff — NEVER hashed;
+#                 #1398. NOTE the residual the measured mode does NOT exercise: a
+#                 PARTIAL truncation that still carries one entry boundary is not
+#                 detectable this way. #1398 measured the cap as HTTP 406 with no
+#                 entry boundary at all, so this is not currently reachable; if it
+#                 ever appears, the `changed_files` count comparison the issue
+#                 names is the remedy — see the `diff_fetch_once` doc below.)
 #   "unavailable" a failed read, or no read at all (a property of the NETWORK)
-# Only the first two can mean "a fresh review is owed"; the third means "retry".
+# Only "empty" can mean "a fresh review is owed"; "unavailable" means "retry".
+# "too_large" is structural: retrying answers the same 406, so it is not retried
+# and its warning must not send an operator hunting a gh/auth fault.
 # The stale-sha guard already states this policy for the HEAD read ("a transient
 # gh/API failure must not block a legitimate record", see the block below), but
 # the DIFF read is the one that actually refused: an empty DIFF_HASH leaves the
@@ -700,6 +741,16 @@ LEGACY_DIFF_HASH=""
 # CHANGED" -- demands the MOST expensive remedy in the system.
 DIFF_FETCH="unavailable"
 DIFF_FETCH_TRIES=0
+# #1398 — set when the digest was minted from a LOCAL checkout instead of the
+# API (only reachable through the size-cap arm). LOCAL_DIFF_ROOT names the
+# checkout so the provenance is visible in the warning rather than implied.
+LOCAL_DIFF=""
+LOCAL_DIFF_ROOT=""
+# The checkout the #1398 fallback resolves from. Defaults to the invoking
+# session's cwd (the session is normally working IN the PR's repo). Overridable
+# so a caller — or the suite — can point at a specific clone. A wrong or absent
+# checkout fails CLOSED (legacy marker), never a wrong digest.
+LOCAL_DIFF_REPO="${RECORD_REVIEW_LOCAL_REPO:-.}"
 # The fetch is RETRIED. A single attempt made a transient API blip
 # indistinguishable from a changed artifact. Measured on agent-infra #1554: a
 # full rail cycle ([1/4] base refresh + ~45 min of [2/4] terminal-CI wait +
@@ -755,14 +806,199 @@ case "$DIFF_FETCH_SLEEP_RAW" in
     fi
     ;;
 esac
+# #1398 — CLASSIFY BY CONTENT, NEVER BY EMPTINESS OR EXIT CODE ALONE.
+# The size-cap arm is the trap this guard exists for, and it is NOT hypothetical:
+# GitHub's 406 body is NON-EMPTY (337 bytes, measured on tortoise#7653). The only
+# thing that stopped a `[ -s "$f" ]` from accepting it was the `&&` short-circuit
+# on the non-zero exit — so any "fix" that relaxes the short-circuit (e.g. `|| true`
+# so a retry arm can inspect the result) would make `[ -s ]` PASS on 337 bytes of
+# ERROR MESSAGE and hash it as the reviewed diff. Every >300-file PR would then
+# share ONE constant digest: the collision ⇒ false-accept direction #1398 exists
+# to prevent. So the body is classified by what it IS.
+#
+# A body is an ERROR OBJECT when it carries no entry boundary AND is (however
+# WRAPPED) a JSON object declaring an HTTP status or the `too_large` code. The
+# entry-boundary exclusion runs FIRST and alone holds the invariant that a real
+# diff is never demoted: a diff always carries `diff --git`, so the exclusion
+# fires before any JSON test, and its content lines are prefixed (`+`, `-`, ` `)
+# so no diff line can even begin with `{`. Once a body is known NOT to be a diff,
+# the only remaining question is WHICH non-diff it is — so the JSON test is
+# deliberately insensitive to how the envelope is formatted.
+#
+# That insensitivity is the point. An earlier revision additionally required the
+# body to be a SINGLE LINE (`grep -c ''` ≤ 1), which classified today's real GitHub
+# 406 only because GitHub emits it on one line. A PRETTY-PRINTED or re-wrapped 406
+# then fell through the size-cap arm and the local fallback was SKIPPED —
+# returning the oversized PR to the very unlandability #1398 exists to remove —
+# and the operator was misdiagnosed. The MEASURED 406 exits NON-ZERO with the
+# envelope on stdout, so it fell to the retryable `unavailable` arm and the
+# warning blamed gh/auth/network (and retried a STRUCTURAL refusal); a 2xx
+# non-diff fell to `nondiff` and blamed a missing entry boundary. Either way the
+# issue's misdiagnosis half re-entered through a different door. (The finding's
+# short form said "falls to `nondiff`": true for the exit-0 shape, while the
+# exit-1 shape is the measured one — 11.11n–p cover both.) The line count was
+# never what protected a real diff — the boundary exclusion precedes it — it only
+# made the classifier formatting-dependent.
+# --- #1398 body classification -------------------------------------------------
+# The text predicates below take the SAME flattened string, so a `"status"` /
+# `"code"` VALUE sitting on its own line classifies identically to one on the same
+# line. Sharing the flatten is the fix: `diff_body_is_size_cap` used to re-grep the
+# ORIGINAL, line-oriented body, where `[[:space:]]*` cannot cross a newline, so an
+# envelope re-wrapped between a key's colon and its value slipped out of the
+# size-cap arm even though the error-object classifier had already recognised it.
+# A HERE-STRING, not a pipe: `tr … | grep -q` under this script's `set -o pipefail`
+# can report a FALSE NEGATIVE when grep matches early and tr takes SIGPIPE (#841).
+flat_body_is_error_object() { # <flat> -> 0 when the flat text is a JSON error object
+  command grep -qE '^\{.*"status"[[:space:]]*:[[:space:]]*"?[45][0-9]{2}"?.*\}$' <<<"$1" 2>/dev/null && return 0
+  command grep -qE '^\{.*"code"[[:space:]]*:[[:space:]]*"too_large".*\}$' <<<"$1" 2>/dev/null && return 0
+  return 1
+}
+# The specific STRUCTURAL failure: GitHub refuses to render a diff above 300
+# files. Recognised by `"code":"too_large"` or `"status":"406"` — the two facts
+# the production measurement recorded verbatim. It runs on the FLATTENED body, so
+# `[[:space:]]*` bridges a line break the source may have carried.
+flat_body_is_size_cap() { # <flat> -> 0 when the flat text declares the 300-file cap
+  command grep -qE '"status"[[:space:]]*:[[:space:]]*"?406"?' <<<"$1" 2>/dev/null && return 0
+  command grep -qE '"code"[[:space:]]*:[[:space:]]*"too_large"' <<<"$1" 2>/dev/null && return 0
+  return 1
+}
+# Flatten a non-diff body into one whitespace-trimmed line so the two predicates
+# above classify a one-line and a pretty-printed / re-wrapped object identically.
+# Returns 1, printing nothing, for: an EMPTY file; a body carrying a `^diff --git`
+# entry boundary (tested FIRST, so a real diff is never demoted, whatever JSON it
+# contains); and a body larger than ${RECORD_REVIEW_BODY_MAX_BYTES:-262144}.
+# The size bound is deliberate, not an assumption: materialising the body as a
+# shell string is O(size) (a 2 MB envelope cost ~2.3 s), so an over-size non-diff
+# body is refused here rather than flattened. It then falls to the caller's
+# `nondiff`/retryable arms — fail-closed either way, and never hashed.
+diff_body_flatten() { # <file> -> flattened body on stdout
+  local flat max="${RECORD_REVIEW_BODY_MAX_BYTES:-262144}"
+  [ -s "$1" ] || return 1
+  command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
+  # Flatten the (non-diff, therefore size-bounded) envelope, then trim the
+  # surrounding whitespace so `^\{` / `\}$` are not layout-dependent.
+  [ "$(command wc -c < "$1" 2>/dev/null || echo 0)" -le "$max" ] || return 1
+  flat="$(command tr -d '\r\n' < "$1" 2>/dev/null || true)"
+  flat="${flat#"${flat%%[![:space:]]*}"}"     # trim leading whitespace
+  flat="${flat%"${flat##*[![:space:]]}"}"     # trim trailing whitespace
+  printf '%s' "$flat"
+}
+diff_body_is_size_cap() { # <file> -> 0 when the body declares the 300-file cap
+  local flat
+  flat="$(diff_body_flatten "$1")" || return 1
+  flat_body_is_error_object "$flat" || return 1
+  flat_body_is_size_cap "$flat"
+}
+# #1398 — mint a diff identity LOCALLY when the API refuses the diff for an
+# oversized PR. Only ever called for the size-cap arm; every other failure keeps
+# today's legacy-marker degradation.
+#
+# The checkout must BE the PR's repo (`origin` normalised against $REPO) and must
+# be able to produce both revisions. Missing objects are the COMMON case, not an
+# edge: `atomic-land.sh` moves the head with a server-side `gh pr update-branch`,
+# so the post-update merge commit exists ONLY on the remote. Without a fetch the
+# fallback would fail after the head already moved — converting today's
+# PRE-update refusal (over-block) into an accept-and-spend, the exact mode
+# atomic-land's own guard exists to prevent. So a BOUNDED, read-only fetch of the
+# PR head and base ref is attempted when (and only when) an object is absent;
+# the fetched head is then required to be the API's declared `.head.sha`, so a
+# concurrent head move degrades rather than binding the wrong content.
+# `RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1` disables the fetch (a narrowing knob used
+# by the hermetic suite, never a way to mint a digest). Replace refs and the
+# grafts FILE are neutralised because either can present a different content graph
+# than the one really in the clone. On ANY doubt → non-zero → legacy marker.
+#
+# `--no-ext-diff`/`--no-textconv` are load-bearing, not tidiness: an external diff
+# driver or textconv filter configured in the clone would print arbitrary content
+# as the "diff". The prefix/context/algorithm pins neutralise ambient config that
+# would otherwise shift the rendering away from the API's.
+#
+# `--full-index` is a SECURITY pin, not cosmetics (cycle-2 review, #1398): a
+# hunk-less (binary) entry has NO hunk, so the normalizer keeps its `index` line
+# VERBATIM (the 2026-09-23 amendment), and without this flag the LOCAL
+# `core.abbrev` (git's minimum is 4 hex) would decide the binding's collision
+# resistance — two different blobs whose 4-hex prefixes collide normalized to one
+# digest, a false accept in the carry arm. Full 40-hex blob ids remove that
+# widen outright. It cannot reduce API-vs-local agreement for hunk-less entries:
+# the API's own index abbreviation is its own width (measured 9 hex here, 13 at
+# `microsoft/vscode` scale), so those two renderings may already diverge — a
+# fail-closed residual, never a false accept — and `--full-index` merely makes
+# the LOCAL side independent of ambient object-store state.
+# `diff.suppressBlankEmpty=false` pins the other config that changes the
+# normalized bytes (a text-diff rendering knob; false is git's default and
+# GitHub's rendering).
+local_diff_for_pr() { # <pr> <out> -> 0 when a diff-comparable body was written
+  local pr="$1" out="$2" dir="${LOCAL_DIFF_REPO:-.}" root="" url="" norm_url=""
+  local meta="" base="" head="" base_ref="" tmp=""
+  local -x GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+  command -v git >/dev/null 2>&1 || return 1
+  root="$(command git -C "$dir" rev-parse --show-toplevel 2>/dev/null || true)"
+  [ -n "$root" ] || return 1
+  url="$(command git -C "$root" config --get remote.origin.url 2>/dev/null || true)"
+  norm_url="$(printf '%s' "$url" \
+    | sed -e 's#^git@github\.com:##' -e 's#^ssh://git@github\.com/##' \
+          -e 's#^https\{0,1\}://github\.com/##' -e 's#\.git$##')"
+  [ "$norm_url" = "$REPO" ] || return 1
+  # The base/head identity is the API's OWN declaration (same as the diff the API
+  # would have rendered) — never a local ref, which a stale origin/… could falsify.
+  meta="$(command gh api "repos/$REPO/pulls/$pr" --jq '[.base.sha,.head.sha,.base.ref]|@tsv' 2>/dev/null || true)"
+  base="$(printf '%s' "$meta" | cut -f1)"
+  head="$(printf '%s' "$meta" | cut -f2)"
+  base_ref="$(printf '%s' "$meta" | cut -f3)"
+  [ -n "$base" ] && [ -n "$head" ] || return 1
+  case "$base$head" in *[!0-9a-f]*) return 1 ;; esac
+  if [ "${RECORD_REVIEW_LOCAL_DIFF_NOFETCH:-0}" != "1" ]; then
+    # Only fetch what is MISSING, and only the PR's own refs. `refs/pull/<pr>/head`
+    # is the canonical remote head, so after `update-branch` it names the merge
+    # commit the API reports — the content the record must bind.
+    command git -C "$root" cat-file -e "$head^{commit}" 2>/dev/null \
+      || command git -C "$root" fetch --quiet --no-tags origin "refs/pull/$pr/head" 2>/dev/null || true
+    command git -C "$root" cat-file -e "$base^{commit}" 2>/dev/null \
+      || case "$base_ref" in
+           ''|*[!A-Za-z0-9._/-]*) : ;;
+           *) command git -C "$root" fetch --quiet --no-tags origin "refs/heads/$base_ref" 2>/dev/null || true ;;
+         esac
+  fi
+  command git -C "$root" cat-file -e "$base^{commit}" 2>/dev/null || return 1
+  command git -C "$root" cat-file -e "$head^{commit}" 2>/dev/null || return 1
+  tmp="$(mktemp 2>/dev/null)" || return 1
+  if command git -C "$root" \
+       -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.relative=false \
+       -c diff.suppressBlankEmpty=false \
+       diff --no-color --no-ext-diff --no-textconv --full-index \
+            --src-prefix=a/ --dst-prefix=b/ --unified=3 --diff-algorithm=myers \
+            --find-renames "$base...$head" > "$tmp" 2>/dev/null \
+     && [ -s "$tmp" ] \
+     && command grep -qE '^diff --git ' "$tmp" 2>/dev/null; then
+    command mv "$tmp" "$out"
+    LOCAL_DIFF_ROOT="$root"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
 # ONE diff read into <out>. The EXIT STATUS carries the reason, which the old
-# `cmd && [ -s ]` one-liner threw away: 0 = read, 1 = the call FAILED (retryable),
-# 2 = the call SUCCEEDED with a 0-byte body (NOT retryable -- an idempotent GET
-# answers the same thing twice, so re-asking cannot change the answer).
+# `cmd && [ -s ]` one-liner threw away:
+#   0 = read, 1 = the call FAILED (retryable), 2 = the call SUCCEEDED with a
+#   0-byte body (NOT retryable -- an idempotent GET answers the same thing twice),
+#   3 = the API refused the diff at its 300-file cap (#1398; STRUCTURAL -- not
+#   retryable, and the arm the local fallback exists for),
+#   4 = the API answered with a body carrying no `diff --git` entry boundary
+#   (#1398; NEVER hashed -- an error body is not a diff). A PARTIAL truncation
+#   that retains an entry boundary is NOT caught here: #1398 MEASURED the cap as
+#   HTTP 406 with `grep -c '^diff --git'` returning 0, so there is no partial
+#   patch to hash and no truncation branch to add.
 diff_fetch_once() { # <pr> <out>
+  local frc=0
   command gh api -H "Accept: application/vnd.github.v3.diff" \
-    "repos/$REPO/pulls/$1" > "$2" 2>/dev/null || return 1
+    "repos/$REPO/pulls/$1" > "$2" 2>/dev/null || frc=$?
+  # CONTENT FIRST, before the exit code is even consulted: a 406 body is
+  # non-empty, so exit-status-only reasoning has to be paired with a content
+  # classification or the body above reaches the hasher.
+  if diff_body_is_size_cap "$2"; then return 3; fi
+  [ "$frc" -eq 0 ] || return 1
   [ -s "$2" ] || return 2
+  command grep -qE '^diff --git ' "$2" 2>/dev/null || return 4
   return 0
 }
 # Sets the globals DIFF_HASH (normalized) and LEGACY_DIFF_HASH (raw) from one
@@ -804,8 +1040,22 @@ diff_hash_for_pr() { # <pr>
   case "$rc" in
     0) DIFF_FETCH="ok" ;;
     2) DIFF_FETCH="empty" ;;
+    3) DIFF_FETCH="too_large" ;;
+    4) DIFF_FETCH="nondiff" ;;
     *) DIFF_FETCH="unavailable" ;;
   esac
+  # #1398 — the API REFUSED the diff at its 300-file cap. That is a STRUCTURAL
+  # ceiling, not a missing tool, so mint the identity locally instead of
+  # degrading: a local `git diff` pushed through the SAME normalizer keeps a
+  # >300-file PR landable across a base-refresh. Only the size-cap arm falls
+  # back — every other failure keeps today's legacy sha-only marker.
+  if [ "$DIFF_FETCH" = "too_large" ] && local_diff_for_pr "$pr" "$tmp"; then
+    DIFF_FETCH="ok"
+    LOCAL_DIFF="1"
+  fi
+  if [ "$DIFF_FETCH" = "ok" ] && [ "$LOCAL_DIFF" = "1" ]; then
+    echo "ℹ️ #1398: the API cannot render this PR's diff (it exceeds GitHub's documented 300-file cap); the review digest was computed from the LOCAL checkout ${LOCAL_DIFF_ROOT:-<unknown>} through the shared normalizer, so the content identity survives a base-refresh" >&2
+  fi
   if [ "$DIFF_FETCH" = "ok" ]; then
     LEGACY_DIFF_HASH="$(command openssl dgst -sha256 < "$tmp" | awk '{print $NF}')"
     if command -v python3 >/dev/null 2>&1 && [ -f "$DIFF_NORMALIZER" ] \
@@ -841,8 +1091,20 @@ if [ -n "$REPO" ]; then
         # A 2xx with no bytes IS a statement about the diff, so it is neither
         # retried nor described as a network failure (#1577).
         echo "⚠️ #2982: could not compute this PR's diff hash — the API answered and the diff body was EMPTY (0 bytes). Recording a legacy sha-only marker; it will NOT carry across a branch update" >&2 ;;
+      too_large)
+        # #1398 — STRUCTURAL, not a tooling fault. The old wording ("gh/API/openssl
+        # unavailable") sent an operator chasing a phantom auth problem for a PR
+        # that is simply too large; openssl (LibreSSL 3.3.6) and gh (2.97.0) were
+        # both present and working when it reproduced 3-of-3. Retrying cannot help:
+        # an idempotent GET answers the same 406.
+        echo "⚠️ #2982/#1398: could not compute this PR's diff hash — the PR EXCEEDS GITHUB'S DOCUMENTED 300-FILE DIFF CAP (HTTP 406, code 'too_large'), and no local checkout could mint the digest (needed ${LOCAL_DIFF_REPO:-.} to be a clone of $REPO holding both the base and head commits). This is STRUCTURAL, NOT a tooling/gh/openssl fault, and RETRYING WILL NOT HELP. Recording a legacy sha-only marker, which will NOT carry across a branch update — so this PR becomes unlandable once its base drifts. Remedy: record from a checkout of $REPO that already contains the PR's base and head commits" >&2 ;;
+      nondiff)
+        # #1398 — a successful HTTP status whose body is not a diff at all. Hashing
+        # it would mint an identity for bytes nobody reviewed (an error body), so
+        # this refuses rather than guesses.
+        echo "⚠️ #2982/#1398: could not compute this PR's diff hash — the API answered with a body that carries NO 'diff --git' entry boundary. Refusing to hash it: a body that is not a diff must NEVER become the reviewed diff. Recording a legacy sha-only marker, which will NOT carry across a branch update" >&2 ;;
       *)
-        echo "⚠️ #2982: could not compute this PR's diff hash — the diff fetch FAILED (gh/API/openssl unavailable; ${DIFF_FETCH_TRIES} of ${DIFF_FETCH_ATTEMPTS} attempt(s) made). A FAILED FETCH IS NOT A CHANGED ARTIFACT: retry the record before paying for a fresh review. Recording a legacy sha-only marker, which will NOT carry across a branch update" >&2 ;;
+        echo "⚠️ #2982: could not compute this PR's diff hash — the API could not be reached or returned no readable diff (transient: gh auth/network; ${DIFF_FETCH_TRIES} of ${DIFF_FETCH_ATTEMPTS} attempt(s) made). A FAILED FETCH IS NOT A CHANGED ARTIFACT: retry the record before paying for a fresh review. Recording a legacy sha-only marker, which will NOT carry across a branch update" >&2 ;;
     esac
   fi
 fi
