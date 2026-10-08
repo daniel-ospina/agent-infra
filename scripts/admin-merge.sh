@@ -623,6 +623,51 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
 
+# pr_review_record_blocks_update <pr> <expected-head> — 0 when updating would leave a
+# review record stale with nothing able to carry it, 1 when the update is safe.
+#
+# ⛔ THE PATH IS LITERAL, SO THE SLUG MUST BE RESOLVED. `gh` fills `{owner}/{repo}`
+# for API calls, but a record is a FILE at `~/.pi/agent/reviews/<owner>-<repo>-<pr>.json`,
+# and `record-review.sh` AUTO-DETECTS the repo when none is passed — writing the
+# repo-qualified name and deleting the legacy `<pr>.json`. Deriving the path from
+# `$REPO` alone therefore read `reviews/--<pr>.json` plus the legacy name the writer
+# removes, in the documented invocation that sets no `--repo`: the guard silently
+# never fired and the update went ahead. Hence the explicit resolution.
+#
+# ⛔ THE PREDICATE IS B5's, NOT "a record exists". `atomic-land.sh` refuses this
+# update only when a record is bound to the current head AND the PR carries no
+# verifiable signed marker — its `pr_has_carry_evidence`, a presence test on the
+# `review recorded: … diff=… sig=…` line — because the carry arm re-binds the
+# verdict to the new head when the three-dot diff survives. A PR that carries one
+# IS safe to update, and refusing it would decline the very remedy this helper
+# exists to perform. Only the unpaired case is refused.
+#
+# Reads the record with `$PYTHON_BIN` rather than a new `jq` dependency: every
+# other JSON read in this script goes through it, and a missing `jq` would make the
+# guard fail OPEN behind `2>/dev/null || true`.
+pr_review_record_blocks_update() {
+  local pr="$1" expected="$2"
+  local owner_repo="${REPO:-}" f="" rec_head="" rec_verdict="" body=""
+  [ -n "$owner_repo" ] || owner_repo="$($GH repo view --json nameWithOwner \
+      --jq .nameWithOwner 2>/dev/null || true)"
+  [ -n "$owner_repo" ] && f="$HOME/.pi/agent/reviews/${owner_repo%/*}-${owner_repo#*/}-$pr.json"
+  { [ -n "$f" ] && [ -f "$f" ]; } || f="$HOME/.pi/agent/reviews/$pr.json"
+  [ -f "$f" ] || return 1
+  rec_head="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("head_sha") or "")' "$f" 2>/dev/null || true)"
+  { [ -n "$rec_head" ] && [ "$rec_head" = "$expected" ]; } || return 1
+  # Carry evidence present -> the update is safe and B5 permits it. An unread
+  # verdict is NOT a licence to update: the marker cannot be shown to carry, so
+  # this stays on B5's fail-closed side and refuses.
+  rec_verdict="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("verdict") or "")' "$f" 2>/dev/null || true)"
+  [ -n "$rec_verdict" ] || return 0
+  local rargs=()
+  [ -n "${REPO:-}" ] && rargs=(--repo "$REPO")
+  body="$($GH pr view "$pr" ${rargs[@]+"${rargs[@]}"} --json body --jq .body 2>/dev/null || true)"
+  printf '%s' "$body" | grep -qE "^review recorded: reviews/${pr}\.json verdict=${rec_verdict} @ [0-9a-f]{40} diff=[0-9a-f]{64} \(.*\) sig=[0-9a-f]{64}$" \
+    && return 1
+  return 0
+}
+
 # ── refresh_pr_branch <pr> <expected-head> ──────────────────────────────────
 # Ask GitHub to bring the PR's head up to date with its base.
 #
@@ -657,26 +702,14 @@ refresh_pr_branch() {
   local slug
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
 
-  # ⛔ DO NOT MOVE A HEAD THAT CARRIES THE ONLY RECORD. An update inserts a merge
-  # commit, so the head moves — and a review record is bound to the head it was
-  # recorded against (`extensions/review-enforcer` refuses a merge when
-  # `record.head_sha != currentHead`), while this rail cannot re-mint one.
-  # atomic-land.sh's B5 refuses this same update for that reason, on measured
-  # grounds — a 22-PR sweep invalidated 17 fresh attestations and landed 0 — and
-  # it cites #4764. So the check runs FIRST: performing an irreversible move and
-  # then recommending the record-preserving alternative would be advice the lane
-  # can no longer take.
-  local rec="$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$pr.json"
-  [ -f "$rec" ] || rec="$HOME/.pi/agent/reviews/$pr.json"
-  local rec_head=""
-  [ -f "$rec" ] && rec_head="$(jq -r '.head_sha // empty' "$rec" 2>/dev/null || true)"
-  if [ -n "$rec_head" ] && [ "$rec_head" = "$expected" ]; then
-    say_err "   ⛔ NOT updating: a review record is bound to the current head (${rec_head:0:12}…)."
-    say_err "      An update would move the head and invalidate the only attestation, and this"
-    say_err "      rail cannot re-mint one. Re-measure WITHOUT moving the head: re-run the PR's"
-    say_err "      checks ('gh run rerun <run-id>'), which re-evaluates the merge ref against the"
-    say_err "      current base. Moving the head — an update or an empty commit — invalidates the"
-    say_err "      record, so it is not the remedy here."
+  if pr_review_record_blocks_update "$pr" "$expected"; then
+    say_err "   ⛔ NOT updating: a review record is bound to the current head and this PR"
+    say_err "      carries no signed marker to carry it onto the new head (atomic-land.sh's B5"
+    say_err "      predicate — a marker with a diff= identity would be carried instead). An"
+    say_err "      update would leave the attestation stale with nothing here able to re-mint it."
+    say_err "      Re-measure WITHOUT moving the head: re-run the PR's checks"
+    say_err "      ('gh run rerun <run-id>'), which re-evaluates the merge ref against the current"
+    say_err "      base. An empty commit moves the head too, so it is not the remedy either."
     return 1
   fi
 
@@ -4599,8 +4632,8 @@ main() {
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
         say_err "   recomputes the merge-ref evaluation and its checks re-run against the base's"
-        say_err "   current head. No review record was bound to the previous head — checked BEFORE"
-        say_err "   updating, because an update cannot be undone and would have invalidated one."
+        say_err "   current head. No review record was left stale by this update — checked BEFORE"
+        say_err "   updating, since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail — WITHOUT moving the"
         say_err "   head: re-run this PR's checks ('gh run rerun' the PR's runs) so the merge-ref"
@@ -4679,8 +4712,8 @@ main() {
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
         say_err "   recomputes the merge ref against $BASE_SHA and its checks re-run against it."
-        say_err "   No review record was bound to the previous head — checked BEFORE updating,"
-        say_err "   because an update cannot be undone and would have invalidated one."
+        say_err "   No review record was left stale by this update — checked BEFORE updating,"
+        say_err "   since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail — WITHOUT moving the"
         say_err "   head: re-run this PR's checks ('gh run rerun' the PR's runs) so the merge ref is"
