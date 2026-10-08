@@ -364,6 +364,43 @@ def collect_filters(lines, on_index):
             return None
         cur_filter = m.group(2) if m.group(2) is not None else (
             m.group(3) if m.group(3) is not None else m.group(4))
+        # ⛔ #1637 — ONLY A FILTER KEY MAY ABANDON THE ATTRIBUTION…
+        # …EXCEPT UNDER A REUSABLE TRIGGER, WHERE THE OLD BAIL IS LOAD-BEARING.
+        #
+        # The bail below (`return None` on an inline non-list scalar) is right for
+        # a FILTER whose shape this reader cannot parse, but it is wrong for a key
+        # that is not a filter at all — and `workflow_dispatch.inputs` is nothing
+        # but those (`description:`, `required:`, `default:`, `type:`). Because a
+        # `None` here means "the region does not fit this shape", the caller fails
+        # closed PER TRIGGER, the answer collapses to `unknown`, and `unknown` is
+        # consumed as PR-EVALUABLE — so the #6807 exemption stopped firing for the
+        # very file it was written for (`deploy-hosted.yml`: `on: push` with
+        # `branches:` + `workflow_dispatch`, and no `pull_request` at all) the
+        # moment #1542 introduced this reader. The regression is measured: the
+        # pre-#1542 predicate answers `no` for that file, the current one
+        # `unknown`, on identical input.
+        #
+        # #1413 IS THE ONE EXCEPTION, AND IT MUST NOT BE GENERALISED. A reusable
+        # workflow's jobs attach a check to a PR head inside the CALLER's run,
+        # under the CALLER's NAME, so this file cannot answer for it — and that
+        # decision is reached through `flt is None`. A `workflow_call` whose
+        # `inputs:` spec cannot be attributed must therefore KEEP failing the
+        # attribution. Both ends are pinned by `REUSABLE_YAML` in
+        # tests/admin-merge/run.sh §67e: a BARE `workflow_call` answers `no`, while
+        # `workflow_call` + an `inputs:` spec answers `unknown`. Skipping the bail
+        # for EVERY trigger collapses the second into the first — `flt` arrives as
+        # `{}`, execution falls through to `trigger_measurable`'s tail
+        # `return False`, and the predicate affirms an exemption for a red a PR may
+        # well have measured. That is a FAIL-OPEN, and the suite caught it.
+        #
+        # NOT A WIDENING: a `pull_request` whose `paths:` cannot be read still
+        # bails (`paths` IS a filter key), and one declaring only `types:` becomes
+        # UNFILTERED — which is PR-evaluable, i.e. BLOCKING.
+        if cur_filter not in _FILTER_KEYS:
+            if cur_trig == "workflow_call":
+                return None
+            cur_filter = None
+            continue
         rest = (m.group(5) or "").strip()
         pats = []
         if rest.startswith("["):

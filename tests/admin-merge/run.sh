@@ -9392,6 +9392,30 @@ pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      -
 pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
+# ── #1637: a NON-FILTER key's inline scalar must not abandon the attribution ─
+# `collect_filters()` bails out of the WHOLE document (`return None`) on an
+# inline, non-list scalar. That is right for a FILTER whose shape it cannot read
+# and WRONG for a key that is not a filter at all — and `workflow_dispatch.inputs`
+# is nothing but those (`description:`, `required:`, `default:`, `type:`). So
+# #1542's reader silently collapsed the answer to `unknown` for every workflow
+# with a normally-specified input, and `unknown` is consumed as PR-EVALUABLE.
+# The #6807 exemption therefore stopped firing for its own motivating file —
+# `deploy-hosted.yml` (`on: push` with `branches:` + `workflow_dispatch`, no
+# `pull_request` at all) — and a `push`-only base red entered §4.6, refusing
+# every PR with a remedy no rebase can satisfy. Measured on identical input:
+# the pre-#1542 predicate answers `no` for that file, the pre-fix one `unknown`.
+pe_case "workflow_dispatch input spec"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      d:\n        description: \x27x\x27\n        required: false\n        default: \x27false\x27\n        type: boolean\n'
+pe_case "input spec, no other trigger" no $'on:\n  workflow_dispatch:\n    inputs:\n      d:\n        default: x\n'
+pe_case "depth-3 scalar under inputs"  no $'on:\n  workflow_dispatch:\n    inputs:\n      d: x\n'
+# The arity of the exemption is UNCHANGED by this fix: only a key in
+# `_FILTER_KEYS` may abandon the attribution, so a `pull_request` whose filter
+# cannot be read still resolves through the trigger NAME and blocks (`yes`),
+# and an inline value on a TRIGGER key still refuses (`unknown`). Both are
+# fail-closed; neither may become `no`.
+pe_case "unreadable paths flow-mapping" yes $'on:\n  pull_request:\n    paths: {a: b}\n'
+pe_case "pull_request w/ only types"    yes $'on:\n  pull_request:\n    types: [opened]\n'
+pe_case "inline value on trigger key"   unknown $'on:\n  push: main\n'
+
 # ── #1542: the trigger's FILTERS decide measurability, not just its name ────
 # A `pull_request` that declares `paths:` can only attach a check to a PR whose
 # changed set matches. So the SAME workflow must answer `yes` for a matching PR
