@@ -623,6 +623,58 @@ usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
 
+# ── refresh_pr_branch <pr> <expected-head> ──────────────────────────────────
+# Ask GitHub to bring the PR's head up to date with its base.
+#
+# WHY THE RAIL PERFORMS THE REMEDY IT PRINTS (#4764). Steps 4.6 and 4.7 both
+# refuse because the PR's checks were produced against a base that is not the
+# current one, and both name "update the branch / push an empty commit" as the
+# remedy. That is a fully-specified, mechanical operation handed to whoever runs
+# the rail at the exact moment the rail has already PROVEN it is needed. Doing it
+# here removes the round trip and certifies nothing: the refreshed head carries
+# no completed check, so THIS invocation still refuses exactly as before and the
+# lane re-runs once CI has measured the new head. The refusal is a re-measurement
+# request, and this is the re-measurement.
+#
+# THE GREEN-BASE CASE IS DELIBERATELY NOT REFRESHED. Step 4.7 refuses a lagging
+# merge ref ONLY when the base is red, because a lag onto a green base has
+# nothing the PR failed to measure and refusing on movement alone would refuse
+# essentially every open PR (its comment measures 12 of 12 open tortoise PRs
+# lagging while main was green). A refresh re-runs every check, so performing one
+# where the rail has already decided the lag is harmless would buy nothing and
+# cost a full CI cycle. It is called only where the rail refuses BECAUSE of the
+# lag.
+#
+# `expected_head_sha` is pinned to the head THIS refusal was computed against: a
+# concurrent push makes GitHub refuse the call rather than silently folding a
+# commit nobody analysed into the branch that is about to be merged.
+#
+# Returns 0 when GitHub accepted the request (the new head appears
+# asynchronously, so the caller must NOT report a sha it has not read), 1 when it
+# did not — in which case the printed manual remedy still stands.
+refresh_pr_branch() {
+  local pr="$1" expected="$2"
+  local slug
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "admin-merge: would bring the branch up to date with its base (--dry-run mutates nothing)."
+    return 1
+  fi
+  local out
+  out="$($GH api -X PUT "$slug/pulls/$pr/update-branch" \
+            -f "expected_head_sha=$expected" 2>&1)" || {
+    say_err "   (the rail asked GitHub to bring the branch up to date and it refused:"
+    say_err "    $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240))"
+    say_err "   The manual remedy below still applies."
+    return 1
+  }
+  info "admin-merge: ⇡ the rail brought the branch up to date with its base."
+  info "   GitHub recomputes the merge-ref evaluation from this, which is a full check"
+  info "   re-run on the new head. Re-run this rail once those checks complete — the update"
+  info "   itself certifies nothing."
+  return 0
+}
+
 # ── write_merge_retraction <pr> <head> <reason> <detail-file> <detail-label> ──
 #
 # CORRECT THE MARKER. A posted evidence marker must never be left standing over
@@ -4514,9 +4566,15 @@ main() {
       say_err "   were produced, so the PR's green surface is STALE for it — it certifies a tree"
       say_err "   that no longer includes this red. This is the #1261 incident (a PR opened before"
       say_err "   the base went red and merged after)."
-      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-      say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
-      say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
+      # #4764: PERFORM the remedy this refusal names. The rail asks GitHub to bring
+      # the head up to date with its base, which recomputes the merge-ref evaluation
+      # and re-runs the checks against the current base; THIS invocation still
+      # refuses, because the refreshed head has no completed check yet. Nothing is
+      # certified by the write — the refusal above is unchanged.
+      refresh_pr_branch "$PR" "$head" || true
+      say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+      say_err "   recomputes the merge-ref evaluation (or re-run this PR's checks yourself) so it"
+      say_err "   covers the base's red. If this PR is the REPAIR, its own checks pass"
       say_err "   on the re-measured tree and the merge then proceeds."
       say_err "   No evidence was posted and no merge attempted."
       exit 1
@@ -4583,9 +4641,12 @@ main() {
       say_err "   base moves but does NOT re-run the PR's checks. This is the #1261 merge-ref-lag case."
       say_err "   Base red(s) this PR has not measured:"
       printf '%s\n' "$BASE_REDS" >&2
-      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-      say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
-      say_err "   merge ref is recomputed against $BASE_SHA and the PR's checks evaluate it. If this PR"
+      # #4764: the same performed remedy as step 4.6 — the lag this refusal names is
+      # exactly what update-branch clears, and the refusal still stands for THIS run.
+      refresh_pr_branch "$PR" "$head" || true
+      say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+      say_err "   recomputes the merge ref against $BASE_SHA (or do it yourself — 'gh run rerun' the"
+      say_err "   PR's runs, or push an empty commit). If this PR"
       say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
       say_err "   No evidence was posted and no merge attempted."
       exit 1
