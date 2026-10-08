@@ -855,7 +855,7 @@ fetch_json() {
 # COMMIT_MSGS, FILES. Prints pass/fail per check; returns failure count.
 
 run_checks() {
-  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards="" close_notes=""
+  local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards="" close_notes="" hazard_intended=""
   local is_micro=false is_stdcomplex=false
   local tier="unspecified"
   local files_plain="" runtime_file="" test_evidence="" files_valid="" files_ok="false"
@@ -927,7 +927,20 @@ run_checks() {
     # claimed to? See scan_close_word_hazards — the blocking shape is an
     # unintended closure; close_word_notes carries the non-blocking one. Both
     # were live on PR #1271 and the old check passed it.
-    close_hazards="$(scan_close_word_hazards "$PR_BODY" "${issue_ref:-${GH_REPO}#${issue_number}}")"
+    #
+    # #1630 (P1) — the hazard scan's "intended" ref is only a sound
+    # suppression when the body CLOSES it. Pre-#1630 issue_ref was ALWAYS a ref
+    # the body closed, so "the body names its own intended ref with a closing
+    # keyword" was a reason to stay quiet. A traceability ref is the opposite:
+    # a ref the body explicitly does NOT close, so it must match NO close-ref.
+    # Passing it would SILENCE a body that says "Part of #N — this does NOT
+    # close #N" while GitHub closes #N on merge, turning a blocked PR into a
+    # false PASS whose merge performs a closure the author disclaimed. The
+    # sentinel cannot equal any close-ref: every ref all_close_refs emits is a
+    # normalized ref carrying a '#'.
+    hazard_intended="$issue_ref"
+    [[ "$issue_ref_kind" == "traceability" ]] && hazard_intended="__no_intended_close__"
+    close_hazards="$(scan_close_word_hazards "$PR_BODY" "${hazard_intended:-${GH_REPO}#${issue_number}}")"
     if [[ -n "$close_hazards" ]]; then
       fail a "closing keyword hazard — GitHub acts on the WORDS in the PR body, not on the sentence: this body would close an issue it does not claim to close."
       printf '%s\n' "$close_hazards"
@@ -1688,6 +1701,34 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
     'Refs #5389' $'modified\textensions/loop-enforcer/termination.ts\t'
   expect_check_a_passes 'code diff + `Part of #N` after a blank line' \
     $'Some preamble.\n\nPart of #5389' $'modified\tscripts/z.sh\t'
+  # #1630 (P1) — the traceability form must NOT suppress the closing-word
+  # hazard. This half was unpinned: the only suppression vectors pinned a
+  # CLOSING intended ref, so nothing exercised the invariant that a
+  # traceability ref can never be the hazard scan's "intended" close-ref.
+  # The shape below is a code diff whose body carries BOTH a traceability ref
+  # and a closing-word mention of that SAME ref — the truthful PARTIAL form
+  # from the P1 report. Before the sentinel fix this reported FAILURES=0 with a
+  # green `✅ [a]` and NO hazard line, while GitHub would CLOSE #5389 on merge:
+  # a false PASS whose merge performs a closure the author disclaimed.
+  expect_check_a_fails() {
+    local desc="$1" body="$2" files="$3" log rc=0
+    log="$(mktemp "${TMPDIR:-/tmp}/pipeline-1630f.XXXXXX")"
+    PR_BODY="$body"; LABELS="complexity:micro"; SCOPING_COMMENT=""; COMMIT_MSGS=""
+    FILES="$files"; FILES_EXPECTED=""
+    FAILURES=0
+    run_checks >"$log" 2>&1 || rc=$?
+    if grep -q '❌ \[a\]' "$log" && grep -q 'H1 unintended close' "$log"; then
+      printf '✅ #1630 check (a) FAILS on the disclaimed-closure shape: %s\n' "$desc"
+    else
+      printf '❌ #1630 check (a) did NOT report the hazard: %s (rc=%s) — a traceability ref must not suppress it\n' "$desc" "$rc" >&2
+      grep -q '✅ \[a\]' "$log" && grep '✅ \[a\]' "$log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    rm -f "$log"
+  }
+  expect_check_a_fails 'code diff + `Part of #N` and a closing-word mention of the SAME ref' \
+    $'Part of #5389\n\n## ⚠️ This PR does NOT close #5389 — items (b)–(g) remain.' \
+    $'modified\textensions/loop-enforcer/termination.ts\t'
   # ── #1012: the closing match is POSITIONAL, and the pattern is shared with
   # record-review.sh::closing_issue_refs (its §8.11 pins the same class). A
   # keyword buried inside a word or a sentence is a mention, not a reference.
