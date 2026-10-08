@@ -83,40 +83,56 @@ Provide a code review for the given pull request.
 
 ## Process (Full Review)
 
-### Step 0.01 — Reviewer Test Scope: DERIVE, never accept a hand-picked list (MANDATORY, always runs)
+### Step 0.0 — Reviewer Test Scope: DERIVE, never accept a hand-picked list
 
-**The controller must never tell the reviewer which test files to run.** Derive the scope from what CI
-actually selects for this diff, plus the importers/callers of every changed symbol:
+**On a full review, before the coverage check below.** The routing below is explicit so this step is
+not silently skipped: it applies to the full review and to `--re-review` (on the fix-commit delta);
+the `--standard-tier` path starts at Step 1 and does not run it.
+
+**The controller must pass the reviewer the DIFF, never a file list.** The reviewer derives its own
+scope: it runs the repo's CI selector for that diff, runs the selected set, and names every file it
+did not run.
 
 ```bash
-gh pr diff <PR_NUMBER> --numstat          # or: the branch's merge-base diff
-# What CI would select for this diff (a repo-specific selector; here it is the tortoise tool):
-uv run python tools/ci_selection.py --changed-files - <<< "$CHANGED"
-# Plus: who imports/calls each changed symbol
-rg -ln '<changed_symbol>|<module_basename>' tests/ tools/ | head -30
+# The repo's CI diff selector — the SAME invocation CI uses, not an approximation.
+CHANGED="$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>/files?per_page=100" --paginate --jq '.[].filename')"
+printf '%s\n' "$CHANGED" | uv run python tools/ci_selection.py --changed-files - --event pull_request
+# Then the callers/importers of every changed symbol (unbounded — do not cap this):
+rg -ln '<changed_symbol>|<module_basename>' --glob '!*.md'
 ```
 
-Then **run what that returns**, and **name every file you did NOT run** in the review comment.
+**The selector is repo-specific.** `tools/ci_selection.py` is the **tortoise** tool; agent-infra,
+eldato and premise-labs do not have it, and this snippet will not run there. The portable rule is:
+*use the repo's CI diff selector; if the repo has none, derive the scope from its test-file→source
+mapping.* Substitute your repo's selector for the snippet above.
 
-**Why this is a gate and not advice — the observed failure.** On PR #7615 (2026-10-07/08) **three
-consecutive fresh-context review cycles reported clean while the head was measurably CI-RED**, and
-cycle 4 emitted `NO ISSUES FOUND` on a red head. The regression was live from revision 2 onward. It
-was missed because each reviewer was handed a fixed 3-file list that **did not contain the covering
-test** and was never asked to find it — the red was a `_BoomSDK.__getattr__` guard in
-`tests/longmem_eval/test_ingest_stall_guard.py`, a file nobody named. **CI caught what three reviews
-missed.** The mechanism is structural, not carelessness: scoping a reviewer by hand-picked files
-silently converts its question from *"is this change correct?"* into *"is this change correct within
-the files I thought of?"*, and the second question has a far smaller denominator.
+**An empty selection is an UNAVAILABLE answer, never "no tests".** This is measured, not
+hypothetical: `scripts/admin-merge.sh` records that the tortoise selector answers
+`slow_run=false carve_out_run=false` on an empty file list — i.e. it would forgive all three
+diff-gated legs. If the selector returns nothing, **stop and report the empty input**; do not
+conclude that there is nothing to run.
+
+**Why this is a gate and not advice — the observed failure.** On tortoise PR #7615 the head
+`8b7ac2d559` was CI-red on
+`tests/longmem_eval/test_ingest_stall_guard.py::test_ingest_haystack_v2_aborts_stalled_question`
+(`AssertionError: SDK touched during a stalled ingest: _graph_write_retry_count`, shard `test (g)`,
+run `37684958263`) — while a fresh-context review **on that same sha** returned `NO ISSUES FOUND`.
+The red was found by CI afterwards, not by the review. The guard that fired is a
+`_BoomSDK.__getattr__` that raises on any attribute access; it lives in a file the reviewer was not
+told to run. **Do not cite a count of clean cycles you cannot point at an artifact for** — cite the
+sha, the failing test, and the permalink of the clean verdict at that sha.
+
+The mechanism is structural, not carelessness: scoping a reviewer by hand-picked files silently
+converts its question from *"is this change correct?"* into *"is this change correct within the
+files I thought of?"*, and the second question has a far smaller denominator.
 
 **Corollaries.**
-- **A review that reports clean without naming its test scope is not evidence.** The scope
-  declaration is part of the verdict.
+- **Intent, not an enforced gate:** record the derived scope in the review comment. A clean verdict
+  without it cannot be audited later — note that the merge gate does **not** read it (Step 10 is
+  explicit that the artifact is an auditability boundary, not proof of review).
 - **A P3 fixed in round N can introduce the red found in round N+1.** On #7615 a `finally` fold added
-  to satisfy a prior round's P3 was *half* of the regression; removing only it leaves the test red.
-  Re-run the derived scope after every fix, not just at the end.
-- **When a change's thesis is a totality claim** ("no X can ever…"), the claim itself is the testable
-  object — enumerate the domain from the **transport's actual refusals** (the engine/library error
-  strings), never from the list the change wrote down.
+  to satisfy a prior round's P3 was half of that regression; removing only it leaves the test red.
+  Re-derive and re-run the scope after every fix, not only at the end.
 
 ### Step 0 — Test Coverage Check (MANDATORY, always runs)
 
