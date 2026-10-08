@@ -234,7 +234,9 @@ for d in ${SCAN_DIRS[@]+"${SCAN_DIRS[@]}"}; do
   case "$d" in /*) scan_dir="$d" ;; *) scan_dir="$ROOT/$d" ;; esac
   # `-e` alone is not enough: an existing but UNREADABLE dir passes it, `find` then fails into
   # a discarded stderr, and the guard reports a clean run over zero files (#7588 review round 4).
-  if [ ! -e "$scan_dir" ] || [ ! -r "$scan_dir" ] || [ ! -x "$scan_dir" ]; then
+  # `-r` is required for either; `-x` (SEARCH) only for a DIRECTORY, since that is what `find`
+  # needs to descend. Requiring `-x` of a named FILE made `--dirs somefile.sh` a false block.
+  if [ ! -e "$scan_dir" ] || [ ! -r "$scan_dir" ] || { [ -d "$scan_dir" ] && [ ! -x "$scan_dir" ]; }; then
     [ "$STRICT_DIRS" -eq 1 ] && {
       echo "check-no-sigpipe-grep: scan dir does not exist, or is not readable and searchable: $d (pass --dirs with this repo's layout)" >&2
       exit 2; }
@@ -348,7 +350,11 @@ if [ -f "$ROOT/$EXC_FILE" ]; then
     f="$(printf '%s' "$line" | awk '{print $1}')"
     n="$(printf '%s' "$line" | awk '{print $2}')"
     case "$n" in ''|*[!0-9]*) fails+="  $EXC_FILE — malformed declaration (2nd column must be an integer): $line"$'\n'; continue ;; esac
-    if [ "$n" -gt 0 ] && ! grep -qx "$f" <<<"$FILES_WITH_HITS"; then
+    # STALE only when the file was actually SCANNED and produced no hits. A declaration for a
+    # file OUTSIDE this invocation's scan set is UNVERIFIED, not stale — otherwise a consumer
+    # whose exceptions file covers files a narrower `--dirs` does not reach gets a red run for
+    # every narrowed invocation, including a developer checking one directory (#7588).
+    if [ "$n" -gt 0 ] && grep -qx "$f" <<<"$FILE_LIST" && ! grep -qx "$f" <<<"$FILES_WITH_HITS"; then
       fails+="  $f — STALE exception: declares $n occurrence(s) but the file has NONE. Delete the line ($EXC_FILE)."$'\n'
     fi
   done < "$ROOT/$EXC_FILE"

@@ -631,6 +631,43 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "a symlink loop does not hide a file reachable through it" \
              || fail "a file was missed in a tree containing a symlink loop (exit $rc)"
 
+# 11ab. a named non-executable FILE is not a false block: `-x` means SEARCH for a directory
+# but EXECUTABLE for a file, and requiring it made `--dirs somefile.sh` exit 2.
+E="$TMP/f11ab"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/entrypoint.sh"
+chmod 644 "$E/scripts/entrypoint.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts/entrypoint.sh' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a named non-executable file is scanned, not blocked (exit 1)" \
+             || fail "a named non-executable file was a false block (exit $rc)"
+
+# 11ac. an exception declared for a file OUTSIDE this run's scan set is UNVERIFIED, not
+# STALE: the guard cannot confirm a declaration it did not scan, and calling that stale
+# reds every narrowed --dirs a consumer runs.
+E="$TMP/f11ac"; mkdir -p "$E/scripts" "$E/other"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'if printf '\''%s'\'' "$A" | grep -q x; then echo 1; fi' > "$E/other/c.sh"
+printf 'other/c.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+bash "$GUARD" --root "$E" --dirs 'scripts other' >"$OUT" 2>&1
+h="$(sed -n 's/.*other\/c\.sh .*actual \([0-9a-f]\{16\}\).*/\1/p' "$OUT" | head -1)"
+printf 'other/c.sh 1 %s #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+rc_full="$(bash "$GUARD" --root "$E" --dirs 'scripts other' >"$OUT" 2>&1; echo $?)"
+# scanning ONLY scripts/: other/c.sh is outside the scan set and must NOT read as stale
+rc_narrow="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc_full" -eq 0 ] && [ "$rc_narrow" -eq 0 ] && ! grep -q 'STALE exception' "$OUT"; then
+  pass "a declaration outside the scan set is UNVERIFIED, not stale (full $rc_full, narrow $rc_narrow)"
+else
+  fail "a narrowed scan read an out-of-scope declaration as stale (full $rc_full, narrow $rc_narrow)"
+fi
+
+# ...and a declaration for a file that IS scanned and clean is still stale — the check
+# must not have been weakened away.
+E="$TMP/f11ad"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/d.sh"
+printf 'scripts/d.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && grep -q 'STALE exception' "$OUT" && pass "a scanned-and-clean declared file is still STALE (exit 1)" \
+             || fail "the stale check was weakened (exit $rc)"
+
 echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ All SIGPIPE false-negative tests passed (${checks} assertions)"
