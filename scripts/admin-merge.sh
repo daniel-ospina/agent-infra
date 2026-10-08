@@ -656,6 +656,30 @@ refresh_pr_branch() {
   local pr="$1" expected="$2"
   local slug
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+
+  # ⛔ DO NOT MOVE A HEAD THAT CARRIES THE ONLY RECORD. An update inserts a merge
+  # commit, so the head moves — and a review record is bound to the head it was
+  # recorded against (`extensions/review-enforcer` refuses a merge when
+  # `record.head_sha != currentHead`), while this rail cannot re-mint one.
+  # atomic-land.sh's B5 refuses this same update for that reason, on measured
+  # grounds — a 22-PR sweep invalidated 17 fresh attestations and landed 0 — and
+  # it cites #4764. So the check runs FIRST: performing an irreversible move and
+  # then recommending the record-preserving alternative would be advice the lane
+  # can no longer take.
+  local rec="$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$pr.json"
+  [ -f "$rec" ] || rec="$HOME/.pi/agent/reviews/$pr.json"
+  local rec_head=""
+  [ -f "$rec" ] && rec_head="$(jq -r '.head_sha // empty' "$rec" 2>/dev/null || true)"
+  if [ -n "$rec_head" ] && [ "$rec_head" = "$expected" ]; then
+    say_err "   ⛔ NOT updating: a review record is bound to the current head (${rec_head:0:12}…)."
+    say_err "      An update would move the head and invalidate the only attestation, and this"
+    say_err "      rail cannot re-mint one. Re-measure WITHOUT moving the head: re-run the PR's"
+    say_err "      checks ('gh run rerun <run-id>'), which re-evaluates the merge ref against the"
+    say_err "      current base. Moving the head — an update or an empty commit — invalidates the"
+    say_err "      record, so it is not the remedy here."
+    return 1
+  fi
+
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: would bring the branch up to date with its base (--dry-run mutates nothing)."
     return 1
@@ -4574,18 +4598,15 @@ main() {
       # head has no completed check yet), so the refusal above is unchanged.
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
-        say_err "   recomputes the merge-ref evaluation, and its checks re-run against the base's"
-        say_err "   current head."
-        say_err "   ⚠️ THE UPDATE MOVED THE HEAD, so a review record bound to the previous head no"
-        say_err "   longer matches it: satisfy the record's head binding before re-running (the"
-        say_err "   code-review skill's rule on a moved head). 'gh run rerun' re-measures WITHOUT"
-        say_err "   moving the head and is the record-preserving alternative — prefer it whenever a"
-        say_err "   record already exists."
+        say_err "   recomputes the merge-ref evaluation and its checks re-run against the base's"
+        say_err "   current head. No review record was bound to the previous head — checked BEFORE"
+        say_err "   updating, because an update cannot be undone and would have invalidated one."
       else
-        say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-        say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
-        say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
-        say_err "   on the re-measured tree and the merge then proceeds."
+        say_err "   RE-MEASURE against the current base, then re-run the rail — WITHOUT moving the"
+        say_err "   head: re-run this PR's checks ('gh run rerun' the PR's runs) so the merge-ref"
+        say_err "   evaluation covers the base's red. Prefer that over pushing an empty commit, which"
+        say_err "   moves the head and invalidates a record bound to it. If this PR is the REPAIR, its"
+        say_err "   own checks pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
@@ -4658,16 +4679,14 @@ main() {
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
         say_err "   recomputes the merge ref against $BASE_SHA and its checks re-run against it."
-        say_err "   ⚠️ THE UPDATE MOVED THE HEAD, so a review record bound to the previous head no"
-        say_err "   longer matches it: satisfy the record's head binding before re-running (the"
-        say_err "   code-review skill's rule on a moved head). 'gh run rerun' re-measures WITHOUT"
-        say_err "   moving the head and is the record-preserving alternative — prefer it whenever a"
-        say_err "   record already exists."
+        say_err "   No review record was bound to the previous head — checked BEFORE updating,"
+        say_err "   because an update cannot be undone and would have invalidated one."
       else
-        say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-        say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
-        say_err "   merge ref is recomputed against $BASE_SHA and the PR's checks evaluate it. If this PR"
-        say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
+        say_err "   RE-MEASURE against the current base, then re-run the rail — WITHOUT moving the"
+        say_err "   head: re-run this PR's checks ('gh run rerun' the PR's runs) so the merge ref is"
+        say_err "   recomputed against $BASE_SHA and the PR's checks evaluate it. Prefer that over"
+        say_err "   pushing an empty commit, which moves the head and invalidates a record bound to"
+        say_err "   it. If this PR is the REPAIR, its own checks then pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
