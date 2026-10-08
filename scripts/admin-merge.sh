@@ -642,17 +642,20 @@ info() { printf '%s\n' "$*"; }
 # `sig=` would read as carryable and the guard would wave through the very move it
 # exists to stop. Rather than reimplement a cryptographic check here, every bound
 # case is refused and the remedy that does not move the head is named. This is
-# therefore STRICTER than B5, never looser: the whole cost is one `gh run rerun`.
+# therefore STRICTER than B5, never looser: the whole cost is re-triggering the PR's
+# checks by an event that does not move the head (`gh run rerun` is NOT that event — it
+# re-executes the SAME merge commit, so it re-measures the old merge ref).
 #
 # pr_review_record_blocks_update <pr> <expected-head> — 0 when updating would strand a
 # review record, 1 when the update is safe. Prints the specific condition on each block arm.
 #
-# ⛔ THE IDENTITY USED FOR THE PATH MUST BE RESOLVED, NEVER TRUSTED. A record is a FILE at
-# `~/.pi/agent/reviews/<owner>-<repo>-<pr>.json`, and `record-review.sh` writes it under the
-# CANONICAL slug it reads back from `gh repo view` — while `gh` itself accepts a `--repo`
-# spelling in any case, and a PR number with a leading zero. Trusting `$REPO`/argv meant
-# `--repo Daniel-Ospina/Agent-Infra` looked for a file that cannot exist, missed, and let the
-# update proceed in an invocation GitHub accepts: the guard was simply absent there.
+# ⛔ BOTH SPELLINGS OF THE REPO KEY MUST BE CHECKED. A record is a FILE at
+# `~/.pi/agent/reviews/<owner>-<repo>-<pr>.json`, and the key is whatever repo string the
+# writer was handed: `record-review.sh` uses the `--repo`/positional repo VERBATIM when it is
+# given one, and the canonical `gh repo view` slug only when it is not. `gh` itself accepts a
+# `--repo` spelling in any case and a PR number with a leading zero, and the merge gate reads
+# the record under the spelling the rail forwards — so a guard that checked a single spelling
+# would miss the other and let the update strand a record the gate still reads.
 #
 # ⛔ CHECK EVERY CANDIDATE, NOT THE FIRST THAT EXISTS. `record-review.sh` deletes a legacy
 # `<pr>.json` only when its embedded `repo` matches, and a repo-less run can leave a stale
@@ -670,7 +673,7 @@ info() { printf '%s\n' "$*"; }
 # `2>/dev/null || true`.
 pr_review_record_blocks_update() {
   local pr="$1" expected="$2"
-  local rargs=() slug="" cands=() f="" rec_head="" rec_repo=""
+  local rargs=() slug="" cands=() f="" rec_head="" rec_repo="" rec_bound=0
   [ -n "${REPO:-}" ] && rargs=(--repo "$REPO")
   slug="$($GH repo view ${rargs[@]+"${rargs[@]}"} --json nameWithOwner \
       --jq .nameWithOwner 2>/dev/null || true)"
@@ -687,15 +690,22 @@ pr_review_record_blocks_update() {
   pr="${pr#"${pr%%[!0]*}"}"        # GitHub accepts 01631; the record path cannot
   [ -n "$pr" ] || pr="0"
   cands+=("$HOME/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json")
+  # ...and the spelling the caller gave, which `record-review.sh` writes verbatim
+  [ -n "${REPO:-}" ] && cands+=("$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$pr.json")
   cands+=("$HOME/.pi/agent/reviews/$pr.json")
   expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
 
   for f in "${cands[@]}"; do
     [ -f "$f" ] || continue
+    rec_bound=0
     case "$f" in
       "$HOME/.pi/agent/reviews/$pr.json")
         rec_repo="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo") or "")' "$f" 2>/dev/null || true)"
-        if [ -n "$rec_repo" ] && [ "$rec_repo" != "$slug" ]; then
+        rec_repo="$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')"
+        if [ -n "$rec_repo" ] \
+           && [ "$rec_repo" != "$(printf '%s' "$slug" | tr 'A-Z' 'a-z')" ] \
+           && { [ -z "${REPO:-}" ] \
+                || [ "$rec_repo" != "$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')" ]; }; then
           continue                      # a different repo's PR of the same number
         fi ;;
     esac
@@ -716,8 +726,15 @@ pr_review_record_blocks_update() {
       say_err "   ⛔ a review record exists at $f but its head_sha is too short to identify a commit."
       return 0
     fi
-    case "$expected" in "$rec_head"*) return 0 ;; esac
-    case "$rec_head" in "$expected"*) return 0 ;; esac
+    case "$expected" in "$rec_head"*) rec_bound=1 ;; esac
+    case "$rec_head" in "$expected"*) rec_bound=1 ;; esac
+    if [ "$rec_bound" -eq 1 ]; then
+      # ⛔ STATE THE CONDITION. The caller's refusal points at "the ⛔ line above", so
+      # every arm that blocks must print one — including this, the commonest arm.
+      say_err "   ⛔ a review record exists at $f and is bound to the head an update would move"
+      say_err "      ($rec_head), so the branch is not moved out from under it."
+      return 0
+    fi
   done
   return 1
 }
@@ -760,9 +777,12 @@ refresh_pr_branch() {
     say_err "   ⛔ NOT updating: the branch is not moved while a review record could be stranded"
     say_err "      (the ⛔ line above states the condition found). This rail does not verify carry"
     say_err "      markers (atomic-land.sh does, with the gate key), so it will not move a head out"
-    say_err "      from under an attestation. Re-measure WITHOUT moving the head: re-run the PR's"
-    say_err "      checks ('gh run rerun <run-id>'), which re-evaluates the merge ref against the"
-    say_err "      current base. An empty commit moves the head too, so it is not the remedy either."
+    say_err "      from under an attestation."
+    say_err "      Clearing this refusal means the tree is measured against the current base. A"
+    say_err "      re-run executes the SAME merge commit, so it re-measures the old merge ref; an"
+    say_err "      empty commit or an update moves the head and strands this record. So decide"
+    say_err "      deliberately: re-review and re-record at a new head, or re-trigger this PR's"
+    say_err "      checks by an event that does not move it."
     return 1
   fi
 
@@ -773,7 +793,7 @@ refresh_pr_branch() {
   local out
   out="$($GH api -X PUT "$slug/pulls/$pr/update-branch" \
             -f "expected_head_sha=$expected" 2>&1)" || {
-    say_err "   (the rail asked GitHub to bring the branch up to date and it refused:"
+    say_err "   (the rail asked GitHub to bring the branch up to date and the call did not succeed:"
     say_err "    $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240))"
     say_err "   The manual remedy below still applies."
     return 1
@@ -4689,10 +4709,10 @@ main() {
         say_err "   updating, since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
-        say_err "   states why it did not do that for you (a bound record, a dry run, or GitHub"
-        say_err "   refused). Re-running this PR's checks re-evaluates the merge ref against the base"
-        say_err "   — prefer that over pushing an empty commit, which moves the head. If this PR is"
-        say_err "   the REPAIR, its own checks pass on the re-measured tree."
+        say_err "   states why the rail did not do it for you (a record it refused to strand, a"
+        say_err "   dry run, or the update call failing). Note that pushing an empty commit moves"
+        say_err "   the head and strands any record bound to it. If this PR is the REPAIR, its own"
+        say_err "   checks pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
@@ -4727,10 +4747,13 @@ main() {
   #
   # WHY IT DOES NOT OVER-BLOCK THE REPAIR. A PR that repairs a red base must be
   # evaluated against a base that CONTAINS the red; if its merge ref lags, the
-  # refusal names the re-run as the remedy, and re-running recomputes the merge
-  # ref against the current base — at which point a genuine repair is green on
-  # its own tree (step 4.5) and 4.6 sees a surface that postdates the red, so it
-  # lands. The refusal is a re-measurement request, never a verdict on the PR.
+  # refusal names a re-triggered check run as the remedy (an event that does not
+  # move the head), and re-triggering recomputes the merge ref against the current
+  # base. A `gh run rerun` does NOT: it re-executes the SAME merge commit, so it
+  # re-measures the ref that was already lagging. Once the checks have re-measured
+  # the current base, a genuine repair is green on its own tree (step 4.5) and 4.6
+  # sees a surface that postdates the red, so it lands. The refusal is a
+  # re-measurement request, never a verdict on the PR.
   #
   # FAIL CLOSED ON AN UNREADABLE PARENT. The probe runs ONLY when the base is red
   # (so a green base costs no extra call), and if it cannot read the parent there
@@ -4769,11 +4792,10 @@ main() {
         say_err "   since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
-        say_err "   states why it did not do that for you (a bound record, a dry run, or GitHub"
-        say_err "   refused). Re-running this PR's checks recomputes the merge ref against"
-        say_err "   $BASE_SHA and the PR's checks evaluate it — prefer that over pushing an empty"
-        say_err "   commit, which moves the head. If this PR is the REPAIR, its own checks then"
-        say_err "   pass on the re-measured tree."
+        say_err "   states why the rail did not do it for you (a record it refused to strand, a"
+        say_err "   dry run, or the update call failing). Note that pushing an empty commit moves"
+        say_err "   the head and strands any record bound to it. If this PR is the REPAIR, its own"
+        say_err "   checks then pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
