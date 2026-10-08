@@ -4575,8 +4575,12 @@ main() {
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
         say_err "   recomputes the merge-ref evaluation, and its checks re-run against the base's"
-        say_err "   current head. If this PR is the REPAIR, its own checks then pass on the"
-        say_err "   re-measured tree and the merge proceeds."
+        say_err "   current head."
+        say_err "   ⚠️ THE UPDATE MOVED THE HEAD, so a review record bound to the previous head no"
+        say_err "   longer matches it: satisfy the record's head binding before re-running (the"
+        say_err "   code-review skill's rule on a moved head). 'gh run rerun' re-measures WITHOUT"
+        say_err "   moving the head and is the record-preserving alternative — prefer it whenever a"
+        say_err "   record already exists."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
         say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
@@ -4654,8 +4658,11 @@ main() {
       if refresh_pr_branch "$PR" "$head"; then
         say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
         say_err "   recomputes the merge ref against $BASE_SHA and its checks re-run against it."
-        say_err "   If this PR is the REPAIR, its own checks then pass on the re-measured tree"
-        say_err "   and the merge proceeds."
+        say_err "   ⚠️ THE UPDATE MOVED THE HEAD, so a review record bound to the previous head no"
+        say_err "   longer matches it: satisfy the record's head binding before re-running (the"
+        say_err "   code-review skill's rule on a moved head). 'gh run rerun' re-measures WITHOUT"
+        say_err "   moving the head and is the record-preserving alternative — prefer it whenever a"
+        say_err "   record already exists."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
         say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
