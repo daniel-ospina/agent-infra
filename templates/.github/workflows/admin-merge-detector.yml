@@ -146,6 +146,19 @@ jobs:
             sed 's/^/  /' extract-err.txt
             exit 1
           fi
+          # #7131: a PRUNED-log fallback key is NOT a comparable failure. It is a
+          # pure function of the JOB NAME, so it is SUBTRACTABLE across runs: if
+          # main's window carries the same job key, a genuinely unique test failure
+          # hidden behind a pruned log is subtracted and this detector reports a
+          # clean loop — "cannot attribute" masquerading as "found nothing", the
+          # exact hole this file's header forbids. Before the fallback existed the
+          # same input failed the extraction above and exited 1, so the change must
+          # not convert that loud refusal into a quiet pass. An unattributable
+          # failure is not a comparable one.
+          if grep -q '^job-unreadable::' merged-fails.txt main-fails.txt 2>/dev/null; then
+            echo "::error::admin-merge detector: a run's log was PRUNED, so its failure set is only job-level — the diff cannot certify this merge"
+            exit 1
+          fi
           # VACUITY GUARD (fresh review P1-3). An EMPTY failing set is only
           # meaningful if the lane actually RAN. A lane that produced no run at all
           # — a wrong workflow name, a `workflow_call`-only reusable whose runs are

@@ -24,6 +24,7 @@ import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+import { redactCommand } from "../shared/redact-command.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -2126,11 +2127,43 @@ function _adminMergeOverride(): boolean {
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
+
+/** Chars of the command's END retained past the bound, so a trailing operation survives. */
+export const TRUNCATION_TAIL = 200;
+
+/**
+ * The command a block REFUSED, redacted and bounded, for the durable audit trail (#1492).
+ *
+ * A `gate_block` entry records `reason` and `tier` — enough to COUNT blocks, not
+ * enough to tell WHICH command was refused. This field answers that, and the
+ * neighbouring hub-state gate carries a `command` field in the same stream, so the
+ * shape is established.
+ *
+ * BOUNDED at BOTH ends. A head-only bound can drop a trailing `&& git push`, which is
+ * the one thing this field exists to show, so the tail is kept as well (#1492).
+ *
+ * REDACTED before bounding: the audit files are world-readable, and the redactor is the
+ * shared one both gates import, so the redaction rule cannot drift between them.
+ */
+export function auditCommand(command: string, limit = 2000): string {
+  const redacted = redactCommand(command);
+  if (redacted.length <= limit) return redacted;
+  // The count is the REDACTED length and says so: redaction shortens the text, so an
+  // unlabelled count would not be the refused command's length (#1492).
+  return (
+    `${redacted.slice(0, limit)}` +
+    `… [truncated, ${redacted.length} chars after redaction] …` +
+    `${redacted.slice(-TRUNCATION_TAIL)}`
+  );
+}
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
 // shape skip (#472) removed the backstop that made that leniency safe (a
@@ -2142,6 +2175,9 @@ export { BLOCK_MESSAGE };
 export const MICRO_BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation (micro tier).",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
@@ -2305,6 +2341,7 @@ export default function (pi: ExtensionAPI) {
           logGateEvent("merge_gate_block", {
             pr: adminPr,
             reason: "admin_merge_no_evidence",
+            command: auditCommand(command), // #1492: the refused command, not just the reason
           });
           return { block: true, reason: adminResult.reason };
         }
@@ -2432,12 +2469,20 @@ export default function (pi: ExtensionAPI) {
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
-        logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: "micro" }); // #516: durable audit
+        logGateEvent("gate_block", {
+          reason: "no_reviewers_dispatch",
+          tier: "micro",
+          command: auditCommand(command), // #1492: the refused command, not just the reason
+        }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
-      logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: tier === "" ? "unlabeled" : tier }); // #516: durable audit
+      logGateEvent("gate_block", {
+        reason: "no_reviewers_dispatch",
+        tier: tier === "" ? "unlabeled" : tier,
+        command: auditCommand(command), // #1492: the refused command, not just the reason
+      }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
 

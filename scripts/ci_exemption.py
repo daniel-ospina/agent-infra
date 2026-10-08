@@ -198,6 +198,28 @@ def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
     if fields[0] in _FAILED_FIELDS:
         if len(fields) == 1:
             return ""
+        # ⛔ A PROGRESS FRAGMENT IS NOT A FAILURE RECORD (#6917). A run log
+        # ECHOES pytest's progress output, and a leading `FAILED` can land in
+        # front of a bare percentage — `FAILED [  2%]`. That payload is not a
+        # malformed id: there is no id on the line AT ALL, it is progress output.
+        # Counting it as a DROP marks the whole set CLIPPED, and a CLIPPED set is
+        # NOT COMPARABLE to a measured zero (#1319) — so the PR cannot be
+        # certified however green it is, and every re-run RETRACTS the evidence
+        # and fails the same way. Measured on tortoise #6917: a PR with `PR=0`
+        # failing tests was refused, permanently, by `PR=2 | main=0` drops whose
+        # only named token was `[  2%]`.
+        #
+        # ⚠️ THIS TEST MUST RUN BEFORE `_SUMMARY_RE`. That pattern matches ANY
+        # `FAILED <payload>` (its nodeid group is `.+?`), so it accepts
+        # `[  2%]` as a nodeid and returns it — the check placed after it was
+        # unreachable, which is how the first attempt at this fix did nothing
+        # while looking correct.
+        #
+        # The test is deliberately NARROW — the ENTIRE payload must be a
+        # bracketed percentage, so a genuine malformed record still DROPS and
+        # still fails closed. This only stops a progress bar being read as one.
+        if _PROGRESS_FRAGMENT_RE.match(" ".join(fields[1:])):
+            return None
         match = _SUMMARY_RE.match(line.strip())
         if match:
             return match.group("nodeid").strip()
@@ -228,6 +250,12 @@ class ParseResult:
     #: (#4469). Recorded separately so the caller REPORTS the attribution instead
     #: of leaving it invisible among the nodeids.
     guard_steps: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from NON-NODEID failure evidence (#6798) —
+    #: a pytest collection error or a watchdog kill. Recorded separately for the
+    #: same reason as ``guard_steps``: the operator must be able to see that the
+    #: run was attributed from a kill banner rather than from a test id, because
+    #: that is what decides whether the remedy is a re-run or a fix.
+    non_nodeid: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -288,6 +316,18 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
     """
     ids: list[str] = []
     rejected: list[str] = []
+    # The PREFIX-STRIPPED lines, kept so the passes below read the SAME text the
+    # record rule reads. Searching the RAW capture instead is a silent miss: every
+    # record line carries a `<job>\t<step>\t<ts>Z ` head, so an anchored pattern
+    # (`^={3,} WATCHDOG: …`) matches NOTHING — a fix that never fires, which is
+    # indistinguishable from an absent fix until a killed leg blocks the fleet
+    # again. It also lets the ANSI SGR escapes be stripped once, here, so the
+    # echoed-source discriminator the banner relies on is not defeated by colour.
+    # Bound BEFORE the loop because the id-file branch never enters the raw-log
+    # block below, and a name bound only there raises UnboundLocalError at the
+    # `return` — the `ids` CLI would crash on EVERY id-file input, not merely
+    # the new ones.
+    non_nodeid: list[str] = []
     for raw in lines.splitlines():
         if raw_log:
             line = _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
@@ -308,6 +348,20 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
                 continue
             unit = line
         if not _NODEID_LOOSE_RE.match(candidate):
+            # #6798: a COLLECTION ERROR is an ATTRIBUTION, not an unattributable
+            # token. pytest reports it as `ERROR <path> - <reason>` with no
+            # `::nodeid`, so the shape check above would DROP it — and a drop
+            # marks the set CLIPPED while the run yields nothing, which is the
+            # permanent refusal. Intercepted BEFORE the drop accounting so the
+            # identity is extracted, never counted as a defect in the capture.
+            # A `FAILED <path>.py` (no `::`) is NOT one of these: pytest emits
+            # collection errors under `ERROR` only.
+            if raw_log:
+                collect_id = _collection_error_id(line)
+                if collect_id is not None:
+                    ids.append(collect_id)
+                    non_nodeid.append(collect_id)
+                    continue
             # The unit reported is the offending TOKEN in log mode (the line may
             # be a whole megabyte of prose prefixed by a stray `FAILED`), and the
             # offending LINE in id-file mode (where the line IS the record).
@@ -323,8 +377,17 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # (raw_log=False): there the file IS the id set already.
         guard_steps, _guard_signatures = guard_step_failures(lines)
         ids.extend(guard_steps)
+        # Pass 3 — NON-NODEID failure evidence (#6798). A watchdog kill leaves no
+        # nodeid and no annotation: the capture's only evidence is the kill
+        # banner, so no shape-checking pass above can see it. Same treatment and
+        # the same reason — COMPARED instead of refused. Also raw-log only, and
+        # read through the SAME helper the `signatures` door uses, so the two
+        # doors cannot disagree about this universe.
+        non_nodeid, _non_nodeid_signatures = non_nodeid_failures(lines)
+        ids.extend(non_nodeid)
     return ParseResult(
-        ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps
+        ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
+        non_nodeid=sorted(set(non_nodeid)),
     )
 
 
@@ -856,6 +919,65 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # unblocked id), which is why this path is deliberately the permissive one.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
+# A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
+# percentage pytest's progress line prints, and it is NOT an id of any kind.
+# Used to keep a progress bar from being read as a failure RECORD (#6917).
+_PROGRESS_FRAGMENT_RE = re.compile(r"^\[\s*\d{1,3}%\]$")
+
+# ── NON-NODEID failure identities (#6798) ────────────────────────────────
+# A failing run does not always name a `::nodeid`. Two measured shapes carry a
+# REAL failure and are not nodeids, so the shape check above drops them, the run
+# contributes nothing, and `admin-merge.sh` step 1c refuses it FOREVER:
+#
+#   `extracted < examined` -> “yielded NO parseable failure identity” -> exit 1
+#
+# That refusal has no exit — neither shape can ever produce a nodeid — so ONE
+# 15-minute watchdog kill on ONE shard becomes a fleet-wide merge block (8
+# landing lanes, ~45 min, 0 PRs converted; tortoise #6798, agent-infra #6145).
+#
+# Both become COMPARABLE identities, exactly as a guard-step annotation did
+# (#4469): main's union is the EXEMPTION ALLOWLIST, so a PR-side id only excuses
+# a failure main is ALSO red on. Correcting the INPUT to the comparison leaves
+# the comparison (§4.6, #1261) untouched.
+
+# pytest's COLLECTION-ERROR record, verbatim (measured, run 36809707842):
+#     ERROR tests/test_gmm_proofs.py - AttributeError: partially initialized
+#     module 'torch' has no attribute 'Tensor' (most likely due to a circular import)
+# Keyed on the FILE, never the message: the exception text varies run to run, and
+# an identity that tracks it can never match main's baseline (the #3756
+# rotating-identity class — it would read as "unique to this PR" forever).
+_COLLECT_ERROR_RE = re.compile(
+    r"^ERROR\s+(?P<path>[A-Za-z0-9_./\-]+\.py)(?:\s+-\s+.+)?$"
+)
+_COLLECT_ERROR_PREFIX = "collect-error::"
+
+# The three banner shapes the runner actually emits (tortoise python-ci.yml:761,
+# 1265, 1810): `WATCHDOG: pytest killed after <n>m`, the fixed 10m slow-leg
+# form, and `WATCHDOG: carve-out pytest killed after 35m`. The optional
+# `carve-out ` qualifier is load-bearing: it is a REACHABLE shape that a pattern
+# pinned to the bare form silently misses, so a carve-out kill would stay
+# zero-id — the same permanent refusal, one shape over.
+_WATCHDOG_KILL_RE = re.compile(
+    r"^={3,}\s*WATCHDOG: (?:carve-out )?pytest killed after \d+m\s*"
+    r"\(\d+ passed, 0 failed, 0 errored so far\)"
+)
+#: The one stable watchdog-kill identity. Deliberately NOT keyed on the shard:
+#: a watchdog overrun is an ENVIRONMENTAL property of the suite, so main's kill
+#: on shard `a` must exempt a PR's kill on shard `h`. Keying it per-shard would
+#: leave every cross-shard kill “unique to this PR” and block the same PRs the
+#: refusal did — the defect relocated, not fixed.
+_PYTEST_KILL_ID = "watchdog-kill::pytest"
+
+# The signatures the two doors must AGREE on. A non-nodeid identity is not a
+# pytest failure with an exception type, so its signature is its CLASS — and it
+# must be CONSTANT, because §4.6 compares signatures with a SUBSET rule
+# (`_signatures_overlap`: every PR signature must have been measured on main).
+# An empty signature on either side fails that rule closed, so an id with no
+# signature does not “compare” at all — it BLOCKS. That is the half of the input
+# the `ids` pass alone does not correct.
+_COLLECT_ERROR_SIG = "collect-error"
+_WATCHDOG_KILL_SIG = "watchdog-kill"
+
 # pytest's failure-block header: ``________ test_name[param] _________``.
 _BLOCK_HEADER_RE = re.compile(r"^_{3,}\s*(?P<name>.+?)\s*_{3,}$")
 # ``E       <assertion or exception>`` — the ``+  where …`` continuations are
@@ -910,6 +1032,8 @@ class SignatureParse:
     unattributed: list[str] = field(default_factory=list)
     #: The guard-step ids that entered ``ids`` (#4469) — REPORTED, never silent.
     guard_steps: list[str] = field(default_factory=list)
+    #: The NON-NODEID ids that entered ``ids`` (#6798) — same reason.
+    non_nodeid: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1054,19 +1178,56 @@ _GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
 _GUARD_INT_RE = re.compile(r"\b\d+\b")
 
 
+#: A NON-NODEID failure key (#6798, #7131) — the families the rate/row doors must
+#: admit. ANCHORED and fully enumerated: this predicate is the gate on main's own
+#: rate table, so admitting a loose string here is a false-EXEMPTION vector, not
+#: a formatting nicety.
+#:
+#: `job-unreadable::<slug>` (#7131) is the JOB-LEVEL fallback the producer emits
+#: when GitHub has PRUNED a failing run's log — the test-level identity does not
+#: exist anywhere, so the run is attributed at job granularity instead of being
+#: refused as unknowable. It carries NO signature, which is what keeps it safe:
+#: the signature gate fails CLOSED on an empty overlap, so a job-level key can
+#: never buy an exemption — it converts an unreadable refusal into a named,
+#: attributable block. The slug charset is exactly `_slug`'s, so the key stays
+#: whitespace-free for the `uniq -c | awk` rate table.
+_NON_NODEID_KEY_RE = re.compile(
+    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+)$"
+)
+
+
 def is_failure_key(key: str) -> bool:
     """Is ``key`` in the universe the RATE table accepts (#4469)?
 
-    A pytest nodeid AND a guard-step identity are both failure keys; the same
-    predicate must gate :func:`parse_rates`, or main's rate row is dropped and
-    every guard failure reads as PR-unique forever.
+    A pytest nodeid, a guard-step identity AND a non-nodeid failure identity
+    (#6798) are all failure keys; the same predicate must gate
+    :func:`parse_rates`, or main's rate row is dropped and every such failure
+    reads as PR-unique forever.
+
+    ⛔ THE STAKES ARE ASYMMETRIC, which is why this is enumerated rather than
+    pattern-loose. `parse_rates` reads MAIN's table: a key wrongly ADMITTED here
+    enters the exemption allowlist, while a key wrongly REJECTED is dropped — and
+    a dropped main-side row makes the PR-side failure look unique, which BLOCKS.
+    Both directions were measured: omitting the #6798 family from this pair of
+    predicates did not merely block, it made `parse_failure_rows` reject the PR's
+    own row, so `decide` saw NO failure and emitted a clean verdict for a red PR
+    (a silent false PASS — strictly worse than the refusal it replaced).
     """
-    return bool(_NODEID_RE.match(key) or _GUARD_KEY_RE.match(key))
+    return bool(
+        _NODEID_RE.match(key)
+        or _GUARD_KEY_RE.match(key)
+        or _NON_NODEID_KEY_RE.match(key)
+    )
 
 
 def is_failure_key_loose(key: str) -> bool:
     """The LOOSE (parameter-space-permitting) form of :func:`is_failure_key`."""
-    return bool(_NODEID_LOOSE_RE.match(key) or _GUARD_KEY_RE.match(key))
+    return bool(
+        _NODEID_LOOSE_RE.match(key)
+        or _GUARD_KEY_RE.match(key)
+        or _NON_NODEID_KEY_RE.match(key)
+    )
 
 
 def _split_log_line(line: str) -> tuple[str, str, str]:
@@ -1111,6 +1272,101 @@ def normalize_guard_error(message: str) -> str:
     if not shape:
         return ""
     return _GUARD_INT_RE.sub("<N>", shape)
+
+
+def _collection_error_id(line: str) -> str | None:
+    """``collect-error::<path>`` for a pytest COLLECTION-ERROR record, else None.
+
+    pytest's collection-error record is ``ERROR <path>.py - <reason>`` (measured,
+    run 36809707842: ``ERROR tests/test_gmm_proofs.py - AttributeError: partially
+    initialized module 'torch' has no attribute 'Tensor'``). It names a FILE that
+    could not be collected and NO test id, so the nodeid shape check drops it and
+    the run contributes nothing — the #6798 permanent refusal.
+
+    THREE conditions, all required:
+
+    1. **The record is LEADING** — the line STARTS with ``ERROR``. A run log
+       echoes the workflow's own shell source, so a substring match would fire on
+       prose (the #1396/#5194 class). Anchoring is what makes the assertion sound.
+    2. **The payload is a bare ``.py`` path** — no ``::``, no spaces. This is the
+       ONLY reason the nodeid pass did not take it, and it is what distinguishes a
+       real file from the English words the drop accounting exists to catch
+       (``FAILED may``).
+    3. **A reason is optional but the path is not invented** — ``ERROR <path>``
+       alone is accepted because pytest prints the bare form when the reason is
+       elided; the path shape is the guarantee, not the detail.
+
+    ⛔ The ``ERROR`` keyword is REQUIRED and is not interchangeable with
+    ``FAILED``: pytest emits collection errors under ``ERROR`` only, so admitting
+    ``FAILED <path>.py`` would let any prose line that happens to end in ``.py``
+    buy an identity.
+
+    The returned id is keyed on the FILE and NOT on the reason: the reason is an
+    exception message that varies run to run, and an identity that tracks it can
+    never match main's baseline — the #3756 rotating-identity class, which reads
+    as "unique to this PR" on every run for as long as it exists.
+    """
+    m = _COLLECT_ERROR_RE.match(line)
+    if not m:
+        return None
+    return f"{_COLLECT_ERROR_PREFIX}{m.group('path')}"
+
+
+def _log_lines(text: str) -> list[str]:
+    """``text`` as PREFIX- and ANSI-stripped lines — the record rule's own view.
+
+    Both doors and both non-nodeid passes read the capture through this, so they
+    cannot disagree about what a line says. Reading the RAW capture instead is a
+    silent miss: every record line carries a ``<job>\t<step>\t<ts>Z `` head, so an
+    anchored pattern matches nothing — a fix that never fires, which is
+    indistinguishable from an absent fix until a killed leg blocks the fleet
+    again. Stripping ANSI here also keeps colour from defeating the
+    echoed-source discriminator.
+    """
+    return [
+        _strip_log_prefix(_ANSI_RE.sub("", raw)).strip()
+        for raw in text.splitlines()
+    ]
+
+
+def non_nodeid_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for the NON-NODEID failure evidence (#6798).
+
+    ONE helper for BOTH doors, exactly as ``guard_step_failures`` is (#4469): the
+    ``ids`` CLI and the ``signatures`` CLI must not disagree about this universe.
+    They must not disagree about the SIGNATURE either — §4.6 compares signatures
+    with a subset rule, and an id signed by one door but not the other fails that
+    rule closed, so the identity would BLOCK instead of compare (the half of the
+    input a bare id extraction does not correct; found by the verifier, not by
+    the unit suite).
+
+    Two shapes, both measured, both raw-log only:
+
+    * a COLLECTION ERROR — ``ERROR <path>.py - <reason>``. Keyed on the FILE;
+      the reason is an exception message that varies run to run, and an identity
+      that tracks it can never match main's baseline (the #3756
+      rotating-identity class).
+    * a WATCHDOG KILL — the banner, at any budget and with or without the
+      ``carve-out`` qualifier. A BARE failure only at ``0 failed`` AND
+      ``0 errored``: those are the conditions under which nothing asserted
+      false. A kill after failures were reported has real nodeids, and those ARE
+      the PR's failures — emitting the bare kill identity there would let a
+      genuine assertion failure ride an environmental exemption.
+    """
+    lines = _log_lines(text)
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in lines:
+        collect_id = _collection_error_id(line)
+        if collect_id is not None:
+            ids.append(collect_id)
+            signatures[collect_id] = frozenset({_COLLECT_ERROR_SIG})
+    if any(_WATCHDOG_KILL_RE.match(line) for line in lines):
+        ids.append(_PYTEST_KILL_ID)
+        signatures[_PYTEST_KILL_ID] = frozenset({_WATCHDOG_KILL_SIG})
+    return sorted(set(ids)), signatures
 
 
 def guard_step_key(step: str, error_shape: str) -> str:
@@ -1290,6 +1546,26 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             continue
         nodeid = m.group("nodeid").strip()
         if not _NODEID_LOOSE_RE.match(nodeid):
+            # #6798: a COLLECTION ERROR is an attribution here too, so the two
+            # doors agree. Confining the interception to the `ids` door left this
+            # one reporting `rejected=2` for a line the other door had already
+            # extracted — and a non-zero `rejected` marks the set CLIPPED, so the
+            # run stayed blocked with a DIFFERENT message. The identity/signature
+            # pair is added by `non_nodeid_failures` (Pass 4 below); here we only
+            # decline to call it a drop. A `FAILED <path>.py` is not one of these:
+            # `_collection_error_id` requires the `ERROR` keyword, which is the
+            # only form pytest emits for a collection error.
+            if _collection_error_id(stripped) is not None:
+                continue
+            # #6917: the SAME rule as `_failed_candidate`, in the SAME order — a
+            # pytest PROGRESS fragment is not a record, so it is not a drop here
+            # either. The module's header promises ONE candidate rule across both
+            # doors; `_SUMMARY_RE`'s nodeid group is `.+?` and accepts `[  2%]`,
+            # so without this the sibling door reported `rejected=1` for a line
+            # the `ids` door had already declined to count — the exact asymmetry
+            # the collection-error intercept above exists to avoid.
+            if _PROGRESS_FRAGMENT_RE.match(nodeid):
+                continue
             rejected.append(stripped)
             continue
         id_list.append(nodeid)
@@ -1366,6 +1642,19 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         signatures[key] = frozenset(sigs)
     id_list.extend(guard_keys)
 
+    # Pass 4 — NON-NODEID failure evidence (#6798). Its ids AND signatures come
+    # from the SAME helper the `ids` CLI uses, so the two doors cannot disagree
+    # about either half. Merged after the nodeid attribution for the same reason
+    # the guard pass is: a non-nodeid key must never be pulled into the `by_name`
+    # join above. Without this pass the `signatures` CLI exits 1 on a
+    # kill-or-collection-only capture (`ok` is False when no id is found), and
+    # `ci-failure-set.sh` treats that as FATAL — so the per-run refusal would be
+    # RELOCATED here rather than removed.
+    non_nodeid_keys, non_nodeid_signatures = non_nodeid_failures(text)
+    for key, sigs in non_nodeid_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(non_nodeid_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
@@ -1373,6 +1662,7 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         unsigned=unsigned,
         unattributed=unattributed,
         guard_steps=guard_keys,
+        non_nodeid=non_nodeid_keys,
     )
 
 
@@ -1535,12 +1825,23 @@ def _cmd_ids(args: argparse.Namespace) -> int:
     print(
         f"ci-exemption: ids={len(parsed.ids)} "
         f"unattributable={len(parsed.rejected)} "
-        f"guard-steps={len(parsed.guard_steps)}",
+        f"guard-steps={len(parsed.guard_steps)} "
+        f"non-nodeid={len(parsed.non_nodeid)}",
         file=sys.stderr,
     )
     for key in parsed.guard_steps:
         print(
             f"ci-exemption: guard-step failure ATTRIBUTED (no test nodeid): {key}",
+            file=sys.stderr,
+        )
+    # #6798: NAME the signal the identity came from. The rail's remedy differs by
+    # signal — a watchdog kill is re-runnable, a collection error is the PR's own
+    # breakage — so an identity that does not say which it is leaves the operator
+    # to guess, which is how a killed leg was read as an un-measured surface in
+    # the first place. Reported separately from the nodeids for the same reason.
+    for key in parsed.non_nodeid:
+        print(
+            f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
             file=sys.stderr,
         )
     return 0
@@ -1567,9 +1868,15 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"ci-exemption: ids={len(parsed.ids)} signed={len(parsed.signatures)} "
         f"unsigned={len(parsed.unsigned)} rejected={len(parsed.rejected)} "
         f"unattributed={len(parsed.unattributed)} "
-        f"guard-steps={len(parsed.guard_steps)}",
+        f"guard-steps={len(parsed.guard_steps)} "
+        f"non-nodeid={len(parsed.non_nodeid)}",
         file=sys.stderr,
     )
+    for key in parsed.non_nodeid:
+        print(
+            f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",
+            file=sys.stderr,
+        )
     return 0 if parsed.ok else 1
 
 

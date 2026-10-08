@@ -15,6 +15,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execFileSync } = require('child_process');
 const ciRefCheck = require('../scripts/ci-ref-check.cjs');
 
 // ─── Env / paths ────────────────────────────────────────────────────────────
@@ -370,18 +371,170 @@ function cmdUpdate() {
   }
 }
 
+/** Resolve [p] in the PHYSICAL namespace — symlinks first, then `..`.
+ *
+ *  THE CONVENTION, STATED (it was never stated, which is why six review cycles
+ *  moved the mismatch from one side to the other instead of removing it):
+ *  containment is measured PHYSICALLY, because the kernel resolves a symlink
+ *  and only THEN applies `..` (Linux path-lookup: a link component "is replaced
+ *  by the link body and path processing continues"), and POSIX `cd -P` does the
+ *  same. Any file the OS actually opens is reached that way, so a LEXICAL
+ *  comparison reads "inside" while the OS reaches OUTSIDE — the symlink escape.
+ *  Lexical is the unsafe direction to be permissive in.
+ *
+ *  `fs.realpathSync` (JS) does not keep that promise: it works on the STRING and
+ *  treats `..` textually, whereas `.native` delegates to the platform resolver
+ *  and returns what the kernel would. The two differ when a `..` appears INSIDE
+ *  a symlink body discovered while walking the path — a link whose body is
+ *  `sub/../other` with `sub` itself a link (measured, Node v22.23.2: `.native`
+ *  -> <target>/other, `fs.realpathSync` -> ENOENT). Note that a `..` in the LINK
+ *  TARGET cannot exercise this: `path.resolve`, at the site that builds
+ *  `resolved`, collapses it before resolution — so this function only ever sees
+ *  a `..`-free path. */
+function physical(p) {
+  return fs.realpathSync.native(p);
+}
+
+/** Canonicalize a path into the PHYSICAL namespace even when the leaf does not
+ *  exist: realpath the deepest existing ancestor and re-append the rest.
+ *
+ *  The containment test compares the target against a physical repo root, so a
+ *  lexical target is only equivalent when no component of the path is a symlink.
+ *  A dangling leaf cannot be realpath'd at all, so it must still be carried into
+ *  the physical namespace by canonicalizing its deepest EXISTING ancestor and
+ *  re-appending the remainder. Otherwise the carve-out's own arm —
+ *  `!fs.existsSync(resolved)`, i.e. a broken IN-REPO link — compares a lexical
+ *  path to a physical root, path.relative emits a `..`-chain, and the in-repo
+ *  link is forgiven where origin/main fails it (false PASS, cycle 5).
+ *
+ *  When even the filesystem ROOT fails to resolve — impossible on POSIX, where
+ *  `physical('/')` always succeeds, but reachable for an absent drive or UNC root
+ *  on Windows — this returns the caller's original spelling. That keeps the
+ *  comparison inside ONE namespace in the degenerate case rather than inventing a
+ *  third. Signalling "unresolved" upward instead would INVERT a documented
+ *  verdict rather than guard one: an absent machine-local link is deliberately
+ *  `info`/exit 0 on GitHub-hosted runners (pinned by tests/drift/run.sh case 18),
+ *  so failing it would redden every consumer's dangling link. `repoRootFor`
+ *  falls back to the caller's spelling too, though on a DIFFERENT condition (any
+ *  unresolvable `dir`, not only an unresolvable root) — see its comment. */
+function canonicalizeExisting(p) {
+  let head = p;
+  const tail = [];
+  for (;;) {
+    try {
+      const real = physical(head);
+      return tail.length ? path.join(real, ...tail) : real;
+    } catch {
+      const parent = path.dirname(head);
+      if (parent === head) return p; // degenerate: even the root is unresolvable
+      tail.unshift(path.basename(head));
+      head = parent;
+    }
+  }
+}
+
+/** The enclosing git work-tree root for [dir], or [dir] when there is none.
+ *
+ *  Containment must be measured against the REPO, not against whatever
+ *  directory the caller passed. `check <nested-dir>` is a supported invocation,
+ *  and measuring against a nested dir classified an in-repo target ABOVE it as
+ *  "machine-local" and forgave it (#7412 — a regression against the previous
+ *  behaviour, which failed that shape). Falls back to [dir] if git is absent or
+ *  the directory is not inside a work tree — which preserves the previous
+ *  CONTAINMENT REFERENCE where the two coincide. (It does not preserve every
+ *  verdict: the predicate changed too, deliberately — see #7412.) */
+function repoRootFor(dir) {
+  try {
+    const top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'],
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    if (top) return physical(top);
+  } catch {
+    /* not a work tree, or git absent — fall through */
+  }
+  // Canonicalize on EVERY route, including the fallback. The target side is
+  // PHYSICAL, so returning a LEXICAL root here would put the two sides back in
+  // different namespaces — re-creating the exact mismatch this anchoring exists
+  // to remove (observed: it reddened the suite by classifying an in-repo target
+  // as machine-local whenever the checked dir was not a git work tree).
+  // The final `return dir` IS lexical, deliberately. It is NOT the same
+  // condition as canonicalizeExisting's fallback, and an earlier revision of
+  // this comment wrongly said so: that one fires only when the upward walk
+  // reaches an unresolvable ROOT, whereas this fires whenever `physical(dir)`
+  // throws for ANY reason — a missing leaf or a missing component is enough.
+  // So when `dir` is missing but the root resolves, THIS side stays lexical
+  // while the target side is canonicalized; the two are not equivalent.
+  // The mismatch cannot reach a verdict: the carve-out is only reached after
+  // readlinkSafe(targetDir/scripts) succeeds, which requires targetDir to be a
+  // resolvable directory, so physical(dir) does not throw on the classify path.
+  try {
+    return physical(dir);
+  } catch {
+    return dir;
+  }
+}
+
 /** Classify a non-matching symlink target.
- *  'machine-local' — committed absolute/escaping path, unverifiable on a CI
- *  runner (the normal state of a consumer's committed symlinks).
- *  'stale' — resolves inside the repo tree (a genuinely rotted relative link). */
-function classifyUnresolved(linkTarget, resolved, targetDir) {
-  const external = path.isAbsolute(linkTarget) || path.relative(targetDir, resolved).startsWith('..');
+ *  'machine-local' — the target ESCAPES the repo tree (measured against the
+ *  work-tree root), so it names a path on whatever machine is running (the
+ *  normal state of a consumer's committed symlinks), as opposed to a link that
+ *  rotted relative to this repo.
+ *  'stale' — resolves inside the repo tree (a genuinely rotted link, or an
+ *  absolute path that points back into the checkout).
+ *
+ *  This asks WHERE the target is, never WHAT it is. An absolute link that
+ *  resolves inside the repo is 'stale', not 'machine-local' (#7412) — treating
+ *  every absolute path as forgivable let a link to a wrong in-repo directory
+ *  pass as `info`. Callers needing to know whether an existing target really
+ *  is the expected surface must ask separately — see isAgentInfraScripts. */
+function classifyUnresolved(resolved, repoRoot) {
+  // `startsWith('..')` alone is WRONG: path.relative returns a plain
+  // `..`-prefixed segment chain for an external path, but it also returns
+  // `..foo/scripts` for a path INSIDE the repo under a directory literally
+  // named `..foo` — so an in-repo target was classified machine-local and
+  // forgiven (a false PASS, #7412). Require `..` as a whole segment.
+  const rel = path.relative(repoRoot, resolved);
+  // path.relative returns the ABSOLUTE `to` when the two paths lie on different
+  // Windows DRIVES (verified: win32.relative('C:\\repo','D:\\other') ===
+  // 'D:\\other'), which matches neither arm below and would classify a plainly
+  // external target as 'stale' — a hard FAIL where origin/main forgave it.
+  const external = rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
   return external ? 'machine-local' : 'stale';
+}
+
+/** Is [resolvedScripts] the scripts/ dir of a real agent-infra checkout?
+ *  Positive identification, so a target that EXISTS but is not the expected
+ *  surface is never forgiven merely for being external (#7412).
+ *
+ *  The basename test is load-bearing: without it any subdirectory under an
+ *  agent-infra checkout (templates/, docs/, …) satisfies the marker check and a
+ *  plainly wrong link is reported as `info` — a false PASS. Verified: a link to
+ *  <agent-infra>/templates was forgiven until this check was added.
+ *
+ *  The isDirectory() test matches the stated contract (this is a `scripts/`
+ *  DIR); without it a regular file named `scripts` under a shaped parent was
+ *  forgiven. */
+function isAgentInfraScripts(resolvedScripts) {
+  if (path.basename(resolvedScripts) !== path.basename(SCRIPTS_SRC)) return false;
+  let st;
+  try {
+    st = fs.statSync(resolvedScripts);
+  } catch {
+    return false;
+  }
+  if (!st.isDirectory()) return false;
+  const root = path.dirname(resolvedScripts);
+  return fs.existsSync(path.join(root, 'manifest.json'))
+    && fs.existsSync(path.join(root, 'bin', 'agent-infra.js'));
 }
 
 /** check [targetDir] — verify symlinks match manifest.json */
 function cmdCheck(targetDir, ciMode) {
   targetDir = targetDir ? path.resolve(targetDir) : process.cwd();
+  // Containment is measured against the work-tree root, NOT targetDir (#7412):
+  // a nested targetDir made an in-repo target above it look machine-local.
+  // Computed only in CI mode — the carve-out that consumes it is `ciMode &&`,
+  // so local mode should not pay for a subprocess it never reads.
+  const repoRoot = ciMode ? repoRootFor(targetDir) : targetDir;
 
   const manifest = loadManifest();
   const version = manifest.version;
@@ -488,14 +641,49 @@ function cmdCheck(targetDir, ciMode) {
         }
       } else {
         const resolved = path.resolve(path.dirname(scriptsDest), linkTarget);
+        // Compare containment within ONE namespace. repoRoot is PHYSICAL
+        // (realpath'd), while `resolved` is lexical and inherits the caller's
+        // spelling of targetDir. Canonicalizing ONLY a resolvable target is not
+        // enough: a DANGLING leaf has no realpath, so it must still be carried
+        // into the physical namespace by canonicalizing its deepest EXISTING
+        // ancestor and re-appending the remainder. Otherwise the carve-out's own
+        // arm — `!fs.existsSync(resolved)`, i.e. a broken IN-REPO link — compares
+        // a lexical path to a physical root, path.relative emits a `..`-chain,
+        // and the in-repo link is forgiven where origin/main fails it: a false
+        // PASS introduced by the fix itself (regression, cycle 5).
+        const canonResolved = canonicalizeExisting(resolved);
         if (resolved === SCRIPTS_SRC) {
           ok++;
           console.log(`   ✅ scripts/`);
-        } else if (ciMode && !fs.existsSync(resolved) && classifyUnresolved(linkTarget, resolved, targetDir) === 'machine-local') {
-          // Committed absolute symlinks point at a machine-local agent-infra
-          // checkout — unverifiable on the CI runner, not propagation drift.
-          issues.push({ type: 'scripts', tier: 'info', reason: `symlink target machine-local (${linkTarget}) — unverifiable on CI runner` });
-          console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} (machine-local, unverifiable in CI)`);
+        } else if (ciMode && classifyUnresolved(canonResolved, repoRoot) === 'machine-local'
+                   // isAgentInfraScripts takes canonResolved, NOT resolved: reading
+                   // the lexical spelling here while classification used the
+                   // physical one let a link whose target was itself a symlink to a
+                   // WRONG subdir pass on the lexical basename `scripts` and be
+                   // forgiven (false PASS, cycle 5). One namespace for both.
+                   && (!fs.existsSync(canonResolved) || isAgentInfraScripts(canonResolved))) {
+          // A committed link escaping the repo points at a machine-local
+          // agent-infra checkout. Forgive it only when the runner cannot reach
+          // it at all (absent — the usual GitHub-hosted case), or when the
+          // target demonstrably IS an agent-infra checkout.
+          //
+          // (#7412) Gating on !fs.existsSync alone was wrong in the other
+          // direction: on a self-hosted runner the machine-local path EXISTS,
+          // so the gate skipped this carve-out and a link the code calls "not
+          // propagation drift" became a hard failure that refused a merge
+          // (same commit, opposite verdicts across runners that disagree on
+          // AGENT_INFRA_PATH). But presence alone must not be enough either —
+          // forgiving every reaching target would turn a real drift FAIL into
+          // a false PASS. Hence positive identification: unverifiable OR
+          // genuinely agent-infra; anything else stays drift.
+          // Word the finding by branch: the two arms are opposite facts, and
+          // collapsing them into "unverifiable" cost real triage time on #7412,
+          // where the log could not distinguish the shapes.
+          const why = fs.existsSync(canonResolved)
+            ? 'machine-local agent-infra checkout'
+            : 'machine-local, unverifiable in CI (target absent on this runner)';
+          issues.push({ type: 'scripts', tier: 'info', reason: `symlink target ${why} — ${linkTarget}` });
+          console.log(`   ℹ️  scripts/ — symlink → ${linkTarget} — ${why}`);
         } else {
           issues.push({ type: 'scripts', tier: 'fail', reason: `points to ${resolved}, expected ${SCRIPTS_SRC}` });
           console.log(`   ⚠️  scripts/ — stale (→ ${linkTarget})`);
