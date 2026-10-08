@@ -290,6 +290,13 @@ new_scen() {
   # applies; a scenario that sets it to ANOTHER slug models `--repo owner/name`
   # naming a different repo while the cwd holds the wrong `tools/`.
   SCEN_CWD_REPO=
+  # #7727: where the rail is RUN from. Empty ⇒ the suite's own cwd. A scenario sets
+  # it to a SUBDIRECTORY of a repo whose root holds `tools/drift-guard.py`, which is
+  # the only way to tell a root-anchored tool test from a cwd-relative one.
+  SCEN_CWD=
+  # #7727: the drift threshold. 0 is the production default; a non-zero value is how
+  # the "distance below the threshold" arms are reached at all.
+  SCEN_DRIFT_TRIGGER=
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -325,6 +332,11 @@ new_scen() {
 # with PPID 1). This helper is only ever called in a subshell or backgrounded, so
 # the `exec` cannot replace this test script.
 rail_exec() { # <extra args...>
+  # #7727: run the rail from a scenario-chosen directory when one is set. The rail
+  # resolves its drift tool against `git rev-parse --show-toplevel`, so the only
+  # honest way to test that anchoring is to RUN it somewhere the answer differs from
+  # the process cwd — a subdirectory of a repo that has the tool at its root.
+  [ -n "${SCEN_CWD:-}" ] && cd "$SCEN_CWD"
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
@@ -334,6 +346,7 @@ rail_exec() { # <extra args...>
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
   ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
+  ATOMIC_LAND_DRIFT_TRIGGER="${SCEN_DRIFT_TRIGGER:-0}" \
     exec bash "$RAIL" "$@"
 }
 
@@ -1287,6 +1300,16 @@ echo "── 17g-E4. the predicate is passed a FETCHABLE base ref (origin/<base>
 # gate cannot prove its freshness") while `--base origin/main` measures. The rail's
 # $BASE is the bare branch name, so passing it would make EVERY read an error and
 # disable the skip permanently — a silent failure of this whole arm.
+# Self-contained (its own scenario): it previously grepped the PREVIOUS scenario's
+# log, so its result depended on E3 existing and running first (round-3 finding).
+new_scen drifte4
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+run_rail 42 --repo "$REPO" --poll 0
 grep -qF -- "origin/main" "$SCEN/drift-calls" \
   && pass "invoked with origin/main" \
   || fail "not passed a fetchable base ref (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
@@ -1367,19 +1390,89 @@ called "pr update-branch" \
   || fail "the head moved for a safe drift"
 
 # ── ROOT ANCHORING — the round-2 fail-OPEN ─────────────────────────────
-echo "── 17g-E9. the tool path is anchored to the repo ROOT, not the process cwd"
-# `gh repo view` walks up, so from a SUBDIRECTORY the identity check passes — but a
-# bare `tools/drift-guard.py` test is relative to the process cwd and misses a tool
-# that IS at the root, reading a PRESENT gate as absent and skipping a drift-red head
-# (measured in review round 2). A behavioural repro needs a git root that HAS the
-# tool, which this hermetic suite cannot place, so assert the MECHANISM directly:
-# the default argv must be built from $CWD_ROOT.
-rg -q 'tool="\$\{CWD_ROOT:-\.\}/tools/drift-guard\.py"' scripts/atomic-land.sh \
-  && pass "the tool path is built from CWD_ROOT (the repo root), not a bare relative path" \
-  || fail "the tool path is not root-anchored — a subdirectory would read a present gate as absent"
-rg -q 'CWD_ROOT="\$\(git rev-parse --show-toplevel' scripts/atomic-land.sh \
-  && pass "CWD_ROOT is resolved from git, so it is the checkout root wherever the shell sits" \
-  || fail "CWD_ROOT is not resolved from git"
+echo "── 17g-E9. the tool is found from a SUBDIRECTORY: the path is anchored to the repo ROOT"
+# BEHAVIOURAL, not a source-text grep. Round 3 showed a grep is satisfied by leaving
+# the anchored string in a COMMENT while the code reverts to a relative path. The
+# rail resolves its tool against `git rev-parse --show-toplevel`, so the only honest
+# test runs the rail somewhere the repo root DIFFERS from the process cwd: a real git
+# checkout whose ROOT holds tools/drift-guard.py, with the rail started in `sub/`.
+# A cwd-relative test would miss the tool at the root, read "no gate", and SKIP a
+# drift-red head — which is exactly what this scenario must NOT do.
+new_scen driftsubdir
+git init -q "$TMP/e9repo"
+mkdir -p "$TMP/e9repo/tools" "$TMP/e9repo/sub"
+# The tool must be PYTHON: the default argv is `uv run python <tool>`.
+cat > "$TMP/e9repo/tools/drift-guard.py" <<'E9EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+p = pathlib.Path(scen, "drift-status")
+if not p.exists():
+    print("drift-guard: no fixture", file=sys.stderr); sys.exit(2)
+st = p.read_text().strip()
+print(json.dumps({"status": st, "base": "origin/main"}))
+sys.exit(0 if st == "ok" else 1)
+E9EOF
+printf 'drift\n'     > "$SCEN/drift-status"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e9repo/sub"   # the rail runs HERE; the tool is at $TMP/e9repo/tools/
+SCEN_CWD_REPO="$REPO"        # identity matches, so the no-gate exception would apply if it were missed
+SCEN_DRIFT_CMD=              # NO override — the default argv must find the root-anchored tool
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed — the tool was found from a subdirectory (root-anchored)" \
+  || fail "SKIPPED from a subdirectory: a present gate read as absent (the round-2 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate actually RAN (not merely 'found')" \
+  || fail "the predicate never ran — found-by-accident or not at all"
+SCEN_CWD=                    # restore for later scenarios
+
+# ── THE TRIGGER BOUNDARY — the round-3 P1 ───────────────────────────────
+echo "── 17g-E12. a MEASURED distance below a non-zero drift threshold still consults the predicate"
+# The skip arms asked "is `behind` non-empty?" where the real question is "is it
+# ZERO?". With the default trigger only 0 reached them, so the difference was
+# invisible; with a non-zero ATOMIC_LAND_DRIFT_TRIGGER a REAL distance lands in
+# them, and the old form skipped a drift-red head WITHOUT calling the predicate
+# while printing "measured current (0 behind)" — a false statement (measured in
+# review round 3). Both arms must fail closed. The trigger is `0` in production;
+# this scenario exercises the boundary the knob exists to make testable.
+new_scen driftbelowtrigger
+SCEN_DRIFT_CMD="$DRIFT"
+SCEN_DRIFT_TRIGGER=20
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"   # A REAL distance, but below the threshold
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (CLEAN arm) — a non-zero distance is never read as current" \
+  || fail "SKIPPED a drift-red head below the threshold and called it 'measured current (0 behind)'"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate was consulted" \
+  || fail "skipped without consulting the predicate (the round-3 P1)"
+
+# The other arm: a NON-CLEAN state below the threshold takes the final `else`.
+new_scen driftbelowtriggerblocked
+SCEN_DRIFT_CMD="$DRIFT"
+SCEN_DRIFT_TRIGGER=20
+printf 'BLOCKED\n'   > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (the final arm) — the same question, one arm over" \
+  || fail "SKIPPED a drift-red BLOCKED head below the threshold (the same 0/empty confusion)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate was consulted there too" \
+  || fail "the final arm skipped without consulting the predicate"
+SCEN_DRIFT_TRIGGER=
 
 # ── THE THIRD SKIP PATH — CLEAN with an UNREADABLE distance ───────────────
 echo "── 17g-E10. CLEAN with an UNREADABLE distance + drift RED ⇒ REFRESH (else it skips unmeasured)"
@@ -1399,6 +1492,11 @@ run_rail 42 --repo "$REPO" --poll 0
 called "pr update-branch" \
   && pass "refreshed on an unreadable distance with a red predicate" \
   || fail "SKIPPED a drift-red CLEAN head on an unreadable distance (the third skip path)"
+# The predicate must have been the REASON: a rail that refreshed on some other
+# ground would also pass the line above (round-3 finding).
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "the predicate was consulted, not bypassed" \
+  || fail "refreshed without consulting the predicate — the third skip path is not gated"
 
 # ── …and the measured-current case must still be a cheap no-op ───────────
 echo "── 17g-E11. CLEAN with a MEASURED-CURRENT head (0 behind) ⇒ no-op, no predicate call"
@@ -1586,6 +1684,18 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # landable" inference — skipping a drift-red head. Anchored to the BEHIND arm's
   # 12 spaces so it cannot silently mutate the drift arm instead. 17g-E7 must redden.
   mutate_and_expect_fail B25  's/^            if \[ "\$\(drift_safe_of\)" = 1 \]; then/            if true; then/m'
+  # B26 (#7727): the THIRD skip path — the CLEAN arm's predicate, reached when the
+  # distance is UNREADABLE or below a non-zero threshold. The failure it prevents:
+  # gating two arms and leaving the third, so a CLEAN head whose compare read failed
+  # is skipped unmeasured — the #7703 shape one unreadable read away. 17g-E10 and
+  # 17g-E12 must redden.
+  # ⛔ 8 SPACES, NOT 10: the final `else` arm's predicate is deliberately nested one
+  # level deeper so that B26 and B27 cannot both match the same line. Two same-indent
+  # sites would make one of these mutations cover only the first (the B19b/B20b trap).
+  mutate_and_expect_fail B26  's/^        if \[ "\$\(drift_safe_of\)" = 1 \]; then/        if true; then/m'
+  # B27 (#7727): the FOURTH site — the final `else` arm, reached by a non-CLEAN state
+  # whose distance is below a non-zero threshold. Anchored to its 10 spaces (see B26).
+  mutate_and_expect_fail B27  's/^          if \[ "\$\(drift_safe_of\)" = 1 \]; then/          if true; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh

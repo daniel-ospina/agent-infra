@@ -162,8 +162,19 @@ ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
 # this shared rail, so the default resolves it against the cwd checkout's ROOT —
 # see drift_safe_of(). Overridable as a whole, exactly like $GH/$RECORD_SH/
 # $ADMIN_MERGE, so the suite can serve it hermetically. The override is read at the
-# single call site inside drift_safe_of() rather than cached here, because the
-# default depends on $CWD_ROOT, which is only known after resolve_repo().
+# two sites inside drift_safe_of() (the missing-tool test and the argv) rather than
+# cached here, because the default depends on $CWD_ROOT, which is only known after
+# resolve_repo().
+#
+# ⚠️ KNOWN LIMITATION, stated rather than implied: the "is there a drift gate?"
+# question is answered from the LOCAL CHECKOUT, not from the target's base ref. If
+# that checkout's `tools/drift-guard.py` is absent while the target repo HAS one — a
+# stale branch, a fork, a locally deleted file — the rail reads "no gate" and takes
+# the skip. The rail is meant to run from the target repo's own checkout, where that
+# cannot arise, and confirming gate existence against the remote base would cost an
+# API round trip per run to guard a case with no measured failure. What the code
+# DOES guarantee is the case that WAS measured: a cwd repo that is not the target is
+# never read as "no gate".
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -730,22 +741,29 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
         # #7727 — CLEAN IS NOT A STATEMENT ABOUT CONTENT, so this no-op may not be
-        # taken on the state name. `behind` reaches this arm when the distance is 0
-        # (measured current — the head contains the base, so nothing can revert and
-        # the no-op is safe) AND when the compare read FAILED (`behind` empty). For
-        # the latter the distance is unavailable and only the drift predicate can
-        # decide: under `strict: false` a genuinely-behind head reports CLEAN, so
-        # this is PR #7703's shape one unreadable read away. This was the one skip
-        # that never consulted the predicate.
-        if [ -n "$behind" ]; then
+        # taken on the state name. `behind` reaches this arm whenever the drift arm
+        # above did NOT fire, which under the default trigger means it is 0 — but
+        # the safety must not REST on that: an unrelated arm's threshold is not
+        # this arm's invariant. With a non-zero ATOMIC_LAND_DRIFT_TRIGGER a real
+        # distance lands here, and a `-n "$behind"` test ("non-empty") skipped it
+        # while printing "measured current (0 behind)" — a false statement AND a
+        # drift-red skip (review round 3, measured). `-eq 0` asks the real
+        # question. `behind` is non-empty here because the `-z` arm below catches
+        # the empty case, and an empty value would make `-eq` fail, which routes
+        # to the predicate below — the fail-closed direction.
+        if [ "$behind" -eq 0 ]; then
           say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
           return 3
         fi
+        # Either an UNREADABLE distance (the compare read failed) or a MEASURED
+        # one below the drift threshold: both are a distance this skip must not
+        # assume away. Under `strict: false` a genuinely-behind head reports CLEAN,
+        # so refusing to measure here is PR #7703's shape one unreadable read away.
         if [ "$(drift_safe_of)" = 1 ]; then
-          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN with an unreadable head/base distance, but merging this head would keep $BASE's content — nothing to update"
+          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN with the head/base distance ${behind:-unreadable}, but merging this head would keep $BASE's content — nothing to update"
           return 3
         fi
-        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head/base distance could not be measured, and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
+        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
@@ -776,8 +794,27 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # base relation (tortoise #6210 / #6169 are the measured population).
         stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)"
       else
-        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE — nothing to update"
-        return 3
+        # #7727 — the same `-eq 0` question as the CLEAN arm above, and for the
+        # same reason: a MEASURED distance below the drift threshold is still a
+        # distance. Under the default trigger only 0 reaches this line; with a
+        # non-zero trigger the `-n` form skipped a real distance without ever
+        # consulting the predicate. A 0 distance is a genuine no-op (the head
+        # contains the base, so nothing can revert); anything else is decided by
+        # the predicate, like every other skip in this step. The non-zero case is
+        # nested one level deeper ON PURPOSE: it keeps this arm's predicate at a
+        # different indent from the CLEAN arm's, so each has its OWN anchored
+        # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
+        # one unanchored pattern silently cover only the first — the B19b/B20b trap.
+        if [ "$behind" -ne 0 ]; then
+          if [ "$(drift_safe_of)" = 1 ]; then
+            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
+            return 3
+          fi
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, and the drift predicate is NOT positively green — REFRESHING on BASE DRIFT (#4174/#7727)"
+        else
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commit(s) behind $BASE — nothing to update"
+          return 3
+        fi
       fi ;;
   esac
   # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
