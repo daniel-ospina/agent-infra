@@ -321,6 +321,9 @@ def collect_filters(lines, on_index):
     cur_trig = None
     cur_filter = None
     base = None
+    # #1637: set when a key that is NOT a filter is seen at trigger depth. A
+    # reusable trigger needs to know (see the guard below and the tail check).
+    nonfilter_seen = False
 
     def _unquote(s):
         if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
@@ -364,40 +367,44 @@ def collect_filters(lines, on_index):
             return None
         cur_filter = m.group(2) if m.group(2) is not None else (
             m.group(3) if m.group(3) is not None else m.group(4))
-        # ⛔ #1637 — ONLY A FILTER KEY MAY ABANDON THE ATTRIBUTION…
-        # …EXCEPT UNDER A REUSABLE TRIGGER, WHERE THE OLD BAIL IS LOAD-BEARING.
-        #
+        # ⛔ #1637 — A NON-FILTER KEY MUST NOT ABANDON THE ATTRIBUTION.
         # The bail below (`return None` on an inline non-list scalar) is right for
         # a FILTER whose shape this reader cannot parse, but it is wrong for a key
         # that is not a filter at all — and `workflow_dispatch.inputs` is nothing
-        # but those (`description:`, `required:`, `default:`, `type:`). Because a
-        # `None` here means "the region does not fit this shape", the caller fails
-        # closed PER TRIGGER, the answer collapses to `unknown`, and `unknown` is
-        # consumed as PR-EVALUABLE — so the #6807 exemption stopped firing for the
-        # very file it was written for (`deploy-hosted.yml`: `on: push` with
+        # but those (`description:`, `required:`, `default:`, `type:`). A `None`
+        # here means "the region does not fit this shape", which the caller reads
+        # as an unattributed trigger — so the #6807 exemption stopped firing for
+        # the very file it was written for (`deploy-hosted.yml`: `on: push` with
         # `branches:` + `workflow_dispatch`, and no `pull_request` at all) the
-        # moment #1542 introduced this reader. The regression is measured: the
-        # pre-#1542 predicate answers `no` for that file, the current one
-        # `unknown`, on identical input.
+        # moment #1542 introduced this reader. Measured on identical input: the
+        # pre-#1542 predicate answers `no` for that file, this one answered
+        # `unknown`.
         #
-        # #1413 IS THE ONE EXCEPTION, AND IT MUST NOT BE GENERALISED. A reusable
-        # workflow's jobs attach a check to a PR head inside the CALLER's run,
-        # under the CALLER's NAME, so this file cannot answer for it — and that
-        # decision is reached through `flt is None`. A `workflow_call` whose
-        # `inputs:` spec cannot be attributed must therefore KEEP failing the
-        # attribution. Both ends are pinned by `REUSABLE_YAML` in
-        # tests/admin-merge/run.sh §67e: a BARE `workflow_call` answers `no`, while
-        # `workflow_call` + an `inputs:` spec answers `unknown`. Skipping the bail
-        # for EVERY trigger collapses the second into the first — `flt` arrives as
-        # `{}`, execution falls through to `trigger_measurable`'s tail
-        # `return False`, and the predicate affirms an exemption for a red a PR may
-        # well have measured. That is a FAIL-OPEN, and the suite caught it.
+        # BUT A NON-FILTER KEY'S SHAPE STILL HAS TO BALANCE. Such a key is not
+        # ours to interpret, yet an UNTERMINATED flow collection is a shape this
+        # reader cannot attribute wherever it appears, so it still bails. Without
+        # this, a `paths:` inside another key's multi-line flow sequence is read as
+        # a top-level PR filter and the verdict moves `yes` -> `no` on input the
+        # reader cannot attribute — a fail-open.
         #
-        # NOT A WIDENING: a `pull_request` whose `paths:` cannot be read still
-        # bails (`paths` IS a filter key), and one declaring only `types:` becomes
-        # UNFILTERED — which is PR-evaluable, i.e. BLOCKING.
+        # #1413 IS THE ONE INVARIANT THAT SURVIVES, AND IT IS A PROPERTY OF THE
+        # TRIGGER — NOT OF WHICH KEY HAPPENED TO BAIL. A reusable workflow's jobs
+        # attach a check to a PR head inside the CALLER's run, under the CALLER's
+        # NAME, so this file cannot answer for it: `unknown` is the only sound
+        # answer, and `no` would be consumed downstream as a false exemption. That
+        # is reached through `flt is None`, so ANY `workflow_call` in the document
+        # whose attribution is not COMPLETE must keep failing the attribution.
+        # ⛔ KEYING THIS ON `cur_trig` WAS A BUG: an unattributable key under a
+        # SIBLING (`workflow_call` + `workflow_dispatch: inputs:` at the same
+        # depth) left the reusable trigger with `flt == {}`, execution fell through
+        # to `trigger_measurable`'s tail `return False`, and the predicate answered
+        # `no` — the same fail-open, one trigger over. The document-level flag
+        # tested at the tail is the correct predicate. A BARE `workflow_call` (no
+        # non-filter key anywhere) still answers `no`.
         if cur_filter not in _FILTER_KEYS:
-            if cur_trig == "workflow_call":
+            nonfilter_seen = True
+            rest = (m.group(5) or "").strip()
+            if rest[:1] in ("[", "{") and rest[-1:] not in ("]", "}"):
                 return None
             cur_filter = None
             continue
@@ -413,6 +420,11 @@ def collect_filters(lines, on_index):
         elif rest and rest not in ("|", ">"):
             return None
         out[cur_trig][cur_filter] = pats
+    # #1413, at the DOCUMENT level (see the guard above): a reusable trigger whose
+    # attribution is INCOMPLETE must fail closed, even when the unattributable key
+    # lived under a sibling trigger.
+    if nonfilter_seen and "workflow_call" in out:
+        return None
     return out
 
 

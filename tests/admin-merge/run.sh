@@ -9407,14 +9407,35 @@ pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_reque
 pe_case "workflow_dispatch input spec"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      d:\n        description: \x27x\x27\n        required: false\n        default: \x27false\x27\n        type: boolean\n'
 pe_case "input spec, no other trigger" no $'on:\n  workflow_dispatch:\n    inputs:\n      d:\n        default: x\n'
 pe_case "depth-3 scalar under inputs"  no $'on:\n  workflow_dispatch:\n    inputs:\n      d: x\n'
-# The arity of the exemption is UNCHANGED by this fix: only a key in
-# `_FILTER_KEYS` may abandon the attribution, so a `pull_request` whose filter
-# cannot be read still resolves through the trigger NAME and blocks (`yes`),
-# and an inline value on a TRIGGER key still refuses (`unknown`). Both are
-# fail-closed; neither may become `no`.
+# These three are NOT evidence that #1637 is fixed — they pass BEFORE and AFTER
+# it (measured against `git show bc0481b:scripts/ci-workflow-pr-evaluable.sh`).
+# They are guards against the OPPOSITE over-generalisation: the fix must not widen
+# the exemption in the other direction either. Only a `pull_request` whose filter
+# cannot be read still resolves through the trigger NAME and blocks (`yes`), and
+# an inline value on a TRIGGER key still refuses (`unknown`). Both fail-closed;
+# neither may become `no`.
 pe_case "unreadable paths flow-mapping" yes $'on:\n  pull_request:\n    paths: {a: b}\n'
 pe_case "pull_request w/ only types"    yes $'on:\n  pull_request:\n    types: [opened]\n'
 pe_case "inline value on trigger key"   unknown $'on:\n  push: main\n'
+# ── P1/P2 from the fresh-context review of PR #1639 (<- both were REAL) ───────
+# P1: the #1413 invariant is a property of the TRIGGER, so it must hold when the
+# unattributable key lives under a SIBLING trigger. Keying it on `cur_trig` let
+# `workflow_call` + `workflow_dispatch: inputs:` fall through to
+# `trigger_measurable`'s tail `return False` and answer `no` — the same fail-open
+# as the one the fix was written to close, one trigger over. Measured against the
+# pre-fix predicate these are `unknown`; the buggy intermediate was `no`.
+pe_case "reusable + sibling input spec"  unknown $'on:\n  workflow_call:\n  workflow_dispatch:\n    inputs:\n      reason:\n        description: why\n'
+pe_case "reusable + sibling push scalar" unknown $'on:\n  workflow_call:\n  push:\n    x: y\n'
+pe_case "reusable + sibling schedule"    unknown $'on:\n  workflow_call:\n  schedule:\n    x: y\n'
+# P2: a NON-FILTER key's SHAPE must still balance. Skipping the bail for such a
+# key also skipped the `rest.startswith("[") and not rest.endswith("]")` arm, so
+# a `paths:` nested inside another key's UNTERMINATED flow sequence was read as a
+# top-level PR filter and the verdict moved `yes` -> `no` on input this reader
+# cannot attribute. This is the arm that keeps it `yes`.
+pe_case "unterminated flow under non-filter key" yes $'on:\n  pull_request:\n    types: [opened,\n            paths: [docs/**]]\n'
+# A BARE `workflow_call` (no non-filter key anywhere) must stay `no`: the
+# document-level invariant only fires when the attribution is INCOMPLETE.
+pe_case "bare reusable stays exempt"     no  $'on:\n  workflow_call:\n'
 
 # ── #1542: the trigger's FILTERS decide measurability, not just its name ────
 # A `pull_request` that declares `paths:` can only attach a check to a PR whose
