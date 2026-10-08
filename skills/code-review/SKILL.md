@@ -96,7 +96,10 @@ names every file it did not run.
 
 **Run the legs CI runs — not just `test_files`.** The selector subtracts the other legs out of
 `test_files`, so a reviewer who runs only that set has a *smaller* denominator than CI, which is the
-defect this step exists to prevent:
+defect this step exists to prevent. These are the three **diff-gated** legs — they are not the whole
+of CI, which also runs always-on Python jobs (`test-track-b` selecting the `track_b` markers that
+every leg below marker-deselects, `test-concurrency-falkor`, `packs-compile`); treat those as further
+files to run or to name as not-run:
 
 | JSON field | Run it when |
 |---|---|
