@@ -634,38 +634,42 @@ info() { printf '%s\n' "$*"; }
 # removes, in the documented invocation that sets no `--repo`: the guard silently
 # never fired and the update went ahead. Hence the explicit resolution.
 #
-# ⛔ THE PREDICATE IS B5's, NOT "a record exists". `atomic-land.sh` refuses this
-# update only when a record is bound to the current head AND the PR carries no
-# verifiable signed marker — its `pr_has_carry_evidence`, a presence test on the
-# `review recorded: … diff=… sig=…` line — because the carry arm re-binds the
-# verdict to the new head when the three-dot diff survives. A PR that carries one
-# IS safe to update, and refusing it would decline the very remedy this helper
-# exists to perform. Only the unpaired case is refused.
+# ⛔ A RECORD BOUND TO THE HEAD BLOCKS THE UPDATE, FULL STOP. `atomic-land.sh`'s B5
+# permits the update when the PR carries a VERIFIED signed marker — it recomputes
+# the HMAC with the gate key, and the carry arm then re-binds the verdict to the new
+# head. This rail has no gate-key or `openssl` path, and the PR body is
+# attacker-writable, so a shape match is not evidence: a forged or rotated-key
+# `sig=` would read as carryable and the guard would wave through the very move it
+# exists to stop. Rather than reimplement a cryptographic check here, every bound
+# case is refused and the remedy that does not move the head is named. This is
+# therefore STRICTER than B5, never looser: the whole cost is one `gh run rerun`.
 #
 # Reads the record with `$PYTHON_BIN` rather than a new `jq` dependency: every
 # other JSON read in this script goes through it, and a missing `jq` would make the
-# guard fail OPEN behind `2>/dev/null || true`.
+# guard fail OPEN behind a `2>/dev/null || true`.
+#
+# ⛔ FAIL CLOSED ON AN UNREADABLE RECORD. No file at all is genuinely safe — there
+# is nothing to strand — but a file that EXISTS and whose `head_sha` cannot be read
+# is not: the guard then cannot tell whether it is bound to this head.
+# `atomic-land.sh` treats that same condition the same way (`stop "the record …
+# carries no usable head_sha"`), so the read failure is a refusal, not an absence.
 pr_review_record_blocks_update() {
   local pr="$1" expected="$2"
-  local owner_repo="${REPO:-}" f="" rec_head="" rec_verdict="" body=""
+  local owner_repo="${REPO:-}" f="" rec_head=""
   [ -n "$owner_repo" ] || owner_repo="$($GH repo view --json nameWithOwner \
       --jq .nameWithOwner 2>/dev/null || true)"
   [ -n "$owner_repo" ] && f="$HOME/.pi/agent/reviews/${owner_repo%/*}-${owner_repo#*/}-$pr.json"
   { [ -n "$f" ] && [ -f "$f" ]; } || f="$HOME/.pi/agent/reviews/$pr.json"
   [ -f "$f" ] || return 1
   rec_head="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("head_sha") or "")' "$f" 2>/dev/null || true)"
-  { [ -n "$rec_head" ] && [ "$rec_head" = "$expected" ]; } || return 1
-  # Carry evidence present -> the update is safe and B5 permits it. An unread
-  # verdict is NOT a licence to update: the marker cannot be shown to carry, so
-  # this stays on B5's fail-closed side and refuses.
-  rec_verdict="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("verdict") or "")' "$f" 2>/dev/null || true)"
-  [ -n "$rec_verdict" ] || return 0
-  local rargs=()
-  [ -n "${REPO:-}" ] && rargs=(--repo "$REPO")
-  body="$($GH pr view "$pr" ${rargs[@]+"${rargs[@]}"} --json body --jq .body 2>/dev/null || true)"
-  printf '%s' "$body" | grep -qE "^review recorded: reviews/${pr}\.json verdict=${rec_verdict} @ [0-9a-f]{40} diff=[0-9a-f]{64} \(.*\) sig=[0-9a-f]{64}$" \
-    && return 1
-  return 0
+  rec_head="$(printf '%s' "$rec_head" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+  [ -n "$rec_head" ] || return 0
+  case "$rec_head" in *[!0-9a-f]*) return 0 ;; esac
+  [ "${#rec_head}" -ge 7 ] || return 0
+  expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+  case "$expected" in "$rec_head"*) return 0 ;; esac
+  case "$rec_head" in "$expected"*) return 0 ;; esac
+  return 1
 }
 
 # ── refresh_pr_branch <pr> <expected-head> ──────────────────────────────────
@@ -703,13 +707,12 @@ refresh_pr_branch() {
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
 
   if pr_review_record_blocks_update "$pr" "$expected"; then
-    say_err "   ⛔ NOT updating: a review record is bound to the current head and this PR"
-    say_err "      carries no signed marker to carry it onto the new head (atomic-land.sh's B5"
-    say_err "      predicate — a marker with a diff= identity would be carried instead). An"
-    say_err "      update would leave the attestation stale with nothing here able to re-mint it."
-    say_err "      Re-measure WITHOUT moving the head: re-run the PR's checks"
-    say_err "      ('gh run rerun <run-id>'), which re-evaluates the merge ref against the current"
-    say_err "      base. An empty commit moves the head too, so it is not the remedy either."
+    say_err "   ⛔ NOT updating: a review record is bound to the current head, and this rail"
+    say_err "      does not verify carry markers (atomic-land.sh does, with the gate key), so it"
+    say_err "      will not move the head out from under the attestation. Re-measure WITHOUT"
+    say_err "      moving the head: re-run the PR's checks ('gh run rerun <run-id>'), which"
+    say_err "      re-evaluates the merge ref against the current base. An empty commit moves the"
+    say_err "      head too, so it is not the remedy either."
     return 1
   fi
 
