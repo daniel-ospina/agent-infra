@@ -687,19 +687,41 @@ pr_review_record_blocks_update() {
     say_err "      so an existing review record cannot be ruled out — refusing to move the head."
     return 0
   fi
-  pr="${pr#"${pr%%[!0]*}"}"        # GitHub accepts 01631; the record path cannot
-  [ -n "$pr" ] || pr="0"
-  cands+=("$HOME/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json")
+  # — THE NUMBER IS KEPT AS GIVEN *AND* STRIPPED. `record-review.sh` names the file with
+  # `$PR` VERBATIM (it only validates `^[0-9]+$`), so a record written for `01631` lives at
+  # `…-01631.json`, while this rail accepts `01631` as the PR argument because GitHub does.
+  # Normalizing in one direction only would read a path the writer never wrote.
+  local nums=("${pr:-0}") n="" keys=("$slug") k=""
+  [ -n "${nums[0]}" ] || nums[0]="0"
+  n="${nums[0]#"${nums[0]%%[!0]*}"}"
+  [ -n "$n" ] || n="0"
+  [ "$n" != "${nums[0]}" ] && nums+=("$n")
   # ...and the spelling the caller gave, which `record-review.sh` writes verbatim
-  [ -n "${REPO:-}" ] && cands+=("$HOME/.pi/agent/reviews/${REPO%/*}-${REPO#*/}-$pr.json")
-  cands+=("$HOME/.pi/agent/reviews/$pr.json")
+  [ -n "${REPO:-}" ] && keys+=("$REPO")
+  for k in "${keys[@]}"; do
+    for n in "${nums[@]}"; do
+      cands+=("$HOME/.pi/agent/reviews/${k%/*}-${k#*/}-$n.json")
+    done
+  done
+  for n in "${nums[@]}"; do
+    cands+=("$HOME/.pi/agent/reviews/$n.json")
+  done
   expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
 
   for f in "${cands[@]}"; do
-    [ -f "$f" ] || continue
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    # ⛔ "EXISTS BUT IS NOT A READABLE REGULAR FILE" IS NOT "NO RECORD". A directory, a
+    # dangling symlink, or a record store this process cannot read would otherwise make
+    # `-f` false and be read as an absent record — the fail-open this guard exists to stop.
+    if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+      say_err "   ⛔ a path exists at $f but it is not a readable regular file — refusing,"
+      say_err "      because the rail cannot tell whether a record is bound to this head."
+      return 0
+    fi
     rec_bound=0
-    case "$f" in
-      "$HOME/.pi/agent/reviews/$pr.json")
+    case "${f##*/}" in
+      *-*) : ;;                        # qualified name: the repo is in the FILENAME
+      *)                               # bare <pr>.json: the repo is a FIELD, so check it
         rec_repo="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo") or "")' "$f" 2>/dev/null || true)"
         rec_repo="$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')"
         if [ -n "$rec_repo" ] \
@@ -4709,10 +4731,10 @@ main() {
         say_err "   updating, since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
-        say_err "   states why the rail did not do it for you (a record it refused to strand, a"
-        say_err "   dry run, or the update call failing). Note that pushing an empty commit moves"
-        say_err "   the head and strands any record bound to it. If this PR is the REPAIR, its own"
-        say_err "   checks pass on the re-measured tree."
+        say_err "   states why the rail did not do it for you: a record it refused to strand, a"
+        say_err "   dry run, an unresolved repo identity, or a failed update call. Note that"
+        say_err "   pushing an empty commit moves the head and strands any record bound to it."
+        say_err "   If this PR is the REPAIR, its own checks pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
@@ -4792,10 +4814,10 @@ main() {
         say_err "   since an update cannot be undone."
       else
         say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
-        say_err "   states why the rail did not do it for you (a record it refused to strand, a"
-        say_err "   dry run, or the update call failing). Note that pushing an empty commit moves"
-        say_err "   the head and strands any record bound to it. If this PR is the REPAIR, its own"
-        say_err "   checks then pass on the re-measured tree."
+        say_err "   states why the rail did not do it for you: a record it refused to strand, a"
+        say_err "   dry run, an unresolved repo identity, or a failed update call. Note that"
+        say_err "   pushing an empty commit moves the head and strands any record bound to it."
+        say_err "   If this PR is the REPAIR, its own checks then pass on the re-measured tree."
       fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
