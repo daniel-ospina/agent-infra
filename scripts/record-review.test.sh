@@ -1495,7 +1495,123 @@ if grep -qF "diff=$L_SHA" <<<"$RECORD_CAP"; then bad "11.11p mutation(p): the mu
 # the true regression, not the finding's short form.
 if grep -qF "300-FILE DIFF CAP" <<<"$RECORD_ERR"; then bad "11.11p mutation(p): the mutant still named the cap — 11.11n is vacuous"; else ok "11.11p mutation(p): with the blind spot restored the pretty cap is NOT named as a cap"; fi
 assert_contains "$RECORD_ERR" "transient: gh auth/network" "11.11p mutation(p): the mutant blames the transient gh/network arm (the regression 11.11n pins)"
-unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
+
+# 11.11q–t: SHARED-FLATTEN drift between the two classifiers (#1398 round 2). The
+#         previous fix made `diff_body_is_error_object` line-agnostic, but
+#         `diff_body_is_size_cap` still re-grepped the ORIGINAL, line-oriented
+#         body — where `[[:space:]]*` cannot cross a newline. An envelope whose
+#         VALUES sit on the next line for BOTH keys was therefore recognised as an
+#         ERROR and NOT as the size cap: `error_object=YES, size_cap=NO`. The
+#         fallback was SKIPPED and the structural refusal was warned as a
+#         transient gh/auth/network fault and RETRIED — the round-1 P3 behind a
+#         narrower trigger. Sharing ONE flatten between the predicates is the fix;
+#         these vectors MUTATION-PIN it (11.11t) so it cannot regress silently.
+CAP406_SPLIT="$T/cap-406-split.json"
+printf '{ "status":\n "406", "code":\n "too_large" }\n' > "$CAP406_SPLIT"
+CAP406_SPLIT_SHA="$(openssl dgst -sha256 < "$CAP406_SPLIT" | awk '{print $NF}')"
+[ "$(grep -c '' "$CAP406_SPLIT")" -gt 1 ] && ok "11.11q fixture: the split-value body is genuinely MULTI-LINE (non-vacuous)" || bad "11.11q fixture: the split-value body is single-line — the vector is vacuous"
+grep -qE '^diff --git' "$CAP406_SPLIT" && bad "11.11q fixture: the split-value body must NOT contain a diff entry" || ok "11.11q fixture: the split-value body carries no 'diff --git' entry"
+# The trigger is specifically the VALUE after the colon on the NEXT line: assert
+# the RAW body defeats the line-oriented matcher the old size-cap predicate used.
+grep -qE '"status"[[:space:]]*:[[:space:]]*"?406"?' "$CAP406_SPLIT" && bad "11.11q fixture: the raw body already matches the line-oriented grep — the trigger is not exercised" || ok "11.11q fixture: the raw body defeats a line-oriented grep (the trigger is real)"
+
+# (q) NO usable checkout: the split-value cap must still classify STRUCTURAL.
+rm -f "$(Q2 424790)"
+STUB_DIFF_406_FILE="$CAP406_SPLIT" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424790 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11q a split-value cap still records (rc 0)" || bad "11.11q rc=$RECORD_RC (err=$RECORD_ERR)"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11q a split-value cap is STRUCTURAL, not retried (1 attempt)" || bad "11.11q made $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 1)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11q the split-value cap error body was hashed (diff= present)"; else ok "11.11q no diff= — the split-value cap body is never hashed"; fi
+if grep -qF "diff=$CAP406_SPLIT_SHA" <<<"$RECORD_CAP"; then bad "11.11q the split-value 406 body's own sha256 was recorded as the reviewed diff"; else ok "11.11q the split-value 406 body's own sha256 is NOT recorded"; fi
+if grep -q '"diff_sha256"' "$(Q2 424790)" 2>/dev/null; then bad "11.11q record carries a diff_sha256 minted from the split-value error body"; else ok "11.11q record omits diff_sha256"; fi
+assert_contains "$RECORD_ERR" "300-FILE DIFF CAP" "11.11q the message names the 300-file cap"
+if grep -qF "NO 'diff --git' entry boundary" <<<"$RECORD_ERR"; then bad "11.11q the split-value cap was misdiagnosed as the nondiff arm"; else ok "11.11q the split-value cap is NOT misdiagnosed as nondiff"; fi
+assert_contains "$RECORD_ERR" "RETRYING WILL NOT HELP" "11.11q says retrying will not help"
+if grep -qF "gh/API/openssl unavailable" <<<"$RECORD_ERR"; then bad "11.11q misdiagnoses the split-value cap as a tooling outage"; else ok "11.11q does NOT blame gh/openssl"; fi
+if grep -qF "transient: gh auth/network" <<<"$RECORD_ERR"; then bad "11.11q blames the transient gh/network arm (the misdiagnosed, retried shape)"; else ok "11.11q is NOT warned as a transient gh/network fault"; fi
+
+# (r) WITH a checkout: the fallback must be ATTEMPTED for the split-value cap and
+#     mint the SAME digest as every other 406 shape — a skipped fallback leaves no
+#     diff= and returns the oversized PR to the unlandability #1398 removes.
+rm -f "$(Q2 424791)"
+STUB_DIFF_406_FILE="$CAP406_SPLIT" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff 424791 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11r a split-value cap with a checkout records (rc 0)" || bad "11.11r rc=$RECORD_RC (err=$RECORD_ERR)"
+assert_contains "$(cat "$(Q2 424791)" 2>/dev/null)" "\"diff_sha256\":\"$L_SHA\"" "11.11r the fallback is ATTEMPTED for the split-value cap and mints the LOCAL digest"
+assert_contains "$RECORD_CAP" "diff=$L_SHA" "11.11r the marker carries the LOCAL digest for the split-value cap"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11r the split-value cap is not re-fetched (1 attempt)" || bad "11.11r attempts=$(grep -cF 'application/vnd.github.v3.diff' "$LOG")"
+if grep -qF "diff=$CAP406_SPLIT_SHA" <<<"$RECORD_CAP"; then bad "11.11r the split-value error body was hashed instead of the local digest"; else ok "11.11r the split-value error body is never hashed"; fi
+assert_contains "$RECORD_ERR" "computed from the LOCAL checkout" "11.11r the provenance is stated for the split-value cap"
+
+# (s) the boundary is DECISIVE: a REAL diff that CONTAINS the same split envelope
+#     text is still a diff and is hashed as one — the shared flatten refuses a
+#     body carrying a `^diff --git` entry BEFORE any JSON test, so no wrapping and
+#     no JSON content can demote a real diff.
+SPLIT_DIFF="$T/split-envelope-in-a-diff.diff"
+printf 'diff --git a/f b/f\nindex 1111111..2222222 100644\n--- a/f\n+++ b/f\n@@ -1,2 +1,5 @@\n ctx\n+{ "status":\n+ "406", "code":\n+ "too_large" }\n ctx2\n' > "$SPLIT_DIFF"
+SPLIT_DIFF_SHA="$(python3 "$NORM1398" < "$SPLIT_DIFF" | openssl dgst -sha256 | awk '{print $NF}')"
+rm -f "$(Q2 424792)"
+STUB_DIFF_FILE="$SPLIT_DIFF" STUB_DIFF_FAIL=0 \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424792 "$SHA" "PR body" "$SPLIT_DIFF" 0
+assert_contains "$(cat "$(Q2 424792)" 2>/dev/null)" "\"diff_sha256\":\"$SPLIT_DIFF_SHA\"" "11.11s a diff containing the split envelope text is still hashed as a diff"
+if grep -qF '300-FILE DIFF CAP' <<<"$RECORD_ERR"; then bad "11.11s the diff carrying the envelope was misclassified as the size cap"; else ok "11.11s the diff carrying the envelope is NOT misclassified as a cap"; fi
+
+# (t) MUTATION PIN — restore the line-oriented re-grep of the ORIGINAL body in
+#     `diff_body_is_size_cap` (the round-2 drift) and show the split-value vector
+#     reddens: the cap is not recognised, the fallback is SKIPPED, and the
+#     structural refusal is blamed on gh/network and RETRIED. 11.11q/r are
+#     load-bearing, not green by accident.
+mkdir -p "$T/mut-splitcap/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$T/mut-splitcap/lib/diff-normalize.py"
+python3 - "$RECORD" "$T/mut-splitcap/record-review.sh" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = """diff_body_is_size_cap() { # <file> -> 0 when the body declares the 300-file cap
+  local flat
+  flat="$(diff_body_flatten "$1")" || return 1
+  flat_body_is_error_object "$flat" || return 1
+  flat_body_is_size_cap "$flat"
+}"""
+new = """diff_body_is_size_cap() { # <file> -> 0 when the body declares the 300-file cap
+  local flat
+  flat="$(diff_body_flatten "$1")" || return 1
+  flat_body_is_error_object "$flat" || return 1
+  # MUTATION: re-grep the ORIGINAL, line-oriented body (the round-2 drift).
+  command grep -qE '"status"[[:space:]]*:[[:space:]]*"?406"?' "$1" 2>/dev/null && return 0
+  command grep -qE '"code"[[:space:]]*:[[:space:]]*"too_large"' "$1" 2>/dev/null && return 0
+  return 1
+}"""
+assert old in text, "mutation anchor not found"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+if cmp -s "$T/mut-splitcap/record-review.sh" "$RECORD"; then bad "11.11t mutation(t): the mutant copy is IDENTICAL to the script"; else ok "11.11t mutation(t): the mutant copy differs from the script"; fi
+rm -f "$(Q2 424793)"
+STUB_DIFF_406_FILE="$CAP406_SPLIT" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff_with "$T/mut-splitcap/record-review.sh" 424793 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=$L_SHA" <<<"$RECORD_CAP"; then bad "11.11t mutation(t): the mutant still minted the fallback digest — 11.11r is vacuous"; else ok "11.11t mutation(t): with the line-oriented re-grep restored the fallback is SKIPPED (rc=$RECORD_RC) — 11.11r is load-bearing"; fi
+if grep -qF "300-FILE DIFF CAP" <<<"$RECORD_ERR"; then bad "11.11t mutation(t): the mutant still named the cap — 11.11q is vacuous"; else ok "11.11t mutation(t): with the re-grep restored the split-value cap is NOT named as a cap"; fi
+assert_contains "$RECORD_ERR" "transient: gh auth/network" "11.11t mutation(t): the mutant blames the transient gh/network arm (the regression 11.11q pins)"
+
+# (u) the flatten BOUND is real. Flattening materialised the body as a shell
+#     string (O(size); a 2 MB envelope cost ~2.3 s), so `diff_body_flatten`
+#     refuses a body above ${RECORD_REVIEW_BODY_MAX_BYTES:-262144} instead of
+#     trusting the envelope to be small. Pin it with a body the same 406 shape
+#     but a bound set below its size: without the check the cap WOULD classify
+#     and the fallback WOULD mint diff=$L_SHA, so this is load-bearing, and the
+#     refusal is fail-closed (never hashed).
+rm -f "$(Q2 424794)"
+RECORD_REVIEW_BODY_MAX_BYTES=1 \
+  STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff 424794 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11u an over-bound non-diff body was hashed (the bound is not enforced)"; else ok "11.11u an over-bound non-diff body is refused — never classified, never hashed"; fi
+if grep -qF "300-FILE DIFF CAP" <<<"$RECORD_ERR"; then bad "11.11u an over-bound body was still classified as the cap"; else ok "11.11u an over-bound body is not flattened or classified"; fi
+unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA CAP406_SPLIT CAP406_SPLIT_SHA SPLIT_DIFF SPLIT_DIFF_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
 
 # ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED

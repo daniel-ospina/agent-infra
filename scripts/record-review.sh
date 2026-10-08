@@ -836,30 +836,55 @@ esac
 # exit-1 shape is the measured one — 11.11n–p cover both.) The line count was
 # never what protected a real diff — the boundary exclusion precedes it — it only
 # made the classifier formatting-dependent.
-diff_body_is_error_object() { # <file> -> 0 when the body IS a JSON error object
-  local flat
-  [ -s "$1" ] || return 1
-  command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
-  # Flatten the (non-diff, therefore bounded) envelope so a one-line and a
-  # pretty-printed / re-wrapped JSON object classify identically, then trim the
-  # surrounding whitespace so `^\{` / `\}$` are not layout-dependent. A HERE-STRING,
-  # not a pipe: `tr … | grep -q` under this script's `set -o pipefail` can report a
-  # FALSE NEGATIVE when grep matches early and tr takes SIGPIPE (#841).
-  flat="$(command tr -d '\r\n' < "$1" 2>/dev/null || true)"
-  flat="${flat#"${flat%%[![:space:]]*}"}"     # trim leading whitespace
-  flat="${flat%"${flat##*[![:space:]]}"}"     # trim trailing whitespace
-  command grep -qE '^\{.*"status"[[:space:]]*:[[:space:]]*"?[45][0-9]{2}"?.*\}$' <<<"$flat" 2>/dev/null && return 0
-  command grep -qE '^\{.*"code"[[:space:]]*:[[:space:]]*"too_large".*\}$' <<<"$flat" 2>/dev/null && return 0
+# --- #1398 body classification -------------------------------------------------
+# The text predicates below take the SAME flattened string, so a `"status"` /
+# `"code"` VALUE sitting on its own line classifies identically to one on the same
+# line. Sharing the flatten is the fix: `diff_body_is_size_cap` used to re-grep the
+# ORIGINAL, line-oriented body, where `[[:space:]]*` cannot cross a newline, so an
+# envelope re-wrapped between a key's colon and its value slipped out of the
+# size-cap arm even though the error-object classifier had already recognised it.
+# A HERE-STRING, not a pipe: `tr … | grep -q` under this script's `set -o pipefail`
+# can report a FALSE NEGATIVE when grep matches early and tr takes SIGPIPE (#841).
+flat_body_is_error_object() { # <flat> -> 0 when the flat text is a JSON error object
+  command grep -qE '^\{.*"status"[[:space:]]*:[[:space:]]*"?[45][0-9]{2}"?.*\}$' <<<"$1" 2>/dev/null && return 0
+  command grep -qE '^\{.*"code"[[:space:]]*:[[:space:]]*"too_large".*\}$' <<<"$1" 2>/dev/null && return 0
   return 1
 }
 # The specific STRUCTURAL failure: GitHub refuses to render a diff above 300
 # files. Recognised by `"code":"too_large"` or `"status":"406"` — the two facts
-# the production measurement recorded verbatim.
-diff_body_is_size_cap() { # <file> -> 0 when the body declares the 300-file cap
-  diff_body_is_error_object "$1" || return 1
-  command grep -qE '"status"[[:space:]]*:[[:space:]]*"?406"?' "$1" 2>/dev/null && return 0
-  command grep -qE '"code"[[:space:]]*:[[:space:]]*"too_large"' "$1" 2>/dev/null && return 0
+# the production measurement recorded verbatim. It runs on the FLATTENED body, so
+# `[[:space:]]*` bridges a line break the source may have carried.
+flat_body_is_size_cap() { # <flat> -> 0 when the flat text declares the 300-file cap
+  command grep -qE '"status"[[:space:]]*:[[:space:]]*"?406"?' <<<"$1" 2>/dev/null && return 0
+  command grep -qE '"code"[[:space:]]*:[[:space:]]*"too_large"' <<<"$1" 2>/dev/null && return 0
   return 1
+}
+# Flatten a non-diff body into one whitespace-trimmed line so the two predicates
+# above classify a one-line and a pretty-printed / re-wrapped object identically.
+# Returns 1, printing nothing, for: an EMPTY file; a body carrying a `^diff --git`
+# entry boundary (tested FIRST, so a real diff is never demoted, whatever JSON it
+# contains); and a body larger than ${RECORD_REVIEW_BODY_MAX_BYTES:-262144}.
+# The size bound is deliberate, not an assumption: materialising the body as a
+# shell string is O(size) (a 2 MB envelope cost ~2.3 s), so an over-size non-diff
+# body is refused here rather than flattened. It then falls to the caller's
+# `nondiff`/retryable arms — fail-closed either way, and never hashed.
+diff_body_flatten() { # <file> -> flattened body on stdout
+  local flat max="${RECORD_REVIEW_BODY_MAX_BYTES:-262144}"
+  [ -s "$1" ] || return 1
+  command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
+  # Flatten the (non-diff, therefore size-bounded) envelope, then trim the
+  # surrounding whitespace so `^\{` / `\}$` are not layout-dependent.
+  [ "$(command wc -c < "$1" 2>/dev/null || echo 0)" -le "$max" ] || return 1
+  flat="$(command tr -d '\r\n' < "$1" 2>/dev/null || true)"
+  flat="${flat#"${flat%%[![:space:]]*}"}"     # trim leading whitespace
+  flat="${flat%"${flat##*[![:space:]]}"}"     # trim trailing whitespace
+  printf '%s' "$flat"
+}
+diff_body_is_size_cap() { # <file> -> 0 when the body declares the 300-file cap
+  local flat
+  flat="$(diff_body_flatten "$1")" || return 1
+  flat_body_is_error_object "$flat" || return 1
+  flat_body_is_size_cap "$flat"
 }
 # #1398 — mint a diff identity LOCALLY when the API refuses the diff for an
 # oversized PR. Only ever called for the size-cap arm; every other failure keeps
