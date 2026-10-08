@@ -98,8 +98,10 @@ names every file it did not run.
 `test_files`, so a reviewer who runs only that set has a *smaller* denominator than CI, which is the
 defect this step exists to prevent. These are the three **diff-gated** legs — they are not the whole
 of CI, which also runs always-on Python jobs (`test-track-b` selecting the `track_b` markers that
-every leg below marker-deselects, `test-concurrency-falkor`, `packs-compile`); treat those as further
-files to run or to name as not-run:
+every leg below marker-deselects, `test-concurrency-falkor`, `packs-compile`, and
+`test-d14-hosted-api` — a whole-tree `-m embedded_only` selection that no other job executes outside
+the carve-out file list); treat those as further files to run or to name as not-run — and enumerate
+the workflow's unconditional jobs yourself rather than trusting this list to be complete:
 
 | JSON field | Run it when |
 |---|---|
