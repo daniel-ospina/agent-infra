@@ -9428,11 +9428,27 @@ pe_case "reusable + sibling input spec"  unknown $'on:\n  workflow_call:\n  work
 pe_case "reusable + sibling push scalar" unknown $'on:\n  workflow_call:\n  push:\n    x: y\n'
 pe_case "reusable + sibling schedule"    unknown $'on:\n  workflow_call:\n  schedule:\n    x: y\n'
 # P2: a NON-FILTER key's SHAPE must still balance. Skipping the bail for such a
-# key also skipped the `rest.startswith("[") and not rest.endswith("]")` arm, so
-# a `paths:` nested inside another key's UNTERMINATED flow sequence was read as a
-# top-level PR filter and the verdict moved `yes` -> `no` on input this reader
-# cannot attribute. This is the arm that keeps it `yes`.
-pe_case "unterminated flow under non-filter key" yes $'on:\n  pull_request:\n    types: [opened,\n            paths: [docs/**]]\n'
+# key also skipped the flow-balance arm, so a `paths:` nested inside another key's
+# UNTERMINATED flow sequence was read as a top-level PR filter and the verdict
+# moved `yes` -> `no` on input this reader cannot attribute.
+# ⛔ THIS ONE NEEDS A CHANGED SET to exhibit the fail-open: without it a PR trigger
+# answers `yes` either way, so a bare `pe_case` would pin the parse change but not
+# the defect (review P3).
+pe_case_paths() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | PR_CHANGED_PATHS="$3" wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate[#1637]: $1 -> $2" || fail "predicate[#1637]: $1 -> expected $2, got '$got'"
+}
+pe_case_paths "unterminated flow under non-filter key" yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened,\n            paths: [docs/**]]\n'
+# …and the type-matched closer: `[opened}` is not a balanced `[`. Taking either
+# closer was type-blind, and `scan_flow_state` decrements on either, so the outer
+# walk did not catch it either (review P3).
+pe_case_paths "mismatched closer under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened}\n    paths: [docs/**]\n'
+# P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
+# reader does not interpret left the flag unset, so a reusable trigger still
+# reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
+# write a schedule.
+pe_case "reusable + sibling schedule list" unknown $'on:\n  workflow_call:\n  schedule:\n    - cron: \x270 0 * * *\x27\n'
 # A BARE `workflow_call` (no non-filter key anywhere) must stay `no`: the
 # document-level invariant only fires when the attribution is INCOMPLETE.
 pe_case "bare reusable stays exempt"     no  $'on:\n  workflow_call:\n'

@@ -361,6 +361,16 @@ def collect_filters(lines, on_index):
             # being exempt). Ignore it and keep reading.
             if cur_filter in _FILTER_KEYS:
                 out[cur_trig].setdefault(cur_filter, []).append(_unquote(s[1:].strip()))
+            else:
+                # ⛔ #1637 REVIEW P2 — THIS IS A CONTENT PATH TOO. A list under a
+                # key this reader does not interpret is attribution it could not
+                # complete, so it must set the flag that lets a REUSABLE trigger
+                # in the same document fail closed. It was the one content path
+                # that did not, so `workflow_call` + `schedule:\n    - cron: …`
+                # reached `flt == {}`, fell through to `trigger_measurable`'s tail
+                # `return False`, and answered `no` — the same fail-open, on the
+                # ordinary way to write a schedule.
+                nonfilter_seen = True
             continue
         m = _BLOCK_KEY_RE.match(raw)
         if not m:
@@ -404,7 +414,7 @@ def collect_filters(lines, on_index):
         if cur_filter not in _FILTER_KEYS:
             nonfilter_seen = True
             rest = (m.group(5) or "").strip()
-            if rest[:1] in ("[", "{") and rest[-1:] not in ("]", "}"):
+            if (rest[:1] == "[" and rest[-1:] != "]") or (rest[:1] == "{" and rest[-1:] != "}"):
                 return None
             cur_filter = None
             continue
