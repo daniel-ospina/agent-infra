@@ -107,7 +107,20 @@ if [ "$1" = "api" ]; then
             [ "$n" -le "$STUB_DIFF_FAIL_TIMES" ] && exit 1
         fi
         [ "${STUB_DIFF_FAIL:-0}" = "1" ] && exit 1
+        # #1398: the DOCUMENTED 300-file cap — gh exits NON-ZERO and writes a
+        # NON-EMPTY JSON error body to stdout (measured: 337 bytes on
+        # tortoise#7653). The non-emptiness is the trap the producer must not
+        # hash; the stub models both streams (body on stdout, exit 1).
+        if [ -n "${STUB_DIFF_406_FILE:-}" ]; then cat "$STUB_DIFF_406_FILE"; exit 1; fi
         cat "${STUB_DIFF_FILE:-/dev/null}"
+        exit 0
+    fi
+    # #1398: the base/head identity the local fallback reads from the PR object.
+    # Distinct from the clean-low meta arm below (that one is a TSV of three
+    # fields); this one is exactly the `[.base.sha,.head.sha,.base.ref]|@tsv` read.
+    if grep -qF -- "base.sha,.head.sha" <<<"$*"; then
+        [ "${STUB_LOCAL_META_FAIL:-0}" = "1" ] && exit 1
+        printf '%s\t%s\t%s\n' "${STUB_LOCAL_BASE:-}" "${STUB_LOCAL_HEAD:-}" "${STUB_LOCAL_BASE_REF:-main}"
         exit 0
     fi
     # #1575 clause (E): the target head's check-runs. STUB_CHECKS_ROWS carries the TSV
@@ -1131,6 +1144,284 @@ json_valid "$(Q2 424523)" && ok "11.10 D NEITHER record is well-formed JSON" || 
 #      was previously UNSET (bash semantics), so STUB_FILES/STUB_DIFF_FILE would
 #      persist into §10 and make its code-bearing vectors see a docs-only diff.
 unset STUB_FILES STUB_DIFF_FILE GH_STUB_PATCH_BODY STUB_HEAD_SHA P2 MB
+
+# ─────────────────────────────────────────────────────────────────────────
+# 11.11 #1398 — the 300-file diff cap: classify by CONTENT, fall back to a
+#       LOCAL diff, and NEVER hash the (non-empty) error body.
+# ─────────────────────────────────────────────────────────────────────────
+# GitHub refuses to render a PR diff above 300 files: `gh api -H
+# "Accept: application/vnd.github.v3.diff"` exits NON-ZERO and writes a
+# NON-EMPTY JSON error object to stdout (MEASURED on tortoise#7653,
+# `changed_files: 2265`: exit 1, 337 bytes on stdout, `grep -c '^diff --git'`
+# → 0). The non-emptiness is the trap: `[ -s "$f" ]` PASSES on it, and the ONLY
+# thing that stopped it being hashed was the `&&` short-circuit on the exit
+# code — so a naive `|| true` "fix" would hash 337 bytes of error message as
+# the reviewed diff, giving every oversized PR ONE constant digest (the
+# collision ⇒ false-accept direction this issue exists to prevent).
+# These vectors pin the classification, the fallback, and that negative control.
+echo "── 11.11 #1398: the 300-file diff cap + local fallback ────────"
+NORM1398="$SCRIPT_DIR/lib/diff-normalize.py"
+
+# A REAL git fixture: the fallback runs `git diff` against actual objects, so a
+# fabricated diff would not exercise it. `origin` names the repo under test so
+# the identity guard accepts it.
+L_REPO="$T/local-repo-1398"
+git init -q "$L_REPO"
+git -C "$L_REPO" config user.email "t@example.test"
+git -C "$L_REPO" config user.name "t"
+git -C "$L_REPO" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
+printf 'line1\nline2\nline3\nline4\nline5\n' > "$L_REPO/f.txt"
+git -C "$L_REPO" add f.txt
+git -C "$L_REPO" -c commit.gpgsign=false commit -q -m base
+L_BASE="$(git -C "$L_REPO" rev-parse HEAD)"
+printf 'line1\nline2\nCHANGED\nline3\nline4\nline5\n' > "$L_REPO/f.txt"
+git -C "$L_REPO" -c commit.gpgsign=false commit -q -am head
+L_HEAD="$(git -C "$L_REPO" rev-parse HEAD)"
+
+# The digest the producer's fallback must arrive at: its exact command, then the
+# SAME shared normalizer the API path uses.
+local_diff_sha1398() { # <repo> <base> <head>
+    git -C "$1" -c diff.noprefix=false -c diff.mnemonicPrefix=false -c diff.relative=false \
+      -c diff.suppressBlankEmpty=false \
+      diff --no-color --no-ext-diff --no-textconv --full-index \
+           --src-prefix=a/ --dst-prefix=b/ --unified=3 --diff-algorithm=myers --find-renames "$2...$3" \
+      | python3 "$NORM1398" | openssl dgst -sha256 | awk '{print $NF}'
+}
+L_SHA="$(local_diff_sha1398 "$L_REPO" "$L_BASE" "$L_HEAD")"
+[ -n "$L_SHA" ] && ok "11.11 fixture: the local rendering yields a normalized digest" || bad "11.11 fixture: no local digest"
+
+# The 406 body. The SHAPE is what the classifier reads (no `diff --git`, one
+# line, JSON error object with status 406 / code too_large).
+CAP406="$T/cap-406.json"
+printf '%s' '{"message":"Sorry, the diff exceeded the maximum number of files (300).","errors":[{"resource":"PullRequest","field":"diff","code":"too_large"}],"documentation_url":"https://docs.github.com/rest/pulls/pulls","status":"406"}' > "$CAP406"
+CAP406_SHA="$(openssl dgst -sha256 < "$CAP406" | awk '{print $NF}')"
+grep -qE '^diff --git' "$CAP406" && bad "11.11 fixture: the cap body must NOT contain a diff entry" || ok "11.11 fixture: the cap body carries no 'diff --git' entry (as measured)"
+
+# (a) NEGATIVE CONTROL — the cap body with NO usable local checkout. It must be
+#     classified STRUCTURAL, attempted ONCE (not retried), and NEVER hashed.
+rm -f "$(Q2 424770)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424770 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11a cap without a checkout still records (rc 0)" || bad "11.11a rc=$RECORD_RC (err=$RECORD_ERR)"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11a a STRUCTURAL cap is NOT retried (1 attempt)" || bad "11.11a made $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 1)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11a the cap error body was hashed into the marker (diff= present)"; else ok "11.11a no diff= — the cap error body is never hashed"; fi
+if grep -qF "diff=$CAP406_SHA" <<<"$RECORD_CAP"; then bad "11.11a THE TRAP: the 406 body's own sha256 was recorded as the reviewed diff"; else ok "11.11a the 406 body's own sha256 is NOT recorded"; fi
+if grep -q '"diff_sha256"' "$(Q2 424770)" 2>/dev/null; then bad "11.11a record carries a diff_sha256 minted from the error body"; else ok "11.11a record omits diff_sha256"; fi
+assert_contains "$RECORD_ERR" "300-FILE DIFF CAP" "11.11a names the STRUCTURAL cause"
+assert_contains "$RECORD_ERR" "RETRYING WILL NOT HELP" "11.11a says retrying will not help"
+if grep -qF "gh/API/openssl unavailable" <<<"$RECORD_ERR"; then bad "11.11a misdiagnoses the documented cap as a tooling outage"; else ok "11.11a does NOT blame gh/openssl"; fi
+
+# (b) the fallback MINTS a digest when a local checkout holds both objects.
+rm -f "$(Q2 424771)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff 424771 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11b cap WITH a local checkout records (rc 0)" || bad "11.11b rc=$RECORD_RC (err=$RECORD_ERR)"
+assert_contains "$(cat "$(Q2 424771)" 2>/dev/null)" "\"diff_sha256\":\"$L_SHA\"" "11.11b the record carries the LOCAL normalized digest"
+assert_contains "$RECORD_CAP" "diff=$L_SHA" "11.11b the marker carries the LOCAL normalized digest"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11b the fallback does not re-fetch (1 attempt)" || bad "11.11b attempts=$(grep -cF 'application/vnd.github.v3.diff' "$LOG")"
+assert_contains "$RECORD_ERR" "computed from the LOCAL checkout" "11.11b the provenance is stated, not implied"
+
+# (c) the SAME content through the API path and the local path produce the SAME
+#     digest. The API rendering differs only in the fields the normalizer exists
+#     to erase — the `index` abbreviation width and the hunk start lines (both
+#     move on a base-only update). Perturb exactly those and hash it as the API
+#     would.
+API_STYLE="$T/api-style-1398.diff"
+python3 - "$L_REPO" "$L_BASE" "$L_HEAD" "$API_STYLE" <<'PY'
+import re, subprocess, sys
+repo, base, head, out = sys.argv[1:5]
+raw = subprocess.run(["git", "-C", repo, "diff", "--no-color", f"{base}...{head}"],
+                     capture_output=True, check=True).stdout.decode("latin-1")
+lines = []
+for ln in raw.split("\n"):
+    m = re.match(r"^index ([0-9a-f]+)\.\.([0-9a-f]+)(.*)$", ln)
+    if m:
+        ln = "index %s..%s%s" % ((m.group(1) + "0" * 13)[:13], (m.group(2) + "0" * 13)[:13], m.group(3))
+    m = re.match(r"^@@ -(\d+)((?:,\d+)?) \+(\d+)((?:,\d+)?) @@(.*)$", ln)
+    if m:
+        ln = "@@ -%d%s +%d%s @@%s" % (int(m.group(1)) + 7, m.group(2), int(m.group(3)) + 13, m.group(4), m.group(5))
+    lines.append(ln)
+open(out, "w").write("\n".join(lines))
+PY
+API_STYLE_SHA="$(python3 "$NORM1398" < "$API_STYLE" | openssl dgst -sha256 | awk '{print $NF}')"
+assert_eq "$API_STYLE_SHA" "$L_SHA" "11.11c an API rendering and the local git diff normalize to the SAME digest"
+rm -f "$(Q2 424772)"
+run_record_diff 424772 "$SHA" "PR body" "$API_STYLE" 0
+assert_contains "$(cat "$(Q2 424772)" 2>/dev/null)" "\"diff_sha256\":\"$L_SHA\"" "11.11c the API path records the SAME digest the local fallback mints"
+
+# (d) a SUCCESSFUL response whose body is not a diff is refused, not hashed —
+#     the 200-with-a-non-diff-body form of the same trap (a 406-shaped body is
+#     already caught as a cap above, so this uses a body that is neither).
+rm -f "$(Q2 424773)"
+printf '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}' > "$T/err-404.json"
+STUB_DIFF_FILE="$T/err-404.json" STUB_DIFF_FAIL=0 \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424773 "$SHA" "PR body" "$T/err-404.json" 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11d a non-diff body was hashed (diff= present)"; else ok "11.11d a body with no 'diff --git' entry is never hashed"; fi
+assert_contains "$RECORD_ERR" "NO 'diff --git' entry boundary" "11.11d the refusal names the missing entry boundary"
+if grep -q '"diff_sha256"' "$(Q2 424773)" 2>/dev/null; then bad "11.11d record carries a diff_sha256 from a non-diff body"; else ok "11.11d record omits diff_sha256"; fi
+
+# (e) the classifier must NOT mistake a REAL diff that CONTAINS the literal
+#     `"code":"too_large"` for the cap error — this fix's own fixtures contain
+#     that string, and a naive substring match would demote every such PR to the
+#     fallback.
+REAL_WITH_CODE="$T/real-with-too-large.diff"
+printf 'diff --git a/f b/f\nindex 1111111..2222222 100644\n--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n ctx\n+    "code":"too_large"\n ctx2\n' > "$REAL_WITH_CODE"
+REAL_WITH_CODE_SHA="$(python3 "$NORM1398" < "$REAL_WITH_CODE" | openssl dgst -sha256 | awk '{print $NF}')"
+rm -f "$(Q2 424774)"
+STUB_DIFF_FILE="$REAL_WITH_CODE" STUB_DIFF_FAIL=0 \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424774 "$SHA" "PR body" "$REAL_WITH_CODE" 0
+assert_contains "$(cat "$(Q2 424774)" 2>/dev/null)" "\"diff_sha256\":\"$REAL_WITH_CODE_SHA\"" "11.11e a real diff containing the literal cap marker is still hashed as a diff"
+
+# (f) MUTATION PIN — the naive `|| true` relaxation the issue warns about. A
+#     copy whose fetch ignores the exit code AND both content guards hashes the
+#     406 body, proving 11.11a is load-bearing rather than green by accident.
+mkdir -p "$T/mut-cap/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$T/mut-cap/lib/diff-normalize.py"
+python3 - "$RECORD" "$T/mut-cap/record-review.sh" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = """  if diff_body_is_size_cap "$2"; then return 3; fi
+  [ "$frc" -eq 0 ] || return 1
+  [ -s "$2" ] || return 2
+  command grep -qE '^diff --git ' "$2" 2>/dev/null || return 4
+  return 0"""
+new = """  # MUTATION (#1398): the naive relaxation — exit code ignored, no content
+  # classification, `[ -s ]` alone decides. This MUST hash the 406 body.
+  [ -s "$2" ] || return 2
+  return 0"""
+assert old in text, "mutation anchor not found"
+open(dst, "w").write(text.replace(old, new))
+PY
+if cmp -s "$T/mut-cap/record-review.sh" "$RECORD"; then bad "11.11f mutation(f): the mutant copy is IDENTICAL to the script"; else ok "11.11f mutation(f): the mutant copy differs from the script"; fi
+rm -f "$(Q2 424775)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff_with "$T/mut-cap/record-review.sh" 424775 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=$CAP406_SHA" <<<"$RECORD_CAP"; then ok "11.11f mutation(f): with the guards removed the 406 body IS hashed (rc=$RECORD_RC) — 11.11a is load-bearing"; else bad "11.11f mutation(f): the mutant still refused the 406 body (rc=$RECORD_RC) — 11.11a is not testing the guard"; fi
+
+# ── 11.11g–l — the fallback's own fail-closed guards. A mutation probe found
+# that removing ALL of them at once left the suite green, so the guards that can
+# be isolated now have vectors: 11.11g pins the repo-identity guard (a
+# wrong-origin checkout HAS the objects, so without the guard the digest IS
+# minted) and 11.11l pins the empty-diff refusal (MEASURED: removing the `[ -s ]`
+# test alone stays green because the entry-boundary grep covers it, and removing
+# the grep alone stays green for the same reason — removing BOTH reddens it).
+# The cat-file guards are defence-in-depth: a missing object makes git's own
+# `diff` fail, so they add an explicit refusal rather than the only one — stated
+# here rather than implied by a count. These decide whether a locally-computed
+# diff may be trusted, the same class tests/record-review/run.sh mutation-pins
+# for lane_dimension_carry.
+#
+# 11.11g: a checkout of a DIFFERENT repo (origin normalises to another owner/name)
+#         must never be used. Without this guard, any unrelated clone could supply
+#         the "reviewed" diff.
+L_WRONG="$T/local-wrong-1398"
+git init -q "$L_WRONG"
+git -C "$L_WRONG" config user.email "t@example.test"
+git -C "$L_WRONG" config user.name "t"
+git -C "$L_WRONG" remote add origin "https://github.com/daniel-ospina/tortoise.git"
+git -C "$L_WRONG" fetch -q --no-tags "$L_REPO" "HEAD:refs/remotes/local/wrongsrc"
+rm -f "$(Q2 424780)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_WRONG" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424780 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11g a checkout of ANOTHER repo produced a diff identity"; else ok "11.11g a checkout whose origin is another repo is refused (no diff=)"; fi
+
+# 11.11h: a revision absent from the checkout must be refused, not fabricated.
+rm -f "$(Q2 424781)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$(printf 'c%.0s' $(seq 1 40))" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424781 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11h a MISSING base object still produced a diff identity"; else ok "11.11h a missing revision is refused (no diff=)"; fi
+
+# 11.11i: the base/head identity read failing must refuse, not fall through to a
+#         local-ref guess.
+rm -f "$(Q2 424782)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_META_FAIL=1 STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424782 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11i a failed base/head read still produced a diff identity"; else ok "11.11i a failed base/head read is refused (no diff=)"; fi
+
+# 11.11j/k: THE accept-and-spend GUARD. `atomic-land.sh` moves the head with a
+# server-side `gh pr update-branch`, so the post-update commit exists ONLY on the
+# remote. Without a fetch the fallback would fail AFTER the head moved — turning
+# today's pre-update refusal into an accept-and-spend. These two vectors pin the
+# fetch and show it is load-bearing: same repo state, fetch off => no hash,
+# fetch on => the digest is minted from the fetched head.
+BARE1398="$T/bare1398"
+git init -q --bare "$BARE1398"
+git -C "$L_REPO" push -q "$BARE1398" "$L_BASE:refs/heads/main" "$L_HEAD:refs/pull/424784/head"
+make_partial_repo1398() { # <dir> [insteadOf-url]
+    git init -q "$1"
+    git -C "$1" config user.email "t@example.test"
+    git -C "$1" config user.name "t"
+    git -C "$1" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
+    [ -n "${2:-}" ] && git -C "$1" config "url.$2.insteadOf" "https://github.com/daniel-ospina/agent-infra.git"
+    # Fetch ONLY the base ref; the PR head object stays absent.
+    git -C "$1" fetch -q --no-tags "$BARE1398" "refs/heads/main:refs/remotes/local/base"
+}
+L_NOFETCH="$T/local-nofetch-1398"
+make_partial_repo1398 "$L_NOFETCH"
+L_FETCH="$T/local-fetch-1398"
+make_partial_repo1398 "$L_FETCH" "$BARE1398"
+if git -C "$L_FETCH" cat-file -e "$L_HEAD^{commit}" 2>/dev/null; then bad "11.11j fixture: the fetch repo must NOT already hold the PR head"; else ok "11.11j fixture: the PR head object is absent before the run"; fi
+rm -f "$(Q2 424783)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_NOFETCH" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424783 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11j with the fetch DISABLED a missing head still produced a hash"; else ok "11.11j with the fetch disabled a missing head is refused (no diff=) — the fetch is load-bearing"; fi
+rm -f "$(Q2 424784)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_FETCH" \
+  run_record_diff 424784 "$SHA" "PR body" /dev/null 0
+assert_contains "$(cat "$(Q2 424784)" 2>/dev/null)" "\"diff_sha256\":\"$L_SHA\"" "11.11k a MISSING post-update head is FETCHED and the digest minted (the accept-and-spend guard)"
+if git -C "$L_FETCH" cat-file -e "$L_HEAD^{commit}" 2>/dev/null; then ok "11.11k the run actually fetched the head object"; else bad "11.11k the head object is still absent — the fetch did not run"; fi
+
+# 11.11l: base == head is an EMPTY diff. Without the emptiness guard the fallback
+#         would hand back a 0-byte body, sha256("") would become the recorded
+#         digest, and every "PR" in that shape would share ONE constant identity
+#         — a false accept. The digest must simply not be minted.
+rm -f "$(Q2 424785)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$L_HEAD" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424785 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11l an EMPTY local diff produced a diff identity"; else ok "11.11l an empty local diff is refused (no diff=) — sha256(\"\") is not minted"; fi
+
+# 11.11m: a HUNK-LESS (binary) entry keeps its `index` line VERBATIM, so an
+#         ambient `core.abbrev` would decide the binding's collision resistance
+#         (git's minimum is 4 hex). The implementation pins `--full-index`; this
+#         fixture sets the HOSTILE `core.abbrev=4`, and the recorded digest must
+#         still be the FULL-index one. Drop `--full-index` and this reddens
+#         because the implementation would emit a 4-hex index line while the
+#         expectation below is framed over the full-index rendering.
+L_BIN="$T/local-bin-1398"
+git init -q "$L_BIN"
+git -C "$L_BIN" config user.email "t@example.test"
+git -C "$L_BIN" config user.name "t"
+git -C "$L_BIN" config core.abbrev 4
+git -C "$L_BIN" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
+{ printf 'BIN\0'; printf '0001\n'; } > "$L_BIN/b.bin"
+git -C "$L_BIN" add b.bin
+git -C "$L_BIN" -c commit.gpgsign=false commit -q -m base
+LB_BASE="$(git -C "$L_BIN" rev-parse HEAD)"
+{ printf 'BIN\0'; printf '0002\n'; } > "$L_BIN/b.bin"
+git -C "$L_BIN" -c commit.gpgsign=false commit -q -am head
+LB_HEAD="$(git -C "$L_BIN" rev-parse HEAD)"
+if git -C "$L_BIN" diff --no-color "$LB_BASE...$LB_HEAD" | grep -q '^Binary files'; then ok "11.11m fixture: the entry is hunk-less (binary) so its index line survives"; else bad "11.11m fixture: the entry is not binary"; fi
+LB_SHA="$(local_diff_sha1398 "$L_BIN" "$LB_BASE" "$LB_HEAD")"
+LB_SHA4="$(git -C "$L_BIN" -c core.abbrev=4 diff --no-color "$LB_BASE...$LB_HEAD" | python3 "$NORM1398" | openssl dgst -sha256 | awk '{print $NF}')"
+if [ "$LB_SHA" != "$LB_SHA4" ]; then ok "11.11m the full-index and the 4-hex renderings really differ (the fixture is not degenerate)"; else bad "11.11m the fixture is degenerate: 4-hex and full-index normalize identically"; fi
+rm -f "$(Q2 424786)"
+STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$LB_BASE" STUB_LOCAL_HEAD="$LB_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_BIN" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
+  run_record_diff 424786 "$SHA" "PR body" /dev/null 0
+assert_contains "$(cat "$(Q2 424786)" 2>/dev/null)" "\"diff_sha256\":\"$LB_SHA\"" "11.11m a hunk-less entry is bound at FULL index width, not the ambient core.abbrev"
+unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
 
 # ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED
