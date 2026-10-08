@@ -520,9 +520,18 @@ printf '3\n' > "$SCEN/pending"
 # The bound is tested BEFORE the sleep, so an unclamped `sleep "$POLL"` lets the
 # rail outlive its documented bound by up to a whole poll interval — measured on
 # the revision before the clamp: `--wait-timeout 2 --poll 8` ran 10 s wall while
-# printing "waiting (≤2s)". A watchdog at 6 s separates the clamped stop (~2 s)
-# from the unclamped one (~8 s), and turns the regression into a FAILED TEST.
-run_rail_watchdog 6 42 --repo "$REPO" --poll 8 --wait-timeout 2
+# printing "waiting (≤2s)". A watchdog separates the clamped stop from the
+# unclamped one, and turns the regression into a FAILED TEST.
+#
+# The interval is deliberately WIDE (poll 60, watchdog 30, bound 2) rather than the
+# original 8/6/2. The ratio is what carries the assertion — the watchdog must sit
+# ABOVE a legitimate stop and BELOW a full poll interval — but the original margin
+# was so thin that on a loaded host (measured: load avg 258 on 10 CPUs) a
+# CLAMPED stop cost 5–7 s of wall time in subprocess overhead alone and straddled
+# the 6 s watchdog, so a correct rail was killed as if it had overshot. That was a
+# false red on 7 of 9 runs. Widening the interval restores the separation without
+# weakening anything: an unclamped `sleep 60` is still caught, just later.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 60 --wait-timeout 2
 rc=$?
 if [ "$rc" -eq 124 ]; then
   fail "the rail overshot its 2s bound — --poll 8 pushed the stop past the bound"
@@ -1356,7 +1365,63 @@ called "pr update-branch" \
 [ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
   && pass "the head was left where it was" \
   || fail "the head moved for a safe drift"
+
+# ── ROOT ANCHORING — the round-2 fail-OPEN ─────────────────────────────
+echo "── 17g-E9. the tool path is anchored to the repo ROOT, not the process cwd"
+# `gh repo view` walks up, so from a SUBDIRECTORY the identity check passes — but a
+# bare `tools/drift-guard.py` test is relative to the process cwd and misses a tool
+# that IS at the root, reading a PRESENT gate as absent and skipping a drift-red head
+# (measured in review round 2). A behavioural repro needs a git root that HAS the
+# tool, which this hermetic suite cannot place, so assert the MECHANISM directly:
+# the default argv must be built from $CWD_ROOT.
+rg -q 'tool="\$\{CWD_ROOT:-\.\}/tools/drift-guard\.py"' scripts/atomic-land.sh \
+  && pass "the tool path is built from CWD_ROOT (the repo root), not a bare relative path" \
+  || fail "the tool path is not root-anchored — a subdirectory would read a present gate as absent"
+rg -q 'CWD_ROOT="\$\(git rev-parse --show-toplevel' scripts/atomic-land.sh \
+  && pass "CWD_ROOT is resolved from git, so it is the checkout root wherever the shell sits" \
+  || fail "CWD_ROOT is not resolved from git"
+
+# ── THE THIRD SKIP PATH — CLEAN with an UNREADABLE distance ───────────────
+echo "── 17g-E10. CLEAN with an UNREADABLE distance + drift RED ⇒ REFRESH (else it skips unmeasured)"
+# `behind` is empty when the compare read fails. The `elif CLEAN` no-op used to absorb
+# that case and return without ever reading the predicate — the one skip that assumed a
+# state name was evidence about content. Under strict=false a genuinely-behind head
+# reports CLEAN, so this is PR #7703's shape one unreadable read away.
+new_scen cleannodistance
 SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '\n'          > "$SCEN/behind"   # empty = the compare API could not be read
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on an unreadable distance with a red predicate" \
+  || fail "SKIPPED a drift-red CLEAN head on an unreadable distance (the third skip path)"
+
+# ── …and the measured-current case must still be a cheap no-op ───────────
+echo "── 17g-E11. CLEAN with a MEASURED-CURRENT head (0 behind) ⇒ no-op, no predicate call"
+# behind=0 means the head contains the base, so no revert is possible and the no-op is
+# correct WITHOUT a subprocess. Pins that the P2 fix did not turn every clean landing
+# into a drift measurement (the cost the predicate adds).
+new_scen cleancurrent
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '0\n'         > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a measured-current head" \
+  || pass "no refresh (0 behind ⇒ nothing can revert)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && fail "consulted the predicate for a measured-current head (needless subprocess)" \
+  || pass "and did NOT spend a predicate call on it"
 
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
@@ -1444,7 +1509,8 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B15  's/^\[ "\$WAIT_TIMEOUT" -le 86400 \].*$/true/m'
   # B16 (#1395 item 1, third door): drop the clamp on the final sleep, so the
   # rail overshoots its own bound by up to a whole poll interval (the bound is
-  # tested before the sleep). 7d's 6 s watchdog then fires at 8 s.
+  # tested before the sleep). 7d's 30 s watchdog then fires, because an unclamped
+  # `sleep "$POLL"` waits the full 60 s interval.
   mutate_and_expect_fail B16  's/^    remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)\n    if \[ "\$remaining" -gt "\$POLL" \]; then remaining="\$POLL"; fi\n    sleep "\$remaining"/    sleep "\044POLL"/m'
   # B17 (#1395 item 1, fourth door): drop the `--poll` cap, so an oversized
   # interval reaches /bin/sleep and multiplies the count-bounded waits as well.

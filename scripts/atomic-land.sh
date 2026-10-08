@@ -114,8 +114,8 @@
 #                           else $HOME/.pi/agent/scripts/record-review.sh)
 #   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
 #   ATOMIC_LAND_DRIFT_GUARD the drift predicate's argv (default: `uv run python
-#                           tools/drift-guard.py`, resolved in the TARGET repo —
-#                           see drift_safe_of(); #7727)
+#                           <cwd repo root>/tools/drift-guard.py` — see
+#                           drift_safe_of(); #7727)
 #   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
 #                           (default: 60) — a non-zero admin-merge exit is never
 #                           read as success; the .merged poll is the only proof.
@@ -136,10 +136,14 @@ set -uo pipefail
 
 PR=""
 REPO=""
-# The cwd's own repo slug, resolved alongside $REPO in resolve_repo(). Kept separate
-# so drift_safe_of() can tell "this repo has no drift gate" from "we are pointed at a
-# different repo" (#7727). Declared here because `set -u` is on.
+# The cwd checkout's repo slug AND root, resolved alongside $REPO in resolve_repo().
+# Kept separate so drift_safe_of() can tell "this repo has no drift gate" from "we are
+# pointed at a different repo" (#7727). The ROOT is needed because `gh repo view`
+# walks up (so the slug matches from any subdirectory) while a relative
+# `tools/drift-guard.py` test does NOT — mixing the two let a subdirectory read a
+# present tool as absent. Declared here because `set -u` is on.
 CWD_REPO=""
+CWD_ROOT=""
 DRY_RUN=0
 NO_WAIT=0
 NO_CITE=0
@@ -155,10 +159,11 @@ RECORD_SH="${ATOMIC_LAND_RECORD_SH:-}"
 ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
 # The drift predicate's argv (#7727). Repo-local BY DESIGN: the tool lives beside
 # the CI job that runs it (`tools/drift-guard.py` in the target repository), not in
-# this shared rail, so the default resolves it relative to the TARGET repo's cwd.
-# Overridable as a whole, exactly like $GH/$RECORD_SH/$ADMIN_MERGE, so the suite
-# can serve it hermetically.
-DRIFT_GUARD_CMD="${ATOMIC_LAND_DRIFT_GUARD:-uv run python tools/drift-guard.py}"
+# this shared rail, so the default resolves it against the cwd checkout's ROOT —
+# see drift_safe_of(). Overridable as a whole, exactly like $GH/$RECORD_SH/
+# $ADMIN_MERGE, so the suite can serve it hermetically. The override is read at the
+# single call site inside drift_safe_of() rather than cached here, because the
+# default depends on $CWD_ROOT, which is only known after resolve_repo().
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -401,15 +406,18 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 # tool in some OTHER checkout proves nothing. That reads the ARTIFACT (the tool's
 # existence), never a setting.
 drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
-  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ] && [ ! -f tools/drift-guard.py ]; then
+  # The tool is resolved against the cwd checkout's ROOT, never the process cwd:
+  # `gh repo view` walks up, so from a subdirectory the identity check passes while a
+  # bare `tools/drift-guard.py` test would miss a tool that IS there — reading a
+  # present gate as absent and skipping a drift-red head (measured; review round 2).
+  local tool="${CWD_ROOT:-.}/tools/drift-guard.py"
+  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ] && [ ! -f "$tool" ]; then
     # A MISSING TOOL PROVES "NO GATE" ONLY IF THE CWD *IS* THE TARGET REPO.
-    # `--repo owner/name` is a supported way to name a DIFFERENT repo, and the
-    # rail never `cd`s, so `./tools/` is then the WRONG repo's — its absence says
-    # nothing about the target's gate. Treating that absence as "harmless" was a
-    # fail-OPEN: the skip fired for a repo that HAS the gate, re-creating exactly
-    # the unlandable head this function exists to prevent (review finding, #7727).
-    # So the exception needs POSITIVE evidence of identity; anything else is
-    # unmeasurable and refreshes.
+    # `--repo owner/name` is a supported way to name a DIFFERENT repo, so `./tools/`
+    # can belong to the wrong one, and its absence then says nothing about the
+    # target's gate. Treating that as "harmless" is a fail-OPEN that re-creates the
+    # unlandable head this function exists to prevent. So the exception needs
+    # POSITIVE evidence of identity; anything else is unmeasurable and refreshes.
     local cwd_l target_l
     cwd_l="$(printf '%s' "$CWD_REPO" | tr 'A-Z' 'a-z')"
     target_l="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
@@ -418,8 +426,10 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     fi
     return 0
   fi
+  # The default argv is anchored to the same root; the override is used verbatim.
+  local cmd="${ATOMIC_LAND_DRIFT_GUARD:-uv run python $tool}"
   local out
-  out="$( $DRIFT_GUARD_CMD --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
+  out="$( $cmd --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
   case "$out" in
     *'"status": "ok"'*|*'"status":"ok"'*) printf '1' ;;
   esac
@@ -505,6 +515,7 @@ resolve_repo() {
   # Empty when the cwd is not a git repo with a GitHub remote, which is the
   # fail-closed direction: the exception simply does not apply.
   CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  CWD_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -z "$REPO" ]; then
     REPO="$CWD_REPO"
   fi
@@ -718,8 +729,23 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       elif [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
-        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
-        return 3
+        # #7727 — CLEAN IS NOT A STATEMENT ABOUT CONTENT, so this no-op may not be
+        # taken on the state name. `behind` reaches this arm when the distance is 0
+        # (measured current — the head contains the base, so nothing can revert and
+        # the no-op is safe) AND when the compare read FAILED (`behind` empty). For
+        # the latter the distance is unavailable and only the drift predicate can
+        # decide: under `strict: false` a genuinely-behind head reports CLEAN, so
+        # this is PR #7703's shape one unreadable read away. This was the one skip
+        # that never consulted the predicate.
+        if [ -n "$behind" ]; then
+          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
+          return 3
+        fi
+        if [ "$(drift_safe_of)" = 1 ]; then
+          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN with an unreadable head/base distance, but merging this head would keep $BASE's content — nothing to update"
+          return 3
+        fi
+        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head/base distance could not be measured, and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
