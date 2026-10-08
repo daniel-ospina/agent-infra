@@ -228,6 +228,34 @@ exit "${SCEN_ADMIN_RC:-0}"
 ADMEOF
 chmod +x "$ADM"
 
+# ── fake drift predicate (#7727) ───────────────────────────────────────────
+# The rail CALLS the target repo's own `tools/drift-guard.py`. A repo with no such
+# tool has no drift gate, so the rail's no-gate branch keeps the #7230 skip and
+# every pre-existing scenario is unaffected. These scenarios inject the predicate
+# via ATOMIC_LAND_DRIFT_GUARD and model its three REAL outcomes, EXIT CODES
+# INCLUDED (the real tool exits 0 green, 1 on a revert, 2 on an environment error):
+#   $SCEN/drift-status = ok     ⇒ exit 0, `"status": "ok"`    (green ⇒ skip stands)
+#   $SCEN/drift-status = drift  ⇒ exit 1, `"status": "drift"` (unsafe ⇒ MUST refresh)
+#   the fixture ABSENT          ⇒ exit 2, no output            (unmeasurable ⇒ refresh)
+# Faithful exit codes are the point: the scenario that must refresh does so on a red
+# MEASUREMENT, not merely on a failing process.
+DRIFT="$TMP/fake-drift-guard"
+cat > "$DRIFT" <<'DRIFTEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'drift-guard %s\n' "$*" >> "$SCEN/drift-calls"
+if [ -f "$SCEN/drift-status" ]; then
+  st="$(cat "$SCEN/drift-status")"
+  printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+  [ "$st" = ok ] && exit 0
+  exit 1
+fi
+echo "drift-guard: could not fetch the base — its freshness cannot be proven" >&2
+exit 2
+DRIFTEOF
+chmod +x "$DRIFT"
+
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
 # A fixture gate key and a marker that is GENUINELY signed with it. The rail verifies
@@ -253,6 +281,11 @@ new_scen() {
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
+  # #7727: the drift predicate is injected per-scenario; absent ⇒ the rail's
+  # no-gate branch (no override AND no tools/drift-guard.py in this repo), which
+  # keeps every pre-existing scenario's skip behaviour bit-for-bit.
+  SCEN_DRIFT_CMD=
+  rm -f "$SCEN/drift-status" 2>/dev/null || true
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -268,6 +301,7 @@ new_scen() {
   printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
+  : > "$SCEN/drift-calls"
   # default fixture record: verdict clean at the OLD head
   SCEN_RECORD_FILE="$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
@@ -295,6 +329,7 @@ rail_exec() { # <extra args...>
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
+  ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
     exec bash "$RAIL" "$@"
 }
 
@@ -1156,6 +1191,109 @@ called "pr update-branch" \
   && pass "refreshed despite the landable state (the fail-safe reaches the drift arm)" \
   || fail "the fail-safe did NOT restore the refresh — the skip is un-disableable"
 
+# ═══ 17g-E. #7727 — a mergeable head is not necessarily a LANDABLE one ═════
+# `mergeable` answers "no text conflict", a different question from "would the merge
+# KEEP the base's content". The skip above takes the second for granted. When it is
+# false the skip leaves the head permanently unlandable: the drift red cannot clear
+# without a refresh, and the skip keeps refusing to do it. Live instance: PR #7703
+# (CLEAN, mergeable, 14 behind) — drift-guard reported 776 lines of silent revert, a
+# zero-conflict rebase made it green, and the refresh WAS the fix.
+# NOTE: SCEN_DRIFT_CMD must be set AFTER each new_scen (which resets it), like every
+# other per-scenario fixture here.
+
+echo "── 17g-E1. CLEAN + behind>0 + strict=false + mergeable + drift RED ⇒ the refresh HAPPENS (#7727)"
+new_scen cleandriftunsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0) after the refresh" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && pass "refreshed: the merge would not keep main's content, so the drift IS what blocks it" \
+  || fail "SKIPPED a drift-unsafe head — the #7230 skip left it unlandable (#7703's shape)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "the drift predicate was consulted at all" \
+  || fail "the predicate was never called"
+# The rail's stdout is the human's evidence for WHY a head moved, so the reason must
+# be attributed to the branch that was actually taken. NOTE the count is not the
+# assertion: the DECISION line (here) and the ACTION line at the update call are both
+# `[1/4] update`, so a refresh legitimately emits two. What must never appear is the
+# sibling arm's line — true of that arm, false here (mergeable IS true) — which a
+# fall-through printed as well: a fresh misattribution inside the fix for one.
+grep -q "drift predicate is NOT positively green" "$SCEN/out" \
+  && pass "the refresh names the drift predicate as the reason" \
+  || fail "the decision line does not name the drift predicate"
+grep -q "not positively mergeable" "$SCEN/out" \
+  && fail "the drift-red path claimed the PR was not mergeable — it IS (false attribution)" \
+  || pass "and it does NOT claim the PR is unmergeable (no fall-through misattribution)"
+
+# ── DIRECTION B — a GREEN predicate must still take the skip ─────────────
+echo "── 17g-E2. …and with the predicate GREEN the head is KEPT (the #7230 fix is preserved)"
+new_scen cleandriftsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a head whose merge WOULD keep main's content — the O3 waste (#7230)" \
+  || pass "did NOT refresh (safe drift ⇒ nothing to repair)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was" \
+  || fail "the head moved for a safe drift"
+
+# ── FAIL-CLOSED — unmeasurable must never stand in for green ─────────────
+echo "── 17g-E3. …and an UNMEASURABLE predicate REFRESHES (fail-closed)"
+new_scen cleandriftunmeasured
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+# NO $SCEN/drift-status: the fake exits 2 with no output, exactly as the real tool
+# does when it cannot prove the base's freshness (#4174).
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on an unmeasurable predicate (a possibly-stale base is never a pass)" \
+  || fail "an unmeasurable predicate was read as GREEN — fail-open"
+
+# ── THE BASE REF SHAPE — a MEASURED trap (#7727) ─────────────────────────
+echo "── 17g-E4. the predicate is passed a FETCHABLE base ref (origin/<base>), not the bare branch"
+# MEASURED: `--base main` exits 2 (`status: error`, "not a remote-tracking ref — the
+# gate cannot prove its freshness") while `--base origin/main` measures. The rail's
+# $BASE is the bare branch name, so passing it would make EVERY read an error and
+# disable the skip permanently — a silent failure of this whole arm.
+grep -qF -- "origin/main" "$SCEN/drift-calls" \
+  && pass "invoked with origin/main" \
+  || fail "not passed a fetchable base ref (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
+
+# ── NO GATE — the one deliberate exception ───────────────────────────────
+echo "── 17g-E5. a repo with NO drift gate keeps the skip (nothing to leave unlandable)"
+new_scen cleandriftnogate
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_DRIFT_CMD=          # no override, and this repo has no tools/drift-guard.py
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed although no drift gate exists to leave the head unlandable" \
+  || pass "did NOT refresh (no gate ⇒ the drift is harmless by construction)"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -1298,6 +1436,13 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # failure it prevents: closing #7230 for one landable state and leaving the other's
   # population (measured at 10 heads) with the same non-termination. 17g-D6 must redden.
   mutate_and_expect_fail B23  's/in CLEAN\|UNSTABLE\) drift_landable=1/in CLEAN\) drift_landable=1/'
+  # B24 (#7727): make the drift predicate INERT — the skip fires on `mergeable`
+  # alone, i.e. the revision before this fix. The failure it prevents: a head whose
+  # merge would silently REVERT a path the base moved is skipped forever, so the
+  # drift red can never clear and the PR is unlandable by the rail's own action
+  # (live: PR #7703, 776 lines of silent revert; the refresh was the whole fix).
+  # 17g-E1 must redden.
+  mutate_and_expect_fail B24  's/if \[ "\$\(drift_safe_of\)" = 1 \]; then/if true; then/'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh

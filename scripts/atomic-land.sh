@@ -113,6 +113,9 @@
 #   ATOMIC_LAND_RECORD_SH   record-review.sh (default: sibling record-review.sh,
 #                           else $HOME/.pi/agent/scripts/record-review.sh)
 #   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
+#   ATOMIC_LAND_DRIFT_GUARD the drift predicate's argv (default: `uv run python
+#                           tools/drift-guard.py`, resolved in the TARGET repo —
+#                           see drift_safe_of(); #7727)
 #   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
 #                           (default: 60) — a non-zero admin-merge exit is never
 #                           read as success; the .merged poll is the only proof.
@@ -146,6 +149,12 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH="${ATOMIC_LAND_GH:-gh}"
 RECORD_SH="${ATOMIC_LAND_RECORD_SH:-}"
 ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
+# The drift predicate's argv (#7727). Repo-local BY DESIGN: the tool lives beside
+# the CI job that runs it (`tools/drift-guard.py` in the target repository), not in
+# this shared rail, so the default resolves it relative to the TARGET repo's cwd.
+# Overridable as a whole, exactly like $GH/$RECORD_SH/$ADMIN_MERGE, so the suite
+# can serve it hermetically.
+DRIFT_GUARD_CMD="${ATOMIC_LAND_DRIFT_GUARD:-uv run python tools/drift-guard.py}"
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -345,6 +354,57 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
   esac
 }
 
+# ── the drift predicate: would merging this head KEEP the base's content? ───
+# #7727. `mergeable` above answers "does this branch merge without a TEXT
+# CONFLICT" — a DIFFERENT question from "would the merge KEEP $BASE's content".
+# The target repo's `tools/drift-guard.py` owns the second (#4174, predicate
+# corrected by #7455) and is already run as a CI gate on every PR; the rail CALLS
+# it and never re-derives the rule, so the two cannot drift apart.
+#
+# WHY THIS EXISTS. The #1565/#7230 skip below assumes a landable head's drift is
+# harmless — "the only thing left between that PR and a merge is the drift, which
+# nothing requires it to close". That holds only while the drift is SAFE. For a
+# head whose merge would silently REVERT a path the base moved, the drift IS what
+# blocks the merge (the drift gate goes red), and the refresh the skip avoids is
+# the ONLY repair: while the skip keeps firing, the head can never become
+# landable, and the refusal is attributed to something else. So the skip is taken
+# on a POSITIVELY green predicate only.
+#
+# ⛔ TWO TRAPS, BOTH MEASURED — do not "simplify" either away:
+#  1. KEY ON THE JSON, NOT THE EXIT CODE. `tools/drift-guard.py` is >=3.12
+#     (#5128) and refuses an older interpreter with `raise SystemExit(msg)`, which
+#     exits **1** — the SAME code the revert arm uses. Measured on the authoring
+#     box (`python3` = 3.9.6): `python3 tools/drift-guard.py` exits 1 having
+#     measured nothing, so a bare exit-code test would read every head as unsafe
+#     and silently reinstate the unconditional refresh this arm exists to prevent.
+#     `--json` separates the two: only a real measurement prints `"status": "ok"`
+#     (green), `"status": "drift"` (a revert) or `"status": "error"`.
+#  2. THE BASE MUST BE A FETCHABLE REMOTE-TRACKING REF. MEASURED: `--base main`
+#     exits 2 with `status: error` (the gate cannot prove a local ref's
+#     freshness), while `--base origin/main` measures. The rail's $BASE is the
+#     bare branch name, so the invocation below passes `origin/$BASE`; passing
+#     $BASE would make every read an error and disable the skip entirely.
+#
+# FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): `1` is printed ONLY
+# for a POSITIVE green measurement. A revert, an environment error, a version
+# guard, a missing tool — all print empty, and the caller REFRESHES on empty.
+# Unmeasurable must never stand in for green.
+#
+# THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
+# repo has no `tools/drift-guard.py` there is no gate that could leave the head
+# unlandable, so the drift is harmless by construction and the skip stands. That
+# reads the ARTIFACT (the tool's existence), not a setting.
+drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
+  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ] && [ ! -f tools/drift-guard.py ]; then
+    printf '1'; return 0
+  fi
+  local out
+  out="$( $DRIFT_GUARD_CMD --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
+  case "$out" in
+    *'"status": "ok"'*|*'"status":"ok"'*) printf '1' ;;
+  esac
+}
+
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
 # leaving the merge base unchanged, so it is the signal for B12: the checks were
 # verified against the old tip and did not cover the new one. `--admin` bypasses
@@ -535,7 +595,10 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # ⚠️ THE DRIFT ARM NEEDS THE SAME PREDICATE — FOR EVERY LANDABLE STATE (#7230).
       # For `CLEAN` and `UNSTABLE` every REQUIRED leg is satisfied, and `strict: false`
       # means the distance to the base is not one of them: the only thing left between
-      # that PR and a merge is the drift, which nothing requires it to close. (Do NOT
+      # that PR and a merge is the drift, which nothing requires it to close. That
+      # inference holds only for a drift that is SAFE — a head whose merge would
+      # silently revert a path the base moved is NOT landable, and drift_safe_of()
+      # below is what separates the two (#7727). (Do NOT
       # widen this to "anything but BLOCKED" — that set carries states that are not
       # landable, which is what the fail-closed enumeration below and mutation B22
       # exist to keep out.) The drift arm refreshed there anyway, so a green,
@@ -594,10 +657,24 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
           if [ "$strict" = false ]; then
             mergeable="$(mergeable_of)"
             if [ "$mergeable" = true ]; then
-              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
-              return 3
+              # #7727 — a mergeable head is not automatically a LANDABLE one: the merge
+              # can still fail to keep the base's content, which is exactly what the
+              # drift gate measures and what this skip would leave in place forever.
+              # Green predicate only.
+              if [ "$(drift_safe_of)" = 1 ]; then
+                say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
+                return 3
+              fi
+              # This is the ELSE of the drift check, not a fall-through: every path
+              # through the arm must emit EXACTLY ONE line, because the stdout is the
+              # human's evidence for why the head moved. A fall-through here printed
+              # the "not positively mergeable" line below as well — true of the OTHER
+              # arm, false here (mergeable IS true), and so a fresh misattribution in
+              # the fix for a misattribution.
+              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #7230 skip would leave it unlandable with a misattributed refusal"
+            else
+              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
             fi
-            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
           else
             say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
           fi
