@@ -6798,6 +6798,68 @@ grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
   || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran on a whitespace-only changed-file list" || pass "no merge attempted"
 
+# (f2) #7702 — A LARGE CHANGED-FILE LIST MUST NOT HANG THE RAIL.
+# The emptiness test in `lane_applicable()` was `${WF_PR_CHANGED_PATHS//[[:space:]]/}`,
+# a bash-3.2 POSIX-character-class global substitution that is SUPER-LINEAR in the
+# length of the string. Measured under /bin/bash 3.2.57 (the interpreter the rail
+# actually runs): 50 paths 3.5 s, 100 paths 21.5 s, 200 paths > 25 s, and PR #7653's
+# 2,265 paths (173 KB) UNBOUNDED past 60 s. The rail printed its header and then hung
+# with NO verdict, NO refusal and NO timeout — so a large PR could not be landed at
+# all, and a watcher could not tell a hang from slow work. The failure mode is a HANG,
+# not a wrong answer, so this scenario BOUNDS the call: under the regression the rail
+# is killed and this leg FAILS instead of hanging the suite.
+new_scen lane7702-largechanged
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7005 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6946 7006 > "$SCEN/runs-main"
+lane_jobset 7006 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7005 success 'test (a)' 'test (b)'
+# ⛔ The workflow body fixture is LOAD-BEARING: without it the fake's contents arm
+# returns nothing, `lane_applicable()` returns at the EMPTY-BODY guard
+# (admin-merge.sh:2484-2487) and NEVER reaches the emptiness test — so the behavioural
+# leg below passed on BOTH the fixed and the regressed rail, i.e. it discriminated
+# nothing. Measured with this line: the fixed rail reaches the test with a 122 KB
+# list, and the regressed rail hangs and is killed at 90 s (verification round 1).
+wf_declares .github/workflows/python-ci.yml pull_request
+# 2,265 paths — the measured size of the PR #7653 list.
+: > "$SCEN/pr-changed-files"
+_w7702i=0
+while [ "$_w7702i" -lt 2265 ]; do
+  printf 'website/apps/dashboard/node_modules/pkg%s/file%s.js\n' "$((_w7702i/10))" "$_w7702i" >> "$SCEN/pr-changed-files"
+  _w7702i=$((_w7702i + 1))
+done
+selector_interp_312
+selector_stub False False
+# ⛔ A background killer + a plain `wait` (bash 3.2 has no `wait -n`, and a finished
+# but unreaped child still answers `kill -0`, so a poll loop cannot distinguish
+# "done" from "hung" here). `wait` returns the real exit status; 137 = SIGKILL.
+( SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+    bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err" ) &
+_w7702rail=$!
+( sleep 90; kill -9 "$_w7702rail" 2>/dev/null ) & _w7702killer=$!
+wait "$_w7702rail" 2>/dev/null; _w7702rc=$?
+kill -9 "$_w7702killer" 2>/dev/null; wait "$_w7702killer" 2>/dev/null
+if [ "$_w7702rc" -eq 137 ]; then
+  fail "#7702: the rail did NOT return within 90s on a 2,265-path changed-file list — the super-linear whitespace substitution at admin-merge.sh:2494 is back (this is the silent multi-hour stall)"
+else
+  pass "#7702: the rail returned on a 2,265-path changed-file list (exit $_w7702rc) instead of hanging"
+fi
+# ⛔ NOT `grep -v … | grep -q …` HERE. Under `set -o pipefail` (run.sh:195) the
+# upstream `grep -v` takes SIGPIPE (141) when the downstream `-q` exits at its first
+# match, so the pipeline status becomes 141 and the `&& fail` arm is SKIPPED: a
+# FAIL-OPEN enforcer that reports green on a regressed file (measured: fires 0.5% of
+# the time, green 99.5% — and the same race made the positive pin false-fail ~99.7%).
+# This is the repo's own #841 class; its guard (`scripts/check-no-sigpipe-grep.sh`)
+# scans only `scripts/`, so an instance in `tests/` is invisible to it. Capture first,
+# then grep a here-string — the repo's documented remedy.
+_w7702_nc="$(grep -v '^[[:space:]]*#' "$ADM")"
+grep -q 'WF_PR_CHANGED_PATHS//\[\[:space:\]\]' <<<"$_w7702_nc" \
+  && fail "#7702: admin-merge.sh again uses \${WF_PR_CHANGED_PATHS//[[:space:]]/} — super-linear in bash 3.2, unbounded on a large PR" \
+  || pass "#7702: the changed-paths emptiness test no longer uses a global whitespace substitution"
+grep -q 'case "\${WF_PR_CHANGED_PATHS:-}" in' <<<"$_w7702_nc" \
+  && pass "#7702: …it uses the linear case-glob form instead (same predicate, one pass)" \
+  || fail "#7702: admin-merge.sh does not test changed-path emptiness with the linear case-glob form"
+
 # (g) #6928 P1-1 — NO ≥3.12 INTERPRETER → FAIL CLOSED, NAMING THE REQUIREMENT.
 # This is the production defect: the rail's own python3 is 3.9.6 and tortoise's
 # selector refuses below 3.12, so the FIRST cut made the whole path refuse on the
