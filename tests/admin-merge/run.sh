@@ -10009,7 +10009,10 @@ else
     || fail "(e) an unreadable record was read as 'no record' and the update proceeded"
   grep -q "update-branch" "$SCEN/calls" && fail "(e) the update was issued despite an unreadable record" \
     || pass "(e) …and no update-branch write was issued"
-  grep -q "head could not be read" "$SCEN/err" \
+  # The guard refuses an unreadable path BEFORE it tries to read a head out of it, so the
+  # reason it now prints is this more specific one. Pinning that exact text keeps the
+  # assertion meaningful: the refusal must say WHY it refused, not merely exit non-zero.
+  grep -q "not a readable regular file" "$SCEN/err" \
     && pass "(e) …naming the unreadable head as the reason" \
     || fail "(e) the refusal does not say the head could not be read"
 fi
@@ -10071,6 +10074,94 @@ grep -q "the rail asked GitHub" "$SCEN/err" \
 grep -q "NOT updating" "$SCEN/err" \
   && fail "(h) the dry run reports the guard's refusal TEXT although no record blocked it" \
   || pass "(h) …and reports no record refusal it did not take"
+
+# (i) THE NUMBER IS KEPT AS GIVEN. `record-review.sh` names the record with `$PR`
+# VERBATIM (it validates only `^[0-9]+$`), so a run for `01631` writes
+# `…-01631.json` — while `gh` accepts a padded number and this rail is invoked with
+# the same spelling the operator typed. A guard that stripped the zeros read a path
+# the writer never writes, so a record bound to the head was invisible and the head
+# was moved out from under a record the merge gate still reads. Pinned shut here.
+new_scen record-leading-zero
+HEAD_RI="f1f1000000000000000000000000000000000000"
+stale_surface "$HEAD_RI"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-01631.json" "$HEAD_RI"
+run_admin_guarded 01631
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) a record filed under the VERBATIM padded number refuses the update (exit $rc)" \
+  || fail "(i) the guard stripped the zeros and read a path the writer never wrote: the update proceeded (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(i) the rail asked to update a branch whose padded-number record is bound to the head" \
+  || pass "(i) …and no update-branch write was issued"
+grep -q "daniel-ospina-agent-infra-01631.json" "$SCEN/err" \
+  && pass "(i) …naming the padded record it refused to strand" \
+  || fail "(i) the refusal does not name the padded record: $(ls "$SCEN/home/.pi/agent/reviews" 2>/dev/null | tr '\n' ' ')"
+
+# (j) "EXISTS BUT IS NOT A READABLE REGULAR FILE" IS NOT "NO RECORD". A directory at
+# a candidate path made the old `[ -f ] || continue` read as absent, so the update
+# went ahead against a record store the guard could not read — the fail-open pinned
+# shut here. A DIRECTORY is used rather than `chmod 000`, because the suite may run as
+# root, where a mode-000 file is still readable and the case would be vacuous.
+new_scen record-store-not-regular
+HEAD_RJ="f2f2000000000000000000000000000000000000"
+stale_surface "$HEAD_RJ"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+mkdir -p "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(j) a DIRECTORY at the candidate path refuses the update (exit $rc)" \
+  || fail "(j) a non-regular path was read as 'no record' and the update proceeded (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(j) the rail asked to update a branch with a record store it could not read" \
+  || pass "(j) …and no update-branch write was issued"
+grep -q "not a readable regular file" "$SCEN/err" \
+  && pass "(j) …saying the path exists but is not a readable regular file" \
+  || fail "(j) the refusal does not state the not-a-regular-file condition"
+
+# (k) A REJECTED UPDATE IS NOT AN UPDATE. `refresh_pr_branch` returns 1 for BOTH a
+# refusal and a failed API call, so a caller that reported the write unconditionally
+# would tell the lane a re-measurement is under way on a path where no new head was
+# created and no check will ever run. The write IS issued (no record to strand) and the
+# rail must report that the call did not succeed — without claiming it updated anything.
+# THIS invocation still refuses either way: the refreshed head carries no completed check.
+new_scen record-absent-update-rejected
+HEAD_RK="f3f3000000000000000000000000000000000000"
+stale_surface "$HEAD_RK"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+: >"$SCEN/update-branch-fail"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(k) the invocation still refuses (exit $rc)" \
+  || fail "(k) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(k) …with no record to strand, the update WAS requested" \
+  || fail "(k) the rail did not attempt the update its own refusal names as the remedy"
+grep -q "the call did not succeed" "$SCEN/err" \
+  && pass "(k) …and the rail reports the call did not succeed" \
+  || fail "(k) the rail does not report the rejected update"
+grep -q "the rail asked GitHub to bring the branch up to date with its base" "$SCEN/out" \
+  && fail "(k) the rail claims it brought the branch up to date although the call was rejected" \
+  || pass "(k) …and claims no update it did not make"
+
+# (l) AN UNRESOLVED REPO IDENTITY IS NOT A REASON TO SKIP THE CHECK. Both record paths
+# are named after the canonical slug, so with no slug the qualified file is unchecked
+# and the update can strand the record this guard exists to protect — the fail-open
+# pinned shut here. Refusing costs one re-run, and every other step of this rail needs
+# a working `gh` against this repo anyway.
+new_scen record-slug-unresolved
+HEAD_RL="f4f4000000000000000000000000000000000000"
+stale_surface "$HEAD_RL"
+rm -f "$SCEN/repo-slug"          # the identity seam's ABSENT state
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(l) an unresolvable repo identity refuses the update (exit $rc)" \
+  || fail "(l) the rail updated with the record identity unresolved (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(l) the update proceeded although the qualified record path could not be derived" \
+  || pass "(l) …and no update-branch write was issued"
+grep -q "repo identity could not be resolved" "$SCEN/err" \
+  && pass "(l) …naming the unresolvable identity as the reason" \
+  || fail "(l) the refusal does not name the unresolvable identity"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
