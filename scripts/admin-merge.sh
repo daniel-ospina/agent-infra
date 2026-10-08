@@ -3319,10 +3319,15 @@ build_evidence() {
 #   measured on this lane, not present on main
 #       main's baseline carries a failure in the SAME unit, so the lane is
 #       demonstrably measuring it and does not show this one red.
-#   not measurable on this lane
+#   absent from main's failure set
 #       main's baseline carries NO failure in that unit. A FAILURE-ONLY baseline
 #       cannot tell "green on main" from "never run on main", so absence is NOT
 #       evidence of novelty — the rail must not call it "unique to this PR".
+#       (#7734) What it must ALSO not say is "no main-side measurement": main's
+#       shards upload the nodeids they RAN (`expected-nodeids.txt`), and on the
+#       four PRs #7734 names main's manifests carry 98/41/23/12 of the blocked
+#       nodeids, so main demonstrably runs those files. The label is ABSENCE FROM
+#       THE FAILURE SET; the block is right, the old wording was not.
 #       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
 #       redislite/GRAPH.COPY race while the embedded lane reproduces it — the old
 #       wording asserted uniqueness with nothing to compare against.)
@@ -3361,7 +3366,7 @@ attribute_residual() {
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then
       printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
     else
-      printf '   %s\n      -> not measurable on this lane: main carries no failure in %s, so absence is NOT evidence of novelty\n' "$nodeid" "$file"
+      printf '   %s\n      -> absent from main failure set: main carries no failure in %s. The baseline is FAILURE-ONLY, so a test main RUNS AND PASSES leaves no row either — this failure is new here, not pre-existing, and it is NOT evidence that main never measured the file (#7734)\n' "$nodeid" "$file"
     fi
   done < "$residual"
 }
@@ -4337,7 +4342,7 @@ main() {
     if [ "$rerun_residual" -gt 0 ]; then
       say_err "admin-merge: ✗ BLOCK — $rerun_residual failure(s) SURVIVED the re-run:"
       # §33 (#1147): the REASON, not just the node id. An UNATTRIBUTABLE id (a rotating identity,
-      # or one with no main-side measurement) is created with `blocked=True`, so its
+      # or one ABSENT from main's failure set) is created with `blocked=True`, so its
       # verdict line is a `BLOCK` line whose reason names the class — and a refusal
       # that printed ONLY the node id would read as an ordinary "unique to this PR",
       # leaving the E5 class unreported. Never exempt-and-SILENT applies to the

@@ -682,7 +682,11 @@ def decide(
 
     Rules, in order — each one closes a declared class:
 
-    * id unknown to main's measurement -> **BLOCK** (no evidence of pre-existence).
+    * id ABSENT from main's failure set -> **BLOCK** (main is not red for it, so the
+      failure is new on this PR). NOT "unmeasured": the baseline is FAILURE-ONLY, so
+      a test main runs and passes leaves no row — calling that "no main-side
+      measurement" asserts main never ran the file, which is false whenever main's
+      shards cover it (tortoise #7734).
     * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
       main also failed; same id is not same failure).
     * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
@@ -762,9 +766,21 @@ def decide(
             continue
 
         if mr is None:
+            # ABSENT-FROM-MAIN, not UNMEASURED (tortoise #7734). This reason used to
+            # read "no main-side measurement", which asserts main never ran the file.
+            # That is FALSE whenever main runs it and the test PASSES: the baseline is
+            # FAILURE-ONLY, so a passing test leaves no row — and main's own shard
+            # artifacts (`expected-nodeids.txt`) show it running the very files the old
+            # wording called unmeasured (98/41/23/12 of the blocked nodeids across four
+            # shards, for the four PRs #7734 names). The DECISION is unchanged and
+            # correct — a failure main is green on is new on this PR — but the reason
+            # must state that, not an absence of measurement the rail cannot establish.
             decision.blocked.append(Verdict(
                 nodeid, True,
-                f"no main-side measurement (PR {pr.rate}) — NOT exempt"))
+                f"absent from main's failure set (PR {pr.rate}) — main is not red "
+                "for this id, so the failure is new here; the baseline is "
+                "failure-only, so a test main RUNS AND PASSES leaves no row "
+                "(main did measure it) — not exempt"))
             continue
 
         if not _signatures_overlap(pr.signatures, sig_main.get(nodeid, frozenset())):
