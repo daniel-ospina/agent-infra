@@ -296,6 +296,16 @@ case "$key" in
     if [ -f "$SCEN/head-$pr" ]; then cat "$SCEN/head-$pr"; exit 0; fi
     [ -f "$SCEN/head" ] && { cat "$SCEN/head"; exit 0; }
     exit 1 ;;
+  "repo view")
+    # ── #4764: THE REVIEW-RECORD GUARD'S IDENTITY RESOLUTION. The guard derives the
+    # record path from the CANONICAL `gh repo view --json nameWithOwner` slug
+    # (`pr_review_record_blocks_update`), so a scenario that exercises it must be able
+    # to answer this call — in the PROJECTED form the rail reads, which is the slug
+    # alone. NO FIXTURE means the identity is UNRESOLVABLE, which is both the guard's
+    # own fail-closed arm and the exact behaviour of every scenario written before this
+    # arm existed, so adding it moves no pre-existing scenario's verdict.
+    [ -f "$SCEN/repo-slug" ] || exit 1
+    cat "$SCEN/repo-slug"; exit 0 ;;
   "run list")
     [ -f "$SCEN/fail-run-list" ] && exit 1
     # A COUNTED failure seam, for the one place where NO flag can separate the
@@ -489,6 +499,22 @@ case "$key" in
     [ -f "$SCEN/merge-noop" ] || touch "$SCEN/merged"
     exit 0 ;;
   api*)
+    # ── #4764: THE BRANCH-UPDATE REQUEST. `refresh_pr_branch` writes with
+    # `gh api -X PUT <slug>/pulls/<N>/update-branch -f expected_head_sha=<sha>` — and
+    # the METHOD comes BEFORE the URL, so `$a2` is `-X` and NO arm below can see this
+    # endpoint. Matched against the whole argv for that reason: falling through to the
+    # `*/pulls/*` projection would answer a WRITE with a pull-request payload and would
+    # make "the rail asked for the update" indistinguishable from a GET. It is only
+    # reachable when the review-record guard PERMITS the update, so no pre-existing
+    # scenario reaches it.
+    case "$*" in
+      *update-branch*)
+        # Its OWN fixture: a REJECTED update must be expressible, because the rail
+        # certifies nothing on this call and must report the write as one that did not
+        # succeed rather than as an update it made.
+        [ -f "$SCEN/update-branch-fail" ] && { printf 'gh: update-branch rejected\n' >&2; exit 1; }
+        printf '{"message":"Updating pull request branch."}\n'; exit 0 ;;
+    esac
     # ── #1261: THE CHECK SURFACES. These URLs are answered from their OWN
     # fixtures and NEVER from the jobs fallback below — that fallback is a
     # catch-all for the #1167 API seam, and letting a health call fall into it
@@ -9811,6 +9837,240 @@ lane_tested "$TMP/uw-rep.txt" python-ci.yml "$HEAD_UW" >"$TMP/uw-guard.txt" 2>&1
   || fail "(d) a head with NO tested run was certified"
 grep -q "NO tested run" "$TMP/uw-guard.txt" && pass "(d) …refusing on tested=0, not on the pending counter" \
   || { fail "(d) the refusal reason is not 'NO tested run'"; sed 's/^/      /' "$TMP/uw-guard.txt" | head -5; }
+
+# ── 69. #4764: THE REVIEW-RECORD GUARD THAT GATES THE BRANCH UPDATE ─────────
+#
+# `refresh_pr_branch` PERFORMS the remedy the 4.6/4.7 refusals name: it asks GitHub
+# to bring the PR's head up to date with its base. That MOVES the head, and a review
+# record at `$HOME/.pi/agent/reviews/` is BOUND to a head — so
+# `pr_review_record_blocks_update` refuses the update whenever a record it can read
+# is bound to the head an update would move. The record's PATH IS NOT ONE FIXED NAME:
+# `record-review.sh` writes `<owner>-<repo>-<pr>.json` under whatever repo string it
+# was handed — VERBATIM when `--repo`/positional is given, the canonical
+# `gh repo view` slug when it is not — while the merge gate reads the record back
+# under the spelling the rail forwards. A guard that checks ONE spelling therefore
+# misses the other and moves a head out from under a record the gate still reads;
+# that is the fail-open these cases pin shut. The legacy `<pr>.json` name is shared
+# between repos, so its embedded `repo` is honoured only when it names no repo or
+# THIS one — case-INSENSITIVELY, because `gh` accepts any case for `--repo` and
+# writes it back verbatim.
+#
+# TWO FIXTURE SEAMS, both INERT without a fixture:
+#   * `$SCEN/repo-slug` answers `gh repo view --json nameWithOwner`. With no fixture
+#     the identity is unresolvable — the guard's own fail-closed arm, and the exact
+#     behaviour of every scenario written before this section.
+#   * the fake's `update-branch` arm answers the write itself, so a REJECTED update
+#     is expressible. What decides every case here is whether the write was ISSUED
+#     at all, and that is read from `$SCEN/calls` — never inferred from the exit
+#     status, which is non-zero for both "refused to update" and "updated, now
+#     re-measure".
+#
+# HOME IS ISOLATED PER SCENARIO. The record store is real filesystem state: a suite
+# that read the operator's real `~/.pi/agent/reviews` would let an unrelated record
+# decide its verdict (and would write into it).
+echo "== 69. #4764: a bound review record blocks the branch update; both record spellings are checked =="
+
+# review_record <filename> <head_sha> [repo] → one record in the scenario's OWN
+# review store. The qualified `<owner>-<repo>-<pr>.json` names carry the repo in the
+# FILENAME; only the legacy `<pr>.json` name carries it in the `repo` field.
+review_record() {
+  mkdir -p "$SCEN/home/.pi/agent/reviews"
+  if [ $# -ge 3 ]; then
+    printf '{"repo":"%s","head_sha":"%s"}\n' "$3" "$2" >"$SCEN/home/.pi/agent/reviews/$1"
+  else
+    printf '{"head_sha":"%s"}\n' "$2" >"$SCEN/home/.pi/agent/reviews/$1"
+  fi
+}
+
+# run_admin_guarded — `run_admin_here`'s invocation with the review store ISOLATED.
+# Every scenario below reaches the guard through the 4.6 STALE-GREEN refusal, the
+# first of the two call sites that perform the update.
+run_admin_guarded() {
+  HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  return $?
+}
+
+# stale_surface <head> — the fixture set of scenario (o) above, reduced to what the
+# guard needs: the PR's OWN tree is GREEN but was produced at 00:01, before a base
+# red that began at 00:02. Step 4.6 therefore refuses, names the re-measure remedy,
+# and calls `refresh_pr_branch` for the head it just read.
+stale_surface() {
+  local head="$1"
+  printf '%s\n' "$head" >"$SCEN/head"
+  lane_pass "$head" 4701 >"$SCEN/runs-$head"
+  lane_pass main4764 4702 >"$SCEN/runs-main"
+  write_pr_checks \
+    "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+  pr_run_map 7301 pull_request 'CI'
+  write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  main_run_map 7401 push 'Post-merge validation'
+  pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+}
+
+# (a) A RECORD BOUND TO THE HEAD BLOCKS THE WRITE. This is the reason the guard
+# exists: the update would move the head and strand the attestation.
+new_scen record-bound-blocks
+HEAD_RB="e7e7000000000000000000000000000000000000"
+stale_surface "$HEAD_RB"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RB"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) the 4.6 staleness refusal still refuses (exit $rc)" \
+  || fail "(a) the rail merged past a bound review record (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(a) the rail asked GitHub to UPDATE a branch whose review record is bound to the head" \
+  || pass "(a) …and NO update-branch write was issued"
+grep -q "bound to the head an update would move" "$SCEN/err" \
+  && pass "(a) …and the refusal STATES the condition, which is the line its own text points at" \
+  || fail "(a) the refusal says 'the ⛔ line above states the condition found' but prints no such line: $(grep -c '⛔' "$SCEN/err") ⛔ line(s) present"
+grep -q "NOT updating" "$SCEN/err" \
+  && pass "(a) …naming the decision (NOT updating) rather than only the reason" \
+  || fail "(a) the refusal does not say it declined to update"
+
+# (b) THE VERBATIM $REPO SPELLING IS CHECKED. `--repo Daniel-Ospina/Agent-Infra` is a
+# spelling `gh` accepts; the canonical slug the fake answers is lowercase. The record
+# exists ONLY under the spelling the writer was handed, so a guard that derives the
+# path from the slug alone reads nothing and writes.
+# NOTE: the two spellings differ only by CASE (record-review.sh is handed a repo
+# string, and `gh` accepts any case for the same repo — there is no non-case
+# difference that names the SAME repo), so on a case-INSENSITIVE filesystem — macOS
+# default — the canonical candidate resolves the same file and neither the write
+# assertion nor the path in the refusal can discriminate. This case pins the bug
+# where it is observable (Linux, i.e. CI); the case-insensitive half of the same
+# defect is pinned FILESYSTEM-INDEPENDENTLY by (c), which compares a string field.
+new_scen record-verbatim-spelling
+HEAD_RV="e8e8000000000000000000000000000000000000"
+stale_surface "$HEAD_RV"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "Daniel-Ospina-Agent-Infra-42.json" "$HEAD_RV"
+run_admin_guarded 42 --repo Daniel-Ospina/Agent-Infra
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) the refusal still stands (exit $rc)" \
+  || fail "(b) the rail merged with a record bound to the head (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(b) the verbatim --repo spelling was NOT checked: the update proceeded although a record under 'Daniel-Ospina-Agent-Infra-42.json' is bound to the head" \
+  || pass "(b) …and the record filed under the VERBATIM --repo spelling was found"
+grep -qi "agent-infra-42.json" "$SCEN/err" \
+  && pass "(b) …naming the record file it refused to strand" \
+  || fail "(b) the refusal does not name the record it found"
+
+# (c) THE LEGACY NAME'S `repo` IS COMPARED CASE-INSENSITIVELY. A pure-string compare,
+# so this half is filesystem-independent: `record-review.sh` writes the `repo` it was
+# handed, verbatim, and `gh` accepts a different case for the same repo.
+new_scen record-legacy-repo-case
+HEAD_RC="e9e9000000000000000000000000000000000000"
+stale_surface "$HEAD_RC"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "42.json" "$HEAD_RC" "Daniel-Ospina/Agent-Infra"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a legacy record whose repo differs only by CASE still refuses (exit $rc)" \
+  || fail "(c) the case-sensitive compare read the record as another repo's and updated the branch"
+grep -q "update-branch" "$SCEN/calls" && fail "(c) the update was issued over a case-different legacy record" \
+  || pass "(c) …and no update-branch write was issued"
+grep -q "/42.json" "$SCEN/err" \
+  && pass "(c) …naming the LEGACY file as the blocking artifact" \
+  || fail "(c) the refusal does not name the legacy record"
+
+# (d) …AND THE OTHER HALF, WHICH MATTERS AS MUCH: a same-number legacy record that
+# names ANOTHER repo is not this PR's record and must NOT block. An over-block is a
+# failure too — it would refuse every update in a repo whose review tooling writes
+# one shared legacy name per number.
+new_scen record-legacy-other-repo
+HEAD_RD="eaea000000000000000000000000000000000000"
+stale_surface "$HEAD_RD"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "42.json" "$HEAD_RD" "someone/other-repo"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) the refusal still stands (exit $rc)" \
+  || fail "(d) the rail merged past an unrelated record (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(d) …and another repo's same-number record does NOT block: the update was requested" \
+  || fail "(d) an unrelated repo's record blocked this PR's update"
+
+# (e) AN EXISTING-BUT-UNREADABLE RECORD BLOCKS. The guard cannot tell whether such a
+# file is bound to this head, and "I could not read it" is never a green.
+new_scen record-unreadable
+HEAD_RE="ebeb000000000000000000000000000000000000"
+stale_surface "$HEAD_RE"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RE"
+chmod 000 "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_admin_guarded 42
+rc=$?
+chmod 600 "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  pass "(e) SKIPPED — running as root, where a mode-000 file is still readable"
+else
+  [ "$rc" -ne 0 ] && pass "(e) an existing-but-UNREADABLE record refuses (exit $rc)" \
+    || fail "(e) an unreadable record was read as 'no record' and the update proceeded"
+  grep -q "update-branch" "$SCEN/calls" && fail "(e) the update was issued despite an unreadable record" \
+    || pass "(e) …and no update-branch write was issued"
+  grep -q "head could not be read" "$SCEN/err" \
+    && pass "(e) …naming the unreadable head as the reason" \
+    || fail "(e) the refusal does not say the head could not be read"
+fi
+
+# (f) NO RECORD AT ALL PERMITS THE WRITE — the remedy the refusal names is performed,
+# and pinning it is what keeps the guard from degrading into an unconditional refusal.
+new_scen record-absent-updates
+HEAD_RF="ecec000000000000000000000000000000000000"
+stale_surface "$HEAD_RF"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(f) this invocation still refuses (the refreshed head has no completed check) (exit $rc)" \
+  || fail "(f) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(f) …but with no record to strand, the update WAS requested" \
+  || fail "(f) the rail refused to update with no record present"
+grep -q "expected_head_sha=$HEAD_RF" "$SCEN/calls" \
+  && pass "(f) …pinned to the head this refusal was computed against" \
+  || fail "(f) the write is not pinned to the head: $(grep 'update-branch' "$SCEN/calls")"
+grep -q "the rail asked GitHub to bring the branch up to date" "$SCEN/out" \
+  && pass "(f) …and the rail reports the write it made (never a sha it has not read)" \
+  || fail "(f) the rail did not report the update it made: $(grep -c 'update' "$SCEN/out") line(s) mentioning update on stdout"
+
+# (g) A RECORD BOUND TO A DIFFERENT HEAD PERMITS THE WRITE. The head has moved since the
+# record was written, so this update strands nothing — the anti-over-block twin of (a).
+new_scen record-other-head-updates
+HEAD_RG="eded000000000000000000000000000000000000"
+stale_surface "$HEAD_RG"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "deb0deb0deb0deb0deb0deb0deb0deb0deb0deb0"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) the refusal still stands (exit $rc)" \
+  || fail "(g) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(g) …and a record bound to ANOTHER head does not block: the update was requested" \
+  || fail "(g) a record bound to a different head blocked this head's update"
+
+# (h) THE DRY RUN WRITES NOTHING AND CLAIMS NOTHING. The guard runs BEFORE the dry-run
+# branch, so a dry run is refused by a bound record exactly as a real run is — and with
+# no record it must reach the dry-run notice, not the update path.
+new_scen record-absent-dry-run
+HEAD_RH="eeee000000000000000000000000000000000000"
+stale_surface "$HEAD_RH"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_guarded 42 --dry-run
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) the dry run refuses (exit $rc)" || fail "(h) expected a refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(h) --dry-run ISSUED an update-branch write" \
+  || pass "(h) …and --dry-run issued NO write"
+grep -q "would bring the branch up to date" "$SCEN/out" \
+  && pass "(h) …saying it WOULD have brought the branch up to date" \
+  || fail "(h) the dry run does not say what it would have done"
+grep -q "the rail asked GitHub" "$SCEN/err" \
+  && fail "(h) the dry run claims the rail asked GitHub to update (it did not)" \
+  || pass "(h) …and claims no update it did not make"
+grep -q "NOT updating" "$SCEN/err" \
+  && fail "(h) the dry run reports the guard's refusal TEXT although no record blocked it" \
+  || pass "(h) …and reports no record refusal it did not take"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
