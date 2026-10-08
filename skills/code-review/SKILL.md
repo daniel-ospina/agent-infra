@@ -83,6 +83,41 @@ Provide a code review for the given pull request.
 
 ## Process (Full Review)
 
+### Step 0.01 — Reviewer Test Scope: DERIVE, never accept a hand-picked list (MANDATORY, always runs)
+
+**The controller must never tell the reviewer which test files to run.** Derive the scope from what CI
+actually selects for this diff, plus the importers/callers of every changed symbol:
+
+```bash
+gh pr diff <PR_NUMBER> --numstat          # or: the branch's merge-base diff
+# What CI would select for this diff (a repo-specific selector; here it is the tortoise tool):
+uv run python tools/ci_selection.py --changed-files - <<< "$CHANGED"
+# Plus: who imports/calls each changed symbol
+rg -ln '<changed_symbol>|<module_basename>' tests/ tools/ | head -30
+```
+
+Then **run what that returns**, and **name every file you did NOT run** in the review comment.
+
+**Why this is a gate and not advice — the observed failure.** On PR #7615 (2026-10-07/08) **three
+consecutive fresh-context review cycles reported clean while the head was measurably CI-RED**, and
+cycle 4 emitted `NO ISSUES FOUND` on a red head. The regression was live from revision 2 onward. It
+was missed because each reviewer was handed a fixed 3-file list that **did not contain the covering
+test** and was never asked to find it — the red was a `_BoomSDK.__getattr__` guard in
+`tests/longmem_eval/test_ingest_stall_guard.py`, a file nobody named. **CI caught what three reviews
+missed.** The mechanism is structural, not carelessness: scoping a reviewer by hand-picked files
+silently converts its question from *"is this change correct?"* into *"is this change correct within
+the files I thought of?"*, and the second question has a far smaller denominator.
+
+**Corollaries.**
+- **A review that reports clean without naming its test scope is not evidence.** The scope
+  declaration is part of the verdict.
+- **A P3 fixed in round N can introduce the red found in round N+1.** On #7615 a `finally` fold added
+  to satisfy a prior round's P3 was *half* of the regression; removing only it leaves the test red.
+  Re-run the derived scope after every fix, not just at the end.
+- **When a change's thesis is a totality claim** ("no X can ever…"), the claim itself is the testable
+  object — enumerate the domain from the **transport's actual refusals** (the engine/library error
+  strings), never from the list the change wrote down.
+
 ### Step 0 — Test Coverage Check (MANDATORY, always runs)
 
 Before reviewing code, check whether source changes are accompanied by test changes:
