@@ -668,7 +668,7 @@ refresh_pr_branch() {
     say_err "   The manual remedy below still applies."
     return 1
   }
-  info "admin-merge: ⇡ the rail brought the branch up to date with its base."
+  info "admin-merge: ⇡ the rail asked GitHub to bring the branch up to date with its base."
   info "   GitHub recomputes the merge-ref evaluation from this, which is a full check"
   info "   re-run on the new head. Re-run this rail once those checks complete — the update"
   info "   itself certifies nothing."
@@ -4566,16 +4566,23 @@ main() {
       say_err "   were produced, so the PR's green surface is STALE for it — it certifies a tree"
       say_err "   that no longer includes this red. This is the #1261 incident (a PR opened before"
       say_err "   the base went red and merged after)."
-      # #4764: PERFORM the remedy this refusal names. The rail asks GitHub to bring
-      # the head up to date with its base, which recomputes the merge-ref evaluation
-      # and re-runs the checks against the current base; THIS invocation still
-      # refuses, because the refreshed head has no completed check yet. Nothing is
-      # certified by the write — the refusal above is unchanged.
-      refresh_pr_branch "$PR" "$head" || true
-      say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
-      say_err "   recomputes the merge-ref evaluation (or re-run this PR's checks yourself) so it"
-      say_err "   covers the base's red. If this PR is the REPAIR, its own checks pass"
-      say_err "   on the re-measured tree and the merge then proceeds."
+      # #4764: PERFORM the remedy this refusal names — and then say which of the two
+      # outcomes actually happened. The helper returns 1 on --dry-run AND on a refused
+      # API call, so an unconditional "the update above …" would tell the lane a
+      # re-measurement is under way on a path where no new head was created and no
+      # check will ever run. THIS invocation still refuses either way (the refreshed
+      # head has no completed check yet), so the refusal above is unchanged.
+      if refresh_pr_branch "$PR" "$head"; then
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+        say_err "   recomputes the merge-ref evaluation, and its checks re-run against the base's"
+        say_err "   current head. If this PR is the REPAIR, its own checks then pass on the"
+        say_err "   re-measured tree and the merge proceeds."
+      else
+        say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
+        say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
+        say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
+        say_err "   on the re-measured tree and the merge then proceeds."
+      fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
@@ -4641,13 +4648,20 @@ main() {
       say_err "   base moves but does NOT re-run the PR's checks. This is the #1261 merge-ref-lag case."
       say_err "   Base red(s) this PR has not measured:"
       printf '%s\n' "$BASE_REDS" >&2
-      # #4764: the same performed remedy as step 4.6 — the lag this refusal names is
-      # exactly what update-branch clears, and the refusal still stands for THIS run.
-      refresh_pr_branch "$PR" "$head" || true
-      say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
-      say_err "   recomputes the merge ref against $BASE_SHA (or do it yourself — 'gh run rerun' the"
-      say_err "   PR's runs, or push an empty commit). If this PR"
-      say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
+      # #4764: the same performed remedy as step 4.6, with the same branch on its
+      # return — the lag this refusal names is exactly what update-branch clears, and
+      # the refusal still stands for THIS run.
+      if refresh_pr_branch "$PR" "$head"; then
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+        say_err "   recomputes the merge ref against $BASE_SHA and its checks re-run against it."
+        say_err "   If this PR is the REPAIR, its own checks then pass on the re-measured tree"
+        say_err "   and the merge proceeds."
+      else
+        say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
+        say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
+        say_err "   merge ref is recomputed against $BASE_SHA and the PR's checks evaluate it. If this PR"
+        say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
+      fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
