@@ -674,9 +674,19 @@ pr_review_record_blocks_update() {
   [ -n "${REPO:-}" ] && rargs=(--repo "$REPO")
   slug="$($GH repo view ${rargs[@]+"${rargs[@]}"} --json nameWithOwner \
       --jq .nameWithOwner 2>/dev/null || true)"
+  # ⛔ AN UNRESOLVED IDENTITY IS NOT A REASON TO SKIP THE CHECK. Both record paths are
+  # named after the canonical slug, so failing to resolve it would leave the qualified
+  # file unchecked and let the update strand the record this guard exists to protect.
+  # Refuse instead: the cost is one re-run, and every other step of this rail needs a
+  # working `gh` against this repo anyway.
+  if [ -z "$slug" ]; then
+    say_err "   ⛔ the repo identity could not be resolved ('gh repo view' returned nothing),"
+    say_err "      so an existing review record cannot be ruled out — refusing to move the head."
+    return 0
+  fi
   pr="${pr#"${pr%%[!0]*}"}"        # GitHub accepts 01631; the record path cannot
   [ -n "$pr" ] || pr="0"
-  [ -n "$slug" ] && cands+=("$HOME/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json")
+  cands+=("$HOME/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json")
   cands+=("$HOME/.pi/agent/reviews/$pr.json")
   expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
 
@@ -685,7 +695,7 @@ pr_review_record_blocks_update() {
     case "$f" in
       "$HOME/.pi/agent/reviews/$pr.json")
         rec_repo="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo") or "")' "$f" 2>/dev/null || true)"
-        if [ -n "$rec_repo" ] && [ -n "$slug" ] && [ "$rec_repo" != "$slug" ]; then
+        if [ -n "$rec_repo" ] && [ "$rec_repo" != "$slug" ]; then
           continue                      # a different repo's PR of the same number
         fi ;;
     esac
