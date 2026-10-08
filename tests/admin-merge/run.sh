@@ -374,6 +374,50 @@ case "$key" in
     # A per-lane fixture, when present, models the FILTERED listing; the bare
     # file models the unfiltered one (the bogus-zero window).
     if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
+    # ── #1417 S2: THE RAIL'S OWN BODY-EDIT PROBE ─────────────────────────────
+    # Recognised by the ONLY field combination no other caller asks for — event
+    # AND status AND conclusion AND workflowName. (The #1261 map arm has `event`
+    # WITHOUT status/conclusion; the raw supersede arm is keyed on
+    # `workflowDatabaseId`.) The output is the 5-field projection
+    # `LANE_RUN_EVENT_JQ` produces (`status  conclusion  id  event  workflowName`),
+    # derived from the SAME fixture the lane listing reads, so the two can never
+    # disagree about a run's state. `event-gen-<n>` is a per-call sequence for a
+    # generation that FINISHES while the rail waits; absent, the single fixture
+    # is served (and every pre-existing scenario is byte-identical).
+    want_event=0
+    case "$fields" in
+      *event*) case "$fields" in *status*|*conclusion*) case "$fields" in *workflowName*) [ "$want_raw" -eq 0 ] && want_event=1 ;; esac ;; esac ;;
+    esac
+    if [ "$want_event" = 1 ]; then
+      if [ "$mode" = "commit" ] && [ -f "$SCEN/event-gen-1" ]; then
+        en=$(( $(cat "$SCEN/event-list-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$en" > "$SCEN/event-list-count"
+        while [ "$en" -gt 1 ] && [ ! -f "$SCEN/event-gen-$en" ]; do en=$((en - 1)); done
+        f="$SCEN/event-gen-$en"
+      fi
+      if [ -f "$f" ]; then
+        awk -F'\t' 'NF>=6 { split($3,p,":"); printf "%s\t%s\t%s\t%s\t%s\n", $1, ($2==""?"-":$2), p[2], $6, $5 }' "$f" \
+          | { if [ -n "$limit" ]; then head -n "$limit"; else cat; fi; }
+      fi
+      exit 0
+    fi
+    if [ "$mode" = "commit" ]; then f="$SCEN/runs-$val"; else f="$SCEN/runs-main"; fi
+    # A per-lane fixture, when present, models the FILTERED listing; the bare
+    # file models the unfiltered one (the bogus-zero window).
+    if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
+    # ── #1417 S1: A SURFACE THAT CHANGES BETWEEN READS ───────────────────────
+    # The rail waits for the generation its own PR-body edit created and then
+    # RE-READS this surface (the whole point: a guard run that FAILS must be in
+    # the re-read set). A static fixture cannot model a run that finishes
+    # mid-wait, so `surface-gen-<n>` is one fixture per read of this `--commit`
+    # surface, in call order, the last one repeating once exhausted. Absent →
+    # every pre-existing scenario is byte-identical.
+    if [ "$mode" = "commit" ] && [ -f "$SCEN/surface-gen-1" ]; then
+      sn=$(( $(cat "$SCEN/surface-list-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$sn" > "$SCEN/surface-list-count"
+      while [ "$sn" -gt 1 ] && [ ! -f "$SCEN/surface-gen-$sn" ]; do sn=$((sn - 1)); done
+      f="$SCEN/surface-gen-$sn"
+    fi
     if [ "$want_raw" = 1 ]; then
       # The raw projection: the fixture verbatim (a legacy 3-field line is handed
       # over as-is, which is exactly how a line the lister did not produce reaches
@@ -842,6 +886,12 @@ lane_pass() {
   lane_jobset "$2" success 'test (a)' 'test (b)'
 }
 lane_queued() { lane_line in_progress "" "$1" "$2"; }
+# #1417: the six-field lane-run fixture the WIDER projections read — the parser's
+# RAW supersede listing (`status  conclusion  sha:id  workflow-id  workflow-name
+# event`) and, from the same fixture, the rail's body-edit EVENT probe. Only the
+# first three fields are the canonical lane line, so `lane_line`/`lane_fail`/
+# `lane_pass`/`lane_queued` fixtures remain valid inputs to every projection.
+lane_ev() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" 1 "$5" "$6"; }
 
 # A main baseline that EXEMPTS <id> under the #3756 decision: `n` tested runs (at
 # least the module's min_runs floor) in which <id> fails with the SAME signature.
@@ -9873,6 +9923,148 @@ lane_tested "$TMP/uw-rep.txt" python-ci.yml "$HEAD_UW" >"$TMP/uw-guard.txt" 2>&1
   || fail "(d) a head with NO tested run was certified"
 grep -q "NO tested run" "$TMP/uw-guard.txt" && pass "(d) …refusing on tested=0, not on the pending counter" \
   || { fail "(d) the refusal reason is not 'NO tested run'"; sed 's/^/      /' "$TMP/uw-guard.txt" | head -5; }
+
+# ── 69. #1417: the rail's own body-edit run generation is WAITED FOR, never a
+#        refusal — and a FAILING guard run still BLOCKS ────────────────────────
+#
+# MEASURED on agent-infra #1495 and #1633 (agent-infra#1417, comment
+# 6057991604). `[3/4] record` PATCHes the review marker into the PR body; that
+# `edited` activity re-triggers exactly the two NON-code-measuring guard
+# workflows (`pipeline-compliance` — #513's verdict binding — and
+# `workflow-lock`), creating two fresh runs 11-87s AFTER `[2/4] verify` certified
+# the head. `[4/4]` then refused with `run still in_progress` against the rail's
+# OWN work, throwing the round away. The fix waits (bounded) for exactly that
+# generation and RE-READS the surface, so a guard run that FAILS is in the
+# re-read failing set — the wait defers a refusal on an UNFINISHED run set, it
+# never excludes a failure.
+echo "== 69. #1417: the rail's own body-edit run generation is waited for =="
+
+# (a) THE MEASURED SHAPE — the observation that must STOP being a refusal. The
+# head's lane is green; the only unfinished runs are the two guard runs the body
+# edit created. `surface-gen-*`/`event-gen-*` model the same live surface
+# changing between reads: the generation is pending at the first read and
+# finished at the next.
+new_scen selfedit-wait
+HEAD_SE="e141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SE" > "$SCEN/head"
+# read 1 — the body edit's generation is queued/in progress (the measured shape).
+# The lane's own passing run is present in BOTH generations: the surface changes,
+# the lane does not.
+{ lane_pass "$HEAD_SE" 41001
+  lane_ev queued - "$HEAD_SE" 41002 'Pipeline Compliance' edited
+  lane_ev in_progress - "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' edited
+} > "$SCEN/surface-gen-1"
+# read 2+ — the generation finished GREEN
+{ lane_pass "$HEAD_SE" 41001
+  lane_ev completed success "$HEAD_SE" 41002 'Pipeline Compliance' edited
+  lane_ev completed success "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' edited
+} > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/runs-$HEAD_SE"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_pass mainse 41004 > "$SCEN/runs-main"
+lane_jobs 41002 'pipeline-compliance:success'
+lane_jobs 41003 'workflow-lock:success'
+write_pr_checks "$(check_run 5301 'ci / lint' completed skipped 7367 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7367 pull_request 'CI'
+main_green_surface
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) the rail's own body-edit generation no longer refuses the merge (exit 0)" \
+  || { fail "(a) the rail still refused its own body-edit generation (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "body-edit run generation (#1417) is still pending" "$SCEN/out" \
+  && pass "(a) …and it WAITED for the generation (the wait is exercised, not dead)" \
+  || fail "(a) the wait never ran — the scenario does not exercise #1417"
+grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge happened" || fail "(a) no merge attempted"
+[ -f "$SCEN/comment" ] && pass "(a) …with its head-bound evidence" || fail "(a) no evidence posted"
+
+# (b) THE SAFETY CONSTRAINT — A GUARD RUN THAT FAILS MUST STILL BLOCK, INCLUDING
+# `pipeline-compliance` (whose entire #513 purpose is to be able to fail here).
+# If the fix were an exclusion, this scenario would merge; it must not.
+new_scen selfedit-fail
+HEAD_SF="f141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head"
+GUARD_ID='tests/test_guard.py::test_marker_binding'
+lane_pass "$HEAD_SF" 41101 > "$SCEN/runs-$HEAD_SF"
+lane_pass mainsf 41105 > "$SCEN/runs-main"
+lane_jobs 41101 'test (a):success' 'test (b):success'
+lane_jobs mainsf 'test (a):success' 'test (b):success'
+log_failed "$GUARD_ID" > "$SCEN/log-41102"
+cp "$SCEN/log-41102" "$SCEN/log-after-41102"   # the guard run keeps failing on the re-run
+lane_ev queued - "$HEAD_SF" 41102 'Pipeline Compliance' edited > "$SCEN/surface-gen-1"
+lane_ev completed failure "$HEAD_SF" 41102 'Pipeline Compliance' edited > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_jobs 41102 'pipeline-compliance:failure'
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a FAILING pipeline-compliance run still BLOCKS (exit $rc)" \
+  || fail "(b) a FAILING guard run was excluded from the decision — the fix is a false-merge hole"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge may be attempted when the guard run is red" \
+  || pass "(b) no merge attempted"
+[ -f "$SCEN/comment" ] && fail "(b) no evidence may be posted for a red guard run" \
+  || pass "(b) no evidence comment posted"
+grep -q "test_marker_binding" "$SCEN/err" \
+  && pass "(b) …and the guard run's failure is NAMED in the refusal" \
+  || { fail "(b) the guard run's failure did not reach the decision"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+
+# (c) THE OTHER SAFETY CONSTRAINT — A RUN THE RAIL DID NOT CREATE IS STILL
+# COUNTED. A push (`synchronize`) is not a body edit and must never be waited
+# for; §1b's unchanged lane-terminal refusal decides.
+new_scen selfedit-foreign
+HEAD_SX="a141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SX" > "$SCEN/head"
+lane_pass "$HEAD_SX" 41201 > "$SCEN/runs-$HEAD_SX"
+lane_ev in_progress - "$HEAD_SX" 41202 'Python CI' synchronize >> "$SCEN/runs-$HEAD_SX"
+lane_pass mainsfx 41205 > "$SCEN/runs-main"
+printf 'in_progress\n' > "$SCEN/status-41202"
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a PUSH's pending run still blocks (exit $rc)" \
+  || fail "(c) a foreign pending run was waited for or ignored — the scoping is too wide"
+grep -q "NOT only the rail's own body-edit run generation" "$SCEN/err" \
+  && pass "(c) …and the rail NAMES that the pending run is not its own" \
+  || { fail "(c) the foreign-pending branch was not reached"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "run still in_progress" "$SCEN/err" \
+  && pass "(c) …then falls through to the UNCHANGED lane-terminal refusal" \
+  || fail "(c) the lane-terminal refusal did not fire for a foreign pending run"
+grep -q "pr merge" "$SCEN/calls" && fail "(c) no merge may be attempted while a foreign run is pending" \
+  || pass "(c) no merge attempted"
+
+# (d) FAIL CLOSED AT THE BOUND. A guard generation that never finishes must
+# still refuse — the wait removes a false refusal, it never creates a merge.
+new_scen selfedit-bound
+HEAD_SB="b141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SB" > "$SCEN/head"
+lane_pass "$HEAD_SB" 41301 > "$SCEN/runs-$HEAD_SB"
+lane_pass mainsb 41305 > "$SCEN/runs-main"
+lane_ev in_progress - "$HEAD_SB" 41302 'Pipeline Compliance' edited > "$SCEN/surface-gen-1"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_SELF_EDIT_WAIT=1 bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) a guard generation still pending at the bound refuses (exit $rc)" \
+  || fail "(d) an unfinished guard generation certified a merge"
+grep -q "STILL pending after 1s" "$SCEN/err" \
+  && pass "(d) …and the bound is what refused it, named with the knob" \
+  || { fail "(d) the refusal was not the wait bound"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "pr merge" "$SCEN/calls" && fail "(d) no merge may be attempted at the bound" || pass "(d) no merge attempted"
+
+# (e) THE KNOB IS VALIDATED LIKE EVERY OTHER TIMING KNOB — an unreadable bound
+# makes the comparison ERROR (test returns 2, the body is SKIPPED), and a skipped
+# bound inside a wait loop is the fail-open this rail refuses elsewhere.
+new_scen selfedit-knob
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=ten bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a non-numeric ADMIN_MERGE_SELF_EDIT_WAIT is refused (exit 2)" \
+  || fail "(e) a non-numeric wait bound was not refused (exit $rc)"
+grep -q "ADMIN_MERGE_SELF_EDIT_WAIT='ten'" "$TMP/err" \
+  && pass "(e) …and the refusal names the knob and its value" \
+  || { fail "(e) the refusal does not name the knob"; sed 's/^/      /' "$TMP/err"; }
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=0300 bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a LEADING-ZERO bound is refused (the octal/decimal split)" \
+  || fail "(e) a leading-zero bound was accepted (exit $rc)"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
