@@ -790,6 +790,36 @@ run_admin_here() {
   return $?
 }
 
+# run_admin_bounded <secs> <rail args...> — run_admin_here under a WALL-CLOCK
+# bound, because a HANG is not a slow test: an unbounded `run_admin` does not
+# FAIL on one, it never returns — the suite (and the CI job) would sit there
+# until the runner's own multi-hour cap, reading as a slow lane rather than a
+# broken rail. That is exactly how #1635 hid: `admin-merge.sh 7653` spun 67
+# CPU-minutes with no verdict and no output. Returns the rail's own exit status,
+# or 124 (the `timeout(1)` convention) when the bound fired. `timeout(1)` itself
+# is not used — it is GNU-only and ABSENT on macOS, where this rail runs.
+run_admin_bounded() {
+  local secs="$1"; shift
+  local pid waited=0 rc=0
+  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1
+    waited=$((waited + 1))
+    if [ "$waited" -ge "$secs" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null; rc=$?
+      # Only a SIGKILL we sent reports 137. A rail that finished on its own in
+      # this same second is reaped by the `wait` with its OWN status, so a
+      # completed run is never mislabelled a timeout.
+      [ "$rc" -eq 137 ] && return 124
+      return "$rc"
+    fi
+  done
+  wait "$pid"
+}
+
 # ── bound-based wait fixtures (#1167 follow-on) ────────────────────────────
 # A remote run has NO within-job activity signal: `updatedAt` advances on
 # job/step transitions, so one long step freezes it for the whole job. The wait
@@ -915,6 +945,19 @@ pr_changed_files() {
   : > "$SCEN/pr-changed-files"
   local p
   for p in "$@"; do printf '%s\n' "$p" >> "$SCEN/pr-changed-files"; done
+}
+
+# pr_changed_files_n <n> [prefix] → an n-file changed set. The #1635 guard: the
+# rail reads this set ONE LINE PER CHANGED FILE, so its SIZE is the variable that
+# matters, and every pre-existing fixture here used 1–3 files (which is why a
+# set-size pathology survived the whole suite). The set is BUILT, not committed.
+pr_changed_files_n() {
+  local n="$1" prefix="${2:-src/generated}" i=0
+  : > "$SCEN/pr-changed-files"
+  while [ "$i" -lt "$n" ]; do
+    printf '%s/module_%04d/handler.py\n' "$prefix" "$i" >> "$SCEN/pr-changed-files"
+    i=$((i + 1))
+  done
 }
 
 # ── THE RESOLVED-INTERPRETER PROOF (the pin that makes M6 go RED) ────────
@@ -9709,6 +9752,42 @@ grep -q "LANE INAPPLICABLE" "$SCEN/err" \
 grep -q "lane: python-ci.yml" "$SCEN/out" \
   && pass "(e) …and the certificate still names the requested lane" \
   || fail "(e) the certificate no longer names the lane that was actually used"
+
+# ── (f) #1635: A LARGE CHANGED SET IS DECIDED, NOT HUNG ─────────────────────
+# The lane-applicability leg reads the PR's changed set — ONE LINE PER CHANGED
+# FILE — and asks whether it is blank. Asked with a GLOBAL PATTERN SUBSTITUTION
+# (`${list//[[:space:]]/}`) that re-scans the whole value once per match, the
+# answer is superlinear in the set (measured on this box: 7 KB → 5.2s, 15 KB →
+# 39s, 32 KB → over 90s at 84% CPU), and a real 2265-file PR (173 KB) burned 67
+# CPU-minutes and NEVER reached a verdict (`admin-merge.sh 7653`; `bash -x`
+# stopped dead on that line, the process held no child and emitted nothing
+# more). Every fixture in this suite used 1–3 paths, which is why the pathology
+# survived review: a LARGE input is not a constructor, but nothing here ever
+# produced one.
+#
+# The bound is the assertion. A hang is not a slow test — an unbounded
+# `run_admin` would not fail, it would never return — so the run is bounded by
+# WALL CLOCK and 25s is orders of magnitude over the correct path (milliseconds)
+# and well under the old construct's ~150s at this size.
+new_scen laneapp_largechanged
+HEAD_LF="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LF" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  pull_request:\n    paths:\n      - src/**\n'
+pr_changed_files_n 700 src/generated
+: > "$SCEN/runs-$HEAD_LF"
+lane_fail mainfeed 20051 > "$SCEN/runs-main"
+run_admin_bounded 25 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 124 ] \
+  && fail "(f) #1635: a 700-file changed set produced NO verdict within 25s — the rail HANGS on a large diff (the whole defect)" \
+  || pass "(f) #1635: a 700-file changed set is decided inside the bound (exit $rc)"
+grep -q 'pulls/42/files' "$SCEN/calls" \
+  && pass "(f) …and the big changed set really was READ (the bound is on the real leg, not on a skipped one)" \
+  || fail "(f) the rail never consulted the changed-file list — this scenario did not exercise the leg it bounds"
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(f) …with the decision UNCHANGED: the lane still refuses for the not-tested reason" \
+  || fail "(f) the large-diff decision changed shape: $(grep -m1 . "$SCEN/err" 2>/dev/null || echo '(no stderr)')"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted" || pass "(f) no merge attempted"
 
 # ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
 # GitHub can leave a workflow run `queued` FOREVER without ever creating a job for

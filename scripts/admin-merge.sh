@@ -2486,12 +2486,21 @@ lane_applicable() {
     return 0
   fi
   read_pr_changed_paths
-  # `//[[:space:]]/` and not a bare `-z`: a WHITESPACE-ONLY value passes `-z` but
-  # is not a changed set, and the predicate reads an empty list as "matches
-  # nothing" — the two together would file an unmeasured lane as INAPPLICABLE.
-  # The predicate collapses an all-blank list to undecidable too (#1614 review);
-  # this leg keeps the rail's own reason line honest as well.
-  if [ -z "${WF_PR_CHANGED_PATHS//[[:space:]]/}" ]; then
+  # A WHITESPACE-ONLY value is not a changed set (a bare `-z` misses it), and the
+  # predicate reads an empty list as "matches nothing" — the two together would
+  # file an unmeasured lane as INAPPLICABLE. The predicate collapses an all-blank
+  # list to undecidable too (#1614 review); this leg keeps the rail's own reason
+  # line honest as well.
+  #
+  # ⛔ NOT `${WF_PR_CHANGED_PATHS//[[:space:]]/}` (#1635). A global pattern
+  # substitution re-scans the WHOLE value once per match, and a changed set is
+  # one line PER CHANGED FILE: at 2265 files (173 KB) it did not finish in an
+  # hour — `admin-merge.sh 7653` burned 67 CPU-minutes at 84.5% and never
+  # reached a verdict, `-x` stopping dead on this line. `tr`'s whitespace class
+  # is the same SET as the glob's, scanned ONCE, left-to-right: 0.10s at 173 KB
+  # and flat in the input. (`tr -d '[:space:]'` is already this file's idiom for
+  # the same "is this blank?" question — see the two uses in `build_evidence`.)
+  if [ -z "$(printf '%s' "$WF_PR_CHANGED_PATHS" | tr -d '[:space:]')" ]; then
     LANE_APPLICABILITY_REASON="the PR's changed-file list could not be READ, so the lane's applicability is UNMEASURED"
     return 0
   fi
