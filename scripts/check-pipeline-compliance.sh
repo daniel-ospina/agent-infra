@@ -938,6 +938,13 @@ run_checks() {
     # false PASS whose merge performs a closure the author disclaimed. The
     # sentinel cannot equal any close-ref: every ref all_close_refs emits is a
     # normalized ref carrying a '#'.
+    #
+    # #1630 (P2, disclosed) — a SECOND consequence, and it too is the
+    # conservative direction: with nothing suppressed, a traceability body that
+    # merely QUOTES a closing keyword in inline code — for its own issue — now
+    # hard-fails, where it previously passed with the H2 advisory. That is not a
+    # regression but the invariant above all_close_refs finally applying here:
+    # inline code is NOT suppressed anywhere in the blocking path.
     hazard_intended="$issue_ref"
     [[ "$issue_ref_kind" == "traceability" ]] && hazard_intended="__no_intended_close__"
     close_hazards="$(scan_close_word_hazards "$PR_BODY" "${hazard_intended:-${GH_REPO}#${issue_number}}")"
