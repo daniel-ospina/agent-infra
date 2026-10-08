@@ -85,42 +85,51 @@ Provide a code review for the given pull request.
 
 ### Step 0.0 — Reviewer Test Scope: DERIVE, never accept a hand-picked list
 
-**On a full review, before the coverage check below.** The routing below is explicit so this step is
-not silently skipped: it applies to the full review and to `--re-review` (on the fix-commit delta);
-the `--standard-tier` path starts at Step 1 and does not run it.
+**On a full review, before the coverage check below.** It applies to the full review. The
+`--standard-tier` path starts at Step 1 and does **not** run it, and `--re-review` skips to Smart
+Re-Review (Step A) — so on a re-review, derive the scope on the fix-commit delta yourself before
+continuing; do not assume this step ran.
 
-**The controller must pass the reviewer the DIFF, never a file list.** The reviewer derives its own
-scope: it runs the repo's CI selector for that diff, runs the selected set, and names every file it
-did not run.
+**The controller must pass the reviewer the DIFF, never a hand-picked list of TEST files.** (Affected
+files as review context, per Step 4, are a different thing.) The reviewer derives its own scope: it
+runs the repo's CI selector for that diff, runs `test_files` from the JSON — expanding the sentinel
+`"ALL"` to the full suite; `slow_selected` is only the slow leg — and names every file it did not run.
 
 ```bash
-# The repo's CI diff selector — the SAME invocation CI uses, not an approximation.
+# The repo's CI diff selector. Guard the INPUT, not the selector's output: an empty or
+# failed file fetch makes the selector answer with a plausible tier-1 smoke set (full=false,
+# slow_run=false, carve_out_run=false) — a silently stripped suite that still reports green.
 CHANGED="$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>/files?per_page=100" --paginate --jq '.[].filename')"
+if [ -z "${CHANGED//[[:space:]]/}" ]; then
+  echo "changed-file list EMPTY (or the fetch failed) — UNAVAILABLE, not 'no tests'"; exit 1
+fi
 printf '%s\n' "$CHANGED" | uv run python tools/ci_selection.py --changed-files - --event pull_request
 # Then the callers/importers of every changed symbol (unbounded — do not cap this):
 rg -ln '<changed_symbol>|<module_basename>' --glob '!*.md'
 ```
+
+An empty **changed-file list** is UNAVAILABLE, never "no tests". Do not test the selector's output
+for emptiness — it never is. This mirrors what CI and the rail already do: CI refuses an empty
+`$BASE...HEAD` set before invoking the selector (`#3442`: *refusing to certify this head on the
+tier-1 smoke alone*), and the rail guards it whitespace-aware (`an unavailable answer, not a diff
+with no files`).
 
 **The selector is repo-specific.** `tools/ci_selection.py` is the **tortoise** tool; agent-infra,
 eldato and premise-labs do not have it, and this snippet will not run there. The portable rule is:
 *use the repo's CI diff selector; if the repo has none, derive the scope from its test-file→source
 mapping.* Substitute your repo's selector for the snippet above.
 
-**An empty selection is an UNAVAILABLE answer, never "no tests".** This is measured, not
-hypothetical: `scripts/admin-merge.sh` records that the tortoise selector answers
-`slow_run=false carve_out_run=false` on an empty file list — i.e. it would forgive all three
-diff-gated legs. If the selector returns nothing, **stop and report the empty input**; do not
-conclude that there is nothing to run.
-
 **Why this is a gate and not advice — the observed failure.** On tortoise PR #7615 the head
 `8b7ac2d559` was CI-red on
 `tests/longmem_eval/test_ingest_stall_guard.py::test_ingest_haystack_v2_aborts_stalled_question`
 (`AssertionError: SDK touched during a stalled ingest: _graph_write_retry_count`, shard `test (g)`,
-run `37684958263`) — while a fresh-context review **on that same sha** returned `NO ISSUES FOUND`.
-The red was found by CI afterwards, not by the review. The guard that fired is a
-`_BoomSDK.__getattr__` that raises on any attribute access; it lives in a file the reviewer was not
-told to run. **Do not cite a count of clean cycles you cannot point at an artifact for** — cite the
-sha, the failing test, and the permalink of the clean verdict at that sha.
+run `37684958263`, completed `failure` at 20:51:52Z) — while a fresh-context review **on that same
+sha**, posted 21:21:26Z
+([comment](https://github.com/daniel-ospina/tortoise/pull/7615#issuecomment-6047099958)), returned
+`NO ISSUES FOUND`. The guard that fired is a `_BoomSDK.__getattr__` that raises on any attribute
+access; it lives in a file the reviewer was not told to run. **Do not cite a count of clean cycles
+you cannot point at an artifact for** — cite the sha, the failing test, and the permalink of the
+clean verdict at that sha.
 
 The mechanism is structural, not carelessness: scoping a reviewer by hand-picked files silently
 converts its question from *"is this change correct?"* into *"is this change correct within the
