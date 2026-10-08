@@ -10068,7 +10068,10 @@ grep -q "update-branch" "$SCEN/calls" \
 grep -q "would bring the branch up to date" "$SCEN/out" \
   && pass "(h) …saying it WOULD have brought the branch up to date" \
   || fail "(h) the dry run does not say what it would have done"
-grep -q "the rail asked GitHub" "$SCEN/err" \
+# The success path prints its claim on STDOUT, so this must read `out`: grepping `err`
+# made the assertion unfalsifiable, because only the API-failure arm writes that text to
+# stderr and this scenario has no failure fixture.
+grep -q "the rail asked GitHub" "$SCEN/out" \
   && fail "(h) the dry run claims the rail asked GitHub to update (it did not)" \
   || pass "(h) …and claims no update it did not make"
 grep -q "NOT updating" "$SCEN/err" \
@@ -10162,6 +10165,64 @@ grep -q "update-branch" "$SCEN/calls" \
 grep -q "repo identity could not be resolved" "$SCEN/err" \
   && pass "(l) …naming the unresolvable identity as the reason" \
   || fail "(l) the refusal does not name the unresolvable identity"
+
+# (m) A REVIEW STORE THAT CANNOT BE SEARCHED IS NOT AN ABSENT RECORD. `[ -e "$f" ]`
+# cannot tell ENOENT from EACCES, so a `~/.pi/agent/reviews` without its read/search
+# bits made every candidate look absent and let the update proceed — measured as a live
+# fail-open (store at mode 000: the guard returned ALLOW and printed "No review record
+# was left stale by this update"). The record is present and bound to the head, and the
+# store arm must refuse BEFORE any candidate path is read. The directory is restored
+# after the run so the suite's own tree walk can remove the scenario.
+new_scen record-store-unsearchable
+HEAD_RM="f5f5000000000000000000000000000000000000"
+stale_surface "$HEAD_RM"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RM"
+chmod 000 "$SCEN/home/.pi/agent/reviews"
+run_admin_guarded 42
+rc=$?
+chmod 700 "$SCEN/home/.pi/agent/reviews" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  # A mode-000 directory is still searchable as root, so the case cannot distinguish the
+  # store arm from a permitted update — SKIP rather than assert a false pass.
+  pass "(m) SKIPPED — running as root, where a mode-000 directory is still searchable"
+else
+  [ "$rc" -ne 0 ] && pass "(m) an UNSEARCHABLE review store refuses the update (exit $rc)" \
+    || fail "(m) an unsearchable store made every record look absent and the update proceeded"
+  grep -q "update-branch" "$SCEN/calls" \
+    && fail "(m) the update was issued although the review store could not be searched" \
+    || pass "(m) …and no update-branch write was issued"
+  grep -q "exists but cannot be searched" "$SCEN/err" \
+    && pass "(m) …naming the unsearchable store as the reason" \
+    || fail "(m) the refusal does not say the store could not be searched"
+fi
+
+# (n) `GH_REPO` IS A RECORD-KEY SPELLING. `record-review.sh` resolves the repo it was
+# handed through `GH_REPO` when no `--repo`/positional is given, and writes the
+# qualified name VERBATIM; the merge gate resolves the record through that same
+# spelling. A guard that checked only the canonical slug and `$REPO` therefore read a
+# path the writer never wrote and moved the head out from under the record — the
+# fail-open pinned shut here.
+# NOTE: the GH_REPO spelling and the canonical slug differ only by CASE (there is no
+# non-case spelling of the SAME repo), so on a case-INSENSITIVE filesystem — macOS
+# default — the canonical candidate resolves the same file and the write assertion
+# cannot discriminate. This case pins the bug where it is observable (Linux, i.e. CI),
+# exactly as (b) does for the `--repo` spelling.
+new_scen record-ghrepo-spelling
+HEAD_RN="f6f6000000000000000000000000000000000000"
+stale_surface "$HEAD_RN"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "Daniel-Ospina-Agent-Infra-42.json" "$HEAD_RN"
+# GH_REPO is exported into the rail for THIS case only: the prefix assignment is placed
+# in run_admin_guarded's own environment and is therefore inherited by the `bash "$ADM"`
+# it launches (verified: the child sees it, the parent does not).
+GH_REPO=Daniel-Ospina/Agent-Infra run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n) a record filed under the GH_REPO spelling refuses the update (exit $rc)" \
+  || fail "(n) the rail merged with a GH_REPO-spelled record bound to the head (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(n) the GH_REPO spelling was NOT checked: the update proceeded although 'Daniel-Ospina-Agent-Infra-42.json' is bound to the head" \
+  || pass "(n) …and no update-branch write was issued"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
