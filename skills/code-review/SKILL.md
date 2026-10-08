@@ -91,9 +91,20 @@ Re-Review (Step A) — so on a re-review, derive the scope on the fix-commit del
 continuing; do not assume this step ran.
 
 **The controller must pass the reviewer the DIFF, never a hand-picked list of TEST files.** (Affected
-files as review context, per Step 4, are a different thing.) The reviewer derives its own scope: it
-runs the repo's CI selector for that diff, runs `test_files` from the JSON — expanding the sentinel
-`"ALL"` to the full suite; `slow_selected` is only the slow leg — and names every file it did not run.
+files as review context, per Step 4, are a different thing.) The reviewer derives its own scope and
+names every file it did not run.
+
+**Run the legs CI runs — not just `test_files`.** The selector subtracts the other legs out of
+`test_files`, so a reviewer who runs only that set has a *smaller* denominator than CI, which is the
+defect this step exists to prevent:
+
+| JSON field | Run it when |
+|---|---|
+| `test_files` | always — if the value is the sentinel `"ALL"`, expand it to the full suite |
+| `slow_selected` | `slow_run` is true (CI's `test-slow`, gated on `slow_run == 'true'`) |
+| the carve-out leg | `carve_out_run` is true (CI's `test-carve-out`); the JSON carries the flag but not the file list — read it from the repo's CI surface config |
+
+If you deliberately leave a leg to CI, say so and name it as not-run. Do not silently drop one.
 
 ```bash
 # The repo's CI diff selector. Guard the INPUT, not the selector's output: an empty or
