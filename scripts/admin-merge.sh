@@ -2491,7 +2491,27 @@ lane_applicable() {
   # nothing" — the two together would file an unmeasured lane as INAPPLICABLE.
   # The predicate collapses an all-blank list to undecidable too (#1614 review);
   # this leg keeps the rail's own reason line honest as well.
-  if [ -z "${WF_PR_CHANGED_PATHS//[[:space:]]/}" ]; then
+  #
+  # ⛔ NOT a global `//[[:space:]]/` replace of $WF_PR_CHANGED_PATHS. That global
+  # substitution is super-linear in bash 3.2 and NEVER completes on a large changed set: measured
+  # on /bin/bash 3.2.57 — 50 paths 3.5 s, 100 paths 21.5 s, 200 paths > 25 s, and
+  # PR #7653's 2,265 paths (173 KB) unbounded past 60 s. That hung the whole rail
+  # SILENTLY (header printed, no verdict, no timeout) so a large PR could not be
+  # landed at all and a watcher could not tell a hang from slow work (#7702).
+  # A `case` glob match is ONE linear pass and tests exactly the same thing —
+  # "does the value contain any non-whitespace character" — so it is not a weaker
+  # guard, only a cheaper one. Do not reintroduce a //...// expansion here.
+  # The `:-` is load-bearing for EXACT equivalence: the old form tolerated an UNSET
+  # variable (`[ -z "${V//…}" ]` on unset V is a no-op under `set -u`), while a bare
+  # `case "$V" in` aborts with "unbound variable". The variable is initialised at
+  # 2375 and always assigned by read_pr_changed_paths() before this line, so the case
+  # is unreachable today — but a future refactor must not turn a fail-closed
+  # UNMEASURED into a hard abort.
+  local _paths_has_nonspace=""
+  case "${WF_PR_CHANGED_PATHS:-}" in
+    *[![:space:]]*) _paths_has_nonspace=1 ;;
+  esac
+  if [ -z "$_paths_has_nonspace" ]; then
     LANE_APPLICABILITY_REASON="the PR's changed-file list could not be READ, so the lane's applicability is UNMEASURED"
     return 0
   fi
