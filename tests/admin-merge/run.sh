@@ -9937,9 +9937,12 @@ grep -q "NOT updating" "$SCEN/err" \
 # string, and `gh` accepts any case for the same repo — there is no non-case
 # difference that names the SAME repo), so on a case-INSENSITIVE filesystem — macOS
 # default — the canonical candidate resolves the same file and neither the write
-# assertion nor the path in the refusal can discriminate. This case pins the bug
-# where it is observable (Linux, i.e. CI); the case-insensitive half of the same
-# defect is pinned FILESYSTEM-INDEPENDENTLY by (c), which compares a string field.
+# assertion nor the path in the refusal can discriminate. This case, and (n), are
+# therefore VACUOUS on such a filesystem: they pin the bug where it is observable
+# (Linux, i.e. CI), and the case-sensitive proof for this defect was made
+# OUT-OF-BAND, against the pre-fix rail. (c) does NOT stand in for them — it compares
+# a string field and exercises a DIFFERENT code path (the legacy `<pr>.json` repo
+# field, not the derivation of the qualified name from the spelling the writer got).
 new_scen record-verbatim-spelling
 HEAD_RV="e8e8000000000000000000000000000000000000"
 stale_surface "$HEAD_RV"
@@ -10003,7 +10006,7 @@ run_admin_guarded 42
 rc=$?
 chmod 600 "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json" 2>/dev/null || true
 if [ "$(id -u)" = "0" ]; then
-  pass "(e) SKIPPED — running as root, where a mode-000 file is still readable"
+  pass "⚠️ SKIPPED (e) — root shell: mode 000 is still readable, so the refusal cannot be asserted here (it DOES run in CI, where the suite is non-root)"
 else
   [ "$rc" -ne 0 ] && pass "(e) an existing-but-UNREADABLE record refuses (exit $rc)" \
     || fail "(e) an unreadable record was read as 'no record' and the update proceeded"
@@ -10185,7 +10188,7 @@ chmod 700 "$SCEN/home/.pi/agent/reviews" 2>/dev/null || true
 if [ "$(id -u)" = "0" ]; then
   # A mode-000 directory is still searchable as root, so the case cannot distinguish the
   # store arm from a permitted update — SKIP rather than assert a false pass.
-  pass "(m) SKIPPED — running as root, where a mode-000 directory is still searchable"
+  pass "⚠️ SKIPPED (m) — root shell: a mode-000 directory is still searchable, so the refusal cannot be asserted here (it DOES run in CI, where the suite is non-root)"
 else
   [ "$rc" -ne 0 ] && pass "(m) an UNSEARCHABLE review store refuses the update (exit $rc)" \
     || fail "(m) an unsearchable store made every record look absent and the update proceeded"
