@@ -698,6 +698,10 @@ pr_review_record_blocks_update() {
   [ "$n" != "${nums[0]}" ] && nums+=("$n")
   # ...and the spelling the caller gave, which `record-review.sh` writes verbatim
   [ -n "${REPO:-}" ] && keys+=("$REPO")
+  # `record-review.sh` also writes the qualified name from `GH_REPO` (that is its repo
+  # resolution), and the merge gate resolves the record through `GH_REPO` as well — so an
+  # environment-only spelling is a real key, exactly like `--repo`.
+  [ -n "${GH_REPO:-}" ] && keys+=("$GH_REPO")
   for k in "${keys[@]}"; do
     for n in "${nums[@]}"; do
       cands+=("$HOME/.pi/agent/reviews/${k%/*}-${k#*/}-$n.json")
@@ -708,6 +712,15 @@ pr_review_record_blocks_update() {
   done
   expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
 
+  # ⛔ A STORE THAT CANNOT BE SEARCHED IS NOT AN ABSENT RECORD. `[ -e ]` cannot tell ENOENT
+  # from EACCES, so a `~/.pi/agent/reviews` without its search/read bits would make every
+  # candidate below look absent and let the update strand a record it never saw.
+  local rdir="$HOME/.pi/agent/reviews"
+  if [ -e "$rdir" ] && { [ ! -r "$rdir" ] || [ ! -x "$rdir" ]; }; then
+    say_err "   ⛔ the review store at $rdir exists but cannot be searched — refusing,"
+    say_err "      because a record bound to this head cannot be ruled out."
+    return 0
+  fi
   for f in "${cands[@]}"; do
     [ -e "$f" ] || [ -L "$f" ] || continue
     # ⛔ "EXISTS BUT IS NOT A READABLE REGULAR FILE" IS NOT "NO RECORD". A directory, a
@@ -4769,8 +4782,10 @@ main() {
   #
   # WHY IT DOES NOT OVER-BLOCK THE REPAIR. A PR that repairs a red base must be
   # evaluated against a base that CONTAINS the red; if its merge ref lags, the
-  # refusal names a re-triggered check run as the remedy (an event that does not
-  # move the head), and re-triggering recomputes the merge ref against the current
+  # remedy is a RE-MEASUREMENT against the current base — the refusals below say
+  # "RE-MEASURE … then re-run the rail", and a re-triggering event that does not move
+  # the head is named where the guard declines to move one. Re-measuring recomputes
+  # the merge ref against the current
   # base. A `gh run rerun` does NOT: it re-executes the SAME merge commit, so it
   # re-measures the ref that was already lagging. Once the checks have re-measured
   # the current base, a genuine repair is green on its own tree (step 4.5) and 4.6
