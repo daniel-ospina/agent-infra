@@ -813,18 +813,43 @@ esac
 # share ONE constant digest: the collision ⇒ false-accept direction #1398 exists
 # to prevent. So the body is classified by what it IS.
 #
-# A body is an ERROR OBJECT when it carries no entry boundary AND is a single-line
-# JSON object declaring an HTTP status. The single-line+JSON shape is deliberate:
-# a REAL diff can legitimately contain the literal `"code":"too_large"` on an
-# added line (this fix's own test fixtures do), and a bare substring match would
-# demote a valid under-cap diff to the fallback. A diff is many lines and starts
-# with `diff --git`; an error body is one line and starts with `{`.
+# A body is an ERROR OBJECT when it carries no entry boundary AND is (however
+# WRAPPED) a JSON object declaring an HTTP status or the `too_large` code. The
+# entry-boundary exclusion runs FIRST and alone holds the invariant that a real
+# diff is never demoted: a diff always carries `diff --git`, so the exclusion
+# fires before any JSON test, and its content lines are prefixed (`+`, `-`, ` `)
+# so no diff line can even begin with `{`. Once a body is known NOT to be a diff,
+# the only remaining question is WHICH non-diff it is — so the JSON test is
+# deliberately insensitive to how the envelope is formatted.
+#
+# That insensitivity is the point. An earlier revision additionally required the
+# body to be a SINGLE LINE (`grep -c ''` ≤ 1), which classified today's real GitHub
+# 406 only because GitHub emits it on one line. A PRETTY-PRINTED or re-wrapped 406
+# then fell through the size-cap arm and the local fallback was SKIPPED —
+# returning the oversized PR to the very unlandability #1398 exists to remove —
+# and the operator was misdiagnosed. The MEASURED 406 exits NON-ZERO with the
+# envelope on stdout, so it fell to the retryable `unavailable` arm and the
+# warning blamed gh/auth/network (and retried a STRUCTURAL refusal); a 2xx
+# non-diff fell to `nondiff` and blamed a missing entry boundary. Either way the
+# issue's misdiagnosis half re-entered through a different door. (The finding's
+# short form said "falls to `nondiff`": true for the exit-0 shape, while the
+# exit-1 shape is the measured one — 11.11n–p cover both.) The line count was
+# never what protected a real diff — the boundary exclusion precedes it — it only
+# made the classifier formatting-dependent.
 diff_body_is_error_object() { # <file> -> 0 when the body IS a JSON error object
+  local flat
   [ -s "$1" ] || return 1
   command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
-  [ "$(command grep -c '' "$1" 2>/dev/null)" -le 1 ] || return 1
-  command grep -qE '^\{.*"status"[[:space:]]*:[[:space:]]*"?[45][0-9]{2}"?.*\}$' "$1" 2>/dev/null && return 0
-  command grep -qE '^\{.*"code"[[:space:]]*:[[:space:]]*"too_large".*\}$' "$1" 2>/dev/null && return 0
+  # Flatten the (non-diff, therefore bounded) envelope so a one-line and a
+  # pretty-printed / re-wrapped JSON object classify identically, then trim the
+  # surrounding whitespace so `^\{` / `\}$` are not layout-dependent. A HERE-STRING,
+  # not a pipe: `tr … | grep -q` under this script's `set -o pipefail` can report a
+  # FALSE NEGATIVE when grep matches early and tr takes SIGPIPE (#841).
+  flat="$(command tr -d '\r\n' < "$1" 2>/dev/null || true)"
+  flat="${flat#"${flat%%[![:space:]]*}"}"     # trim leading whitespace
+  flat="${flat%"${flat##*[![:space:]]}"}"     # trim trailing whitespace
+  command grep -qE '^\{.*"status"[[:space:]]*:[[:space:]]*"?[45][0-9]{2}"?.*\}$' <<<"$flat" 2>/dev/null && return 0
+  command grep -qE '^\{.*"code"[[:space:]]*:[[:space:]]*"too_large".*\}$' <<<"$flat" 2>/dev/null && return 0
   return 1
 }
 # The specific STRUCTURAL failure: GitHub refuses to render a diff above 300

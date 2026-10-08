@@ -1421,7 +1421,81 @@ STUB_DIFF_406_FILE="$CAP406" STUB_LOCAL_BASE="$LB_BASE" STUB_LOCAL_HEAD="$LB_HEA
   RECORD_REVIEW_LOCAL_REPO="$L_BIN" RECORD_REVIEW_LOCAL_DIFF_NOFETCH=1 \
   run_record_diff 424786 "$SHA" "PR body" /dev/null 0
 assert_contains "$(cat "$(Q2 424786)" 2>/dev/null)" "\"diff_sha256\":\"$LB_SHA\"" "11.11m a hunk-less entry is bound at FULL index width, not the ambient core.abbrev"
-unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
+# 11.11n–p: WRAPPING-ROBUSTNESS of the cap classification (#1398). The
+#         single-line requirement in `diff_body_is_error_object` (a `grep -c ''`
+#         ≤ 1 line test) classified the real 406 only because GitHub emits it on
+#         ONE line. A PRETTY-PRINTED / re-wrapped envelope — GitHub, or a proxy,
+#         reformatting the error — fell through to the `nondiff` arm: the local
+#         fallback was SKIPPED (the oversized PR returned to the unlandability
+#         this fix removes) and the operator was told the body had NO entry
+#         boundary instead of being told about the 300-file cap. The fixture
+#         below is MUTATION-PINNED (11.11p) so it cannot pass vacuously.
+CAP406_PRETTY="$T/cap-406-pretty.json"
+printf '{\n  "message": "Sorry, the diff exceeded the maximum number of files (300).",\n  "errors": [\n    { "resource": "PullRequest", "field": "diff", "code": "too_large" }\n  ],\n  "documentation_url": "https://docs.github.com/rest/pulls/pulls",\n  "status": "406"\n}\n' > "$CAP406_PRETTY"
+CAP406_PRETTY_SHA="$(openssl dgst -sha256 < "$CAP406_PRETTY" | awk '{print $NF}')"
+[ "$(grep -c '' "$CAP406_PRETTY")" -gt 1 ] && ok "11.11n fixture: the pretty cap body is genuinely MULTI-LINE (non-vacuous)" || bad "11.11n fixture: the pretty cap body is single-line — the vector is vacuous"
+grep -qE '^diff --git' "$CAP406_PRETTY" && bad "11.11n fixture: the pretty cap body must NOT contain a diff entry" || ok "11.11n fixture: the pretty cap body carries no 'diff --git' entry"
+
+# (n) NO usable checkout: the pretty cap must still classify STRUCTURAL and the
+#     diagnosis must name the CAP, not the missing entry boundary.
+rm -f "$(Q2 424787)"
+STUB_DIFF_406_FILE="$CAP406_PRETTY" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" \
+  run_record_diff 424787 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11n a pretty-printed cap still records (rc 0)" || bad "11.11n rc=$RECORD_RC (err=$RECORD_ERR)"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11n a pretty-printed cap is STRUCTURAL, not retried (1 attempt)" || bad "11.11n made $(grep -cF 'application/vnd.github.v3.diff' "$LOG") attempts (expected 1)"
+if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11n the pretty cap error body was hashed (diff= present)"; else ok "11.11n no diff= — the pretty cap body is never hashed"; fi
+if grep -qF "diff=$CAP406_PRETTY_SHA" <<<"$RECORD_CAP"; then bad "11.11n the pretty 406 body's own sha256 was recorded as the reviewed diff"; else ok "11.11n the pretty 406 body's own sha256 is NOT recorded"; fi
+if grep -q '"diff_sha256"' "$(Q2 424787)" 2>/dev/null; then bad "11.11n record carries a diff_sha256 minted from the pretty error body"; else ok "11.11n record omits diff_sha256"; fi
+assert_contains "$RECORD_ERR" "300-FILE DIFF CAP" "11.11n the message names the 300-file cap"
+if grep -qF "NO 'diff --git' entry boundary" <<<"$RECORD_ERR"; then bad "11.11n the pretty cap was misdiagnosed as the nondiff arm"; else ok "11.11n the pretty cap is NOT misdiagnosed as nondiff"; fi
+assert_contains "$RECORD_ERR" "RETRYING WILL NOT HELP" "11.11n says retrying will not help"
+if grep -qF "gh/API/openssl unavailable" <<<"$RECORD_ERR"; then bad "11.11n misdiagnoses the pretty cap as a tooling outage"; else ok "11.11n does NOT blame gh/openssl"; fi
+
+# (o) WITH a checkout: the fallback must be ATTEMPTED for the pretty cap and mint
+#     the SAME digest as the one-line body — a skipped fallback leaves no diff=.
+rm -f "$(Q2 424788)"
+STUB_DIFF_406_FILE="$CAP406_PRETTY" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff 424788 "$SHA" "PR body" /dev/null 0
+[ "$RECORD_RC" = "0" ] && ok "11.11o a pretty cap with a checkout records (rc 0)" || bad "11.11o rc=$RECORD_RC (err=$RECORD_ERR)"
+assert_contains "$(cat "$(Q2 424788)" 2>/dev/null)" "\"diff_sha256\":\"$L_SHA\"" "11.11o the fallback is ATTEMPTED for the pretty cap and mints the LOCAL digest"
+assert_contains "$RECORD_CAP" "diff=$L_SHA" "11.11o the marker carries the LOCAL digest for the pretty cap"
+[ "$(grep -cF 'application/vnd.github.v3.diff' "$LOG")" = "1" ] && ok "11.11o the pretty cap is not re-fetched (1 attempt)" || bad "11.11o attempts=$(grep -cF 'application/vnd.github.v3.diff' "$LOG")"
+if grep -qF "diff=$CAP406_PRETTY_SHA" <<<"$RECORD_CAP"; then bad "11.11o the pretty error body was hashed instead of the local digest"; else ok "11.11o the pretty error body is never hashed"; fi
+assert_contains "$RECORD_ERR" "computed from the LOCAL checkout" "11.11o the provenance is stated for the pretty cap"
+
+# (p) MUTATION PIN — restore the `≤1 line` blind spot and show the pretty vector
+#     reddens: the pretty cap is demoted to the `nondiff` arm, the fallback is
+#     SKIPPED, and the operator is misdiagnosed. This is the regression 11.11n/o
+#     exist to prevent, so those vectors are load-bearing, not green by accident.
+mkdir -p "$T/mut-lines/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$T/mut-lines/lib/diff-normalize.py"
+python3 - "$RECORD" "$T/mut-lines/record-review.sh" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = """  command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
+  # Flatten"""
+new = """  command grep -qE '^diff --git ' "$1" 2>/dev/null && return 1
+  [ "$(command grep -c '' "$1" 2>/dev/null)" -le 1 ] || return 1  # MUTATION: the <=1-line blind spot
+  # Flatten"""
+assert old in text, "mutation anchor not found"
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+if cmp -s "$T/mut-lines/record-review.sh" "$RECORD"; then bad "11.11p mutation(p): the mutant copy is IDENTICAL to the script"; else ok "11.11p mutation(p): the mutant copy differs from the script"; fi
+rm -f "$(Q2 424789)"
+STUB_DIFF_406_FILE="$CAP406_PRETTY" STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" \
+  RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  run_record_diff_with "$T/mut-lines/record-review.sh" 424789 "$SHA" "PR body" /dev/null 0
+if grep -qF "diff=$L_SHA" <<<"$RECORD_CAP"; then bad "11.11p mutation(p): the mutant still minted the fallback digest — 11.11o is vacuous"; else ok "11.11p mutation(p): with the <=1-line blind spot restored the fallback is SKIPPED (rc=$RECORD_RC) — 11.11o is load-bearing"; fi
+# The MEASURED 406 exits NON-ZERO with the envelope on stdout, so the blind spot
+# drops the pretty cap onto the RETRYABLE `unavailable` arm (gh/auth/network
+# blame, and a STRUCTURAL refusal retried), NOT the exit-0 `nondiff` arm. Assert
+# the true regression, not the finding's short form.
+if grep -qF "300-FILE DIFF CAP" <<<"$RECORD_ERR"; then bad "11.11p mutation(p): the mutant still named the cap — 11.11n is vacuous"; else ok "11.11p mutation(p): with the blind spot restored the pretty cap is NOT named as a cap"; fi
+assert_contains "$RECORD_ERR" "transient: gh auth/network" "11.11p mutation(p): the mutant blames the transient gh/network arm (the regression 11.11n pins)"
+unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
 
 # ─────────────────────────────────────────────────────────────────────────
 # 12. #1362 D1 — the review-evidence digest is computed over the NORMALIZED
