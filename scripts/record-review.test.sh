@@ -1673,14 +1673,14 @@ STUB_DIFF_406_FILE="$CAP406" RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
   STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" run_print_diff_hash 424805
 assert_eq "$PDH_OUT" "ok${PDH_TAB}${L_SHA}" "11.12f the size-cap fallback mints the LOCAL normalized digest"
 
-# (g) the mode never mints a digest from ANY non-ok status (belt-and-braces on
-#     the parse contract the extension enforces).
-for _out in "empty${PDH_TAB}" "nondiff${PDH_TAB}" "too_large${PDH_TAB}" "unavailable${PDH_TAB}"; do
-    _status="${_out%%${PDH_TAB}*}"
-    case "$_out" in *"${PDH_TAB}"*) _hash="${_out#*${PDH_TAB}}" ;; *) _hash="<no-tab>" ;; esac
-    assert_eq "$_hash" "" "11.12g status '$_status' carries an EMPTY hash"
-done
-unset PDH_OUT PDH_RC _out _status _hash PDH_TAB PDH_EMPTY_DIGEST PDH_NONDIFF
+# NOTE: a former §11.12g looped over four hardcoded `<status>TAB` literals and
+# asserted their (hand-constructed) hash field was empty. It never invoked
+# `run_print_diff_hash`, so it could not fail whatever the seam emitted —
+# TAUTOLOGICAL, not coverage. The contract it claimed to pin (only `ok` carries
+# a digest) is already pinned by 11.12b-e, each of which RUNS the seam and
+# asserts the full `<status>TAB` output — so the loop was deleted rather than
+# reworded. The four non-ok statuses are the seam's complete non-ok set.
+unset PDH_OUT PDH_RC PDH_TAB PDH_EMPTY_DIGEST PDH_NONDIFF
 
 unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA CAP406_SPLIT CAP406_SPLIT_SHA SPLIT_DIFF SPLIT_DIFF_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
 
