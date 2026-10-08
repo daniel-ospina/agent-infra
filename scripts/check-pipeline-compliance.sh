@@ -6,30 +6,29 @@
 # skill's job; lint/typecheck/tests are separate CI). For a PR it checks, in
 # order:
 #
-#   a. LINKED ISSUE      — PR body references an issue via a closing keyword
-#                          (Fixes #N / Closes #N / Resolves #N, plus
+#   a. LINKED ISSUE      — PR body references an issue, either with a closing
+#                          keyword (Fixes #N / Closes #N / Resolves #N, plus
 #                          owner/repo#N or https://github.com/owner/repo/issues/N
-#                          for cross-repo issues) that BEGINS A LINE, optionally
-#                          after a Markdown line-leading prefix — bullet,
-#                          ordered-list marker, blockquote, ATX heading or
-#                          task-list checkbox (compound included) — and/or an
+#                          for cross-repo issues) or with a NON-closing
+#                          traceability keyword (Refs / Part of / Advances /
+#                          Tracks / Relates to). Either form must BEGIN A LINE,
+#                          optionally after a Markdown line-leading prefix —
+#                          bullet, ordered-list marker, blockquote, ATX heading
+#                          or task-list checkbox (compound included) — and/or an
 #                          emphasis/bold/backtick marker. A mid-sentence
 #                          mention is not a reference (#1012).
 #                          For cross-repo refs the
 #                          labels (tier) and scoping comments (checks b–e) are
 #                          fetched from the issue's OWN repo, not the PR's.
-#                          A PR whose diff is ENTIRELY an artifact — the class
-#                          named once in ARTIFACT_CLASS_DESC below, never
-#                          restated here — may
-#                          instead use a NON-closing traceability keyword
-#                          (Refs / Part of / Advances / Tracks / Relates to).
-#                          Rationale: a planning/instruction-artifact PR
-#                          implements no runtime work, so demanding a closing
-#                          keyword would force a FALSE close of the linked
-#                          issue — often an open parent whose children carry
-#                          the work. The closing form always wins when both are
-#                          present, and the fallback is unreachable for any PR
-#                          that touches a code path (pr_is_artifact_only).
+#                          The traceability form is accepted for ANY diff
+#                          (#1630). Rationale: the gate's job is that a PR is
+#                          TRACEABLE to an issue, and requiring a CLOSING
+#                          keyword is the wrong test for whether a PR is scoped
+#                          to an issue — every closing keyword auto-closes, so
+#                          a PR implementing only PART of an issue would have
+#                          to LIE (`Closes #N` closes an issue it does not
+#                          resolve) or fail the gate. The closing form always
+#                          wins when both are present.
 #   b. SCOPING COMMENT   — linked issue has a comment with the
 #                          `<!-- issue-scoping:` marker (posted by the
 #                          issue-scoping skill)
@@ -170,7 +169,7 @@ ARTIFACT_CLASS_MEMBERS=(
 # one is wanted; the frame contributes only `^(` and `)`.
 # Refuse an empty table loudly. On bash 3.2 an empty array aborts under `set -u`,
 # but bash >= 4.4 (what CI runs) expands it and renders `^()`, which matches
-# EVERY path — the artifact-only fallback would then fire for a code-only diff.
+# EVERY path — the class would then claim a code-only diff is artifact-only.
 # A silent fail-open is the one outcome this must never have.
 if [[ "${#ARTIFACT_CLASS_MEMBERS[@]}" -eq 0 ]]; then
   echo "❌ ARTIFACT_CLASS_MEMBERS is empty — the artifact-only class would match EVERYTHING. Refusing to start." >&2
@@ -209,17 +208,20 @@ Env:
   PIPELINE_COMPLIANCE_SELF_TEST=1 parser-only self-test (no gh calls)
 
 Check (a) scope:
-  A closing keyword ("Fixes #N" / "Closes #N" / "Resolves #N", or owner/repo#N
-  / a full issue URL) must BEGIN A LINE, optionally preceded by a Markdown
-  line-leading prefix — a bullet, ordered-list marker, blockquote, ATX heading
-  or task-list checkbox (compound/nested prefixes included) — and/or an
-  emphasis/bold/backtick marker. A mid-sentence mention does NOT
-  count, because it can auto-close an issue on merge (#1012).
-  A diff that is ENTIRELY an artifact — $ARTIFACT_CLASS_DESC — may
-  instead use a
-  NON-closing traceability keyword (Refs / Part of / Advances / Tracks /
-  Relates to #N); closure is not implied. Any .ts/.js/.mjs/script/workflow path
-  makes that fallback unreachable (#786).
+  An issue reference — a closing keyword ("Fixes #N" / "Closes #N" /
+  "Resolves #N", or owner/repo#N / a full issue URL) or a NON-closing
+  traceability keyword (Refs / Part of / Advances / Tracks / Relates to #N) —
+  must BEGIN A LINE, optionally preceded by a Markdown line-leading prefix — a
+  bullet, ordered-list marker, blockquote, ATX heading or task-list checkbox
+  (compound/nested prefixes included) — and/or an emphasis/bold/backtick
+  marker. A mid-sentence mention does NOT count, because it can auto-close an
+  issue on merge (#1012).
+  The traceability form is accepted for ANY diff (#1630) — including a diff
+  that is entirely an artifact ($ARTIFACT_CLASS_DESC) — and closure is NOT
+  implied: only a closing keyword auto-closes the issue on merge. Requiring a
+  closing keyword is the wrong test for whether a PR is scoped to an issue: a
+  PR implementing only PART of one would have to lie (every closing keyword
+  closes the issue it names) or fail the gate.
 EOF
 }
 
@@ -321,7 +323,8 @@ fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 
 # Closing-keyword class (check a's default) and the NON-closing traceability
-# class (the artifact-only fallback). \b anchors the TRACE keywords so a
+# class (check a's other accepted form, for ANY diff since #1630). \b anchors
+# the TRACE keywords so a
 # substring cannot masquerade as one ("prefs #42" must not read as
 # "refs #42"). CLOSING_KW stays byte-identical to
 # record-review.sh::closing_issue_refs (a documented cross-script contract);
@@ -362,8 +365,8 @@ CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
 #
 # The direction of the bug differed per site: pr_is_artifact_only's
 # `! printf … | grep -qvE` and the #513 clean-micro binding were FAIL-OPEN (a
-# raced pipeline read as "artifact-only" / "marker absent"), while checks (b), (c),
-# (d) and (e) were fail-closed false BLOCKS.
+# raced pipeline misreported the artifact class / read as "marker absent"),
+# while checks (b), (c), (d) and (e) were fail-closed false BLOCKS.
 #
 # WHO CONVERTED WHAT: #716 (`0542c6d`, follow-ups `4230ffc`, `25a51e7`) already
 # moved all eight sites to here-strings on `main`, so THIS change is the pin,
@@ -403,7 +406,7 @@ resolve_issue_only_ref() {
 parse_issue_ref() {
   local text="$1" kwpat="${2:-$CLOSING_KW}" m repo num kw
   # Positional for BOTH classes: parse_trace_ref delegates here, so a
-  # mid-sentence mention cannot unlock the artifact-only fallback either.
+  # mid-sentence mention cannot satisfy the traceability form either.
   kw="${REFCTX}${kwpat}"
   # a. full URL — /issues/<n> explicitly, never /pull/<n>.
   m="$(printf '%s\n' "$text" | grep -ioE "${kw}[[:space:]]*https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+" | head -1 || true)"
@@ -429,9 +432,10 @@ parse_issue_ref() {
 
 # parse_trace_ref <text> — like parse_issue_ref, but matching the NON-closing
 # traceability keywords (Refs / Part of / Advances / Tracks / Relates to).
-# Never call this unconditionally: a non-closing reference asserts "this PR
-# advances #N", not "this PR completes #N", so it satisfies check (a) only
-# for an ARTIFACT-ONLY PR — see resolve_issue_ref / pr_is_artifact_only.
+# A non-closing reference asserts "this PR advances #N", not "this PR completes
+# #N": it satisfies check (a) for ANY diff (#1630), and it never closes the
+# issue on merge. Call it only from resolve_issue_ref, AFTER the closing form
+# has been tried — the closing form must always win there.
 parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 
 # ── #1274 — the closing-word HAZARD scan ────────────────────────────────────
@@ -701,7 +705,7 @@ files_rows() {
       if ($2 == "") { bad = 1; next }
       s = $1
       # The GitHub diff-entry status enum. `unchanged` is documented and must
-      # be accepted, or a legitimate artifact-only PR is wrongly BLOCKED.
+      # be accepted, or a legitimate diff list is wrongly rejected.
       if (s != "added" && s != "modified" && s != "removed" && s != "renamed" && s != "changed" && s != "copied" && s != "unchanged") { bad = 1; next }
       # A rename must carry its old path; without it we cannot judge both ends.
       if (s == "renamed" && $3 == "") { bad = 1; next }
@@ -721,9 +725,11 @@ files_rows() {
 # the class declared once as ARTIFACT_CLASS_RE / ARTIFACT_CLASS_DESC above.
 # This comment deliberately does NOT re-list the class (#1611).
 # `files` is the "<status><TAB><filename><TAB><old>" list from the pulls/files
-# fetch. Fails CLOSED on anything it cannot prove, because this predicate is
-# what unlocks check (a)'s non-closing keyword — a false `true` would let a
-# code PR dodge closure.
+# fetch. Fails CLOSED on anything it cannot prove: since #1630 it no longer
+# GATES check (a) — the traceability keyword is accepted for any diff — but it
+# still selects how check (a)'s PASS line reads, and it is this gate's single
+# statement of the artifact class, so it must never answer `true` for a diff it
+# cannot prove is entirely artifacts.
 #
 # THE CLASS IS A POSITIVE ALLOWLIST (#786), not a negative "no executable
 # extension" rule: docs/ (any file — the #720 carve-out), instruction-layer
@@ -731,17 +737,18 @@ files_rows() {
 # .github/CODEOWNERS (review-routing config with no executable logic — the
 # #786 headline case, PR #674), and nothing else. A negative rule was rejected
 # because a new or unlisted file type would enter the class silently — the
-# wrong direction for a closure gate. This is why a CODE PR (any
-# .ts/.js/.mjs/script/workflow path) still cannot use the traceability keyword:
-# it is simply not on the list. `docs/` is a PREFIX (any file under it); the
+# wrong direction for a class that must be provable. A CODE PR (any
+# .ts/.js/.mjs/script/workflow path) is simply not on the list. `docs/` is a
+# PREFIX (any file under it); the
 # other entries are EXACT/pattern paths, so e.g. `.github/workflows/*.yml`,
 # `.github/CODEOWNERS.d/x` and `templates/.github/workflows/pipeline-compliance.yml`
 # are NOT artifacts. The `templates/` entry is Markdown-only (#1409) for exactly
 # that reason: 18 of the 21 tracked files under templates/ are executable
 # (workflows, launchd plists, husky hooks, JSON config), so a directory-wide
-# entry would have handed check (a)'s traceability keyword to a workflow edit.
+# entry would have classified a workflow edit as an artifact.
 # Four ways to be untrustworthy, all → NOT artifact-only:
-#   1. Empty/unreadable list (a broken fetch must never weaken closure).
+#   1. Empty/unreadable list (a broken fetch must never be answered as
+#      artifacts).
 #   2. Any row the shared validator rejects — malformed framing or an empty
 #      filename. Git allows newlines and tabs INSIDE a path, and GH reports
 #      filenames raw, so such a name splits one real file into several
@@ -765,41 +772,48 @@ pr_is_artifact_only() {
   rows="$(files_rows "$1")" || return 1
   [[ -n "$rows" ]] || return 1
   # The 3000-entry cap counts DISTINCT paths, matching the files_rows guard and
-  # the unit GitHub caps at. Counting ROWS would wrongly deny the traceability
-  # fallback to a complete list of >=3000 diff entries with fewer distinct
+  # the unit GitHub caps at. Counting ROWS would wrongly deny the artifact class
+  # to a complete list of >=3000 diff entries with fewer distinct
   # paths (a delete+add pair is two rows for one path).
   count="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2 }' | LC_ALL=C sort -u | wc -l | tr -d ' ')"
   [[ "$count" -lt 3000 ]] || return 1
   # Both ends of every row must be in the artifact class (the new path always,
-  # the old path whenever present). One failing row denies the fallback — this
-  # is the anti-vacuous guard: any code path anywhere keeps check (a) closed.
+  # the old path whenever present). One failing row denies the class — this
+  # is the anti-vacuous guard: one code path anywhere makes the diff NOT
+  # artifact-only.
   paths="$(printf '%s\n' "$rows" | LC_ALL=C awk -F '\t' '{ print $2; if ($3 != "") print $3 }')"
   [[ -n "$paths" ]] || return 1
   # #836 — here-string, never `printf … | grep -q`. This one was the most
   # dangerous site of the family: a raced pipeline INVERTS to "artifact-only"
-  # (fail-OPEN), which unlocks check (a)'s non-closing traceability keyword for
-  # a PR that touches code.
+  # (fail-OPEN), so the classifier answers `true` for a diff that is not one.
   # templates/**/*.md is instruction-layer Markdown in the SAME sense as
   # AGENTS.md and skills/**/*.md (#1409): it ships governance prose, implements
   # no runtime work, and — being the source that materializes into every repo's
   # AGENTS.md — is the file the base⊆AGENTS.md pin FORCES every instruction-layer
-  # rule change to touch. Leaving it off the allowlist made the class
-  # unreachable for exactly those PRs: artifact-only read false, the
-  # traceability alternative is gated on it (resolve_issue_ref), so the only
-  # remaining keyword was a closing one — a FALSE close or a blocked PR.
+  # rule change to touch. Before #1630 the class gated check (a)'s traceability
+  # keyword, so leaving templates/ off the allowlist blocked exactly those PRs
+  # (#1400 merged only by taking a false close; #1461 sat red 11 days). Since
+  # #1630 the class only words the PASS line, and the entry is kept because the
+  # class is this gate's one statement of what "artifact" means.
   # The `.md` restriction is load-bearing, not decorative: see the 18/21 note
   # above.
   ! grep -qvE "$ARTIFACT_CLASS_RE" <<<"$paths"
 }
 
-# resolve_issue_ref <pr-body> <files> — check (a)'s resolution, shared with
-# the live issue lookup so checks b–e always run against the SAME issue the
-# gate reported in (a). The closing keyword wins outright; the artifact-only
-# traceability fallback is consulted only when no closing reference exists.
+# resolve_issue_ref <pr-body> — check (a)'s resolution, shared with the live
+# issue lookup so checks b–e always run against the SAME issue the gate
+# reported in (a). The closing keyword wins outright; when there is no closing
+# reference a NON-closing traceability keyword resolves (#1630).
+# The resolution is deliberately DIFF-AGNOSTIC: the traceability form is
+# accepted for ANY diff, code included, because requiring a CLOSING keyword is
+# the wrong test for whether a PR is scoped to an issue — every closing keyword
+# auto-closes, so a PR implementing only PART of an issue would have to LIE or
+# fail. The artifact class no longer gates this; it only classifies check (a)'s
+# PASS line (pr_is_artifact_only, called from run_checks).
 resolve_issue_ref() {
   local ref
   ref="$(parse_issue_ref "$1")"
-  if [[ -z "$ref" ]] && pr_is_artifact_only "$2"; then
+  if [[ -z "$ref" ]]; then
     ref="$(parse_trace_ref "$1")"
   fi
   printf '%s' "$ref"
@@ -872,19 +886,19 @@ run_checks() {
   fi
   echo ""
 
-  # a. LINKED ISSUE — closing keyword in the PR body; "owner/repo#N" (repo =
+  # a. LINKED ISSUE — an issue reference in the PR body; "owner/repo#N" (repo =
   # $GH_REPO for a bare "#N"). resolve_issue_ref is the SINGLE resolution
   # point, shared with the live issue lookup below, so check (a)'s verdict and
   # the issue that b–e actually run against can never drift apart.
   #
-  # Artifact-only PRs (the class declared once as ARTIFACT_CLASS_DESC below —
-  # deliberately not re-listed here, because a prose copy is what went stale in
-  # #1409: this comment omitted templates/**/*.md for a week)
-  # may fall back to a non-closing traceability keyword — such a PR closes no
-  # runtime work, so requiring a closing keyword would force a FALSE close of
-  # the linked issue. The closing form always wins when both are present, and
-  # the fallback is unreachable for any PR that touches a code path
-  # (pr_is_artifact_only).
+  # A non-closing traceability keyword resolves for ANY diff (#1630) — not only
+  # for an artifact-only PR. Requiring a CLOSING keyword is the wrong test for
+  # whether a PR is scoped to an issue: every closing keyword auto-closes, so a
+  # PR implementing only PART of an issue would have to LIE (claim a close it
+  # does not perform) or fail the gate. The closing form still always wins when
+  # both are present, and only a closing keyword auto-closes on merge.
+  # pr_is_artifact_only no longer gates this; it only selects the wording of
+  # the PASS line below.
   if [[ "$ISSUE_ONLY" == "1" ]]; then
     # #792 --issue-only: the target issue is an INPUT, not a PR-body parse —
     # pre-PR there is no PR body for check (a) to read. Skipped with a named
@@ -892,7 +906,7 @@ run_checks() {
     issue_ref="$ISSUE_REF"
     issue_ref_kind="issue-only"
   else
-    issue_ref="$(resolve_issue_ref "$PR_BODY" "$FILES")"
+    issue_ref="$(resolve_issue_ref "$PR_BODY")"
     issue_ref_kind="closing"
     if [[ -n "$issue_ref" && -z "$(parse_issue_ref "$PR_BODY")" ]]; then
       issue_ref_kind="traceability"
@@ -925,12 +939,14 @@ run_checks() {
       if [[ -n "$close_notes" ]]; then printf '%s\n' "$close_notes"; fi
       if [[ "$issue_ref_kind" == "closing" ]]; then
         pass a "linked issue $issue_display (closing keyword in PR body)"
-      else
+      elif pr_is_artifact_only "$FILES"; then
         pass a "linked issue $issue_display (traceability keyword in PR body — artifact-only PR, closure not implied)"
+      else
+        pass a "linked issue $issue_display (traceability keyword in PR body — PART of $issue_display, closure not implied)"
       fi
     fi
   else
-    fail a "no linked issue — PR body must carry a closing keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo) that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge); a PR whose diff is ENTIRELY under $ARTIFACT_CLASS_DESC may instead use \"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"."
+    fail a "no linked issue — PR body must carry an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede it; a mid-sentence mention does NOT count, and can auto-close an issue on merge). EITHER a CLOSING keyword (\"Fixes #N\" / \"Closes #N\" / \"Resolves #N\", or owner/repo#N / full issue URL for cross-repo), which auto-closes the issue on merge, OR a NON-closing traceability keyword (\"Refs #N\" / \"Part of #N\" / \"Advances #N\" / \"Tracks #N\" / \"Relates to #N\"), which does not. The traceability form is accepted for ANY diff (#1630) — the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for it — because requiring a closing keyword forces a PR that implements only PART of an issue to falsely auto-close it."
     echo "      Missing: issue reference in PR body."
     echo "      Invoke:  issue-scoping — run it, then reference the issue when opening the PR."
     echo ""
@@ -1117,7 +1133,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "PR:   $GH_REPO#$PR_NUMBER"
   echo ""
   echo "Would check, in order:"
-  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under $ARTIFACT_CLASS_DESC may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
+  echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count, and can auto-close an issue on merge): EITHER a closing keyword (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL), which auto-closes on merge, OR a non-closing traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N), which does not — accepted for ANY diff (#1630), so a PR implementing only PART of an issue need not lie; the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for the traceability form — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
   echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
@@ -1438,10 +1454,11 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_ref '####### Closes #173' ''
 
   # ── #720: closing parser must NOT accept traceability keywords ────────────
-  # These are the RED-if-broken assertions for the artifact-only fallback. If
-  # parse_issue_ref ever matches "Refs/Part of/...", check (a) could be
-  # satisfied on a CODE PR without closing any issue — the weakening this
-  # design exists to prevent.
+  # These are the RED-if-broken assertions for check (a)'s TWO-class
+  # resolution. If parse_issue_ref ever matched "Refs/Part of/...", the closing
+  # form could no longer be told from the traceability one — and closure, which
+  # only the closing form implies on merge, would be inferred from a keyword
+  # that never closes anything (#1630).
   expect_ref 'Refs #631' ''
   expect_ref 'Part of #631' ''
   expect_ref 'Advances #631' ''
@@ -1472,7 +1489,7 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_trace 'No issue referenced here' ''
   expect_trace 'Part of the fleet' ''
 
-  # ── #720 + #786: artifact-only gate + combined resolution ────────────────
+  # ── #720 + #786 + #1630: the artifact class + combined resolution ────────
   expect_artifact_only() {
     local desc="$1" files="$2" want="$3" expected="${4:-}" got rc=0
     FILES_EXPECTED="$expected"
@@ -1496,8 +1513,9 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'instruction-layer skills .md only' $'modified\tskills/foo/SKILL.md\t' true
   expect_artifact_only 'instruction-layer + docs' $'modified\tAGENTS.md\t\nadded\tdocs/plans/x.md\t' true
   # ...but the class is a POSITIVE ALLOWLIST. One code path anywhere still
-  # fails closed — the anti-vacuous guard for #786: a code PR carrying only
-  # "Refs #N" must NOT unlock the traceability fallback.
+  # fails closed — if the class were widened too far, a code-bearing diff would
+  # be misreported as an artifact-only one (and, before #1630, could have dodged
+  # closure with a bare "Refs #N").
   expect_artifact_only 'instruction-layer + code' $'modified\tAGENTS.md\t\nmodified\tscripts/z.sh\t' false
   expect_artifact_only 'skills non-.md (skill payload)' $'modified\tskills/foo/run.sh\t' false
   expect_artifact_only 'nested AGENTS.md is NOT the instruction layer' $'modified\tsub/AGENTS.md\t' false
@@ -1557,14 +1575,14 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'CODEOWNERS + docs (the live #674 diff)' $'modified\t.github/CODEOWNERS\t\nmodified\tdocs/ops/guarded-paths.md\t\nadded\tdocs/plans/x.md\t' true
   expect_artifact_only 'CODEOWNERS + workflow (still code)' $'modified\t.github/CODEOWNERS\t\nmodified\t.github/workflows/ci.yml\t' false
   expect_artifact_only 'CODEOWNERS-adjacent path is not the exact artifact' $'modified\t.github/CODEOWNERS.d/x\t' false
-  # Empty/unreadable file list must NOT unlock the fallback (fails closed).
+  # Empty/unreadable file list must answer NOT artifact-only (fails closed).
   expect_artifact_only 'empty list' '' false
   expect_artifact_only 'status-only row' $'added' false
   # Fail-closed tripwires (VGATE #720). A filename containing a newline or tab
   # breaks the row framing; an EMPTY filename can vanish when command
   # substitution strips the trailing newline (order-dependent open); a rename
   # deletes its old path. All must read as NOT artifact-only — otherwise a code
-  # PR could pass check (a) with only a traceability keyword.
+  # diff would be misreported as an artifact-only one.
   expect_artifact_only 'injected newline filename' $'added\tdocs/a.md\t\nadded\t\nscripts/evil.sh' false
   expect_artifact_only 'bare newline filename' $'added\tdocs/a.md\t\nadded\t\n\t' false
   expect_artifact_only 'tab inside filename' $'added\tdocs/a.md\t\nadded\tdocs\tb.md\t' false
@@ -1591,17 +1609,17 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   expect_artifact_only 'split-row: non-docs old path on an added row' $'renamed\tdocs/x\tdocs/old\nadded\tdocs/y\tscripts/evil.sh' false
   expect_artifact_only 'copied: docs new + code old' $'copied\tdocs/x.md\tscripts/x.sh' false
   # `unchanged` is in GitHub's documented diff-entry status enum; rejecting it
-  # would wrongly block a legitimate artifact-only PR.
+  # would wrongly reject a legitimate artifact-only list.
   expect_artifact_only 'unchanged status' $'unchanged\tdocs/a.md\t' true
   expect_artifact_only 'at the 3000-file API cap' "$(i=0; while [[ $i -lt 3000 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" false
   expect_artifact_only 'just under the cap' "$(i=0; while [[ $i -lt 2999 ]]; do printf 'added\tdocs/f%s.md\t\n' "$i"; i=$((i+1)); done)" true
   # The cap counts DISTINCT paths, so a 3000-row list of 1500 delete+add pairs
-  # is a complete, valid artifact-only list and must NOT be denied the fallback.
+  # is a complete, valid artifact-only list and must NOT be denied the class.
   expect_artifact_only '3000 rows / 1500 distinct docs paths' "$(i=0; while [[ $i -lt 1500 ]]; do printf 'removed\tdocs/f%s.md\t\nadded\tdocs/f%s.md\t\n' "$i" "$i"; i=$((i+1)); done)" true
 
   expect_resolve() {
-    local desc="$1" body="$2" files="$3" expected="$4" got
-    got="$(resolve_issue_ref "$body" "$files")"
+    local desc="$1" body="$2" expected="$3" got
+    got="$(resolve_issue_ref "$body")"
     if [[ "$got" == "$expected" ]]; then
       printf '✅ resolve_issue_ref(%s) → %q\n' "$desc" "$got"
     else
@@ -1609,38 +1627,67 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
       selffail=$((selffail + 1))
     fi
   }
-  DOCS_ONLY_FILES=$'added\tdocs/plans/x.md\t'
-  INSTRUCTION_FILES=$'modified\tskills/x/SKILL.md\t\nmodified\tAGENTS.md\t'
-  CODEOWNERS_FILES=$'modified\t.github/CODEOWNERS\t\nmodified\tdocs/ops/guarded-paths.md\t'
-  CODE_FILES=$'added\tscripts/z.sh\t'
-  GATE_CODE_FILES=$'modified\textensions/loop-enforcer/termination.ts\t'
-  # ── #786 / #1012 ACCEPTANCE VECTORS — the five that define this fix ──────
-  # (1) docs-only + trace keyword: the #720 behaviour, must not regress.
-  expect_resolve 'docs-only + Refs' 'Refs #631' "$DOCS_ONLY_FILES" "$GH_REPO#631"
-  # (2) instruction-layer + trace keyword: NEW in #786; RED before Part 2.
-  expect_resolve 'instruction-layer + Part of' 'Part of #631' "$INSTRUCTION_FILES" "$GH_REPO#631"
-  # (2b) #786's headline case: the live #674 diff (CODEOWNERS + docs/) with
-  #      `Refs #667` must resolve — #674 is otherwise green and must not be
-  #      forced to falsely close #667.
-  expect_resolve 'CODEOWNERS + docs + Refs (the #674 case)' 'Refs #667' "$CODEOWNERS_FILES" "$GH_REPO#667"
-  # (3) ANTI-VACUOUS: a CODE diff with ONLY a trace keyword resolves to EMPTY,
-  #     i.e. check (a) still FAILS. This is the vector that goes red if the
-  #     artifact class is widened too far.
-  expect_resolve 'code + Refs (must stay empty)' 'Refs #949' "$GATE_CODE_FILES" ''
-  # (4) #1012 LIVE REGRESSION: a code diff whose body only MENTIONS a closing
-  #     keyword resolves to EMPTY. This sentence is the one that satisfied
-  #     check (a) on PR #968. RED before Part 1.
-  expect_resolve 'code + mid-sentence closing mention' \
+  # ── #720 / #786 / #1012 / #1630 ACCEPTANCE VECTORS ──────────────────────
+  # Resolution is DIFF-AGNOSTIC since #1630, so these vectors pass the BODY
+  # ONLY: the traceability form satisfies check (a) whatever the diff touches.
+  # The artifact class is no longer part of this decision — it selects the PASS
+  # line's wording and is pinned by expect_artifact_only above.
+  # (1) a trace keyword resolves at all: the #720 behaviour, must not regress.
+  expect_resolve 'Refs' 'Refs #631' "$GH_REPO#631"
+  # (2) THE #1630 FIX — the trace keyword resolves where the diff is NOT an
+  #     artifact. `Part of` is the partial-PR form the issue names (#1529/#1525
+  #     carry `Refs #5389`); before this fix every one of these resolved to
+  #     EMPTY, leaving a PARTIAL PR with no legal reference at all.
+  expect_resolve 'Part of (the #1630 partial-PR case)' 'Part of #631' "$GH_REPO#631"
+  expect_resolve 'Advances' 'Advances #631' "$GH_REPO#631"
+  expect_resolve 'Tracks' 'Tracks #631' "$GH_REPO#631"
+  expect_resolve 'Relates to' 'Relates to #631' "$GH_REPO#631"
+  # (3) the closing form still WINS when both are present — #1630 widens what
+  #     SATISFIES check (a); it changes nothing about what auto-closes on merge.
+  expect_resolve 'closing beats trace' $'Refs #631\nCloses #701' "$GH_REPO#701"
+  # (4) #1012 LIVE REGRESSION: a body that only MENTIONS a closing keyword
+  #     resolves to EMPTY. This sentence is the one that satisfied check (a) on
+  #     PR #968, and a mid-sentence mention can auto-close an issue on merge.
+  expect_resolve 'mid-sentence closing mention' \
     'Fixing (a) is an authoring decision — a closing keyword would falsely close #949.' \
-    "$CODE_FILES" ''
-  # (5) a normal own-line closing keyword still resolves (no regression).
-  expect_resolve 'own-line Closes' $'Prose preamble that references nothing\n\nCloses #631' "$CODE_FILES" "$GH_REPO#631"
-  # The closing form must win even on an artifact-only PR, and must work even
-  # when the PR touches code (closure semantics are never weakened for code PRs).
-  expect_resolve 'closing beats trace (docs-only)' $'Refs #631\nCloses #701' "$DOCS_ONLY_FILES" "$GH_REPO#701"
-  expect_resolve 'closing + code' $'Refs #631\nCloses #701' "$CODE_FILES" "$GH_REPO#701"
-  expect_resolve 'trace + code' 'Refs #631' "$CODE_FILES" ''
-  expect_resolve 'no ref at all' 'nothing here' "$CODE_FILES" ''
+    ''
+  # (5) the TRACE form is POSITIONAL too, so the widened acceptance still cannot
+  #     be satisfied by prose — otherwise an issue number merely mentioned in
+  #     passing would read as a reference.
+  expect_resolve 'mid-sentence trace mention' \
+    'This is part of a wider effort; see refs #631 for context.' \
+    ''
+  # (6) a normal own-line closing keyword still resolves (no regression).
+  expect_resolve 'own-line Closes' $'Prose preamble that references nothing\n\nCloses #631' "$GH_REPO#631"
+  expect_resolve 'no ref at all' 'nothing here' ''
+  # ── #1630 END-TO-END: check (a) PASSES on a CODE diff that carries only a
+  # line-leading traceability keyword. This is the defect itself, not a parser
+  # unit: both vectors were RED before the fix (check (a) reported "no linked
+  # issue"), because the traceability form was gated on pr_is_artifact_only.
+  # The body is the truthful PARTIAL form the live PRs carry (#1529/#1525 use
+  # `Refs #5389`); a closing keyword would have falsely closed an issue the PR
+  # does not resolve. complexity:micro is set so b–e are exempt and the
+  # assertion is about check (a) alone.
+  expect_check_a_passes() {
+    local desc="$1" body="$2" files="$3" log rc=0
+    log="$(mktemp "${TMPDIR:-/tmp}/pipeline-1630.XXXXXX")"
+    PR_BODY="$body"; LABELS="complexity:micro"; SCOPING_COMMENT=""; COMMIT_MSGS=""
+    FILES="$files"; FILES_EXPECTED=""
+    FAILURES=0
+    run_checks >"$log" 2>&1 || rc=$?
+    if grep -qF '✅ [a] linked issue' "$log"; then
+      printf '✅ #1630 check (a) PASSES on a non-artifact diff: %s\n' "$desc"
+    else
+      printf '❌ #1630 check (a) FAILED on a non-artifact diff: %s (rc=%s) — the traceability form must not be gated on the artifact class\n' "$desc" "$rc" >&2
+      grep -q '❌ \[a\]' "$log" && grep '❌ \[a\]' "$log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    rm -f "$log"
+  }
+  expect_check_a_passes 'code diff + line-leading `Refs #N` (the #1529/#1525 form)' \
+    'Refs #5389' $'modified\textensions/loop-enforcer/termination.ts\t'
+  expect_check_a_passes 'code diff + `Part of #N` after a blank line' \
+    $'Some preamble.\n\nPart of #5389' $'modified\tscripts/z.sh\t'
   # ── #1012: the closing match is POSITIONAL, and the pattern is shared with
   # record-review.sh::closing_issue_refs (its §8.11 pins the same class). A
   # keyword buried inside a word or a sentence is a mention, not a reference.
@@ -2013,9 +2060,12 @@ $big_filler"
   # ── #836 fail-OPEN site: pr_is_artifact_only at a racy size ─────────────────
   # pr_is_artifact_only's `! printf … | grep -qvE '^(docs/|AGENTS\.md$|skills/.*\.md$|\.github/CODEOWNERS$)'` did not merely
   # false-block: on a raced pipeline it INVERTED to "artifact-only" (measured
-  # ~88% of runs at ~89 KB), which unlocks check (a)'s non-closing
-  # traceability keyword for a code PR. The small `expect_artifact_only` vectors
-  # cannot race, so the site has its own large-input behavioural pin: a >64 KB
+  # ~88% of runs at ~89 KB), misreporting a code-bearing diff as an
+  # artifact-only one. (It gated check (a)'s traceability keyword until #1630;
+  # now it only words the PASS line — the pin stays because the predicate must
+  # answer correctly for the class it declares.) The small
+  # `expect_artifact_only` vectors cannot race, so the site has its own
+  # large-input behavioural pin: a >64 KB
   # row list whose FIRST row is a non-artifact path must read NOT artifact-only, on
   # EVERY run.
   # (The regex in that quote is the SHAPE AT THE TIME — `printf | grep`, before
@@ -2039,7 +2089,7 @@ $big_filler"
     printf '✅ #836 pr_is_artifact_only fail-OPEN site: %s/%s runs kept a non-artifact start as NOT artifact-only (%s-byte list)\n' \
       "$REPS" "$REPS" "$big_paths_bytes"
   else
-    printf '❌ #836 pr_is_artifact_only fail-OPEN site: %s/%s runs reported a non-artifact list as artifact-only (BROKEN-PIPE regression — check (a) could be dodged on a code PR)\n' \
+    printf '❌ #836 pr_is_artifact_only fail-OPEN site: %s/%s runs reported a non-artifact list as artifact-only (BROKEN-PIPE regression — the class answer is wrong)\n' \
       "$docs_open_bad" "$REPS" >&2
     selffail=$((selffail + 1))
   fi
@@ -2371,7 +2421,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the artifact-only traceability form; pr_is_artifact_only gates the fallback over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path; the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); resolve_issue_ref prefers closure."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); resolve_issue_ref prefers closure."
   exit 0
 fi
 
@@ -2410,9 +2460,8 @@ PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
 
 # Files fetched as "status<TAB>filename<TAB>previous_filename" — check e needs
 # the status to count only added/modified test files as evidence; checks d/e
-# derive plain names; check (a)'s artifact-only gate needs the old path to judge
-# renames. Fetched BEFORE the issue resolution: check (a)'s artifact-only fallback
-# needs the file list to decide whether a non-closing keyword is acceptable.
+# derive plain names; check (a)'s PASS wording needs the old path to judge
+# renames (pr_is_artifact_only). Fetched before the checks that read it.
 FILES="$(fetch_json "pulls/$PR_NUMBER/files" '.[] | "\(.status)\t\(.filename)\t\(.previous_filename // "")"' 1)"
 # Authoritative file count for this PR. files_rows demands the validated
 # DISTINCT-new-path count EQUAL this, which is what makes a forged or
@@ -2425,7 +2474,7 @@ FILES_EXPECTED="$(fetch_json "pulls/$PR_NUMBER" '.changed_files // ""')"
 # resolve_issue_ref returns "owner/repo#N"; split so labels/comments are
 # fetched from the issue's OWN repo — cross-repo refs would otherwise 404
 # against the PR's repo or resolve the wrong repo's same-numbered issue.
-LIVE_ISSUE_REF="$(resolve_issue_ref "$PR_BODY" "$FILES")"
+LIVE_ISSUE_REF="$(resolve_issue_ref "$PR_BODY")"
 LIVE_ISSUE="${LIVE_ISSUE_REF##*#}"
 LIVE_ISSUE_REPO="${LIVE_ISSUE_REF%#*}"
 LIVE_ISSUE_REPO="${LIVE_ISSUE_REPO:-$GH_REPO}"
