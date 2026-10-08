@@ -1,5 +1,22 @@
 #!/usr/bin/env bash
 # record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <artifact>]
+#
+# record-review.sh --print-diff-hash <pr> [owner/repo]
+#   READ-ONLY (#1351): compute the PR's live normalized three-dot diff digest
+#   and print `<status>\t<hash>` on stdout, then exit WITHOUT writing a record.
+#   This is the consumer seam for the local merge gate
+#   (extensions/review-enforcer/index.ts), which must compare a recorded
+#   `diff_sha256` against the PR's CURRENT diff the SAME way the GitHub
+#   ai-review-gate's rule (b) does. The diff machinery below
+#   (`diff_hash_for_pr`, the #1398 size-cap local fallback, and
+#   scripts/lib/diff-normalize.py) is DELIBERATELY the one implementation: a
+#   second hashing path would be a second definition of "unchanged" for one
+#   cross-repo contract.
+#   status is one of ok | empty | too_large | nondiff | unavailable (the same
+#   classification the record path uses); ONLY `ok` carries a hash, and an
+#   empty or non-diff body NEVER does. Exit 0 — the status field carries the
+#   outcome, so a non-zero exit stays reserved for a usage/argument error.
+#
 # Records a code-review verdict for a PR into ~/.pi/agent/reviews/<PR>.json,
 # consumed by the review-enforcer merge registry gate
 # (extensions/review-enforcer/index.ts, issue #138).
@@ -543,6 +560,9 @@ done
 # Only $1..$4 are read, so a dropped trailing flag used to shift the repo
 # position and still write a record with rc=0.
 FORCE_STALE=0
+# #1351 — set by --print-diff-hash (read-only consumer seam, see the header).
+# Initialised here so `set -u` is satisfied when the flag is absent.
+PRINT_DIFF_HASH=0
 EVIDENCE=""
 # tortoise#7391: what the record carries. Set ONLY by the verification gate below, so a
 # record claims `evidence` only when this run actually read and accepted that
@@ -555,6 +575,7 @@ _i=0
 while [ "$_i" -lt "${#_argv[@]}" ]; do
   _arg="${_argv[$_i]}"
   case "$_arg" in
+    --print-diff-hash) PRINT_DIFF_HASH=1 ;;
     --force-stale) FORCE_STALE=1 ;;
     --evidence)
       # tortoise#7391: consumes the NEXT argument (the review-artifact reference).
@@ -583,12 +604,30 @@ else
   set --
 fi
 PR="${1:?usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--force-stale] [--evidence <artifact>]}"
-SHA="${2:?missing head_sha}"
-VERDICT="${3:-clean}"
-REPO="${4:-}"
+if [ "$PRINT_DIFF_HASH" -eq 1 ]; then
+  # #1351 — positional shape for the read-only mode: <pr> [owner/repo]. There
+  # is NO head_sha and NO verdict here: the caller is asking about a PR whose
+  # CURRENT head the record already disagrees with (that is why it is asking),
+  # and it wants the diff identity that decides whether the disagreement is a
+  # content change or a merge-only head move.
+  SHA=""
+  VERDICT=""
+  REPO="${2:-}"
+else
+  SHA="${2:?missing head_sha}"
+  VERDICT="${3:-clean}"
+  REPO="${4:-}"
+fi
 case "$VERDICT" in
   clean|clean-micro|clean-low) ;;
-  *) echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2 ;;
+  *)
+    # --print-diff-hash carries NO verdict (it writes nothing), so only the
+    # record path is refused here. The arm is expressed this way — rather than
+    # folding the case into the else above — so the mutation harness's
+    # `sed 's#^  clean|clean-micro|clean-low) ;;#…#'` anchor keeps matching.
+    if [ "$PRINT_DIFF_HASH" -ne 1 ]; then
+      echo "verdict must be 'clean', 'clean-micro' or 'clean-low'; refusing to record '$VERDICT'" >&2; exit 2
+    fi ;;
 esac
 # ── clean-low × --force-stale is an argument-level contradiction (#1348) ──
 # clean-low certifies the CONTENT SHAPE OF A SPECIFIC REVISION. --force-stale
@@ -607,7 +646,7 @@ fi
 if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
   echo "PR number must be numeric; refusing to record '$PR'" >&2; exit 2
 fi
-if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+if [ "$PRINT_DIFF_HASH" -eq 0 ] && ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "head_sha must be a full 40-char hex sha (got '${SHA:0:12}…'); refusing to record" >&2; exit 2
 fi
 # tortoise#7391: the sha the CALLER named, kept before any carry re-binds $SHA to the
@@ -1107,6 +1146,18 @@ if [ -n "$REPO" ]; then
         echo "⚠️ #2982: could not compute this PR's diff hash — the API could not be reached or returned no readable diff (transient: gh auth/network; ${DIFF_FETCH_TRIES} of ${DIFF_FETCH_ATTEMPTS} attempt(s) made). A FAILED FETCH IS NOT A CHANGED ARTIFACT: retry the record before paying for a fresh review. Recording a legacy sha-only marker, which will NOT carry across a branch update" >&2 ;;
     esac
   fi
+fi
+
+# #1351 — the read-only consumer seam EXITS here: after the diff read, before
+# the stale-sha guard and every write. `ok` is the only status a consumer may
+# act on, and every non-ok status is paired with an EMPTY hash — so a degraded
+# or refused fetch can never be mistaken for a digest, and a caller that ignores
+# the status still finds nothing to compare. The hash is the SAME normalized
+# digest the record path stores, and the SAME one the GitHub
+# ai-review-gate computes live — one definition of "unchanged".
+if [ "$PRINT_DIFF_HASH" -eq 1 ]; then
+  printf '%s\t%s\n' "${DIFF_FETCH:-unavailable}" "${DIFF_HASH:-}"
+  exit 0
 fi
 
 # ── Stale-sha guard (#2133, extended by #2982): $SHA must be the CURRENT head
