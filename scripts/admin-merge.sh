@@ -712,13 +712,32 @@ pr_review_record_blocks_update() {
   done
   expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
 
-  # ⛔ A STORE THAT CANNOT BE SEARCHED IS NOT AN ABSENT RECORD. `[ -e ]` cannot tell ENOENT
-  # from EACCES, so a `~/.pi/agent/reviews` without its search/read bits would make every
-  # candidate below look absent and let the update strand a record it never saw.
-  local rdir="$HOME/.pi/agent/reviews"
-  if [ -e "$rdir" ] && { [ ! -r "$rdir" ] || [ ! -x "$rdir" ]; }; then
-    say_err "   ⛔ the review store at $rdir exists but cannot be searched — refusing,"
-    say_err "      because a record bound to this head cannot be ruled out."
+  # ⛔ A STORE — OR ANY ANCESTOR OF IT — THAT CANNOT BE SEARCHED IS NOT AN ABSENT STORE.
+  # `stat` fails with EACCES when a path component denies search, so every candidate below
+  # would look absent and the update would strand a record the rail never saw. The walk is
+  # over the components: hardening only the store's own bits still reads as "no store at
+  # all" when `~/.pi` or `~/.pi/agent` is what denies search.
+  local rdir="$HOME/.pi/agent/reviews" anc=""
+  for anc in "$HOME" "$HOME/.pi" "$HOME/.pi/agent"; do
+    if [ -d "$anc" ] && [ ! -x "$anc" ]; then
+      say_err "   ⛔ the path to the review store cannot be searched ($anc) — refusing,"
+      say_err "      because a record bound to this head cannot be ruled out."
+      return 0
+    fi
+    if [ -L "$anc" ] && [ ! -e "$anc" ]; then
+      say_err "   ⛔ the path to the review store runs through a dangling symlink ($anc) — refusing."
+      return 0
+    fi
+  done
+  if [ -d "$rdir" ]; then
+    if [ ! -r "$rdir" ] || [ ! -x "$rdir" ]; then
+      say_err "   ⛔ the review store at $rdir exists but cannot be searched — refusing,"
+      say_err "      because a record bound to this head cannot be ruled out."
+      return 0
+    fi
+  elif [ -e "$rdir" ] || [ -L "$rdir" ]; then
+    say_err "   ⛔ a path exists at $rdir but it is not a directory — refusing, because a"
+    say_err "      record store cannot be read through it."
     return 0
   fi
   for f in "${cands[@]}"; do
@@ -813,11 +832,11 @@ refresh_pr_branch() {
     say_err "      (the ⛔ line above states the condition found). This rail does not verify carry"
     say_err "      markers (atomic-land.sh does, with the gate key), so it will not move a head out"
     say_err "      from under an attestation."
-    say_err "      Clearing this refusal means the tree is measured against the current base. A"
-    say_err "      re-run executes the SAME merge commit, so it re-measures the old merge ref; an"
-    say_err "      empty commit or an update moves the head and strands this record. So decide"
-    say_err "      deliberately: re-review and re-record at a new head, or re-trigger this PR's"
-    say_err "      checks by an event that does not move it."
+    say_err "      Clearing this refusal depends on the ⛔ line: for a record BOUND to this head,"
+    say_err "      re-review and re-record at a new head, or re-trigger this PR's checks by an"
+    say_err "      event that does not move it — a re-run re-executes the SAME merge commit, and an"
+    say_err "      update or empty commit moves the head and strands the record. For a store, path or"
+    say_err "      JSON the rail could not read, repair that first: neither action above clears it."
     return 1
   fi
 
