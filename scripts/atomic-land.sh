@@ -136,6 +136,10 @@ set -uo pipefail
 
 PR=""
 REPO=""
+# The cwd's own repo slug, resolved alongside $REPO in resolve_repo(). Kept separate
+# so drift_safe_of() can tell "this repo has no drift gate" from "we are pointed at a
+# different repo" (#7727). Declared here because `set -u` is on.
+CWD_REPO=""
 DRY_RUN=0
 NO_WAIT=0
 NO_CITE=0
@@ -392,11 +396,27 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 #
 # THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
 # repo has no `tools/drift-guard.py` there is no gate that could leave the head
-# unlandable, so the drift is harmless by construction and the skip stands. That
-# reads the ARTIFACT (the tool's existence), not a setting.
+# unlandable, so the drift is harmless by construction and the skip stands — but
+# ONLY when the cwd is demonstrably the target repo (see the body below); a missing
+# tool in some OTHER checkout proves nothing. That reads the ARTIFACT (the tool's
+# existence), never a setting.
 drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
   if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ] && [ ! -f tools/drift-guard.py ]; then
-    printf '1'; return 0
+    # A MISSING TOOL PROVES "NO GATE" ONLY IF THE CWD *IS* THE TARGET REPO.
+    # `--repo owner/name` is a supported way to name a DIFFERENT repo, and the
+    # rail never `cd`s, so `./tools/` is then the WRONG repo's — its absence says
+    # nothing about the target's gate. Treating that absence as "harmless" was a
+    # fail-OPEN: the skip fired for a repo that HAS the gate, re-creating exactly
+    # the unlandable head this function exists to prevent (review finding, #7727).
+    # So the exception needs POSITIVE evidence of identity; anything else is
+    # unmeasurable and refreshes.
+    local cwd_l target_l
+    cwd_l="$(printf '%s' "$CWD_REPO" | tr 'A-Z' 'a-z')"
+    target_l="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+    if [ -n "$cwd_l" ] && [ "$cwd_l" = "$target_l" ]; then
+      printf '1'; return 0
+    fi
+    return 0
   fi
   local out
   out="$( $DRIFT_GUARD_CMD --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
@@ -479,8 +499,14 @@ pr_has_carry_evidence() {
 # #2982/#767; #1397 tracks what remains.)
 
 resolve_repo() {
+  # The cwd's OWN repo slug, always. drift_safe_of() needs it to tell "this repo
+  # has no drift gate" (true ⇒ the #7230 skip stands) from "we were pointed at a
+  # DIFFERENT repo, so ./tools/ is not its gate" (⇒ unmeasurable ⇒ refresh).
+  # Empty when the cwd is not a git repo with a GitHub remote, which is the
+  # fail-closed direction: the exception simply does not apply.
+  CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
   if [ -z "$REPO" ]; then
-    REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    REPO="$CWD_REPO"
   fi
   case "$REPO" in
     */*) ;;
@@ -630,10 +656,20 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         if [ "$strict" = false ]; then
           mergeable="$(mergeable_of)"
           if [ "$mergeable" = true ]; then
-            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
-            return 3
+            # #7727 — the SAME inference the drift arm above was fixed for. A
+            # `BEHIND` head routed here is skipped on `mergeable` alone, and
+            # `mergeable` answers "no text conflict", not "the merge KEEPS the
+            # base's content". Measured: this arm and the drift arm are the two
+            # places the rail decides a landable head needs no refresh, and a
+            # drift-red head is not landable in either.
+            if [ "$(drift_safe_of)" = 1 ]; then
+              say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+              return 3
+            fi
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #1565 skip would leave it unlandable with a misattributed refusal"
+          else
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
           fi
-          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
         else
           say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
         fi

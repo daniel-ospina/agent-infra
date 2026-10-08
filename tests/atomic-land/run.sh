@@ -286,6 +286,10 @@ new_scen() {
   # keeps every pre-existing scenario's skip behaviour bit-for-bit.
   SCEN_DRIFT_CMD=
   rm -f "$SCEN/drift-status" 2>/dev/null || true
+  # #7727: the cwd's repo slug. Defaults to the target repo, so the drift exception
+  # applies; a scenario that sets it to ANOTHER slug models `--repo owner/name`
+  # naming a different repo while the cwd holds the wrong `tools/`.
+  SCEN_CWD_REPO=
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -321,7 +325,7 @@ new_scen() {
 # with PPID 1). This helper is only ever called in a subshell or backgrounded, so
 # the `exec` cannot replace this test script.
 rail_exec() { # <extra args...>
-  SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
+  SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
   SCEN_RECORD_NO_WRITE="${SCEN_RECORD_NO_WRITE:-0}" \
@@ -1294,6 +1298,66 @@ called "pr update-branch" \
   && fail "refreshed although no drift gate exists to leave the head unlandable" \
   || pass "did NOT refresh (no gate ⇒ the drift is harmless by construction)"
 
+# ── THE CWD IS NOT THE TARGET REPO — a fail-OPEN the review found ─────────
+echo "── 17g-E6. a missing tool with --repo naming ANOTHER repo ⇒ REFRESH (absence proves nothing)"
+# The rail never `cd`s and `--repo owner/name` is supported, so `./tools/` can belong
+# to a DIFFERENT repo. Inferenceing "no gate" from its absence then skips a head whose
+# target DOES have the gate — the exact unlandable-head failure #7727 exists to stop.
+# The exception therefore needs positive evidence that the cwd IS the target repo.
+new_scen driftwrongcwd
+SCEN_CWD_REPO="daniel-ospina/some-other-repo"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_DRIFT_CMD=          # no override and no local tool: the case that used to skip
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (an unverifiable cwd is unmeasurable ⇒ fail-closed)" \
+  || fail "SKIPPED on a missing tool in the WRONG repo — fail-OPEN (the review's P1)"
+
+# ── THE SIBLING ARM — the same inference one arm over ─────────────────────
+echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
+# The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
+# root cause: `mergeable` answers "no text conflict", not "the merge keeps the content".
+new_scen behinddriftunsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'BEHIND\n'    > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on a drift-red BEHIND head (the other arm consulted the predicate too)" \
+  || fail "SKIPPED a drift-unsafe BEHIND head — the same inference, one arm over"
+
+echo "── 17g-E8. …and BEHIND with a GREEN predicate still SKIPS (#1565 preserved)"
+new_scen behinddriftsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'BEHIND\n'    > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+# Assert the rail is HEALTHY, not merely quiet. Absence of an update call is
+# satisfied by a rail that crashed before reaching it, so E8 would report a skip on
+# a dead run — the sibling E2 (rc + head) and E5 (rc) both check this, and the
+# asymmetry was the gap. A "did not refresh" verdict must mean "chose not to".
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a BEHIND head with safe drift — #1565's skip was reversed" \
+  || pass "did NOT refresh (safe drift ⇒ the BEHIND skip stands)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was" \
+  || fail "the head moved for a safe drift"
+SCEN_DRIFT_CMD="$DRIFT"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -1436,13 +1500,26 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # failure it prevents: closing #7230 for one landable state and leaving the other's
   # population (measured at 10 heads) with the same non-termination. 17g-D6 must redden.
   mutate_and_expect_fail B23  's/in CLEAN\|UNSTABLE\) drift_landable=1/in CLEAN\) drift_landable=1/'
-  # B24 (#7727): make the drift predicate INERT — the skip fires on `mergeable`
-  # alone, i.e. the revision before this fix. The failure it prevents: a head whose
-  # merge would silently REVERT a path the base moved is skipped forever, so the
-  # drift red can never clear and the PR is unlandable by the rail's own action
-  # (live: PR #7703, 776 lines of silent revert; the refresh was the whole fix).
-  # 17g-E1 must redden.
-  mutate_and_expect_fail B24  's/if \[ "\$\(drift_safe_of\)" = 1 \]; then/if true; then/'
+  # B24 (#7727): make the DRIFT arm's predicate INERT — the skip fires on
+  # `mergeable` alone there, i.e. the revision before this fix. The failure it
+  # prevents: a head whose merge would silently REVERT a path the base moved is
+  # skipped forever, so the drift red can never clear and the PR is unlandable by
+  # the rail's own action (live: PR #7703, 776 lines of silent revert; the refresh
+  # was the whole fix). 17g-E1 must redden.
+  # ⛔ ANCHORED TO 14 SPACES ON PURPOSE. `drift_safe_of` now appears in TWO arms, and
+  # the BEHIND one comes FIRST in the file, so an unanchored pattern replaces THAT
+  # arm instead — which is exactly what happened on the first cut of this pair: both
+  # mutations mutated the same line, so the drift arm shipped UNPINNED while the suite
+  # still reported both "covered". This is the B19b/B20b lesson repeating, one level
+  # down: extending a predicate's use quietly narrows an unanchored mutation set.
+  # `mutate_and_expect_fail` reports "reddened nothing — the mutation did not apply"
+  # when the pattern stops matching, so re-indenting either arm fails LOUDLY.
+  mutate_and_expect_fail B24  's/^              if \[ "\$\(drift_safe_of\)" = 1 \]; then/              if true; then/m'
+  # B25 (#7727): the SIBLING arm must consult the predicate too. The failure it
+  # prevents: fixing one arm and leaving the other — the same "mergeable means
+  # landable" inference — skipping a drift-red head. Anchored to the BEHIND arm's
+  # 12 spaces so it cannot silently mutate the drift arm instead. 17g-E7 must redden.
+  mutate_and_expect_fail B25  's/^            if \[ "\$\(drift_safe_of\)" = 1 \]; then/            if true; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
