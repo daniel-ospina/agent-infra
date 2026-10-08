@@ -120,6 +120,12 @@
 #                           Deliberately NOT under $TMPDIR, which is caller-controlled.
 #   ATOMIC_LAND_LOCK_GRACE  seconds a pid-less lock is treated as LIVE, not stale
 #                           (default: 60) — closes the mkdir→pid TOCTOU (B11).
+#   ATOMIC_LAND_LOCK_STALE_AFTER  seconds an ORPHANED holder may publish no
+#                           heartbeat before its lock is reclaimed (default: 600).
+#                           The rail beats from its own poll loops, so a working
+#                           rail never reaches this; a missing heartbeat is LIVE.
+#                           Validated at startup — a non-numeric value would
+#                           silently disable every reclaim (B11b, #1395).
 #   ATOMIC_LAND_UNKNOWN_POLLS  re-polls for a transient `mergeStateStatus=UNKNOWN`
 #                           before failing closed (default: 5).
 #   ATOMIC_LAND_REFRESH_ALWAYS  1 = always refresh a drifting head (a BEHIND enum, or
@@ -139,6 +145,10 @@ NO_CITE=0
 WOULD_UPDATE=0
 WAIT_TIMEOUT=5400
 POLL=30
+# B11b: how long a holder may publish no heartbeat before an ORPHANED lock is
+# treated as abandoned. The rail beats at least once per poll interval, so 20x the
+# default cadence cannot be reached by a rail that is working.
+LOCK_STALE_AFTER="${ATOMIC_LAND_LOCK_STALE_AFTER:-600}"
 MAX_ROUNDS=2
 MERGE_FLAGS=()
 
@@ -203,6 +213,12 @@ case "$POLL" in ''|*[!0-9]*) err "atomic-land: --poll must be a non-negative int
 # two loops to 25 min and 100 min instead of 68 years. Fails closed on an
 # oversized literal via the same comparison error as the cap above.
 [ "$POLL" -le 300 ] 2>/dev/null || { err "atomic-land: --poll must be at most 300s"; exit 2; }
+# B11b: same class, same reason. A non-numeric value makes `[ "$age" -ge
+# "$LOCK_STALE_AFTER" ]` fail, and a failed `[` is FALSE — so a typo would
+# silently DISABLE every reclaim and restore the #1395 symptom (an orphaned rail
+# holding a PR's lock forever) with no diagnostic anywhere.
+case "$LOCK_STALE_AFTER" in ''|*[!0-9]*) err "atomic-land: ATOMIC_LAND_LOCK_STALE_AFTER must be a non-negative integer"; exit 2 ;; esac
+[ "$LOCK_STALE_AFTER" -ge 1 ] 2>/dev/null || { err "atomic-land: ATOMIC_LAND_LOCK_STALE_AFTER must be at least 1s"; exit 2; }
 case "$MAX_ROUNDS" in ''|*[!0-9]*) err "atomic-land: --max-rounds must be a positive integer"; exit 2 ;; esac
 [ "$MAX_ROUNDS" -ge 1 ] || { err "atomic-land: --max-rounds must be >= 1"; exit 2; }
 [ "$MAX_ROUNDS" -le 5 ] || { err "atomic-land: --max-rounds is bounded at 5"; exit 2; }
@@ -223,50 +239,69 @@ gh_() { "$GH" "$@"; }
 # flock); a crashed holder is reclaimed by PID liveness, bounded to one reclaim.
 LOCKDIR=""
 
-# ── B11b — is a LIVE pid a working rail, or an orphan nobody will collect? ─────
+# ── B11b — is a LIVE pid a working rail, or one that stopped making progress? ──
 #
 # `kill -0` answers "is this pid alive". That is NOT the question the lock needs,
 # which is "is a rail still working on this PR". The gap was named as the
 # *consequence* half of #1395 item 1 — "the B11 lock reclaim requires a DEAD PID,
 # so a wedged rail holds the PR's lock for as long as it lives" — while the fix
 # that closed that issue (PR #1532) addressed only the `--poll 0` door. The clause
-# therefore stayed true, and it has now bitten with a live specimen.
+# stayed true, and it produced a live specimen:
 #
-# MEASURED, 2026-10-08, tortoise#7653: `atomic-land 7653` pid 41953 sat for 3h51m
-# — 2.6x this script's own WAIT_TIMEOUT — with ppid 1 (orphaned; the lane that
-# started it was gone), no controlling terminal, and 0.16s of CPU unchanged
-# across a 45s sample. It held a fully-green MERGEABLE/CLEAN PR, carrying a clean
-# review bound to the exact head, permanently unlandable: no age bound, no CPU
-# bound, and no flag to release it.
+# MEASURED, 2026-10-08, tortoise#7653: pid 41953 sat for 3h51m — 2.6x this
+# script's own WAIT_TIMEOUT — with ppid 1 (orphaned; the lane that started it was
+# gone), no controlling terminal, and 0.16s of CPU unchanged across a 45s sample.
+# It held a fully-green MERGEABLE/CLEAN PR, with a clean review bound to the exact
+# head, permanently unlandable: no age bound, no CPU bound, no flag to release it.
 #
-# WHY CPU DELTA ALONE WOULD ITSELF BE A BUG: this rail LEGITIMATELY sits at zero
-# CPU for up to WAIT_TIMEOUT while its verify step waits on checks. A parked rail
-# is the NORMAL state, not a symptom. So the door must be narrow, and ALL FOUR
-# conditions are required — any doubt leaves the lock LIVE (fail-closed):
-#   1. the pid is alive;
-#   2. it is ORPHANED (ppid 1) — nothing will ever collect its result;
-#   3. the lock is older than a ceiling well past the rail's own maximum life;
-#   4. its CPU time does not advance across a sample — it cannot be mid-merge.
-# A live, working rail fails at least one of these, so it is never displaced. The
-# steal stays the existing atomic `mv` (exactly one contender can win).
-cpu_time_of() { # <pid> -> its CPU-time field, or empty if unreadable
-  local t
-  t="$(ps -o time= -p "$1" 2>/dev/null | tr -d ' ')" || return 1
-  [ -n "$t" ] || return 1
-  case "$t" in *-*) t="${t##*-}" ;; esac   # drop a leading "Nd-" days field
-  printf '%s' "$t"
+# WHY A HEARTBEAT, AND NOT AGE OR CPU (review cycle 1 of #1638, which reproduced
+# both). The first attempt of this change measured wall-age and CPU delta. A
+# fresh-context review showed both are unsound, with the numbers:
+#   • CPU delta cannot work, because IDLE IS THIS RAIL'S NORMAL STATE. Its verify
+#     and land loops sit in `sleep $POLL` (30s default), so a live, working rail
+#     shows flat CPU across any short sample. MEASURED: a live orphan on the
+#     rail's own cadence was declared abandoned in 2 of 8 calls.
+#   • A wall-age ceiling cannot be sized safely: the lock is held across
+#     MAX_ROUNDS rounds, each with update + record + a merge-confirm poll of up to
+#     ATOMIC_LAND_CONFIRM_MAX (60) x sleep 10, so the rail's own LEGITIMATE
+#     maximum life exceeds any ceiling derived from WAIT_TIMEOUT alone.
+#   • The 2s CPU sample also opened a CHECK-THEN-ACT window: two contenders could
+#     both sample the same aged lock and both proceed. REPRODUCED: 2-3 of 3
+#     contenders acquired the same aged orphan-held lock — and 3,2,2 at the
+#     default ceiling. That is the B11 interleave the lock exists to prevent,
+#     i.e. strictly WORSE than the bug being fixed.
+#
+# The heartbeat removes the sampling entirely. The rail writes a beat from its OWN
+# poll loops, so a rail that is working beats and a rail that is wedged stops:
+# liveness measures PROGRESS, which is the actual question. A side process that
+# beat independently would NOT work — it outlives the wedge and keeps the lock
+# looking fresh, which is the original bug in a new costume.
+#
+# Every condition is required, and any doubt leaves the lock LIVE:
+#   1. the pid is alive and still the pid the lock names;
+#   2. it is ORPHANED (ppid 1) — nothing will ever collect its result, so the
+#      conservative direction costs nothing;
+#   3. its heartbeat is STALE. A MISSING heartbeat is LIVE (fail-closed): that
+#      covers an older-format lock and the mkdir→beat window.
+touch_heartbeat() {
+  [ -n "$LOCKDIR" ] || return 0
+  : > "$LOCKDIR/heartbeat" 2>/dev/null || true
 }
-holder_is_abandoned() { # <pid> <lock-age-s> -> 0 = abandoned, 1 = treat as LIVE
-  local pid="$1" age_s="$2" ceiling cpu_before cpu_after
-  ceiling="${ATOMIC_LAND_LOCK_STALE_AFTER:-$(( WAIT_TIMEOUT * 2 + 1800 ))}"
-  [ "$age_s" -ge "$ceiling" ] 2>/dev/null || return 1
+heartbeat_age() { # -> seconds since the last beat, or empty if absent/unreadable
+  local mt now_s
+  [ -n "$LOCKDIR" ] || return 1
+  [ -f "$LOCKDIR/heartbeat" ] || return 1
+  now_s="$(date +%s)"
+  mt="$({ stat -c %Y "$LOCKDIR/heartbeat" 2>/dev/null || stat -f %m "$LOCKDIR/heartbeat" 2>/dev/null; } || true)"
+  case "$mt" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$(( now_s - mt ))"
+}
+holder_is_abandoned() { # <pid> -> 0 = abandoned, 1 = treat as LIVE
+  local pid="$1" age
   [ "$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')" = "1" ] || return 1
-  cpu_before="$(cpu_time_of "$pid")" || return 1
-  sleep "${ATOMIC_LAND_LOCK_STALE_SAMPLE:-2}"
-  kill -0 "$pid" 2>/dev/null || return 1
-  cpu_after="$(cpu_time_of "$pid")" || return 1
-  [ "$cpu_before" = "$cpu_after" ] || return 1
-  ABANDON_PID="$pid"; ABANDON_AGE="$age_s"; ABANDON_CEILING="$ceiling"
+  age="$(heartbeat_age)" || return 1
+  [ "$age" -ge "$LOCK_STALE_AFTER" ] 2>/dev/null || return 1
+  ABANDON_PID="$pid"; ABANDON_AGE="$age"
   return 0
 }
 
@@ -283,7 +318,7 @@ acquire_lock() {
   # ~25-38% naturally against a stale lock). The steal is therefore an ATOMIC
   # RENAME: `mv` of the lock directory succeeds for exactly ONE contender, so the
   # others fall through to the loop and re-read the lock that now exists.
-  local tries=0 other age now_s mt stolen
+  local tries=0 other age now_s mt stolen sother
   while :; do
     tries=$((tries + 1))
     if mkdir "$LOCKDIR" 2>/dev/null; then break; fi
@@ -295,8 +330,8 @@ acquire_lock() {
     mt="$({ stat -c %Y "$LOCKDIR" 2>/dev/null || stat -f %m "$LOCKDIR" 2>/dev/null; } || true)"
     case "$mt" in ''|*[!0-9]*) age=0 ;; *) age=$(( now_s - mt )) ;; esac
     if [ -n "$other" ] && kill -0 "$other" 2>/dev/null; then
-      if holder_is_abandoned "$other" "$age"; then
-        err "atomic-land: RECLAIMING an abandoned per-PR lock for $REPO#$PR — pid $ABANDON_PID is orphaned (ppid 1), its lock is ${ABANDON_AGE}s old (ceiling ${ABANDON_CEILING}s) and its CPU time did not advance across ${ATOMIC_LAND_LOCK_STALE_SAMPLE:-2}s. The lane that started it is gone (#1395); a live rail always fails one of these tests."
+      if holder_is_abandoned "$other"; then
+        err "atomic-land: RECLAIMING an abandoned per-PR lock for $REPO#$PR — pid $ABANDON_PID is orphaned (ppid 1) and has published no heartbeat for ${ABANDON_AGE}s (stale threshold ${LOCK_STALE_AFTER}s). The lane that started it is gone (#1395); a rail that is working beats from its own poll loop and never reaches this."
       else
         stop "another atomic-land is already running for $REPO#$PR (pid $other) — refusing to interleave"
       fi
@@ -307,14 +342,29 @@ acquire_lock() {
     if [ -z "$other" ] && [ "$age" -lt "${ATOMIC_LAND_LOCK_GRACE:-60}" ]; then
       stop "another atomic-land holds the lock for $REPO#$PR (no pid yet — still starting) — refusing to interleave"
     fi
-    # Stale: claim it by rename (atomic; at most one rail can win), then retry mkdir.
+    # Claim by ATOMIC RENAME, then CONFIRM the directory we actually won is still
+    # the one we judged. Deciding on a path we do not hold is check-then-act, and
+    # its window is what let two contenders both land the same PR (#1638 cycle 1,
+    # reproduced at 2-3 of 3). At most one contender can win a given `mv`, and if
+    # the pid it finds is not the pid it judged, someone re-created the lock in
+    # between: we just took a LIVE rail's directory, so give it back and refuse.
     stolen="$LOCKDIR.reclaim.$$"
-    mv "$LOCKDIR" "$stolen" 2>/dev/null && rm -rf "$stolen"
+    if mv "$LOCKDIR" "$stolen" 2>/dev/null; then
+      sother="$(cat "$stolen/pid" 2>/dev/null || true)"
+      if [ "$sother" = "$other" ]; then
+        rm -rf "$stolen"
+      else
+        [ -e "$LOCKDIR" ] || mv "$stolen" "$LOCKDIR" 2>/dev/null
+        rm -rf "$stolen"
+        stop "another atomic-land is already running for $REPO#$PR (pid ${sother:-unknown}) — refusing to interleave"
+      fi
+    fi
     if [ "$tries" -ge 5 ]; then
       stop "could not acquire the per-PR lock ($LOCKDIR) — refusing to race"
     fi
   done
   printf '%s\n' "$$" > "$LOCKDIR/pid"
+  touch_heartbeat
   trap 'rm -rf "$LOCKDIR"' EXIT INT TERM HUP
 }
 
@@ -549,6 +599,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # undetermined state still fails CLOSED.
       while [ "$t" -lt "${ATOMIC_LAND_UNKNOWN_POLLS:-5}" ]; do
         t=$((t + 1))
+        touch_heartbeat
         sleep "$POLL"
         resolve_state
         case "$MERGE_STATE" in UNKNOWN|""|null) : ;; *) break ;; esac
@@ -718,7 +769,7 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
   while [ "$i" -lt 20 ]; do
     after="$(gh_ pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json headRefOid --jq .headRefOid 2>/dev/null || true)"
     if [ -n "$after" ] && [ "$after" != "$before" ]; then HEAD="$after"; break; fi
-    i=$((i + 1)); sleep "$POLL"
+    i=$((i + 1)); touch_heartbeat; sleep "$POLL"
   done
   [ -n "$after" ] && [ "$after" != "$before" ] \
     || stop "the update did not move the head (still ${before:0:12}…) — nothing to carry a record onto"
@@ -794,6 +845,7 @@ wait_terminal() {
     # (bash 3.2), after step [1/4] has already moved the head. Same base everywhere.
     remaining=$(( 10#$WAIT_TIMEOUT - elapsed ))
     if [ "$remaining" -gt "$POLL" ]; then remaining="$POLL"; fi
+    touch_heartbeat
     sleep "$remaining"
   done
 }

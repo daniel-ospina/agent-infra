@@ -828,93 +828,111 @@ rc=$?
 [ "$rc" -eq 0 ] && pass "reclaimed and completed (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
 called "admin-merge" && pass "the unit landed after reclaiming a stale lock" || fail "did not proceed after reclaiming a stale lock"
 
-# ═══ 17l. B11b — an ORPHANED, aged, parked LIVE-pid lock is reclaimed ═══
+# ═══ 17l. B11b — an ORPHANED holder that stopped beating is reclaimed ═══
 # #1395 item 1's SECOND half, which the fix for item 1 did not address: the
-# reclaim required a DEAD pid, so a rail that outlived its parent (ppid 1) and
-# stopped making progress held the PR's lock forever. Live specimen 2026-10-08 —
+# reclaim required a DEAD pid, so a rail that outlived its parent and stopped
+# making progress held the PR's lock forever. Live specimen 2026-10-08 —
 # tortoise#7653, 3h51m against this script's own 90-minute bound, 0.16s of CPU
 # unchanged across a 45s sample, blocking a fully-green CLEAN PR.
-echo "── 17l. an orphaned + aged + parked live-pid lock IS reclaimed (B11b)"
+make_orphan() { # -> pid of a process reparented to 1 (its parent has exited)
+  local p k=0
+  p="$(sh -c 'nohup sleep 300 >/dev/null 2>&1 & echo $!')"
+  while [ "$k" -lt 15 ]; do
+    [ "$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')" = "1" ] && break
+    k=$((k + 1)); sleep 0.2
+  done
+  printf '%s' "$p"
+}
+echo "── 17l. an orphaned holder with a STALE heartbeat IS reclaimed (B11b)"
 new_scen abandonedlock
 LOCK4="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
 mkdir -p "$LOCK4"
-# A genuinely ORPHANED process: `sh -c` starts the sleep and exits at once, so the
-# sleep is reparented to 1 before we look at it — the specimen's exact shape, and
-# something `$$` cannot fake.
-ORPHAN_PID="$(sh -c 'nohup sleep 120 >/dev/null 2>&1 & echo $!')"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ "$(ps -o ppid= -p "$ORPHAN_PID" 2>/dev/null | tr -d ' ')" = "1" ] && break
-  sleep 0.2
-done
+ORPHAN_PID="$(make_orphan)"
 [ "$(ps -o ppid= -p "$ORPHAN_PID" 2>/dev/null | tr -d ' ')" = "1" ] \
   && pass "fixture: the holder is genuinely orphaned (ppid 1)" \
   || fail "fixture is not orphaned — this case would be vacuous"
 printf '%s\n' "$ORPHAN_PID" > "$LOCK4/pid"
+# A heartbeat that has gone stale. Backdated rather than slept through, so the
+# case does not depend on a timing threshold to be meaningful.
+: > "$LOCK4/heartbeat"
+touch -t 202001010000 "$LOCK4/heartbeat" 2>/dev/null || true
 SCEN_RECORD_LOG=1
-# The ceiling is arithmetically unreachable in a test, so shrink it rather than
-# sleeping through it. The ppid and CPU-delta conditions are still exercised for
-# real against a real orphan.
-export ATOMIC_LAND_LOCK_STALE_AFTER=0
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
-unset ATOMIC_LAND_LOCK_STALE_AFTER
 [ "$rc" -eq 0 ] && pass "reclaimed and completed (rc 0)" || fail "expected rc 0, got $rc ($(tail -1 "$SCEN/err"))"
 called "admin-merge" && pass "the unit landed after reclaiming an abandoned lock" || fail "did not proceed after reclaiming an abandoned lock"
 grep -qi "RECLAIMING an abandoned" "$SCEN/err" && pass "the reclaim is announced, not silent" || fail "the reclaim was silent — a stolen lock must never be quiet"
 kill -9 "$ORPHAN_PID" 2>/dev/null
 rm -rf "$LOCK4"
 
-# ═══ 17m. B11b — the ppid test is load-bearing ════════════════════════════
-# An aged lock held by a LIVE, NON-orphaned pid is a working rail (or this test
-# shell). Dropping the ppid condition would steal from it — the B11 interleave
-# this lock exists to prevent. This case reddens on that narrowing.
-echo "── 17m. an aged but NON-orphaned live lock still refuses (ppid is load-bearing)"
-new_scen nonorphanlock
+# ═══ 17m. B11b — the HEARTBEAT is load-bearing ═══════════════════════════
+# An orphan whose heartbeat is FRESH is a rail still working: it beats from its
+# own poll loop, and this is the pin for that condition. Dropping the staleness
+# requirement would steal from it — the B11 interleave the lock exists to
+# prevent. (This is the case the first attempt at this change could not write:
+# it sampled CPU, and a working rail's CPU is FLAT between 30s polls.)
+echo "── 17m. an orphaned holder with a FRESH heartbeat refuses (heartbeat is load-bearing)"
+new_scen freshbeatlock
 LOCK5="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
 mkdir -p "$LOCK5"
-# The holder must be LIVE and NOT orphaned. `$$` is NOT a safe fixture for this:
-# when the suite itself is launched detached (`nohup ... &`), `$$` is reparented to
-# 1, so the case silently inverts — it did, on the first full run, where 17m
-# reddened for the WRONG reason while the guard was correct. A background child of
-# THIS script is deterministic instead: its ppid is `$$`, which is never 1.
-sleep 120 &
-HOLDER=$!
-printf '%s\n' "$HOLDER" > "$LOCK5/pid"
-[ "$(ps -o ppid= -p "$HOLDER" 2>/dev/null | tr -d ' ')" != "1" ] \
-  && pass "fixture: the holder is live and NOT orphaned" \
-  || fail "fixture is orphaned — this case would be vacuous"
-export ATOMIC_LAND_LOCK_STALE_AFTER=0                       # even with the ceiling at 0
+ORPHAN2="$(make_orphan)"
+printf '%s\n' "$ORPHAN2" > "$LOCK5/pid"
+: > "$LOCK5/heartbeat"                       # fresh: just beaten, like a working rail
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
+called "admin-merge" && fail "reclaimed a lock from a holder that was still beating (B11 fail-open)" || pass "did NOT reclaim a beating holder's lock"
+grep -qi "already running" "$SCEN/err" && pass "the refusal names the concurrent rail" || fail "the refusal does not name the concurrent rail"
+kill -9 "$ORPHAN2" 2>/dev/null
+rm -rf "$LOCK5"
+
+# ═══ 17n. B11b — a MISSING heartbeat is LIVE, not stale ══════════════════
+# The lock directory is created before the first beat is written, so a rail in
+# that window has no heartbeat file. Reading "no file" as "stale" would reclaim a
+# lock that was created milliseconds ago — the same TOCTOU as 17c, one field
+# over. Older-format locks land here too.
+echo "── 17n. an orphaned lock with NO heartbeat file refuses (missing = LIVE)"
+new_scen noheartbeatlock
+LOCK6="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
+mkdir -p "$LOCK6"
+ORPHAN3="$(make_orphan)"
+printf '%s\n' "$ORPHAN3" > "$LOCK6/pid"
+# deliberately NO heartbeat file, and a threshold of 0 so ONLY the missing-file
+# guard can refuse this — otherwise the case would pass for the wrong reason.
+export ATOMIC_LAND_LOCK_STALE_AFTER=1
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 unset ATOMIC_LAND_LOCK_STALE_AFTER
 [ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
-called "admin-merge" && fail "reclaimed a lock from a LIVE non-orphaned holder (B11 fail-open)" || pass "did NOT reclaim a live holder's lock"
+called "admin-merge" && fail "reclaimed a lock that had published no heartbeat yet (B11 fail-open)" || pass "did NOT reclaim an unheartbeated lock"
 grep -qi "already running" "$SCEN/err" && pass "the refusal names the concurrent rail" || fail "the refusal does not name the concurrent rail"
-kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
-rm -rf "$LOCK5"
+kill -9 "$ORPHAN3" 2>/dev/null
+rm -rf "$LOCK6"
 
-# ═══ 17n. B11b — the age test is load-bearing ════════════════════════════
-# An ORPHANED process younger than the ceiling may still be mid-merge (a rail
-# whose parent died seconds ago keeps running). Dropping the age condition would
-# reclaim it. This uses the DEFAULT ceiling, so it also pins that the fix does not
-# steal a fresh orphan.
-echo "── 17n. an ORPHANED but FRESH lock still refuses (age is load-bearing)"
-new_scen youngorphanlock
-LOCK6="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
-mkdir -p "$LOCK6"
-ORPHAN_PID2="$(sh -c 'nohup sleep 120 >/dev/null 2>&1 & echo $!')"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  [ "$(ps -o ppid= -p "$ORPHAN_PID2" 2>/dev/null | tr -d ' ')" = "1" ] && break
-  sleep 0.2
-done
-printf '%s\n' "$ORPHAN_PID2" > "$LOCK6/pid"
+# ═══ 17o. B11b — the ORPHAN condition is load-bearing ════════════════════
+# A lock whose holder is LIVE and whose PARENT is alive is not abandoned, even
+# with a stale heartbeat: something is still waiting for its result, so it may be
+# in a long non-polling phase. Dropping the ppid condition would steal it. This
+# is the conservative direction, and it is the pin for that condition.
+echo "── 17o. a holder with a LIVING parent and a stale heartbeat refuses (ppid is load-bearing)"
+new_scen nonorphanlock
+LOCK7="$SCEN/home/.pi/agent/locks/atomic-land-daniel-ospina-agent-infra-42.lock"
+mkdir -p "$LOCK7"
+sleep 300 &
+HOLDER=$!
+printf '%s\n' "$HOLDER" > "$LOCK7/pid"
+[ "$(ps -o ppid= -p "$HOLDER" 2>/dev/null | tr -d ' ')" != "1" ] \
+  && pass "fixture: the holder is live and NOT orphaned" \
+  || fail "fixture is orphaned — this case would be vacuous"
+: > "$LOCK7/heartbeat"
+touch -t 202001010000 "$LOCK7/heartbeat" 2>/dev/null || true   # stale, so ONLY ppid can refuse
 run_rail 42 --repo "$REPO" --poll 0
 rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1)" || fail "expected rc 1, got $rc"
-called "admin-merge" && fail "reclaimed a FRESH orphan — a rail whose parent just died may still be working" || pass "did NOT reclaim a fresh orphan"
+called "admin-merge" && fail "reclaimed a lock whose holder still has a living parent (B11 fail-open)" || pass "did NOT reclaim a lock with a live parent"
 grep -qi "already running" "$SCEN/err" && pass "the refusal names the concurrent rail" || fail "the refusal does not name the concurrent rail"
-kill -9 "$ORPHAN_PID2" 2>/dev/null
-rm -rf "$LOCK6"
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null || true
+rm -rf "$LOCK7"
 
 # ═══ 17f. B5 — never spend an attestation the unit cannot restore ═══════
 # Measured cost of NOT checking this: a 22-PR sweep invalidated 17 fresh
@@ -1310,12 +1328,16 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B6b  's/^(\s*)stop "the merge state of .*$/$1return 3/m'
   # B11b: reclaim a pid-less lock immediately — the mkdir→pid TOCTOU
   mutate_and_expect_fail B11b 's/if \[ -z "\$other" \] && \[ "\$age" -lt "\${ATOMIC_LAND_LOCK_GRACE:-60}" \]; then/if false; then/'
-  # B11c: drop the ORPHAN requirement — reclaim from a live, non-orphaned holder,
-  # which is the B11 interleave the lock exists to prevent (17m reds).
-  mutate_and_expect_fail B11c 's/= "1" \] \|\| return 1/= "1" ] || true/'
-  # B11d: drop the AGE ceiling — reclaim an orphan whose parent died seconds ago,
-  # which may still be mid-merge (17n reds).
-  mutate_and_expect_fail B11d 's/"\$age_s" -ge "\$ceiling"/1 -ge 0/'
+  # B11c: drop the HEARTBEAT-staleness requirement — reclaim a lock from a holder
+  # that is still beating, which is the B11 interleave the lock exists to prevent
+  # (17m reds).
+  mutate_and_expect_fail B11c 's/\[ "\$age" -ge "\$LOCK_STALE_AFTER" \] 2>\/dev\/null \|\| return 1/true \|\| return 1/'
+  # B11d: treat a MISSING heartbeat as stale — reclaim a lock created milliseconds
+  # ago, in the mkdir→beat window (17n reds).
+  mutate_and_expect_fail B11d 's/\[ -f "\$LOCKDIR\/heartbeat" \] \|\| return 1/true/'
+  # B11e: drop the ORPHAN requirement — reclaim a lock whose holder still has a
+  # living parent, so something is still waiting for its result (17o reds).
+  mutate_and_expect_fail B11e 's/= "1" \] \|\| return 1/= "1" ] || true/'
   # B6: never stop on the terminal-check wait expiry
   mutate_and_expect_fail B6   's/^      stop "the checks at.*$/      return 0/m'
   # B14 (#1395 item 1): credit `elapsed` from a NOMINAL poll count instead of a
