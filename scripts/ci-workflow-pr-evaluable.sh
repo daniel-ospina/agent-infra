@@ -348,8 +348,23 @@ def collect_filters(lines, on_index):
             cur_filter = None
             out.setdefault(cur_trig, {})
             rest = (m.group(5) or "").strip()
-            if rest and rest not in ("|", ">"):
-                return None  # an inline value on the trigger key
+            # ⛔ NO VALUE ON A TRIGGER KEY IS READABLE. The `|`/`>` allowance
+            # that used to live here was WRONG (#1637 review round 3): a trigger
+            # key whose value is a bare block scalar is not bailed, so the block
+            # BODY was re-read as if it were the trigger's mapping. When that body
+            # is filter-key lines, the attribution ends with `out["workflow_call"]
+            # == {}` and `nonfilter_seen` still False — the tail falls through to
+            # `trigger_measurable`'s `return False` and the predicate answers `no`:
+            #
+            #     on:
+            #       workflow_call: |
+            #         paths: [docs/**]
+            #
+            # The allowance is needed ONLY on the non-filter-key branch below, for
+            # `description: |`. GitHub rejects a string value for `on.<event>`, so
+            # nothing legal is refused by dropping it here.
+            if rest:
+                return None  # an inline value or block scalar on the trigger key
             continue
         if cur_trig is None:
             return None

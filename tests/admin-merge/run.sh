@@ -9431,9 +9431,11 @@ pe_case "reusable + sibling schedule"    unknown $'on:\n  workflow_call:\n  sche
 # key also skipped the flow-balance arm, so a `paths:` nested inside another key's
 # UNTERMINATED flow sequence was read as a top-level PR filter and the verdict
 # moved `yes` -> `no` on input this reader cannot attribute.
-# ⛔ THIS ONE NEEDS A CHANGED SET to exhibit the fail-open: without it a PR trigger
-# answers `yes` either way, so a bare `pe_case` would pin the parse change but not
-# the defect (review P3).
+# ⛔ THE CHANGED SET IS NOT WHAT MAKES THIS PIN THE DEFECT (review round 3, P3 —
+# the earlier claim here was WRONG). Measured against the buggy commit, the
+# NO-changed-set run answers `unknown`, which also fails the pinned `yes`. The set
+# is carried because the fail-open is only REACHABLE with one, not because it is
+# what distinguishes the arms.
 pe_case_paths() {  # <label> <expected> <changed-paths> <yaml>
   local got
   got="$(printf '%s' "$4" | PR_CHANGED_PATHS="$3" wf_eval)"
@@ -9444,6 +9446,13 @@ pe_case_paths "unterminated flow under non-filter key" yes 'src/app.ts' $'on:\n 
 # closer was type-blind, and `scan_flow_state` decrements on either, so the outer
 # walk did not catch it either (review P3).
 pe_case_paths "mismatched closer under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened}\n    paths: [docs/**]\n'
+# A TRIGGER key's value is never readable. A bare block scalar used to be allowed
+# through and its BODY re-read as the trigger's mapping, so a filter-key line
+# inside it was attributed as a real filter and `workflow_call: |` fell to `no`
+# (review round 3, P2). The `|`/`>` allowance is needed only on the non-filter-key
+# branch below, for `description: |`.
+pe_case "trigger-key block scalar"        unknown $'on:\n  workflow_call: |\n    paths: [docs/**]\n'
+pe_case "sibling trigger block scalar"    unknown $'on:\n  workflow_call:\n  schedule: |\n    paths: [docs/**]\n'
 # P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
 # reader does not interpret left the flag unset, so a reusable trigger still
 # reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
