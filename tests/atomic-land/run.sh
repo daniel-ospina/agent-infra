@@ -1989,6 +1989,25 @@ origin_form_case bracurl "ssh://[evil.invalid]@github.com/$REPO" refresh "git's 
 echo "── 17g-E32. origin '[evil.invalid]@github.com:<slug>' ⇒ REFRESH (the same rule in the scp-like form)"
 origin_form_case bracescp "[evil.invalid]@github.com:$REPO" refresh "the scp-like form applies git's host_end() too"
 
+echo "── 17g-E33. origin 'git://evil.invalid@github.com/<slug>' ⇒ REFRESH (the git:// transport has NO userinfo)"
+# Measured: `fatal: unable to look up evil.invalid@github.com (port 9418)` — the `@` is
+# part of the HOSTNAME there, so cutting at it names the target.
+origin_form_case gituserinfo "git://evil.invalid@github.com/$REPO" refresh "the git:// transport has no userinfo, so the '@' is part of the hostname"
+
+echo "── 17g-E34. origin 'ssh://github.com:evil/<slug>' ⇒ REFRESH (a non-numeric suffix is part of the HOSTNAME, not a port)"
+# Measured: git looks up host `github.com:evil` — and an `ssh_config` `Host
+# github.com:evil` alias makes that a DIFFERENT MACHINE, so a first-colon cut is a real
+# wrong-subject read and not a theoretical one.
+origin_form_case portnotnum "ssh://github.com:evil/$REPO" refresh "git's hostname is github.com:evil, not github.com"
+
+echo "── 17g-E35. origin 'ssh://github.com:65536/<slug>' ⇒ REFRESH (a port above 65535 is not a port)"
+origin_form_case porttoobig "ssh://github.com:65536/$REPO" refresh "65536 is not a port, so it stays part of the hostname"
+
+echo "── 17g-E36. origin 'ssh://github.com:22/<slug>' ⇒ the skip STILL applies (a REAL port is stripped)"
+# The other direction, so the rule cannot be "refuse every colon": git strips `:22` and
+# contacts `github.com`, which IS the target.
+origin_form_case portreal "ssh://github.com:22/$REPO" skip "a real port is stripped, so the host is the target's"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -2455,7 +2474,19 @@ if true; then
   # `|` is the delimiter, NOT `#`: the replacement contains `${1##*@}`, and a `#`
   # delimiter truncates there and silently substitutes NOTHING at exit 0 — the anchor
   # pass then reports "the mutation did not apply", which is how this was caught.
-  mutate_and_expect_fail B43  's|^.*the literal IS the host.*$|    [*) printf %s "\${1##*@}" ;;|m'
+  mutate_and_expect_fail B43  's/^.*the literal IS the host.*$/    [*) printf %s "\${2##*@}" ;;/m'
+  # B44 (#7727): userinfo belongs to the TRANSPORT. The failure it prevents:
+  # `git://evil.invalid@github.com/<slug>`, whose hostname git takes WHOLE (the git://
+  # transport has no userinfo), read as the TARGET by a last-`@` cut. 17g-E33 must redden.
+  # The delimiter is `/`, NOT `|`: these patterns contain literal pipes, and with `|` as
+  # the delimiter an escaped `\|` collapses to regex ALTERNATION instead of a literal
+  # pipe (measured). `%%:*}` is avoided by letting `.*$` consume the rest of the line.
+  mutate_and_expect_fail B44  's/^ *git\|file\) printf .%s. "\$2" ;;.*$/         git|file) printf %s "\${2##*@}" ;;/m'
+  # B45 (#7727): a suffix is a port only when it IS one. The failure it prevents:
+  # `ssh://github.com:evil/<slug>`, whose hostname git takes as `github.com:evil` (and
+  # an `ssh_config` alias can point that at another machine), read as the TARGET by a
+  # first-colon cut. 17g-E34 and 17g-E35 must redden; 17g-E36 must stay green.
+  mutate_and_expect_fail B45  's/^ *case "\$p" in.*$/         printf %s "\${a%%:*}";;/m'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A

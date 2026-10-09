@@ -429,10 +429,21 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 # literal, never at the first colon: `[2001:db8::1]` and `[2001:dead::9]` both reduce
 # to `[2001` under a first-colon cut, so two DIFFERENT hosts would compare equal —
 # exactly the silent wrong-repo fail-open drift_safe_of() exists to refuse (#7727).
-remote_host_of() { # <[host]:port | host:port | host> -> host, verbatim
-  case "$1" in
-    \[*) local h="${1#\[}"; printf "[%s]" "${h%%]*}" ;;
-    *)   printf "%s" "${1%%:*}" ;;
+remote_host_of() { # <[host][:port] | host[:port]> -> host, verbatim
+  # THE PORT IS STRIPPED ONLY WHEN IT **IS** A PORT. `connect.c: get_host_and_port()`
+  # takes the suffix as a port only when `strtol` consumes the WHOLE remainder and it is
+  # below 65536 (six digits, or any non-digit, is not a port). Measured:
+  # `ssh://github.com:evil/<slug>` and `git://github.com:evil/<slug>` both look up host
+  # `github.com:evil`, while a first-colon cut names `github.com` — the TARGET, and
+  # reachable to a different machine through an `ssh_config` `Host github.com:evil` alias
+  # (review round 17).
+  local a="$1" h p
+  case "$a" in
+    \[*) case "$a" in *\]*) : ;; *) printf '' ; return 0 ;; esac
+         h="${a#\[}"; printf "[%s]" "${h%%]*}" ;;
+    *)   p="${a#*:}"
+         if [ "$p" = "$a" ]; then printf '%s' "$a"; return 0; fi
+         case "$p" in *[!0-9]*|??????*|'') printf '%s' "$a" ;; *) if [ "$p" -lt 65536 ]; then printf '%s' "${a%%:*}"; else printf '%s' "$a"; fi ;; esac ;;
   esac
 }
 
@@ -446,12 +457,20 @@ remote_host_of() { # <[host]:port | host:port | host> -> host, verbatim
 # one grammar rule further in (review round 16). `remote_host_of` already reads a
 # leading bracket correctly, so the cut must simply not be applied there; a bracket
 # anywhere else is a shape we cannot place, and it fails closed like every other
-# unreadable authority.
-strip_userinfo() { # <authority> -> authority with any userinfo removed
-  case "$1" in
-    \[*) case "$1" in *\]*) printf '%s' "$1" ;; *) printf '' ;; esac ;;   # the literal IS the host
+# unreadable authority. USERINFO BELONGS TO THE TRANSPORT, THOUGH: `git://` and
+# `file://` have none, so an `@` there is part of the HOSTNAME (measured:
+# `git://evil.invalid@github.com/<slug>` is looked up as host
+# `evil.invalid@github.com`) and a last-`@` cut would name the TARGET — the same
+# fail-OPEN, one transport over. Every other scheme cuts at the LAST `@`, which is what
+# curl and git both use.
+strip_userinfo() { # <scheme> <authority> -> authority with any userinfo removed
+  case "$2" in
+    \[*) case "$2" in *\]*) printf '%s' "$2" ;; *) printf '' ;; esac ;;   # the literal IS the host
     *\[*|*\]*) printf '' ;;                                              # a bracket we cannot place
-    *) printf '%s' "${1##*@}" ;;                                          # curl and git both use the LAST '@'
+    *) case "$1" in
+         git|file) printf '%s' "$2" ;;                                # these transports have no userinfo
+         *) printf '%s' "${2##*@}" ;;                                 # curl and git both use the LAST '@'
+       esac ;;
   esac
 }
 
@@ -562,7 +581,7 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     if [ -n "$origin_scheme_l" ]; then
       origin_authority_l="${origin_l#*://}"
       origin_path_l="${origin_authority_l#*/}"
-      origin_authority_l="$(strip_userinfo "${origin_authority_l%%/*}")"
+      origin_authority_l="$(strip_userinfo "$origin_scheme_l" "${origin_authority_l%%/*}")"
       if [ "$origin_scheme_l" = "file" ]; then
         case "$origin_authority_l" in
           ''|localhost) : ;;
@@ -576,7 +595,7 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
           pre_colon_l="${origin_l%%:*}"
           case "$pre_colon_l" in
             */*) : ;;             # a slash first ⇒ a LOCAL PATH, not a remote
-            *) origin_authority_l="$(strip_userinfo "$pre_colon_l")"; origin_path_l="${origin_l#*:}" ;;
+            *) origin_authority_l="$(strip_userinfo '' "$pre_colon_l")"; origin_path_l="${origin_l#*:}" ;;
           esac ;;
       esac
     fi
