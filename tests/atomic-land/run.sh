@@ -1665,6 +1665,67 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although the authority it would fetch is unreadable" \
   || pass "and it was never consulted: the authority check failed before any measurement"
 
+# ── A FOREIGN OWNER WITH AN EXTRA LEADING PATH SEGMENT — round 11 ────────
+echo "── 17g-E21. origin '.../evil/<owner>/<name>' ⇒ REFRESH (the path must BE the target's, not end with it)"
+# A suffix test (`*/owner/name`) accepts this: the string does end with the target
+# slug. But the repository path is `evil/owner/name`, so the owner is not ours. E16
+# covers the same assertion from the other side — a different NAME under the same
+# owner — so both shapes are pinned, and both redden under B30.
+new_scen driftforeignowner
+git init -q "$TMP/e21repo"
+mkdir -p "$TMP/e21repo/tools" "$TMP/e21repo/sub"
+git -C "$TMP/e21repo" remote add origin "https://github.com/evil/$REPO.git"
+cat > "$TMP/e21repo/tools/drift-guard.py" <<'E21EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E21EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e21repo/sub"
+SCEN_CWD_REPO="$REPO"     # the host matches; only the extra leading segment separates these
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — 'evil/<owner>/<name>' ends with the slug but is not the target's path" \
+  || fail "SKIPPED: a foreign owner's path was accepted because it ENDS with owner/name (the round-11 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the remote's path is not the target's" \
+  || pass "and it was never consulted: the path assertion failed before any measurement"
+
+# ── AN UNREADABLE BASE REF — round 11 ────────────────────────────────────
+echo "── 17g-E22. the base ref is UNREADABLE ⇒ REFRESH (unmeasurable is not absent)"
+# The no-gate exception is the one skip with NO measurement, so absence must be
+# MEASURED. `git ls-tree` reports three outcomes apart: an entry (present), no output
+# at rc 0 (absent), and a non-zero rc (unreadable). Here `origin/main` names a BLOB,
+# not a tree, so ls-tree fails — the shape a corrupt object or an unfetched promisor
+# blob produces. Only rc 0 WITH NO OUTPUT may take the skip.
+new_scen driftunreadableref
+git init -q "$TMP/e22repo"
+mkdir -p "$TMP/e22repo/sub"
+git -C "$TMP/e22repo" remote add origin "https://github.com/$REPO.git"
+printf 'not a tree\n' > "$SCEN/blobbody"
+git -C "$TMP/e22repo" update-ref refs/remotes/origin/main \
+  "$(git -C "$TMP/e22repo" hash-object -w --stdin < "$SCEN/blobbody")"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e22repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — an unreadable base ref is 'no measurement', not 'no gate'" \
+  || fail "SKIPPED: an unreadable base ref read as 'the target has no drift gate' (a T1 skip with no measurement)"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -2041,16 +2102,22 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # distance below a non-zero trigger is skipped unmeasured (the round-3 P1). 17g-E12
   # must redden.
   mutate_and_expect_fail B29  's/^        if \[ "\$\{behind:-\}" = "0" \]; then$/        if [ -n "\044behind" ]; then/m'
-  # B30 (#7727): the ORIGIN-REMOTE assertion — the round-7 wrong-repo green. The
+  # B30 (#7727): the ORIGIN-REMOTE PATH assertion — the round-7 wrong-repo green. The
   # failure it prevents: the tool fetches the checkout's `origin` remote while
-  # `gh repo view` prefers `upstream`, so a fork checkout passes the slug check and
-  # its green is attributed to the target. 17g-E16 must redden.
-  mutate_and_expect_fail B30  's/^      \*\) return 0 ;;$/      *) : ;;/m'
-  # B32 (#7727): the no-gate exception's BASE-REF read. The failure it prevents:
-  # a stale checkout (or a locally deleted file) reading "no gate" for a repo that HAS
-  # one, and taking the skip unmeasured — a T1 skip with no measurement. 17g-E19 must
-  # redden.
-  mutate_and_expect_fail B32  's/^         && ! git -C "\$\{CWD_ROOT:-\.\}" cat-file -e "origin\/\$BASE:tools\/drift-guard\.py" 2>\/dev\/null/         \&\& :/m'
+  # `gh repo view` prefers `upstream`, so a fork checkout passes the identity check and
+  # its green is attributed to the target. With the path test inert the fork's
+  # `owner/name-fork` is accepted. 17g-E16 and 17g-E21 must redden.
+  mutate_and_expect_fail B30  's/^    if \[ "\$origin_path_l" != "\$target_l" \]; then$/    if false; then/m'
+  # B32 (#7727): the no-gate exception's ABSENCE test. The failure it prevents: a
+  # base ref that DOES contain the tool being read as "no gate" — a stale checkout, or
+  # a locally deleted file — so the skip is taken unmeasured (T1). 17g-E19 must redden.
+  mutate_and_expect_fail B32  's/^      if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/      if [ "\$tree_rc" -eq 0 ]; then/m'
+  # B34 (#7727): the UNREADABILITY test. The failure it prevents: an unreadable ref or
+  # tree (a partial clone whose promisor blob was never fetched, a corrupt object)
+  # collapsing into "the target has no gate", so the skip is taken on a repo that HAS
+  # one. rc 0 + no output is the ONLY shape that may skip. 17g-E22 must redden, and
+  # 17g-E5 must stay green.
+  mutate_and_expect_fail B34  's/^      if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/      if [ -z "\$tree_out" ]; then/m'
   # B33 (#7727): the scp-like authority arm. The failure it prevents: an origin of the
   # form `user:pw@github.com/o/n`, which git fetches from host `user` while a
   # first-`@` read names the TARGET's host — a T6 wrong-repo MATCH. 17g-E20 must redden.
