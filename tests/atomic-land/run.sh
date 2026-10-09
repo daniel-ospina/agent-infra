@@ -288,6 +288,43 @@ exit "$(cat "$SCEN/drift-exit")"
 DRIFTEOF
 chmod +x "$DRIFT_EXITCODE"
 
+# A FAKE `uv` ON PATH — the suite must not depend on a real TOOLCHAIN for the rail's
+# default predicate argv (`uv run python <tool>`). CI has no guaranteed `uv`, and no
+# interpreter it can fetch for a scratch checkout, so a scenario that needs the default
+# argv read "unmeasurable" → refresh → RED for a reason that has nothing to do with the
+# code: measured, 17g-E29 and 17g-E36 failed in CI while passing locally — a test
+# measuring the HOST, not the change. The shim reproduces the fixture contract exactly
+# (consult $SCEN/drift-status, log the call, exit 0/1/2 by status) and RECORDS the tool
+# path the rail resolved, so the root-anchored path assertion is observable rather than
+# inferred from a refresh (see 17g-E9).
+FAKEBIN="$TMP/fakebin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/uv" <<'UVEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+tool=""
+# The rail invokes `uv run python <tool> --json --base ... --head <sha>`, so the
+# TOOL is the first *.py argument — the LAST argument is the head sha (taking it
+# as the tool made every default-argv scenario read "unmeasurable", which is the
+# CI symptom this shim exists to remove).
+for a in "$@"; do case "$a" in *.py) tool="$a"; break ;; esac; done
+printf 'drift-guard tool=%s\n' "$tool" >> "$SCEN/drift-calls"
+if [ ! -f "$tool" ]; then
+  echo "drift-guard: no tool at $tool" >&2
+  exit 2
+fi
+if [ -f "$SCEN/drift-status" ]; then
+  st="$(cat "$SCEN/drift-status")"
+  printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+  [ "$st" = ok ] && exit 0
+  exit 1
+fi
+echo "drift-guard: could not fetch the base — its freshness cannot be proven" >&2
+exit 2
+UVEOF
+chmod +x "$FAKEBIN/uv"
+PATH="$FAKEBIN:$PATH"; export PATH
+
 # The DEFAULT run directory for every scenario. It must be a real git checkout whose
 # `origin` carries the target slug, because the rail asserts the remote its predicate
 # fetches: defaulting to the CALLER's cwd made each no-override scenario depend on
@@ -1929,6 +1966,14 @@ origin_form_case() { # <name> <origin-url> <expect: refresh|skip> <why>
   mkdir -p "$dir/tools" "$dir/sub"
   git -C "$dir" remote add origin "$url"
   cp "$TMP/e2x-tool.py" "$dir/tools/drift-guard.py"   # PRESENT: a skip would consult it
+  # The predicate's VERDICT, in the same contract every other scenario uses. It must
+  # not come from running the fixture through the ambient toolchain: CI has no `uv`,
+  # so a scenario that needed the real default argv red "unmeasurable" → refresh for a
+  # reason that has nothing to do with the grammar under test (measured: E29/E36).
+  # `drift` for the refresh cases too, so that a leak past the identity gate still
+  # LOGS a call and trips the "never consulted" assertion instead of passing quietly.
+  if [ "$expect" = skip ]; then printf 'ok\n' > "$SCEN/drift-status"
+  else                          printf 'drift\n' > "$SCEN/drift-status"; fi
   printf 'CLEAN\n'     > "$SCEN/state"
   printf '14\n'        > "$SCEN/behind"
   printf 'false\n'     > "$SCEN/strict"
@@ -2089,6 +2134,9 @@ run_rail 42 --repo "$REPO" --poll 0
 called "pr update-branch" \
   && pass "refreshed — the tool was found from a subdirectory (root-anchored)" \
   || fail "SKIPPED from a subdirectory: a present gate read as absent (the round-2 fail-OPEN)"
+grep -qF -- "/e9repo/tools/drift-guard.py" "$SCEN/drift-calls" 2>/dev/null \
+  && pass "and the tool the rail resolved is the ROOT-anchored path, not a cwd-relative one" \
+  || fail "the rail resolved a different tool path: $(tail -1 "$SCEN/drift-calls" 2>/dev/null)"
 grep -qF -- "drift-guard" "$SCEN/drift-calls" \
   && pass "and the predicate actually RAN (not merely 'found')" \
   || fail "the predicate never ran — found-by-accident or not at all"
