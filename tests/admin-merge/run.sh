@@ -9460,6 +9460,116 @@ pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      -
 pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
+# ── #1637: a NON-FILTER key's inline scalar must not abandon the attribution ─
+# `collect_filters()` bails out of the WHOLE document (`return None`) on an
+# inline, non-list scalar. That is right for a FILTER whose shape it cannot read
+# and WRONG for a key that is not a filter at all — and `workflow_dispatch.inputs`
+# is nothing but those (`description:`, `required:`, `default:`, `type:`). So
+# #1542's reader silently collapsed the answer to `unknown` for every workflow
+# with a normally-specified input, and `unknown` is consumed as PR-EVALUABLE.
+# The #6807 exemption therefore stopped firing for its own motivating file —
+# `deploy-hosted.yml` (`on: push` with `branches:` + `workflow_dispatch`, no
+# `pull_request` at all) — and a `push`-only base red entered §4.6, refusing
+# every PR with a remedy no rebase can satisfy. Measured on identical input:
+# the pre-#1542 predicate answers `no` for that file, the pre-fix one `unknown`.
+pe_case "workflow_dispatch input spec"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      d:\n        description: \x27x\x27\n        required: false\n        default: \x27false\x27\n        type: boolean\n'
+pe_case "input spec, no other trigger" no $'on:\n  workflow_dispatch:\n    inputs:\n      d:\n        default: x\n'
+pe_case "depth-3 scalar under inputs"  no $'on:\n  workflow_dispatch:\n    inputs:\n      d: x\n'
+# These three are NOT evidence that #1637 is fixed — they pass BEFORE and AFTER
+# it (measured against `git show bc0481b:scripts/ci-workflow-pr-evaluable.sh`).
+# They are guards against the OPPOSITE over-generalisation: the fix must not widen
+# the exemption in the other direction either. Only a `pull_request` whose filter
+# cannot be read still resolves through the trigger NAME and blocks (`yes`), and
+# an inline value on a TRIGGER key still refuses (`unknown`). Both fail-closed;
+# neither may become `no`.
+pe_case "unreadable paths flow-mapping" yes $'on:\n  pull_request:\n    paths: {a: b}\n'
+pe_case "pull_request w/ only types"    yes $'on:\n  pull_request:\n    types: [opened]\n'
+pe_case "inline value on trigger key"   unknown $'on:\n  push: main\n'
+# ── P1/P2 from the fresh-context review of PR #1639 (<- both were REAL) ───────
+# P1: the #1413 invariant is a property of the TRIGGER, so it must hold when the
+# unattributable key lives under a SIBLING trigger. Keying it on `cur_trig` let
+# `workflow_call` + `workflow_dispatch: inputs:` fall through to
+# `trigger_measurable`'s tail `return False` and answer `no` — the same fail-open
+# as the one the fix was written to close, one trigger over. Measured against the
+# pre-fix predicate these are `unknown`; the buggy intermediate was `no`.
+pe_case "reusable + sibling input spec"  unknown $'on:\n  workflow_call:\n  workflow_dispatch:\n    inputs:\n      reason:\n        description: why\n'
+pe_case "reusable + sibling push scalar" unknown $'on:\n  workflow_call:\n  push:\n    x: y\n'
+pe_case "reusable + sibling schedule"    unknown $'on:\n  workflow_call:\n  schedule:\n    x: y\n'
+# P2: a NON-FILTER key's SHAPE must still balance. Skipping the bail for such a
+# key also skipped the flow-balance arm, so a `paths:` nested inside another key's
+# UNTERMINATED flow sequence was read as a top-level PR filter and the verdict
+# moved `yes` -> `no` on input this reader cannot attribute.
+# ⛔ THE CHANGED SET IS NOT WHAT MAKES THIS PIN THE DEFECT (review round 3, P3 —
+# the earlier claim here was WRONG). Measured against the buggy commit, the
+# NO-changed-set run answers `unknown`, which also fails the pinned `yes`. The set
+# is carried because the fail-open is only REACHABLE with one, not because it is
+# what distinguishes the arms.
+pe_case_paths() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | PR_CHANGED_PATHS="$3" wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate[#1637]: $1 -> $2" || fail "predicate[#1637]: $1 -> expected $2, got '$got'"
+}
+pe_case_paths "unterminated flow under non-filter key" yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened,\n            paths: [docs/**]]\n'
+# …and the type-matched closer: `[opened}` is not a balanced `[`. Taking either
+# closer was type-blind, and `scan_flow_state` decrements on either, so the outer
+# walk did not catch it either (review P3).
+pe_case_paths "mismatched closer under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened}\n    paths: [docs/**]\n'
+# A TRIGGER key's value is never readable. A bare block scalar used to be allowed
+# through and its BODY re-read as the trigger's mapping, so a filter-key line
+# inside it was attributed as a real filter and `workflow_call: |` fell to `no`
+# (review round 3, P2). The `|`/`>` allowance is needed only on the non-filter-key
+# branch below, for `description: |`.
+pe_case "trigger-key block scalar"        unknown $'on:\n  workflow_call: |\n    paths: [docs/**]\n'
+pe_case "sibling trigger block scalar"    unknown $'on:\n  workflow_call:\n  schedule: |\n    paths: [docs/**]\n'
+# Round 4. The reader still had two holes, and they are ONE statement: a value
+# already consumed is not a key. A block scalar's body is content, and a
+# NON-FILTER key's empty value opens a subtree whose children are not trigger-depth
+# keys. Each case below answered `no` on 45fc45b1 (fail-open) and `yes` now.
+pe_case_paths "filter-key block scalar"       yes 'src/app.ts' $'on:\n  pull_request:\n    paths: |\n      - docs/**\n'
+pe_case_paths "non-filter block scalar body"  yes 'src/app.ts' $'on:\n  pull_request:\n    types: |\n      paths: [docs/**]\n'
+pe_case_paths "filter under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types:\n      paths: [docs/**]\n'
+# ⛔ AND THE OVER-BLOCK THE SAME CHANGE NEARLY SHIPPED. Skipping the subtree is
+# what fixes the two above, but a subtree skip applied ONLY to block scalars left
+# `workflow_dispatch.inputs.<name>.<field>` — `deploy-hosted.yml`'s real shape,
+# the file #6807 exists for — answering `unknown`, because a body line that is not
+# a key bailed the whole attribution. This case is the regression net for that: it
+# must stay `no`.
+pe_case "legit nested inputs, no PR trigger"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      a:\n        description: |\n          paths: [not, ours]\n'
+# Round 5: the continuation of a MULTI-LINE QUOTED SCALAR is not a key. Unlike
+# #1649's nested flow element this is not ambiguous with anything — the quote is
+# OPEN, so the continuation is unambiguously scalar content — and it escaped BOTH
+# round-4 invariants: the block-scalar skip only skips DEEPER lines, and the depth
+# check matches exactly at the key's own indent. PyYAML reads this document as
+# types='opened paths: [docs/**] a: b', i.e. NO paths filter; the reader injected
+# one and answered `no` (fail-open) on 41ade4bc.
+pe_case_paths "continuation of a quoted scalar" yes 'src/app.ts' $'on:\n  pull_request:\n    types: "opened\n    paths: [docs/**]\n    a: b"\n'
+# …and the closed-on-one-line form must NOT be skipped: there the filter is real,
+# and `docs/**` does not match `src/app.ts`.
+pe_case_paths "closed quoted scalar keeps filter" no 'src/app.ts' $'on:\n  pull_request:\n    types: "opened"\n    paths: [docs/**]\n'
+# Round 6 (F1): the OUTER `on:` walk scanned a block scalar's body too, so a `"`
+# inside a `description: |` body opened a phantom quote that was never closed, the
+# EOF check refused the file, and a push-only workflow LOST the #6807 exemption it
+# is entitled to. The file below is GitHub-legal; `unknown` re-breaks the very
+# exemption this PR restores. Same invariant as `collect_filters`, one level up.
+pe_case "quote inside a block-scalar body"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          "quoted\n'
+# …and a body line the walk would otherwise read as an EXPLICIT KEY (`? k` / `: v`)
+# or as an unrecognised key must not refuse the file either — measured `unknown`
+# before the skip, `no` after.
+# ⛔ AN EARLIER VERSION OF THIS CASE PINNED NOTHING. It used a `paths:`-looking
+# body line, which review round 7 correctly measured as answering `no` on BOTH the
+# pre-fix and post-fix commits — it guarded `collect_filters`'s pre-existing skip,
+# not the walk change it was placed under. Replaced rather than kept as
+# decoration, since a test that cannot fail is not evidence.
+pe_case "explicit-key line in a | body"     no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          ? explicit\n'
+# P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
+# reader does not interpret left the flag unset, so a reusable trigger still
+# reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
+# write a schedule.
+pe_case "reusable + sibling schedule list" unknown $'on:\n  workflow_call:\n  schedule:\n    - cron: \x270 0 * * *\x27\n'
+# A BARE `workflow_call` (no non-filter key anywhere) must stay `no`: the
+# document-level invariant only fires when the attribution is INCOMPLETE.
+pe_case "bare reusable stays exempt"     no  $'on:\n  workflow_call:\n'
+
 # ── #1542: the trigger's FILTERS decide measurability, not just its name ────
 # A `pull_request` that declares `paths:` can only attach a check to a PR whose
 # changed set matches. So the SAME workflow must answer `yes` for a matching PR
