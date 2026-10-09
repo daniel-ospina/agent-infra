@@ -113,6 +113,9 @@
 #   ATOMIC_LAND_RECORD_SH   record-review.sh (default: sibling record-review.sh,
 #                           else $HOME/.pi/agent/scripts/record-review.sh)
 #   ATOMIC_LAND_ADMIN_MERGE admin-merge.sh (default: sibling admin-merge.sh)
+#   ATOMIC_LAND_DRIFT_GUARD the drift predicate's argv (default: `uv run python
+#                           <cwd repo root>/tools/drift-guard.py` — see
+#                           drift_safe_of(); #7727)
 #   ATOMIC_LAND_CONFIRM_MAX how many times to confirm the merge via the API
 #                           (default: 60) — a non-zero admin-merge exit is never
 #                           read as success; the .merged poll is the only proof.
@@ -133,6 +136,19 @@ set -uo pipefail
 
 PR=""
 REPO=""
+# The cwd checkout's repo slug AND root, resolved alongside $REPO in resolve_repo().
+# Kept separate so drift_safe_of() can tell "this repo has no drift gate" from "we are
+# pointed at a different repo" (#7727). The ROOT is needed because `gh repo view`
+# walks up (so the slug matches from any subdirectory) while a relative
+# `tools/drift-guard.py` test does NOT — mixing the two let a subdirectory read a
+# present tool as absent. Declared here because `set -u` is on.
+CWD_REPO=""
+CWD_ROOT=""
+# The cwd repo's canonical https URL, as gh reports it. The drift predicate fetches
+# the checkout's `origin` remote, and a remote is (host, owner, name): the slug check
+# pins owner/name, and this pins the host — a same-slug remote on ANOTHER host (a
+# mirror, a GHE/GitLab path) is a different repository (#7727).
+CWD_URL=""
 DRY_RUN=0
 NO_WAIT=0
 NO_CITE=0
@@ -146,6 +162,26 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH="${ATOMIC_LAND_GH:-gh}"
 RECORD_SH="${ATOMIC_LAND_RECORD_SH:-}"
 ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
+# The drift predicate's argv (#7727). Repo-local BY DESIGN: the tool lives beside
+# the CI job that runs it (`tools/drift-guard.py` in the target repository), not in
+# this shared rail, so the default resolves it against the cwd checkout's ROOT —
+# see drift_safe_of(). Overridable as a whole, exactly like $GH/$RECORD_SH/
+# $ADMIN_MERGE, so the suite can serve it hermetically. The override is read at the
+# two sites inside drift_safe_of() (the missing-tool test and the argv) rather than
+# cached here, because the default depends on $CWD_ROOT, which is only known after
+# resolve_repo().
+#
+# The "is there a drift gate?" question is answered from the TARGET'S BASE REF —
+# `origin/$BASE`, the same ref the predicate itself measures against, read locally.
+# A stale checkout or a locally deleted file used to read "no gate" for a repo that
+# HAS one and take the skip unmeasured; the skip now requires the positive pair (the
+# ref is readable here AND does not contain `tools/drift-guard.py`), so anything
+# short of that refreshes. Separately, a cwd repo that is not the target is never
+# read as "no gate", and a `origin` remote that is not the target's — a fork, a
+# mirror, another host, an unreadable authority — is refused by the assertions below
+# rather than skipped. What remains deliberately unchecked is that this checkout is on
+# a branch whose BASE REF is the reviewed one: `origin/$BASE` is by construction the
+# ref the predicate compares the head against, so the question does not arise.
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -345,6 +381,296 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
   esac
 }
 
+# ── the drift predicate: would merging this head KEEP the base's content? ───
+# #7727. `mergeable` above answers "does this branch merge without a TEXT
+# CONFLICT" — a DIFFERENT question from "would the merge KEEP $BASE's content".
+# The target repo's `tools/drift-guard.py` owns the second (#4174, predicate
+# corrected by #7455) and is already run as a CI gate on every PR; the rail CALLS
+# it and never re-derives the rule, so the two cannot drift apart.
+#
+# WHY THIS EXISTS. The #1565/#7230 skip below assumes a landable head's drift is
+# harmless — "the only thing left between that PR and a merge is the drift, which
+# nothing requires it to close". That holds only while the drift is SAFE. For a
+# head whose merge would silently REVERT a path the base moved, the drift IS what
+# blocks the merge (the drift gate goes red), and the refresh the skip avoids is
+# the ONLY repair: while the skip keeps firing, the head can never become
+# landable, and the refusal is attributed to something else. So the skip is taken
+# on a POSITIVELY green predicate only.
+#
+# ⛔ TWO TRAPS, BOTH MEASURED — do not "simplify" either away:
+#  1. KEY ON THE JSON, NOT THE EXIT CODE. `tools/drift-guard.py` is >=3.12
+#     (#5128) and refuses an older interpreter with `raise SystemExit(msg)`, which
+#     exits **1** — the SAME code the revert arm uses. Measured on the authoring
+#     box (`python3` = 3.9.6): `python3 tools/drift-guard.py` exits 1 having
+#     measured nothing, so a bare exit-code test would read every head as unsafe
+#     and silently reinstate the unconditional refresh this arm exists to prevent.
+#     `--json` separates the two: only a real measurement prints `"status": "ok"`
+#     (green), `"status": "drift"` (a revert) or `"status": "error"`.
+#  2. THE BASE MUST BE A FETCHABLE REMOTE-TRACKING REF. MEASURED: `--base main`
+#     exits 2 with `status: error` (the gate cannot prove a local ref's
+#     freshness), while `--base origin/main` measures. The rail's $BASE is the
+#     bare branch name, so the invocation below passes `origin/$BASE`; passing
+#     $BASE would make every read an error and disable the skip entirely.
+#
+# FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): green is printed ONLY
+# for a POSITIVE green measurement, or for the one no-gate exception named below.
+# A revert, an environment error, a version guard, a checkout that cannot be
+# identified as the target, or a missing tool in a checkout that is NOT the target
+# — all print empty, and the caller REFRESHES on empty. Unmeasurable must never
+# stand in for green.
+#
+# THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
+# repo has no `tools/drift-guard.py` there is no gate that could leave the head
+# unlandable, so the drift is harmless by construction and the skip stands — but
+# ONLY when the cwd is demonstrably the target repo (see the body below); a missing
+# tool in some OTHER checkout proves nothing. That reads the ARTIFACT (the tool's
+# existence), never a setting.
+# The HOST of a git remote authority. It must cut at the CLOSING BRACKET of an IPv6
+# literal, never at the first colon: `[2001:db8::1]` and `[2001:dead::9]` both reduce
+# to `[2001` under a first-colon cut, so two DIFFERENT hosts would compare equal —
+# exactly the silent wrong-repo fail-open drift_safe_of() exists to refuse (#7727).
+remote_host_of() { # <[host][:port] | host[:port]> -> host, verbatim
+  # THE PORT IS STRIPPED ONLY WHEN IT **IS** A PORT. `connect.c: get_host_and_port()`
+  # takes the suffix as a port only when `strtol` consumes the WHOLE remainder and it is
+  # below 65536 (six digits, or any non-digit, is not a port). Measured:
+  # `ssh://github.com:evil/<slug>` and `git://github.com:evil/<slug>` both look up host
+  # `github.com:evil`, while a first-colon cut names `github.com` — the TARGET, and
+  # reachable to a different machine through an `ssh_config` `Host github.com:evil` alias
+  # (review round 17).
+  local a="$1" h p
+  case "$a" in
+    \[*) case "$a" in *\]*) : ;; *) printf '' ; return 0 ;; esac
+         h="${a#\[}"; printf "[%s]" "${h%%]*}" ;;
+    *)   p="${a#*:}"
+         if [ "$p" = "$a" ]; then printf '%s' "$a"; return 0; fi
+         case "$p" in *[!0-9]*|??????*|'') printf '%s' "$a" ;; *) if [ "$p" -lt 65536 ]; then printf '%s' "${a%%:*}"; else printf '%s' "$a"; fi ;; esac ;;
+  esac
+}
+
+# GIT'S HOST IS NOT "THE TEXT AFTER THE FIRST `@`". An authority that STARTS with `[` is
+# a bracketed LITERAL whose host ends at `]`, and everything after the `]` — userinfo
+# included — is DISCARDED (`connect.c: host_end()` searches for `@[` FIRST for exactly
+# this reason). Cutting at the first `@` therefore names the host git throws away:
+# `ssh://[evil.invalid]@github.com/<slug>` is fetched FROM `evil.invalid` (measured:
+# `git-upload-pack evil.invalid '/<slug>'`) while the cut names `github.com`, i.e. the
+# TARGET — the same wrong-subject MATCH as the fragment and the slash-before-the-colon,
+# one grammar rule further in (review round 16). `remote_host_of` already reads a
+# leading bracket correctly, so the cut must simply not be applied there; a bracket
+# anywhere else is a shape we cannot place, and it fails closed like every other
+# unreadable authority. USERINFO BELONGS TO THE TRANSPORT, THOUGH: `git://` and
+# `file://` have none, so an `@` there is part of the HOSTNAME (measured:
+# `git://evil.invalid@github.com/<slug>` is looked up as host
+# `evil.invalid@github.com`) and a last-`@` cut would name the TARGET — the same
+# fail-OPEN, one transport over. Every other scheme cuts at the LAST `@`, which is what
+# curl and git both use.
+strip_userinfo() { # <scheme> <authority> -> authority with any userinfo removed
+  case "$2" in
+    \[*) case "$2" in *\]*) printf '%s' "$2" ;; *) printf '' ;; esac ;;   # the literal IS the host
+    *\[*|*\]*) printf '' ;;                                              # a bracket we cannot place
+    *) case "$1" in
+         git|file) printf '%s' "$2" ;;                                # these transports have no userinfo
+         *) printf '%s' "${2##*@}" ;;                                 # curl and git both use the LAST '@'
+       esac ;;
+  esac
+}
+
+drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
+  # The tool is resolved against the cwd checkout's ROOT, never the process cwd:
+  # `gh repo view` walks up, so from a subdirectory the identity check passes while a
+  # bare `tools/drift-guard.py` test would miss a tool that IS there — reading a
+  # present gate as absent and skipping a drift-red head (measured; review round 2).
+  local tool="${CWD_ROOT:-.}/tools/drift-guard.py"
+  # IDENTITY GATES *EVERY* PATH, not only the missing-tool one. The tool measures the
+  # repo of ITS OWN checkout (`git rev-parse --show-toplevel` + `origin/<base>` — see
+  # tortoise tools/drift-guard.py), so a green from it is a statement about the CWD
+  # repo, whatever `--repo` says. `--repo owner/name` is a supported way to name a
+  # DIFFERENT repo, so a measurement taken here can be of the WRONG repo and a missing
+  # tool can belong to the WRONG one — and BOTH are unmeasurable. Attaching either to
+  # $REPO is the fail-OPEN that re-creates the unlandable head this function exists to
+  # prevent. (Review round 4: the identity test used to cover ONLY the missing-tool
+  # branch, so a PRESENT tool in a non-target checkout ran and its green was
+  # returned.) The override is exempt — the caller injects it and owns what it
+  # measures. Unmeasurable refreshes.
+  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ]; then
+    local cwd_l target_l
+    cwd_l="$(printf '%s' "$CWD_REPO" | tr 'A-Z' 'a-z')"
+    target_l="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
+    if [ -z "$cwd_l" ] || [ "$cwd_l" != "$target_l" ]; then
+      return 0
+    fi
+    # AND A THIRD SUBJECT: THE REMOTE THE TOOL ACTUALLY FETCHES. It fetches the
+    # checkout's `origin` remote, while `gh repo view` resolves the "base repo" and
+    # PREFERS a remote named `upstream`. MEASURED: with origin=<fork> and
+    # upstream=<target>, `gh repo view --json nameWithOwner` prints the UPSTREAM — so
+    # the check above can pass while the measurement is of the FORK, whose green is
+    # then attributed to the target (review round 7: the round-4 fail-OPEN one layer
+    # down). Assert the remote the tool will fetch: its HOST and its PATH must both be
+    # the target's — a differently named remote, a missing remote, an unreadable URL,
+    # another host, another owner, or another repository name refreshes, the same
+    # direction every other unreadable case takes. The PORT is deliberately dropped on
+    # both sides (an explicit :443 or :22 must not turn a correct remote into a
+    # refresh); a same-host different-port remote is out of scope, not asserted.
+    local origin_l
+    origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
+    origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
+    if [ -z "$target_l" ] || [ -z "$origin_l" ]; then
+      return 0
+    fi
+    # The remote's AUTHORITY (host; userinfo and port stripped) and its PATH. The path
+    # must be the target's EXACTLY. A suffix test — the obvious `*/owner/name` — also
+    # accepts `.../evil/owner/name`, reading a foreign owner's repository as ours, and
+    # a fork named `owner/name-fork` contains the slug too. Both are the same
+    # wrong-repo fail-OPEN, one leading path segment and one character wide.
+    #
+    # A scheme-less remote is git's scp-like `[user@]host:path`, whose host ends at the
+    # FIRST colon — and git only takes that form when NO slash precedes it. So
+    # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`; reading the
+    # authority as everything after the first `@` would name the TARGET's host and take
+    # the skip on a fetch that goes somewhere else.
+    #
+    # WHICH FORM IS THIS? Git's own rule (`url.c: url_is_local_not_ssh`), not a guess at
+    # the SHAPE of the string — because the arm chosen decides which SUBJECT is
+    # compared, and an arm that matches a string git would treat as a local path names
+    # the target from it. (Review round 15: `foo/bar@github.com:o/n` has a slash BEFORE
+    # the colon, so git runs `git-upload-pack` on a directory, yet the `*@*:*` arm read
+    # host `github.com` and path `o/n` out of it; `./weird://github.com/o/n` is not a
+    # URL at all — `.` cannot start a scheme — yet the `*://*` arm read the same pair.
+    # Both are the round-7 fail-OPEN, keyed on the string instead of on the grammar.)
+    # The rule is:
+    #   * a VALID scheme — `[A-Za-z][A-Za-z0-9+.-]*` — followed by `://` is a URL, and
+    #     its authority runs to the first `/`;
+    #   * else, if there is a colon and NO SLASH BEFORE IT, it is scp-like and the host
+    #     ends at that colon;
+    #   * else it is a LOCAL PATH, which has no host to compare and cannot be read as
+    #     the target's remote;
+    #   * a `file://` URL with a host other than `localhost` is refused. git does NOT
+    #     reject it as malformed — it IGNORES the host and resolves the URL to a local
+    #     path (measured: `file://github.com/<slug>` runs `git-upload-pack '/<slug>'`).
+    #     So the refusal is not "unfetchable": it is that git's SUBJECT here is a local
+    #     directory, which is not the target's remote, and a repository that happened to
+    #     exist at that path would be a wrong subject rather than an error.
+    #   * a pre-`://` part that is not a legal scheme makes git split at `://` anyway and
+    #     die on the unknown protocol (measured: `./weird://host/<slug>` ⇒ `fatal:
+    #     protocol './weird' is not supported`). Classifying it as a local path is this
+    #     code's own conservative simplification, NOT what git does — do not "correct" it
+    #     back toward a `://`-means-URL test, which is the fail-open direction.
+    #
+    # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
+    # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
+    # `evil.invalid#` and names the TARGET, while curl — and so git over http(s) — stops
+    # at `#` and fetches `evil.invalid`. The transports are the CURL-BASED ones, not just
+    # http(s): `ftp://evil.invalid#@tgt` resolves to `evil.invalid` too (measured:
+    # `Could not resolve host: evil.invalid`), while git's own error line prints the
+    # post-fragment URL — so the failure is invisible in the message git emits. ssh does
+    # not end the URL there: git passes the fragment as part of the repository PATH, so
+    # cutting it would read `ssh://host/o/n#x` as the target while the fetch goes to
+    # `o/n#x`. Leaving it makes the path differ from the slug, which refreshes.
+    local target_host_l origin_host_l origin_authority_l origin_path_l origin_scheme_l pre_colon_l
+    target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
+    target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
+    target_host_l="$(remote_host_of "$target_host_l")"
+    case "$origin_l" in
+      http://*|https://*|ftp://*|ftps://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
+      *) : ;;                                             # ssh and git:// keep it in the path
+    esac
+    origin_authority_l=""; origin_path_l=""; origin_scheme_l=""
+    case "$origin_l" in
+      *://*) origin_scheme_l="${origin_l%%://*}"
+             case "$origin_scheme_l" in
+               ''|[!A-Za-z]*|*[!A-Za-z0-9+.-]*) origin_scheme_l="" ;;   # not a scheme ⇒ not a URL
+             esac ;;
+    esac
+    # A QUERY IS NOT REASONABLE FROM HERE, so a remote that carries one fails closed.
+    # The two directions disagree and BOTH are wrong for us: for curl transports git
+    # keeps the query INSIDE the request path (measured: `https://github.com/o/n?x=1`
+    # ⇒ `GET /o/n?x=1/info/refs`), so the repository fetched is not the one the slug
+    # names; and an authority-shaped `?` (`https://evil.invalid?@github.com/o/n`) makes
+    # curl contact `evil.invalid` while the text after the `@` names the TARGET —
+    # measured, the same fail-OPEN as the fragment, one delimiter over. For ssh the
+    # authority boundary at `?` is git's own parser's business, so there is nothing
+    # here to verify. Both are unmeasurable, and unmeasurable refreshes.
+    case "$origin_l" in
+      *\?*) return 0 ;;
+    esac
+    if [ -n "$origin_scheme_l" ]; then
+      origin_authority_l="${origin_l#*://}"
+      origin_path_l="${origin_authority_l#*/}"
+      origin_authority_l="$(strip_userinfo "$origin_scheme_l" "${origin_authority_l%%/*}")"
+      if [ "$origin_scheme_l" = "file" ]; then
+        case "$origin_authority_l" in
+          ''|localhost) : ;;
+          *) return 0 ;;          # git ignores the host: the subject is a LOCAL PATH, not this remote
+        esac
+      fi
+    else
+      case "$origin_l" in
+        *:*)
+          # scp-like ONLY when no slash precedes the first colon (git's rule, exactly).
+          pre_colon_l="${origin_l%%:*}"
+          case "$pre_colon_l" in
+            */*) : ;;             # a slash first ⇒ a LOCAL PATH, not a remote
+            *) origin_authority_l="$(strip_userinfo '' "$pre_colon_l")"; origin_path_l="${origin_l#*:}" ;;
+          esac ;;
+      esac
+    fi
+    origin_host_l="$(remote_host_of "$origin_authority_l")"
+    if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
+      return 0
+    fi
+    if [ "$origin_path_l" != "$target_l" ]; then
+      return 0
+    fi
+    # The cwd IS the target and it has no LOCAL tool. That is a skip with no
+    # measurement, so it must rest on the right SUBJECT: "the TARGET has no drift
+    # gate", not "this working tree has no such file". A stale checkout, or a
+    # locally deleted file, would otherwise read "no gate" for a repo that HAS one
+    # and take the skip unmeasured.
+    #
+    # The primitive must separate ABSENCE from UNREADABILITY, and two obvious ones do
+    # not. `git cat-file -e` exits 128 BOTH for a path that is absent AND for an object
+    # that cannot be READ (a corrupt object; a partial clone whose promisor is
+    # unreachable), so `! cat-file` reads "unmeasurable" as "no gate". `git rev-parse
+    # --verify --quiet <rev>:<path>` is no better — 1 for a missing tree and for a
+    # missing path alike — and the bare `git rev-parse <rev>:<path>` is 128 for both.
+    # `git ls-tree` READS the tree and reports the three outcomes apart: an entry at
+    # rc 0, no output at rc 0, and a NON-ZERO rc for an unreadable ref or tree. Only
+    # the middle one may take the skip.
+    #
+    # And the ref must be one we can PLACE IN TIME. The predicate this skip bypasses
+    # FETCHES the base — its own guard is explicit that a worktree which never fetched
+    # holds a STALE origin/<base> and that "a local ref cannot be proven fresh"
+    # (#4174) — while a local `origin/$BASE` is exactly that ref. So the local tip must
+    # equal the base tip the API reports; otherwise we are reading a revision we cannot
+    # date, which is not a measurement and must refresh.
+    #
+    # And the read must be of THAT object. Replace refs are the trap: `git rev-parse`
+    # ignores them and `git ls-tree` honours them, so a `git replace` redirecting the
+    # base sha to an empty tree would pass the tip check above and then report "no
+    # gate" — the two reads naming DIFFERENT objects for the same ref. `ls-tree` is
+    # therefore called with `--no-replace-objects`, on the sha the tip check just
+    # verified rather than on the ref again.
+    if [ ! -f "$tool" ]; then
+      local live_tip local_tip tree_out="" tree_rc=0
+      live_tip="$(base_tip)"
+      local_tip="$(git -C "${CWD_ROOT:-.}" rev-parse --verify --quiet "origin/$BASE" 2>/dev/null || true)"
+      if [ -n "$live_tip" ] && [ "$local_tip" = "$live_tip" ]; then
+        tree_out="$(git --no-replace-objects -C "${CWD_ROOT:-.}" ls-tree "$local_tip" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
+        if [ "$tree_rc" -eq 0 ] && [ -z "$tree_out" ]; then
+          printf '1'
+        fi
+      fi
+      return 0
+    fi
+  fi
+  # The default argv is anchored to the same root; the override is used verbatim.
+  local cmd="${ATOMIC_LAND_DRIFT_GUARD:-uv run python $tool}"
+  local out
+  out="$( $cmd --json --base "origin/$BASE" --head "$HEAD" 2>/dev/null || true )"
+  case "$out" in
+    *'"status": "ok"'*|*'"status":"ok"'*) printf '1' ;;
+  esac
+}
+
 # The base branch's TIP at a moment in time. A concurrent merge ADVANCES it while
 # leaving the merge base unchanged, so it is the signal for B12: the checks were
 # verified against the old tip and did not cover the new one. `--admin` bypasses
@@ -419,8 +745,18 @@ pr_has_carry_evidence() {
 # #2982/#767; #1397 tracks what remains.)
 
 resolve_repo() {
+  # The repo the GitHub CLI resolves for the cwd. NOT necessarily the cwd's `origin`:
+  # the CLI prefers a remote named `upstream`, so a fork checkout resolves to its
+  # UPSTREAM. drift_safe_of() treats this as one half of the identity and asserts the
+  # remote the predicate actually FETCHES separately — do not delete that assertion
+  # on the assumption that this one already names the cwd's own repo.
+  # Empty when the cwd is not a git repo with a GitHub remote, which is the
+  # fail-closed direction: the exception simply does not apply.
+  CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  CWD_URL="$(gh_ repo view --json url -q .url 2>/dev/null || true)"
+  CWD_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -z "$REPO" ]; then
-    REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+    REPO="$CWD_REPO"
   fi
   case "$REPO" in
     */*) ;;
@@ -535,7 +871,10 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       # ⚠️ THE DRIFT ARM NEEDS THE SAME PREDICATE — FOR EVERY LANDABLE STATE (#7230).
       # For `CLEAN` and `UNSTABLE` every REQUIRED leg is satisfied, and `strict: false`
       # means the distance to the base is not one of them: the only thing left between
-      # that PR and a merge is the drift, which nothing requires it to close. (Do NOT
+      # that PR and a merge is the drift, which nothing requires it to close. That
+      # inference holds only for a drift that is SAFE — a head whose merge would
+      # silently revert a path the base moved is NOT landable, and drift_safe_of()
+      # below is what separates the two (#7727). (Do NOT
       # widen this to "anything but BLOCKED" — that set carries states that are not
       # landable, which is what the fail-closed enumeration below and mutation B22
       # exist to keep out.) The drift arm refreshed there anyway, so a green,
@@ -567,10 +906,20 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         if [ "$strict" = false ]; then
           mergeable="$(mergeable_of)"
           if [ "$mergeable" = true ]; then
-            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
-            return 3
+            # #7727 — the SAME inference the drift arm above was fixed for. A
+            # `BEHIND` head routed here is skipped on `mergeable` alone, and
+            # `mergeable` answers "no text conflict", not "the merge KEEPS the
+            # base's content". Measured: this arm and the drift arm are the two
+            # places the rail decides a landable head needs no refresh, and a
+            # drift-red head is not landable in either.
+            if [ "$(drift_safe_of)" = 1 ]; then
+              say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (step 3 re-records here if the record is stale; the verify step below still waits for whatever is not yet terminal) (#1565)"
+              return 3
+            fi
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #1565 skip would leave it unlandable with a misattributed refusal"
+          else
+            say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
           fi
-          say "atomic-land: [1/4] update — mergeStateStatus=BEHIND and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
         else
           say "atomic-land: [1/4] update — mergeStateStatus=BEHIND, strict=${strict:-unreadable} (read live) — refreshing"
         fi
@@ -594,10 +943,24 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
           if [ "$strict" = false ]; then
             mergeable="$(mergeable_of)"
             if [ "$mergeable" = true ]; then
-              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live) and the PR is mergeable — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
-              return 3
+              # #7727 — a mergeable head is not automatically a LANDABLE one: the merge
+              # can still fail to keep the base's content, which is exactly what the
+              # drift gate measures and what this skip would leave in place forever.
+              # Green predicate only.
+              if [ "$(drift_safe_of)" = 1 ]; then
+                say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, but branch protection does not require an up-to-date branch (strict=false, read live), the PR is mergeable, and merging it would keep $BASE's content — SKIPPING the refresh: head ${HEAD:0:12}… is kept, so no head move invalidates the record and no check is invalidated (#7230)"
+                return 3
+              fi
+              # This is the ELSE of the drift check, not a fall-through: every path
+              # through the arm must emit EXACTLY ONE line, because the stdout is the
+              # human's evidence for why the head moved. A fall-through here printed
+              # the "not positively mergeable" line below as well — true of the OTHER
+              # arm, false here (mergeable IS true), and so a fresh misattribution in
+              # the fix for a misattribution.
+              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE, strict=false live and the PR is mergeable, but the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING, because the head move is what makes this head landable and the #7230 skip would leave it unlandable with a misattributed refusal"
+            else
+              say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
             fi
-            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE and strict=false live, but the PR is not positively mergeable (mergeable=${mergeable:-unreadable}) — refreshing (fail-closed)"
           else
             say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE with the head $behind commit(s) behind $BASE and strict=${strict:-unreadable} (read live) — refreshing"
           fi
@@ -605,8 +968,34 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
       elif [ -n "$behind" ] && [ "$behind" -gt "${ATOMIC_LAND_DRIFT_TRIGGER:-0}" ]; then
         say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE (not BEHIND) but the head is $behind commit(s) behind $BASE — refreshing on BASE DRIFT"
       elif [ "$MERGE_STATE" = "CLEAN" ]; then
-        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN — nothing to update"
-        return 3
+        # #7727 — CLEAN IS NOT A STATEMENT ABOUT CONTENT, so this no-op may not be
+        # taken on the state name. `behind` reaches this arm whenever the drift arm
+        # above did NOT fire, which under the default trigger means it is 0 — but
+        # the safety must not REST on that: an unrelated arm's threshold is not
+        # this arm's invariant. With a non-zero ATOMIC_LAND_DRIFT_TRIGGER a real
+        # distance lands here, and a `-n "$behind"` test ("non-empty") skipped it
+        # while printing "measured current (0 behind)" — a false statement AND a
+        # drift-red skip (review round 3, measured). So the test is against the
+        # VALUE, and it is a STRING test, never arithmetic: `behind` is EMPTY on the
+        # very path this arm exists for (the compare read failed — the `-z` arm is
+        # BELOW this one and does not catch it first), and `[ "" -eq 0 ]` is not
+        # false — it is a bash diagnostic plus rc 2. The `if` still took the false
+        # branch, so the direction held, but on an ERROR, and it printed
+        # `[: : integer expression expected` on every such landing (round 4,
+        # measured). An exact string test can do neither.
+        if [ "${behind:-}" = "0" ]; then
+          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
+          return 3
+        fi
+        # Either an UNREADABLE distance (the compare read failed) or a MEASURED
+        # one below the drift threshold: both are a distance this skip must not
+        # assume away. Under `strict: false` a genuinely-behind head reports CLEAN,
+        # so refusing to measure here is PR #7703's shape one unreadable read away.
+        if [ "$(drift_safe_of)" = 1 ]; then
+          say "atomic-land: [1/4] update — mergeStateStatus=CLEAN with the head/base distance ${behind:-unreadable}, but merging this head would keep $BASE's content — nothing to update"
+          return 3
+        fi
+        say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the drift predicate is NOT positively green: merging this head may not keep $BASE's content, or it could not be measured (#4174/#7727) — REFRESHING (the state name is not evidence about content)"
       elif [ -z "$behind" ]; then
         # B13 (fail-closed) — an UNREADABLE distance is not proof that the head is
         # current, and the silent "up to date" read is the exact defect this arm
@@ -621,9 +1010,12 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # through to it and had its head moved for nothing.) `CLEAN` keeps its no-op
         # for the CORRECT reason, not that one: the drift arm has already decided
         # the distance for every landable state whose compare read succeeded, and
-        # where it did NOT succeed a landable head still needs no refresh — under
-        # `strict: false` the distance is not a requirement, and under `strict:
-        # true` a stale branch is never reported `CLEAN`.
+        # where it did NOT succeed the CLEAN arm ABOVE decides that head with the
+        # drift predicate — unmeasured means refresh — so this arm's no-op covers
+        # only a head whose distance was both READ and zero. (An earlier version of
+        # this sentence said a landable head with an unreadable distance "still needs
+        # no refresh"; the CLEAN arm's predicate call is exactly what makes that
+        # false, and it is the sentence a maintainer would cite to delete it.)
         #
         # (Do NOT name `BEHIND` or `BLOCKED` as what strict produces here — this file
         # already records at :45-47 and :282-285 that `BEHIND` occurs WITH OR WITHOUT
@@ -637,8 +1029,30 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # base relation (tortoise #6210 / #6169 are the measured population).
         stop "could not measure the head/base divergence of $REPO#$PR (mergeStateStatus=$MERGE_STATE, compare API read failed) — refusing to treat a blocked head as up to date (B13)"
       else
-        say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE — nothing to update"
-        return 3
+        # #7727 — the same `-eq 0` question as the CLEAN arm above, and for the
+        # same reason: a MEASURED distance below the drift threshold is still a
+        # distance. Under the default trigger only 0 reaches this line; with a
+        # non-zero trigger the `-n` form skipped a real distance without ever
+        # consulting the predicate. A 0 distance is a genuine no-op (the head
+        # contains the base, so nothing can revert); anything else is decided by
+        # the predicate, like every other skip in this step. The non-zero case is
+        # nested one level deeper ON PURPOSE: it keeps this arm's predicate at a
+        # different indent from the CLEAN arm's, so each has its OWN anchored
+        # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
+        # one unanchored pattern silently cover only the first — the B19b/B20b trap.
+        # A STRING comparison, like the CLEAN arm above: the test cannot ERROR, so
+        # the branch taken is a decision about the distance rather than about the
+        # shell. Anything that is not exactly "0" goes to the predicate.
+        if [ "${behind:-}" != "0" ]; then
+          if [ "$(drift_safe_of)" = 1 ]; then
+            say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
+            return 3
+          fi
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, and the drift predicate is NOT positively green — REFRESHING on BASE DRIFT (#4174/#7727)"
+        else
+          say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured 0 commit(s) behind $BASE — nothing to update"
+          return 3
+        fi
       fi ;;
   esac
   # B5 — never SPEND an attestation the unit cannot restore. A branch update moves
