@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (64 on BSD/macOS, 65 on GNU findutils — the platform CI runs).
+#      platform-dependent (66 on BSD/macOS, 68 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -823,12 +823,36 @@ chmod 755 "$E/scripts/locked"
 E="$TMP/f11al"; mkdir -p "$E/scripts/locked" "$E/fakebin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
 chmod 000 "$E/scripts/locked"
-printf '%s\n' '#!/bin/sh' 'printf "%s" "/dev/null"' > "$E/fakebin/mktemp"
+# Reached through a SYMLINK, as 11ah does, so the guard's exit trap unlinks the link and not the
+# device: the trap is an unconditional `rm -f "$FIND_ERRS"`, and handing it /dev/null directly
+# deletes the device node wherever the guard runs as root.
+ln -s /dev/null "$E/sink"
+printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" > "$E/fakebin/mktemp"
 chmod +x "$E/fakebin/mktemp"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 chmod 755 "$E/scripts/locked"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a write-DISCARDING sink refuses a verdict (exit 2)" \
              || fail "a sink that swallows find's stderr produced a verdict anyway (exit $rc)"
+
+# 11am. ...and the unreadable-file probe must not OVER-block. A basename carrying an extension
+# (`notes.txt`) is excluded by the NAME rule alone with no read, so the guard would never have
+# opened it and making it fatal is a real false BLOCK on a tree the guard can clear. The other
+# half is pinned too, because the tempting simplification (probe only AFTER `is_shell_file`)
+# reopens the fail-open: an unreadable EXTENSIONLESS file cannot be ruled out as a shell script.
+E="$TMP/f11am"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/ok.sh"
+printf 'notes, not shell\n' > "$E/scripts/notes.txt"
+chmod 000 "$E/scripts/notes.txt"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/notes.txt"
+[ "$rc" -eq 0 ] && pass "an unreadable file the guard never reads is not a false block (exit 0)" \
+             || fail "an unreadable .txt was refused (exit $rc) — a false block"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/deploy"
+chmod 000 "$E/scripts/deploy"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/deploy"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable EXTENSIONLESS file is still fatal (exit 2)" \
+             || fail "an unreadable extensionless file was reported clean (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

@@ -206,6 +206,22 @@ trap 'rm -f "$FIND_ERRS"' EXIT
 # POSIX-sh files, and so are most of `.github/scripts/` — including an extensionless script
 # that shipped the very false negative this guard exists to catch (tortoise#7588). A
 # `-name '*.sh'` filter reports a clean run having never read them.
+# The NAME half of `is_shell_file`, asked on its own: true when the BASENAME definitively
+# EXCLUDES the file without any read (the `.*.*` / `?*.*` arms below). Kept as its own
+# predicate so the readability probe can ask "would the guard read this at all?" WITHOUT first
+# attempting the read the probe exists to test. It mirrors `is_shell_file`'s precedence exactly,
+# including the `*.sh`/`*.bash` arm being checked first — `foo.txt.sh` is claimed by name, so it
+# is never excluded here either.
+name_excluded() {
+  case "$1" in
+    *.sh|*.bash) return 1 ;;
+  esac
+  case "${1##*/}" in
+    .*.*|?*.*) return 0 ;;
+  esac
+  return 1
+}
+
 is_shell_file() {
   case "$1" in
     *.sh|*.bash) return 0 ;;
@@ -264,17 +280,29 @@ scan_files() {
   # trace at all: `awk` reports `can't open file` on a stderr nobody inspects, and `find -L`
   # could STAT it, so NO diagnostic reaches the partition — a clean verdict over a file the
   # guard never read. Route it into the sink, whose partition is fail-closed by construction.
-  # This mirrors the unreadable-DIRECTORY rule above, and for the same reason: the guard cannot
-  # clear content it has not seen, and it cannot even rule the file OUT, because an unreadable
-  # file's shebang cannot be read either.
+  #
+  # WHAT IS FATAL IS NARROWER THAN "ANY UNREADABLE FILE", and the difference is the NAME rule.
+  # A basename carrying an extension (`notes.txt`, `.env.local`) is excluded without any read,
+  # so the guard would never have opened it and refusing it is a false BLOCK on a tree the guard
+  # can clear. Everything else is either claimed by name (`*.sh`/`*.bash`) or UNDECIDED until its
+  # shebang is read — and that read is exactly what cannot happen — so an unreadable extensionless
+  # file stays fatal: it cannot be ruled out as a shell script. (Probing only AFTER
+  # `is_shell_file` would be the tempting simplification and it reopens that fail-open.)
+  # The `.husky` arm scans EVERY listed file, extension or not, so there the unconditional probe
+  # is right: every one of them is a file the guard would have read.
   case "${dir##*/}" in
     .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
               [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
               printf '%s\n' "$f"
             done ;;
     *) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
-         [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
-         is_shell_file "$f" && printf '%s\n' "$f"
+         if name_excluded "$f"; then
+           :
+         elif [ -r "$f" ]; then
+           is_shell_file "$f" && printf '%s\n' "$f"
+         else
+           printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
+         fi
        done ;;
   esac
 }
