@@ -1687,11 +1687,12 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although the authority it would fetch is unreadable" \
   || pass "and it was never consulted: the authority check failed before any measurement"
 
-# ...and the OTHER scp-like form: ONE colon, no trailing one. NO arm matches, the
-# authority stays EMPTY, and the HOST test is what refuses it — a different assertion
-# from the form above, so it needs its OWN scenario: sharing one would let the first
-# sub-case's refresh satisfy a "did the rail refresh?" assertion for the second, which
-# is exactly how a vacuous assertion passes (review round 15).
+# ...and the OTHER scp-like form: the colon is followed by a SLASH, not by another
+# colon, so the path is the userinfo plus the slug. The authority git takes is `user`
+# (the text before the first colon), which is not the target's host, so the HOST test
+# refuses it — the PATH test would refuse it too. It needs its OWN scenario: sharing one
+# with the form above would let the first sub-case's refresh satisfy a "did the rail
+# refresh?" assertion for the second, which is how a vacuous assertion passes (round 15).
 new_scen driftscpnouser
 git init -q "$TMP/e20crepo"
 mkdir -p "$TMP/e20crepo/tools" "$TMP/e20crepo/sub"
@@ -1960,8 +1961,12 @@ echo "── 17g-E27. origin 'foo/bar@github.com:<slug>' ⇒ REFRESH (a slash be
 # the old `*@*:*` arm read host `github.com` and path `<slug>` straight out of it.
 origin_form_case slashpath "foo/bar@github.com:$REPO" refresh "a slash before the colon makes it a local path, not the target's remote"
 
-echo "── 17g-E28. origin './weird://github.com/<slug>' ⇒ REFRESH ('.' cannot start a scheme, so it is not a URL)"
-origin_form_case badscheme "./weird://github.com/$REPO" refresh "'.' cannot start a scheme, so git treats the whole string as a path"
+echo "── 17g-E28. origin './weird://github.com/<slug>' ⇒ REFRESH (not a legal scheme, so not a URL)"
+# Measured: git splits at `://` anyway and dies on the unknown protocol —
+# `fatal: protocol './weird' is not supported` — so it does NOT read the string as a
+# path. Classifying it as one is this code's conservative simplification, and the
+# refresh is the safe direction either way.
+origin_form_case badscheme "./weird://github.com/$REPO" refresh "'.' cannot start a scheme, so it is not a URL"
 
 echo "── 17g-E29. origin '<host>:<owner>/<name>' ⇒ the skip STILL applies (git's scp form needs no user)"
 # The fail-CLOSED half: `[user@]host:path` is a documented git remote form. Reading it
@@ -1973,6 +1978,16 @@ echo "── 17g-E30. origin 'file://github.com/<slug>' ⇒ REFRESH (git cannot 
 # git rejects a `file://` URL with a non-empty host other than `localhost` ("URL using
 # bad/illegal format"), so the URL has no fetchable subject and cannot be compared.
 origin_form_case filehost "file://github.com/$REPO" refresh "a file:// URL with a foreign host is not fetchable at all"
+
+echo "── 17g-E31. origin 'ssh://[evil.invalid]@github.com/<slug>' ⇒ REFRESH (git's host is the BRACKETED literal, not the text after the '@')"
+# Measured: `git-upload-pack evil.invalid '/<slug>'`. git's `host_end()` searches for
+# `@[` FIRST, so an authority that BEGINS with `[` is a bracketed literal whose host
+# ends at `]` and everything after the `]` is discarded. A first-`@` cut names the
+# target instead — the round-7 fail-OPEN one grammar rule further in.
+origin_form_case bracurl "ssh://[evil.invalid]@github.com/$REPO" refresh "git's host is the bracketed literal and everything after ']' is discarded"
+
+echo "── 17g-E32. origin '[evil.invalid]@github.com:<slug>' ⇒ REFRESH (the same rule in the scp-like form)"
+origin_form_case bracescp "[evil.invalid]@github.com:$REPO" refresh "the scp-like form applies git's host_end() too"
 
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
@@ -2433,6 +2448,14 @@ if true; then
   # which disables the skip AND the no-gate exception for every such remote. 17g-E29
   # must redden.
   mutate_and_expect_fail B42  's#^            \*\) origin_authority_l=.*$#            *) : ;;#m'
+  # B43 (#7727): the bracketed-literal host rule. The failure it prevents:
+  # `ssh://[evil.invalid]@github.com/<slug>`, whose host git takes from INSIDE the
+  # brackets, read as the TARGET by a first-`@` cut — a T6 wrong-repo MATCH. 17g-E31
+  # and 17g-E32 must redden.
+  # `|` is the delimiter, NOT `#`: the replacement contains `${1##*@}`, and a `#`
+  # delimiter truncates there and silently substitutes NOTHING at exit 0 — the anchor
+  # pass then reports "the mutation did not apply", which is how this was caught.
+  mutate_and_expect_fail B43  's|^.*the literal IS the host.*$|    [*) printf %s "\${1##*@}" ;;|m'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A

@@ -436,6 +436,25 @@ remote_host_of() { # <[host]:port | host:port | host> -> host, verbatim
   esac
 }
 
+# GIT'S HOST IS NOT "THE TEXT AFTER THE FIRST `@`". An authority that STARTS with `[` is
+# a bracketed LITERAL whose host ends at `]`, and everything after the `]` — userinfo
+# included — is DISCARDED (`connect.c: host_end()` searches for `@[` FIRST for exactly
+# this reason). Cutting at the first `@` therefore names the host git throws away:
+# `ssh://[evil.invalid]@github.com/<slug>` is fetched FROM `evil.invalid` (measured:
+# `git-upload-pack evil.invalid '/<slug>'`) while the cut names `github.com`, i.e. the
+# TARGET — the same wrong-subject MATCH as the fragment and the slash-before-the-colon,
+# one grammar rule further in (review round 16). `remote_host_of` already reads a
+# leading bracket correctly, so the cut must simply not be applied there; a bracket
+# anywhere else is a shape we cannot place, and it fails closed like every other
+# unreadable authority.
+strip_userinfo() { # <authority> -> authority with any userinfo removed
+  case "$1" in
+    \[*) case "$1" in *\]*) printf '%s' "$1" ;; *) printf '' ;; esac ;;   # the literal IS the host
+    *\[*|*\]*) printf '' ;;                                              # a bracket we cannot place
+    *) printf '%s' "${1##*@}" ;;                                          # curl and git both use the LAST '@'
+  esac
+}
+
 drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
   # The tool is resolved against the cwd checkout's ROOT, never the process cwd:
   # `gh repo view` walks up, so from a subdirectory the identity check passes while a
@@ -505,8 +524,17 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     #     ends at that colon;
     #   * else it is a LOCAL PATH, which has no host to compare and cannot be read as
     #     the target's remote;
-    #   * a `file://` URL whose host is neither empty nor `localhost` cannot be fetched
-    #     at all (git: "URL using bad/illegal format"), so it is unmeasurable.
+    #   * a `file://` URL with a host other than `localhost` is refused. git does NOT
+    #     reject it as malformed — it IGNORES the host and resolves the URL to a local
+    #     path (measured: `file://github.com/<slug>` runs `git-upload-pack '/<slug>'`).
+    #     So the refusal is not "unfetchable": it is that git's SUBJECT here is a local
+    #     directory, which is not the target's remote, and a repository that happened to
+    #     exist at that path would be a wrong subject rather than an error.
+    #   * a pre-`://` part that is not a legal scheme makes git split at `://` anyway and
+    #     die on the unknown protocol (measured: `./weird://host/<slug>` ⇒ `fatal:
+    #     protocol './weird' is not supported`). Classifying it as a local path is this
+    #     code's own conservative simplification, NOT what git does — do not "correct" it
+    #     back toward a `://`-means-URL test, which is the fail-open direction.
     #
     # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
     # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
@@ -534,12 +562,11 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     if [ -n "$origin_scheme_l" ]; then
       origin_authority_l="${origin_l#*://}"
       origin_path_l="${origin_authority_l#*/}"
-      origin_authority_l="${origin_authority_l%%/*}"
-      origin_authority_l="${origin_authority_l#*@}"
+      origin_authority_l="$(strip_userinfo "${origin_authority_l%%/*}")"
       if [ "$origin_scheme_l" = "file" ]; then
         case "$origin_authority_l" in
           ''|localhost) : ;;
-          *) return 0 ;;          # git cannot fetch this URL at all ⇒ nothing to compare
+          *) return 0 ;;          # git ignores the host: the subject is a LOCAL PATH, not this remote
         esac
       fi
     else
@@ -549,7 +576,7 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
           pre_colon_l="${origin_l%%:*}"
           case "$pre_colon_l" in
             */*) : ;;             # a slash first ⇒ a LOCAL PATH, not a remote
-            *) origin_authority_l="${pre_colon_l#*@}"; origin_path_l="${origin_l#*:}" ;;
+            *) origin_authority_l="$(strip_userinfo "$pre_colon_l")"; origin_path_l="${origin_l#*:}" ;;
           esac ;;
       esac
     fi
