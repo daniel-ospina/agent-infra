@@ -560,8 +560,9 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
     intercept first (the missing main signature fails the overlap check), so the
     mutation does not surface as an exemption here — the reason assertion is what
     pins the membership gate. MUTATION: remove the `mr is None` membership block →
-    the blocked reason changes → this REDs on the `"no main-side measurement"`
-    assertion.
+    the blocked reason changes → this REDs on the `"absent from main's failure set"`
+    assertion. That wording is itself pinned (tortoise #7734): the reason must not
+    claim main never MEASURED the file, which the failure-only baseline cannot know.
     """
     other = "tests/test_other.py::TestT::test_other"
     decision = decide(
@@ -570,7 +571,13 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
     )
 
     assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert "absent from main's failure set" in decision.blocked[0].reason
+    assert "no main-side measurement" not in decision.blocked[0].reason
+    # #7734: the reason must claim NEITHER un-measurability NOR novelty. The old text
+    # asserted the first; asserting the second would be equally unsupported for the
+    # non-nodeid families this branch also covers. Pin the honest clause positively.
+    assert "NOT evidence of novelty" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
     assert decision.visible_exemptions() == []
 
 
@@ -769,7 +776,8 @@ def test_an_id_main_never_failed_is_always_pr_unique():
     )
 
     assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
 
 
 # ── verdict-stability · the ACCEPTANCE test ───────────────────────────────
@@ -1681,8 +1689,8 @@ def test_guard_step_absent_from_main_still_blocks():
         k_pr=8,
     )
 
-    assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
 
 
 def test_a_pytest_nodeid_is_never_re_keyed_as_a_guard_step():
