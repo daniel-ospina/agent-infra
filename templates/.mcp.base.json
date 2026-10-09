@@ -1,5 +1,20 @@
 {
   "mcpServers": {
+    "seo-intelligence": {
+      "command": "${AGENT_INFRA_PATH}/mcp-servers/seo-intelligence/node_modules/.bin/tsx",
+      "args": [
+        "server.ts"
+      ],
+      "cwd": "${AGENT_INFRA_PATH}/mcp-servers/seo-intelligence",
+      "env": {
+        "PERPLEXITY_API_KEY": "${PERPLEXITY_API_KEY}"
+      },
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder — ~$0.005/query flat, never the $5-40 chat models",
+      "whenToLoad": "research/search tasks FIRST (prefer over web_search); also GSC, SERP, Places and HubSpot tasks. NOTE: requires a one-time `npm install` in mcp-servers/seo-intelligence per checkout, or the entry fails to spawn",
+      "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
+    },
     "exa": {
       "command": "npx",
       "args": [
