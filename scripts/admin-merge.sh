@@ -3366,7 +3366,7 @@ attribute_residual() {
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then
       printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
     else
-      printf '   %s\n      -> absent from main failure set: main carries no failure in %s. The baseline is FAILURE-ONLY, so a test main RUNS AND PASSES leaves no row either — this failure is new here, not pre-existing, and it is NOT evidence that main never measured the file (#7734)\n' "$nodeid" "$file"
+      printf '   %s\n      -> absent from main'\''s failure set: main carries no failure in %s. The baseline is FAILURE-ONLY, so this cannot tell '\''green on main'\'' from '\''never run on main'\'': absence is NOT evidence of novelty, and it is also NOT evidence main never ran the file (#7734)\n' "$nodeid" "$file"
     fi
   done < "$residual"
 }
@@ -4354,9 +4354,10 @@ main() {
       # them leaves either the E5 class or the file-level refusal unexplained.
       attribute_residual "$TMP/unique2.txt" "$TMP/main-fails.txt" >&2
       say_err "   The attribution above separates MEASURED-ABSENT (main's lane demonstrably"
-      say_err "   measures this file and does not show this test red) from NOT-MEASURABLE"
-      say_err "   (main's baseline carries no measurement of the file, so absence is NOT"
-      say_err "   evidence of novelty). BOTH block; no label here clears a failure."
+      say_err "   measures this file and does not show this test red) from ABSENT FROM MAIN'S"
+      say_err "   FAILURE SET (main carries no failure in it). The baseline is FAILURE-ONLY,"
+      say_err "   so absence is NOT evidence of novelty — and NOT evidence main never ran"
+      say_err "   the file, either (#7734). BOTH block; no label here clears a failure."
       say_err "   The exemption decision still refuses them — merge refused."
       exit 1
     fi

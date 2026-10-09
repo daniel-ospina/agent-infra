@@ -573,6 +573,11 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
     assert decision.any_blocked
     assert "absent from main's failure set" in decision.blocked[0].reason
     assert "no main-side measurement" not in decision.blocked[0].reason
+    # #7734: the reason must claim NEITHER un-measurability NOR novelty. The old text
+    # asserted the first; asserting the second would be equally unsupported for the
+    # non-nodeid families this branch also covers. Pin the honest clause positively.
+    assert "NOT evidence of novelty" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
     assert decision.visible_exemptions() == []
 
 
@@ -771,6 +776,7 @@ def test_an_id_main_never_failed_is_always_pr_unique():
     )
 
     assert decision.any_blocked
+    assert decision.blocked[0].blocked is True
     assert "absent from main's failure set" in decision.blocked[0].reason
 
 
@@ -1683,7 +1689,7 @@ def test_guard_step_absent_from_main_still_blocks():
         k_pr=8,
     )
 
-    assert decision.any_blocked
+    assert decision.blocked[0].blocked is True
     assert "absent from main's failure set" in decision.blocked[0].reason
 
 

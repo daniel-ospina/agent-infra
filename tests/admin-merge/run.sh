@@ -1996,7 +1996,7 @@ fi
 
 # ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
 # The verdict is only half the diagnosis: `attribute_residual` labels each
-# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# residual id "measured on this lane" or "absent from main's failure set". It derives the UNIT
 # with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
 # the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
 # the SAME unit and the operator is told the lane is re-measuring main's failure
@@ -2019,7 +2019,7 @@ grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-
   || pass "(f) …never the bare 'collect-error' prefix as a unit"
 grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
   || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
-grep -q "absent from main failure set" "$TMP/err" && pass "(f) …as absent from main's failure set (a different file on main is not this failure)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(f) …as absent from main's failure set (a different file on main is not this failure)" \
   || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
   || pass "(f) no merge attempted"
@@ -3729,7 +3729,7 @@ grep -q "run list" "$SCEN/calls" \
 #   (d) the re-run ceiling is DERIVED (2 x the slowest OBSERVED shard) and the
 #       derivation is stated
 #   (e) a failure whose file main's lane has NOT measured reads
-#       "absent from main failure set" — the refusal STAYS, and there is no
+#       "absent from main's failure set" — the refusal STAYS, and there is no
 #       waiver label (B1's docker/embedded redislite case)
 echo "== 37. the two waits, the derived ceiling, and non-narrowing attribution =="
 
@@ -3904,8 +3904,8 @@ run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(e) an unmeasured-file failure STILL BLOCKS (exit $rc) — the refusal is not narrowed" \
   || fail "(e) an unmeasured-file failure was allowed through"
-grep -q "absent from main failure set" "$TMP/err" \
-  && pass "(e) it reports 'absent from main failure set' instead of 'unique to this PR'" \
+grep -q "^ *-> absent from main" "$TMP/err" \
+  && pass "(e) it reports 'absent from main's failure set' instead of 'unique to this PR'" \
   || fail "(e) the output still asserts uniqueness with no measurement on main"
 grep -q "test_copy_race" "$TMP/err" && pass "(e) …naming the failure" || fail "(e) the failure is not named"
 grep -q "BOTH block" "$TMP/err" \
@@ -3930,7 +3930,13 @@ rc=$?
 grep -q "measured on this lane, not present on main" "$TMP/err" \
   && pass "(e2) it reads 'measured on this lane, not present on main'" \
   || fail "(e2) the measured-absent label is missing"
-grep -q "absent from main failure set" "$TMP/err" && fail "(e2) a measured failure was called absent from the failure set" \
+# SCOPE THE PATTERN TO THE SHELL'S OWN LABEL, never the bare string (#7734). The
+# id-level reason in ci_exemption.py and `attribute_residual`'s file-level label are
+# deliberately now the SAME wording, so a bare substring grep matches the DECISION's
+# line too — which in this scenario always fires, making the assertion fail whatever
+# the shell prints. Only `attribute_residual` emits a line beginning `-> `, so the
+# anchor restores the discrimination the label unification removed.
+grep -q "^ *-> absent from main" "$TMP/err" && fail "(e2) a measured failure was called absent from the failure set" \
   || pass "(e2) the two labels are distinct"
 
 # ── 38. THE PER-SHARD BOUND DERIVATION (#1167) ────────────────────────
@@ -7996,7 +8002,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on the mixed
 # second parser in the shell), and the bare `guard-step` prefix must never be
 # reported as a unit no real failure occupies, which would flip the diagnosis to
 # "measured on this lane, not present on main". Here main is red on a DIFFERENT
-# unit, so the guard failure is "absent from main failure set" — and the STEP is
+# unit, so the guard failure is "absent from main's failure set" — and the STEP is
 # what is named.
 new_scen guardresid
 HEAD_GR="e4e4000000000000000000000000000000000000"
@@ -8012,7 +8018,7 @@ grep -q "Assert-no-redislite-orphans-issue" "$TMP/out" && pass "(e) …and the r
   || fail "(e) the guard step is not named in the residual: $(grep -c . "$TMP/out") line(s)"
 grep -q "no failure in guard-step" "$TMP/err" && fail "(e) the bare mechanism was reported as the unit" \
   || pass "(e) …never the bare 'guard-step' prefix as a unit"
-grep -q "absent from main failure set" "$TMP/err" && pass "(e) …as absent from main's failure set (absence is not novelty)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(e) …as absent from main's failure set (absence is not novelty)" \
   || fail "(e) the absence of a main-side guard unit was mis-described: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
   || pass "(e) no merge attempted"
