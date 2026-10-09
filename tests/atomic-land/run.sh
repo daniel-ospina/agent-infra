@@ -256,6 +256,23 @@ exit 2
 DRIFTEOF
 chmod +x "$DRIFT"
 
+# A SECOND fixture whose EXIT CODE is DECOUPLED from its JSON status. The fixture
+# above keeps them faithful (exit 0 iff status ok), which is realistic but makes
+# trap 1 UNTESTABLE: a rail that reads the process exit code instead of the JSON
+# `status` passes every scenario, so a regression to exit-code keying ships green.
+# This fixture can CONTRADICT itself, which is the only way to pin trap 1 (#7727).
+DRIFT_EXITCODE="$TMP/fake-drift-guard-decoupled"
+cat > "$DRIFT_EXITCODE" <<'DRIFTEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'drift-guard %s\n' "$*" >> "$SCEN/drift-calls"
+st="$(cat "$SCEN/drift-status")"
+printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+exit "$(cat "$SCEN/drift-exit")"
+DRIFTEOF
+chmod +x "$DRIFT_EXITCODE"
+
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
 # A fixture gate key and a marker that is GENUINELY signed with it. The rail verifies
@@ -1079,7 +1096,13 @@ called "pr update-branch" \
 # Contract pin (the #1565 review P0): the tokens the rail maps must be the CLI's enum
 # tokens. Scenario A exercises MERGEABLE, so a predicate that only accepted `true`
 # fails there; this states the contract once more in its own right.
-grep -q 'MERGEABLE' "$RAIL" && grep -q 'CONFLICTING' "$RAIL" \
+# Anchored to the MAPPING ARMS, not to any occurrence of the token: both tokens
+# ALSO appear in the comment above naming the CLI's enum, so the earlier bare
+# `grep -q MERGEABLE` was satisfied by the comment alone — deleting both mapping
+# arms left it green (measured, round 4). The behavioural coverage is 17g-A (a
+# predicate that accepted only `true` would fail there); this only states the token
+# contract, so it must read the arms themselves.
+grep -qE '^[[:space:]]*MERGEABLE\)' "$RAIL" && grep -qE '^[[:space:]]*CONFLICTING\)' "$RAIL" \
   && pass "the mergeable mapping names the CLI's enum tokens (MERGEABLE/CONFLICTING)" \
   || fail "the mergeable mapping does not name the CLI's enum tokens"
 
@@ -1313,6 +1336,49 @@ run_rail 42 --repo "$REPO" --poll 0
 grep -qF -- "origin/main" "$SCEN/drift-calls" \
   && pass "invoked with origin/main" \
   || fail "not passed a fetchable base ref (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
+grep -qF -- "--json" "$SCEN/drift-calls" \
+  && pass "invoked with --json (the JSON status, not the exit code, is the decision basis)" \
+  || fail "not passed --json — the decision basis would be the tool's unspecified human output"
+grep -qF -- "--head $HEAD_OLD" "$SCEN/drift-calls" \
+  && pass "invoked with the head under review ($HEAD_OLD)" \
+  || fail "the head under review was not passed to the predicate (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
+
+# ── THE EXIT CODE IS NOT THE DECISION BASIS — trap 1, pinned in BOTH directions ──
+echo "── 17g-E13. status=drift with exit 0 ⇒ REFRESH (a green must be a MEASUREMENT, not a return code)"
+# The main fixture couples code to payload, so it cannot tell a JSON-keyed rail from
+# an exit-code-keyed one. Trap 1 says the tool exits 1 for a revert AND for an
+# unusable interpreter, so the exit code cannot be the decision — but only a fixture
+# whose code CONTRADICTS its payload can prove the rail obeys that.
+new_scen driftexitcode
+SCEN_DRIFT_CMD="$DRIFT_EXITCODE"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+printf '0\n'         > "$SCEN/drift-exit"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed — a drift measurement was not read as green for exiting 0" \
+  || fail "SKIPPED on exit 0 while the payload said status=drift (the exit-code trap, unpinned)"
+
+echo "── 17g-E14. status=ok with exit 1 ⇒ SKIP (the same trap, the other direction)"
+new_scen driftexitcode2
+SCEN_DRIFT_CMD="$DRIFT_EXITCODE"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+printf '1\n'         > "$SCEN/drift-exit"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "REFRESHED on a green MEASUREMENT because the process exited 1" \
+  || pass "did NOT refresh (a green measurement is kept, whatever the exit code)"
 
 # ── NO GATE — the one deliberate exception ───────────────────────────────
 echo "── 17g-E5. a repo with NO drift gate keeps the skip (nothing to leave unlandable)"
@@ -1348,6 +1414,39 @@ run_rail 42 --repo "$REPO" --poll 0
 called "pr update-branch" \
   && pass "refreshed (an unverifiable cwd is unmeasurable ⇒ fail-closed)" \
   || fail "SKIPPED on a missing tool in the WRONG repo — fail-OPEN (the review's P1)"
+
+# ── A PRESENT TOOL IN A CHECKOUT THAT IS NOT THE TARGET — the round-4 fail-OPEN ──
+echo "── 17g-E15. a PRESENT tool in a checkout that is NOT the target ⇒ REFRESH (its green is about the WRONG repo)"
+# The identity test used to sit INSIDE the missing-tool branch, so when the tool WAS
+# present it ran from ANY checkout and its green was attributed to the target. The
+# tool measures its OWN checkout's repo (`git rev-parse --show-toplevel` +
+# `origin/<base>`), so a green here is a statement about a DIFFERENT repo — the same
+# unlandable-head fail-OPEN the missing-tool branch was fixed for, one branch over.
+new_scen driftwrongcwdwithtool
+git init -q "$TMP/e15repo"
+mkdir -p "$TMP/e15repo/tools" "$TMP/e15repo/sub"
+cat > "$TMP/e15repo/tools/drift-guard.py" <<'E15EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E15EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e15repo/sub"                    # the tool IS here, at the scratch root
+SCEN_CWD_REPO="daniel-ospina/some-other-repo"  # ...but the checkout is NOT the target
+SCEN_DRIFT_CMD=                                # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — a green measured against ANOTHER repo is not evidence about the target" \
+  || fail "SKIPPED on a green from another repo's tool (the round-4 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate RAN before the identity was established — its wrong-repo green was used" \
+  || pass "and it was never consulted: identity failed before any measurement"
 
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
@@ -1563,6 +1662,22 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
       fail "mutation $name did NOT redden the suite (class NOT covered)"
     fi
   }
+  # The four predicate anchors below are separated by INDENTATION, not by content:
+  # the same predicate text sits at four sites. If two ever share a
+  # leading-whitespace run, an anchored pattern mutates the FIRST only while the
+  # suite still prints "class covered" — the second site ships unpinned (the
+  # B19b/B20b trap, recorded above). "class covered" is an exit code and cannot say
+  # WHICH site it covered, so pin the invariant the anchors rest on: each must
+  # match exactly ONE line.
+  for _ind in 14 12 10 8; do
+    _n="$(awk -v n="$_ind" '
+      { ind=0; while (substr($0, ind+1, 1) == " ") ind++
+        if (ind == n && index($0, "drift_safe_of") && index($0, "= 1 ]")) c++ }
+      END { print c+0 }' "$RAIL")"
+    [ "$_n" = 1 ] \
+      && pass "the ${_ind}-space predicate anchor matches exactly one line" \
+      || fail "the ${_ind}-space predicate anchor matches $_n line(s) — a mutation could cover a different site and still report class covered"
+  done
   # B1: pass the CURRENT head to record-review instead of the prior head
   mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"\044RECORD_SH" "\044PR" "\044HEAD"/'
   # B2a: drop the record precondition
@@ -1696,6 +1811,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B27 (#7727): the FOURTH site — the final `else` arm, reached by a non-CLEAN state
   # whose distance is below a non-zero threshold. Anchored to its 10 spaces (see B26).
   mutate_and_expect_fail B27  's/^          if \[ "\$\(drift_safe_of\)" = 1 \]; then/          if true; then/m'
+  # B28 (#7727): the IDENTITY HOIST — the round-4 fail-OPEN. The failure it prevents:
+  # the tool's measurement (or its absence) is attributed to a repo the cwd checkout
+  # is NOT, so a wrong-repo green takes a skip. 17g-E6 and 17g-E15 must redden.
+  mutate_and_expect_fail B28  's/^    if \[ -z "\$cwd_l" \] \|\| \[ "\$cwd_l" != "\$target_l" \]; then$/    if false; then/m'
+  # B29 (#7727): the CLEAN arm's VALUE test. The failure it prevents: testing the
+  # distance for EMPTINESS where the question is whether it is ZERO, so a measured
+  # distance below a non-zero trigger is skipped unmeasured (the round-3 P1). 17g-E12
+  # must redden.
+  mutate_and_expect_fail B29  's/^        if \[ "\$\{behind:-\}" = "0" \]; then$/        if [ -n "\044behind" ]; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh

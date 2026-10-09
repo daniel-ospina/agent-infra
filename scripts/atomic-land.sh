@@ -407,8 +407,10 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 #
 # FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): `1` is printed ONLY
 # for a POSITIVE green measurement. A revert, an environment error, a version
-# guard, a missing tool — all print empty, and the caller REFRESHES on empty.
-# Unmeasurable must never stand in for green.
+# guard, a checkout that cannot be identified as the target, or a missing tool in
+# a checkout that is NOT the target — all print empty, and the caller REFRESHES on
+# empty. Unmeasurable must never stand in for green. (The ONE case that prints `1`
+# is named below: the target repo itself has no tool.)
 #
 # THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
 # repo has no `tools/drift-guard.py` there is no gate that could leave the head
@@ -422,20 +424,30 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
   # bare `tools/drift-guard.py` test would miss a tool that IS there — reading a
   # present gate as absent and skipping a drift-red head (measured; review round 2).
   local tool="${CWD_ROOT:-.}/tools/drift-guard.py"
-  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ] && [ ! -f "$tool" ]; then
-    # A MISSING TOOL PROVES "NO GATE" ONLY IF THE CWD *IS* THE TARGET REPO.
-    # `--repo owner/name` is a supported way to name a DIFFERENT repo, so `./tools/`
-    # can belong to the wrong one, and its absence then says nothing about the
-    # target's gate. Treating that as "harmless" is a fail-OPEN that re-creates the
-    # unlandable head this function exists to prevent. So the exception needs
-    # POSITIVE evidence of identity; anything else is unmeasurable and refreshes.
+  # IDENTITY GATES *EVERY* PATH, not only the missing-tool one. The tool measures the
+  # repo of ITS OWN checkout (`git rev-parse --show-toplevel` + `origin/<base>` — see
+  # tortoise tools/drift-guard.py), so a green from it is a statement about the CWD
+  # repo, whatever `--repo` says. `--repo owner/name` is a supported way to name a
+  # DIFFERENT repo, so a measurement taken here can be of the WRONG repo and a missing
+  # tool can belong to the WRONG one — and BOTH are unmeasurable. Attaching either to
+  # $REPO is the fail-OPEN that re-creates the unlandable head this function exists to
+  # prevent. (Review round 4: the identity test used to cover ONLY the missing-tool
+  # branch, so a PRESENT tool in a non-target checkout ran and its green was
+  # returned.) The override is exempt — the caller injects it and owns what it
+  # measures. Unmeasurable refreshes.
+  if [ -z "${ATOMIC_LAND_DRIFT_GUARD:-}" ]; then
     local cwd_l target_l
     cwd_l="$(printf '%s' "$CWD_REPO" | tr 'A-Z' 'a-z')"
     target_l="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
-    if [ -n "$cwd_l" ] && [ "$cwd_l" = "$target_l" ]; then
+    if [ -z "$cwd_l" ] || [ "$cwd_l" != "$target_l" ]; then
+      return 0
+    fi
+    # The cwd IS the target and it has NO tool: there is no gate that could leave
+    # the head unlandable, so the skip stands. This reads the ARTIFACT (the tool's
+    # existence) plus a MEASURED identity, never a setting.
+    if [ ! -f "$tool" ]; then
       printf '1'; return 0
     fi
-    return 0
   fi
   # The default argv is anchored to the same root; the override is used verbatim.
   local cmd="${ATOMIC_LAND_DRIFT_GUARD:-uv run python $tool}"
@@ -747,11 +759,15 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # this arm's invariant. With a non-zero ATOMIC_LAND_DRIFT_TRIGGER a real
         # distance lands here, and a `-n "$behind"` test ("non-empty") skipped it
         # while printing "measured current (0 behind)" — a false statement AND a
-        # drift-red skip (review round 3, measured). `-eq 0` asks the real
-        # question. `behind` is non-empty here because the `-z` arm below catches
-        # the empty case, and an empty value would make `-eq` fail, which routes
-        # to the predicate below — the fail-closed direction.
-        if [ "$behind" -eq 0 ]; then
+        # drift-red skip (review round 3, measured). So the test is against the
+        # VALUE, and it is a STRING test, never arithmetic: `behind` is EMPTY on the
+        # very path this arm exists for (the compare read failed — the `-z` arm is
+        # BELOW this one and does not catch it first), and `[ "" -eq 0 ]` is not
+        # false — it is a bash diagnostic plus rc 2. The `if` still took the false
+        # branch, so the direction held, but on an ERROR, and it printed
+        # `[: : integer expression expected` on every such landing (round 4,
+        # measured). An exact string test can do neither.
+        if [ "${behind:-}" = "0" ]; then
           say "atomic-land: [1/4] update — mergeStateStatus=CLEAN and the head is measured current (0 behind) — nothing to update"
           return 3
         fi
@@ -805,7 +821,9 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # different indent from the CLEAN arm's, so each has its OWN anchored
         # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
         # one unanchored pattern silently cover only the first — the B19b/B20b trap.
-        if [ "$behind" -ne 0 ]; then
+        # The test is a STRING comparison for the same reason as the CLEAN arm: an
+        # empty value beside `-ne` would be a diagnostic, not a decision.
+        if [ "${behind:-}" != "0" ]; then
           if [ "$(drift_safe_of)" = 1 ]; then
             say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
             return 3
