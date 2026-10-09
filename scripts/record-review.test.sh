@@ -1611,6 +1611,77 @@ RECORD_REVIEW_BODY_MAX_BYTES=1 \
   run_record_diff 424794 "$SHA" "PR body" /dev/null 0
 if grep -qF "diff=" <<<"$RECORD_CAP"; then bad "11.11u an over-bound non-diff body was hashed (the bound is not enforced)"; else ok "11.11u an over-bound non-diff body is refused — never classified, never hashed"; fi
 if grep -qF "300-FILE DIFF CAP" <<<"$RECORD_ERR"; then bad "11.11u an over-bound body was still classified as the cap"; else ok "11.11u an over-bound body is not flattened or classified"; fi
+
+# ─────────────────────────────────────────────────────────────────────────
+# 11.12 #1351 — the READ-ONLY consumer seam: `--print-diff-hash <pr> [repo]`
+# ─────────────────────────────────────────────────────────────────────────
+# The local merge gate (extensions/review-enforcer) accepts a recorded review
+# whose `diff_sha256` matches the PR's CURRENT diff even at a stale head — the
+# same content-identity carry the GitHub ai-review-gate implements. It must use
+# THIS script's diff machinery rather than a second hashing scheme, so the seam
+# prints `<status>\t<hash>` from `diff_hash_for_pr` and exits before any write.
+# These pin the contract the extension parses: ONLY `ok` carries a digest, a
+# degraded/refused fetch NEVER does, and no record is written.
+echo "── 11.12 #1351: --print-diff-hash (read-only consumer seam) ────────"
+PDH_DIFF="$T/prdh-real.diff"
+printf 'diff --git a/docs/x.md b/docs/x.md\nindex 1111111..2222222 100644\n--- a/docs/x.md\n+++ b/docs/x.md\n@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n' > "$PDH_DIFF"
+PDH_SHA="$(python3 "$NORM1398" < "$PDH_DIFF" | openssl dgst -sha256 | awk '{print $NF}')"
+PDH_TAB="$(printf '\t')"
+PDH_EMPTY_DIGEST="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+run_print_diff_hash() { # <pr> [repo] -> PDH_OUT / PDH_RC
+    PDH_OUT="$(PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+        STUB_DIFF_FILE="${STUB_DIFF_FILE:-/dev/null}" STUB_DIFF_FAIL="${STUB_DIFF_FAIL:-0}" \
+        STUB_DIFF_406_FILE="${STUB_DIFF_406_FILE:-}" \
+        STUB_LOCAL_BASE="${STUB_LOCAL_BASE:-}" STUB_LOCAL_HEAD="${STUB_LOCAL_HEAD:-}" \
+        RECORD_REVIEW_LOCAL_REPO="${RECORD_REVIEW_LOCAL_REPO:-.}" \
+        bash "$RECORD" --print-diff-hash "$1" "${2:-daniel-ospina/agent-infra}" 2>"$T/pdh-err")"
+    PDH_RC=$?
+}
+
+# (a) a readable diff → ok + the SAME normalized digest the record path stores.
+rm -f "$(Q2 424800)"
+STUB_DIFF_FILE="$PDH_DIFF" STUB_DIFF_FAIL=0 run_print_diff_hash 424800
+assert_eq "$PDH_RC" "0" "11.12a exit 0 (the status field carries the outcome)"
+assert_eq "$PDH_OUT" "ok${PDH_TAB}${PDH_SHA}" "11.12a a readable diff prints ok + the normalized digest"
+if [ -e "$(Q2 424800)" ]; then bad "11.12a the read-only mode wrote a record"; else ok "11.12a no record is written"; fi
+
+# (b) the EMPTY body — the CONSTANT-digest trap. It must print `empty` with NO
+#     digest; sha256("") would collide across every PR and carry any stale record.
+STUB_DIFF_FILE=/dev/null STUB_DIFF_FAIL=0 run_print_diff_hash 424801
+assert_eq "$PDH_OUT" "empty${PDH_TAB}" "11.12b an empty body prints empty + NO digest"
+if grep -qF "$PDH_EMPTY_DIGEST" <<<"$PDH_OUT"; then bad "11.12b THE TRAP: sha256(\"\") was printed as a digest"; else ok "11.12b sha256(\"\") is never printed"; fi
+
+# (c) a 2xx whose body is not a diff (an error object) → nondiff, never hashed.
+PDH_NONDIFF="$T/prdh-nondiff.json"
+printf '%s' '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}' > "$PDH_NONDIFF"
+STUB_DIFF_FILE="$PDH_NONDIFF" STUB_DIFF_FAIL=0 run_print_diff_hash 424802
+assert_eq "$PDH_OUT" "nondiff${PDH_TAB}" "11.12c a non-diff body prints nondiff + NO digest"
+
+# (d) the DOCUMENTED 300-file cap, with no usable local checkout → too_large.
+STUB_DIFF_406_FILE="$CAP406" RECORD_REVIEW_LOCAL_REPO="$T/no-such-checkout-1398" run_print_diff_hash 424803
+assert_eq "$PDH_OUT" "too_large${PDH_TAB}" "11.12d the API cap prints too_large + NO digest"
+
+# (e) a failed read → unavailable (NEVER a digest: a failed read is not a match).
+STUB_DIFF_FAIL=1 run_print_diff_hash 424804
+assert_eq "$PDH_OUT" "unavailable${PDH_TAB}" "11.12e a failed fetch prints unavailable + NO digest"
+
+# (f) the #1398 fallback is available to the SEAM too: the cap with a local
+#     checkout holding both objects mints the local digest (so an oversized PR
+#     still carries across a base refresh).
+STUB_DIFF_406_FILE="$CAP406" RECORD_REVIEW_LOCAL_REPO="$L_REPO" \
+  STUB_LOCAL_BASE="$L_BASE" STUB_LOCAL_HEAD="$L_HEAD" run_print_diff_hash 424805
+assert_eq "$PDH_OUT" "ok${PDH_TAB}${L_SHA}" "11.12f the size-cap fallback mints the LOCAL normalized digest"
+
+# NOTE: a former §11.12g looped over four hardcoded `<status>TAB` literals and
+# asserted their (hand-constructed) hash field was empty. It never invoked
+# `run_print_diff_hash`, so it could not fail whatever the seam emitted —
+# TAUTOLOGICAL, not coverage. The contract it claimed to pin (only `ok` carries
+# a digest) is already pinned by 11.12b-e, each of which RUNS the seam and
+# asserts the full `<status>TAB` output — so the loop was deleted rather than
+# reworded. The four non-ok statuses are the seam's complete non-ok set.
+unset PDH_OUT PDH_RC PDH_TAB PDH_EMPTY_DIGEST PDH_NONDIFF
+
 unset STUB_DIFF_406_FILE STUB_LOCAL_BASE STUB_LOCAL_HEAD STUB_LOCAL_META_FAIL STUB_LOCAL_BASE_REF RECORD_REVIEW_LOCAL_DIFF_NOFETCH STUB_DIFF_FAIL STUB_DIFF_FILE NORM1398 L_REPO L_BASE L_HEAD L_SHA CAP406 CAP406_SHA CAP406_PRETTY CAP406_PRETTY_SHA CAP406_SPLIT CAP406_SPLIT_SHA SPLIT_DIFF SPLIT_DIFF_SHA API_STYLE API_STYLE_SHA REAL_WITH_CODE REAL_WITH_CODE_SHA L_WRONG L_NOFETCH L_FETCH BARE1398 L_BIN LB_BASE LB_HEAD LB_SHA LB_SHA4
 
 # ─────────────────────────────────────────────────────────────────────────
