@@ -273,6 +273,14 @@ exit "$(cat "$SCEN/drift-exit")"
 DRIFTEOF
 chmod +x "$DRIFT_EXITCODE"
 
+# The DEFAULT run directory for every scenario. It must be a real git checkout whose
+# `origin` carries the target slug, because the rail asserts the remote its predicate
+# fetches: defaulting to the CALLER's cwd made each no-override scenario depend on
+# that checkout's origin, so a fork clone false-redded for a reason unrelated to the
+# code (review round 8). This one is the suite's own and hermetic.
+git init -q "$TMP/default-cwd" 2>/dev/null || true
+git -C "$TMP/default-cwd" remote add origin "https://github.com/$REPO.git" 2>/dev/null || true
+
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
 # A fixture gate key and a marker that is GENUINELY signed with it. The rail verifies
@@ -307,10 +315,11 @@ new_scen() {
   # applies; a scenario that sets it to ANOTHER slug models `--repo owner/name`
   # naming a different repo while the cwd holds the wrong `tools/`.
   SCEN_CWD_REPO=
-  # #7727: where the rail is RUN from. Empty ⇒ $ROOT, THIS suite's checkout (which
-  # has no `tools/drift-guard.py`). A scenario sets it to a SUBDIRECTORY of a repo
-  # whose root holds `tools/drift-guard.py`, which is the only way to tell a
-  # root-anchored tool test from a cwd-relative one.
+  # #7727: where the rail is RUN from. Empty ⇒ $TMP/default-cwd, a HERMETIC checkout
+  # whose `origin` carries the target slug (the rail asserts the remote its predicate
+  # fetches). A scenario sets it to a SUBDIRECTORY of a repo whose root holds
+  # `tools/drift-guard.py`, which is the only way to tell a root-anchored tool test
+  # from a cwd-relative one.
   SCEN_CWD=
   # #7727: the drift threshold. 0 is the production default; a non-zero value is how
   # the "distance below the threshold" arms are reached at all.
@@ -350,14 +359,15 @@ new_scen() {
 # with PPID 1). This helper is only ever called in a subshell or backgrounded, so
 # the `exec` cannot replace this test script.
 rail_exec() { # <extra args...>
-  # #7727: run the rail from a DETERMINISTIC directory — $ROOT, this suite's own
-  # checkout, unless the scenario names another. Inheriting the caller's cwd makes
-  # the no-gate exception depend on ambient state: launched from a checkout that
-  # HAS `tools/drift-guard.py` (tortoise, the repo this rail lands), the identity
-  # fixture still matches and the rail runs that FOREIGN tool against the fixture's
-  # sha, so every no-override skip scenario false-reds for a reason unrelated to
-  # the code (review round 6, measured).
-  cd "${SCEN_CWD:-$ROOT}"
+  # #7727: run the rail from a DETERMINISTIC directory — the suite's own hermetic
+  # checkout (whose origin carries the target slug), unless the scenario names
+  # another. Inheriting the caller's cwd made the identity assertions depend on
+  # ambient state: launched from a checkout that HAS `tools/drift-guard.py` (tortoise,
+  # the repo this rail lands) the rail ran that FOREIGN tool, and launched from a
+  # clone whose origin differs it read as unidentifiable — either way every
+  # no-override scenario false-redded for a reason unrelated to the code (review
+  # rounds 6 and 8, both measured).
+  cd "${SCEN_CWD:-$TMP/default-cwd}"
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \

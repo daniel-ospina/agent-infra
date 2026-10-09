@@ -448,9 +448,14 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # upstream=<target>, `gh repo view --json nameWithOwner` prints the UPSTREAM — so
     # the check above can pass while the measurement is of the FORK, whose green is
     # then attributed to the target (review round 7: the round-4 fail-OPEN one layer
-    # down). Assert the remote the tool will fetch. A URL that does not carry
-    # `owner/name` — a local-path clone — matches nothing and refreshes: the
-    # conservative direction, and the same one every other unreadable case takes.
+    # down). Assert the remote the tool will fetch: anything that does not END in the
+    # target slug — a differently named remote, a missing remote, an unreadable URL —
+    # refreshes, the same direction every other unreadable case takes.
+    # ⚠️ KNOWN LIMIT, filed rather than closed here (tortoise#7727): the match is on
+    # the URL's LAST PATH SEGMENT, so it does not verify the HOST. A remote on another
+    # host whose path still ends in `owner/name` (a mirror, a GitLab/GHE path) matches.
+    # Closing it means comparing the full remote identity against the clone URL gh
+    # itself reports, with a test per URL form — its own change, not a rider.
     local origin_l
     origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
     origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
@@ -817,9 +822,12 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # through to it and had its head moved for nothing.) `CLEAN` keeps its no-op
         # for the CORRECT reason, not that one: the drift arm has already decided
         # the distance for every landable state whose compare read succeeded, and
-        # where it did NOT succeed a landable head still needs no refresh — under
-        # `strict: false` the distance is not a requirement, and under `strict:
-        # true` a stale branch is never reported `CLEAN`.
+        # where it did NOT succeed the CLEAN arm ABOVE decides that head with the
+        # drift predicate — unmeasured means refresh — so this arm's no-op covers
+        # only a head whose distance was both READ and zero. (An earlier version of
+        # this sentence said a landable head with an unreadable distance "still needs
+        # no refresh"; the CLEAN arm's predicate call is exactly what makes that
+        # false, and it is the sentence a maintainer would cite to delete it.)
         #
         # (Do NOT name `BEHIND` or `BLOCKED` as what strict produces here — this file
         # already records at :45-47 and :282-285 that `BEHIND` occurs WITH OR WITHOUT
