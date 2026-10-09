@@ -144,6 +144,11 @@ REPO=""
 # present tool as absent. Declared here because `set -u` is on.
 CWD_REPO=""
 CWD_ROOT=""
+# The cwd repo's canonical https URL, as gh reports it. The drift predicate fetches
+# the checkout's `origin` remote, and a remote is (host, owner, name): the slug check
+# pins owner/name, and this pins the host — a same-slug remote on ANOTHER host (a
+# mirror, a GHE/GitLab path) is a different repository (#7727).
+CWD_URL=""
 DRY_RUN=0
 NO_WAIT=0
 NO_CITE=0
@@ -470,6 +475,25 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
       */"$target_l"|*:"$target_l") : ;;
       *) return 0 ;;
     esac
+    # AND THE HOST. The boundary above pins owner/name; a remote is (host, owner,
+    # name), and a same-slug remote on a DIFFERENT host is a different repository —
+    # its green is not a statement about the target. gh reports the target's clone
+    # URL, so take the host from there and require the origin's host to equal it.
+    # Every form that resolves to no host (a local path, a bare name) has an empty
+    # host and refreshes. The port is dropped on both sides, so an explicit :443 or
+    # :22 does not turn a correct remote into a refresh.
+    local target_host_l origin_host_l
+    target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
+    target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"
+    target_host_l="${target_host_l#*@}"; target_host_l="${target_host_l%%:*}"
+    origin_host_l=""
+    case "$origin_l" in
+      *://*) origin_host_l="${origin_l#*://}"; origin_host_l="${origin_host_l%%/*}"; origin_host_l="${origin_host_l#*@}"; origin_host_l="${origin_host_l%%:*}" ;;
+      *@*:*) origin_host_l="${origin_l#*@}"; origin_host_l="${origin_host_l%%:*}" ;;
+    esac
+    if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
+      return 0
+    fi
     # The cwd IS the target and it has NO tool: there is no gate that could leave
     # the head unlandable, so the skip stands. This reads the ARTIFACT (the tool's
     # existence) plus a MEASURED identity, never a setting.
@@ -566,6 +590,7 @@ resolve_repo() {
   # Empty when the cwd is not a git repo with a GitHub remote, which is the
   # fail-closed direction: the exception simply does not apply.
   CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
+  CWD_URL="$(gh_ repo view --json url -q .url 2>/dev/null || true)"
   CWD_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -z "$REPO" ]; then
     REPO="$CWD_REPO"

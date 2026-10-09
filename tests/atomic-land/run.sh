@@ -85,7 +85,12 @@ cur_state() {
 
 case "${1:-} ${2:-}" in
   "repo view")
-    printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
+    # The rail asks for the slug AND the canonical URL; the URL is what pins the
+    # drift predicate's HOST (#7727), so the fixture must speak both shapes.
+    case "$*" in
+      *--json*url*) printf 'https://github.com/%s\n' "${REPO_FIXTURE:-$REPO}"; exit 0 ;;
+      *) printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
+    esac ;;
   "pr update-branch")
     # Model the branch update: the head moves to head-new.
     [ "${SCEN_UPDATE_FAIL:-0}" = 1 ] && exit 1
@@ -1502,6 +1507,38 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although the remote it fetches is not the target" \
   || pass "and it was never consulted: the remote assertion failed before any measurement"
 
+# ── A SAME-SLUG REMOTE ON ANOTHER HOST — round 8 ──
+echo "── 17g-E17. origin on a DIFFERENT host with the same owner/name ⇒ REFRESH (a remote is host+owner+name)"
+# The path-boundary check pins owner/name. A remote is (host, owner, name), so a
+# mirror on another host whose path still ends `owner/name` is a DIFFERENT repository;
+# its green must not be attributed to the target (review round 8).
+new_scen driftforeignhost
+git init -q "$TMP/e17repo"
+mkdir -p "$TMP/e17repo/tools" "$TMP/e17repo/sub"
+git -C "$TMP/e17repo" remote add origin "https://gitlab.com/grp/$REPO.git"
+cat > "$TMP/e17repo/tools/drift-guard.py" <<'E17EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E17EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e17repo/sub"
+SCEN_CWD_REPO="$REPO"     # gh names the target, so the slug check passes; the HOST must stop it
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — a same-slug remote on another host is a different repository" \
+  || fail "SKIPPED on a green from a mirror on a FOREIGN host (the round-8 wrong-repo green)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its HOST is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -1883,6 +1920,10 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # `gh repo view` prefers `upstream`, so a fork checkout passes the slug check and
   # its green is attributed to the target. 17g-E16 must redden.
   mutate_and_expect_fail B30  's/^      \*\) return 0 ;;$/      *) : ;;/m'
+  # B31 (#7727): the HOST assertion. The failure it prevents: a same-slug remote on a
+  # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
+  # green would be attributed to the target. 17g-E17 must redden.
+  mutate_and_expect_fail B31  's/^    if \[ -z "\$target_host_l" \] \|\| \[ "\$origin_host_l" != "\$target_host_l" \]; then$/    if false; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
