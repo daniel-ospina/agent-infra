@@ -713,6 +713,25 @@ else:
     merges = []
     flow_depth = 0
     open_quote = ""
+    # ⛔ A BLOCK SCALAR'S BODY IS FREE TEXT AND IS NEVER SCANNED FOR STATE
+    # (review round 6, F1). Without this the walk mistook a `"` inside a
+    # `description: |` body for the start of a quoted scalar, never closed it, and
+    # refused the WHOLE FILE at the EOF check below:
+    #
+    #     on:
+    #       push:
+    #         branches: [main]
+    #       workflow_dispatch:
+    #         inputs:
+    #           msg:
+    #             description: |
+    #               "quoted
+    #
+    # That is a GitHub-LEGAL file, and `no` is its correct answer (push-only, so
+    # #6807's exemption applies). Answering `unknown` re-breaks the very exemption
+    # this PR exists to restore, and it is the same invariant `collect_filters`
+    # already enforces one level down — the walk needed it too.
+    block_above = None
     for raw in lines[on_index + 1:]:
         if flow_depth == 0 and not open_quote:
             if not raw.strip():
@@ -722,6 +741,10 @@ else:
             if raw[:1] not in (" ", "\t"):
                 break  # next top-level key genuinely ends the `on:` block
             indent = len(raw) - len(raw.lstrip(" \t"))
+            if block_above is not None:
+                if indent > block_above:
+                    continue  # a block scalar's body — not a key, and not state
+                block_above = None
             if "\t" in raw[:indent]:
                 # A tab in the indentation is not legal YAML; refuse.
                 sys.stdout.write(UNKNOWN + "\n")
@@ -750,6 +773,8 @@ else:
                 sys.stdout.write(UNKNOWN + "\n")
                 sys.exit(0)
             collected.append((indent, key))
+            if (m.group(5) or "").strip()[:1] in ("|", ">"):
+                block_above = indent
             flow_depth, open_quote = scan_flow_state(raw, flow_depth, open_quote)
         else:
             # Inside an open flow collection / quoted scalar: this line is a

@@ -9478,6 +9478,14 @@ pe_case_paths "continuation of a quoted scalar" yes 'src/app.ts' $'on:\n  pull_r
 # …and the closed-on-one-line form must NOT be skipped: there the filter is real,
 # and `docs/**` does not match `src/app.ts`.
 pe_case_paths "closed quoted scalar keeps filter" no 'src/app.ts' $'on:\n  pull_request:\n    types: "opened"\n    paths: [docs/**]\n'
+# Round 6 (F1): the OUTER `on:` walk scanned a block scalar's body too, so a `"`
+# inside a `description: |` body opened a phantom quote that was never closed, the
+# EOF check refused the file, and a push-only workflow LOST the #6807 exemption it
+# is entitled to. The file below is GitHub-legal; `unknown` re-breaks the very
+# exemption this PR restores. Same invariant as `collect_filters`, one level up.
+pe_case "quote inside a block-scalar body"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          "quoted\n'
+# …and a `paths:` line inside that body must not become a filter either.
+pe_case "filter-looking line in a | body"   no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: >-\n          paths: [docs/**]\n'
 # P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
 # reader does not interpret left the flag unset, so a reusable trigger still
 # reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
