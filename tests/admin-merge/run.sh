@@ -1977,7 +1977,7 @@ if grep -q 'CLEAN' "$TMP/kk-dec.out"; then
 elif grep -q '^watchdog-kill::pytest$' "$TMP/kk-blocked.txt" 2>/dev/null; then
   pass "main GREEN on the kill => BLOCKED by name, not silently certified clean"
 else
-  fail "expected the kill to be BLOCKED with no main-side measurement; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
+  fail "expected the kill to be BLOCKED as absent from main's failure set; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
 fi
 # And the COMPARABLE direction: main red on the same identity at the same rate
 # must EXEMPT — otherwise the door is admitted but the comparison still fails.
@@ -1996,7 +1996,7 @@ fi
 
 # ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
 # The verdict is only half the diagnosis: `attribute_residual` labels each
-# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# residual id "measured on this lane" or "absent from main's failure set". It derives the UNIT
 # with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
 # the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
 # the SAME unit and the operator is told the lane is re-measuring main's failure
@@ -2019,7 +2019,7 @@ grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-
   || pass "(f) …never the bare 'collect-error' prefix as a unit"
 grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
   || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
-grep -q "not measurable on this lane" "$TMP/err" && pass "(f) …as not-measurable (a different file on main is not this failure)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(f) …as absent from main's failure set (a different file on main is not this failure)" \
   || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
   || pass "(f) no merge attempted"
@@ -3729,7 +3729,7 @@ grep -q "run list" "$SCEN/calls" \
 #   (d) the re-run ceiling is DERIVED (2 x the slowest OBSERVED shard) and the
 #       derivation is stated
 #   (e) a failure whose file main's lane has NOT measured reads
-#       "not measurable on this lane" — the refusal STAYS, and there is no
+#       "absent from main's failure set" — the refusal STAYS, and there is no
 #       waiver label (B1's docker/embedded redislite case)
 echo "== 37. the two waits, the derived ceiling, and non-narrowing attribution =="
 
@@ -3904,8 +3904,8 @@ run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(e) an unmeasured-file failure STILL BLOCKS (exit $rc) — the refusal is not narrowed" \
   || fail "(e) an unmeasured-file failure was allowed through"
-grep -q "not measurable on this lane" "$TMP/err" \
-  && pass "(e) it reports 'not measurable on this lane' instead of 'unique to this PR'" \
+grep -q "^ *-> absent from main" "$TMP/err" \
+  && pass "(e) it reports 'absent from main's failure set' instead of 'unique to this PR'" \
   || fail "(e) the output still asserts uniqueness with no measurement on main"
 grep -q "test_copy_race" "$TMP/err" && pass "(e) …naming the failure" || fail "(e) the failure is not named"
 grep -q "BOTH block" "$TMP/err" \
@@ -3930,7 +3930,13 @@ rc=$?
 grep -q "measured on this lane, not present on main" "$TMP/err" \
   && pass "(e2) it reads 'measured on this lane, not present on main'" \
   || fail "(e2) the measured-absent label is missing"
-grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
+# SCOPE THE PATTERN TO THE SHELL'S OWN LABEL, never the bare string (#7734). The
+# id-level reason in ci_exemption.py and `attribute_residual`'s file-level label are
+# deliberately now the SAME wording, so a bare substring grep matches the DECISION's
+# line too — which in this scenario always fires, making the assertion fail whatever
+# the shell prints. Only `attribute_residual` emits a line beginning `-> `, so the
+# anchor restores the discrimination the label unification removed.
+grep -q "^ *-> absent from main" "$TMP/err" && fail "(e2) a measured failure was called absent from the failure set" \
   || pass "(e2) the two labels are distinct"
 
 # ── 38. THE PER-SHARD BOUND DERIVATION (#1167) ────────────────────────
@@ -6755,6 +6761,68 @@ grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
   || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran on a whitespace-only changed-file list" || pass "no merge attempted"
 
+# (f2) #7702 — A LARGE CHANGED-FILE LIST MUST NOT HANG THE RAIL.
+# The emptiness test in `lane_applicable()` was `${WF_PR_CHANGED_PATHS//[[:space:]]/}`,
+# a bash-3.2 POSIX-character-class global substitution that is SUPER-LINEAR in the
+# length of the string. Measured under /bin/bash 3.2.57 (the interpreter the rail
+# actually runs): 50 paths 3.5 s, 100 paths 21.5 s, 200 paths > 25 s, and PR #7653's
+# 2,265 paths (173 KB) UNBOUNDED past 60 s. The rail printed its header and then hung
+# with NO verdict, NO refusal and NO timeout — so a large PR could not be landed at
+# all, and a watcher could not tell a hang from slow work. The failure mode is a HANG,
+# not a wrong answer, so this scenario BOUNDS the call: under the regression the rail
+# is killed and this leg FAILS instead of hanging the suite.
+new_scen lane7702-largechanged
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7005 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6946 7006 > "$SCEN/runs-main"
+lane_jobset 7006 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7005 success 'test (a)' 'test (b)'
+# ⛔ The workflow body fixture is LOAD-BEARING: without it the fake's contents arm
+# returns nothing, `lane_applicable()` returns at the EMPTY-BODY guard
+# (admin-merge.sh:2484-2487) and NEVER reaches the emptiness test — so the behavioural
+# leg below passed on BOTH the fixed and the regressed rail, i.e. it discriminated
+# nothing. Measured with this line: the fixed rail reaches the test with a 122 KB
+# list, and the regressed rail hangs and is killed at 90 s (verification round 1).
+wf_declares .github/workflows/python-ci.yml pull_request
+# 2,265 paths — the measured size of the PR #7653 list.
+: > "$SCEN/pr-changed-files"
+_w7702i=0
+while [ "$_w7702i" -lt 2265 ]; do
+  printf 'website/apps/dashboard/node_modules/pkg%s/file%s.js\n' "$((_w7702i/10))" "$_w7702i" >> "$SCEN/pr-changed-files"
+  _w7702i=$((_w7702i + 1))
+done
+selector_interp_312
+selector_stub False False
+# ⛔ A background killer + a plain `wait` (bash 3.2 has no `wait -n`, and a finished
+# but unreaped child still answers `kill -0`, so a poll loop cannot distinguish
+# "done" from "hung" here). `wait` returns the real exit status; 137 = SIGKILL.
+( SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+    bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err" ) &
+_w7702rail=$!
+( sleep 90; kill -9 "$_w7702rail" 2>/dev/null ) & _w7702killer=$!
+wait "$_w7702rail" 2>/dev/null; _w7702rc=$?
+kill -9 "$_w7702killer" 2>/dev/null; wait "$_w7702killer" 2>/dev/null
+if [ "$_w7702rc" -eq 137 ]; then
+  fail "#7702: the rail did NOT return within 90s on a 2,265-path changed-file list — the super-linear whitespace substitution at admin-merge.sh:2494 is back (this is the silent multi-hour stall)"
+else
+  pass "#7702: the rail returned on a 2,265-path changed-file list (exit $_w7702rc) instead of hanging"
+fi
+# ⛔ NOT `grep -v … | grep -q …` HERE. Under `set -o pipefail` (run.sh:195) the
+# upstream `grep -v` takes SIGPIPE (141) when the downstream `-q` exits at its first
+# match, so the pipeline status becomes 141 and the `&& fail` arm is SKIPPED: a
+# FAIL-OPEN enforcer that reports green on a regressed file (measured: fires 0.5% of
+# the time, green 99.5% — and the same race made the positive pin false-fail ~99.7%).
+# This is the repo's own #841 class; its guard (`scripts/check-no-sigpipe-grep.sh`)
+# scans only `scripts/`, so an instance in `tests/` is invisible to it. Capture first,
+# then grep a here-string — the repo's documented remedy.
+_w7702_nc="$(grep -v '^[[:space:]]*#' "$ADM")"
+grep -q 'WF_PR_CHANGED_PATHS//\[\[:space:\]\]' <<<"$_w7702_nc" \
+  && fail "#7702: admin-merge.sh again uses \${WF_PR_CHANGED_PATHS//[[:space:]]/} — super-linear in bash 3.2, unbounded on a large PR" \
+  || pass "#7702: the changed-paths emptiness test no longer uses a global whitespace substitution"
+grep -q 'case "\${WF_PR_CHANGED_PATHS:-}" in' <<<"$_w7702_nc" \
+  && pass "#7702: …it uses the linear case-glob form instead (same predicate, one pass)" \
+  || fail "#7702: admin-merge.sh does not test changed-path emptiness with the linear case-glob form"
+
 # (g) #6928 P1-1 — NO ≥3.12 INTERPRETER → FAIL CLOSED, NAMING THE REQUIREMENT.
 # This is the production defect: the rail's own python3 is 3.9.6 and tortoise's
 # selector refuses below 3.12, so the FIRST cut made the whole path refuse on the
@@ -7934,7 +8002,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on the mixed
 # second parser in the shell), and the bare `guard-step` prefix must never be
 # reported as a unit no real failure occupies, which would flip the diagnosis to
 # "measured on this lane, not present on main". Here main is red on a DIFFERENT
-# unit, so the guard failure is "not measurable on this lane" — and the STEP is
+# unit, so the guard failure is "absent from main's failure set" — and the STEP is
 # what is named.
 new_scen guardresid
 HEAD_GR="e4e4000000000000000000000000000000000000"
@@ -7950,7 +8018,7 @@ grep -q "Assert-no-redislite-orphans-issue" "$TMP/out" && pass "(e) …and the r
   || fail "(e) the guard step is not named in the residual: $(grep -c . "$TMP/out") line(s)"
 grep -q "no failure in guard-step" "$TMP/err" && fail "(e) the bare mechanism was reported as the unit" \
   || pass "(e) …never the bare 'guard-step' prefix as a unit"
-grep -q "not measurable on this lane" "$TMP/err" && pass "(e) …as not-measurable (absence is not novelty)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(e) …as absent from main's failure set (absence is not novelty)" \
   || fail "(e) the absence of a main-side guard unit was mis-described: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
   || pass "(e) no merge attempted"
