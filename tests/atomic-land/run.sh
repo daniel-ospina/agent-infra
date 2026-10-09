@@ -1461,10 +1461,13 @@ echo "── 17g-E16. a fork layout (origin=fork, upstream=target) ⇒ REFRESH (
 # nameWithOwner -q .nameWithOwner` prints `daniel-ospina/tortoise`. So the CWD_REPO
 # check passes (gh named the target) while the measurement is of the FORK — the
 # round-4 fail-OPEN one layer down (review round 7).
+# The fork's name is deliberately the TARGET'S plus a suffix: `owner/name-fork`
+# CONTAINS `owner/name`, so a substring test passes it and the slug must be matched
+# at a PATH BOUNDARY instead.
 new_scen driftforklayout
 git init -q "$TMP/e16repo"
 mkdir -p "$TMP/e16repo/tools" "$TMP/e16repo/sub"
-git -C "$TMP/e16repo" remote add origin   "https://github.com/daniel-ospina/some-fork.git"
+git -C "$TMP/e16repo" remote add origin   "https://github.com/${REPO}-fork.git"
 git -C "$TMP/e16repo" remote add upstream "https://github.com/$REPO.git"
 cat > "$TMP/e16repo/tools/drift-guard.py" <<'E16EOF'
 import json, os, pathlib, sys

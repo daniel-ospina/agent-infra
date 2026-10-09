@@ -453,11 +453,16 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # conservative direction, and the same one every other unreadable case takes.
     local origin_l
     origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
+    origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
     if [ -z "$target_l" ] || [ -z "$origin_l" ]; then
       return 0
     fi
+    # A BOUNDARY match, never a substring: the slug must be the WHOLE last path
+    # segment. A fork named after the target under the same owner (`owner/name-fork`)
+    # CONTAINS `owner/name`, so a substring test would pass it and attribute the
+    # fork's green to the target — the same fail-OPEN, one character wide.
     case "$origin_l" in
-      *"$target_l"*) : ;;
+      */"$target_l"|*:"$target_l") : ;;
       *) return 0 ;;
     esac
     # The cwd IS the target and it has NO tool: there is no gate that could leave
