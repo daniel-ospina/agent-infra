@@ -9484,8 +9484,15 @@ pe_case_paths "closed quoted scalar keeps filter" no 'src/app.ts' $'on:\n  pull_
 # is entitled to. The file below is GitHub-legal; `unknown` re-breaks the very
 # exemption this PR restores. Same invariant as `collect_filters`, one level up.
 pe_case "quote inside a block-scalar body"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          "quoted\n'
-# …and a `paths:` line inside that body must not become a filter either.
-pe_case "filter-looking line in a | body"   no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: >-\n          paths: [docs/**]\n'
+# …and a body line the walk would otherwise read as an EXPLICIT KEY (`? k` / `: v`)
+# or as an unrecognised key must not refuse the file either — measured `unknown`
+# before the skip, `no` after.
+# ⛔ AN EARLIER VERSION OF THIS CASE PINNED NOTHING. It used a `paths:`-looking
+# body line, which review round 7 correctly measured as answering `no` on BOTH the
+# pre-fix and post-fix commits — it guarded `collect_filters`'s pre-existing skip,
+# not the walk change it was placed under. Replaced rather than kept as
+# decoration, since a test that cannot fail is not evidence.
+pe_case "explicit-key line in a | body"     no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          ? explicit\n'
 # P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
 # reader does not interpret left the flag unset, so a reusable trigger still
 # reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
