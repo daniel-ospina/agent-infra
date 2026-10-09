@@ -442,6 +442,24 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     if [ -z "$cwd_l" ] || [ "$cwd_l" != "$target_l" ]; then
       return 0
     fi
+    # AND A THIRD SUBJECT: THE REMOTE THE TOOL ACTUALLY FETCHES. It fetches the
+    # checkout's `origin` remote, while `gh repo view` resolves the "base repo" and
+    # PREFERS a remote named `upstream`. MEASURED: with origin=<fork> and
+    # upstream=<target>, `gh repo view --json nameWithOwner` prints the UPSTREAM — so
+    # the check above can pass while the measurement is of the FORK, whose green is
+    # then attributed to the target (review round 7: the round-4 fail-OPEN one layer
+    # down). Assert the remote the tool will fetch. A URL that does not carry
+    # `owner/name` — a local-path clone — matches nothing and refreshes: the
+    # conservative direction, and the same one every other unreadable case takes.
+    local origin_l
+    origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
+    if [ -z "$target_l" ] || [ -z "$origin_l" ]; then
+      return 0
+    fi
+    case "$origin_l" in
+      *"$target_l"*) : ;;
+      *) return 0 ;;
+    esac
     # The cwd IS the target and it has NO tool: there is no gate that could leave
     # the head unlandable, so the skip stands. This reads the ARTIFACT (the tool's
     # existence) plus a MEASURED identity, never a setting.

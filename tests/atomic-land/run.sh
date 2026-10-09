@@ -1452,6 +1452,43 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate RAN before the identity was established — its wrong-repo green was used" \
   || pass "and it was never consulted: identity failed before any measurement"
 
+# ── A FORK LAYOUT — `gh` and the tool DISAGREE about which repo this is ──
+echo "── 17g-E16. a fork layout (origin=fork, upstream=target) ⇒ REFRESH (the tool fetches origin, not what gh resolves)"
+# The tool fetches the checkout's `origin` remote. `gh repo view` resolves the "base
+# repo" and PREFERS a remote named `upstream`. MEASURED on this box: with
+# origin=https://github.com/daniel-ospina/agent-infra.git and
+# upstream=https://github.com/daniel-ospina/tortoise.git, `gh repo view --json
+# nameWithOwner -q .nameWithOwner` prints `daniel-ospina/tortoise`. So the CWD_REPO
+# check passes (gh named the target) while the measurement is of the FORK — the
+# round-4 fail-OPEN one layer down (review round 7).
+new_scen driftforklayout
+git init -q "$TMP/e16repo"
+mkdir -p "$TMP/e16repo/tools" "$TMP/e16repo/sub"
+git -C "$TMP/e16repo" remote add origin   "https://github.com/daniel-ospina/some-fork.git"
+git -C "$TMP/e16repo" remote add upstream "https://github.com/$REPO.git"
+cat > "$TMP/e16repo/tools/drift-guard.py" <<'E16EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E16EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e16repo/sub"
+SCEN_CWD_REPO="$REPO"     # gh resolves the UPSTREAM, which IS the target, so that check passes
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the tool fetches origin (the fork), so its green is not about the target" \
+  || fail "SKIPPED on a green measured from a FORK's origin (the round-7 wrong-repo green)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the remote it fetches is not the target" \
+  || pass "and it was never consulted: the remote assertion failed before any measurement"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -1504,6 +1541,10 @@ echo "── 17g-E9. the tool is found from a SUBDIRECTORY: the path is anchored
 new_scen driftsubdir
 git init -q "$TMP/e9repo"
 mkdir -p "$TMP/e9repo/tools" "$TMP/e9repo/sub"
+# An `origin` remote whose URL carries the target slug: the gate now also asserts the
+# remote the tool FETCHES, so a scratch repo without one reads as unidentifiable and
+# refreshes before the predicate is ever consulted (see 17g-E16).
+git -C "$TMP/e9repo" remote add origin "https://github.com/$REPO.git"
 # The tool must be PYTHON: the default argv is `uv run python <tool>`.
 cat > "$TMP/e9repo/tools/drift-guard.py" <<'E9EOF'
 import json, os, pathlib, sys
@@ -1824,6 +1865,11 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # distance below a non-zero trigger is skipped unmeasured (the round-3 P1). 17g-E12
   # must redden.
   mutate_and_expect_fail B29  's/^        if \[ "\$\{behind:-\}" = "0" \]; then$/        if [ -n "\044behind" ]; then/m'
+  # B30 (#7727): the ORIGIN-REMOTE assertion — the round-7 wrong-repo green. The
+  # failure it prevents: the tool fetches the checkout's `origin` remote while
+  # `gh repo view` prefers `upstream`, so a fork checkout passes the slug check and
+  # its green is attributed to the target. 17g-E16 must redden.
+  mutate_and_expect_fail B30  's/^      \*\) return 0 ;;$/      *) : ;;/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh
