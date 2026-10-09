@@ -405,12 +405,12 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 #     bare branch name, so the invocation below passes `origin/$BASE`; passing
 #     $BASE would make every read an error and disable the skip entirely.
 #
-# FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): `1` is printed ONLY
-# for a POSITIVE green measurement. A revert, an environment error, a version
-# guard, a checkout that cannot be identified as the target, or a missing tool in
-# a checkout that is NOT the target — all print empty, and the caller REFRESHES on
-# empty. Unmeasurable must never stand in for green. (The ONE case that prints `1`
-# is named below: the target repo itself has no tool.)
+# FAIL-CLOSED DIRECTION, matching strict_of()/mergeable_of(): green is printed ONLY
+# for a POSITIVE green measurement, or for the one no-gate exception named below.
+# A revert, an environment error, a version guard, a checkout that cannot be
+# identified as the target, or a missing tool in a checkout that is NOT the target
+# — all print empty, and the caller REFRESHES on empty. Unmeasurable must never
+# stand in for green.
 #
 # THE ONE DELIBERATE EXCEPTION is a repo with NO drift gate at all: if the target
 # repo has no `tools/drift-guard.py` there is no gate that could leave the head
@@ -821,8 +821,12 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # different indent from the CLEAN arm's, so each has its OWN anchored
         # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
         # one unanchored pattern silently cover only the first — the B19b/B20b trap.
-        # The test is a STRING comparison for the same reason as the CLEAN arm: an
-        # empty value beside `-ne` would be a diagnostic, not a decision.
+        # A STRING comparison, like the CLEAN arm above. `-ne` on a value that is
+        # not a representable integer — an overflowed or zero-padded count — makes
+        # the test ERROR, and an erroring test takes the `else` below, which reports
+        # "0 behind" and returns 3: a false "current" skip on a distance that was
+        # never measured as 0. A string test cannot do that; anything that is not
+        # exactly "0" goes to the predicate.
         if [ "${behind:-}" != "0" ]; then
           if [ "$(drift_safe_of)" = 1 ]; then
             say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
