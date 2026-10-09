@@ -88,7 +88,10 @@ case "${1:-} ${2:-}" in
     # The rail asks for the slug AND the canonical URL; the URL is what pins the
     # drift predicate's HOST (#7727), so the fixture must speak both shapes.
     case "$*" in
-      *--json*url*) printf 'https://github.com/%s\n' "${REPO_FIXTURE:-$REPO}"; exit 0 ;;
+      *--json*url*)
+        # A scenario may pin the web url the CLI reports (e.g. an IPv6-literal host).
+        [ -n "${SCEN:-}" ] && [ -f "$SCEN/cwd-url" ] && { cat "$SCEN/cwd-url"; exit 0; }
+        printf 'https://github.com/%s\n' "${REPO_FIXTURE:-$REPO}"; exit 0 ;;
       *) printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
     esac ;;
   "pr update-branch")
@@ -1443,6 +1446,11 @@ echo "── 17g-E15. a PRESENT tool in a checkout that is NOT the target ⇒ RE
 # unlandable-head fail-OPEN the missing-tool branch was fixed for, one branch over.
 new_scen driftwrongcwdwithtool
 git init -q "$TMP/e15repo"
+# An origin that SATISFIES the remote assertions (slug at a boundary, same host), so
+# the SCEN_CWD_REPO mismatch below is the ONLY thing that can reject this checkout.
+# Without it the origin read is empty and this scenario refreshes for that reason
+# instead, leaving mutation B28 (identity gate inert) undetected here (review round 9).
+git -C "$TMP/e15repo" remote add origin "https://github.com/$REPO.git"
 mkdir -p "$TMP/e15repo/tools" "$TMP/e15repo/sub"
 cat > "$TMP/e15repo/tools/drift-guard.py" <<'E15EOF'
 import json, os, pathlib, sys
@@ -1535,6 +1543,42 @@ SCEN_CWD=
 called "pr update-branch" \
   && pass "refreshed — a same-slug remote on another host is a different repository" \
   || fail "SKIPPED on a green from a mirror on a FOREIGN host (the round-8 wrong-repo green)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its HOST is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
+# ── AN IPv6-LITERAL HOST — round 9 ───────────────────────────────────────
+echo "── 17g-E18. two IPv6-literal hosts, same owner/name ⇒ REFRESH (a colon is not always a port separator)"
+# The host parser cuts at the first colon to drop `:port`. For `[2001:db8::1]` that
+# colon is INSIDE the brackets, so both sides reduce to `[2001` and two DIFFERENT
+# hosts compare EQUAL — the silent wrong-repo fail-OPEN, reachable whenever gh and
+# origin are both IP-literal (a self-hosted GHE addressed by address). The parser
+# must cut at the closing bracket instead. Reverting `remote_host_of`'s `\[*` arm to
+# a first-colon cut reddens THIS scenario (and only it).
+new_scen driftipv6host
+git init -q "$TMP/e18repo"
+mkdir -p "$TMP/e18repo/tools" "$TMP/e18repo/sub"
+git -C "$TMP/e18repo" remote add origin "https://[2001:dead::9]/$REPO.git"
+printf 'https://[2001:db8::1]/%s\n' "$REPO" > "$SCEN/cwd-url"
+cat > "$TMP/e18repo/tools/drift-guard.py" <<'E18EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E18EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e18repo/sub"
+SCEN_CWD_REPO="$REPO"     # the slug passes; only the HOST separates these two
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — [2001:db8::1] and [2001:dead::9] are different hosts, not one [2001" \
+  || fail "SKIPPED: two DIFFERENT IPv6 hosts collapsed to the same prefix (the round-9 fail-OPEN)"
 grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although its HOST is not the target's" \
   || pass "and it was never consulted: the host assertion failed before any measurement"

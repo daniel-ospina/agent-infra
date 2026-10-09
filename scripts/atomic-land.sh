@@ -174,12 +174,13 @@ ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
 # ⚠️ KNOWN LIMITATION, stated rather than implied: the "is there a drift gate?"
 # question is answered from the LOCAL CHECKOUT, not from the target's base ref. If
 # that checkout's `tools/drift-guard.py` is absent while the target repo HAS one — a
-# stale branch, a fork, a locally deleted file — the rail reads "no gate" and takes
-# the skip. The rail is meant to run from the target repo's own checkout, where that
-# cannot arise, and confirming gate existence against the remote base would cost an
-# API round trip per run to guard a case with no measured failure. What the code
-# DOES guarantee is the case that WAS measured: a cwd repo that is not the target is
-# never read as "no gate".
+# stale branch, a locally deleted file — the rail reads "no gate" and takes the skip.
+# The rail is meant to run from the target repo's own checkout, where that cannot
+# arise, and confirming gate existence against the remote base would cost an API
+# round trip per run to guard a case with no measured failure. What the code DOES
+# guarantee is the cases that WERE measured: a cwd repo that is not the target is
+# never read as "no gate", and a fork's `origin` — the case this comment used to
+# name — is refused by the origin assertion below rather than skipped.
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -423,6 +424,17 @@ mergeable_of() { # -> true | false | "" (empty = unreadable ⇒ the caller refre
 # ONLY when the cwd is demonstrably the target repo (see the body below); a missing
 # tool in some OTHER checkout proves nothing. That reads the ARTIFACT (the tool's
 # existence), never a setting.
+# The HOST of a git remote authority. It must cut at the CLOSING BRACKET of an IPv6
+# literal, never at the first colon: `[2001:db8::1]` and `[2001:dead::9]` both reduce
+# to `[2001` under a first-colon cut, so two DIFFERENT hosts would compare equal —
+# exactly the silent wrong-repo fail-open drift_safe_of() exists to refuse (#7727).
+remote_host_of() { # <[host]:port | host:port | host> -> host, verbatim
+  case "$1" in
+    \[*) local h="${1#\[}"; printf "[%s]" "${h%%]*}" ;;
+    *)   printf "%s" "${1%%:*}" ;;
+  esac
+}
+
 drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refreshes)
   # The tool is resolved against the cwd checkout's ROOT, never the process cwd:
   # `gh repo view` walks up, so from a subdirectory the identity check passes while a
@@ -456,11 +468,6 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # down). Assert the remote the tool will fetch: anything that does not END in the
     # target slug — a differently named remote, a missing remote, an unreadable URL —
     # refreshes, the same direction every other unreadable case takes.
-    # ⚠️ KNOWN LIMIT, filed rather than closed here (tortoise#7727): the match is on
-    # the URL's LAST PATH SEGMENT, so it does not verify the HOST. A remote on another
-    # host whose path still ends in `owner/name` (a mirror, a GitLab/GHE path) matches.
-    # Closing it means comparing the full remote identity against the clone URL gh
-    # itself reports, with a test per URL form — its own change, not a rider.
     local origin_l
     origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
     origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
@@ -477,20 +484,23 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     esac
     # AND THE HOST. The boundary above pins owner/name; a remote is (host, owner,
     # name), and a same-slug remote on a DIFFERENT host is a different repository —
-    # its green is not a statement about the target. gh reports the target's clone
-    # URL, so take the host from there and require the origin's host to equal it.
-    # Every form that resolves to no host (a local path, a bare name) has an empty
-    # host and refreshes. The port is dropped on both sides, so an explicit :443 or
-    # :22 does not turn a correct remote into a refresh.
-    local target_host_l origin_host_l
+    # its green is not a statement about the target. Take the host from the URL gh
+    # reports for the target (its WEB url, `--json url`; on a host whose git and web
+    # names differ that mismatches and refreshes — the conservative direction) and
+    # require the origin's host to equal it. Every form that resolves to no host (a
+    # local path, a bare name) has an empty host and refreshes. The port is dropped on
+    # both sides, so an explicit :443 or :22 does not turn a correct remote into a
+    # refresh.
+    local target_host_l origin_host_l origin_authority_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
-    target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"
-    target_host_l="${target_host_l#*@}"; target_host_l="${target_host_l%%:*}"
-    origin_host_l=""
+    target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
+    target_host_l="$(remote_host_of "$target_host_l")"
+    origin_authority_l=""
     case "$origin_l" in
-      *://*) origin_host_l="${origin_l#*://}"; origin_host_l="${origin_host_l%%/*}"; origin_host_l="${origin_host_l#*@}"; origin_host_l="${origin_host_l%%:*}" ;;
-      *@*:*) origin_host_l="${origin_l#*@}"; origin_host_l="${origin_host_l%%:*}" ;;
+      *://*) origin_authority_l="${origin_l#*://}"; origin_authority_l="${origin_authority_l%%/*}"; origin_authority_l="${origin_authority_l#*@}" ;;
+      *@*:*) origin_authority_l="${origin_l#*@}" ;;
     esac
+    origin_host_l="$(remote_host_of "$origin_authority_l")"
     if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
       return 0
     fi
