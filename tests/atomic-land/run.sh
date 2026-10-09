@@ -1683,6 +1683,31 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although the authority it would fetch is unreadable" \
   || pass "and it was never consulted: the authority check failed before any measurement"
 
+# ...and the OTHER scp-like form: ONE colon, no trailing one. NO arm matches, the
+# authority stays EMPTY, and the HOST test is what refuses it — a different assertion
+# from the form above, so it needs its own execution (review round 14).
+git init -q "$TMP/e20brepo"
+mkdir -p "$TMP/e20brepo/tools" "$TMP/e20brepo/sub"
+git -C "$TMP/e20brepo" remote add origin "user:pw@github.com/$REPO"
+cat > "$TMP/e20brepo/tools/drift-guard.py" <<'E20BEOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E20BEOF
+SCEN_CWD="$TMP/e20brepo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — no arm matches that form, so the authority is empty and the HOST test refuses it" \
+  || fail "SKIPPED: the one-colon scp-like form produced a readable authority"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the authority could not be read" \
+  || pass "and it was never consulted there either"
+
 # ── A FOREIGN OWNER WITH AN EXTRA LEADING PATH SEGMENT — round 11 ────────
 echo "── 17g-E21. origin '.../evil/<owner>/<name>' ⇒ REFRESH (the path must BE the target's, not end with it)"
 # A suffix test (`*/owner/name`) accepts this: the string does end with the target
@@ -1808,6 +1833,74 @@ called "pr update-branch" \
 grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although its host is not the target's" \
   || pass "and it was never consulted: the host assertion failed before any measurement"
+
+# ── THE FRAGMENT CUT IS TRANSPORT-DEPENDENT — round 14 ───────────────────
+echo "── 17g-E25. an ssh origin with a '#' ⇒ REFRESH (git keeps the fragment in the repository PATH)"
+# The cut is right for http(s), where curl ends the URL at `#`. It is WRONG for ssh:
+# git passes the fragment as part of the path, so cutting it would read
+# `ssh://host/<slug>#x` as the target while the fetch goes to `<slug>#x`.
+new_scen driftsshfragment
+git init -q "$TMP/e25repo"
+mkdir -p "$TMP/e25repo/tools" "$TMP/e25repo/sub"
+git -C "$TMP/e25repo" remote add origin "ssh://git@github.com/$REPO#x"
+cat > "$TMP/e25repo/tools/drift-guard.py" <<'E25EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E25EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e25repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — ssh does not end the URL at '#', so the path is <slug>#x, not <slug>" \
+  || fail "SKIPPED: the fragment was cut for ssh, where git keeps it in the path (the round-14 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its path is not the target's" \
+  || pass "and it was never consulted: the path assertion failed before any measurement"
+
+# ── A REPLACED BASE OBJECT — round 14 ────────────────────────────────────
+echo "── 17g-E26. the base ref's object is REPLACED by a tree without the tool ⇒ REFRESH (indirection must not undo the tip check)"
+# `git rev-parse <ref>` IGNORES replace refs; `git ls-tree <ref>` HONOURS them. So a
+# `git replace` mapping the base sha to an empty tree passes the freshness test and then
+# reports "no gate" — the two reads naming DIFFERENT objects for the same ref. The
+# absence read therefore runs with `--no-replace-objects`, on the sha the tip check just
+# verified.
+new_scen driftreplacedref
+rm -rf "$TMP/e26repo"; git init -q "$TMP/e26repo"
+mkdir -p "$TMP/e26repo/tools" "$TMP/e26repo/sub"
+git -C "$TMP/e26repo" remote add origin "https://github.com/$REPO.git"
+printf 'x\n' > "$TMP/e26repo/README.md"
+printf 'x\n' > "$TMP/e26repo/tools/drift-guard.py"
+git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e26repo" update-ref refs/remotes/origin/main HEAD
+E26_SHA="$(git -C "$TMP/e26repo" rev-parse origin/main)"
+E26_TREE="$(git -C "$TMP/e26repo" hash-object -t tree /dev/null)"
+E26_REPL="$(git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite commit-tree "$E26_TREE" -m replaced)"
+git -C "$TMP/e26repo" replace "$E26_SHA" "$E26_REPL"
+rm -f "$TMP/e26repo/tools/drift-guard.py"          # no LOCAL tool either
+printf '%s\n' "$E26_SHA" > "$SCEN/base-tip"         # the API reports the same sha
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e26repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — replace refs are ignored, so the base object really does carry the tool" \
+  || fail "SKIPPED: a replace ref hid the tool from the absence read while the tip check passed (a T1 skip with no measurement)"
 
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
@@ -2236,11 +2329,21 @@ if true; then
   # one. rc 0 + no output is the ONLY shape that may skip. 17g-E22 must redden, and
   # 17g-E5 must stay green.
   mutate_and_expect_fail B34  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ -z "\$tree_out" ]; then/m'
-  # B36 (#7727): the FRAGMENT cut in the authority. The failure it prevents:
-  # `https://evil.invalid#@github.com/<slug>`, whose host is `evil.invalid` for curl
-  # and git but reads as the TARGET when the authority is split naively — a T6
-  # wrong-repo MATCH. 17g-E24 must redden.
-  mutate_and_expect_fail B36  's/^             origin_authority_l="\$\{origin_authority_l%%#\*\}"/             :/m'
+  # B36 (#7727): the FRAGMENT cut. The failure it prevents:
+  # `https://evil.invalid#@github.com/<slug>`, whose host is `evil.invalid` for curl —
+  # and so for git over http(s) — but which reads as the TARGET when the authority is
+  # split naively: a T6 wrong-repo MATCH. 17g-E24 must redden.
+  mutate_and_expect_fail B36  's/origin_l="\$\{origin_l%%#\*\}"/:/'
+  # B37 (#7727): applying that cut to the transports where git does NOT end the URL at
+  # `#`. The failure it prevents: `ssh://host/<slug>#x` reads as the target while the
+  # fetch goes to the path `<slug>#x` — the same wrong-repo MATCH, one transport over.
+  # 17g-E25 must redden.
+  mutate_and_expect_fail B37  's/^      \*\) : ;;.*ssh and git:\/\/ keep it.*$/      *) origin_l="\044{origin_l%%#*}";;/m'
+  # B38 (#7727): the replace-ref defence. The failure it prevents: `git rev-parse`
+  # IGNORES replace refs and `git ls-tree` HONOURS them, so a `git replace` redirecting
+  # the base sha to an empty tree passes the freshness test and then reports "no gate" —
+  # a skip with no measurement on a repo whose base HAS the gate. 17g-E26 must redden.
+  mutate_and_expect_fail B38  's/ --no-replace-objects//'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A

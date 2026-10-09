@@ -493,21 +493,28 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # `user:pw@host:path` the `*@*:*` arm DOES match and the path — taken from after the
     # first colon — begins with the userinfo, so the PATH test refuses it; in
     # `user:pw@host/path` no arm matches at all, the authority stays EMPTY, and the HOST
-    # test refuses it. (`17g-E20` is the second form.)
+    # test refuses it. (Both forms are pinned: `17g-E20` runs the first, its second
+    # sub-case the second.)
+    #
+    # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
+    # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
+    # `evil.invalid#` and names the TARGET, while curl — and so git over http(s) — stops
+    # at `#` and fetches `evil.invalid`. It is cut ONLY for the transports where curl
+    # ends the URL there. ssh does not: git passes the fragment as part of the
+    # repository PATH, so cutting it there would read `ssh://host/o/n#x` as the target
+    # while the fetch goes to `o/n#x`. Leaving it makes the path differ from the slug,
+    # which refreshes.
     local target_host_l origin_host_l origin_authority_l origin_path_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
     target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
     target_host_l="$(remote_host_of "$target_host_l")"
+    case "$origin_l" in
+      http://*|https://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
+      *) : ;;                                             # ssh and git:// keep it in the path
+    esac
     origin_authority_l=""; origin_path_l=""
     case "$origin_l" in
       *://*) origin_authority_l="${origin_l#*://}"
-             # A FRAGMENT ends the URL for every client that fetches it — curl, and so
-             # git — but NOT for a naive authority/path split: `https://evil.invalid#@tgt`
-             # would then read the userinfo as `evil.invalid#` and name the TARGET, so a
-             # green from a foreign host was attributed to it (review round 13). Cut at
-             # `#` before splitting. (`?` is NOT cut: git sends the query as part of the
-             # request path, so a query makes the path differ from the slug and refreshes.)
-             origin_authority_l="${origin_authority_l%%#*}"
              origin_path_l="${origin_authority_l#*/}"
              origin_authority_l="${origin_authority_l%%/*}"
              origin_authority_l="${origin_authority_l#*@}" ;;
@@ -543,12 +550,19 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # (#4174) — while a local `origin/$BASE` is exactly that ref. So the local tip must
     # equal the base tip the API reports; otherwise we are reading a revision we cannot
     # date, which is not a measurement and must refresh.
+    #
+    # And the read must be of THAT object. Replace refs are the trap: `git rev-parse`
+    # ignores them and `git ls-tree` honours them, so a `git replace` redirecting the
+    # base sha to an empty tree would pass the tip check above and then report "no
+    # gate" — the two reads naming DIFFERENT objects for the same ref. `ls-tree` is
+    # therefore called with `--no-replace-objects`, on the sha the tip check just
+    # verified rather than on the ref again.
     if [ ! -f "$tool" ]; then
       local live_tip local_tip tree_out="" tree_rc=0
       live_tip="$(base_tip)"
       local_tip="$(git -C "${CWD_ROOT:-.}" rev-parse --verify --quiet "origin/$BASE" 2>/dev/null || true)"
       if [ -n "$live_tip" ] && [ "$local_tip" = "$live_tip" ]; then
-        tree_out="$(git -C "${CWD_ROOT:-.}" ls-tree "origin/$BASE" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
+        tree_out="$(git --no-replace-objects -C "${CWD_ROOT:-.}" ls-tree "$local_tip" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
         if [ "$tree_rc" -eq 0 ] && [ -z "$tree_out" ]; then
           printf '1'
         fi
