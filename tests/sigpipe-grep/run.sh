@@ -743,9 +743,14 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
 
 # 11ah. OPENABILITY IS NOT WRITABILITY. A sink that takes the open and then refuses the write —
 # a full volume — swallows find's diagnostics exactly as a missing file does, so the partition
-# reads empty over a partial scan. `/dev/full` is that state on tap; the sink is reached through
-# a SYMLINK so the guard's exit trap unlinks the link and not the device. Where /dev/full does
-# not exist (BSD/macOS) the pin says so rather than passing vacuously.
+# reads empty over a partial scan. `/dev/full` is that state on tap. The sink is reached through
+# a SYMLINK because the guard's exit trap is an unconditional `rm -f "$FIND_ERRS"` and a DEVICE
+# handed to it directly would be unlinked. That is DEFENSIVE, not a live fix: the failing write
+# below exits 2 at the precondition, which is installed BEFORE the trap, so the trap is not
+# reached on this path and the symlink is insurance against the trap ever being reordered ahead
+# of it. (An earlier comment asserted the deletion as a live hazard; it was verified not to be
+# one at this commit.) Where /dev/full does not exist (BSD/macOS) the pin says so rather than
+# passing vacuously.
 E="$TMP/f11ah"; mkdir -p "$E/scripts" "$E/fakebin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
 sink_state="unavailable"
@@ -823,9 +828,11 @@ chmod 755 "$E/scripts/locked"
 E="$TMP/f11al"; mkdir -p "$E/scripts/locked" "$E/fakebin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
 chmod 000 "$E/scripts/locked"
-# Reached through a SYMLINK, as 11ah does, so the guard's exit trap unlinks the link and not the
-# device: the trap is an unconditional `rm -f "$FIND_ERRS"`, and handing it /dev/null directly
-# deletes the device node wherever the guard runs as root.
+# Reached through a SYMLINK, as 11ah does, because the guard's exit trap is an unconditional
+# `rm -f "$FIND_ERRS"` and a DEVICE handed to it directly would be unlinked. This is DEFENSIVE:
+# on this path the read-back precondition exits 2 first and the trap (which is installed AFTER
+# it) is never reached — verified by tracing the guard, and the correction is recorded here
+# because the round-3 commit message asserted the opposite as a live hazard.
 ln -s /dev/null "$E/sink"
 printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" > "$E/fakebin/mktemp"
 chmod +x "$E/fakebin/mktemp"
