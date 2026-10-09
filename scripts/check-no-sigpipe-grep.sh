@@ -147,11 +147,23 @@ FIND_ERRS="$(mktemp)" || {
   echo "check-no-sigpipe-grep: cannot create a diagnostics file (TMPDIR unset or unwritable) — refusing to report a verdict over a scan that has not run" >&2
   exit 2
 }
-# mktemp's STATUS is not proof the sink is usable, and neither is OPENABILITY: a wrapper that
-# exits 0 without creating a file, or a sink on a volume that takes the open but refuses the
-# write, would swallow find's stderr, leave the partition empty, and let a partial scan read as
-# a clean one. Write a byte (which a full volume rejects) and truncate it away again.
-if ! { printf x >>"$FIND_ERRS" && : >"$FIND_ERRS"; } 2>/dev/null; then
+# The sink must be ABSOLUTE. The scan runs after `cd "$ROOT"` (the FILE_LIST subshell below),
+# while this precondition and the partition read both run in the guard's original cwd — so a
+# RELATIVE mktemp result would be WRITTEN under $ROOT and READ here, i.e. two different files,
+# an empty partition, and a clean verdict over a partial scan. That is not hypothetical: GNU
+# `mktemp` with no template implies `--tmpdir`, so it emits a relative name whenever TMPDIR
+# itself is relative.
+case "$FIND_ERRS" in
+  /*) ;;
+  *) FIND_ERRS="$PWD/$FIND_ERRS" ;;
+esac
+# mktemp's STATUS is not proof the sink is usable, and neither is OPENABILITY or WRITE-ONLY
+# success: a wrapper that exits 0 without creating a file, a sink on a volume that takes the
+# open but refuses the write, and a sink that accepts the write but discards it (or cannot be
+# READ back) would ALL swallow find's stderr, leave the partition empty, and let a partial scan
+# read as a clean one. Instead of trusting the write, read the byte back — which is what the
+# partition will do — then truncate it away again.
+if ! { printf x >>"$FIND_ERRS" && [ "$(cat "$FIND_ERRS" 2>/dev/null)" = x ] && : >"$FIND_ERRS"; } 2>/dev/null; then
   echo "check-no-sigpipe-grep: the diagnostics file is not writable — refusing to report a verdict over a scan that has not run" >&2
   exit 2
 fi
@@ -248,9 +260,20 @@ scan_files() {
   case "$dir" in -*) target="./$dir" ;; esac
   # The basename decides, so `$ROOT/.husky` and `.husky` select identically — otherwise the
   # count pre-pass and the scan disagree about which files were read.
+  # A file `find` LISTED but that cannot be OPENED would be skipped by the scanner below with no
+  # trace at all: `awk` reports `can't open file` on a stderr nobody inspects, and `find -L`
+  # could STAT it, so NO diagnostic reaches the partition — a clean verdict over a file the
+  # guard never read. Route it into the sink, whose partition is fail-closed by construction.
+  # This mirrors the unreadable-DIRECTORY rule above, and for the same reason: the guard cannot
+  # clear content it has not seen, and it cannot even rule the file OUT, because an unreadable
+  # file's shebang cannot be read either.
   case "${dir##*/}" in
-    .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" ;;
+    .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
+              [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
+              printf '%s\n' "$f"
+            done ;;
     *) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
+         [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
          is_shell_file "$f" && printf '%s\n' "$f"
        done ;;
   esac

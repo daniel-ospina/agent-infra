@@ -53,9 +53,10 @@
 #      exempt: the ELOOP wording means a path did not resolve at all (a chain, reachable no
 #      other way) and stays fatal (11af); a tree holding BOTH a cycle and an unreadable dir is
 #      still exit 2 (11ab). The cycle pin has teeth on GNU find (CI); BSD find emits no cycle
-#      diagnostic, so there it passes with or without the exclusion. 11af runs only where find
-#      reports an unresolvable chain, so the suite's assertion count is platform-dependent
-#      (59 on BSD/macOS, 60 on GNU findutils — the platform CI runs).
+#      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
+#      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
+#      where find reports an unresolvable chain, so the suite's assertion count is
+#      platform-dependent (64 on BSD/macOS, 65 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -761,6 +762,73 @@ else
   [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a sink that opens but rejects the write refuses a verdict (exit 2)" \
                || fail "a write-rejecting sink still produced a verdict (exit $rc)"
 fi
+
+# 11ai. ...and the cycle EXEMPTION and its ANCHOR are pinned on every platform. 11aa needs
+# findutils' own cycle report, which BSD find never emits — so on macOS it passes with or
+# without the exemption, and an edit that deletes the exempt arm or loosens its match would be
+# caught only on CI. `find` is stubbed (as 11ag stubs `mktemp`) so both polarities are asserted
+# here. (b) is what pins the ANCHOR: an unanchored `*'File system loop detected'*` matches a
+# permission error whose PATH merely contains that text — a path the tree under scan controls —
+# and so exempts a real partial scan. That is a reachable fail-open, not a theoretical one.
+E="$TMP/f11ai"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+# (a) a GNU-shaped cycle report, with everything reachable still listed
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
+  'printf "%s\n" "scripts/a.sh"' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "find's cycle report is EXEMPT: the file it did not hide is still read (exit 1)" \
+             || fail "the cycle exemption is not what makes the loop case clean (exit $rc)"
+# (b) a permission error whose path merely CONTAINS the cycle text must NOT be exempt
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "find: scripts/File system loop detected/x: Permission denied" >&2' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "the cycle match is ANCHORED: an error whose path contains the text is still fatal (exit 2)" \
+             || fail "an unanchored cycle match exempted a real partial scan (exit $rc)"
+
+# 11aj. A file the scan LISTED but cannot OPEN is not "clean". `find -L` STAT'd it, so no
+# diagnostic reaches the partition, and `awk` fails on it with a status nothing checks — the run
+# would print a verdict over a file it never read. Pinned with a mode-000 `*.sh`, which is
+# claimed by NAME, so no shebang read is involved and the pin isolates this path.
+E="$TMP/f11aj"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked.sh"
+chmod 000 "$E/scripts/locked.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/locked.sh"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable LISTED file refuses a verdict (exit 2)" \
+             || fail "the idiom in an unreadable file was reported clean (exit $rc)"
+
+# 11ak. ...and the sink must be ABSOLUTE. The precondition and the partition read run in the
+# guard's OWN cwd, but `find` writes to it after `cd "$ROOT"` — so a RELATIVE mktemp result names
+# two different files: find's errors land in $ROOT/<name>, the partition reads $PWD/<name> empty,
+# and a partial scan reads as a clean one. GNU `mktemp` emits exactly that shape when TMPDIR is
+# relative, so `mktemp` is stubbed to emit it without depending on the platform's mktemp. The
+# cwd MUST differ from --root, or the two resolutions coincide and the pin is vacuous.
+E="$TMP/f11ak"; mkdir -p "$E/scripts/locked" "$E/fakebin" "$E/run"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "rel-sink.$$"' ': >"rel-sink.$$"' > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(cd "$E/run" && PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a RELATIVE diagnostics sink still refuses a verdict (exit 2)" \
+             || fail "a relative sink made the partition read empty over a partial scan (exit $rc)"
+
+# 11al. ...and a sink that ACCEPTS the write and discards it is not usable either. Reading the
+# byte back is the only form that catches it: the write succeeds, so a write-only precondition
+# passes while the partition reads empty over a partial scan. `/dev/null` exists on both
+# platforms, so this pin is never skipped.
+E="$TMP/f11al"; mkdir -p "$E/scripts/locked" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+printf '%s\n' '#!/bin/sh' 'printf "%s" "/dev/null"' > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a write-DISCARDING sink refuses a verdict (exit 2)" \
+             || fail "a sink that swallows find's stderr produced a verdict anyway (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
