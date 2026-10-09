@@ -488,13 +488,25 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # FIRST colon — and git only takes that form when NO slash precedes it. So
     # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`; reading the
     # authority as everything after the first `@` would name the TARGET's host and take
-    # the skip on a fetch that goes somewhere else. A colon before the first `@` needs
-    # no arm of its own, and WHICH test refuses it depends on the form: in
-    # `user:pw@host:path` the `*@*:*` arm DOES match and the path — taken from after the
-    # first colon — begins with the userinfo, so the PATH test refuses it; in
-    # `user:pw@host/path` no arm matches at all, the authority stays EMPTY, and the HOST
-    # test refuses it. (Both forms are pinned: `17g-E20` runs the first, its second
-    # sub-case the second.)
+    # the skip on a fetch that goes somewhere else.
+    #
+    # WHICH FORM IS THIS? Git's own rule (`url.c: url_is_local_not_ssh`), not a guess at
+    # the SHAPE of the string — because the arm chosen decides which SUBJECT is
+    # compared, and an arm that matches a string git would treat as a local path names
+    # the target from it. (Review round 15: `foo/bar@github.com:o/n` has a slash BEFORE
+    # the colon, so git runs `git-upload-pack` on a directory, yet the `*@*:*` arm read
+    # host `github.com` and path `o/n` out of it; `./weird://github.com/o/n` is not a
+    # URL at all — `.` cannot start a scheme — yet the `*://*` arm read the same pair.
+    # Both are the round-7 fail-OPEN, keyed on the string instead of on the grammar.)
+    # The rule is:
+    #   * a VALID scheme — `[A-Za-z][A-Za-z0-9+.-]*` — followed by `://` is a URL, and
+    #     its authority runs to the first `/`;
+    #   * else, if there is a colon and NO SLASH BEFORE IT, it is scp-like and the host
+    #     ends at that colon;
+    #   * else it is a LOCAL PATH, which has no host to compare and cannot be read as
+    #     the target's remote;
+    #   * a `file://` URL whose host is neither empty nor `localhost` cannot be fetched
+    #     at all (git: "URL using bad/illegal format"), so it is unmeasurable.
     #
     # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
     # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
@@ -504,7 +516,7 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # repository PATH, so cutting it there would read `ssh://host/o/n#x` as the target
     # while the fetch goes to `o/n#x`. Leaving it makes the path differ from the slug,
     # which refreshes.
-    local target_host_l origin_host_l origin_authority_l origin_path_l
+    local target_host_l origin_host_l origin_authority_l origin_path_l origin_scheme_l pre_colon_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
     target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
     target_host_l="$(remote_host_of "$target_host_l")"
@@ -512,15 +524,35 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
       http://*|https://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
       *) : ;;                                             # ssh and git:// keep it in the path
     esac
-    origin_authority_l=""; origin_path_l=""
+    origin_authority_l=""; origin_path_l=""; origin_scheme_l=""
     case "$origin_l" in
-      *://*) origin_authority_l="${origin_l#*://}"
-             origin_path_l="${origin_authority_l#*/}"
-             origin_authority_l="${origin_authority_l%%/*}"
-             origin_authority_l="${origin_authority_l#*@}" ;;
-      *@*:*) origin_authority_l="${origin_l#*@}"
-             origin_path_l="${origin_l#*:}" ;;
+      *://*) origin_scheme_l="${origin_l%%://*}"
+             case "$origin_scheme_l" in
+               ''|[!A-Za-z]*|*[!A-Za-z0-9+.-]*) origin_scheme_l="" ;;   # not a scheme ⇒ not a URL
+             esac ;;
     esac
+    if [ -n "$origin_scheme_l" ]; then
+      origin_authority_l="${origin_l#*://}"
+      origin_path_l="${origin_authority_l#*/}"
+      origin_authority_l="${origin_authority_l%%/*}"
+      origin_authority_l="${origin_authority_l#*@}"
+      if [ "$origin_scheme_l" = "file" ]; then
+        case "$origin_authority_l" in
+          ''|localhost) : ;;
+          *) return 0 ;;          # git cannot fetch this URL at all ⇒ nothing to compare
+        esac
+      fi
+    else
+      case "$origin_l" in
+        *:*)
+          # scp-like ONLY when no slash precedes the first colon (git's rule, exactly).
+          pre_colon_l="${origin_l%%:*}"
+          case "$pre_colon_l" in
+            */*) : ;;             # a slash first ⇒ a LOCAL PATH, not a remote
+            *) origin_authority_l="${pre_colon_l#*@}"; origin_path_l="${origin_l#*:}" ;;
+          esac ;;
+      esac
+    fi
     origin_host_l="$(remote_host_of "$origin_authority_l")"
     if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
       return 0

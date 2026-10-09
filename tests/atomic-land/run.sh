@@ -1544,12 +1544,16 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
 # ── A SAME-SLUG REMOTE ON ANOTHER HOST — round 8 ──
 echo "── 17g-E17. origin on a DIFFERENT host with the same owner/name ⇒ REFRESH (a remote is host+owner+name)"
 # The path-boundary check pins owner/name. A remote is (host, owner, name), so a
-# mirror on another host whose path still ends `owner/name` is a DIFFERENT repository;
-# its green must not be attributed to the target (review round 8).
+# mirror on another host with the SAME owner/name is a DIFFERENT repository; its green
+# must not be attributed to the target (review round 8). The path here is IDENTICAL to
+# the slug on purpose — review round 15 found the fixture carried an extra `grp/`
+# segment, so the PATH test refused it and the HOST test was never exercised: the
+# scenario passed for a reason other than the one it named. 17g-E21 is the extra-segment
+# case; this one must rest on the host alone.
 new_scen driftforeignhost
 git init -q "$TMP/e17repo"
 mkdir -p "$TMP/e17repo/tools" "$TMP/e17repo/sub"
-git -C "$TMP/e17repo" remote add origin "https://gitlab.com/grp/$REPO.git"
+git -C "$TMP/e17repo" remote add origin "https://gitlab.com/$REPO.git"
 cat > "$TMP/e17repo/tools/drift-guard.py" <<'E17EOF'
 import json, os, pathlib, sys
 scen = os.environ["SCEN"]
@@ -1685,17 +1689,20 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
 
 # ...and the OTHER scp-like form: ONE colon, no trailing one. NO arm matches, the
 # authority stays EMPTY, and the HOST test is what refuses it — a different assertion
-# from the form above, so it needs its own execution (review round 14).
-git init -q "$TMP/e20brepo"
-mkdir -p "$TMP/e20brepo/tools" "$TMP/e20brepo/sub"
-git -C "$TMP/e20brepo" remote add origin "user:pw@github.com/$REPO"
-cat > "$TMP/e20brepo/tools/drift-guard.py" <<'E20BEOF'
+# from the form above, so it needs its OWN scenario: sharing one would let the first
+# sub-case's refresh satisfy a "did the rail refresh?" assertion for the second, which
+# is exactly how a vacuous assertion passes (review round 15).
+new_scen driftscpnouser
+git init -q "$TMP/e20crepo"
+mkdir -p "$TMP/e20crepo/tools" "$TMP/e20crepo/sub"
+git -C "$TMP/e20crepo" remote add origin "user:pw@github.com/$REPO"
+cat > "$TMP/e20crepo/tools/drift-guard.py" <<'E20CEOF'
 import json, os, pathlib, sys
 scen = os.environ["SCEN"]
 pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
 print(json.dumps({"status": "ok", "base": "origin/main"}))
-E20BEOF
-SCEN_CWD="$TMP/e20brepo/sub"
+E20CEOF
+SCEN_CWD="$TMP/e20crepo/sub"
 SCEN_CWD_REPO="$REPO"
 SCEN_DRIFT_CMD=           # NO override: exercise the real default path
 SCEN_RECORD_LOG=1
@@ -1901,6 +1908,71 @@ SCEN_CWD=
 called "pr update-branch" \
   && pass "refreshed — replace refs are ignored, so the base object really does carry the tool" \
   || fail "SKIPPED: a replace ref hid the tool from the absence read while the tip check passed (a T1 skip with no measurement)"
+
+# ── THE URL FORM IS DECIDED BY GIT'S GRAMMAR, NOT BY THE STRING'S SHAPE — r15 ───
+# The `case` arms that split the remote used to be chosen by SHAPE. A shape that git
+# resolves differently is a wrong-subject read, and round 15 found two: a string with a
+# slash before its colon is a LOCAL PATH to git, and a `://` whose scheme is not a legal
+# scheme is not a URL at all — yet both named the TARGET's host and path.
+cat > "$TMP/e2x-tool.py" <<'E2XEOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E2XEOF
+
+origin_form_case() { # <name> <origin-url> <expect: refresh|skip> <why>
+  local name="$1" url="$2" expect="$3" why="$4" dir="$TMP/e27-$1"
+  new_scen "driftform$name"
+  rm -rf "$dir"; git init -q "$dir"
+  mkdir -p "$dir/tools" "$dir/sub"
+  git -C "$dir" remote add origin "$url"
+  cp "$TMP/e2x-tool.py" "$dir/tools/drift-guard.py"   # PRESENT: a skip would consult it
+  printf 'CLEAN\n'     > "$SCEN/state"
+  printf '14\n'        > "$SCEN/behind"
+  printf 'false\n'     > "$SCEN/strict"
+  printf 'MERGEABLE\n' > "$SCEN/mergeable"
+  SCEN_CWD="$dir/sub"
+  SCEN_CWD_REPO="$REPO"
+  SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+  SCEN_RECORD_LOG=1
+  run_rail 42 --repo "$REPO" --poll 0
+  SCEN_CWD=
+  if [ "$expect" = refresh ]; then
+    called "pr update-branch" \
+      && pass "$name refreshed — $why" \
+      || fail "$name SKIPPED: $why"
+    grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+      && fail "$name: the predicate was CONSULTED on a remote that is not the target's" \
+      || pass "$name: and it was never consulted"
+  else
+    called "pr update-branch" \
+      && fail "$name refreshed although $why" \
+      || pass "$name did NOT refresh — $why"
+    grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+      && pass "$name: and the predicate WAS consulted" \
+      || fail "$name: never consulted the predicate — the remote was rejected before any measurement"
+  fi
+}
+
+echo "── 17g-E27. origin 'foo/bar@github.com:<slug>' ⇒ REFRESH (a slash before the colon makes it a LOCAL PATH)"
+# `git-upload-pack` runs on a DIRECTORY here, so no part of that string is a host — but
+# the old `*@*:*` arm read host `github.com` and path `<slug>` straight out of it.
+origin_form_case slashpath "foo/bar@github.com:$REPO" refresh "a slash before the colon makes it a local path, not the target's remote"
+
+echo "── 17g-E28. origin './weird://github.com/<slug>' ⇒ REFRESH ('.' cannot start a scheme, so it is not a URL)"
+origin_form_case badscheme "./weird://github.com/$REPO" refresh "'.' cannot start a scheme, so git treats the whole string as a path"
+
+echo "── 17g-E29. origin '<host>:<owner>/<name>' ⇒ the skip STILL applies (git's scp form needs no user)"
+# The fail-CLOSED half: `[user@]host:path` is a documented git remote form. Reading it
+# as unidentifiable disabled the skip — and with it the no-gate exception — for every
+# repo whose origin uses it.
+origin_form_case scplike "github.com:$REPO" skip "git's scp-like form names the target, and the predicate is green"
+
+echo "── 17g-E30. origin 'file://github.com/<slug>' ⇒ REFRESH (git cannot fetch that URL at all)"
+# git rejects a `file://` URL with a non-empty host other than `localhost` ("URL using
+# bad/illegal format"), so the URL has no fetchable subject and cannot be compared.
+origin_form_case filehost "file://github.com/$REPO" refresh "a file:// URL with a foreign host is not fetchable at all"
 
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
@@ -2344,6 +2416,23 @@ if true; then
   # the base sha to an empty tree passes the freshness test and then reports "no gate" —
   # a skip with no measurement on a repo whose base HAS the gate. 17g-E26 must redden.
   mutate_and_expect_fail B38  's/ --no-replace-objects//'
+  # B39 (#7727): git's "no slash before the colon" rule for the scp-like form. The
+  # failure it prevents: `foo/bar@github.com/<slug>`, a LOCAL PATH to git, read as the
+  # target's host and path — a T6 wrong-repo MATCH. 17g-E27 must redden.
+  mutate_and_expect_fail B39  's#^            \*/\*\).*$#            zzz) : ;;#m'
+  # B40 (#7727): the scheme must be a legal scheme. The failure it prevents:
+  # `./weird://github.com/<slug>`, which git treats as a path, read as a URL — the same
+  # T6 MATCH, one shape over. 17g-E28 must redden.
+  mutate_and_expect_fail B40  "s#^( *).*origin_scheme_l=\"\" ;;.*\$#\$1'') origin_scheme_l=\"\" ;;#m"
+  # B41 (#7727): the `file://` host rule. The failure it prevents: a URL git cannot
+  # fetch at all being compared as though it had a fetchable subject, so a foreign
+  # `file://` host reads as the target's. 17g-E30 must redden.
+  mutate_and_expect_fail B41  's#^          \*\) return 0 ;;.*$#          *) : ;;#m'
+  # B42 (#7727): the scp-like arm itself — the fail-CLOSED half. The failure it
+  # prevents: `host:<slug>` (git's documented form, no user) rejected as unidentifiable,
+  # which disables the skip AND the no-gate exception for every such remote. 17g-E29
+  # must redden.
+  mutate_and_expect_fail B42  's#^            \*\) origin_authority_l=.*$#            *) : ;;#m'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A
@@ -2351,7 +2440,7 @@ if true; then
   # scenario; the arm is gone and E20 is now pinned by B30 like E16 and E21.
   # B31 (#7727): the HOST assertion. The failure it prevents: a same-slug remote on a
   # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
-  # green would be attributed to the target. 17g-E17 must redden.
+  # green would be attributed to the target. 17g-E17 and 17g-E18 must both redden.
   mutate_and_expect_fail B31  's/^    if \[ -z "\$target_host_l" \] \|\| \[ "\$origin_host_l" != "\$target_host_l" \]; then$/    if false; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
