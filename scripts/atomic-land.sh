@@ -489,8 +489,11 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`; reading the
     # authority as everything after the first `@` would name the TARGET's host and take
     # the skip on a fetch that goes somewhere else. A colon before the first `@` needs
-    # no arm of its own: the path is then taken from AFTER that colon, so it begins
-    # with the userinfo and can never equal the slug — the path test below refuses it.
+    # no arm of its own, and WHICH test refuses it depends on the form: in
+    # `user:pw@host:path` the `*@*:*` arm DOES match and the path — taken from after the
+    # first colon — begins with the userinfo, so the PATH test refuses it; in
+    # `user:pw@host/path` no arm matches at all, the authority stays EMPTY, and the HOST
+    # test refuses it. (`17g-E20` is the second form.)
     local target_host_l origin_host_l origin_authority_l origin_path_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
     target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
@@ -498,6 +501,13 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     origin_authority_l=""; origin_path_l=""
     case "$origin_l" in
       *://*) origin_authority_l="${origin_l#*://}"
+             # A FRAGMENT ends the URL for every client that fetches it — curl, and so
+             # git — but NOT for a naive authority/path split: `https://evil.invalid#@tgt`
+             # would then read the userinfo as `evil.invalid#` and name the TARGET, so a
+             # green from a foreign host was attributed to it (review round 13). Cut at
+             # `#` before splitting. (`?` is NOT cut: git sends the query as part of the
+             # request path, so a query makes the path differ from the slug and refreshes.)
+             origin_authority_l="${origin_authority_l%%#*}"
              origin_path_l="${origin_authority_l#*/}"
              origin_authority_l="${origin_authority_l%%/*}"
              origin_authority_l="${origin_authority_l#*@}" ;;

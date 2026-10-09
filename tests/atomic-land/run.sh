@@ -177,6 +177,13 @@ case "${1:-} ${2:-}" in
             if [ -f "$SCEN/base-tip-seq" ]; then
               n=$(( $(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0) + 1 ))
               printf '%s' "$n" > "$SCEN/base-tip-count"
+              # Past the end, REPEAT the last line. An extra read anywhere in the rail
+              # must not silently return EMPTY — an empty tip reads as "unreadable" and
+              # fires a different arm than the fixture intended, so a scenario that
+              # happens to combine a sequence fixture with a new read would pass (or
+              # fail) for a reason that has nothing to do with what it tests.
+              _total="$(wc -l < "$SCEN/base-tip-seq" | tr -d ' ')"
+              [ "$n" -gt "$_total" ] && n="$_total"
               sed -n "${n}p" "$SCEN/base-tip-seq"
               exit 0
             fi
@@ -1769,6 +1776,39 @@ called "pr update-branch" \
   && pass "refreshed — the local base ref is not the tip the API reports, so its absence proves nothing" \
   || fail "SKIPPED on a base ref that cannot be shown to be the target's current one (the round-12 T1 fail-OPEN)"
 
+# ── A FRAGMENT IN THE ORIGIN URL — round 13 ───────────────────────────────
+echo "── 17g-E24. origin with a '#' fragment ⇒ REFRESH (the fragment ends the URL for git, not for a naive authority split)"
+# `https://evil.invalid#@github.com/<slug>` — a browser and curl end the URL at `#`,
+# so its host is `evil.invalid`; a naive authority/path split reads the userinfo as
+# `evil.invalid#` and the host as `github.com`, i.e. the TARGET, and attributes the
+# foreign tool's green to it. The authority is cut at `#` before the split.
+new_scen driftfragmentauthority
+git init -q "$TMP/e24repo"
+mkdir -p "$TMP/e24repo/tools" "$TMP/e24repo/sub"
+git -C "$TMP/e24repo" remote add origin "https://evil.invalid#@github.com/$REPO"
+cat > "$TMP/e24repo/tools/drift-guard.py" <<'E24EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E24EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e24repo/sub"
+SCEN_CWD_REPO="$REPO"     # the CLI still names the target (the upstream/fork layout)
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the fragment ends the authority, so the host is evil.invalid" \
+  || fail "SKIPPED: a '#' fragment let a foreign host read as the target's (the round-13 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its host is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -2016,7 +2056,13 @@ if true; then
   # suite still prints "class covered" — the second site ships unpinned (the
   # B19b/B20b trap, recorded above). "class covered" is an exit code and cannot say
   # WHICH site it covered, so pin the invariant the anchors rest on: each must
-  # match exactly ONE line.
+  # match exactly ONE line. ⛔ GATED ON `ATOMIC_LAND_ANCHORS`, like
+  # `mutate_and_expect_fail` itself: a CHILD run is handed an already-MUTATED rail, so
+  # the four predicate lines it asserts on are exactly the lines those mutations
+  # rewrite — the loop then fails by construction, the child exits non-zero, and the
+  # parent reads that as "class covered". Ungated, B24/B25/B26/B27 would report
+  # coverage whether or not a single scenario detected them.
+  if [ "${ATOMIC_LAND_ANCHORS:-1}" != "0" ]; then
   for _ind in 14 12 10 8; do
     _n="$(awk -v n="$_ind" '
       { ind=0; while (substr($0, ind+1, 1) == " ") ind++
@@ -2026,6 +2072,7 @@ if true; then
       && pass "the ${_ind}-space predicate anchor matches exactly one line" \
       || fail "the ${_ind}-space predicate anchor matches $_n line(s) — a mutation could cover a different site and still report class covered"
   done
+  fi
   # B1: pass the CURRENT head to record-review instead of the prior head
   mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"\044RECORD_SH" "\044PR" "\044HEAD"/'
   # B2a: drop the record precondition
@@ -2189,6 +2236,11 @@ if true; then
   # one. rc 0 + no output is the ONLY shape that may skip. 17g-E22 must redden, and
   # 17g-E5 must stay green.
   mutate_and_expect_fail B34  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ -z "\$tree_out" ]; then/m'
+  # B36 (#7727): the FRAGMENT cut in the authority. The failure it prevents:
+  # `https://evil.invalid#@github.com/<slug>`, whose host is `evil.invalid` for curl
+  # and git but reads as the TARGET when the authority is split naively — a T6
+  # wrong-repo MATCH. 17g-E24 must redden.
+  mutate_and_expect_fail B36  's/^             origin_authority_l="\$\{origin_authority_l%%#\*\}"/             :/m'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A
