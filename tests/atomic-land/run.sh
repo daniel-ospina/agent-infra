@@ -288,6 +288,17 @@ chmod +x "$DRIFT_EXITCODE"
 # code (review round 8). This one is the suite's own and hermetic.
 git init -q "$TMP/default-cwd" 2>/dev/null || true
 git -C "$TMP/default-cwd" remote add origin "https://github.com/$REPO.git" 2>/dev/null || true
+# A readable `origin/main` WITH NO tool in it. The no-gate exception asks the BASE REF
+# whether a gate exists (a stale checkout must not read "no gate" for a repo that has
+# one), so the hermetic checkout needs the ref it asks for. `git init` alone leaves
+# `origin/main` unborn, which the exception correctly reads as unprovable — and every
+# no-override scenario would then refresh for a reason unrelated to what it tests.
+printf 'x\n' > "$TMP/default-cwd/README.md"
+git -C "$TMP/default-cwd" -c user.email=suite@example.invalid -c user.name=suite \
+  add README.md >/dev/null 2>&1
+git -C "$TMP/default-cwd" -c user.email=suite@example.invalid -c user.name=suite \
+  commit -q -m init >/dev/null 2>&1
+git -C "$TMP/default-cwd" update-ref refs/remotes/origin/main HEAD
 
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
@@ -1583,6 +1594,77 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
   && fail "the predicate was CONSULTED although its HOST is not the target's" \
   || pass "and it was never consulted: the host assertion failed before any measurement"
 
+# ── STALE CHECKOUT — the no-gate exception must ask the BASE REF ────────
+echo "── 17g-E19. the base ref HAS the tool but this checkout does not ⇒ REFRESH (a stale tree is not evidence of no gate)"
+# "No local file" is not "no gate". A checkout one commit behind the base, or a file
+# deleted locally, reads "no gate" for a repo that HAS one — and that skip is
+# unmeasured. The exception therefore asks `origin/<base>` (the same ref the predicate
+# measures against) and takes the skip only when the ref is READABLE and lacks the
+# tool. Here the ref has it and the tree does not.
+new_scen driftstalegatetree
+rm -rf "$TMP/e19repo"; git init -q "$TMP/e19repo"
+mkdir -p "$TMP/e19repo/tools" "$TMP/e19repo/sub"
+git -C "$TMP/e19repo" remote add origin "https://github.com/$REPO.git"
+cat > "$TMP/e19repo/tools/drift-guard.py" <<'E19EOF'
+import json
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E19EOF
+printf 'x\n' > "$TMP/e19repo/README.md"
+git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e19repo" update-ref refs/remotes/origin/main HEAD
+rm -f "$TMP/e19repo/tools/drift-guard.py"      # the base ref HAS it; this tree does not
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e19repo/sub"
+SCEN_CWD_REPO="$REPO"     # identity and host pass; only the base-ref read separates these
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the base ref carries a gate this checkout cannot run" \
+  || fail "SKIPPED: a stale working tree read as 'the target has no drift gate'"
+
+# ── A SCHEME-LESS ORIGIN WITH A COLON BEFORE THE `@` — round 10 ─────────
+echo "── 17g-E20. scheme-less origin 'user:pw@github.com/o/n' ⇒ REFRESH (git reads the host as 'user', not github.com)"
+# git's scp-like form is `[user@]host:path`, and github's own scp form is
+# `git@github.com:owner/name`. Writing userinfo into THAT form gives
+# `user:pw@github.com:owner/name` — which git still reads as scp-like, because no
+# slash precedes the first colon, so its host is `user` and its path is
+# `pw@github.com:owner/name`. The rail's first-`@` read instead named the TARGET's host
+# and took the skip on a fetch that ssh's elsewhere. NOTE the colon on BOTH sides is
+# what makes this shape discriminating: without the trailing colon the fallback arm
+# does not match either and the authority is empty for the right reason.
+new_scen driftscplikeuserinfo
+git init -q "$TMP/e20repo"
+mkdir -p "$TMP/e20repo/tools" "$TMP/e20repo/sub"
+git -C "$TMP/e20repo" remote add origin "user:pw@github.com:$REPO"
+cat > "$TMP/e20repo/tools/drift-guard.py" <<'E20EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E20EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e20repo/sub"
+SCEN_CWD_REPO="$REPO"     # the slug and the naive host parse BOTH pass; git's parse disagrees
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the remote's authority is unreadable, so its green is not about the target" \
+  || fail "SKIPPED on a fetch whose host git parses as 'user', not the target (the round-10 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the authority it would fetch is unreadable" \
+  || pass "and it was never consulted: the authority check failed before any measurement"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -1964,6 +2046,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # `gh repo view` prefers `upstream`, so a fork checkout passes the slug check and
   # its green is attributed to the target. 17g-E16 must redden.
   mutate_and_expect_fail B30  's/^      \*\) return 0 ;;$/      *) : ;;/m'
+  # B32 (#7727): the no-gate exception's BASE-REF read. The failure it prevents:
+  # a stale checkout (or a locally deleted file) reading "no gate" for a repo that HAS
+  # one, and taking the skip unmeasured — a T1 skip with no measurement. 17g-E19 must
+  # redden.
+  mutate_and_expect_fail B32  's/^         && ! git -C "\$\{CWD_ROOT:-\.\}" cat-file -e "origin\/\$BASE:tools\/drift-guard\.py" 2>\/dev\/null/         \&\& :/m'
+  # B33 (#7727): the scp-like authority arm. The failure it prevents: an origin of the
+  # form `user:pw@github.com/o/n`, which git fetches from host `user` while a
+  # first-`@` read names the TARGET's host — a T6 wrong-repo MATCH. 17g-E20 must redden.
+  mutate_and_expect_fail B33  's/^      \*:\*@\*\) : ;;$/      *:*@*NEVERMATCH) : ;;/m'
   # B31 (#7727): the HOST assertion. The failure it prevents: a same-slug remote on a
   # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
   # green would be attributed to the target. 17g-E17 must redden.

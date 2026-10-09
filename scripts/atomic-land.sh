@@ -171,16 +171,17 @@ ADMIN_MERGE="${ATOMIC_LAND_ADMIN_MERGE:-$SELF_DIR/admin-merge.sh}"
 # cached here, because the default depends on $CWD_ROOT, which is only known after
 # resolve_repo().
 #
-# ⚠️ KNOWN LIMITATION, stated rather than implied: the "is there a drift gate?"
-# question is answered from the LOCAL CHECKOUT, not from the target's base ref. If
-# that checkout's `tools/drift-guard.py` is absent while the target repo HAS one — a
-# stale branch, a locally deleted file — the rail reads "no gate" and takes the skip.
-# The rail is meant to run from the target repo's own checkout, where that cannot
-# arise, and confirming gate existence against the remote base would cost an API
-# round trip per run to guard a case with no measured failure. What the code DOES
-# guarantee is the cases that WERE measured: a cwd repo that is not the target is
-# never read as "no gate", and a fork's `origin` — the case this comment used to
-# name — is refused by the origin assertion below rather than skipped.
+# The "is there a drift gate?" question is answered from the TARGET'S BASE REF —
+# `origin/$BASE`, the same ref the predicate itself measures against, read locally.
+# A stale checkout or a locally deleted file used to read "no gate" for a repo that
+# HAS one and take the skip unmeasured; the skip now requires the positive pair (the
+# ref is readable here AND does not contain `tools/drift-guard.py`), so anything
+# short of that refreshes. Separately, a cwd repo that is not the target is never
+# read as "no gate", and a `origin` remote that is not the target's — a fork, a
+# mirror, another host, an unreadable authority — is refused by the assertions below
+# rather than skipped. What remains deliberately unchecked is that this checkout is on
+# a branch whose BASE REF is the reviewed one: `origin/$BASE` is by construction the
+# ref the predicate compares the head against, so the question does not arise.
 
 if [ -z "$RECORD_SH" ]; then
   if [ -x "$SELF_DIR/record-review.sh" ]; then
@@ -498,17 +499,33 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     origin_authority_l=""
     case "$origin_l" in
       *://*) origin_authority_l="${origin_l#*://}"; origin_authority_l="${origin_authority_l%%/*}"; origin_authority_l="${origin_authority_l#*@}" ;;
+      # A SCHEME-LESS remote is git's scp-like `[user@]host:path`, whose host ends at
+      # the FIRST colon — and git only takes that form when NO slash precedes it. So
+      # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`. Reading the
+      # authority as everything after the first `@` names the TARGET's host instead
+      # and takes the skip on a fetch that goes somewhere else entirely. The colon
+      # must come AFTER the `@`; a colon before it is not an authority we can read.
+      *:*@*) : ;;
       *@*:*) origin_authority_l="${origin_l#*@}" ;;
     esac
     origin_host_l="$(remote_host_of "$origin_authority_l")"
     if [ -z "$target_host_l" ] || [ "$origin_host_l" != "$target_host_l" ]; then
       return 0
     fi
-    # The cwd IS the target and it has NO tool: there is no gate that could leave
-    # the head unlandable, so the skip stands. This reads the ARTIFACT (the tool's
-    # existence) plus a MEASURED identity, never a setting.
+    # The cwd IS the target and it has no LOCAL tool. That is a skip with no
+    # measurement, so it must rest on the right SUBJECT: "the TARGET has no drift
+    # gate", not "this working tree has no such file". A stale checkout, or a
+    # locally deleted file, would otherwise read "no gate" for a repo that HAS one
+    # and take the skip unmeasured. Ask the BASE REF — the same ref the predicate
+    # itself measures against, and a local read — and allow the skip ONLY on the
+    # positive pair: the ref is readable here AND does not contain the tool.
+    # Anything else, including an unfetched ref, refreshes (fail-closed).
     if [ ! -f "$tool" ]; then
-      printf '1'; return 0
+      if git -C "${CWD_ROOT:-.}" rev-parse --verify --quiet "origin/$BASE" >/dev/null 2>&1 \
+         && ! git -C "${CWD_ROOT:-.}" cat-file -e "origin/$BASE:tools/drift-guard.py" 2>/dev/null; then
+        printf '1'
+      fi
+      return 0
     fi
   fi
   # The default argv is anchored to the same root; the override is used verbatim.
@@ -594,9 +611,11 @@ pr_has_carry_evidence() {
 # #2982/#767; #1397 tracks what remains.)
 
 resolve_repo() {
-  # The cwd's OWN repo slug, always. drift_safe_of() needs it to tell "this repo
-  # has no drift gate" (true ⇒ the #7230 skip stands) from "we were pointed at a
-  # DIFFERENT repo, so ./tools/ is not its gate" (⇒ unmeasurable ⇒ refresh).
+  # The repo the GitHub CLI resolves for the cwd. NOT necessarily the cwd's `origin`:
+  # the CLI prefers a remote named `upstream`, so a fork checkout resolves to its
+  # UPSTREAM. drift_safe_of() treats this as one half of the identity and asserts the
+  # remote the predicate actually FETCHES separately — do not delete that assertion
+  # on the assumption that this one already names the cwd's own repo.
   # Empty when the cwd is not a git repo with a GitHub remote, which is the
   # fail-closed direction: the exception simply does not apply.
   CWD_REPO="$(gh_ repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)"
