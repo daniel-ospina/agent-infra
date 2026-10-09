@@ -354,7 +354,12 @@ new_scen() {
   printf '5\n' > "$SCEN/completed"
   printf 'MERGED\n' > "$SCEN/merged"
   printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
-  printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  # #7727: the base tip the CLI reports. The no-gate exception requires the local base
+  # ref to MATCH this (a ref that cannot be dated is not a measurement), and the
+  # hermetic checkout's `origin/main` is what every scenario without its own cwd reads.
+  # A made-up sha here made the freshness test refuse in 17g-A/D1/D6 — scenarios that
+  # reach the no-gate skip — so they refreshed for a reason unrelated to what they test.
+  printf '%s\n' "$(git -C "$TMP/default-cwd" rev-parse origin/main)" > "$SCEN/base-tip"
   printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
@@ -1416,6 +1421,9 @@ called "pr update-branch" \
 # ── NO GATE — the one deliberate exception ───────────────────────────────
 echo "── 17g-E5. a repo with NO drift gate keeps the skip (nothing to leave unlandable)"
 new_scen cleandriftnogate
+# `new_scen` already defaults the reported base tip to THIS checkout's `origin/main`
+# (the no-gate exception requires the local base ref to match it), so E5 needs no
+# override of its own — the default IS this scenario's fixture.
 printf 'CLEAN\n'     > "$SCEN/state"
 printf '14\n'        > "$SCEN/behind"
 printf 'false\n'     > "$SCEN/strict"
@@ -1614,6 +1622,9 @@ git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite add
 git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
 git -C "$TMP/e19repo" update-ref refs/remotes/origin/main HEAD
 rm -f "$TMP/e19repo/tools/drift-guard.py"      # the base ref HAS it; this tree does not
+# ...and the API must report that same tip, or E19 would refresh on the freshness
+# precondition before reaching the absence test it exists to exercise.
+printf '%s\n' "$(git -C "$TMP/e19repo" rev-parse origin/main)" > "$SCEN/base-tip"
 printf 'CLEAN\n'     > "$SCEN/state"
 printf '14\n'        > "$SCEN/behind"
 printf 'false\n'     > "$SCEN/strict"
@@ -1712,6 +1723,9 @@ git -C "$TMP/e22repo" remote add origin "https://github.com/$REPO.git"
 printf 'not a tree\n' > "$SCEN/blobbody"
 git -C "$TMP/e22repo" update-ref refs/remotes/origin/main \
   "$(git -C "$TMP/e22repo" hash-object -w --stdin < "$SCEN/blobbody")"
+# The freshness precondition must hold here too, or E22 would refresh before reaching
+# the unreadability it exists to test.
+printf '%s\n' "$(git -C "$TMP/e22repo" rev-parse origin/main)" > "$SCEN/base-tip"
 printf 'CLEAN\n'     > "$SCEN/state"
 printf '14\n'        > "$SCEN/behind"
 printf 'false\n'     > "$SCEN/strict"
@@ -1725,6 +1739,35 @@ SCEN_CWD=
 called "pr update-branch" \
   && pass "refreshed — an unreadable base ref is 'no measurement', not 'no gate'" \
   || fail "SKIPPED: an unreadable base ref read as 'the target has no drift gate' (a T1 skip with no measurement)"
+
+# ── A STALE BASE REF — round 12 ──────────────────────────────────────────
+echo "── 17g-E23. the local base ref is STALE ⇒ REFRESH (a ref we cannot date is not a measurement)"
+# The predicate this skip bypasses FETCHES the base, because a worktree that never
+# fetched holds a stale `origin/<base>` and "a local ref cannot be proven fresh"
+# (#4174). A local ABSENCE read is exactly that ref, so it may skip only while the
+# local tip equals the tip the API reports. Here it does not.
+new_scen driftstaleref
+rm -rf "$TMP/e23repo"; git init -q "$TMP/e23repo"
+mkdir -p "$TMP/e23repo/sub"
+git -C "$TMP/e23repo" remote add origin "https://github.com/$REPO.git"
+printf 'x\n' > "$TMP/e23repo/README.md"
+git -C "$TMP/e23repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e23repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e23repo" update-ref refs/remotes/origin/main HEAD
+printf '0000000000000000000000000000000000000000\n' > "$SCEN/base-tip"   # the API reports a DIFFERENT tip
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e23repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the local base ref is not the tip the API reports, so its absence proves nothing" \
+  || fail "SKIPPED on a base ref that cannot be shown to be the target's current one (the round-12 T1 fail-OPEN)"
 
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
@@ -1907,7 +1950,16 @@ grep -qF -- "drift-guard" "$SCEN/drift-calls" \
 # class B1-B12 must be covered by a test that FAILS against the revision before
 # its fix. This section mutates the rail and asserts the suite reddens. A mutation
 # that leaves the suite green means the class is NOT covered.
-if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
+if true; then
+  # ⛔ THIS BLOCK IS ENTERED IN BOTH MODES, on purpose. The anchor check inside
+  # `mutate_and_expect_fail` is cheap (perl + cmp, no suite run) and is the only thing
+  # that catches a DEAD ENFORCER — a pattern that stopped matching because the line it
+  # anchored to was edited. That happened for real: an inline comment appended to the
+  # `*:*@*)` arm silently killed B33, and because CI runs with the default
+  # ATOMIC_LAND_MUTATIONS=1 the suite went RED there while every local run at
+  # ATOMIC_LAND_MUTATIONS=0 stayed green. Gating the anchor check behind the mutation
+  # mode is what let that gap exist; RUN_MUTATIONS now gates only the suite re-runs.
+  RUN_MUTATIONS="${ATOMIC_LAND_MUTATIONS:-1}"
   echo "── 18. mutation coverage — each declared bypass class must be caught"
   MUT="$TMP/mut"; mkdir -p "$MUT"
   # Two perl traps have cost this harness real coverage (all four instances fixed
@@ -1921,6 +1973,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # harness still prints "class covered". Trap (1) is caught only by reading the
   # diff, which is why every expression here is hand-audited.
   mutate_and_expect_fail() { # <name> <perl-expr>
+    # A CHILD run (`ATOMIC_LAND_ANCHORS=0`) must not assert anchors at all: it is
+    # handed an ALREADY-mutated rail, so the mutation's own pattern by definition no
+    # longer applies there. Failing on that would make the child exit non-zero for a
+    # reason unrelated to the scenarios, and a non-zero child is read below as "class
+    # covered" — a FALSE POSITIVE for every mutation whose anchor line it rewrote.
+    # (Measured: B32/B34 share one line, so each one's child tripped the other's
+    # anchor.) The anchor pass belongs to the top-level run only; `ANCHORS` gates it
+    # separately from `RUN_MUTATIONS`, which gates the suite re-runs in THAT run.
+    [ "${ATOMIC_LAND_ANCHORS:-1}" = "0" ] && return 0
     local name="$1"
     local expr="$2"
     local src="$MUT/$name.sh"
@@ -1937,7 +1998,12 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
       fail "mutation $name produced a file that does not PARSE — corrupt mutation, not coverage"
       return
     fi
-    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
+    if [ "$RUN_MUTATIONS" = "0" ]; then
+      # Anchor-only mode: the pattern applied and still parses. Do NOT re-run the suite.
+      pass "anchor $name applies"
+      return
+    fi
+    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
     if [ $? -ne 0 ]; then
       pass "mutation $name reddens the suite (class covered)"
     else
@@ -2111,17 +2177,23 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # B32 (#7727): the no-gate exception's ABSENCE test. The failure it prevents: a
   # base ref that DOES contain the tool being read as "no gate" — a stale checkout, or
   # a locally deleted file — so the skip is taken unmeasured (T1). 17g-E19 must redden.
-  mutate_and_expect_fail B32  's/^      if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/      if [ "\$tree_rc" -eq 0 ]; then/m'
+  mutate_and_expect_fail B32  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ "\$tree_rc" -eq 0 ]; then/m'
+  # B35 (#7727): the no-gate exception's FRESHNESS precondition. The failure it
+  # prevents: a local `origin/$BASE` that predates the gate being read as "the target
+  # has no gate" — the predicate this skip bypasses fetches the base precisely because
+  # a ref that was never re-fetched cannot be proven fresh (#4174). 17g-E23 must redden.
+  mutate_and_expect_fail B35  's/^      if \[ -n "\$live_tip" \] && \[ "\$local_tip" = "\$live_tip" \]; then$/      if [ -n "\$live_tip" ]; then/m'
   # B34 (#7727): the UNREADABILITY test. The failure it prevents: an unreadable ref or
   # tree (a partial clone whose promisor blob was never fetched, a corrupt object)
   # collapsing into "the target has no gate", so the skip is taken on a repo that HAS
   # one. rc 0 + no output is the ONLY shape that may skip. 17g-E22 must redden, and
   # 17g-E5 must stay green.
-  mutate_and_expect_fail B34  's/^      if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/      if [ -z "\$tree_out" ]; then/m'
-  # B33 (#7727): the scp-like authority arm. The failure it prevents: an origin of the
-  # form `user:pw@github.com/o/n`, which git fetches from host `user` while a
-  # first-`@` read names the TARGET's host — a T6 wrong-repo MATCH. 17g-E20 must redden.
-  mutate_and_expect_fail B33  's/^      \*:\*@\*\) : ;;$/      *:*@*NEVERMATCH) : ;;/m'
+  mutate_and_expect_fail B34  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ -z "\$tree_out" ]; then/m'
+  # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
+  # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
+  # the path from the same first colon, so it disagrees with the slug anyway). A
+  # mutation of a redundant arm cannot redden anything, which made 17g-E20 a vacuous
+  # scenario; the arm is gone and E20 is now pinned by B30 like E16 and E21.
   # B31 (#7727): the HOST assertion. The failure it prevents: a same-slug remote on a
   # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
   # green would be attributed to the target. 17g-E17 must redden.

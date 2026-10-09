@@ -466,17 +466,19 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # upstream=<target>, `gh repo view --json nameWithOwner` prints the UPSTREAM — so
     # the check above can pass while the measurement is of the FORK, whose green is
     # then attributed to the target (review round 7: the round-4 fail-OPEN one layer
-    # down). Assert the remote the tool will fetch: its authority, its host and its
-    # path must ALL be the target's — a differently named remote, a missing remote, an
-    # unreadable URL, another host, or another owner's path refreshes, the same
-    # direction every other unreadable case takes.
+    # down). Assert the remote the tool will fetch: its HOST and its PATH must both be
+    # the target's — a differently named remote, a missing remote, an unreadable URL,
+    # another host, another owner, or another repository name refreshes, the same
+    # direction every other unreadable case takes. The PORT is deliberately dropped on
+    # both sides (an explicit :443 or :22 must not turn a correct remote into a
+    # refresh); a same-host different-port remote is out of scope, not asserted.
     local origin_l
     origin_l="$(git -C "${CWD_ROOT:-.}" remote get-url origin 2>/dev/null | tr A-Z a-z || true)"
     origin_l="${origin_l%.git}"; origin_l="${origin_l%/}"
     if [ -z "$target_l" ] || [ -z "$origin_l" ]; then
       return 0
     fi
-    # The remote's AUTHORITY (host[:port], userinfo stripped) and its PATH. The path
+    # The remote's AUTHORITY (host; userinfo and port stripped) and its PATH. The path
     # must be the target's EXACTLY. A suffix test — the obvious `*/owner/name` — also
     # accepts `.../evil/owner/name`, reading a foreign owner's repository as ours, and
     # a fork named `owner/name-fork` contains the slug too. Both are the same
@@ -486,8 +488,9 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # FIRST colon — and git only takes that form when NO slash precedes it. So
     # `user:pw@github.com/o/n` is host `user`, path `pw@github.com/o/n`; reading the
     # authority as everything after the first `@` would name the TARGET's host and take
-    # the skip on a fetch that goes somewhere else. A colon before the first `@` is not
-    # an authority we can read, and anything we cannot read refreshes.
+    # the skip on a fetch that goes somewhere else. A colon before the first `@` needs
+    # no arm of its own: the path is then taken from AFTER that colon, so it begins
+    # with the userinfo and can never equal the slug — the path test below refuses it.
     local target_host_l origin_host_l origin_authority_l origin_path_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
     target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
@@ -498,7 +501,6 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
              origin_path_l="${origin_authority_l#*/}"
              origin_authority_l="${origin_authority_l%%/*}"
              origin_authority_l="${origin_authority_l#*@}" ;;
-      *:*@*) : ;;   # a colon BEFORE the first `@`: not an authority we can read
       *@*:*) origin_authority_l="${origin_l#*@}"
              origin_path_l="${origin_l#*:}" ;;
     esac
@@ -516,18 +518,30 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # and take the skip unmeasured.
     #
     # The primitive must separate ABSENCE from UNREADABILITY, and two obvious ones do
-    # not. `git cat-file -e` exits 128 for both, so `! cat-file` reads "unmeasurable"
-    # as "no gate". `git rev-parse <rev>:<path>` exits 1 for both in a repo with no
-    # promisor (measured: a deleted tree object and an absent path are both rc 1) and
-    # only 128 when a partial clone's fetch fails. `git ls-tree` READS the tree and
-    # reports all three apart: rc 0 with an entry = present, **rc 0 with NO output =
-    # measured absent**, **rc non-zero = the ref or tree is unreadable**. Only the
-    # middle one may take the skip.
+    # not. `git cat-file -e` exits 128 BOTH for a path that is absent AND for an object
+    # that cannot be READ (a corrupt object; a partial clone whose promisor is
+    # unreachable), so `! cat-file` reads "unmeasurable" as "no gate". `git rev-parse
+    # --verify --quiet <rev>:<path>` is no better — 1 for a missing tree and for a
+    # missing path alike — and the bare `git rev-parse <rev>:<path>` is 128 for both.
+    # `git ls-tree` READS the tree and reports the three outcomes apart: an entry at
+    # rc 0, no output at rc 0, and a NON-ZERO rc for an unreadable ref or tree. Only
+    # the middle one may take the skip.
+    #
+    # And the ref must be one we can PLACE IN TIME. The predicate this skip bypasses
+    # FETCHES the base — its own guard is explicit that a worktree which never fetched
+    # holds a STALE origin/<base> and that "a local ref cannot be proven fresh"
+    # (#4174) — while a local `origin/$BASE` is exactly that ref. So the local tip must
+    # equal the base tip the API reports; otherwise we are reading a revision we cannot
+    # date, which is not a measurement and must refresh.
     if [ ! -f "$tool" ]; then
-      local tree_out="" tree_rc=0
-      tree_out="$(git -C "${CWD_ROOT:-.}" ls-tree "origin/$BASE" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
-      if [ "$tree_rc" -eq 0 ] && [ -z "$tree_out" ]; then
-        printf '1'
+      local live_tip local_tip tree_out="" tree_rc=0
+      live_tip="$(base_tip)"
+      local_tip="$(git -C "${CWD_ROOT:-.}" rev-parse --verify --quiet "origin/$BASE" 2>/dev/null || true)"
+      if [ -n "$live_tip" ] && [ "$local_tip" = "$live_tip" ]; then
+        tree_out="$(git -C "${CWD_ROOT:-.}" ls-tree "origin/$BASE" -- tools/drift-guard.py 2>/dev/null)" || tree_rc=$?
+        if [ "$tree_rc" -eq 0 ] && [ -z "$tree_out" ]; then
+          printf '1'
+        fi
       fi
       return 0
     fi
