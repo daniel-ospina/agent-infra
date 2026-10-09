@@ -9453,6 +9453,20 @@ pe_case_paths "mismatched closer under non-filter key"   yes 'src/app.ts' $'on:\
 # branch below, for `description: |`.
 pe_case "trigger-key block scalar"        unknown $'on:\n  workflow_call: |\n    paths: [docs/**]\n'
 pe_case "sibling trigger block scalar"    unknown $'on:\n  workflow_call:\n  schedule: |\n    paths: [docs/**]\n'
+# Round 4. The reader still had two holes, and they are ONE statement: a value
+# already consumed is not a key. A block scalar's body is content, and a
+# NON-FILTER key's empty value opens a subtree whose children are not trigger-depth
+# keys. Each case below answered `no` on 45fc45b1 (fail-open) and `yes` now.
+pe_case_paths "filter-key block scalar"       yes 'src/app.ts' $'on:\n  pull_request:\n    paths: |\n      - docs/**\n'
+pe_case_paths "non-filter block scalar body"  yes 'src/app.ts' $'on:\n  pull_request:\n    types: |\n      paths: [docs/**]\n'
+pe_case_paths "filter under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types:\n      paths: [docs/**]\n'
+# ⛔ AND THE OVER-BLOCK THE SAME CHANGE NEARLY SHIPPED. Skipping the subtree is
+# what fixes the two above, but a subtree skip applied ONLY to block scalars left
+# `workflow_dispatch.inputs.<name>.<field>` — `deploy-hosted.yml`'s real shape,
+# the file #6807 exists for — answering `unknown`, because a body line that is not
+# a key bailed the whole attribution. This case is the regression net for that: it
+# must stay `no`.
+pe_case "legit nested inputs, no PR trigger"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      a:\n        description: |\n          paths: [not, ours]\n'
 # P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
 # reader does not interpret left the flag unset, so a reusable trigger still
 # reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to

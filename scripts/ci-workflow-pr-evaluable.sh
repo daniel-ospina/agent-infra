@@ -315,7 +315,19 @@ def collect_filters(lines, on_index):
     caller then fails closed PER TRIGGER. It reads only a depth-1 `trigger:`, a
     depth-2 filter key under it, and `- 'pattern'` items (or an inline `[a, b]`).
     Anything else — an inline value on the trigger key, a deeper nesting, a
-    non-list scalar — abandons the attribution rather than guessing it.
+    non-list scalar, a block scalar — abandons the attribution rather than
+    guessing it.
+
+    ⛔ WHAT THIS IS NOT (#1637 review round 4): this is a line reader, not a YAML
+    parser, and it cannot become one here. One shape is genuinely undecidable for
+    it — an inline flow list element that is ITSELF a bracketed collection
+    (`paths: [[docs/**]]`) is character-for-character ambiguous with a legal glob
+    character class (`paths: ['docs/[a-z]*.md']`). Classifying one as invalid
+    would refuse the other, so the former is read optimistically and is NOT a
+    covered case. It costs nothing in practice: GitHub rejects a nested list where
+    it requires strings, so that workflow is never created and never attaches a
+    check for the exemption to get wrong. The boundary is recorded in
+    agent-infra#1649 rather than papered over with a guess.
     """
     out = {}
     cur_trig = None
@@ -324,6 +336,27 @@ def collect_filters(lines, on_index):
     # #1637: set when a key that is NOT a filter is seen at trigger depth. A
     # reusable trigger needs to know (see the guard below and the tail check).
     nonfilter_seen = False
+    # ⛔ THE TWO INVARIANTS THAT CLOSE THE #1637 DEFECT CLASS (review round 4).
+    # Every fail-open in rounds 1-4 was the reader GUESSING at a shape it had not
+    # fully recognised, and each one came through one of these two holes:
+    #
+    #   key_indent  — the indent a depth-2 key must sit at. The reader accepted
+    #                 ANY `indent > base` as a depth-2 key, so a filter nested
+    #                 under a non-filter key (`types:\n      paths: [docs/**]`)
+    #                 was read as a SIBLING filter and the verdict moved to `no`.
+    #                 It is set by the first depth-2 key; each later key must match
+    #                 it exactly or the attribution is abandoned.
+    #   block_above — the indent of a key whose value is a BLOCK SCALAR (`|`/`>`),
+    #                 so that its BODY is skipped. The body used to be re-read as
+    #                 if it were the trigger's mapping, letting a STRING value
+    #                 supply filter keys: `paths: |` reached `pats == []` with
+    #                 `nonfilter_seen` still False, and `workflow_call: |` fell
+    #                 through to the tail `return False` and answered `no`.
+    #
+    # Both are the same statement — a value already consumed is not a key — which
+    # is the only thing this reader ever got wrong.
+    key_indent = None
+    block_above = None
 
     def _unquote(s):
         if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
@@ -336,6 +369,14 @@ def collect_filters(lines, on_index):
         if raw[:1] not in (" ", "\t"):
             break
         indent = len(raw) - len(raw.lstrip(" \t"))
+        # ⛔ A CONSUMED VALUE'S BODY IS NOT A KEY. Lines more indented than a key
+        # whose value was a block scalar are that scalar's CONTENT (`description: |`
+        # bodies are free text and may contain anything, including text that looks
+        # like `paths: [...]`). Re-reading them was review round 4's P2-b.
+        if block_above is not None:
+            if indent > block_above:
+                continue
+            block_above = None
         s = raw.strip()
         if base is None:
             base = indent
@@ -347,6 +388,8 @@ def collect_filters(lines, on_index):
                 m.group(3) if m.group(3) is not None else m.group(4))
             cur_filter = None
             out.setdefault(cur_trig, {})
+            # Each trigger establishes its own depth-2 indent.
+            key_indent = None
             rest = (m.group(5) or "").strip()
             # ⛔ NO VALUE ON A TRIGGER KEY IS READABLE. The `|`/`>` allowance
             # that used to live here was WRONG (#1637 review round 3): a trigger
@@ -360,9 +403,10 @@ def collect_filters(lines, on_index):
             #       workflow_call: |
             #         paths: [docs/**]
             #
-            # The allowance is needed ONLY on the non-filter-key branch below, for
-            # `description: |`. GitHub rejects a string value for `on.<event>`, so
-            # nothing legal is refused by dropping it here.
+            # GitHub rejects a string value for `on.<event>`, so nothing legal is
+            # refused by bailing on every value here. (This is NOT the allowance
+            # the non-filter-key branch below relies on — that branch permits a
+            # block scalar itself, and now SKIPS its body rather than reading it.)
             if rest:
                 return None  # an inline value or block scalar on the trigger key
             continue
@@ -392,6 +436,16 @@ def collect_filters(lines, on_index):
             return None
         cur_filter = m.group(2) if m.group(2) is not None else (
             m.group(3) if m.group(3) is not None else m.group(4))
+        # ⛔ THE DEPTH HAS TO BE ONE THIS READER CAN PLACE. Every depth-2 key sits
+        # at the SAME indent; a line deeper than that is a child of the previous
+        # key, not a sibling filter. Accepting any `indent > base` let a filter
+        # nested under a non-filter key be read as a real PR filter, moving the
+        # verdict `yes` -> `no` on input the reader cannot attribute — review
+        # round 4's P2-d, and the exact shape round 2's own comment upbraids.
+        if key_indent is None:
+            key_indent = indent
+        elif indent != key_indent:
+            return None
         # ⛔ #1637 — A NON-FILTER KEY MUST NOT ABANDON THE ATTRIBUTION.
         # The bail below (`return None` on an inline non-list scalar) is right for
         # a FILTER whose shape this reader cannot parse, but it is wrong for a key
@@ -429,7 +483,28 @@ def collect_filters(lines, on_index):
         if cur_filter not in _FILTER_KEYS:
             nonfilter_seen = True
             rest = (m.group(5) or "").strip()
-            if (rest[:1] == "[" and rest[-1:] != "]") or (rest[:1] == "{" and rest[-1:] != "}"):
+            if rest[:1] in ("|", ">"):
+                # A BLOCK SCALAR on a key this reader does not interpret. Its value
+                # is free text (`description: |` under `workflow_dispatch.inputs`,
+                # which is what keeps `deploy-hosted.yml` exempt), so SKIP THE BODY
+                # and keep the attribution complete. Letting the body be re-read is
+                # what supplied a phantom `paths:` filter — review round 4's P2-b.
+                block_above = indent
+            elif not rest:
+                # ⛔ AN EMPTY VALUE OPENS A SUBTREE — SKIP IT ENTIRELY. Its children
+                # are not trigger-depth keys: `workflow_dispatch.inputs.<name>.<field>`
+                # is the ordinary shape, and `a:`/`description:` sit at deeper indents
+                # this reader has no business placing. Two defects came from reading
+                # them anyway. A filter nested under a non-filter key was read as a
+                # SIBLING filter, moving the verdict `yes` -> `no` (round 4's P2-d);
+                # and when a body line did not look like a key at all the reader bailed
+                # outright, answering `unknown` for `deploy-hosted.yml` — the very file
+                # #6807 exists for. That over-block was caught by this lane's own
+                # falsification matrix before commit, and the subtree skip fixes both
+                # directions at once: a value already consumed is not a key, whether
+                # that value was a block scalar, a mapping, or nothing yet.
+                block_above = indent
+            elif (rest[:1] == "[" and rest[-1:] != "]") or (rest[:1] == "{" and rest[-1:] != "}"):
                 return None
             cur_filter = None
             continue
@@ -442,7 +517,12 @@ def collect_filters(lines, on_index):
                 part = part.strip()
                 if part:
                     pats.append(_unquote(part))
-        elif rest and rest not in ("|", ">"):
+        elif rest:
+            # ⛔ A FILTER IS A LIST OR NOTHING. The `|`/`>` allowance this branch
+            # used to carry was an unexplained exemption with no legal use — a
+            # block scalar is not a pattern list, and accepting it stored `pats ==
+            # []` while its BODY was re-read as the trigger's mapping (review
+            # round 4's P2-a). Every other non-list scalar already bailed here.
             return None
         out[cur_trig][cur_filter] = pats
     # #1413, at the DOCUMENT level (see the guard above): a reusable trigger whose
