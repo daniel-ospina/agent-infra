@@ -9467,6 +9467,17 @@ pe_case_paths "filter under non-filter key"   yes 'src/app.ts' $'on:\n  pull_req
 # a key bailed the whole attribution. This case is the regression net for that: it
 # must stay `no`.
 pe_case "legit nested inputs, no PR trigger"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      a:\n        description: |\n          paths: [not, ours]\n'
+# Round 5: the continuation of a MULTI-LINE QUOTED SCALAR is not a key. Unlike
+# #1649's nested flow element this is not ambiguous with anything — the quote is
+# OPEN, so the continuation is unambiguously scalar content — and it escaped BOTH
+# round-4 invariants: the block-scalar skip only skips DEEPER lines, and the depth
+# check matches exactly at the key's own indent. PyYAML reads this document as
+# types='opened paths: [docs/**] a: b', i.e. NO paths filter; the reader injected
+# one and answered `no` (fail-open) on 41ade4bc.
+pe_case_paths "continuation of a quoted scalar" yes 'src/app.ts' $'on:\n  pull_request:\n    types: "opened\n    paths: [docs/**]\n    a: b"\n'
+# …and the closed-on-one-line form must NOT be skipped: there the filter is real,
+# and `docs/**` does not match `src/app.ts`.
+pe_case_paths "closed quoted scalar keeps filter" no 'src/app.ts' $'on:\n  pull_request:\n    types: "opened"\n    paths: [docs/**]\n'
 # P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
 # reader does not interpret left the flag unset, so a reusable trigger still
 # reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to

@@ -357,6 +357,32 @@ def collect_filters(lines, on_index):
     # is the only thing this reader ever got wrong.
     key_indent = None
     block_above = None
+    # ⛔ AND A THIRD: A LINE INSIDE AN OPEN QUOTED SCALAR OR FLOW COLLECTION IS A
+    # CONTINUATION, NEVER A KEY (review round 5). A multi-line quoted value
+    # continues at the SAME indent as its key, so it escaped BOTH invariants above
+    # — `block_above` skips only DEEPER lines, and `key_indent` matches exactly
+    # there — and a `paths: [docs/**]` line INSIDE the string was read as a real PR
+    # filter:
+    #
+    #     on:
+    #       pull_request:
+    #         types: "opened
+    #         paths: [docs/**]
+    #         a: b"
+    #
+    # PyYAML reads that as types='opened paths: [docs/**] a: b' — there is no
+    # `paths` filter at all, yet the predicate answered `no` and the rail consumed
+    # it as an exemption. The outer `on:` walk ALREADY carries this state (it is
+    # what stops a column-0 continuation from terminating the region); the same
+    # state is simply needed one level down, so this reuses scan_flow_state rather
+    # than inventing a second reader.
+    #
+    # NOTE the contrast with #1649: a nested flow element is genuinely ambiguous
+    # with a glob character class, so refusing it would over-block. Here the quote
+    # is OPEN, so the continuation is unambiguously scalar content and skipping it
+    # cannot over-block a legal document.
+    flow_depth = 0
+    open_quote = ""
 
     def _unquote(s):
         if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
@@ -365,6 +391,12 @@ def collect_filters(lines, on_index):
 
     for raw in lines[on_index + 1:]:
         if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        # ⛔ A CONTINUATION, NOT A KEY — checked BEFORE the column-0 break, because
+        # a multi-line scalar may continue at column 0 (the outer walk carries the
+        # same state for exactly that reason).
+        if open_quote or flow_depth > 0:
+            flow_depth, open_quote = scan_flow_state(raw, flow_depth, open_quote)
             continue
         if raw[:1] not in (" ", "\t"):
             break
@@ -378,6 +410,11 @@ def collect_filters(lines, on_index):
                 continue
             block_above = None
         s = raw.strip()
+        # Carry the quote/flow state INTO the next line. This sits AFTER the
+        # block-scalar skip on purpose: a `|` body is free text and must not be
+        # scanned for quotes, or a stray `"` in prose would open a phantom scalar
+        # and swallow the rest of the trigger.
+        flow_depth, open_quote = scan_flow_state(raw, flow_depth, open_quote)
         if base is None:
             base = indent
         if indent == base:
