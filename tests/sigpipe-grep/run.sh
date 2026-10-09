@@ -47,6 +47,15 @@
 #      fail while the DEFAULT set still tolerates an absent dir, the root file's precedence
 #      over the shared one, a non-shell interpreter not being claimed, and the file count in
 #      the clean message that makes "scanned nothing" visible.
+#  11aa. a SYMLINK CYCLE is not a partial scan. `find -L` is required so a consumer's symlinked
+#      `scripts/` is descended, so it can also meet a cycle — and everything a cycle reaches
+#      is reachable without it, so the file is still read. Only findutils' own cycle report is
+#      exempt: the ELOOP wording means a path did not resolve at all (a chain, reachable no
+#      other way) and stays fatal (11af); a tree holding BOTH a cycle and an unreadable dir is
+#      still exit 2 (11ab). The cycle pin has teeth on GNU find (CI); BSD find emits no cycle
+#      diagnostic, so there it passes with or without the exclusion. 11af runs only where find
+#      reports an unresolvable chain, so the suite's assertion count is platform-dependent
+#      (59 on BSD/macOS, 60 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -623,27 +632,46 @@ chmod 755 "$E/nested/deep"
 [ "$rc" -eq 2 ] && pass "a partial scan beneath a readable dir → exit 2, not a clean run" \
              || fail "a partial scan was reported clean (exit $rc)"
 
-# 11aa. a symlink loop is NOT a missed-file defect — everything reachable through it is
+# 11aa. a symlink CYCLE is NOT a missed-file defect — everything reachable through it is
 # reachable without it — so the pin is that the file is still read, not that `find` errors.
+# This pin needs findutils: it depends on find's own cycle report being emitted for a self-loop
+# (GNU/CI: `File system loop detected`). Two known limits, deliberate and fail-closed:
+#   · BSD find prints no cycle diagnostic at all, so here the pin passes with or without the
+#     exemption it holds (the guard cannot see the difference);
+#   · a MUTUAL PAIR (`one -> other`, `other -> one`) is a cycle find reports as ELOOP, so it
+#     exits 2 — an accepted false BLOCK, never a missed file;
+# and BusyBox `find` (a bare Alpine, no findutils) reports EVERY cycle as `Symbolic link loop`,
+# which stays fatal — so the guard requires findutils, as this repo's CI installs.
 E="$TMP/f11aa"; mkdir -p "$E/scripts"; ln -s . "$E/scripts/loop"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "a symlink loop does not hide a file reachable through it" \
              || fail "a file was missed in a tree containing a symlink loop (exit $rc)"
 
-# 11ab. a named non-executable FILE is not a false block: `-x` means SEARCH for a directory
+# 11ab. ...and partitioning the loop diagnostic out must NOT swallow a real one: a tree that
+# holds BOTH a loop and an unreadable directory is still a partial scan (exit 2). Without this
+# pin the loop filter could be widened into "ignore find's stderr" and stay green.
+E="$TMP/f11abloop"; mkdir -p "$E/scripts/locked"; ln -s . "$E/scripts/loop"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && pass "a loop does not excuse a genuine partial scan (exit 2)" \
+             || fail "a partial scan was reported clean in a tree that also holds a loop (exit $rc)"
+
+# 11ac. a named non-executable FILE is not a false block: `-x` means SEARCH for a directory
 # but EXECUTABLE for a file, and requiring it made `--dirs somefile.sh` exit 2.
-E="$TMP/f11ab"; mkdir -p "$E/scripts"
+E="$TMP/f11ac"; mkdir -p "$E/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/entrypoint.sh"
 chmod 644 "$E/scripts/entrypoint.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts/entrypoint.sh' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "a named non-executable file is scanned, not blocked (exit 1)" \
              || fail "a named non-executable file was a false block (exit $rc)"
 
-# 11ac. an exception declared for a file OUTSIDE this run's scan set is UNVERIFIED, not
+# 11ad. an exception declared for a file OUTSIDE this run's scan set is UNVERIFIED, not
 # STALE: the guard cannot confirm a declaration it did not scan, and calling that stale
 # reds every narrowed --dirs a consumer runs.
-E="$TMP/f11ac"; mkdir -p "$E/scripts" "$E/other"
+E="$TMP/f11ad"; mkdir -p "$E/scripts" "$E/other"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'if printf '\''%s'\'' "$A" | grep -q x; then echo 1; fi' > "$E/other/c.sh"
 printf 'other/c.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
@@ -659,14 +687,80 @@ else
   fail "a narrowed scan read an out-of-scope declaration as stale (full $rc_full, narrow $rc_narrow)"
 fi
 
-# ...and a declaration for a file that IS scanned and clean is still stale — the check
+# 11ae. ...and a declaration for a file that IS scanned and clean is still stale — the check
 # must not have been weakened away.
-E="$TMP/f11ad"; mkdir -p "$E/scripts"
+E="$TMP/f11ae"; mkdir -p "$E/scripts"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/d.sh"
 printf 'scripts/d.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && grep -q 'STALE exception' "$OUT" && pass "a scanned-and-clean declared file is still STALE (exit 1)" \
              || fail "the stale check was weakened (exit $rc)"
+
+# 11af. ELOOP IS NOT A CYCLE. The kernel raises ELOOP whenever a path fails to resolve within
+# its symlink budget, which includes a NON-cyclic chain — and a chain's target is reachable no
+# other way, so it is a genuine partial scan. Exempting the ELOOP wording is a false clean, and
+# this pin is what fails if that exemption returns.
+# The pin runs only where find reports the failure, which is SHAPE- AND PLATFORM-dependent —
+# an entry whose whole resolution fails is skipped in silence by BSD find (exit 0, the deep
+# links unlisted, so there is nothing for the guard to see), while GNU findutils reports it.
+# The probe below queries find the way the GUARD does (from $E, on the same relative path),
+# so the skip decision measures the invocation that is actually asserted about. The reason for
+# any skip is printed rather than passed over in silence.
+E="$TMP/f11af"; mkdir -p "$E/scripts" "$E/chain" "$E/outside"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/outside/bad.sh"
+ln -s ../outside "$E/chain/l0"
+i=1
+while [ "$i" -le 45 ]; do ln -s "l$((i-1))" "$E/chain/l$i"; i=$((i+1)); done
+ln -s ../chain/l45 "$E/scripts/entry"
+chain_errs="$(cd "$E" && find -L scripts -type f 2>&1 >/dev/null)"
+if [ -z "$chain_errs" ]; then
+  echo "   ⏭️  a chain that cannot resolve: this platform's find reports no failure for this shape (BSD) — pin skipped; it runs wherever find reports the failure (GNU findutils, CI)"
+else
+  rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+  [ "$rc" -eq 2 ] && pass "a symlink chain that cannot resolve is a partial scan (exit 2)" \
+               || fail "an unresolved symlink chain was reported clean (exit $rc)"
+fi
+
+# 11ag. the diagnostics sink is a fail-closed precondition. If it cannot be created OR cannot be
+# written, find's stderr goes nowhere, the partition sees an empty file, and a partial scan reads
+# as a clean one. The guard must refuse rather than report a verdict. `mktemp` is stubbed rather
+# than pointed at a bad TMPDIR, because BSD `mktemp` ignores TMPDIR — a stub is the only form
+# that asserts this on both platforms. Both failure shapes are pinned: a `mktemp` that FAILS
+# while naming a usable path (so ONLY the status check can refuse), and one that claims success
+# while producing an unusable sink.
+E="$TMP/f11ag"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" 'exit 1' > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a diagnostics sink that cannot be created refuses a verdict (exit 2)" \
+             || fail "a failed mktemp still produced a verdict (exit $rc)"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a diagnostics sink that cannot be written refuses a verdict (exit 2)" \
+             || fail "an unusable diagnostics sink still produced a verdict (exit $rc)"
+
+# 11ah. OPENABILITY IS NOT WRITABILITY. A sink that takes the open and then refuses the write —
+# a full volume — swallows find's diagnostics exactly as a missing file does, so the partition
+# reads empty over a partial scan. `/dev/full` is that state on tap; the sink is reached through
+# a SYMLINK so the guard's exit trap unlinks the link and not the device. Where /dev/full does
+# not exist (BSD/macOS) the pin says so rather than passing vacuously.
+E="$TMP/f11ah"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+sink_state="unavailable"
+if [ -e /dev/full ] && { : >>/dev/full; } 2>/dev/null; then
+  if { printf x >>/dev/full; } 2>/dev/null; then sink_state="writable"; else sink_state="full"; fi
+fi
+if [ "$sink_state" != full ]; then
+  echo "   ⏭️  a sink that opens but rejects the write: /dev/full is $sink_state here — pin skipped; it runs where /dev/full is an always-full device (Linux/CI)"
+else
+  ln -s /dev/full "$E/sink"
+  printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" 'exit 0' > "$E/fakebin/mktemp"
+  chmod +x "$E/fakebin/mktemp"
+  rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+  [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a sink that opens but rejects the write refuses a verdict (exit 2)" \
+               || fail "a write-rejecting sink still produced a verdict (exit $rc)"
+fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then

@@ -138,12 +138,53 @@ else
   EXC_FILE="scripts/sigpipe-grep-exceptions.txt"
 fi
 
-# `find` errors are NOT discarded. A directory it cannot descend, or a symlink loop, makes
-# `find` print an error and yield a PARTIAL list — which is a clean run over files that were
-# never read, the guard's cardinal sin (#7588 review round 5). Readability of the scan dir
-# itself is checked above; this catches everything underneath it.
-FIND_ERRS="$(mktemp)"
+# `find` errors are NOT discarded. A directory it cannot descend makes `find` print an error
+# and yield a PARTIAL list — which is a clean run over files that were never read, the guard's
+# cardinal sin (#7588 review round 5). Readability of the scan dir itself is checked above;
+# this catches everything underneath it. A SYMLINK LOOP is the one diagnostic that is NOT a
+# partial scan — see the partition below.
+FIND_ERRS="$(mktemp)" || {
+  echo "check-no-sigpipe-grep: cannot create a diagnostics file (TMPDIR unset or unwritable) — refusing to report a verdict over a scan that has not run" >&2
+  exit 2
+}
+# mktemp's STATUS is not proof the sink is usable, and neither is OPENABILITY: a wrapper that
+# exits 0 without creating a file, or a sink on a volume that takes the open but refuses the
+# write, would swallow find's stderr, leave the partition empty, and let a partial scan read as
+# a clean one. Write a byte (which a full volume rejects) and truncate it away again.
+if ! { printf x >>"$FIND_ERRS" && : >"$FIND_ERRS"; } 2>/dev/null; then
+  echo "check-no-sigpipe-grep: the diagnostics file is not writable — refusing to report a verdict over a scan that has not run" >&2
+  exit 2
+fi
 trap 'rm -f "$FIND_ERRS"' EXIT
+
+# ONE diagnostic is exempt from the partial-scan rule: findutils' own CYCLE report, matched
+# by prefix in the partition below (`find: File system loop detected`). `find -L` is required so
+# the top-level symlink a consumer repo's `scripts/` IS gets descended, so `find` can also meet a
+# cycle — and everything a cycle reaches is reachable WITHOUT it, so find lists every file and
+# the diagnostic only records that it did not follow the cycle once more. Reading it as a
+# partial scan reds a tree the guard read completely, which is the false block its own suite
+# pins (#11aa).
+#
+# NOTHING ELSE IS EXEMPT. ELOOP (`Too many levels of symbolic links` — glibc's and BSD libc's
+# wording — or `Symbolic link loop`, musl's) is raised whenever a path fails to resolve within
+# the kernel's symlink budget, and the overwhelmingly common case of that is a NON-cyclic chain
+# whose content is reachable no other way. Treating it as benign would let the guard exit 0
+# having read no file — the exact false clean this guard exists to prevent — so it stays fatal.
+# The cost is a false BLOCK on two shapes, and the polarity is deliberate because a partial scan
+# is never a clean scan:
+#   · an over-long chain (the case above), and
+#   · a cycle find reports as ELOOP rather than as its own cycle report — a MUTUAL SYMLINK PAIR
+#     (`one -> other`, `other -> one`) is one. Recorded as a limit next to #11aa, not excused:
+#     GNU find exits 2 there, while BSD find lists both entries and exits 0, so the guard's false
+#     BLOCK is real on CI and does not arise on macOS.
+# BSD find's silence is SHAPE-DEPENDENT, so do not read it as a platform guarantee: an entry
+# whose whole resolution fails is skipped in silence with no file listed and exit 0 (what the
+# suite's #11af fixture does, and its skip line discloses), while reaching the depth limit
+# mid-descent under an absolute path does print the ELOOP wording (find exits 1) and the guard
+# then refuses with exit 2 — 2 is the guard's status, never find's.
+#
+# `LC_ALL=C` on the find calls below (`scan_files`) pins the cycle wording: findutils is
+# gettext-translated, and a translated report would not match the partition's prefix.
 
 # `find -L` so a scan dir that is a SYMLINK is still descended into (consumer repos
 # symlink `scripts/` back to this repo; plain `find` returns nothing and the guard would
@@ -208,8 +249,8 @@ scan_files() {
   # The basename decides, so `$ROOT/.husky` and `.husky` select identically — otherwise the
   # count pre-pass and the scan disagree about which files were read.
   case "${dir##*/}" in
-    .husky) find -L "$target" -type f 2>>"$FIND_ERRS" ;;
-    *) find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
+    .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" ;;
+    *) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
          is_shell_file "$f" && printf '%s\n' "$f"
        done ;;
   esac
@@ -256,13 +297,33 @@ FILE_LIST="$(
 )"
 FILE_COUNT="$(printf '%s\n' "$FILE_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
-# A partial scan is not a clean scan: if `find` could not read part of the tree, say so and
-# stop rather than report a verdict over an unknown subset.
-if [ -s "$FIND_ERRS" ]; then
+# Partition find's diagnostics. A cycle report loses no file, so it is announced and the run
+# continues; ANYTHING ELSE is a file the guard never read, and a partial scan is not a clean
+# scan — say so and stop rather than report a verdict over an unknown subset.
+#
+# The partition is done by the SHELL, never by an external command, so it is fail-closed by
+# construction: every line of the file is read, and a line is benign only if it matches the
+# cycle report. A classifier that could itself fail (a `grep` whose status is not 0/1, say)
+# would leave BOTH lists empty and print a clean run over a partial scan — which is why no
+# external command decides this verdict.
+LOOP_ERRS=""; PARTIAL_ERRS=""
+while IFS= read -r err_line || [ -n "$err_line" ]; do
+  case "$err_line" in
+    'find: File system loop detected'*) LOOP_ERRS="${LOOP_ERRS}${err_line}"$'\n' ;;
+    '') ;;
+    *) PARTIAL_ERRS="${PARTIAL_ERRS}${err_line}"$'\n' ;;
+  esac
+done < "$FIND_ERRS"
+if [ -n "$LOOP_ERRS" ]; then
+  echo "check-no-sigpipe-grep: note — a symlink cycle was seen while scanning; a cycle reaches no file its own tree does not, so the run continues:" >&2
+  printf '%s' "$LOOP_ERRS" >&2
+fi
+if [ -n "$PARTIAL_ERRS" ]; then
   echo "check-no-sigpipe-grep: could not fully scan every file — a partial scan is not a clean scan:" >&2
-  cat "$FIND_ERRS" >&2
+  printf '%s' "$PARTIAL_ERRS" >&2
   exit 2
 fi
+unset LOOP_ERRS PARTIAL_ERRS err_line
 
 HITS="$(
   cd "$ROOT" || exit 2
