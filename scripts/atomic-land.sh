@@ -558,17 +558,19 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
     # A `#` FRAGMENT is transport-dependent, and NOT cutting it where git does cut it
     # was a wrong-repo MATCH: `https://evil.invalid#@tgt` reads its userinfo as
     # `evil.invalid#` and names the TARGET, while curl — and so git over http(s) — stops
-    # at `#` and fetches `evil.invalid`. It is cut ONLY for the transports where curl
-    # ends the URL there. ssh does not: git passes the fragment as part of the
-    # repository PATH, so cutting it there would read `ssh://host/o/n#x` as the target
-    # while the fetch goes to `o/n#x`. Leaving it makes the path differ from the slug,
-    # which refreshes.
+    # at `#` and fetches `evil.invalid`. The transports are the CURL-BASED ones, not just
+    # http(s): `ftp://evil.invalid#@tgt` resolves to `evil.invalid` too (measured:
+    # `Could not resolve host: evil.invalid`), while git's own error line prints the
+    # post-fragment URL — so the failure is invisible in the message git emits. ssh does
+    # not end the URL there: git passes the fragment as part of the repository PATH, so
+    # cutting it would read `ssh://host/o/n#x` as the target while the fetch goes to
+    # `o/n#x`. Leaving it makes the path differ from the slug, which refreshes.
     local target_host_l origin_host_l origin_authority_l origin_path_l origin_scheme_l pre_colon_l
     target_host_l="$(printf '%s' "$CWD_URL" | tr A-Z a-z)"
     target_host_l="${target_host_l#*://}"; target_host_l="${target_host_l%%/*}"; target_host_l="${target_host_l#*@}"
     target_host_l="$(remote_host_of "$target_host_l")"
     case "$origin_l" in
-      http://*|https://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
+      http://*|https://*|ftp://*|ftps://*) origin_l="${origin_l%%#*}" ;;   # curl ends the URL at '#'
       *) : ;;                                             # ssh and git:// keep it in the path
     esac
     origin_authority_l=""; origin_path_l=""; origin_scheme_l=""

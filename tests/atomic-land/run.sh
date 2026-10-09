@@ -2053,6 +2053,12 @@ echo "── 17g-E36. origin 'ssh://github.com:22/<slug>' ⇒ the skip STILL app
 # contacts `github.com`, which IS the target.
 origin_form_case portreal "ssh://github.com:22/$REPO" skip "a real port is stripped, so the host is the target's"
 
+echo "── 17g-E37. origin 'ftp://evil.invalid#@github.com/<slug>' ⇒ REFRESH (the fragment cut is not http-only)"
+# Measured: curl resolves `evil.invalid` for ftp exactly as for https, while git's own
+# error line prints the post-fragment URL — so a cut covering only http(s) named the
+# TARGET for a fetch that went to a foreign host (review round 18).
+origin_form_case ftpfragment "ftp://evil.invalid#@github.com/$REPO" refresh "curl ends the URL at '#' for ftp too, so the host is evil.invalid"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
