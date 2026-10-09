@@ -580,6 +580,18 @@ drift_safe_of() { # -> 1 | "" (empty = not positively safe ⇒ the caller refres
                ''|[!A-Za-z]*|*[!A-Za-z0-9+.-]*) origin_scheme_l="" ;;   # not a scheme ⇒ not a URL
              esac ;;
     esac
+    # A QUERY IS NOT REASONABLE FROM HERE, so a remote that carries one fails closed.
+    # The two directions disagree and BOTH are wrong for us: for curl transports git
+    # keeps the query INSIDE the request path (measured: `https://github.com/o/n?x=1`
+    # ⇒ `GET /o/n?x=1/info/refs`), so the repository fetched is not the one the slug
+    # names; and an authority-shaped `?` (`https://evil.invalid?@github.com/o/n`) makes
+    # curl contact `evil.invalid` while the text after the `@` names the TARGET —
+    # measured, the same fail-OPEN as the fragment, one delimiter over. For ssh the
+    # authority boundary at `?` is git's own parser's business, so there is nothing
+    # here to verify. Both are unmeasurable, and unmeasurable refreshes.
+    case "$origin_l" in
+      *\?*) return 0 ;;
+    esac
     if [ -n "$origin_scheme_l" ]; then
       origin_authority_l="${origin_l#*://}"
       origin_path_l="${origin_authority_l#*/}"

@@ -2059,6 +2059,15 @@ echo "── 17g-E37. origin 'ftp://evil.invalid#@github.com/<slug>' ⇒ REFRESH
 # TARGET for a fetch that went to a foreign host (review round 18).
 origin_form_case ftpfragment "ftp://evil.invalid#@github.com/$REPO" refresh "curl ends the URL at '#' for ftp too, so the host is evil.invalid"
 
+echo "── 17g-E38. a remote carrying a QUERY ⇒ REFRESH (both directions are unmeasurable)"
+# Measured: `https://github.com/<slug>?x=1` makes git request `/…?x=1/info/refs` — a
+# repository path that is NOT the slug — and `https://evil.invalid?@github.com/<slug>`
+# makes curl contact `evil.invalid` while the text after the `@` names the TARGET (the
+# same fail-OPEN as the fragment, one delimiter over). The rail refuses to reason about
+# either, for every scheme.
+origin_form_case queryauth "https://evil.invalid?@github.com/$REPO" refresh "curl contacts evil.invalid, so the '@'-suffix must not name the target"
+origin_form_case querypath "https://github.com/$REPO?x=1" refresh "git keeps the query in the request path, so the repository is not the slug's"
+
 # ── THE SIBLING ARM — the same inference one arm over ─────────────────────
 echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
 # The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
@@ -2541,6 +2550,10 @@ if true; then
   # an `ssh_config` alias can point that at another machine), read as the TARGET by a
   # first-colon cut. 17g-E34 and 17g-E35 must redden; 17g-E36 must stay green.
   mutate_and_expect_fail B45  's/^ *case "\$p" in.*$/         printf %s "\${a%%:*}";;/m'
+  # B47 (#7727): the QUERY refusal. The failure it prevents:
+  # `https://evil.invalid?@github.com/<slug>`, where curl contacts `evil.invalid` but
+  # the text after the `@` names the TARGET. 17g-E38 must redden.
+  mutate_and_expect_fail B47  's/^ *\*\\\?\*\) return 0 ;;.*$/      *) : ;;/m'
   # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
   # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
   # the path from the same first colon, so it disagrees with the slug anyway). A
