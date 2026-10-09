@@ -307,9 +307,10 @@ new_scen() {
   # applies; a scenario that sets it to ANOTHER slug models `--repo owner/name`
   # naming a different repo while the cwd holds the wrong `tools/`.
   SCEN_CWD_REPO=
-  # #7727: where the rail is RUN from. Empty ⇒ the suite's own cwd. A scenario sets
-  # it to a SUBDIRECTORY of a repo whose root holds `tools/drift-guard.py`, which is
-  # the only way to tell a root-anchored tool test from a cwd-relative one.
+  # #7727: where the rail is RUN from. Empty ⇒ $ROOT, THIS suite's checkout (which
+  # has no `tools/drift-guard.py`). A scenario sets it to a SUBDIRECTORY of a repo
+  # whose root holds `tools/drift-guard.py`, which is the only way to tell a
+  # root-anchored tool test from a cwd-relative one.
   SCEN_CWD=
   # #7727: the drift threshold. 0 is the production default; a non-zero value is how
   # the "distance below the threshold" arms are reached at all.
@@ -349,11 +350,14 @@ new_scen() {
 # with PPID 1). This helper is only ever called in a subshell or backgrounded, so
 # the `exec` cannot replace this test script.
 rail_exec() { # <extra args...>
-  # #7727: run the rail from a scenario-chosen directory when one is set. The rail
-  # resolves its drift tool against `git rev-parse --show-toplevel`, so the only
-  # honest way to test that anchoring is to RUN it somewhere the answer differs from
-  # the process cwd — a subdirectory of a repo that has the tool at its root.
-  [ -n "${SCEN_CWD:-}" ] && cd "$SCEN_CWD"
+  # #7727: run the rail from a DETERMINISTIC directory — $ROOT, this suite's own
+  # checkout, unless the scenario names another. Inheriting the caller's cwd makes
+  # the no-gate exception depend on ambient state: launched from a checkout that
+  # HAS `tools/drift-guard.py` (tortoise, the repo this rail lands), the identity
+  # fixture still matches and the rail runs that FOREIGN tool against the fixture's
+  # sha, so every no-override skip scenario false-reds for a reason unrelated to
+  # the code (review round 6, measured).
+  cd "${SCEN_CWD:-$ROOT}"
   SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
@@ -564,7 +568,7 @@ printf '3\n' > "$SCEN/pending"
 run_rail_watchdog 30 42 --repo "$REPO" --poll 60 --wait-timeout 2
 rc=$?
 if [ "$rc" -eq 124 ]; then
-  fail "the rail overshot its 2s bound — --poll 8 pushed the stop past the bound"
+  fail "the rail overshot its 2s bound — --poll 60 pushed the stop past the bound"
 elif [ "$rc" -eq 1 ]; then
   pass "stops at the bound, not a full poll interval later (rc 1)"
 else

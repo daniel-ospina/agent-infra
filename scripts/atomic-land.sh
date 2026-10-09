@@ -821,12 +821,9 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
         # different indent from the CLEAN arm's, so each has its OWN anchored
         # mutation (B26 at 8 spaces, B27 at 10). Two same-indent sites would make
         # one unanchored pattern silently cover only the first — the B19b/B20b trap.
-        # A STRING comparison, like the CLEAN arm above. `-ne` on a value that is
-        # not a representable integer — an overflowed or zero-padded count — makes
-        # the test ERROR, and an erroring test takes the `else` below, which reports
-        # "0 behind" and returns 3: a false "current" skip on a distance that was
-        # never measured as 0. A string test cannot do that; anything that is not
-        # exactly "0" goes to the predicate.
+        # A STRING comparison, like the CLEAN arm above: the test cannot ERROR, so
+        # the branch taken is a decision about the distance rather than about the
+        # shell. Anything that is not exactly "0" goes to the predicate.
         if [ "${behind:-}" != "0" ]; then
           if [ "$(drift_safe_of)" = 1 ]; then
             say "atomic-land: [1/4] update — mergeStateStatus=$MERGE_STATE, measured $behind commit(s) behind $BASE, but merging this head would keep $BASE's content — nothing to update"
