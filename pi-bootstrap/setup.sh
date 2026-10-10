@@ -415,6 +415,38 @@ for base in "${fleet_tools[@]}"; do
 done
 echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + fleet-health + map-sessions, #1178)"
 
+# ── LANE ORCHESTRATION farm (#1552) ──────────────────────────────────────────
+# The dispatch/guard path for the cmux lane fleet lived ONLY as untracked files in
+# ~/.pi/agent/scripts/ and ~/.pi/agent/state/. Measured 2026-10-01: TEN of them were
+# absent from this repo and from every farm list, so the machinery that decides whether
+# a lane may be given work had no history, no test, and no rollback -- and the fix for a
+# broken gate could not go through the gate. That is #1552, and it is why the 2026-10-01
+# incident (an automatic dispatcher sent work to lanes that could not take it) could not
+# be repaired reviewably: the repair had no home to land in.
+#
+# They must land FLAT in $DEST/scripts (not scripts/lane/) because they invoke each other
+# by sibling path -- safe-send.sh calls lane-guard.py beside it, turn-classify.py shells
+# lane-status.py beside it. The farm therefore RENAMES the directory: source
+# scripts/lane/<f> -> dest scripts/<f>. Same idempotent real-copy refresh model as above.
+lane_srcs=(lane-status.py lane-guard.py lane-triage.py lane-wip.py safe-send.sh \
+           queue-dispatch.py turn-classify.py turn-end.py heartbeat-loop.sh \
+           orchestrator-heartbeat.sh)
+mkdir -p "$DEST/scripts"
+lane_copied=0
+for base in "${lane_srcs[@]}"; do
+  f="$INFRA_ROOT/scripts/lane/$base"
+  [ -f "$f" ] || continue
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then
+    echo "    replacing farm symlink with real copy: scripts/$base"
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+  lane_copied=$((lane_copied+1))
+done
+echo "    scripts/lane farm: $lane_copied copied (lane orchestration + dispatch guard, #1552)"
+
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a
 # machine that already has it keeps hanging on every interactive boot until the
