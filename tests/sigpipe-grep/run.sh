@@ -35,6 +35,32 @@
 #      `--quiet`; comment lines are NOT flagged; a pipeline broken after a bare trailing `|`;
 #      a SYMLINKED scan dir is still descended (`find -L`); extensionless `.husky/` hooks are
 #      scanned; and the exception CONTENT-HASH defeats a count-preserving swap.
+#  11. the CONSUMER-REPO knobs (tortoise#7588). This guard is shared by SYMLINK, so in a
+#      consumer repo `scripts/` points back here: the default scan set reads the wrong tree
+#      and the shared exceptions path is one the consumer cannot write. `--dirs` /
+#      SIGPIPE_SCAN_DIRS set the scan set, a ROOT `.sigpipe-grep-exceptions.txt` is honoured
+#      and announced, and selection is by NAME **OR SHEBANG** — an extensionless
+#      `.github/scripts/` entry (the shape two of the four shipped sites had) is scanned,
+#      while an extensionless non-shell file still is not. Round 2 of review added: the
+#      BASENAME rule (a dotted DIRECTORY must not hide an extensionless script), `--dirs ''`
+#      and a whitespace-only set must be usage errors, a typo'd dir in an EXPLICIT set must
+#      fail while the DEFAULT set still tolerates an absent dir, the root file's precedence
+#      over the shared one, a non-shell interpreter not being claimed, and the file count in
+#      the clean message that makes "scanned nothing" visible.
+#  11aa. a SYMLINK CYCLE is not a partial scan. `find -L` is required so a consumer's symlinked
+#      `scripts/` is descended, so it can also meet a cycle — and everything a cycle reaches
+#      is reachable without it, so the file is still read. Only findutils' own cycle report is
+#      exempt: the ELOOP wording means a path did not resolve at all (a chain, reachable no
+#      other way) and stays fatal (11af); a tree holding BOTH a cycle and an unreadable dir is
+#      still exit 2 (11ab). NO pin distinguishes this on a real `find` alone: BSD find emits no
+#      cycle diagnostic at all, and GNU findutils reports it but ALSO exits 1 while listing every
+#      file — so a raw-status refusal turned that into a false block (it reddened `sigpipe-grep` on
+#      CI). 11ai therefore stubs `find` to pin all three halves on every platform: the exemption
+#      (a), the enumerator's status being judged AFTER the exemption so GNU's exit 1 is not a false
+#      block (a2), and the ANCHOR of the match (b). TWO pins are platform-gated, so the assertion
+#      count depends on it: 11af runs only where find reports an unresolvable chain, and 11ah only
+#      where /dev/full exists — both GNU/Linux. The count is therefore platform-dependent; read it
+#      from the suite's own summary line rather than pinning a number here.
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -352,6 +378,773 @@ if [ "$rc" -eq 1 ] && grep -q 'CONTENT changed' "$OUT"; then
 else
   fail "a count-preserving swap was accepted (exit $rc)"
 fi
+
+echo ""
+echo "11. consumer-repo knobs — settable scan set, ROOT exceptions file, shebang selection"
+echo ""
+
+# 11a. --dirs selects the consumer's own layout. The control is the SAME fixture with the
+# default set, so the idiom being found only when the dir is named is what is pinned.
+E="$TMP/f11a"; mkdir -p "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if printf '\''%s'\'' "$R" | grep -q "$DEPLOY_REF"; then echo y; fi' > "$E/.github/scripts/deploy"
+rc_default="$(guard_rc "$E")"
+rc_dirs="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc_default" -eq 0 ] && [ "$rc_dirs" -eq 1 ]; then
+  pass "--dirs selects the consumer layout (default $rc_default, --dirs $rc_dirs)"
+else
+  fail "--dirs did not change the scan set (default $rc_default, --dirs $rc_dirs)"
+fi
+
+# 11b. SIGPIPE_SCAN_DIRS is the same knob for callers that cannot pass an argument
+rc_env="$(SIGPIPE_SCAN_DIRS='.github/scripts' bash "$GUARD" --root "$E" >"$OUT" 2>&1; echo $?)"
+if [ "$rc_env" -eq 1 ]; then
+  pass "SIGPIPE_SCAN_DIRS is honoured (exit $rc_env)"
+else
+  fail "SIGPIPE_SCAN_DIRS was ignored (exit $rc_env)"
+fi
+
+# 11c. SELECTION BY SHEBANG. Two of the four sites that shipped this bug were extensionless
+# `.github/scripts/` entries; a `-name '*.sh'` filter reads them as a clean run.
+E="$TMP/f11c"; mkdir -p "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.github/scripts/check-thing"
+rc="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 1 ]; then
+  pass "an extensionless script WITH a shebang is scanned (exit $rc)"
+else
+  fail "an extensionless shebang script was skipped (exit $rc) — the .github/scripts blind spot"
+fi
+
+# 11d. ...and the widening is not a blanket: an extensionless NON-shell file is still skipped
+E="$TMP/f11d"; mkdir -p "$E/.github"
+printf '%s\n' 'prose about printf '\''%s'\'' "$V" | grep -q pat — not shell at all' > "$E/.github/NOTES"
+rc="$(bash "$GUARD" --root "$E" --dirs '.github' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 0 ]; then
+  pass "an extensionless non-shell file is not scanned (no false positive)"
+else
+  fail "a non-shell extensionless file was flagged (exit $rc)"
+fi
+
+# 11e. a ROOT exceptions file is honoured AND announced. A consumer's `scripts/` is a symlink
+# it cannot write through, so the shared path must not be the only place an exception can live.
+E="$TMP/f11e"; mkdir -p "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if printf '\''%s'\'' "$A" | grep -q x; then echo 1; fi' > "$E/.github/scripts/b.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
+# learn the fingerprint the same way 10g does: declare a WRONG hash and read the actual one
+printf '.github/scripts/b.sh 1 deadbeefdeadbeef #7588\n' > "$E/.sigpipe-grep-exceptions.txt"
+rc_hash="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
+real_hash="$(sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' "$OUT" | head -1)"
+printf '.github/scripts/b.sh 1 %s #7588\n' "$real_hash" > "$E/.sigpipe-grep-exceptions.txt"
+rc2="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 1 ] && [ -n "$real_hash" ] && [ "$rc2" -eq 0 ] && grep -q 'DECLARED BLOCKED' "$OUT"; then
+  pass "a ROOT .sigpipe-grep-exceptions.txt is honoured and announced (undeclared $rc, wrong-hash $rc_hash, declared $rc2)"
+else
+  fail "the root exceptions file was ignored (undeclared exit $rc, wrong-hash exit $rc_hash, declared exit $rc2, hash '$real_hash')"
+fi
+
+# 11f. `--dirs` with no value is a usage error — never a silent fall back to the default set
+bash "$GUARD" --dirs >"$OUT" 2>&1
+[ $? -eq 2 ] && pass "--dirs without a value → exit 2" \
+             || fail "expected exit 2 for --dirs with no value"
+
+# 11g. the BASENAME rule. `*/*.*` let a dot in a DIRECTORY component hide an extensionless
+# script, so the fix's whole point was defeated for `scripts/v2.1/deploy` — a clean run on a
+# file that contains the idiom. Uses the DEFAULT set, so it also pins that selection.
+E="$TMP/f11g"; mkdir -p "$E/scripts/v2.1"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/v2.1/deploy"
+rc="$(guard_rc "$E")"
+[ "$rc" -eq 1 ] && pass "an extensionless script under a DOTTED directory is scanned" \
+             || fail "a dotted directory hid an extensionless script (exit $rc) — a false clean"
+
+# 11h. `--dirs ''` must NOT fall back to the default set. In a consumer whose `scripts/`
+# symlinks back here that fallback scans the wrong tree and prints a clean run — the #7588
+# failure this change exists to end.
+E="$TMP/f11h"; mkdir -p "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.github/scripts/deploy"
+rc="$(bash "$GUARD" --root "$E" --dirs '' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && grep -q 'the scan set is empty' "$OUT" && pass "--dirs '' → exit 2 (never a silent fall back to the default set)" \
+             || fail "--dirs '' fell back to the default set (exit $rc)"
+
+# 11i. a whitespace-only set resolves to a ZERO-ELEMENT array: a usage error, not a zero-file
+# scan reported as clean (and not a `set -u` crash on bash 3.2). On 3.2 the empty array also trips
+# `set -u` in the enumeration subshell, so the refusal has two independent sources there; this pin
+# asserts the refusal itself, not which of the two produced it. The message is asserted because on
+# this platform the `set -u` crash refuses the same case: without it the pin stays green if the
+# check is deleted, so it would not be covering what it is named for (measured: deleting the check
+# leaves the suite green on bash 3.2 and fails on bash 5).
+E="$TMP/f11i"; mkdir -p "$E/scripts"; printf 'echo hi\n' > "$E/scripts/a.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs '   ' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && grep -q 'the scan set is empty' "$OUT" && pass "a whitespace-only scan set → exit 2" \
+             || fail "a whitespace-only scan set was not rejected as empty (exit $rc)"
+
+# 11j. an EXPLICIT set names dirs the caller believes exist: a typo must fail, not scan nothing
+E="$TMP/f11j"; mkdir -p "$E/.github/scripts"
+rc="$(bash "$GUARD" --root "$E" --dirs '.github/scrips' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && pass "a misspelled dir in an explicit set → exit 2" \
+             || fail "a misspelled dir was silently skipped (exit $rc)"
+
+# 11k. the DEFAULT set still TOLERATES an absent dir — `.husky`/`pi-bootstrap` are not in
+# every repo, so this must not become a hard error (it would break every existing caller).
+E="$TMP/f11k"; mkdir -p "$E/scripts"; printf 'echo hi\n' > "$E/scripts/a.sh"
+rc="$(guard_rc "$E")"
+[ "$rc" -eq 0 ] && pass "the default set tolerates an absent dir (exit 0)" \
+             || fail "the default set errored on an absent dir (exit $rc)"
+
+# 11l. PRECEDENCE: a root file SHADOWS the shared one. A root file can only make the guard
+# STRICTER (it cannot weaken a shared declaration it does not repeat), and this pins that
+# exactly: a valid shared declaration works alone, and an EMPTY root file makes it unusable.
+E="$TMP/f11l"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if printf '\''%s'\'' "$A" | grep -q x; then echo 1; fi' > "$E/scripts/b.sh"
+printf 'scripts/b.sh 1 deadbeefdeadbeef #999\n' > "$E/scripts/sigpipe-grep-exceptions.txt"
+guard_rc "$E" >/dev/null
+real_hash="$(sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' "$OUT" | head -1)"
+printf 'scripts/b.sh 1 %s #999\n' "$real_hash" > "$E/scripts/sigpipe-grep-exceptions.txt"
+rc_shared="$(guard_rc "$E")"
+printf '# a root file exists, declaring nothing\n' > "$E/.sigpipe-grep-exceptions.txt"
+rc_shadowed="$(guard_rc "$E")"
+if [ "$rc_shared" -eq 0 ] && [ "$rc_shadowed" -eq 1 ]; then
+  pass "the shared declaration works alone ($rc_shared) and a root file SHADOWS it ($rc_shadowed)"
+else
+  fail "precedence is not root-over-shared (shared $rc_shared, shadowed $rc_shadowed)"
+fi
+
+# 11m. a NON-SHELL interpreter is not claimed. `*sh*` also matched fish/tcsh/zsh/xonsh, which
+# have no pipefail and where the printed bash-only remedy is invalid advice.
+E="$TMP/f11m"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env fish' 'printf x | grep -q y' > "$E/scripts/fishscript"
+printf '%s\n' '#!/bin/zsh' 'printf x | grep -q y' > "$E/scripts/zshscript"
+rc="$(guard_rc "$E")"
+[ "$rc" -eq 0 ] && pass "fish/zsh shebangs are not claimed (no inapplicable remedy)" \
+             || fail "a non-shell interpreter was claimed (exit $rc)"
+
+# 11n. the clean message carries a FILE COUNT, so "scanned nothing" is distinguishable from
+# "scanned and clean" — indistinguishable before, and why a wrong-tree run looked fine.
+E="$TMP/f11n"; mkdir -p "$E/scripts"; printf '#!/usr/bin/env bash\necho hi\n' > "$E/scripts/a.sh"
+rc="$(guard_rc "$E")"
+if [ "$rc" -eq 0 ] && grep -qE 'scanned [1-9][0-9]* file' "$OUT"; then
+  pass "the clean message reports the number of files scanned"
+else
+  fail "the clean message does not report a file count (exit $rc)"
+fi
+
+# 11p. SIGPIPE_SCAN_DIRS set-but-EMPTY must be an error too. It is the same false-clean
+# class as `--dirs ''`, reached through the env knob: a caller forwarding a possibly-unset
+# variable would otherwise scan the DEFAULT set — here a `scripts/` symlinked to a clean
+# tree, which is exactly the #7588 shape and reports ✅ on a repo that has the idiom.
+E="$TMP/f11p"; mkdir -p "$E/.github/scripts" "$E/shared/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.github/scripts/deploy"
+printf '%s\n' '#!/usr/bin/env bash' 'echo clean' > "$E/shared/scripts/ok.sh"
+ln -s ../shared/scripts "$E/scripts"
+rc_empty="$(SIGPIPE_SCAN_DIRS='' bash "$GUARD" --root "$E" >"$OUT" 2>&1; echo $?)"
+rc_ws="$(SIGPIPE_SCAN_DIRS='   ' bash "$GUARD" --root "$E" >"$OUT" 2>&1; echo $?)"
+if [ "$rc_empty" -eq 2 ] && [ "$rc_ws" -eq 2 ] && grep -q 'the scan set is empty' "$OUT"; then
+  pass "an EMPTY SIGPIPE_SCAN_DIRS is a usage error, not a fall back (empty $rc_empty, ws $rc_ws)"
+else
+  fail "an empty SIGPIPE_SCAN_DIRS fell back to the default set (empty $rc_empty, ws $rc_ws)"
+fi
+
+# 11q. an ABSOLUTE --dirs is honoured — a legitimate caller shape must not be a false block
+E="$TMP/f11q"; mkdir -p "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.github/scripts/deploy"
+rc="$(bash "$GUARD" --root "$E" --dirs "$E/.github/scripts" >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "an absolute --dirs is honoured (exit 1)" \
+             || fail "an absolute --dirs was rejected or missed (exit $rc)"
+
+# 11r. the count and the scan must select .husky IDENTICALLY (the .husky case matches on the
+# basename, so a `$ROOT/`-qualified path does not silently fall to the name/shebang filter)
+E="$TMP/f11r"; mkdir -p "$E/.husky" "$E/scripts"
+printf '%s\n' '#!/usr/bin/env sh' 'echo hi' > "$E/.husky/pre-commit"
+printf '#!/usr/bin/env bash\necho hi\n' > "$E/scripts/a.sh"
+rc="$(guard_rc "$E")"
+if [ "$rc" -eq 0 ] && grep -qE 'scanned 2 file' "$OUT"; then
+  pass "the count includes .husky files (scanned 2)"
+else
+  fail "the count and the scan disagree about .husky (exit $rc)"
+fi
+
+# 11s. a TRAILING SLASH on a scan dir must not change selection: `${dir##*/}` on `.husky/`
+# is empty, so `.husky/` fell to the name/shebang filter and skipped the extensionless
+# hooks — a green run over zero files.
+E="$TMP/f11s"; mkdir -p "$E/.husky"
+printf '%s\n' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/pre-commit"
+rc_plain="$(bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 2>&1; echo $?)"
+rc_slash="$(bash "$GUARD" --root "$E" --dirs '.husky/' >"$OUT" 2>&1; echo $?)"
+if [ "$rc_plain" -eq 1 ] && [ "$rc_slash" -eq 1 ]; then
+  pass "a trailing slash does not change selection ('.husky' $rc_plain, '.husky/' $rc_slash)"
+else
+  fail "'.husky/' scanned nothing (plain $rc_plain, slash $rc_slash) — a false clean"
+fi
+
+# 11t. a NEWLINE in the value is refused: `read -a` takes one line, so the rest would be
+# silently dropped and never validated (a CI variable delivered as a YAML block).
+E="$TMP/f11t"; mkdir -p "$E/scripts" "$E/.github/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/deploy"
+rc="$(bash "$GUARD" --root "$E" --dirs $'.github/scripts\nscripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && pass "a newline in --dirs → exit 2 (never a silently truncated set)" \
+             || fail "a multi-line scan set was silently truncated (exit $rc)"
+
+# 11u. a scan dir whose name begins with `-` is a `find` predicate, so it failed into a
+# discarded stderr and an empty list — green, nothing scanned. Newly reachable via --dirs.
+E="$TMP/f11u"; mkdir -p "$E/-weird"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/-weird/a.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs '-weird' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a '-'-prefixed scan dir is scanned (exit 1)" \
+             || fail "a '-'-prefixed scan dir was skipped (exit $rc) — a false clean"
+
+# 11v. the bounded shebang read must not clip the interpreter token: a long shebang line
+# still names its shell (this is the case a 512-byte cap got wrong).
+E="$TMP/f11v"; mkdir -p "$E/scripts"
+pad="$(printf 'a%.0s' {1..501})"
+printf '%s\n' "#!/${pad}/bin/bash" 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/prog"
+rc="$(bash "$GUARD" --root "$E" --dirs scripts >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a long shebang line still names its shell (exit 1)" \
+             || fail "the bounded read clipped the interpreter token (exit $rc)"
+
+# 11w. slash NORMALISATION is complete: `//` and a trailing `/.` are the same dir as `/`.
+# `${dir%/}` strips one slash, so `.husky//` fell to the name/shebang filter — a green run
+# over zero files, the very shape 11s closes for a single slash.
+E="$TMP/f11w"; mkdir -p "$E/.husky"
+printf '%s\n' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/pre-commit"
+rc_double="$(bash "$GUARD" --root "$E" --dirs '.husky//' >"$OUT" 2>&1; echo $?)"
+rc_dot="$(bash "$GUARD" --root "$E" --dirs '.husky/.' >"$OUT" 2>&1; echo $?)"
+if [ "$rc_double" -eq 1 ] && [ "$rc_dot" -eq 1 ]; then
+  pass "'.husky//' and '.husky/.' select like '.husky' ($rc_double, $rc_dot)"
+else
+  fail "slash normalisation is incomplete (double $rc_double, dot $rc_dot) — a false clean"
+fi
+
+# 11x. an existing but UNREADABLE explicit dir is a false clean: `test -e` passes, `find`
+# fails into a discarded stderr, and the guard reports a clean run over zero files.
+E="$TMP/f11x"; mkdir -p "$E/locked"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/locked/a.sh"
+chmod 000 "$E/locked"
+rc="$(bash "$GUARD" --root "$E" --dirs 'locked' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/locked"
+[ "$rc" -eq 2 ] && pass "an unreadable explicit scan dir → exit 2 (never a clean run)" \
+             || fail "an unreadable scan dir produced a false clean (exit $rc)"
+
+# 11y. a readable-but-NOT-SEARCHABLE explicit dir is the same false clean: `test -r` passes
+# for a 0444 dir, but `find` needs `-x` to descend, so it yielded an empty list.
+E="$TMP/f11y"; mkdir -p "$E/locked"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/locked/a.sh"
+chmod 444 "$E/locked"
+rc="$(bash "$GUARD" --root "$E" --dirs 'locked' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/locked"
+[ "$rc" -eq 2 ] && pass "a search-denied explicit scan dir → exit 2" \
+             || fail "a search-denied scan dir produced a false clean (exit $rc)"
+
+# 11z. and the same class BENEATH a readable dir: `find` prints an error and yields a PARTIAL
+# list, which was reported as a clean run over files it never read.
+E="$TMP/f11z"; mkdir -p "$E/nested/deep"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/nested/deep/a.sh"
+chmod 000 "$E/nested/deep"
+rc="$(bash "$GUARD" --root "$E" --dirs 'nested' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/nested/deep"
+[ "$rc" -eq 2 ] && pass "a partial scan beneath a readable dir → exit 2, not a clean run" \
+             || fail "a partial scan was reported clean (exit $rc)"
+
+# 11aa. a symlink CYCLE is NOT a missed-file defect — everything reachable through it is
+# reachable without it — so the pin is that the file is still read, not that `find` errors.
+# This pin needs findutils: it depends on find's own cycle report being emitted for a self-loop
+# (GNU/CI: `File system loop detected`). Two known limits, deliberate and fail-closed:
+#   · BSD find prints no cycle diagnostic at all, so here the pin passes with or without the
+#     exemption it holds (the guard cannot see the difference);
+#   · a MUTUAL PAIR (`one -> other`, `other -> one`) is a cycle find reports as ELOOP, so it
+#     exits 2 — an accepted false BLOCK, never a missed file;
+# and BusyBox `find` (a bare Alpine, no findutils) reports EVERY cycle as `Symbolic link loop`,
+# which stays fatal — so the guard requires findutils, as this repo's CI installs.
+E="$TMP/f11aa"; mkdir -p "$E/scripts"; ln -s . "$E/scripts/loop"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a symlink loop does not hide a file reachable through it" \
+             || fail "a file was missed in a tree containing a symlink loop (exit $rc)"
+
+# 11ab. ...and partitioning the loop diagnostic out must NOT swallow a real one: a tree that
+# holds BOTH a loop and an unreadable directory is still a partial scan (exit 2). Without this
+# pin the loop filter could be widened into "ignore find's stderr" and stay green.
+E="$TMP/f11abloop"; mkdir -p "$E/scripts/locked"; ln -s . "$E/scripts/loop"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && pass "a loop does not excuse a genuine partial scan (exit 2)" \
+             || fail "a partial scan was reported clean in a tree that also holds a loop (exit $rc)"
+
+# 11ac. a named non-executable FILE is not a false block: `-x` means SEARCH for a directory
+# but EXECUTABLE for a file, and requiring it made `--dirs somefile.sh` exit 2.
+E="$TMP/f11ac"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/entrypoint.sh"
+chmod 644 "$E/scripts/entrypoint.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts/entrypoint.sh' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a named non-executable file is scanned, not blocked (exit 1)" \
+             || fail "a named non-executable file was a false block (exit $rc)"
+
+# 11ad. an exception declared for a file OUTSIDE this run's scan set is UNVERIFIED, not
+# STALE: the guard cannot confirm a declaration it did not scan, and calling that stale
+# reds every narrowed --dirs a consumer runs.
+E="$TMP/f11ad"; mkdir -p "$E/scripts" "$E/other"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'if printf '\''%s'\'' "$A" | grep -q x; then echo 1; fi' > "$E/other/c.sh"
+printf 'other/c.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+bash "$GUARD" --root "$E" --dirs 'scripts other' >"$OUT" 2>&1
+h="$(sed -n 's/.*other\/c\.sh .*actual \([0-9a-f]\{16\}\).*/\1/p' "$OUT" | head -1)"
+printf 'other/c.sh 1 %s #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+rc_full="$(bash "$GUARD" --root "$E" --dirs 'scripts other' >"$OUT" 2>&1; echo $?)"
+# scanning ONLY scripts/: other/c.sh is outside the scan set and must NOT read as stale
+rc_narrow="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc_full" -eq 0 ] && [ "$rc_narrow" -eq 0 ] && ! grep -q 'STALE exception' "$OUT"; then
+  pass "a declaration outside the scan set is UNVERIFIED, not stale (full $rc_full, narrow $rc_narrow)"
+else
+  fail "a narrowed scan read an out-of-scope declaration as stale (full $rc_full, narrow $rc_narrow)"
+fi
+
+# 11ae. ...and a declaration for a file that IS scanned and clean is still stale — the check
+# must not have been weakened away.
+E="$TMP/f11ae"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/d.sh"
+printf 'scripts/d.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && grep -q 'STALE exception' "$OUT" && pass "a scanned-and-clean declared file is still STALE (exit 1)" \
+             || fail "the stale check was weakened (exit $rc)"
+
+# 11af. ELOOP IS NOT A CYCLE. The kernel raises ELOOP whenever a path fails to resolve within
+# its symlink budget, which includes a NON-cyclic chain — and a chain's target is reachable no
+# other way, so it is a genuine partial scan. Exempting the ELOOP wording is a false clean, and
+# this pin is what fails if that exemption returns.
+# The pin runs only where find reports the failure, which is SHAPE- AND PLATFORM-dependent —
+# an entry whose whole resolution fails is skipped in silence by BSD find (exit 0, the deep
+# links unlisted, so there is nothing for the guard to see), while GNU findutils reports it.
+# The probe below queries find the way the GUARD does (from $E, on the same relative path),
+# so the skip decision measures the invocation that is actually asserted about. The reason for
+# any skip is printed rather than passed over in silence.
+E="$TMP/f11af"; mkdir -p "$E/scripts" "$E/chain" "$E/outside"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/outside/bad.sh"
+ln -s ../outside "$E/chain/l0"
+i=1
+while [ "$i" -le 45 ]; do ln -s "l$((i-1))" "$E/chain/l$i"; i=$((i+1)); done
+ln -s ../chain/l45 "$E/scripts/entry"
+chain_errs="$(cd "$E" && find -L scripts -type f 2>&1 >/dev/null)"
+if [ -z "$chain_errs" ]; then
+  echo "   ⏭️  a chain that cannot resolve: this platform's find reports no failure for this shape (BSD) — pin skipped; it runs wherever find reports the failure (GNU findutils, CI)"
+else
+  rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+  [ "$rc" -eq 2 ] && pass "a symlink chain that cannot resolve is a partial scan (exit 2)" \
+               || fail "an unresolved symlink chain was reported clean (exit $rc)"
+fi
+
+# 11ag. the diagnostics sink is a fail-closed precondition. If it cannot be created OR cannot be
+# written, find's stderr goes nowhere, the partition sees an empty file, and a partial scan reads
+# as a clean one. The guard must refuse rather than report a verdict. `mktemp` is stubbed rather
+# than pointed at a bad TMPDIR, because BSD `mktemp` ignores TMPDIR — a stub is the only form
+# that asserts this on both platforms. Both failure shapes are pinned: a `mktemp` that FAILS
+# while naming a usable path (so ONLY the status check can refuse), and one that claims success
+# while producing an unusable sink.
+E="$TMP/f11ag"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" 'exit 1' > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a diagnostics sink that cannot be created refuses a verdict (exit 2)" \
+             || fail "a failed mktemp still produced a verdict (exit $rc)"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a diagnostics sink that cannot be written refuses a verdict (exit 2)" \
+             || fail "an unusable diagnostics sink still produced a verdict (exit $rc)"
+
+# 11ah. OPENABILITY IS NOT WRITABILITY. A sink that takes the open and then refuses the write —
+# a full volume — swallows find's diagnostics exactly as a missing file does, so the partition
+# reads empty over a partial scan. `/dev/full` is that state on tap. The sink goes through a
+# SYMLINK so the guard's exit trap — an unconditional `rm -f "$FIND_ERRS"` — can only ever
+# remove the link, never the device. Where /dev/full does not exist (BSD/macOS) the pin says so
+# rather than passing vacuously.
+E="$TMP/f11ah"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+sink_state="unavailable"
+if [ -e /dev/full ] && { : >>/dev/full; } 2>/dev/null; then
+  if { printf x >>/dev/full; } 2>/dev/null; then sink_state="writable"; else sink_state="full"; fi
+fi
+if [ "$sink_state" != full ]; then
+  echo "   ⏭️  a sink that opens but rejects the write: /dev/full is $sink_state here — pin skipped; it runs where /dev/full is an always-full device (Linux/CI)"
+else
+  ln -s /dev/full "$E/sink"
+  printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" 'exit 0' > "$E/fakebin/mktemp"
+  chmod +x "$E/fakebin/mktemp"
+  rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+  [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a sink that opens but rejects the write refuses a verdict (exit 2)" \
+               || fail "a write-rejecting sink still produced a verdict (exit $rc)"
+fi
+
+# 11ai. ...and the cycle EXEMPTION and its ANCHOR are pinned on every platform. 11aa needs
+# findutils' own cycle report, which BSD find never emits — so on macOS it passes with or
+# without the exemption, and an edit that deletes the exempt arm or loosens its match would be
+# caught only on CI. `find` is stubbed (as 11ag stubs `mktemp`) so both polarities are asserted
+# here. (b) is what pins the ANCHOR: an unanchored `*'File system loop detected'*` matches a
+# permission error whose PATH merely contains that text — a path the tree under scan controls —
+# and so exempts a real partial scan. That is a reachable fail-open, not a theoretical one.
+E="$TMP/f11ai"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+# (a) a GNU-shaped cycle report, with everything reachable still listed
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
+  'printf "%s\n" "scripts/a.sh"' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "find's cycle report is EXEMPT: the file it did not hide is still read (exit 1)" \
+             || fail "the cycle exemption is not what makes the loop case clean (exit $rc)"
+# (a2) ...and the ENUMERATOR'S STATUS must be judged after the exemption, not before it. GNU
+# findutils reports a cycle AND exits 1 while listing every file, so a raw status refusal turns the
+# benign case into a false block — it reddened `sigpipe-grep` on CI. This pin is the GNU shape.
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' \
+  'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
+  'printf "%s\n" "scripts/a.sh"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a cycle that ALSO exits 1 is still exempt (exit 1, not a false block)" \
+             || fail "find's exit 1 on a cycle became a false block (exit $rc)"
+# (b) a permission error whose path merely CONTAINS the cycle text must NOT be exempt. The stub
+# answers the `-maxdepth 0` probe on stdout, so ONLY the partition can decide this — writing only
+# to stderr would make the probe refuse first and pass this pin for the wrong reason.
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts" ;; esac' \
+  'printf "%s\n" "find: scripts/File system loop detected/x: Permission denied" >&2' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "the cycle match is ANCHORED: an error whose path contains the text is still fatal (exit 2)" \
+             || fail "an unanchored cycle match exempted a real partial scan (exit $rc)"
+
+# (a3) ...and the exemption is scoped PER DIRECTORY: a cycle report from one dir must not excuse a
+# DIFFERENT dir that exited non-zero with no diagnostic at all. Exempting it globally reports a clean
+# scan over that dir's unenumerated files — and a silent or shimmed enumerator is precisely the case
+# this status check exists for.
+E="$TMP/f11ai3"; mkdir -p "$E/a" "$E/b" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/b/withheld.sh"
+printf '%s\n' '#!/bin/sh' \
+  't="$2"' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "$t"; exit 0 ;; esac' \
+  'case "$t" in *a*) printf "%s\n" "find: File system loop detected; ‘a/loop’ is part of the same file system loop as ‘a’." >&2; exit 1 ;; esac' \
+  'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc_one="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'b' >"$OUT" 2>&1; echo $?)"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'a b' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && [ "$rc_one" -eq 2 ] && ! grep -q '✅' "$OUT" \
+  && pass "a cycle in one dir does not exempt another dir's silent failure (exit 2)" \
+  || fail "a cycle report globally exempted a different dir's silent failure (exit $rc, alone $rc_one)"
+
+# 11aj. A file the scan LISTED but cannot OPEN is not "clean". `find -L` STAT'd it, so no
+# diagnostic reaches the partition, and the readiness probe is what names it — but the probe is not
+# the only defence: the scanner's own status (SCAN_RC) refuses the same case, so this pin asserts the
+# REFUSAL (exit 2), which either path provides, rather than the probe specifically (measured:
+# deleting the probe still exits 2 via SCAN_RC). Pinned with a mode-000 `*.sh`, which is claimed by
+# NAME, so no shebang read is involved and the pin isolates this case.
+E="$TMP/f11aj"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked.sh"
+chmod 000 "$E/scripts/locked.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/locked.sh"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable LISTED file refuses a verdict (exit 2)" \
+             || fail "the idiom in an unreadable file was reported clean (exit $rc)"
+
+# 11aj2. ...and a CLIPPED first line is the same undecidable case as an empty read: the reader stops
+# at 4096 bytes, so a longer first line has its interpreter token cut off, names no shell, and the
+# file is dropped from the scan set — a clean verdict over an extensionless file that holds the
+# idiom. The refusal is bounded to a genuinely clipped line, so the boundary control below (a file
+# SHORT enough to be read whole, whose first line is just as long) must stay clean.
+E="$TMP/f11aj2"; mkdir -p "$E/scripts"
+{
+  printf '#!'; printf 'a%.0s' $(seq 1 4090); printf '/bin/bash\n'
+  printf 'printf '\''%s'\'' "$V" | grep -q pat\n'
+} > "$E/scripts/longshebang"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a first line longer than the reader reads refuses a verdict (exit 2)" \
+             || fail "a clipped shebang line dropped an extensionless file from the scan set (exit $rc)"
+# the boundary: the same long first line, in a file small enough to be read to the end, is decided
+# by its content — and that tree is CLEAN, so the refusal keys on the CLIP, not on a long line
+E="$TMP/f11aj2b"; mkdir -p "$E/scripts"
+{
+  printf '#!'; printf 'a%.0s' $(seq 1 4000); printf '/bin/bash\n'
+} > "$E/scripts/shortshebang"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] && grep -q '✅' "$OUT" && pass "a long first line in a file read WHOLE is classified, not refused (exit 0)" \
+             || fail "a fully-read long first line was refused by length alone (exit $rc)"
+
+# 11ak. ...and the sink must be ABSOLUTE. The precondition and the partition read run in the
+# guard's OWN cwd, but `find` writes to it after `cd "$ROOT"` — so a RELATIVE mktemp result names
+# two different files: find's errors land in $ROOT/<name>, the partition reads $PWD/<name> empty,
+# and a partial scan reads as a clean one. GNU `mktemp` emits exactly that shape when TMPDIR is
+# relative, so `mktemp` is stubbed to emit it without depending on the platform's mktemp. The
+# cwd MUST differ from --root, or the two resolutions coincide and the pin is vacuous.
+E="$TMP/f11ak"; mkdir -p "$E/scripts/locked" "$E/fakebin" "$E/run"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+# The enumerator is stubbed to print the PROBE answer AND a permission diagnostic, then exit 0 — so
+# it is find's SILENCE about the unreadable dir, not its exit status, that must refuse. With a real
+# `find` the enumerator-status guard fired first and this pin (and 11al below) passed without
+# exercising the sink at all.
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "find: scripts/locked: Permission denied" >&2' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "rel-sink.$$"' ': >"rel-sink.$$"' > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(cd "$E/run" && PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a RELATIVE diagnostics sink still refuses a verdict (exit 2)" \
+             || fail "a relative sink made the partition read empty over a partial scan (exit $rc)"
+
+# 11al. ...and a sink that ACCEPTS the write and discards it is not usable either. Reading the
+# byte back is the only form that catches it: the write succeeds, so a write-only precondition
+# passes while the partition reads empty over a partial scan. `/dev/null` exists on both
+# platforms, so this pin is never skipped.
+E="$TMP/f11al"; mkdir -p "$E/scripts/locked" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
+chmod 000 "$E/scripts/locked"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "find: scripts/locked: Permission denied" >&2' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+# Reached through a SYMLINK, as 11ah does, so the guard's exit trap (`rm -f "$FIND_ERRS"`) can
+# only ever remove the link, never the device.
+ln -s /dev/null "$E/sink"
+printf '%s\n' '#!/bin/sh' "printf '%s' '$E/sink'" > "$E/fakebin/mktemp"
+chmod +x "$E/fakebin/mktemp"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 755 "$E/scripts/locked"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a write-DISCARDING sink refuses a verdict (exit 2)" \
+             || fail "a sink that swallows find's stderr produced a verdict anyway (exit $rc)"
+
+# 11am. ...and the unreadable-file probe must not OVER-block. A basename carrying an extension
+# (`notes.txt`) is excluded by the NAME rule alone with no read, so the guard would never have
+# opened it and making it fatal is a real false BLOCK on a tree the guard can clear. The other
+# half is pinned too, because the tempting simplification (probe only AFTER `is_shell_file`)
+# reopens the fail-open: an unreadable EXTENSIONLESS file cannot be ruled out as a shell script.
+E="$TMP/f11am"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/ok.sh"
+printf 'notes, not shell\n' > "$E/scripts/notes.txt"
+chmod 000 "$E/scripts/notes.txt"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/notes.txt"
+[ "$rc" -eq 0 ] && pass "an unreadable file the guard never reads is not a false block (exit 0)" \
+             || fail "an unreadable .txt was refused (exit $rc) — a false block"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/deploy"
+chmod 000 "$E/scripts/deploy"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+chmod 644 "$E/scripts/deploy"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable EXTENSIONLESS file is still fatal (exit 2)" \
+             || fail "an unreadable extensionless file was reported clean (exit $rc)"
+
+# 11an. the SCAN PASS's own status is part of the fail-closed contract: a scanner that is missing
+# or that fails prints no hits, and no hits is indistinguishable
+# from a clean tree — the guard would print ✅ over files it never read. `awk` is stubbed through
+# PATH, as 11ag stubs `mktemp`, so the pin does not depend on uninstalling anything.
+E="$TMP/f11an"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/awk"
+chmod +x "$E/fakebin/awk"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING scanner refuses a verdict (exit 2)" \
+             || fail "a failing scanner still produced a verdict (exit $rc)"
+
+# 11ao. a FAILING READER is not a clean file. `is_shell_file` reads a bounded shebang prefix with
+# `head`; an empty read names no interpreter, so an EXTENSIONLESS shell file is dropped from the
+# scan set and the guard reports clean over a file it never read — the exact tortoise#7588 shape,
+# since the files that arm exists to claim are precisely the extensionless ones. `head` is stubbed
+# through PATH, as 11ag stubs `mktemp`.
+E="$TMP/f11ao"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/deploy"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/head"
+chmod +x "$E/fakebin/head"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING shebang reader refuses a verdict (exit 2)" \
+             || fail "a failing reader dropped an extensionless shell file (exit $rc)"
+
+# 11ap. ...and the CLASSIFICATION pass is the same class: if it fails while HITS is non-empty, the
+# verdict loop is skipped and an idiom that WAS found is never reported. `cut` is the only tool in
+# that pipeline the scan-status guard cannot see, so it is pinned separately.
+E="$TMP/f11ap"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING classifier refuses a verdict (exit 2)" \
+             || fail "a found idiom was dropped by a failing classifier (exit $rc)"
+# ...and the PARTIAL classifier is the shape the value cross-check CANNOT see: TWO files really do
+# contain the idiom, and the classifier reports ONE of them — a genuine entry, so its list is
+# non-empty and every path in it is real — and exits 3, withholding the other. Nothing downstream
+# can tell the second was dropped, so the STATUS is the only thing that can refuse. The stub must
+# fail ONLY on the classifying invocation: a blanket `cut` stub also intercepts `fingerprint`'s
+# `cut -c1-16`, and the fingerprint refusal then yields the same exit 2, hiding the mutation
+# (measured — with a blanket stub, deleting the classifier's status check left the suite green).
+E="$TMP/f11ap2"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/b.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *"-d: -f1"*) printf "%s\n" "scripts/a.sh"; exit 3 ;; esac' 'exec /usr/bin/cut "$@"' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a PARTIAL classifier refuses a verdict (exit 2)" \
+             || fail "a partial classification hid an undeclared idiom (exit $rc)"
+
+# 11aq. a SILENTLY failing `find` is the one failure the diagnostics partition cannot see: it
+# writes no error, so it lists nothing and the guard reports a clean run over a tree it never
+# enumerated. What is checked is find's OWN status, not the pipeline's (which is only the loop's
+# last iteration). `find` is stubbed through PATH, as 11ag stubs `mktemp`.
+E="$TMP/f11aq"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SILENTLY failing enumerator refuses a verdict (exit 2)" \
+             || fail "a silently failing find reported a tree it never listed (exit $rc)"
+
+# 11ar. ...and membership is decided IN THE SHELL, so a `grep` that lies successfully cannot decide
+# it. `grep` exits 0 (match), 1 (none) or >1 (error); a shim printing nothing and exiting 0 reports
+# BOTH memberships as MATCHES, which suppresses the stale check and lets a stale declaration pass.
+# The stub fails that way only on `-qx`, so the declaration lookup (which the real `grep` handles)
+# still works. The idiom file must be DECLARED CORRECTLY, so the STALE line is the only finding.
+E="$TMP/f11ar"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/b.sh"
+printf 'scripts/b.sh 1 deadbeefdeadbeef #999\nscripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+h="$(bash "$GUARD" --root "$E" --dirs 'scripts' 2>&1 | sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+printf 'scripts/b.sh 1 %s #999\nscripts/a.sh 1 deadbeefdeadbeef #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -qx) exit 0 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && grep -q 'STALE exception' "$OUT" && pass "a SILENT-SUCCESS grep cannot suppress the stale check (exit 1)" \
+             || fail "a lying grep suppressed the stale check (exit $rc)"
+
+# 11as. ...and the occurrence COUNT is the same shape once more. `grep -c` exits 1 for a zero
+# count, so only >1 is an error — absorbed as a boolean, an error left `actual` EMPTY, the count
+# comparison then failed SILENTLY (`integer expression expected`, `if` false), the COUNT check was
+# skipped, and control fell through to the CONTENT-HASH check. A declaration whose count
+# contradicts its own hash therefore passed as a warning and the guard exited 0. The declaration
+# is first written with the RIGHT hash (so the hash check cannot save it) and the WRONG count.
+E="$TMP/f11as"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+h="$(bash "$GUARD" --root "$E" --dirs 'scripts' 2>&1 | sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+printf 'scripts/a.sh 2 %s #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+rc_real="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -c) exit 3 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc_real" -eq 1 ] && [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING occurrence count refuses a verdict (exit 2)" \
+             || fail "a failing occurrence count skipped the count check (real $rc_real, stub $rc)"
+# ...and the SAME hole opens one exit code over, which is why the guard validates the VALUE and
+# not the status: a shim printing nothing and exiting 1 leaves `actual` empty exactly as exit 3
+# did. `grep -c` legitimately exits 1 for a ZERO count, so a status gate cannot separate them.
+printf '%s\n' '#!/bin/sh' 'case "$1" in -c) exit 1 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SILENT count (exit 1, no output) refuses too (exit 2)" \
+             || fail "a silent count was read as zero and skipped the check (exit $rc)"
+
+# 11at. ...and the CONTENT fingerprint is the last input to that comparison, with a failure mode a
+# shape check CANNOT catch: a failing fingerprint pipeline yields the hash of EMPTY INPUT
+# (`e3b0c44298fc1c14…`), which is a perfectly well-formed 16 hex chars. A declaration carrying it
+# would therefore be ACCEPTED, defeating the guarantee that a count-preserving swap does not
+# inherit an exception. The stub fails only on the pattern-FIRST invocation (the fingerprint),
+# leaving the flag-first lookups working.
+E="$TMP/f11at"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 e3b0c44298fc1c14 #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -*) exec /usr/bin/grep "$@" ;; esac' 'exit 3' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING fingerprint refuses a verdict (exit 2)" \
+             || fail "the hash of empty input was accepted as a declaration (exit $rc)"
+# ...and the SILENT-SUCCESS twin, which no status check can catch: the fingerprint pipeline swallows
+# its input, prints nothing and exits 0, so the digest is that of EMPTY input. Only an explicit
+# value check sees it — and it is the exact failure the comment above names as un-catchable by shape.
+printf '%s\n' '#!/bin/sh' 'case "$1" in -*) exec /usr/bin/grep "$@" ;; esac' 'cat >/dev/null' 'exit 0' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING fingerprint refuses a verdict (exit 2)" \
+             || fail "the empty-input digest was accepted from a silent pipeline (exit $rc)"
+# ...and a fingerprint that emits a WELL-FORMED digest and FAILS is the shape neither the
+# empty-value nor the empty-digest check can see; only the status can. Without it a
+# count-preserving CONTENT SWAP inherits an existing exception (the fingerprint becomes a constant).
+E="$TMP/f11at2"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 aaaaaaaaaaaaaaaa #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *256*) printf "%s\n" "aaaaaaaaaaaaaaaa"; exit 3 ;; esac' 'exec /usr/bin/shasum "$@"' > "$E/fakebin/shasum"
+chmod +x "$E/fakebin/shasum"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a WELL-FORMED but failing fingerprint refuses (exit 2)" \
+             || fail "a constant fingerprint let a content swap inherit an exception (exit $rc)"
+
+# 11au. ...and a CLASSIFIER that swallows its input is the same shape: with `cut` printing nothing
+# and exiting 0, FILES_WITH_HITS is empty while HITS is not, so the whole per-file loop is skipped
+# and the guard reports clean with the idiom sitting in HITS. The cross-check between those two
+# VALUES needs no external, so it cannot itself fail open. The stub leaves the fingerprint's
+# `cut -c1-16` working so this pin isolates the classification path.
+E="$TMP/f11au"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-c1-16*) exec /usr/bin/cut "$@" ;; esac' 'cat >/dev/null' 'exit 0' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING classifier refuses a verdict (exit 2)" \
+             || fail "unclassified hits were reported clean (exit $rc)"
+
+# 11av. a SWALLOWING shebang reader (exit 0, no output) is invisible to the status check and leaves
+# `chunk` empty, so an EXTENSIONLESS shell file is dropped from the scan set — the tortoise#7588
+# shape, in the arm that exists to claim exactly those files. The invariant is exact and needs no
+# external: a non-empty file cannot yield an empty read.
+E="$TMP/f11av"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/check-migration-drift"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/clean.sh"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/head"
+chmod +x "$E/fakebin/head"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING shebang reader refuses a verdict (exit 2)" \
+             || fail "a silent reader dropped an extensionless shell file (exit $rc)"
+
+# 11aw. ...and a SWALLOWING enumerator (exit 0, no output) lists an empty tree, so the guard reports
+# `scanned 0 file(s)` and exits 0 over files that are there. Pinned because the existing enumerator
+# pin (11aq) covers only a NON-ZERO exit, which is a different member of the family.
+E="$TMP/f11aw"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING enumerator refuses a verdict (exit 2)" \
+             || fail "a silently empty tree was reported clean (exit $rc)"
+
+# 11ax. ...and a PARTIAL list with a non-zero exit is a different member again, and the only one the
+# `find -maxdepth 0` probe above cannot see (that probe catches total silence). A `find` that lists
+# SOME files, withholds the one holding the idiom, and exits 1 would otherwise scan an unknown
+# subset and report clean — which is what find's OWN status (`PIPESTATUS[0]`, not the loop's last
+# iteration) is for. The stub answers the probe, then lists a clean file only.
+E="$TMP/f11ax"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/seen.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/withheld.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "scripts/seen.sh"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a PARTIAL list with a non-zero exit refuses (exit 2)" \
+             || fail "a partial enumeration was reported clean (exit $rc)"
+
+# 11ay. ...and the empty-read invariant must NOT fire on a file that is non-empty but CAPTURES as
+# empty. Command substitution strips trailing newlines and every NUL, so a newline-only or NUL-only
+# extensionless file (a `.gitkeep`) looks like an empty read in the captured text — testing the BYTE
+# COUNT is what keeps that from being a false BLOCK, so this pin is a tree that must come back CLEAN.
+E="$TMP/f11ay"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/ok.sh"
+printf '\n\n\n' > "$E/scripts/BLANK"
+: > "$E/scripts/ZERO"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] && pass "a BLANK extensionless file is not a false block (exit 0)" \
+             || fail "a newline-only file was refused as an empty read (exit $rc)"
+
+# 11az. ...and `scan_files` has TWO arms, each carrying its own `return "${PIPESTATUS[0]}"`, so the
+# partial-list pin above covers only the filtered one. A `.husky` hook withheld from the list is the
+# same silent miss, and nothing else would notice because `.husky` files are ALL scanned. NOTE
+# what this pin actually covers: with `set -o pipefail` the pipeline already yields find's non-zero
+# status, so DELETEING the return is still caught; what was unpinned is an explicit WRONG one
+# (`return 0`), which is what the mutation uses.
+E="$TMP/f11az"; mkdir -p "$E/.husky" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/.husky/seen"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/withheld"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" ".husky"; exit 0 ;; esac' 'printf "%s\n" ".husky/seen"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a partial .husky enumeration refuses (exit 2)" \
+             || fail "a withheld .husky hook was reported clean (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
