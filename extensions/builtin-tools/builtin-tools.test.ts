@@ -32,7 +32,7 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -51,6 +51,18 @@ import {
   scanStderrForUsage,
 } from "./index.js";
 import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.js";
+// #1662 — background dispatch + status/collect seam.
+import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs } from "./index.js";
+import {
+  mintRunId,
+  resolveTaskRunsRoot,
+  readRunRecord,
+  writeRunRecord,
+  safeRunId,
+  runLogPath,
+  pidAlive,
+  DEFAULT_TASK_RUNS_ROOT,
+} from "../shared/task-runs.js";
 import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
 import { dirname, join, resolve } from "node:path";
 
@@ -7463,6 +7475,309 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   equal(h({ toolName: "task", isError: false, details: undefined }), undefined, "no details → nothing to prove, stays a success");
   equal(h({ toolName: "task", isError: false, details: { status: "ok" } }), undefined, "a status this hook does not know as a failure stays a success");
 });
+
+// ═══════════════════════════════════════════════════════════
+// #1662 — background task dispatch (returns-early) + status/collect
+// ═══════════════════════════════════════════════════════════
+section("#1662 — task-runs registry (shared/task-runs.ts)");
+
+test("#1662: safeRunId rejects path-escape shapes and accepts a uuid", () => {
+  ok(safeRunId(mintRunId()) !== null, "a minted uuid is a safe segment");
+  equal(safeRunId("../escape"), null, "a `..` segment is refused");
+  equal(safeRunId("/etc/passwd"), null, "an absolute path is refused");
+  equal(safeRunId("a/b"), null, "a slash is refused");
+  equal(safeRunId(""), null, "empty is refused");
+  equal(safeRunId(undefined), null, "non-string is refused");
+});
+
+test("#1662: run records round-trip atomically; a corrupt record reads as ABSENT", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-runs-"));
+  try {
+    const id = mintRunId();
+    const rec = {
+      run_id: id,
+      pid: 4242,
+      pgid: 4242,
+      log_path: runLogPath(dir, id),
+      started_at: 123,
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      cwd: dir,
+      nonce: "abc123",
+      status: "running" as const,
+    };
+    const w = writeRunRecord(dir, rec as any);
+    ok(w.ok, `write succeeds: ${w.error ?? ""}`);
+    deepEqual(readRunRecord(dir, id), rec, "exact round-trip");
+    // Corrupt on disk → null, never a confident terminal state.
+    writeFileSync(join(dir, `${id}.json`), "{not json", "utf-8");
+    equal(readRunRecord(dir, id), null, "corrupt record reads as absent");
+    equal(readRunRecord(dir, "does-not-exist"), null, "missing record reads as absent");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: pidAlive is true for this process, false for a dead/invalid pid", () => {
+  equal(pidAlive(process.pid), true, "our own pid is alive");
+  equal(pidAlive(999_999_999), false, "an out-of-range pid is dead");
+  equal(pidAlive(null), false, "null is dead");
+  equal(pidAlive(1), false, "pid 1 is never probed (never signal init/PID 1)");
+});
+
+test("#1662: resolveTaskRunsRoot honours TASK_RUNS_ROOT, else the ~/.pi default", () => {
+  equal(resolveTaskRunsRoot({}), DEFAULT_TASK_RUNS_ROOT, "default is ~/.pi/agent/task-runs");
+  equal(resolveTaskRunsRoot({ TASK_RUNS_ROOT: "/tmp/x" }), "/tmp/x", "env override wins");
+  equal(resolveTaskRunsRoot({ TASK_RUNS_ROOT: "~/sub" }), join(process.env.HOME ?? "", "sub"), "tilde expands");
+});
+
+test("#1662: getHeartbeatTimeoutMs mirrors the shipped 30-min T declaration", () => {
+  withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+    equal(getHeartbeatTimeoutMs(), 1_800_000, "default T is 30 min");
+  });
+  withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: "1000" }, () => {
+    equal(getHeartbeatTimeoutMs(), 60_000, "T is clamped to the 60s floor");
+  });
+  // The source pin (this file, above) requires the DECLARATION to stay a single
+  // `const HEARTBEAT_TIMEOUT_MS = Math.max(...)`; the getter must not duplicate it.
+  const occurrences = source.match(/^[ \t]*const\s+HEARTBEAT_TIMEOUT_MS\s*=/gm) ?? [];
+  equal(occurrences.length, 1, "the T declaration still occurs exactly once");
+});
+
+section("#1662 — task_status derivation (markers, never %CPU)");
+
+// A record whose pid is OUR pid (alive) and whose log holds a fresh, nonce-signed
+// marker stream. `utimesSync` lets the wedged twin make the log stale.
+function seedRunningRun(dir: string, opts: { nonce?: string | null; markers?: string; logAgeMs?: number } = {}) {
+  const id = mintRunId();
+  const log = runLogPath(dir, id);
+  const nonce = opts.nonce === undefined ? "testnonce" : opts.nonce;
+  const nm = nonce ? ` nonce=${nonce}` : "";
+  writeFileSync(
+    log,
+    opts.markers ??
+      `[task-heartbeat] ready${nm}\n[task-heartbeat] turn_start${nm} 1\n[task-heartbeat] tool_start${nm} t1 bash\n[task-heartbeat] tick${nm} tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=2000 saw_msg=0 saw_tool=1\n`,
+    "utf-8",
+  );
+  if (opts.logAgeMs) {
+    const t = new Date(Date.now() - opts.logAgeMs);
+    utimesSync(log, t, t);
+  }
+  const rec = {
+    run_id: id,
+    pid: process.pid,
+    pgid: process.pid,
+    log_path: log,
+    started_at: Date.now(),
+    model: "deepseek-v4-flash",
+    provider: "deepseek",
+    cwd: dir,
+    nonce,
+    status: "running" as const,
+  };
+  writeRunRecord(dir, rec as any);
+  return { id, rec };
+}
+
+test("#1662: a live pid with fresh nonce-signed markers reads ALIVE", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-alive-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir);
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "alive flag");
+      equal(v.terminal, false, "not terminal");
+      equal(v.heartbeat?.tools_in_flight, 1, "marker state is surfaced");
+      equal(v.review_gate, "parent-required", "the review gate is a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: ALIVE is not derived from %CPU — a quiet-but-live marker stream stays alive (the 0%-CPU footgun)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-cpu-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // A lane mid long tool call: fresh markers, no completed progress — the
+      // slow-tool shape that reads 0 % CPU. The status seam must NOT call it wedged.
+      const { id } = seedRunningRun(dir, {
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=60000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "alive", "a quiet-but-marking lane is alive");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a stale log (markers stopped) with a live pid reads WEDGED", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-wedged-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { logAgeMs: 7_200_000 }); // 2h stale > 60-min window
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "wedged", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "the pid is still alive — wedged ≠ dead");
+      equal(v.review_gate, "parent-required", "review gate still a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a nonce MISMATCH is not a life sign (foreign writer on the child's fd 2)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nonce-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, {
+        nonce: "expected",
+        markers: `[task-heartbeat] tool_start nonce=forged t1 bash\n[task-heartbeat] tick nonce=forged tools=1 turn=1 stream_age_ms=1 tool_age_max_ms=1 saw_msg=0 saw_tool=1\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "a forged nonce is refused");
+      // With no valid markers and a fresh log, a young run is not yet wedged.
+      ok(v.status === "alive" || v.status === "wedged", `status is a live-state verdict, got ${v.status}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an unknown run_id reads UNKNOWN (never a crash, never a confident terminal)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-unknown-"));
+  try {
+    const v = evaluateTaskRunStatus("not-a-real-run", dir);
+    equal(v.status, "unknown", "unknown run");
+    equal(v.terminal, false, "not terminal");
+    equal(collectTaskRun("not-a-real-run", dir).terminal, false, "collect agrees");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+section("#1662 — task_collect");
+
+test("#1662: collect returns the final message + exit once terminal, and a not-finished notice while running", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-collect-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir);
+      const running = collectTaskRun(id, dir);
+      equal(running.terminal, false, "a running lane is not collectable");
+      equal(running.content, null, "no content while running");
+      ok(String(running.note).includes("not finished"), `not-finished note: ${running.note}`);
+
+      const done = { ...seedRunningRun(dir).rec, status: "done" as const, exit_code: 0, final_content: [{ type: "text", text: "FINAL-42" }], final_details: { model: "m", provider: "p" }, settled_at: Date.now() };
+      writeRunRecord(dir, done as any);
+      const got = collectTaskRun(done.run_id, dir);
+      equal(got.terminal, true, "terminal");
+      equal(got.status, "done", "status");
+      equal(got.exit_code, 0, "exit code");
+      equal(got.content?.[0]?.text, "FINAL-42", "final message");
+      equal(got.review_gate, "parent-required", "review gate is a parent step");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+section("#1662 — startBackgroundTask (returns-early, E2E through the real spawn)");
+
+const FAKE_PI_BG_SHIM = `#!/bin/sh
+NONCE="${'${TASK_HEARTBEAT_NONCE:-}'}"
+m() { echo "[task-heartbeat] $1" >&2; }
+m "ready nonce=$NONCE"
+m "turn_start nonce=$NONCE 1"
+m "tool_start nonce=$NONCE t1 bash"
+echo "BG-PARTIAL"
+m "tick nonce=$NONCE tools=1 turn=1 stream_age_ms=0 tool_age_max_ms=0 saw_msg=0 saw_tool=1"
+sleep 4
+m "tool_end nonce=$NONCE t1"
+echo "BG-FINAL-MESSAGE"
+m "session_end nonce=$NONCE"
+exit 0
+`;
+
+testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it alive, task_collect reaps the final message", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-bg-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  writeFileSync(join(shimDir, "pi"), FAKE_PI_BG_SHIM, { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_SESSION_ROOT = join(dir, "sessions");
+    process.env.DISPATCH_LEDGER = "0";
+    process.argv[1] = undefined as unknown as string;
+    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH };
+    const runId = mintRunId();
+
+    // (1) RETURNS EARLY: the child sleeps 2s, but this must return in well under that.
+    const t0 = Date.now();
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env,
+      args: ["-p", "--no-session", "background me"],
+      runId,
+      runsRoot: dir,
+      nonce: null,
+    });
+    const elapsed = Date.now() - t0;
+    ok(elapsed < 3000, `returns early (took ${elapsed}ms while the child sleeps 4000ms)`);
+    equal(handle.run_id, runId, "run id echoed");
+    ok(typeof handle.pid === "number" && handle.pid > 1, `pid captured synchronously (${handle.pid})`);
+    ok(typeof handle.pgid === "number" && handle.pgid > 1, `pgid captured (${handle.pgid})`);
+    equal(handle.pgid, handle.pid, "TASK_DETACHED setsid ⇒ the child is its own group leader (pgid === pid)");
+
+    // (2) STATUS: alive while the child runs (heartbeats/markers, not %CPU).
+    const alive = evaluateTaskRunStatus(runId, dir);
+    equal(alive.alive, true, "the child pid is alive");
+    equal(alive.status, "alive", `a running lane reads alive (got ${alive.status}: ${alive.note ?? ""})`);
+    equal(alive.review_gate, "parent-required", "review gate is a parent step");
+
+    // (3) COLLECT: poll until terminal (the child exits after ~4s).
+    let view = collectTaskRun(runId, dir);
+    const deadline = Date.now() + 30_000;
+    while (!view.terminal && Date.now() < deadline) {
+      await sleep(200);
+      view = collectTaskRun(runId, dir);
+    }
+    equal(view.terminal, true, `run reached terminal (status=${view.status})`);
+    equal(view.status, "done", `clean exit ⇒ done, got ${view.status} [${view.reason ?? ""}]`);
+    ok(String(view.content?.[0]?.text).includes("BG-FINAL-MESSAGE"), `final message collected: ${JSON.stringify(view.content)}`);
+    equal(view.review_gate, "parent-required", "collect still carries the parent review obligation");
+  } finally {
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+section("#1662 — tool surface");
+
+{
+  const names: string[] = [];
+  (builtinTools as any)({ on: () => {}, registerTool: (def: any) => { names.push(def?.name); } });
+  test("#1662: task declares `background`; task_status and task_collect are registered", () => {
+    ok(names.includes("task_status"), `task_status registered (got: ${names.join(",")})`);
+    ok(names.includes("task_collect"), `task_collect registered (got: ${names.join(",")})`);
+    ok(/background:\s*Type\.Optional\(/.test(source), "the task tool schema declares an optional background param");
+    ok(source.includes('name: "task_status"') && source.includes('name: "task_collect"'), "both new tools are named in source");
+    // The review-gate constraint must be explicit in the code comment.
+    ok(source.includes("REVIEW GATE IS A PARENT STEP"), "the code states the review gate is a parent step (#825)");
+  });
+}
 
   for (const t of asyncTests) await t();
   console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
