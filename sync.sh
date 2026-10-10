@@ -4,6 +4,44 @@
 set -euo pipefail
 cd "$(dirname "$0")"   # agent-infra root
 
+# #1661 — unmerged index entries make git refuse every `pull`/`checkout`, so
+# sync fails forever, silently, and the extensions on this machine freeze at the
+# stuck commit. Surface the offending paths + a valid remedy BEFORE the branch
+# guard (this blocks sync on ANY branch) and exit non-zero so no caller mistakes
+# it for success. Distinguish the abandoned index-only state the issue measured
+# from a live merge/rebase/cherry-pick/revert: a rebase INVERTS --ours/--theirs,
+# so a blanket keep-theirs remedy is unsafe there.
+if [ -n "$(git ls-files -u)" ]; then
+  gitdir="$(git rev-parse --absolute-git-dir)"
+  op=""
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then op=rebase
+  elif [ -f "$gitdir/CHERRY_PICK_HEAD" ]; then op=cherry-pick
+  elif [ -f "$gitdir/REVERT_HEAD" ]; then op=revert
+  elif [ -f "$gitdir/MERGE_HEAD" ]; then op=merge
+  fi
+  if [ -n "$op" ]; then
+    echo "⛔ sync.sh: ${op} IN PROGRESS with unmerged paths — sync is impossible until it is concluded."
+    echo "   Unmerged paths:"
+    git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
+    echo "   Finish: resolve each path, then: git ${op} --continue"
+    echo "   Or abort: git ${op} --abort"
+    echo "   (a rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command)"
+    echo "   Then re-run: ./sync.sh"
+    exit 1
+  fi
+  echo "⛔ sync.sh: STUCK MERGE CONFLICT in the index — sync is impossible until it is resolved."
+  echo "   (index-only stuck state: no MERGE_HEAD, so a plain sync can never recover)"
+  echo "   Unmerged paths:"
+  git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
+  echo "   Remedy (per path — pick the side that exists:"
+  echo "     --theirs needs stage 3; --ours needs stage 2; git rm for a deleted side):"
+  echo "     git checkout --theirs <path> && git add <path>"
+  echo "     git checkout --ours <path> && git add <path>"
+  echo "     git rm <path>"
+  echo "   Then re-run: ./sync.sh"
+  exit 1
+fi
+
 # #265: never pull/FF-move while the checkout sits on a NON-main branch — a
 # `pull --ff-only origin main` on a behind feature branch silently advances
 # that branch's ref to origin/main's tip (name unchanged), moving the branch
