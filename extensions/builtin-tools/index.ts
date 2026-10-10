@@ -94,15 +94,20 @@ import {
 // heartbeat parsing for status lives here (parseHeartbeatLine) so the import
 // direction stays one-way (builtin-tools → shared/task-runs).
 import {
+  createBoundedLogWriter,
   ensureTaskRunsRoot,
   logMtimeMs,
   mintRunId,
   pidAlive,
+  pruneTaskRuns,
   readRunRecord,
+  resolveTaskRunsLogMaxBytes,
+  resolveTaskRunsPruneBounds,
   resolveTaskRunsRoot,
   runLogPath,
   safeRunId,
   writeRunRecord,
+  type BoundedLogWriter,
   type TaskRunRecord,
   type TaskRunStatus,
 } from "../shared/task-runs.js";
@@ -3515,24 +3520,26 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     // returns-early caller can (a) derive liveness from [task-heartbeat]
     // markers later and (b) collect the final message after the fact. Purely
     // additive: with no `logPath` the child streams exactly as before.
-    let logStream: fs.WriteStream | null = null;
+    //
+    // BOUNDED (#1662 review): an uncapped tee let a chatty child fill the disk;
+    // the writer truncates at TASK_RUNS_LOG_MAX_BYTES while keeping the log
+    // mtime FRESH, so a live lane never reads as `wedged` just because its log
+    // was capped.
+    let logTee: BoundedLogWriter | null = null;
     if (observers?.logPath) {
       try {
         // 0600: the log holds the child's raw stdout+stderr (markers, and any
         // secrets the child prints). The record root is 0700, but TASK_RUNS_ROOT
         // is an operator override and may point outside a 0700 directory, so the
         // FILE itself must not be group/world-readable (#1662 review).
-        logStream = fs.createWriteStream(observers.logPath, { flags: "a", mode: 0o600 });
-        logStream.on("error", (err: Error) => {
-          console.error(`[task] background capture log unavailable (${observers.logPath}): ${err.message}`);
-          logStream = null;
-        });
+        logTee = createBoundedLogWriter(observers.logPath, resolveTaskRunsLogMaxBytes());
+        if (!logTee) throw new Error("could not open capture log");
         // Flush on close (not on settle) so a SIGKILLed child's last bytes
         // still land before the log is read.
-        proc.once("close", () => { logStream?.end(); });
+        proc.once("close", () => logTee?.close());
       } catch (err) {
         console.error(`[task] background capture log open failed (${observers.logPath}): ${err instanceof Error ? err.message : String(err)}`);
-        logStream = null;
+        logTee = null;
       }
     }
     // #1662 returns-early contract: the Promise executor body runs
@@ -3678,13 +3685,13 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     };
 
     proc.stdout.on("data", (data: Buffer) => {
-      logStream?.write(data); // #1662 background capture tee
+      logTee?.write(data); // #1662 background capture tee
       stdout = appendCap(stdout, data.toString(), 1_000_000);
       lastHeartbeat = Date.now();
       hasOutput = true;
     });
     proc.stderr.on("data", (data: Buffer) => {
-      logStream?.write(data); // #1662 background capture tee (markers verbatim)
+      logTee?.write(data); // #1662 background capture tee (markers verbatim)
       ingestHeartbeatChunk(data.toString(), hbCtx);
     });
 
@@ -4665,15 +4672,26 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
   }
   if (rec.status === "running") {
     const view = evaluateTaskRunStatus(rec.run_id, runsRoot);
-    if (!view.alive) {
-      // The child is gone but no terminal record was ever persisted. The only
-      // writer of the terminal record is the PARENT's fire-and-forget `.then`
-      // (startBackgroundTask), so if the parent died mid-run the record stays
-      // `running` forever and `task_collect` used to return "not finished"
-      // indefinitely — the documented poll loop could never terminate and the
-      // final message was unreachable (#1662 review). Finalize as a FAILED
-      // salvage (fail-closed: a settle we cannot prove is never a success) and
-      // hand back the capture log so partials remain reachable.
+    // Settle-lost: the terminal record was never persisted (the only writer is
+    // the PARENT's fire-and-forget `.then` in startBackgroundTask, so a parent
+    // that died mid-run leaves the record `running` forever). The original gate
+    // was `!view.alive`, but `pidAlive` is a bare existence probe: it cannot
+    // distinguish a live holder from a RECYCLED pid (docs/ops/fleet-liveness.md
+    // §6). A dead child whose pid was reused therefore reads `alive` forever and
+    // `task_collect` never terminates. Pair the probe with the same age backstop
+    // `task_status` already applies: a live lane with heartbeats enabled writes
+    // a marker every tick, so a log that has gone stale past the heartbeat
+    // freshness window is a lane that is not progressing (`wedged`) — treat it
+    // as settle-lost too. Finalize as a FAILED salvage (fail-closed: a settle we
+    // cannot prove is never a success) and hand back the capture log so partials
+    // remain reachable (#1662 review).
+    const staleSettle =
+      view.log_write_age_ms !== null &&
+      view.log_write_age_ms > getHeartbeatFreshWindowMs();
+    if (!view.alive || staleSettle) {
+      const why = view.alive
+        ? "no heartbeat/log activity past the freshness window and no terminal record was persisted"
+        : "process is gone and no terminal record was persisted (parent exited mid-run?)";
       return {
         run_id: rec.run_id,
         status: "failed",
@@ -4683,7 +4701,7 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
         content: rec.final_content ?? null,
         details: rec.final_details ?? { salvaged: true, log_path: rec.log_path },
         review_gate: "parent-required",
-        note: `process is gone and no terminal record was persisted (parent exited mid-run?) — finalized as failed; raw capture log: ${rec.log_path}`,
+        note: `${why} — finalized as failed; raw capture log: ${rec.log_path}`,
       };
     }
     return {
@@ -4815,6 +4833,19 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
     status: "running",
   };
   const created = ensureTaskRunsRoot(runsRoot);
+  // #1662 review: bound the durable run tree. Every dispatch leaves a record +
+  // capture log, and nothing pruned them. Best-effort synchronous pass that
+  // evicts the oldest NON-LIVE runs by age OR total bytes, run BEFORE this
+  // dispatch's record is written so the new run is never a candidate. Mirrors
+  // the sibling `pi-task-session-prune.sh` contract; disable with
+  // TASK_RUNS_PRUNE=0. It never throws into the returns-early path.
+  if (created.ok && process.env.TASK_RUNS_PRUNE !== "0") {
+    try {
+      pruneTaskRuns(runsRoot, resolveTaskRunsPruneBounds());
+    } catch (err) {
+      console.error(`[task] task-runs retention sweep failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
   let recordPersisted = false;
   if (created.ok) {
     const w = writeRunRecord(runsRoot, baseRecord);
@@ -5878,12 +5909,12 @@ export default function (pi: ExtensionAPI) {
     name: "task_status",
     label: "Task Status (background run)",
     description:
-      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which salvages it fail-closed. Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal, then RUN THE REVIEW GATE (a parent step, #825).",
+      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which salvages it fail-closed. Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal or `gone`, then RUN THE REVIEW GATE (a parent step, #825).",
     promptSnippet: "Check the liveness of a background task run",
     promptGuidelines: [
       "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect, do NOT read it as success.",
       "Liveness comes from the child's [task-heartbeat] markers and a pid probe — never from %CPU. A lane blocked in a long tool call reads 0 % CPU but is still alive.",
-      "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status, then run the review ceremony (a PARENT step, #825).",
+      "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status OR `gone` (process gone, terminal record not persisted — collect it directly, fail-closed), then run the review ceremony (a PARENT step, #825).",
     ],
     parameters: Type.Object({
       run_id: Type.String({ description: "The run_id returned by task({ background: true })." }),
@@ -5921,7 +5952,7 @@ export default function (pi: ExtensionAPI) {
       "Collect the final message + exit status of a finished background `task({ background: true })` run. Non-blocking: returns a not-finished notice while the lane is still running. After it returns a terminal result you MUST run the review ceremony for the lane — the review gate is a parent step (sub-agents run with AGENT_SKIP_REVIEW_GATE=1, #825).",
     promptSnippet: "Collect the result of a finished background task run",
     promptGuidelines: [
-      "Use task_collect({ run_id }) to reap a background lane once task_status reports a terminal status. It returns the same final message + exit status a blocking task call would have.",
+      "Use task_collect({ run_id }) to reap a background lane once task_status reports a terminal status or `gone`. It returns the same final message + exit status a blocking task call would have; a lane wedged on a stale log is also salvaged fail-closed rather than polled forever.",
       "task_collect never blocks: while the lane is running it returns a not-finished notice — poll task_status instead of blocking.",
       "⚠️ THE REVIEW GATE IS A PARENT STEP (#825): after collecting a terminal result, run the review ceremony for the lane BEFORE treating it as complete. Sub-agents cannot self-review.",
     ],

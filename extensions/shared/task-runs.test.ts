@@ -12,11 +12,16 @@
 
 import {
   DEFAULT_TASK_RUNS_ROOT,
+  DEFAULT_TASK_RUNS_LOG_MAX_BYTES,
+  createBoundedLogWriter,
   ensureTaskRunsRoot,
   logMtimeMs,
   mintRunId,
   pidAlive,
+  pruneTaskRuns,
   readRunRecord,
+  resolveTaskRunsLogMaxBytes,
+  resolveTaskRunsPruneBounds,
   resolveTaskRunsRoot,
   runLogPath,
   runRecordPath,
@@ -25,7 +30,7 @@ import {
   type TaskRunRecord,
 } from "./task-runs.js";
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -177,6 +182,151 @@ test("logMtimeMs: a number when present, null when missing", () => {
   equal(logMtimeMs(log), null, "missing log");
   writeFileSync(log, "hello", "utf-8");
   ok(typeof logMtimeMs(log) === "number" && (logMtimeMs(log) as number) > 0, "existing log has an mtime");
+});
+
+section("bounded capture log (#1662 review)");
+
+test("createBoundedLogWriter: caps the file while keeping the mtime fresh", () => {
+  const dir = tmpDir("tee");
+  const log = runLogPath(dir, "tee");
+  const w = createBoundedLogWriter(log, 1000);
+  ok(w !== null, "writer opens");
+  if (!w) return;
+  const before = logMtimeMs(log);
+  for (let i = 0; i < 10; i++) w.write("x".repeat(400));
+  ok(statSync(log).size <= 1000, `file stays within the cap (got ${statSync(log).size})`);
+  equal(w.truncated(), true, "overflow was recorded");
+  ok(readFileSync(log, "utf-8").length > 0, "recent output survives the truncation");
+  const after = logMtimeMs(log);
+  ok(after !== null && before !== null && after >= before, "the log mtime stays fresh (liveness clock)");
+  w.close();
+  w.close(); // idempotent
+});
+
+test("createBoundedLogWriter: a single oversized chunk keeps only its tail", () => {
+  const dir = tmpDir("tee-oversize");
+  const log = runLogPath(dir, "oversize");
+  const w = createBoundedLogWriter(log, 1000);
+  ok(w !== null, "writer opens");
+  if (!w) return;
+  w.write("y".repeat(5000));
+  ok(statSync(log).size <= 1000, `oversized write is capped (got ${statSync(log).size})`);
+  const body = readFileSync(log, "utf-8");
+  equal(body.length, 1000, "the tail of the chunk survives, not nothing");
+  w.close();
+});
+
+test("createBoundedLogWriter: an unopenable path returns null and never throws", () => {
+  const dir = tmpDir("tee-fail");
+  equal(createBoundedLogWriter(join(dir, "missing", "run.log"), 100), null, "null when it cannot open");
+});
+
+test("resolveTaskRunsLogMaxBytes: default + env override + invalid fallback", () => {
+  equal(resolveTaskRunsLogMaxBytes({}), DEFAULT_TASK_RUNS_LOG_MAX_BYTES, "default cap");
+  equal(resolveTaskRunsLogMaxBytes({ TASK_RUNS_LOG_MAX_BYTES: "2048" }), 2048, "env override");
+  equal(resolveTaskRunsLogMaxBytes({ TASK_RUNS_LOG_MAX_BYTES: "bad" }), DEFAULT_TASK_RUNS_LOG_MAX_BYTES, "invalid falls back");
+  equal(resolveTaskRunsLogMaxBytes({ TASK_RUNS_LOG_MAX_BYTES: "-1" }), DEFAULT_TASK_RUNS_LOG_MAX_BYTES, "non-positive falls back");
+});
+
+section("retention sweep (#1662 review)");
+
+const DAY = 24 * 60 * 60 * 1000;
+
+/** Seed a run record + log and backdate BOTH mtimes by ageMs. */
+function seedRun(
+  dir: string,
+  opts: { status?: TaskRunRecord["status"]; pid?: number | null; ageMs?: number; logBytes?: number } = {},
+): { id: string; logPath: string; recPath: string } {
+  const id = mintRunId();
+  const logPath = runLogPath(dir, id);
+  writeFileSync(logPath, "L".repeat(opts.logBytes ?? 10), "utf-8");
+  const rec = record({
+    run_id: id,
+    pid: opts.pid === undefined ? 999_999_999 : opts.pid,
+    pgid: null,
+    log_path: logPath,
+    status: opts.status ?? "done",
+  });
+  const recPath = runRecordPath(dir, id);
+  writeRunRecord(dir, rec);
+  if (opts.ageMs) {
+    const t = new Date(Date.now() - opts.ageMs);
+    utimesSync(logPath, t, t);
+    utimesSync(recPath, t, t);
+  }
+  return { id, logPath, recPath };
+}
+
+test("pruneTaskRuns: age-expired non-live runs are evicted (record + log); young ones survive", () => {
+  const dir = tmpDir("prune-age");
+  const old = seedRun(dir, { ageMs: 9 * DAY });
+  const young = seedRun(dir, { ageMs: 1000 });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now() });
+  equal(r.pruned, 1, "exactly the age-expired run");
+  equal(existsSync(old.logPath), false, "old capture log removed");
+  equal(existsSync(old.recPath), false, "old record removed");
+  equal(existsSync(young.logPath), true, "young log survives");
+  equal(existsSync(young.recPath), true, "young record survives");
+  ok(r.freedBytes > 0, "freed bytes reported");
+});
+
+test("pruneTaskRuns: a LIVE running run is never evicted, even when ancient", () => {
+  const dir = tmpDir("prune-live");
+  const live = seedRun(dir, { status: "running", pid: process.pid, ageMs: 99 * DAY });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 1, maxBytes: 1, now: Date.now() });
+  equal(r.pruned, 0, "live run kept");
+  equal(r.keptLive, 1, "counted live");
+  equal(existsSync(live.recPath), true, "live record survives");
+  equal(existsSync(live.logPath), true, "live log survives");
+});
+
+test("pruneTaskRuns: a dead-pid running run is kept only while its log is fresh (settle grace)", () => {
+  const dir = tmpDir("prune-settle");
+  const fresh = seedRun(dir, { status: "running", pid: 999_999_999, ageMs: 0 });
+  const stale = seedRun(dir, { status: "running", pid: 999_999_999, ageMs: 30 * 60_000 });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 1, maxBytes: 1_000_000_000, now: Date.now() });
+  equal(existsSync(fresh.recPath), true, "settle-pending (fresh log) run survives the grace");
+  equal(existsSync(stale.recPath), false, "stale settle-lost run is evictable and pruned");
+  equal(r.pruned, 1, "only the stale run");
+});
+
+test("pruneTaskRuns: the byte cap evicts oldest non-live first; live bytes count but are never evicted", () => {
+  const dir = tmpDir("prune-size");
+  const a = seedRun(dir, { ageMs: 3000, logBytes: 600 });
+  const b = seedRun(dir, { ageMs: 2000, logBytes: 600 });
+  const live = seedRun(dir, { status: "running", pid: process.pid, ageMs: 10, logBytes: 600 });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 365 * DAY, maxBytes: 1000, now: Date.now() });
+  equal(r.pruned, 2, "both non-live runs evicted to get under the cap");
+  equal(existsSync(a.recPath), false, "oldest evicted first");
+  equal(existsSync(b.recPath), false, "next-oldest evicted");
+  equal(existsSync(live.recPath), true, "live run's bytes counted but never evicted");
+  ok(r.freedBytes > 0, "freed bytes reported");
+});
+
+test("pruneTaskRuns: a symlinked run file is never followed or deleted", () => {
+  const dir = tmpDir("prune-symlink");
+  const outside = join(dir, "outside.txt");
+  writeFileSync(outside, "PRECIOUS", "utf-8");
+  symlinkSync(outside, join(dir, `${mintRunId()}.json`));
+  const r = pruneTaskRuns(dir, { maxAgeMs: 1, maxBytes: 1, now: Date.now() });
+  equal(existsSync(outside), true, "symlink target untouched");
+  equal(readFileSync(outside, "utf-8"), "PRECIOUS", "target unmodified");
+  equal(r.pruned, 0, "a symlink is not a run");
+});
+
+test("pruneTaskRuns: an absent root is a clean no-op", () => {
+  const r = pruneTaskRuns(join(tmpDir("prune-absent"), "nope"), { maxAgeMs: 1, maxBytes: 1 });
+  deepEqual(r, { examined: 0, pruned: 0, freedBytes: 0, keptLive: 0, errors: [] });
+});
+
+test("resolveTaskRunsPruneBounds: 7-day/2-GiB defaults + env overrides + invalid fallback", () => {
+  const d = resolveTaskRunsPruneBounds({});
+  equal(d.maxBytes, 2 * 1024 * 1024 * 1024, "2 GiB default");
+  equal(d.maxAgeMs, 7 * DAY, "7 day default");
+  const o = resolveTaskRunsPruneBounds({ TASK_RUNS_MAX_AGE_DAYS: "1", TASK_RUNS_MAX_BYTES: "1024" });
+  equal(o.maxAgeMs, DAY, "1 day override");
+  equal(o.maxBytes, 1024, "byte override");
+  equal(resolveTaskRunsPruneBounds({ TASK_RUNS_MAX_BYTES: "bad" }).maxBytes, 2 * 1024 * 1024 * 1024, "invalid falls back");
 });
 
 // ── Results ─────────────────────────────────────────────

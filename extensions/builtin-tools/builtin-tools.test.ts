@@ -7865,6 +7865,34 @@ test("#1662: a running record whose process is gone is FINALIZED by collect (no 
   }
 });
 
+test("#1662: a recycled pid does not strand collect — a stale LIVE record is still salvaged", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-recycled-pid-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // `pidAlive` is a bare existence probe: a dead child's RECYCLED pid reads
+      // alive, so gating the settle-lost salvage on `!view.alive` alone let
+      // task_collect return "not finished" forever (the parent that would have
+      // persisted the terminal record is gone). `seedRunningRun` defaults pid to
+      // process.pid (guaranteed alive) with a 2h-stale log — the recycled-pid
+      // shape. The age backstop task_status already applies must also terminate
+      // the collect loop, fail-closed (#1662 review).
+      const { id } = seedRunningRun(dir, { logAgeMs: 7_200_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.alive, true, "the probed pid is alive (recycled or wedged)");
+      equal(v.status, "wedged", "the stale log already reads wedged");
+      const got = collectTaskRun(id, dir);
+      equal(got.terminal, true, "collect terminates instead of looping forever on a recycled pid");
+      equal(got.status, "failed", "a settle that cannot be proven is fail-closed, never success");
+      equal(got.reason, "settle-lost", "the lost-settle reason is named");
+      ok(String(got.note).includes("freshness window"), `stale-live salvage note: ${got.note}`);
+      equal((got.details as any)?.log_path, runLogPath(dir, id), "the capture log is handed back for partials");
+      equal(got.review_gate, "parent-required", "review obligation still rides on the salvage");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#1662: a done lane with no recorded exit code is NOT rendered as signal death", () => {
   const done: any = { run_id: "r1", status: "done", terminal: true, exit_code: null, review_gate: "parent-required" };
   const head = formatCollectedRunHead(done);
@@ -7969,6 +7997,48 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
     if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
     if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: the retention sweep runs on dispatch — an age-expired run is pruned before the new one", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-prune-"));
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedMaxAge = process.env.TASK_RUNS_MAX_AGE_DAYS;
+  try {
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_RUNS_MAX_AGE_DAYS = "7";
+    // An old terminal run (record + capture log), nine days back.
+    const oldId = mintRunId();
+    const oldLog = runLogPath(dir, oldId);
+    writeFileSync(oldLog, "old", "utf-8");
+    writeRunRecord(dir, {
+      run_id: oldId, pid: 999_999_999, pgid: null, log_path: oldLog, started_at: 1,
+      model: "m", provider: "p", cwd: dir, nonce: null, status: "done",
+    } as any);
+    const back = new Date(Date.now() - 9 * 24 * 3600 * 1000);
+    utimesSync(oldLog, back, back);
+    utimesSync(join(dir, `${oldId}.json`), back, back);
+
+    // An unspawnable target refuses synchronously. The sweep runs BEFORE the new
+    // record is written, so this proves the dispatch-path wiring without a child.
+    const notADir = join(dir, "not-a-dir");
+    writeFileSync(notADir, "x");
+    startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: dir,
+      nonce: null,
+    });
+    equal(existsSync(join(dir, `${oldId}.json`)), false, "the age-expired record was pruned on dispatch");
+    equal(existsSync(oldLog), false, "the age-expired capture log was pruned on dispatch");
+  } finally {
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedMaxAge === undefined) delete process.env.TASK_RUNS_MAX_AGE_DAYS; else process.env.TASK_RUNS_MAX_AGE_DAYS = savedMaxAge;
     rmSync(dir, { recursive: true, force: true });
   }
 });

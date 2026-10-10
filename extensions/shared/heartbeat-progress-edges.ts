@@ -963,6 +963,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
       "live e2e harness socket-close delay in a load-balancer test script, not a session-liveness bound",
     owner: "#1068",
   },
+  {
+    symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",
+    rationale:
+      "durable task-run RECORD retention age (7 days) in shared/task-runs.ts — a disk-retention backstop for the run-record/log tree, not a session or child liveness bound (the byte cap binds first in practice); paired with the live-pid / settle-grace guard so it never evicts an in-flight lane",
+    owner: "#1662",
+  },
 ];
 
 // ── scan specification ──────────────────────────────────────────────────────
