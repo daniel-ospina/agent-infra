@@ -474,20 +474,27 @@ FILES_WITH_HITS="$(printf '%s\n' "$HITS" | sed '/^$/d' | cut -d: -f1 | LC_ALL=C 
 if [ -n "$FILES_WITH_HITS" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    actual="$(printf '%s\n' "$HITS" | sed '/^$/d' | grep -c "^$(printf '%s' "$f" | sed 's/[.[\*^$]/\\&/g'):")" || actual_rc=$?
-    # `grep -c` legitimately exits 1 for a ZERO count, so only >1 is an ERROR. Absorbed as a
-    # boolean, an error left `actual` EMPTY — and an empty operand makes the count comparison
-    # below fail silently (the shell prints `integer expression expected`, the `if` is false), so
-    # the COUNT check was skipped entirely and control fell through to the CONTENT-HASH check.
-    # A declaration whose count contradicts its own hash then passed as a warning, and the guard
-    # exited 0 — the exact contract ("a declaration whose COUNT or CONTENT-HASH does not match
-    # the file FAILS") this check exists to keep.
-    if [ "${actual_rc:-0}" -gt 1 ]; then
-      echo "check-no-sigpipe-grep: could not count the occurrences in $f — refusing a verdict" >&2
+    actual="$(printf '%s\n' "$HITS" | sed '/^$/d' | grep -c "^$(printf '%s' "$f" | sed 's/[.[\*^$]/\\&/g'):")"
+    # VALIDATE THE VALUE, not the exit code. `grep -c` exits 0 (count printed), 1 (zero AND
+    # `grep`'s ordinary no-match, which for -c still prints `0`), or >1 (an ERROR). Gate on the
+    # status alone and the hole just moves: a shim printing nothing exiting 1 leaves `actual`
+    # EMPTY, and an empty operand makes the comparison below fail SILENTLY (`integer expression
+    # expected`, the `if` is false), so the COUNT check is skipped and control falls through to
+    # the CONTENT-HASH check — a declaration whose count contradicts its own hash then passes as
+    # a warning and the guard exits 0, against its own contract. A count is a non-negative
+    # integer or it is nothing; anything else refuses here.
+    case "$actual" in
+      ''|*[!0-9]*)
+        echo "check-no-sigpipe-grep: could not count the occurrences in $f — refusing a verdict" >&2
+        exit 2 ;;
+    esac
+    # Same reasoning for the fingerprint: an empty pipeline yields the hash of EMPTY INPUT
+    # (`e3b0c44298fc1c14…`), which is a well-FORMED value, so no shape check can catch it — a
+    # declaration carrying it would be accepted and defeat the count-preserving-swap guarantee.
+    if ! hash="$(fingerprint "$f")" || [ -z "$hash" ]; then
+      echo "check-no-sigpipe-grep: could not fingerprint $f — refusing a verdict" >&2
       exit 2
     fi
-    actual_rc=0
-    hash="$(fingerprint "$f")"
     line="$(grep -E "^$(printf '%s' "$f" | sed 's/[].[\*^$/]/\\&/g')[[:space:]]" "$ROOT/$EXC_FILE" 2>/dev/null | head -1)"
     if [ -z "$line" ]; then
       fails+="  $f — $actual occurrence(s), undeclared"$'\n'

@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (72 on BSD/macOS, 74 on GNU findutils — the platform CI runs).
+#      platform-dependent (74 on BSD/macOS, 76 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -933,6 +933,29 @@ chmod +x "$E/fakebin/grep"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc_real" -eq 1 ] && [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING occurrence count refuses a verdict (exit 2)" \
              || fail "a failing occurrence count skipped the count check (real $rc_real, stub $rc)"
+# ...and the SAME hole opens one exit code over, which is why the guard validates the VALUE and
+# not the status: a shim printing nothing and exiting 1 leaves `actual` empty exactly as exit 3
+# did. `grep -c` legitimately exits 1 for a ZERO count, so a status gate cannot separate them.
+printf '%s\n' '#!/bin/sh' 'case "$1" in -c) exit 1 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SILENT count (exit 1, no output) refuses too (exit 2)" \
+             || fail "a silent count was read as zero and skipped the check (exit $rc)"
+
+# 11at. ...and the CONTENT fingerprint is the last input to that comparison, with a failure mode a
+# shape check CANNOT catch: a failing fingerprint pipeline yields the hash of EMPTY INPUT
+# (`e3b0c44298fc1c14…`), which is a perfectly well-formed 16 hex chars. A declaration carrying it
+# would therefore be ACCEPTED, defeating the guarantee that a count-preserving swap does not
+# inherit an exception. The stub fails only on the pattern-FIRST invocation (the fingerprint),
+# leaving the flag-first lookups working.
+E="$TMP/f11at"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 e3b0c44298fc1c14 #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -*) exec /usr/bin/grep "$@" ;; esac' 'exit 3' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING fingerprint refuses a verdict (exit 2)" \
+             || fail "the hash of empty input was accepted as a declaration (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
