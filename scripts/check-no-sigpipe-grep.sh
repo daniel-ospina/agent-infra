@@ -258,6 +258,14 @@ is_shell_file() {
     printf 'check-no-sigpipe-grep: cannot read %s\n' "$1" >>"$FIND_ERRS"
     return 1
   }
+  # A NON-EMPTY FILE CANNOT YIELD AN EMPTY READ. A reader that consumes nothing, prints nothing and
+  # exits 0 is invisible to the status check above, and the empty chunk names no interpreter — so an
+  # EXTENSIONLESS shell file is dropped from the scan set and the guard reports clean over it. That
+  # is the tortoise#7588 shape, and this arm exists precisely to claim extensionless files.
+  if [ -s "$1" ] && [ -z "$chunk" ]; then
+    printf 'check-no-sigpipe-grep: the shebang reader returned nothing for the non-empty file %s\n' "$1" >>"$FIND_ERRS"
+    return 1
+  fi
   first="${chunk%%$'\n'*}"
   case "$first" in
     '#!'*/sh|'#!'*/sh[[:space:]]*|'#!'*/bash|'#!'*/bash[[:space:]]*|\
@@ -304,6 +312,15 @@ scan_files() {
   # diagnostic, so it lists nothing and the guard reports a clean run over a tree it never
   # enumerated. Hence both arms report FIND's own status (PIPESTATUS[0], read immediately after
   # the pipeline) rather than the loop's, which is only its last iteration's.
+  # A SILENTLY SUCCEEDING enumerator (consumes nothing, prints nothing, exits 0) lists an empty
+  # tree and no status check can see it — the same family as the swallowing classifier, and the
+  # result is `✅ … scanned 0 file(s)` over files that are sitting right there. `find -L <path>
+  # -maxdepth 0` ALWAYS prints the path itself, so an empty result from that probe proves the tool
+  # is not reporting what it sees; refuse rather than scan a tree we were told is empty.
+  if [ -z "$(LC_ALL=C find -L "$target" -maxdepth 0 2>/dev/null)" ]; then
+    printf 'check-no-sigpipe-grep: the enumerator reported nothing for %s, which exists\n' "$target" >>"$FIND_ERRS"
+    return 1
+  fi
   case "${dir##*/}" in
     .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
               [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"

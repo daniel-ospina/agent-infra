@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (76 on BSD/macOS, 78 on GNU findutils — the platform CI runs).
+#      platform-dependent (78 on BSD/macOS, 80 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -980,6 +980,30 @@ chmod +x "$E/fakebin/cut"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING classifier refuses a verdict (exit 2)" \
              || fail "unclassified hits were reported clean (exit $rc)"
+
+# 11av. a SWALLOWING shebang reader (exit 0, no output) is invisible to the status check and leaves
+# `chunk` empty, so an EXTENSIONLESS shell file is dropped from the scan set — the tortoise#7588
+# shape, in the arm that exists to claim exactly those files. The invariant is exact and needs no
+# external: a non-empty file cannot yield an empty read.
+E="$TMP/f11av"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/check-migration-drift"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/clean.sh"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/head"
+chmod +x "$E/fakebin/head"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING shebang reader refuses a verdict (exit 2)" \
+             || fail "a silent reader dropped an extensionless shell file (exit $rc)"
+
+# 11aw. ...and a SWALLOWING enumerator (exit 0, no output) lists an empty tree, so the guard reports
+# `scanned 0 file(s)` and exits 0 over files that are there. Pinned because the existing enumerator
+# pin (11aq) covers only a NON-ZERO exit, which is a different member of the family.
+E="$TMP/f11aw"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING enumerator refuses a verdict (exit 2)" \
+             || fail "a silently empty tree was reported clean (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
