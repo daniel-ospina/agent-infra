@@ -461,17 +461,20 @@ rc="$(guard_rc "$E")"
 E="$TMP/f11h"; mkdir -p "$E/.github/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.github/scripts/deploy"
 rc="$(bash "$GUARD" --root "$E" --dirs '' >"$OUT" 2>&1; echo $?)"
-[ "$rc" -eq 2 ] && pass "--dirs '' → exit 2 (never a silent fall back to the default set)" \
+[ "$rc" -eq 2 ] && grep -q 'the scan set is empty' "$OUT" && pass "--dirs '' → exit 2 (never a silent fall back to the default set)" \
              || fail "--dirs '' fell back to the default set (exit $rc)"
 
 # 11i. a whitespace-only set resolves to a ZERO-ELEMENT array: a usage error, not a zero-file
 # scan reported as clean (and not a `set -u` crash on bash 3.2). On 3.2 the empty array also trips
 # `set -u` in the enumeration subshell, so the refusal has two independent sources there; this pin
-# asserts the refusal itself, not which of the two produced it.
+# asserts the refusal itself, not which of the two produced it. The message is asserted because on
+# this platform the `set -u` crash refuses the same case: without it the pin stays green if the
+# check is deleted, so it would not be covering what it is named for (measured: deleting the check
+# leaves the suite green on bash 3.2 and fails on bash 5).
 E="$TMP/f11i"; mkdir -p "$E/scripts"; printf 'echo hi\n' > "$E/scripts/a.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs '   ' >"$OUT" 2>&1; echo $?)"
-[ "$rc" -eq 2 ] && pass "a whitespace-only scan set → exit 2" \
-             || fail "a whitespace-only scan set was not rejected (exit $rc)"
+[ "$rc" -eq 2 ] && grep -q 'the scan set is empty' "$OUT" && pass "a whitespace-only scan set → exit 2" \
+             || fail "a whitespace-only scan set was not rejected as empty (exit $rc)"
 
 # 11j. an EXPLICIT set names dirs the caller believes exist: a typo must fail, not scan nothing
 E="$TMP/f11j"; mkdir -p "$E/.github/scripts"
@@ -533,7 +536,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'echo clean' > "$E/shared/scripts/ok.sh"
 ln -s ../shared/scripts "$E/scripts"
 rc_empty="$(SIGPIPE_SCAN_DIRS='' bash "$GUARD" --root "$E" >"$OUT" 2>&1; echo $?)"
 rc_ws="$(SIGPIPE_SCAN_DIRS='   ' bash "$GUARD" --root "$E" >"$OUT" 2>&1; echo $?)"
-if [ "$rc_empty" -eq 2 ] && [ "$rc_ws" -eq 2 ]; then
+if [ "$rc_empty" -eq 2 ] && [ "$rc_ws" -eq 2 ] && grep -q 'the scan set is empty' "$OUT"; then
   pass "an EMPTY SIGPIPE_SCAN_DIRS is a usage error, not a fall back (empty $rc_empty, ws $rc_ws)"
 else
   fail "an empty SIGPIPE_SCAN_DIRS fell back to the default set (empty $rc_empty, ws $rc_ws)"
