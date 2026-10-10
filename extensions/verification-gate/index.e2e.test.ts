@@ -5115,6 +5115,74 @@ async function main() {
     git(repo, "commit -m untrack-vendored");
   });
 
+  // ── #1660: the [VGATE] remedy loop must CONVERGE across worktrees ──
+  // The incident: a PASS verifier dispatch, using the exact prompt the block
+  // printed, did not clear the block. Root cause pinned here: the merge path
+  // resolved its blocked-file context from the mutable single-slot
+  // lastBlockedCwd/lastBlockedFiles. A later block in ANOTHER worktree
+  // overwrote the slot, so the dispatch named root A but the merge treated it
+  // as foreign, discarded A's blocked files, and fell back to the CURRENT
+  // STAGED diff — EMPTY for a committed branch (`gh pr create`). The PASS
+  // recorded zero files, wrote no bridge, and the retry re-blocked identically.
+  test("scenario 1660: a [VGATE] PASS dispatched for worktree A still converges after worktree B also blocked (per-root bookkeeping)", async () => {
+    const hub = join(TEST_ROOT, "repo-1660-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base.txt"), "b\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m base");
+    const baseSha = git(hub, "rev-parse HEAD");
+    git(hub, "remote add origin git@github.com:e2e/self.git");
+    // Two linked worktrees, each carrying the SAME repo-relative path so a
+    // root mismatch is demonstrable (a record for root A can exist for the
+    // very path root B blocks on).
+    const wtA = join(hub, ".worktrees", "wt-a");
+    const wtB = join(hub, ".worktrees", "wt-b");
+    git(hub, `worktree add ${wtA} -b feat-a`);
+    git(hub, `worktree add ${wtB} -b feat-b`);
+    for (const [wt, content] of [[wtA, "a\n"], [wtB, "b\n"]] as const) {
+      git(wt, `update-ref refs/remotes/origin/main ${baseSha}`);
+      mkdirSync(join(wt, "src"), { recursive: true });
+      writeFileSync(join(wt, "src", "shared.ts"), content);
+      git(wt, "add src/shared.ts");
+      git(wt, "commit -m work");
+    }
+    await fire("session_start", {});
+
+    const opA = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtA} && gh pr create --title a`, cwd: wtA } };
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtB} && gh pr create --title b`, cwd: wtB } };
+    const blockA = await fire("tool_call", opA);
+    ok(blockA && blockA.block === true, "1660: worktree A must block first (no verification)");
+    const promptA = blockA.reason.match(/task\(prompt='([\s\S]*?)', \.\.\.\)/)![1];
+    ok(promptA.includes(`Project root: ${realpathSync(wtA)}`), "1660: the printed remedy names worktree A's root");
+    // A SECOND block in worktree B overwrites the single-slot block context.
+    const blockB = await fire("tool_call", opB);
+    ok(blockB && blockB.block === true, "1660: worktree B must block too");
+
+    // The agent now follows the instructions for block A EXACTLY (same prompt).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: promptA },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    ok(existsSync(bridgePath) && readFileSync(bridgePath, "utf8").includes(realpathSync(wtA)),
+      "1660: the PASS must have recorded against worktree A and written the bridge (pre-fix: zero-merge, no bridge)");
+
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined, "1660: the retry on the SAME root must be ALLOWED — pre-fix it re-blocked identically (non-convergence)");
+
+    // Loud diagnosis: with A's record now present, B's block must say the same
+    // path is verified under a DIFFERENT root and name BOTH roots.
+    const bAfter = await fire("tool_call", opB);
+    ok(bAfter && bAfter.block === true, "1660: worktree B is still unverified — it must block");
+    ok(bAfter.reason.includes("ROOT MISMATCH"), "1660: the block must diagnose a root mismatch (not repeat the generic 'not checked')");
+    ok(bAfter.reason.includes(realpathSync(wtA)) && bAfter.reason.includes(realpathSync(wtB)),
+      "1660: the diagnosis must log BOTH roots (recorded + this op)");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

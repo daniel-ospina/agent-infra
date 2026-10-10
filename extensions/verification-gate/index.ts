@@ -77,6 +77,54 @@ export function resolveMergeRoot(blockedCwd: string | null, prompt: string): { r
   return { root: resolveGitRoot(process.cwd()), foreign: false };
 }
 
+// #1660: remember the blocked-file set for the root the blocked op computed.
+// Called at the block site; read via blockedContextFor() at every verifier
+// merge, so the verifier's result is recorded against the same root the retry
+// will compute even when the single-slot stash has since moved on.
+function rememberBlock(root: string, files: string[]): void {
+  blockedFilesByRoot.set(normalizeWorktreeRoot(root), [...files]);
+}
+
+// #1660: the blocked-file set that belongs to `projectRoot` — the live
+// single-slot stash when it matches, else the per-root registry. Empty when
+// this root was never blocked (fail-closed: the caller falls back to diff
+// scoping, exactly as before). Never returns another root's files.
+function blockedContextFor(projectRoot: string): string[] {
+  const norm = normalizeWorktreeRoot(projectRoot);
+  if (lastBlockedCwd !== null && normalizeWorktreeRoot(lastBlockedCwd) === norm) {
+    return lastBlockedFiles;
+  }
+  return blockedFilesByRoot.get(norm) ?? [];
+}
+
+// Every root `verifiedSet` holds a record for under `relPath`, other than
+// `normRoot`. Distinguishes a ROOT MISMATCH (a verifier recorded this path, but
+// for a different tree) from a genuine NO RECORD at block time (#1660) — the
+// difference between "re-dispatch against the right root" and "no verifier ever
+// recorded this path".
+function rootsHoldingPath(normRoot: string, relPath: string): string[] {
+  const out: string[] = [];
+  for (const key of verifiedSet.keys()) {
+    const parsed = parseCompoundKey(key);
+    if (parsed && parsed.path === relPath && parsed.root !== normRoot) out.push(parsed.root);
+  }
+  return out;
+}
+
+// #1660: record the outcome of a verifier PASS merge so the NEXT block can name
+// the mismatch loudly. This is diagnostics only — it never feeds an allow/block
+// decision (parity with #561's ceremony diagnostics).
+function noteVerifierDisposition(projectRoot: string, promptFiles: number, recorded: number, cause: string): void {
+  lastVerifierNote = {
+    root: normalizeWorktreeRoot(projectRoot),
+    blockRoot: lastBlockedCwd === null ? null : normalizeWorktreeRoot(lastBlockedCwd),
+    text:
+      `  ⚠ #1660 verifier disposition: verifier root=${normalizeWorktreeRoot(projectRoot)}, ` +
+      `blocked-op root=${lastBlockedCwd === null ? "<none>" : normalizeWorktreeRoot(lastBlockedCwd)}, ` +
+      `prompt files=${promptFiles}, recorded=${recorded} — ${cause}`,
+  };
+}
+
 // #190: shared diff-scoping pre-filter for verifier PASS merges. When a block
 // context exists, keep only files in the blocked diff (#5673). When the
 // context is empty or foreign (wrong-root rebind), keep only files in the
@@ -184,6 +232,23 @@ let dispatchStreak = 0;
 // a session the agent loop is sequential. If concurrent verifier flows are ever needed, key by toolCallId.
 let lastBlockedCwd: string | null = null;
 let lastBlockedFiles: string[] = [];
+// #1660: per-root block registry — the durable bookkeeping that makes a
+// verifier dispatch land on the SAME root the blocked operation computed. The
+// single-slot stash above is overwritten by the NEXT block, so a verifier whose
+// prompt named root A (after a later block in root B) was classified foreign,
+// its blocked-diff filter was discarded, and `scopeFiles` fell back to the
+// CURRENT staged diff — EMPTY for a committed branch (`gh pr create`). The PASS
+// then recorded zero files, wrote no bridge, and the retry re-blocked with the
+// identical "not checked by verifier sub-agent" line: the remedy loop never
+// converged (#1660). Keying the blocked set by resolved root makes the record
+// land on the blocked op's root regardless of block ordering. Safety is
+// unchanged: a root that never blocked gets no context, so #190's foreign-root
+// guard still holds.
+const blockedFilesByRoot = new Map<string, string[]>();
+// #1660: the last verifier disposition, so a retry block can say WHY nothing
+// was recorded (root mismatch vs no record vs zero-merge) and name BOTH roots,
+// instead of repeating the generic "not checked by verifier sub-agent".
+let lastVerifierNote: { root: string; blockRoot: string | null; text: string } | null = null;
 // #7574: when VGATE allows a git commit, lint-staged (pre-commit hook) may modify files
 // on disk (ESLint --fix). The stored verified hash is pre-lint, but the committed version
 // is post-lint. Re-hash on the next git op to capture the post-lint state.
@@ -3683,6 +3748,8 @@ export default function (pi: ExtensionAPI) {
     vgateFailures = 0;
     lastBlockedCwd = null;
     lastBlockedFiles = [];
+    blockedFilesByRoot.clear(); // #1660: block context is session-scoped (the bridge is the durable channel)
+    lastVerifierNote = null;
     pendingRehash = null;
     pendingRehashFiles = [];
     blockAttempts.clear();
@@ -3720,6 +3787,8 @@ export default function (pi: ExtensionAPI) {
     // D1's stored-hash match-or-drop makes any stale entry inert (fail-closed).
     lastBlockedCwd = null;
     lastBlockedFiles = [];
+    blockedFilesByRoot.clear(); // #1660: never leak block context across sessions
+    lastVerifierNote = null;
     pendingRehash = null;
     pendingRehashFiles = [];
   });
@@ -4216,8 +4285,25 @@ export default function (pi: ExtensionAPI) {
     // #7590: include expected vs actual hash in mismatch diagnostics
     const reasons: string[] = [];
     if (unverified.length > 0) {
-      reasons.push(`  Unverified files (not checked by verifier sub-agent):`);
-      unverified.forEach(f => reasons.push(`    - ${f}`));
+      // #1660: say WHY, per file. A record under a DIFFERENT root is a ROOT
+      // MISMATCH (name both roots) — not an absent verification. Only when no
+      // root holds a record is it genuinely "no verifier ever checked this".
+      // The old generic line ("not checked by verifier sub-agent") repeated even
+      // after a PASS dispatch and made the remedy loop unactionable.
+      reasons.push(`  Unverified files (no verification record for this root):`);
+      for (const f of unverified) {
+        reasons.push(`    - ${f}`);
+        const others = rootsHoldingPath(worktreeRoot, f);
+        if (others.length > 0) {
+          reasons.push(`      ⚠ ROOT MISMATCH — this path is verified, but under a different root:`);
+          others.forEach(r => reasons.push(`        recorded root: ${r}`));
+          reasons.push(`        this op root:  ${worktreeRoot}`);
+          reasons.push(`      → Re-dispatch with "Project root: ${worktreeRoot}".`);
+        } else {
+          reasons.push(`      no record under any root (dispatch a [VGATE] verifier naming this path).`);
+        }
+      }
+      if (lastVerifierNote !== null && lastVerifierNote.root === worktreeRoot) reasons.push(lastVerifierNote.text);
     }
     if (mismatched.length > 0) {
       reasons.push(`  Hash mismatch (file changed since verification):`);
@@ -4267,6 +4353,7 @@ export default function (pi: ExtensionAPI) {
     console.log(`[verification-gate] 🚫 Blocked: ${unverified.length} unverified, ${mismatched.length} mismatched`);
     lastBlockedCwd = cwd; // stash authoritative cwd for the merge path (#5607)
     lastBlockedFiles = [...changedFiles]; // #5673: scope verifier to diff files only
+    rememberBlock(cwd, changedFiles); // #1660: durable per-root context for the merge path
     return { block: true, reason };
   });
 
@@ -4284,6 +4371,7 @@ export default function (pi: ExtensionAPI) {
     const prompt = String(input.prompt ?? input.task ?? "");
     const isVerifier = agent === "verifier" || prompt.includes("[VGATE]");
     if (!isVerifier) return undefined;
+    lastVerifierNote = null; // #1660: the disposition always reflects the LATEST verifier dispatch (a stale zero-merge note must not outlive the dispatch that supersedes it)
 
     // Extract JSON from content
     const content = event.content;
@@ -4374,18 +4462,15 @@ export default function (pi: ExtensionAPI) {
         || /✅.*PASS(?:\b|:|—)/i.test(textContent);
 
       if (hasPass) {
-        // #190: wrong-root guard — a prompt whose explicit `Project root:`
-        // realpath-differs from the stashed block cwd targets a different
-        // worktree; the stale block context must not shadow it (or every
-        // proactive dispatch in worktree B would zero-merge against A's stale
-        // state and recreate the blocked-until-auto-bypass loop).
-        const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
-        // #190 review: expand directory paths against the PRE-clear blocked
-        // list (a foreign dispatch must still resolve dirs from the real block
-        // context), then clear the stale context atomically — lastBlockedCwd
-        // together with lastBlockedFiles, so no half-cleared (old-root + empty
-        // filter) state survives.
-        const blockedSnapshot = [...lastBlockedFiles];
+        // #1660: the prompt's explicit `Project root:` is authoritative; the
+        // per-root registry supplies the blocked-file set for THAT root even
+        // when the single-slot stash has moved on (a later block elsewhere, or
+        // post-block git ops). This is what makes the verifier's PASS land on
+        // the SAME root the retry computes. #190's foreign-root safety is
+        // preserved by construction: a root that never blocked has no context.
+        const { root: projectRoot } = resolveMergeRoot(lastBlockedCwd, prompt);
+        const blockFiles = blockedContextFor(projectRoot);
+        const blockedSnapshot = [...blockFiles];
 
         // Extract file list from the prompt. #190: broadened regex accepts
         // `\n\nClassification:` and no-period separators (incident dispatch #1).
@@ -4406,14 +4491,8 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        if (foreign) {
-          // stale context — do not filter against it (atomic clear)
-          lastBlockedFiles = [];
-          lastBlockedCwd = null;
-        }
-
         // #336: when the prompt names files, merge those (diff-scoped). When it
-        // names none (deviant/foreign prompt, or a verifier dispatched without
+        // names none (deviant prompt, or a verifier dispatched without
         // the literal `verify files:` phrase), fall back to the files the gate
         // is CURRENTLY blocking — the authoritative set — instead of
         // zero-merging. The pre-#336 fallback only fired for standalone verdict
@@ -4425,17 +4504,18 @@ export default function (pi: ExtensionAPI) {
         let mergeFiles: string[];
         if (promptFiles.size > 0) {
           mergeFiles = [...promptFiles];
-        } else if (lastBlockedFiles.length > 0) {
-          mergeFiles = [...lastBlockedFiles];
-          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${lastBlockedFiles.length} blocked files`);
+        } else if (blockFiles.length > 0) {
+          mergeFiles = [...blockFiles];
+          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${blockFiles.length} blocked files`);
         } else {
           mergeFiles = [];
         }
 
         // #190: shared diff-scoping — blocked-context filter (#5673) or, when
-        // the context is empty/foreign, staged-diff scoping (never a blind
-        // pass-through; known registry keys stay mergeable per #38).
-        const { kept: filteredPromptFiles, skipped } = scopeFiles(mergeFiles, projectRoot, lastBlockedFiles, verifiedSet);
+        // the context is empty, staged-diff scoping (never a blind pass-through;
+        // known registry keys stay mergeable per #38). #1660: the blocked
+        // context is keyed to projectRoot, not the mutable single slot.
+        const { kept: filteredPromptFiles, skipped } = scopeFiles(mergeFiles, projectRoot, blockFiles, verifiedSet);
         const merged = hashAndMergeFiles(verifiedSet, blockAttempts, filteredPromptFiles, projectRoot);
         if (merged > 0) {
           console.log(`[verification-gate] ✅ Plain-text PASS — merged ${merged}/${mergeFiles.length} files from prompt${skipped > 0 ? ` (skipped ${skipped} not in diff)` : ''} (${verifiedSet.size} total)`);
@@ -4446,7 +4526,14 @@ export default function (pi: ExtensionAPI) {
           // #190: zero-merge does NOT consume the block context — a retry
           // dispatch still needs lastBlockedCwd/lastBlockedFiles (a malformed
           // first dispatch must not erase the state the retry depends on).
-          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${mergeFiles.length} in scope)`);
+          // #1660: name BOTH roots + why nothing recorded, so the retry block is
+          // diagnosable rather than an identical generic refusal.
+          const cause = blockFiles.length === 0
+            ? "no block context for this root — the prompt's Project root matched no blocked op"
+            : "the prompt's files matched neither the blocked set nor the current diff";
+          console.error(`[verification-gate] ⚠️ Plain-text PASS but could not hash any files (${mergeFiles.length} in scope) — ${cause}`);
+          console.error(`[verification-gate] ⚠️ #1660 zero-merge: verifier root=${projectRoot}, blocked-op root=${lastBlockedCwd ?? "<none>"}, blocked files for root=${blockFiles.length}`);
+          noteVerifierDisposition(projectRoot, promptFiles.size, merged, cause);
           recordDispatchJudgment("zero-merge-pass"); // #561
         }
         return undefined;
@@ -4460,11 +4547,15 @@ export default function (pi: ExtensionAPI) {
       // the plain-text branch (never a blind pass-through).
       const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
       const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
+      // #1660: resolve the root FIRST and expand a named directory against
+      // THIS root's blocked set (not the mutable single slot).
+      const { root: projectRoot } = resolveMergeRoot(lastBlockedCwd, prompt);
+      const blockFiles = blockedContextFor(projectRoot); // #1660: per-root context, not the mutable slot
       const promptFiles = new Set<string>();
       for (const f of rawFiles) {
         const isDir = f.endsWith('/') || !f.includes('.');
-        if (isDir && lastBlockedFiles.length > 0) {
-          for (const blocked of lastBlockedFiles) {
+        if (isDir && blockFiles.length > 0) {
+          for (const blocked of blockFiles) {
             if (blocked.startsWith(f)) promptFiles.add(blocked);
           }
         } else {
@@ -4486,10 +4577,8 @@ export default function (pi: ExtensionAPI) {
           recordDispatchFailure("fail-open-refused"); // #561: dispatch-format class — moves the streak (latch divergence: vgateFailures does NOT count this class; the streak is messaging-only)
           return undefined;
         }
-        const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
-        if (foreign) lastBlockedFiles = [];
         const normRoot = normalizeWorktreeRoot(projectRoot);
-        const { kept: scopedFiles } = scopeFiles([...promptFiles], projectRoot, lastBlockedFiles, verifiedSet);
+        const { kept: scopedFiles } = scopeFiles([...promptFiles], projectRoot, blockFiles, verifiedSet);
         let merged = 0;
         for (const file of scopedFiles) {
           try {
@@ -4549,10 +4638,12 @@ export default function (pi: ExtensionAPI) {
 
     // #5673/#7595: merge verifier files into the registry. Keys are normalized
     // to repo-relative; known paths always update (re-verification is authoritative).
-    // #190: wrong-root guard + shared diff-scoping — empty/foreign context scopes
-    // against the current staged diff, never a blind pass-through.
-    const { root: projectRoot, foreign } = resolveMergeRoot(lastBlockedCwd, prompt);
-    if (foreign) lastBlockedFiles = []; // stale block context — do not filter against it
+    // #190/#1660: diff-scoping — the blocked-file set is resolved PER ROOT, so a
+    // verifier PASS for root A records against root A even when a later block
+    // moved the single-slot stash to root B. An empty context scopes against the
+    // current staged diff, never a blind pass-through.
+    const { root: projectRoot } = resolveMergeRoot(lastBlockedCwd, prompt);
+    const blockFiles = blockedContextFor(projectRoot);
 
     // #336: a schema-valid PASS with EMPTY verified_files carries no
     // verifier-supplied hashes — the pre-#336 code zero-merged here (records
@@ -4560,10 +4651,9 @@ export default function (pi: ExtensionAPI) {
     // Fall back to the files the gate is CURRENTLY blocking: hash them at
     // merge time (current disk state) so a post-PASS edit still re-blocks
     // (fail-closed), and diff-scope them so a hash-less PASS can never mark
-    // arbitrary files verified. A foreign (wrong-root) block context is
-    // already cleared above → lastBlockedFiles is empty → zero-merge.
+    // arbitrary files verified. A root with no block context → zero-merge.
     if (result.verified_files.length === 0) {
-      const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, lastBlockedFiles, projectRoot);
+      const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, blockFiles, projectRoot);
       if (fallbackMerged > 0) {
         vgateFailures = 0;
         recordDispatchSuccess(); // #561
@@ -4573,7 +4663,10 @@ export default function (pi: ExtensionAPI) {
       } else {
         // #190: zero-merge does NOT consume the block context — a retry
         // dispatch still needs lastBlockedCwd/lastBlockedFiles.
-        console.error(`[verification-gate] ⚠️ PASS with empty verified_files and no block context — zero-merge, failure streak NOT reset (#132)`);
+        // #1660: name both roots + why nothing recorded.
+        console.error(`[verification-gate] ⚠️ PASS with empty verified_files and no block context for root ${projectRoot} — zero-merge, failure streak NOT reset (#132)`);
+        console.error(`[verification-gate] ⚠️ #1660 zero-merge: verifier root=${projectRoot}, blocked-op root=${lastBlockedCwd ?? "<none>"}, blocked files for root=${blockFiles.length}`);
+        noteVerifierDisposition(projectRoot, 0, fallbackMerged, "PASS carried no verified_files and this root has no blocked-file context");
         recordDispatchJudgment("zero-merge-pass"); // #561
       }
       return undefined;
@@ -4582,11 +4675,11 @@ export default function (pi: ExtensionAPI) {
     const { kept: scopedVerifiedFiles, skipped: scopeSkipped } = scopeFiles(
       result.verified_files.map(vf => vf.path),
       projectRoot,
-      lastBlockedFiles,
+      blockFiles,
       verifiedSet
     );
     const scopedResults = result.verified_files.filter(vf => scopedVerifiedFiles.includes(vf.path));
-    const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, scopedResults, projectRoot, lastBlockedFiles);
+    const { merged, skipped } = mergeVerifiedFiles(verifiedSet, blockAttempts, scopedResults, projectRoot, blockFiles);
     const totalSkipped = skipped + scopeSkipped;
 
     // #132 A.5: only a merge proves dispatch health. A zero-merge PASS (all files
@@ -4605,7 +4698,13 @@ export default function (pi: ExtensionAPI) {
     } else {
       // #190: zero-merge does NOT consume the block context — a retry dispatch
       // still needs lastBlockedCwd/lastBlockedFiles.
+      // #1660: name BOTH roots + why nothing recorded.
       console.error(`[verification-gate] ⚠️ PASS but merged 0 files${totalSkipped > 0 ? ` (${totalSkipped} skipped as not in diff)` : ' (empty verified_files)'} — failure streak NOT reset (#132)`);
+      console.error(`[verification-gate] ⚠️ #1660 zero-merge: verifier root=${projectRoot}, blocked-op root=${lastBlockedCwd ?? "<none>"}, blocked files for root=${blockFiles.length}`);
+      noteVerifierDisposition(projectRoot, result.verified_files.length, merged,
+        totalSkipped > 0
+          ? `the verifier's file list matched neither the blocked set for ${projectRoot} nor its current diff`
+          : `the verifier's PASS carried no usable files`);
       recordDispatchJudgment("zero-merge-pass"); // #561
     }
     return undefined;
