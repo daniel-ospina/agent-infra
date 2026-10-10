@@ -52,12 +52,15 @@
 #      is reachable without it, so the file is still read. Only findutils' own cycle report is
 #      exempt: the ELOOP wording means a path did not resolve at all (a chain, reachable no
 #      other way) and stays fatal (11af); a tree holding BOTH a cycle and an unreadable dir is
-#      still exit 2 (11ab). The cycle pin has teeth on GNU find (CI); BSD find emits no cycle
-#      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
-#      to pin BOTH the exemption and the ANCHOR of its match on every platform. TWO pins are
-#      platform-gated, so the assertion count depends on it: 11af runs only where find reports an
-#      unresolvable chain, and 11ah only where /dev/full exists — both GNU/Linux, so the suite
-#      reports (81 on BSD/macOS, 83 on GNU findutils — the platform CI runs).
+#      still exit 2 (11ab). NO pin distinguishes this on a real `find` alone: BSD find emits no
+#      cycle diagnostic at all, and GNU findutils reports it but ALSO exits 1 while listing every
+#      file — so a raw-status refusal turned that into a false block (it reddened `sigpipe-grep` on
+#      CI). 11ai therefore stubs `find` to pin all three halves on every platform: the exemption
+#      (a), the enumerator's status being judged AFTER the exemption so GNU's exit 1 is not a false
+#      block (a2), and the ANCHOR of the match (b). TWO pins are platform-gated, so the assertion
+#      count depends on it: 11af runs only where find reports an unresolvable chain, and 11ah only
+#      where /dev/full exists — both GNU/Linux — so the suite reports 82 on BSD/macOS and 84 on
+#      GNU findutils, the platform CI runs.
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -782,8 +785,22 @@ chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "find's cycle report is EXEMPT: the file it did not hide is still read (exit 1)" \
              || fail "the cycle exemption is not what makes the loop case clean (exit $rc)"
-# (b) a permission error whose path merely CONTAINS the cycle text must NOT be exempt
+# (a2) ...and the ENUMERATOR'S STATUS must be judged after the exemption, not before it. GNU
+# findutils reports a cycle AND exits 1 while listing every file, so a raw status refusal turns the
+# benign case into a false block — it reddened `sigpipe-grep` on CI. This pin is the GNU shape.
 printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' \
+  'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
+  'printf "%s\n" "scripts/a.sh"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 1 ] && pass "a cycle that ALSO exits 1 is still exempt (exit 1, not a false block)" \
+             || fail "find's exit 1 on a cycle became a false block (exit $rc)"
+# (b) a permission error whose path merely CONTAINS the cycle text must NOT be exempt. The stub
+# answers the `-maxdepth 0` probe on stdout, so ONLY the partition can decide this — writing only
+# to stderr would make the probe refuse first and pass this pin for the wrong reason.
+printf '%s\n' '#!/bin/sh' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts" ;; esac' \
   'printf "%s\n" "find: scripts/File system loop detected/x: Permission denied" >&2' > "$E/fakebin/find"
 chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
@@ -811,6 +828,12 @@ chmod 644 "$E/scripts/locked.sh"
 E="$TMP/f11ak"; mkdir -p "$E/scripts/locked" "$E/fakebin" "$E/run"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
 chmod 000 "$E/scripts/locked"
+# The enumerator is stubbed to print the PROBE answer AND a permission diagnostic, then exit 0 — so
+# it is find's SILENCE about the unreadable dir, not its exit status, that must refuse. With a real
+# `find` the enumerator-status guard fired first and this pin (and 11al below) passed without
+# exercising the sink at all.
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "find: scripts/locked: Permission denied" >&2' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
 printf '%s\n' '#!/bin/sh' 'printf "%s\n" "rel-sink.$$"' ': >"rel-sink.$$"' > "$E/fakebin/mktemp"
 chmod +x "$E/fakebin/mktemp"
 rc="$(cd "$E/run" && PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
@@ -825,6 +848,8 @@ chmod 755 "$E/scripts/locked"
 E="$TMP/f11al"; mkdir -p "$E/scripts/locked" "$E/fakebin"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked/a.sh"
 chmod 000 "$E/scripts/locked"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "find: scripts/locked: Permission denied" >&2' 'exit 0' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
 # Reached through a SYMLINK, as 11ah does, so the guard's exit trap (`rm -f "$FIND_ERRS"`) can
 # only ever remove the link, never the device.
 ln -s /dev/null "$E/sink"
@@ -1034,8 +1059,10 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 
 # 11az. ...and `scan_files` has TWO arms, each carrying its own `return "${PIPESTATUS[0]}"`, so the
 # partial-list pin above covers only the filtered one. A `.husky` hook withheld from the list is the
-# same silent miss, and nothing else would notice because `.husky` files are ALL scanned — so
-# deleting just that arm's return went undetected before this pin.
+# same silent miss, and nothing else would notice because `.husky` files are ALL scanned. NOTE
+# what this pin actually covers: with `set -o pipefail` the pipeline already yields find's non-zero
+# status, so DELETEING the return is still caught; what was unpinned is an explicit WRONG one
+# (`return 0`), which is what the mutation uses.
 E="$TMP/f11az"; mkdir -p "$E/.husky" "$E/fakebin"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/.husky/seen"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/withheld"

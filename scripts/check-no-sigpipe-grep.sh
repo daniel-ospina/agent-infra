@@ -395,10 +395,7 @@ FILE_LIST="$(
     [ -e "$d" ] && { scan_files "$d" || rc=$?; }
   done
   exit "$rc"
-)" || {
-  echo "check-no-sigpipe-grep: the file enumeration did not complete — refusing a verdict over a tree it may not have listed" >&2
-  exit 2
-}
+)" || ENUM_RC=$?
 FILE_COUNT="$(printf '%s\n' "$FILE_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
 # Partition find's diagnostics. A cycle report loses no file, so it is announced and the run
@@ -427,7 +424,20 @@ if [ -n "$PARTIAL_ERRS" ]; then
   printf '%s' "$PARTIAL_ERRS" >&2
   exit 2
 fi
+# The enumerator's OWN status, judged HERE rather than at the assignment, and only when the
+# partition does not already explain it. That ordering is load-bearing: GNU `find -L` exits 1 when
+# it meets a symlink cycle WHILE LISTING EVERY FILE, so refusing on the raw status turned the benign
+# case this partition exempts into a false BLOCK — it reddened `sigpipe-grep` on CI, where findutils
+# reports the cycle and exits 1, while BSD find stays silent and exits 0. A non-zero status is
+# therefore fatal only when NO cycle report accounts for it (a silently failing or shimmed
+# enumerator, which writes no diagnostic at all).
+LOOP_SEEN=0
+[ -n "$LOOP_ERRS" ] && LOOP_SEEN=1
 unset LOOP_ERRS PARTIAL_ERRS err_line
+if [ "${ENUM_RC:-0}" -ne 0 ] && [ "$LOOP_SEEN" -eq 0 ]; then
+  echo "check-no-sigpipe-grep: the file enumeration did not complete — refusing a verdict over a tree it may not have listed" >&2
+  exit 2
+fi
 
 HITS="$(
   cd "$ROOT" || exit 2
