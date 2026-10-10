@@ -480,20 +480,47 @@ HITS="$(
   printf '%s\n' "$FILE_LIST" | sed '/^$/d' | sort | while IFS= read -r f; do
     awk -v F="$f" '
       # does the text after "grep " carry a quiet flag?  (-q, -Fqx, -iq, --quiet)
+      #
+      # A digit in the same token counts. `-qm1` is the SAME failure as `-q` (measured: with a
+      # 1.3 MiB payload both return 141 under pipefail), and refusing to recognise the combined
+      # form left a file the guard CLAIMED and reported as scanned, containing an idiom it
+      # missed — a false clean, the one verdict a guard must never produce.
       function has_quiet(s,   n, i, parts, t) {
         n = split(s, parts, /[ \t]+/)
         for (i = 1; i <= n; i++) {
           t = parts[i]
           if (t == "--quiet") return 1
           if (t == "--") return 0
-          if (t ~ /^-[A-Za-z]*q[A-Za-z]*$/) return 1
+          if (t ~ /^-[A-Za-z0-9]*q[A-Za-z0-9]*$/) return 1
           if (t !~ /^-/) return 0
         }
         return 0
       }
+      # The statement with quoted spans removed — for MATCHING only, never for reporting. A
+      # quoted argument may contain a pipe (printf "%s" "a|b" | grep -q p), which is data
+      # rather than a pipeline break; a `[^|]*` bridge stops on it and calls the file clean.
+      function unquoted(s,   out, i, c, q, n) {
+        n = length(s); out = ""; q = ""
+        for (i = 1; i <= n; i++) {
+          c = substr(s, i, 1)
+          if (q == "") { if (c == "\"" || c == "\047") q = c; else out = out c }
+          else if (c == q) q = ""
+        }
+        return out
+      }
+      # writer -> pipe -> a quiet grep. `grep` is reachable three ways and each is the same
+      # idiom: bare, by path (/bin/grep), and through `command grep` — the last is the form a
+      # shell function shadowing grep invites, so it is the likeliest one inside a hook.
+      # Defined ONCE: this shape was previously matched by a copy-pasted regex at three sites,
+      # so a fix to any one of them would have left the other two missing the same idiom.
+      function is_idiom(s,   bare) {
+        bare = unquoted(s)
+        return (match(bare, /(printf|echo)[^|]*\|[ \t]*(command[ \t]+)?([^ \t]*\/)?grep[ \t]+/) &&
+                has_quiet(substr(bare, RSTART + RLENGTH)))
+      }
       # a pure comment or blank line is documentation: it cannot execute, so it is skipped
       # (otherwise a script that merely DOCUMENTS the anti-pattern fails the build).
-      /^[ \t]*#/ || /^[ \t]*$/ { if (buf != "") { if (match(buf, /(printf|echo)[^|]*\|[ \t]*grep[ \t]+/) && has_quiet(substr(buf, RSTART + RLENGTH))) print F ":" start ": " buf } ; buf = ""; start = 0; next }
+      /^[ \t]*#/ || /^[ \t]*$/ { if (buf != "") { if (is_idiom(buf)) print F ":" start ": " buf } ; buf = ""; start = 0; next }
       {
         raw = $0
         if (start == 0) start = NR
@@ -505,12 +532,12 @@ HITS="$(
           next
         }
         joined = buf raw; buf = ""
-        if (match(joined, /(printf|echo)[^|]*\|[ \t]*grep[ \t]+/) && has_quiet(substr(joined, RSTART + RLENGTH))) print F ":" start ": " joined
+        if (is_idiom(joined)) print F ":" start ": " joined
         start = 0
       }
       END {
         if (buf != "") {
-          if (match(buf, /(printf|echo)[^|]*\|[ \t]*grep[ \t]+/) && has_quiet(substr(buf, RSTART + RLENGTH))) print F ":" start ": " buf
+          if (is_idiom(buf)) print F ":" start ": " buf
         }
       }
     ' "$f" || { printf 'check-no-sigpipe-grep: the scanner failed on %s — refusing a verdict over files it may not have read\n' "$f" >&2; exit 2; }

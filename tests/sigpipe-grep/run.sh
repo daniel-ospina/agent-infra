@@ -1146,6 +1146,69 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a partial .husky enumeration refuses (exit 2)" \
              || fail "a withheld .husky hook was reported clean (exit $rc)"
 
+# ============================================================================
+# 12. THE MATCHER ITSELF — four shapes the guard used to report CLEAN (#1645)
+#
+#     Each of these is a FALSE CLEAN: the file is CLAIMED and counted inside
+#     "scanned N file(s)" while it contains the idiom, so the gate passes over a tree
+#     that has the bug. That is the one verdict a guard must never produce. Each pin
+#     below FAILS if its fix is reverted — a matcher pin that also passes under the old
+#     matcher would be decoration.
+# ----------------------------------------------------------------------------
+
+# 12a. `-qm1` — a digit in the same token as `q`. has_quiet() matched /^-[A-Za-z]*q[A-Za-z]*$/,
+#      so the combined form was not recognised, and because the token still began with `-`
+#      the loop did not stop either: it walked on to the pattern and returned 0.
+E="$TMP/f12a"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -qm1 pat' > "$E/scripts/combined.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'combined\.sh' "$OUT" \
+  && pass "a quiet flag carrying a digit (-qm1) is caught" \
+  || fail "grep -qm1 was reported clean (exit $rc) — the false clean #1645 describes"
+
+# 12b. `/bin/grep` — the matcher required the bare word `grep`, so a fully qualified
+#      invocation was invisible to it.
+E="$TMP/f12b"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | /bin/grep -q pat' > "$E/scripts/bypath.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'bypath\.sh' "$OUT" \
+  && pass "a by-path invocation (/bin/grep) is caught" \
+  || fail "/bin/grep -q was reported clean (exit $rc)"
+
+# 12c. `command grep` — the form a shell function shadowing grep invites, which makes it the
+#      likeliest one inside a hook.
+E="$TMP/f12c"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | command grep -q pat' > "$E/scripts/shadowed.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'shadowed\.sh' "$OUT" \
+  && pass "command grep is caught (the shadowing form)" \
+  || fail "command grep -q was reported clean (exit $rc)"
+
+# 12d. a literal `|` INSIDE the writer argument. The `[^|]*` bridge cannot cross it, so the
+#      shape was missed even though that pipe is data rather than a pipeline break.
+E="$TMP/f12d"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "a|b" | grep -q pat' > "$E/scripts/pipearg.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'pipearg\.sh' "$OUT" \
+  && pass "a literal pipe inside the writer argument is caught" \
+  || fail "a quoted pipe defeated the bridge and the file was reported clean (exit $rc)"
+
+# 12e. THE COUNTERWEIGHT. A false CLEAN is the cardinal sin, but a false BLOCK is a real cost,
+#      and the widened matcher must not become an over-match machine. Three near-misses must
+#      stay clean — a grep with no writer, a writer whose consumer is not quiet, and a quoted
+#      pipe with no grep at all — while the ONE real idiom in the same tree is still flagged.
+#      This is what keeps the fix from being "match more" rather than "match correctly".
+E="$TMP/f12e"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q pat file' > "$E/scripts/nowriter.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep pat' > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "a | b"' > "$E/scripts/justdata.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q pat' > "$E/scripts/real.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real\.sh' "$OUT" \
+  && ! grep -q 'nowriter' "$OUT" && ! grep -q 'notquiet' "$OUT" && ! grep -q 'justdata' "$OUT" \
+  && pass "only the real idiom is flagged — 3 near-misses stay clean (no over-match)" \
+  || fail "over-match: a near-miss was reported as the idiom (exit $rc)"
+
 echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ All SIGPIPE false-negative tests passed (${checks} assertions)"
