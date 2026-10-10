@@ -59,8 +59,8 @@
 #      (a), the enumerator's status being judged AFTER the exemption so GNU's exit 1 is not a false
 #      block (a2), and the ANCHOR of the match (b). TWO pins are platform-gated, so the assertion
 #      count depends on it: 11af runs only where find reports an unresolvable chain, and 11ah only
-#      where /dev/full exists — both GNU/Linux — so the suite reports 82 on BSD/macOS and 84 on
-#      GNU findutils, the platform CI runs.
+#      where /dev/full exists — both GNU/Linux — so the suite reports 84 here (BSD/macOS, MEASURED)
+#      and higher on GNU findutils, the platform CI runs.
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -386,7 +386,7 @@ echo ""
 # 11a. --dirs selects the consumer's own layout. The control is the SAME fixture with the
 # default set, so the idiom being found only when the dir is named is what is pinned.
 E="$TMP/f11a"; mkdir -p "$E/.github/scripts"
-printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if printf '\''%s'\'' "$R" | grep -q refs/heads/main; then echo y; fi' > "$E/.github/scripts/deploy"
+printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'if printf '\''%s'\'' "$R" | grep -q "$DEPLOY_REF"; then echo y; fi' > "$E/.github/scripts/deploy"
 rc_default="$(guard_rc "$E")"
 rc_dirs="$(bash "$GUARD" --root "$E" --dirs '.github/scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc_default" -eq 0 ] && [ "$rc_dirs" -eq 1 ]; then
@@ -465,7 +465,9 @@ rc="$(bash "$GUARD" --root "$E" --dirs '' >"$OUT" 2>&1; echo $?)"
              || fail "--dirs '' fell back to the default set (exit $rc)"
 
 # 11i. a whitespace-only set resolves to a ZERO-ELEMENT array: a usage error, not a zero-file
-# scan reported as clean (and not a `set -u` crash on bash 3.2).
+# scan reported as clean (and not a `set -u` crash on bash 3.2). On 3.2 the empty array also trips
+# `set -u` in the enumeration subshell, so the refusal has two independent sources there; this pin
+# asserts the refusal itself, not which of the two produced it.
 E="$TMP/f11i"; mkdir -p "$E/scripts"; printf 'echo hi\n' > "$E/scripts/a.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs '   ' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && pass "a whitespace-only scan set → exit 2" \
@@ -808,9 +810,11 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
              || fail "an unanchored cycle match exempted a real partial scan (exit $rc)"
 
 # 11aj. A file the scan LISTED but cannot OPEN is not "clean". `find -L` STAT'd it, so no
-# diagnostic reaches the partition, and `awk` fails on it with a status nothing checks — the run
-# would print a verdict over a file it never read. Pinned with a mode-000 `*.sh`, which is
-# claimed by NAME, so no shebang read is involved and the pin isolates this path.
+# diagnostic reaches the partition, and the readiness probe is what names it — but the probe is not
+# the only defence: the scanner's own status (SCAN_RC) refuses the same case, so this pin asserts the
+# REFUSAL (exit 2), which either path provides, rather than the probe specifically (measured:
+# deleting the probe still exits 2 via SCAN_RC). Pinned with a mode-000 `*.sh`, which is claimed by
+# NAME, so no shebang read is involved and the pin isolates this case.
 E="$TMP/f11aj"; mkdir -p "$E/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/locked.sh"
 chmod 000 "$E/scripts/locked.sh"
@@ -915,6 +919,21 @@ chmod +x "$E/fakebin/cut"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING classifier refuses a verdict (exit 2)" \
              || fail "a found idiom was dropped by a failing classifier (exit $rc)"
+# ...and the PARTIAL classifier is the shape the value cross-check CANNOT see: TWO files really do
+# contain the idiom, and the classifier reports ONE of them — a genuine entry, so its list is
+# non-empty and every path in it is real — and exits 3, withholding the other. Nothing downstream
+# can tell the second was dropped, so the STATUS is the only thing that can refuse. The stub must
+# fail ONLY on the classifying invocation: a blanket `cut` stub also intercepts `fingerprint`'s
+# `cut -c1-16`, and the fingerprint refusal then yields the same exit 2, hiding the mutation
+# (measured — with a blanket stub, deleting the classifier's status check left the suite green).
+E="$TMP/f11ap2"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/b.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *"-d: -f1"*) printf "%s\n" "scripts/a.sh"; exit 3 ;; esac' 'exec /usr/bin/cut "$@"' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a PARTIAL classifier refuses a verdict (exit 2)" \
+             || fail "a partial classification hid an undeclared idiom (exit $rc)"
 
 # 11aq. a SILENTLY failing `find` is the one failure the diagnostics partition cannot see: it
 # writes no error, so it lists nothing and the guard reports a clean run over a tree it never
@@ -993,6 +1012,17 @@ chmod +x "$E/fakebin/grep"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING fingerprint refuses a verdict (exit 2)" \
              || fail "the empty-input digest was accepted from a silent pipeline (exit $rc)"
+# ...and a fingerprint that emits a WELL-FORMED digest and FAILS is the shape neither the
+# empty-value nor the empty-digest check can see; only the status can. Without it a
+# count-preserving CONTENT SWAP inherits an existing exception (the fingerprint becomes a constant).
+E="$TMP/f11at2"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 aaaaaaaaaaaaaaaa #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *256*) printf "%s\n" "aaaaaaaaaaaaaaaa"; exit 3 ;; esac' 'exec /usr/bin/shasum "$@"' > "$E/fakebin/shasum"
+chmod +x "$E/fakebin/shasum"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a WELL-FORMED but failing fingerprint refuses (exit 2)" \
+             || fail "a constant fingerprint let a content swap inherit an exception (exit $rc)"
 
 # 11au. ...and a CLASSIFIER that swallows its input is the same shape: with `cut` printing nothing
 # and exiting 0, FILES_WITH_HITS is empty while HITS is not, so the whole per-file loop is skipped

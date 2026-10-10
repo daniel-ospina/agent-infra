@@ -304,10 +304,11 @@ scan_files() {
   case "$dir" in -*) target="./$dir" ;; esac
   # The basename decides, so `$ROOT/.husky` and `.husky` select identically — otherwise the
   # count pre-pass and the scan disagree about which files were read.
-  # A file `find` LISTED but that cannot be OPENED would be skipped by the scanner below with no
-  # trace at all: `awk` reports `can't open file` on a stderr nobody inspects, and `find -L`
-  # could STAT it, so NO diagnostic reaches the partition — a clean verdict over a file the
-  # guard never read. Route it into the sink, whose partition is fail-closed by construction.
+  # A file `find` LISTED but that cannot be OPENED would otherwise be skipped by the scanner with no
+  # trace at all: `find -L` could STAT it, so no diagnostic reaches the partition, and only the
+  # scanner's own status (SCAN_RC) would notice. Pushing it into the sink makes the failure explicit
+  # and names the file; the status check is what actually enforces it, so treat this as the clearer
+  # diagnostic, not the only guard.
   #
   # WHAT IS FATAL IS NARROWER THAN "ANY UNREADABLE FILE", and the difference is the NAME rule.
   # A basename carrying an extension (`notes.txt`, `.env.local`) is excluded without any read,
@@ -320,8 +321,9 @@ scan_files() {
   # is right: every one of them is a file the guard would have read.
   # A SILENTLY failing `find` is the one failure the partition above cannot see: it writes no
   # diagnostic, so it lists nothing and the guard reports a clean run over a tree it never
-  # enumerated. Hence both arms report FIND's own status (PIPESTATUS[0], read immediately after
-  # the pipeline) rather than the loop's, which is only its last iteration's.
+  # enumerated. Both arms report FIND's own status (PIPESTATUS[0], read immediately after the
+  # pipeline). `set -o pipefail` already yields that status for the pipeline itself, so the explicit
+  # return is a statement of intent rather than the mechanism — the mechanism is the pipeline's.
   # A SILENTLY SUCCEEDING enumerator (consumes nothing, prints nothing, exits 0) lists an empty
   # tree and no status check can see it — the same family as the swallowing classifier, and the
   # result is `✅ … scanned 0 file(s)` over files that are sitting right there. `find -L <path>
