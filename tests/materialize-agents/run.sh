@@ -335,6 +335,36 @@ for f in "$ROOT/AGENTS.md" "$BASE"; do
   if [ "${n:-0}" -eq 1 ]; then pass "anchor ×1 in ${f#"$ROOT"/}"; else fail "anchor count ${n} in ${f#"$ROOT"/}"; fi
 done
 
+# ── MD026 pin: no ATX heading in the base template may end in punctuation ───
+# A trailing period sat on the SESSION RECAP heading and rode into every repo
+# that materialized the base, where markdownlint reports it as MD026 and the
+# repo's REQUIRED `docs` check fails on a line the consumer never wrote.
+# Reproduced on tortoise#7976 (verbatim restoration of that heading) and filed
+# as agent-infra#1668; fixing it in the consumer alone regresses, because the
+# supported remedy for base-owned drift is a re-materialize. Fenced code is
+# skipped: markdownlint does not lint `#` lines inside a fence.
+md026_hits="$(awk '
+  {
+    line = $0
+    if (line ~ /^[[:space:]]*[`~]{3,}/) {
+      tok = line; sub(/^[[:space:]]*/, "", tok); c = substr(tok, 1, 1)
+      if (fence == "") { fence = c } else if (fence == c) { fence = "" }
+      next
+    }
+    if (fence != "") next
+    if (line ~ /^#{1,6}[[:space:]]/) {
+      sub(/[[:space:]]+$/, "", line)
+      if (line ~ /[.,;:!?]$/) print "line " NR ": " line
+    }
+  }
+' "$BASE")"
+if [ -z "$md026_hits" ]; then
+  pass "base template: no heading ends in punctuation (MD026)"
+else
+  fail "base template: heading(s) end in punctuation (MD026) — consumers inherit this as their own required docs-check failure"
+  printf '%s\n' "$md026_hits" | sed -n '1,5p'
+fi
+
 echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ materialize-agents suite: all checks passed"
