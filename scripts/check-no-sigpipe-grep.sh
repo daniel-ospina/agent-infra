@@ -306,11 +306,9 @@ scan_files() {
   # count pre-pass and the scan disagree about which files were read.
   # A file `find` LISTED but that cannot be OPENED must not be skipped in silence: `find -L` could
   # STAT it, so no diagnostic reaches the partition, and the scanner would print a verdict over a
-  # file it never read. Pushing it into the sink names the file and fails the partition, and that
-  # PUSH is what refuses the shipped shape (measured: removing it yields `scanned 0 file(s)` and
-  # exit 0). The readiness test below is NOT interchangeable with it — removing the test merely
-  # moves the failure to the scanner's own status, which is why the two pins disagree about which
-  # one is load-bearing.
+  # file it never read. Pushing it into the sink is what refuses that case; the readiness test below
+  # covers the same files a second time and is not a substitute — remove the push and the run is
+  # clean, remove the test and the refusal simply comes from the scanner's own status.
   #
   # WHAT IS FATAL IS NARROWER THAN "ANY UNREADABLE FILE", and the difference is the NAME rule.
   # A basename carrying an extension (`notes.txt`, `.env.local`) is excluded without any read,
@@ -323,12 +321,8 @@ scan_files() {
   # is right: every one of them is a file the guard would have read.
   # A SILENTLY failing `find` is the one failure the partition above cannot see: it writes no
   # diagnostic, so it lists nothing and the guard reports a clean run over a tree it never
-  # enumerated. Both arms report FIND's own status (PIPESTATUS[0], read immediately after the
-  # pipeline) rather than the loop's, which is only its last iteration's: with the loop's status a
-  # completely enumerated tree that merely contains a non-shell file reads as a failed enumeration
-  # and becomes a false block (measured: deleting both returns fails as such — 11d and 11m).
-  # `set -o pipefail` supplies the same status for the pipeline itself, so the return states the
-  # contract locally rather than being the only thing that catches a silent `find`.
+  # enumerated. Both arms therefore return the PIPELINE's status — the producer's, read immediately
+  # after the pipeline — rather than the loop's, whose value is only its last iteration's.
   # A SILENTLY SUCCEEDING enumerator (consumes nothing, prints nothing, exits 0) lists an empty
   # tree and no status check can see it — the same family as the swallowing classifier, and the
   # result is `✅ … scanned 0 file(s)` over files that are sitting right there. `find -L <path>
