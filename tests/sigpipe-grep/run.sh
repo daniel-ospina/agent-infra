@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (69 on BSD/macOS, 71 on GNU findutils — the platform CI runs).
+#      platform-dependent (71 on BSD/macOS, 73 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -854,8 +854,8 @@ chmod 644 "$E/scripts/deploy"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable EXTENSIONLESS file is still fatal (exit 2)" \
              || fail "an unreadable extensionless file was reported clean (exit $rc)"
 
-# 11an. the SCAN PASS's own status is part of the fail-closed contract, and it was the last hole
-# in it: a scanner that is missing or that fails prints no hits, and no hits is indistinguishable
+# 11an. the SCAN PASS's own status is part of the fail-closed contract: a scanner that is missing
+# or that fails prints no hits, and no hits is indistinguishable
 # from a clean tree — the guard would print ✅ over files it never read. `awk` is stubbed through
 # PATH, as 11ag stubs `mktemp`, so the pin does not depend on uninstalling anything.
 E="$TMP/f11an"; mkdir -p "$E/scripts" "$E/fakebin"
@@ -889,6 +889,32 @@ chmod +x "$E/fakebin/cut"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING classifier refuses a verdict (exit 2)" \
              || fail "a found idiom was dropped by a failing classifier (exit $rc)"
+
+# 11aq. a SILENTLY failing `find` is the one failure the diagnostics partition cannot see: it
+# writes no error, so it lists nothing and the guard reports a clean run over a tree it never
+# enumerated. What is checked is find's OWN status, not the pipeline's (which is only the loop's
+# last iteration). `find` is stubbed through PATH, as 11ag stubs `mktemp`.
+E="$TMP/f11aq"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SILENTLY failing enumerator refuses a verdict (exit 2)" \
+             || fail "a silently failing find reported a tree it never listed (exit $rc)"
+
+# 11ar. ...and a membership test must not absorb a FAILING `grep`. `grep` exits 0 (match), 1 (no
+# match) or >1 (ERROR, printing nothing); read as a bare boolean, the error reads as "no match",
+# so a STALE declaration is silently accepted. The stub fails ONLY on `-qx`, which is the shape
+# that reaches this check: the declaration lookup uses `-E` and must still work.
+E="$TMP/f11ar"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/b.sh"
+printf 'scripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -qx) exit 3 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING membership test refuses a verdict (exit 2)" \
+             || fail "a failing membership test was absorbed as 'no match' (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

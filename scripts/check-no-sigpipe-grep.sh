@@ -300,11 +300,16 @@ scan_files() {
   # `is_shell_file` would be the tempting simplification and it reopens that fail-open.)
   # The `.husky` arm scans EVERY listed file, extension or not, so there the unconditional probe
   # is right: every one of them is a file the guard would have read.
+  # A SILENTLY failing `find` is the one failure the partition above cannot see: it writes no
+  # diagnostic, so it lists nothing and the guard reports a clean run over a tree it never
+  # enumerated. Hence both arms report FIND's own status (PIPESTATUS[0], read immediately after
+  # the pipeline) rather than the loop's, which is only its last iteration's.
   case "${dir##*/}" in
     .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
               [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
               printf '%s\n' "$f"
-            done ;;
+            done
+            return "${PIPESTATUS[0]}" ;;
     *) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
          if name_excluded "$f"; then
            :
@@ -313,7 +318,8 @@ scan_files() {
          else
            printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
          fi
-       done ;;
+       done
+       return "${PIPESTATUS[0]}" ;;
   esac
 }
 
@@ -346,16 +352,26 @@ for d in ${SCAN_DIRS[@]+"${SCAN_DIRS[@]}"}; do
 done
 unset scan_dir
 
+# The enumeration's status is part of the contract for the same reason: the fail-closed partition
+# catches an error `find` PRINTS, never a silent non-zero exit. The per-dir status is find's own
+# (see scan_files), NOT the function's — `scan_files` legitimately ends on a non-zero
+# `is_shell_file` for a dir holding only extensionless non-shell files, so testing the function's
+# status here would make every such tree a false block.
 FILE_LIST="$(
   cd "$ROOT" || exit 2
+  rc=0
   for d in "${SCAN_DIRS[@]}"; do
     # An ABSENT dir is SKIPPED here, never scanned: the default set tolerates `.husky` and
     # `pi-bootstrap` being absent, and `find` on a missing path would populate FIND_ERRS and
     # turn every such run into a false exit 2. Existence of an EXPLICITLY named dir was
     # already enforced above.
-    [ -e "$d" ] && scan_files "$d"
+    [ -e "$d" ] && { scan_files "$d" || rc=$?; }
   done
-)"
+  exit "$rc"
+)" || {
+  echo "check-no-sigpipe-grep: the file enumeration did not complete — refusing a verdict over a tree it may not have listed" >&2
+  exit 2
+}
 FILE_COUNT="$(printf '%s\n' "$FILE_LIST" | sed '/^$/d' | wc -l | tr -d ' ')"
 
 # Partition find's diagnostics. A cycle report loses no file, so it is announced and the run
@@ -494,7 +510,18 @@ if [ -f "$ROOT/$EXC_FILE" ]; then
     # file OUTSIDE this invocation's scan set is UNVERIFIED, not stale — otherwise a consumer
     # whose exceptions file covers files a narrower `--dirs` does not reach gets a red run for
     # every narrowed invocation, including a developer checking one directory (#7588).
-    if [ "$n" -gt 0 ] && grep -qx "$f" <<<"$FILE_LIST" && ! grep -qx "$f" <<<"$FILES_WITH_HITS"; then
+    # `grep` exits 0 (match), 1 (no match) or >1 (ERROR). Used as a bare boolean, a >1 exit — a
+    # broken or shimmed `grep`, which prints nothing — reads as "no match", so a STALE exception is
+    # silently accepted and the guard exits 0. The membership tests are therefore made explicit:
+    # anything above 1 refuses, rather than being absorbed as "absent".
+    in_file_list=0 in_hits=0
+    grep -qx "$f" <<<"$FILE_LIST" || in_file_list=$?
+    grep -qx "$f" <<<"$FILES_WITH_HITS" || in_hits=$?
+    if [ "$in_file_list" -gt 1 ] || [ "$in_hits" -gt 1 ]; then
+      echo "check-no-sigpipe-grep: could not test a declaration against the scan — refusing a verdict" >&2
+      exit 2
+    fi
+    if [ "$n" -gt 0 ] && [ "$in_file_list" -eq 0 ] && [ "$in_hits" -ne 0 ]; then
       fails+="  $f — STALE exception: declares $n occurrence(s) but the file has NONE. Delete the line ($EXC_FILE)."$'\n'
     fi
   done < "$ROOT/$EXC_FILE"
