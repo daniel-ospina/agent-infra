@@ -143,7 +143,7 @@ task_collect({ run_id })                 # the final message + exit status, once
 ```
 
 - **Liveness comes from the child's `[task-heartbeat]` markers, never from `%CPU`.** `%CPU == 0` means *waiting*, not finished — a lane blocked in a long tool call is exactly 0 % CPU (`docs/ops/fleet-liveness.md`). `task_status` reads the same markers the watchdog uses (pid probe + fresh markers), and returns non-blockingly.
-- **`task_collect` never blocks.** While the lane runs it returns a not-finished notice; poll `task_status` instead. Reaping loop: poll `task_status` between other work → call `task_collect` once it reports a terminal status.
+- **`task_collect` never blocks.** While the lane runs it returns a not-finished notice; poll `task_status` instead. Reaping loop: poll `task_status` between other work → call `task_collect` once it reports a terminal status (`done` | `failed` | `cut`) **or `gone`** (the process is gone but the terminal record was not persisted — collect it directly; it is salvaged fail-closed to `failed`). A lane left `wedged` with a stale log is likewise terminated by `task_collect` (same fail-closed salvage) instead of being polled forever.
 - **It is ONE spawn per background lane** — no zero-output retry and no provider-failover hop chain. A lane that fails surfaces as status `failed`; re-dispatch it (the #208 resume contract: assume-dead, not done; design waves as resumable).
 - **Reused machinery, not a parallel universe:** the background path spawns through the same `spawnSubAgent`, so `TASK_DETACHED`'s own pgid, the settle-path sweep, `TASK_HARD_CAP_MS`, and the state-aware watchdog all still apply. A capped lane still returns partials via `task_collect`.
 
