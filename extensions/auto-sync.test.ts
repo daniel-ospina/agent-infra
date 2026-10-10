@@ -5,14 +5,14 @@
  * Uses real throwaway git repos (bare origin + clones) so the state machine is
  * exercised against genuine git semantics, not mocks.
  */
-import { execSync, spawn } from "node:child_process";
+import { execSync, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
@@ -72,8 +72,9 @@ function seededOrigin(): string {
 }
 
 /** #1661: a checkout in the exact stuck shape — unmerged stage-2/3 entries with
- * NO MERGE_HEAD (an abandoned conflict), so pull --ff-only refuses forever. */
-function makeStuckConflict(): string {
+ * NO MERGE_HEAD (an abandoned conflict), so pull --ff-only refuses forever.
+ * `keepMergeHead=true` leaves an ACTIVE merge in progress (for op detection). */
+function makeStuckConflict(keepMergeHead = false): string {
   const origin = seededOrigin();
   const pusher = makeClone(origin);
   const repo = makeClone(origin); // both at seed BEFORE any push
@@ -87,7 +88,29 @@ function makeStuckConflict(): string {
   git(repo, "fetch -q origin");
   try { git(repo, "merge origin/main"); } catch { /* expected conflict */ }
   // Drop MERGE_HEAD: the index-only stuck state the issue measured.
-  rmSync(join(repo, ".git", "MERGE_HEAD"), { force: true });
+  if (!keepMergeHead) rmSync(join(repo, ".git", "MERGE_HEAD"), { force: true });
+  return repo;
+}
+
+/** #1661 (review): a checkout that is BOTH behind origin/main AND has an
+ * index-only stuck index. The plain stuck fixture above ends up DIVERGED, so a
+ * missing session_start early return would not run sync.sh anyway — this
+ * fixture is "behind", where mode=auto DOES run sync.sh, so it genuinely pins
+ * the early return. Entries are injected with `update-index --index-info` (the
+ * same leftover stage-1/2/3 shape, with no MERGE_HEAD) while HEAD stays an
+ * ancestor of origin/main. */
+function makeBehindStuckConflict(): string {
+  const origin = seededOrigin();
+  const repo = makeClone(origin);
+  const pusher = makeClone(origin);
+  commit(pusher, "remote ahead");
+  git(pusher, "push -q origin main");
+  git(repo, "fetch -q origin");
+  const base = git(repo, "rev-parse HEAD:file.txt").trim();
+  const ours = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "ours\n", encoding: "utf-8" }).trim();
+  const theirs = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "theirs\n", encoding: "utf-8" }).trim();
+  const info = `100644 ${base} 1\tfile.txt\n100644 ${ours} 2\tfile.txt\n100644 ${theirs} 3\tfile.txt\n`;
+  execFileSync("git", ["-C", repo, "update-index", "--index-info"], { input: info, encoding: "utf-8" });
   return repo;
 }
 
@@ -413,7 +436,7 @@ async function main() {
 
   await test("unmergedBanner: empty for a clean index, names paths + remedy otherwise", () => {
     equal(unmergedBanner(repoCurrent, []).length, 0);
-    const lines = unmergedBanner(repoCurrent, [{ path: "docs/x.md", detail: "stage 2" }]);
+    const lines = unmergedBanner(repoCurrent, [{ path: "docs/x.md", detail: "UU" }]);
     ok(lines.some((l) => l.includes("STUCK MERGE CONFLICT")), "must be loud");
     ok(lines.some((l) => l.includes("docs/x.md")), "must name the path");
     ok(lines.some((l) => l.includes("checkout --theirs")), "must give the one-line remedy");
@@ -453,6 +476,90 @@ async function main() {
     ok(out.includes("STUCK MERGE CONFLICT"), `expected loud banner, got: ${out}`);
     ok(out.includes("file.txt"), `expected the unmerged path, got: ${out}`);
     ok(out.includes("checkout --theirs"), `expected the remedy, got: ${out}`);
+  });
+
+  await test("unmergedEntries: benign rename whose old name starts with an unmerged code → no phantom (#1661 review)", () => {
+    const origin = seededOrigin();
+    const repo = makeClone(origin);
+    // "AU"THORS: the old naive parser read the rename's extra original-path
+    // record as `XY PATH` and fabricated an unmerged entry "HORS".
+    writeFileSync(join(repo, "AUTHORS"), "authors\n");
+    git(repo, "add AUTHORS");
+    git(repo, "commit -q -m authors");
+    git(repo, "mv AUTHORS README.md");
+    equal(git(repo, "ls-files -u").trim(), "", "fixture must have a clean index");
+    const entries = unmergedEntries(repo);
+    equal(entries.length, 0, `a plain rename must not read as unmerged: ${JSON.stringify(entries)}`);
+  });
+
+  await test("unmergedOp: active merge → 'merge'; abandoned conflict → 'index-only'", () => {
+    const merging = makeStuckConflict(true);
+    equal(existsSync(join(merging, ".git", "MERGE_HEAD")), true, "fixture must keep MERGE_HEAD");
+    equal(unmergedOp(merging), "merge");
+    equal(unmergedOp(makeStuckConflict()), "index-only");
+  });
+
+  await test("unmergedBanner: a live merge never claims 'no MERGE_HEAD' and points at merge --abort", () => {
+    const lines = unmergedBanner("/repo", [{ path: "file.txt", detail: "UU" }], "merge");
+    ok(lines.some((l) => l.includes("MERGE IN PROGRESS")), `expected in-progress wording: ${lines.join("\n")}`);
+    ok(!lines.some((l) => l.includes("no MERGE_HEAD")), "must not assert no MERGE_HEAD for a live merge");
+    ok(lines.some((l) => l.includes("merge --abort")), "must offer the abort");
+    ok(!lines.some((l) => l.includes("STUCK MERGE CONFLICT")), "must not use the index-only banner");
+  });
+
+  await test("unmergedBanner: a live rebase never recommends --theirs (rebase inverts it)", () => {
+    const lines = unmergedBanner("/repo", [{ path: "f.txt", detail: "UU" }], "rebase");
+    ok(lines.some((l) => l.includes("REBASE IN PROGRESS")), `expected rebase wording: ${lines.join("\n")}`);
+    ok(!lines.some((l) => l.includes("checkout --theirs")), "rebase inverts --ours/--theirs — a blanket --theirs is unsafe");
+    ok(lines.some((l) => l.includes("rebase --abort")), "must offer the abort");
+    ok(lines.some((l) => l.includes("rebase --continue")), "must offer the finish");
+  });
+
+  await test("unmergedBanner: remedy matches the conflict code (no side that does not exist)", () => {
+    const ud = unmergedBanner("/r", [{ path: "f", detail: "UD" }]);
+    ok(ud.some((l) => l.includes("checkout --ours")), `UD has stage 2 only → --ours: ${ud.join("\n")}`);
+    ok(!ud.some((l) => l.includes("checkout --theirs")), "UD has no stage 3 → --theirs would error");
+    const dd = unmergedBanner("/r", [{ path: "f", detail: "DD" }]);
+    ok(dd.some((l) => l.includes(`git -C "/r" rm "f"`)), `DD has neither side → git rm: ${dd.join("\n")}`);
+    ok(!dd.some((l) => l.includes("checkout")), "DD has no stage 2/3 → no checkout");
+  });
+
+  await test("stuck index ALSO behind (mode auto) → early return keeps sync.sh from running (#1661 review)", async () => {
+    const stuck = makeBehindStuckConflict();
+    equal(syncState(stuck), "behind", "fixture must be behind, not diverged");
+    ok(unmergedEntries(stuck).length > 0, "fixture must have a stuck index");
+    const marker = join(stuck, "SYNC_RAN");
+    writeStubSync(stuck, marker);
+    const headBefore = git(stuck, "rev-parse HEAD").trim();
+    const lines = await runSession(stuck, { mode: "auto" });
+    ok(lines.some((l) => l.includes("STUCK MERGE CONFLICT")), `expected stuck banner, got: ${lines.join("\n")}`);
+    ok(!existsSync(marker), "sync.sh MUST NOT run on a stuck index even when behind + auto");
+    equal(git(stuck, "rev-parse HEAD").trim(), headBefore, "HEAD must not move");
+  });
+
+  await test("sync.sh in an active merge → names the merge, not the index-only diagnosis, exits 1", () => {
+    const merging = makeStuckConflict(true);
+    writeFileSync(join(merging, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    let code = 0;
+    let out = "";
+    try {
+      out = execSync(`bash "${join(merging, "sync.sh")}" 2>&1`, { encoding: "utf-8" });
+    } catch (e: any) {
+      code = e.status ?? 0;
+      out = String(e.stdout ?? e.message);
+    }
+    equal(code, 1, `expected non-zero exit, got ${code}; output: ${out}`);
+    ok(out.includes("merge IN PROGRESS"), `expected in-progress wording, got: ${out}`);
+    ok(out.includes("merge --abort"), `expected the abort, got: ${out}`);
+    ok(!out.includes("index-only stuck state"), `must not mislabel a live merge: ${out}`);
+  });
+
+  await test("session_start: an active merge is reported as in-progress, not 'STUCK ... no MERGE_HEAD' (#1661 review)", async () => {
+    const merging = makeStuckConflict(true);
+    const lines = await runSession(merging, { print: true });
+    ok(lines.some((l) => l.includes("MERGE IN PROGRESS")), `expected in-progress wording: ${lines.join("\n")}`);
+    ok(!lines.some((l) => l.includes("no MERGE_HEAD")), "must not assert no MERGE_HEAD for a live merge");
+    ok(!lines.some((l) => l.includes("STUCK MERGE CONFLICT")), "must not mislabel a live merge as the index-only state");
   });
 
   await test("stalenessBanner: quiet below threshold, loud above", () => {

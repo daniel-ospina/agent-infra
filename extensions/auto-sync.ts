@@ -1,8 +1,11 @@
 // auto-sync.ts — Level-1 machine sync for agent-infra (session_start)
 //
 // On session start, if AGENT_INFRA_PATH is set:
-//   - ANY unmerged index entry (stuck conflict, no MERGE_HEAD) → LOUD banner with
-//     the offending paths + remedy, in every mode, and no pull attempt (#1661)
+//   - ANY unmerged index entry → LOUD banner with the offending paths + a
+//     code-aware remedy, in every mode, and no pull attempt (#1661). The banner
+//     distinguishes a live merge/rebase/cherry-pick/revert (finish or abort it)
+//     from the abandoned index-only state the issue measured — a rebase INVERTS
+//     --ours/--theirs, so a blanket --theirs is unsafe there.
 //   - fetch origin and compare HEAD vs origin/main
 //   - behind → AGENT_SYNC_MODE=auto  : run sync.sh (pull --ff-only + refresh config)
 //   - behind → AGENT_SYNC_MODE=warn  : print a hint to run `cd "$AGENT_INFRA_PATH" && ./sync.sh`
@@ -83,20 +86,34 @@ const UNMERGED_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 export interface UnmergedEntry { path: string; detail: string }
 
 /**
- * #1661 (1): unmerged index entries — the index-only stuck conflict (leftover
- * stage-1/2/3 entries with NO MERGE_HEAD) that makes every `git pull --ff-only`
- * fail forever. `git status --porcelain` supplies the reader-friendly code
- * (`UU`, `AA`, `DD`, …) and `git ls-files -u` the authoritative stage list;
- * they are UNIONED so a shape either source misses is still caught. Never
- * throws — this is a diagnostic, not a gate, so an unreadable repo yields []
- * (no false alarm) rather than breaking session start.
+ * #1661 (1): unmerged index entries — leftover stage-1/2/3 entries that make
+ * every `git pull --ff-only` fail forever, whether they come from the abandoned
+ * index-only state (no MERGE_HEAD) or a live merge/rebase/cherry-pick/revert
+ * (caller distinguishes via `unmergedOp`). `git status --porcelain` supplies the
+ * reader-friendly code (`UU`, `AA`, `DD`, …) and `git ls-files -u` the
+ * authoritative stage list; they are UNIONED so a shape either source misses is
+ * still caught. Never throws — this is a diagnostic, not a gate, so an
+ * unreadable repo yields [] (no false alarm) rather than breaking session start.
  */
 export function unmergedEntries(repo: string): UnmergedEntry[] {
   const found = new Map<string, string>();
   try {
-    for (const rec of execFileSync("git", ["-C", repo, "status", "--porcelain", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0")) {
+    const recs = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0");
+    for (let i = 0; i < recs.length; i++) {
+      const rec = recs[i];
       if (rec.length < 4) continue;
       const code = rec.slice(0, 2);
+      // #1661 (review): porcelain-v1 -z emits an EXTRA NUL record after a
+      // rename/copy — the ORIGINAL path (`R  <new>\0<old>\0`). Re-reading it as
+      // `XY PATH` turns a benign `git mv` whose old name starts with an unmerged
+      // code (e.g. "AUTHORS" → "AU") into a phantom entry with a truncated path
+      // ("HORS"); session_start would then print the STUCK banner and return
+      // while sync.sh's `git ls-files -u` is clean, freezing sync for the whole
+      // session. Consume the original-path record.
+      if (code[0] === "R" || code[0] === "C" || code[1] === "R" || code[1] === "C") {
+        i++;
+        continue;
+      }
       if (UNMERGED_CODES.has(code)) found.set(rec.slice(3), code);
     }
   } catch { /* git unavailable / not a repo — no signal */ }
@@ -115,26 +132,99 @@ export function unmergedEntries(repo: string): UnmergedEntry[] {
 }
 
 /**
- * #1661 (1): the LOUD banner for a stuck index — names the offending paths and
- * the one-line remedy. No shell is run here (repo/first are only interpolated),
- * so this is pure and unit-testable. Empty for a clean index.
+ * #1661 (review): what, if anything, is mid-flight in the checkout. The
+ * abandoned conflict the issue is about has NO sequencer state ("index-only");
+ * a live merge/rebase/cherry-pick/revert leaves MERGE_HEAD / CHERRY_PICK_HEAD /
+ * REVERT_HEAD or a rebase-merge|rebase-apply directory. The distinction matters
+ * because the banner must not assert "no MERGE_HEAD" for a live merge, and a
+ * rebase INVERTS --ours/--theirs relative to a merge, so the old blanket
+ * `checkout --theirs` remedy could silently discard the user's commit.
  */
-export function unmergedBanner(repo: string, entries: UnmergedEntry[]): string[] {
-  if (entries.length === 0) return [];
-  const lines = [
-    `[auto-sync] ⛔ STUCK MERGE CONFLICT in agent-infra's index — every sync fails and the extensions you loaded are FROZEN.`,
-    `[auto-sync]    ${entries.length} unmerged path(s) (index-only stuck state — no MERGE_HEAD, so a plain sync can never recover):`,
-  ];
-  for (const e of entries.slice(0, 6)) lines.push(`[auto-sync]      ${e.path}  [${e.detail}]`);
-  if (entries.length > 6) lines.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
-  const first = entries[0].path;
-  lines.push(`[auto-sync]    Resolve one path at a time — keep origin's version (--theirs) or yours (--ours), then stage it:`);
-  lines.push(`[auto-sync]      git -C "${repo}" checkout --theirs "${first}" && git -C "${repo}" add "${first}"`);
-  if (entries.some((e) => e.detail === "DD")) {
-    lines.push(`[auto-sync]      (a [DD] path is deleted on both sides — use: git -C "${repo}" rm <path>)`);
+export type UnmergedOp = "index-only" | "merge" | "rebase" | "cherry-pick" | "revert";
+
+export function unmergedOp(repo: string): UnmergedOp {
+  let gitDir: string;
+  try {
+    // `--git-path` is cwd-relative (and a linked worktree's .git is a FILE), so
+    // resolve the absolute per-worktree git dir once and join names onto it.
+    gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--absolute-git-dir"], { encoding: "utf-8", timeout: 5_000 }).trim();
+  } catch {
+    return "index-only";
   }
-  lines.push(`[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`);
-  return lines;
+  const has = (name: string): boolean => gitDir.length > 0 && existsSync(join(gitDir, name));
+  if (has("rebase-merge") || has("rebase-apply")) return "rebase";
+  if (has("CHERRY_PICK_HEAD")) return "cherry-pick";
+  if (has("REVERT_HEAD")) return "revert";
+  if (has("MERGE_HEAD")) return "merge";
+  return "index-only";
+}
+
+/**
+ * #1661 (review): a remedy valid for the entry's conflict shape. `--theirs`
+ * needs index stage 3 and `--ours` needs stage 2; DD has neither and AU/UD lack
+ * stage 3, DU/UA lack stage 2 — so the old hard-coded `--theirs` errored
+ * ("path ... does not have their version") for those codes. Pure.
+ */
+function remedyCommands(repo: string, e: UnmergedEntry): string[] {
+  const keepTheirs = `git -C "${repo}" checkout --theirs "${e.path}" && git -C "${repo}" add "${e.path}"`;
+  const keepOurs = `git -C "${repo}" checkout --ours "${e.path}" && git -C "${repo}" add "${e.path}"`;
+  const remove = `git -C "${repo}" rm "${e.path}"`;
+  switch (e.detail) {
+    case "DD": // deleted on both sides — no stage 2 or 3
+      return [`both sides deleted this path: ${remove}`];
+    case "UD": // deleted by them — stage 2 only
+      return [`origin deleted this path — keep yours: ${keepOurs}`, `or match origin: ${remove}`];
+    case "DU": // deleted by us — stage 3 only
+      return [`origin has this path and you deleted it — take origin's: ${keepTheirs}`];
+    case "AU": // added by us — stage 2 only
+      return [`you added this path — keep yours: ${keepOurs}`, `or match origin: ${remove}`];
+    case "UA": // added by them — stage 3 only
+      return [`origin added this path — take it: ${keepTheirs}`];
+    case "UU":
+    case "AA":
+      return [`keep origin's version: ${keepTheirs}`, `or keep yours: ${keepOurs}`];
+    default: // ls-files fallback detail ("stage 1"/"stage 2"/"stage 3"/"stage ?")
+      if (e.detail.includes("2")) return [`keep yours (stage 2): ${keepOurs}`];
+      if (e.detail.includes("3")) return [`keep origin's version (stage 3): ${keepTheirs}`];
+      if (e.detail.includes("1")) return [`base-only entry: ${remove}`];
+      return [`inspect: git -C "${repo}" status`, `then keep origin's version: ${keepTheirs}`];
+  }
+}
+
+/**
+ * #1661 (1): the LOUD banner for unmerged index entries. `op` (from
+ * `unmergedOp`) selects the wording: the abandoned index-only conflict the issue
+ * is about, or a live merge/rebase/cherry-pick/revert that must be concluded
+ * before syncing. The remedy is chosen per conflict code (see remedyCommands)
+ * rather than a blanket `--theirs`. No shell is run here (repo/paths are only
+ * interpolated), so this is pure and unit-testable. Empty for a clean index.
+ */
+export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: UnmergedOp = "index-only"): string[] {
+  if (entries.length === 0) return [];
+  const list: string[] = [`[auto-sync]    ${entries.length} unmerged path(s):`];
+  for (const e of entries.slice(0, 6)) list.push(`[auto-sync]      ${e.path}  [${e.detail}]`);
+  if (entries.length > 6) list.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
+
+  if (op !== "index-only") {
+    return [
+      `[auto-sync] ⛔ ${op.toUpperCase()} IN PROGRESS with unmerged paths — sync must wait until it is concluded.`,
+      ...list,
+      `[auto-sync]    Finish: resolve each path, \`git -C "${repo}" add <path>\`, then \`git -C "${repo}" ${op} --continue\`.`,
+      `[auto-sync]    Or abort: git -C "${repo}" ${op} --abort`,
+      `[auto-sync]    (${op} inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command.)`,
+      `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+    ];
+  }
+
+  return [
+    `[auto-sync] ⛔ STUCK MERGE CONFLICT in agent-infra's index — every sync fails and the extensions you loaded are FROZEN.`,
+    `[auto-sync]    (index-only stuck state — no MERGE_HEAD, so a plain sync can never recover.)`,
+    ...list,
+    `[auto-sync]    Resolve one path at a time, then stage it:`,
+    ...remedyCommands(repo, entries[0]).map((c) => `[auto-sync]      ${c}`),
+    `[auto-sync]      (a [DD] path must be \`git rm\`d; --theirs needs stage 3, --ours needs stage 2)`,
+    `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+  ];
 }
 
 /**
@@ -547,15 +637,17 @@ export default function (pi: ExtensionAPI) {
     if (!infraPath) return;          // not configured — silent
     if (!existsSync(infraPath)) return;
 
-    // #1661 (1): the stuck-index check runs BEFORE the print-mode return, before
-    // the fetch and before any mutation. Leftover unmerged stage-1/2/3 entries
-    // (no MERGE_HEAD) make `git pull --ff-only` refuse forever, and this used to
-    // fail into silence — exactly the state a sub-agent must never be told
-    // nothing about. Read-only and cheap, so it runs in every mode, and a pull is
-    // pointless until the index is resolved.
+    // #1661 (1): the unmerged-index check runs BEFORE the print-mode return,
+    // before the fetch and before any mutation. Leftover unmerged stage-1/2/3
+    // entries make `git pull --ff-only` refuse forever, and this used to fail
+    // into silence — exactly the state a sub-agent must never be told nothing
+    // about. `unmergedOp` distinguishes the abandoned index-only state from a
+    // live merge/rebase/cherry-pick/revert so the banner does not misdiagnose it
+    // (a rebase inverts --ours/--theirs). Read-only and cheap, so it runs in
+    // every mode, and a pull is pointless until the index is resolved.
     const unmerged = unmergedEntries(infraPath);
     if (unmerged.length > 0) {
-      for (const line of unmergedBanner(infraPath, unmerged)) console.log(line);
+      for (const line of unmergedBanner(infraPath, unmerged, unmergedOp(infraPath))) console.log(line);
       return;
     }
 
