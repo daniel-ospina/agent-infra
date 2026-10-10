@@ -5,9 +5,10 @@
 // Arch: DEC-006 (graph): JSONL event log + FalkorDB. Markdown docs in ~/.tortoise/docs/.
 //
 // #312 delta 2 — hosted-cloud capture path (mirrors reflect-hook): when
-// `cloud: true` AND an API key is present, agent_end sessions are POSTed to
-// {apiUrl}/v1/sessions instead of running `python -m tortoise.ingest` locally.
-// The local-file path is unchanged (byte-identical) when cloud is unset/false.
+// `cloud: true` AND an API key is present AND the shared egress gate allows it
+// (no repo/env deny), agent_end sessions are POSTed to {apiUrl}/v1/sessions
+// instead of running `python -m tortoise.ingest` locally. The local-file path is
+// unchanged (byte-identical) when cloud is unset/false.
 // A durable JSONL record (~/.tortoise/session-events/) is written BEFORE the
 // network attempt so a teardown mid-fetch never loses data silently.
 //
@@ -26,6 +27,12 @@
 //   cloud              — true = hosted capture (requires apiKey; default false)
 //   apiKey             — Bearer key (tt_...) for hosted capture (or TORTOISE_API_KEY)
 //   apiUrl             — hosted API base (or TORTOISE_API_URL; default https://api.premiselabs.co)
+//
+// #803: hosted capture is DATA EGRESS and additionally requires that no repo/env
+// deny is in effect — `<repo>/.pi/tortoise-capture.json` `{"cloud": false}` or
+// `TORTOISE_CAPTURE_CLOUD=0` force local capture. Deny-only surfaces: neither can
+// ENABLE cloud on its own (a repo must never grant itself egress). Gate shared
+// with reflect-hook via extensions/shared/capture-gate.ts.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn } from "node:child_process";
@@ -39,6 +46,12 @@ import {
   modelFromContext,
   type SessionAttribution,
 } from "../shared/capture-attribution.js";
+import {
+  asConfigStringField,
+  resolveCaptureGate,
+  resolveProjectRoot,
+  type CaptureGateResult,
+} from "../shared/capture-gate.js";
 
 // ── Config ──────────────────────────────────────────────
 
@@ -55,11 +68,11 @@ interface TortoiseConfig {
   tortoiseSrcDir?: string;
   /** Model spec for point extraction. Default: "mock:TortoiseM0" */
   pointModel?: string;
-  /** #312: hosted-cloud capture. When true AND apiKey is set, sessions POST to {apiUrl}/v1/sessions instead of local python ingest. */
+  /** #312: hosted-cloud capture. When true, sessions POST to {apiUrl}/v1/sessions instead of local python ingest — but ONLY if the shared egress gate also allows it (a key present AND no repo/env deny; see extensions/shared/capture-gate.ts). */
   cloud?: boolean;
   /** #312: hosted API base URL. Default: https://api.premiselabs.co */
   apiUrl?: string;
-  /** #312: Bearer key (tt_...) required to enable hosted capture. */
+  /** #312: Bearer key (tt_...) for hosted capture. A CREDENTIAL, not a consent gate: required but never sufficient. */
   apiKey?: string;
 }
 
@@ -68,21 +81,80 @@ function expandTilde(p: string): string {
   return p;
 }
 
+/**
+ * String-or-nothing guard: a hand-written config field can be any JSON type.
+ * `asString` is the silent guard used for env vars (always string|undefined).
+ */
+const asString = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+
+/**
+ * The config-file guard: like {@link asString}, but a field that is PRESENT and
+ * not a string is warned about and dropped. A silent drop hid a mistyped
+ * `apiUrl`, which then sent transcripts to the DEFAULT hosted endpoint instead of
+ * the operator's intended host — the #775 "wrong host, silently" class. The
+ * warning fires per config LOAD, which is once per process for the default path
+ * (`loadConfig` caches). THE SAME guard is shared with reflect-hook
+ * ({@link asConfigStringField}), which uploads the FULL transcript at quit time.
+ * `null` counts as PRESENT (it is dropped with a warning, not treated as absent).
+ */
+function asConfigString(field: string, v: unknown): string | undefined {
+  return asConfigStringField({
+    prefix: "[tortoise-capture]",
+    field,
+    value: v,
+    defaultApiUrl: DEFAULT_API_URL,
+  });
+}
+
 function configPath(): string {
   return join(homedir(), ".pi", "agent", "tortoise-config.json");
 }
 
 let _config: TortoiseConfig | null = null;
 
-function loadConfig(): TortoiseConfig {
-  if (_config) return _config;
-  try {
-    const raw = readFileSync(configPath(), "utf-8");
-    _config = JSON.parse(raw) as TortoiseConfig;
-  } catch {
-    _config = { autoCapture: false };
+/**
+ * Normalise a parsed config file at the boundary. JSON can hold any top-level
+ * type (array/string/number) and a hand-written field can be a non-string; both
+ * would otherwise throw deep inside the extension (`...trim is not a function`),
+ * killing registration and losing even LOCAL capture (#803 review cycle 1 P1).
+ */
+export function normalizeConfig(parsed: unknown): TortoiseConfig {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { autoCapture: false };
   }
-  return _config;
+  const raw = parsed as Record<string, unknown>;
+  const cfg: TortoiseConfig = { autoCapture: Boolean(raw.autoCapture) };
+  const dbPath = asConfigString("dbPath", raw.dbPath);
+  if (dbPath !== undefined) cfg.dbPath = dbPath;
+  const docsDir = asConfigString("docsDir", raw.docsDir);
+  if (docsDir !== undefined) cfg.docsDir = docsDir;
+  const tortoiseSrcDir = asConfigString("tortoiseSrcDir", raw.tortoiseSrcDir);
+  if (tortoiseSrcDir !== undefined) cfg.tortoiseSrcDir = tortoiseSrcDir;
+  const pointModel = asConfigString("pointModel", raw.pointModel);
+  if (pointModel !== undefined) cfg.pointModel = pointModel;
+  if (raw.cloud === true) cfg.cloud = true;
+  const apiUrl = asConfigString("apiUrl", raw.apiUrl);
+  if (apiUrl !== undefined) cfg.apiUrl = apiUrl;
+  const apiKey = asConfigString("apiKey", raw.apiKey);
+  if (apiKey !== undefined) cfg.apiKey = apiKey;
+  return cfg;
+}
+
+/**
+ * Load the operator config. `opts.configPath` is a test seam (mirrors
+ * reflect-hook's loadConfig); the default path is cached per process.
+ */
+export function loadConfig(opts?: { configPath?: string }): TortoiseConfig {
+  if (!opts && _config) return _config;
+  let cfg: TortoiseConfig;
+  try {
+    const raw = readFileSync(opts?.configPath ?? configPath(), "utf-8");
+    cfg = normalizeConfig(JSON.parse(raw));
+  } catch {
+    cfg = { autoCapture: false };
+  }
+  if (!opts) _config = cfg;
+  return cfg;
 }
 
 // ── Conversation extraction (same pattern as Mem0 plugin) ───────
@@ -295,16 +367,34 @@ const CLOUD_FALLBACK_DIR =
 
 /** Resolve hosted API base + key — env wins, file falls back, apiUrl defaults (mirrors reflect-hook). */
 export function cloudConfig(config: TortoiseConfig): { apiUrl: string; apiKey: string } {
-  const apiKey = (process.env.TORTOISE_API_KEY || config.apiKey || "").trim();
+  const apiKey = (
+    asString(process.env.TORTOISE_API_KEY) ||
+    asString(config.apiKey) ||
+    ""
+  ).trim();
   const apiUrl =
-    (process.env.TORTOISE_API_URL || config.apiUrl || "").replace(/\/+$/, "") ||
-    DEFAULT_API_URL;
+    (asString(process.env.TORTOISE_API_URL) || asString(config.apiUrl) || "").replace(
+      /\/+$/,
+      "",
+    ) || DEFAULT_API_URL;
   return { apiUrl, apiKey };
 }
 
-/** Cloud mode is active only when explicitly enabled AND a key exists. */
-export function isCloudEnabled(config: TortoiseConfig): boolean {
-  return config.cloud === true && cloudConfig(config).apiKey.length > 0;
+/**
+ * Cloud mode is active only when explicitly opted in AND a key exists AND no
+ * repo/env deny (#803). Same shared gate as reflect-hook — see
+ * extensions/shared/capture-gate.ts. `projectDir` defaults to process.cwd().
+ */
+export function isCloudEnabled(
+  config: TortoiseConfig,
+  opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
+): boolean {
+  return resolveCaptureGate({
+    cloud: config.cloud,
+    apiKey: cloudConfig(config).apiKey,
+    projectDir: opts?.projectDir ?? resolveProjectRoot(process.cwd()),
+    env: opts?.env,
+  }).enabled;
 }
 
 /** Append a durable JSONL record (shaped like the /v1/sessions payload) BEFORE the network attempt. */
@@ -524,6 +614,50 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
   // Ensure PID directory exists (same as db dir for default, but explicit for custom paths)
   mkdirSync(join(homedir(), ".tortoise"), { recursive: true });
 
+  // Lazy evaluation: unless `cloud: true`, do NOT spawn git or resolve the key at
+  // all — the default local-capture case must not pay a git subprocess on every
+  // event (a non-git cwd would otherwise re-spawn on each agent_end, because a
+  // failed resolution is deliberately never cached).
+  const initProjectDir = config.cloud === true ? resolveProjectRoot(process.cwd()) : process.cwd();
+  const initialGate: CaptureGateResult =
+    config.cloud === true
+      ? resolveCaptureGate({
+          cloud: config.cloud,
+          apiKey: cloudConfig(config).apiKey,
+          projectDir: initProjectDir,
+          env: process.env,
+        })
+      : { enabled: false, reason: "cloud-not-enabled" };
+
+  // One honest gate line, reused by the egress restatement so the startup
+  // disclosure and the POST decision can never contradict each other.
+  const logCloudGate = (gate: CaptureGateResult): void => {
+    if (gate.enabled) {
+      const { apiUrl } = cloudConfig(config);
+      console.log(
+        `[tortoise-capture] enabled — cloud capture ON: sessions POST to ${apiUrl}/v1/sessions (local python ingest replaced)`,
+      );
+    } else if (
+      gate.reason === "repo-opt-out" ||
+      gate.reason === "env-disabled" ||
+      gate.reason === "repo-root-unresolved"
+    ) {
+      // #803: an operator/repo deny — or an unresolvable repo scope, which fails
+      // closed — beat an otherwise-valid cloud config; say so rather than
+      // silently falling through to the local path.
+      console.log(
+        `[tortoise-capture] enabled — cloud capture OFF (${gate.reason}); capturing locally to ~/.tortoise/docs/`,
+      );
+    } else if (config.cloud === true) {
+      console.warn(
+        `[tortoise-capture] cloud: true but no apiKey/TORTOISE_API_KEY — falling back to local ingest (set apiKey in ${configPath()})`,
+      );
+    } else {
+      console.log("[tortoise-capture] enabled — auto-capturing conversations to ~/.tortoise/docs/");
+    }
+  };
+  logCloudGate(initialGate);
+
   pi.on("agent_end", async (event, ctx) => {
     const messages = (event as any).messages ?? [];
     const conversation = extractConversation(messages);
@@ -585,7 +719,30 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
       // Update tracking state
       state.lastMessageCount = conversation.length;
 
-      if (isCloudEnabled(config)) {
+      const egressProjectDir =
+        config.cloud === true ? resolveProjectRoot(ctx.cwd ?? process.cwd()) : (ctx.cwd ?? process.cwd());
+      const egressGate: CaptureGateResult =
+        config.cloud === true
+          ? resolveCaptureGate({
+              cloud: config.cloud,
+              apiKey: cloudConfig(config).apiKey,
+              projectDir: egressProjectDir,
+              env: process.env,
+            })
+          : { enabled: false, reason: "cloud-not-enabled" };
+      // Restate when the egress decision differs from the startup line (the
+      // session's cwd can differ from the launch cwd after a rebind/resume) so
+      // the disclosure can never contradict the POST.
+      if (
+        config.cloud === true &&
+        (egressGate.enabled !== initialGate.enabled ||
+          egressGate.reason !== initialGate.reason ||
+          egressProjectDir !== initProjectDir)
+      ) {
+        logCloudGate(egressGate);
+      }
+
+      if (egressGate.enabled) {
         // #312: hosted-cloud path — REPLACES local python ingest. Durable JSONL
         // record is written BEFORE the network attempt (data never lost); the
         // POST is fire-and-forget with a bounded 30s timeout, never awaited so
@@ -629,18 +786,6 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
     }
   });
 
-  if (isCloudEnabled(config)) {
-    const { apiUrl } = cloudConfig(config);
-    console.log(
-      `[tortoise-capture] enabled — cloud capture ON: sessions POST to ${apiUrl}/v1/sessions (local python ingest replaced)`,
-    );
-  } else if (config.cloud === true) {
-    console.warn(
-      `[tortoise-capture] cloud: true but no apiKey/TORTOISE_API_KEY — falling back to local ingest (set apiKey in ${configPath()})`,
-    );
-  } else {
-    console.log("[tortoise-capture] enabled — auto-capturing conversations to ~/.tortoise/docs/");
-  }
 }
 
 // ── Extraction pipeline helpers ──────────────────────────
