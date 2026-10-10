@@ -470,6 +470,14 @@ FILES_WITH_HITS="$(printf '%s\n' "$HITS" | sed '/^$/d' | cut -d: -f1 | LC_ALL=C 
   echo "check-no-sigpipe-grep: could not classify the scan's hits — refusing a verdict over files that may contain the idiom" >&2
   exit 2
 }
+# A STATUS check cannot cover the converse: a classifier that CONSUMES its input, prints nothing and
+# exits 0 empties the classification while HITS is not empty, the per-file loop below is skipped,
+# and the guard reports clean with the idiom sitting in HITS. Cross-check the two VALUES instead —
+# this needs no external command, so it cannot itself fail open.
+if [ -z "$FILES_WITH_HITS" ] && [ -n "$HITS" ]; then
+  echo "check-no-sigpipe-grep: the scan found matches that could not be classified — refusing a verdict" >&2
+  exit 2
+fi
 
 if [ -n "$FILES_WITH_HITS" ]; then
   while IFS= read -r f; do
@@ -495,6 +503,15 @@ if [ -n "$FILES_WITH_HITS" ]; then
       echo "check-no-sigpipe-grep: could not fingerprint $f — refusing a verdict" >&2
       exit 2
     fi
+    # ...and the empty-input digest must be refused explicitly, because it is the ONE failure a
+    # well-formedness check cannot see: it is 16 valid hex characters, and it is what a fingerprint
+    # pipeline yields when it swallows its input and still exits 0. A real file in FILES_WITH_HITS
+    # has at least one matched line, so sha256 of the empty string is unreachable for a correct run.
+    case "$hash" in
+      e3b0c44298fc1c14)
+        echo "check-no-sigpipe-grep: the fingerprint of $f is the digest of EMPTY input — refusing a verdict" >&2
+        exit 2 ;;
+    esac
     line="$(grep -E "^$(printf '%s' "$f" | sed 's/[].[\*^$/]/\\&/g')[[:space:]]" "$ROOT/$EXC_FILE" 2>/dev/null | head -1)"
     if [ -z "$line" ]; then
       fails+="  $f — $actual occurrence(s), undeclared"$'\n'
@@ -529,17 +546,19 @@ if [ -f "$ROOT/$EXC_FILE" ]; then
     # file OUTSIDE this invocation's scan set is UNVERIFIED, not stale — otherwise a consumer
     # whose exceptions file covers files a narrower `--dirs` does not reach gets a red run for
     # every narrowed invocation, including a developer checking one directory (#7588).
-    # `grep` exits 0 (match), 1 (no match) or >1 (ERROR). Used as a bare boolean, a >1 exit — a
-    # broken or shimmed `grep`, which prints nothing — reads as "no match", so a STALE exception is
-    # silently accepted and the guard exits 0. The membership tests are therefore made explicit:
-    # anything above 1 refuses, rather than being absorbed as "absent".
-    in_file_list=0 in_hits=0
-    grep -qx "$f" <<<"$FILE_LIST" || in_file_list=$?
-    grep -qx "$f" <<<"$FILES_WITH_HITS" || in_hits=$?
-    if [ "$in_file_list" -gt 1 ] || [ "$in_hits" -gt 1 ]; then
-      echo "check-no-sigpipe-grep: could not test a declaration against the scan — refusing a verdict" >&2
-      exit 2
-    fi
+    # Membership is decided IN THE SHELL, not by an external. `grep` cannot do it fail-closed: it
+    # exits 0 for a match, 1 for none and >1 for an error, so a shim that prints nothing and exits 0
+    # reports BOTH memberships true — which suppresses the stale check and lets a stale declaration
+    # pass. A `case` cannot fail that way, and quoting the needle keeps its characters literal
+    # (quoting suppresses globbing), so a path containing `*`/`?`/`[` is still exact.
+    case $'\n'"$FILE_LIST"$'\n' in
+      *$'\n'"$f"$'\n'*) in_file_list=0 ;;
+      *) in_file_list=1 ;;
+    esac
+    case $'\n'"$FILES_WITH_HITS"$'\n' in
+      *$'\n'"$f"$'\n'*) in_hits=0 ;;
+      *) in_hits=1 ;;
+    esac
     if [ "$n" -gt 0 ] && [ "$in_file_list" -eq 0 ] && [ "$in_hits" -ne 0 ]; then
       fails+="  $f — STALE exception: declares $n occurrence(s) but the file has NONE. Delete the line ($EXC_FILE)."$'\n'
     fi

@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (74 on BSD/macOS, 76 on GNU findutils — the platform CI runs).
+#      platform-dependent (76 on BSD/macOS, 78 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -902,19 +902,22 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SILENTLY failing enumerator refuses a verdict (exit 2)" \
              || fail "a silently failing find reported a tree it never listed (exit $rc)"
 
-# 11ar. ...and a membership test must not absorb a FAILING `grep`. `grep` exits 0 (match), 1 (no
-# match) or >1 (ERROR, printing nothing); read as a bare boolean, the error reads as "no match",
-# so a STALE declaration is silently accepted. The stub fails ONLY on `-qx`, which is the shape
-# that reaches this check: the declaration lookup uses `-E` and must still work.
+# 11ar. ...and membership is decided IN THE SHELL, so a `grep` that lies successfully cannot decide
+# it. `grep` exits 0 (match), 1 (none) or >1 (error); a shim printing nothing and exiting 0 reports
+# BOTH memberships as MATCHES, which suppresses the stale check and lets a stale declaration pass.
+# The stub fails that way only on `-qx`, so the declaration lookup (which the real `grep` handles)
+# still works. The idiom file must be DECLARED CORRECTLY, so the STALE line is the only finding.
 E="$TMP/f11ar"; mkdir -p "$E/scripts" "$E/fakebin"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/a.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/b.sh"
-printf 'scripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
-printf '%s\n' '#!/bin/sh' 'case "$1" in -qx) exit 3 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+printf 'scripts/b.sh 1 deadbeefdeadbeef #999\nscripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+h="$(bash "$GUARD" --root "$E" --dirs 'scripts' 2>&1 | sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+printf 'scripts/b.sh 1 %s #999\nscripts/a.sh 1 deadbeefdeadbeef #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -qx) exit 0 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
 chmod +x "$E/fakebin/grep"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
-[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING membership test refuses a verdict (exit 2)" \
-             || fail "a failing membership test was absorbed as 'no match' (exit $rc)"
+[ "$rc" -eq 1 ] && grep -q 'STALE exception' "$OUT" && pass "a SILENT-SUCCESS grep cannot suppress the stale check (exit 1)" \
+             || fail "a lying grep suppressed the stale check (exit $rc)"
 
 # 11as. ...and the occurrence COUNT is the same shape once more. `grep -c` exits 1 for a zero
 # count, so only >1 is an error — absorbed as a boolean, an error left `actual` EMPTY, the count
@@ -956,6 +959,27 @@ chmod +x "$E/fakebin/grep"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING fingerprint refuses a verdict (exit 2)" \
              || fail "the hash of empty input was accepted as a declaration (exit $rc)"
+# ...and the SILENT-SUCCESS twin, which no status check can catch: the fingerprint pipeline swallows
+# its input, prints nothing and exits 0, so the digest is that of EMPTY input. Only an explicit
+# value check sees it — and it is the exact failure the comment above names as un-catchable by shape.
+printf '%s\n' '#!/bin/sh' 'case "$1" in -*) exec /usr/bin/grep "$@" ;; esac' 'cat >/dev/null' 'exit 0' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING fingerprint refuses a verdict (exit 2)" \
+             || fail "the empty-input digest was accepted from a silent pipeline (exit $rc)"
+
+# 11au. ...and a CLASSIFIER that swallows its input is the same shape: with `cut` printing nothing
+# and exiting 0, FILES_WITH_HITS is empty while HITS is not, so the whole per-file loop is skipped
+# and the guard reports clean with the idiom sitting in HITS. The cross-check between those two
+# VALUES needs no external, so it cannot itself fail open. The stub leaves the fingerprint's
+# `cut -c1-16` working so this pin isolates the classification path.
+E="$TMP/f11au"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-c1-16*) exec /usr/bin/cut "$@" ;; esac' 'cat >/dev/null' 'exit 0' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING classifier refuses a verdict (exit 2)" \
+             || fail "unclassified hits were reported clean (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
