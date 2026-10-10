@@ -75,6 +75,12 @@ export interface TaskRunRecord {
   model: string;
   provider: string;
   cwd: string;
+  /** the dispatch's RESOLVED stream-stall bound (S) — the per-dispatch
+   * `stream_stall_ms` override if given, else `TASK_STREAM_STALL_MS`, else the
+   * 20-min default. This is the SAME value the watchdog applies, persisted so
+   * `task_status` compares `tool_age_max_ms` against the bound that will
+   * actually kill the lane instead of a compile-time constant (#1662 review). */
+  stream_stall_ms?: number;
   /** per-dispatch `TASK_HEARTBEAT_NONCE` — lets `task_status` authenticate the
    * markers it replays out of the log (a foreign writer on the child's fd 2
    * must not forge life signs). */

@@ -3518,7 +3518,11 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
     let logStream: fs.WriteStream | null = null;
     if (observers?.logPath) {
       try {
-        logStream = fs.createWriteStream(observers.logPath, { flags: "a" });
+        // 0600: the log holds the child's raw stdout+stderr (markers, and any
+        // secrets the child prints). The record root is 0700, but TASK_RUNS_ROOT
+        // is an operator override and may point outside a 0700 directory, so the
+        // FILE itself must not be group/world-readable (#1662 review).
+        logStream = fs.createWriteStream(observers.logPath, { flags: "a", mode: 0o600 });
         logStream.on("error", (err: Error) => {
           console.error(`[task] background capture log unavailable (${observers.logPath}): ${err.message}`);
           logStream = null;
@@ -4432,9 +4436,10 @@ const FAILED_TASK_STATUS = new Set(["failed", "circuit_open", "invalid-cwd", "in
 // (the cap), and a durable run record to collect the outcome later.
 //
 // ⛔ DESIGN CONSTRAINT — THE REVIEW GATE STAYS A PARENT STEP (#825). Sub-agents
-// run with AGENT_SKIP_REVIEW_GATE=1 because a child has no `task` tool and
-// cannot dispatch reviewers itself; the PARENT enforces the review ceremony
-// centrally for the PR as a whole. (VGATE is a different matter and stays
+// run with AGENT_SKIP_REVIEW_GATE=1 FORCED, so the review dispatch cannot be
+// satisfied from inside the child (the flag disables the review-enforcer
+// there); the PARENT enforces the review ceremony centrally for the PR as a
+// whole. (VGATE is a different matter and stays
 // ACTIVE for the child via the verified-file bridge — see the subAgentEnv
 // comment in the task tool.) A background mode must therefore keep the
 // review ceremony an EXPLICIT parent step — the `task_collect` analogue of the
@@ -4587,11 +4592,34 @@ export function evaluateTaskRunStatus(
     // DONE; task_collect reads whatever the record holds.
     return { ...base, status: "done", terminal: false, alive, note: "process is gone; finalize pending — call task_collect" };
   }
-  if (heartbeat && heartbeat.tools_in_flight > 0 && heartbeat.tool_age_max_ms > DEFAULT_STREAM_STALL_MS) {
-    return { ...base, status: "wedged", terminal: false, alive, note: `in-flight tool older than the stream-stall bound (${Math.round(DEFAULT_STREAM_STALL_MS / 60_000)} min)` };
+  // The bound the watchdog will ACTUALLY apply for this dispatch. A background
+  // lane carries the resolved S in its record (per-dispatch `stream_stall_ms` →
+  // env → default); a legacy/absent field falls back to the live env/default.
+  // Comparing against the compile-time DEFAULT_STREAM_STALL_MS would report
+  // `wedged` at 20 min for a lane dispatched with a raised bound that the
+  // watchdog would keep alive for another 40 min — the #1030 long-quiet-tool
+  // shape this mode exists to serve (#1662 review).
+  const streamStallMs =
+    typeof rec.stream_stall_ms === "number" && Number.isFinite(rec.stream_stall_ms) && rec.stream_stall_ms > 0
+      ? rec.stream_stall_ms
+      : getStreamStallMs();
+  if (heartbeat && heartbeat.tools_in_flight > 0 && heartbeat.tool_age_max_ms > streamStallMs) {
+    return { ...base, status: "wedged", terminal: false, alive, note: `in-flight tool older than the stream-stall bound (${Math.round(streamStallMs / 60_000)} min)` };
   }
   const staleLog = base.log_write_age_ms !== null && base.log_write_age_ms > getHeartbeatFreshWindowMs();
-  const noMarkerYet = heartbeat !== null && heartbeat.markers === 0 && base.age_ms > getFirstOutputTimeoutMs();
+  // A FRESH log is never `wedged` merely because no marker is in the read
+  // window: `markers === 0` means "no marker in the last 512 KB", not "no
+  // activity". This is a supported configuration (TASK_HEARTBEAT_DISABLE=1
+  // silences the emitter while the child still writes stdout), and a child that
+  // pushes >512 KB of non-marker output past the last tick pushes the marker out
+  // of the tail window. Gate the missing-marker wedge on log staleness —
+  // mirroring the watchdog's tier-1 check, which keys on "no output at all",
+  // never on marker count (#1662 review).
+  const noMarkerYet =
+    heartbeat !== null &&
+    heartbeat.markers === 0 &&
+    base.log_write_age_ms !== null &&
+    base.log_write_age_ms > getFirstOutputTimeoutMs();
   if (staleLog || noMarkerYet) {
     return { ...base, status: "wedged", terminal: false, alive, note: "no fresh heartbeat/log activity — lane may be blocked at the OS level" };
   }
@@ -4629,6 +4657,27 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
   }
   if (rec.status === "running") {
     const view = evaluateTaskRunStatus(rec.run_id, runsRoot);
+    if (!view.alive) {
+      // The child is gone but no terminal record was ever persisted. The only
+      // writer of the terminal record is the PARENT's fire-and-forget `.then`
+      // (startBackgroundTask), so if the parent died mid-run the record stays
+      // `running` forever and `task_collect` used to return "not finished"
+      // indefinitely — the documented poll loop could never terminate and the
+      // final message was unreachable (#1662 review). Finalize as a FAILED
+      // salvage (fail-closed: a settle we cannot prove is never a success) and
+      // hand back the capture log so partials remain reachable.
+      return {
+        run_id: rec.run_id,
+        status: "failed",
+        terminal: true,
+        exit_code: rec.exit_code,
+        reason: rec.reason ?? "settle-lost",
+        content: rec.final_content ?? null,
+        details: rec.final_details ?? { salvaged: true, log_path: rec.log_path },
+        review_gate: "parent-required",
+        note: `process is gone and no terminal record was persisted (parent exited mid-run?) — finalized as failed; raw capture log: ${rec.log_path}`,
+      };
+    }
     return {
       run_id: rec.run_id,
       status: view.status,
@@ -4693,6 +4742,10 @@ export interface BackgroundDispatchHandle {
   pgid: number | null;
   log_path: string;
   started_at: number;
+  /** false when the durable run record could not be written (root unwritable,
+   * ENOSPC, …). task_status/task_collect will read UNKNOWN; the caller must not
+   * treat the lane as durable. Surfaced in the tool result (#1662 review). */
+  record_persisted: boolean;
 }
 
 /**
@@ -4725,11 +4778,19 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
     provider: input.provider,
     cwd: resolveTaskCwd(input.cwd),
     nonce: input.nonce,
+    // Resolved ONCE here so task_status can never diverge from the watchdog:
+    // the per-dispatch override if the task tool passed one, else env/default.
+    stream_stall_ms: input.streamStallMs ?? getStreamStallMs(),
     status: "running",
   };
   const created = ensureTaskRunsRoot(runsRoot);
+  let recordPersisted = false;
   if (created.ok) {
-    writeRunRecord(runsRoot, baseRecord);
+    const w = writeRunRecord(runsRoot, baseRecord);
+    recordPersisted = w.ok;
+    if (!w.ok) {
+      console.error(`[task] background record persist failed (${logPath}): ${w.error ?? "unknown"} — task_status/task_collect will read UNKNOWN`);
+    }
   } else {
     console.error(`[task] background run root ${runsRoot} unavailable (${created.error ?? "unknown"}) — task_status/task_collect degraded`);
   }
@@ -4757,7 +4818,11 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
   // already in hand. Persist it (best-effort) so task_status has a pid to probe
   // even if the parent never reaches the settle handler.
   if (created.ok) {
-    writeRunRecord(runsRoot, { ...baseRecord, pid: spawnInfo.pid, pgid: spawnInfo.pgid });
+    const w = writeRunRecord(runsRoot, { ...baseRecord, pid: spawnInfo.pid, pgid: spawnInfo.pgid });
+    if (!w.ok) {
+      recordPersisted = false;
+      console.error(`[task] background pid persist failed (${logPath}): ${w.error ?? "unknown"} — task_status/task_collect will read UNKNOWN`);
+    }
   }
 
   // Fire-and-forget settle persistence. The CALLER never awaits this — that is
@@ -4797,6 +4862,11 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
     pgid: spawnInfo.pgid,
     log_path: created.ok ? logPath : "",
     started_at: startedAt,
+    // A failed persist is REPORTED, never swallowed (task-runs.ts documents
+    // "a failed persist is reported to the caller"). Without this the handle
+    // looks like a successful dispatch while task_status answers UNKNOWN
+    // forever and the lane's result is silently lost (#1662 review).
+    record_persisted: recordPersisted,
   };
 }
 
@@ -4824,7 +4894,21 @@ export default function (pi: ExtensionAPI) {
   // `hookResult?.isError`).
   pi.on("tool_result", (event) => {
     const e = event as { toolName?: string; isError?: boolean; details?: TaskResultDetails };
-    if (e.toolName !== "task" || e.isError) return;
+    if (e.isError) return;
+    // #1662 review: `task_collect` reaps a background lane by returning the
+    // SAME terminal payload a blocking `task` call would have — but under a
+    // task-run view whose failure fields are `status` (done|failed|cut) and
+    // `exit_code` (snake_case), not the `TaskResultDetails` shape below. Without
+    // this branch a background lane cut at the hard cap (or failed) is reaped
+    // as `isError:false` — exactly the #1508 incident, one seam over. Only a
+    // terminal collect is a verdict; a not-finished notice is left alone.
+    if (e.toolName === "task_collect") {
+      const c = e.details as { terminal?: boolean; status?: string; exit_code?: number | null } | undefined;
+      if (c?.terminal !== true) return;
+      const failed = (typeof c.exit_code === "number" && c.exit_code !== 0) || c.status === "failed" || c.status === "cut";
+      return failed ? { isError: true } : undefined;
+    }
+    if (e.toolName !== "task") return;
     const d = e.details;
     // A failed dispatch may carry any of these markers. TWO layers produce them:
     //  * the TASK TOOL's own terminal failures are a `status` — a refusal
@@ -5520,8 +5604,8 @@ export default function (pi: ExtensionAPI) {
       // persistence (startBackgroundTask).
       //
       // ⚠️ REVIEW GATE IS A PARENT STEP (#825). The child runs with
-      // AGENT_SKIP_REVIEW_GATE=1 and cannot review itself (it has no `task`
-      // tool); the PARENT runs the review ceremony centrally. A background lane
+      // AGENT_SKIP_REVIEW_GATE=1 FORCED, so it cannot satisfy the review
+      // dispatch from inside; the PARENT runs the review ceremony centrally. A background lane
       // makes that step easy to forget, so the handle, `task_status` and
       // `task_collect` all carry `review_gate: "parent-required"` and the docs
       // spell out dispatch → status → collect → REVIEW before accept. A
@@ -5554,7 +5638,11 @@ export default function (pi: ExtensionAPI) {
               `🚀 Background sub-agent dispatched (returns-early).\n` +
               `run_id: ${handle.run_id}\n` +
               `pid: ${handle.pid ?? "unknown"}  pgid: ${handle.pgid ?? "unknown"}\n` +
-              `log: ${handle.log_path || "(unavailable)"}\n\n` +
+              `log: ${handle.log_path || "(unavailable)"}\n` +
+              (handle.record_persisted
+                ? ""
+                : `⚠️ run record was NOT persisted — task_status/task_collect will read UNKNOWN for this run_id; re-dispatch or check TASK_RUNS_ROOT.\n`) +
+              `\n` +
               `Poll: task_status({ run_id: "${handle.run_id}" })  → alive | wedged | done\n` +
               `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
               `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
@@ -5566,6 +5654,7 @@ export default function (pi: ExtensionAPI) {
             log_path: handle.log_path,
             status: "running",
             background: true,
+            record_persisted: handle.record_persisted,
             reviewGate: "parent-required",
           },
         };
@@ -5800,7 +5889,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text }], details: view };
       }
       const body = view.content?.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("\n") ?? "(no output)";
-      const head = `✅ Background run ${view.run_id} finished — status: ${view.status}`
+      const head = `${view.status === "done" ? "✅" : "❌"} Background run ${view.run_id} finished — status: ${view.status}`
         + (view.exit_code === undefined ? "" : ` (exit ${view.exit_code === null ? "signal" : view.exit_code})`)
         + (view.reason ? ` [${view.reason}]` : "");
       const text = `${head}\n\n${body}\n\n⚠️ REVIEW GATE IS A PARENT STEP (#825): before treating this lane as complete, run the review ceremony for its output. The child ran with AGENT_SKIP_REVIEW_GATE=1 and cannot self-review.`;

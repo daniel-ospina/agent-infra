@@ -32,7 +32,7 @@ import { ok, equal, deepEqual } from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
-import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync } from "node:fs";
+import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -7474,6 +7474,14 @@ test("#1508 — the registered tool_result handler turns a failed child into isE
   equal(h({ toolName: "task", isError: true, details: { exitCode: 1 } }), undefined, "an already-errored result is left alone");
   equal(h({ toolName: "task", isError: false, details: undefined }), undefined, "no details → nothing to prove, stays a success");
   equal(h({ toolName: "task", isError: false, details: { status: "ok" } }), undefined, "a status this hook does not know as a failure stays a success");
+  // #1662 review: `task_collect` reaps a terminal background lane under its own
+  // details shape (`status` done|failed|cut + snake_case `exit_code`), so a
+  // failure/cut lane must not slip back through as isError:false.
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "failed", exit_code: null } }), { isError: true }, "a collected failed lane is an error");
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "cut", exit_code: 0 } }), { isError: true }, "a collected cut lane (exit 0) is an error");
+  deepEqual(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "done", exit_code: 1 } }), { isError: true }, "a nonzero exit is an error");
+  equal(h({ toolName: "task_collect", isError: false, details: { terminal: true, status: "done", exit_code: 0 } }), undefined, "a clean collect stays a success");
+  equal(h({ toolName: "task_collect", isError: false, details: { terminal: false, status: "alive" } }), undefined, "a not-finished notice is not an error");
 });
 
 // ═══════════════════════════════════════════════════════════
@@ -7548,7 +7556,20 @@ section("#1662 — task_status derivation (markers, never %CPU)");
 
 // A record whose pid is OUR pid (alive) and whose log holds a fresh, nonce-signed
 // marker stream. `utimesSync` lets the wedged twin make the log stale.
-function seedRunningRun(dir: string, opts: { nonce?: string | null; markers?: string; logAgeMs?: number } = {}) {
+function seedRunningRun(
+  dir: string,
+  opts: {
+    nonce?: string | null;
+    markers?: string;
+    logAgeMs?: number;
+    /** started_at is pushed back this far so `age_ms` can exceed a bound. */
+    ageMs?: number;
+    /** the resolved stream-stall bound persisted on the record (S). */
+    streamStallMs?: number;
+    /** override the probed pid (a dead pid simulates a lost parent/child). */
+    pid?: number | null;
+  } = {},
+) {
   const id = mintRunId();
   const log = runLogPath(dir, id);
   const nonce = opts.nonce === undefined ? "testnonce" : opts.nonce;
@@ -7565,14 +7586,15 @@ function seedRunningRun(dir: string, opts: { nonce?: string | null; markers?: st
   }
   const rec = {
     run_id: id,
-    pid: process.pid,
-    pgid: process.pid,
+    pid: opts.pid === undefined ? process.pid : opts.pid,
+    pgid: opts.pid === undefined ? process.pid : opts.pid,
     log_path: log,
-    started_at: Date.now(),
+    started_at: Date.now() - (opts.ageMs ?? 0),
     model: "deepseek-v4-flash",
     provider: "deepseek",
     cwd: dir,
     nonce,
+    ...(opts.streamStallMs !== undefined ? { stream_stall_ms: opts.streamStallMs } : {}),
     status: "running" as const,
   };
   writeRunRecord(dir, rec as any);
@@ -7606,6 +7628,83 @@ test("#1662: ALIVE is not derived from %CPU — a quiet-but-live marker stream s
         markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=60000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1\n`,
       });
       equal(evaluateTaskRunStatus(id, dir).status, "alive", "a quiet-but-marking lane is alive");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool past the DEFAULT bound but under the dispatch's stream_stall_ms stays ALIVE", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-override-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: undefined }, () => {
+      // 21.7 min of in-flight tool: > the 20-min DEFAULT (so a hardcoded
+      // comparison says wedged) but < the 60-min bound this lane was dispatched
+      // with. The watchdog would keep it alive; task_status must too.
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 3_600_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `a raised dispatch bound must be honoured (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: without a persisted bound the env TASK_STREAM_STALL_MS is the fallback (not the constant)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-env-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: "3600000" }, () => {
+      const { id } = seedRunningRun(dir, {
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "alive", "env bound honoured when the record has none");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool past the persisted bound reads WEDGED (negative twin)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-wedge-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 60_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "over the persisted bound ⇒ wedged");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a FRESH log with no heartbeat markers stays ALIVE (TASK_HEARTBEAT_DISABLE shape)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-fresh-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // Emitter off: the child writes ordinary stdout, no markers. The run is
+      // older than the 60s first-output bound, but the LOG is fresh — the old
+      // `markers === 0` clause called this wedged with a false "no activity" note.
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 120_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "no marker in the tail");
+      equal(v.status, "alive", `a fresh no-marker log is not wedged (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a STALE log with no markers reads WEDGED (the no-output shape)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-stale-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 3_700_000, logAgeMs: 3_700_000 });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "no output at all past the bound ⇒ wedged");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -7683,6 +7782,26 @@ test("#1662: collect returns the final message + exit once terminal, and a not-f
   }
 });
 
+test("#1662: a running record whose process is gone is FINALIZED by collect (no infinite 'not finished')", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-salvage-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The parent died mid-run: the child pid is gone but its terminal record
+      // was never written. The documented poll loop must still terminate.
+      const { id } = seedRunningRun(dir, { pid: 999_999_999 });
+      const got = collectTaskRun(id, dir);
+      equal(got.terminal, true, "collect terminates instead of looping forever");
+      equal(got.status, "failed", "a settle that cannot be proven is fail-closed, never success");
+      equal(got.reason, "settle-lost", "the lost-settle reason is named");
+      ok(String(got.note).includes("process is gone"), `salvage note: ${got.note}`);
+      equal((got.details as any)?.log_path, runLogPath(dir, id), "the capture log is handed back for partials");
+      equal(got.review_gate, "parent-required", "review obligation still rides on the salvage");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 section("#1662 — startBackgroundTask (returns-early, E2E through the real spawn)");
 
 const FAKE_PI_BG_SHIM = `#!/bin/sh
@@ -7754,6 +7873,11 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     equal(view.status, "done", `clean exit ⇒ done, got ${view.status} [${view.reason ?? ""}]`);
     ok(String(view.content?.[0]?.text).includes("BG-FINAL-MESSAGE"), `final message collected: ${JSON.stringify(view.content)}`);
     equal(view.review_gate, "parent-required", "collect still carries the parent review obligation");
+    equal(handle.record_persisted, true, "a successful dispatch reports the record was persisted");
+
+    // (4) The capture log is owner-only 0600 — it holds the child's raw output.
+    ok(existsSync(handle.log_path), "capture log exists");
+    equal(statSync(handle.log_path).mode & 0o777, 0o600, "capture log is not group/world-readable");
   } finally {
     process.env.PATH = savedPath;
     process.argv[1] = savedArgv1;
@@ -7761,6 +7885,30 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
     if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a failed record persist is SURFACED in the handle, never swallowed", () => {
+  const base = mkdtempSync(join(tmpdir(), "t1662-persistfail-"));
+  try {
+    // An unwritable runs root (a file, not a directory) AND a target that is a
+    // file, so spawnSubAgent refuses synchronously without spawning a child.
+    const notADir = join(base, "not-a-dir");
+    writeFileSync(notADir, "x");
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: join(notADir, "child"),
+      nonce: null,
+    });
+    equal(handle.record_persisted, false, "persist failure is reported to the caller");
+    equal(handle.log_path, "", "no capture log when the root could not be created");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
   }
 });
 
@@ -7776,6 +7924,11 @@ section("#1662 — tool surface");
     ok(source.includes('name: "task_status"') && source.includes('name: "task_collect"'), "both new tools are named in source");
     // The review-gate constraint must be explicit in the code comment.
     ok(source.includes("REVIEW GATE IS A PARENT STEP"), "the code states the review gate is a parent step (#825)");
+    // #1662 review: the stated rationale was FALSE — task children DO have the
+    // `task` tool (the same file says so for VGATE). The correct mechanism is
+    // the forced `AGENT_SKIP_REVIEW_GATE=1`, and the false claim must not return.
+    equal(source.includes("has no `task` tool"), false, "the false 'no task tool' rationale is gone");
+    ok(source.includes("AGENT_SKIP_REVIEW_GATE=1 FORCED"), "the review-gate rationale names the forced skip flag");
   });
 }
 
