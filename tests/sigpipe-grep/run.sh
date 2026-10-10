@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (71 on BSD/macOS, 73 on GNU findutils — the platform CI runs).
+#      platform-dependent (72 on BSD/macOS, 74 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -915,6 +915,24 @@ chmod +x "$E/fakebin/grep"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING membership test refuses a verdict (exit 2)" \
              || fail "a failing membership test was absorbed as 'no match' (exit $rc)"
+
+# 11as. ...and the occurrence COUNT is the same shape once more. `grep -c` exits 1 for a zero
+# count, so only >1 is an error — absorbed as a boolean, an error left `actual` EMPTY, the count
+# comparison then failed SILENTLY (`integer expression expected`, `if` false), the COUNT check was
+# skipped, and control fell through to the CONTENT-HASH check. A declaration whose count
+# contradicts its own hash therefore passed as a warning and the guard exited 0. The declaration
+# is first written with the RIGHT hash (so the hash check cannot save it) and the WRONG count.
+E="$TMP/f11as"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf 'scripts/a.sh 1 deadbeefdeadbeef #999\n' > "$E/.sigpipe-grep-exceptions.txt"
+h="$(bash "$GUARD" --root "$E" --dirs 'scripts' 2>&1 | sed -n 's/.*actual \([0-9a-f]\{16\}\).*/\1/p' | head -1)"
+printf 'scripts/a.sh 2 %s #999\n' "$h" > "$E/.sigpipe-grep-exceptions.txt"
+rc_real="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+printf '%s\n' '#!/bin/sh' 'case "$1" in -c) exit 3 ;; esac' 'exec /usr/bin/grep "$@"' > "$E/fakebin/grep"
+chmod +x "$E/fakebin/grep"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc_real" -eq 1 ] && [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING occurrence count refuses a verdict (exit 2)" \
+             || fail "a failing occurrence count skipped the count check (real $rc_real, stub $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

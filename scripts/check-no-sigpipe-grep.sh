@@ -474,7 +474,19 @@ FILES_WITH_HITS="$(printf '%s\n' "$HITS" | sed '/^$/d' | cut -d: -f1 | LC_ALL=C 
 if [ -n "$FILES_WITH_HITS" ]; then
   while IFS= read -r f; do
     [ -z "$f" ] && continue
-    actual="$(printf '%s\n' "$HITS" | sed '/^$/d' | grep -c "^$(printf '%s' "$f" | sed 's/[.[\*^$]/\\&/g'):")"
+    actual="$(printf '%s\n' "$HITS" | sed '/^$/d' | grep -c "^$(printf '%s' "$f" | sed 's/[.[\*^$]/\\&/g'):")" || actual_rc=$?
+    # `grep -c` legitimately exits 1 for a ZERO count, so only >1 is an ERROR. Absorbed as a
+    # boolean, an error left `actual` EMPTY — and an empty operand makes the count comparison
+    # below fail silently (the shell prints `integer expression expected`, the `if` is false), so
+    # the COUNT check was skipped entirely and control fell through to the CONTENT-HASH check.
+    # A declaration whose count contradicts its own hash then passed as a warning, and the guard
+    # exited 0 — the exact contract ("a declaration whose COUNT or CONTENT-HASH does not match
+    # the file FAILS") this check exists to keep.
+    if [ "${actual_rc:-0}" -gt 1 ]; then
+      echo "check-no-sigpipe-grep: could not count the occurrences in $f — refusing a verdict" >&2
+      exit 2
+    fi
+    actual_rc=0
     hash="$(fingerprint "$f")"
     line="$(grep -E "^$(printf '%s' "$f" | sed 's/[].[\*^$/]/\\&/g')[[:space:]]" "$ROOT/$EXC_FILE" 2>/dev/null | head -1)"
     if [ -z "$line" ]; then
