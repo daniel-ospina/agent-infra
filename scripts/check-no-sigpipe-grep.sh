@@ -266,8 +266,8 @@ is_shell_file() {
   # The test is the reader's BYTE COUNT, never the captured text: command substitution strips
   # trailing newlines and every NUL, so a legitimate file of newlines or NULs (a `.gitkeep`) also
   # captures as empty and would be a false BLOCK. The second read is paid only in that suspicious
-  # case. `wc -c` is already load-bearing in this guard, and a non-integer count refuses too — the
-  # same fail-closed polarity, since it means the measurement itself is not trustworthy.
+  # case. `wc` is already load-bearing (the file-count message) and a non-integer count refuses too
+  # — the same fail-closed polarity, since it means the measurement itself is not trustworthy.
   if [ -s "$1" ] && [ -z "$chunk" ]; then
     _nread="$(head -c 4096 "$1" 2>/dev/null | wc -c | tr -d ' ')"
     case "$_nread" in

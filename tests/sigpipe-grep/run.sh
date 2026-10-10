@@ -54,9 +54,10 @@
 #      other way) and stays fatal (11af); a tree holding BOTH a cycle and an unreadable dir is
 #      still exit 2 (11ab). The cycle pin has teeth on GNU find (CI); BSD find emits no cycle
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
-#      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
-#      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (80 on BSD/macOS, 82 on GNU findutils — the platform CI runs).
+#      to pin BOTH the exemption and the ANCHOR of its match on every platform. TWO pins are
+#      platform-gated, so the assertion count depends on it: 11af runs only where find reports an
+#      unresolvable chain, and 11ah only where /dev/full exists — both GNU/Linux, so the suite
+#      reports (81 on BSD/macOS, 83 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -1030,6 +1031,19 @@ printf '\n\n\n' > "$E/scripts/BLANK"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 0 ] && pass "a BLANK extensionless file is not a false block (exit 0)" \
              || fail "a newline-only file was refused as an empty read (exit $rc)"
+
+# 11az. ...and `scan_files` has TWO arms, each carrying its own `return "${PIPESTATUS[0]}"`, so the
+# partial-list pin above covers only the filtered one. A `.husky` hook withheld from the list is the
+# same silent miss, and nothing else would notice because `.husky` files are ALL scanned — so
+# deleting just that arm's return went undetected before this pin.
+E="$TMP/f11az"; mkdir -p "$E/.husky" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/.husky/seen"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/withheld"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" ".husky"; exit 0 ;; esac' 'printf "%s\n" ".husky/seen"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a partial .husky enumeration refuses (exit 2)" \
+             || fail "a withheld .husky hook was reported clean (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
