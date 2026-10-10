@@ -125,6 +125,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 __all__ = [
@@ -146,7 +147,12 @@ __all__ = [
     "TERMINAL_STOP_REASONS",
     "tool_stall_ms",
     "cpu_attributable",
+    "in_flight_progress",
+    "PROGRESSING",
+    "NO_PROGRESS",
+    "PROGRESS_UNKNOWN",
     "tool_veto_expired",
+    "tool_from_jsonl",
     "record_vetoes",
     "is_dead_evidence",
     "observed_from_probe",
@@ -243,7 +249,7 @@ _TOOL_STALL_NUM, _TOOL_STALL_DEN = 2, 3
 RECORD_VETO_MS = 72 * 3600 * 1000
 # The reaper's idle proof bound (`REAP_IDLE_HOURS` default 24h).
 IDLE_MS = 24 * 3600 * 1000
-# `CPU_LIVENESS_TOOL_NAMES`, extensions/task-heartbeat.ts:281 — allowlist by
+# `CPU_LIVENESS_TOOL_NAMES`, extensions/task-heartbeat.ts:430 — allowlist by
 # design; `task` is deliberately ABSENT (a nested sub-agent's quiet is
 # legitimate), pinned by builtin-tools.test.ts test id E279a2.
 CPU_LIVENESS_TOOL_NAMES = frozenset({"bash"})
@@ -411,6 +417,63 @@ def cpu_attributable(tool: Tool) -> bool:
     return tool.name in CPU_LIVENESS_TOOL_NAMES
 
 
+# ── the PROGRESS verdict (#5389) ─────────────────────────────────────────
+# The tri-state the watchdog's ``inFlightProgress``
+# (extensions/builtin-tools/index.ts) returns, and the ONE place this module
+# answers "is the in-flight tool still working?". Mirrored rather than
+# re-derived: the module's own contract (see ``tool_veto_expired``) is that the
+# classifier CITES the watchdog's rule and never invents one, and #5389 changed
+# that rule — so a classifier still reading silence alone would be a SECOND
+# contract for one rule, the defect ``docs/ops/fleet-liveness.md`` §6 names.
+PROGRESSING = "progressing"
+NO_PROGRESS = "no-progress"
+PROGRESS_UNKNOWN = "unknown"
+
+
+def in_flight_progress(tool: Tool, cpu_stall_ms: int = CPU_STALL_MS) -> str:
+    """``inFlightProgress(st, cpuStallMs)`` from the watchdog (#5389).
+
+    The second argument is the BOUND, not the measurement — mirroring the
+    watchdog's signature (``builtin-tools/index.ts``), where it is
+    ``i.cpuStallMs``. ``cpu_stall_ms=0`` therefore means **the channel is
+    switched off** (``TASK_CPU_STALL_MS=0``), never "this tool is unprobed".
+
+    The direction of each state is the whole point, and it is the SAME in both
+    consumers:
+
+      * ``"progressing"`` — the tool's subtree has DEMONSTRATED CPU work this
+        round and is still advancing (flat for at most the bound). POSITIVE
+        progress evidence: it VETOES the cut. CPU is a SPARE signal — it
+        protects, it never convicts.
+      * ``"no-progress"`` — demonstrated work, then flat past the bound
+        (``toolCpuStallMs > cpuStallMs``). The only state that may license an
+        in-flight cut.
+      * ``"unknown"`` — no evidence either way. It never licenses a cut, and it
+        never expires the veto on its own; the caller falls through to the AGE
+        backstop.
+
+    ``cpu_advanced`` is read FIRST, and the property that matters is which test
+    does NOT exist: a `toolCpuStallMs <= 0` sentinel placed ahead of the latch.
+    The not-probed sentinel is ``cpu_stall_ms == 0`` **and**
+    ``cpu_advanced == False`` — so the latch alone already decides it — but a
+    PROBED tool that advanced on this very tick ALSO reports
+    ``cpu_stall_ms == 0``, because ``stepCpuLiveness`` stamps
+    ``lastAdvanceAt = now`` on a strict increase and ``now - lastAdvanceAt == 0``.
+    A sentinel-first reading files the STRONGEST progress evidence there is
+    under ``"unknown"`` — measured live on the #5387 false cut, whose Alive
+    state read ``toolCpuMs=135910 toolCpuStallMs=0 toolCpuAdvanced=true``.
+    """
+    if not tool.cpu_advanced:
+        return PROGRESS_UNKNOWN
+    # ``TASK_CPU_STALL_MS=0`` disables the channel; an operator who switched it
+    # off has not thereby authorised a cut on it.
+    if cpu_stall_ms <= 0:
+        return PROGRESS_UNKNOWN
+    if tool.cpu_stall_ms is None:
+        return PROGRESS_UNKNOWN
+    return NO_PROGRESS if tool.cpu_stall_ms > cpu_stall_ms else PROGRESSING
+
+
 def tool_veto_expired(tool: Optional[Tool]) -> bool:
     """Would the watchdog's own clause have cut this in-flight tool by now? (C5)
 
@@ -418,30 +481,76 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
     for the tool's SHAPE.
 
       * streamed, then stopped (``tool_updates``) — ``tool-silence``
-        (index.ts:2605): ``effStreamAge > S`` with S = 20 min.
-      * never emitted an update, but demonstrated CPU work (``cpu_advanced``) —
-        ``tool-dead`` (index.ts:2680-2690) is a CONJUNCTION:
-        ``toolCpuStallMs > cpuStallMs`` (:2686, 30 min) **and**
-        ``effToolAge > streamStallMs`` (:2687, 20 min). 30 min binds only when
-        the CPU-stall and tool-age clocks start together.
-      * no output and no demonstrated CPU — the age backstop, ``tool-stall``
-        (index.ts:2697-2701): ``toolStallMs`` (4h at the 6h cap) while the turn
-        is ACTIVE, and ``min(toolStallMs, heartbeatTimeoutMs)`` (30 min) when it
-        is NOT. The turn-inactive branch is the one v4 missed, and missing it is
-        the fail-OPEN direction: the classifier would stay quiet for hours after
+        (index.ts:2961-2969): ``effStreamAge > S`` with S = 20 min — **AND,
+        since #5389, positive no-progress evidence** (``in_flight_progress``).
+        Silence alone read ABSENCE OF OUTPUT as ABSENCE OF WORK and expired this
+        veto on a tool that was still burning CPU: measured, 1203 s against the
+        1200 s bound with ``toolCpuAdvanced=true`` and 154 CPU-seconds burned
+        (tortoise #5387).
+      * never emitted an update, but demonstrated CPU work — ``tool-dead``
+        (index.ts:3053-3061) is a CONJUNCTION: ``progress === "no-progress"``
+        (:3057 — which is where the 30 min CPU-stall conjunct now lives) **and**
+        ``effToolAge > streamStallMs`` (:3058, 20 min). 30 min binds only when the
+        CPU-stall and tool-age clocks start together.
+      * ``"progressing"``, ``"unknown"``, or a non-attributable tool kind — the
+        AGE backstop, ``tool-stall`` (index.ts:3063-3071): ``toolStallMs`` (4h
+        at the 6h cap) while the turn is ACTIVE, and
+        ``min(toolStallMs, heartbeatTimeoutMs)`` (30 min) when it is NOT. The
+        turn-inactive branch is the one v4 missed, and missing it is the
+        fail-OPEN direction: the classifier would stay quiet for hours after
         the watchdog had already cut.
+
+        The backstop is PROGRESS-BLIND in the watchdog — no CPU conjunct, just
+        ``effToolAge > bound`` — so this is where a ``"progressing"`` tool is
+        bounded too. Progress evidence defers ``tool-silence``/``tool-dead`` to
+        the backstop; it does not exempt the tool from it. That is also why
+        ``"unknown"`` is bounded rather than left open: a channel that cannot be
+        read may not expire the veto at S, and must not keep it alive past the
+        watchdog's own ceiling either. And it is why the JSONL-derived tool
+        (``tool_from_jsonl``, no CPU channel at all) still bounds a fleet lane at
+        4h ACTIVE / 30 min turn-inactive.
 
     While this returns False the tool is a VETO against ``wedged``; once it
     returns True the veto has EXPIRED (T9: the veto must never be forever).
     """
     if tool is None or tool.tools_in_flight <= 0:
         return False
-    if tool.tool_updates:
-        return _exceeds(tool.silence_age_ms, STREAM_STALL_MS)
-    if cpu_attributable(tool) and tool.cpu_advanced:
-        if tool.cpu_stall_ms is None or tool.cpu_stall_ms <= CPU_STALL_MS:
-            return False
-        return _exceeds(tool.tool_age_ms, STREAM_STALL_MS)
+    progress = in_flight_progress(tool)
+    # #5389 (b): BOTH in-flight clauses require positive no-progress evidence.
+    # Silence alone read ABSENCE OF OUTPUT as ABSENCE OF WORK and expired this
+    # veto on a tool that was still burning CPU — measured, 1203 s against the
+    # 1200 s bound with `toolCpuAdvanced=true` and 154 CPU-seconds burned
+    # (tortoise #5387) — so `"progressing"` keeps the veto and `"unknown"`
+    # never expires it either here.
+    # Each clause RETURNS ONLY WHEN IT FIRES. A clause that does not fire must
+    # fall through to the backstop below — an unconditional `return` here (which
+    # is what both the pre-#5389 code and the first cut of this change did) holds
+    # the veto open FOREVER for a shape whose clause is merely not yet due: a
+    # `no-progress` tool whose silence is still inside S, or whose `streamAgeMs`
+    # a producer omitted, would never expire at any age. That is the one outcome
+    # T9 forbids, and it also diverges from the watchdog, which cuts that shape
+    # at the progress-blind `tool-stall` backstop. (#5389 review, cycle 2 F1.)
+    if progress == NO_PROGRESS:
+        # clause 1 — `tool-silence`: streamed, then stopped.
+        if tool.tool_updates and _exceeds(tool.silence_age_ms, STREAM_STALL_MS):
+            return True
+        # clause 1b — `tool-dead`: never streamed, but demonstrated CPU work and
+        # then stopped. The watchdog guards it with `!st.toolUpdates` (the strict
+        # complement of clause 1); without that guard it would expire a
+        # `tool_updates=1` tool at S instead of deferring it to the backstop.
+        if (not tool.tool_updates and cpu_attributable(tool)
+                and _exceeds(tool.tool_age_ms, STREAM_STALL_MS)):
+            return True
+    # `"progressing"`, `"unknown"`, a non-attributable tool kind, and a
+    # `no-progress` shape whose clause is not yet due ALL reach the watchdog's
+    # AGE backstop, and that is the faithful mirror: the watchdog's `tool-stall`
+    # clause (index.ts:3068-3072) has NO CPU or progress conjunct —
+    # `effToolAge > bound` alone — so it cuts a tool whose CPU is STILL ADVANCING
+    # once the age backstop is passed. Progress evidence buys a reprieve from
+    # `tool-silence`/`tool-dead` (S = 20 min), never an exemption from the
+    # backstop; an early `return False` would make the classifier stand quiet
+    # where the watchdog had already cut — a second contract for one rule, in the
+    # opposite direction from the one §6 names.
     if tool.turn_active:
         bound = tool_stall_ms(tool.hard_cap_ms)
     else:
@@ -918,6 +1027,142 @@ def turn_from_jsonl(path: Optional[str]) -> Optional[Turn]:
     return turn_from_entry(entry)
 
 
+# #5389 (a) — the fields are `builtin-tools`' wire names; the transcript's own
+# keys are lowerCamel (`toolCall` / `toolCallId` / `stopReason`).
+def _iso_ms(stamp) -> Optional[int]:
+    """A session entry's ISO-8601 UTC `timestamp` as epoch ms, or None.
+
+    Unparseable is None, never 0. Returning 0 would set `started = 0`, so the
+    derived age becomes `now_ms - 0` — i.e. ~56 years — which EXCEEDS every
+    backstop: the veto would be EXPIRED on a timestamp this parser could not
+    read, and `evaluate` would be free to report `wedged` on unreadable evidence.
+    That is the FAIL-OPEN direction. None is the fail-closed one: it propagates
+    to `_exceeds`, which refuses to expire a veto on an unknown age, and the
+    caller bounds it off the transcript's own mtime (#5389 review, cycle 2 F2).
+    """
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    text = stamp[:-1] + "+00:00" if stamp.endswith("Z") else stamp
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
+def tool_from_jsonl(
+    path: Optional[str],
+    now_ms: int,
+    silence_age_ms: Optional[int] = None,
+) -> Optional[Tool]:
+    """The in-flight tool, read from the session's OWN transcript (#5389 a).
+
+    WHY THIS EXISTS. ``docs/ops/fleet-liveness.md`` §5 item 2 measured that
+    ``_tool_from_record`` reads ``toolsInFlight``/``toolAgeMaxMs``/``streamAgeMs``
+    /``toolUpdates`` off the cmux store record and **no store record carries
+    them** — re-measured 2026-09-29: **0 of 1011**. So ``ev.tool`` was always
+    ``None``, the veto never fired, and the transcript tail was the only
+    open-turn signal. A fleet lane runs its tools in the SAME transcript this
+    module already reads for its turn boundary, so the consumer that would make
+    the veto live needs no new writer: an assistant message carrying tool calls
+    with no ``toolResult`` after it IS a tool in flight.
+
+    This is the wiring change §5 item 2 pre-authorised ("A consumer supplying the
+    fields … would make it live — that is a wiring change, not a new rule"),
+    and it is the cheapest of the two routes it names: no ``ps`` census, no CPU
+    sampling, no process-tree walk. It is also the route
+    ``docs/ops/pi-idle-repl-reaper-policy.md`` already sanctions — the LANE'S OWN
+    pi session JSONL is the idle/quiet proof, and a child's is the child proof.
+
+    ONLY TWO FIELDS ARE DERIVABLE, and the omissions are deliberate:
+
+      * ``tool_updates`` ("this round produced RENDERABLE output") is NOT
+        recoverable — pi persists no tool output before the tool ends, and a
+        `toolResult` would mean the tool is no longer in flight. Left False.
+      * ``cpu_advanced`` / ``cpu_stall_ms`` come from the task-child heartbeat
+        (``extensions/task-heartbeat.ts``), which is gated to
+        ``TASK_HEARTBEAT=1 AND PI_MODE=print`` and is silent in an interactive
+        lane. Left False / 0.
+
+    Both omissions push in the FAIL-CLOSED direction and neither is a silent
+    hole: with ``tool_updates`` False and progress ``"unknown"``,
+    ``tool_veto_expired`` takes the AGE backstop (4 h while the turn is active,
+    30 min when it is not) instead of the 20 min silence bound. The veto
+    therefore holds LONGER than ``tool-silence`` would, and the SAME as the
+    ``tool-stall`` backstop the watchdog itself applies to a tool with no
+    readable CPU channel — it never stands quiet where the watchdog had already
+    cut, and it is always bounded (T9: never forever).
+
+    ``turn_active`` is the one field the transcript cannot supply, and it is
+    set True — the fail-CLOSED choice, which selects the 4 h backstop rather
+    than the 30 min one (a lane whose transcript shows an unanswered call is by
+    definition not resting).
+
+    Returns None — never a zeroed Tool — when the tail shows no in-flight tool:
+    a ``None`` veto and an empty one are different claims, and manufacturing the
+    empty one would assert "no tool is running" from a transcript this parser
+    simply could not read.
+    """
+    if not path:
+        return None
+    entry, last_entry, _size = _last_message_entry(path)
+    # Mirror turn_from_jsonl: a compaction trailer decides neither disposition.
+    if (last_entry is not None and isinstance(last_entry, dict)
+            and last_entry.get("type") == "compaction"):
+        return None
+    if not isinstance(entry, dict):
+        return None
+    msg = entry.get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return None
+    calls = [item for item in (msg.get("content") or [])
+             if isinstance(item, dict) and item.get("type") == "toolCall"]
+    if not calls:
+        return None
+    # A call-carrying message whose stop reason DISCARDS its calls is not an
+    # in-flight tool (`turn_from_entry` decides the same way, so the veto and
+    # the boundary cannot disagree about whether this message is open).
+    if msg.get("stopReason") in CALL_DISCARDING_STOP_REASONS:
+        return None
+    started = _iso_ms(entry.get("timestamp"))
+    if started is None:
+        # #5389 review P1: an UNREADABLE entry stamp must not leave the age
+        # UNKNOWN. A derived tool is `"unknown"` by construction (no CPU
+        # channel), so the AGE backstop is the only bound it can reach — and
+        # `_exceeds(None, bound)` is deliberately False, which would make the
+        # veto PERMANENT: the lane would read `running-quiet/tool-in-flight`
+        # forever and `idle` would become unreachable, which is the one outcome
+        # T9 forbids. Fall back to the transcript's OWN mtime: it is a genuine
+        # measurement, it UNDERSTATES the call's age (the file is written at or
+        # after the call), and it grows without bound while the file is frozen,
+        # so the veto still expires.
+        try:
+            started = int(os.stat(path).st_mtime * 1000)
+        except OSError:
+            # Cannot date the call from ANY source. Do NOT return a Tool here:
+            # `_exceeds(None, bound)` is False, so an unmeasurable age makes the
+            # veto PERMANENT (T9 forbids it — and that is the defect the previous
+            # line's fallback exists to avoid). Returning None is bounded AND
+            # safe rather than fail-open: a stat failure here is a stat failure
+            # in `jsonl_state` too, so `gather` carries `jsonl_age_ms=None` and
+            # `evaluate` names that `jsonl-age-unknown` — an ABSTENTION reached
+            # after the (now absent) veto, never `wedged`. (#5389 review, cycle 3.)
+            return None
+    age = max(0, now_ms - started)
+    return Tool(
+        name=str(calls[0].get("name") or ""),
+        tools_in_flight=len(calls),
+        tool_updates=False,
+        silence_age_ms=silence_age_ms,
+        tool_age_ms=age,
+        cpu_advanced=False,
+        cpu_stall_ms=0,
+        turn_active=True,
+    )
+
+
 def session_file_for(sid: str, cwd: Optional[str], sessions_dir: str = DEFAULT_SESSIONS_DIR) -> Optional[str]:
     """The session JSONL for ``sid`` (the reaper's sid-token-boundary match)."""
     enc = (cwd or "").lstrip("/").replace("/", "-")
@@ -977,6 +1222,12 @@ def gather(
     turn = turn_from_jsonl(sfile)
 
     tool = _tool_from_record(rec) if isinstance(rec, dict) else None
+    if tool is None:
+        # #5389 (a): no store record carries the watchdog's tool fields (measured
+        # 0 of 1011, 2026-09-29), so the record path is authoritative ONLY when a
+        # producer actually supplies them. Otherwise the lane's OWN transcript is
+        # the producer — the consumer that makes the already-built veto live.
+        tool = tool_from_jsonl(sfile, now, silence_age_ms=age)
     record = None
     if isinstance(rec, dict):
         non_idle = not (rec.get("agentLifecycle") == "idle" and rec.get("runtimeStatus") == "idle")
@@ -1004,11 +1255,17 @@ def _updated_at(val) -> Optional[float]:
 
 
 def _tool_from_record(rec: dict) -> Optional[Tool]:
-    """A store record may carry the watchdog's tick fields (task children do).
+    """The store record's tick fields, when a producer supplies them.
 
-    Fleet sessions generally do not — the consumer supplies them from the ps
-    child scan or a heartbeat. Absent fields stay ``None``/False, which keeps
-    the tool veto in place (fail-closed: quiet is never a stall).
+    No producer does today (measured 2026-09-29: **0 of 1011** records carry
+    ``toolsInFlight``), which is why :func:`gather` falls back to
+    :func:`tool_from_jsonl`. This route stays authoritative when it IS supplied,
+    because it carries two fields the transcript cannot: ``toolUpdates`` (the
+    round produced renderable output) and the ``cpuAdvanced`` / ``cpuStallMs``
+    pair from the task-child heartbeat.
+
+    Absent fields stay ``None``/False, which keeps the tool veto in place
+    (fail-closed: quiet is never a stall).
     """
     tif = rec.get("toolsInFlight")
     if not tif:
