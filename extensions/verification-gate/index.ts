@@ -4371,6 +4371,7 @@ export default function (pi: ExtensionAPI) {
     const prompt = String(input.prompt ?? input.task ?? "");
     const isVerifier = agent === "verifier" || prompt.includes("[VGATE]");
     if (!isVerifier) return undefined;
+    lastVerifierNote = null; // #1660: the disposition always reflects the LATEST verifier dispatch (a stale zero-merge note must not outlive the dispatch that supersedes it)
 
     // Extract JSON from content
     const content = event.content;
