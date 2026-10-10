@@ -924,14 +924,20 @@ test("the scale functions read exactly TASK_LOAD_SCALE_OFF — no scale knobs", 
 });
 
 test("the two duplicated getSystemLoad probes read the same OS sources", () => {
-  for (const [name, src] of [
-    ["builtin-tools", builtinSrc],
-    ["slack-bridge", slackSrc],
-  ] as const) {
-    const body = extractFunctionBody(src, "getSystemLoad");
-    ok(body.includes('"/proc/loadavg"'), `${name}'s getSystemLoad no longer reads /proc/loadavg`);
-    ok(body.includes("sysctl -n vm.loadavg"), `${name}'s getSystemLoad no longer reads sysctl vm.loadavg`);
-  }
+  // #1485: builtin-tools extracted the probe body into `probeSystemLoad()` so the
+  // REPORTING path can render `unknown` while `getSystemLoad()` keeps its
+  // 0-on-failure bound-scaling contract. Follow the delegation rather than
+  // demanding the OS reads stay inline in `getSystemLoad`. (slack-bridge never
+  // split its probe — its arm is unchanged.)
+  const btGet = extractFunctionBody(builtinSrc, "getSystemLoad");
+  ok(btGet.includes("probeSystemLoad()"), "builtin-tools getSystemLoad no longer delegates the load probe (#1485)");
+  const btProbe = extractFunctionBody(builtinSrc, "probeSystemLoad");
+  ok(btProbe.includes('"/proc/loadavg"'), "builtin-tools probeSystemLoad no longer reads /proc/loadavg");
+  ok(btProbe.includes("sysctl -n vm.loadavg"), "builtin-tools probeSystemLoad no longer reads sysctl vm.loadavg");
+
+  const slackGet = extractFunctionBody(slackSrc, "getSystemLoad");
+  ok(slackGet.includes('"/proc/loadavg"'), "slack-bridge's getSystemLoad no longer reads /proc/loadavg");
+  ok(slackGet.includes("sysctl -n vm.loadavg"), "slack-bridge's getSystemLoad no longer reads sysctl vm.loadavg");
 });
 
 test("the §3 default for TASK_FIRST_OUTPUT_TIMEOUT_MS is the code's own default", () => {
