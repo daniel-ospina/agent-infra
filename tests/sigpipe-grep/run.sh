@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (78 on BSD/macOS, 80 on GNU findutils — the platform CI runs).
+#      platform-dependent (80 on BSD/macOS, 82 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -1004,6 +1004,32 @@ chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a SWALLOWING enumerator refuses a verdict (exit 2)" \
              || fail "a silently empty tree was reported clean (exit $rc)"
+
+# 11ax. ...and a PARTIAL list with a non-zero exit is a different member again, and the only one the
+# `find -maxdepth 0` probe above cannot see (that probe catches total silence). A `find` that lists
+# SOME files, withholds the one holding the idiom, and exits 1 would otherwise scan an unknown
+# subset and report clean — which is what find's OWN status (`PIPESTATUS[0]`, not the loop's last
+# iteration) is for. The stub answers the probe, then lists a clean file only.
+E="$TMP/f11ax"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/seen.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/withheld.sh"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "scripts/seen.sh"' 'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a PARTIAL list with a non-zero exit refuses (exit 2)" \
+             || fail "a partial enumeration was reported clean (exit $rc)"
+
+# 11ay. ...and the empty-read invariant must NOT fire on a file that is non-empty but CAPTURES as
+# empty. Command substitution strips trailing newlines and every NUL, so a newline-only or NUL-only
+# extensionless file (a `.gitkeep`) looks like an empty read in the captured text — testing the BYTE
+# COUNT is what keeps that from being a false BLOCK, so this pin is a tree that must come back CLEAN.
+E="$TMP/f11ay"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/ok.sh"
+printf '\n\n\n' > "$E/scripts/BLANK"
+: > "$E/scripts/ZERO"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] && pass "a BLANK extensionless file is not a false block (exit 0)" \
+             || fail "a newline-only file was refused as an empty read (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

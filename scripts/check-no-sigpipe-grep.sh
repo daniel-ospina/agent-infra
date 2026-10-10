@@ -262,9 +262,19 @@ is_shell_file() {
   # exits 0 is invisible to the status check above, and the empty chunk names no interpreter — so an
   # EXTENSIONLESS shell file is dropped from the scan set and the guard reports clean over it. That
   # is the tortoise#7588 shape, and this arm exists precisely to claim extensionless files.
+  #
+  # The test is the reader's BYTE COUNT, never the captured text: command substitution strips
+  # trailing newlines and every NUL, so a legitimate file of newlines or NULs (a `.gitkeep`) also
+  # captures as empty and would be a false BLOCK. The second read is paid only in that suspicious
+  # case. `wc -c` is already load-bearing in this guard, and a non-integer count refuses too — the
+  # same fail-closed polarity, since it means the measurement itself is not trustworthy.
   if [ -s "$1" ] && [ -z "$chunk" ]; then
-    printf 'check-no-sigpipe-grep: the shebang reader returned nothing for the non-empty file %s\n' "$1" >>"$FIND_ERRS"
-    return 1
+    _nread="$(head -c 4096 "$1" 2>/dev/null | wc -c | tr -d ' ')"
+    case "$_nread" in
+      ''|*[!0-9]*|0)
+        printf 'check-no-sigpipe-grep: the shebang reader returned nothing for the non-empty file %s\n' "$1" >>"$FIND_ERRS"
+        return 1 ;;
+    esac
   fi
   first="${chunk%%$'\n'*}"
   case "$first" in
