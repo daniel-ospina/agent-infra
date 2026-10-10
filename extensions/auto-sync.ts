@@ -1,9 +1,14 @@
 // auto-sync.ts — Level-1 machine sync for agent-infra (session_start)
 //
 // On session start, if AGENT_INFRA_PATH is set:
+//   - ANY unmerged index entry (stuck conflict, no MERGE_HEAD) → LOUD banner with
+//     the offending paths + remedy, in every mode, and no pull attempt (#1661)
 //   - fetch origin and compare HEAD vs origin/main
 //   - behind → AGENT_SYNC_MODE=auto  : run sync.sh (pull --ff-only + refresh config)
 //   - behind → AGENT_SYNC_MODE=warn  : print a hint to run `cd "$AGENT_INFRA_PATH" && ./sync.sh`
+//   - behind ≥ AGENT_SYNC_STALE_COMMITS (default 25) → staleness banner (#1661)
+//   - print mode → never pulls, but traces staleness instead of returning
+//     silently, so a sub-agent's environment is not invisibly stale (#1661)
 //   - ahead  → report unpushed commits + push hint (informational; never pushes)
 //   - diverged → surface git status/log guidance + next step (ff blocked)
 //   - current → silent
@@ -35,6 +40,101 @@ export function aheadCount(repo: string): number {
   } catch {
     return 0;
   }
+}
+
+/** Commits origin/<branch> has that HEAD lacks (0 when undetermined). */
+export function behindCount(repo: string, branch = "main"): number {
+  try {
+    const out = execSync(`git -C "${repo}" rev-list --count HEAD..origin/${branch}`, { encoding: "utf-8", timeout: 10_000 }).trim();
+    const n = Number(out);
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** #1661: at or above this many commits behind origin/main the pin is reported
+ * as a banner, not a one-line hint. Override with AGENT_SYNC_STALE_COMMITS. */
+export const DEFAULT_STALE_COMMITS = 25;
+
+export function stalenessThreshold(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.AGENT_SYNC_STALE_COMMITS);
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_STALE_COMMITS;
+}
+
+/**
+ * #1661 (2): the "your tooling is old" banner. EMPTY below `threshold` — a
+ * one-commit-behind checkout is normal and must stay quiet. Above it, the
+ * magnitude of the pin (the thing that was invisible) is stated explicitly.
+ * Pure (repo is only interpolated) so it is directly unit-testable.
+ */
+export function stalenessBanner(repo: string, behind: number, threshold: number): string[] {
+  if (behind < threshold) return [];
+  return [
+    `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
+    `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
+    `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`,
+  ];
+}
+
+/** Unmerged porcelain codes — the `U*`/`AA`/`DD` conflict shapes (#1661). */
+const UNMERGED_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+
+export interface UnmergedEntry { path: string; detail: string }
+
+/**
+ * #1661 (1): unmerged index entries — the index-only stuck conflict (leftover
+ * stage-1/2/3 entries with NO MERGE_HEAD) that makes every `git pull --ff-only`
+ * fail forever. `git status --porcelain` supplies the reader-friendly code
+ * (`UU`, `AA`, `DD`, …) and `git ls-files -u` the authoritative stage list;
+ * they are UNIONED so a shape either source misses is still caught. Never
+ * throws — this is a diagnostic, not a gate, so an unreadable repo yields []
+ * (no false alarm) rather than breaking session start.
+ */
+export function unmergedEntries(repo: string): UnmergedEntry[] {
+  const found = new Map<string, string>();
+  try {
+    for (const rec of execFileSync("git", ["-C", repo, "status", "--porcelain", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0")) {
+      if (rec.length < 4) continue;
+      const code = rec.slice(0, 2);
+      if (UNMERGED_CODES.has(code)) found.set(rec.slice(3), code);
+    }
+  } catch { /* git unavailable / not a repo — no signal */ }
+  try {
+    for (const rec of execFileSync("git", ["-C", repo, "ls-files", "-u", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0")) {
+      const tab = rec.indexOf("\t");
+      if (tab === -1) continue;
+      const path = rec.slice(tab + 1);
+      if (!path || found.has(path)) continue;
+      found.set(path, `stage ${rec.slice(0, tab).trim().split(/\s+/).pop() ?? "?"}`);
+    }
+  } catch { /* ignore */ }
+  return [...found.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([path, detail]) => ({ path, detail }));
+}
+
+/**
+ * #1661 (1): the LOUD banner for a stuck index — names the offending paths and
+ * the one-line remedy. No shell is run here (repo/first are only interpolated),
+ * so this is pure and unit-testable. Empty for a clean index.
+ */
+export function unmergedBanner(repo: string, entries: UnmergedEntry[]): string[] {
+  if (entries.length === 0) return [];
+  const lines = [
+    `[auto-sync] ⛔ STUCK MERGE CONFLICT in agent-infra's index — every sync fails and the extensions you loaded are FROZEN.`,
+    `[auto-sync]    ${entries.length} unmerged path(s) (index-only stuck state — no MERGE_HEAD, so a plain sync can never recover):`,
+  ];
+  for (const e of entries.slice(0, 6)) lines.push(`[auto-sync]      ${e.path}  [${e.detail}]`);
+  if (entries.length > 6) lines.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
+  const first = entries[0].path;
+  lines.push(`[auto-sync]    Resolve one path at a time — keep origin's version (--theirs) or yours (--ours), then stage it:`);
+  lines.push(`[auto-sync]      git -C "${repo}" checkout --theirs "${first}" && git -C "${repo}" add "${first}"`);
+  if (entries.some((e) => e.detail === "DD")) {
+    lines.push(`[auto-sync]      (a [DD] path is deleted on both sides — use: git -C "${repo}" rm <path>)`);
+  }
+  lines.push(`[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`);
+  return lines;
 }
 
 /**
@@ -446,7 +546,32 @@ export default function (pi: ExtensionAPI) {
     const infraPath = process.env.AGENT_INFRA_PATH;
     if (!infraPath) return;          // not configured — silent
     if (!existsSync(infraPath)) return;
-    if (isPrintMode()) return; // sub-agents: no pulls, no noise
+
+    // #1661 (1): the stuck-index check runs BEFORE the print-mode return, before
+    // the fetch and before any mutation. Leftover unmerged stage-1/2/3 entries
+    // (no MERGE_HEAD) make `git pull --ff-only` refuse forever, and this used to
+    // fail into silence — exactly the state a sub-agent must never be told
+    // nothing about. Read-only and cheap, so it runs in every mode, and a pull is
+    // pointless until the index is resolved.
+    const unmerged = unmergedEntries(infraPath);
+    if (unmerged.length > 0) {
+      for (const line of unmergedBanner(infraPath, unmerged)) console.log(line);
+      return;
+    }
+
+    // #1661 (3): sub-agents still never pull — but they no longer return with
+    // ZERO signal. A stale toolset is now visible to a print-mode sub-agent
+    // (no fetch here: the count uses the last-fetched origin/main ref, a lower
+    // bound, so print-mode startup stays network-free).
+    if (isPrintMode()) {
+      const behind = behindCount(infraPath);
+      if (behind > 0) {
+        const loud = stalenessBanner(infraPath, behind, stalenessThreshold());
+        if (loud.length > 0) for (const line of loud) console.log(line);
+        else console.log(`[auto-sync] ⏭️ print mode — no pull; extensions loaded from ${infraPath} @ ${shortHead(infraPath)} (${behind} commit(s) behind origin/main)`);
+      }
+      return;
+    }
 
     try {
       execSync(`git -C "${infraPath}" fetch origin --quiet`, { timeout: 30_000, stdio: "ignore" });
@@ -474,6 +599,11 @@ export default function (pi: ExtensionAPI) {
 
     const state = syncState(infraPath);
     const syncHint = `cd "${infraPath}" && ./sync.sh`;
+    const behind = state === "behind" ? behindCount(infraPath) : 0;
+
+    // #1661 (2): surface a LARGE pin. The checkout could sit hundreds of commits
+    // behind with nothing but the one-line "update available" hint below.
+    for (const line of stalenessBanner(infraPath, behind, stalenessThreshold())) console.log(line);
 
     // ahead → nothing to fetch; report unpushed commits so they're not silently skipped.
     if (state === "ahead") {
@@ -541,6 +671,6 @@ export default function (pi: ExtensionAPI) {
 
     if (state !== "behind") return; // current — silent
 
-    console.log(`[auto-sync] ⚠️  agent-infra update available — run: ${syncHint}`);
+    console.log(`[auto-sync] ⚠️  agent-infra update available (${behind} commit(s) behind) — run: ${syncHint}`);
   });
 }

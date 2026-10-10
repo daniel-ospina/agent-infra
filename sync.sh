@@ -4,6 +4,23 @@
 set -euo pipefail
 cd "$(dirname "$0")"   # agent-infra root
 
+# #1661 — index-only stuck conflict: leftover unmerged stage-1/2/3 entries with
+# NO MERGE_HEAD (an abandoned conflict). Unmerged paths make git refuse every
+# `pull`/`checkout`, so sync fails forever, silently, and the extensions on this
+# machine freeze at the stuck commit. Surface the offending paths + the one-line
+# remedy BEFORE the branch guard (this blocks sync on ANY branch) and exit
+# non-zero so no caller can mistake it for success.
+if [ -n "$(git ls-files -u)" ]; then
+  echo "⛔ sync.sh: STUCK MERGE CONFLICT in the index — sync is impossible until it is resolved."
+  echo "   (index-only stuck state: no MERGE_HEAD, so a plain sync can never recover)"
+  echo "   Unmerged paths:"
+  git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
+  echo "   Remedy (per path, keep origin's side; use --ours to keep yours):"
+  echo "     git checkout --theirs <path> && git add <path>"
+  echo "   Then re-run: ./sync.sh"
+  exit 1
+fi
+
 # #265: never pull/FF-move while the checkout sits on a NON-main branch — a
 # `pull --ff-only origin main` on a behind feature branch silently advances
 # that branch's ref to origin/main's tip (name unchanged), moving the branch
