@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (66 on BSD/macOS, 68 on GNU findutils — the platform CI runs).
+#      platform-dependent (67 on BSD/macOS, 69 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -853,6 +853,18 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 chmod 644 "$E/scripts/deploy"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable EXTENSIONLESS file is still fatal (exit 2)" \
              || fail "an unreadable extensionless file was reported clean (exit $rc)"
+
+# 11an. the SCAN PASS's own status is part of the fail-closed contract, and it was the last hole
+# in it: a scanner that is missing or that fails prints no hits, and no hits is indistinguishable
+# from a clean tree — the guard would print ✅ over files it never read. `awk` is stubbed through
+# PATH, as 11ag stubs `mktemp`, so the pin does not depend on uninstalling anything.
+E="$TMP/f11an"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/awk"
+chmod +x "$E/fakebin/awk"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING scanner refuses a verdict (exit 2)" \
+             || fail "a failing scanner still produced a verdict (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

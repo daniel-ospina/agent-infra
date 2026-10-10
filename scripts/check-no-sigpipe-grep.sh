@@ -191,9 +191,9 @@ trap 'rm -f "$FIND_ERRS"' EXIT
 #     BLOCK is real on CI and does not arise on macOS.
 # BSD find's silence is SHAPE-DEPENDENT, so do not read it as a platform guarantee: an entry
 # whose whole resolution fails is skipped in silence with no file listed and exit 0 (what the
-# suite's #11af fixture does, and its skip line discloses), while reaching the depth limit
-# mid-descent under an absolute path does print the ELOOP wording (find exits 1) and the guard
-# then refuses with exit 2 — 2 is the guard's status, never find's.
+# suite's #11af fixture does, and its skip line discloses). Do not generalise from that to what
+# BSD find prints in shapes this suite cannot construct: Darwin's find carries no
+# `Too many levels of symbolic links` string at all — that wording belongs to libc, not to find.
 #
 # `LC_ALL=C` on the find calls below (`scan_files`) pins the cycle wording: findutils is
 # gettext-translated, and a translated report would not match the partition's prefix.
@@ -237,8 +237,10 @@ is_shell_file() {
   esac
   # Extensionless: claim it only if its first line names a SHELL. Captured first, never
   # piped into a quiet grep — that is the very idiom this guard exists to catch.
-  # The interpreter TOKEN must be sh/bash: a bare `*sh*` also claims fish/tcsh/zsh/xonsh,
-  # which have no `pipefail` and where the printed remedy (a bash here-string) is invalid.
+  # The interpreter TOKEN must be sh/bash, never a bare `*sh*`: a token match would also claim
+  # fish/tcsh/xonsh, which have no `pipefail` at all. zsh IS excluded deliberately, but as a
+  # SCOPE limit rather than a capability fact — zsh does have `pipefail` (`setopt pipefail`); it
+  # is out because the remedy this guard prints is a BASH here-string, which is invalid there.
   # Read a BOUNDED prefix. `head -1` on a file with no newline reads to EOF, so a large
   # extensionless non-shell file would be materialised into a shell variable (measured on
   # bash 3.2: a 300 MB no-newline file cost 82s and 315 MB RSS, vs 0.21s when it was
@@ -414,9 +416,20 @@ HITS="$(
           if (match(buf, /(printf|echo)[^|]*\|[ \t]*grep[ \t]+/) && has_quiet(substr(buf, RSTART + RLENGTH))) print F ":" start ": " buf
         }
       }
-    ' "$f"
+    ' "$f" || { printf 'check-no-sigpipe-grep: the scanner failed on %s — refusing a verdict over files it may not have read\n' "$f" >&2; exit 2; }
   done
 )"
+# The scan pass's OWN status is part of the fail-closed contract, and it was the last hole in it:
+# a scanner that is MISSING or that fails prints no hits, and no hits is indistinguishable from a
+# clean tree. The pipeline's status is the loop's, the loop's is its LAST iteration's, so a
+# failure on any earlier file is masked — and the assignment's status is discarded entirely
+# unless it is read here. (`find`/`cat`/`mktemp` failures were already fatal around the SINK;
+# this applies the same rule around the SCANNER.)
+SCAN_RC=$?
+if [ "$SCAN_RC" -ne 0 ]; then
+  echo "check-no-sigpipe-grep: the scan pass did not complete (status $SCAN_RC) — refusing a verdict over files it may not have read" >&2
+  exit 2
+fi
 
 # content fingerprint of one file's matched lines — lets an exception pin the CONTENT, not
 # just a count (a count-preserving swap must not inherit an existing exception).
