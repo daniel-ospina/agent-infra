@@ -40,6 +40,8 @@ subagent({
 
 The subagent tool blocks until ALL tasks complete. All tasks run concurrently — wall-clock time ≈ slowest task, not sum of all tasks.
 
+If you must NOT block the orchestrator (long-running lanes, work you can overlap with planning), dispatch with `task({ ..., background: true })` instead — it returns immediately with a run handle. See the **Background Execution Note** below.
+
 ### 2. Concurrency Control
 
 ```
@@ -125,13 +127,31 @@ The orchestrator checks the background result before starting implementation. If
 - **executing-plans** — Step 0 pre-warming, Phase 3 verification dispatch
 
 **Uses:**
-- **subagent** tool (built-in) — provides `subagent` with `tasks` array for parallel dispatch. No `background` flag exists; use bash `&` for non-blocking work (see Background Execution Note below).
+- **subagent** tool (built-in) — provides `subagent` with `tasks` array for parallel dispatch. It always blocks until completion. For non-blocking work, use the **`task({ background: true })`** primitive (`task_status` / `task_collect`) — see Background Execution Note below. A bounded bash `&` is still the tool for NON-pi background jobs (typechecks, builds).
 
 
 
 ## Background Execution Note
 
-The `subagent` tool blocks until completion — there is no `background: true` parameter. For truly non-blocking background work (pre-warming, long-running side tasks), use `bash` background processes (`&`) with output redirected to temp files. Check temp files before the result is needed.
+The `subagent` tool blocks until completion. The **`task`** tool now has a first-class non-blocking mode (#1662) — do NOT hand-roll a bounded bash launch just to avoid blocking on a pi lane:
+
+```
+task({ prompt, background: true })
+  → { run_id, pid, pgid, log_path }      # returns IMMEDIATELY, never awaits
+task_status({ run_id })                  # alive | wedged | gone | done
+task_collect({ run_id })                 # the final message + exit status, once done
+```
+
+- **Liveness comes from the child's `[task-heartbeat]` markers, never from `%CPU`.** `%CPU == 0` means *waiting*, not finished — a lane blocked in a long tool call is exactly 0 % CPU (`docs/ops/fleet-liveness.md`). `task_status` reads the same markers the watchdog uses (pid probe + fresh markers), and returns non-blockingly.
+- **`task_collect` never blocks.** While the lane runs it returns a not-finished notice; poll `task_status` instead. Reaping loop: poll `task_status` between other work → call `task_collect` once it reports a terminal status (`done` | `failed` | `cut`) **or `gone`** (the process is gone but the terminal record was not persisted — collect it directly; it is salvaged fail-closed to `failed`). A lane left `wedged` with a stale log is likewise terminated by `task_collect` (same fail-closed salvage) instead of being polled forever.
+- **It is ONE spawn per background lane** — no zero-output retry and no provider-failover hop chain. A lane that fails surfaces as status `failed`; re-dispatch it (the #208 resume contract: assume-dead, not done; design waves as resumable).
+- **Reused machinery, not a parallel universe:** the background path spawns through the same `spawnSubAgent`, so `TASK_DETACHED`'s own pgid, the settle-path sweep, `TASK_HARD_CAP_MS`, and the state-aware watchdog all still apply. A capped lane still returns partials via `task_collect`.
+
+> ⛔ **REVIEW GATE IS A PARENT STEP — the `task_collect` analogue of `watch`.** Sub-agents run with `AGENT_SKIP_REVIEW_GATE=1` FORCED, so the review dispatch cannot be satisfied from inside the child; the PARENT enforces the review ceremony centrally (#825). A background lane makes that step easy to forget: `task_status`, `task_collect`, and the dispatch handle all carry `review_gate: "parent-required"`. **After `task_collect` returns a terminal result you MUST run the review ceremony for that lane before treating it as complete.** A background lane that is collected but never reviewed is UNREVIEWED CODE BY DEFAULT.
+
+For a **NON-pi** background job (pre-warming a typecheck, a long build, a vendored tool), the bounded bash template below is still correct — it needs the deadline watchdog + log redirect, but NO `[task-heartbeat]` markers (those are pi-runtime-only). Never launch a nested `pi` that way: use `task({ background: true })` (or, if you truly must, the full bounded template in `### Bounded nested pi launch`).
+
+Check a non-pi background result before it is needed.
 
 > ⛔ **Fleet policy — load-aware scheduling (#209).** Before dispatching a heavy wave or rerun batch, defer while the machine is under load: `bash scripts/wait-for-load.sh 8 600` (shared helper, promoted from the wt-291 gated-rerun pattern). The task watchdog's load-aware bounds — the first-message bound and the marker-gap cut bound (#1070) — scale with loadavg through the fixed bands declared in `docs/ops/load-policy.md` §6, which is the contract for those numbers (**not restated here**, so the two cannot drift); `TASK_LOAD_SCALE_OFF=1` bypasses the scaling. A load storm therefore no longer cuts live sub-agents for first-message latency, and an explicit `TASK_HEARTBEAT_CUT_GAP_MS` is honoured verbatim and never rescaled.
 
