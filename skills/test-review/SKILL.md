@@ -1,9 +1,9 @@
 ---
 name: test-review
-description: Review-fix loop for tests. Dispatches 4 parallel reviewers (correctness, coverage+surface, journey-alignment, test-quality), merges issues, fixes with research, and loops until clean or convergence. Invoked by test-writing after test creation and by code-review at PR time.
+description: Review-fix loop for tests. Dispatches 2 merged reviewers by concern (A correctness + discriminating power, B coverage + surface + journey alignment), plus C (e2e + reproducibility) only when the change touches e2e surfaces; merges issues, fixes with research, and loops until clean or convergence. Invoked by test-writing after test creation and by code-review at PR time.
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-version: 1.0.0
+version: 1.1.0
 steps:
   - name: dispatch_reviewers
     type: parallel
@@ -32,6 +32,21 @@ steps:
 
 > **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
+> **v1.1.0 (reviewer merge).** The 4 dispatch slots are merged into **2 reviewers by concern**, so every former lens is covered by exactly one merged reviewer:
+>
+> | Merged reviewer | Absorbs | Concern it covers |
+> |---|---|---|
+> | **A — Correctness & Discriminating Power** | #1 Correctness & Quality + #4 Test Quality | is each assertion *correct*, and does it actually discriminate? Runs **two ordered passes** — mechanical correctness, then semantic strength |
+> | **B — Coverage, Surface & Journey Alignment** | #2 Coverage & Surface Alignment + #3 Journey Alignment | does the suite cover the required surfaces and journey steps, at the right layer? |
+> | **C — E2E & Reproducibility** (conditional) | new — dispatches `skills/reviewers/e2e-coverage`, `skills/reviewers/e2e-reproducibility` | fires only when the change touches e2e surfaces |
+>
+> **Why the two passes stay ordered.** `skills/reviewers/test-quality/SKILL.md` records the boundary: a test can pass mechanical correctness and still be a weak test that proves nothing. Merging the *dispatch* must not merge the *judgement* — so pass 2 is a separate pass with its own `ISSUE:` output and its own `check:` field (TQ1–TQ7), and it runs **after** pass 1, never instead of it.
+>
+> **The count.** `proportional-gates` §Review Cycles **owns** the reviewer-count table and is unchanged. `test-review`'s merged panel is **2** (3 when C fires), so a High-risk test review fields at most 3; the table's "4" is an upper bound this panel cannot reach, and depth is scaled *inside* A and B instead (A's two passes always run). Deliberate — see the `OVERRIDES:` line on #1538.
+>
+> Supersedes `test-review`'s reviewer-count clause only (not the HOW/WHAT boundary), extending #1538/#1539 from `code-review` to this skill. Measured basis: a live review of DMeer PR #1112 made **45 `task` dispatches, 16 of them (36%) test-review reviewers** — the largest single block — and host load reached 115.
+
+
 # Test Review
 
 Automated review-fix cycle for tests. Ensures tests are correct, complete, and aligned with integration surfaces and user journeys before merge.
@@ -48,12 +63,12 @@ Automated review-fix cycle for tests. Ensures tests are correct, complete, and a
 
 At minimum, provide the test file content. Surface map and journey map are extracted from the plan doc if available.
 
-**Also required for Reviewer #1, and passed by the `test-writing` Step 3.5 dispatch:** `TEST DIFF` (the diff of the test files in this batch) and `SABOTAGE EVIDENCE` (the observed failure against the unfixed code). Reviewer #1's discriminating-power check is decidable *only* from these; pass `"none supplied"` when either is genuinely absent (the check then names the missing evidence rather than guessing). A manual invocation that omits them runs that check blind.
+**Also required for Reviewer A's pass 1, and passed by the `test-writing` Step 3.5 dispatch:** `TEST DIFF` (the diff of the test files in this batch) and `SABOTAGE EVIDENCE` (the observed failure against the unfixed code). Reviewer A's pass 1 discriminating-power check is decidable *only* from these; pass `"none supplied"` when either is genuinely absent (the check then names the missing evidence rather than guessing). A manual invocation that omits them runs that check blind.
 
 ## Review Cycle
 
 ```
-Phase 1: Review (4 parallel agents — fresh task sub-agents)
+Phase 1: Review (2 merged reviewers — fresh task sub-agents; + C when e2e)
     ↓
 Phase 2: Merge & Dedup
     ↓
@@ -137,7 +152,7 @@ This creates a searchable memory that future Tortoise lookups (Phase 0a) will fi
 
 #### Phase 0d — Output
 
-Produce a `### Testing Knowledge` block with ALL findings (from knowledge base + Tortoise + fresh research). Inject as context for all 4 reviewers and the fixer:
+Produce a `### Testing Knowledge` block with ALL findings (from knowledge base + Tortoise + fresh research). Inject as context for every merged reviewer and the fixer:
 
 ```markdown
 ### Testing Knowledge (research intake)
@@ -153,17 +168,21 @@ Produce a `### Testing Knowledge` block with ALL findings (from knowledge base +
 
 **If no surface map:** skip Phase 0 entirely — no domain-specific testing knowledge needed.
 
-### Phase 1 — Review (4 Parallel Agents)
+### Phase 1 — Review (2 merged reviewers, by concern)
 
-Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch the merged reviewers **in parallel** via Pi `task` — **A** and **B**, plus **C** when the change touches e2e surfaces. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
 
-**Multi-file support:** TEST FILE may be a single file or a list. For multiple files, review all simultaneously — 4 parallel reviewers examine all files in one dispatch. Output per-file issues with file path prefix. Limit 5 files per dispatch (context window).
+**A runs two ORDERED passes in one dispatch** — mechanical correctness, then semantic strength. The passes are never collapsed into one judgement: a test can pass the first and still be a weak test that provides zero confidence (`skills/reviewers/test-quality/SKILL.md`, Boundary).
+
+**Multi-file support:** TEST FILE may be a single file or a list. For multiple files, review all simultaneously — the merged reviewers examine all files in one dispatch. Output per-file issues with file path prefix. Limit 5 files per dispatch (context window).
 
 **CRITICAL:** Every review cycle dispatches FRESH `task` sub-agents. Reviewers have no memory of prior cycles, no investment in defending prior fixes. This prevents confirmation bias.
 
 ---
 
-**Reviewer #1 — Correctness & Quality:**
+**Reviewer A — Correctness & Discriminating Power.**
+
+**Pass 1 — mechanical correctness** (run this pass first):
 
 ```
 You are reviewing tests for correctness and quality. Your job is to find issues — NOT to fix them.
@@ -219,111 +238,7 @@ If no issues: NO ISSUES FOUND
 
 ---
 
-**Reviewer #2 — Coverage & Surface Alignment:**
-
-```
-You are reviewing tests for coverage completeness and surface alignment. Your job is to find gaps — NOT to fix them.
-
-TEST FILE: <full test file content>
-SURFACE MAP: <integration surface map from plan, or "none">
-TESTING KNOWLEDGE: <Phase 0 research findings, or "none">
-
-Use the Testing Knowledge to verify the test uses the correct testing approach for each surface type. Flag tests that use patterns known to be unreliable for the surface being tested.
-
-CHECK THESE DIMENSIONS:
-
-1. HAPPY PATH COVERAGE:
-   - Does the test cover the primary success case?
-   - Is the happy path tested with realistic data?
-
-2. FAILURE MODE COVERAGE:
-   - Does the test cover at least 2 failure modes from the surface map?
-   - If no surface map: does the test cover at least 2 failure modes independent of the happy path?
-   - Are failure assertions specific (correct error code/message, not just "not success")?
-
-3. BOUNDARY VALUES:
-   - For numeric inputs: 0, 1, max-1, max tested?
-   - For arrays/collections: empty, single element, max capacity tested?
-   - For strings: empty, single char, max length tested?
-   - For booleans: both true and false tested?
-
-4. SURFACE ALIGNMENT:
-   - Does the test use the correct test layer? (Compare against surface map assignments)
-   - Specifically flag: SQL business logic tested with TS mocks (should be pgTAP)
-   - External API calls without contract validation tests
-   - Auth boundaries without integration tests
-   - Unit tests mocking where surface map says integration
-
-5. MISSING TESTS:
-   - Are there surfaces in the map with NO corresponding test?
-   - Are there failure modes in the map with NO test?
-   - Are there user journey steps with NO test?
-
-For each issue, return EXACTLY:
-ISSUE:
-  severity: P0|P1|P2
-  dimension: happy-path|failure-mode|boundary-value|surface-alignment|missing-test
-  location: <test file, test name, or "missing">
-  description: <what's missing or wrong>
-  suggestion: <what to add or fix>
-
-P0=missing critical test (uncovered surface, wrong layer for SQL logic)
-P1=important gap (missing failure mode, boundary not tested)
-P2=improvement (additional boundary, edge case)
-If no issues: NO ISSUES FOUND
-```
-
----
-
-**Reviewer #3 — Journey Alignment** (skip if no Journey Test Map):
-
-```
-You are reviewing tests for alignment with user journeys. Your job is to find misalignments — NOT to fix them.
-
-TEST FILE: <full test file content>
-JOURNEY MAP: <journey test map from plan>
-
-CHECK THESE DIMENSIONS:
-
-1. JOURNEY STEP COVERAGE:
-   - For each step in the Journey Test Map, is there a corresponding test?
-   - Does the test verify the acceptance criteria from the journey step?
-   - Are there journey steps with no test at all?
-
-2. OUTCOME VERIFICATION:
-   - Does each journey-linked test verify the OUTCOME the user experiences?
-   - Not just: "the API returned 200"
-   - But: "the user sees the booking confirmation with a valid code"
-   - Cross-reference test assertions against journey acceptance criteria
-
-3. FAILURE JOURNEYS:
-   - Does the Journey Test Map list failure modes?
-   - Is each failure mode tested?
-   - Does the failure test verify the DEGRADED user experience? (Not just "error returned")
-
-4. SEQUENCING:
-   - If the journey has ordered steps, do tests verify the sequence?
-   - Are there tests that verify step N's output feeds into step N+1?
-
-For each issue, return EXACTLY:
-ISSUE:
-  severity: P0|P1|P2
-  dimension: journey-coverage|outcome-verification|failure-journey|sequencing
-  location: <test name or journey step>
-  description: <what's missing or misaligned>
-  suggestion: <what to add or fix>
-
-P0=journey step completely untested, or outcome verified wrong
-P1=important gap (failure journey untested, sequence not verified)
-P2=improvement (better outcome assertion)
-If no issues: NO ISSUES FOUND
-```
-
-**If no Journey Test Map is provided:** Skip Reviewer #3. Run Reviewers #1, #2, and #4.
-
----
-
-**Reviewer #4 — Test Quality:**
+**Pass 2 — semantic strength** (SAME reviewer, run AFTER pass 1; return this pass's `ISSUE:` blocks separately, using the `check:` field below):
 
 ```
 You are reviewing tests for semantic quality — WHAT they verify, not HOW they're written. Your job is to find weak tests that pass mechanical gates but provide zero confidence. Do NOT fix — only flag.
@@ -380,11 +295,161 @@ If no issues: NO ISSUES FOUND
 
 ---
 
+**Reviewer B — Coverage, Surface & Journey Alignment.**
+
+**Part 1 — coverage and surface** (run this part first):
+
+```
+You are reviewing tests for coverage completeness and surface alignment. Your job is to find gaps — NOT to fix them.
+
+TEST FILE: <full test file content>
+SURFACE MAP: <integration surface map from plan, or "none">
+TESTING KNOWLEDGE: <Phase 0 research findings, or "none">
+
+Use the Testing Knowledge to verify the test uses the correct testing approach for each surface type. Flag tests that use patterns known to be unreliable for the surface being tested.
+
+CHECK THESE DIMENSIONS:
+
+1. HAPPY PATH COVERAGE:
+   - Does the test cover the primary success case?
+   - Is the happy path tested with realistic data?
+
+2. FAILURE MODE COVERAGE:
+   - Does the test cover at least 2 failure modes from the surface map?
+   - If no surface map: does the test cover at least 2 failure modes independent of the happy path?
+   - Are failure assertions specific (correct error code/message, not just "not success")?
+
+3. BOUNDARY VALUES:
+   - For numeric inputs: 0, 1, max-1, max tested?
+   - For arrays/collections: empty, single element, max capacity tested?
+   - For strings: empty, single char, max length tested?
+   - For booleans: both true and false tested?
+
+4. SURFACE ALIGNMENT:
+   - Does the test use the correct test layer? (Compare against surface map assignments)
+   - Specifically flag: SQL business logic tested with TS mocks (should be pgTAP)
+   - External API calls without contract validation tests
+   - Auth boundaries without integration tests
+   - Unit tests mocking where surface map says integration
+
+5. MISSING TESTS:
+   - Are there surfaces in the map with NO corresponding test?
+   - Are there failure modes in the map with NO test?
+   - Are there user journey steps with NO test?
+
+For each issue, return EXACTLY:
+ISSUE:
+  severity: P0|P1|P2
+  dimension: happy-path|failure-mode|boundary-value|surface-alignment|missing-test
+  location: <test file, test name, or "missing">
+  description: <what's missing or wrong>
+  suggestion: <what to add or fix>
+
+P0=missing critical test (uncovered surface, wrong layer for SQL logic)
+P1=important gap (missing failure mode, boundary not tested)
+P2=improvement (additional boundary, edge case)
+If no issues: NO ISSUES FOUND
+```
+
+---
+
+**Part 2 — journey alignment** (SAME reviewer, run AFTER part 1; skip if no Journey Test Map):
+
+```
+You are reviewing tests for alignment with user journeys. Your job is to find misalignments — NOT to fix them.
+
+TEST FILE: <full test file content>
+JOURNEY MAP: <journey test map from plan>
+
+CHECK THESE DIMENSIONS:
+
+1. JOURNEY STEP COVERAGE:
+   - For each step in the Journey Test Map, is there a corresponding test?
+   - Does the test verify the acceptance criteria from the journey step?
+   - Are there journey steps with no test at all?
+
+2. OUTCOME VERIFICATION:
+   - Does each journey-linked test verify the OUTCOME the user experiences?
+   - Not just: "the API returned 200"
+   - But: "the user sees the booking confirmation with a valid code"
+   - Cross-reference test assertions against journey acceptance criteria
+
+3. FAILURE JOURNEYS:
+   - Does the Journey Test Map list failure modes?
+   - Is each failure mode tested?
+   - Does the failure test verify the DEGRADED user experience? (Not just "error returned")
+
+4. SEQUENCING:
+   - If the journey has ordered steps, do tests verify the sequence?
+   - Are there tests that verify step N's output feeds into step N+1?
+
+For each issue, return EXACTLY:
+ISSUE:
+  severity: P0|P1|P2
+  dimension: journey-coverage|outcome-verification|failure-journey|sequencing
+  location: <test name or journey step>
+  description: <what's missing or misaligned>
+  suggestion: <what to add or fix>
+
+P0=journey step completely untested, or outcome verified wrong
+P1=important gap (failure journey untested, sequence not verified)
+P2=improvement (better outcome assertion)
+If no issues: NO ISSUES FOUND
+```
+
+**If no Journey Test Map is provided:** skip B's part 2. B's part 1 still runs.
+
+---
+
+---
+
+**Reviewer C — E2E & Reproducibility** (conditional — dispatch ONLY when the change touches e2e surfaces: an E2E scenario, a Playwright/browser surface, or a change to how a failure is reproduced):
+
+```
+You are reviewing tests for end-to-end coverage and reproducibility. Your job is to find gaps — NOT to fix them.
+
+TEST FILE: <full test file content>
+E2E SCENARIOS: <E2E scenarios / Journey Test Map, or "none">
+SURFACE MAP: <integration surface map from plan, or "none">
+
+CHECK THESE DIMENSIONS:
+
+1. E2E COVERAGE:
+   - Is each end-to-end scenario in the plan covered by a test that drives the real stack?
+   - Are there scenario steps exercised only through mocks, when the scenario claims end-to-end?
+
+2. REPRODUCIBILITY:
+   - Does the test reproduce the failure deterministically, or does it depend on timing/ordering?
+   - Is the failure it pins re-runnable in isolation (single test, no shared state from a prior test)?
+   - Is there a recorded command that reproduces the failure against the unfixed code?
+
+3. ENVIRONMENT HONESTY:
+   - Does the test assert on what the user observes, or on an intermediate artifact?
+   - Are timeouts/bounds stated rather than inherited from a default?
+
+For each issue, return EXACTLY:
+ISSUE:
+  severity: P0|P1|P2
+  dimension: e2e-coverage|reproducibility|environment-honesty
+  location: <test name or line number>
+  description: <what's wrong>
+  suggestion: <what to fix>
+
+P0=scenario claimed end-to-end but driven through mocks, or failure not reproducible at all
+P1=non-deterministic reproduction, or ordering-dependent test
+P2=weaker assertion than the scenario requires
+If no issues: NO ISSUES FOUND
+```
+
+Catalog checklists for this reviewer: `skills/reviewers/e2e-coverage/SKILL.md` and `skills/reviewers/e2e-reproducibility/SKILL.md`.
+
+---
+
 ### Phase 2 — Merge & Dedup
 
 1. Parse all `ISSUE:` blocks from reviewer outputs
 2. Dedup: same location + similar description → keep higher severity
-3. Sort: P0 > P1 > P2, then correctness > coverage > journey > test-quality
+3. Sort: P0 > P1 > P2, then pass 1 (mechanical correctness) > pass 2 (semantic strength) > coverage/surface > journey
 4. If zero issues → tests are clean, exit with `NO ISSUES FOUND`
 
 ### Phase 3 — Fix (Research-Backed)
@@ -447,7 +512,7 @@ After all reviewers return clean, output:
 ```
 ✅ Test review complete:
   - Review cycles: N
-  - Reviewers per cycle: <3-4>
+  - Reviewers per cycle: 2 (A, B) — or 3 when C fires (e2e)
   - Issues found and fixed: N
   - Final status: CLEAN
 
@@ -469,7 +534,7 @@ Journey map coverage: ✓ | skipped (no journey map)
 - `test-design` output (Integration Surface Map)
 - Plan doc's `### Journey Test Map` section
 
-**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, **10-cycle cap** — see "Hard cap: 10 cycles" above).
+**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 2 merged reviewers plus C, **10-cycle cap** — see "Hard cap: 10 cycles" above).
 
 ## When NOT to Use
 
