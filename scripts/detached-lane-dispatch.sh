@@ -15,7 +15,10 @@
 # with NO watchdog, and provides the three things that makes safe:
 #   start   — dispatch N lanes, staggered, with a concurrency cap
 #   status  — which lanes are alive / done / hung
-#   reap    — kill lanes that finished their work but never exited
+#   reap    — kill lanes that finished their work but never exited. Fires only on
+#             POSITIVE COMPOSITE evidence (CPU frozen + no descendants + log quiet
+#             past the stream bound). Never on %CPU alone — see the liveness note
+#             in the body, and docs/ops/fleet-liveness.md.
 #   watch   — poll for each lane's PR, then run reviewer → fixer → re-review
 #
 # ⛔ READ THIS BEFORE USING IT
@@ -38,7 +41,7 @@
 #                                    [--run-dir DIR] [--model M] [--max-concurrent N]
 #                                    [--prompt-file FILE]
 #   detached-lane-dispatch.sh status --run-dir DIR
-#   detached-lane-dispatch.sh reap   --run-dir DIR [--max-age-min 180]
+#   detached-lane-dispatch.sh reap   --run-dir DIR [--stream-bound-min 20] [--dry-run]
 #   detached-lane-dispatch.sh watch  --run-dir DIR [--hours 5]
 #
 # The default prompt asks the lane to create its own worktree from origin/main,
@@ -131,43 +134,113 @@ cmd_start() {
   echo "next: detached-lane-dispatch.sh status --run-dir $run_dir"
 }
 
-cmd_status() {
-  local run_dir=""
-  while [ $# -gt 0 ]; do case "$1" in --run-dir) run_dir="$2"; shift 2;; *) die "unknown arg: $1";; esac; done
-  need run_dir run-dir
-  [ -s "$run_dir/launched.txt" ] || die "no launched.txt in $run_dir"
-  while read -r n pid; do
-    if kill -0 "$pid" 2>/dev/null; then
-      local cpu etime; read -r cpu etime < <(ps -o %cpu=,etime= -p "$pid" 2>/dev/null)
-      if [ "${cpu%%.*}" -eq 0 ]; then printf '#%-6s ALIVE  HUNG?  cpu=%s etime=%s\n' "$n" "$cpu" "$etime"
-      else printf '#%-6s ALIVE  working cpu=%s etime=%s\n' "$n" "$cpu" "$etime"; fi
-    else printf '#%-6s DONE\n' "$n"; fi
-  done < "$run_dir/launched.txt"
+# ── liveness signals ───────────────────────────────────────────────────────────
+# The fleet already has a liveness doctrine: docs/ops/fleet-liveness.md, with a
+# pure verdict function (tools/fleet/liveness.py) emitting exactly one of
+# dead | running-quiet | wedged | idle | unknown. This tool deliberately borrows
+# three of its rules, because getting them wrong is how you kill a healthy lane:
+#
+#   1. %CPU IS NOT A LIVENESS SIGNAL. A lane blocked inside a long TOOL CALL
+#      (a 20-minute pytest, a network round-trip, a model turn) is ~0.0% CPU.
+#      Instantaneous %cpu is a DECAYED AVERAGE and reads 0 for any I/O-bound
+#      wait. `cum_cpu_s` (cumulative CPU seconds, from `ps -o cputime=`) sampled
+#      twice is the real signal — and even then only as ONE input.
+#   2. A FAILED READ MUST NEVER PRODUCE A KILL. The doctrine's rule 0: an
+#      unreadable `ps` abstains (\`ps-unreadable\`), never `dead`. Every probe
+#      here fails open.
+#   3. A FROZEN TRANSCRIPT ALONE IS AMBIGUOUS. The doctrine names a stream bound
+#      (STREAM_STALL_MS, 20 min) below which a frozen transcript is
+#      `running-quiet`, not `wedged`. Reaping below that bound is the bug.
+#
+# So reap fires ONLY on a POSITIVE, COMPOSITE conclusion: no CPU advance since
+# the previous sample AND no live descendants AND the log quiet past the stream
+# bound. Anything else abstains and says which signal was missing.
+
+STREAM_BOUND_MIN_DEFAULT=20   # fleet doctrine's STREAM_STALL_MS
+
+cpu_s() { # cumulative CPU seconds for a pid; empty on a failed read (fail-open)
+  local t; t=$(ps -o cputime= -p "$1" 2>/dev/null | tr -d ' ')
+  [ -n "$t" ] || return 1
+  local days=0 rest="$t"
+  case "$t" in *-*) days="${t%%-*}"; rest="${t#*-}";; esac
+  local -a f; IFS=: read -ra f <<< "$rest"
+  local h=0 m=0 s=0
+  case "${#f[@]}" in 3) h="${f[0]}"; m="${f[1]}"; s="${f[2]}";; 2) m="${f[0]}"; s="${f[1]}";; 1) s="${f[0]}";; esac
+  awk -v d="$days" -v h="$h" -v m="$m" -v s="$s" 'BEGIN{printf "%d", ((d*24+h)*3600+m*60+s)}'
 }
 
-# A lane whose PR is open but whose process is still 0%-CPU-and-sleeping is the
-# failure mode this pattern introduces: pi never exits after the work is done.
-cmd_reap() {
-  local run_dir="" max_age=180
+live_descendants() { # count of live descendant processes, depth-capped; "?" on a failed read
+  local root="$1" frontier="$1" next total=0 depth=0
+  while [ -n "$frontier" ] && [ "$depth" -lt 4 ]; do
+    next=""
+    for p in $frontier; do
+      local kids; kids=$(pgrep -P "$p" 2>/dev/null) || kids=""
+      [ -n "$kids" ] && { total=$((total + $(printf '%s\n' $kids | wc -l | tr -d ' '))); next="$next $kids"; }
+    done
+    frontier="$next"; depth=$((depth+1))
+  done
+  printf '%s' "$total"
+}
+
+log_age_s() { # seconds since the lane log last changed; empty if absent
+  local f="$1"; [ -f "$f" ] || return 1
+  echo $(( $(date +%s) - $(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) ))
+}
+
+cmd_status() {
+  local run_dir="" bound=$STREAM_BOUND_MIN_DEFAULT
   while [ $# -gt 0 ]; do case "$1" in
-    --run-dir) run_dir="$2"; shift 2;; --max-age-min) max_age="$2"; shift 2;;
+    --run-dir) run_dir="$2"; shift 2;; --stream-bound-min) bound="$2"; shift 2;;
     *) die "unknown arg: $1";; esac; done
   need run_dir run-dir
-  while read -r n pid; do
+  [ -s "$run_dir/launched.txt" ] || die "no launched.txt in $run_dir"
+  printf '%-8s %-16s %-12s %s\n' ISSUE STATE CPU_s DESC LOG_AGE
+  while read -r n pid _rest; do
+    [ -n "$pid" ] || continue
+    if ! kill -0 "$pid" 2>/dev/null; then printf '%-8s %-16s\n' "#$n" DONE; continue; fi
+    local c d a age="-" state
+    c=$(cpu_s "$pid") || c="?"; d=$(live_descendants "$pid")
+    a=$(log_age_s "$run_dir/$n.log") || a=""; [ -n "$a" ] && age="${a}s"
+    if [ "$c" = "?" ]; then state="unknown(ps)"
+    elif [ "$d" != "0" ]; then state="running-quiet"
+    elif [ -n "$a" ] && [ "$a" -le $((bound*60)) ]; then state="running-quiet"
+    else state="wedged?"; fi
+    printf '%-8s %-16s %-12s %-6s %s\n' "#$n" "$state" "$c" "$d" "$age"
+  done < "$run_dir/launched.txt"
+  echo "(running-quiet = working or blocked-in-tool-call; re-run reap to decide)"
+}
+
+# Reap fires ONLY on positive, composite evidence — see the doctrine note above.
+# Run it periodically (e.g. every 5 min): it needs two CPU samples to compare.
+cmd_reap() {
+  local run_dir="" bound=$STREAM_BOUND_MIN_DEFAULT cpu_window=1 dry=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --run-dir) run_dir="$2"; shift 2;;
+    --stream-bound-min) bound="$2"; shift 2;;
+    --cpu-window) cpu_window="$2"; shift 2;;      # samples to observe (1 = since last run)
+    --dry-run) dry=1; shift;;
+    --max-age-min) shift 2;;                        # accepted + ignored: CPU age is not a signal
+    *) die "unknown arg: $1";; esac; done
+  need run_dir run-dir
+  [ -s "$run_dir/launched.txt" ] || die "no launched.txt in $run_dir"
+  while read -r n pid _rest; do
+    [ -n "$pid" ] || continue
     kill -0 "$pid" 2>/dev/null || continue
-    local cpu etime_s etime
-    read -r cpu etime < <(ps -o %cpu=,etime= -p "$pid" 2>/dev/null)
-    # etime: [[dd-]hh:]mm:ss  → seconds
-    etime_s=0; IFS=: read -ra p <<< "$etime"
-    case "${#p[@]}" in
-      2) etime_s=$(( ${p[0]}*60 + ${p[1]} ));;
-      3) etime_s=$(( ${p[0]}*3600 + ${p[1]}*60 + ${p[2]} ));;
-      4) etime_s=$(( ${p[0]}*86400 + ${p[1]}*3600 + ${p[2]}*60 + ${p[3]} ));;
-    esac
-    if [ "${cpu%%.*}" -eq 0 ] && [ "$etime_s" -gt $((max_age*60)) ]; then
-      echo "reaping #$n pid=$pid (cpu=$cpu etime=$etime > ${max_age}m idle)"
-      kill "$pid" 2>/dev/null
-    fi
+    local now prev_file="$run_dir/cpu-$n.prev" age d c prev
+    c=$(cpu_s "$pid") || { echo "#${n}: ABSTAIN — ps unreadable (fail-open; never kills)"; continue; }
+    d=$(live_descendants "$pid")
+    now="$c"
+    prev="$(cat "$prev_file" 2>/dev/null || echo "")"
+    echo "$now" > "$prev_file"
+    age=$(log_age_s "$run_dir/$n.log") || age=""
+    if [ -z "$prev" ]; then echo "#${n}: ABSTAIN — first CPU sample ($now s); need a second"; continue; fi
+    if [ "$now" -gt "$prev" ]; then echo "#${n}: ABSTAIN — CPU advanced ${prev}s → ${now}s (working)"; continue; fi
+    if [ "$d" != "0" ]; then echo "#${n}: ABSTAIN — ${d} live descendant(s) (in a tool call)"; continue; fi
+    if [ -z "$age" ]; then echo "#${n}: ABSTAIN — no log to date"; continue; fi
+    if [ "$age" -le $((bound*60)) ]; then echo "#${n}: ABSTAIN — log quiet ${age}s < stream bound ${bound}m (running-quiet)"; continue; fi
+    if [ "$dry" -eq 1 ]; then echo "#${n}: WOULD REAP — cpu frozen at ${now}s, 0 descendants, log quiet ${age}s (> ${bound}m)"; continue; fi
+    echo "#${n}: REAP — cpu frozen at ${now}s, 0 descendants, log quiet ${age}s (> ${bound}m)"
+    kill "$pid" 2>/dev/null; rm -f "$prev_file"
   done < "$run_dir/launched.txt"
 }
 

@@ -51,12 +51,12 @@ until then.
    Detached, no watchdog, parent returns immediately. Launches are **staggered**
    (`DETACHED_STAGGER`, default 45 s) because N concurrent dependency installs on one
    box is an IO storm, and capped (`--max-concurrent`).
-2. **Status** — reports each lane `ALIVE (working)` / `ALIVE (HUNG?)` / `DONE` from
-   `ps -o %cpu=,etime=`.
-3. **Reap** — kills lanes that are `0.0 % CPU` and sleeping past `--max-age-min`.
-   This is the failure mode this pattern *introduces*: pi sometimes never exits after
-   its work is done (observed twice — process in state `S` at 0 % CPU long after its
-   PR was open). Always run `reap` on a timer.
+2. **Status** — reports each lane `DONE` / `running-quiet` / `wedged?` / `unknown(ps)`
+   from cumulative CPU (`ps -o cputime=`), live descendants, and log age. Deliberately
+   **not** from `%CPU` — see "Liveness" below.
+3. **Reap** — kills lanes that have positively finished but never exited. **It does
+   NOT use `%CPU`**, and that is the single most important correction in this
+   document — see "Liveness" below.
 4. **Watch** — polls for each lane's PR and hands it to a fresh-context reviewer, then
    fixer, then re-review. **This is the review gate** (see below).
 
@@ -82,6 +82,46 @@ verification or review gates itself, and leaving them on deadlocks the lane. It 
    a cmux pane (it verifies the *artifact* — the message became a conversation message —
    not the send). Use this for headless lanes.
 
+## Liveness — why `reap` does not use `%CPU`
+
+The first version of this tool reaped on `%cpu == 0 && age > N`. **That is wrong,
+and it would have killed healthy lanes.** Three reasons, all of which the fleet's own
+liveness doctrine already states ([`docs/ops/fleet-liveness.md`](ops/fleet-liveness.md),
+verdict function `tools/fleet/liveness.py`):
+
+1. **`%CPU` is not a liveness signal.** It is a decayed average, and it reads ~0.0
+   for anything I/O-bound. A lane *blocked inside a long tool call* — a 20-minute
+   `pytest`, a network round-trip, a long model turn — is exactly 0.0 % CPU. The
+   failure this pattern needs to clean up is *the process that finished*, but the
+   failure a CPU test actually catches is *the process that is waiting*, which is
+   most of a healthy lane's life.
+2. **A failed read must never produce a kill.** The doctrine's rule 0: an unreadable
+   `ps` abstains (`ps-unreadable`), it never renders `dead`. Every probe in `reap`
+   fails open.
+3. **A frozen transcript alone is ambiguous.** The doctrine names a *stream bound*
+   (20 min) below which a frozen transcript is `running-quiet`, **not** `wedged`.
+
+So `reap` fires only on a **positive, composite** conclusion:
+
+| signal | rule |
+|---|---|
+| cumulative CPU | from `ps -o cputime=` (monotonic), sampled twice — **must not have advanced** |
+| descendants | **zero** live descendant processes (a live `pytest`/`uv`/`git` child vetoes) |
+| log quiet | longer than the **stream bound** (default 20 min, matching the doctrine) |
+
+Anything less abstains and prints **which signal was missing** (`ABSTAIN — …`), so a
+debugging agent can see why it refused. `status` reports the same three signals and
+labels a lane `running-quiet` / `wedged?` / `unknown(ps)` / `DONE` rather than
+pretending a single number decides.
+
+**Run it periodically** (e.g. every 5 min) — it compares CPU against its previous
+sample, which it stores in `<run-dir>/cpu-<issue>.prev`. Use `--dry-run` to see the
+verdict before acting.
+
+An earlier version of this doc also said "always run `reap` on a timer"; the honest
+version is: run it on a timer, and expect it to **abstain most of the time** — that is
+the correct behaviour, not a failure.
+
 ## What you give up vs `task`
 
 | | `task` | detached |
@@ -91,7 +131,8 @@ verification or review gates itself, and leaving them on deadlocks the lane. It 
 | structured result | yes | no — parse the log tail |
 | gate enforcement | forced on | **you must re-impose it** |
 | concurrency cap | 8 tasks / 4 concurrent | manual (`--max-concurrent`) |
-| process cleanup | handled | **manual (`reap`)** |
+| process cleanup | handled (parent-side reap + child-side orphan watchdog) | **manual (`reap`)** |
+| liveness detection | child emits `[task-heartbeat]` life signs on stderr, parent parses them | none — you infer it from `ps` + log age |
 
 For minutes-long lanes, `task` is still the better tool. Use detached only when a lane
 genuinely needs to run long.
@@ -101,7 +142,8 @@ genuinely needs to run long.
 ```bash
 scripts/detached-lane-dispatch.sh start  --issue 123 --issue 456 --repo /path/to/repo
 scripts/detached-lane-dispatch.sh status --run-dir /tmp/pi-lanes/<stamp>
-scripts/detached-lane-dispatch.sh reap   --run-dir /tmp/pi-lanes/<stamp> --max-age-min 180
+scripts/detached-lane-dispatch.sh reap   --run-dir /tmp/pi-lanes/<stamp> --dry-run
+scripts/detached-lane-dispatch.sh reap   --run-dir /tmp/pi-lanes/<stamp> --stream-bound-min 20
 scripts/detached-lane-dispatch.sh watch  --run-dir /tmp/pi-lanes/<stamp> --hours 5
 ```
 
