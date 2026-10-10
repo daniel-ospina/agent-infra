@@ -277,6 +277,24 @@ is_shell_file() {
     esac
   fi
   first="${chunk%%$'\n'*}"
+  # A CLIPPED FIRST LINE IS THE SAME UNDECIDABLE CASE as an empty read: `chunk` stops at 4096 bytes,
+  # so a first line longer than that has its interpreter token cut off and names no shell we can see
+  # — the file is dropped from the scan set and the guard reports clean over it. Only an actually
+  # clipped line matters, so the second read is paid solely when the chunk carries no newline AND
+  # the file is longer than the chunk (a 4096-byte file read whole is decidable and stays clean).
+  if [ "$first" = "$chunk" ]; then
+    _nmore="$(head -c 4097 "$1" 2>/dev/null | wc -c | tr -d ' ')"
+    case "$_nmore" in
+      ''|*[!0-9]*)
+        printf 'check-no-sigpipe-grep: the shebang reader returned no usable byte count for %s\n' "$1" >>"$FIND_ERRS"
+        return 1 ;;
+      *)
+        if [ "$_nmore" -gt 4096 ]; then
+          printf 'check-no-sigpipe-grep: the first line of %s is longer than the shebang reader reads — cannot tell whether it is a shell script\n' "$1" >>"$FIND_ERRS"
+          return 1
+        fi ;;
+    esac
+  fi
   case "$first" in
     '#!'*/sh|'#!'*/sh[[:space:]]*|'#!'*/bash|'#!'*/bash[[:space:]]*|\
     '#!'*[[:space:]]sh|'#!'*[[:space:]]sh[[:space:]]*|\
@@ -308,7 +326,8 @@ scan_files() {
   # STAT it, so no diagnostic reaches the partition, and the scanner would print a verdict over a
   # file it never read. Pushing it into the sink is what refuses that case; the readiness test below
   # covers the same files a second time and is not a substitute — remove the push and the run is
-  # clean, remove the test and the refusal simply comes from the scanner's own status.
+  # clean, remove the test and the refusal merely arrives from elsewhere (the scanner's own status
+  # for a name-claimed `*.sh`, this arm's read-failure push for an extensionless file).
   #
   # WHAT IS FATAL IS NARROWER THAN "ANY UNREADABLE FILE", and the difference is the NAME rule.
   # A basename carrying an extension (`notes.txt`, `.env.local`) is excluded without any read,
@@ -321,8 +340,9 @@ scan_files() {
   # is right: every one of them is a file the guard would have read.
   # A SILENTLY failing `find` is the one failure the partition above cannot see: it writes no
   # diagnostic, so it lists nothing and the guard reports a clean run over a tree it never
-  # enumerated. Both arms therefore return the PIPELINE's status — the producer's, read immediately
-  # after the pipeline — rather than the loop's, whose value is only its last iteration's.
+  # enumerated. Both arms therefore return the PRODUCER's status (`${PIPESTATUS[0]}`, read
+  # immediately after the pipeline) rather than the pipeline's, which under `pipefail` is the
+  # rightmost non-zero — the loop's, when the last listed file is not a shell file.
   # A SILENTLY SUCCEEDING enumerator (consumes nothing, prints nothing, exits 0) lists an empty
   # tree and no status check can see it — the same family as the swallowing classifier, and the
   # result is `✅ … scanned 0 file(s)` over files that are sitting right there. `find -L <path>
@@ -393,7 +413,22 @@ FILE_LIST="$(
     # `pi-bootstrap` being absent, and `find` on a missing path would populate FIND_ERRS and
     # turn every such run into a false exit 2. Existence of an EXPLICITLY named dir was
     # already enforced above.
-    [ -e "$d" ] && { scan_files "$d" || rc=$?; }
+    # The enumerator-status exemption is scoped PER DIRECTORY, not applied globally. A cycle report
+    # from one directory says nothing about a DIFFERENT directory that exited non-zero with no
+    # diagnostic: exempting that globally lets its unenumerated files pass as a clean scan. A dir
+    # whose status is non-zero and which produced no cycle report of its own therefore records a
+    # partial-scan error, which the partition refuses regardless of what any other dir reported.
+    if [ -e "$d" ]; then
+      _before="$(wc -l <"$FIND_ERRS" 2>/dev/null | tr -d ' ')"
+      if ! scan_files "$d"; then
+        _rc=$?
+        _loops="$(sed -n "$(( ${_before:-0} + 1 )),\$p" "$FIND_ERRS" 2>/dev/null | LC_ALL=C grep -c 'find: File system loop detected' || true)"
+        if [ "${_loops:-0}" -eq 0 ]; then
+          printf 'check-no-sigpipe-grep: the enumeration did not complete for %s\n' "$d" >>"$FIND_ERRS"
+          rc=$_rc
+        fi
+      fi
+    fi
   done
   exit "$rc"
 )" || ENUM_RC=$?
@@ -481,12 +516,12 @@ HITS="$(
     ' "$f" || { printf 'check-no-sigpipe-grep: the scanner failed on %s — refusing a verdict over files it may not have read\n' "$f" >&2; exit 2; }
   done
 )"
-# The scan pass's OWN status is part of the fail-closed contract:
-# a scanner that is MISSING or that fails prints no hits, and no hits is indistinguishable from a
-# clean tree. The pipeline's status is the loop's, the loop's is its LAST iteration's, so a
-# failure on any earlier file is masked — and the assignment's status is discarded entirely
-# unless it is read here. (`find`/`cat`/`mktemp` failures were already fatal around the SINK;
-# this applies the same rule around the SCANNER.)
+# The scan pass's OWN status is part of the fail-closed contract: a scanner that is MISSING or that
+# fails prints no hits, and no hits is indistinguishable from a clean tree. The scanner aborts the
+# loop itself on the first file it fails on, so the loop's status does carry that case — but the
+# assignment's status is discarded entirely unless it is read here, and reading it also covers a
+# `sed`/`sort`/`cd` failure in the other stages. (`find`/`cat`/`mktemp` failures were already fatal
+# around the SINK; this applies the same rule around the SCANNER.)
 SCAN_RC=$?
 if [ "$SCAN_RC" -ne 0 ]; then
   echo "check-no-sigpipe-grep: the scan pass did not complete (status $SCAN_RC) — refusing a verdict over files it may not have read" >&2

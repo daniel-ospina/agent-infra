@@ -59,8 +59,8 @@
 #      (a), the enumerator's status being judged AFTER the exemption so GNU's exit 1 is not a false
 #      block (a2), and the ANCHOR of the match (b). TWO pins are platform-gated, so the assertion
 #      count depends on it: 11af runs only where find reports an unresolvable chain, and 11ah only
-#      where /dev/full exists — both GNU/Linux — so the suite reports 84 here (BSD/macOS, MEASURED)
-#      and higher on GNU findutils, the platform CI runs.
+#      where /dev/full exists — both GNU/Linux. The count is therefore platform-dependent; read it
+#      from the suite's own summary line rather than pinning a number here.
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -812,6 +812,24 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "the cycle match is ANCHORED: an error whose path contains the text is still fatal (exit 2)" \
              || fail "an unanchored cycle match exempted a real partial scan (exit $rc)"
 
+# (a3) ...and the exemption is scoped PER DIRECTORY: a cycle report from one dir must not excuse a
+# DIFFERENT dir that exited non-zero with no diagnostic at all. Exempting it globally reports a clean
+# scan over that dir's unenumerated files — and a silent or shimmed enumerator is precisely the case
+# this status check exists for.
+E="$TMP/f11ai3"; mkdir -p "$E/a" "$E/b" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/b/withheld.sh"
+printf '%s\n' '#!/bin/sh' \
+  't="$2"' \
+  'case "$*" in *-maxdepth\ 0*) printf "%s\n" "$t"; exit 0 ;; esac' \
+  'case "$t" in *a*) printf "%s\n" "find: File system loop detected; ‘a/loop’ is part of the same file system loop as ‘a’." >&2; exit 1 ;; esac' \
+  'exit 1' > "$E/fakebin/find"
+chmod +x "$E/fakebin/find"
+rc_one="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'b' >"$OUT" 2>&1; echo $?)"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'a b' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && [ "$rc_one" -eq 2 ] && ! grep -q '✅' "$OUT" \
+  && pass "a cycle in one dir does not exempt another dir's silent failure (exit 2)" \
+  || fail "a cycle report globally exempted a different dir's silent failure (exit $rc, alone $rc_one)"
+
 # 11aj. A file the scan LISTED but cannot OPEN is not "clean". `find -L` STAT'd it, so no
 # diagnostic reaches the partition, and the readiness probe is what names it — but the probe is not
 # the only defence: the scanner's own status (SCAN_RC) refuses the same case, so this pin asserts the
@@ -825,6 +843,29 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 chmod 644 "$E/scripts/locked.sh"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "an unreadable LISTED file refuses a verdict (exit 2)" \
              || fail "the idiom in an unreadable file was reported clean (exit $rc)"
+
+# 11aj2. ...and a CLIPPED first line is the same undecidable case as an empty read: the reader stops
+# at 4096 bytes, so a longer first line has its interpreter token cut off, names no shell, and the
+# file is dropped from the scan set — a clean verdict over an extensionless file that holds the
+# idiom. The refusal is bounded to a genuinely clipped line, so the boundary control below (a file
+# SHORT enough to be read whole, whose first line is just as long) must stay clean.
+E="$TMP/f11aj2"; mkdir -p "$E/scripts"
+{
+  printf '#!'; printf 'a%.0s' $(seq 1 4090); printf '/bin/bash\n'
+  printf 'printf '\''%s'\'' "$V" | grep -q pat\n'
+} > "$E/scripts/longshebang"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a first line longer than the reader reads refuses a verdict (exit 2)" \
+             || fail "a clipped shebang line dropped an extensionless file from the scan set (exit $rc)"
+# the boundary: the same long first line, in a file small enough to be read to the end, is decided
+# by its content — and that tree is CLEAN, so the refusal keys on the CLIP, not on a long line
+E="$TMP/f11aj2b"; mkdir -p "$E/scripts"
+{
+  printf '#!'; printf 'a%.0s' $(seq 1 4000); printf '/bin/bash\n'
+} > "$E/scripts/shortshebang"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] && grep -q '✅' "$OUT" && pass "a long first line in a file read WHOLE is classified, not refused (exit 0)" \
+             || fail "a fully-read long first line was refused by length alone (exit $rc)"
 
 # 11ak. ...and the sink must be ABSOLUTE. The precondition and the partition read run in the
 # guard's OWN cwd, but `find` writes to it after `cd "$ROOT"` — so a RELATIVE mktemp result names
