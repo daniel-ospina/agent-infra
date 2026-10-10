@@ -278,21 +278,32 @@ is_shell_file() {
   fi
   first="${chunk%%$'\n'*}"
   # A CLIPPED FIRST LINE IS THE SAME UNDECIDABLE CASE as an empty read: `chunk` stops at 4096 bytes,
-  # so a first line longer than that has its interpreter token cut off and names no shell we can see
-  # — the file is dropped from the scan set and the guard reports clean over it. Only an actually
-  # clipped line matters, so the second read is paid solely when the chunk carries no newline AND
-  # the file is longer than the chunk (a 4096-byte file read whole is decidable and stays clean).
+  # so a first line longer than that has its interpreter token cut off, names no shell we can see,
+  # and the file is dropped from the scan set — a clean verdict over a file that holds the idiom.
+  #
+  # The clip is judged from the RAW bytes, never from `chunk`: command substitution strips the
+  # trailing newline, so a first line that ends exactly at the read's edge would look unterminated
+  # and a fully-read line would be refused. A newline within the first 4097 bytes proves the line
+  # ended inside the read (a 4096-byte first line is still fully visible); a file no longer than the
+  # read is decidable whatever it holds.
   if [ "$first" = "$chunk" ]; then
+    _nlines="$(head -c 4097 "$1" 2>/dev/null | wc -l | tr -d ' ')"
     _nmore="$(head -c 4097 "$1" 2>/dev/null | wc -c | tr -d ' ')"
-    case "$_nmore" in
+    case "$_nlines" in
       ''|*[!0-9]*)
-        printf 'check-no-sigpipe-grep: the shebang reader returned no usable byte count for %s\n' "$1" >>"$FIND_ERRS"
+        printf 'check-no-sigpipe-grep: the shebang reader returned no usable line count for %s\n' "$1" >>"$FIND_ERRS"
         return 1 ;;
-      *)
-        if [ "$_nmore" -gt 4096 ]; then
-          printf 'check-no-sigpipe-grep: the first line of %s is longer than the shebang reader reads — cannot tell whether it is a shell script\n' "$1" >>"$FIND_ERRS"
-          return 1
-        fi ;;
+      0)
+        case "$_nmore" in
+          ''|*[!0-9]*)
+            printf 'check-no-sigpipe-grep: the shebang reader returned no usable byte count for %s\n' "$1" >>"$FIND_ERRS"
+            return 1 ;;
+          *)
+            if [ "$_nmore" -gt 4096 ]; then
+              printf 'check-no-sigpipe-grep: the first line of %s is longer than the shebang reader reads — cannot tell whether it is a shell script\n' "$1" >>"$FIND_ERRS"
+              return 1
+            fi ;;
+        esac ;;
     esac
   fi
   case "$first" in
@@ -352,13 +363,24 @@ scan_files() {
     printf 'check-no-sigpipe-grep: the enumerator reported nothing for %s, which exists\n' "$target" >>"$FIND_ERRS"
     return 1
   fi
+  # Both arms read NUL-delimited, so a path containing a NEWLINE is one entry instead of two. Read
+  # line-wise it would be split into two phantom paths — `a\nb.sh` becomes `a` and `b.sh` — and the
+  # real file is never opened while a readable `b.sh` elsewhere makes the split look like a clean
+  # scan. Such a path cannot be carried through the line-oriented stages below, so it is REFUSED:
+  # the guard may not report a clean run over a file it did not read.
   case "${dir##*/}" in
-    .husky) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
+    .husky) LC_ALL=C find -L "$target" -type f -print0 2>>"$FIND_ERRS" | while IFS= read -r -d '' f || [ -n "$f" ]; do
+              case "$f" in *$'\n'*)
+                printf 'check-no-sigpipe-grep: %s contains a newline — cannot scan it safely\n' "$f" >>"$FIND_ERRS"
+                continue ;; esac
               [ -r "$f" ] || printf 'check-no-sigpipe-grep: cannot read %s\n' "$f" >>"$FIND_ERRS"
               printf '%s\n' "$f"
             done
             return "${PIPESTATUS[0]}" ;;
-    *) LC_ALL=C find -L "$target" -type f 2>>"$FIND_ERRS" | while IFS= read -r f; do
+    *) LC_ALL=C find -L "$target" -type f -print0 2>>"$FIND_ERRS" | while IFS= read -r -d '' f || [ -n "$f" ]; do
+         case "$f" in *$'\n'*)
+           printf 'check-no-sigpipe-grep: %s contains a newline — cannot scan it safely\n' "$f" >>"$FIND_ERRS"
+           continue ;; esac
          if name_excluded "$f"; then
            :
          elif [ -r "$f" ]; then
@@ -420,8 +442,12 @@ FILE_LIST="$(
     # partial-scan error, which the partition refuses regardless of what any other dir reported.
     if [ -e "$d" ]; then
       _before="$(wc -l <"$FIND_ERRS" 2>/dev/null | tr -d ' ')"
-      if ! scan_files "$d"; then
-        _rc=$?
+      # NOTE the capture order: capturing inside an if-test records the status of the NEGATION
+      # (always 0), so every failing dir would read as clean. (No quotes in this comment: inside
+      # a double-quoted command substitution the shell does not treat this line as a comment,
+      # so an apostrophe here opens a string and the file stops parsing.)
+      scan_files "$d"; _rc=$?
+      if [ "$_rc" -ne 0 ]; then
         _loops="$(sed -n "$(( ${_before:-0} + 1 )),\$p" "$FIND_ERRS" 2>/dev/null | LC_ALL=C grep -c 'find: File system loop detected' || true)"
         if [ "${_loops:-0}" -eq 0 ]; then
           printf 'check-no-sigpipe-grep: the enumeration did not complete for %s\n' "$d" >>"$FIND_ERRS"

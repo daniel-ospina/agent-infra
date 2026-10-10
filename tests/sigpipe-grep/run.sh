@@ -777,7 +777,10 @@ fi
 # findutils' own cycle report, which BSD find never emits — so on macOS it passes with or
 # without the exemption, and an edit that deletes the exempt arm or loosens its match would be
 # caught only on CI. `find` is stubbed (as 11ag stubs `mktemp`) so both polarities are asserted
-# here. (b) is what pins the ANCHOR: an unanchored `*'File system loop detected'*` matches a
+# here. A stub standing in for the enumerator must emit its paths NUL-terminated — that is the
+# shape the guard reads (`-print0`); newline-terminated output is refused as one newline-bearing
+# path, which is the fail-closed answer to an enumerator that does not speak the format.
+# (b) is what pins the ANCHOR: an unanchored `*'File system loop detected'*` matches a
 # permission error whose PATH merely contains that text — a path the tree under scan controls —
 # and so exempts a real partial scan. That is a reachable fail-open, not a theoretical one.
 E="$TMP/f11ai"; mkdir -p "$E/scripts" "$E/fakebin"
@@ -785,7 +788,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E
 # (a) a GNU-shaped cycle report, with everything reachable still listed
 printf '%s\n' '#!/bin/sh' \
   'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
-  'printf "%s\n" "scripts/a.sh"' > "$E/fakebin/find"
+  'printf "%s\\0" "scripts/a.sh"' > "$E/fakebin/find"
 chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "find's cycle report is EXEMPT: the file it did not hide is still read (exit 1)" \
@@ -796,7 +799,7 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
 printf '%s\n' '#!/bin/sh' \
   'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' \
   'printf "%s\n" "find: File system loop detected; ‘scripts/loop’ is part of the same file system loop as ‘scripts’." >&2' \
-  'printf "%s\n" "scripts/a.sh"' 'exit 1' > "$E/fakebin/find"
+  'printf "%s\\0" "scripts/a.sh"' 'exit 1' > "$E/fakebin/find"
 chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 1 ] && pass "a cycle that ALSO exits 1 is still exempt (exit 1, not a false block)" \
@@ -866,6 +869,23 @@ E="$TMP/f11aj2b"; mkdir -p "$E/scripts"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 0 ] && grep -q '✅' "$OUT" && pass "a long first line in a file read WHOLE is classified, not refused (exit 0)" \
              || fail "a fully-read long first line was refused by length alone (exit $rc)"
+
+# 11aj4. a path containing a NEWLINE must not be split into TWO phantom paths. Read line-wise
+# (`find … | while read -r f`) the single file `x.sh<newline>y.sh` becomes `x.sh` and `y.sh`, so the
+# real file is never opened. BOTH phantoms must resolve for this to be a false clean, so the fixture
+# makes each one a readable clean file: a bare unreadable phantom is refused by the ordinary
+# unreadable-file rule and the pin would pass for a reason it does not name.
+E="$TMP/f11aj4"; mkdir -p "$E/scripts"
+# A newline cannot come from command substitution — it strips trailing newlines, so `$(printf '\n')`
+# expands to nothing and the fixture becomes an ordinary filename. Hold it in a variable instead.
+NL='
+'
+printf '%s\n' '#!/usr/bin/env bash' 'echo clean' > "$E/scripts/x.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo clean' > "$E/y.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/x.sh${NL}y.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a path containing a newline refuses a verdict (exit 2)" \
+             || fail "a newline in a path hid a file from the scan (exit $rc)"
 
 # 11ak. ...and the sink must be ABSOLUTE. The precondition and the partition read run in the
 # guard's OWN cwd, but `find` writes to it after `cd "$ROOT"` — so a RELATIVE mktemp result names
@@ -1113,7 +1133,7 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT"
 E="$TMP/f11ax"; mkdir -p "$E/scripts" "$E/fakebin"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/scripts/seen.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/withheld.sh"
-printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\n" "scripts/seen.sh"' 'exit 1' > "$E/fakebin/find"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" "scripts"; exit 0 ;; esac' 'printf "%s\\0" "scripts/seen.sh"' 'exit 1' > "$E/fakebin/find"
 chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a PARTIAL list with a non-zero exit refuses (exit 2)" \
@@ -1140,7 +1160,7 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 E="$TMP/f11az"; mkdir -p "$E/.husky" "$E/fakebin"
 printf '#!/usr/bin/env bash\necho clean\n' > "$E/.husky/seen"
 printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/.husky/withheld"
-printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" ".husky"; exit 0 ;; esac' 'printf "%s\n" ".husky/seen"' 'exit 1' > "$E/fakebin/find"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *-maxdepth\ 0*) printf "%s\n" ".husky"; exit 0 ;; esac' 'printf "%s\\0" ".husky/seen"' 'exit 1' > "$E/fakebin/find"
 chmod +x "$E/fakebin/find"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a partial .husky enumeration refuses (exit 2)" \
