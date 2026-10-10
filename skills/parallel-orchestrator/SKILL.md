@@ -138,7 +138,7 @@ The `subagent` tool blocks until completion. The **`task`** tool now has a first
 ```
 task({ prompt, background: true })
   → { run_id, pid, pgid, log_path }      # returns IMMEDIATELY, never awaits
-task_status({ run_id })                  # alive | wedged | done
+task_status({ run_id })                  # alive | wedged | gone | done
 task_collect({ run_id })                 # the final message + exit status, once done
 ```
 

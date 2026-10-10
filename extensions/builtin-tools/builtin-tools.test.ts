@@ -52,7 +52,7 @@ import {
 } from "./index.js";
 import { readLatchState, setExhausted, familyOf, familyLegs } from "../shared/provider-failover.js";
 // #1662 — background dispatch + status/collect seam.
-import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs } from "./index.js";
+import { startBackgroundTask, evaluateTaskRunStatus, collectTaskRun, getHeartbeatTimeoutMs, formatCollectedRunHead, buildBackgroundDispatchResult } from "./index.js";
 import {
   mintRunId,
   resolveTaskRunsRoot,
@@ -7711,6 +7711,27 @@ test("#1662: a STALE log with no markers reads WEDGED (the no-output shape)", ()
   }
 });
 
+test("#1662: a no-marker log past the 60s first-output bound but WITHIN the freshness window reads WEDGED (the noMarkerYet clause)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nomarker-midband-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_HEARTBEAT_INTERVAL_MS: undefined }, () => {
+      // 5 min log age lies STRICTLY between getFirstOutputTimeoutMs() (60s) and
+      // getHeartbeatFreshWindowMs() (max(2×T, 2×tick), default 60 min), so
+      // `staleLog` is FALSE. `noMarkerYet` is therefore the SOLE clause that can
+      // produce `wedged` here — delete it and this test flips to `alive` (the
+      // stale twin above never proves the clause because staleLog short-circuits
+      // the OR) (#1662 review).
+      const { id } = seedRunningRun(dir, { markers: "plain stdout line, no markers\n", ageMs: 600_000, logAgeMs: 300_000 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "no marker in the tail");
+      equal(v.status, "wedged", `got ${v.status}: ${v.note ?? ""}`);
+      equal(v.alive, true, "the pid is still alive — wedged ≠ dead");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#1662: a stale log (markers stopped) with a live pid reads WEDGED", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-wedged-"));
   try {
@@ -7738,6 +7759,48 @@ test("#1662: a nonce MISMATCH is not a life sign (foreign writer on the child's 
       equal(v.heartbeat?.markers, 0, "a forged nonce is refused");
       // With no valid markers and a fresh log, a young run is not yet wedged.
       ok(v.status === "alive" || v.status === "wedged", `status is a live-state verdict, got ${v.status}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a null-nonce record parses NO markers — the nonce fails CLOSED", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-nonce-null-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // Pre-fix `rec.nonce ?? undefined` meant an UNAUTHENTICATED parse: these
+      // unsigned markers would count, letting a foreign writer on the child's
+      // fd 2 forge life signs. Fail-closed is `rec.nonce ?? ""`, which matches
+      // no marker (no marker carries an empty nonce) (#1662 review).
+      const { id } = seedRunningRun(dir, {
+        nonce: null,
+        markers: `[task-heartbeat] tool_start t1 bash\n[task-heartbeat] tick tools=1 turn=1 stream_age_ms=1 tool_age_max_ms=1 saw_msg=0 saw_tool=1\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.heartbeat?.markers, 0, "a null nonce authenticates nothing");
+      // With no valid markers and a fresh log, a young run is a live-state verdict.
+      ok(v.status === "alive" || v.status === "wedged", `status is a live-state verdict, got ${v.status}`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a running record whose process is gone reads GONE, never the terminal-success label done", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-gone-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The parent died mid-run: the child pid is gone but the record is still
+      // `running`. `done` is the terminal-SUCCESS vocabulary; a poller keyed on
+      // `status === "done"` must not read this as success (#1662 review).
+      const { id } = seedRunningRun(dir, { pid: 999_999_999 });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.alive, false, "the process is gone");
+      equal(v.terminal, false, "not terminal until task_collect salvages it");
+      equal(v.status, "gone", `a settle-lost lane must not read as done (got ${v.status}: ${v.note ?? ""})`);
+      // collect still finalizes it fail-closed.
+      equal(collectTaskRun(id, dir).status, "failed", "collect fails it closed");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -7802,6 +7865,18 @@ test("#1662: a running record whose process is gone is FINALIZED by collect (no 
   }
 });
 
+test("#1662: a done lane with no recorded exit code is NOT rendered as signal death", () => {
+  const done: any = { run_id: "r1", status: "done", terminal: true, exit_code: null, review_gate: "parent-required" };
+  const head = formatCollectedRunHead(done);
+  ok(!head.includes("signal"), `a done lane must not claim signal death: ${head}`);
+  equal(head.includes("(exit"), false, "no exit annotation when the code was not recorded");
+  equal(formatCollectedRunHead({ ...done, exit_code: undefined }).includes("(exit"), false, "undefined exit_code omits the annotation");
+  // The failure/cut shapes keep the annotation; a known code is surfaced.
+  ok(formatCollectedRunHead({ ...done, status: "cut", exit_code: null }).includes("(exit signal)"), "a null-exit cut still reads signal");
+  ok(formatCollectedRunHead({ ...done, status: "failed", exit_code: 1 }).includes("(exit 1)"), "a numeric failure exit is surfaced");
+  ok(formatCollectedRunHead({ ...done, status: "done", exit_code: 0 }).includes("(exit 0)"), "a known zero exit is surfaced");
+});
+
 section("#1662 — startBackgroundTask (returns-early, E2E through the real spawn)");
 
 const FAKE_PI_BG_SHIM = `#!/bin/sh
@@ -7835,7 +7910,12 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     process.env.TASK_SESSION_ROOT = join(dir, "sessions");
     process.env.DISPATCH_LEDGER = "0";
     process.argv[1] = undefined as unknown as string;
-    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH };
+    // A REAL dispatch nonce shared by the record and the child's marker stream,
+    // so the markers in the capture log authenticate. Without it (null) the
+    // pre-fix parser fell back to UNAUTHENTICATED and the alive verdict was a
+    // fail-open (#1662 review).
+    const nonce = "e2enonce";
+    const env: Record<string, string | undefined> = { ...process.env, PATH: process.env.PATH, TASK_HEARTBEAT_NONCE: nonce };
     const runId = mintRunId();
 
     // (1) RETURNS EARLY: the child sleeps 2s, but this must return in well under that.
@@ -7847,7 +7927,7 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
       args: ["-p", "--no-session", "background me"],
       runId,
       runsRoot: dir,
-      nonce: null,
+      nonce,
     });
     const elapsed = Date.now() - t0;
     ok(elapsed < 3000, `returns early (took ${elapsed}ms while the child sleeps 4000ms)`);
@@ -7855,6 +7935,7 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     ok(typeof handle.pid === "number" && handle.pid > 1, `pid captured synchronously (${handle.pid})`);
     ok(typeof handle.pgid === "number" && handle.pgid > 1, `pgid captured (${handle.pgid})`);
     equal(handle.pgid, handle.pid, "TASK_DETACHED setsid ⇒ the child is its own group leader (pgid === pid)");
+    equal(handle.review_gate, "parent-required", "the dispatch handle itself carries the parent review obligation");
 
     // (2) STATUS: alive while the child runs (heartbeats/markers, not %CPU).
     const alive = evaluateTaskRunStatus(runId, dir);
@@ -7874,6 +7955,10 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
     ok(String(view.content?.[0]?.text).includes("BG-FINAL-MESSAGE"), `final message collected: ${JSON.stringify(view.content)}`);
     equal(view.review_gate, "parent-required", "collect still carries the parent review obligation");
     equal(handle.record_persisted, true, "a successful dispatch reports the record was persisted");
+    // The success composer omits an exit code (it is not a signal death), so a
+    // clean lane must not be reaped as `(exit signal)` (#1662 review).
+    equal(view.exit_code, null, "a clean lane records no exit code — null, not signal death");
+    ok(!formatCollectedRunHead(view).includes("signal"), `a done lane must not render as signal death: ${formatCollectedRunHead(view)}`);
 
     // (4) The capture log is owner-only 0600 — it holds the child's raw output.
     ok(existsSync(handle.log_path), "capture log exists");
@@ -7929,6 +8014,34 @@ section("#1662 — tool surface");
     // the forced `AGENT_SKIP_REVIEW_GATE=1`, and the false claim must not return.
     equal(source.includes("has no `task` tool"), false, "the false 'no task tool' rationale is gone");
     ok(source.includes("AGENT_SKIP_REVIEW_GATE=1 FORCED"), "the review-gate rationale names the forced skip flag");
+  });
+
+  test("#1662: the dispatch result carries snake_case review_gate, matching task_status/task_collect", () => {
+    const res = buildBackgroundDispatchResult({
+      run_id: "run-123",
+      pid: 42,
+      pgid: 42,
+      log_path: "/tmp/run-123.log",
+      started_at: 1,
+      record_persisted: true,
+      review_gate: "parent-required",
+    });
+    equal((res.details as any).review_gate, "parent-required", "the consumer-facing field is review_gate");
+    equal((res.details as any).reviewGate, undefined, "the camelCase spelling must not return");
+    ok(String(res.content[0].text).includes("run-123"), "the run id is rendered");
+    const unpersisted = buildBackgroundDispatchResult({
+      run_id: "r2",
+      pid: null,
+      pgid: null,
+      log_path: "",
+      started_at: 1,
+      record_persisted: false,
+      review_gate: "parent-required",
+    });
+    ok(String(unpersisted.content[0].text).includes("NOT persisted"), "a failed persist is surfaced in the text");
+    // The module must never reintroduce the camelCase field on the dispatch result.
+    equal(/\breviewGate\s*:/.test(source), false, "no camelCase reviewGate field remains in the module");
+    ok(source.includes("review_gate: handle.review_gate"), "the dispatch details read the handle's review_gate");
   });
 }
 

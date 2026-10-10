@@ -4486,14 +4486,18 @@ function readLogTail(logPath: string, maxBytes = 512_000): string | null {
 
 /** Replay the capture log through the SAME heartbeat parser the watchdog uses.
  * Nonce-authenticated (a foreign writer on the child's fd 2 must not forge life
- * signs). Returns null when there is no log to read. */
+ * signs). A null/absent nonce must FAIL CLOSED: `parseHeartbeatLine` only
+ * enforces the nonce when `expectedNonce !== undefined`, so passing `undefined`
+ * would parse EVERY marker unauthenticated. Pass "" instead — no marker carries
+ * an empty nonce, so a null-nonce record yields ZERO valid markers (#1662
+ * review). Returns null when there is no log to read. */
 function parseRunHeartbeat(rec: TaskRunRecord): TaskRunStatusView["heartbeat"] {
   const tail = readLogTail(rec.log_path);
   if (tail === null) return null;
   const state = createHeartbeatState();
   for (const line of tail.split(/\r?\n/)) {
     try {
-      parseHeartbeatLine(line, state, 0, rec.nonce ?? undefined);
+      parseHeartbeatLine(line, state, 0, rec.nonce ?? "");
     } catch {
       // A single malformed line must never poison the whole status read.
     }
@@ -4514,7 +4518,7 @@ function parseRunHeartbeat(rec: TaskRunRecord): TaskRunStatusView["heartbeat"] {
  * lane blocked in a long tool call is exactly 0 % CPU; docs/ops/fleet-liveness.md). */
 export interface TaskRunStatusView {
   run_id: string;
-  status: TaskRunStatus | "unknown";
+  status: TaskRunStatus | "unknown" | "gone";
   /** true only when the run has reached a terminal state and its outcome is
    * persisted — i.e. `task_collect` will return the final message. */
   terminal: boolean;
@@ -4588,9 +4592,13 @@ export function evaluateTaskRunStatus(
   }
   if (!alive) {
     // The child is gone but the settle handler has not persisted yet (a
-    // millisecond window) — or the parent died. Either way the process is
-    // DONE; task_collect reads whatever the record holds.
-    return { ...base, status: "done", terminal: false, alive, note: "process is gone; finalize pending — call task_collect" };
+    // millisecond window) — or the parent died. The process is OVER, but it is
+    // NOT a proven success: reporting the terminal-success label `done` here
+    // let a poller keyed on `status === "done"` read a killed/settle-lost lane
+    // as successful before task_collect failed it closed. Return the distinct
+    // non-terminal `gone`; task_collect salvages the record (fail-closed) into
+    // a terminal `failed` (#1662 review).
+    return { ...base, status: "gone", terminal: false, alive, note: "process is gone; finalize pending — call task_collect" };
   }
   // The bound the watchdog will ACTUALLY apply for this dispatch. A background
   // lane carries the resolved S in its record (per-dispatch `stream_stall_ms` →
@@ -4630,7 +4638,7 @@ export function evaluateTaskRunStatus(
  * once terminal (the exact payload a blocking `task` call would have returned). */
 export interface TaskCollectView {
   run_id: string;
-  status: TaskRunStatus | "unknown";
+  status: TaskRunStatus | "unknown" | "gone";
   terminal: boolean;
   exit_code?: number | null;
   reason?: string;
@@ -4700,6 +4708,23 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
   };
 }
 
+/** The one-line head of a terminal `task_collect` result. Extracted so the
+ * exit-code rendering is testable: a `done` lane whose success details carry no
+ * exit code must NOT be rendered as signal death. In the record, `exit_code:
+ * null` means signal death for a `cut`/`failed` lane, but `composeTaskResult`'s
+ * success branch omits the code entirely, so null on a `done` record means
+ * "not recorded" — not a signal (#1662 review). */
+export function formatCollectedRunHead(view: TaskCollectView): string {
+  const exit =
+    typeof view.exit_code === "number"
+      ? ` (exit ${view.exit_code})`
+      : (view.status === "cut" || view.status === "failed") && view.exit_code === null
+        ? " (exit signal)"
+        : "";
+  const icon = view.status === "done" ? "✅" : "❌";
+  return `${icon} Background run ${view.run_id} finished — status: ${view.status}${exit}${view.reason ? ` [${view.reason}]` : ""}`;
+}
+
 /** Map a settled `spawnSubAgent` result to a terminal run status. */
 function classifyBackgroundOutcome(
   result: { content: any[]; details: Record<string, unknown> } | undefined,
@@ -4742,6 +4767,12 @@ export interface BackgroundDispatchHandle {
   pgid: number | null;
   log_path: string;
   started_at: number;
+  /** Always "parent-required" — the child runs with AGENT_SKIP_REVIEW_GATE=1
+   * and cannot review itself; the parent must run the review ceremony (#825).
+   * Carried on the handle itself, not just the tool result, so every consumer
+   * of the dispatch reads the same field name `task_status`/`task_collect` use
+   * (#1662 review). */
+  review_gate: "parent-required";
   /** false when the durable run record could not be written (root unwritable,
    * ENOSPC, …). task_status/task_collect will read UNKNOWN; the caller must not
    * treat the lane as durable. Surfaced in the tool result (#1662 review). */
@@ -4867,6 +4898,47 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
     // looks like a successful dispatch while task_status answers UNKNOWN
     // forever and the lane's result is silently lost (#1662 review).
     record_persisted: recordPersisted,
+    review_gate: "parent-required",
+  };
+}
+
+/** Build the user-visible result of a returns-early background dispatch.
+ * Extracted from the tool body so the review-gate field and the handle surface
+ * are testable without spawning a child (#1662 review). The details use the
+ * SAME snake_case `review_gate` spelling as `task_status`/`task_collect`, so a
+ * consumer reading `details.review_gate` gets "parent-required" — the dispatch
+ * result previously emitted camelCase `reviewGate` while every sibling seam
+ * used `review_gate`. */
+export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle): {
+  content: Array<{ type: string; text: string }>;
+  details: Record<string, unknown>;
+} {
+  return {
+    content: [{
+      type: "text",
+      text:
+        `🚀 Background sub-agent dispatched (returns-early).\n` +
+        `run_id: ${handle.run_id}\n` +
+        `pid: ${handle.pid ?? "unknown"}  pgid: ${handle.pgid ?? "unknown"}\n` +
+        `log: ${handle.log_path || "(unavailable)"}\n` +
+        (handle.record_persisted
+          ? ""
+          : `⚠️ run record was NOT persisted — task_status/task_collect will read UNKNOWN for this run_id; re-dispatch or check TASK_RUNS_ROOT.\n`) +
+        `\n` +
+        `Poll: task_status({ run_id: "${handle.run_id}" })  → alive | wedged | gone | done\n` +
+        `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
+        `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
+    }],
+    details: {
+      run_id: handle.run_id,
+      pid: handle.pid,
+      pgid: handle.pgid,
+      log_path: handle.log_path,
+      status: "running",
+      background: true,
+      record_persisted: handle.record_persisted,
+      review_gate: handle.review_gate,
+    },
   };
 }
 
@@ -5268,7 +5340,7 @@ export default function (pi: ExtensionAPI) {
       background: Type.Optional(
         Type.Boolean({
           description:
-            "#1662: RETURN IMMEDIATELY instead of awaiting the child. Spawns the lane detached and returns `{ run_id, pid, pgid, log_path }` without blocking. Observe it with `task_status({ run_id })` (alive | wedged | done, derived from the child's `[task-heartbeat]` markers — NOT %CPU) and reap it with `task_collect({ run_id })` once done. Reuses the same watchdog/hard-cap/settle-sweep machinery as a blocking dispatch; it is ONE spawn (no zero-output retry, no failover hop chain) — a failed lane is surfaced as status `failed` and the orchestrator re-dispatches it (#208 resume contract). ⚠️ The review gate is a PARENT step: sub-agents run with AGENT_SKIP_REVIEW_GATE=1 and cannot review themselves (#825), so after `task_collect` you MUST run the review ceremony for the lane before treating it as complete.",
+            "#1662: RETURN IMMEDIATELY instead of awaiting the child. Spawns the lane detached and returns `{ run_id, pid, pgid, log_path }` without blocking. Observe it with `task_status({ run_id })` (alive | wedged | gone | done, derived from the child's `[task-heartbeat]` markers — NOT %CPU) and reap it with `task_collect({ run_id })` once done. Reuses the same watchdog/hard-cap/settle-sweep machinery as a blocking dispatch; it is ONE spawn (no zero-output retry, no failover hop chain) — a failed lane is surfaced as status `failed` and the orchestrator re-dispatches it (#208 resume contract). ⚠️ The review gate is a PARENT step: sub-agents run with AGENT_SKIP_REVIEW_GATE=1 and cannot review themselves (#825), so after `task_collect` you MUST run the review ceremony for the lane before treating it as complete.",
         })
       ),
     }),
@@ -5631,33 +5703,7 @@ export default function (pi: ExtensionAPI) {
           runsRoot,
           nonce: backgroundNonce ?? null,
         });
-        return {
-          content: [{
-            type: "text",
-            text:
-              `🚀 Background sub-agent dispatched (returns-early).\n` +
-              `run_id: ${handle.run_id}\n` +
-              `pid: ${handle.pid ?? "unknown"}  pgid: ${handle.pgid ?? "unknown"}\n` +
-              `log: ${handle.log_path || "(unavailable)"}\n` +
-              (handle.record_persisted
-                ? ""
-                : `⚠️ run record was NOT persisted — task_status/task_collect will read UNKNOWN for this run_id; re-dispatch or check TASK_RUNS_ROOT.\n`) +
-              `\n` +
-              `Poll: task_status({ run_id: "${handle.run_id}" })  → alive | wedged | done\n` +
-              `Reap:  task_collect({ run_id: "${handle.run_id}" }) → final message + exit status\n\n` +
-              `⚠️ REVIEW GATE IS A PARENT STEP (#825): the child runs with AGENT_SKIP_REVIEW_GATE=1 and cannot review itself. After task_collect returns a terminal result, run the review ceremony for this lane BEFORE treating it as complete.`,
-          }],
-          details: {
-            run_id: handle.run_id,
-            pid: handle.pid,
-            pgid: handle.pgid,
-            log_path: handle.log_path,
-            status: "running",
-            background: true,
-            record_persisted: handle.record_persisted,
-            reviewGate: "parent-required",
-          },
-        };
+        return buildBackgroundDispatchResult(handle);
       }
 
       let result = await retry((attempt) => spawnLeg(dispatchLeg, attempt), retryOptions);
@@ -5821,7 +5867,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════════
-  // task_status — background-run liveness (alive | wedged | done)
+  // task_status — background-run liveness (alive | wedged | gone | done)
   // ═══════════════════════════════════════════════════════════════
   // #1662: the status seam for `task({ background: true })`. Liveness is
   // derived from the child's `[task-heartbeat]` markers + a pid probe — NEVER
@@ -5832,10 +5878,10 @@ export default function (pi: ExtensionAPI) {
     name: "task_status",
     label: "Task Status (background run)",
     description:
-      "Check a background `task({ background: true })` run: alive | wedged | done. Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal, then RUN THE REVIEW GATE (a parent step, #825).",
+      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which salvages it fail-closed. Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal, then RUN THE REVIEW GATE (a parent step, #825).",
     promptSnippet: "Check the liveness of a background task run",
     promptGuidelines: [
-      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | done.",
+      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect, do NOT read it as success.",
       "Liveness comes from the child's [task-heartbeat] markers and a pid probe — never from %CPU. A lane blocked in a long tool call reads 0 % CPU but is still alive.",
       "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status, then run the review ceremony (a PARENT step, #825).",
     ],
@@ -5889,9 +5935,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text }], details: view };
       }
       const body = view.content?.map((c: any) => (typeof c?.text === "string" ? c.text : "")).join("\n") ?? "(no output)";
-      const head = `${view.status === "done" ? "✅" : "❌"} Background run ${view.run_id} finished — status: ${view.status}`
-        + (view.exit_code === undefined ? "" : ` (exit ${view.exit_code === null ? "signal" : view.exit_code})`)
-        + (view.reason ? ` [${view.reason}]` : "");
+      const head = formatCollectedRunHead(view);
       const text = `${head}\n\n${body}\n\n⚠️ REVIEW GATE IS A PARENT STEP (#825): before treating this lane as complete, run the review ceremony for its output. The child ran with AGENT_SKIP_REVIEW_GATE=1 and cannot self-review.`;
       return { content: [{ type: "text", text }], details: view };
     },
