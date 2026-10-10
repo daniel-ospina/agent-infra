@@ -237,19 +237,27 @@ is_shell_file() {
   esac
   # Extensionless: claim it only if its first line names a SHELL. Captured first, never
   # piped into a quiet grep — that is the very idiom this guard exists to catch.
-  # The interpreter TOKEN must be sh/bash, never a bare `*sh*`: a token match would also claim
-  # fish/tcsh/xonsh, which have no `pipefail` at all. zsh IS excluded deliberately, but as a
-  # SCOPE limit rather than a capability fact — zsh does have `pipefail` (`setopt pipefail`); it
-  # is out because the remedy this guard prints is a BASH here-string, which is invalid there.
+  # The interpreter TOKEN must be sh/bash, never a bare `*sh*`: this guard's scan set and the
+  # remedy it prints are POSIX-sh/bash-specific, so other interpreters are out of SCOPE by
+  # decision. That is deliberately NOT a claim about their pipeline semantics — zsh has
+  # `pipefail` (`setopt pipefail`) and tcsh propagates a failed element regardless — so restoring
+  # a capability argument here would be wrong for both of them again.
   # Read a BOUNDED prefix. `head -1` on a file with no newline reads to EOF, so a large
   # extensionless non-shell file would be materialised into a shell variable (measured on
   # bash 3.2: a 300 MB no-newline file cost 82s and 315 MB RSS, vs 0.21s when it was
   # skipped). Real binaries stop at their first newline anyway; this bound stops the cost
   # depending on that luck.
+  # A FAILING reader is the same class as an unreadable file, and it fails in the direction that
+  # matters: an empty `chunk` names no interpreter, so the file is dropped from the scan set and
+  # the guard reports a clean run over a file it never read — the exact tortoise#7588 shape, since
+  # the files this arm exists to claim are extensionless. Route it into the same fail-closed sink.
   local chunk first
   # 4096, not 512: a real shebang is a few dozen bytes, but a cap that clips the interpreter
   # token would be a false NEGATIVE (the old unbounded `head -1` would have claimed it).
-  chunk="$(head -c 4096 "$1" 2>/dev/null)"
+  chunk="$(head -c 4096 "$1" 2>/dev/null)" || {
+    printf 'check-no-sigpipe-grep: cannot read %s\n' "$1" >>"$FIND_ERRS"
+    return 1
+  }
   first="${chunk%%$'\n'*}"
   case "$first" in
     '#!'*/sh|'#!'*/sh[[:space:]]*|'#!'*/bash|'#!'*/bash[[:space:]]*|\
@@ -419,7 +427,7 @@ HITS="$(
     ' "$f" || { printf 'check-no-sigpipe-grep: the scanner failed on %s — refusing a verdict over files it may not have read\n' "$f" >&2; exit 2; }
   done
 )"
-# The scan pass's OWN status is part of the fail-closed contract, and it was the last hole in it:
+# The scan pass's OWN status is part of the fail-closed contract:
 # a scanner that is MISSING or that fails prints no hits, and no hits is indistinguishable from a
 # clean tree. The pipeline's status is the loop's, the loop's is its LAST iteration's, so a
 # failure on any earlier file is masked — and the assignment's status is discarded entirely
@@ -438,7 +446,14 @@ fingerprint() { # <path> ; reads HITS from the environment
 }
 
 fails="" warns=""
-FILES_WITH_HITS="$(printf '%s\n' "$HITS" | sed '/^$/d' | cut -d: -f1 | LC_ALL=C sort -u)"
+# The CLASSIFICATION pass decides whether the verdict loop runs at all, so its status is part of
+# the contract in the same way the scan pass's is: if it fails, FILES_WITH_HITS is empty while
+# HITS is not, the loop below is skipped, and the guard reports clean with the idiom sitting in
+# HITS. (`cut` is the only tool in this pipeline that the SCAN_RC guard above cannot see.)
+FILES_WITH_HITS="$(printf '%s\n' "$HITS" | sed '/^$/d' | cut -d: -f1 | LC_ALL=C sort -u)" || {
+  echo "check-no-sigpipe-grep: could not classify the scan's hits — refusing a verdict over files that may contain the idiom" >&2
+  exit 2
+}
 
 if [ -n "$FILES_WITH_HITS" ]; then
   while IFS= read -r f; do

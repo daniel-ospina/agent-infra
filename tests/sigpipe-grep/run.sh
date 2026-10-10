@@ -56,7 +56,7 @@
 #      diagnostic, so there it passes with or without the exclusion; 11ai therefore stubs `find`
 #      to pin BOTH the exemption and the ANCHOR of its match on every platform. 11af runs only
 #      where find reports an unresolvable chain, so the suite's assertion count is
-#      platform-dependent (67 on BSD/macOS, 69 on GNU findutils — the platform CI runs).
+#      platform-dependent (69 on BSD/macOS, 71 on GNU findutils — the platform CI runs).
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -865,6 +865,30 @@ chmod +x "$E/fakebin/awk"
 rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING scanner refuses a verdict (exit 2)" \
              || fail "a failing scanner still produced a verdict (exit $rc)"
+
+# 11ao. a FAILING READER is not a clean file. `is_shell_file` reads a bounded shebang prefix with
+# `head`; an empty read names no interpreter, so an EXTENSIONLESS shell file is dropped from the
+# scan set and the guard reports clean over a file it never read — the exact tortoise#7588 shape,
+# since the files that arm exists to claim are precisely the extensionless ones. `head` is stubbed
+# through PATH, as 11ag stubs `mktemp`.
+E="$TMP/f11ao"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/deploy"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/head"
+chmod +x "$E/fakebin/head"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING shebang reader refuses a verdict (exit 2)" \
+             || fail "a failing reader dropped an extensionless shell file (exit $rc)"
+
+# 11ap. ...and the CLASSIFICATION pass is the same class: if it fails while HITS is non-empty, the
+# verdict loop is skipped and an idiom that WAS found is never reported. `cut` is the only tool in
+# that pipeline the scan-status guard cannot see, so it is pinned separately.
+E="$TMP/f11ap"; mkdir -p "$E/scripts" "$E/fakebin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "$V" | grep -q pat' > "$E/scripts/a.sh"
+printf '%s\n' '#!/bin/sh' 'exit 3' > "$E/fakebin/cut"
+chmod +x "$E/fakebin/cut"
+rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a FAILING classifier refuses a verdict (exit 2)" \
+             || fail "a found idiom was dropped by a failing classifier (exit $rc)"
 
 echo ""
 if [ "$failures" -eq 0 ]; then
