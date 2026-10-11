@@ -87,3 +87,40 @@ def test_an_abandoned_child_does_not_mask_a_wedge(L):
 def test_a_missing_child_stat_does_not_count_against_the_child(L):
     """`child_stale is None` is an unreadable stat, not evidence the child is dead."""
     assert L.child_suppresses(L.WEDGED, [], [], {"call_id": "x"}, None) is True
+
+
+# ── "no record" is not "failed read" ─────────────────────────────────────────
+#
+# The two render differently on purpose. `cmux list-workspaces --json` covers the live fleet;
+# lane-status ALSO unions in rows from the session files, which have no cmux record at all. So a
+# lane can legitimately have no `latest_submitted_at` while cmux read perfectly well -- and that
+# is a different fact from cmux being unreadable, which means NOTHING follows from inbound.
+
+def test_absent_record_is_not_a_failed_read(L, monkeypatch):
+    """cmux read fine; this lane just has no inbound record -> (None, True)."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [("OTHER-WS", {"latest_submitted_at": None})])
+    epoch, readable = L._submitted_epoch("2C-PACK-COMPILE")
+    assert (epoch, readable) == (None, True)
+
+
+def test_unreadable_cmux_reports_itself_as_unreadable(L, monkeypatch):
+    """cmux could not be read at all -> (None, False). Must NOT look like 'no record'."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [])
+    epoch, readable = L._submitted_epoch("ANY")
+    assert (epoch, readable) == (None, False)
+
+
+def test_a_parsable_timestamp_comes_back_readable(L, monkeypatch):
+    """A live workspace's inbound parses through the existing ts_epoch (UTC, `Z` suffix)."""
+    monkeypatch.setattr(L, "_live_workspaces",
+                        lambda: [("WS-1", {"latest_submitted_at": "2026-10-11T22:11:13.924Z"})])
+    epoch, readable = L._submitted_epoch("ws-1")   # case-insensitive match
+    assert readable is True and epoch and epoch > 1_700_000_000
+
+
+def test_the_two_unknowns_are_never_rendered_alike(L):
+    """The row-level contract the renderer depends on: readable=0 -> UNREAD, else '-' when None."""
+    def render(r):
+        return "UNREAD" if not r.get("inbound_readable", False) else ("-" if r.get("inbound_age") is None else "AGE")
+    assert render({"inbound_readable": False, "inbound_age": None}) == "UNREAD"
+    assert render({"inbound_readable": True, "inbound_age": None}) == "-"

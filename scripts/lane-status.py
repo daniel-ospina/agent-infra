@@ -392,18 +392,30 @@ def _live_workspaces():
 
 
 def _submitted_epoch(ws):
-    """Epoch of the lane's last SUBMITTED turn, from the cmux record. None when unreadable.
+    """The lane's last INBOUND turn, from the cmux record, PLUS whether cmux was readable.
 
-    Reads the SAME cached `_live_workspaces()` payload the roster union already fetches, so
-    this costs no extra `cmux` call. `None` (not 0) when absent or unparsable -- an unread
-    timestamp must abstain, never read as "submitted in 1970" (which would veto everything)
-    or as "never submitted" (which would veto nothing and claim knowledge we do not have).
+    Returns `(epoch, readable)`, and the SECOND element is the point -- "we could not read cmux"
+    and "cmux read fine but this lane has no inbound record" are DIFFERENT FACTS and must not
+    render identically (an absent signal is not a failed read, and a failed read must never be
+    reported as an empty success).
+
+      (epoch, True)  -> the workspace's last inbound turn
+      (None,  True)  -> cmux READ OK; this lane simply has no inbound record (e.g. it is not a
+                        live cmux workspace at all, only a row from the session-file union)
+      (None,  False) -> cmux itself could not be read -- UNREAD, and nothing follows from it
+
+    Reads the SAME cached `_live_workspaces()` payload the roster union already fetches, so this
+    costs no extra `cmux` call. Never 0: an unread timestamp must not read as "submitted in
+    1970" (which would discount everything) nor as a confident "no inbound".
     """
+    live = _live_workspaces()
+    if not live:
+        return None, False
     want = (ws or "").upper()
-    for wsid, x in _live_workspaces():
+    for wsid, x in live:
         if wsid.upper() == want:
-            return ts_epoch(x.get("latest_submitted_at"))
-    return None
+            return ts_epoch(x.get("latest_submitted_at")), True
+    return None, True
 
 
 def _live_label(wsid, x):
@@ -1291,7 +1303,7 @@ def main():
         # ── INBOUND-RECENCY: a PRIOR, not a liveness proof (owner 2026-10-11, corrected) ───
         # `None` abstains. The AGE is reported on every row because it is the discriminator: a
         # lane whose last inbound is hours old AND that shows no output is the suspicious one.
-        _se = _submitted_epoch(ws)
+        _se, inbound_readable = _submitted_epoch(ws)
         inbound_age = None if _se is None else int(time.time() - _se)
         if child_suppresses(verdict, declared, pane_kids, child, child_stale):
             verdict = WAITING
@@ -1309,7 +1321,7 @@ def main():
             except Exception:
                 cur_size = s["size"]
         out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
-                       inbound_age=inbound_age, cpu=_cpu,
+                       inbound_age=inbound_age, inbound_readable=inbound_readable, cpu=_cpu,
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
@@ -1371,8 +1383,10 @@ def main():
                 bits += " ⚠️ past 20m harness bound"
             extra = f"{bits} :: {c['task'][:40]}" if c["task"] else bits
         _sa = r.get("inbound_age")
-        if _sa is None:
-            _sub = "inbound=UNREAD"
+        if not r.get("inbound_readable", False):
+            _sub = "inbound=UNREAD"          # cmux itself could not be read
+        elif _sa is None:
+            _sub = "inbound=-"               # read OK; this lane has no inbound record
         elif _sa >= 3600:
             _sub = f"inbound={_sa//3600}h{(_sa%3600)//60:02d}m"
         elif _sa >= 60:
