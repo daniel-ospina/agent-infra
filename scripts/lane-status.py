@@ -54,10 +54,54 @@ ABANDON_S = 30 * 60          # == the harness's own in-flight bound (OVERDUE_S),
                               # outlive it, so past this the child is DEAD and its
                               # still-open call is a stale record, not a wait.
 
-# A lane with a LIVE child is WAITING on it -- never IDLE, never WEDGED, never "stuck".
-# WEDGED is the costly member: its instruction is to check the process, which invites a
-# kill/respawn of a HEALTHY lane.
-CHILD_SUPPRESSED = (DONE_IDLE, WIP_IDLE, WEDGED, CHILD_STUCK, WAITING_OVERDUE)
+# Verdicts that tell a reader to ACT on a lane -- dispatch it, or check/kill it. A live
+# signal must never be overridden BY one of these. WEDGED is the costly member: its
+# instruction is to check the process, which invites a kill/respawn of a HEALTHY lane.
+ACTION_VERDICTS = (DONE_IDLE, WIP_IDLE, WEDGED, CHILD_STUCK, WAITING_OVERDUE)
+CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer child-specific
+
+# ── INBOUND-RECENCY IS A **PRIOR**, NOT A LIVENESS PROOF (owner 2026-10-11, corrected) ────────
+# `cmux list-workspaces --json` gives, per workspace, `latest_submitted_at` + `latest_submitted_message`
+# for the whole fleet in ONE call. Useful -- but ⛔ IT IS INBOUND. It is the last turn SUBMITTED TO the
+# workspace, not output produced BY it. Inspecting the whole column shows every value is inbound: the
+# orchestrator's is the heartbeat, `Tortoise markeitng`'s is the OWNER asking a question, `rail-4764`'s
+# is a dispatch someone sent it. So it answers "when was this lane last TOLD something", NOT "is this
+# lane producing". An earlier version of this file treated it as a liveness signal and let it veto any
+# verdict; that was WRONG and is reverted here.
+#
+# WHAT IT IS GOOD FOR (the weaker, true claims):
+#   1. STALENESS -- a lane whose last inbound is hours old AND which shows no output is genuinely
+#      suspicious. That ESCALATES to a real check; it is never a WEDGED verdict on its own.
+#   2. That work was recently ASSIGNED -- a fresh work order means "do not call this idle". This is
+#      the case it was actually needed for: `2a Projection keys` read IDLE->WITHHELD on a work order
+#      submitted 0.03h earlier, and acting on that would have interrupted live work.
+#
+# ⛔ WHAT ACTUAL LIVENESS USES: the lane's SESSION JSONL mtime/size (`stale`/`grew`, above). That is
+# OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal.
+# Inbound-recency is reported BESIDE it, never in place of it.
+#
+# ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts
+# only the IDLE family ("dispatch it") and NEVER WEDGED / CHILD-STUCK / CHILD-OVERDUE ("check the
+# process", "a child is stuck"). Suppressing those on an INBOUND event would hide a real wedge -- and
+# one of tonight's lanes, `tortoise-sweep`, was genuinely wedged.
+INBOUND_LIVE_S = ABANDON_S      # == the harness's own in-flight bound: inside it, the lane was
+                                # told something a legal turn ago, so "idle" is not a safe claim.
+INBOUND_DISCOUNTS = (DONE_IDLE, WIP_IDLE)
+
+
+def inbound_discounts_idle(verdict, inbound_age):
+    """Does a recent INBOUND event discount this verdict -- i.e. "do not call this idle"?
+
+    Scoped to INBOUND_DISCOUNTS on purpose. An inbound event proves only that the lane was
+    recently TOLD something, so it may stop us DISPATCHING to a lane that was just given work;
+    it may not overrule a claim that the lane is stuck, which rests on the lane's own OUTPUT.
+
+    `None` -- an unread timestamp -- ABSTAINS: a failed read must neither discount a verdict
+    nor be read as staleness.
+    """
+    if inbound_age is None:
+        return False
+    return inbound_age <= INBOUND_LIVE_S and verdict in INBOUND_DISCOUNTS
 
 
 def child_suppresses(verdict, declared, pane_kids, child, child_stale, abandon_s=None):
@@ -86,7 +130,7 @@ def child_suppresses(verdict, declared, pane_kids, child, child_stale, abandon_s
     """
     bound = ABANDON_S if abandon_s is None else abandon_s
     live_child = bool(child) and not (child_stale is not None and child_stale > bound)
-    return bool(declared or pane_kids or live_child) and verdict in CHILD_SUPPRESSED
+    return bool(declared or pane_kids or live_child) and verdict in ACTION_VERDICTS
                               # MEASURED 2026-09-27: this was 6*3600, so a child the
                               # harness had killed ~5.5 hours earlier was still returned
                               # as a live pending child and reported as `WAITING-CHILD
@@ -345,6 +389,21 @@ def _live_workspaces():
         rows = []
     _LIVE_CACHE.append(rows)
     return rows
+
+
+def _submitted_epoch(ws):
+    """Epoch of the lane's last SUBMITTED turn, from the cmux record. None when unreadable.
+
+    Reads the SAME cached `_live_workspaces()` payload the roster union already fetches, so
+    this costs no extra `cmux` call. `None` (not 0) when absent or unparsable -- an unread
+    timestamp must abstain, never read as "submitted in 1970" (which would veto everything)
+    or as "never submitted" (which would veto nothing and claim knowledge we do not have).
+    """
+    want = (ws or "").upper()
+    for wsid, x in _live_workspaces():
+        if wsid.upper() == want:
+            return ts_epoch(x.get("latest_submitted_at"))
+    return None
 
 
 def _live_label(wsid, x):
@@ -1229,7 +1288,15 @@ def main():
         # and must not mask a real wedge. Absence is preferred to a wrong class everywhere else in
         # this test -- here too: a missing child_file (child_stale is None) does NOT count against
         # the child, because an unreadable stat is not evidence the child is dead.
+        # ── INBOUND-RECENCY: a PRIOR, not a liveness proof (owner 2026-10-11, corrected) ───
+        # `None` abstains. The AGE is reported on every row because it is the discriminator: a
+        # lane whose last inbound is hours old AND that shows no output is the suspicious one.
+        _se = _submitted_epoch(ws)
+        inbound_age = None if _se is None else int(time.time() - _se)
         if child_suppresses(verdict, declared, pane_kids, child, child_stale):
+            verdict = WAITING
+        # Discounts IDLE only -- never WEDGED / CHILD-STUCK / CHILD-OVERDUE (see the constant).
+        if inbound_discounts_idle(verdict, inbound_age):
             verdict = WAITING        # `size` is the session file's CURRENT byte length, and it is the
         # fingerprint turn-end.py keys on: a lane that has taken a turn has a
         # bigger file; one that is sitting still has the same number. That is
@@ -1242,7 +1309,7 @@ def main():
             except Exception:
                 cur_size = s["size"]
         out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
-                       cpu=_cpu,
+                       inbound_age=inbound_age, cpu=_cpu,
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
@@ -1277,7 +1344,7 @@ def main():
              WIP_IDLE: 4,
              LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, WORKING: 8, UNKNOWN: 9}
     out.sort(key=lambda r: order.get(r["verdict"], 9))
-    print(f"{'LANE':<26} {'VERDICT':<14} {'SELF':>7} {'UI':<8} CHILD / LAST")
+    print(f"{'LANE':<26} {'VERDICT':<14} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  CHILD / LAST")
     print("-" * 106)
     for r in out:
         st = "-" if r["stale_s"] is None else (
@@ -1303,7 +1370,16 @@ def main():
             if age > OVERDUE_S:
                 bits += " ⚠️ past 20m harness bound"
             extra = f"{bits} :: {c['task'][:40]}" if c["task"] else bits
-        print(f"{r['lane']:<26} {r['verdict']:<14} {st:>7} {ui:<8} {extra}")
+        _sa = r.get("inbound_age")
+        if _sa is None:
+            _sub = "inbound=UNREAD"
+        elif _sa >= 3600:
+            _sub = f"inbound={_sa//3600}h{(_sa%3600)//60:02d}m"
+        elif _sa >= 60:
+            _sub = f"inbound={_sa//60}m{_sa%60:02d}s"
+        else:
+            _sub = f"inbound={_sa}s"
+        print(f"{r['lane']:<26} {r['verdict']:<14} {st:>7} {ui:<8} {_sub:>10}  {extra}")
         for line in r["recent"]:
             print(f"{'':<26} {'':<12} {'':>7} {'':<8}   · {line}")
     print()
