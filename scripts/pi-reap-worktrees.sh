@@ -231,7 +231,12 @@ EPHEMERAL=" .venv node_modules __pycache__ .pytest_cache .mypy_cache .ruff_cache
 # `website/apps/dashboard/dist/`). That 49 is why "ignored is clean" is wrong
 # and why this is a narrow allowlist rather than a blanket rule.
 # `*.egg-info` is a suffix rule and is handled in is_regenerable_ignored().
-IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .cache .DS_Store node_modules .venv .ci-selection .longmemeval_cache .wrangler .playwright-mcp .ipynb_checkpoints htmlcov :memory: "
+# `.cache` is DELIBERATELY ABSENT: it is the one generic name in the old
+# EPHEMERAL list, and the ROOT-only rule it replaced existed precisely to keep a
+# NESTED `src/.cache/` out of the tolerant set (operator data, not build junk).
+# Every name here is instead tool-scoped, so a nested match is still provably
+# regenerable.
+IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store node_modules .venv .ci-selection .longmemeval_cache .wrangler .playwright-mcp .ipynb_checkpoints htmlcov :memory: "
 
 MODE=unknown
 LIST_ONLY=0
@@ -663,7 +668,7 @@ live_cwd_for() { # <canon> <recorded> -> pid whose cwd is inside ("" when none)
 # must be deleted before `git worktree remove`, which refuses on untracked
 # files); otherwise up to 3 offending entries.
 clean_gate() {
-    local path="$1" out rc buf bad="" ignored="" eph="" reg="" n=0 line xy p base
+    local path="$1" out rc buf bad="" ignored="" eph="" n=0 line xy p base
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-st.XXXXXX")" || { printf 'status-error\tmktemp-failed\n'; return 0; }
     run_bounded "$REAP_WT_STATUS_TIMEOUT" "$out" \
         "$GIT_BIN" -C "$path" -c core.quotepath=false status --porcelain -z \
@@ -695,7 +700,19 @@ clean_gate() {
                     # Ignored: non-blocking ONLY for pure regenerable cache.
                     # Anything else is operator data and PRESERVES (G2b).
                     if is_regenerable_ignored "$p"; then
-                        reg="$reg$p "
+                        # TOLERATED AND DELIBERATELY NOT COLLECTED. Anything
+                        # appended to the `clean` payload is later expanded
+                        # UNQUOTED by remove_one (`for entry in $eph`) and
+                        # `rm -rf`'d, so the payload MUST stay limited to the
+                        # space-free ROOT names the branch above admits: a
+                        # nested path with a space would split into fragments
+                        # and delete an unrelated, possibly TRACKED directory
+                        # (`website (copy)/…` -> `rm -rf $wt/website`).
+                        # Ignored entries need no pre-delete anyway — verified:
+                        # `git worktree remove` (no --force) returns rc=0 with
+                        # an ignored `__pycache__/` present, which is exactly why
+                        # the ignored half of this gate exists at all.
+                        :
                     else
                         n=$((n + 1)); [ "$n" -le 3 ] && ignored="$ignored$p "
                     fi
@@ -710,7 +727,7 @@ clean_gate() {
     elif [ -n "$ignored" ]; then
         printf 'ignored-artifact\t%s\n' "$(printf '%s' "$ignored" | sed 's/ $//')"
     else
-        printf 'clean\t%s\n' "$(printf '%s' "$eph$reg" | sed 's/ $//')"
+        printf 'clean\t%s\n' "$(printf '%s' "$eph" | sed 's/ $//')"
     fi
 }
 
