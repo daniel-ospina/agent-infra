@@ -148,8 +148,13 @@ def main():
     check("live child -> no action", c["action"] is None, c)
     c = cls(row(verdict="CHILD-STUCK", child={"age": 4000, "task": "x"},
                 child_stale=3600, child_activity=3600))
-    check("child quiet and idle on disk -> CHILD-OVERDUE", c["verdict"] == "CHILD-OVERDUE", c)
-    check("CHILD-OVERDUE -> unblock list", c["action"] == "wedged", c)
+    # ⛔ CHILD-STUCK IS PRESERVED, NOT COLLAPSED INTO CHILD-OVERDUE. The row says a child transcript
+    # EXISTS and went quiet past the bound -- that is evidence, so the label survives and the lane
+    # keeps its place in the unblock list. CHILD-OVERDUE is the verdict for "no child reachable at
+    # all", which is UNKNOWN and prescribes NO action (asserted further down).
+    check("child transcript quiet -> CHILD-STUCK (preserved, not collapsed)",
+          c["verdict"] == "CHILD-STUCK", c)
+    check("CHILD-STUCK -> unblock list (a transcript is evidence)", c["action"] == "wedged", c)
     # an unmatched task/subagent dispatch IS a child, even when lane-status dropped it as stale
     c = cls(row(verdict="WEDGED", tool={"name": "subagent", "age": 10200, "timeout": None}))
     check("unmatched subagent 2h50m -> CHILD-OVERDUE", c["verdict"] == "CHILD-OVERDUE", c)
@@ -182,11 +187,16 @@ def main():
           c["verdict"] == "CHILD-OVERDUE" and c["step"] == "6", c)
 
     # UNMATCHED (no result recorded) is reported -- but the wording must not claim a cut: nothing
-    # readable here can see one.
+    # readable here can see one. ⛔ AND IT IS NOT AN ACTION: CHILD-OVERDUE is UNKNOWN, so it must not
+    # reach the unblock list. This is the defect that made the beat read
+    # `WEDGED->1 unblock: 5&9 MCP and SDK surface` while that lane held a LIVE child (task in flight
+    # 89m) -- following it interrupts live work.
     c = cls(row(verdict="WEDGED", tool={"name": "task", "age": 10200, "timeout": None}),
             LS=FakeLS(files={"sid-1": "/fake/parent.jsonl"}, recs=[rec_call("c1", "task")]))
-    check("UNMATCHED dispatch -> reported",
-          c["verdict"] == "CHILD-OVERDUE" and c["action"] == "wedged", c)
+    check("UNMATCHED dispatch -> reported as CHILD-OVERDUE",
+          c["verdict"] == "CHILD-OVERDUE" and c["step"] == "6", c)
+    check("  but CHILD-OVERDUE prescribes NO action (unknown != stall)",
+          c["action"] is None, c)
     check("  wording says UNMATCHED, never CUT",
           any("UNMATCHED" in w for w in c["why"])
           and not any("a cut child looks exactly like this" in w for w in c["why"])
@@ -303,6 +313,37 @@ def main():
     check("the reason names the missing workspace",
           bool(_g) and any("no longer exists" in w for w in _g[0]["why"]),
           _g[0]["why"] if _g else "gone1 absent from report")
+
+    # ── CHILD-OVERDUE is NOT an action; CHILD-STUCK is ──────────────────────────────────────────
+    # Measured 2026-10-11: the beat's ONE actionable line read
+    # `WEDGED->1 unblock: 5&9 MCP and SDK surface` while that lane held a LIVE child
+    # (`task in flight 89m`) -- acting on it interrupts live work. CHILD-OVERDUE means no child is
+    # reachable from here, i.e. UNKNOWN, and an unknown must not become an instruction. CHILD-STUCK
+    # has a transcript that EXISTS and went quiet past the bound -- that is evidence, so it keeps
+    # its place in the unblock list. The rule is about the BEAT, so it is asserted at bucket level,
+    # not only on the row's `action`.
+    print("")
+    print("CHILD-OVERDUE is UNKNOWN -> report-only;  CHILD-STUCK has evidence -> unblock list")
+    rows_c = [
+        row(lane="decoyc", sid="sid-decoyc", cpu=True),
+        row(lane="overdue1", sid="sid-overdue1", verdict="CHILD-OVERDUE", ws="WS-C",
+            child={"age": 4000, "task": "x"}),
+        row(lane="stuck1", sid="sid-stuck1", verdict="CHILD-STUCK", ws="WS-C",
+            child={"age": 4000, "task": "x"}, child_stale=3600, child_activity=3600),
+    ]
+    _files_c = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
+                                             "--x-repo-%s--" % r["lane"], "s.jsonl")) for r in rows_c)
+    _cwds_c = {"0": "/x/repo-decoyc", "1": "/x/repo-overdue1", "2": "/x/repo-stuck1"}
+    fs_c = FakeLS(files=_files_c, cwds=_cwds_c, cpus=dict(_cwds_c))
+    resc = LA.build(rows_c, fs_c, None, use_jev=False, live={"WS-C"})
+    _act_c = {c["lane"] for c in resc["idle"] + resc["wip"] + resc["wedged"]}
+    _rep_c = {c["lane"] for c in resc["report"]}
+    check("CHILD-OVERDUE is NOT offered for an unblock", "overdue1" not in _act_c)
+    check("CHILD-OVERDUE is still REPORTED (the evidence is kept, not dropped)",
+          "overdue1" in _rep_c)
+    check("CHILD-STUCK keeps its place in the unblock list", "stuck1" in _act_c)
+    check("the partition invariant survives the child-overdue move",
+          sum(len(resc[k]) for k in ("idle", "wip", "wedged", "report", "quiet")) == len(rows_c))
     # ⛔ THE UUID SURVIVED; THE LANE DID NOT (2026-10-10, #7957 H4). Measured LIVE: three of the six
     # lanes the beat offered as IDLE had a live UUID under a DIFFERENT title -- `land-6260` was
     # `P1 data-loss`, `Merigng PR` was `PR 2`, `\u03c0 - land-lane-1` was `5285 Decision`. The

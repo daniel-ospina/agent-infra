@@ -124,3 +124,33 @@ def test_the_two_unknowns_are_never_rendered_alike(L):
         return "UNREAD" if not r.get("inbound_readable", False) else ("-" if r.get("inbound_age") is None else "AGE")
     assert render({"inbound_readable": False, "inbound_age": None}) == "UNREAD"
     assert render({"inbound_readable": True, "inbound_age": None}) == "-"
+
+
+# ── the discount must not fire on an inbound the lane has already ANSWERED ────
+#
+# `stale_s` is the lane's OWN session-file age — its output. When output is newer than the
+# inbound, the lane took the work order, finished the turn and is idle again. Measured on
+# `2a Projection keys`: inbound 27m old, last write 25m old (a completed turn), so it was
+# genuinely free and the discount was suppressing a lane that needed dispatching.
+
+def test_a_consumed_inbound_does_not_discount_idle(L):
+    """Output NEWER than the inbound -> the lane already answered it -> IDLE stands."""
+    assert L.inbound_discounts_idle(L.DONE_IDLE, inbound_age=1660, stale_s=1498) is False
+
+
+def test_an_unanswered_inbound_does_discount_idle(L):
+    """Silent for longer than since it was told -> it has not responded -> do not call it idle."""
+    assert L.inbound_discounts_idle(L.DONE_IDLE, inbound_age=108, stale_s=4000) is True
+
+
+def test_an_unread_output_age_does_not_fire_the_consumed_check(L):
+    """`stale_s=None` is unread, not 'consumed' — it must not flip the discount either way."""
+    assert L.inbound_discounts_idle(L.DONE_IDLE, inbound_age=60, stale_s=None) is True
+
+
+def test_the_discount_has_its_own_label_not_the_child_one(L):
+    """⛔ The discount must not claim a child. `2a` read WAITING-CHILD with no child of any kind
+    (no `child`, no `pane_children`, no `declared`) purely because this discount reused the
+    child-wait label — so a reader chasing an imaginary child could not see the lane was free."""
+    assert L.WAITING_INBOUND != L.WAITING
+    assert "CHILD" not in L.WAITING_INBOUND.upper()

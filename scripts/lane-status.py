@@ -87,9 +87,16 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 INBOUND_LIVE_S = ABANDON_S      # == the harness's own in-flight bound: inside it, the lane was
                                 # told something a legal turn ago, so "idle" is not a safe claim.
 INBOUND_DISCOUNTS = (DONE_IDLE, WIP_IDLE)
+# ⛔ ITS OWN VERDICT, NOT "WAITING-CHILD". The discount and the child prior are DIFFERENT
+# observations -- "it was recently told something" vs "a child is in flight" -- and reusing the
+# child label made the table assert a child that does not exist. MEASURED 2026-10-11:
+# `2a Projection keys` read `WAITING-CHILD` with NO `child`, NO `pane_children` and NO `declared`;
+# the label came from this discount, so a reader chasing an imaginary child could not see that the
+# lane was in fact simply free. A suppression target must name the evidence that produced it.
+WAITING_INBOUND = "RECENT-INBOUND"
 
 
-def inbound_discounts_idle(verdict, inbound_age):
+def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
     """Does a recent INBOUND event discount this verdict -- i.e. "do not call this idle"?
 
     Scoped to INBOUND_DISCOUNTS on purpose. An inbound event proves only that the lane was
@@ -98,10 +105,25 @@ def inbound_discounts_idle(verdict, inbound_age):
 
     `None` -- an unread timestamp -- ABSTAINS: a failed read must neither discount a verdict
     nor be read as staleness.
+
+    ⛔ AND ONLY WHILE THE LANE HAS NOT WRITTEN SINCE. `stale_s` is the lane's OWN session-file age
+    -- its output. When the output is NEWER than the inbound (`stale_s < inbound_age`), the lane has
+    already ANSWERED what it was told: it took the work order, finished the turn, and is idle again,
+    so the discount must NOT fire. MEASURED 2026-10-11 on `2a Projection keys`: inbound 27m old but
+    its last write 25m old -- a COMPLETED turn ("Posted as 6114467601 on #6151") -- so the work
+    order had been consumed and IDLE was correct. The rule without this check suppressed a genuinely
+    free lane and mislabelled it as waiting on a child. `stale_s=None` (unread) does not fire the
+    check either way: an unread output age is not evidence the inbound was consumed.
     """
     if inbound_age is None:
         return False
-    return inbound_age <= INBOUND_LIVE_S and verdict in INBOUND_DISCOUNTS
+    if verdict not in INBOUND_DISCOUNTS:
+        return False
+    if inbound_age > INBOUND_LIVE_S:
+        return False
+    if stale_s is not None and stale_s < inbound_age:
+        return False        # output is newer than the inbound: it was consumed, so IDLE stands
+    return True
 
 
 def child_suppresses(verdict, declared, pane_kids, child, child_stale, abandon_s=None):
@@ -1307,9 +1329,10 @@ def main():
         inbound_age = None if _se is None else int(time.time() - _se)
         if child_suppresses(verdict, declared, pane_kids, child, child_stale):
             verdict = WAITING
-        # Discounts IDLE only -- never WEDGED / CHILD-STUCK / CHILD-OVERDUE (see the constant).
-        if inbound_discounts_idle(verdict, inbound_age):
-            verdict = WAITING        # `size` is the session file's CURRENT byte length, and it is the
+        # Discounts IDLE only -- never WEDGED / CHILD-STUCK / CHILD-OVERDUE (see the constant),
+        # and only while the lane has not written since it was told (see the function).
+        if inbound_discounts_idle(verdict, inbound_age, stale):
+            verdict = WAITING_INBOUND        # `size` is the session file's CURRENT byte length, and it is the
         # fingerprint turn-end.py keys on: a lane that has taken a turn has a
         # bigger file; one that is sitting still has the same number. That is
         # how "nudge once per idle episode" is enforced with no database — the

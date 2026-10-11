@@ -415,7 +415,17 @@ def classify_row(row, dead, files, LS):
                             % (disp.get("name"), _age(age), OVERDUE_S // 60))
                         r["why"] += ev
                         return r
-                    r.update(verdict="CHILD-OVERDUE", step="6", action="wedged")
+                    # ⛔ NOT ACTIONABLE. CHILD-OVERDUE = the dispatch is UNMATCHED and no child
+                    # is reachable to recurse into -- the classifier's own words are "we know the
+                    # dispatch is UNMATCHED; we do NOT know it was cut". That is UNKNOWN, and
+                    # unknown is not evidence of a stall. It was action="wedged", which made the
+                    # beat's ONE actionable line read `WEDGED->1 unblock: 5&9 MCP and SDK surface`
+                    # while that lane held a LIVE child (task in flight 89m): following it
+                    # interrupts live work. A `task` child legitimately runs 35-65m (a merge rail
+                    # measured 119m), so "past the ~20m bound" does not separate a stall from a
+                    # long job. Same polarity as the child-count fix: SUPPRESS over mislabel. The
+                    # EVIDENCE is kept -- the lane still appears, in REPORT-ONLY, with its why.
+                    r.update(verdict="CHILD-OVERDUE", step="6", action=None)
                     r["why"].append(
                         "an UNMATCHED %s dispatch is %s old, past the %dm harness in-flight "
                         "bound: no result is recorded for its call id and no child is reachable "
@@ -448,10 +458,26 @@ def classify_row(row, dead, files, LS):
         if row.get("verdict") in ("WAITING-CHILD", "CHILD-OVERDUE", "CHILD-STUCK"):
             # STEP 6: recursion. The parent's quiet is CORRECT only while the child is alive;
             # with no evidence of life it is a real candidate -- but a child past the ~20m bound is
-            # FREQUENTLY legitimate (measured: a 119m merge rail, a 35-65m deploy). So it is
-            # reported to unblock, never reaped.
-            r.update(verdict=("CHILD-OVERDUE" if not child_live else "WAITING_ON_CHILD"),
-                     step="6", action="wedged" if not child_live else None)
+            # FREQUENTLY legitimate (measured: a 119m merge rail, a 35-65m deploy).
+            #
+            # ⛔ DO NOT COLLAPSE CHILD-STUCK INTO CHILD-OVERDUE, and do not make EITHER actionable
+            # from this branch. `child_live` is False here BY CONSTRUCTION (the branch above returns
+            # whenever it is True), so the original ternary always yielded CHILD-OVERDUE and always
+            # set action="wedged" -- every "a child signal exists but nothing about it is readable"
+            # became an ACTION, which is why `5&9` was advertised for an unblock while its child was
+            # live. The two verdicts are not interchangeable: CHILD-STUCK means a child transcript
+            # EXISTS and went quiet past the bound (evidence, so it stays a candidate -- still
+            # "confirm before acting", never reap on it alone), while CHILD-OVERDUE means no child is
+            # reachable at all (unknown, so it is report-only and NOT an action). Distinguishing them
+            # is the entire reason there are two verdicts.
+            _row_v = row.get("verdict")
+            r.update(verdict=("CHILD-STUCK" if _row_v == "CHILD-STUCK" else "CHILD-OVERDUE"),
+                     step="6",
+                     # CHILD-STUCK KEEPS its place in the unblock list: its transcript EXISTS and went
+                     # quiet past the bound, which is evidence (still "confirm before acting", never
+                     # reap on it alone). CHILD-OVERDUE prescribes NO action -- it is an unknown, and
+                     # the bucket loop below sends it to REPORT-ONLY rather than the unblock list.
+                     action=("wedged" if _row_v == "CHILD-STUCK" else None))
             r["why"] += ev or ["a child is in flight but nothing about it can be read from here"]
             # THE ROW'S VERDICT IS A SUSPICION, AND THE EVIDENCE JUST PRINTED CAN CONTRADICT IT.
             # MEASURED 2026-10-05: `tortoise-sweep` carried verdict CHILD-OVERDUE from the scan
@@ -918,8 +944,20 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
                                "auto-compacts. Tell it plainly to CONTINUE the task in hand; it is "
                                "NOT finished and NOT free capacity.")
             wip.append(c)
-        elif v in ("STALLED", "DEAD", "CHILD-OVERDUE"):
+        elif v in ("STALLED", "DEAD", "CHILD-STUCK"):
             wedged.append(c)
+        elif v == "CHILD-OVERDUE":
+            # ⛔ CHILD-OVERDUE IS NOT AN ACTION. See the CHILD-STUCK/CHILD-OVERDUE note in
+            # `classify()`: this verdict means no child is reachable from here, i.e. UNKNOWN -- and
+            # unknown must not be turned into an instruction. Bucketing it as `wedged` is what made
+            # the beat read `WEDGED->1 unblock: 5&9 MCP and SDK surface` while that lane held a live
+            # child (task in flight 89m); acting on it would have interrupted live work. It moves to
+            # REPORT-ONLY, which keeps the lane and its why visible without inviting the interrupt --
+            # the same SUPPRESS-rather-than-mislabel polarity as the child-count fix.
+            c["why"].insert(0, "NOT an action: the child is unverifiable from here (no reachable "
+                               "child), and a task child legitimately runs past this bound -- "
+                               "unknown, not evidence of a stall")
+            report.append(c)
         else:                                           # BLOCKED_* / UNBOUND / AMBIGUOUS / UNCLASSIFIED
             report.append(c)
 
