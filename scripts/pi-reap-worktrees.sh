@@ -691,9 +691,12 @@ clean_gate() {
         base="${p%/}"; base="${base##*/}"
         case "$xy" in
             '??'|'!!')
-                # ROOT-level ephemeral allowlist: `src/.cache/` is tolerated
-                # ONLY through the regenerable-ignored rule below, never by
-                # being nested alone.
+                # ROOT-level ephemeral allowlist ONLY. A NESTED `src/.cache/`
+                # is tolerated by NOTHING: `.cache` is deliberately absent from
+                # IGNORED_REGENERABLE (a nested cache is operator data). This
+                # branch is also what keeps the `clean` payload safe — it admits
+                # nothing but space-free ROOT names, and remove_one expands that
+                # payload UNQUOTED.
                 if [ "${p%/}" = "$base" ] && is_ephemeral_name "$base"; then
                     eph="$eph$p "
                 elif [ "$xy" = '!!' ]; then
@@ -998,10 +1001,13 @@ classify_one() {
 
 # ── removal ────────────────────────────────────────────────────────────
 # remove_one <path>
-# Never --force. Deletes ONLY declared-ephemeral UNTRACKED (??) entries first
-# (git refuses a worktree containing untracked files); ignored (`!!`)
-# ephemerals are handled by git itself. A refusal/timeout is REPORTED as
-# REMOVE-FAILED, never swallowed.
+# Never --force. Deletes the declared-ephemeral ROOT names first, whether
+# UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
+# root branch collects both, so both are pre-deleted here. NESTED ignored
+# regenerable caches are NOT collected and are left to git, which removes them
+# with the checkout: `git worktree remove` does not refuse ignored files
+# (verified — that fact is the whole reason the ignored gate exists).
+# A refusal/timeout is REPORTED as REMOVE-FAILED, never swallowed.
 #
 # The pre-delete is a recursive filesystem delete over a checkout this script
 # does not control, so it runs under the SAME watchdog as the removal — it was
