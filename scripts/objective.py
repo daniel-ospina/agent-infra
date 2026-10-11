@@ -477,6 +477,23 @@ CLASS_ORDER = ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict
 # `drive`/`drift-guard`/`sigpipe-guard` are "never blockers" is TRUE for the 7 required contexts
 # and FALSE for the rail; the instrument inherited the wrong one.
 RAIL_GATES = ("flip-gate", "drift-guard", "provenance")
+# ⛔ EXCLUDED FROM THE DO LIST BECAUSE IT IS NOT REQUIRED -- NOT BECAUSE IT "CANNOT PASS".
+# MEASURED 2026-10-11, job 114560749590: `agent-infra-ci / lint` is an ordinary ruff gate
+# (`tortoise/.github/workflows/ci.yml:2023` -> `lint-command: pip install ruff==0.16.4 && ruff check .`).
+# It issues NO merge command, has NO review-enforcement guard, and refuses nothing. It failed with
+#     "Found 6 errors. [*] 3 fixable with the `--fix` option"
+# -- six REAL lint errors, three auto-fixable, owned by #5203. So this red is GENUINE WORK, just not
+# the work of any PR lane: it is main-side (ruff lints the whole tree, so every .py-changing PR
+# inherits it) and the check is not one of the 7 required contexts.
+#
+# ⚠️ THE "CANNOT PASS BY CONSTRUCTION" STORY IS REAL -- BUT IT IS A DIFFERENT ARTIFACT. The guard that
+# prints "✅ Review enforcement (admin-merge evidence) gate is working correctly." and then refuses the
+# very rail it mandates (so the guard succeeding IS the job failure) is `extensions/review-enforcer` /
+# `extensions/ln` in agent-infra, exercised by `agent-infra/.github/workflows/ci-main.yml:144-150`.
+# That is tortoise #6395 / agent-infra #1203 -- both OPEN. Do NOT attach that mechanism to THIS name:
+# it would hide six fixable lint errors behind a "nothing to do here" story, which is the failure this rail exists to
+# prevent. Two different checks; one name was doing duty for both.
+NOT_REQUIRED_CHECKS = ("agent-infra-ci / lint",)
 
 
 # ⛔ A TOKEN THAT NAMES AN ACTION BUT NOT ITS OBJECT IS A REPORT, NOT AN INSTRUCTION.
@@ -675,6 +692,25 @@ def classify_pr(pr, cr, att_clean):
     return "fix-ci"
 
 
+def fix_ci_reasons(cr):
+    """The REQUIRED check names that are non-green, sorted -- the IN-PROGRESS work list.
+
+    ⛔ ONLY THE 7 BRANCH-PROTECTION CONTEXTS MAY APPEAR. This list once carried every red job
+    name, so it read `python-ci-gate=11 test (b)=4 test (g)=3 test-slow (a)=3 ... drive` -- job
+    names that are all inside the ONE required context `python-ci-gate`, plus non-required
+    checks (`drive`, `manifest-integrity`, `agent-infra-ci / lint`). That over-reported the work
+    and sent lanes at jobs that gate nothing. NOW: a red, in-flight, or NEVER-RAN required
+    check counts (absence is not green here -- a check that never ran IS the `rerun-checks`
+    work), `ai-review-gate` is excluded (it has its own action), and SELF_DEFEATING_CHECKS are
+    excluded explicitly.
+    """
+    red, flight = rollup_checks(cr)
+    seen = {c.get("name") for c in cr if c.get("name")}
+    return sorted(n for n in REQUIRED
+                  if (n in red or n in flight or n not in seen)
+                  and n != "ai-review-gate" and n not in NOT_REQUIRED_CHECKS)
+
+
 def classify_queue(non):
     """(Counter of CLASS_ORDER, surface_count) or (None, surface) when ANY PR was unreadable.
 
@@ -698,12 +734,17 @@ def classify_queue(non):
                 why = rail_block_reason(_red, _fl,
                                         {c.get("name") for c in cr if c.get("name")})
             elif k == "fix-ci" and cr:
-                # NAME THE FAILING CHECK, so the work is obvious without re-deriving it. Job
-                # names (e.g. `test (slow (b))`) matter: they say whether this is a real break
-                # or the load-dependent timeout class (#5049).
-                _red, _fl = rollup_checks(cr)
-                why = ",".join(sorted(n for n in _red
-                                      if n != "ai-review-gate" and n not in RAIL_GATES)) or "?"
+                # ⛔ FILTERED BY `REQUIRED` -- THE BUCKET COUNTS ONLY THE 7 BRANCH-PROTECTION
+                # CONTEXTS. It previously counted EVERY red job name, so the list carried
+                # `test (b)`/`test (g)`/`test-slow (a)`-class job names (all inside the ONE
+                # required context `python-ci-gate`), plus `drive` and `manifest-integrity`,
+                # which are NOT required and never gate a merge. Measured 2026-10-11: the list
+                # ran to `python-ci-gate=11 test (b)=4 test (g)=3 test-slow (a)=3 ... drive` --
+                # an inflated count over checks no lane has to fix, which is how the bucket both
+                # over-reported work and sent lanes at non-gating jobs.
+                # A required check that is RED, IN FLIGHT, or NEVER RAN all count: absence is
+                # not green here (a check that never ran is exactly the `rerun-checks` work).
+                why = ",".join(fix_ci_reasons(cr)) or "?"
             by_class[k].append((p["number"], why))
         if touches_surface(p):
             surface += 1
@@ -884,9 +925,10 @@ def build(prev=None):
 
     # -- the verdict: ONE word the heartbeat can alert on ----------------------
     if GH_BLOCKED == "RATE-LIMITED":
-        verdict = "GH-BLOCKED"       # NOT a property of the tree: the fleet cannot read
+        verdict = "GH-RATE-LIMITED"  # NOT a property of the tree: the fleet cannot read
     elif mstate == "RED":
-        verdict = "BLOCKED"          # nothing can drain; own the tree, not the lanes
+        verdict = "FIX-MAIN"         # main is RED -- DO: fix main's failing required check
+                                      # (the beat prints failing_required=<check> right beside this)
     elif q is None or mstate == "UNKNOWN":
         verdict = "UNKNOWN"          # never extrapolate from an unreadable surface
     # The verdict is about the QUEUE. `crit_max` is deliberately NOT a term here: CI time is
@@ -1059,6 +1101,27 @@ def _top_proc():
 # own pressure verdict and swap").
 RES_RECLAIM_CPU, RES_RECLAIM_PRESSURE_FREE, RES_RECLAIM_SWAPACT = 90, 10, 50
 RES_HOLD_CPU, RES_ONE_CPU, RES_MANY_CPU, RES_MANY_SWAPACT = 75, 50, 50, 50
+
+# ── DISPATCH ADVISORY (owner 2026-10-11) -- a HUMAN HINT, NOT A BAND ─────────────────────
+# ⛔ THIS IS DELIBERATELY NOT PART OF THE BAND, AND MUST NEVER STEER `res_action()`. This block
+# already records why load is not a band input: load is a LAGGING average (1/5/15 min) and cannot
+# answer "right now", which is what `runq` answers. That decision STANDS -- `runq` remains the
+# machine's saturation band and `load` is not in RES_REQUIRED. What the owner asked for is an
+# ADVISORY in plain words, exactly as `mem` and `swap` are already printed without banding.
+#
+# ⛔ THE TWO SIGNALS WILL SOMETIMES DISAGREE (a high runq with a still-low load average is the
+# normal transient, because load has not caught up). THAT IS EXPECTED AND CORRECT -- do not
+# "fix" it by feeding load into the band, and do not delete the advisory to remove the apparent
+# contradiction. Two signals, two jobs: `runq` = is the box saturated RIGHT NOW (band);
+# `load` = should I add work (human hint).
+#
+# Basis: measured 2026-10-11 on this 10-core box (state/DISPATCH-THRESHOLDS-2026-10-11.md):
+#   load 41-76   -> queue DRAINED (waiting 25 -> 15)
+#   load 101-143 -> queue FLAT for hours
+#   load 156+    -> REGRESSED (waiting 15 -> 17)
+# i.e. ~10x cores. Refine as more data lands.
+LOAD_REFUSE = 100    # at/above -> recommend NOT dispatching new work
+LOAD_CAUTION = 50    # at/above -> recommend ONE lane at a time
 # Every band input. A missing one forces `UNKNOWN` rather than a confident band.
 # `swap` is deliberately ABSENT from this tuple: it is printed, but it no longer decides.
 RES_REQUIRED = ("cpu", "runq", "cores", "mem_used", "pressure_free", "swap_act",
@@ -1089,8 +1152,43 @@ def res_action(r):
     return "hold"                  # cpu is low but the queue or swap activity is not: no green light
 
 
+def _load_avg():
+    """The 1-minute load average, or None when it could not be read.
+
+    ⛔ None, NEVER 0 -- an unread load must SAY SO. A fabricated `0` would read as "idle box",
+    and the advisory built on it would say "dispatch freely" on a machine nobody measured.
+    1-minute (not 5/15) because this is a hint about the next few minutes, which is the window
+    a dispatch decision covers.
+    """
+    try:
+        return float(os.getloadavg()[0])
+    except Exception:
+        return None
+
+
+def load_advisory(r):
+    """The `ADVISORY:` clause for the RES line -- a HUMAN hint, never a band.
+
+    ⛔ REPORTED, NOT BANDED. This function must never be called from `res_action()`, and `load`
+    must never join RES_REQUIRED: the advisory states a recommendation in words while the BAND
+    keeps deciding, so the box can be advised against dispatch while the band still says
+    dispatch-one (which is the intended reading, not a bug).
+
+    Four outputs, and the unread case is one of them: a load we could not read is `unread`, and
+    it NEVER implies "dispatch freely" -- a failed read is not an empty success.
+    """
+    v = r.get("load")
+    if v is None:
+        return "load=unread ADVISORY: unknown"
+    if v >= LOAD_REFUSE:
+        return "load={:.0f} ADVISORY: DO NOT DISPATCH new work until the next heartbeat".format(v)
+    if v >= LOAD_CAUTION:
+        return "load={:.0f} ADVISORY: dispatch ONE lane at a time".format(v)
+    return "load={:.0f} ADVISORY: dispatch freely".format(v)
+
+
 def resources():
-    """The five `RES:` signals, each None when it could NOT be read (see res_action).
+    """The `RES:` signals, each None when it could NOT be read (see res_action).
 
     ⛔ A SIGNAL THAT COULD NOT BE READ IS `None`, NEVER `0`. A prototype of this segment
     printed `pi processes=0` from a `pgrep` pattern that did not match -- a FALSE ZERO, the
@@ -1109,6 +1207,8 @@ def resources():
     r["swap"] = _swap_pct()
     r["swap_act"] = _swap_activity()
     r["top_name"], r["top_pcpu"] = _top_proc()
+    # REPORTED ONLY -- never banded, never in RES_REQUIRED, never read by res_action().
+    r["load"] = _load_avg()
     return r
 
 
@@ -1130,10 +1230,10 @@ def res_line(r=None, age=0):
     top = "UNKNOWN" if (r.get("top_name") is None or r.get("top_pcpu") is None) \
         else f"{r['top_name']}({r['top_pcpu']}%)"
     return ("RES: cpu={}% runq={}/{} mem={}%|{}%free swap={}% swap-act={}pg/s top={} "
-            "res_age={}s | DO: {}").format(
+            "res_age={}s {} | DO: {}").format(
         _rf(r.get("cpu")), _rf(r.get("runq")), _rf(r.get("cores")),
         _rf(r.get("mem_used")), _rf(r.get("pressure_free")), _rf(r.get("swap")),
-        _rf(r.get("swap_act")), top, age, res_action(r))
+        _rf(r.get("swap_act")), top, age, load_advisory(r), res_action(r))
 
 
 # Resource actions that must NEVER coexist with a dispatch instruction on the same line.

@@ -625,6 +625,42 @@ class TestActionVocabulary:
     def test_a_rail_clean_attested_pr_is_still_call_rail(self):
         assert self.o.classify_pr(self._pr(), self._cr(), True) == "call-rail"
 
+    def test_a_non_required_check_never_reaches_the_DO_list(self):
+        """A readout that sends lanes at useless work is a defect with a measurable cost: it burned
+        lane cycles chasing `agent-infra-ci / lint` (a job that trips its OWN guard and reports its
+        own success as a failure) and job names like `test (b)` that live INSIDE the one required
+        context `python-ci-gate` and therefore gate nothing on their own."""
+        cr = self._cr(red=["python-ci-gate"])
+        for i, nm in enumerate(("drive", "agent-infra-ci / lint", "test (b)", "manifest-integrity")):
+            cr.append({"id": 700 + i, "name": nm, "status": "completed",
+                       "conclusion": "failure", "app": {"slug": "actions"}, "details_url": self.DU})
+        got = self.o.fix_ci_reasons(cr)
+        assert got == ["python-ci-gate"], got          # ONLY the required context
+        for banned in ("drive", "agent-infra-ci / lint", "test (b)", "manifest-integrity"):
+            assert banned not in got, banned
+
+    def test_a_required_check_that_never_ran_is_work(self):
+        """Absence is not green here: a required check that never ran IS the rerun-checks work."""
+        assert "docs" in self.o.fix_ci_reasons(self._cr(absent=["docs"]))
+
+    def test_ai_review_gate_has_its_own_action_not_a_fix_ci_entry(self):
+        assert "ai-review-gate" not in self.o.fix_ci_reasons(self._cr(red=["ai-review-gate"]))
+
+    def test_the_non_required_check_is_named_not_implicit(self):
+        """Excluded EXPLICITLY, so it cannot re-enter if it is ever added to branch protection.
+
+        ⛔ AND NOT FOR THE REASON ONCE WRITTEN HERE. `agent-infra-ci / lint` does NOT "fail by
+        construction": measured 2026-10-11 (job 114560749590) it is a plain ruff gate that failed on
+        "Found 6 errors. [*] 3 fixable with the `--fix` option" -- real, fixable lint errors, tracked
+        by #5203. It is excluded only because it is NOT one of the 7 required contexts.
+
+        The self-defeating guard (prints "gate is working correctly", then refuses the rail it
+        mandates and fails the job) is `extensions/review-enforcer` -- agent-infra #6395 / #1203 --
+        a DIFFERENT check. One name was doing duty for two artifacts.
+        """
+        assert "agent-infra-ci / lint" in self.o.NOT_REQUIRED_CHECKS
+        assert not hasattr(self.o, "SELF_DEFEATING_CHECKS")   # the false framing is gone
+
     def test_classification_is_total_and_ordered(self):
         """Every PR yields EXACTLY ONE class, or None -- the partition cannot leak."""
         for ms in ("BLOCKED", "DIRTY", "UNSTABLE", "CLEAN"):
@@ -641,6 +677,61 @@ class TestActionVocabulary:
 # pattern that did not match -- a FALSE ZERO. Zero is a claim; an unread signal is UNKNOWN,
 # and it must never be laundered into a confident band.
 class TestResourceBands:
+
+    def test_REQUIRED_matches_branch_protection_or_says_unknown(self):
+        """`REQUIRED` is a HARDCODED tuple that equals branch protection only by coincidence of
+        maintenance. Nothing pinned it, so a branch-protection change would silently re-break the
+        DO-list filter in BOTH directions (omitting real work / advertising dead work).
+
+        ⛔ AND AN UNREAD COMPARISON IS `skip`, NEVER A PASS. If `gh` cannot be reached we have NOT
+        verified the set -- reporting a green here would be exactly the false all-clear this lane
+        keeps removing. A skip is the honest `unknown`.
+        """
+        import json, subprocess
+        o = self.o
+        try:
+            p = subprocess.run(["gh", "api",
+                                "repos/{}/branches/main/protection".format(o.REPO),
+                                "--jq", ".required_status_checks.contexts"],
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            import pytest; pytest.skip("gh unavailable: {}".format(e))
+        if p.returncode != 0:
+            import pytest; pytest.skip("branch protection unreadable: {}".format(p.stderr.strip()[:120]))
+        try:
+            live = set(json.loads(p.stdout))
+        except Exception:
+            import pytest; pytest.skip("unparsable branch protection payload")
+        assert live == set(o.REQUIRED), (
+            "REQUIRED has DRIFTED from branch protection.\n"
+            "  only in REQUIRED (will advertise dead work): {}\n"
+            "  only in protection (will omit real work):   {}".format(
+                sorted(set(o.REQUIRED) - live), sorted(live - set(o.REQUIRED))))
+        assert live, "an EMPTY protection context set is not a match"
+
+    def test_load_advisory_four_branches_unread_is_never_free(self):
+        """All three bands + the unread case. An UNREAD load must SAY SO and must never read as
+        'dispatch freely' -- a failed read is not an empty success."""
+        o = self.o
+        assert "DO NOT DISPATCH" in o.load_advisory({"load": float(o.LOAD_REFUSE)})
+        assert "DO NOT DISPATCH" in o.load_advisory({"load": 500.0})
+        assert "ONE lane" in o.load_advisory({"load": float(o.LOAD_CAUTION)})
+        assert "ONE lane" in o.load_advisory({"load": 51.0})
+        assert "freely" in o.load_advisory({"load": 0.0})
+        got = o.load_advisory({"load": None})
+        assert got == "load=unread ADVISORY: unknown", got
+        assert "freely" not in got
+
+    def test_load_never_bands_and_never_steers_res_action(self):
+        """REPORTED, not BANDED: `load` is absent from RES_REQUIRED, and a REFUSE-level load
+        leaves the band untouched. The two signals are ALLOWED to disagree -- that is the design."""
+        o = self.o
+        assert "load" not in o.RES_REQUIRED
+        r = dict(cores=10, cpu=5.0, runq=1, mem_used=50.0, pressure_free=80.0,
+                 swap_act=0.0, top_name="x", top_pcpu=1.0)
+        assert o.res_action(r) == "dispatch-many", o.res_action(r)
+        assert o.res_action(dict(r, load=999.0)) == "dispatch-many"   # unchanged by load
+        assert "DO NOT DISPATCH" in o.load_advisory(dict(r, load=999.0))
     @classmethod
     def setup_class(cls):
         cls.o = _objective_mod()
