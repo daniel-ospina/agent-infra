@@ -1116,7 +1116,7 @@ RES_HOLD_CPU, RES_ONE_CPU, RES_MANY_CPU, RES_MANY_SWAPACT = 75, 50, 50, 50
 # `load` = should I add work (human hint).
 #
 # Basis: measured 2026-10-11 on this 10-core box (state/DISPATCH-THRESHOLDS-2026-10-11.md):
-#   load 41-76   -> queue DRAINED (waiting 25 -> 15)
+#   load 41-46   -> queue DRAINED (waiting 25 -> 15); 76 = transition (NOT drained)
 #   load 101-143 -> queue FLAT for hours
 #   load 156+    -> REGRESSED (waiting 15 -> 17)
 # i.e. ~10x cores. Refine as more data lands.
