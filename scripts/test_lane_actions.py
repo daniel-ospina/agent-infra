@@ -1026,3 +1026,168 @@ class TestResourceBands:
         assert self.o.rail_block_reason({"drift-guard"}, set(), set()) == "drift-guard"   # RED does
         assert self.o.rail_block_reason(set(), {"provenance"}, set()) == "provenance"     # flight does
 
+
+# ── a degraded snapshot is refused on EVERY path ──────────────────────────────
+# ⛔ Review 2026-10-12: this refusal existed only inside the `--stdin` branch, so the default invoke
+# path -- which is how heartbeat-loop.sh calls this tool -- accepted a degraded snapshot and acted
+# on a fleet read missing every live-only lane. These two tests exist so the refusal cannot drift
+# back into one branch.
+
+def test_a_degraded_snapshot_is_refused():
+    rows = [{"lane": "a", "verdict": "WORKING"}, {"lane": "b", "degraded": True}]
+    try:
+        LA._refuse_if_degraded(rows, "test")
+    except SystemExit as e:
+        assert "REFUSING a DEGRADED snapshot" in str(e)
+    else:
+        raise AssertionError("a degraded row must refuse the whole snapshot")
+
+
+def test_a_healthy_snapshot_is_not_refused():
+    """The guard must not fire on a clean read, or it becomes the same false block in reverse."""
+    rows = [{"lane": "a", "verdict": "WORKING", "degraded": False},
+            {"lane": "b", "verdict": "WEDGED"}]
+    LA._refuse_if_degraded(rows, "test")           # must not raise
+
+
+def test_the_partial_guard_is_measured_against_the_live_roster(monkeypatch):
+    """⛔ `want` was `len(_registry_labels())` -- the hand-written TSV -- while `registry()` had just
+    become live-only. `16 >= 27 - REGISTRY_GRACE` is FALSE, so the guard called a HEALTHY snapshot
+    PARTIAL and re-ran the whole scan with --no-cache on every pass, up to ~300s per tick, forever.
+
+    Hermetic on purpose: an earlier version asserted `want > 0` ("the live roster must be readable on
+    this box"), which made this test a property of the DEVELOPER'S MACHINE -- it fails wherever cmux
+    is absent, i.e. in CI, which is exactly where it needs to run.
+    """
+    # `_live_workspaces` lives in lane-status, not here, so it is passed in as the module object
+    # (which is how `load_snapshot` calls it) rather than monkeypatched onto this module.
+    mod = type("M", (), {"_live_workspaces": staticmethod(lambda: [("ws1", {}), ("ws2", {})])})
+    assert LA._live_want(mod) == 2, "want must come from the live roster"
+
+    class Boom:
+        @staticmethod
+        def _live_workspaces():
+            raise RuntimeError("cmux down")
+    assert LA._live_want(Boom) is None, "an unreadable roster is UNKNOWN -- None, never 0"
+
+
+def test_unknown_fleet_size_still_forces_a_re_scan(monkeypatch):
+    """⛔ NONE IS NOT ZERO, PROVEN BEHAVIOURALLY. `_live_want` returned 0 on failure and the guard was
+    `if not want or ...`, so an unreadable roster DISABLED the partial-snapshot guard entirely: a
+    truncated snapshot was accepted on the FIRST attempt with no re-scan and no warning. "Guard
+    disabled" and "guard needed" were the same event -- the fail-open direction, a partial fleet read
+    published as a healthy one.
+
+    ⛔ THIS TEST WAS A SOURCE-STRING ASSERTION on `if want is not None and ...`, which a reviewer
+    correctly identified as pinning the literal TEXT rather than the behaviour: any semantically
+    equivalent rewrite would pass while the fail-open returned. This drives the real invoke path
+    with an unreadable roster and asserts the `--no-cache` re-scan actually happens -- under the old
+    `if not want` polarity, `not 0` is True, attempt 0 returns, and this fails with exactly 1 run.
+    """
+    import subprocess as _sp
+
+    calls = []
+
+    class _R:
+        stderr = ""
+        returncode = 0
+
+        def __init__(self, out):
+            self.stdout = out
+
+    def _run(*a, **k):
+        calls.append(list(a[0]) if a and isinstance(a[0], list) else [])
+        return _R(json.dumps([{"lane": "a", "verdict": "WORKING"}]))
+
+    monkeypatch.setattr(_sp, "run", _run)
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: None)   # roster UNREADABLE
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=None))
+    assert len(calls) == 2, (
+        "an unreadable roster (None) must NOT satisfy the partial-snapshot guard -- expected the full "
+        "cached pass plus a --no-cache re-scan, got %d run(s): %r" % (len(calls), calls))
+    assert "--no-cache" in calls[1], "the re-scan must bypass the cache"
+    assert rows, "a best-effort snapshot must still be returned after the re-scan"
+
+
+def test_an_unreadable_roster_is_reported_as_unknown_not_zero():
+    """The helper's own polarity, behaviourally: unreadable AND empty both mean UNKNOWN, never 0.
+    This is what made `if not want` dangerous -- 0 reads as 'nothing is missing'."""
+    class _Boom:
+        @staticmethod
+        def _live_workspaces():
+            raise OSError("cmux down")
+
+    class _Empty:
+        @staticmethod
+        def _live_workspaces():
+            return []
+
+    assert LA._live_want(LS=_Boom) is None, "an unreadable roster must be None (unknown)"
+    assert LA._live_want(LS=_Empty) is None, "an EMPTY roster is unknown, not 0 -- 0 disables the guard"
+
+
+# ── the refusal must be pinned at the CALL SITE, not the helper ────────────────
+# ⛔ Review cycles 2 AND 3 both falsified the earlier claim that "these two tests exist so the refusal
+# cannot drift back into one branch": they called `_refuse_if_degraded` DIRECTLY, so deleting either
+# call site left the suite green. A test of a gate must fail when the gate is removed from the code
+# path it protects -- these drive the real entry point on BOTH paths.
+
+class _Args:
+    def __init__(self, stdin=None, sample=12, budget=300):
+        self.stdin, self.sample, self.budget = stdin, sample, budget
+
+
+def _degraded_rows():
+    return [{"lane": "a", "verdict": "WORKING"},
+            {"lane": "b", "verdict": "WORKING", "degraded": True}]
+
+
+def test_load_snapshot_refuses_a_degraded_stdin_snapshot(tmp_path):
+    f = tmp_path / "snap.json"
+    f.write_text(json.dumps(_degraded_rows()))
+    try:
+        LA.load_snapshot(_Args(stdin=str(f)))
+    except SystemExit as e:
+        assert "DEGRADED" in str(e), e
+        return
+    raise AssertionError("the --stdin path accepted a degraded snapshot")
+
+
+def test_load_snapshot_refuses_a_degraded_invoke_path_snapshot(monkeypatch):
+    """⛔ THE INVOKE PATH. `_refuse_if_degraded` is called there too, and until this test existed
+    deleting that call kept the suite green -- the exact fail-open the guard exists to prevent."""
+    import subprocess as _sp
+
+    class _R:
+        stdout = json.dumps(_degraded_rows())
+        stderr = ""
+        returncode = 0
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
+    try:
+        LA.load_snapshot(_Args(stdin=None))
+    except SystemExit as e:
+        assert "DEGRADED" in str(e), e
+        return
+    raise AssertionError("the invoke path accepted a degraded snapshot")
+
+
+def test_load_snapshot_accepts_a_healthy_snapshot_on_both_paths(tmp_path, monkeypatch):
+    """The guards must not become a false block: a clean snapshot still loads."""
+    healthy = [{"lane": "a", "verdict": "WORKING", "degraded": False}]
+    f = tmp_path / "snap.json"
+    f.write_text(json.dumps(healthy))
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=str(f)))
+    assert rows == healthy
+
+    import subprocess as _sp
+
+    class _R:
+        stdout = json.dumps(healthy)
+        stderr = ""
+        returncode = 0
+
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: _R())
+    monkeypatch.setattr(LA, "_live_want", lambda LS=None: 1)
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=None))
+    assert rows == healthy

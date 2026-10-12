@@ -138,6 +138,50 @@ def _clip(t, n):
     return t if len(t) <= n else t[: n - 1].rstrip() + "\u2026"
 
 
+DEGRADED_MSG = (
+    "lane-actions: REFUSING a DEGRADED snapshot -- lane-status could not read the cmux fleet "
+    "roster, so it covers the hand-written TSV only and every live-only lane is INVISIBLE. "
+    "Acting on it would report a blind fleet as a healthy one; re-run lane-status against a "
+    "reachable cmux.")
+
+
+def _refuse_if_degraded(rows, where):
+    """⛔ ONE GUARD, BOTH PATHS. The refusal used to live INSIDE the `--stdin` branch only, so the
+    OTHER path accepted a degraded snapshot and acted on a fleet read missing every live-only lane.
+
+    ⛔ WHICH PATH IS PRODUCTION: `--stdin`. heartbeat-loop.sh invokes this tool as
+    `lane-actions.py --stdin "$SNAP"`; the invoke path is the secondary one (queue-dispatch). An
+    earlier version of this docstring said the opposite, which told the next reader to guard the
+    wrong branch. Both are guarded now, and the tests that pin them live in test_lane_actions.py."""
+    if any(r.get("degraded") for r in rows if isinstance(r, dict)):
+        raise SystemExit(DEGRADED_MSG + " (%s)" % where)
+
+
+def _live_want(LS=None):
+    """The fleet size the scan is SUPPOSED to return, or None when it cannot be known.
+
+    ⛔ NONE IS NOT ZERO. This returned 0 on failure, and the guard is `if not want or ...` -- so an
+    UNREADABLE roster DISABLED the partial-snapshot guard entirely, accepting a truncated snapshot on
+    the first attempt with no re-scan and no warning. "Guard disabled" and "guard needed" were the
+    same event, which is the fail-open direction: a partial fleet read published as a healthy one.
+    Callers must treat None as UNKNOWN and take the strongest read available.
+
+    The fleet size the scan is SUPPOSED to return: the LIVE roster, never the hand-written TSV.
+
+    ⛔ MEASURED 2026-10-12: this was `len(_registry_labels())` -- the TSV, 27 rows -- while
+    `registry()` had just become live-only (16 workspaces). `16 >= 27 - REGISTRY_GRACE` is FALSE, so
+    the partial-snapshot guard declared a HEALTHY snapshot PARTIAL and re-ran the entire scan with
+    `--no-cache` on every pass, up to ~300s per tick, forever. A guard against a truncated snapshot
+    must be measured against what a complete one contains.
+    """
+    try:
+        mod = LS or _load(LS_PATH, "lane_status_livewant")
+        n = len(mod._live_workspaces() or [])
+        return n or None
+    except Exception:
+        return None
+
+
 def _registry_labels():
     out = []
     try:
@@ -391,6 +435,17 @@ def classify_row(row, dead, files, LS):
         r.update(verdict="AMBIGUOUS-IDENT", step="0", action="report")
         r["why"].append("session %s is claimed by %s -- neither panel's staleness or CPU reading "
                         "is demonstrably about this lane" % (sid[:8], ", ".join(row["_dup_sid"])))
+        return r
+    if row.get("session_verified") is False:
+        # ⛔ THE SAME ABSTENTION AS `not sid`, ONE STEP LATER (2026-10-12). The row HAS an id, but
+        # lane-status could not confirm it is the one being written -- so `stale_s`, the transcript
+        # and the CPU reading below may all describe a DIFFERENT, dead session. MEASURED: two lanes
+        # were bound to sessions last written 64h18m and 12h30m earlier and both rendered
+        # `DONE-IDLE`; a `DONE-IDLE` here invites dispatching a lane that is already running work.
+        r.update(verdict="UNVERIFIED-SESSION", step="0", action="report")
+        r["why"].append("the session id under this lane could not be confirmed as the one being "
+                        "written (no fresh write, no content match), so nothing below is "
+                        "attributable to it (NEVER dead, NEVER idle)")
         return r
 
     # -- STEP 1 does the process exist? -------------------------------------------------
@@ -1250,7 +1305,7 @@ def render_beat(res, path_for_beat):
 
 
 # ── input ────────────────────────────────────────────────────────────────────────────────
-def load_snapshot(args):
+def load_snapshot(args, LS=None):
     """(rows, snapshot_age_s, reference_clock). Rejects a PARTIAL snapshot -- see the note below."""
     if args.stdin:
         try:
@@ -1265,6 +1320,15 @@ def load_snapshot(args):
             rows = json.loads(raw)
         except Exception as e:
             raise SystemExit("lane-actions: cannot read snapshot %s: %r" % (args.stdin, e))
+        # ── A DEGRADED SNAPSHOT IS NOT A FLEET READ ────────────────────────────────────
+        # ⛔ THE `--stdin` PATH HAD NO GUARD. Every row carries `degraded` when lane-status
+        # could not read the cmux fleet roster, and on that path the roster is the hand-written
+        # TSV alone -- every live-only lane INVISIBLE. MEASURED 2026-10-12: the snapshot the
+        # heartbeat publishes carried 26 workspaces, ALL of them TSV and ZERO of the 13 live-only
+        # ones, while four lanes were stalled; `WEDGED (0)` was printed off it. The re-scan guard
+        # below (`len(rows) >= want - REGISTRY_GRACE`) is bypassed entirely when --stdin is used,
+        # which is exactly how heartbeat-loop.sh calls this tool. So the refusal lives HERE too.
+        _refuse_if_degraded(rows, args.stdin)
         # The header must state the DATA's age, not the run time: a snapshot published by an earlier
         # pass (a killed tick leaves the last good one in place) is still usable, but the reader has
         # to be able to see how old it is.
@@ -1276,7 +1340,7 @@ def load_snapshot(args):
     # refused here: a partial snapshot is re-scanned for real rather than classified as the fleet.
     sys.path.insert(0, SCRIPTS)
     import subprocess
-    want = len(_registry_labels())
+    want = _live_want(LS)
     for attempt in (0, 1):
         cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
         if attempt:
@@ -1291,14 +1355,19 @@ def load_snapshot(args):
                 os.path.join(STATE, "lane-status.cache")))
         except OSError:
             age = 0
-        if not want or len(rows) >= want - REGISTRY_GRACE:
+        _refuse_if_degraded(rows, "lane-status.py invoke path")
+        if want is not None and len(rows) >= want - REGISTRY_GRACE:
             try:
                 ref = os.path.getmtime(os.path.join(STATE, "lane-status.cache"))
             except OSError:
                 ref = time.time()
             return rows, age, ref
-        sys.stderr.write("lane-actions: snapshot PARTIAL (%d of %d registry lanes) -- "
-                         "re-scanning without the cache\n" % (len(rows), want))
+        # Unknown fleet size -> we cannot measure completeness, so take the STRONGEST read we can
+        # rather than accept this one. `attempt` is 0 on the cached pass and 1 on the --no-cache
+        # pass; after the second there is nothing better to try and `return rows` below stands.
+        sys.stderr.write("lane-actions: snapshot %s (%s of %s) -- re-scanning without the cache\n"
+                         % ("PARTIAL" if want is not None else "UNVERIFIABLE",
+                            len(rows), want if want is not None else "an unknown fleet size"))
     return rows, age, time.time()
 
 
@@ -1316,7 +1385,7 @@ def main():
 
     LS = _load(LS_PATH, "lane_status")
     LV = _load(LV_PATH, "lane_verdict")
-    rows, snap_age, ref = load_snapshot(a)
+    rows, snap_age, ref = load_snapshot(a, LS)
     if not isinstance(rows, list) or not rows:
         sys.stderr.write("lane-actions: empty snapshot -- refusing to write a verdict\n")
         return 2
