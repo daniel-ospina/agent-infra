@@ -79,6 +79,66 @@ Formula: `w_eff = w × (1 − strength)` — the mitigation is a graded
 DAMPENER, never a refutation (a mitigated NAND stays a contradiction, only
 weaker).
 
+## Annotation Dimensions — the Other Weight Mechanism
+
+A second, independent lever scales an operator's weight: the four **annotation
+dimensions** on every IMPL/NAND edge. Mitigation only ever *damps* an operator
+(0.10–0.50); annotation *bands* it — it can make a well-rated operator count for
+**more** as well as less. Use mitigation when the connection is weaker than it
+looks, and annotation when the connection's quality is known and should be graded.
+
+| Dimension | Reads as | Direction |
+|---|---|---|
+| `bias` | How one-sided the source's stake is (hidden agenda) | **Inverted** — high bias reads WORSE |
+| `precision` | How sharply the claim is defined | High reads BETTER |
+| `consistency` | How well it agrees with the rest of the graph | High reads BETTER |
+| `directness` | How directly the evidence bears on the claim | High reads BETTER |
+
+Each is a number in `0.0–1.0`. Set all four together:
+`tortoise_annotate_operator` (hosted) /
+`sdk.annotate_operator(id, bias, precision, consistency, directness)` (self-hosted).
+
+```
+q      = mean(1 − bias, precision, consistency, directness)
+factor = 2 ** (2q − 1)          # 0.5 (worst) … 1.0 (neutral) … 2.0 (best)
+```
+
+| Rating | Factor |
+|---|---|
+| **no rating at all, or all four at 0.5** | **exactly 1.0** |
+| worst possible (bias 1.0, others 0.0) | 0.5 |
+| best possible (bias 0.0, others 1.0) | 2.0 |
+| only `precision` at 1.0, the rest unrated | 1.189 |
+
+Four rules that decide how to use it:
+
+- **Unrated is exactly neutral, and neutral is the default.** Leave the
+  dimensions alone unless you have a reason. Rating is a deliberate act —
+  never set them as a by-product of writing something else.
+- **Averaged, not multiplied.** Rating one dimension well never penalises the
+  others, and a partial rating moves the factor only as far as that
+  dimension justifies. A rating of 0.9 across the board reads BETTER than
+  unrated, not worse.
+- **Symmetric — for every rating that halves a weight there is one that
+  doubles it.** Do not use these to express disagreement; that is NAND's job.
+  Use them to say "this reasoning is stronger, or weaker, than an unrated
+  connection".
+- **A rating does not require a source.** These dimensions grade how much a
+  connection contributes, so they apply as much to a reasoning link you built
+  yourself as to one backed by external evidence. Grade the connection;
+  provenance belongs on the point, in `credibility` / `sourceKind`.
+
+On a **NAND** the top of the band is partly absorbed: `NAND_BASE_WEIGHT` is
+8.0 and the final clamp is `[0.1, 10.0]`, so `8.0 × 2.0 = 16.0` clamps to
+`10.0`. Strengthening is fully effective on IMPL and only partly on NAND.
+
+> **Do not confuse these with source credibility tiers.** `sourceKind`
+> (T0–T4) and the `credibility` kwarg set a **Point's** Beta prior — how much
+> we trust the claim itself. The annotation dimensions grade an
+> **Operator's** weight — how much this connection contributes. They are
+> separate systems: a T0 source on a heavily-biased connection is still a
+> heavily-biased connection.
+
 ## The Critical Semantic: Truth vs Weight
 
 When a claim faces challenge, you have two tools. They address different things:
@@ -115,6 +175,8 @@ Challenge received:
 ├─ Claim is FACTUALLY WRONG? → NAND the Point directly (truth attack)
 ├─ Claim is TRUE but OVERSTATED? → mitigate_operator on the edge (relevance attack, 0.10–0.50)
 ├─ Claim is TRUE but IRRELEVANT to what it's connected to? → NAND the operator (relevance attack)
+├─ Claim is TRUE, the link holds, but its QUALITY is known and should be graded?
+│    → annotate_operator on the edge (grades its weight, 0.5–2.0; leave unset = exactly neutral)
 └─ Option is a BAD FIT for a criterion? → NAND/mitigate the operator between them, never the option or criterion points
 ```
 
