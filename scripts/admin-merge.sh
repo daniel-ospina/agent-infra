@@ -730,7 +730,10 @@ pr_review_record_blocks_update() {
     fi
   done
   if [ -d "$rdir" ]; then
-    if [ ! -r "$rdir" ] || [ ! -x "$rdir" ]; then
+    # Only SEARCH is required: the candidates are read by name, so the store need not be
+    # listable (mode 111 is enough). Requiring read made an unlistable-but-searchable
+    # store a refusal for a condition that is false.
+    if [ ! -x "$rdir" ]; then
       say_err "   ⛔ the review store at $rdir exists but cannot be searched — refusing,"
       say_err "      because a record bound to this head cannot be ruled out."
       return 0

@@ -10405,6 +10405,34 @@ grep -q "update-branch" "$SCEN/calls" \
   && fail "(n) the GH_REPO spelling was NOT checked: the update proceeded although 'Daniel-Ospina-Agent-Infra-42.json' is bound to the head" \
   || pass "(n) …and no update-branch write was issued"
 
+# (o) A SEARCHABLE-BUT-UNLISTABLE STORE IS NOT "UNSEARCHABLE". The candidate records are read
+# BY NAME, so directory SEARCH (`-x`) is the only permission this guard uses; requiring
+# directory READ (`-r`) turned an unlistable store into a refusal for a condition that was
+# FALSE, blocking an update that stranded nothing. Mode 111 = searchable, not listable.
+# This is the anti-over-block twin of (m), and (g) already proves the update is permitted once
+# the guard can look: so mode 111 with a record bound to ANOTHER head must REQUEST the update.
+new_scen record-store-searchable-not-listable
+HEAD_RO="f7f7000000000000000000000000000000000000"
+stale_surface "$HEAD_RO"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+chmod 111 "$SCEN/home/.pi/agent/reviews"
+run_admin_guarded 42
+rc=$?
+chmod 700 "$SCEN/home/.pi/agent/reviews" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  # Root bypasses the permission bits, so this case cannot distinguish the store arm here —
+  # SKIP rather than assert a false pass (it DOES run in CI, where the suite is non-root).
+  pass "⚠️ SKIPPED (o) — root shell: a mode-111 directory is still readable as root, so the store arm cannot be distinguished here"
+else
+  grep -q "cannot be searched" "$SCEN/err" \
+    && fail "(o) a SEARCHABLE store was refused as unsearchable: the guard required READ (-r) where it only uses SEARCH (-x) to read the candidate names it builds" \
+    || pass "(o) a searchable-but-unlistable store is not treated as unsearchable"
+  grep -q "update-branch" "$SCEN/calls" \
+    && pass "(o) …and with no record bound to THIS head, the update WAS requested" \
+    || fail "(o) …but no update-branch write was issued: the store blocked an update that stranded nothing"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1
