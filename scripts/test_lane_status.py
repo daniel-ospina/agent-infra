@@ -233,3 +233,50 @@ def test_the_message_is_shown_only_for_recent_inbound(L):
     src = open(_PATH, encoding="utf-8").read()
     assert 'r["verdict"] == WAITING_INBOUND and r.get("inbound_msg") and _sa is not None' in src, \
         "the message must be gated on the RECENT-INBOUND verdict AND a real age"
+
+
+def test_an_unread_screen_is_unknown_never_a_confident_no_spinner(L):
+    """⛔ `read-screen` IS INTERMITTENTLY EMPTY UNDER LOAD, AND EMPTY MUST NOT MEAN "NO SPINNER".
+
+    `sh()` returns "" on ANY exception, including a timeout, and the file's own comment measures
+    `read-screen` at ~10-15s per call. So `"Working" in ""` was False and a FAILED READ became a
+    confident claim about the pane. Two consequences, both wrong:
+      - the UI column printed `-`, a claim, indistinguishable from a real read with no spinner;
+      - `classify`'s long-tool gate saw `spinner=False` and ruled the long tool OUT, pushing a lane
+        with a tool genuinely in flight toward WEDGED.
+    A live pi pane always draws a status line, so an empty screen is an UNREAD, never a blank pane.
+    """
+    for blank in ("", "   ", "\n\n", None):
+        _sc = blank if isinstance(blank, str) else ""
+        assert (None if not _sc.strip() else True) is None, f"blank {blank!r} must be UNKNOWN"
+
+
+def test_classify_does_not_rule_out_a_tool_on_an_unread_screen(L):
+    """The long-tool gate must read `spinner is not False`, so UNKNOWN cannot exclude the tool."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert "if not child and tool_inflight and spinner is not False:" in src, \
+        "an unread screen must not be treated as evidence of no spinner"
+    assert "spinner = None if not _sc.strip() else" in src, "the spinner must be tri-state"
+
+
+def test_unknown_reads_differently_from_a_read_with_no_spinner(L):
+    """The UI column must not render UNKNOWN and False alike -- the same rule as inbound=UNREAD."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert '{True: "Working", False: "-", None: "UNREAD"}' in src
+
+
+def test_unread_screen_cannot_produce_a_wedged_action(L):
+    """⛔ END TO END: with a live tool in flight and an UNREAD screen, the verdict must not be WEDGED.
+
+    This is the whole point of the tri-state. `tool_inflight` is evidence of a direct tool call that
+    no file probe can see; if an unreadable screen were allowed to cancel it, the fleet would be told
+    to interrupt live work on exactly the loaded box where read-screen fails most.
+    """
+    assert L.LONG_TOOL in (
+        L.classify(stale=1200, grew=False, spinner=None, last_kind="tool", child=None,
+                   child_stale=None, child_grew=None, child_activity_age=None,
+                   tool_inflight={"age": 300, "timeout": None}, last_stop=None, has_sid=True),
+        L.classify(stale=1200, grew=False, spinner=None, last_kind="tool", child=None,
+                   child_stale=None, child_grew=None, child_activity_age=None,
+                   tool_inflight={"age": 300, "timeout": 7200}, last_stop=None, has_sid=True),
+    ), "an unread screen must not turn a live tool into a wedge"

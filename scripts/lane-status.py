@@ -1053,7 +1053,11 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
     if grew:
         return WORKING
     # ── a long DIRECT tool call is not a wedge ────────────────────────────
-    if not child and tool_inflight and spinner:
+    # ⛔ `spinner is not False`, NOT `spinner`: an UNREAD screen (`None`) must not be counted as
+    # evidence of NO spinner. `tool_inflight` is itself strong evidence of a direct tool call, so
+    # when the screen is unread we cannot rule the long tool OUT -- and the safe direction is to
+    # keep the lane out of WEDGED. Only a screen that was READ and carries no spinner excludes it.
+    if not child and tool_inflight and spinner is not False:
         age = tool_inflight.get("age")
         tmo = tool_inflight.get("timeout")
         if age is not None and tmo and age < tmo:
@@ -1266,7 +1270,21 @@ def main():
         # higher in the scrollback and turn a DONE-IDLE lane into a WEDGED one.
         screen = ((_screens[ws] if ws in _screens else read_screen(ws))
                   if s["sid"] else "")
-        spinner = "Working" in "\n".join((screen or "").splitlines()[-12:])
+        # ── TRI-STATE, AND THE THIRD VALUE IS THE POINT ──────────────────────────────────
+        # `"Working" in ""` is False, so ANY empty read became a confident "this lane shows no
+        # spinner" -- an absent signal rendered as a definite value. MEASURED 2026-10-11: 15 of 32
+        # rows are empty reads, and the cause is NOT load, it is that the WORKSPACE IS GONE:
+        #   `cmux read-screen --workspace <dead-id>` prints `Error: not_found: Workspace not found`
+        #   on STDERR, writes 0 bytes to STDOUT, and exits 0 -- so `sh()` (stdout only) sees "", and
+        #   the exit code cannot distinguish it either.
+        # 15/15 of those rows also report `inbound=-` (cmux read OK, no record), and 0/17 of the rows
+        # with a real screen do -- so an empty screen is a reliable proxy for a dead workspace.
+        # A live pi pane always draws a status line, so an empty screen is NEVER a blank pane.
+        #   True  = the screen says Working
+        #   False = the screen was READ and carries no spinner
+        #   None  = the screen could not be read -- UNKNOWN, and nothing follows from it
+        _sc = screen if isinstance(screen, str) else ""
+        spinner = None if not _sc.strip() else ("Working" in "\n".join(_sc.splitlines()[-12:]))
         # NOTE the 3600s bound. The pane line's PRESENCE is the liveness signal --
         # pi prints it while the child runs and redraws the screen as the spinner
         # animates. Filtering it on a 900s transcript age was wrong: a child inside
@@ -1438,7 +1456,9 @@ def main():
             f"{r['stale_s']//3600}h{(r['stale_s']%3600)//60:02d}m" if r["stale_s"] >= 3600
             else f"{r['stale_s']//60}m{r['stale_s']%60:02d}s" if r["stale_s"] >= 60
             else f"{r['stale_s']}s")
-        ui = "Working" if r["spinner"] else "-"
+        # An UNREAD screen must not print the same glyph as a READ one carrying no spinner:
+        # `-` is a claim ("read, no spinner"); the unread case is the absence of a claim.
+        ui = {True: "Working", False: "-", None: "UNREAD"}[r["spinner"]]
         extra = r["last"]
         if r.get("tool") and not r["child"]:
             t = r["tool"]
