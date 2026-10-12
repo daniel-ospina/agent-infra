@@ -56,7 +56,7 @@ def test_wedged_is_never_discounted_by_an_inbound_event(L):
 def test_stale_inbound_does_not_discount_idle(L):
     """A lane that was told something 5h ago and has produced nothing since is the genuinely
     suspicious one -- the age is the discriminator, so an old inbound discounts nothing."""
-    assert L.inbound_discounts_idle(L.DONE_IDLE, L.INBOUND_LIVE_S + 1) is False
+    assert L.inbound_discounts_idle(L.DONE_IDLE, L.INBOUND_FRESH_S + 1) is False
 
 
 def test_unread_inbound_abstains(L):
@@ -146,6 +146,20 @@ def test_an_unanswered_inbound_does_discount_idle(L):
 def test_an_unread_output_age_does_not_fire_the_consumed_check(L):
     """`stale_s=None` is unread, not 'consumed' — it must not flip the discount either way."""
     assert L.inbound_discounts_idle(L.DONE_IDLE, inbound_age=60, stale_s=None) is True
+
+
+def test_the_name_does_not_claim_liveness(L):
+    """⛔ The withdrawn over-claim must not survive in a NAME.
+
+    The file spends thirty lines retracting "`latest_submitted_at` is a liveness signal". A constant
+    called `INBOUND_LIVE_S` would let the next reader re-derive it anyway, because a name is read
+    far more often than the prose beside it. This is a cheap structural guarantee that the
+    correction cannot quietly revert.
+    """
+    src = open(_PATH, encoding="utf-8").read()
+    assert "INBOUND_LIVE_S" not in src
+    assert "INBOUND_FRESH_S" in src
+    assert hasattr(L, "INBOUND_FRESH_S") and not hasattr(L, "INBOUND_LIVE_S")
 
 
 def test_the_discount_has_its_own_label_not_the_child_one(L):

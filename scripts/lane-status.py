@@ -84,7 +84,13 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 # only the IDLE family ("dispatch it") and NEVER WEDGED / CHILD-STUCK / CHILD-OVERDUE ("check the
 # process", "a child is stuck"). Suppressing those on an INBOUND event would hide a real wedge -- and
 # one of tonight's lanes, `tortoise-sweep`, was genuinely wedged.
-INBOUND_LIVE_S = ABANDON_S      # == the harness's own in-flight bound: inside it, the lane was
+# ⛔ NOT NAMED FOR LIVENESS. The correction that withdrew the over-claim ("`latest_submitted_at` is
+# a liveness signal") is only as durable as the NAMES it leaves behind: a constant whose name says
+# LIVE invites the next reader to re-derive exactly the claim this file spends thirty lines
+# retracting. (The old identifier is deliberately not repeated here — `test_lane_status.py` asserts
+# it is absent from this file, so a comment quoting it would fail the pin.) The bound is about how
+# RECENT the inbound is, and nothing more.
+INBOUND_FRESH_S = ABANDON_S    # == the harness's own in-flight bound: inside it, the lane was
                                 # told something a legal turn ago, so "idle" is not a safe claim.
 INBOUND_DISCOUNTS = (DONE_IDLE, WIP_IDLE)
 # ⛔ ITS OWN VERDICT, NOT "WAITING-CHILD". The discount and the child prior are DIFFERENT
@@ -119,7 +125,7 @@ def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
         return False
     if verdict not in INBOUND_DISCOUNTS:
         return False
-    if inbound_age > INBOUND_LIVE_S:
+    if inbound_age > INBOUND_FRESH_S:
         return False
     if stale_s is not None and stale_s < inbound_age:
         return False        # output is newer than the inbound: it was consumed, so IDLE stands
@@ -1332,7 +1338,7 @@ def main():
         # what made the inbound prior DEAD CODE: `child_suppresses` rewrites `verdict` to
         # WAITING-CHILD, `WAITING-CHILD` is not in `INBOUND_DISCOUNTS`, and so the inbound check
         # could never fire. MEASURED 2026-10-11: FOURTEEN live lanes carried a fresh inbound
-        # (<= INBOUND_LIVE_S) and ZERO produced RECENT-INBOUND. Each prior is a statement about the
+        # (<= INBOUND_FRESH_S) and ZERO produced RECENT-INBOUND. Each prior is a statement about the
         # SAME original classification, so both read it; the child prior has precedence when both
         # apply, because a live child is OUTPUT evidence while an inbound is only an INPUT event.
         _base_verdict = verdict
