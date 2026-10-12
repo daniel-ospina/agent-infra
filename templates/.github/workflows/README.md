@@ -50,7 +50,7 @@ For a PR it checks, in order (all failures printed, not just the first):
 |---|-------|--------------------|-------------|
 | a | Linked issue | PR body has a closing keyword (`Fixes #N` / `Closes #N` / `Resolves #N`; full GitHub keyword set accepted) | issue-scoping |
 | b | Scoping comment | Linked issue has a comment with the `<!-- issue-scoping:` marker | issue-scoping |
-| c | Code-review evidence | PR body or any PR commit message references review dispatch (`code-review`, `reviewer`, `[review]`, `VGATE`, `review recorded`, `review-enforcer`) | code-review |
+| c | Code-review evidence | PR body, any PR commit message, **or** a PR comment from an owner/member/collaborator carrying the `record-review.sh` marker (`^review recorded:`) references review dispatch (`code-review`, `reviewer`, `[review]`, `VGATE`, `review recorded`, `review-enforcer`). The comment arm exists because a later PR-body edit destroys a body-only copy (`agent-infra#1224`) | code-review |
 | d | Plan doc | PR adds/modifies `docs/plans/*.md`, **or** scoping comment contains a `Wiring` section (wiring-check table) | writing-plans, issue-scoping |
 | e | Test coverage evidence | PR touching runtime code (`extensions/**/*.ts` excl. `*.test.ts`, `extensions/**/*.js`, `bin/*.js`) must have new/updated `*.test.ts` / `*.test.js` in the diff **or** test-run markers in PR body/commits (`tests green`, `N passed`, `N/N`, `VGATE PASS`, `test suite`, `pytest`, `npm test`, `vitest`) | code-review (Step 0), test-writing |
 

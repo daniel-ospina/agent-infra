@@ -129,6 +129,16 @@ case "${1:-} ${2:-}" in
         fi
         cat "$SCEN/merge-base" 2>/dev/null || echo cccccccccccccccccccccccccccccccccccccccc
         exit 0 ;;
+      */issues/*/comments)
+        # #1224: the append-only evidence channel the rail now reads. The arm
+        # REFUSES a fetch that drops the author filter: without this check the
+        # rail could stop passing --jq "$PR_EVIDENCE_COMMENTS_JQ" and this suite
+        # would stay green while an arbitrary public commenter's marker became
+        # evidence (the exact cycle-1 false PASS).
+        case "$jqprog" in
+          *author_association*) cat "$SCEN/pr-comments" 2>/dev/null || echo ""; exit 0 ;;
+          *) echo "stub: rail comment fetch without the author filter" >&2; exit 3 ;;
+        esac ;;
       */pulls/*)
         case "$jqprog" in
           *body*) cat "$SCEN/pr-body" 2>/dev/null || echo ""; exit 0 ;;
@@ -240,6 +250,7 @@ new_scen() {
   # a body that merely LOOKS like a marker is not evidence (it is attacker-writable).
   printf '%s' "$GATE_KEY_FIXTURE" > "$SCEN/home/.pi/agent/.ai-review-gate-key"
   marker_fixture 42 clean "$HEAD_OLD" > "$SCEN/pr-body"
+  : > "$SCEN/pr-comments"
 }
 
 run_rail() { # <extra args...>
@@ -642,6 +653,40 @@ rc=$?
 [ "$rc" -eq 1 ] && pass "refused (rc 1) — no line verified under the current key" || fail "expected rc 1, got $rc"
 called "pr update-branch" && fail "spent the attestation under a rotated key (B5)" || pass "did NOT update"
 
+# 17k. #1224 — the signed marker survives an UNRELATED PR-body edit because it is
+# ALSO posted to an append-only PR comment. Here the body has been edited and no
+# longer carries the marker; the comment does. Reading the body ALONE (the
+# pre-#1224 rail) refuses and spends nothing — a false block on a still-correct
+# record — so this scenario is RED against the pre-change rail and pins the
+# union read.
+echo "── 17k. the marker survives a body edit via the append-only comment (#1224)"
+new_scen commentedit
+# The body was edited after recording: the marker is gone from it...
+printf 'Fixes #1224\n\nA later, unrelated body edit (typo fix).\n' > "$SCEN/pr-body"
+# ...but the append-only comment still carries the genuinely-signed marker.
+marker_fixture 42 clean "$HEAD_OLD" > "$SCEN/pr-comments"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "proceeded (rc 0) — evidence found in the comment channel" || fail "expected rc 0, got $rc (the body edit hid the comment marker)"
+called "pr update-branch 42" && pass "the update was NOT blocked by a lost body marker" || fail "updated nothing — the union read is missing"
+called "admin-merge" && pass "the unit landed" || fail "the unit did not land after the comment supplied the evidence"
+
+# 17l. BC1 on the COMMENT channel: a shape-valid but FORGED marker living ONLY
+# in a comment must be refused, exactly as 17g refuses it in the body. The HMAC
+# comparison is channel-agnostic; this pins that widening the READ to comments
+# did not turn it into a shape-only acceptance.
+echo "── 17l. a FORGED marker in a COMMENT is not evidence either (#1224)"
+new_scen forgedcomment
+printf 'Fixes #1224\n' > "$SCEN/pr-body"   # body edited: no marker there
+printf 'review recorded: reviews/42.json verdict=clean @ %s diff=%s (%s) sig=%s\n' \
+  "$HEAD_OLD" "1111111111111111111111111111111111111111111111111111111111111111" "$REPO" \
+  "4444444444444444444444444444444444444444444444444444444444444444" > "$SCEN/pr-comments"
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 1 ] && pass "refused (rc 1) — a comment shape match is not evidence" || fail "expected rc 1, got $rc"
+called "pr update-branch" && fail "spent the attestation on a FORGED comment marker" || pass "did NOT update on a forged comment marker"
+called "admin-merge" && fail "landed on a forged comment marker" || pass "did not land"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
@@ -712,6 +757,11 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # D1d (#1362): the partial-install diagnostic is not a bypass class, but it is
   # a D1 behavior the suite pins — removing its guard must redden scenario 2.
   mutate_and_expect_fail D1d  's/if \[ ! -f "\$DIFF_NORMALIZER_SH" \]; then/if false; then/'
+  # #1224: dropping the append-only comment arm must redden 17k — the body edit
+  # then hides the marker and the rail refuses a still-correct record. The
+  # replacement keeps `$body` (escaped, so perl does not interpolate it) and
+  # empties only the comment channel, isolating THAT read.
+  mutate_and_expect_fail B1224 's/"\$body" "\$comments"/"\$body" ""/'
 fi
 
 if [ "$failures" -gt 0 ]; then

@@ -260,6 +260,64 @@ clean_low_shape_ok() {
   return 0
 }
 
+# ── PR_EVIDENCE_COMMENTS_JQ (#1224) ──────────────────────────────────────
+# The jq filter selecting which PR comments may carry review evidence: comments
+# from REPO-AFFILIATED authors only (OWNER / MEMBER / COLLABORATOR). On a PUBLIC
+# repo EVERY GitHub user with read access can comment, so without this filter a
+# drive-by commenter could satisfy a required check by typing the marker; the
+# filter narrows admission to authors inside the repository's own trust boundary.
+#
+# It is a NARROWING, NOT an equivalence with the body's writer set — do not
+# restate it as parity. `author_association` reports the author's relationship to
+# the owning organization, NOT their write permission, so two residuals are known
+# and declared (agent-infra#1224):
+#   * OVER-admit  — a read-only org MEMBER, or a read-only outside COLLABORATOR,
+#                   is admitted although they cannot edit the PR body.
+#   * UNDER-admit — a PR author who is an outside CONTRIBUTOR is NOT admitted, so
+#                   for their PRs only the body mirror carries the marker.
+# Both are accepted: check (c) is a PRESENCE check that has never verified
+# authenticity (the HMAC key lives in record-review.sh, not in the gate), and the
+# filter exists to stop an arbitrary public commenter from greening it.
+#
+# BYTE-IDENTICAL ACROSS record-review.sh, check-pipeline-compliance.sh AND
+# atomic-land.sh — pinned mechanically by record-review.test.sh §8.13a, which
+# also pins that each reader APPLIES the filter at its fetch. The three readers
+# must admit the same evidence or one of them acts on comments the others ignore.
+PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
+
+# ── evidence_text_for_pr <repo> <pr> (#1224) ─────────────────────────────
+# Print the PR's evidence-bearing text: the PR BODY followed by EVERY issue
+# comment, one record per line. Best-effort — a gh/API failure prints whatever
+# was readable (possibly nothing), and every CALLER fails closed on missing
+# evidence because it HMAC-verifies before trusting a line.
+#
+# WHY BOTH CHANNELS. The signed marker is stored in the PR BODY, which is a
+# MUTABLE field: any later edit — a typo fix, a corrected issue ref, a
+# mechanical rewrite — silently destroys a marker kept only there, and the gate
+# then reddens on a review that genuinely happened (agent-infra #1224; two
+# instances 2026-09-18). The SAME signed marker is therefore also posted as a PR
+# COMMENT (see the evidence-post block in main), which is append-only with
+# respect to the body. Readers union the two, so a body edit that removes the
+# body copy cannot hide evidence that still exists in a comment.
+#
+# The comment is NOT a trust boundary and this does not weaken verification:
+# it is exactly as attacker-writable as the body, so callers still verify the
+# HMAC over the marker text and still refuse a forged or stale one. What the
+# union restores is AVAILABILITY of genuine evidence, never its authenticity.
+evidence_text_for_pr() { # <repo> <pr>
+  local repo="$1" pr="$2" body="" comments=""
+  command -v gh >/dev/null 2>&1 || return 0
+  body="$(gh api "repos/$repo/pulls/$pr" --jq .body 2>/dev/null || true)"
+  [ "$body" = "null" ] && body=""
+  [ -n "$body" ] && printf '%s\n' "$body"
+  # --paginate: a PR with many comments must not hide the marker on page 2.
+  # AUTHOR-FILTERED (PR_EVIDENCE_COMMENTS_JQ): affiliated roles only — a
+  # NARROWING of the writer set, not parity with the body's (see the constant).
+  comments="$(gh api "repos/$repo/issues/$pr/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null || true)"
+  [ -n "$comments" ] && printf '%s\n' "$comments"
+  return 0
+}
+
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # ── #980: the second-model subsystem was removed ────────────────────────
@@ -498,8 +556,12 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     # exact diff? Only then is the head-move provably a no-op to the artifact.
     PRIOR_DIFF=""
     if [ -n "$DIFF_HASH" ]; then
-      PRIOR_BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
-      [ "$PRIOR_BODY" = "null" ] && PRIOR_BODY=""
+      # #1224: read BODY + COMMENTS. A body edit must not hide the marker this
+      # script (or an earlier run) posted to the append-only comment channel —
+      # otherwise the body edit turns a still-correct carry-forward into an
+      # exit-3 refusal. Authenticity is unaffected: the HMAC check below is
+      # unchanged and still governs.
+      PRIOR_BODY="$(evidence_text_for_pr "$REPO" "$PR")"
       # The prior marker is evidence ONLY if it is AUTHENTIC. The PR body is
       # attacker-writable, so matching `sig=[0-9a-f]{64}` is not enough: a forged
       # `sig=<64 zeros>` line would satisfy the shape, be carried forward, and be
@@ -525,7 +587,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         if [ -n "$PRIOR_EXPECT" ] && [ "$PRIOR_SIG" = "$PRIOR_EXPECT" ]; then
           PRIOR_DIFF="$DIFF_HASH"
         else
-          echo "⚠️ #784: found prior evidence in the PR body with the right shape but a BAD SIGNATURE — ignoring it (the PR body is not a trust boundary)" >&2
+          echo "⚠️ #784: found prior evidence in the PR body OR a PR comment with the right shape but a BAD SIGNATURE — ignoring it (neither channel is a trust boundary)" >&2
         fi
       fi
     fi
@@ -783,11 +845,27 @@ if [ -n "$LEGACY" ] && [ -f "$LEGACY" ]; then
   fi
 fi
 
-# ── Auto-post review evidence into the PR body (#163 follow-up) ──────────
+# ── Auto-post review evidence (#163 follow-up; #1224 append-only channel) ─
 # The pipeline compliance check (c) looks for review markers in the PR
 # body/commits. Real reviews were lagging the gate because nothing posted
-# the evidence (PR #163 merged RED for exactly this). Append a marker line
-# here, at record time. Idempotent; best-effort — NEVER fails the record.
+# the evidence (PR #163 merged RED for exactly this). Post a marker line here,
+# at record time. Idempotent; best-effort — NEVER fails the record.
+#
+# #1224 — TWO CHANNELS, ONE SIGNED MARKER. The marker is posted to the PR
+# COMMENT thread (append-only) AND to the PR body (legacy mirror). The body is
+# a MUTABLE field: any later edit destroys a marker kept only there and reddens
+# a required check on a review that genuinely happened. The comment survives
+# that edit, so every repo-local reader unions body + comments. The body mirror
+# is kept so consumers that still read only the body (tortoise's ai-review-gate
+# workflow) keep working until they adopt the same read.
+#
+# ⚠️ DROP CONDITION — adopting the read is NOT sufficient. The body PATCH is
+# also what RE-RUNS the gate: `.github/workflows/pipeline-compliance.yml`
+# triggers on `pull_request: edited`, and a PR comment fires `issue_comment`,
+# which it does not listen to. Dropping the mirror therefore requires either an
+# `issue_comment` trigger added to that workflow or another re-run mechanism;
+# otherwise a marker posted to a comment would be readable but the required
+# check would not re-evaluate until the next push (agent-infra#1224 follow-up).
 if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   # Sign the marker (HMAC-SHA256 over the marker text, AI_REVIEW_GATE_KEY) so
   # the GitHub ai-review-gate required check cannot be satisfied by editing
@@ -821,32 +899,55 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   else
     echo "⚠️ AI_REVIEW_GATE_KEY not configured (env or ~/.pi/agent/.ai-review-gate-key) — posting unsigned marker; ai-review-gate required check will fail. Configure the key to match the repo secret." >&2
   fi
+  # ── #1224: append-only channel FIRST ────────────────────────────────────
+  # A PR comment cannot be altered by editing the PR body, so this copy
+  # survives the exact edit that destroys the body copy. Verification is
+  # UNCHANGED: the comment carries the IDENTICAL signed text, and every reader
+  # HMAC-verifies it — a forged comment cannot pass and a deleted one fails
+  # closed. Idempotent on the marker text so a re-run at the same head does not
+  # mint a duplicate; a NEW record at a new head appends its own comment, which
+  # is the same append-only semantics the body already had. Best-effort: a
+  # failure here still leaves the body mirror, and the record is never lost.
+  EXISTING_COMMENTS="$(gh api "repos/$REPO/issues/$PR/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null || true)"
+  if ! grep -qF "$MARKER" <<<"$EXISTING_COMMENTS"; then
+    jq -n --arg body "$MARKER" '{body: $body}' 2>/dev/null \
+      | gh api -X POST "repos/$REPO/issues/$PR/comments" --input - >/dev/null 2>&1 \
+      && echo "review evidence posted to $REPO#$PR (append-only comment — survives a PR-body edit in repos whose gate reads comments)" \
+      || echo "note: could not post the review-evidence comment (record still saved; the body mirror below is the fallback)" >&2
+  fi
   # Read the PR body — distinguish a genuinely EMPTY body (post marker-only)
-  # from a GET FAILURE (skip the post loudly — never clobber the description).
+  # from a GET FAILURE (skip the mirror loudly — never clobber the description).
+  # #1224: a failure here NO LONGER aborts the post — the append-only comment
+  # above already carries the evidence, so the record keeps its surviving
+  # attestation even when the body read fails.
+  BODY_OK=0
   if BODY="$(gh api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null)"; then
     [ "$BODY" = "null" ] && BODY=""
+    BODY_OK=1
   else
-    echo "⚠️ record-review: could not read PR body (transient API failure?) — evidence post skipped; record still saved. Re-run record-review.sh to retry the post." >&2
-    exit 0
+    echo "⚠️ record-review: could not read PR body (transient API failure?) — body mirror skipped; the append-only comment still carries the evidence for readers that read comments (pipeline-compliance, atomic-land). A consumer that reads the BODY ONLY — the cross-repo tortoise ai-review-gate — will stay RED: re-run record-review.sh to retry the body post." >&2
+    BODY=""
   fi
-  # Idempotent append — post even when the body is EMPTY (an empty body must
-  # not silently skip the evidence post; the gate would fail with no trace).
-  MISSING=""
-  if ! grep -qF "$MARKER" <<<"$BODY"; then
-    MISSING="$MARKER"
-  fi
-  if [ -n "$MISSING" ]; then
-    if [ -n "$BODY" ]; then
-      NEWBODY="${BODY}
+  if [ "$BODY_OK" = 1 ]; then
+    # Idempotent append — post even when the body is EMPTY (an empty body must
+    # not silently skip the evidence post; the gate would fail with no trace).
+    MISSING=""
+    if ! grep -qF "$MARKER" <<<"$BODY"; then
+      MISSING="$MARKER"
+    fi
+    if [ -n "$MISSING" ]; then
+      if [ -n "$BODY" ]; then
+        NEWBODY="${BODY}
 
 ${MISSING}"
-    else
-      NEWBODY="$MISSING"
+      else
+        NEWBODY="$MISSING"
+      fi
+      jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
+        | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
+        && echo "review evidence posted to $REPO#$PR body (legacy mirror)" \
+        || echo "note: could not post review evidence to PR body (record still saved; the append-only comment carries it for readers that read comments — a body-only consumer will stay RED)" >&2
     fi
-    jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
-      | gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
-      && echo "review evidence posted to $REPO#$PR body" \
-      || echo "note: could not post review evidence to PR body (record still saved)" >&2
   fi
 else
   echo "⚠️ record-review: evidence post skipped (gh CLI missing or REPO undetectable) — the record is saved, but the ai-review-gate required check will fail until evidence is posted manually." >&2

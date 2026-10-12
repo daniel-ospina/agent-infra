@@ -262,6 +262,20 @@ if [ -z "$GATE_KEY_RAW" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
 fi
 GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
 
+# ── PR_EVIDENCE_COMMENTS_JQ (#1224) ──────────────────────────────────────
+# The jq filter selecting which PR comments may carry review evidence: comments
+# from REPO-AFFILIATED authors only (OWNER / MEMBER / COLLABORATOR). The comment
+# thread on a PUBLIC repo is writable by ANY GitHub user with read access, so an
+# unfiltered arm would admit evidence from an actor with no repository role.
+# NARROWING, NOT parity: author_association reports relationship to the owning
+# org, not write permission — a read-only org MEMBER is admitted though they
+# cannot edit the body (over-admit), and a PR author who is an outside
+# CONTRIBUTOR is not admitted (under-admit). Both declared, agent-infra#1224.
+# BYTE-IDENTICAL ACROSS record-review.sh, check-pipeline-compliance.sh
+# AND atomic-land.sh — pinned by record-review.test.sh §8.13a, which also pins
+# that each reader APPLIES the filter at its fetch.
+PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
+
 # Can the record at the current head be RESTORED by the producer's carry-forward
 # after an update? Requires a marker that is (a) shape-valid WITH a diff= identity
 # and (b) authentically signed by the gate key. Mirrors the producer's own carry
@@ -279,9 +293,22 @@ GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
 # "unchanged" for one cross-repo contract. The rail reads the diff= value as an
 # opaque identity and cites it verbatim.
 pr_has_carry_evidence() {
-  local line="" text="" sig="" expect=""
-  line="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null \
-    | grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" || true)"
+  local line="" text="" sig="" expect="" body="" comments="" evidence=""
+  # #1224: the marker may live in an APPEND-ONLY PR COMMENT as well as in the
+  # body, because an unrelated body edit destroys a body-only copy. Both
+  # channels are read; the FIRST matching line still governs (ordering is
+  # unchanged). Authenticity is UNAFFECTED — the HMAC check below is untouched,
+  # and a comment is exactly as attacker-writable as the body, so only a valid
+  # signature counts. The comment read is AUTHOR-FILTERED (PR_EVIDENCE_COMMENTS_JQ):
+  # affiliated roles only, which NARROWS — but does not equal — the body's writer
+  # set (see the constant's comment for the declared over/under-admission).
+  # The two sources are captured to variables and matched with a here-string
+  # rather than `gh_ | grep -m1`, so the union is explicit and the pipe's exit
+  # status cannot be mistaken for a read result.
+  body="$(gh_ api "repos/$REPO/pulls/$PR" --jq .body 2>/dev/null || true)"
+  comments="$(gh_ api "repos/$REPO/issues/$PR/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null || true)"
+  evidence="$(printf '%s\n%s\n' "$body" "$comments")"
+  line="$(grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=${RECORD_VERDICT} @ [0-9a-f]{40} diff=[0-9a-f]{64} \\(.*\\) sig=[0-9a-f]{64}$" <<<"$evidence" || true)"
   [ -n "$line" ] || return 1
   [ -n "$GATE_KEY" ] || return 1
   text="${line% sig=*}"; sig="${line##* sig=}"

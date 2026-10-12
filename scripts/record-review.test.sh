@@ -47,6 +47,20 @@ cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
 if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
+    # #1224: the append-only COMMENT post. Distinguished from the body PATCH by
+    # its endpoint, so a comment capture and a body capture never collide (a
+    # collision would make one of the two assertions vacuous). The endpoint is
+    # pinned to the ISSUE-comment path: a post to `pulls/<N>/comments` (the
+    # review-comment endpoint, which NO reader fetches) must not satisfy the
+    # capture, or the vector would bless an endpoint nothing can read.
+    if grep -qE -- 'issues/[^/]+/comments' <<<"$*"; then
+        if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then
+            cat >"$STUB_COMMENT_CAPTURE"
+        else
+            cat >/dev/null
+        fi
+        exit 0
+    fi
     # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
     # STUB_CAPTURE (#2982, the diff-binding sink) is checked FIRST so precedence is
     # deterministic; GH_STUB_PATCH_BODY is retained as a fallback because main's
@@ -75,11 +89,25 @@ if [ "$1" = "api" ]; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
+    # #1224: the append-only comment stream. Placed BEFORE the `.body` arm so
+    # `--jq '.[].body'` can never fall through to the PR-body answer. The fetch
+    # must go through the AUTHOR FILTER: a call that drops
+    # `--jq "$PR_EVIDENCE_COMMENTS_JQ"` would admit a drive-by commenter's marker
+    # (the cycle-1 false PASS), so the stub REFUSES it — the suite must redden on
+    # an unfiltered fetch, not stay green.
+    if grep -qE -- 'issues/[^/]+/comments' <<<"$*"; then
+        grep -qF -- 'author_association' <<<"$*" || { echo "stub: /comments fetch without the author filter" >&2; exit 3; }
+        grep -qF -- '--paginate' <<<"$*" || { echo "stub: /comments fetch without --paginate" >&2; exit 3; }
+        [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+        [ -n "${STUB_COMMENTS:-}" ] && printf '%s\n' "$STUB_COMMENTS"
+        exit 0
+    fi
     if grep -qF -- "--jq .body" <<<"$*"; then
         # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
         # filter and prints the string bare — it does not emit a JSON wrapper.
         # #2982's carry-forward check greps the body for a marker LINE, so it
         # needs real newlines rather than "\n" escapes.
+        [ "${STUB_BODY_FAIL:-0}" = "1" ] && exit 1
         printf '%s' "${STUB_BODY:-PR body}"
         exit 0
     fi
@@ -219,13 +247,13 @@ refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
 run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
     local rec="$1" pr="$2" sha="$3" body="$4" dfile="${5:-/dev/null}" dfail="${6:-0}"
     shift $(( $# > 6 ? 6 : $# ))   # remaining args pass verbatim to record-review.sh
-    local rcfile="$T/rc" errfile="$T/err" cap="$T/cap"
-    : > "$LOG"; : > "$cap"; rm -f "$errfile"
+    local rcfile="$T/rc" errfile="$T/err" cap="$T/cap" ccap="$T/ccap"
+    : > "$LOG"; : > "$cap"; : > "$ccap"; rm -f "$errfile"
     (
         export HOME="$F_HOME"
         export PATH="$T/bin:$PATH"
         export GH_STUB_LOG="$LOG"
-        export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap"
+        export STUB_BODY="$body" STUB_DIFF_FILE="$dfile" STUB_DIFF_FAIL="$dfail" STUB_CAPTURE="$cap" STUB_COMMENT_CAPTURE="$ccap"
         rc=0
         bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
@@ -233,6 +261,8 @@ run_record_diff_with() { # <record-script> <pr> <sha> <body> [diff-file] [diff-f
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
     RECORD_CAP="$(cat "$cap" 2>/dev/null || true)"
+    # #1224: stdout of the append-only COMMENT post (the `{"body":"…"}` JSON).
+    RECORD_CCAP="$(cat "$ccap" 2>/dev/null || true)"
 }
 run_record_diff() { # <pr> <sha> <body> [diff-file] [diff-fail] [extra record args…]
     run_record_diff_with "$RECORD" "$@"
@@ -491,6 +521,34 @@ A_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$SCRIPT_DIR/check-pipeline-complianc
 B_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$RECORD" || true)"
 [ -n "$A_CONST" ] && [ -n "$B_CONST" ] || bad "cross-script pin: REFCTX/CLOSING_KW lines missing from a script (extraction is vacuous)"
 assert_eq "$A_CONST" "$B_CONST" "cross-script byte-identity: REFCTX + CLOSING_KW lines identical"
+
+# #1224 — the PR-comment AUTHOR FILTER must be byte-identical across the THREE
+# readers that admit comment evidence: check (c), the producer's carry-forward,
+# and the atomic-land rail. If one admits a different comment set, the readers
+# disagree about what evidence exists — one acts on comments another ignores,
+# and the required check's writer set silently differs from the rail's.
+# (Labeled 8.13a: it extends the §8.13 cross-script-pin family.)
+JQ_C="$(grep -E '^PR_EVIDENCE_COMMENTS_JQ=' "$SCRIPT_DIR/check-pipeline-compliance.sh" || true)"
+JQ_R="$(grep -E '^PR_EVIDENCE_COMMENTS_JQ=' "$RECORD" || true)"
+JQ_A="$(grep -E '^PR_EVIDENCE_COMMENTS_JQ=' "$SCRIPT_DIR/atomic-land.sh" || true)"
+[ -n "$JQ_C" ] && [ -n "$JQ_R" ] && [ -n "$JQ_A" ] || bad "cross-script pin: PR_EVIDENCE_COMMENTS_JQ missing from a script (extraction is vacuous)"
+assert_eq "$JQ_C" "$JQ_R" "cross-script byte-identity: PR_EVIDENCE_COMMENTS_JQ (check-c vs producer)"
+assert_eq "$JQ_R" "$JQ_A" "cross-script byte-identity: PR_EVIDENCE_COMMENTS_JQ (producer vs rail)"
+
+# §8.13a — and the filter must be APPLIED at every fetch, not merely declared.
+# A pin on the literal alone cannot see a fetch that stops PASSING it: dropping
+# the `--jq "$PR_EVIDENCE_COMMENTS_JQ"` argument leaves all three constants
+# byte-identical and every suite green, silently reopening the cycle-1 false
+# PASS (an arbitrary public commenter greening the required check). These count
+# the comment fetches that carry the filter, by exact string, per file.
+Q_R1="$(grep -cF 'issues/$pr/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ"' "$RECORD" || true)"
+Q_R2="$(grep -cF 'issues/$PR/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ"' "$RECORD" || true)"
+Q_A="$(grep -cF 'issues/$PR/comments" --paginate --jq "$PR_EVIDENCE_COMMENTS_JQ"' "$SCRIPT_DIR/atomic-land.sh" || true)"
+Q_C="$(grep -cF 'issues/$PR_NUMBER/comments" "$PR_EVIDENCE_COMMENTS_JQ" 1' "$SCRIPT_DIR/check-pipeline-compliance.sh" || true)"
+assert_eq "$Q_R1" "1" "producer: carry-forward comment fetch passes --paginate + the author filter"
+assert_eq "$Q_R2" "1" "producer: evidence-post comment fetch passes --paginate + the author filter"
+assert_eq "$Q_A" "1" "rail: comment fetch passes --paginate + the author filter"
+assert_eq "$Q_C" "1" "check (c): PR_COMMENTS fetch passes the author filter"
 
 # 8.14 FALSE-REFUSAL guard on the parity scan (#1012 r3). The parity scan is
 # WORD-BOUNDARY-anchored. Unanchored, the keyword class matches INSIDE English
@@ -1309,6 +1367,105 @@ if grep -q "compare/" "$LOG"; then
 else
     ok "clean verdict performs no clean-low diff read"
 fi
+
+echo ""
+echo "── 13. #1224: append-only PR-comment evidence channel ──────────"
+# The signed marker is posted to a PR COMMENT as well as into the body, because
+# a later body edit destroys a body-only copy (two live instances 2026-09-18).
+# These vectors pin the producer AND the carry-forward READER, which
+# HMAC-verifies — the comment adds AVAILABILITY of genuine evidence, never
+# authenticity. §10.7 unset the key, so re-establish the deterministic one.
+export AI_REVIEW_GATE_KEY="$TEST_GATE_KEY"
+
+# 13.1 producer posts the SAME signed marker to the comment channel.
+run_record_diff 424600 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "13.1 record succeeds" || bad "13.1 record (rc=$RECORD_RC)"
+assert_contains "$RECORD_CCAP" "review recorded: reviews/424600.json verdict=clean @ $SHA diff=$DH " "13.1 comment carries the marker"
+CM12="$(printf '%s' "$RECORD_CCAP" | jq -r .body 2>/dev/null || true)"
+CM_TEXT="${CM12% sig=*}"; CM_SIG="${CM12##* sig=}"
+CM_EXPECT="$(printf '%s' "$CM_TEXT" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+[ -n "$CM12" ] && [ "$CM_SIG" = "$CM_EXPECT" ] && ok "13.1 comment marker's HMAC verifies under the gate key" || bad "13.1 comment marker signature does not verify (got '$CM_SIG')"
+
+# 13.2 idempotent — an identical marker already in the thread mints no duplicate.
+STUB_COMMENTS="$CM12" run_record_diff 424600 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "13.2 re-record succeeds" || bad "13.2 re-record (rc=$RECORD_RC)"
+if [ -z "$RECORD_CCAP" ]; then ok "13.2 identical marker present → no duplicate comment"; else bad "13.2 posted a duplicate comment"; fi
+
+# 13.3 THE SYMPTOM: attestation recorded → body edited → the reader still finds
+# AND VERIFIES the evidence. The head has moved (stale), the body no longer
+# carries the marker (the edit), and only the append-only comment does. The
+# carry-forward arm must accept it instead of refusing (exit 3). Against a
+# body-only producer this is RED — the very defect #1224 reports.
+PRIOR12="review recorded: reviews/424602.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%s' "review recorded: reviews/424602.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra)" | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+rm -f "$(Q2 424602)"
+STUB_COMMENTS="$PRIOR12" run_record_diff 424602 "$STALE" "a body edited AFTER recording — no marker here" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "13.3 a body edit does not hide the comment marker (carry-forward rc 0)" || bad "13.3 carry-forward refused after a body edit (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "carry-forward" "13.3 explains the carry-forward"
+assert_contains "$(cat "$(Q2 424602)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "13.3 re-records at the CURRENT head from comment evidence"
+
+# 13.4 verification is NOT weakened: a FORGED comment marker must not carry
+# forward. A comment is exactly as attacker-writable as the body, so only a
+# valid HMAC counts; the channel change must not have relaxed that.
+FORGED12="review recorded: reviews/424603.json verdict=clean @ $STALE diff=$DH (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+rm -f "$(Q2 424603)"
+STUB_COMMENTS="$FORGED12" run_record_diff 424603 "$STALE" "body without markers" "$D_F"
+[ "$RECORD_RC" = "3" ] && ok "13.4 a forged comment marker does NOT carry forward (rc 3)" || bad "13.4 FORGED comment marker carried forward! (rc=$RECORD_RC)"
+[ ! -f "$(Q2 424603)" ] && ok "13.4 no record written from forged comment evidence" || bad "13.4 wrote a record from forged comment evidence"
+assert_contains "$RECORD_ERR" "BAD SIGNATURE" "13.4 names the bad signature"
+
+# 13.5 durable mutation proof — a producer with the comment post NEUTERED
+# captures nothing, so 13.1 is regression-sensitive to the fix rather than
+# passing for an unrelated reason.
+MUT_NOCOMMENT="$T/mutant-nocomment.sh"
+sed 's#gh api -X POST "repos/\$REPO/issues/\$PR/comments" --input -#cat >/dev/null#' "$RECORD" > "$MUT_NOCOMMENT"
+bash -n "$MUT_NOCOMMENT" && ok "13.5 neutered-comment mutant parses" || bad "13.5 mutant is not valid bash"
+if cmp -s "$MUT_NOCOMMENT" "$RECORD"; then bad "13.5 comment-neutering sed did not change the script"; else ok "13.5 comment-neutering sed changed the script"; fi
+run_record_diff_with "$MUT_NOCOMMENT" 424604 "$SHA" "PR body" "$D_F"
+# Positive control (cycle-2 review): RECORD_CCAP is empty for ANY early abort, so
+# assert the mutant REACHED the post block — it completed (rc 0) and posted the
+# body mirror. Without this, a future sibling dependency that aborted the mutant
+# early would leave 13.5 green for the wrong reason.
+[ "$RECORD_RC" = "0" ] && ok "13.5 mutant reached the post block (rc 0)" || bad "13.5 mutant aborted before the post block (rc=$RECORD_RC)"
+assert_contains "$(printf '%s' "$RECORD_CAP" | jq -r .body 2>/dev/null || true)" "review recorded: reviews/424604.json" "13.5 mutant still posted the body mirror (only the comment path was neutered)"
+if [ -z "$RECORD_CCAP" ]; then ok "13.5 mutation: neutered comment post captures nothing (13.1 is load-bearing)"; else bad "13.5 mutation: neutered post still captured a comment"; fi
+
+# 13.6 DEGRADED PATHS (review cycle 1). The body read failing must NOT cost the
+# surviving attestation: the comment is posted first, and the body mirror is
+# skipped loudly rather than aborting the post (the old code `exit 0`d here).
+STUB_BODY_FAIL=1 run_record_diff 424605 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "13.6 body-read failure still records (rc 0)" || bad "13.6 body-read failure aborted the record (rc=$RECORD_RC)"
+assert_contains "$RECORD_CCAP" "review recorded: reviews/424605.json" "13.6 the append-only comment carries the marker despite the body-read failure"
+if [ -z "$RECORD_CAP" ]; then ok "13.6 the body mirror was skipped (never clobber an unreadable body)"; else bad "13.6 posted a body mirror after a failed body read"; fi
+assert_contains "$RECORD_ERR" "body mirror skipped" "13.6 the skip is announced, not silent"
+
+# 13.7 the comment-IDEMPOTENCY fetch failing must not block the post: an empty
+# existing-thread read means "no prior marker seen", so the marker is posted.
+STUB_COMMENTS_FAIL=1 run_record_diff 424606 "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "13.7 comments-fetch failure still records (rc 0)" || bad "13.7 comments-fetch failure aborted the record (rc=$RECORD_RC)"
+assert_contains "$RECORD_CCAP" "review recorded: reviews/424606.json" "13.7 the comment is still posted when the existing-thread read fails"
+assert_contains "$(printf '%s' "$RECORD_CAP" | jq -r .body 2>/dev/null || true)" "review recorded: reviews/424606.json" "13.7 the body mirror is still posted too"
+
+# 13.8 the comment AUTHOR FILTER (PR_EVIDENCE_COMMENTS_JQ) must exclude a
+# drive-by commenter on a public repo. The same jq expression is used by all
+# three readers (§8.13a pins the byte-identity and the application); here it is
+# exercised directly, with a MEMBER present so the constant's middle arm is
+# pinned too (removing `MEMBER` from all three copies kept the byte-identity pin
+# satisfied and every suite green under cycle-2 review).
+if command -v jq >/dev/null 2>&1; then
+    eval "$(grep -E '^PR_EVIDENCE_COMMENTS_JQ=' "$RECORD" | head -1)"
+    [ -n "$PR_EVIDENCE_COMMENTS_JQ" ] || bad "13.8 PR_EVIDENCE_COMMENTS_JQ could not be read from the producer"
+    CF='[{"author_association":"NONE","body":"review recorded: drive-by"},{"author_association":"OWNER","body":"review recorded: real"},{"author_association":"MEMBER","body":"review recorded: member"}]'
+    CK="$(printf '%s' "$CF" | jq -r "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null || true)"
+    if ! grep -q 'drive-by' <<<"$CK" && grep -q 'real' <<<"$CK" && grep -q 'member' <<<"$CK"; then
+        ok "13.8 the comment author filter drops a non-affiliated comment and keeps OWNER + MEMBER"
+    else
+        bad "13.8 the author filter admitted a drive-by comment (kept: $CK)"
+    fi
+    unset CF CK
+else
+    bad "13.8 jq is unavailable — the author-filter vector cannot run"
+fi
+unset AI_REVIEW_GATE_KEY
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

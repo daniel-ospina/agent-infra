@@ -33,9 +33,15 @@
 #   b. SCOPING COMMENT   — linked issue has a comment with the
 #                          `<!-- issue-scoping:` marker (posted by the
 #                          issue-scoping skill)
-#   c. CODE-REVIEW EVID  — PR body OR any PR commit message references review
+#   c. CODE-REVIEW EVID  — PR body, any PR commit message, OR a PR comment
+#                          (author-filtered to body-editor roles) carrying the
+#                          record-review.sh marker line references review
 #                          dispatch (code-review | reviewer | [review] |
-#                          VGATE | review recorded | review-enforcer)
+#                          VGATE | review recorded | review-enforcer). The
+#                          comment arm admits ONLY `^review recorded:` lines
+#                          from owner/member/collaborator comments (#1224), so
+#                          neither an unrelated comment NOR a drive-by
+#                          commenter on a public repo can satisfy this check.
 #   d. PLAN DOC          — complexity:standard/complex issues need a plan doc:
 #                          the PR adds/modifies a file under docs/plans/*.md,
 #                          OR the scoping comment contains a `Wiring` section
@@ -292,6 +298,26 @@ REVIEW_EVIDENCE_RE='code-review|reviewer|\[review\]|VGATE|review[[:space:]]+reco
 TEST_EVIDENCE_RE='tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'
 CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
 
+# PR_EVIDENCE_COMMENTS_JQ (#1224) — the jq filter selecting which PR comments may
+# carry review evidence: comments from REPO-AFFILIATED authors only (OWNER /
+# MEMBER / COLLABORATOR). On a PUBLIC repo EVERY GitHub user with read access can
+# comment, so an unfiltered arm would let an actor with NO repository role satisfy
+# this required check by typing the marker.
+# It is a NARROWING, NOT an equivalence with the body's writer set.
+# `author_association` reports the author's relationship to the owning
+# organization, NOT their write permission, so two residuals are declared
+# (agent-infra#1224): a read-only org MEMBER / outside COLLABORATOR is ADMITTED
+# though they cannot edit the body (over-admit), and a PR author who is an
+# outside CONTRIBUTOR is NOT admitted (under-admit — for their PRs the body
+# mirror is the carrier). This check has never verified authenticity (the HMAC
+# key lives in record-review.sh), so the filter's job is to keep an arbitrary
+# public commenter from greening a required check.
+# BYTE-IDENTICAL ACROSS record-review.sh, check-pipeline-compliance.sh AND
+# atomic-land.sh — pinned by record-review.test.sh §8.13a, which ALSO pins that
+# each reader applies the filter at its fetch; the three readers must admit the
+# same evidence or one acts on comments the others ignore.
+PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
+
 # ── #836: never pipe a multi-KB string into `grep -q` ────────────────────────
 # Under `set -euo pipefail`, `printf … | grep -q …` is a RACE on any input well
 # above PIPE_BUF: `grep -q` exits at the FIRST match while `printf` is still
@@ -324,6 +350,34 @@ CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
 has_review_evidence() { grep -qiE "$REVIEW_EVIDENCE_RE" <<<"$1"; }
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
+
+# review_marker_lines <comment-text> — the ONLY comment arm check (c) admits.
+# #1224: record-review.sh posts its signed marker as a PR COMMENT as well as in
+# the body, because the body is a MUTABLE field and any later edit (a typo fix,
+# a corrected issue ref) silently destroys a marker kept only there — reddening
+# a required check on a review that genuinely happened. Comments are append-only
+# with respect to the body, so the marker survives the edit.
+#
+# NARROWNESS IS THE POINT. Admitting ALL comment text to the keyword scan would
+# let an unrelated comment satisfy (c) — a real loosening. Admitting only lines
+# that BEGIN with the marker prefix admits exactly the evidence the producer
+# writes and nothing else: the accepted vocabulary is unchanged, because the
+# identical marker text was already admissible from the body and commit
+# messages.
+#
+# THE WRITER SET IS NOT WIDENED EITHER. The comment arm is AUTHOR-FILTERED to
+# body-editor roles (PR_EVIDENCE_COMMENTS_JQ) at the fetch: on a public repo the
+# comment thread is writable by any GitHub user with read access, whereas the
+# body is writable only by the author and collaborators, so an unfiltered arm
+# would let an actor with no repository role satisfy a required check. With the
+# filter, the admitted comment authors are exactly those who could already have
+# written the same marker into the body or a commit message. (c) has never
+# verified authenticity — record-review.sh, not this gate, holds the key — so
+# this restores AVAILABILITY of genuine evidence without widening who may
+# provide it.
+review_marker_lines() { # <text>
+  grep -E '^review recorded:' <<<"$1" || true
+}
 
 # resolve_issue_only_ref <target> — map an --issue-only target to owner/repo#N:
 # a bare number resolves against $GH_REPO, an explicit owner/repo#N passes
@@ -773,8 +827,9 @@ fetch_json() {
 }
 
 # ── Core checks ─────────────────────────────────────────────────────────────
-# Runs against globals (set by the caller): PR_BODY, LABELS, SCOPING_COMMENT,
-# COMMIT_MSGS, FILES. Prints pass/fail per check; returns failure count.
+# Runs against globals (set by the caller): PR_BODY, PR_COMMENTS, LABELS,
+# SCOPING_COMMENT, COMMIT_MSGS, FILES. Prints pass/fail per check; returns
+# failure count.
 
 run_checks() {
   local issue_ref="" issue_ref_kind="" issue_number="" issue_repo="" issue_display="" plan_file="" wiring_found="no" close_hazards="" close_notes=""
@@ -893,8 +948,9 @@ run_checks() {
       echo "      Invoke:  issue-scoping — it posts the scoping comment, whose first line carries the marker."
     fi
 
-    # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
-    EVID_TEXT="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"
+    # c. CODE-REVIEW EVIDENCE — PR body, commit messages, or the append-only
+    # PR-comment markers (#1224).
+    EVID_TEXT="$(printf '%s\n%s\n%s\n' "$PR_BODY" "$(review_marker_lines "${PR_COMMENTS:-}")" "$COMMIT_MSGS")"
     if [[ "$ISSUE_ONLY" == "1" ]]; then
       # #792: needs the PR body/commits, which do not exist pre-PR. Skipped
       # with a named reason; the merge-time run still enforces it.
@@ -914,15 +970,17 @@ run_checks() {
       # prose mentioning the marker text (this PR's own description tripped
       # the bare-substring grep on the first pipeline-compliance run).
       if has_clean_micro_marker "$EVID_TEXT"; then
-        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
+        fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo>), and remove EVERY stale \"verdict=clean-micro\" evidence: delete the marker line from the PR BODY and delete EVERY PR COMMENT that carries it (#1224 stores the marker in both channels, and the producer APPENDS one marker per re-record — deleting a single copy leaves the binding firing)."
+        echo "      Find the comments:  gh api --paginate \"repos/$GH_REPO/issues/$PR_NUMBER/comments\" --jq '.[] | select(.body | test(\"verdict=clean-micro\")) | \"\\(.id)  \\(.body)\"'"
+        echo "      Delete each one:    gh api -X DELETE \"repos/$GH_REPO/issues/comments/<id>\""
       else
-        pass c "code-review evidence in PR body/commits (review dispatch marker)"
+        pass c "code-review evidence in PR body/commits/comments (review dispatch marker)"
       fi
     else
-      fail c "no code-review evidence — PR body or a commit message must reference review dispatch."
+      fail c "no code-review evidence — PR body, a commit message, or the append-only PR-comment marker must reference review dispatch."
       echo "      Accepts: code-review | reviewer | [review] | VGATE | review recorded | review-enforcer."
-      echo "      Missing: review dispatch record in PR body or commits."
-      echo "      Invoke:  code-review — it records review evidence (commit message / PR body)."
+      echo "      Missing: review dispatch record in PR body, commits, or a PR comment carrying the record-review.sh marker."
+      echo "      Invoke:  code-review — it records review evidence (commit message / PR body / PR comment)."
     fi
 
     # d. PLAN DOC — standard/complex only.
@@ -1042,7 +1100,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
     echo "  b. SCOPING COMMENT  gh api repos/<repo>/issues/<n>/comments → one comment must carry the '<!-- issue-scoping:' marker as its first content line, or as its last one set off by a blank line (a mention anywhere else does not count)"
     echo "  d. WIRING           the scoping comment's 'Wiring' section, for complexity:standard/complex only (the docs/plans/*.md branch needs the PR diff and is checked at merge time)"
     echo ""
-    echo "Skipped as PR-dependent: a (PR body), c (PR body/commits), e (PR diff + body) — all enforced at the required status check."
+    echo "Skipped as PR-dependent: a (PR body), c (PR body/commits/comments), e (PR diff + body) — all enforced at the required status check."
     echo "Exemptions: complexity:micro skips b–d (identical tier exemption to the full run)."
     echo "Exit: 0 (compliant, simulated)."
     exit 0
@@ -1054,7 +1112,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for closing keywords (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL) that BEGIN A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count); a PR whose diff is ENTIRELY under docs/, entirely instruction-layer Markdown (skills/**/*.md, AGENTS.md), or entirely .github/CODEOWNERS may instead use a traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N) — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
-  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
+  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body + PR comments → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
@@ -2027,7 +2085,7 @@ $big_filler"
     ISSUE_REF="$GH_REPO#1"
     LABELS="$1"
     SCOPING_COMMENT="$2"
-    PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
+    PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""; PR_COMMENTS=""
     FAILURES=0
     IO_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-792-io.XXXXXX")"
     # summarize() is captured too, so a vector can assert the preflight's PASS
@@ -2114,6 +2172,78 @@ $big_filler"
   io_cleanup
   unset IO_LOG IO_FAILURES IO_SKIPS IO_REMEDY IO_LISTCAUSE IO_B 2>/dev/null || true
 
+  # ── #1224: check (c) reads the append-only PR-comment channel ───────────
+  # record-review.sh posts the signed marker to a PR COMMENT as well as into
+  # the PR body, because a later body edit destroys a body-only copy (two live
+  # instances 2026-09-18). These vectors pin both directions. Against the
+  # pre-change gate (body only), vector 1 fails — a body edit that removed the
+  # marker made (c) red on a genuinely-reviewed PR — so the suite is
+  # regression-sensitive to the fix.
+  run_c() { # <pr_body> <pr_comments> <commit_msgs>
+    PR_BODY="$1"; PR_COMMENTS="$2"; COMMIT_MSGS="$3"
+    LABELS="complexity:standard"; SCOPING_COMMENT="<!-- issue-scoping: #1224 -->"
+    FILES=$'added\tdocs/plans/2026-09-28-issue-1224-comment-evidence.md\t'; FILES_EXPECTED=1
+    FAILURES=0
+    C_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-1224-c.XXXXXX")"
+    run_checks > "$C_LOG" 2>&1 || true
+    C_FAILURES="$FAILURES"
+  }
+  c_report() {
+    local desc="$1" ok="$2"
+    if [[ "$ok" == "1" ]]; then
+      printf '✅ #1224 check (c): %s\n' "$desc"
+    else
+      printf '❌ #1224 check (c): %s\n' "$desc" >&2
+      grep -E '❌ \[|✅ \[' "$C_LOG" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    rm -f "$C_LOG"
+  }
+  C_MARKER="review recorded: reviews/1224.json verdict=clean @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra) sig=$(printf '%064d' 0)"
+  # 1. The marker lives ONLY in a comment (the body was edited and lost it) →
+  #    check (c) must still find it, with ZERO failures.
+  run_c "Fixes #1" "$C_MARKER" ""
+  c_report 'marker in a COMMENT survives a body edit → (c) passes' \
+    "$([[ "$C_FAILURES" -eq 0 ]] && grep -q '✅ \[c\]' "$C_LOG" && echo 1 || echo 0)"
+  # 2. An UNRELATED comment must NOT satisfy (c) — the comment arm admits only
+  #    marker lines, so the accepted vocabulary is not loosened.
+  run_c "Fixes #1" "thanks, this looks good to me — reviewer approved!" ""
+  c_report 'an unrelated comment does NOT satisfy (c)' \
+    "$([[ "$C_FAILURES" -ge 1 ]] && grep -q '❌ \[c\]' "$C_LOG" && echo 1 || echo 0)"
+  # 2b. A marker QUOTED MID-LINE must NOT satisfy (c): `review_marker_lines`
+  #     admits only LINE-LEADING markers, and that anchor is the narrowing that
+  #     keeps a body-editor's "I saw the line review recorded: … in the log"
+  #     prose from greening the required check. Without a vector for the anchor,
+  #     dropping `^` reddens nothing.
+  run_c "Fixes #1" "FYI the log shows review recorded: reviews/1224.json verdict=clean @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra) sig=$(printf '%064d' 0) mid-sentence" ""
+  c_report 'a marker QUOTED mid-line does NOT satisfy (c)' \
+    "$([[ "$C_FAILURES" -ge 1 ]] && grep -q '❌ \[c\]' "$C_LOG" && echo 1 || echo 0)"
+  # 3. The #513 tier binding must see the comment arm too, or a comment-borne
+  #    clean-micro marker would satisfy (c) while the binding stayed silent.
+  run_c "Fixes #1" "review recorded: reviews/1224.json verdict=clean-micro @ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb (daniel-ospina/agent-infra)" ""
+  c_report 'a COMMENT-borne clean-micro marker still trips the #513 binding' \
+    "$(grep -q 'clean-micro verdict marker' "$C_LOG" && echo 1 || echo 0)"
+  # The author filter is applied at the FETCH (a jq expression), so run_checks
+  # receives PR_COMMENTS already filtered — test the expression itself against a
+  # fixture, using the SAME constant the fetch uses so the vector cannot drift
+  # from production. A drive-by commenter (author_association NONE) on a public
+  # repo must not be able to satisfy the required check.
+  if command -v jq >/dev/null 2>&1; then
+    C_FIXTURE='[{"author_association":"NONE","body":"review recorded: drive-by"},{"author_association":"CONTRIBUTOR","body":"review recorded: contributor"},{"author_association":"OWNER","body":"review recorded: real"},{"author_association":"MEMBER","body":"review recorded: member"},{"author_association":"COLLABORATOR","body":"review recorded: collab"}]'
+    C_KEPT="$(printf '%s' "$C_FIXTURE" | jq -r "$PR_EVIDENCE_COMMENTS_JQ" 2>/dev/null || true)"
+    if [[ "$(printf '%s\n' "$C_KEPT" | grep -c .)" -eq 3 ]] \
+       && ! grep -q 'drive-by' <<<"$C_KEPT" && ! grep -q 'contributor' <<<"$C_KEPT" \
+       && grep -q 'real' <<<"$C_KEPT" && grep -q 'member' <<<"$C_KEPT" && grep -q 'collab' <<<"$C_KEPT"; then
+      printf '✅ #1224 check (c): the comment author filter keeps OWNER/MEMBER/COLLABORATOR and drops NONE/CONTRIBUTOR\n'
+    else
+      printf '❌ #1224 check (c): the author filter admitted a non-body-editor comment (kept: %s)\n' "$C_KEPT" >&2
+      selffail=$((selffail + 1))
+    fi
+  else
+    printf '❌ #1224 check (c): jq is unavailable — the author-filter vector cannot run (the producer requires jq, so this environment is broken)' >&2
+    selffail=$((selffail + 1))
+  fi
+  unset C_MARKER C_LOG C_FAILURES C_FIXTURE C_KEPT 2>/dev/null || true
 
   if [[ "$selffail" -gt 0 ]]; then
     echo "❌ SELF-TEST FAILED ($selffail assertion(s))." >&2
@@ -2148,6 +2278,7 @@ if [[ "$ISSUE_ONLY" == "1" ]]; then
   # repo contains one, but the delimiter must not be forgeable from the data.
   SCOPING_COMMENT="$(fetch_json "issues/$IO_ISSUE/comments" '.[].body | gsub("\u001e"; "") + "\u001e"' 1 "$IO_REPO")"
   PR_BODY=""; COMMIT_MSGS=""; FILES=""; FILES_EXPECTED=""
+  PR_COMMENTS=""   # #1224: no PR diff/body pre-PR, so no comment thread either
   run_checks || true
   summarize
   exit
@@ -2155,6 +2286,18 @@ fi
 
 # ── Live run ────────────────────────────────────────────────────────────────
 PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
+# #1224: the append-only evidence channel. record-review.sh posts the SAME
+# signed marker as a PR comment, so check (c) survives a later PR-body edit.
+# Fetched per PR (paginated) and AUTHOR-FILTERED (PR_EVIDENCE_COMMENTS_JQ).
+# FAIL-SOFT: a failed fetch falls back to the pre-#1224 evidence set (body +
+# commits) rather than reddening the required check. Losing the comment arm is
+# exactly the pre-change behaviour, so it cannot widen (c); it can only fail to
+# help. fetch_json exits 2 on failure, which the `if !` absorbs (the assignment
+# is a condition, so `set -e` does not fire).
+if ! PR_COMMENTS="$(fetch_json "issues/$PR_NUMBER/comments" "$PR_EVIDENCE_COMMENTS_JQ" 1)"; then
+  PR_COMMENTS=""
+  echo "⚠️ #1224: could not read PR comments — the append-only evidence channel is unavailable this run; falling back to PR body + commit messages (the pre-#1224 behaviour)." >&2
+fi
 
 # Files fetched as "status<TAB>filename<TAB>previous_filename" — check e needs
 # the status to count only added/modified test files as evidence; checks d/e
