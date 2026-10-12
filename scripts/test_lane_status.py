@@ -185,3 +185,51 @@ def test_the_inbound_prior_reads_the_base_verdict(L):
     assert "child_suppresses(_base_verdict" in src, "the child prior does not read the base verdict"
     assert "inbound_discounts_idle(_base_verdict" in src, "the inbound prior does not read the base verdict"
     assert "elif inbound_discounts_idle(_base_verdict" in src, "the priors must not both apply"
+
+
+def test_inbound_message_is_one_sanitised_line_or_none(L):
+    """⛔ The inbound TEXT must be a single short line, and ABSENT must not render as EMPTY.
+
+    `latest_submitted_message` is a whole turn, so it can contain newlines and be thousands of
+    characters. Two failure modes: a raw turn wrecks the one-line-per-lane table, and a missing
+    record returned as `""` becomes indistinguishable from "the turn was empty".
+    """
+    fake = {"ws-1": {"latest_submitted_message": "hello\n\n  world\t!!  "},
+            "ws-2": {"latest_submitted_message": "x" * 500},
+            "ws-3": {"latest_submitted_message": "   \n  "},
+            "ws-4": {}}
+    orig = L._live_workspaces
+    try:
+        L._live_workspaces = lambda: list(fake.items())
+        got1 = L._inbound_message("ws-1")
+        assert got1 == "hello world !!", got1
+        assert "\n" not in got1 and "\t" not in got1
+        got2 = L._inbound_message("ws-2")
+        assert len(got2) == L.INBOUND_MSG_MAX + 3 and got2.endswith("..."), (len(got2), got2[:20])
+        assert L._inbound_message("ws-3") is None, "whitespace-only must be None, not ''"
+        assert L._inbound_message("ws-4") is None, "no record must be None, not ''"
+        assert L._inbound_message(None) is None
+        assert L._inbound_message("never-seen") is None
+    finally:
+        L._live_workspaces = orig
+
+
+def test_inbound_message_abstains_when_cmux_is_unreadable(L):
+    """An unread cmux must yield None -- never a message, and never a crash."""
+    orig = L._live_workspaces
+    try:
+        L._live_workspaces = lambda: []
+        assert L._inbound_message("ws-1") is None
+    finally:
+        L._live_workspaces = orig
+
+
+def test_the_message_is_shown_only_for_recent_inbound(L):
+    """⛔ Ordering: only a RECENT-INBOUND row may spend its line on the message.
+
+    Showing it on every row would bury the discriminator column, and the message is not liveness --
+    it belongs on screen exactly where it explains a suppression.
+    """
+    src = open(_PATH, encoding="utf-8").read()
+    assert 'r["verdict"] == WAITING_INBOUND and r.get("inbound_msg") and _sa is not None' in src, \
+        "the message must be gated on the RECENT-INBOUND verdict AND a real age"

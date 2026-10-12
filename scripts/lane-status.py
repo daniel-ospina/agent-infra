@@ -446,6 +446,39 @@ def _submitted_epoch(ws):
     return None, True
 
 
+# Long enough to tell "WORK ORDER: fix the python-ci-gate..." from "quick question about...", short
+# enough that one lane stays one line. The table is a triage surface, not a transcript.
+INBOUND_MSG_MAX = 72
+
+
+def _inbound_message(ws):
+    """The last turn SUBMITTED TO this lane -- INBOUND -- sanitised to one short line, or None.
+
+    ⛔ INBOUND, and the distinction is the whole correction: this is what someone SENT the lane, not
+    what the lane PRODUCED. It is not evidence of liveness and must never be read as such; its job
+    is to make a `RECENT-INBOUND` suppression auditable, because that verdict is the same whether
+    the lane was just handed work (leave it alone) or was asked a question and went quiet (act on
+    it), and only the text separates those.
+
+    Reads the SAME cached `_live_workspaces()` payload as `_submitted_epoch`, so it costs no extra
+    `cmux` call. Returns `None` -- never `""` -- when there is no record, so an absent message
+    cannot render as a present-but-empty one.
+    """
+    live = _live_workspaces()
+    if not live:
+        return None
+    want = (ws or "").upper()
+    for wsid, x in live:
+        if wsid.upper() != want:
+            continue
+        m = x.get("latest_submitted_message")
+        if not isinstance(m, str) or not m.strip():
+            return None
+        one = " ".join(m.split())
+        return one if len(one) <= INBOUND_MSG_MAX else one[:INBOUND_MSG_MAX] + "..."
+    return None
+
+
 def _live_label(wsid, x):
     t = (x.get("custom_title") or "").strip()
     if t:
@@ -1333,6 +1366,11 @@ def main():
         # lane whose last inbound is hours old AND that shows no output is the suspicious one.
         _se, inbound_readable = _submitted_epoch(ws)
         inbound_age = None if _se is None else int(time.time() - _se)
+        # The MESSAGE is surfaced for one reason: a RECENT-INBOUND suppression is otherwise
+        # INAUDITABLE. The prior fires when a lane was told something and has not answered, and a
+        # reader who cannot see WHAT it was told cannot tell "work just assigned, leave it alone"
+        # from "a question that went unanswered" -- opposite actions from the same verdict.
+        inbound_msg = _inbound_message(ws)
         # ── BOTH PRIORS ARE EVALUATED AGAINST THE CLASSIFIER'S OWN VERDICT ──────────
         # ⛔ NOT AGAINST EACH OTHER'S OUTPUT. Evaluating the second against the first's result is
         # what made the inbound prior DEAD CODE: `child_suppresses` rewrites `verdict` to
@@ -1358,6 +1396,7 @@ def main():
                 cur_size = s["size"]
         out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
                        inbound_age=inbound_age, inbound_readable=inbound_readable, cpu=_cpu,
+                       inbound_msg=inbound_msg,
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
@@ -1419,6 +1458,13 @@ def main():
                 bits += " ⚠️ past 20m harness bound"
             extra = f"{bits} :: {c['task'][:40]}" if c["task"] else bits
         _sa = r.get("inbound_age")
+        # ⛔ Show the inbound TEXT only where it explains something -- on a RECENT-INBOUND
+        # suppression. Everywhere else the age is enough, and a message on every line would bury
+        # the column that matters. `inbound=-` / `inbound=UNREAD` are left alone: there is no
+        # message to show and inventing a rendering for one would fake the absent signal.
+        if r["verdict"] == WAITING_INBOUND and r.get("inbound_msg") and _sa is not None:
+            extra = f"told {_sa//60}m{_sa%60:02d}s ago: {r['inbound_msg']}" if (_sa or 0) >= 60 \
+                else f"told {_sa}s ago: {r['inbound_msg']}"
         if not r.get("inbound_readable", False):
             _sub = "inbound=UNREAD"          # cmux itself could not be read
         elif _sa is None:
