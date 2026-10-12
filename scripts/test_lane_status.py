@@ -252,11 +252,39 @@ def test_an_unread_screen_is_unknown_never_a_confident_no_spinner(L):
 
 
 def test_classify_does_not_rule_out_a_tool_on_an_unread_screen(L):
-    """The long-tool gate must read `spinner is not False`, so UNKNOWN cannot exclude the tool."""
-    src = open(_PATH, encoding="utf-8").read()
-    assert "if not (child and child_evidence) and tool_inflight and spinner is not False:" in src, \
-        "an unread screen must not be treated as evidence of no spinner"
-    assert "spinner = None if not _sc.strip() else" in src, "the spinner must be tri-state"
+    """The long-tool gate must read `spinner is not False`, so UNKNOWN cannot exclude the tool.
+
+    ⛔ BEHAVIOURAL, NOT A SOURCE GREP. This asserted on the literal text of the guard, which pinned
+    the EXPRESSION rather than the rule: it went red when the guard was rewritten to stop gating on
+    child evidence (the fix for `Drain` reading CHILD-STUCK mid-`bash`), even though the rewritten
+    guard reads `spinner is not False` exactly as required. A source assertion cannot tell those two
+    apart; calling `classify()` can.
+    """
+    ti = {"name": "bash", "timeout": 1790, "age": 1415}
+    # an UNREAD screen (None) must not exclude a tool that is inside its own declared budget
+    assert L.classify(1507, False, None, "tool", None, None, None, None, ti) == L.LONG_TOOL
+    # a screen READ with no spinner is genuine evidence against an in-flight tool
+    assert L.classify(1507, False, False, "tool", None, None, None, None, ti) != L.LONG_TOOL
+
+
+def test_a_live_tool_outranks_a_days_old_abandoned_child_record(L):
+    """⛔ THE REGRESSION. Measured 2026-10-12 on `Drain (PR queue support)`: its pi held a live
+    `bash -> sleep 52` poll loop (0 CPU, no connection) while an abandoned `task` record from
+    3.9 days earlier sat in its session. The long-tool guard was gated on `child_has_evidence`,
+    which is true merely because the child has a transcript -- so the guard was skipped, `ti` was
+    left None, and the lane read CHILD-STUCK where the PRE-CHANGE instrument read LONG-TOOL.
+    A declared-budget tool in flight on the PARENT is the strongest explanation of the quiet, and
+    no record about a child may suppress it."""
+    child = {"call_id": "x", "age": 338417, "abandoned": True}
+    ti = {"name": "bash", "timeout": 1790, "age": 1415}
+    v = L.classify(1507, False, True, "tool", child, 334455, False, None, ti,
+                   has_sid=True)
+    assert v == L.LONG_TOOL, (
+        "a live tool call within its declared budget must read LONG-TOOL, not %s -- an abandoned "
+        "child record may not suppress the parent's own in-flight tool" % v)
+    # ...and the abandoned record is still answered when there is NO tool in flight.
+    v2 = L.classify(12007, False, True, "tool", child, 11438, False, None, None, has_sid=True)
+    assert v2 == L.CHILD_STUCK, "with no tool in flight the child record still decides: %s" % v2
 
 
 def test_unknown_reads_differently_from_a_read_with_no_spinner(L):
@@ -639,3 +667,60 @@ def test_a_degraded_roster_falls_back_to_the_file_and_only_the_file(L, tmp_path,
         rows = L.registry()
     assert [r[0] for r in rows] == ["Some lane"]
     assert "DEGRADED" in err.getvalue()
+
+
+def test_in_flight_tool_reads_the_parent_regardless_of_any_child_record(L, tmp_path):
+    """⛔ THE MISSING SEAM, AND WHY IT IS A SEAM RATHER THAN A TEST. A verifier's mutation round
+    found that main()'s `ti` construction had NO test protection: reverting it to the child-gated
+    form restored the `Drain` regression and the whole suite stayed green, because every other
+    `tool_inflight` assertion calls `classify()` directly with an explicit value and nothing drives
+    main(). Extracting `in_flight_tool(f)` makes the parent-only contract *structural* -- it has no
+    child parameter, so it cannot be made to depend on one -- and this drives it from a real session
+    file that contains BOTH a live in-flight tool call and an ancient abandoned `task` record.
+    """
+    import json as _json
+    import time as _time
+    now = _time.time()
+    iso = lambda t: _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime(t)) + ".000Z"
+    recs = [
+        # an abandoned `task` dispatch from 3.9 days ago, never matched -- the `Drain` shape
+        {"timestamp": iso(now - 338417), "cwd": "/tmp/x", "message": {
+            "role": "assistant", "content": [
+                {"type": "toolCall", "id": "old", "name": "task",
+                 "arguments": {"prompt": "review"}}]}},
+        # ...and the PARENT's live, budgeted tool call, which is the thing that must be seen
+        {"timestamp": iso(now - 1415), "cwd": "/tmp/x", "message": {
+            "role": "assistant", "content": [
+                {"type": "toolCall", "id": "live", "name": "bash",
+                 "arguments": {"command": "while :; do sleep 52; done"}}]}},
+    ]
+    f = tmp_path / "s.jsonl"
+    f.write_text("\n".join(_json.dumps(r) for r in recs) + "\n")
+    ti = L.in_flight_tool(str(f))
+    assert ti is not None, "the parent's in-flight tool must be read from the session"
+    assert ti["name"] == "bash" and ti["timeout"] is None
+    assert 1400 < ti["age"] < 1440, ti
+    assert L.in_flight_tool(None) is None and L.in_flight_tool("/nope/missing.jsonl") is None
+
+
+def test_in_flight_tool_cannot_be_made_to_depend_on_a_child(L):
+    """The structural pin: a function with no child parameter cannot suppress on child evidence."""
+    import inspect
+    params = list(inspect.signature(L.in_flight_tool).parameters)
+    assert params == ["f"], (
+        "in_flight_tool must take only the session path -- a `child` parameter is how the parent's "
+        "own in-flight tool got suppressed, and the signature makes that unreachable (got %r)" % params)
+
+
+def test_main_reads_its_in_flight_tool_through_that_seam(L):
+    """⛔ WIRING PIN, DELIBERATELY A SOURCE ASSERTION. The helper's contract is covered
+    behaviourally above, but main() is not drivable under test (it reads cmux, the registry and the
+    pane), so nothing else can see whether the CALL SITE re-adds a child condition. This pins exactly
+    that one line and nothing else; it is a statement about wiring, not about behaviour, and is
+    labelled as such rather than presented as coverage."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert "        ti = in_flight_tool(f)\n" in src, (
+        "main() must read the in-flight tool through `in_flight_tool(f)` -- gating it on `child` "
+        "again restores the Drain regression (CHILD-STUCK on a lane in a live poll loop)")
+    assert "in_flight_tool(f) if" not in src.replace("        ti = in_flight_tool(f)\n", ""), (
+        "the call site must not be conditional on anything")

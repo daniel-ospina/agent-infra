@@ -1011,6 +1011,29 @@ def last_tool_call(path):
     return dict(ts=ts, name=name, timeout=tmo)
 
 
+def in_flight_tool(f):
+    """The PARENT's newest in-flight tool call as {name, timeout, age}, or None.
+
+    ⛔ IT TAKES NO CHILD ARGUMENT, AND THAT IS THE POINT. The guard this feeds was once written
+    `if f and not (child and child_has_evidence(...))`, so a record about a CHILD could suppress a
+    fact about the PARENT -- and it did. MEASURED 2026-10-12, `Drain (PR queue support)`: its pi held
+    a live `bash -> sleep 52` poll loop (0 CPU, no established connection) while an abandoned `task`
+    record from 3.9 days earlier sat in its session (`child_stale` 334455s). `ti` was left None, the
+    long-tool guard could not fire, and the lane read CHILD-STUCK where the PRE-CHANGE instrument
+    read LONG-TOOL. A function that cannot see a child cannot be made to depend on one, so the
+    suppression is impossible by construction rather than merely commented against. `child_has_evidence`
+    still decides the child branch in `classify()` -- it was simply never the right question here.
+    """
+    if not f:
+        return None
+    tc = last_tool_call(f)
+    if not tc:
+        return None
+    e = ts_epoch(tc["ts"])
+    return dict(name=tc["name"], timeout=tc["timeout"],
+                age=int(time.time() - e) if e else None)
+
+
 def parent_cwd(path):
     """The cwd a session was started in — first record carries it."""
     try:
@@ -1262,6 +1285,16 @@ def child_has_evidence(child, child_stale, child_grew, child_activity_age):
     used by `classify()` AND by main's in-flight-tool guard: two inline copies is how the two
     drifted, and the drift is what let `Storage Archictecture` read CHILD-STUCK mid-`bash` on
     2026-10-12 (see the note in `classify`).
+
+    ⛔ BUT `child_stale is not None` IS THE WRONG QUESTION FOR THE LONG-TOOL GUARD, and gating that
+    guard on this helper is what kept a lane in a LIVE poll loop reading CHILD-STUCK. `child_stale`
+    is known whenever a transcript exists, so this returns True for a 72195s-stale record in the
+    very `Storage Archictecture` case cited above and for a 334455s (3.9-day) one on `Drain` -- the
+    guard below was therefore skipped exactly when it was needed, and `Drain`'s live
+    `bash -> sleep 52` (0 CPU, no connection) read CHILD-STUCK where the pre-change instrument
+    correctly read LONG-TOOL. Whether we hold a record ABOUT a child says nothing about whether the
+    PARENT has a tool in flight; those are two different facts and each guard must ask its own.
+    Measured after the fix, `Drain`: LONG-TOOL, matching the pre-change instrument.
     """
     return bool(child) and (
         child_stale is not None or child_grew
@@ -1324,7 +1357,13 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
     # evidence of NO spinner. `tool_inflight` is itself strong evidence of a direct tool call, so
     # when the screen is unread we cannot rule the long tool OUT -- and the safe direction is to
     # keep the lane out of WEDGED. Only a screen that was READ and carries no spinner excludes it.
-    if not (child and child_evidence) and tool_inflight and spinner is not False:
+    # ⛔ ASKS ONLY ABOUT THE PARENT. It used to read `not (child and child_evidence)`, which had the
+    # same defect as main's `ti` gate: `child_evidence` is true merely because the child has a
+    # transcript, so the guard was SKIPPED for the exact abandoned-record cases it was written for.
+    # A declared-budget tool in flight on the PARENT is the strongest available explanation of the
+    # quiet, and no record about a child may suppress it. Verified against the pre-change
+    # instrument on `Drain` (LONG-TOOL, not CHILD-STUCK).
+    if tool_inflight and spinner is not False:
         age = tool_inflight.get("age")
         tmo = tool_inflight.get("timeout")
         if age is not None and tmo and age < tmo:
@@ -1618,17 +1657,10 @@ def main():
             child_act = child_activity(child["cwd"])
 
         # a direct tool still in flight, with its own declared budget
-        # ⛔ `not (child and child_evidence)`, NOT `not child`: a record that knows nothing about its
-        # child must not suppress the parent's own in-flight tool call. Gated on `not child` alone,
-        # an evidence-free abandoned record left `ti` None, which is what removed the long-tool
-        # guard and left `Storage Archictecture` reading CHILD-STUCK mid-`bash` (2026-10-12).
-        ti = None
-        if f and not (child and child_has_evidence(child, child_stale, child_grew, child_act)):
-            tc = last_tool_call(f)
-            if tc:
-                e = ts_epoch(tc["ts"])
-                ti = dict(name=tc["name"], timeout=tc["timeout"],
-                          age=int(time.time() - e) if e else None)
+        # ⛔ THE PARENT'S OWN IN-FLIGHT TOOL, READ WITHOUT REFERENCE TO ANY CHILD -- see
+        # `in_flight_tool` for the measured regression this shape makes impossible. (`child_has_evidence`
+        # is still what decides the child branch in `classify()`.)
+        ti = in_flight_tool(f)
 
         _cpu = lane_cpu_busy(label, s["file"], _dir_lanes, _dir_pids, cpu0, cpu1)
         verdict = classify(stale, grew, spinner, last_kind, child, child_stale,
