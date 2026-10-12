@@ -724,3 +724,71 @@ def test_main_reads_its_in_flight_tool_through_that_seam(L):
         "again restores the Drain regression (CHILD-STUCK on a lane in a live poll loop)")
     assert "in_flight_tool(f) if" not in src.replace("        ti = in_flight_tool(f)\n", ""), (
         "the call site must not be conditional on anything")
+
+
+# ── a read our own teardown killed is NOT an unreadable roster ────────────────
+# ⛔ MEASURED 2026-10-12: all 23 `DEGRADED -- the cmux fleet roster was unreadable` lines in the
+# heartbeat log were immediately preceded by the tick being SIGTERM'd at its 390s bound. NONE was a
+# genuine read failure (cmux answered in 0.05-0.08s at load 69). The instrument was reporting a cause
+# it had never established -- blaming cmux for our own death.
+
+def test_a_signal_killed_child_is_reported_as_teardown_not_a_refusal(L):
+    """A child that died by SIGNAL is not a statement about what we were reading."""
+    out, ok = L.sh_rc(["/bin/bash", "-c", "kill -TERM $$"], timeout=20)
+    assert ok is False and out == ""
+    assert L.LAST_FAILURE["kind"] == "signal", L.LAST_FAILURE
+    assert L.LAST_FAILURE["rc"] == -15, L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is True
+
+
+def test_an_ordinary_nonzero_exit_is_still_a_refusal(L):
+    """The polarity must not swallow the real case: a refusal keeps its original wording."""
+    _out, ok = L.sh_rc(["/bin/bash", "-c", "exit 3"], timeout=20)
+    assert ok is False
+    assert L.LAST_FAILURE["kind"] == "nonzero" and L.LAST_FAILURE["rc"] == 3, L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is False
+
+
+def test_a_timeout_is_not_teardown(L):
+    _out, ok = L.sh_rc(["/bin/sleep", "5"], timeout=1, attempts=1)
+    assert ok is False
+    assert L.LAST_FAILURE["kind"] == "timeout", L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is False
+
+
+def test_a_successful_read_records_no_failure(L):
+    out, ok = L.sh_rc(["/bin/echo", "hello"], timeout=20)
+    assert ok is True and "hello" in out
+    assert L.LAST_FAILURE is None
+    assert L.last_failure_was_teardown() is False
+
+
+def _degraded_stderr(L, failure, monkeypatch):
+    """Drive `registry()` -- that is where the DEGRADED wording lives, NOT in `_live_workspaces()`.
+    Driving the wrong function made two assertions pass against a message that was never printed,
+    which is the same "pins the wrong artefact" trap these tests exist to avoid."""
+    import io as _io
+    import contextlib as _ctx
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: ("", False))
+    monkeypatch.setattr(L, "LAST_FAILURE", failure)
+    monkeypatch.setattr(L, "_LIVE_CACHE", [], raising=False)
+    monkeypatch.setattr(L, "LIVE_READABLE", None, raising=False)
+    err = _io.StringIO()
+    with _ctx.redirect_stderr(err):
+        L.registry()
+    out = err.getvalue()
+    assert "DEGRADED" in out, "registry() did not report the degraded read at all: %r" % out
+    return out
+
+
+def test_the_degraded_message_does_not_blame_cmux_when_we_were_killed(L, monkeypatch):
+    """The wording must follow the EVIDENCE. A teardown says so and explicitly disclaims cmux."""
+    msg = _degraded_stderr(L, dict(kind="signal", rc=-15, cmd="cmux", attempt=2), monkeypatch)
+    assert "KILLED BY A SIGNAL" in msg and "NOT a claim that cmux is down" in msg, msg
+    assert "unreadable after" not in msg, "a signal death must not be reported as a cmux refusal"
+
+
+def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypatch):
+    msg = _degraded_stderr(L, dict(kind="nonzero", rc=1, cmd="cmux", attempt=2), monkeypatch)
+    assert "unreadable after" in msg and "'nonzero'" in msg, msg
+    assert "KILLED BY A SIGNAL" not in msg

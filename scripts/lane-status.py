@@ -237,18 +237,44 @@ def sh_rc(cmd, timeout=60, attempts=RETRY_ATTEMPTS):
     identically: collapsing them is how a degraded read became a confident verdict (see
     `_live_workspaces` and `resolve_session`, both of which treated "we could not look" as
     "there is nothing there").
+
+    ⛔ AND WHY IT FAILED IS RECORDED, NOT FLATTENED INTO `ok=False`. `LAST_FAILURE` distinguishes
+    a read that was REFUSED from one our own teardown KILLED. Measured 2026-10-12: all 23
+    `DEGRADED -- the cmux fleet roster was unreadable` lines in the heartbeat log were immediately
+    preceded by the tick being SIGTERM'd at its 390s bound, and NONE was a genuine read failure --
+    cmux answered in 0.05-0.08s at load 69. The instrument was reporting a cause it had never
+    established, blaming cmux for our own death, which is how a watchdog teaches its operator to
+    ignore it. A signal-killed child is its own outcome.
     """
-    for i in range(max(1, attempts)):
+    global LAST_FAILURE
+    LAST_FAILURE = None
+    n = max(1, attempts)
+    for i in range(n):
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=timeout, env=CMUX)
             if p.returncode == 0:
                 return p.stdout or "", True
-        except Exception:
-            pass
-        if i + 1 < max(1, attempts):
+            kind = "signal" if p.returncode is not None and p.returncode < 0 else "nonzero"
+            LAST_FAILURE = dict(kind=kind, rc=p.returncode, cmd=cmd[0], attempt=i + 1)
+        except subprocess.TimeoutExpired:
+            LAST_FAILURE = dict(kind="timeout", rc=None, cmd=cmd[0], attempt=i + 1)
+        except Exception as e:
+            LAST_FAILURE = dict(kind="unrunnable", rc=None, cmd=cmd[0],
+                                attempt=i + 1, error=type(e).__name__)
+        if i + 1 < n:
             time.sleep(RETRY_BACKOFF_S * (i + 1))
     return "", False
+
+
+def last_failure_was_teardown():
+    """Whether the last failed read died by SIGNAL -- i.e. we were being torn down.
+
+    A signal-killed child is not a refusal by the thing we were reading, and must not be reported
+    as one (see `sh_rc`). Every other failure kind -- a non-zero exit, a timeout, an unrunnable
+    binary -- IS a statement about the read and keeps the original wording.
+    """
+    return bool(LAST_FAILURE) and LAST_FAILURE.get("kind") == "signal"
 
 
 def sh(cmd, timeout=60, attempts=RETRY_ATTEMPTS):
@@ -468,10 +494,22 @@ def registry():
         # `degraded` and `lane-actions.py` REFUSES such a snapshot, because it covers the file only
         # and every live-only lane is INVISIBLE in it.
         # stderr, so stdout stays a parseable fleet read for callers that inspect LIVE_READABLE.
-        sys.stderr.write(
-            "lane-status: DEGRADED -- the cmux fleet roster was unreadable after "
-            f"{RETRY_ATTEMPTS} attempts; this scan covers the hand-written TSV only, so every "
-            "live-only lane is INVISIBLE to it. Do NOT publish this as a fleet read.\n")
+        # ⛔ THE REASON IS REPORTED, NOT INVENTED. A read our own teardown killed is NOT an
+        # unreadable roster -- see `sh_rc`. Getting this wrong is how 23 consecutive log lines
+        # blamed cmux for a SIGTERM to the tick, and how an operator learns to ignore the alarm.
+        if last_failure_was_teardown():
+            sys.stderr.write(
+                "lane-status: DEGRADED -- the cmux fleet read was KILLED BY A SIGNAL "
+                f"(rc={LAST_FAILURE.get('rc')}), i.e. this process was being torn down (most likely "
+                "the heartbeat tick hitting its stall bound). This is NOT a claim that cmux is "
+                "down. The scan below covers the hand-written TSV only, so every live-only lane is "
+                "INVISIBLE in it -- do NOT publish it as a fleet read.\n")
+        else:
+            sys.stderr.write(
+                "lane-status: DEGRADED -- the cmux fleet roster was unreadable after "
+                f"{RETRY_ATTEMPTS} attempts ({LAST_FAILURE or 'no failure recorded'}); this scan "
+                "covers the hand-written TSV only, so every live-only lane is INVISIBLE to it. "
+                "Do NOT publish this as a fleet read.\n")
         return tsv
     return rows
 
@@ -501,6 +539,7 @@ _LIVE_CACHE = []
 # under `registry()` records the SAME failure on 2026-09-28 ("13 lanes the monitor could not
 # see"); a fallback indistinguishable from a healthy read is how it comes back, silently.
 LIVE_READABLE = None
+LAST_FAILURE = None
 
 
 def _live_workspaces():
