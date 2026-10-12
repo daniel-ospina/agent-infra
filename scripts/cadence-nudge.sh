@@ -70,7 +70,20 @@ now=$(date +%s)
 last=$(sed -n 's/.*NUDGE at=\([0-9][0-9]*\) delivered=yes.*/\1/p' "$LOG" 2>/dev/null | tail -1)
 # Fail LOUD on an unparseable timestamp rather than treating it as epoch 0: if the log format
 # changes, a silent 0 means "due" on EVERY pass and the floor turns into a flood.
-if ! printf '%s' "${last:-}" | grep -qE '^[0-9]{9,}$'; then
+#
+# ⛔ HERE-STRING, NOT A PIPE INTO `grep -q` -- because of a POLICY BAN, not because this call site
+# is broken. `scripts/check-no-sigpipe-grep.sh` (#841) bans the idiom outright, and it cannot do
+# otherwise: the SIGPIPE race needs ALL of `pipefail` active, a payload larger than the ~64 KiB pipe
+# buffer AFTER the match, and the match on an early line -- a property of the PAYLOAD, which the
+# guard cannot see. So the ban is unconditional and this site must comply.
+#
+# State the mechanism honestly for THIS site: `last` is captured digits-only from an anchored `sed`
+# (one line, ~10 bytes), far below the ~64 KiB window, so the race does NOT occur here today. The
+# old form would have been correct at runtime and is still refused. What the ban protects is the
+# FUTURE: the same idiom at a site whose payload does grow would silently invert a successful match
+# into "could not parse" and `exit 0` without sending. A here-string has no upstream writer, so its
+# status is grep's own at any payload size, which is why it is the sanctioned form.
+if ! grep -qE '^[0-9]{9,}$' <<<"${last:-}"; then
   printf '%s CADENCE-NUDGE: could not parse a previous NUDGE timestamp from %s -- not sending\n' \
     "$(date '+%m-%d %H:%M:%S')" "$LOG" >> "$LOG"
   exit 0
