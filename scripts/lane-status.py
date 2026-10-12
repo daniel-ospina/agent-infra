@@ -1327,11 +1327,18 @@ def main():
         # lane whose last inbound is hours old AND that shows no output is the suspicious one.
         _se, inbound_readable = _submitted_epoch(ws)
         inbound_age = None if _se is None else int(time.time() - _se)
-        if child_suppresses(verdict, declared, pane_kids, child, child_stale):
+        # ── BOTH PRIORS ARE EVALUATED AGAINST THE CLASSIFIER'S OWN VERDICT ──────────
+        # ⛔ NOT AGAINST EACH OTHER'S OUTPUT. Evaluating the second against the first's result is
+        # what made the inbound prior DEAD CODE: `child_suppresses` rewrites `verdict` to
+        # WAITING-CHILD, `WAITING-CHILD` is not in `INBOUND_DISCOUNTS`, and so the inbound check
+        # could never fire. MEASURED 2026-10-11: FOURTEEN live lanes carried a fresh inbound
+        # (<= INBOUND_LIVE_S) and ZERO produced RECENT-INBOUND. Each prior is a statement about the
+        # SAME original classification, so both read it; the child prior has precedence when both
+        # apply, because a live child is OUTPUT evidence while an inbound is only an INPUT event.
+        _base_verdict = verdict
+        if child_suppresses(_base_verdict, declared, pane_kids, child, child_stale):
             verdict = WAITING
-        # Discounts IDLE only -- never WEDGED / CHILD-STUCK / CHILD-OVERDUE (see the constant),
-        # and only while the lane has not written since it was told (see the function).
-        if inbound_discounts_idle(verdict, inbound_age, stale):
+        elif inbound_discounts_idle(_base_verdict, inbound_age, stale):
             verdict = WAITING_INBOUND        # `size` is the session file's CURRENT byte length, and it is the
         # fingerprint turn-end.py keys on: a lane that has taken a turn has a
         # bigger file; one that is sitting still has the same number. That is

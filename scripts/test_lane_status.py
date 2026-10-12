@@ -154,3 +154,20 @@ def test_the_discount_has_its_own_label_not_the_child_one(L):
     child-wait label — so a reader chasing an imaginary child could not see the lane was free."""
     assert L.WAITING_INBOUND != L.WAITING
     assert "CHILD" not in L.WAITING_INBOUND.upper()
+
+
+def test_the_inbound_prior_reads_the_base_verdict(L):
+    """⛔ THE TWO PRIORS MUST READ THE SAME ORIGINAL VERDICT.
+
+    `child_suppresses` REWRITES `verdict` to WAITING-CHILD, and WAITING-CHILD is not in
+    `INBOUND_DISCOUNTS` — so if the inbound prior reads the rewritten value it can NEVER fire, for
+    any lane that has a child. It is a latent dead-code bug that no behavioural test would catch
+    while every fresh-inbound lane also has a child (measured 2026-10-11: 14 lanes with a fresh
+    inbound, 0 RECENT-INBOUND). Hence a structural pin: both priors are fed `_base_verdict`, and the
+    second is an `elif`, so the child prior wins and exactly one label is produced.
+    """
+    src = open(_PATH, encoding="utf-8").read()
+    assert "_base_verdict = verdict" in src, "the base verdict is not captured before suppression"
+    assert "child_suppresses(_base_verdict" in src, "the child prior does not read the base verdict"
+    assert "inbound_discounts_idle(_base_verdict" in src, "the inbound prior does not read the base verdict"
+    assert "elif inbound_discounts_idle(_base_verdict" in src, "the priors must not both apply"
