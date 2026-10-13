@@ -33,6 +33,13 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
 # so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# A digit string is not enough for a TUNABLE: `[` errors at or above 2**63, and an errored test is
+# FALSE, which OPENS the very gate the value configures (MAX_LANES=99999999999999999999 passed the
+# class test, then `[ "$LANES" -ge "$MAX_LANES" ]` errored and the lane cap was gone). So the limits
+# carry a bound too -- but ONLY the limits: `is_num` must stay generous because it also validates an
+# epoch mtime, which is already 10 digits, and a tighter bound silently rejected every file as
+# un-stat-able (the reaper stopped reaping).
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 # Coerce HERE — immediately before the ONLY reads of _NCPU and MAX_LOAD, not in the input-validation
 # block 30 lines below. A guard placed THERE guarded nothing (#1702 review): MAX_LOAD is derived on
@@ -41,9 +48,14 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # MAX_LOAD gets the same coercion for the same reason every other threshold below does: it is
 # supplied by the launchd plist, and a typo there would open the load gate rather than close it
 # (`[ -ge ]` on a non-number is FALSE, and a false test in the gate chain ALLOWS dispatch).
-is_num "${_NCPU:-}"    || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"
-is_num "${MAX_LOAD:-}" || MAX_LOAD=$(( _NCPU * 10 ))
+#
+# It is `is_limit`, not `is_num`, because a non-number is only the FIRST way the gate opens: `[`
+# ERRORS at or above 2**63 ("integer expression expected"), so an absurd-but-numeric MAX_LOAD
+# slips past is_num and then aborts the gate chain — the same fail-open this block exists to
+# close. `_NCPU` keeps is_num: its source is `nproc` on this host, not the plist.
+is_num "${_NCPU:-}"      || _NCPU=4
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
@@ -72,8 +84,26 @@ safe_ref() {
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
-is_num "${MIN_SWAP_FREE:-600}"   || MIN_SWAP_FREE=600
-is_num "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
+is_limit "${MIN_SWAP_FREE:-600}"   || MIN_SWAP_FREE=600
+is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
+# The same rule applies to EVERY other plist-supplied limit, and these are the ones that fail in the
+# OPEN direction: MAX_LANES drops the lane cap (`[ "$LANES" -ge "$MAX_LANES" ]` errors to false, and
+# a false test ALLOWS dispatch), MERGE_PRIORITY_AT makes mp_reason() print nothing so the
+# drain-before-dispatch gate disappears entirely, BATCH never breaks the candidate loop
+# (`[ "$K" -ge "$BATCH" ]` errors to false) so ONE cycle dispatches and writes off the whole backlog,
+# and CYC makes `sleep` error so the controller spins with no delay. MAX_FIX_TRIES and MAX_REVIEW
+# fail OPEN too, which is worth spelling out because both LOOK like caps: `[ "$NFC" -ge "$MAX_FIX_TRIES" ]`
+# errors to false and control falls straight through to the SPAWN `elif`, so a cap of 3 let fixer
+# attempt 10 run; and `$((MAX_REVIEW + 2))` reads a leading-zero value as OCTAL (030 -> 26, not 30),
+# which is the same trap the scope decision already normalises with `10#` below. MAX_FIX is coerced
+# for the same reason. Each is first read below this point, so coercing here is still guard-before-use.
+is_limit "${MAX_LANES:-}"         || MAX_LANES=4
+is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
+is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=10
+is_limit "${MAX_FIX:-}"           || MAX_FIX=3
+is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
+is_limit "${BATCH:-}"             || BATCH=2
+is_limit "${CYC:-}"               || CYC=240
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -201,6 +231,11 @@ trap 'rm -f "$LOCKF"' EXIT
 # timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
 # keeps the pane alive, so the concurrency caps — which count SESSIONS — silently halve.
 STALE_MIN="${STALE_MIN:-40}"
+# §4 documents STALE_MIN and README tells a cell to set it through $ENV_FILE, so it is env-supplied
+# like the rest -- but its only read is the arithmetic just below and it had NO coercion, so
+# `STALE_MIN=abc` aborted the controller mid-cycle under `set -u` ("abc: unbound variable") instead
+# of degrading. Guard-before-use, same rule as every other limit.
+is_limit "${STALE_MIN:-}" || STALE_MIN=40
 
 # ── stale-worker reaper ───────────────────────────────────────────────────────
 # Kill a worker that has gone silent. It only ever touches tmux sessions, so it can never reach
@@ -217,7 +252,7 @@ reap_stale_workers() {
     # (#1702): set -u turned the unassigned `age` into `File: unbound variable`.
     m="$(file_mtime_epoch "$f")" || continue
     age=$(( $(date +%s) - m ))
-    [ "$age" -gt $((STALE_MIN * 60)) ] || continue
+    [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
     pid="$(tmux list-panes -t "=$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
     echo "[reap-worker] $s silent ${age}s -> killing session (pane_pid=${pid:-?})" >> "$LOG"
     # `=name` forces an EXACT session match. Without it tmux prefix-matches, so if this session
@@ -284,7 +319,7 @@ res_line() {
   echo "[res] cpu(${cpu:-?}) | mem(${pmem:-?}) | swap(${swapfree:-?}/${swaptotal:-?}) | disk(${dline:-?}) | procs=$procs runnable=$runnable | svc(${svcs:-?}) | gh_gql=${rate:-?}" >> "$LOG"
 }
 review_slots() { # <open_prs>
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $((MAX_REVIEW + 2)); else echo "$MAX_REVIEW"; fi
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $(( 10#${MAX_REVIEW:-4} + 2 )); else echo "$MAX_REVIEW"; fi
 }
 
 # Count of open PRs. This one number drives THREE decisions — scope (BROAD drain vs OWN), the

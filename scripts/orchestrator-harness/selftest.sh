@@ -625,6 +625,21 @@ case "$_da$_db" in
   *UNSET*) rcu=1; echo "      a limit resolves to UNSET -- no default was found in one of the files";;
 esac
 ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
+# ⛔ The agreement check above proves the two FILES agree; it cannot see both drifting TOGETHER, and
+# the non-vacuity rule only requires NOT-UNSET. Pin the documented value of each host-independent
+# limit (README §4's table). Mutation-verified: MIN_SWAP_FREE=0 in BOTH files left this whole section
+# green while the swap gate became `[ "$SWFREE" -le 0 ]`, which can never bind — the back-pressure
+# README §8 calls the box's real throttle, silently disabled. MAX_LOAD is excluded because its default
+# is the host's core count; §8's nlim driver covers it behaviourally.
+dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=10 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+got_lim=""
+for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+  got_lim="$got_lim $_k=$(dval "$_k")"
+done
+got_lim="${got_lim# }"
+[ "$got_lim" = "$expect_lim" ] && rcv=0 || { rcv=1; echo "      limits differ from the documented defaults:"; echo "        expected: $expect_lim"; echo "        got:      $got_lim"; }
+ck "every host-independent limit default matches README §4 (two files cannot drift together)" $rcv
 
 # ── 8) the dispatch gate consults load and names the binding gate ────────────────
 # MAX_LOAD was rendered into the plist and documented, but never compared to anything.
@@ -636,7 +651,8 @@ ck "dispatch skip message names the binding gate" $rc
 # Mutating MIN_MEM_FREE_MB's default to 0 in BOTH files (so §7's agreement check stays green) left
 # the entire suite green while the gate became `[ "$MEMAVAIL_MB" -le 0 ]`, which never binds.
 # Pin the documented default, then DRIVE the shipped gate chain to prove it is a comparison.
-mem_def="$(printf '%s\n' "$_db" | awk -F= '$1=="MIN_MEM_FREE_MB"{print $2}' | head -1)"
+mem_def="$(dval MIN_MEM_FREE_MB)"
+swp_def="$(dval MIN_SWAP_FREE)"
 [ "$mem_def" = "512" ] && rcd=0 || { rcd=1; echo "      MIN_MEM_FREE_MB resolves to '$mem_def' -- README documents 512"; }
 ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped files" $rcd
 GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
@@ -652,6 +668,23 @@ mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_
 ck "the memory gate FIRES below the ceiling and names it (mem_avail<=min_mem_free_mb)" $rcw
 [ -z "$(mrw 1 0 0 9999 0 9999 100 4 600 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the memory gate does NOT fire when available memory is above the ceiling" $rcw
+# ⛔ The swap gate is the other half of "the binding gates in practice", and it was UNTESTED: §7's
+# default-agreement check only requires a limit to be NOT-UNSET, so setting MIN_SWAP_FREE to 0 in
+# BOTH files left the suite at 284/0 while the gate became `[ "$SWFREE" -le 0 ]`, which can never
+# bind. Both fixtures above pass SWTOTAL=0, which short-circuits the gate's own `[ "$SWTOTAL" -ne 0 ]`
+# guard BEFORE the comparison is reached -- so the gate was never driven at all. Drive it with real
+# swap, in both directions.
+[ "$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")'"; }
+ck "the swap gate FIRES below the ceiling and names it (swap_free<=min_swap_free)" $rcw
+[ -z "$(mrw 1 0 2048 2000 0 9999 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || rcw=1
+ck "the swap gate does NOT fire when free swap is above the ceiling" $rcw
+# ⛔ And with a NON-DEFAULT ceiling: the two cases above pass `$swp_def`, so they prove the gate fires
+# at whatever the default is -- a regression that HARDCODED 600 into the comparison (leaving the
+# plist's MIN_SWAP_FREE inert) stayed green. A ceiling the default cannot be pins the wiring itself.
+[ "$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")'"; }
+ck "the swap gate honours a NON-DEFAULT MIN_SWAP_FREE (the ceiling is read, not hardcoded)" $rcw
+[ -z "$(mrw 1 0 2048 750 0 9999 100 4 700 "$mem_def")" ] && rcw=0 || rcw=1
+ck "the swap gate stays shut just above a non-default ceiling" $rcw
 grep -q 'merge-priority' "$LOOP" && rc=0 || rc=1
 ck "the loop implements merge-priority above the backlog threshold" $rc
 grep -q '= "CONFLICTING"' "$LOOP" && rc=0 || rc=1
@@ -1891,8 +1924,133 @@ _ncpu_guard_line="$(grep -n 'is_num "${_NCPU:-}"' "$LOOP" | head -1 | cut -d: -f
 _maxload_line="$(grep -n '^MAX_LOAD="' "$LOOP" | head -1 | cut -d: -f1)"
 [ -n "$_ncpu_guard_line" ] && [ -n "$_maxload_line" ] && [ "$_ncpu_guard_line" -lt "$_maxload_line" ] && rc=0 || rc=1
 ck "orch-loop.sh coerces _NCPU BEFORE MAX_LOAD reads it (guard is not guard-after-use)" $rc
-grep -q 'is_num "${MAX_LOAD:-}"' "$LOOP" && rc=0 || rc=1
+grep -q 'is_limit "${MAX_LOAD:-}"' "$LOOP" && rc=0 || rc=1
 ck "orch-loop.sh coerces a non-numeric MAX_LOAD instead of letting the load gate fail OPEN" $rc
+# ⛔ Behaviour, not source text. The grep above restates the implementation line, and every other
+# fixture in this file sets MAX_LOAD to a valid integer, so nothing ever DROVE the coercion. Extract
+# the shipped coercion lines and run them, the way the memory and swap gates are driven above.
+NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; } )"
+# ⛔ Non-vacuity: NGRD ALWAYS contains the is_num() definition, so `[ -n "$NGRD" ]` passes with zero
+# coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
+# and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
+_ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
+[ "$_ngrd_n" = "12" ] && rcn=0 || { rcn=1; echo "      expected 12 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 12 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# <MAX_LOAD> <MAX_LANES> <MERGE_PRIORITY_AT> <BATCH>, with MAX_REVIEW/MAX_FIX/MAX_FIX_TRIES/STALE_MIN
+# unset and CYC non-numeric -> the values the shipped coercion leaves behind
+# ⛔ HERMETIC: every variable the coercion block touches is set explicitly. Leaving them unset is not
+# enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
+# and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
+nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; CYC=abc; STALE_MIN=
+           eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
+[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
+ck "numeric plist limits survive the coercion unchanged" $rc
+# ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
+# prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
+# read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
+# Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
+# ⛔ MAX_LOAD's DEFAULT -- not its coercion -- decides the value when the plist does not set one, and
+# every other fixture passes MAX_LOAD explicitly, so `_NCPU * 10` -> `_NCPU * 5` in BOTH files stayed
+# green. Pin the FORMULA, which is host-independent even though its evaluation is not.
+# ⛔ rc=0 first: this loop only ever ASSIGNS 1, so without the reset a stale rc from an earlier check
+# makes it a false red -- the very "rc set but not asserted" defect this file warns about.
+rc=0
+for _f in "$LOOP" "$INST"; do
+  grep -qF 'MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"' "$_f" || { rc=1; echo "      $_f does not default MAX_LOAD to cores*10"; }
+done
+ck "both files default MAX_LOAD to the cores*10 formula (it cannot drift in both together)" $rc
+# ⛔ The leading-zero trap, again: MERGE_PRIORITY_AT is normalised with `10#` for the scope decision
+# but review_slots read MAX_REVIEW through $(( )) -- `030` returned 26, not 30.
+grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
+ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
+grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
+ck "the reaper reads STALE_MIN in base 10" $rc
+# ── install.sh's render guards, DRIVEN (not grepped) ─────────────────────────────
+# Source-text pins are exactly what this file was told to stop doing: `if false && grep …` leaves the
+# text intact and the guard dead. So RUN the real installer. This is §6's sandbox pattern, seeded with
+# an existing plist -- the upgrade path is a re-install over a live config, which is the one a
+# non-atomic render destroys.
+mk_sb() { local d; d="$(mktemp -d "$TMP/sbx.XXXXXX")"
+  mkdir -p "$d/Library/LaunchAgents" "$d/.config" "$d/.pi/agent/scripts" "$d/.local/share/pi-node/current/bin"
+  ln -s "$HOME/.config/gh" "$d/.config/gh" 2>/dev/null || true
+  [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$d/.pi/agent/scripts/record-review.sh"
+  printf '#!/bin/bash\nexit 0\n' > "$d/.local/share/pi-node/current/bin/pi"; chmod +x "$d/.local/share/pi-node/current/bin/pi"
+  printf 'SEED\n' > "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  printf '%s' "$d"; }
+run_inst_at() { # <installer> <sandbox> [VAR=VAL…] -> "<rc>|<live-plist first line>|<stderr tail>"
+  local i="$1" d="$2"; shift 2
+  env HOME="$d" O="$TMP/glt-o" REPO="$HERE/../.." OR="acme/widget" "$@" bash "$i" >"$d/out" 2>&1
+  printf '%s|%s|%s' "$?" "$(head -1 "$d/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" 2>/dev/null)" "$(tail -1 "$d/out")"; }
+run_inst() { run_inst_at "$INST" "$@"; }
+# Fields are "<rc>|<live-plist-first-line>|<stderr tail>" -- slice by FIELD, not by ${out#*|}.
+inst_rc()  { printf '%s' "$1" | cut -d'|' -f1; }
+inst_pl()  { printf '%s' "$1" | cut -d'|' -f2; }
+# A FRESH sandbox per case: a rejected install is not supposed to touch the live plist, but if one
+# case (correctly) succeeds it would replace the seed and make every later case meaningless.
+out="$(run_inst "$(mk_sb)" MAX_LANES=4x)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      MAX_LANES=4x -> '$out'"; }
+ck "install.sh refuses a non-integer limit AND leaves the live plist untouched" $rc
+out="$(run_inst "$(mk_sb)" MAX_LANES=99999999999999999999)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      huge MAX_LANES -> '$out'"; }
+ck "install.sh refuses an out-of-range limit (>=2**63, where [ errors and the gate fails OPEN)" $rc
+out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
+ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
+SBT="$(mk_sb)"; run_inst "$SBT" MAX_LANES=4x >/dev/null
+ls "$SBT/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+ck "a rejected render leaves no temp plist behind (the render is not atomic by accident)" $rc
+# ⛔ The cases above fail BEFORE the render or AFTER it completes, so neither drives the window
+# BETWEEN `RENDER=` and the `mv`. The render runs under `set -euo pipefail`, so a template read that
+# fails aborts THERE, orphaning `*.plist.new.<pid>` in LaunchAgents with nothing to prune it
+# (README §7.5 tracks exactly this unbounded growth). Make the template unreadable in a COPY so sed
+# cannot open its input, and assert the sandbox holds ONLY the seed afterwards -- the `trap ... EXIT`
+# is what makes this pass, so deleting it turns this red.
+HDR="$TMP/hdr"; rm -rf "$HDR"; mkdir -p "$HDR"; cp "$HERE"/*.sh "$HERE/launchd.plist.template" "$HDR/" 2>/dev/null
+chmod 000 "$HDR/launchd.plist.template"
+SBR="$(mk_sb)"; out="$(run_inst_at "$HDR/install.sh" "$SBR")"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      unreadable template -> '$out'"; }
+ck "a render that cannot read its template fails instead of installing a truncated plist" $rc
+# ⛔ NON-VACUITY, and it is not hypothetical: run this suite from a directory that is NOT a git
+# checkout (a plain `cp` of the harness, say) and install.sh dies at its "not a git checkout" guard
+# BEFORE the render -- leaving no orphan, so the pin below would pass while testing nothing.
+#
+# ⛔ Naming the template is NOT a sufficient proxy for "reached the render": install.sh's
+# `[ -f "$TEMPLATE" ] || die "missing template: $TEMPLATE"` runs BEFORE `RENDER=` and names the
+# template too. So if the `cp` above fails for the TEMPLATE only (its stderr is swallowed by
+# `2>/dev/null`), the run dies at that guard and a name-matching check would call it "reached the
+# render" -- three greens with the render never entered, which is the vacuity this is meant to
+# forbid. Assert the FIXTURE, then require the RENDER-side failure specifically.
+[ -f "$HDR/launchd.plist.template" ] && [ ! -r "$HDR/launchd.plist.template" ] && rc=0 || { rc=1; echo "      fixture precondition failed: the template copy is absent or still readable"; }
+ck "the unreadable-template fixture is in place (a swallowed cp must be loud, not silent)" $rc
+# ⛔ A here-string, not a pipe: `printf … | grep -q` lets grep exit at its first match while the
+# writer is still pushing, so the writer takes SIGPIPE and `pipefail` reports 141 — the false
+# negative this repo bans (`scripts/check-no-sigpipe-grep.sh`, #841).
+grep -q 'Permission denied' <<<"$out" && rc=0 || { rc=1; echo "      the run did not fail AT THE RENDER: '$out'"; }
+ck "the unreadable-template case failed at the render, not at an earlier guard that also names it" $rc
+ls "$SBR/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+ck "a render that ABORTS mid-flight leaves no orphan temp plist (the path rm -f alone misses)" $rc
+chmod 644 "$HDR/launchd.plist.template"
+# ⛔ ATOMICITY ITSELF is untested by the three cases above: they all fail BEFORE the render, so a
+# render that wrote straight into the live plist would blindside only one that failed AFTER it. Force
+# that path with a template token that has no substitution rule, in a COPY of the harness.
+HD="$TMP/hd"; mkdir -p "$HD"; cp "$HERE"/*.sh "$HERE/launchd.plist.template" "$HD/" 2>/dev/null
+printf '\n\t<key>__NORULE__</key>\n\t<string>x</string>\n' >> "$HD/launchd.plist.template"
+out="$(run_inst_at "$HD/install.sh" "$(mk_sb)")"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      post-render rejection -> '$out'"; }
+ck "a POST-render rejection leaves the live plist intact (the render is atomic)" $rc
+SBG="$(mk_sb)"; out="$(run_inst "$SBG")"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      a clean render failed: '$out'"; }
+ck "install.sh still installs the happy path (the new guards do not refuse a legal config)" $rc
+SBPL="$SBG/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
+ck "no unrendered token survives a successful render (driven through the real installer)" $rc
+plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
+ck "the freshly rendered plist is valid XML" $rc
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
