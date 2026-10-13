@@ -335,9 +335,10 @@ print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pe
             fi
           fi
         elif grep -qE 'docs|test-isolation|license-surface|legal-e2e|pricing-artifact' <<<"$V"; then
-          # A required check OTHER than the review gate or python CI is red — docs lint, a committed
-          # conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran those, so such a
-          # PR sat red forever with no worker at all (observed: #8278 had conflict markers committed,
+          # A required check OTHER than the review gate or python CI is red — docs lint, a
+          # committed conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran
+          # those, so such a PR sat red forever with no worker at all (observed: #8278 carried two
+          # docs-lint findings — MD056, an unescaped '|' in a table row, and MD046, fence style;
           # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
           # which now also receives the failing CI log, capped like every other fix loop.
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"

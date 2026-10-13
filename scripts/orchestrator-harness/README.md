@@ -25,12 +25,13 @@ doc_status: draft
 >
 > **Where it lives now.** `agent-infra/scripts/orchestrator-harness/` (relocation:
 > agent-infra#1700). The home is agent-infra because this is fleet/agent operations, not
-> tortoise product code — the merge rail it drives (`admin-merge.sh`) is already in
-> `agent-infra/scripts/`, alongside `atomic-land.sh`, `cadence-nudge.sh`, and the
-> `checkout-hygiene/`, `heartbeats/`, `ci/` tool subdirectories. The old tortoise path
+> tortoise product code — the merge rail it sits alongside (`admin-merge.sh`, `atomic-land.sh`)
+> and the fleet scripts it is launched by (`cadence-nudge.sh`, `ci_runner_gate.sh`,
+> `cloud-cell-supervisor.sh`) are already in `agent-infra/scripts/`, as are the multi-file tool
+> subdirectories `checkout-hygiene/`, `ci/` and `gh-shim/`. The old tortoise path
 > (`operations/orchestrator-harness/`) is replaced by a stub pointer to this home in a follow-up
-> tortoise PR that opens only after this one merges (tortoise#8432) — until then it is a stale
-> duplicate; do not run it.
+> tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
+> issue); until that PR lands the old path is a stale duplicate, so do not run it.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -429,7 +430,8 @@ records which are live and which are retired.
 ### 7.4 Defects found in the first review of this artifact (all fixed here)
 
 These are kept as a record because each one is a *failure mode of the design*, not a typo, and
-because the self-test now drives every one of them:
+because the self-test now drives every one of the shipped-script failure modes
+(`retired/` fixes are annotated in place and only parsed — the retired tree is dead code):
 
 | Defect | Impact | Fix |
 |---|---|---|
@@ -473,6 +475,15 @@ because the self-test now drives every one of them:
 - **The fixer's CI-log fetch (agent-infra#1703).** `fix-one.sh` reads the workflow run's
   `--log-failed | tail -80` rather than the failed *job's* log, so a multi-failed-job run can feed
   the fixer the wrong check's output. Raised as a P1 in the tortoise#8298 review and never applied.
+- **The runner-label gate reports success on values it never read (agent-infra#1704).** In
+  `ci_runner_gate.sh`, an unreadable queue count falls through to "healthy" (the integer test
+  errors and the `||` chain reads that as false) and `set_labels()` reports success when the runner
+  enumeration fails (the loop runs zero times and `[ "$fail" -eq 0 ]` succeeds). Both are false
+  PASSes on a gate that changes runner labels.
+- **The reaper fails open when the PR listing fails (agent-infra#1705).** `refresh-candidates.sh`
+  writes an empty `.pr_brs` on a failed listing, so `has_pr` is false for every issue and PR-bearing
+  issues are un-blacklisted and re-dispatched. Same class as the `open_pr_count()` fail-closed fix
+  in §7.4, in a file that fix did not reach.
 
 ---
 

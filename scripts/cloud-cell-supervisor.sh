@@ -46,6 +46,11 @@ die() { say "FATAL: $*" >&2; exit 1; }
 export HOME="$CELL_HOME"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 
+# SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
+# validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
+# would coerce a blank keys.env entry to auto and evaporate the pin this override exists for.
+[ -z "${SCOPE+x}" ] && SCOPE=auto
+
 # ── check: can this cell actually run a controller? ─────────────────────────────
 cmd_check() {
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
@@ -64,7 +69,7 @@ cmd_check() {
   for w in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
-  [ -z "$missing" ] || die "worker scripts missing from \$O:$missing — run 'start' (it seeds \$O) or: cp '$HARNESS'/*.sh '$O'/"
+  [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
 
   if [ -n "${AI_REVIEW_GATE_KEY:-}" ] || [ -s "$HOME/.pi/agent/.ai-review-gate-key" ]; then
     say "ok: merge authority key present"
@@ -86,25 +91,35 @@ cmd_check() {
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
-  # Seed the running copy first. orch-loop.sh spawns its workers from $O, not from $HARNESS, so a
-  # cell whose $O is empty runs the inline sweep but can never review, fix or dispatch. Idempotent;
-  # mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
-  mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
-  cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
-  cmd_check >/dev/null || exit 1
+  # Refuse a bad SCOPE before anything starts or is written: a typo, or a set-but-BLANK keys.env
+  # entry, must not silently become `auto` (the default above applies only when SCOPE is UNSET).
+  case "$SCOPE" in
+    auto|own|broad) ;;
+    *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
+  esac
+  # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
+  # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
     return 0
   fi
+  # Seed the running copy: orch-loop.sh spawns its workers from $O, not from $HARNESS, so a
+  # cell whose $O is empty runs the inline sweep but can never review, fix or dispatch.
+  # Idempotent; mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
+  mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
+  cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
+  cmd_check >/dev/null || exit 1
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.
-  # SCOPE must be forwarded EXPLICITLY: a tmux server that already exists (normal after `stop`,
-  # or while lanes run) serves a new session from ITS OWN environment, so an exported SCOPE is
-  # silently dropped and the cell falls back to `auto` — the shared-queue drain the pin exists to
-  # prevent. (Measured: `SCOPE=own tmux new-session …` against a live server sees an empty SCOPE.)
+  # ⛔ The tmux SERVER supplies a new session's environment, not this shell: once a server exists
+  # (normal after `stop`, or while lanes run) an exported HOME/key/tunable is silently dropped —
+  # measured for SCOPE, and the same mechanism applies to every other variable (a rotated
+  # key in $ENV_FILE would be ignored, and a pinned MAX_LANES would revert to its default). So the
+  # session re-sources $ENV_FILE itself and the values below are set inside the session, AFTER it.
+  # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='${SCOPE:-auto}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -125,7 +140,7 @@ cmd_status() {
   say "state dir: $O"
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-' || echo 0)"
+  say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
 }
 
 cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at $O/logs/orch-loop.log"; }

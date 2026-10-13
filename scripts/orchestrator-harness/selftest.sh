@@ -154,10 +154,16 @@ PY
   ck "shipped refresh loop: the pre-flighted CLEAN candidates reach the backlog" $rc
 fi
 
-# ── 6) install.sh renders correctly, including values sed would mangle ───────────
-# Runs the real installer with a hostile $O containing '&' (in sed, & expands to the matched
-# text, so `O=/tmp/a&b` used to render the path as /tmp/a__O__b — a VALID plist pointing at
-# the wrong paths, which plutil -lint cannot catch).
+# ── 6) install.sh renders correctly, including values sed/XML would mangle ────────
+# Runs the real installer with a hostile-but-LEGAL $O. "Legal" matters: install.sh now applies
+# orch-loop.sh's own $O guard, so a quote or shell metacharacter (`&`, `'`, space, …) is refused
+# at install time — which is the point, since such a value would crash-loop the daemon under
+# KeepAlive. What remains reachable, and is tested here, is XML metacharacter escaping (`<`, `>`,
+# a bare one of which makes the plist invalid XML and launchd silently refuses to load it) plus the
+# round-trip decode below. (Historical: an unescaped `&` in the sed REPLACEMENT expanded to the
+# matched text, rendering `O=/tmp/a&b` as /tmp/a__O__b — a VALID plist pointing at the wrong paths,
+# which plutil -lint cannot catch. That path is now unreachable by construction and the guard is
+# asserted in 16d.)
 SB="$TMP/sb"; mkdir -p "$SB/Library/LaunchAgents" "$SB/.config" "$SB/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB/.pi/agent/scripts/record-review.sh"
@@ -165,7 +171,7 @@ ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 # EXECUTES pi — so a sandbox HOME must expose a runnable pi, exactly as a real install's HOME does.
 mkdir -p "$SB/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmod +x "$SB/.local/share/pi-node/current/bin/pi"
-HOSTILE="$TMP/x&y"
+HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL" ] && rc=0 || { rc=1; echo "      install.sh did not render a plist: $(tail -3 "$TMP/inst.out")"; }
@@ -173,10 +179,10 @@ ck "install.sh renders a plist" $rc
 if [ -f "$PL" ]; then
   grep -q '__[A-Z_]*__' "$PL" && rc=1 || rc=0
   ck "no unsubstituted placeholder survives rendering" $rc
-  # The value must appear XML-escaped (a bare & is illegal XML); correctness is then proven by
-  # the round-trip check below, which decodes it back and compares.
-  grep -qF 'x&amp;y' "$PL" && rc=0 || { rc=1; echo "      expected XML-escaped '&' in the plist"; }
-  ck "a '&' in a path is XML-escaped in the plist" $rc
+  # The value must appear XML-escaped (a bare < or > is illegal XML); correctness is then proven
+  # by the round-trip check below, which decodes it back and compares.
+  grep -qF 'x&lt;y&gt;z' "$PL" && rc=0 || { rc=1; echo "      expected XML-escaped '<' '>' in the plist"; }
+  ck "a '<'/'>' in a path is XML-escaped in the plist" $rc
   plutil -lint "$PL" >/dev/null 2>&1 && rc=0 || rc=1
   ck "the rendered plist is valid XML" $rc
   # Round-trip: XML-escaping must decode back to the original path, not merely be well-formed.
@@ -635,6 +641,100 @@ ck "install.sh renders SCOPE into the plist" $rc
 ck "install.sh refuses an invalid SCOPE" $rc
 grep -qF 'SCOPE must be auto|own|broad' "$TMP/inst.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.err")"; }
 ck "install.sh names the accepted SCOPE values" $rc
+
+# The rendered VALUE, not just the placeholder. A render that ignores $SCOPE entirely (e.g. a
+# hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
+# both greps above stay green while the pin silently evaporates at install time. Assert the value
+# that actually lands in the plist, through the real installer.
+PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+render_scope() {   # $1 = a value, or the literal __UNSET__
+  if [ "$1" = "__UNSET__" ]; then
+    HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" env -u SCOPE bash "$INST" >/dev/null 2>&1
+  else
+    HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" SCOPE="$1" bash "$INST" >/dev/null 2>&1
+  fi
+  plutil -extract EnvironmentVariables.SCOPE raw "$PL2" 2>/dev/null || echo MISSING
+}
+for want in own broad; do
+  got="$(render_scope "$want")"
+  [ "$got" = "$want" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted '$want'"; }
+  ck "the plist renders SCOPE=$want, not a hardcoded default" $rc
+done
+got="$(render_scope __UNSET__)"
+[ "$got" = "auto" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted 'auto'"; }
+ck "an UNSET SCOPE renders the auto default" $rc
+
+# set-but-EMPTY is FATAL on BOTH launchers — a blank plist / keys.env entry must not become `auto`,
+# which is the shared-queue drain the override exists to prevent. install.sh:
+( SCOPE= HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.empty.err" ); rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted a set-but-empty SCOPE"; }
+ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
+# ... and the cell supervisor, which forwards it into the tmux session's command string:
+( SCOPE= HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      the cell supervisor accepted a set-but-empty SCOPE"; }
+ck "the cell supervisor refuses a set-but-empty SCOPE" $rc
+grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 || rc=1
+ck "the cell supervisor names the accepted SCOPE values" $rc
+
+# install.sh must refuse the SAME $O its controller refuses: a plist that renders here but is
+# rejected there is worse than a refusal — RunAtLoad+KeepAlive relaunches a guaranteed-fatal
+# controller forever. Both halves are asserted, so the two guards cannot drift apart silently.
+( O="$TMP/o space" bash "$HERE/orch-loop.sh" >/dev/null 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      orch-loop.sh accepted an \$O containing a space"; }
+ck "orch-loop.sh refuses an \$O containing a space" $rc
+( HOME="$SB" O="$TMP/o space" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.o.err" ); rc=$?
+[ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.o.err" && rc=0 || { rc=1; echo "      install.sh accepted it: $(tail -2 "$TMP/inst.o.err")"; }
+ck "install.sh refuses the same \$O orch-loop.sh refuses" $rc
+
+# --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
+# a misbehaving daemon is exactly who must not be stopped by it.
+( HOME="$SB" SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh --uninstall was blocked by SCOPE=banana"; }
+ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
+
+# ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
+# A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
+# the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
+# documentation, not a setting. Drive the shipped cmd_start with a tmux stub that records the
+# command it is handed (this is the only place the forwarding can be observed).
+TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
+cp "$HERE"/*.sh "$TMP/tm/harness/"
+cat > "$TM/tmux" <<'STUB'
+#!/bin/bash
+case "$1" in
+  has-session) [ -f "$TM_STATE/up" ] && exit 0 || exit 1 ;;
+  new-session) shift; printf '%s\n' "$*" > "$TM_STATE/cmd"; : > "$TM_STATE/up"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+printf '#!/bin/bash\nexit 0\n' > "$TM/gh"
+chmod +x "$TM/tmux" "$TM/gh"
+sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
+  rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+  if [ "$1" = "__UNSET__" ]; then
+    env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+      bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
+  else
+    PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE="$1" \
+      bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
+  fi
+}
+for want in own broad; do
+  sup_start "$want"
+  grep -qF "SCOPE='$want'" "$TMP/tm/cmd" 2>/dev/null && rc=0 || { rc=1; echo "      forwarded: $(cat "$TMP/tm/cmd" 2>/dev/null)"; }
+  ck "the cell supervisor inlines SCOPE=$want into the session command" $rc
+done
+# UNSET must reach the controller as the auto default being absent-or-auto — but a typo/blank must
+# die BEFORE a session is created (nothing started, no tmux command recorded).
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
+ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

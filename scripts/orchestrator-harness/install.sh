@@ -27,8 +27,11 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
-# A fleet runs exactly ONE broad box; the rest pin own. Validated below.
-SCOPE="${SCOPE:-auto}"
+# A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the --uninstall
+# branch (uninstall does not render, and must never be blocked by a config typo).
+# ⛔ Presence, not emptiness: `${SCOPE:-auto}` would coerce a set-but-BLANK value to auto and
+# silently evaporate the pin — the exact failure the whole SCOPE override exists to prevent.
+[ -z "${SCOPE+x}" ] && SCOPE=auto
 
 LABEL="com.eldato.orchestrator-loop"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -38,14 +41,6 @@ die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
 
-# SCOPE is operator config: orch-loop.sh treats anything but auto|own|broad (or unset) as FATAL,
-# so a typo rendered into the plist would produce a daemon that dies on its first cycle. Refuse it
-# at install time, where the operator can still see it.
-case "$SCOPE" in
-  auto|own|broad) ;;
-  *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
-esac
-
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--uninstall" ]; then
   launchctl unload -w "$PLIST" 2>/dev/null || true
@@ -54,6 +49,22 @@ if [ "${1:-}" = "--uninstall" ]; then
   echo "   State and logs left intact: $O/{logs,state,wip}"
   exit 0
 fi
+
+# SCOPE is operator config: orch-loop.sh treats anything but auto|own|broad (or UNSET) as FATAL,
+# and set-but-empty is fatal too. Refuse it at install time, where the operator can still see it,
+# so a typo cannot be rendered into a plist that dies on its first cycle.
+case "$SCOPE" in
+  auto|own|broad) ;;
+  *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
+esac
+
+# $O must satisfy the SAME guard orch-loop.sh applies: it rejects a quote or shell metacharacter,
+# because $O is interpolated into every lane's command string. A path that renders here but is
+# refused there is worse than a refusal — with RunAtLoad+KeepAlive the daemon relaunches a
+# guaranteed-fatal controller forever. Refuse at install time, where the operator can see it.
+case "$O" in
+  *"'"*|*'"'*|*'`'*|*'$'*|*';'*|*'|'*|*'&'*|*' '*) die "\$O must not contain a quote or shell metacharacter: $O" ;;
+esac
 
 # ── platform ─────────────────────────────────────────────────────────────────────
 echo "==> preflight"
@@ -229,6 +240,7 @@ ok "state dir $O"
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
+mkdir -p "$(dirname "$PLIST")" || die "cannot create $(dirname "$PLIST") — is HOME=$HOME correct?"
 # Two independent levels of escaping are required, and they fail differently:
 #  1. XML — a bare & < > makes the plist invalid XML and launchd will not load it. (plutil -lint
 #     catches this, so it fails loudly rather than silently.)
