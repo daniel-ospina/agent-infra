@@ -751,6 +751,13 @@ ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INS
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'gate key file present'*) rc=0 ;; *) rc=1; echo "      install.sh did not report a non-empty key file" ;; esac
 ck "install.sh reports a NON-EMPTY key file present (non-vacuity)" $rc
+# The consumer strips whitespace, so a 1-byte newline (what `echo "$KEY" > file` writes for an unset
+# variable) is NOT a key — size alone must not bless it.
+printf '\n' > "$SB/.pi/agent/.ai-review-gate-key"
+ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
+rm -f "$SB/.pi/agent/.ai-review-gate-key"
+case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed a whitespace-only key file" ;; *) rc=0 ;; esac
+ck "install.sh does not bless a WHITESPACE-ONLY key file" $rc
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
@@ -882,6 +889,20 @@ serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$K
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr" in *'will NOT receive it'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
+# ... and the OTHER branch: an empty keys.env with NO ambient key must also reach start's stderr
+# (filtering on just the two easy-to-grep verdicts left this one silent).
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
+case "$serr2" in *'AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr2" | tail -2)" ;; esac
+ck "the start path surfaces the no-key verdict on stderr" $rc
+# A whitespace-only key FILE is not a key either (the consumer strips whitespace).
+mkdir -p "$KC/home/.pi/agent"; printf '\n' > "$KC/home/.pi/agent/.ai-review-gate-key"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-empty-key.env" '' )"
+rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
+case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
+ck "cmd_check does not bless a WHITESPACE-ONLY key file" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

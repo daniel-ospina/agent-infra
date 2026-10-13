@@ -37,6 +37,12 @@ doc_status: draft
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
 > issue); until that PR lands the old path is a stale duplicate, so do not run it.
 >
+> ⛔ **That follow-up must PORT tortoise#8437 before it removes anything (agent-infra#1712).** This
+> directory is a point-in-time copy taken at 2026-10-13 05:50 local; tortoise#8437
+> (`8fe1e7b13`, merged 12:58Z the same day — core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead
+> `REPO` default corrected) touched these same six files and is NOT here. Removing the tortoise copy
+> without it would delete the only tree carrying those fixes.
+>
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
 > Tracked by tortoise#8246.
@@ -495,6 +501,12 @@ These are kept as a record because each one is a *failure mode of the design*, n
   are spawned through a second tmux boundary, and a tmux session is served from the SERVER's
   environment, so with a pre-existing server a keys.env key is reported present by `cmd_check` while
   every merge runs keyless (a false PASS; `record-review.sh` then posts an UNSIGNED marker).
+- **This directory is older than its source (agent-infra#1712).** tortoise#8437 (`8fe1e7b13`) merged
+  after the copy was taken and touched these same six files; the tortoise-side removal must port it
+  first or it deletes the only tree carrying those fixes.
+- **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
+  file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
+  having created no session.
 
 ---
 

@@ -38,9 +38,10 @@ O="${O:-$CELL_HOME/orchestrator}"
 # path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
 SESSION="${SESSION:-orch}"
-# OR and the merge key are interpolated into the session command string, so they are defaulted
-# here — the guard below reads them with `${!v}` under `set -u`, which errors on an unset name, and
-# the string must not depend on the guard running first. `${OR:-…}` keeps today's default.
+# OR is interpolated into the session command string, so it is defaulted here — the guard below reads
+# it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
+# the guard running first. `${OR:-…}` keeps today's default. (The merge key is NOT interpolated — a
+# secret in an argv string is visible to ps/tmux; see the session command below.)
 OR="${OR:-daniel-ospina/tortoise}"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -55,6 +56,15 @@ safe_argv() {
     ''|*"'"*|*'"'*|*'`'*|*'$'*|*';'*|*'|'*|*'&'*|*' '*) return 1 ;;
   esac
   return 0
+}
+
+# The key FILE is authoritative (install.sh treats it so) — but test its CONTENT, not its size:
+# record-review.sh strips whitespace and treats an empty result as absent, so a 1-byte newline file
+# (exactly what `echo "$KEY" > file` writes for an unset var) would be blessed and then fail the
+# gate. Same class as the empty keys.env assignment the ENV_FILE branch rejects.
+keyfile_has_key() {
+  [ -s "${HOME:-}/.pi/agent/.ai-review-gate-key" ] || return 1
+  [ -n "$(tr -d '[:space:]' < "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null)" ]
 }
 
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
@@ -99,10 +109,10 @@ cmd_check() {
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
-  # FILE is authoritative (as install.sh treats it), and a key in $ENV_FILE reaches the session
-  # because the session re-sources it. An ambient-only export does NOT — tmux serves a new session
-  # from the server's environment — so it is named rather than silently counted as present.
-  if [ -s "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+  # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
+  # it. An ambient-only export does NOT — tmux serves a new session from the server's environment —
+  # so it is named rather than silently counted as present.
+  if keyfile_has_key; then
     say "ok: merge authority key present (~/.pi/agent/.ai-review-gate-key)"
   elif [ -n "$KEY_IN_FILE" ]; then
     say "ok: merge authority key present in $ENV_FILE (the session re-sources it)"
@@ -161,7 +171,9 @@ cmd_start() {
   # keyless cell with no signal. Run the check once, fail loudly, and surface its key lines on stderr.
   local chk
   if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
-  printf '%s\n' "$chk" | grep -Ei 'merge authority key|will NOT receive it' >&2 || true
+  # All FOUR verdicts, including "no AI_REVIEW_GATE_KEY and no key file": filtering on the two that
+  # happen to be easy to grep would leave the empty-keys.env case silent again.
+  printf '%s\n' "$chk" | grep -Ei 'merge authority|AI_REVIEW_GATE_KEY|will NOT receive it' >&2 || true
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.

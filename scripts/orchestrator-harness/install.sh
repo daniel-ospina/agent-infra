@@ -198,14 +198,15 @@ done
 # must be reported as insufficient rather than as "present", or the box silently degrades to
 # review-only while everyone believes it holds the merge authority.
 KEY_FILE="$HOME/.pi/agent/.ai-review-gate-key"
-# -s, not -f: a ZERO-BYTE key file is not a key. `-f` blessed it, and the daemon then recorded
-# reviews UNSIGNED and failed ai-review-gate — the same failure as the env-only case below, with the
-# file branch taken (see README §7.4).
-if [ -s "$KEY_FILE" ]; then
+# -s, not -f: a ZERO-BYTE key file is not a key. And test the CONTENT, not the size: the consumer
+# (record-review.sh) strips whitespace and treats the result as absent, so a 1-byte newline file —
+# exactly what `echo "$AI_REVIEW_GATE_KEY" > file` writes for an unset variable — must not be blessed.
+KEY_TRIMMED="$(tr -d '[:space:]' < "$KEY_FILE" 2>/dev/null || true)"
+if [ -n "$KEY_TRIMMED" ]; then
   ok "gate key file present ($KEY_FILE)"
   [ -n "${AI_REVIEW_GATE_KEY:-}" ] && ok "AI_REVIEW_GATE_KEY also exported in this shell"
 elif [ -f "$KEY_FILE" ]; then
-  warn "$KEY_FILE exists but is EMPTY — treated as absent."
+  warn "$KEY_FILE holds no key (empty or whitespace-only) — treated as absent."
   warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."
   warn "  → fix: printf '%s' \"\$AI_REVIEW_GATE_KEY\" > $KEY_FILE && chmod 600 $KEY_FILE"
 elif [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
