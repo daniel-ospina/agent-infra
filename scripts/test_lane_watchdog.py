@@ -538,6 +538,35 @@ def test_a_failed_FIRST_ps_read_does_not_wipe_the_clock(W, monkeypatch, tmp_path
     assert "ps-unreadable" in (tmp_path / "l.jsonl").read_text()
 
 
+def test_an_unreadable_state_file_is_not_an_empty_one(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 3. `except Exception: state = {}` made an INTACT but unreadable (or
+    truncated) state file -- the exact artifact the old truncating write left behind --
+    indistinguishable from a first run. The clock was then reset for EVERY candidate (another full
+    FROZEN_MIN of blindness) and the intact observation was OVERWRITTEN, while the run reported
+    `state_write: ok` and exited 0. A MISSING file is a genuine first run; anything else refuses."""
+    state = tmp_path / "s.json"
+    W.write_state(str(state), {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}})
+    intact = state.read_text()
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    os.chmod(state, 0)                       # intact on disk, unreadable to its own owner
+    try:
+        assert W.main() == 3, "an unreadable state file must not report a clean pass"
+        assert json.loads(capsys.readouterr().out)["state_unreadable"] is True
+        assert "state-unreadable" in (tmp_path / "l.jsonl").read_text()
+    finally:
+        os.chmod(state, 0o600)
+    assert state.read_text() == intact, "an unreadable state file must NOT be overwritten"
+
+
+def test_a_missing_state_file_is_a_first_run(W, monkeypatch, tmp_path):
+    """The mirror: the gate must not turn "no such file" into a refusal, or a fresh host could
+    never start. `ripen()` writes a state file, so point STATE at one that does not exist."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "never-written.json"))
+    assert W.main() == 0, "a missing state file is a genuine first run, not an unreadable one"
+
+
 def test_a_successful_run_reports_the_state_write(W, monkeypatch, tmp_path, capsys):
     """⛔ THE REPORT MUST SAY THE OBSERVATION WAS PERSISTED. `state_write` was emitted ONLY on
     failure, so a healthy run and a run whose field was absent were indistinguishable -- and an

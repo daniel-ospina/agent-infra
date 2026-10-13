@@ -702,10 +702,28 @@ def main():
         return 3
     cands = frozen_subtrees(a, b)
 
+    # ⛔ AN UNREADABLE STATE FILE IS NOT AN EMPTY ONE (#1696, review cycle 3). `except Exception:
+    # state = {}` made an INTACT but unreadable -- or truncated -- file indistinguishable from a
+    # first run. That is the exact artifact the old truncating write left behind, and the run then
+    # reset every candidate's clock (another full FROZEN_MIN of blindness) AND overwrote the intact
+    # observation, while reporting `state_write: ok` and exiting 0. A MISSING file is a genuine first
+    # run; anything else refuses, loudly, and writes NOTHING.
     try:
-        state = json.load(open(STATE))
-    except Exception:
+        with open(STATE) as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
         state = {}
+    except Exception as e:
+        _log(dict(event="state-unreadable", ts=int(time.time()),
+                  error=f"{e.__class__.__name__}: {e}"))
+        report = dict(observed=len(b), frozen=len(cands), ripe=0, watching=[], refused=[],
+                      reaped=[], state_unreadable=True, ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 STATE FILE UNREADABLE -- refusing to judge without the prior observation, "
+                  "and refusing to overwrite it", file=sys.stderr)
+        return 3
 
     ripe, watching, refused, ticks = evaluate(cands, b, state, min_age=args.min_age)
 
