@@ -39,16 +39,18 @@ doc_status: draft
 >
 > ⛔ **That follow-up must PORT every post-copy change before it removes anything
 > (agent-infra#1712).** This directory is a point-in-time copy taken at 2026-10-13 05:50 local
-> (= 10:50Z), and the tortoise tree moved twice afterwards:
+> (= 10:50Z), and the tortoise tree moved **three** times afterwards:
 >
 > | commit | tortoise | what it carries |
 > |---|---|---|
 > | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected — six of these files |
 > | `a59858d07` | #8465/#8467 | dispatch pool ordered by **severity**, not issue number — `refresh-candidates.sh` + `selftest.sh` |
+> | `ff6d1bc19` | #8471 | the follow-up that makes #8465's self-tests discriminate — `refresh-candidates.sh` + `selftest.sh` |
 >
-> Neither is here (`sort -n -u` is still the pool's only ordering). The safe instruction for the
-> follow-up is **not** a list of shas: diff the tortoise tree against this one and port everything
-> not present. Removing the tortoise copy otherwise deletes the only tree carrying those fixes.
+> None is here, and `sort -n -u` still orders **both** the pool and the backlog (line 104), with
+> issue number as the pool's only key. The safe instruction for the follow-up is **not** a list of
+> shas: diff the tortoise tree against this one and port everything not present. Removing the
+> tortoise copy otherwise deletes the only tree carrying those fixes.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -174,8 +176,9 @@ work unless they coordinate (see §5, "broad mode").
 ## 4. Install
 
 ```bash
-# 1. Put the harness where $O will point (default ~/orchestrator).
-#    Run this from an agent-infra checkout — the harness now lives there.
+# 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
+#    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
+#    not the shipped copies.
 mkdir -p ~/orchestrator && cp scripts/orchestrator-harness/*.sh ~/orchestrator/
 mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 
@@ -188,8 +191,10 @@ export SCOPE=own                         # drain scope: auto (default) | own | b
                                          # install.sh renders this into the plist (launchd
                                          # inherits no shell env) and refuses a bad value.
 
-# 3. Render + install the launchd agent (does NOT load it)
-./install.sh
+# 3. Render + install the launchd agent (does NOT load it). Invoke it BY PATH, from that same
+#    repo root: install.sh resolves `launchd.plist.template` from ITS OWN directory, so
+#    `cd ~/orchestrator && ./install.sh` dies with "missing template" — step 1 copies only *.sh.
+bash scripts/orchestrator-harness/install.sh
 
 # 4. Start it when you mean to
 launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
@@ -240,12 +245,23 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `REVIEW_TIMEOUT` | `1800` | wall-clock limit on a reviewer `pi` run (s) |
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 
-**Every agent spawn is load-gated, not just lane dispatch.** A Mac reboot lands in an indexing
+⛔ **`STALE_MIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
+carries 15 placeholders — the nine limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+— and no `__STALE_MIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
+of these four and re-running `install.sh` silently has no effect, and a hand-added plist key is
+overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
+scripts.
+
+**The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
 lane gate already respected `MAX_LOAD`; the merge sweep did not, so a fresh boot got six reviewers
-piled onto the spike. `can_spawn()` now guards all four spawn sites — conflict fixer, review-fix
-fixer, CI-red fixer, merge re-review — while the cheap actions (`gh pr merge`, `gh pr ready`,
-`gh run rerun`) stay ungated, so merges keep flowing during a spike and nothing is starved.
+piled onto the spike. `can_spawn()` now guards the four spawn sites in `orch-loop.sh` — conflict
+fixer, review-fix fixer, CI-red fixer, merge re-review — while the cheap actions (`gh pr merge`,
+`gh pr ready`, `gh run rerun`) stay ungated, so merges keep flowing during a spike and nothing is
+starved. ⛔ **That is the controller's *decisions*, not every spawn.** Three worker entry points
+spawn a `pi` agent with no `MAX_LOAD` read of their own — `chain-<N>` → `merge-one.sh` (the
+first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `adopt-fix.sh` →
+`fix-one.sh`; tracked as agent-infra#1720.
 
 **Swap, not lanes, is what actually throttles this box.** Observed at 15 concurrent workers:
 `swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on 8 GB;
@@ -269,9 +285,14 @@ after a restart until it was fixed).
    **This is a local file, so it serialises one box only** — two boxes sharing a repo are not
    coordinated by it (§7.2b, tortoise#5052).
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
-   or `ISSUES <n>`. A CLEAN comment may not contain "issues remain", "NOT CLEAN", or
-   "requires human attention" — forbidden phrases, so an equivocal review cannot be laundered
-   into a merge.
+   or `ISSUES <n>`. A CLEAN comment may not assert an unresolved outcome. The enforcer is the
+   evidence veto in `scripts/record-review.sh`, and its vocabulary is `NOT CLEAN`, "requires human
+   attention/input", "unresolved issues", "auto-fix stalled/failed/reached/converged", "test
+   review capped", `[ADVERSARIAL-BOUND]`, and a **counted** `N issues remain`. The count is
+   deliberate: a bare "issues remain" is NOT matched, because the veto must not false-refuse the
+   legitimate clean phrasing "No issues remain after the fixes" — which also means a CLEAN comment
+   whose body says (uncounted) that issues remain does pass the veto. Quote the gate's list, not a
+   wider one.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
    covers every non-draft PR in the repo except the branch classes it deliberately never touches
    (`design/`, `scope/`, `dependabot/` — the selector is
@@ -516,10 +537,13 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **The merge key reaches the controller but not the merge workers (agent-infra#1711).** The workers
   are spawned through a second tmux boundary, and a tmux session is served from the SERVER's
   environment, so with a pre-existing server a keys.env key is reported present by `cmd_check` while
-  every merge runs keyless (a false PASS; `record-review.sh` then posts an UNSIGNED marker).
-- **This directory is older than its source (agent-infra#1712).** tortoise#8437 (`8fe1e7b13`) merged
-  after the copy was taken and touched these same six files; the tortoise-side removal must port it
-  first or it deletes the only tree carrying those fixes.
+  every merge runs keyless (a false PASS; `record-review.sh` then posts an UNSIGNED marker). The
+  same boundary also drops `$O`, so under a non-default `$O` the workers write `state/` the
+  controller never reads — recorded with the measurements on that issue.
+- **This directory is older than its source (agent-infra#1712).** Three commits merged after the
+  copy was taken — tortoise#8437 (`8fe1e7b13`, six of these files), tortoise#8465/#8467
+  (`a59858d07`) and tortoise#8471 (`ff6d1bc19`). The tortoise-side removal must port them first or
+  it deletes the only tree carrying those fixes.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
@@ -528,6 +552,32 @@ These are kept as a record because each one is a *failure mode of the design*, n
   `gh pr merge --auto`; `cancelled` is treated as a failure and routed to a fixer. `record-review.sh`
   and `admin-merge.sh` implement the opposite (allow-list) polarity, adopted after a merge went ahead
   on a conclusion neither red nor pending.
+- **A returning INT/TERM trap does not stop the controller or a worker (agent-infra#1715).**
+  `trap 'rm -f "$LOCKF"' EXIT INT TERM` runs its handler and **resumes** — a non-interactive bash
+  terminates only on `EXIT`. So `pkill -f orch-loop.sh` (§6 step 2, and the stop block `install.sh`
+  prints) deletes `.orch.lock` while the loop keeps sweeping and merging, and the next start passes
+  `acq()`: the documented stop-then-start yields **two controllers on one queue**. Same pattern at
+  `merge-one.sh:60`, where the per-PR claim is released while the merge worker runs on.
+- **`refresh-candidates.sh` records `checked.txt` before the pre-flight verdict (agent-infra#1716).**
+  The append precedes the pre-flight, and nothing prunes a `checked.txt` entry that never reached
+  `dispatched.txt` — the reaper walks `dispatched.txt` only. So an errored pre-flight (a broken
+  scout venv: the failure this file's own comment records) permanently blacklists a dispatchable
+  issue, and the backlog stops refilling with no signal.
+- **`cmd_check` never tests `record-review.sh` (agent-infra#1717).** `merge-one.sh` calls it at
+  `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
+  prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
+  marker is written — one fresh review per cycle, forever, with no terminal state.
+- **`cloud-cell-bringup.sh` deletes the pushed gh token only on the success branch (agent-infra#1718).**
+  `die` on a failed `gh auth login` exits before `rm -f "$tokfile"`, leaving a push-capable token at
+  `/tmp/.gh-tok` on the VM.
+- **`ci_runner_gate.sh` is versioned here but wired to nothing (agent-infra#1719).** No
+  `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
+  still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy
+  that runs — and a second box has no fallback gate at all.
+- **Three worker launch paths spawn ungated (agent-infra#1720).** `chain-<N>` → `merge-one.sh` (the
+  first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh` and `adopt-fix.sh` →
+  `fix-one.sh` read no `MAX_LOAD`; only the controller's four spawn *decisions* are gated, and §4
+  says so.
 
 ---
 

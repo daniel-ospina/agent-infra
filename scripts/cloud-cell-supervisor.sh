@@ -62,10 +62,6 @@ safe_argv() {
 # record-review.sh strips whitespace and treats an empty result as absent, so a 1-byte newline file
 # (exactly what `echo "$KEY" > file` writes for an unset var) would be blessed and then fail the
 # gate. Same class as the empty keys.env assignment the ENV_FILE branch rejects.
-# The key FILE is authoritative (install.sh treats it so) — but test its CONTENT, not its size:
-# record-review.sh strips whitespace and treats an empty result as absent, so a 1-byte newline file
-# (exactly what `echo "$KEY" > file` writes for an unset var) would be blessed and then fail the
-# gate. Same class as the empty keys.env assignment the ENV_FILE branch rejects.
 # ⛔ Read $CELL_HOME, NOT $HOME: keys.env is sourced above and may set HOME, while the session
 # forces HOME back to $CELL_HOME AFTER that source — so the verdict would inspect a home the
 # session will never use (false present, or false absent, either way).
