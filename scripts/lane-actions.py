@@ -333,12 +333,53 @@ def dispatch_result(parent_file, LS):
         return None
 
 
+def told_but_silent(inbound_age, stale_s):
+    """True when the lane was TOLD something AFTER it last produced output.
+
+    ⛔ THIS IS THE **ACTION** SURFACE'S RULE, AND IT IS NOT `inbound_discounts_idle`. That one is
+    the **CLAIM** surface's rule: a PRIOR, scoped to the IDLE family, never `WEDGED`, because an
+    input event cannot prove a wedge resolved. This one is a **VETO** and it is verdict-INDEPENDENT:
+    a lane that received work and has produced nothing since is not free capacity, whatever anyone
+    believes about its state. A claim and an instruction are different speech acts.
+
+    DELEGATED, WITH A LOCAL FALLBACK -- and the fallback is not redundancy.
+    `LS_PATH` resolves to the DEPLOYED `~/.pi/agent/scripts/lane-status.py`, not to the copy beside
+    this file, and the two are deployed INDEPENDENTLY. A hard `LS.told_but_silent(...)` therefore
+    crashed the live beat with `AttributeError: module 'lane_status' has no attribute
+    'told_but_silent'` as soon as this file landed ahead of its sibling (reproduced 2026-10-12).
+    A triage instrument that cannot run is worse than one with a duplicated predicate, so the rule
+    is stated here as well and the two are pinned equal by the check
+    `the local fallback agrees with the canonical rule on every input` in `test_lane_actions.py`.
+    (An earlier draft cited a test function name that does not exist -- the pin is an inline
+    `check(...)` inside `main()`, not a `test_*` function, which is why the citation must name the
+    check string.) The sibling is still preferred when present, so a future change to the canonical
+    rule takes effect without touching this file.
+    """
+    if inbound_age is None or stale_s is None:
+        return False
+    return inbound_age < stale_s
+
+
+def told_but_silent_via(LS):
+    """`LS`'s own `told_but_silent` when the loaded module provides it, else the local fallback.
+
+    Never raises: an older deployed sibling must degrade to the same rule, not to a traceback.
+    """
+    fn = getattr(LS, "told_but_silent", None)
+    return fn if callable(fn) else told_but_silent
+
+
 def classify_row(row, dead, files, LS):
     """Return a dict: step, verdict, why, action_class. Deterministic; no Jev here."""
     lane = row["lane"]
     sid = row.get("sid")
     r = {"lane": lane, "ws": row.get("ws") or "", "stale": row.get("stale_s"),
-         "verdict": None, "step": None, "why": [], "action": None}
+         "verdict": None, "step": None, "why": [], "action": None,
+         # The INBOUND evidence is carried through so the BUCKET decision can consult it. It is not
+         # used here: this function decides what the lane's state LOOKS like, and the bucket loop
+         # decides whether a human may be told to ACT on it. Those are different questions and the
+         # inbound prior answers only the second (see `told_but_silent`).
+         "inbound_age": row.get("inbound_age"), "inbound_msg": row.get("inbound_msg")}
 
     # -- STEP 0 identity ----------------------------------------------------------------
     if not sid:
@@ -936,7 +977,37 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
             report.append(c)
             continue
         if v == "DONE_READY":
-            idle.append(c)
+            # ⛔ FAIL-CLOSED: `DONE_READY` is read from the lane's own last WORDS, which cannot know
+            # that a work order landed AFTER they were written -- so a lane told something and silent
+            # since would be offered as free capacity. This list is an INSTRUCTION TO A HUMAN, so a
+            # guess reaches a person as a deed. Owner, verbatim: "Both of those were in the DO list
+            # telling me to act. Acting would have interrupted live work."
+            #
+            # The fully-PAIRED measured instance (`Merigng PR`, 2026-10-11, read live from
+            # `lane-status.py --json`): inbound_age=1210s, stale_s=18858s -- told 20m ago, silent for
+            # 5h14m, with a `task` still in flight. It read `WEDGED` before this change and
+            # `RECENT-INBOUND` after it.
+            #
+            # The finding that prompted this (`state/FINDING-actuator-gap-concrete-2026-10-11.md:43`)
+            # records `2a Projection keys` as `IDLE->1 WITHHELD` with `latest_submitted 0.03h ago`
+            # (108s). That reading did NOT record the lane's output age, so 108s is NOT paired with
+            # any `stale_s` and no fixture claims it is -- an earlier draft of this comment paired
+            # them and asserted a `stale` the source never carried.
+            #
+            # ⛔ ABSTENTION IS DELIBERATE AND IS NOT A HOLE. When `inbound_age` is None the predicate
+            # returns False, so the lane IS still offered. That is fail-OPEN on an UNREAD signal --
+            # deliberately, and it is a different fact from "inferred from an absence": it is the
+            # same rule the rest of this instrument follows, where an unread value is never turned
+            # into a positive claim in either direction. It is NOT "idleness is proven": where the
+            # evidence exists it must show the lane answered after it was told.
+            if told_but_silent_via(LS)(c.get("inbound_age"), c.get("stale")):
+                c["why"].insert(0, "was given work %s ago and has produced NOTHING since (last "
+                                   "output %s ago) -- NOT free capacity; dispatching would "
+                                   "double up on work already assigned it"
+                                % (_age(c.get("inbound_age")), _age(c.get("stale"))))
+                report.append(c)
+            else:
+                idle.append(c)
         elif v == "CONTINUE":
             wip.append(c)
         elif v == "CONTEXT-MISBELIEF":

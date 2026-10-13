@@ -132,6 +132,34 @@ def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
     return True
 
 
+def told_but_silent(inbound_age, stale_s):
+    """True when the lane was TOLD something AFTER it last produced output.
+
+    ⛔ THIS IS THE **ACTION** SURFACE'S RULE, AND IT IS NOT `inbound_discounts_idle`. That one is
+    the **CLAIM** surface's rule: a PRIOR, scoped to the IDLE family, never `WEDGED`, because an
+    input event cannot prove a wedge resolved. This one is a **VETO** and it is
+    verdict-INDEPENDENT: a lane that received work and has produced nothing since is not free
+    capacity, whatever anyone believes about its state. A claim and an instruction are different
+    speech acts, and keeping them in two functions is what stops a later change collapsing them
+    into one. They are deliberately near each other so the contrast is visible.
+
+    Why it exists (MEASURED 2026-10-11, four instances): the beat's IDLE set is decided by the
+    Step-5 words layer -- JEV reads the lane's own LAST WORDS, which cannot know that a work order
+    landed AFTER they were written. So `2a Projection keys` read `DONE_READY` from words emitted
+    before a `WORK ORDER -- #8169` arrived 108s earlier, and the beat published `IDLE->1 WITHHELD
+    2a Projection keys` -- an instruction to a human to hand work to a lane that already had it.
+    Owner, verbatim: "Both of those were in the DO list telling me to act. Acting would have
+    interrupted live work."
+
+    `None` on EITHER side ABSTAINS (False). An unread inbound, or an unknown output age, is not
+    evidence of silence; returning True on a failed read would exclude a lane on a fact nobody
+    established. Same rule as everywhere else here: an unread signal is not a value.
+    """
+    if inbound_age is None or stale_s is None:
+        return False
+    return inbound_age < stale_s
+
+
 def child_suppresses(verdict, declared, pane_kids, child, child_stale, abandon_s=None):
     """Should this verdict be suppressed to WAITING because the lane has a child?
 
