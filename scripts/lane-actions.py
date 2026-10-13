@@ -152,8 +152,17 @@ def _refuse_if_degraded(rows, where):
     `--stdin` branch only, so the OTHER path accepted a degraded snapshot and acted on a fleet read
     missing every live-only lane." That lineage claim is FALSE: at this PR's base NEITHER path had
     any degraded refusal (`git show 42f0b14:scripts/lane-actions.py | grep -c degraded` -> 0), so
-    both arrived together and nothing was ever "left" unguarded. The deployed copy that predated
-    this branch asserted the same claim about the OTHER direction. The correction matters because a
+    both arrived together and nothing was ever "left" unguarded. ⚠️ AND THIS CORRECTION'S FIRST
+    DRAFT INTRODUCED A NEW FALSEHOOD (caught by review cycle 3), which is the worst class here: it
+    claimed "the deployed copy that predated this branch asserted the same claim about the OTHER
+    direction". Both halves are wrong. The deployed
+    `~/.pi/agent/scripts/lane-actions.py` carries this SAME sentence about the SAME path — a second
+    copy of the falsehood, not a different direction — and it did NOT predate this branch: it
+    contains `def offerable` / `CONF_MIN`, and `git log -S 'def offerable' --all --
+    scripts/lane-actions.py` shows those enter history only in this branch's own commit. It is a
+    snapshot of this branch's IN-PROGRESS work, so it is evidence about nothing else. The core
+    correction above stands on the base-lineage check; only the comparison to the deployed copy was
+    invented. The correction matters because a
     reader who believes one path was historically the hole will guard that one — which is the
     failure this docstring already warns about one paragraph below.
 
