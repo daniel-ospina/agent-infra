@@ -356,9 +356,15 @@ def evaluate(cands, table, state, now=None, min_age=MIN_AGE):
             watching.append(dict(pid=pid, age_s=c["age_s"],
                                  reason="subtree composition changed -- it is doing something"))
         if c["age_s"] is None:
-            # ⛔ AN UNREADABLE AGE MUST REFUSE, NOT SKIP THE GATE. `age_s < min_age` is False when
-            # age is None, so MIN_AGE was bypassed entirely and the candidate ripened at +1800s
-            # regardless of how new it was. Every other unclear read in this file abstains.
+            # ⛔ AN UNREADABLE AGE MUST REFUSE RATHER THAN BE COMPARED. `_age_seconds()` returns None
+            # when its `ps` read fails, and `None < min_age` does not evaluate to False in Python 3 —
+            # it RAISES TypeError. ⚠️ CORRECTED 2026-10-13: this comment claimed the comparison was
+            # "False when age is None, so MIN_AGE was bypassed entirely and the candidate ripened at
+            # +1800s". The first half is wrong (`python3 -c "print(None < 300)"` -> TypeError), and
+            # `evaluate()` is called with no surrounding try/except, so the unguarded path would have
+            # ABORTED the whole run, not silently ripened anything. No committed state of this file
+            # ever contained that bypass. The guard is still required — a failed `ps` must abstain —
+            # but its real effect is "turn a crash into an abstention", which is the honest reason.
             watching.append(dict(pid=pid, age_s=None, reason="age unreadable -- refusing to judge"))
             continue
         if c["age_s"] < min_age:

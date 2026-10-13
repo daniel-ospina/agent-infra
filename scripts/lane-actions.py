@@ -167,9 +167,12 @@ def _refuse_if_degraded(rows, where):
     failure this docstring already warns about one paragraph below.
 
     ⛔ WHICH PATH IS PRODUCTION: `--stdin`. heartbeat-loop.sh invokes this tool as
-    `lane-actions.py --stdin "$SNAP"`; the invoke path is the secondary one (queue-dispatch). An
-    earlier version of this docstring said the opposite, which told the next reader to guard the
-    wrong branch. Both are guarded now, and the tests that pin them live in test_lane_actions.py."""
+    `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
+    ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
+    FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
+    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py:238`
+    (`lane-actions.py --json`). Both paths are guarded; the tests that pin them live in
+    test_lane_actions.py."""
     if any(r.get("degraded") for r in rows if isinstance(r, dict)):
         raise SystemExit(DEGRADED_MSG + " (%s)" % where)
 
