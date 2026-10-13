@@ -595,7 +595,10 @@ if need "$TMP/scope.sh" "the scope-select block is extracted from the shipped or
   [ "$out" = "BROAD|$S_BROAD" ] && [ "$grepl" = true ] && rc=0 || { rc=1; echo "      unset/14 got '$out' log=$(cat "$TMP/scope.log")"; }
   ck "shipped scope: SCOPE unset drives the auto default (>10 -> BROAD)" $rc
   out="$(drive_scope_unset 10)"
-  [ "$out" = "OWN|$S_OWN" ] && rc=0 || { rc=1; echo "      unset/10 got '$out'"; }
+  # The log line is asserted too: at OPEN_N=10 `auto` and a mutated `own` DEFAULT are
+  # indistinguishable from MODE alone, so an unset-default mutation would stay green here.
+  grep -qF '[scope] open=10 -> OWN (auto)' "$TMP/scope.log" && grepl=true || grepl=false
+  [ "$out" = "OWN|$S_OWN" ] && [ "$grepl" = true ] && rc=0 || { rc=1; echo "      unset/10 got '$out' log=$(cat "$TMP/scope.log")"; }
   ck "shipped scope: SCOPE unset drives the auto default (at the threshold -> OWN)" $rc
   out="$(drive_scope auto 10)"
   [ "$out" = "OWN|$S_OWN" ] && grepp=true || grepp=false
@@ -635,12 +638,16 @@ fi
 grep -qF '__SCOPE__' "$HERE/launchd.plist.template" && rc=0 || rc=1
 ck "the plist template carries a SCOPE key" $rc
 grep -qF '__SCOPE__' "$INST" && rc=0 || rc=1
-ck "install.sh renders SCOPE into the plist" $rc
-( SCOPE=banana bash "$INST" >/dev/null 2>"$TMP/inst.err" ); rc=$?
+ck "the SCOPE placeholder is present in install.sh (diagnostic; the value is asserted below)" $rc
+# Sandboxed, and the refusal REASON is asserted: without HOME/REPO/O overrides, a mutant that
+# deletes the validator still exits non-zero (an unrelated preflight failure), so an rc-only check
+# would stay green — and on a host where the default REPO exists it would write a plist into the
+# operator's REAL ~/Library/LaunchAgents.
+( SCOPE=banana HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.err" ); rc=$?
 [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted SCOPE=banana (rc=$rc)"; }
 ck "install.sh refuses an invalid SCOPE" $rc
 grep -qF 'SCOPE must be auto|own|broad' "$TMP/inst.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.err")"; }
-ck "install.sh names the accepted SCOPE values" $rc
+ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 
 # The rendered VALUE, not just the placeholder. A render that ignores $SCOPE entirely (e.g. a
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
@@ -669,20 +676,32 @@ ck "an UNSET SCOPE renders the auto default" $rc
 ( SCOPE= HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.empty.err" ); rc=$?
 [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted a set-but-empty SCOPE"; }
 ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
-# ... and the cell supervisor, which forwards it into the tmux session's command string:
+# ... and the cell supervisor, which forwards it into the tmux session's command string. Provision
+# CELL_HOME and the repo so a non-zero rc cannot come from cmd_check's preflight, and require the
+# SCOPE message so a neutered validator cannot pass on the preflight failure's rc.
+mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
 ( SCOPE= HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
-[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      the cell supervisor accepted a set-but-empty SCOPE"; }
-ck "the cell supervisor refuses a set-but-empty SCOPE" $rc
-grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 || rc=1
-ck "the cell supervisor names the accepted SCOPE values" $rc
+[ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 \
+  || { rc=1; echo "      rc=$rc; stderr: $(tail -2 "$TMP/sup.empty.err")"; }
+ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted values" $rc
 
 # install.sh must refuse the SAME $O its controller refuses: a plist that renders here but is
 # rejected there is worse than a refusal — RunAtLoad+KeepAlive relaunches a guaranteed-fatal
 # controller forever. Both halves are asserted, so the two guards cannot drift apart silently.
-( O="$TMP/o space" bash "$HERE/orch-loop.sh" >/dev/null 2>&1 ); rc=$?
-[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      orch-loop.sh accepted an \$O containing a space"; }
-ck "orch-loop.sh refuses an \$O containing a space" $rc
+# Drive the SHIPPED guard, EXTRACTED — never the live controller: running orch-loop.sh to test it
+# would enter its dispatch loop with the DEFAULT OR (daniel-ospina/tortoise) and could merge PRs if
+# the guard regressed — the very regression this check exists to catch (the suite must stay
+# offline: "No network, no tmux server, no git writes").
+awk '/^case "\$O" in/{f=1} f{print} f&&/^esac/{exit}' "$HERE/orch-loop.sh" > "$TMP/oguard.sh"
+if need "$TMP/oguard.sh" "the \$O guard is extracted from the shipped orch-loop.sh"; then
+  ( O="$TMP/o space"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
+  [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      the guard accepted an \$O containing a space"; }
+  ck "orch-loop.sh's \$O guard refuses a space" $rc
+  ( O="$TMP/clean-o"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      the guard rejected a clean \$O (rc=$rc)"; }
+  ck "orch-loop.sh's \$O guard accepts a clean path (non-vacuity)" $rc
+fi
 ( HOME="$SB" O="$TMP/o space" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.o.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.o.err" && rc=0 || { rc=1; echo "      install.sh accepted it: $(tail -2 "$TMP/inst.o.err")"; }
 ck "install.sh refuses the same \$O orch-loop.sh refuses" $rc
@@ -722,10 +741,11 @@ sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   fi
 }
-for want in own broad; do
+for want in own broad __UNSET__; do
   sup_start "$want"
-  grep -qF "SCOPE='$want'" "$TMP/tm/cmd" 2>/dev/null && rc=0 || { rc=1; echo "      forwarded: $(cat "$TMP/tm/cmd" 2>/dev/null)"; }
-  ck "the cell supervisor inlines SCOPE=$want into the session command" $rc
+  wantval="$want"; [ "$want" = "__UNSET__" ] && wantval=auto
+  grep -qF "SCOPE='$wantval'" "$TMP/tm/cmd" 2>/dev/null && rc=0 || { rc=1; echo "      forwarded: $(cat "$TMP/tm/cmd" 2>/dev/null)"; }
+  ck "the cell supervisor inlines SCOPE=$wantval for '$want' into the session command" $rc
 done
 # UNSET must reach the controller as the auto default being absent-or-auto — but a typo/blank must
 # die BEFORE a session is created (nothing started, no tmux command recorded).
@@ -735,6 +755,17 @@ rm -f "$TMP/tm/up" "$TMP/tm/cmd"
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
+
+# Every interpolated value must be metacharacter-free (the session string is handed to tmux, which
+# runs it with sh -c), so a quote in $O must be refused BEFORE a session exists — and before any
+# injected command could run. The sibling guards in orch-loop.sh and install.sh are asserted above.
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
+( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'; touch $TMP/tm/INJECTED; #" HARNESS="$TMP/tm/harness" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
+  || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
+ck "a metacharacter in \$O is refused before any session is created" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

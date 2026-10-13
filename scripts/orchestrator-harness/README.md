@@ -26,9 +26,11 @@ doc_status: draft
 > **Where it lives now.** `agent-infra/scripts/orchestrator-harness/` (relocation:
 > agent-infra#1700). The home is agent-infra because this is fleet/agent operations, not
 > tortoise product code — the merge rail it sits alongside (`admin-merge.sh`, `atomic-land.sh`)
-> and the fleet scripts it is launched by (`cadence-nudge.sh`, `ci_runner_gate.sh`,
-> `cloud-cell-supervisor.sh`) are already in `agent-infra/scripts/`, as are the multi-file tool
-> subdirectories `checkout-hygiene/`, `ci/` and `gh-shim/`. The old tortoise path
+> and the fleet script it is launched by (`cadence-nudge.sh`) are already in
+> `agent-infra/scripts/`, as are the multi-file tool subdirectories `checkout-hygiene/`, `ci/`
+> and `gh-shim/`. The per-cell launchers `ci_runner_gate.sh` and `cloud-cell-supervisor.sh` are
+> versioned into that directory by this same change (they existed only in local config before).
+> The old tortoise path
 > (`operations/orchestrator-harness/`) is replaced by a stub pointer to this home in a follow-up
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
 > issue); until that PR lands the old path is a stale duplicate, so do not run it.
@@ -429,9 +431,8 @@ records which are live and which are retired.
 
 ### 7.4 Defects found in the first review of this artifact (all fixed here)
 
-These are kept as a record because each one is a *failure mode of the design*, not a typo, and
-because the self-test now drives every one of the shipped-script failure modes
-(`retired/` fixes are annotated in place and only parsed — the retired tree is dead code):
+These are kept as a record because each one is a *failure mode of the design*, not a typo.
+(`retired/` fixes are annotated in place and only parsed — the retired tree is dead code.)
 
 | Defect | Impact | Fix |
 |---|---|---|
@@ -448,7 +449,7 @@ because the self-test now drives every one of the shipped-script failure modes
 | `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
 | the pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the spawn (`{A\|\|B\|\|C;} \|\| D && echo` parses as `({A\|\|B\|\|C} \|\| D) && echo`) | a stalled drain looked busy | explicit `if/elif` branches |
 | **this file's own self-test** re-implemented the fixed logic instead of reading the shipped scripts | it passed on the broken copy, so it pinned nothing — and the README claimed it did (found by the History reviewer, who proved 10/16 still passed on the pre-fix tree) | every check now extracts and drives the real classifier, `sess()`, claim block and reaper, or runs `install.sh`; §9/§7 claims corrected |
-| `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test asserts all 8 limit defaults agree between the two scripts |
+| `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test asserts all 9 limit defaults agree between the two scripts |
 | the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |

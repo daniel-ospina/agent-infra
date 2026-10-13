@@ -38,13 +38,26 @@ O="${O:-$CELL_HOME/orchestrator}"
 # path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
 SESSION="${SESSION:-orch}"
-LOCK="$O/.orch.lock"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
 
+# A quote or shell metacharacter in any value interpolated into the session command string would
+# break out of it — the string is handed to tmux, which runs it with sh -c. The harness applies
+# exactly this guard to $O before every spawn; apply it here to EVERY interpolated value, so the
+# supervisor cannot be the weak link. (Same class as orch-loop.sh:39-41 and install.sh:65-67.)
+safe_argv() {
+  case "${1:-}" in
+    ''|*"'"*|*'"'*|*'`'*|*'$'*|*';'*|*'|'*|*'&'*|*' '*) return 1 ;;
+  esac
+  return 0
+}
+
+# LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
+# from a stale $O makes `stop` release and announce the wrong path.
 export HOME="$CELL_HOME"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+LOCK="$O/.orch.lock"
 
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
@@ -99,10 +112,19 @@ cmd_start() {
   esac
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
+  # Nothing is started or written on this path, so a bad value below cannot hurt it.
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
     return 0
   fi
+  # Every value below is interpolated into the session command string, so every one must be
+  # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
+  # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
+  local v
+  for v in O REPO CELL_HOME ENV_FILE HARNESS; do
+    [ -n "${!v}" ] || continue
+    safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
+  done
   # Seed the running copy: orch-loop.sh spawns its workers from $O, not from $HARNESS, so a
   # cell whose $O is empty runs the inline sweep but can never review, fix or dispatch.
   # Idempotent; mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
@@ -117,9 +139,11 @@ cmd_start() {
   # measured for SCOPE, and the same mechanism applies to every other variable (a rotated
   # key in $ENV_FILE would be ignored, and a pinned MAX_LANES would revert to its default). So the
   # session re-sources $ENV_FILE itself and the values below are set inside the session, AFTER it.
+  # The merge authority key rides WITH the session for the same reason: cmd_check must not report
+  # it present from THIS shell's env while the controller runs keyless (a false green).
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='$SCOPE' AI_REVIEW_GATE_KEY='${AI_REVIEW_GATE_KEY:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
