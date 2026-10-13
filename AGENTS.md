@@ -110,6 +110,33 @@ Every infra issue, gate, guard, workflow step, or refactor is classified **A** o
 
 **What this does NOT cover, and what still goes to the owner:** a P0-consequence decision (data loss, deletion, spend), and any **recorded decision** the fix would reverse. Reversing a recorded decision is a **reopen**: argue it in the decision's own home, with the evidence in front of the owner, per the contradiction test above. An `OVERRIDES:` marker makes such a departure *findable* — it does **not** authorize it.
 
+### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
+
+**When the owner approves the CONTENT of an exact change, apply it.** On an owner-gated artifact the
+reservation is on the **decision**, not on the **keystroke**.
+
+- ⛔ **Not** the rule: *"only the owner may edit this file."* That reading converts a 30-second
+  mechanical step into a human round trip.
+- ✅ **The rule:** the owner decides what the artifact says; a lane may not introduce, alter or drop
+  an entry on its own initiative — but applying a diff the owner has approved **is executing his
+  decision**, not making one.
+
+**Why it needs saying: this failure is silent and it LOOKS diligent.** A lane that declines to apply
+an approved diff produces no error, reds no check, and reports itself as *"waiting on the owner"* —
+so no instrument can see it, and the whole cost lands on the owner's attention. Measured 2026-10-13:
+an owner-approved `docs/ONTOLOGY.md` change sat for a full round trip; the owner's reply was
+*"i alreayd aprpvoed that. no? so anyhow, what's the blocked?"* — nothing was blocked but the lane's
+own reading, and it landed in seconds once applied.
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
+approving. **Unsure which diff was approved** → state the diff you believe is approved and apply
+that; this question is answered by *naming the diff*, never by stopping.
+
+⛔ This relaxes nothing else. Content a lane invented is still not adoptable, a decision this would
+reverse is still a **reopen**, and consistency between a pack manifest and the ontology doc is still
+the guard's verdict to return — not the lane's judgement.
+
 ---
 
 ## ⛔ DESIGN PRINCIPLE: Good > Easy
