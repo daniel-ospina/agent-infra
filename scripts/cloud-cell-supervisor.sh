@@ -62,9 +62,17 @@ safe_argv() {
 # record-review.sh strips whitespace and treats an empty result as absent, so a 1-byte newline file
 # (exactly what `echo "$KEY" > file` writes for an unset var) would be blessed and then fail the
 # gate. Same class as the empty keys.env assignment the ENV_FILE branch rejects.
+# The key FILE is authoritative (install.sh treats it so) — but test its CONTENT, not its size:
+# record-review.sh strips whitespace and treats an empty result as absent, so a 1-byte newline file
+# (exactly what `echo "$KEY" > file` writes for an unset var) would be blessed and then fail the
+# gate. Same class as the empty keys.env assignment the ENV_FILE branch rejects.
+# ⛔ Read $CELL_HOME, NOT $HOME: keys.env is sourced above and may set HOME, while the session
+# forces HOME back to $CELL_HOME AFTER that source — so the verdict would inspect a home the
+# session will never use (false present, or false absent, either way).
 keyfile_has_key() {
-  [ -s "${HOME:-}/.pi/agent/.ai-review-gate-key" ] || return 1
-  [ -n "$(tr -d '[:space:]' < "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null)" ]
+  local kf="$CELL_HOME/.pi/agent/.ai-review-gate-key"
+  [ -s "$kf" ] || return 1
+  [ -n "$(tr -d '[:space:]' < "$kf" 2>/dev/null)" ]
 }
 
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
@@ -77,11 +85,18 @@ LOCK="$O/.orch.lock"
 # while an ambient-only export does not (tmux serves a session from the server's environment).
 # ⛔ Test the VALUE with the session's own semantics, not the line: `AI_REVIEW_GATE_KEY=` matches a
 # textual grep but sources to EMPTY, and an empty key is treated as absent downstream — reporting
-# it present would bless a cell that cannot merge.
-KEY_IN_FILE=""
+# it present would bless a cell that cannot merge. So normalize the sourced value EXACTLY as the
+# consumer does (record-review.sh / atomic-land.sh: take the env value, strip whitespace).
+KEY_IN_FILE_RAW=""
 if [ -f "$ENV_FILE" ]; then
-  env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${AI_REVIEW_GATE_KEY:-}" ]' _ "$ENV_FILE" 2>/dev/null && KEY_IN_FILE=1
+  KEY_IN_FILE_RAW="$(env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; printf %s "${AI_REVIEW_GATE_KEY:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
 fi
+KEY_IN_FILE="$(printf '%s' "$KEY_IN_FILE_RAW" | tr -d '[:space:]')"
+# Raw-non-empty means the consumer takes the ENV value and never falls back to the key FILE (its
+# fallback is `[ -z "$GATE_KEY" ]` on the raw value). If that value normalizes to empty, the file
+# check is SHADOWED — so this state must be judged absent-and_dead, never present.
+KEY_IN_FILE_SET=0
+[ -n "$KEY_IN_FILE_RAW" ] && KEY_IN_FILE_SET=1
 
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
@@ -112,17 +127,26 @@ cmd_check() {
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
   # it. An ambient-only export does NOT — tmux serves a new session from the server's environment —
   # so it is named rather than silently counted as present.
-  if keyfile_has_key; then
-    say "ok: merge authority key present (~/.pi/agent/.ai-review-gate-key)"
-  elif [ -n "$KEY_IN_FILE" ]; then
+  # ⛔ ORDER MATTERS. The consumer is env-FIRST: it takes $ENV_FILE's value when non-empty and only
+  # then falls back to the key file. A whitespace-only value in keys.env therefore SHADOWS a valid
+  # key file (the raw value is non-empty, so the fallback never runs, and the normalized value is
+  # empty) — so that case must be checked BEFORE the file, and reported as a failure, not a "present".
+  if [ -n "$KEY_IN_FILE" ]; then
     say "ok: merge authority key present in $ENV_FILE (the session re-sources it)"
+  elif [ "$KEY_IN_FILE_SET" = 1 ]; then
+    say "warn: AI_REVIEW_GATE_KEY in $ENV_FILE is WHITESPACE-ONLY. The consumer strips whitespace,"
+    say "      so it resolves to EMPTY — and because the env value wins, it will NOT fall back to"
+    say "      ~/.pi/agent/.ai-review-gate-key. Every review would be recorded UNSIGNED."
+    say "      Fix: remove the key line from $ENV_FILE, or give it a real value."
+  elif keyfile_has_key; then
+    say "ok: merge authority key present ($CELL_HOME/.pi/agent/.ai-review-gate-key)"
   else
     if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
       say "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
       say "      session will NOT receive it (tmux serves a new session the SERVER's environment)."
       say "      Write it to $ENV_FILE, or to ~/.pi/agent/.ai-review-gate-key."
     else
-      say "warn: no AI_REVIEW_GATE_KEY and no ~/.pi/agent/.ai-review-gate-key."
+      say "warn: no AI_REVIEW_GATE_KEY and no $CELL_HOME/.pi/agent/.ai-review-gate-key."
     fi
     say "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
     say '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'

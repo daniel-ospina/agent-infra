@@ -903,6 +903,46 @@ out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-empty-key.env" '' )"
 rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
 case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
 ck "cmd_check does not bless a WHITESPACE-ONLY key file" $rc
+# A WHITESPACE-ONLY value in keys.env is the same false green one step earlier: the consumer
+# strips whitespace, and because the raw value is non-empty it never falls back to the key FILE.
+# cmd_check must judge it absent (not "present in $ENV_FILE").
+printf 'AI_REVIEW_GATE_KEY="   "\n' > "$KC/home/keys-ws-value.env"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-ws-value.env" '' )"
+case "$out" in
+  *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;;
+  *'WHITESPACE-ONLY'*) rc=0 ;;
+  *) rc=1; echo "      no whitespace verdict: $(printf '%s' "$out" | tail -2)" ;;
+esac
+ck "a WHITESPACE-ONLY key in keys.env is not reported present, and is named" $rc
+# …and it SHADOWS a valid key file (the consumer's fallback is on the raw value), so a real file
+# must not turn that same verdict green.
+printf 'FILEKEY\n' > "$KC/home/.pi/agent/.ai-review-gate-key"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-ws-value.env" '' )"
+rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
+case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
+ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
+# The start path must surface that verdict too: it starts the cell either way, and it is the only
+# signal the operator gets.
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
+case "$serr3" in *'WHITESPACE-ONLY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
+ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
+# keys.env may set HOME, and the session forces HOME back to $CELL_HOME afterwards — so the key
+# verdict must read $CELL_HOME, the home the session will actually use. A keys.env HOME= that
+# points at a key-bearing directory must NOT make the verdict green.
+KH="$KC/other-home"; mkdir -p "$KH/.pi/agent"; printf 'FILEKEY\n' > "$KH/.pi/agent/.ai-review-gate-key"
+printf 'HOME=%s\n' "$KH" > "$KC/home/keys-home.env"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-home.env" '' )"
+case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
+ck "a keys.env HOME= does not make the key verdict green (it reads \$CELL_HOME)" $rc
+# …and the mirror: a key in $CELL_HOME IS present, even though this shell's HOME differs.
+printf 'FILEKEY\n' > "$KC/home/.pi/agent/.ai-review-gate-key"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-empty.env" 'HOME=/nonexistent-home' )"
+rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
+case "$out" in *'merge authority key present'*) rc=0 ;; *) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; esac
+ck "a key in \$CELL_HOME is reported present even when this shell's \$HOME differs" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

@@ -452,6 +452,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
+| **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** (found across the later review rounds) | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses — and each of the four cases is pinned by a check a mutation turns red |
 | Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
 | `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
 | `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
@@ -576,9 +577,11 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix**. `install.sh` compares all 8 live scripts against the running
-copies at `$O` and warns loudly on drift, because the daemon executes `$O/<script>` — a fix that
-only lands in this directory is not in effect. If you are adopting this onto an existing box, sync
+those copies **plus every §7.4 fix**. `install.sh` compares the scripts it invokes — the seven loop
+scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
+on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
+in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
+compared, since the daemon does not run it. If you are adopting this onto an existing box, sync
 them (`cp <harness>/*.sh $O/`) and restart the loop before trusting any §5 invariant.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
