@@ -277,7 +277,9 @@ after a restart until it was fixed).
    branches/worktrees, which are invisible across boxes, so two `own`-pinned boxes can still race
    the same PR (§7.2b, tortoise#5052) — the pin must not be mistaken for a claim registry.
 4. **Drafts are deliberately excluded** from the sweep — a peer's draft PR is not yours to
-   merge. The cost is that our *own* lanes' drafts stall invisibly (see §7.2).
+   merge. The cost is that a *peer's* draft stalls until they ready it. Our **own** lanes' drafts do
+   not: the sweep selects drafts whose branch matches the harness's own patterns (`*-tm`, `*-cap`,
+   `fix/*`), readies them once, and sweeps them from the next cycle (see §7.2).
 5. **Workers never touch the main checkout.** Every lane runs in `.worktrees/tm-<N>`; the
    controller only reads. `lane.sh` instructs its agent not to create or remove worktrees.
 6. **No `task` sub-agents.** Extensions that would gate a nested agent (`review-enforcer`,
@@ -508,6 +510,11 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
+- **`orch-loop.sh` classifies checks by a deny-list (agent-infra#1714).** An unrecognised or null
+  conclusion is neither red nor explicitly pending in its list, so it reads `PENDING` and reaches
+  `gh pr merge --auto`; `cancelled` is treated as a failure and routed to a fixer. `record-review.sh`
+  and `admin-merge.sh` implement the opposite (allow-list) polarity, adopted after a merge went ahead
+  on a conclusion neither red nor pending.
 
 ---
 

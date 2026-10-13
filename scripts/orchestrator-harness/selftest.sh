@@ -937,12 +937,32 @@ printf 'HOME=%s\n' "$KH" > "$KC/home/keys-home.env"
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-home.env" '' )"
 case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
 ck "a keys.env HOME= does not make the key verdict green (it reads \$CELL_HOME)" $rc
-# …and the mirror: a key in $CELL_HOME IS present, even though this shell's HOME differs.
+# …and the mirror image of the SAME divergence, so the pair discriminates in both directions: a
+# keys.env HOME= pointing at a directory WITHOUT a key must not hide the key that IS in $CELL_HOME.
+# (Setting HOME in the helper's env cannot discriminate: the supervisor re-exports HOME=$CELL_HOME
+# before sourcing, so ONLY a keys.env HOME= can make the two differ — which is why both halves are
+# driven through the file. A $HOME passed as an env prefix passes on the pre-fix code too.)
 printf 'FILEKEY\n' > "$KC/home/.pi/agent/.ai-review-gate-key"
-out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-empty.env" 'HOME=/nonexistent-home' )"
+mkdir -p "$KC/no-key-home"
+printf 'HOME=%s\n' "$KC/no-key-home" > "$KC/home/keys-other-home.env"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-other-home.env" '' )"
 rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
 case "$out" in *'merge authority key present'*) rc=0 ;; *) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; esac
-ck "a key in \$CELL_HOME is reported present even when this shell's \$HOME differs" $rc
+ck "a keys.env HOME= without a key does not hide the key in \$CELL_HOME" $rc
+# A value of exactly ONE NEWLINE is whitespace-only for the consumer (it strips whitespace) but
+# NON-EMPTY for its raw test, so the consumer takes the env branch and never reads the key file.
+# `$( )` strips trailing newlines, so a capture-based test reads this as "no env value" and the
+# file branch answers — the divergence that made a keyless cell read as present.
+printf 'AI_REVIEW_GATE_KEY="\n"\n' > "$KC/home/keys-nl.env"
+printf 'FILEKEY\n' > "$KC/home/.pi/agent/.ai-review-gate-key"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-nl.env" '' )"
+rm -f "$KC/home/.pi/agent/.ai-review-gate-key"
+case "$out" in
+  *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;;
+  *'WHITESPACE-ONLY'*) rc=0 ;;
+  *) rc=1; echo "      no whitespace verdict: $(printf '%s' "$out" | tail -2)" ;;
+esac
+ck "a NEWLINE-ONLY key in keys.env is judged whitespace-only, not present via the file" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into
