@@ -199,14 +199,15 @@ cmd_start() {
   cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
-  # keyless cell with no signal. Run the check once, fail loudly, and surface its key lines on stderr.
+  # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
   local chk
   if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
-  # All FOUR verdicts, including "no AI_REVIEW_GATE_KEY and no key file": filtering on the two that
-  # happen to be easy to grep would leave the empty-keys.env case silent again.
-  # The path cue keeps each verdict's SECOND line — the instruction naming the path the session
-  # actually reads — so the operator is not shown a diagnosis with the remedy filtered out.
-  printf '%s\n' "$chk" | grep -Ei 'merge authority|AI_REVIEW_GATE_KEY|will NOT receive it|\.ai-review-gate-key' >&2 || true
+  # ⛔ Print the WHOLE verdict — do NOT filter it by matching the verdict prose. Line-matching was
+  # tried and failed three times: each verdict is several lines, and any pattern keyed on the first
+  # line silently drops the continuation — the remedy ("Fix: remove the key line…") and the warning
+  # that a keyless cell is still a MERGE ACTOR. The block is printed verbatim; `die` already does the
+  # same on the failure path.
+  printf '%s\n' "$chk" >&2
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.

@@ -932,9 +932,10 @@ serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$K
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
-# keys.env may set HOME, and the session forces HOME back to $CELL_HOME afterwards — so the key
-# verdict must read $CELL_HOME, the home the session will actually use. A keys.env HOME= that
-# points at a key-bearing directory must NOT make the verdict green.
+# keys.env may set HOME, and the supervisor re-exports HOME=$CELL_HOME AFTER sourcing — so the key
+# verdict must not depend on which home a keys.env HOME= line points at. (Full disclosure: with that
+# re-export in place ${HOME} and $CELL_HOME are the same value, so this pins the BEHAVIOUR, not the
+# spelling — a mutant that reads ${HOME} is equivalent and stays green, by design.)
 KH="$KC/other-home"; mkdir -p "$KH/.pi/agent"; printf 'FILEKEY\n' > "$KH/.pi/agent/.ai-review-gate-key"
 printf 'HOME=%s\n' "$KH" > "$KC/home/keys-home.env"
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-home.env" '' )"
@@ -981,6 +982,44 @@ else
   rc=1; echo "      gh was never invoked with a recorded HOME"
 fi
 ck "cmd_check runs gh under \$CELL_HOME, not a keys.env HOME=" $rc
+# The SAME divergence exists in cloud-cell-bringup.sh (it sources keys.env and runs check_gh
+# afterwards), and it has no other guard at all — deleting its re-export left the suite green.
+# Driven for real: the script's own flow with stub tools, and the gh stub records the HOME that
+# `auth status` ran under.
+BG="$TMP/bg"; mkdir -p "$BG/stub" "$BG/home/.pi/agent" "$BG/otherhome"
+git init -q "$BG/work" 2>/dev/null || true
+cat > "$BG/stub/gh" <<'GHSTUB'
+#!/bin/bash
+case "$*" in
+  *"auth status"*) [ -n "${GH_HOME_RECORD:-}" ] && printf '%s\n' "$HOME" >> "$GH_HOME_RECORD"; exit 0 ;;
+  *"api user"*) echo tester; exit 0 ;;
+  *"api repos/"*) echo true; exit 0 ;;
+esac
+exit 0
+GHSTUB
+printf '#!/bin/bash\necho 200\n' > "$BG/stub/curl"
+printf '#!/bin/bash\necho LANE_READY\n' > "$BG/stub/pi"
+printf '#!/bin/bash\nshift; exec "$@"\n' > "$BG/stub/timeout"
+printf '#!/bin/bash\nexit 0\n' > "$BG/stub/docker"
+chmod +x "$BG/stub/"*
+printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
+GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
+GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
+  WORKDIR="$BG/work" ENV_FILE= bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
+if [ -s "$TMP/bg-gh-home.txt" ]; then
+  [ "$(cat "$TMP/bg-gh-home.txt")" = "$BG/home" ] && rc=0 || { rc=1; echo "      bringup's gh saw HOME=$(cat "$TMP/bg-gh-home.txt"), cell home is $BG/home"; }
+else
+  rc=1; echo "      bringup never ran gh auth status"
+fi
+ck "cloud-cell-bringup runs gh under \$CELL_HOME, not a keys.env HOME=" $rc
+# …and with no ENV_FILE it must resolve the default UNDER $CELL_HOME, not the hard-coded
+# /tmp/cell-home path it used to name — otherwise it validates and sources a file the cell never
+# reads, and a stale one there would false-green the bring-up.
+case "$(cat "$TMP/bg.out")" in
+  *"sourced $BG/home/keys.env"*) rc=0 ;;
+  *) rc=1; echo "      bringup did not source \$CELL_HOME/keys.env ($(grep -c . "$TMP/bg.out") output lines)" ;;
+esac
+ck "cloud-cell-bringup resolves the default keys.env under \$CELL_HOME" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

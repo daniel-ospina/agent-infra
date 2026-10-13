@@ -38,7 +38,7 @@ set -uo pipefail
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"
 WORKDIR="${WORKDIR:-/tmp/cell}"
-ENV_FILE="${ENV_FILE:-/tmp/cell-home/keys.env}"
+ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 MODE="${1:---check}"
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }

@@ -37,11 +37,18 @@ doc_status: draft
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
 > issue); until that PR lands the old path is a stale duplicate, so do not run it.
 >
-> ⛔ **That follow-up must PORT tortoise#8437 before it removes anything (agent-infra#1712).** This
-> directory is a point-in-time copy taken at 2026-10-13 05:50 local; tortoise#8437
-> (`8fe1e7b13`, merged 12:58Z the same day — core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead
-> `REPO` default corrected) touched these same six files and is NOT here. Removing the tortoise copy
-> without it would delete the only tree carrying those fixes.
+> ⛔ **That follow-up must PORT every post-copy change before it removes anything
+> (agent-infra#1712).** This directory is a point-in-time copy taken at 2026-10-13 05:50 local
+> (= 10:50Z), and the tortoise tree moved twice afterwards:
+>
+> | commit | tortoise | what it carries |
+> |---|---|---|
+> | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected — six of these files |
+> | `a59858d07` | #8465/#8467 | dispatch pool ordered by **severity**, not issue number — `refresh-candidates.sh` + `selftest.sh` |
+>
+> Neither is here (`sort -n -u` is still the pool's only ordering). The safe instruction for the
+> follow-up is **not** a list of shas: diff the tortoise tree against this one and port everything
+> not present. Removing the tortoise copy otherwise deletes the only tree carrying those fixes.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -198,9 +205,9 @@ launchctl unload -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
 Run the offline self-test first — it needs no network, tmux server or git writes. **Every check
 exercises the shipped script** (it extracts the real classifier, `sess()`, the claim block and the
 reaper, or runs `install.sh` for real) rather than re-implementing the logic — a test that
-re-implements the fix passes on the broken copy and proves nothing. That failure mode was found in
-review of this very file. Every check is written to fail on the pre-fix tree it
-pins; the live total is printed by `./selftest.sh` rather than quoted here.
+re-implements the fix passes on the broken copy and proves nothing. `need()` fails a check whose
+extraction comes back empty, so a check cannot pass by driving nothing; the live total is printed
+by `./selftest.sh` rather than quoted here.
 
 ```bash
 ./selftest.sh          # run it for the live list. Covers: syntax, exact session matching, the
@@ -266,9 +273,12 @@ after a restart until it was fixed).
    "requires human attention" — forbidden phrases, so an equivocal review cannot be laundered
    into a merge.
 3. **Scope adapts to the queue — and can be pinned.** `open PRs > 10` → **broad** mode: the sweep
-   covers *every* non-draft PR in the repo, not just this box's. `≤ 10` → own branches only
-   (`*-tm`, `*-cap`, `fix/*`). Broad mode is how this box drains a peer's queue; it is also how two
-   boxes accidentally duplicate work if they both run broad. `SCOPE` overrides the count: `auto`
+   covers every non-draft PR in the repo except the branch classes it deliberately never touches
+   (`design/`, `scope/`, `dependabot/` — the selector is
+   `select(.headRefName|test("^design/|^scope/|^dependabot/")|not)`), not just this box's. `≤ 10` →
+   own branches only (`*-tm`, `*-cap`, `fix/*`). Broad mode is how this box drains a peer's queue;
+   it is also how two boxes accidentally duplicate work if they both run broad. `SCOPE` overrides
+   the count: `auto`
    (default — the rule above), `own` (own-only even above the threshold), `broad` (broad even below
    it); any other value is fatal, so a typo cannot silently pick a scope. In a multi-box fleet
    exactly one box takes `broad` and the rest pin `SCOPE=own` (measured 2026-10-13: an unpinned
@@ -416,7 +426,8 @@ its checks, failed `ai-review-gate`, and no worker ever touched it. Observed: **
 **Fix:** the sweep now includes drafts that match the harness's **own** branch patterns
 (`*-tm`, `*-cap`, `fix/*`) and readies them once (`gh pr ready`) before the next cycle processes
 them. Foreign drafts are excluded exactly as before — #4212 (`scope/w6b-graph-candidate`) is
-another box's draft and is correctly left alone.
+another box's draft and is correctly left alone. (Note the two exclusions are independent: a PR on
+`design/`, `scope/` or `dependabot/` is never swept even when it is not a draft — see §5.)
 
 ### 7.2c Conflicted PRs — **FIXED in this PR**
 
@@ -454,7 +465,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
-| **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses — and each of the four cases is pinned by a check a mutation turns red |
+| **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |
 | Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
 | `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
 | `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
@@ -472,9 +483,11 @@ These are kept as a record because each one is a *failure mode of the design*, n
 
 ### 7.5 Still open, deliberately not fixed here
 
-- **`state/` and `wip/` grow without bound.** Nothing prunes `merged-*.done`, `needsfix-*`,
-  `fixcount-*`, `mergeclaim-*.lock`, `parked-*` or expired `rerun-*`. Needs a retention rule rather
-  than an ad-hoc `find -mtime`.
+- **`state/` and `wip/` grow without bound.** There is no time- or size-based retention: nothing
+  expires `merged-*.done`, `fixcount-*`, `parked-*` or stale `rerun-*`. (`mergeclaim-*.lock` and
+  `needsfix-*` are pruned when they are consumed or their owner dies — `merge-one.sh`'s `trap`, the
+  controller's `claim_live()`, and the successful-fixer path — so they are bounded by traffic, not by
+  time.) Needs a retention rule rather than an ad-hoc `find -mtime`.
 - **`[ -z "$WT" ] && { … }` as a script's last statement** makes the exit status that of the
   test. The shipped `fix-one.sh` ends with a positive `echo` so it no longer leaks a non-zero
   status, but the pattern is easy to reintroduce — a `exit 0` at the end of each script would pin it.
