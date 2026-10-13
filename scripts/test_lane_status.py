@@ -280,3 +280,47 @@ def test_unread_screen_cannot_produce_a_wedged_action(L):
                    child_stale=None, child_grew=None, child_activity_age=None,
                    tool_inflight={"age": 300, "timeout": 7200}, last_stop=None, has_sid=True),
     ), "an unread screen must not turn a live tool into a wedge"
+
+
+def test_told_but_silent_is_the_ACTION_surface_rule_not_the_claim_one(L):
+    """⛔ TWO RULES, TWO SURFACES, DELIBERATELY NOT ONE FUNCTION.
+
+    `inbound_discounts_idle` is the CLAIM surface's rule: a PRIOR, IDLE-family only, never WEDGED,
+    because an input event cannot prove a wedge resolved. `told_but_silent` is the ACTION surface's
+    rule: a VETO, verdict-independent, because a lane that received work and has produced nothing
+    since is not free capacity whatever anyone believes about its state. A claim and an instruction
+    are different speech acts; keeping them separate is what stops a later change collapsing them.
+    """
+    # The fully-PAIRED measured instance (`Merigng PR`, 2026-10-11): told 20m ago, last output
+    # 5h14m ago. The finding's own `2a Projection keys` reading recorded only
+    # `latest_submitted 0.03h ago` and NO output age, so its 108s is deliberately NOT paired with a
+    # `stale_s` -- pairing it would assert an output age the source never carried.
+    assert L.told_but_silent(1210, 18858) is True
+    # Told 27m ago but wrote 25m ago -- it ANSWERED, so the order was consumed and it IS free.
+    assert L.told_but_silent(1620, 1500) is False
+    # Told 36s ago while writing 3s ago -- output is newer, it is working, not silent.
+    assert L.told_but_silent(36, 3) is False
+    # Old inbound, never answered: still not free capacity.
+    assert L.told_but_silent(10800, 20000) is True
+    # A simultaneous inbound and output is not silence.
+    assert L.told_but_silent(600, 600) is False
+
+
+def test_told_but_silent_abstains_on_an_unread_signal(L):
+    """⛔ `None` ABSTAINS. An unread inbound, or an unknown output age, is NOT evidence of silence --
+    returning True would exclude a lane on a fact nobody established. Same rule as everywhere else:
+    an unread signal is not a value, and it must not render as one."""
+    assert L.told_but_silent(None, 5000) is False    # inbound unread
+    assert L.told_but_silent(100, None) is False     # output age unknown
+    assert L.told_but_silent(None, None) is False    # both unknown
+
+
+def test_the_VETO_is_not_the_discount(L):
+    """The two rules must disagree on the case that separates them, or one has absorbed the other.
+
+    A WEDGED lane with a fresh inbound: the CLAIM rule must NOT fire (an input event cannot resolve
+    a wedge), while the ACTION rule must still fire (do not instruct a human to act on a lane just
+    given work). If a refactor ever made these agree here, the surfaces have collapsed.
+    """
+    assert L.inbound_discounts_idle(L.WEDGED, 1210, 18858) is False, "the claim rule must not clear a wedge"
+    assert L.told_but_silent(1210, 18858) is True, "the action rule must still veto the instruction"

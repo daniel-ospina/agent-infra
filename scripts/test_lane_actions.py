@@ -28,6 +28,9 @@ def load(name, path):
 
 
 LA = load("lane_actions", os.path.join(HERE, "lane-actions.py"))
+# The REAL lane-status module, so `FakeLS` delegates the shared rule to it instead of restating it --
+# a fake that reimplements the rule under test cannot detect that rule changing.
+LS_MOD = load("lane_status", os.path.join(HERE, "lane-status.py"))
 
 FAILS = []
 
@@ -66,6 +69,9 @@ class FakeLS:
 
     def ts_epoch(self, ts):
         return 0
+
+    def told_but_silent(self, inbound_age, stale_s):
+        return LS_MOD.told_but_silent(inbound_age, stale_s)
 
     def records(self, path, limit=None):
         return self._recs
@@ -281,6 +287,57 @@ def main():
     check("the file pointer is in the clause", "NEEDS-ACTION.md" in line)
     check("the clause fits the beat budget and is not truncated",
           len(line) <= LA.SUMMARY_MAX and "\u2026" not in line, "%d chars" % len(line))
+
+    # ── THE ACTION-SURFACE VETO: told work after its last output => NOT free capacity ─────────
+    # ⛔ THE OWNER'S OWN WORDS: "Both of those were in the DO list telling me to act. Acting would
+    # have interrupted live work." So this is asserted at the PUBLISHED-LINE level, not just on a
+    # row: the beat must not be ABLE to say `IDLE->` about such a lane. `DONE_READY` is read from
+    # the lane's own last WORDS, which cannot know a work order landed after they were written.
+    print("The DO list is FAIL-CLOSED: a lane told work after its last output is not offered")
+    _real_jev5 = LA.jev_step5
+    try:
+        LA.jev_step5 = lambda step5, LV, enabled=True: (
+            {c["lane"]: ("DONE_READY", 0.9) for c in step5}, {"source": "JEV", "error": None})
+        rows_fc = [
+            # the fully-PAIRED measured instance (`Merigng PR`, 2026-10-11, read live): told 20m
+            # ago (inbound_age=1210), silent for 5h14m (stale_s=18858), `task` still in flight.
+            # The finding's `2a Projection keys` reading recorded only `latest_submitted 0.03h ago`
+            # and NO output age, so its 108s is deliberately not paired with a `stale_s` anywhere.
+            row(lane="told1", sid="sid-told1", verdict="DONE-IDLE", stale_s=18858,
+                inbound_age=1210),
+            # genuinely free: no inbound record at all
+            row(lane="free1", sid="sid-free1", verdict="DONE-IDLE", stale_s=600,
+                inbound_age=None),
+            # told 27m ago but WROTE 25m ago -- the order was consumed, so it IS free
+            row(lane="consumed1", sid="sid-consumed1", verdict="DONE-IDLE", stale_s=1500,
+                inbound_age=1620),
+        ]
+        files_fc = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
+                                                "--x-repo-%s--" % r["lane"], "s.jsonl"))
+                        for r in rows_fc)
+        cwds_fc = dict((str(i), "/x/repo-%s" % r["lane"]) for i, r in enumerate(rows_fc))
+        res_fc = LA.build(rows_fc, FakeLS(files=files_fc, cwds=cwds_fc, cpus=dict(cwds_fc)),
+                          None, use_jev=False, live={"WS-1"})
+        idles = {c["lane"] for c in res_fc["idle"]}
+        check("a lane told work and silent since is NOT in the dispatch list",
+              "told1" not in idles, sorted(idles))
+        _t = [c for c in res_fc["report"] if c["lane"] == "told1"]
+        check("...and is REPORTED instead, with the EVIDENCE named",
+              bool(_t) and any("given work" in w for w in _t[0]["why"]),
+              [c["why"][:1] for c in res_fc["report"]])
+        check("a genuinely free lane STILL dispatches (the list is not empty by accident)",
+              "free1" in idles, sorted(idles))
+        check("a lane that ANSWERED what it was told is still free",
+              "consumed1" in idles, sorted(idles))
+        beat_fc = LA.render_beat(res_fc, "state/NEEDS-ACTION.md")
+        _clause = beat_fc.split("|")[0]
+        check("THE PUBLISHED LINE cannot name the withheld lane",
+              "told1" not in _clause, _clause[:140])
+        check("THE PUBLISHED LINE still dispatches both free lanes",
+              "IDLE->2" in _clause and "free1" in _clause and "consumed1" in _clause,
+              _clause[:160])
+    finally:
+        LA.jev_step5 = _real_jev5
 
     # ── the workspace-existence filter (tortoise#7738) ───────────────────────────────────────────
     # A lane whose cmux workspace no longer exists cannot be dispatched, unblocked or relaunched,
@@ -527,6 +584,35 @@ def main():
         LA.LIVE_WS_FILE = _saved_wsfile2
         import shutil
         shutil.rmtree(_tmpd, ignore_errors=True)
+
+    # ── THE DEPLOYMENT COUPLING, PINNED ─────────────────────────────────────────────────────────
+    # ⛔ `LS_PATH` resolves to the DEPLOYED `~/.pi/agent/scripts/lane-status.py`, NOT the copy beside
+    # this file, and the two deploy INDEPENDENTLY. Calling the sibling's new predicate directly
+    # crashed the live beat with `AttributeError: module 'lane_status' has no attribute
+    # 'told_but_silent'` the moment lane-actions.py landed first (reproduced 2026-10-12: exit 1, no
+    # beat produced). So the rule is stated locally as a fallback -- and a duplicated predicate
+    # drifts unless something pins it, which is this.
+    print("The deployed-sibling fallback matches the canonical rule")
+    _grid = [(None, None), (None, 1), (1, None), (0, 0), (1, 2), (2, 1), (1210, 18858),
+             (1620, 1500), (36, 3), (10800, 20000), (600, 600)]
+    _mismatch = [(ia, st, LS_MOD.told_but_silent(ia, st), LA.told_but_silent(ia, st))
+                 for ia, st in _grid if LS_MOD.told_but_silent(ia, st) != LA.told_but_silent(ia, st)]
+    check("the local fallback agrees with the canonical rule on every input",
+          not _mismatch, _mismatch)
+
+    class _WithFn:
+        @staticmethod
+        def told_but_silent(ia, st):
+            return "sibling"
+
+    class _WithoutFn:
+        pass
+
+    check("the selector PREFERS the sibling when present (a future rule change takes effect)",
+          LA.told_but_silent_via(_WithFn) is _WithFn.told_but_silent)
+    check("the selector degrades to the SAME RULE against an older deployed sibling",
+          LA.told_but_silent_via(_WithoutFn) is LA.told_but_silent
+          and LA.told_but_silent_via(object()) is LA.told_but_silent)
 
     print("")
     if FAILS:
@@ -939,3 +1025,4 @@ class TestResourceBands:
         assert self.o.rail_block_reason(set(), set(), set()) is None
         assert self.o.rail_block_reason({"drift-guard"}, set(), set()) == "drift-guard"   # RED does
         assert self.o.rail_block_reason(set(), {"provenance"}, set()) == "provenance"     # flight does
+
