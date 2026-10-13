@@ -41,6 +41,49 @@ def W():
     return mod
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_paths(W, monkeypatch, tmp_path):
+    """⛔ EVERY TEST IN THIS FILE RUNS INSIDE THIS FIXTURE (#1734, measured 2026-10-13).
+
+    `_log()` appends to the module-global `LOG`, which resolves to
+    `~/.pi/agent/state/lane-watchdog.jsonl` -- the PRODUCTION reaper log, and the artifact an operator
+    reads to tell "the reaper is fine and found nothing" from "the reaper has been inert for a week".
+    Tests that call `reap()` -- and `frozen_subtrees()`, which logs its abstentions directly -- wrote
+    the production log. The worst of them drives `reap()` against a LIVE pid to prove the fence, so
+    its rows carry a real host pid and read as production rows in that file. No count is asserted
+    here: it is a moving number in a file this docstring cannot revalidate, and the recipe below
+    measures it on demand.
+
+    Redirecting the three paths here rather than in each test makes this hermetic BY CONSTRUCTION: a
+    test added later is inside the fixture unless it deliberately undoes it. This is the same class
+    as #1696 (an unreadable input treated as a definite answer) and as the cache non-hermeticity
+    review cycle 4 found in `test_lane_status.py` -- applied to the EVIDENCE, where the damage is not
+    transient: it survives the run and is read later by someone who cannot know which rows are real.
+
+    The proof is external and depends on no test remembering anything -- run it before trusting this:
+
+        before=$(shasum -a 256 ~/.pi/agent/state/lane-watchdog.jsonl)
+        /usr/bin/python3 -m pytest scripts/test_lane_watchdog.py -q
+        after=$(shasum -a 256 ~/.pi/agent/state/lane-watchdog.jsonl)
+        [ "$before" = "$after" ]   # a full run must leave the production log BYTE-identical
+    """
+    home = os.path.expanduser("~/.pi/agent/state")
+    for name in ("STATE", "LOG", "LOCK"):
+        monkeypatch.setattr(W, name, str(tmp_path / name.lower()))
+        assert not getattr(W, name).startswith(home), f"{name} still points at production"
+
+
+def test_the_suite_never_points_at_the_production_state_files(W):
+    """⛔ THE FIXTURE MUST BE IN FORCE, NOT MERELY PRESENT (#1734). Deleting `_hermetic_paths` must
+    fail HERE. Without this test the fixture is a convention, and the next edit that removes it
+    silently resumes writing fixture rows into the reaper's operational history, where they cannot be
+    told from real ones."""
+    home = os.path.expanduser("~/.pi/agent/state")
+    for name in ("STATE", "LOG", "LOCK"):
+        value = getattr(W, name)
+        assert not value.startswith(home), f"{name} points at production during tests: {value}"
+
+
 def T(ppid, cpu=0.0, stat="Ss", cmd="pi"):
     """One `ps` row."""
     return dict(ppid=ppid, stat=stat, cpu=cpu, cmd=cmd)
