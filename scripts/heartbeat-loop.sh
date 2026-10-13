@@ -330,6 +330,25 @@ while :; do
     printf '%s LANE-ACTION no fresh snapshot -- fallback scan launched detached\n' \
       "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
   fi
+  # ── THE WEDGE WATCHDOG — unstick a lane stuck behind a FROZEN child dispatch ──
+  # A `task`/`subagent` dispatch can hang forever with NO watchdog: measured 2026-10-12, three
+  # children of the ORCHESTRATOR sat in `Ss` with a CPU delta of literally zero for 2h28m while the
+  # call never returned, and nothing in the fleet observed it (the lane's process is alive, its CPU
+  # advances, there is no error). `TERM` on those three returned the call in the same second.
+  # scripts/lane-watchdog.py implements it with the three reaping gates as CODE -- zero CPU delta
+  # over a measured window, an ancestry walk that refuses anything under a human terminal, and the
+  # child's subtree provably unchanged across ticks -- and it signals the CHILD, never the lane.
+  # DETACHED, like the fallback scan above: it needs a ~30s CPU window, and a step that must fit
+  # inside a pass already overrunning is a step that never runs. It SELF-LOCKS, so launching it on
+  # consecutive passes is safe -- the second run exits immediately instead of double-counting its
+  # own ticks, which is the gate that separates a stuck child from one in a long model call.
+  # ⛔ ARMED, because a hang nothing observes is the failure this exists to end. Kill switch:
+  # export LANE_WATCHDOG_APPLY=0 (the script's own default, for manual runs, is a DRY RUN).
+  if [ "${LANE_WATCHDOG_APPLY:-1}" = "1" ]; then
+    nohup /usr/bin/python3 "$SCRIPTS/lane-watchdog.py" --apply >>"$LOG" 2>&1 &
+  else
+    nohup /usr/bin/python3 "$SCRIPTS/lane-watchdog.py" >>"$LOG" 2>&1 &
+  fi
   # 2. the turn-end classifier — WHY the turn ended (Jev, one `choice` question):
   #    a question with no protocol -> tell it to route it; stopped with work left
   #    -> remind it of the no-pause rule; a question already routed, or finished

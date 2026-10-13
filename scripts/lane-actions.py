@@ -138,6 +138,70 @@ def _clip(t, n):
     return t if len(t) <= n else t[: n - 1].rstrip() + "\u2026"
 
 
+DEGRADED_MSG = (
+    "lane-actions: REFUSING a DEGRADED snapshot -- lane-status could not read the cmux fleet "
+    "roster, so it covers the hand-written TSV only and every live-only lane is INVISIBLE. "
+    "Acting on it would report a blind fleet as a healthy one; re-run lane-status against a "
+    "reachable cmux.")
+
+
+def _refuse_if_degraded(rows, where):
+    """⛔ ONE GUARD, BOTH PATHS — and both have been guarded from the start.
+
+    ⚠️ CORRECTED 2026-10-13. This docstring opened with "The refusal used to live INSIDE the
+    `--stdin` branch only, so the OTHER path accepted a degraded snapshot and acted on a fleet read
+    missing every live-only lane." That lineage claim is FALSE: at this PR's base NEITHER path had
+    any degraded refusal (`git show 42f0b14:scripts/lane-actions.py | grep -c degraded` -> 0), so
+    both arrived together and nothing was ever "left" unguarded. ⚠️ AND THIS CORRECTION'S FIRST
+    DRAFT INTRODUCED A NEW FALSEHOOD (caught by review cycle 3), which is the worst class here: it
+    claimed "the deployed copy that predated this branch asserted the same claim about the OTHER
+    direction". Both halves are wrong. The deployed
+    `~/.pi/agent/scripts/lane-actions.py` carries this SAME sentence about the SAME path — a second
+    copy of the falsehood, not a different direction — and it did NOT predate this branch: it
+    contains `def offerable` / `CONF_MIN`, and `git log -S 'def offerable' --all --
+    scripts/lane-actions.py` shows those enter history only in this branch's own commit. It is a
+    snapshot of this branch's IN-PROGRESS work, so it is evidence about nothing else. The core
+    correction above stands on the base-lineage check; only the comparison to the deployed copy was
+    invented. The correction matters because a
+    reader who believes one path was historically the hole will guard that one — which is the
+    failure this docstring already warns about one paragraph below.
+
+    ⛔ WHICH PATH IS PRODUCTION: `--stdin`. heartbeat-loop.sh invokes this tool as
+    `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
+    ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
+    FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
+    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py:238`
+    (`lane-actions.py --json`). Both paths are guarded; the tests that pin them live in
+    test_lane_actions.py."""
+    if any(r.get("degraded") for r in rows if isinstance(r, dict)):
+        raise SystemExit(DEGRADED_MSG + " (%s)" % where)
+
+
+def _live_want(LS=None):
+    """The fleet size the scan is SUPPOSED to return, or None when it cannot be known.
+
+    ⛔ NONE IS NOT ZERO. This returned 0 on failure, and the guard is `if not want or ...` -- so an
+    UNREADABLE roster DISABLED the partial-snapshot guard entirely, accepting a truncated snapshot on
+    the first attempt with no re-scan and no warning. "Guard disabled" and "guard needed" were the
+    same event, which is the fail-open direction: a partial fleet read published as a healthy one.
+    Callers must treat None as UNKNOWN and take the strongest read available.
+
+    The fleet size the scan is SUPPOSED to return: the LIVE roster, never the hand-written TSV.
+
+    ⛔ MEASURED 2026-10-12: this was `len(_registry_labels())` -- the TSV, 27 rows -- while
+    `registry()` had just become live-only (16 workspaces). `16 >= 27 - REGISTRY_GRACE` is FALSE, so
+    the partial-snapshot guard declared a HEALTHY snapshot PARTIAL and re-ran the entire scan with
+    `--no-cache` on every pass, up to ~300s per tick, forever. A guard against a truncated snapshot
+    must be measured against what a complete one contains.
+    """
+    try:
+        mod = LS or _load(LS_PATH, "lane_status_livewant")
+        n = len(mod._live_workspaces() or [])
+        return n or None
+    except Exception:
+        return None
+
+
 def _registry_labels():
     out = []
     try:
@@ -392,6 +456,17 @@ def classify_row(row, dead, files, LS):
         r["why"].append("session %s is claimed by %s -- neither panel's staleness or CPU reading "
                         "is demonstrably about this lane" % (sid[:8], ", ".join(row["_dup_sid"])))
         return r
+    if row.get("session_verified") is False:
+        # ⛔ THE SAME ABSTENTION AS `not sid`, ONE STEP LATER (2026-10-12). The row HAS an id, but
+        # lane-status could not confirm it is the one being written -- so `stale_s`, the transcript
+        # and the CPU reading below may all describe a DIFFERENT, dead session. MEASURED: two lanes
+        # were bound to sessions last written 64h18m and 12h30m earlier and both rendered
+        # `DONE-IDLE`; a `DONE-IDLE` here invites dispatching a lane that is already running work.
+        r.update(verdict="UNVERIFIED-SESSION", step="0", action="report")
+        r["why"].append("the session id under this lane could not be confirmed as the one being "
+                        "written (no fresh write, no content match), so nothing below is "
+                        "attributable to it (NEVER dead, NEVER idle)")
+        return r
 
     # -- STEP 1 does the process exist? -------------------------------------------------
     if lane in dead:
@@ -587,6 +662,57 @@ def classify_row(row, dead, files, LS):
 # ── STEP 5: ONE batched Jev call for the whole fleet's words layer ────────────────────────
 STEP5_OUTCOMES = ("CONTINUE", "BLOCKED_EXTERNAL", "BLOCKED_HUMAN", "DONE_READY", "STALLED",
                   "CONTEXT-MISBELIEF")
+
+# ⛔ AN ACTION IS A CLAIM ABOUT THE LANE, AND A CLAIM NEEDS CONFIDENCE. `conf` was carried all the
+# way from the model (`:690`) to the report and GATED NOWHERE -- `:1130` only formats it. So the
+# label alone decided, and a coin-flip carried exactly the weight of a certainty.
+CONF_MIN = 0.7
+
+# The labels that may become an INSTRUCTION. `BLOCKED_HUMAN` (waiting on the owner) and
+# `BLOCKED_EXTERNAL` (CI / rail / another lane) are absent deliberately: neither is work the lane
+# should be told to resume, and one is a live conversation.
+OFFERABLE = ("DONE_READY", "CONTINUE", "CONTEXT-MISBELIEF", "STALLED", "DEAD", "CHILD-OVERDUE")
+
+# ⛔ THE CONFIDENCE FLOOR APPLIES TO THE WORDS LAYER ONLY -- NOT TO EVERY `OFFERABLE` LABEL.
+# `conf` is produced by the Step-5 Jev call and exists for NO other step, while `DEAD` (Step 1, the
+# process is not alive) and `CHILD-OVERDUE` (Step 6, the child record's age) are MECHANICAL: their
+# evidence is the process table and the child record, and neither carries -- or needs -- a
+# confidence. Applying the floor to them was a reproduced crash: `c["conf"]` raised `KeyError`,
+# and because `main()` calls `build()` unguarded, ONE such lane aborted the entire fleet
+# classification and wrote no verdict file at all. A gate that cannot read its input must not
+# silently stop classifying the fleet.
+WORDS_LABELS = frozenset(STEP5_OUTCOMES)
+
+
+def offerable(v, conf):
+    """Whether `v` may become an INSTRUCTION to a lane at this confidence.
+
+    ⛔ MEASURED 2026-10-12, `NEEDS-ACTION.md:27`:
+
+        - 3 Onboarding [CONTINUE 0.44] (2h58m)
+            - WHY: last words said -55s ago | no session write for 2h58m, no spinner contradiction
+
+    A 44%-confident label, on a lane that had written nothing for ~3h, became `say CONTINUE, not a
+    new task`. The classifier was not missing and the resolution table was not wrong -- the label was
+    simply allowed to act on its own. This is the one place that decides, so the rule cannot be
+    bypassed by a later branch.
+
+    `BLOCKED_HUMAN` is never offerable whatever its confidence: a lane waiting on the OWNER must not
+    be told to continue -- that is the conversation, and typing into it corrupts the thing the lane
+    is for. It is absent from `OFFERABLE` for exactly that reason.
+
+    UNKNOWN CONFIDENCE IS NOT HIGH CONFIDENCE (fail closed): `None` is refused rather than treated as
+    "no objection", the same polarity as every other unclear read in this fleet. But that rule is for
+    the WORDS LAYER -- a mechanical label carries no confidence to be unknown.
+    """
+    if v not in OFFERABLE:
+        return False
+    if v not in WORDS_LABELS:
+        # Mechanical verdict (DEAD / CHILD-OVERDUE): no confidence is carried and none is required.
+        return True
+    if conf is None:
+        return False
+    return conf >= CONF_MIN
 
 CONTEXT_CRITERION = (
     "Its last words say it is running out of context / must stop / must hand off to preserve room. "
@@ -954,10 +1080,8 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
 
     # -- buckets. The tree's resolution table, applied verbatim ---------------------------
     idle, wip, wedged, report, quiet = [], [], [], [], []
-    OFFERABLE = ("DONE_READY", "CONTINUE", "CONTEXT-MISBELIEF", "STALLED", "DEAD", "CHILD-OVERDUE")
     for c in classified:
-        v = c["verdict"]
-        # Steps 2-4 resolved the lane to a NO-ACTION verdict (WORKING / WAITING_ON_CHILD /
+        v = c["verdict"]        # Steps 2-4 resolved the lane to a NO-ACTION verdict (WORKING / WAITING_ON_CHILD /
         # TOOL-IN-FLIGHT). It needs neither an action nor a report, so it appears in neither
         # section -- it is counted in the summary line instead, so the reader can see the whole
         # fleet was classified rather than just the lanes that needed something.
@@ -974,6 +1098,16 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
         if v in OFFERABLE and c["busy"]:
             c["why"].insert(0, "already auto-nudged this hour (result SENT/QUEUED) -- do NOT "
                                "message again; it is working")
+            report.append(c)
+            continue
+        # ⛔ A LOW-CONFIDENCE LABEL IS NOT AN INSTRUCTION -- see `offerable()`. MEASURED
+        # 2026-10-12 (`NEEDS-ACTION.md:27`): `- 3 Onboarding [CONTINUE 0.44] (2h58m)` became
+        # "say CONTINUE, not a new task", typed at a lane inert for ~3h. Nothing gated the
+        # confidence, so a coin-flip label carried the same weight as a certain one.
+        if v in OFFERABLE and not offerable(v, c.get("conf")):
+            c["why"].insert(0, "label %s at %s confidence (needs >= %.2f) -- REPORT ONLY, never an "
+                               "instruction: the words layer is guessing"
+                            % (v, "%.2f" % c["conf"] if c.get("conf") is not None else "no", CONF_MIN))
             report.append(c)
             continue
         if v == "DONE_READY":
@@ -1250,7 +1384,7 @@ def render_beat(res, path_for_beat):
 
 
 # ── input ────────────────────────────────────────────────────────────────────────────────
-def load_snapshot(args):
+def load_snapshot(args, LS=None):
     """(rows, snapshot_age_s, reference_clock). Rejects a PARTIAL snapshot -- see the note below."""
     if args.stdin:
         try:
@@ -1265,6 +1399,15 @@ def load_snapshot(args):
             rows = json.loads(raw)
         except Exception as e:
             raise SystemExit("lane-actions: cannot read snapshot %s: %r" % (args.stdin, e))
+        # ── A DEGRADED SNAPSHOT IS NOT A FLEET READ ────────────────────────────────────
+        # ⛔ THE `--stdin` PATH HAD NO GUARD. Every row carries `degraded` when lane-status
+        # could not read the cmux fleet roster, and on that path the roster is the hand-written
+        # TSV alone -- every live-only lane INVISIBLE. MEASURED 2026-10-12: the snapshot the
+        # heartbeat publishes carried 26 workspaces, ALL of them TSV and ZERO of the 13 live-only
+        # ones, while four lanes were stalled; `WEDGED (0)` was printed off it. The re-scan guard
+        # below (`len(rows) >= want - REGISTRY_GRACE`) is bypassed entirely when --stdin is used,
+        # which is exactly how heartbeat-loop.sh calls this tool. So the refusal lives HERE too.
+        _refuse_if_degraded(rows, args.stdin)
         # The header must state the DATA's age, not the run time: a snapshot published by an earlier
         # pass (a killed tick leaves the last good one in place) is still usable, but the reader has
         # to be able to see how old it is.
@@ -1276,7 +1419,7 @@ def load_snapshot(args):
     # refused here: a partial snapshot is re-scanned for real rather than classified as the fleet.
     sys.path.insert(0, SCRIPTS)
     import subprocess
-    want = len(_registry_labels())
+    want = _live_want(LS)
     for attempt in (0, 1):
         cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
         if attempt:
@@ -1291,14 +1434,19 @@ def load_snapshot(args):
                 os.path.join(STATE, "lane-status.cache")))
         except OSError:
             age = 0
-        if not want or len(rows) >= want - REGISTRY_GRACE:
+        _refuse_if_degraded(rows, "lane-status.py invoke path")
+        if want is not None and len(rows) >= want - REGISTRY_GRACE:
             try:
                 ref = os.path.getmtime(os.path.join(STATE, "lane-status.cache"))
             except OSError:
                 ref = time.time()
             return rows, age, ref
-        sys.stderr.write("lane-actions: snapshot PARTIAL (%d of %d registry lanes) -- "
-                         "re-scanning without the cache\n" % (len(rows), want))
+        # Unknown fleet size -> we cannot measure completeness, so take the STRONGEST read we can
+        # rather than accept this one. `attempt` is 0 on the cached pass and 1 on the --no-cache
+        # pass; after the second there is nothing better to try and `return rows` below stands.
+        sys.stderr.write("lane-actions: snapshot %s (%s of %s) -- re-scanning without the cache\n"
+                         % ("PARTIAL" if want is not None else "UNVERIFIABLE",
+                            len(rows), want if want is not None else "an unknown fleet size"))
     return rows, age, time.time()
 
 
@@ -1316,7 +1464,7 @@ def main():
 
     LS = _load(LS_PATH, "lane_status")
     LV = _load(LV_PATH, "lane_verdict")
-    rows, snap_age, ref = load_snapshot(a)
+    rows, snap_age, ref = load_snapshot(a, LS)
     if not isinstance(rows, list) or not rows:
         sys.stderr.write("lane-actions: empty snapshot -- refusing to write a verdict\n")
         return 2

@@ -252,11 +252,39 @@ def test_an_unread_screen_is_unknown_never_a_confident_no_spinner(L):
 
 
 def test_classify_does_not_rule_out_a_tool_on_an_unread_screen(L):
-    """The long-tool gate must read `spinner is not False`, so UNKNOWN cannot exclude the tool."""
-    src = open(_PATH, encoding="utf-8").read()
-    assert "if not child and tool_inflight and spinner is not False:" in src, \
-        "an unread screen must not be treated as evidence of no spinner"
-    assert "spinner = None if not _sc.strip() else" in src, "the spinner must be tri-state"
+    """The long-tool gate must read `spinner is not False`, so UNKNOWN cannot exclude the tool.
+
+    ⛔ BEHAVIOURAL, NOT A SOURCE GREP. This asserted on the literal text of the guard, which pinned
+    the EXPRESSION rather than the rule: it went red when the guard was rewritten to stop gating on
+    child evidence (the fix for `Drain` reading CHILD-STUCK mid-`bash`), even though the rewritten
+    guard reads `spinner is not False` exactly as required. A source assertion cannot tell those two
+    apart; calling `classify()` can.
+    """
+    ti = {"name": "bash", "timeout": 1790, "age": 1415}
+    # an UNREAD screen (None) must not exclude a tool that is inside its own declared budget
+    assert L.classify(1507, False, None, "tool", None, None, None, None, ti) == L.LONG_TOOL
+    # a screen READ with no spinner is genuine evidence against an in-flight tool
+    assert L.classify(1507, False, False, "tool", None, None, None, None, ti) != L.LONG_TOOL
+
+
+def test_a_live_tool_outranks_a_days_old_abandoned_child_record(L):
+    """⛔ THE REGRESSION. Measured 2026-10-12 on `Drain (PR queue support)`: its pi held a live
+    `bash -> sleep 52` poll loop (0 CPU, no connection) while an abandoned `task` record from
+    3.9 days earlier sat in its session. The long-tool guard was gated on `child_has_evidence`,
+    which is true merely because the child has a transcript -- so the guard was skipped, `ti` was
+    left None, and the lane read CHILD-STUCK where the PRE-CHANGE instrument read LONG-TOOL.
+    A declared-budget tool in flight on the PARENT is the strongest explanation of the quiet, and
+    no record about a child may suppress it."""
+    child = {"call_id": "x", "age": 338417, "abandoned": True}
+    ti = {"name": "bash", "timeout": 1790, "age": 1415}
+    v = L.classify(1507, False, True, "tool", child, 334455, False, None, ti,
+                   has_sid=True)
+    assert v == L.LONG_TOOL, (
+        "a live tool call within its declared budget must read LONG-TOOL, not %s -- an abandoned "
+        "child record may not suppress the parent's own in-flight tool" % v)
+    # ...and the abandoned record is still answered when there is NO tool in flight.
+    v2 = L.classify(12007, False, True, "tool", child, 11438, False, None, None, has_sid=True)
+    assert v2 == L.CHILD_STUCK, "with no tool in flight the child record still decides: %s" % v2
 
 
 def test_unknown_reads_differently_from_a_read_with_no_spinner(L):
@@ -324,3 +352,596 @@ def test_the_VETO_is_not_the_discount(L):
     """
     assert L.inbound_discounts_idle(L.WEDGED, 1210, 18858) is False, "the claim rule must not clear a wedge"
     assert L.told_but_silent(1210, 18858) is True, "the action rule must still veto the instruction"
+def test_an_unread_screen_is_never_a_dispatchable_verdict(L):
+    """⛔ `DONE-IDLE` IS A DISPATCH INVITATION, AND IT REQUIRED A POSITIVE READ (2026-10-13).
+
+    The long-tool gate was pinned to `spinner is not False` when the tri-state landed; the four
+    VERDICT sites were left on plain truthiness, where `None` is falsy. The measured effect is
+    exactly ONE error class: `DONE-IDLE` -> `UNKNOWN`. An unread screen became the verdict that
+    invites a new task onto a lane whose state was never established.
+
+    ⛔ AND THE NARROW CLAIM IS THE ONE THAT IS TRUE. An earlier draft of this docstring said the
+    unread screen could also yield `WEDGED`, a kill invitation. A verifier FALSIFIED that against the
+    artifact: every `WEDGED` return is `WEDGED if spinner else DONE_IDLE`, so `None` is falsy and
+    picks `DONE_IDLE` -- an exhaustive 58,320-combination grid over the pre-fix `classify()` with
+    `spinner=None` produced DONE-IDLE 4,082 times and **WEDGED 0 times**. The falsified claim is
+    recorded here rather than deleted, so the next reader does not re-derive it -- and because
+    stating it would have made this fix look broader than it is.
+
+    ⛔ ONE ASSERTION PER CALL SITE, NOT ONE FOR THE HELPER. Three sites route through
+    `_idle_verdict()` and one is inline; a test that only exercised the helper would stay green if a
+    CALL SITE were reverted to `if spinner else`, which is the mutation this must catch.
+    """
+    def c(**kw):
+        args = dict(stale=1200, grew=False, spinner=None, last_kind="assistant", child=None,
+                    child_stale=None, child_grew=None, child_activity_age=None,
+                    tool_inflight=None, last_stop=None, has_sid=True)
+        args.update(kw)
+        return L.classify(**args)
+
+    # site 1 -- an abandoned child record beside a COMPLETED turn (reachable because
+    # `parent_stopped` needs child_stale > 900, which this record does not have)
+    v1 = c(child={"call_id": "x", "age": 99999, "abandoned": True}, child_stale=500,
+           last_stop="stop")
+    assert v1 == L.UNKNOWN, "unread screen + completed turn + abandoned record: got %s" % v1
+    # site 2 -- a stale screen on a COMPLETED turn
+    v2 = c(last_stop="stop")
+    assert v2 == L.UNKNOWN, "unread screen on a completed turn: got %s" % v2
+    # site 3 -- the frozen-pane fallthrough (a call still owed its result)
+    v3 = c(last_kind="bash")
+    assert v3 == L.UNKNOWN, "unread screen on a frozen pane: got %s" % v3
+    # site 4 -- the final assistant branch, reached only below the stale bound
+    v4 = c(stale=120)
+    assert v4 == L.UNKNOWN, "unread screen below the stale bound: got %s" % v4
+    # ⛔ THE FALSE-BLOCK CONTROL. A screen READ with no spinner IS evidence of a finished turn,
+    # and these sites must keep saying so -- otherwise the fix would have made UNREAD the only
+    # reachable answer on a quiet fleet.
+    assert c(spinner=False, last_stop="stop") == L.DONE_IDLE
+    assert c(spinner=True, last_stop="stop") == L.WIP_IDLE
+    assert c(spinner=True, last_kind="bash") == L.WEDGED
+    assert c(spinner=False, last_kind="bash") == L.DONE_IDLE
+
+
+def test_a_missing_lane_registry_is_an_absence_not_a_crash(L, tmp_path, monkeypatch):
+    """⛔ THE REGISTRY OPEN WAS UNGUARDED, SO AN ABSENT FILE RAISED OUT OF THE WHOLE SCAN.
+
+    `_tsv_rows()`'s own docstring states the contract -- never publish a roster it could not read --
+    while `open(REG)` sat outside any `try`. A crash is not the safe direction either: the callers
+    that wrap the scan fall back to publishing a smaller roster, which is the exact failure this
+    file was fixed to stop. An unreadable registry must return NO rows, so `main()` reaches its own
+    `if not rows: raise` and NAMES the unreadable read.
+    """
+    monkeypatch.setattr(L, "REG", str(tmp_path / "nope.tsv"))
+    assert L._tsv_rows() == []
+    # ...and a real file still parses (the false-block control)
+    p = tmp_path / "lane-registry.tsv"
+    p.write_text("# comment\nlabel\tws-uuid\tissue-label\n")
+    monkeypatch.setattr(L, "REG", str(p))
+    assert L._tsv_rows() == [("label", "ws-uuid", "issue-label")]
+
+
+def test_a_degraded_snapshot_is_never_cached(L, tmp_path):
+    """⛔ ONE FAILED READ MUST NOT BECOME A STICKY FAILURE FOR THE WHOLE TTL (2026-10-12, measured).
+
+    The launchd PATH hole made every row `degraded`, and the snapshot was then CACHED for the 420 s
+    TTL -- so after the PATH was fixed `--json` still returned 27/27 degraded rows until the TTL
+    expired, and `lane-actions.py` refuses degraded snapshots, so `pr-doctor` stayed unable to
+    dispatch on a fleet it could no longer see. Deleting the guard left all 152 tests green (found
+    by a VGATE mutation pass), so this test exists specifically to fail without it.
+    """
+    import json
+    cache = tmp_path / "lane-status.cache"
+    # a healthy snapshot IS published (the false-block control)
+    assert L._publish_snapshot([{"verdict": "WORKING", "degraded": False}], str(cache), "k") is True
+    assert json.loads(cache.read_text())["out"][0]["verdict"] == "WORKING"
+    cache.unlink()
+    # the measured degraded shape: EVERY row says degraded, and nothing may be written
+    assert L._publish_snapshot([{"verdict": "WORKING", "degraded": True}], str(cache), "k") is False
+    assert not cache.exists(), "a degraded snapshot must never be cached"
+    # ONE degraded row among many refuses the WHOLE snapshot -- a partial read is still a bad read
+    assert L._publish_snapshot([{"degraded": False}, {"degraded": True}], str(cache), "k") is False
+    assert not cache.exists()
+    # a non-dict row (a malformed snapshot) must not crash the publisher
+    assert L._publish_snapshot(["oops"], str(cache), "k") is True
+
+
+def test_a_compound_failed_read_cannot_publish_or_cache_an_empty_fleet(L, tmp_path):
+    """⛔ `degraded` IS A PER-ROW FLAG, SO AN EMPTY ROSTER CARRIES NO FLAG AT ALL (2026-10-13).
+
+    `any(r.get("degraded") for r in [])` is vacuously False, so the degraded refusal could not fire
+    on the very input a COMPOUND failed read produces (registry unreadable AND the cmux read
+    failed) — `registry()` returns `[]`, `main()` printed `[]`, exited 0, and cached it. Measured by
+    review: `publish empty snapshot wrote cache?: True; contents {"out": []}`. An empty fleet then
+    looked FRESH for the whole 420 s TTL and the `-s "$SNAP"` freshness test refused to launch the
+    fallback scan. Both halves are now refused, and this test exists because the docstrings that
+    claimed a `main()` guard covered it were FALSE — no such guard existed.
+    """
+    cache = tmp_path / "lane-status.cache"
+    assert L._publish_snapshot([], str(cache), "k") is False, "an empty fleet must not be cached"
+    assert not cache.exists()
+
+
+def test_main_refuses_an_empty_roster_instead_of_publishing_it(L, monkeypatch, capsys):
+    """⛔ A SOURCE GREP IS NOT AN ENFORCED GUARD (2026-10-13, found by review cycle 2).
+
+    The first version of this assertion grepped the file for the refusal's MESSAGE AND NOTHING ELSE.
+    A source grep pins the guard's WORDING, never its EFFECT: deleting only the `raise SystemExit(3)`
+    while keeping the message left ALL 160 tests green, and `main()` then returned normally with
+    `[]` on stdout — which is precisely the dark-fleet failure this guard exists to prevent
+    (`heartbeat-loop.sh` promotes the `.tmp` snapshot when `-s` succeeds, and the freshness branch
+    then suppresses the fallback scan for 15 min). Measured by review. Drive `main()` instead, so
+    that removing the refusal fails HERE and not merely somewhere in the prose.
+    """
+    monkeypatch.setattr(L, "registry", lambda: [])
+    monkeypatch.setattr(L.sys, "argv", ["lane-status.py", "--json"])
+    with pytest.raises(SystemExit) as exc:
+        L.main()
+    assert exc.value.code == 3, "an empty roster must exit non-zero, got %r" % (exc.value.code,)
+    assert capsys.readouterr().out.strip() == "", "an empty roster must publish NOTHING"
+
+
+def test_an_unread_screen_never_reaches_the_dispatchable_verdict_at_the_fifth_site(L):
+    """⛔ THE TRI-STATE FIX MISSED A FIFTH SITE, AND REVIEW FOUND IT, NOT THE TESTS (2026-10-13).
+
+    `if last_kind is None: return DONE_IDLE if has_sid else UNBOUND` never consulted `spinner` at
+    all — so a session holding no parseable records PLUS an UNREADABLE screen still returned the one
+    verdict that invites a new task. Reachable from `main()`: a resolved `sid` whose session has no
+    records, with `read-screen` having failed under load (its measured ~10–15 s latency makes that
+    routine). Same absent-read-collapsed-to-a-definite-value class as the four `_idle_verdict()`
+    sites, which is why it belongs in this file's tests rather than in a follow-up.
+    """
+    def c(**kw):
+        args = dict(stale=None, grew=False, spinner=None, last_kind=None, child=None,
+                    child_stale=None, child_grew=None, child_activity_age=None,
+                    tool_inflight=None, last_stop=None, has_sid=True)
+        args.update(kw)
+        return L.classify(**args)
+
+    assert c() == L.UNKNOWN, "an unread screen with no readable records must abstain, got %s" % c()
+    # false-block controls: a POSITIVE read at the same site still decides
+    assert c(spinner=False) == L.DONE_IDLE
+    assert c(spinner=True) == L.WIP_IDLE
+    # ...and a lane with no session at all is still UNBOUND, not UNKNOWN
+    assert c(has_sid=False) == L.UNBOUND
+
+
+# ── a failed read is retried, and is never rendered as an empty success ───────
+#
+# ⛔ THE FAILURE THESE GUARD (2026-10-12). `cmux list-workspaces --json` timed out at load, the
+# exception was swallowed into `""`, and the fleet roster silently shrank to the hand-written TSV:
+# the published snapshot carried 26 workspaces, ALL of them TSV and ZERO of the 13 live-only ones,
+# while four lanes were stalled. One unreadable socket also made `resolve_session` return the
+# RECORDED id unchecked, binding two lanes to sessions last written 64h18m and 12h30m earlier and
+# reporting both `DONE-IDLE`. A failed read must be RETRIED, then REPORTED -- never believed.
+
+def test_a_failed_read_is_retried_before_it_is_believed(L, monkeypatch):
+    calls = []
+
+    class P:
+        returncode = 1
+        stdout = ""
+
+    monkeypatch.setattr(L.subprocess, "run", lambda *a, **k: (calls.append(1), P())[1])
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    out, ok = L.sh_rc(["cmux", "list-workspaces", "--json"])
+    assert ok is False
+    assert len(calls) == L.RETRY_ATTEMPTS >= 2, "a failed read must be retried at least once"
+
+
+def test_a_retry_that_succeeds_is_believed(L, monkeypatch):
+    """The retry exists for a TRANSIENT failure (a control-socket timeout under load), so a
+    second attempt that answers must be used, not discarded."""
+    seq = [TimeoutError("cmux timed out")]
+
+    class P:
+        returncode = 0
+        stdout = "[]"
+
+    calls = []
+
+    def fake(*a, **k):
+        calls.append(1)
+        x = seq.pop(0) if seq else P()
+        if isinstance(x, Exception):
+            raise x
+        return x
+
+    monkeypatch.setattr(L.subprocess, "run", fake)
+    monkeypatch.setattr(L.time, "sleep", lambda s: None)
+    out, ok = L.sh_rc(["cmux", "list-workspaces", "--json"])
+    assert ok is True and out == "[]"
+    assert len(calls) == 2, "the second attempt must actually be made"
+
+
+def test_an_empty_read_and_a_failed_read_are_different_facts(L, monkeypatch):
+    """`ok` is what separates them. Collapsing the two is the whole defect."""
+    monkeypatch.setattr(L.subprocess, "run", lambda *a, **k: _ok(""))
+    empty, ok1 = L.sh_rc(["x"])
+    assert (empty, ok1) == ("", True), "a SUCCESSFUL empty read is not a failure"
+    monkeypatch.setattr(L.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(OSError()))
+    assert L.sh_rc(["x"], attempts=1) == ("", False)
+
+
+def _ok(stdout, rc=0):
+    class P:
+        returncode = rc
+    P.stdout = stdout
+    return P()
+
+
+def test_an_unreadable_fleet_roster_is_not_an_empty_fleet(L, monkeypatch):
+    """⛔ THE SHRINK. `[]` used to be returned for BOTH "no workspaces" and "could not look",
+    and `registry()` unions the TSV with it -- so an unreachable cmux became a 26-lane fleet."""
+    monkeypatch.setattr(L, "_LIVE_CACHE", [])
+    monkeypatch.setattr(L, "LIVE_READABLE", None)
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: ("", False))
+    assert L._live_workspaces() == []
+    assert L.LIVE_READABLE is False, "unreadable must be a stated fact, not an empty list"
+
+
+def test_a_degraded_roster_says_so_on_stderr(L, monkeypatch, capsys):
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [])
+    monkeypatch.setattr(L, "LIVE_READABLE", False)
+    L.registry()
+    assert "DEGRADED" in capsys.readouterr().err, \
+        "a fallback indistinguishable from a healthy read is how the blind spot returns"
+
+
+# ── a session id we cannot confirm must not assert an idle lane ───────────────
+
+def test_a_session_id_that_cannot_be_confirmed_is_reported_unverified(L, monkeypatch):
+    """The documented failure, surviving on the path where nothing disagrees with it: cmux gives
+    no id, so the RECORDED id is returned -- and it is a recovery hint, not a liveness proof.
+    The workspace IS live (that is the case that costs something), so the flag must fire."""
+    monkeypatch.setattr(L, "sh", lambda *a, **k: "")          # pane read produced nothing
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: "01a102f5-b9b5-7554-9528-a0ffd03e69f8")
+    monkeypatch.setattr(L, "session_file", lambda sid: None)  # ... and resolves to no file
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [("ANY-WS", {})])   # the pane still exists
+    sid, verified = L.resolve_session_ex("ANY-WS")
+    assert sid == "01a102f5-b9b5-7554-9528-a0ffd03e69f8"
+    assert verified is False
+
+
+def test_a_dead_workspace_is_not_reported_as_an_unverified_lane(L, monkeypatch):
+    """⛔ A DEAD LANE IS NOT AN UNVERIFIED ONE. 24 of the 39 registry rows are not live cmux
+    workspaces, and `surface resume show` on a dead one exits 0 with empty stdout -- so every one
+    of them would otherwise land in REPORT ONLY and bury the lanes that matter."""
+    monkeypatch.setattr(L, "sh", lambda *a, **k: "")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: "01a102f5-b9b5-7554-9528-a0ffd03e69f8")
+    monkeypatch.setattr(L, "session_file", lambda sid: None)
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [("SOME-OTHER-WS", {})])
+    sid, verified = L.resolve_session_ex("GONE-WS")
+    assert sid == "01a102f5-b9b5-7554-9528-a0ffd03e69f8"
+    assert verified is True, "a workspace that no longer exists cannot be mis-bound"
+
+
+def test_a_freshly_written_session_is_verified(L, monkeypatch, tmp_path):
+    f = tmp_path / "s.jsonl"
+    f.write_text("{}\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                      "cd -- '/x' ; exec pi --session' '11111111-1111-1111-1111-111111111111'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(f))
+    sid, verified = L.resolve_session_ex("ANY-WS")
+    assert sid == "11111111-1111-1111-1111-111111111111" and verified is True
+
+
+def test_resolve_session_still_returns_a_bare_id_for_callers_like_lane_guard(L, monkeypatch):
+    monkeypatch.setattr(L, "resolve_session_ex", lambda ws: ("abc", False))
+    assert L.resolve_session("X") == "abc"
+
+
+# ── an outstanding dispatch is not a wedge ────────────────────────────────────
+#
+# ⛔ THE 2026-10-12 FALSE POSITIVE, and the reason ABANDON_S was load-bearing alone. Four lanes
+# read WEDGED while their children were alive (two running pytest for 2h26m, one polling CI for
+# 1h30m). WEDGED's instruction is "check the process" and its measured cost is a kill/respawn of a
+# HEALTHY lane -- so an unmatched dispatch whose child we cannot see must ABSTAIN, not accuse.
+
+def test_an_outstanding_dispatch_is_never_a_wedge(L):
+    v = L.classify(stale=8052, grew=False, spinner=True, last_kind="tool",
+                   child=None, child_stale=None, child_grew=None, child_activity_age=None,
+                   tool_inflight={"name": "task", "timeout": None, "age": 8052}, has_sid=True)
+    assert v == L.WAITING_OVERDUE, "an UNMATCHED dispatch is not a proven cut"
+    assert v != L.WEDGED
+
+
+def test_a_real_wedge_is_still_a_wedge(L):
+    """The abstention must not disarm the verdict: nothing in flight, stale, spinner -> WEDGED."""
+    v = L.classify(stale=8052, grew=False, spinner=True, last_kind="bash",
+                   child=None, child_stale=None, child_grew=None, child_activity_age=None,
+                   tool_inflight=None, has_sid=True)
+    assert v == L.WEDGED
+
+
+def test_an_abandoned_child_that_is_still_writing_is_waiting(L):
+    """The case that decides the whole change: the record is past ABANDON_S, but the child's own
+    transcript was written 14s ago. The lane is WAITING, and used to read WEDGED."""
+    child = {"call_id": "x", "age": 874, "abandoned": True}
+    assert L.classify(874, False, True, "tool", child, 14, False, 25, None, has_sid=True) == L.WAITING
+
+
+def test_an_abandoned_child_gone_quiet_is_reported_stuck_not_wedged(L):
+    child = {"call_id": "x", "age": 12007, "abandoned": True}
+    assert L.classify(12007, False, True, "tool", child, 11438, False, None, None,
+                      has_sid=True) == L.CHILD_STUCK
+
+
+def test_a_completed_turn_outranks_an_abandoned_child_record(L):
+    """⛔ THE PROTECTION. Keeping abandoned records must not resurrect the failure the old discard
+    was written to stop: a dispatch from days ago making a healthy lane read stuck forever."""
+    child = {"call_id": "x", "age": 264600, "abandoned": True}
+    v = L.classify(264600, False, True, "assistant", child, 250000, False, None, None,
+                   last_stop="stop", has_sid=True)
+    assert v == L.WIP_IDLE
+
+
+def test_pending_child_keeps_the_record_and_flags_it_abandoned(L, tmp_path):
+    import json as _json
+    import time as _time
+    old = _time.strftime("%Y-%m-%dT%H:%M:%S",
+                         _time.gmtime(_time.time() - L.ABANDON_S - 600)) + ".000Z"
+    f = tmp_path / "s.jsonl"
+    f.write_text(_json.dumps({"timestamp": old, "cwd": "/tmp/x", "message": {
+        "role": "assistant",
+        "content": [{"type": "toolCall", "id": "c1", "name": "task",
+                     "arguments": {"prompt": "p"}}]}}) + "\n")
+    ch = L.pending_child(str(f))
+    assert ch is not None, "an old record must not be erased -- it is evidence a result never came"
+    assert ch["abandoned"] is True
+
+
+def test_an_abandoned_record_still_does_not_suppress(L):
+    """ABANDON_S keeps its one honest job: the record may not SUPPRESS an action verdict."""
+    assert L.child_suppresses(L.WEDGED, [], [], {"call_id": "x", "abandoned": True},
+                              L.ABANDON_S + 1) is False
+
+
+def test_a_pane_confirmed_session_is_verified_even_when_quiet(L, monkeypatch, tmp_path):
+    """⛔ A QUIET SESSION IS NOT AN UNCONFIRMED ONE. A lane waiting on a long child writes nothing
+    for as long as the child runs -- that is the shape this whole file exists to classify. So "the
+    file has not been written for an hour" must NOT read as "this is not the live session", or the
+    abstention would fire on exactly the lanes the child fix is about.
+    """
+    import time as _time
+    f = tmp_path / "s.jsonl"
+    f.write_text("{}\n")
+    os.utime(str(f), (_time.time() - 4000, _time.time() - 4000))   # quiet for over an hour
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '22222222-2222-2222-2222-222222222222'")
+    monkeypatch.setattr(L, "session_file", lambda sid: str(f))
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "22222222-2222-2222-2222-222222222222"
+    assert verified is True, "the pane is authoritative about which session it runs"
+
+
+def test_no_id_is_not_an_unconfirmed_id(L, monkeypatch):
+    """`verified=None` where there is no id at all. A flag that fires where it does not apply is
+    how a real one gets ignored -- and the row's abstention is already `sid is None`."""
+    monkeypatch.setattr(L, "sh", lambda *a, **k: "")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    assert L.resolve_session_ex("ANY-WS") == (None, None)
+
+
+def test_a_parallel_round_is_judged_by_its_most_live_child(L, tmp_path, monkeypatch):
+    """⛔ The 2026-10-12 defect: 5&9 held FIVE unmatched calls and `open_calls[-1]` was the
+    QUIETEST, so the lane read CHILD-STUCK while two siblings wrote 8m and 12m ago. A lane is
+    waiting if ANY child is live, so the pick must be on evidence, not on order."""
+    import json, time
+    live, dead = tmp_path / "live", tmp_path / "dead"
+    live.mkdir(); dead.mkdir()
+    # OLDEST FIRST: `live` is dispatched first, `dead` LAST -- so `pending_child` (newest) is the
+    # dead one, which is exactly the trap.
+    f = tmp_path / "s.jsonl"
+    f.write_text("\n".join(json.dumps({
+        "type": "message", "timestamp": "2026-10-12T08:00:00.000Z",
+        "message": {"role": "assistant", "content": [
+            {"type": "toolCall", "name": "task", "id": cid,
+             "arguments": {"prompt": "x", "cwd": cwd}}]}})
+        for cid, cwd in (("c_live", str(live)), ("c_dead", str(dead)))) + "\n")
+    kid = live / "child.jsonl"
+    kid.write_text("{}\n")
+    by_cwd = {str(live): str(kid), str(dead): None}
+    monkeypatch.setattr(L, "find_child_session",
+                        lambda cwd, e, exclude=None: by_cwd.get(cwd))
+    kids = L.pending_children(str(f))
+    assert [k["call_id"] for k in kids] == ["c_dead", "c_live"], "newest-first ordering"
+    assert L.pending_child(str(f))["call_id"] == "c_dead", "the trap: newest is the quiet one"
+    best, best_file = L.most_live_child(kids)
+    assert best["call_id"] == "c_live", "the pick must follow liveness, not order"
+    assert best_file == str(kid)
+
+
+def test_a_record_with_no_child_evidence_does_not_decide_the_verdict(L):
+    """⛔ Measured 2026-10-12, `Storage Archictecture`: a 35h-old abandoned record with
+    `child_stale=72195` and no on-disk activity pinned CHILD-STUCK while the parent had written 86s
+    earlier and was mid-`bash`. A lane actively being driven is WORKING, and a record that knows
+    nothing about its child must not pick the verdict -- it also silently disabled the long-tool
+    guard, which is gated on `not child`."""
+    rec = {"call_id": "c", "ts": None, "age": 126536, "abandoned": True, "cwd": "/x"}
+    # No trace of the child at all: the parent's own state answers.
+    assert L.classify(86, False, True, "tool", rec, None, False, None, None) == L.WORKING
+    # A quiet parent is still served, by the `abandoned` clause at the bottom: report-only.
+    assert L.classify(5000, False, False, "tool", rec, None, False, None, None) == L.WAITING_OVERDUE
+    # Real child evidence still decides.
+    assert L.classify(5000, False, False, "tool", rec, 770, False, None, None) == L.WAITING
+    # And a FRESH parent write outranks even a quiet transcript (the Storage Archictecture case).
+    assert L.classify(86, False, True, "tool", rec, 72195, False, None, None) == L.WORKING
+
+
+def test_a_long_direct_tool_call_is_still_not_a_wedge_with_a_stale_record(L):
+    """The guard is gated on `not child`; an evidence-free abandoned record must not disable it."""
+    rec = {"call_id": "c", "ts": None, "age": 126536, "abandoned": True, "cwd": "/x"}
+    ti = {"name": "bash", "age": 300, "timeout": None}
+    assert L.classify(5000, False, True, "tool", rec, None, False, None, ti) == L.LONG_TOOL
+
+
+def test_the_live_panel_is_the_roster_and_the_file_is_only_metadata(L, tmp_path, monkeypatch):
+    """⛔ The 2026-10-12 complaint: 39 published rows against 16 live workspaces, so two-thirds of
+    the reported "fleet" were workspaces that no longer exist. A deleted lane must stop being a
+    lane, and a lane created after the file was last edited must appear without anyone editing it.
+    """
+    f = tmp_path / "reg.tsv"
+    f.write_text(
+        "5&9 MCP and SDK surface\t{dead-uuid}\tlane:c5-9-mcp-sdk\n"
+        "Storage Archictecture\t{recreated-old-uuid}\tlane:c-storage\n")
+    monkeypatch.setattr(L, "REG", str(f))
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("{recreated-new-uuid}", {"title": "Storage Archictecture"}),   # uuid churned
+        ("{brand-new-uuid}", {"title": "Brand new lane"}),              # never in the file
+    ])
+    monkeypatch.setattr(L, "_live_label", lambda wsid, x: x["title"])
+    monkeypatch.setattr(L, "LIVE_READABLE", True)
+    rows = L.registry()
+    labels = [r[0] for r in rows]
+
+    assert labels == ["Storage Archictecture", "Brand new lane"], \
+        f"the file's dead row must not be a lane; got {labels}"
+    # The uuid was recreated, so the issue-label is recovered by TITLE -- otherwise a lane silently
+    # loses the label that says which repo work it owns.
+    assert rows[0][2] == "lane:c-storage", rows[0]
+    # A lane the file has never heard of is still a lane; it just has no issue-label yet.
+    assert rows[1][2] == ""
+
+
+def test_a_degraded_roster_falls_back_to_the_file_and_only_the_file(L, tmp_path, monkeypatch):
+    """When cmux is unreadable we cannot enumerate panes, so the file's rows are all we have -- and
+    the caller marks the snapshot degraded so `lane-actions.py` refuses it."""
+    import io, contextlib
+    f = tmp_path / "reg.tsv"
+    f.write_text("Some lane\t{uuid}\tlane:x\n")
+    monkeypatch.setattr(L, "REG", str(f))
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [])
+    monkeypatch.setattr(L, "LIVE_READABLE", False)
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        rows = L.registry()
+    assert [r[0] for r in rows] == ["Some lane"]
+    assert "DEGRADED" in err.getvalue()
+
+
+def test_in_flight_tool_reads_the_parent_regardless_of_any_child_record(L, tmp_path):
+    """⛔ THE MISSING SEAM, AND WHY IT IS A SEAM RATHER THAN A TEST. A verifier's mutation round
+    found that main()'s `ti` construction had NO test protection: reverting it to the child-gated
+    form restored the `Drain` regression and the whole suite stayed green, because every other
+    `tool_inflight` assertion calls `classify()` directly with an explicit value and nothing drives
+    main(). Extracting `in_flight_tool(f)` makes the parent-only contract *structural* -- it has no
+    child parameter, so it cannot be made to depend on one -- and this drives it from a real session
+    file that contains BOTH a live in-flight tool call and an ancient abandoned `task` record.
+    """
+    import json as _json
+    import time as _time
+    now = _time.time()
+    iso = lambda t: _time.strftime("%Y-%m-%dT%H:%M:%S", _time.gmtime(t)) + ".000Z"
+    recs = [
+        # an abandoned `task` dispatch from 3.9 days ago, never matched -- the `Drain` shape
+        {"timestamp": iso(now - 338417), "cwd": "/tmp/x", "message": {
+            "role": "assistant", "content": [
+                {"type": "toolCall", "id": "old", "name": "task",
+                 "arguments": {"prompt": "review"}}]}},
+        # ...and the PARENT's live, budgeted tool call, which is the thing that must be seen
+        {"timestamp": iso(now - 1415), "cwd": "/tmp/x", "message": {
+            "role": "assistant", "content": [
+                {"type": "toolCall", "id": "live", "name": "bash",
+                 "arguments": {"command": "while :; do sleep 52; done"}}]}},
+    ]
+    f = tmp_path / "s.jsonl"
+    f.write_text("\n".join(_json.dumps(r) for r in recs) + "\n")
+    ti = L.in_flight_tool(str(f))
+    assert ti is not None, "the parent's in-flight tool must be read from the session"
+    assert ti["name"] == "bash" and ti["timeout"] is None
+    assert 1400 < ti["age"] < 1440, ti
+    assert L.in_flight_tool(None) is None and L.in_flight_tool("/nope/missing.jsonl") is None
+
+
+def test_in_flight_tool_cannot_be_made_to_depend_on_a_child(L):
+    """The structural pin: a function with no child parameter cannot suppress on child evidence."""
+    import inspect
+    params = list(inspect.signature(L.in_flight_tool).parameters)
+    assert params == ["f"], (
+        "in_flight_tool must take only the session path -- a `child` parameter is how the parent's "
+        "own in-flight tool got suppressed, and the signature makes that unreachable (got %r)" % params)
+
+
+def test_main_reads_its_in_flight_tool_through_that_seam(L):
+    """⛔ WIRING PIN, DELIBERATELY A SOURCE ASSERTION. The helper's contract is covered
+    behaviourally above, but main() is not drivable under test (it reads cmux, the registry and the
+    pane), so nothing else can see whether the CALL SITE re-adds a child condition. This pins exactly
+    that one line and nothing else; it is a statement about wiring, not about behaviour, and is
+    labelled as such rather than presented as coverage."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert "        ti = in_flight_tool(f)\n" in src, (
+        "main() must read the in-flight tool through `in_flight_tool(f)` -- gating it on `child` "
+        "again restores the Drain regression (CHILD-STUCK on a lane in a live poll loop)")
+    assert "in_flight_tool(f) if" not in src.replace("        ti = in_flight_tool(f)\n", ""), (
+        "the call site must not be conditional on anything")
+
+
+# ── a read our own teardown killed is NOT an unreadable roster ────────────────
+# ⛔ MEASURED 2026-10-12: all 23 `DEGRADED -- the cmux fleet roster was unreadable` lines in the
+# heartbeat log were immediately preceded by the tick being SIGTERM'd at its 390s bound. NONE was a
+# genuine read failure (cmux answered in 0.05-0.08s at load 69). The instrument was reporting a cause
+# it had never established -- blaming cmux for our own death.
+
+def test_a_signal_killed_child_is_reported_as_teardown_not_a_refusal(L):
+    """A child that died by SIGNAL is not a statement about what we were reading."""
+    out, ok = L.sh_rc(["/bin/bash", "-c", "kill -TERM $$"], timeout=20)
+    assert ok is False and out == ""
+    assert L.LAST_FAILURE["kind"] == "signal", L.LAST_FAILURE
+    assert L.LAST_FAILURE["rc"] == -15, L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is True
+
+
+def test_an_ordinary_nonzero_exit_is_still_a_refusal(L):
+    """The polarity must not swallow the real case: a refusal keeps its original wording."""
+    _out, ok = L.sh_rc(["/bin/bash", "-c", "exit 3"], timeout=20)
+    assert ok is False
+    assert L.LAST_FAILURE["kind"] == "nonzero" and L.LAST_FAILURE["rc"] == 3, L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is False
+
+
+def test_a_timeout_is_not_teardown(L):
+    _out, ok = L.sh_rc(["/bin/sleep", "5"], timeout=1, attempts=1)
+    assert ok is False
+    assert L.LAST_FAILURE["kind"] == "timeout", L.LAST_FAILURE
+    assert L.last_failure_was_teardown() is False
+
+
+def test_a_successful_read_records_no_failure(L):
+    out, ok = L.sh_rc(["/bin/echo", "hello"], timeout=20)
+    assert ok is True and "hello" in out
+    assert L.LAST_FAILURE is None
+    assert L.last_failure_was_teardown() is False
+
+
+def _degraded_stderr(L, failure, monkeypatch):
+    """Drive `registry()` -- that is where the DEGRADED wording lives, NOT in `_live_workspaces()`.
+    Driving the wrong function made two assertions pass against a message that was never printed,
+    which is the same "pins the wrong artefact" trap these tests exist to avoid."""
+    import io as _io
+    import contextlib as _ctx
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: ("", False))
+    monkeypatch.setattr(L, "LAST_FAILURE", failure)
+    monkeypatch.setattr(L, "_LIVE_CACHE", [], raising=False)
+    monkeypatch.setattr(L, "LIVE_READABLE", None, raising=False)
+    err = _io.StringIO()
+    with _ctx.redirect_stderr(err):
+        L.registry()
+    out = err.getvalue()
+    assert "DEGRADED" in out, "registry() did not report the degraded read at all: %r" % out
+    return out
+
+
+def test_the_degraded_message_does_not_blame_cmux_when_we_were_killed(L, monkeypatch):
+    """The wording must follow the EVIDENCE. A teardown says so and explicitly disclaims cmux."""
+    msg = _degraded_stderr(L, dict(kind="signal", rc=-15, cmd="cmux", attempt=2), monkeypatch)
+    assert "KILLED BY A SIGNAL" in msg and "NOT a claim that cmux is down" in msg, msg
+    assert "unreadable after" not in msg, "a signal death must not be reported as a cmux refusal"
+
+
+def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypatch):
+    msg = _degraded_stderr(L, dict(kind="nonzero", rc=1, cmd="cmux", attempt=2), monkeypatch)
+    assert "unreadable after" in msg and "'nonzero'" in msg, msg
+    assert "KILLED BY A SIGNAL" not in msg

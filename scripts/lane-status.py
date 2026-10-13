@@ -25,7 +25,23 @@ Usage:
 import json, os, re, subprocess, sys, time, glob, argparse
 from collections import Counter
 
+# ⛔ cmux IS NOT ON PATH FOR A LAUNCHD JOB. Measured 2026-10-12: the heartbeat's launchd
+# environment carries NO PATH AT ALL (`launchctl print gui/$UID/com.tortoise.heartbeat-loop` shows
+# only SSH_AUTH_SOCK). `sh_rc` runs every subprocess with `env=CMUX`, so with no PATH the
+# `["cmux", ...]` spawn fails, `LIVE_READABLE` goes False, EVERY row is marked `degraded`, and
+# `lane-actions.py` then REFUSES the snapshot — so `pr-doctor.py` classified 15 open PRs on every
+# pass and could not dispatch one fix. Do not rely on an inherited PATH a daemon does not have:
+# name the binary's directory explicitly. (Same failure class as the `gh` shim, #8246.)
+_CMUX_BIN_DIRS = (
+    "/Applications/cmux.app/Contents/Resources/bin",
+    os.path.join(os.path.expanduser("~"), ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
 CMUX = dict(os.environ, CMUX_QUIET="1")
+_present = [d for d in _CMUX_BIN_DIRS if os.path.isdir(d)]
+if _present:
+    CMUX["PATH"] = os.pathsep.join(_present + [CMUX.get("PATH", "")])
 SD = os.path.expanduser("~/.pi/agent/sessions")
 TASK_SD = os.path.expanduser("~/.pi/agent/task-sessions")
 REG = os.path.expanduser("~/.pi/agent/state/lane-registry.tsv")
@@ -50,9 +66,19 @@ LONG_TOOL = "LONG-TOOL"
 # call from days ago (whose result was never recorded) makes a healthy lane read
 # CHILD-STUCK forever. Real children that run this long have already timed out.
 ABANDON_S = 30 * 60          # == the harness's own in-flight bound (OVERDUE_S),
-                              # plus a small margin. A `task`/`subagent` child CANNOT
-                              # outlive it, so past this the child is DEAD and its
-                              # still-open call is a stale record, not a wait.
+                              # plus a small margin.
+                              # ⛔ WHAT THIS ANSWERS, NARROWED 2026-10-12. It used to mean "past
+                              # this the child is DEAD, so its open call is a stale record" -- and
+                              # that premise is FALSE (measured: three task children alive and
+                              # running pytest at 2h26m, a child polling CI at 1h30m). A child
+                              # outlives this whenever it keeps producing OUTPUT; the harness
+                              # bound is on SILENCE, not on runtime. ABANDON_S now answers only
+                              # its supportable question -- "may this record SUPPRESS an action
+                              # verdict" (child_suppresses) -- and never "does the child exist".
+                              # `pending_child` reports `abandoned=True` instead of erasing it.
+SESSION_VERIFY_S = 30 * 60   # a session file nobody has written for this long is NOT verified
+                              # as "the live session" -- resolve_session_ex says so out loud
+                              # rather than asserting an idle lane off a dead id.
 
 # Verdicts that tell a reader to ACT on a lane -- dispatch it, or check/kill it. A live
 # signal must never be overridden BY one of these. WEDGED is the costly member: its
@@ -210,12 +236,65 @@ _PI_PROCS = None
 # the child's on-disk effects are observable.
 
 
-def sh(cmd, timeout=60):
-    try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, env=CMUX).stdout
-    except Exception:
-        return ""
+# ⛔ A FAILED READ IS RETRIED AT LEAST ONCE BEFORE IT IS BELIEVED (owner, 2026-10-12).
+# The failure this guards is TRANSIENT BY NATURE: a control-socket call that times out under
+# load (measured 13.4-15.1s per `cmux` call at load 130+, against a fixed 15s CLI deadline) is
+# indistinguishable from a hang, and one immediate retry converts most of them into a real
+# answer. Retrying costs a second; being wrong costs the fleet its monitor.
+RETRY_ATTEMPTS = 2          # == one retry
+RETRY_BACKOFF_S = 1.5
+
+
+def sh_rc(cmd, timeout=60, attempts=RETRY_ATTEMPTS):
+    """`(stdout, ok)`.
+
+    `ok=False` means the CALL FAILED -- non-zero exit, timeout, or an unrunnable binary. An
+    EMPTY stdout with `ok=True` is a SUCCESSFUL EMPTY READ, and the two must never render
+    identically: collapsing them is how a degraded read became a confident verdict (see
+    `_live_workspaces` and `resolve_session`, both of which treated "we could not look" as
+    "there is nothing there").
+
+    ⛔ AND WHY IT FAILED IS RECORDED, NOT FLATTENED INTO `ok=False`. `LAST_FAILURE` distinguishes
+    a read that was REFUSED from one our own teardown KILLED. Measured 2026-10-12: all 23
+    `DEGRADED -- the cmux fleet roster was unreadable` lines in the heartbeat log were immediately
+    preceded by the tick being SIGTERM'd at its 390s bound, and NONE was a genuine read failure --
+    cmux answered in 0.05-0.08s at load 69. The instrument was reporting a cause it had never
+    established, blaming cmux for our own death, which is how a watchdog teaches its operator to
+    ignore it. A signal-killed child is its own outcome.
+    """
+    global LAST_FAILURE
+    LAST_FAILURE = None
+    n = max(1, attempts)
+    for i in range(n):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout, env=CMUX)
+            if p.returncode == 0:
+                return p.stdout or "", True
+            kind = "signal" if p.returncode is not None and p.returncode < 0 else "nonzero"
+            LAST_FAILURE = dict(kind=kind, rc=p.returncode, cmd=cmd[0], attempt=i + 1)
+        except subprocess.TimeoutExpired:
+            LAST_FAILURE = dict(kind="timeout", rc=None, cmd=cmd[0], attempt=i + 1)
+        except Exception as e:
+            LAST_FAILURE = dict(kind="unrunnable", rc=None, cmd=cmd[0],
+                                attempt=i + 1, error=type(e).__name__)
+        if i + 1 < n:
+            time.sleep(RETRY_BACKOFF_S * (i + 1))
+    return "", False
+
+
+def last_failure_was_teardown():
+    """Whether the last failed read died by SIGNAL -- i.e. we were being torn down.
+
+    A signal-killed child is not a refusal by the thing we were reading, and must not be reported
+    as one (see `sh_rc`). Every other failure kind -- a non-zero exit, a timeout, an unrunnable
+    binary -- IS a statement about the read and keeps the original wording.
+    """
+    return bool(LAST_FAILURE) and LAST_FAILURE.get("kind") == "signal"
+
+
+def sh(cmd, timeout=60, attempts=RETRY_ATTEMPTS):
+    return sh_rc(cmd, timeout, attempts)[0]
 
 
 # ── DECISION-TREE STEP 2: CPU-TIME DELTA (the doc's STRONGEST signal) ─────────────────
@@ -370,6 +449,43 @@ def declared_children(label):
     return found
 
 
+def _tsv_rows():
+    """The hand-written file's rows: `(label, workspace, issue-label)`.
+
+    ⛔ THESE ARE *METADATA*, NOT LANES (2026-10-12). The file is keyed by workspace uuid, and a
+    workspace uuid DIES whenever the pane is recreated -- this fleet's normal recovery path
+    (`respawn-pane` deletes and recreates it). So the file accumulates rows for workspaces that no
+    longer exist. MEASURED 2026-10-12: the published roster carried 39 rows against 16 live cmux
+    workspaces -- ~24 of them stale, which is why "the fleet" could not be read off it. The pane is
+    the authority (the file's own header says so); this file supplies the two things a pane cannot
+    express: the issue-label, and a title match for a lane whose uuid was recreated.
+    """
+    rows = []
+    try:
+        fh = open(REG, errors="ignore")
+    except OSError:
+        # ⛔ A MISSING/UNREADABLE REGISTRY IS AN ABSENCE, NOT AN EMPTY FLEET (2026-10-13). The
+        # contract stated in this function is "never publish a roster it could not read" — but the
+        # open() was unguarded, so an absent file raised out of the whole scan instead of
+        # abstaining. A crash is not the safe direction here either: callers that catch and fall
+        # back publish the TSV as the roster, which is exactly the failure this file was fixed to
+        # stop. Returning nothing is what makes the EMPTY case visible instead of plausible: `main()`
+        # refuses an empty roster (see its own guard), which names the unreadable read rather than
+        # publishing an empty fleet. (This comment previously credited a `main()` guard that did not
+        # exist — corrected 2026-10-13 when the guard was actually added.)
+        return []
+    with fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#") or "\t" not in line:
+                continue
+            parts = [p.strip() for p in line.split("\t")]
+            label, ws = parts[0], parts[1]
+            issue_label = parts[2] if len(parts) > 2 else ""
+            rows.append((label, ws, issue_label))
+    return rows
+
+
 def registry():
     """`label<TAB>workspace<TAB>issue-label[<TAB>...]`
 
@@ -381,23 +497,50 @@ def registry():
     column yields "" rather than an error — a lane that owns no repo label
     (`HANG`, `A`) is a legitimate row.
     """
+    tsv = _tsv_rows()
+    live = _live_workspaces()
+    by_uuid = {ws.upper(): il for _, ws, il in tsv}
+    by_title = {label.strip().lower(): il for label, _, il in tsv}
+    # ⛔ THE LIVE PANEL IS THE ROSTER; THE FILE IS ONLY METADATA (2026-10-12).
+    # The roster used to be `TSV union live`, so a deleted lane kept being reported as a lane
+    # forever -- 39 published rows against 16 live workspaces, i.e. two-thirds of the reported
+    # "fleet" did not exist. Lanes open and close daily, so ANY hand-maintained roster is stale by
+    # construction: "more of a general process that reads the lanes in cmux, than an outdated
+    # list". We enumerate the panes that EXIST and use the file only to enrich them.
+    #
+    # The LABEL comes from the live pane title, never from the file: the naming scheme makes those
+    # the same string, and taking the live one means a renamed lane is reported under its real name
+    # instead of whatever it was called when someone last hand-edited a file. The file is consulted
+    # for the issue-label by workspace uuid, else by title -- which is what preserves a lane's issue
+    # label across the uuid churn that recreating a pane causes.
     rows = []
-    for line in open(REG, errors="ignore"):
-        line = line.rstrip("\n")
-        if not line or line.startswith("#") or "\t" not in line:
-            continue
-        parts = [p.strip() for p in line.split("\t")]
-        label, ws = parts[0], parts[1]
-        issue_label = parts[2] if len(parts) > 2 else ""
-        rows.append((label, ws, issue_label))
-    # union with the LIVE fleet, so a workspace created after the roster was
-    # written is still classified instead of silently sitting outside the monitor
-    known = {ws.upper() for _, ws, _ in rows}
-    for wsid, x in _live_workspaces():
-        if wsid.upper() in known:
-            continue
-        known.add(wsid.upper())
-        rows.append((_live_label(wsid, x), wsid, ""))
+    for wsid, x in live:
+        title = _live_label(wsid, x)
+        il = by_uuid.get(wsid.upper()) or by_title.get(title.strip().lower()) or ""
+        rows.append((title, wsid, il))
+    if LIVE_READABLE is False:
+        # ⛔ A DEGRADED READ MUST BE LOUD *AND* MUST NOT PRETEND TO BE A FLEET. We cannot enumerate
+        # the panes, so we fall back to the file's rows -- but the caller stamps every row
+        # `degraded` and `lane-actions.py` REFUSES such a snapshot, because it covers the file only
+        # and every live-only lane is INVISIBLE in it.
+        # stderr, so stdout stays a parseable fleet read for callers that inspect LIVE_READABLE.
+        # ⛔ THE REASON IS REPORTED, NOT INVENTED. A read our own teardown killed is NOT an
+        # unreadable roster -- see `sh_rc`. Getting this wrong is how 23 consecutive log lines
+        # blamed cmux for a SIGTERM to the tick, and how an operator learns to ignore the alarm.
+        if last_failure_was_teardown():
+            sys.stderr.write(
+                "lane-status: DEGRADED -- the cmux fleet read was KILLED BY A SIGNAL "
+                f"(rc={LAST_FAILURE.get('rc')}), i.e. this process was being torn down (most likely "
+                "the heartbeat tick hitting its stall bound). This is NOT a claim that cmux is "
+                "down. The scan below covers the hand-written TSV only, so every live-only lane is "
+                "INVISIBLE in it -- do NOT publish it as a fleet read.\n")
+        else:
+            sys.stderr.write(
+                "lane-status: DEGRADED -- the cmux fleet roster was unreadable after "
+                f"{RETRY_ATTEMPTS} attempts ({LAST_FAILURE or 'no failure recorded'}); this scan "
+                "covers the hand-written TSV only, so every live-only lane is INVISIBLE to it. "
+                "Do NOT publish this as a fleet read.\n")
+        return tsv
     return rows
 
 
@@ -417,14 +560,27 @@ ORCH_WS = os.environ.get("ORCH_WS", "C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD")
 
 _LIVE_CACHE = []
 
+# Did the FLEET ROSTER actually read? `None` = not attempted; `True`/`False` = the answer.
+# ⛔ THIS EXISTS BECAUSE AN EMPTY LIST IS NOT AN ANSWER. `_live_workspaces()` swallowed every
+# failure into `[]`, and `registry()` unions the hand-written TSV with that list -- so an
+# unreachable cmux silently degenerated the fleet back to the TSV. MEASURED 2026-10-12: the
+# published snapshot carried 26 workspaces, ALL of them TSV and ZERO of the 13 live-only ones
+# (`CMUX cloud`, `decisions`, the reader's own viewer) -- while 4 lanes were stalled. The comment
+# under `registry()` records the SAME failure on 2026-09-28 ("13 lanes the monitor could not
+# see"); a fallback indistinguishable from a healthy read is how it comes back, silently.
+LIVE_READABLE = None
+LAST_FAILURE = None
+
 
 def _live_workspaces():
+    global LIVE_READABLE
     if _LIVE_CACHE:
         return _LIVE_CACHE[0]
     rows = []
+    out, ok = sh_rc(["cmux", "list-workspaces", "--json"], timeout=45)
     try:
-        out = subprocess.run(["cmux", "list-workspaces", "--json"],
-                             capture_output=True, text=True, timeout=45).stdout
+        if not ok:
+            raise ValueError("cmux fleet roster unreadable")
         data = json.loads(out)
         for x in (data if isinstance(data, list) else data.get("workspaces", [])):
             wsid = str(x.get("id") or "").strip()
@@ -441,8 +597,22 @@ def _live_workspaces():
                 continue
             if wsid:
                 rows.append((wsid, x))
+        # ⛔ AN EMPTY LIST IS NOT AN ANSWER -- THE SAME RULE THE REST OF THIS FILE RUNS ON.
+        # `sh_rc` returning ok only means the COMMAND succeeded. A renamed key after a cmux version
+        # bump, `{}`, or `{"error": ...}` on a zero exit all leave `ok=True` and this list EMPTY,
+        # which published `LIVE_READABLE=True` with a zero-row roster: registry() returns [], the
+        # snapshot is [], and the freshness test (`-s "$SNAP"`) refuses to launch the fallback scan,
+        # so the fleet goes DARK while every read-quality flag says healthy. MEASURED by an
+        # adversarial review 2026-10-12: `{"error":"no such subcommand"}` with rc=0 produced
+        # exactly that. The owner always has workspaces, and reporting an unreadable fleet is the
+        # safe direction.
+        if not rows:
+            raise ValueError("cmux roster parsed but yielded no workspaces")
     except Exception:
-        rows = []
+        # ⛔ NOT A NEUTRAL FALLBACK. This is the shrink that hides 13 lanes; it is recorded in
+        # LIVE_READABLE so the caller can REFUSE rather than publish a confident partial fleet.
+        rows, ok = [], False
+    LIVE_READABLE = ok
     _LIVE_CACHE.append(rows)
     return rows
 
@@ -529,7 +699,21 @@ def _recorded_session(ws):
 
 
 def resolve_session(ws):
-    """Resolve from the PANE, never a pinned id — pins die on respawn.
+    """The lane's session id, for a caller that wants nothing else (lane-guard.py)."""
+    return resolve_session_ex(ws)[0]
+
+
+def resolve_session_ex(ws):
+    """`(session_id, verified)` — resolve from the PANE, never a pinned id: pins die on respawn.
+
+    ⛔ `verified` IS NOT DECORATION, AND ITS ABSENCE IS WHY THIS WAS WRONG TWICE. A resolved id
+    is only as good as the read that produced it, and there are paths that cannot check it.
+    MEASURED 2026-10-12, all from ONE unreadable cmux socket: `Storage Archictecture` bound to a
+    session last written 64h18m earlier and `5&9 MCP and SDK surface` to one 12h30m earlier --
+    both published as `DONE-IDLE`, while the panes were demonstrably on other sessions. The
+    freshness check below existed and could not fire, because it sits AFTER the returns.
+    `verified=False` means "this id could not be confirmed as the one being written", so the
+    verdict built on it must ABSTAIN rather than assert idleness.
 
     BUT (2026-09-27) the pane's cmux resume record is not authoritative after a
     MANUAL relaunch. Relaunching a lane by typing `pi --session <id>` into its
@@ -549,17 +733,51 @@ def resolve_session(ws):
     pane = m.group(1) if m else None
     rec = _recorded_session(ws)
 
+    expect_live = True
     if not pane:
-        return rec
-    if not rec or rec == pane:
-        return pane
-    pf, rf = session_file(pane), session_file(rec)
-    if pf and rf:
-        chosen = rec if os.path.getmtime(rf) > os.path.getmtime(pf) else pane
-    elif rf and not pf:
-        chosen = rec
+        # No parseable id from the pane. The RECORDED id is a recovery hint, not a liveness
+        # proof, so it is taken UNVERIFIED -- the check at the end decides what it is worth.
+        # Returning it unchecked here is the defect in the docstring, surviving on the one path
+        # where there is nothing for it to disagree with.
+        chosen, had_pane = rec, False
+        # ⛔ A DEAD LANE IS NOT AN UNVERIFIED ONE. This flag catches a LIVE lane mis-bound to a
+        # session nobody is writing -- the case that renders `DONE-IDLE` and invites a duplicate
+        # dispatch. The TSV half of the registry is largely stale (MEASURED 2026-10-12: 24 of 39
+        # rows are not live cmux workspaces, and `surface resume show` on a dead one prints to
+        # stderr, writes 0 bytes to stdout and EXITS 0 -- so that empty read is indistinguishable
+        # from a real one and the recorded id is simply history). Firing on those would flood
+        # REPORT ONLY with lanes that are merely gone and bury the real signal, and a dead
+        # workspace cannot be mis-bound in a way that costs anything.
+        try:
+            # ⛔ A ROSTER WE COULD NOT READ IS "UNKNOWN", NEVER "NOT LIVE". When cmux is
+            # unreadable `_live_workspaces()` returns EMPTY, so this membership test answered False
+            # for every row and the caller concluded `not expect_live` -> `verified=True` on exactly
+            # the unreadable-cmux case the flag was written for. The impact was masked only because
+            # lane-actions refuses `degraded` snapshots -- i.e. the guard's correctness depended on a
+            # DIFFERENT guard, and any change to the degradation policy would silently reopen it.
+            if LIVE_READABLE is False:
+                expect_live = True
+            else:
+                expect_live = (ws or "").upper() in {w.upper() for w, _x in _live_workspaces()}
+        except Exception:
+            expect_live = True      # cannot tell -> never silently clear the flag
+    elif not rec or rec == pane:
+        chosen, had_pane = pane, True
     else:
-        chosen = pane
+        pf, rf = session_file(pane), session_file(rec)
+        if pf and rf:
+            chosen = rec if os.path.getmtime(rf) > os.path.getmtime(pf) else pane
+        elif rf and not pf:
+            chosen = rec
+        else:
+            chosen = pane
+        had_pane = True
+    if not chosen:
+        # `verified=None` -- NOT False. There is no id here, so "could not confirm it" is not a
+        # statement about anything; the row's abstention is `sid is None`, which the consumer
+        # already reads first. A flag that fires where it does not apply is how a real one gets
+        # ignored.
+        return None, None
 
     # LAST RESORT (2026-09-27, measured): everything above still assumes one of the
     # two ids is the LIVE one. After a manual relaunch a lane can be writing to a
@@ -574,8 +792,19 @@ def resolve_session(ws):
         label = next((l for l, w, _ in registry() if w == ws), "")
         alt = _content_session(label, cf)
         if alt:
-            return os.path.basename(alt)[:-len(".jsonl")].split("_")[-1]
-    return chosen
+            return os.path.basename(alt)[:-len(".jsonl")].split("_")[-1], True
+    if had_pane or not expect_live:
+        # ⛔ A QUIET SESSION IS NOT AN UNCONFIRMED ONE. The PANE is authoritative about which
+        # session it is running, and a lane waiting on a long child writes NOTHING for as long as
+        # the child runs -- that is the shape this whole file exists to classify correctly. So
+        # "the file has not been written for an hour" must NOT be read as "this is not the live
+        # session"; only the ABSENCE of any id (cmux unread, and nothing corroborates the
+        # recorded one) leaves the id unverified.
+        return chosen, True
+    # No id came from the pane: the recorded id is a recovery hint, and it is only VERIFIED if
+    # something corroborates it -- a write recent enough to be the live session. This is the path
+    # that bound two lanes to sessions last written 64h18m and 12h30m earlier.
+    return chosen, bool(cf) and (time.time() - os.path.getmtime(cf)) <= SESSION_VERIFY_S
 
 
 def _first_user_message(path):
@@ -851,6 +1080,29 @@ def last_tool_call(path):
     return dict(ts=ts, name=name, timeout=tmo)
 
 
+def in_flight_tool(f):
+    """The PARENT's newest in-flight tool call as {name, timeout, age}, or None.
+
+    ⛔ IT TAKES NO CHILD ARGUMENT, AND THAT IS THE POINT. The guard this feeds was once written
+    `if f and not (child and child_has_evidence(...))`, so a record about a CHILD could suppress a
+    fact about the PARENT -- and it did. MEASURED 2026-10-12, `Drain (PR queue support)`: its pi held
+    a live `bash -> sleep 52` poll loop (0 CPU, no established connection) while an abandoned `task`
+    record from 3.9 days earlier sat in its session (`child_stale` 334455s). `ti` was left None, the
+    long-tool guard could not fire, and the lane read CHILD-STUCK where the PRE-CHANGE instrument
+    read LONG-TOOL. A function that cannot see a child cannot be made to depend on one, so the
+    suppression is impossible by construction rather than merely commented against. `child_has_evidence`
+    still decides the child branch in `classify()` -- it was simply never the right question here.
+    """
+    if not f:
+        return None
+    tc = last_tool_call(f)
+    if not tc:
+        return None
+    e = ts_epoch(tc["ts"])
+    return dict(name=tc["name"], timeout=tc["timeout"],
+                age=int(time.time() - e) if e else None)
+
+
 def parent_cwd(path):
     """The cwd a session was started in — first record carries it."""
     try:
@@ -860,11 +1112,23 @@ def parent_cwd(path):
         return None
 
 
-def pending_child(parent_file):
-    """Newest unmatched child call, or None.
+def pending_children(parent_file):
+    """ALL unmatched child calls, newest first.
 
-    Returns None for an ABANDONED call (older than ABANDON_S): a dispatch whose
-    result was never recorded must not pin a lane as stuck forever.
+    ⛔ ALL OF THEM, NOT JUST THE NEWEST (2026-10-12). A lane dispatches in PARALLEL: `5&9 MCP and
+    SDK surface` held FIVE unmatched calls from one `task(),task(),task(),task()` round, and
+    judging it by `open_calls[-1]` picked the single quietest child and read `CHILD-STUCK` while
+    two siblings had transcripts written 8m and 12m earlier and the pane was running
+    `admin-merge.sh`. `lane-actions.py` routes CHILD-STUCK to "unblock it", so that verdict is an
+    action aimed at a lane that is working. This is the failure this file already records -- "5&9
+    read CHILD-STUCK off a 27m-old pending child while its pane showed TWO live children" -- and
+    it returned because the fix looked at ONE child. A lane is waiting if ANY child is live.
+
+    ⛔ AND AN OLD RECORD IS KEPT, NEVER ERASED: `abandoned` is reported so `classify()` can
+    decide. Erasing it asserted the child was DEAD, on a premise that is false (measured: three
+    task children alive and running pytest at 2h26m, a child polling CI at 1h30m). What ABANDON_S
+    legitimately answers is whether a record may SUPPRESS a verdict (`child_suppresses`), never
+    whether the child exists.
     """
     calls = {}
     results = set()
@@ -878,24 +1142,55 @@ def pending_child(parent_file):
                     calls[c.get("id")] = (r.get("timestamp"), args)
         elif m.get("role") == "toolResult" and m.get("toolName") in TOOL_NAMES:
             results.add(m.get("toolCallId"))
-    open_calls = [(cid, v) for cid, v in calls.items() if cid not in results]
-    if not open_calls:
-        return None
-    cid, (ts, args) = open_calls[-1]
-    age = None
-    if ts:
-        e = ts_epoch(ts)
-        if e:
-            age = int(time.time() - e)
-    if age is not None and age > ABANDON_S:
-        return None
-    # `subagent` passes `task`; the `task` tool passes `prompt`. Both carry `cwd`
-    # only sometimes, so fall back to the parent's own cwd.
-    hint = args.get("task") or args.get("prompt") or ""
-    return dict(call_id=cid, ts=ts, age=age,
-                cwd=args.get("cwd") or parent_cwd(parent_file),
-                task=hint[:120],
-                agent=args.get("agent") or "?")
+    out = []
+    for cid, (ts, args) in reversed([(c, v) for c, v in calls.items() if c not in results]):
+        age = None
+        if ts:
+            e = ts_epoch(ts)
+            if e:
+                age = int(time.time() - e)
+        # `subagent` passes `task`; the `task` tool passes `prompt`. Both carry `cwd`
+        # only sometimes, so fall back to the parent's own cwd.
+        hint = args.get("task") or args.get("prompt") or ""
+        out.append(dict(call_id=cid, ts=ts, age=age,
+                        abandoned=age is not None and age > ABANDON_S,
+                        cwd=args.get("cwd") or parent_cwd(parent_file),
+                        task=hint[:120],
+                        agent=args.get("agent") or "?"))
+    return out
+
+
+def most_live_child(kid_calls, exclude=None):
+    """The child of a parallel round that carries the most liveness evidence.
+
+    ⛔ EVIDENCE, NOT ORDER -- see `pending_children`. The freshest transcript wins; a child with no
+    transcript at all loses to one that has any.
+    """
+    best, best_file, best_age = None, None, None
+    for k in kid_calls:
+        c = find_child_session(k["cwd"], ts_epoch(k["ts"]), exclude=exclude) \
+            if k.get("cwd") else None
+        a = int(time.time() - os.path.getmtime(c)) if c else None
+        if best is None or (a is not None and (best_age is None or a < best_age)):
+            best, best_file, best_age = k, c, a
+        # ⛔ STOP ON THE FIRST CLEARLY-LIVE CHILD. `find_child_session` walks the task-session dir,
+        # and `main()` hands this every open dispatch -- so a five-call parallel round (the exact
+        # case this change targets) paid five walks on the tick's documented 90-300s critical path.
+        # A child measured inside the long-tool window has already decided the question.
+        if a is not None and a < 900:
+            break
+    return best, best_file
+
+
+def pending_child(parent_file):
+    """The NEWEST unmatched child call, for a caller that wants exactly one.
+
+    `main()` does NOT use this: it takes `pending_children()` and picks on EVIDENCE, because the
+    newest is not the most live and judging a parallel round by one arbitrary member is the defect
+    `pending_children` documents.
+    """
+    kids = pending_children(parent_file)
+    return kids[0] if kids else None
 
 
 def last_child_verdict(parent_file):
@@ -1050,6 +1345,58 @@ def parse_child_lines(screen):
     return kids
 
 
+def child_has_evidence(child, child_stale, child_grew, child_activity_age):
+    """Whether we hold evidence ABOUT the child, as opposed to merely a record that one started.
+
+    An unmatched dispatch proves a child was STARTED -- never, by itself, anything about what it is
+    doing. When the child left no trace at all (no transcript, no on-disk effect, no sampled
+    growth), the parent's own state is the better witness and must get to answer. ONE definition,
+    used by `classify()` AND by main's in-flight-tool guard: two inline copies is how the two
+    drifted, and the drift is what let `Storage Archictecture` read CHILD-STUCK mid-`bash` on
+    2026-10-12 (see the note in `classify`).
+
+    ⛔ BUT `child_stale is not None` IS THE WRONG QUESTION FOR THE LONG-TOOL GUARD, and gating that
+    guard on this helper is what kept a lane in a LIVE poll loop reading CHILD-STUCK. `child_stale`
+    is known whenever a transcript exists, so this returns True for a 72195s-stale record in the
+    very `Storage Archictecture` case cited above and for a 334455s (3.9-day) one on `Drain` -- the
+    guard below was therefore skipped exactly when it was needed, and `Drain`'s live
+    `bash -> sleep 52` (0 CPU, no connection) read CHILD-STUCK where the pre-change instrument
+    correctly read LONG-TOOL. Whether we hold a record ABOUT a child says nothing about whether the
+    PARENT has a tool in flight; those are two different facts and each guard must ask its own.
+    Measured after the fix, `Drain`: LONG-TOOL, matching the pre-change instrument.
+    """
+    return bool(child) and (
+        child_stale is not None or child_grew
+        or (child_activity_age is not None and child_activity_age < 900))
+
+
+def _idle_verdict(spinner):
+    """`DONE_IDLE` requires a POSITIVE read that the screen is static.
+
+    ⛔ THE FLEET'S STATED POLARITY IS `spinner is not False`, NOT TRUTHINESS (2026-10-13). An
+    UNREAD screen (`None`) is not a weaker verdict — it is a DIFFERENT state, and the fleet's own
+    contract says so (`docs/ops/fleet-liveness.md`: an unknown always carries a named reason,
+    never a weaker `wedged`). At these return sites plain truthiness made `None` falsy, so a
+    screen we could not read returned `DONE-IDLE` — a DISPATCH invitation, the exact action the
+    read layer exists to make safe. The long-tool guard above already used the correct polarity;
+    these sites were never brought to it. MEASURED: `classify(stale=1200, grew=False,
+    spinner=None, ...)` -> `DONE-IDLE` before, -> `UNKNOWN` after.
+
+    ⛔ WHAT ACTUALLY PROTECTS THE LANE — CORRECTED 2026-10-13. This docstring first claimed
+    "`UNKNOWN` is not in `lane-actions.OFFERABLE`, so it routes to REPORT ONLY". That is FALSE of
+    the consumer: `lane-actions.classify_row()` places every unresolved lane on `step="5"`, and
+    `build()` then REPLACES the verdict with the JEV words-layer label — so a lane-status verdict
+    is `why` TEXT, not the bucket. An unread screen can therefore still reach the beat's DO list;
+    what stands in the way is the confidence floor (a low-confidence label is not emitted as an
+    instruction) and `queue-dispatch.py`, which gates on this verdict directly. The routing gap is
+    filed rather than papered over: the abstention here is still the correct producer behaviour,
+    and it does bite for every consumer that reads the verdict directly.
+    """
+    if spinner is None:
+        return UNKNOWN
+    return WIP_IDLE if spinner else DONE_IDLE
+
+
 def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
              child_activity_age, tool_inflight, last_stop=None, has_sid=False,
              cpu_busy=None):
@@ -1077,15 +1424,50 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # orchestrator's own (`01a10486`, `01a10487` vs `01a102a3`), i.e. freshly relaunched panes
         # that had never received a task. `dispatched 0` was reported while 6 landing rows and 12
         # conflicts waited. `has_sid` is the fact that separates the two cases.
-        return DONE_IDLE if has_sid else UNBOUND
+        #
+        # ⛔ BUT `DONE-IDLE` HERE STILL REQUIRES A POSITIVE READ (2026-10-13). This FIFTH site was
+        # missed when the tri-state landed: it returned the dispatchable verdict without consulting
+        # `spinner` AT ALL, so an UNREADABLE screen on a session holding no parseable records still
+        # invited a new task onto a lane whose state nobody read. Same absent-read-collapsed-to-a-
+        # definite-value class as the four sites `_idle_verdict()` covers; found by review, not by
+        # the tests. Measured: `classify(stale=None, grew=False, spinner=None, last_kind=None,
+        # has_sid=True)` -> `DONE-IDLE` before, -> `UNKNOWN` after.
+        return _idle_verdict(spinner) if has_sid else UNBOUND
     if grew:
+        return WORKING
+    # ⛔ A RECORD THAT KNOWS NOTHING ABOUT ITS CHILD MUST NOT DECIDE THE VERDICT.
+    # An unmatched dispatch is evidence that a child was STARTED -- never, by itself, evidence about
+    # what it is doing. When the child left no trace at all (no transcript, no on-disk effect, no
+    # sampled growth), the parent's own state is the better witness and the parent-state logic below
+    # must get to answer. MEASURED 2026-10-12, `Storage Archictecture`: a 35h-old abandoned record
+    # with `child_stale=72195` and `child_activity=None` pinned the verdict at CHILD-STUCK while the
+    # parent had written 86s earlier and was mid-`bash` -- a lane actively being driven, read as a
+    # stuck child. It also silently disabled the long-tool-call guard below, which is gated on
+    # `not child`. A genuinely quiet parent is still served: the `abandoned` clause at the bottom of
+    # this function answers it with WAITING_OVERDUE, which lane-actions.py routes to REPORT ONLY.
+    child_evidence = child_has_evidence(child, child_stale, child_grew, child_activity_age)
+    # ⛔ A FRESH PARENT WRITE OUTRANKS A CHILD RECORD -- hoisted above the child inference
+    # 2026-10-12. The pane retains its last frame, so a spinner glyph alone is not evidence of
+    # activity; a session written in the last 90s IS. Measured that tick: `Storage Archictecture`
+    # had written 86s earlier and held an in-flight `bash`, yet a 35h-old abandoned record with
+    # `child_stale=72195` and no on-disk effect pinned it at CHILD-STUCK -- the verdict
+    # lane-actions.py turns into "unblock it". A child INFERENCE may only speak about a lane that is
+    # not itself writing; evidence about the parent beats an inference about a child we cannot see.
+    # A hang is not lost by this: it is one tick old, and past 90s the child logic is reached anyway.
+    if spinner and stale is not None and stale < 90:
         return WORKING
     # ── a long DIRECT tool call is not a wedge ────────────────────────────
     # ⛔ `spinner is not False`, NOT `spinner`: an UNREAD screen (`None`) must not be counted as
     # evidence of NO spinner. `tool_inflight` is itself strong evidence of a direct tool call, so
     # when the screen is unread we cannot rule the long tool OUT -- and the safe direction is to
     # keep the lane out of WEDGED. Only a screen that was READ and carries no spinner excludes it.
-    if not child and tool_inflight and spinner is not False:
+    # ⛔ ASKS ONLY ABOUT THE PARENT. It used to read `not (child and child_evidence)`, which had the
+    # same defect as main's `ti` gate: `child_evidence` is true merely because the child has a
+    # transcript, so the guard was SKIPPED for the exact abandoned-record cases it was written for.
+    # A declared-budget tool in flight on the PARENT is the strongest available explanation of the
+    # quiet, and no record about a child may suppress it. Verified against the pre-change
+    # instrument on `Drain` (LONG-TOOL, not CHILD-STUCK).
+    if tool_inflight and spinner is not False:
         age = tool_inflight.get("age")
         tmo = tool_inflight.get("timeout")
         if age is not None and tmo and age < tmo:
@@ -1110,7 +1492,25 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         child and child_stale is not None and child_stale > 900
         and not spinner and stale is not None and stale > 600
     )
-    if child and not parent_stopped:
+    # ⛔ A RECORD THAT KNOWS NOTHING ABOUT ITS CHILD MUST NOT DECIDE THE VERDICT.
+    # An unmatched dispatch is evidence that a child was STARTED -- never, by itself, evidence about
+    # what it is doing. When the child left no trace at all (no transcript, no on-disk effect, no
+    # sampled growth), the parent's own state is the better witness and the parent-state logic below
+    # must get to answer. MEASURED 2026-10-12, `Storage Archictecture`: a 35h-old abandoned record
+    # with `child_stale=72195` and `child_activity=None` pinned the verdict at CHILD-STUCK while the
+    # parent had written 86s earlier and was mid-`bash` -- a lane actively being driven, read as a
+    # stuck child. It also silently disabled the long-tool-call guard below, which is gated on
+    # `not child`. A genuinely quiet parent is still served: the `abandoned` clause at the bottom of
+    # this function answers it with WAITING_OVERDUE, which lane-actions.py routes to REPORT ONLY.
+    # (`child_evidence` is computed above, before the long-tool guard that also needs it.)
+    if child and child_evidence and not parent_stopped:
+        # ⛔ A COMPLETED TURN OUTRANKS AN ABANDONED CHILD RECORD. An unmatched dispatch we cannot
+        # vouch for is a stale RECORD, not evidence of a wait; if the lane's own last message is
+        # the assistant ENDING its turn, the lane is idle and that record is history. Without
+        # this, keeping abandoned records would resurrect the "a call from days ago makes a
+        # healthy lane read CHILD-STUCK forever" failure the old discard was written to stop.
+        if child.get("abandoned") and last_kind == "assistant" and last_stop == "stop":
+            return _idle_verdict(spinner)
         if child_grew:
             return WAITING                      # parent idle, child healthy — correct
         if child_stale is not None:
@@ -1141,8 +1541,6 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         if child["age"] is not None and child["age"] > OVERDUE_S:
             return WAITING_OVERDUE              # past the watchdog's own bound
         return WAITING
-    if spinner and stale is not None and stale < 90:
-        return WORKING
     if stale is not None and stale > 600:
         # ── a COMPLETED turn is IDLE, never a wedge ──────────────────────────
         # The pane retains its last frame, spinner glyph included, so a static
@@ -1155,15 +1553,53 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # 1h24m quiet) that read "Blocked on the owner" and "Lane report:" --
         # two lanes flagged for attention every tick of a shift for being done.
         if last_kind == "assistant" and last_stop == "stop":
-            return WIP_IDLE if spinner else DONE_IDLE
+            return _idle_verdict(spinner)
+        # ⛔ AN OUTSTANDING DISPATCH IS NOT A WEDGE (2026-10-12). WEDGED's instruction is "check
+        # the process", and its measured cost is a kill/respawn of a HEALTHY lane. We arrive here
+        # holding an unmatched `task`/`subagent` call and no usable child evidence -- i.e. we know
+        # a dispatch was made and we do NOT know what became of it. That is exactly
+        # CHILD-OVERDUE's meaning ("UNMATCHED, not proven cut"), and lane-actions.py already routes
+        # it to REPORT ONLY, so the owner still sees it and no kill is invited.
+        if (tool_inflight and tool_inflight.get("name") in TOOL_NAMES) \
+                or (child and child.get("abandoned")):
+            return WAITING_OVERDUE
+        if spinner is None:
+            return UNKNOWN          # unreadable screen: abstain (was DONE-IDLE — a dispatch invite)
         return WEDGED if spinner else DONE_IDLE
     if last_kind == "user":
         return WIP_IDLE
     if last_kind == "tool":
         return WORKING
     if last_kind == "assistant":
-        return WIP_IDLE if spinner else DONE_IDLE
+        return _idle_verdict(spinner)
     return UNKNOWN
+
+
+def _publish_snapshot(out, cache_path, key):
+    """Write the machine snapshot to `cache_path` — but NEVER a degraded one.
+
+    ⛔ A DEGRADED READ MUST NOT BECOME A STICKY FAILURE (2026-10-12, measured). Caching a degraded
+    snapshot for the 420 s TTL makes ONE failed read poison every consumer for the rest of the
+    window: after the launchd PATH bug was fixed, `--json` STILL returned 27/27 degraded rows until
+    the TTL expired, and `lane-actions.py` refuses degraded snapshots — so `pr-doctor` stayed unable
+    to dispatch on a fleet it could no longer see. Cache a SUCCESS or nothing: a missing cache costs
+    one real scan, which is the safe direction. Returns True iff a snapshot was written.
+    """
+    if not out:
+        # ⛔ AN EMPTY SNAPSHOT IS NOT A HEALTHY FLEET (2026-10-13). `degraded` is a PER-ROW flag, so
+        # on an empty row set `any(...)` is vacuously False and this publisher cached `[]` — exactly
+        # what a COMPOUND failed read produces (registry unreadable AND cmux unreadable). Caching it
+        # presents an empty fleet as a FRESH published read for the whole TTL, and the freshness
+        # test (`-s "$SNAP"`) then refuses to launch the fallback scan: the fleet goes DARK while
+        # every read-quality flag says healthy. A missing cache costs one real scan.
+        return False
+    if any(isinstance(r, dict) and r.get("degraded") for r in out):
+        return False
+    _tmp = cache_path + ".tmp"
+    with open(_tmp, "w") as fh:
+        json.dump({"key": key, "t": time.time(), "out": out}, fh, default=str)
+    os.replace(_tmp, cache_path)   # atomic: a reader never sees a half-written snapshot
+    return True
 
 
 def main():
@@ -1218,6 +1654,20 @@ def main():
             pass      # a broken or absent cache must never break the scan -- fall through to a real read
 
     rows = registry()
+    # ⛔ AN EMPTY ROSTER IS NOT AN ANSWER, AND `registry()` CAN RETURN ONE (2026-10-13). The
+    # docstring on `_tsv_rows()` (and a test docstring) asserted that "returning nothing lets `main()`
+    # hit its own `if not rows: raise`". No such guard existed here — `grep -n 'not rows'` matched
+    # only `_live_workspaces()`. So the COMPOUND failure (registry unreadable AND cmux unreadable)
+    # produced `rows=[]`, printed `[]`, exited 0, and cached it: a healthy-looking EMPTY fleet. The
+    # two artifacts that claimed this guard existed were false; one of them was written by the same
+    # change that added `_tsv_rows`'s `except OSError`. Enforce it here, and refuse to publish.
+    if not rows:
+        sys.stderr.write(
+            "lane-status: REFUSING — the roster is EMPTY (registry unreadable and/or the cmux read\n"
+            "  failed). An empty fleet is not a read; publishing it would make the fleet look\n"
+            "  healthy-and-idle for the whole cache TTL. Check ~/.pi/agent/state/lane-registry.tsv\n"
+            "  and the cmux socket.\n")
+        raise SystemExit(3)
     if a.only:
         _want = {x.strip().lower() for x in a.only.split(",") if x.strip()}
         rows = [r for r in rows
@@ -1234,12 +1684,10 @@ def main():
     # similarity to the loop below.
     snap = {}
     for label, ws, _il in rows:
-        sid = resolve_session(ws)
+        sid, _verified = resolve_session_ex(ws)
         f = session_file(sid)
-        child = pending_child(f) if f else None
-        cf = find_child_session(child["cwd"], ts_epoch(child["ts"]), exclude=f) \
-            if (child and child.get("cwd")) else None
-        snap[label] = dict(ws=ws, sid=sid, file=f,
+        child, cf = most_live_child(pending_children(f) if f else [], exclude=f)
+        snap[label] = dict(ws=ws, sid=sid, verified=_verified, file=f,
                            size=os.path.getsize(f) if f else None,
                            child=child, child_file=cf,
                            child_size=os.path.getsize(cf) if cf else None)
@@ -1356,13 +1804,10 @@ def main():
             child_act = child_activity(child["cwd"])
 
         # a direct tool still in flight, with its own declared budget
-        ti = None
-        if f and not child:
-            tc = last_tool_call(f)
-            if tc:
-                e = ts_epoch(tc["ts"])
-                ti = dict(name=tc["name"], timeout=tc["timeout"],
-                          age=int(time.time() - e) if e else None)
+        # ⛔ THE PARENT'S OWN IN-FLIGHT TOOL, READ WITHOUT REFERENCE TO ANY CHILD -- see
+        # `in_flight_tool` for the measured regression this shape makes impossible. (`child_has_evidence`
+        # is still what decides the child branch in `classify()`.)
+        ti = in_flight_tool(f)
 
         _cpu = lane_cpu_busy(label, s["file"], _dir_lanes, _dir_pids, cpu0, cpu1)
         verdict = classify(stale, grew, spinner, last_kind, child, child_stale,
@@ -1402,8 +1847,16 @@ def main():
         # STALL), two of them while the pane showed a live child. WEDGED is the costly one: its
         # instruction invites a kill/respawn of a HEALTHY lane.
         #
-        # The bound is ABANDON_S, the SAME one pending_child already applies: a `task` child
-        # cannot outlive the harness's in-flight bound, so past it the open call is a stale RECORD
+        # The bound is ABANDON_S, the SAME one pending_child already applies.
+        # ⛔ CORRECTED 2026-10-13 — THIS COMMENT USED TO STATE THE PREMISE THAT `ABANDON_S`'s OWN
+        # DOCSTRING RETRACTS. It read: "a `task` child cannot outlive the harness's in-flight
+        # bound, so past it the open call is a stale RECORD". That is FALSE of the artifact and
+        # measured false in production (three `task` children alive and running pytest at 2h26m, a
+        # child polling CI at 1h30m) — the measurement is in `pending_children()`'s docstring, which
+        # states the retraction. ⚠️ This pointer first read "30 lines above": it was wrong by ~1787
+        # lines, and a mis-located retraction is exactly how the premise gets re-derived backwards. What actually makes an old record safe to discount here is that the
+        # child's OWN transcript and on-disk effect are consulted FIRST
+        # (`most_live_child` / `child_suppresses`) — not the mere passage of time.
         # and must not mask a real wedge. Absence is preferred to a wrong class everywhere else in
         # this test -- here too: a missing child_file (child_stale is None) does NOT count against
         # the child, because an unreadable stat is not evidence the child is dead.
@@ -1443,6 +1896,15 @@ def main():
         out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
                        inbound_age=inbound_age, inbound_readable=inbound_readable, cpu=_cpu,
                        inbound_msg=inbound_msg,
+                       # ── THE TWO READ-QUALITY FLAGS, ON EVERY ROW ──────────────────────
+                       # Neither is a verdict. `degraded` says the FLEET ROSTER could not be
+                       # read, so this row set is the hand-written TSV and every live-only lane
+                       # is missing (a consumer must REFUSE, not act). `session_verified` says
+                       # whether the session id under this row was confirmed as the one being
+                       # written; when it is False the verdict is built on an id we could not
+                       # check, so it must ABSTAIN rather than assert an idle lane.
+                       degraded=(LIVE_READABLE is False),
+                       session_verified=s.get("verified"),
                        declared=declared, pane_children=pane_kids,
                         spinner=spinner, sid=s["sid"], ws=s["ws"], size=cur_size,
                         issue_label=ilabel,
@@ -1463,11 +1925,7 @@ def main():
         # pass. A caller that wants no cache at all is not a case the wake-up path has.
         try:
             _cf = os.path.join(os.path.expanduser("~/.pi/agent/state"), "lane-status.cache")
-            _tmp = _cf + ".tmp"
-            with open(_tmp, "w") as fh:
-                json.dump({"key": json.dumps([a.only]), "t": time.time(),
-                           "out": out}, fh, default=str)
-            os.replace(_tmp, _cf)   # atomic: a reader never sees a half-written snapshot
+            _publish_snapshot(out, _cf, json.dumps([a.only]))
         except Exception:
             pass      # caching is an optimisation; failing to cache must not fail the scan
         print(_blob)
