@@ -146,8 +146,16 @@ DEGRADED_MSG = (
 
 
 def _refuse_if_degraded(rows, where):
-    """⛔ ONE GUARD, BOTH PATHS. The refusal used to live INSIDE the `--stdin` branch only, so the
-    OTHER path accepted a degraded snapshot and acted on a fleet read missing every live-only lane.
+    """⛔ ONE GUARD, BOTH PATHS — and both have been guarded from the start.
+
+    ⚠️ CORRECTED 2026-10-13. This docstring opened with "The refusal used to live INSIDE the
+    `--stdin` branch only, so the OTHER path accepted a degraded snapshot and acted on a fleet read
+    missing every live-only lane." That lineage claim is FALSE: at this PR's base NEITHER path had
+    any degraded refusal (`git show 42f0b14:scripts/lane-actions.py | grep -c degraded` -> 0), so
+    both arrived together and nothing was ever "left" unguarded. The deployed copy that predated
+    this branch asserted the same claim about the OTHER direction. The correction matters because a
+    reader who believes one path was historically the hole will guard that one — which is the
+    failure this docstring already warns about one paragraph below.
 
     ⛔ WHICH PATH IS PRODUCTION: `--stdin`. heartbeat-loop.sh invokes this tool as
     `lane-actions.py --stdin "$SNAP"`; the invoke path is the secondary one (queue-dispatch). An

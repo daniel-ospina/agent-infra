@@ -459,9 +459,25 @@ def test_a_compound_failed_read_cannot_publish_or_cache_an_empty_fleet(L, tmp_pa
     cache = tmp_path / "lane-status.cache"
     assert L._publish_snapshot([], str(cache), "k") is False, "an empty fleet must not be cached"
     assert not cache.exists()
-    # and the roster entry point must refuse rather than exit 0 with `[]`
-    src = open(_PATH, encoding="utf-8").read()
-    assert "REFUSING — the roster is EMPTY" in src, "main() must name an empty roster, not publish it"
+
+
+def test_main_refuses_an_empty_roster_instead_of_publishing_it(L, monkeypatch, capsys):
+    """⛔ A SOURCE GREP IS NOT AN ENFORCED GUARD (2026-10-13, found by review cycle 2).
+
+    The first version of this assertion grepped the file for the refusal's MESSAGE AND NOTHING ELSE.
+    A source grep pins the guard's WORDING, never its EFFECT: deleting only the `raise SystemExit(3)`
+    while keeping the message left ALL 160 tests green, and `main()` then returned normally with
+    `[]` on stdout — which is precisely the dark-fleet failure this guard exists to prevent
+    (`heartbeat-loop.sh` promotes the `.tmp` snapshot when `-s` succeeds, and the freshness branch
+    then suppresses the fallback scan for 15 min). Measured by review. Drive `main()` instead, so
+    that removing the refusal fails HERE and not merely somewhere in the prose.
+    """
+    monkeypatch.setattr(L, "registry", lambda: [])
+    monkeypatch.setattr(L.sys, "argv", ["lane-status.py", "--json"])
+    with pytest.raises(SystemExit) as exc:
+        L.main()
+    assert exc.value.code == 3, "an empty roster must exit non-zero, got %r" % (exc.value.code,)
+    assert capsys.readouterr().out.strip() == "", "an empty roster must publish NOTHING"
 
 
 def test_an_unread_screen_never_reaches_the_dispatchable_verdict_at_the_fifth_site(L):

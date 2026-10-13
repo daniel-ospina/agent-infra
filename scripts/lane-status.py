@@ -1852,9 +1852,9 @@ def main():
         # DOCSTRING RETRACTS. It read: "a `task` child cannot outlive the harness's in-flight
         # bound, so past it the open call is a stale RECORD". That is FALSE of the artifact and
         # measured false in production (three `task` children alive and running pytest at 2h26m, a
-        # child polling CI at 1h30m — cited verbatim by ABANDON_S's docstring 30 lines above, which
-        # this file already retracts). Leaving the two claims in one file is how the retraction gets
-        # re-derived backwards. What actually makes an old record safe to discount here is that the
+        # child polling CI at 1h30m) — the measurement is in `pending_children()`'s docstring, which
+        # states the retraction. ⚠️ This pointer first read "30 lines above": it was wrong by ~1787
+        # lines, and a mis-located retraction is exactly how the premise gets re-derived backwards. What actually makes an old record safe to discount here is that the
         # child's OWN transcript and on-disk effect are consulted FIRST
         # (`most_live_child` / `child_suppresses`) — not the mere passage of time.
         # and must not mask a real wedge. Absence is preferred to a wrong class everywhere else in
