@@ -3,6 +3,14 @@
 # merge-one.sh --argv <file>            (4 lines: repo, owner/repo, pr, branch)
 # Full chain for ONE PR: fresh-context review -> evidence comment -> record-review -> wait green -> merge.
 # This box holds the AI_REVIEW_GATE_KEY, so it owns the merge authority for its own PRs.
+#
+# ⛔ TERMINAL STATE (#1717). Every failure that leaves the signed marker absent — the record step
+# cannot run, the reviewer posted no evidence comment, the record itself failed — writes
+# `$O/state/parked-<PR>` (the head a human must look at) BEFORE exiting, instead of exiting
+# silently. That file is what the controller's parked guard reads, so the loop stops instead of
+# spawning another review; and this script refuses to re-review an already-parked head itself, so
+# the chain-<N> and fix-one.sh paths (which never consult the controller) cannot re-pay either.
+# A later push changes the head and re-arms the PR by construction.
 set -u
 # --argv exists because these values are attacker-influenced (a PR branch name may contain quotes,
 # semicolons, $ and backticks) and the controller must launch us from a tmux `sh -c` string.
@@ -337,6 +345,44 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   exit 0
 fi
 
+# ── 0) terminal state and the record dependency — BEFORE the paid review (#1717) ──────────────
+# `park` records the terminal state at the head that was reviewed. It is deliberately the SAME
+# marker the controller's own park paths write (`parked-<PR>` = the head, so a new push re-arms),
+# plus a `parkreason-<PR>` that names WHY — the controller cannot say why, and "PARKED" with no
+# reason is a state nobody can act on.
+park() { # park <reason…>
+  local why="$*"
+  [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
+  printf '%s\n' "$why" > "$O/state/parkreason-$PR"
+  echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
+}
+
+# Honour the park HERE, not only in the controller. chain-<N> and fix-one.sh invoke this script
+# directly, and the controller's parked guard is invisible to them; without this the park would
+# hold only the path that was already fixed. Exit 5 = "refused, already parked at this head".
+if [ -n "${HEAD:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD" ]; then
+  echo "[merge $PR] PARKED at head=$HEAD — refusing to re-review (reason: $(cat "$O/state/parkreason-$PR" 2>/dev/null)). A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >> "$L.log"
+  exit 5
+fi
+
+# ⛔ THE RECORD STEP IS THE ONLY MERGE PATH, AND IT USED TO BE PAID TO DISCOVER IT WAS MISSING
+# (#1717). record-review.sh mints the signed marker ai-review-gate verifies; on a fresh cell the
+# file is absent. The pre-fix flow ran the WHOLE fresh-context review (up to REVIEW_TIMEOUT = 1800 s,
+# PAID) and only then failed — and its `exit 3` skipped the `*)` arm that writes the fixer marker,
+# so the next cycle saw an unmarked FAILED:ai-review-gate and spawned another review. One paid
+# review per cycle, forever. Refuse BEFORE the paid step, and leave the terminal marker.
+RECORDER="$HOME/.pi/agent/scripts/record-review.sh"
+if [ ! -e "$RECORDER" ]; then
+  park "record-review.sh MISSING at $RECORDER — the record step cannot run, so this PR can never be signed or merged. Provision it (cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER missing — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+if [ ! -x "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is NOT EXECUTABLE — the record step would fail (126) after a PAID review. Fix: chmod +x '$RECORDER', then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER not executable — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
@@ -367,12 +413,24 @@ case "$LAST" in
     URL="$(printf '%s' "$LAST" | grep -oE 'https?://[^ ]+' | head -1)"
     CID="$(printf '%s' "$URL" | grep -oE '[0-9]+$')"
     echo "[merge $PR] evidence comment id=${CID:-?} url=$URL" >> "$L.log"
-    if [ -z "${CID:-}" ]; then echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2; fi
+    if [ -z "${CID:-}" ]; then
+      # The reviewer said CLEAN but named no comment, so there is no artifact to sign — the gate can
+      # NEVER go green at this head. Park it: the pre-fix bare `exit 2` left no marker, so the loop
+      # re-paid for a fresh review every cycle (#1717).
+      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head"
+      echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
+    fi
     # ── 2) record the review (writes the signed marker into the PR body) ──
-    "$HOME/.pi/agent/scripts/record-review.sh" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
+    "$RECORDER" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
     rc=$?
     echo "[merge $PR] record-review rc=$rc" >> "$L.log"
-    [ $rc -ne 0 ] && { echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3; }
+    if [ $rc -ne 0 ]; then
+      # No signed marker exists, so the gate cannot pass and the PR cannot merge. The pre-fix
+      # `exit 3` left no marker at ALL, so the next cycle saw an unmarked FAILED:ai-review-gate and
+      # spawned another fresh (paid) review — forever (#1717). Park, and name the failing rc.
+      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
+    fi
     # ── 3) wait for the REPO'S review gate to go green (read the LATEST check row) ──
     # Reached only in `gate` mode, so this repo DOES require the gate. The NAME is an input
     # (agent-infra#1764): it was the literal `ai-review-gate`, which is tortoise's name. The jq
@@ -395,6 +453,11 @@ for c in rows:
       [ "$gate" = "SUCCESS" ] && break
       sleep 30
     done
+    # ⛔ NOT parked, deliberately (verified by reading the controller, not assumed): the signed
+    # marker IS in the PR body by here, so this head can still merge. A park would make the loop's
+    # top-of-cycle parked guard `continue` past a PR whose gate turns green a minute later — a
+    # stranded merge, strictly worse than the cost of the retry. A record failure cannot be
+    # stranded, which is why THAT is parked.
     if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
     # ── 4) merge ──
     if gh pr merge "$PR" --repo "$OR" --squash >> "$L.log" 2>&1; then
