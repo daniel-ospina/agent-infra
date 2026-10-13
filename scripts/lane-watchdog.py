@@ -338,7 +338,7 @@ def has_live_connection(pid):
     return None                         # failed, timed out, or spoke up: UNKNOWN, and UNKNOWN refuses
 
 
-def frozen_subtrees(table_a, table_b, now=None):
+def frozen_subtrees(table_a, table_b, now=None, unreadable=None):
     """Every `pi` child of a `pi` parent whose whole subtree gained no CPU across the window.
 
     Returns a list of `dict(pid, ppid, age_s, d_cpu)`. This is the DETECTOR only — it decides
@@ -385,7 +385,30 @@ def frozen_subtrees(table_a, table_b, now=None):
         # middle `pi` whose GRANDCHILD holds the provider connection. Measured by review: candidates
         # `[(200, [200, 300])]` with 300 holding an ESTABLISHED connection — 300 was correctly
         # excluded as its own candidate, and was then dragged into 200's kill list anyway.
-        if any(has_live_connection(q) is not False for q in subtree):
+        # ⛔ AN UNREADABLE PROBE IS NOT A LIVE CONNECTION, AND IT IS NOT SILENCE EITHER (#1696,
+        # review cycle 4). `has_live_connection` returns None when `lsof` is missing, errors or times
+        # out, and `is not False` then excluded the candidate -- so THREE different worlds produced
+        # identical output: a child holding a live provider call, a child with no connection, and a
+        # BROKEN PROBE. In all three the candidate set came back empty, `main()` wrote an empty state
+        # (another full FROZEN_MIN of blindness) and exited 0 with nothing logged, so an operator
+        # could not tell a working reaper from a disarmed one. An unreadable probe is now recorded on
+        # `unreadable` and the caller REFUSES, exactly as it does for an unreadable `ps` -- every
+        # other input that feeds the state file already refuses.
+        verdict = "no-connection"
+        for q in subtree:
+            seen = has_live_connection(q)
+            if seen is True:
+                verdict = "connected"
+                break
+            if seen is None:
+                verdict = "unreadable"
+                break
+        if verdict == "unreadable":
+            if unreadable is not None:
+                unreadable.append(pid)
+            _log(dict(event="connection-unreadable", ts=int(now), pid=pid, subtree=subtree))
+            continue
+        if verdict == "connected":
             continue
         # The whole subtree is parked. `age_s` comes from the child's own process age.
         out.append(dict(pid=pid, ppid=b["ppid"], age_s=_age_seconds(pid, table_b),
@@ -700,7 +723,20 @@ def main():
             print("\u26d4 ps UNREADABLE -- refusing to judge, and refusing to overwrite the "
                   "observation state")
         return 3
-    cands = frozen_subtrees(a, b)
+    unreadable = []
+    cands = frozen_subtrees(a, b, unreadable=unreadable)
+    if unreadable:
+        # ⛔ (see `frozen_subtrees`) An unreadable connection probe must not read as "no candidate":
+        # that would wipe the state and report success. The probe is already logged per candidate;
+        # this refuses to judge at all.
+        report = dict(observed=len(b), frozen=0, ripe=0, watching=[], refused=[], reaped=[],
+                      connection_unreadable=len(unreadable), ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 CONNECTION PROBE UNREADABLE -- refusing to judge, and refusing to "
+                  "overwrite the observation state", file=sys.stderr)
+        return 3
 
     # ⛔ AN UNREADABLE STATE FILE IS NOT AN EMPTY ONE (#1696, review cycle 3). `except Exception:
     # state = {}` made an INTACT but unreadable -- or truncated -- file indistinguishable from a

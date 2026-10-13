@@ -854,3 +854,44 @@ def test_descendants_terminates_on_a_cycle(W):
     t.start()
     t.join(timeout=5)
     assert not t.is_alive(), "descendants() must terminate on a cyclic table"
+
+
+def test_an_unreadable_connection_probe_refuses_instead_of_silently_emptying(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 4. `has_live_connection` returns None when `lsof` is missing, errors or
+    times out (30s bound), and the gate read `is not False` -- so THREE different worlds produced
+    identical output: a child holding an established provider call, a child with no connection, and a
+    BROKEN PROBE. In all three the candidate set came back empty, the state file was overwritten with
+    the empty observation (another full FROZEN_MIN of blindness) and the run exited 0 with NOTHING
+    logged -- so an operator could not tell a working reaper from a disarmed one. Measured before the
+    fix: an unreadable probe and a live connection were byte-for-byte identical. This is the same
+    'an input that could not be read is treated as a definite answer' class the other three inputs
+    (ps, lock, state) already refuse on."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    ripe = tmp_path / "ripe.json"
+    before = ripe.read_bytes()
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: None)   # lsof broken
+    assert W.main() == 3, "an unreadable probe must refuse, not report a clean empty fleet"
+    assert json.loads(capsys.readouterr().out)["connection_unreadable"] >= 1
+    assert "connection-unreadable" in (tmp_path / "l.jsonl").read_text()
+    assert ripe.read_bytes() == before, "a refused run must not overwrite the observation state"
+
+
+def test_frozen_subtrees_records_an_unreadable_probe_instead_of_dropping_the_candidate(W, monkeypatch):
+    """The unit-level half: the pid is REPORTED, so the refusal above can name what it refused over."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: None)
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    unreadable = []
+    assert W.frozen_subtrees(table, table, unreadable=unreadable) == []
+    assert unreadable == [300], unreadable
+
+
+def test_a_working_probe_is_still_decisive_in_both_directions(W, monkeypatch):
+    """The mirror, so the new refusal cannot swallow a working probe: False (no connection) must
+    still yield the candidate, and True (an established connection) must still spare it."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    unreadable = []
+    assert [c["pid"] for c in W.frozen_subtrees(table, table, unreadable=unreadable)] == [300]
+    assert unreadable == []
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: True)
+    assert W.frozen_subtrees(table, table) == []
