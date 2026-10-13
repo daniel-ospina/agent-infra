@@ -198,9 +198,16 @@ done
 # must be reported as insufficient rather than as "present", or the box silently degrades to
 # review-only while everyone believes it holds the merge authority.
 KEY_FILE="$HOME/.pi/agent/.ai-review-gate-key"
-if [ -f "$KEY_FILE" ]; then
+# -s, not -f: a ZERO-BYTE key file is not a key. `-f` blessed it, and the daemon then recorded
+# reviews UNSIGNED and failed ai-review-gate — the same failure as the env-only case below, with the
+# file branch taken (see README §7.4).
+if [ -s "$KEY_FILE" ]; then
   ok "gate key file present ($KEY_FILE)"
   [ -n "${AI_REVIEW_GATE_KEY:-}" ] && ok "AI_REVIEW_GATE_KEY also exported in this shell"
+elif [ -f "$KEY_FILE" ]; then
+  warn "$KEY_FILE exists but is EMPTY — treated as absent."
+  warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."
+  warn "  → fix: printf '%s' \"\$AI_REVIEW_GATE_KEY\" > $KEY_FILE && chmod 600 $KEY_FILE"
 elif [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
   warn "AI_REVIEW_GATE_KEY is set in THIS SHELL ONLY — launchd will not see it."
   warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."

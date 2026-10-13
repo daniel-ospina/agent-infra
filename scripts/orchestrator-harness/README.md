@@ -26,11 +26,12 @@ doc_status: draft
 > **Where it lives now.** `agent-infra/scripts/orchestrator-harness/` (relocation:
 > agent-infra#1700). The home is agent-infra because this is fleet/agent operations, not
 > tortoise product code — the merge rail it sits alongside (`admin-merge.sh`, `atomic-land.sh`)
-> and the fleet's box-level scripts (`cadence-nudge.sh`, `ci_runner_gate.sh`) are already in
-> `agent-infra/scripts/`, as are the multi-file tool subdirectories `checkout-hygiene/`, `ci/`
-> and `gh-shim/`. The per-cell launcher `cloud-cell-supervisor.sh` is versioned into that
-> directory by this same change (it existed only in local config before; on a cell it is what starts
-> this controller, since launchd is macOS-only).
+> and the fleet's box-level script `cadence-nudge.sh` are already in `agent-infra/scripts/`, as
+> are the multi-file tool subdirectories `checkout-hygiene/`, `ci/` and `gh-shim/`. Three scripts
+> this same change versions into that directory existed only in local config before:
+> `ci_runner_gate.sh` (the CI runner-label fallback gate), `cloud-cell-bringup.sh` (cell bring-up)
+> and `cloud-cell-supervisor.sh` (the per-cell launcher — on a cell it is what starts this
+> controller, since launchd is macOS-only).
 > The old tortoise path
 > (`operations/orchestrator-harness/`) is replaced by a stub pointer to this home in a follow-up
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
@@ -486,6 +487,14 @@ These are kept as a record because each one is a *failure mode of the design*, n
   writes an empty `.pr_brs` on a failed listing, so `has_pr` is false for every issue and PR-bearing
   issues are un-blacklisted and re-dispatched. Same class as the `open_pr_count()` fail-closed fix
   in §7.4, in a file that fix did not reach.
+- **`dispatch-merge.sh` interpolates `$REPO`/`$OR` unguarded (agent-infra#1710).** Both are built into
+  a tmux `sh -c` lane/chain command with no metacharacter guard — the class closed for `$O` in
+  `orch-loop.sh` and for six values in `cloud-cell-supervisor.sh`. A `'` in either closes the quoted
+  span; separately, a lane that dies instantly is still logged as a successful spawn.
+- **The merge key reaches the controller but not the merge workers (agent-infra#1711).** The workers
+  are spawned through a second tmux boundary, and a tmux session is served from the SERVER's
+  environment, so with a pre-existing server a keys.env key is reported present by `cmd_check` while
+  every merge runs keyless (a false PASS; `record-review.sh` then posts an UNSIGNED marker).
 
 ---
 

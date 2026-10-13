@@ -740,6 +740,18 @@ ck "install.sh refuses a quote in \$O" $rc
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh --uninstall was blocked by SCOPE=banana"; }
 ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
+# A ZERO-BYTE key file is not a key: `-f` blessed it, and the daemon then recorded reviews
+# UNSIGNED and failed ai-review-gate — the env-only failure with the file branch taken (README §7.4).
+: > "$SB/.pi/agent/.ai-review-gate-key"
+ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
+case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed an empty key file" ;; *) rc=0 ;; esac
+ck "install.sh does not bless a ZERO-BYTE key file" $rc
+printf 'k\n' > "$SB/.pi/agent/.ai-review-gate-key"
+ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
+rm -f "$SB/.pi/agent/.ai-review-gate-key"
+case "$ikout" in *'gate key file present'*) rc=0 ;; *) rc=1; echo "      install.sh did not report a non-empty key file" ;; esac
+ck "install.sh reports a NON-EMPTY key file present (non-vacuity)" $rc
+
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
 # the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
@@ -807,6 +819,22 @@ rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a metacharacter in \$OR is refused before any session is created" $rc
+# The QUOTE is the break-out enabler, so drive it ALONE — no $, ; or # for another alternative to
+# match: a guard that lost only the quote alternatives must still go red here.
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$TMP/tm/harness" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
+  || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
+ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x'q" \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
+  || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
+ck "a QUOTE-ONLY \$OR is refused (the quote is the break-out enabler)" $rc
 # The merge key must NOT be interpolated into the session string at all: a secret in an argv string
 # is visible to ps/tmux, and it was the other unguarded member of this same class. It reaches the
 # session through \$ENV_FILE (which the session re-sources).
@@ -840,6 +868,20 @@ ck "cmd_check reports the key present when keys.env carries it" $rc
 out="$(kc_check "$KC/home/keys-empty.env" 'AI_REVIEW_GATE_KEY=AMBIENT')"
 case "$out" in *'will NOT receive it'*) rc=0 ;; *) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; esac
 ck "cmd_check warns that an ambient-only key does not reach the session" $rc
+# An EMPTY assignment matches a textual grep but sources to empty, which downstream treats as
+# absent — so it must not be reported present (a false green on a cell that cannot merge).
+printf 'AI_REVIEW_GATE_KEY=\n' > "$KC/home/keys-empty-key.env"
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-empty-key.env" '' )"
+case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; *) rc=0 ;; esac
+ck "an EMPTY key in keys.env is NOT reported present" $rc
+# The start path is the ONLY path that starts a cell, so it must not swallow the verdict: an
+# operator who exported the key ambiently gets a keyless cell and no signal otherwise.
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
+case "$serr" in *'will NOT receive it'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
+ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

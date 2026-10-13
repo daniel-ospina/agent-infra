@@ -62,11 +62,16 @@ safe_argv() {
 export HOME="$CELL_HOME"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 LOCK="$O/.orch.lock"
-# Does the ENV FILE itself carry the merge key? cmd_check must judge what the SESSION will see, not
-# what this shell happens to hold: the session re-sources $ENV_FILE, so a keys.env key reaches it
-# while an ambient-only export does not (tmux serves the session from the server's environment).
+# Does the ENV FILE itself carry a NON-EMPTY merge key? cmd_check must judge what the SESSION will
+# see, not what this shell holds: the session re-sources $ENV_FILE (so a keys.env key reaches it)
+# while an ambient-only export does not (tmux serves a session from the server's environment).
+# ⛔ Test the VALUE with the session's own semantics, not the line: `AI_REVIEW_GATE_KEY=` matches a
+# textual grep but sources to EMPTY, and an empty key is treated as absent downstream — reporting
+# it present would bless a cell that cannot merge.
 KEY_IN_FILE=""
-[ -f "$ENV_FILE" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?AI_REVIEW_GATE_KEY=' "$ENV_FILE" && KEY_IN_FILE=1
+if [ -f "$ENV_FILE" ]; then
+  env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${AI_REVIEW_GATE_KEY:-}" ]' _ "$ENV_FILE" 2>/dev/null && KEY_IN_FILE=1
+fi
 
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
@@ -151,7 +156,12 @@ cmd_start() {
   # Idempotent; mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
-  cmd_check >/dev/null || exit 1
+  # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
+  # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
+  # keyless cell with no signal. Run the check once, fail loudly, and surface its key lines on stderr.
+  local chk
+  if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
+  printf '%s\n' "$chk" | grep -Ei 'merge authority key|will NOT receive it' >&2 || true
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.
