@@ -14,7 +14,7 @@ The hang is invisible to every other probe in the fleet: the lane's process is a
 advancing, there is no error, and no watchdog covers it (`TASK_STREAM_STALL_MS` bounds the builtin
 `task` tool, not this path). So it must be detected here.
 
-⛔ THE THREE GATES — ALL REQUIRED, AND A RAPER THAT SKIPS ONE IS A LANE-KILLER
+⛔ THE THREE GATES — ALL REQUIRED, AND A REAPER THAT SKIPS ONE IS A LANE-KILLER
 ─────────────────────────────────────────────────────────────────────────────
 A child that is legitimately busy is indistinguishable from a frozen one by any SINGLE signal:
 
@@ -28,6 +28,12 @@ A child that is legitimately busy is indistinguishable from a frozen one by any 
      the subtree must be frozen ACROSS TICKS (see `FROZEN_TICKS`), not merely at one instant.
 
 If either read is unclear: REPORT, DO NOT REAP.
+
+⛔ AND A FOURTH CONDITION ON THE SIGNAL ITSELF. Those three gates decide WHETHER a subtree may be
+signalled; the signal must also land on the process that was measured. So every victim is re-fenced
+through the fleet's ONE identity rule (`scripts/lib/pid-identity.sh`) between the snapshot and the
+`os.kill`, and an unprovable victim abstains. Without it, a pid recycled in that window receives a
+SIGTERM meant for a corpse — see `reap()` and `lib_path()`.
 
 ⛔ AND IT REAPS THE CHILD, NEVER THE LANE. The lane's own `pi` holds the conversation and its
 context; killing it destroys the lane's work. The frozen offspring hold nothing — they are the
@@ -47,6 +53,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 CPU_TOL = 0.1        # seconds of CPU a subtree may gain across WINDOW and still count as frozen
@@ -62,6 +69,30 @@ FROZEN_MIN = 1800    # ... spanning at least this long
 LOG = os.path.expanduser("~/.pi/agent/state/lane-watchdog.jsonl")
 LOCK = os.path.expanduser("~/.pi/agent/state/lane-watchdog.lock")
 STATE = os.path.expanduser("~/.pi/agent/state/lane-watchdog.candidates.json")
+
+# ── THE SHARED IDENTITY RULE: one rule, one process boundary (#1178) ──────────
+# ⛔ WHY THIS IS A SUBPROCESS AND NOT A SECOND OPINION (#1696). `reap()` used to signal by pid
+# alone: identity was derived from this file's OWN `ps` table, and never re-checked between the
+# snapshot and the `os.kill`. A pid recycled inside that window received the signal in place of the
+# process that was measured. The fleet's ONE process-identity rule already exists --
+# `scripts/lib/pid-identity.sh` -- and is consumed by the reviewed kill path (Bash,
+# `scripts/pi-reap-idle.sh`) and by the liveness classifier (Python, `tools/fleet/liveness.py`)
+# through exactly this guarded-main CLI. #1178 chose one implementation over a second opinion, and
+# `docs/ops/fleet-liveness.md` §3 names adding a second identity probe as the "two contracts for one
+# safety rule" defect that decision exists to remove. So the reaper FORKS the rule rather than
+# re-implementing it: it supplies the incarnation it recorded and asks whether the pid still holds
+# it. The fence tolerance is the rule's own (`FENCE_TOLERANCE_SECONDS`, default 3) and is
+# deliberately NOT re-declared here -- a number copied into this file is a second contract.
+#
+# ⛔ AN UNRUNNABLE RULE ABSTAINS. A missing, broken or timed-out CLI answers `unknown`, and `unknown`
+# never authorises a signal. That is the fail-closed direction on the one call that is irreversible.
+# It does mean a permanently unreadable rule makes the reaper inert -- which is why the abstention
+# is LOGGED and counted (`reap-abstained`) rather than passed over in silence.
+def lib_path():
+    """The shared rule's path. `PI_PID_IDENTITY_LIB` overrides it (same env name the classifier
+    honours), which is also the seam the tests use to stand a stub rule in front of the fence."""
+    return os.environ.get("PI_PID_IDENTITY_LIB") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "lib", "pid-identity.sh")
 
 # ⛔ THE BOUNDARY, NOT A MARKER ANYWHERE IN THE CHAIN. Both the owner's shell AND every fleet lane
 # run through `login` + `-zsh`; what separates them is which terminal the chain hangs off.
@@ -91,23 +122,151 @@ def cpu_seconds(tok):
 
 
 def ps_table():
-    """{pid: dict(ppid, stat, cpu, cmd)} for every process, one snapshot."""
+    """{pid: dict(ppid, stat, cpu, start, cmd)} for every process, ONE snapshot.
+
+    ⛔ `lstart` IS READ IN THIS SAME SNAPSHOT, NOT IN A SECOND ONE (#1696, review cycle 1). The
+    incarnation a signal is fenced against must belong to the process that was MEASURED. Reading it
+    afterwards -- even milliseconds later, after the per-candidate `lsof` and `ps -o etime` calls --
+    leaves a window in which the pid can be recycled, and the fence would then be checking the
+    REPLACEMENT's start, answer `holder`, and signal it. One snapshot closes the window: identity
+    and the CPU/ancestry evidence then come from the same read.
+
+    `lstart` sits BEFORE `command=` because `command=` consumes the rest of the line, and `lstart`
+    is five whitespace-separated tokens (`Mon Oct 13 09:41:20 2026`), hence the bounded split.
+    """
     try:
-        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,stat=,time=,command=", "-ww"],
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,stat=,time=,lstart=,command=", "-ww"],
                              capture_output=True, text=True, timeout=60).stdout
     except Exception:
         return {}
     table = {}
     for line in out.splitlines():
-        f = line.split(None, 4)
-        if len(f) < 5:
+        f = line.split(None, 9)
+        if len(f) < 10:
             continue
         try:
-            pid = int(f[0])
+            pid, ppid = int(f[0]), int(f[1])
         except ValueError:
             continue
-        table[pid] = dict(ppid=int(f[1]), stat=f[2], cpu=cpu_seconds(f[3]), cmd=f[4])
+        table[pid] = dict(ppid=ppid, stat=f[2], cpu=cpu_seconds(f[3]),
+                          start=_lstart_to_epoch(" ".join(f[4:9])), cmd=f[9])
     return table
+
+
+def ps_readable(table):
+    """Is this a READ, or a FAILED read shaped like an empty fleet?
+
+    ⛔ `ps_table()` returns `{}` on ANY failure, and `{}` used to be persisted as a definite "no
+    processes". That filters every candidate out of `alive` (see `main()`) and so wipes EVERY
+    frozen clock: one transient `ps` timeout resets the whole gate, and a persistent failure is an
+    ARMED reaper that never ripens, exits 0, and logs nothing.
+
+    A real table always contains pid 1 and THIS process. That bar is deliberately **STRONGER** than
+    the shared rule's own `pid_table_nonempty` (which requires only a non-blank line) -- it is NOT
+    the same check, and calling it the same invited a later edit to "align" the reaper downward.
+    This read feeds a file whose emptiness is destructive, so it takes the stricter test.
+    """
+    return bool(table) and 1 in table and os.getpid() in table
+
+
+_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
+           "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def _lstart_to_epoch(text):
+    """An `lstart` line -> epoch seconds, WITHOUT `strptime`, and order-agnostically.
+
+    ⛔ WHY NOT `strptime` (#1696). Its format string cannot express BOTH of the field orders `ps`
+    emits: macOS prints `Sun 11 Oct 23:41:02 2026` (weekday, DAY, MONTH) and Linux prints
+    `Mon Oct 13 09:41:20 2026` (weekday, MONTH, DAY). One format string therefore raises
+    `ValueError` on one of the two platforms, which would drop every pid out of the map -- no start
+    seconds, no fence, no signal, i.e. an INERT reaper that reports success.
+
+    ⚠️ CORRECTED 2026-10-13 (review cycle 1): this docstring used to blame the LOCALE -- "the
+    abbreviated names are not in the loaded locale table". That was FALSE, and the measurement is
+    one line: with `LC_TIME` unset, `strptime("Mon Oct 13 09:41:20 2026", "%a %b %d %H:%M:%S %Y")`
+    SUCCEEDS; only the day-first string raises. The real cause is the field order, which is the
+    reason the parse is order-agnostic. The locale plays no part in it.
+
+    So the month is found by NAME, the day is the remaining short numeric token, the weekday is
+    discarded, and `ps` prints these in English unconditionally.
+    """
+    parts = text.split()
+    month = None
+    for tok in parts:
+        low = tok.lower()[:3]
+        if low in _MONTHS:
+            month = _MONTHS.index(low) + 1
+            break
+    clock = next((t for t in parts if ":" in t), None)
+    year = next((t for t in parts if t.isdigit() and len(t) == 4), None)
+    day = next((t for t in parts if t.isdigit() and len(t) <= 2), None)
+    if month is None or clock is None or year is None or day is None:
+        return None
+    try:
+        hh, mm, ss = (int(x) for x in clock.split(":"))
+        return time.mktime((int(year), month, int(day), hh, mm, ss, 0, 1, -1))
+    except ValueError:
+        return None
+
+
+def write_state(path, data):
+    """Write the tick's observations ATOMICALLY, or raise.
+
+    ⛔ ATOMIC, AND LOUD ON FAILURE (#1696). This file IS the gate that separates a stuck child from
+    one in a long model call: it is the only record that a subtree was already frozen on the
+    PREVIOUS tick. The old body was `json.dump(alive, open(STATE, "w"))` inside
+    `except Exception: pass`, which failed twice over:
+
+      * `open(path, "w")` TRUNCATES before writing, so a crash mid-dump left an empty or half-
+        written file. That is indistinguishable from "no prior observation": the frozen clock
+        restarted, and the reaper became INERT FOREVER while every run still reported success.
+      * the `pass` made the failure silent -- the whole defect, since the reaper's value is that it
+        is safe to leave ARMED, and one that quietly stops working gives false assurance.
+
+    `tempfile` + `os.replace` is this fleet's standard for peer-visible state: a reader sees either
+    the previous file or the complete new one, never a truncation. A failure PROPAGATES so `main()`
+    can report it and exit non-zero, and the previous observation stays on disk, so no clock is
+    restarted by a failed write.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".lane-watchdog-state.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def probe_pid(pid, start_seconds_value, *, lib=None):
+    """Ask the shared rule whether `pid` still holds the incarnation we recorded.
+
+    Returns `(authorised, reason)`. `authorised` is True for `holder` and NOTHING else: `absent`,
+    `zombie`, `off-fence` and `unknown` all withhold the signal. Mirrors
+    `tools/fleet/liveness.py::_run_lib`, including its contract that a missing or unrunnable CLI is
+    `unknown` and must never read as absence.
+    """
+    cmd = ["bash", lib or lib_path(), "probe", str(pid),
+           "" if start_seconds_value is None else str(int(start_seconds_value))]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+                              check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"unknown:probe-launch-failed:{exc.__class__.__name__}"
+    out = proc.stdout.decode("utf-8", "replace").strip()
+    first = out.splitlines()[0].strip() if out else ""
+    status = (first.split() or ["unknown"])[0]
+    if status not in ("holder", "absent", "zombie", "off-fence", "unknown"):
+        status = "unknown"
+    return (proc.returncode == 0 and status == "holder"), f"{status}:{first or 'no-output'}"
 
 
 def descendants(root, table):
@@ -179,7 +338,7 @@ def has_live_connection(pid):
     return None                         # failed, timed out, or spoke up: UNKNOWN, and UNKNOWN refuses
 
 
-def frozen_subtrees(table_a, table_b, now=None):
+def frozen_subtrees(table_a, table_b, now=None, unreadable=None):
     """Every `pi` child of a `pi` parent whose whole subtree gained no CPU across the window.
 
     Returns a list of `dict(pid, ppid, age_s, d_cpu)`. This is the DETECTOR only — it decides
@@ -226,11 +385,39 @@ def frozen_subtrees(table_a, table_b, now=None):
         # middle `pi` whose GRANDCHILD holds the provider connection. Measured by review: candidates
         # `[(200, [200, 300])]` with 300 holding an ESTABLISHED connection — 300 was correctly
         # excluded as its own candidate, and was then dragged into 200's kill list anyway.
-        if any(has_live_connection(q) is not False for q in subtree):
+        # ⛔ AN UNREADABLE PROBE IS NOT A LIVE CONNECTION, AND IT IS NOT SILENCE EITHER (#1696,
+        # review cycle 4). `has_live_connection` returns None when `lsof` is missing, errors or times
+        # out, and `is not False` then excluded the candidate -- so THREE different worlds produced
+        # identical output: a child holding a live provider call, a child with no connection, and a
+        # BROKEN PROBE. In all three the candidate set came back empty, `main()` wrote an empty state
+        # (another full FROZEN_MIN of blindness) and exited 0 with nothing logged, so an operator
+        # could not tell a working reaper from a disarmed one. An unreadable probe is now recorded on
+        # `unreadable` and the caller REFUSES, exactly as it does for an unreadable `ps` -- every
+        # other input that feeds the state file already refuses.
+        verdict = "no-connection"
+        for q in subtree:
+            seen = has_live_connection(q)
+            if seen is True:
+                verdict = "connected"
+                break
+            if seen is None:
+                verdict = "unreadable"
+                break
+        if verdict == "unreadable":
+            if unreadable is not None:
+                unreadable.append(pid)
+            _log(dict(event="connection-unreadable", ts=int(now), pid=pid, subtree=subtree))
+            continue
+        if verdict == "connected":
             continue
         # The whole subtree is parked. `age_s` comes from the child's own process age.
         out.append(dict(pid=pid, ppid=b["ppid"], age_s=_age_seconds(pid, table_b),
                         d_cpu=round(d, 3), subtree=subtree))
+    # The incarnation of every pid that could be signalled later, taken from the SAME snapshot that
+    # judged the subtree parked -- never a second read (see `ps_table`).
+    for c in out:
+        c["starts"] = {q: table_b[q]["start"] for q in c["subtree"]
+                       if table_b.get(q, {}).get("start") is not None}
     return out
 
 
@@ -406,27 +593,61 @@ def evaluate(cands, table, state, now=None, min_age=MIN_AGE):
     return ripe, watching, refused, ticks
 
 
-def reap(cand, table_a, table_b, ts):
+def reap(cand, table_a, table_b, ts, *, lib=None):
     """GATE passed -> TERM the frozen subtree, child first, and report what happened.
 
     The parent is never signalled: its context is the lane's work, and the whole point is to make
     its tool call RETURN, which terminating the offspring does.
+
+    ⛔ EVERY VICTIM IS RE-FENCED AT SIGNAL TIME (#1696). The identity was recorded when the subtree
+    was measured (`cand["starts"]`); between that read and this loop a pid can die and be reused,
+    and a signal is irreversible. So each victim is put back to the shared rule -- `probe <pid>
+    <start>` -- and only `holder` is signalled. Anything else, including a victim we cannot fence at
+    all because the probe could not run, is ABSTAINED and logged.
+
+    ⛔ AN ABSTENTION IS PER-PID, NEVER PER-CANDIDATE. Skipping the whole subtree because one pid
+    stopped being provable would let a recycled sibling rescue a genuinely frozen one -- but
+    signalling the unprovable pid is the data-loss case. The pids are independent, so each is judged
+    on its own fence.
     """
-    killed = []
+    killed, vanished, abstained = [], [], []
+    starts = cand.get("starts") or {}
     # children before parents, so nothing is reparented mid-kill
     for pid in sorted(cand["subtree"], key=lambda p: -len(ancestry(p, table_b))):
+        authorised, why = probe_pid(pid, starts.get(pid), lib=lib)
+        if not authorised:
+            abstained.append(dict(pid=pid, reason=why))
+            _log(dict(event="reap-abstained", ts=ts, pid=pid, reason=why, parent=cand["pid"]))
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
             killed.append(pid)
         except ProcessLookupError:
-            pass
+            # ⛔ GONE BETWEEN THE FENCE AND THE SIGNAL IS THE END STATE WE WANTED, not a failure.
+            # The rule answered `holder` a moment ago and the process has since exited: there is
+            # nothing to signal and nothing broken. It is not counted as a kill either, so the
+            # report cannot claim either way by accident.
+            vanished.append(pid)
         except Exception as e:
-            return dict(pid=cand["pid"], ended=False, killed=killed, error=str(e))
-    return dict(pid=cand["pid"], ended=True, killed=killed, parent=cand["ppid"])
+            return dict(pid=cand["pid"], ended=False, killed=killed, vanished=vanished,
+                        abstained=abstained, error=str(e))
+    # ⛔ CONSERVATIVE (#1696, review cycle 1): an abstained victim is still frozen, so a candidate
+    # whose sibling was withheld has NOT provably ended.
+    return dict(pid=cand["pid"], ended=bool(killed or vanished) and not abstained, killed=killed,
+                vanished=vanished, abstained=abstained, parent=cand["ppid"])
 
 
 def acquire_lock():
-    """Hold the single-run lock, or return None when another run already holds it.
+    """Hold the single-run lock, or report WHY not.
+
+    Returns `(fh, None)` on success, `(None, "held")` when another run holds it, and
+    `(None, "unavailable")` when the lock could not even be created.
+
+    ⛔ THE TWO FAILURES ARE NOT THE SAME (#1696, review cycle 1). Contention is normal, expected, and
+    silent. An UNOPENABLE lock is an environmental failure that makes the reaper inert -- and under
+    the production invocation (`nohup ... --apply >> "$LOG"`) it used to print nothing and exit 0,
+    never reaching the loud state-write path, because it returns before it. A silent no-op is the
+    failure this whole file exists to avoid; the healthy-looking one is the dangerous one.
 
     ⛔ REQUIRED, NOT A NICETY. The tick may launch this detached on consecutive passes, and the
     "frozen ACROSS TICKS" rule is exactly what two concurrent runs would corrupt: both would read
@@ -443,17 +664,17 @@ def acquire_lock():
         # from one in a long model call. Returning True here was fail-open on the one mechanism the
         # docstring calls "REQUIRED, NOT A NICETY" -- for a process-killer the safe direction is to
         # do nothing.
-        return None
+        return None, "unavailable"
     try:
         os.makedirs(os.path.dirname(LOCK), exist_ok=True)
         fh = open(LOCK, "w")
     except Exception:
-        return None
+        return None, "unavailable"
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return None
-    return fh
+        return None, "held"
+    return fh, None
 
 
 def main():
@@ -467,8 +688,16 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    hold = acquire_lock()
+    hold, lock_why = acquire_lock()
     if hold is None:
+        if lock_why == "unavailable":
+            # ⛔ NOT CONTENTION: the lock could not be created, so this run is inert for an
+            # environmental reason. Silent by default in production, which is why it is logged and
+            # returns non-zero instead.
+            _log(dict(event="lock-unavailable", ts=int(time.time())))
+            print("\u26d4 LOCK UNAVAILABLE -- the lock file could not be created, so the reaper "
+                  "did NOT run", file=sys.stderr)
+            return 3
         # Another run owns the observation state; observe nothing rather than double-count ticks.
         if args.json:
             print(json.dumps(dict(skipped="another run holds the lock")))
@@ -477,12 +706,60 @@ def main():
     a = ps_table()
     time.sleep(args.window)
     b = ps_table()
-    cands = frozen_subtrees(a, b)
+    if not (ps_readable(a) and ps_readable(b)):
+        # ⛔ BOTH READS, NOT JUST THE LAST ONE (#1696, review cycle 2). A failed FIRST read is the
+        # same defect seen from the other end: `frozen_subtrees(a, b)` finds no `table_a` row for any
+        # pid, so it returns NO candidates, `ticks` comes back empty, and the state file is
+        # overwritten with `{}` -- every frozen clock wiped, while the run reports `state_write: ok`
+        # and exits 0. The first read is taken under load, before the window sleep, so it is not the
+        # more trustworthy of the two for being first.
+        _log(dict(event="ps-unreadable", ts=int(time.time()),
+                  observed=len(a), observed_window=len(b)))
+        report = dict(observed=len(b), frozen=0, ripe=0, watching=[], refused=[], reaped=[],
+                      ps_readable=False, ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 ps UNREADABLE -- refusing to judge, and refusing to overwrite the "
+                  "observation state")
+        return 3
+    unreadable = []
+    cands = frozen_subtrees(a, b, unreadable=unreadable)
+    if unreadable:
+        # ⛔ (see `frozen_subtrees`) An unreadable connection probe must not read as "no candidate":
+        # that would wipe the state and report success. The probe is already logged per candidate;
+        # this refuses to judge at all.
+        report = dict(observed=len(b), frozen=0, ripe=0, watching=[], refused=[], reaped=[],
+                      connection_unreadable=len(unreadable), ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 CONNECTION PROBE UNREADABLE -- refusing to judge, and refusing to "
+                  "overwrite the observation state", file=sys.stderr)
+        return 3
 
+    # ⛔ AN UNREADABLE STATE FILE IS NOT AN EMPTY ONE (#1696, review cycle 3). `except Exception:
+    # state = {}` made an INTACT but unreadable -- or truncated -- file indistinguishable from a
+    # first run. That is the exact artifact the old truncating write left behind, and the run then
+    # reset every candidate's clock (another full FROZEN_MIN of blindness) AND overwrote the intact
+    # observation, while reporting `state_write: ok` and exiting 0. A MISSING file is a genuine first
+    # run; anything else refuses, loudly, and writes NOTHING.
     try:
-        state = json.load(open(STATE))
-    except Exception:
+        with open(STATE) as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
         state = {}
+    except Exception as e:
+        _log(dict(event="state-unreadable", ts=int(time.time()),
+                  error=f"{e.__class__.__name__}: {e}"))
+        report = dict(observed=len(b), frozen=len(cands), ripe=0, watching=[], refused=[],
+                      reaped=[], state_unreadable=True, ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 STATE FILE UNREADABLE -- refusing to judge without the prior observation, "
+                  "and refusing to overwrite it", file=sys.stderr)
+        return 3
 
     ripe, watching, refused, ticks = evaluate(cands, b, state, min_age=args.min_age)
 
@@ -500,12 +777,18 @@ def main():
                   pids=[c["pid"] for c in ripe]))
 
     # only keep observations for processes that still exist, so the file cannot grow forever
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
     alive = {p: v for p, v in ticks.items() if int(p) in b}
+    state_error = None
     try:
-        json.dump(alive, open(STATE, "w"), indent=1)
-    except Exception:
-        pass
+        write_state(STATE, alive)
+        report["state_write"] = "ok"
+    except Exception as e:
+        # ⛔ NOT SWALLOWED (#1696). A failed state write means the frozen clock did NOT advance;
+        # the previous observation stands on disk (the write is atomic), so nothing restarts --
+        # but this run must not report a clean pass, or an inert reaper looks healthy forever.
+        state_error = f"{e.__class__.__name__}: {e}"
+        report["state_write"] = "failed"
+        _log(dict(event="state-write-failed", ts=report["ts"], error=state_error))
 
     if args.json:
         print(json.dumps(report, indent=1))
@@ -515,10 +798,17 @@ def main():
         for c in ripe:
             print(f"  RIPE pid={c['pid']} ppid={c['ppid']} age={c['age_s']}s "
                   f"frozen={c['frozen_for']}s dCPU={c['d_cpu']}")
+        for r in report["reaped"]:
+            for a in r.get("abstained", []):
+                print(f"  FENCE-ABSTAIN pid={a['pid']} -- {a['reason']} (NOT signalled)")
         for c in watching:
             print(f"  watch pid={c['pid']} age={c.get('age_s')}s -- {c['reason']}")
         for c in refused:
             print(f"  REFUSED pid={c['pid']} -- {c['reason']}")
+    if state_error:
+        print(f"⛔ STATE WRITE FAILED ({state_error}) -- the frozen clock did NOT advance; the "
+              f"previous observation stands and this run is NOT healthy", file=sys.stderr)
+        return 3
     return 0
 
 
