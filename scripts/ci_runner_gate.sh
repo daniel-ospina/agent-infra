@@ -89,7 +89,9 @@ print(comp, len(inc))
 }
 
 # ── label control ───────────────────────────────────────────────────────────────
-runner_ids() { gh api "repos/$REPO/actions/runners" --jq '.runners[].id' 2>/dev/null; }
+# ⛔ --paginate is REQUIRED: `gh api` returns at most 30 runners per page, so a pool larger than
+# that was relabelled only in part, and `set_labels` reported ok=N over a truncated set.
+runner_ids() { gh api --paginate "repos/$REPO/actions/runners" --jq '.runners[].id' 2>/dev/null; }
 
 set_labels() { # $1 = json array body
   local body="$1" id ok=0 fail=0
@@ -108,10 +110,19 @@ fallback_on()  { set_labels "{\"labels\":[\"$POOL_LABEL\",\"$FALLBACK_LABEL\"]}"
 fallback_off() { set_labels "{\"labels\":[\"$POOL_LABEL\"]}"; }
 
 current_mode() {  # github | local | unknown
-  local n
-  n="$(gh api "repos/$REPO/actions/runners" \
-        --jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>&1)" || { log "gh api failed: ${n:0:300}"; return 1; }
-  case "$n" in ''|*[!0-9]*) log "gh api returned non-numeric: ${n:0:300}"; return 1 ;; esac
+  # ⛔ PER-PAGE COUNTS, SUMMED. Without --paginate the read stops at the default 30 runners, so a
+  # fallback-labelled runner that lands on a later page is invisible and the mode resolves `github`
+  # while the fallback is still attached — the gate then leaves the stale fallback in place and
+  # reports the wrong mode. `--jq` cannot aggregate across pages (a `length` emits one number PER
+  # PAGE, which the numeric guard below would reject rather than sum), and gh 2.97 refuses `--slurp`
+  # together with `--jq` (verified: "the `--slurp` option is not supported with `--jq`"), so the
+  # per-page counts are summed here instead. The failure signal is unchanged: a failed or
+  # non-numeric read still returns 1 (unknown), never a guessed mode.
+  local n pages
+  pages="$(gh api --paginate "repos/$REPO/actions/runners" \
+        --jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>&1)" || { log "gh api failed: ${pages:0:300}"; return 1; }
+  case "$pages" in ''|*[!0-9[:space:]]*) log "gh api returned non-numeric: ${pages:0:300}"; return 1 ;; esac
+  n="$(printf '%s\n' "$pages" | awk '{s+=$1} END{printf "%d", s+0}')"
   if [ "${n:-0}" -gt 0 ]; then echo local; else echo github; fi
 }
 

@@ -699,12 +699,30 @@ case "$1" in
 esac
 STUB
 chmod +x "$STUB_TM/tmux"
+# The stub must be ABLE to record a session: without this the new-session write fails, so the
+# session-file clause below could never fire and a mutant that started a real session would surface
+# only through the refusal-message clause. Created empty, the stub still reports has-session=absent.
+mkdir -p "$TMP/sup-empty"
 ( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
-[ ! -f "$TMP/sup-empty/cmd" ] || { rc=1; echo "      a session was created despite a set-but-empty SCOPE"; }
-[ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 \
-  || { rc=1; echo "      rc=$rc; stderr: $(tail -2 "$TMP/sup.empty.err")"; }
+# ONE conjunction. This was two statements and the second RECOMPUTED rc from its own exit status,
+# discarding the first — so a mutant that created the session and only then died with the SCOPE
+# message printed the violation and still reported PASS. Each clause must hold for the PASS: a
+# non-zero rc, NO session file (the stub above can now truly record one), and the refusal message.
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/sup-empty/cmd" ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 \
+  || { rc=1; echo "      a session was created, or the SCOPE refusal was not reached; stderr: $(tail -2 "$TMP/sup.empty.err")"; }
 ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted values" $rc
+
+# ... and `check` must refuse it too. Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a
+# preflight that certifies a SCOPE its own `start` then dies on is a FALSE PASS on the only question
+# that verdict answers. Driven with a value NEITHER subcommand accepts, and both halves asserted: the
+# refusal names the accepted values, AND the certification line is absent.
+( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+    bash "$HERE/../cloud-cell-supervisor.sh" check >"$TMP/sup.chkbad.out" 2>"$TMP/sup.chkbad.err" ); rc=$?
+[ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.chkbad.err" \
+  && ! grep -qF 'CELL CAN RUN A CONTROLLER' "$TMP/sup.chkbad.out" && rc=0 \
+  || { rc=1; echo "      check certified (or failed to refuse) SCOPE=banana; stderr: $(tail -2 "$TMP/sup.chkbad.err")"; }
+ck "the cell supervisor's check refuses a bad SCOPE instead of certifying the cell" $rc
 
 # install.sh must refuse the SAME $O its controller refuses: a plist that renders here but is
 # rejected there is worse than a refusal — RunAtLoad+KeepAlive relaunches a guaranteed-fatal

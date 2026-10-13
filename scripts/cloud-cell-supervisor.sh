@@ -102,12 +102,24 @@ KEY_IN_FILE="$(printf '%s' "$KEY_IN_FILE_RAW" | tr -d '[:space:]')"
 # check is SHADOWED — so this state must be judged absent-and-dead, never present.
 
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
-# validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
-# would coerce a blank keys.env entry to auto and evaporate the pin this override exists for.
+# validated by validate_scope() and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}`
+# here would coerce a blank keys.env entry to auto and evaporate the pin this override exists for.
 [ -z "${SCOPE+x}" ] && SCOPE=auto
+
+# Refuse a bad SCOPE wherever the cell is judged or started. `check` MUST run this too: its verdict is
+# "CELL CAN RUN A CONTROLLER", and a cell whose preflight says YES while its `start` dies on the same
+# config is a FALSE PASS on exactly the question that verdict answers. A typo, or a set-but-BLANK
+# keys.env entry, must not silently become `auto` (the default applies only when SCOPE is UNSET).
+validate_scope() {
+  case "$SCOPE" in
+    auto|own|broad) ;;
+    *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
+  esac
+}
 
 # ── check: can this cell actually run a controller? ─────────────────────────────
 cmd_check() {
+  validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
   [ -d "$HARNESS" ] || die "harness not found at $HARNESS (clone the repo first)"
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
@@ -167,12 +179,9 @@ cmd_check() {
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
-  # Refuse a bad SCOPE before anything starts or is written: a typo, or a set-but-BLANK keys.env
-  # entry, must not silently become `auto` (the default above applies only when SCOPE is UNSET).
-  case "$SCOPE" in
-    auto|own|broad) ;;
-    *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
-  esac
+  # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
+  # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
+  validate_scope
   # Guard BEFORE seeding. $O is the controller's working copy and `start` on a live cell would
   # otherwise replace the worker scripts its next spawn executes (and race a half-copied script).
   # Nothing is started or written on this path, so a bad value below cannot hurt it.

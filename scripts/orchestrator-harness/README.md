@@ -287,8 +287,9 @@ after a restart until it was fixed).
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
    or `ISSUES <n>`. A CLEAN comment may not assert an unresolved outcome. The enforcer is the
    evidence veto in `scripts/record-review.sh`, and its vocabulary is `NOT CLEAN`, "requires human
-   attention/input", "unresolved issues", "auto-fix stalled/failed/reached/converged", "test
-   review capped", `[ADVERSARIAL-BOUND]`, and a **counted** `N issues remain`. The count is
+   attention/input/review", "unresolved issues",
+   "auto-fix stalled/failed/reached/converged/aborted/stuck", "test review capped",
+   `[ADVERSARIAL-BOUND]`, and a **counted** `N issues remain`. The count is
    deliberate: a bare "issues remain" is NOT matched, because the veto must not false-refuse the
    legitimate clean phrasing "No issues remain after the fixes" — which also means a CLEAN comment
    whose body says (uncounted) that issues remain does pass the veto. Quote the gate's list, not a
