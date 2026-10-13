@@ -393,6 +393,56 @@ def test_a_child_with_no_connection_is_still_a_candidate(W, monkeypatch):
     assert [c["pid"] for c in W.frozen_subtrees(a, b)] == [300]
 
 
+def test_a_failed_lsof_never_reads_as_no_connection(W, monkeypatch):
+    """⛔ THE CALLEE, NOT THE CONSUMER — THIS IS THE READ THAT AUTHORISES THE KILL (2026-10-13).
+
+    `test_an_unknown_connection_state_refuses` proves the CONSUMER's polarity by monkeypatching
+    `has_live_connection` ITSELF, so it stayed green while the function returned `False` for an
+    lsof that FAILED — and `False` is the only value that puts a child in the reap set. Probe the
+    function, not its callers.
+
+    ⛔ THE EXPECTATIONS BELOW ARE MEASURED ON THIS HOST (lsof 4.91), because the first cut of this
+    fix inverted them: a dead pid and a live pid with no established TCP BOTH exit **1** with empty
+    stdout AND empty stderr, while a genuine failure exits 1 but writes to stderr. A `rc != 0 ->
+    None` rule would have made the reaper permanently INERT; a `bool(stdout)` rule made a failed
+    read a kill licence. Both are wrong, in opposite directions.
+    """
+    class R:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def fake(rc, out="", err=""):
+        monkeypatch.setattr(W.subprocess, "run", lambda *a, **k: R(rc, out, err))
+        return W.has_live_connection(4242)
+
+    # ── the measured "ran fine, located nothing" shape: silence on both streams at rc=1 ──
+    assert fake(1) is False, "lsof rc=1 with no output is the genuine 'no connection'"
+    # ── anything that FAILED, however it reports, is UNKNOWN and must refuse ──
+    assert fake(1, err="lsof: illegal option character: -\n") is None, "a failing lsof is UNKNOWN"
+    assert fake(127) is None, "a missing lsof is UNKNOWN"
+    assert fake(-9) is None, "a signalled lsof is UNKNOWN"
+    assert fake(0) is None, "rc=0 with NO output is anomalous, not a clean 'no connection'"
+    assert fake(2, out="something") is None, "output with a dirty exit is UNKNOWN"
+    # a timeout / spawn failure raises, and must also refuse
+    def boom(*a, **k):
+        raise OSError("timed out")
+    monkeypatch.setattr(W.subprocess, "run", boom)
+    assert W.has_live_connection(4242) is None
+    # ── FALSE-BLOCK CONTROL: the one shape that means a connection is HELD ──
+    assert fake(0, out="COMMAND  PID USER FD TYPE\npi 4242 d 12u IPv4 0x1 0t0 TCP a->b:443 (ESTABLISHED)\n") is True
+
+
+def test_the_connection_probe_still_licenses_a_reap(W, monkeypatch):
+    """The other pole. If the probe never returns False the watchdog is an INERT enforcer, so the
+    'no connection' path must still reach the reap set through the REAL probe (not a stub)."""
+    class R:
+        returncode, stdout, stderr = 1, "", ""
+    monkeypatch.setattr(W.subprocess, "run", lambda *a, **k: R())
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    assert [c["pid"] for c in W.frozen_subtrees(a, b)] == [300]
+
+
 # ── fail-open P2s found by review cycle 3 ────────────────────────────────────
 
 def test_an_unreadable_age_refuses_rather_than_skipping_min_age(W, monkeypatch):

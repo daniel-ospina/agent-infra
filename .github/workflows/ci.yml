@@ -249,7 +249,7 @@ jobs:
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane

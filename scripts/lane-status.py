@@ -25,7 +25,23 @@ Usage:
 import json, os, re, subprocess, sys, time, glob, argparse
 from collections import Counter
 
+# ⛔ cmux IS NOT ON PATH FOR A LAUNCHD JOB. Measured 2026-10-12: the heartbeat's launchd
+# environment carries NO PATH AT ALL (`launchctl print gui/$UID/com.tortoise.heartbeat-loop` shows
+# only SSH_AUTH_SOCK). `sh_rc` runs every subprocess with `env=CMUX`, so with no PATH the
+# `["cmux", ...]` spawn fails, `LIVE_READABLE` goes False, EVERY row is marked `degraded`, and
+# `lane-actions.py` then REFUSES the snapshot — so `pr-doctor.py` classified 15 open PRs on every
+# pass and could not dispatch one fix. Do not rely on an inherited PATH a daemon does not have:
+# name the binary's directory explicitly. (Same failure class as the `gh` shim, #8246.)
+_CMUX_BIN_DIRS = (
+    "/Applications/cmux.app/Contents/Resources/bin",
+    os.path.join(os.path.expanduser("~"), ".local", "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+)
 CMUX = dict(os.environ, CMUX_QUIET="1")
+_present = [d for d in _CMUX_BIN_DIRS if os.path.isdir(d)]
+if _present:
+    CMUX["PATH"] = os.pathsep.join(_present + [CMUX.get("PATH", "")])
 SD = os.path.expanduser("~/.pi/agent/sessions")
 TASK_SD = os.path.expanduser("~/.pi/agent/task-sessions")
 REG = os.path.expanduser("~/.pi/agent/state/lane-registry.tsv")
@@ -445,14 +461,26 @@ def _tsv_rows():
     express: the issue-label, and a title match for a lane whose uuid was recreated.
     """
     rows = []
-    for line in open(REG, errors="ignore"):
-        line = line.rstrip("\n")
-        if not line or line.startswith("#") or "\t" not in line:
-            continue
-        parts = [p.strip() for p in line.split("\t")]
-        label, ws = parts[0], parts[1]
-        issue_label = parts[2] if len(parts) > 2 else ""
-        rows.append((label, ws, issue_label))
+    try:
+        fh = open(REG, errors="ignore")
+    except OSError:
+        # ⛔ A MISSING/UNREADABLE REGISTRY IS AN ABSENCE, NOT AN EMPTY FLEET (2026-10-13). The
+        # contract stated in this function is "never publish a roster it could not read" — but the
+        # open() was unguarded, so an absent file raised out of the whole scan instead of
+        # abstaining. A crash is not the safe direction here either: callers that catch and fall
+        # back publish the TSV as the roster, which is exactly the failure this file was fixed to
+        # stop. Returning nothing lets `main()` hit its own `if not rows: raise`, which names the
+        # unreadable read instead of silently asserting an empty fleet.
+        return []
+    with fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line or line.startswith("#") or "\t" not in line:
+                continue
+            parts = [p.strip() for p in line.split("\t")]
+            label, ws = parts[0], parts[1]
+            issue_label = parts[2] if len(parts) > 2 else ""
+            rows.append((label, ws, issue_label))
     return rows
 
 
@@ -1340,6 +1368,24 @@ def child_has_evidence(child, child_stale, child_grew, child_activity_age):
         or (child_activity_age is not None and child_activity_age < 900))
 
 
+def _idle_verdict(spinner):
+    """`DONE_IDLE` requires a POSITIVE read that the screen is static.
+
+    ⛔ THE FLEET'S STATED POLARITY IS `spinner is not False`, NOT TRUTHINESS (2026-10-13). An
+    UNREAD screen (`None`) is not a weaker verdict — it is a DIFFERENT state, and the fleet's own
+    contract says so (`docs/ops/fleet-liveness.md`: an unknown always carries a named reason,
+    never a weaker `wedged`). At these return sites plain truthiness made `None` falsy, so a
+    screen we could not read returned `DONE-IDLE` — a DISPATCH invitation, the exact action the
+    read layer exists to make safe. The long-tool guard above already used the correct polarity;
+    these sites were never brought to it. MEASURED: `classify(stale=1200, grew=False,
+    spinner=None, ...)` -> `DONE-IDLE` before, -> `UNKNOWN` after. `UNKNOWN` is not in
+    `lane-actions.OFFERABLE`, so it routes to REPORT ONLY.
+    """
+    if spinner is None:
+        return UNKNOWN
+    return WIP_IDLE if spinner else DONE_IDLE
+
+
 def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
              child_activity_age, tool_inflight, last_stop=None, has_sid=False,
              cpu_busy=None):
@@ -1445,7 +1491,7 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # this, keeping abandoned records would resurrect the "a call from days ago makes a
         # healthy lane read CHILD-STUCK forever" failure the old discard was written to stop.
         if child.get("abandoned") and last_kind == "assistant" and last_stop == "stop":
-            return WIP_IDLE if spinner else DONE_IDLE
+            return _idle_verdict(spinner)
         if child_grew:
             return WAITING                      # parent idle, child healthy — correct
         if child_stale is not None:
@@ -1488,7 +1534,7 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # 1h24m quiet) that read "Blocked on the owner" and "Lane report:" --
         # two lanes flagged for attention every tick of a shift for being done.
         if last_kind == "assistant" and last_stop == "stop":
-            return WIP_IDLE if spinner else DONE_IDLE
+            return _idle_verdict(spinner)
         # ⛔ AN OUTSTANDING DISPATCH IS NOT A WEDGE (2026-10-12). WEDGED's instruction is "check
         # the process", and its measured cost is a kill/respawn of a HEALTHY lane. We arrive here
         # holding an unmatched `task`/`subagent` call and no usable child evidence -- i.e. we know
@@ -1498,14 +1544,35 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         if (tool_inflight and tool_inflight.get("name") in TOOL_NAMES) \
                 or (child and child.get("abandoned")):
             return WAITING_OVERDUE
+        if spinner is None:
+            return UNKNOWN          # unreadable screen: abstain (was DONE-IDLE — a dispatch invite)
         return WEDGED if spinner else DONE_IDLE
     if last_kind == "user":
         return WIP_IDLE
     if last_kind == "tool":
         return WORKING
     if last_kind == "assistant":
-        return WIP_IDLE if spinner else DONE_IDLE
+        return _idle_verdict(spinner)
     return UNKNOWN
+
+
+def _publish_snapshot(out, cache_path, key):
+    """Write the machine snapshot to `cache_path` — but NEVER a degraded one.
+
+    ⛔ A DEGRADED READ MUST NOT BECOME A STICKY FAILURE (2026-10-12, measured). Caching a degraded
+    snapshot for the 420 s TTL makes ONE failed read poison every consumer for the rest of the
+    window: after the launchd PATH bug was fixed, `--json` STILL returned 27/27 degraded rows until
+    the TTL expired, and `lane-actions.py` refuses degraded snapshots — so `pr-doctor` stayed unable
+    to dispatch on a fleet it could no longer see. Cache a SUCCESS or nothing: a missing cache costs
+    one real scan, which is the safe direction. Returns True iff a snapshot was written.
+    """
+    if any(isinstance(r, dict) and r.get("degraded") for r in out):
+        return False
+    _tmp = cache_path + ".tmp"
+    with open(_tmp, "w") as fh:
+        json.dump({"key": key, "t": time.time(), "out": out}, fh, default=str)
+    os.replace(_tmp, cache_path)   # atomic: a reader never sees a half-written snapshot
+    return True
 
 
 def main():
@@ -1809,11 +1876,7 @@ def main():
         # pass. A caller that wants no cache at all is not a case the wake-up path has.
         try:
             _cf = os.path.join(os.path.expanduser("~/.pi/agent/state"), "lane-status.cache")
-            _tmp = _cf + ".tmp"
-            with open(_tmp, "w") as fh:
-                json.dump({"key": json.dumps([a.only]), "t": time.time(),
-                           "out": out}, fh, default=str)
-            os.replace(_tmp, _cf)   # atomic: a reader never sees a half-written snapshot
+            _publish_snapshot(out, _cf, json.dumps([a.only]))
         except Exception:
             pass      # caching is an optimisation; failing to cache must not fail the scan
         print(_blob)

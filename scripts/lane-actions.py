@@ -643,6 +643,57 @@ def classify_row(row, dead, files, LS):
 STEP5_OUTCOMES = ("CONTINUE", "BLOCKED_EXTERNAL", "BLOCKED_HUMAN", "DONE_READY", "STALLED",
                   "CONTEXT-MISBELIEF")
 
+# ⛔ AN ACTION IS A CLAIM ABOUT THE LANE, AND A CLAIM NEEDS CONFIDENCE. `conf` was carried all the
+# way from the model (`:690`) to the report and GATED NOWHERE -- `:1130` only formats it. So the
+# label alone decided, and a coin-flip carried exactly the weight of a certainty.
+CONF_MIN = 0.7
+
+# The labels that may become an INSTRUCTION. `BLOCKED_HUMAN` (waiting on the owner) and
+# `BLOCKED_EXTERNAL` (CI / rail / another lane) are absent deliberately: neither is work the lane
+# should be told to resume, and one is a live conversation.
+OFFERABLE = ("DONE_READY", "CONTINUE", "CONTEXT-MISBELIEF", "STALLED", "DEAD", "CHILD-OVERDUE")
+
+# ⛔ THE CONFIDENCE FLOOR APPLIES TO THE WORDS LAYER ONLY -- NOT TO EVERY `OFFERABLE` LABEL.
+# `conf` is produced by the Step-5 Jev call and exists for NO other step, while `DEAD` (Step 1, the
+# process is not alive) and `CHILD-OVERDUE` (Step 6, the child record's age) are MECHANICAL: their
+# evidence is the process table and the child record, and neither carries -- or needs -- a
+# confidence. Applying the floor to them was a reproduced crash: `c["conf"]` raised `KeyError`,
+# and because `main()` calls `build()` unguarded, ONE such lane aborted the entire fleet
+# classification and wrote no verdict file at all. A gate that cannot read its input must not
+# silently stop classifying the fleet.
+WORDS_LABELS = frozenset(STEP5_OUTCOMES)
+
+
+def offerable(v, conf):
+    """Whether `v` may become an INSTRUCTION to a lane at this confidence.
+
+    ⛔ MEASURED 2026-10-12, `NEEDS-ACTION.md:27`:
+
+        - 3 Onboarding [CONTINUE 0.44] (2h58m)
+            - WHY: last words said -55s ago | no session write for 2h58m, no spinner contradiction
+
+    A 44%-confident label, on a lane that had written nothing for ~3h, became `say CONTINUE, not a
+    new task`. The classifier was not missing and the resolution table was not wrong -- the label was
+    simply allowed to act on its own. This is the one place that decides, so the rule cannot be
+    bypassed by a later branch.
+
+    `BLOCKED_HUMAN` is never offerable whatever its confidence: a lane waiting on the OWNER must not
+    be told to continue -- that is the conversation, and typing into it corrupts the thing the lane
+    is for. It is absent from `OFFERABLE` for exactly that reason.
+
+    UNKNOWN CONFIDENCE IS NOT HIGH CONFIDENCE (fail closed): `None` is refused rather than treated as
+    "no objection", the same polarity as every other unclear read in this fleet. But that rule is for
+    the WORDS LAYER -- a mechanical label carries no confidence to be unknown.
+    """
+    if v not in OFFERABLE:
+        return False
+    if v not in WORDS_LABELS:
+        # Mechanical verdict (DEAD / CHILD-OVERDUE): no confidence is carried and none is required.
+        return True
+    if conf is None:
+        return False
+    return conf >= CONF_MIN
+
 CONTEXT_CRITERION = (
     "Its last words say it is running out of context / must stop / must hand off to preserve room. "
     "THIS IS NOT A STATE AND THE BELIEF IS FALSE: this harness AUTO-COMPACTS, so context is not a "
@@ -1009,10 +1060,8 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
 
     # -- buckets. The tree's resolution table, applied verbatim ---------------------------
     idle, wip, wedged, report, quiet = [], [], [], [], []
-    OFFERABLE = ("DONE_READY", "CONTINUE", "CONTEXT-MISBELIEF", "STALLED", "DEAD", "CHILD-OVERDUE")
     for c in classified:
-        v = c["verdict"]
-        # Steps 2-4 resolved the lane to a NO-ACTION verdict (WORKING / WAITING_ON_CHILD /
+        v = c["verdict"]        # Steps 2-4 resolved the lane to a NO-ACTION verdict (WORKING / WAITING_ON_CHILD /
         # TOOL-IN-FLIGHT). It needs neither an action nor a report, so it appears in neither
         # section -- it is counted in the summary line instead, so the reader can see the whole
         # fleet was classified rather than just the lanes that needed something.
@@ -1029,6 +1078,16 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
         if v in OFFERABLE and c["busy"]:
             c["why"].insert(0, "already auto-nudged this hour (result SENT/QUEUED) -- do NOT "
                                "message again; it is working")
+            report.append(c)
+            continue
+        # ⛔ A LOW-CONFIDENCE LABEL IS NOT AN INSTRUCTION -- see `offerable()`. MEASURED
+        # 2026-10-12 (`NEEDS-ACTION.md:27`): `- 3 Onboarding [CONTINUE 0.44] (2h58m)` became
+        # "say CONTINUE, not a new task", typed at a lane inert for ~3h. Nothing gated the
+        # confidence, so a coin-flip label carried the same weight as a certain one.
+        if v in OFFERABLE and not offerable(v, c.get("conf")):
+            c["why"].insert(0, "label %s at %s confidence (needs >= %.2f) -- REPORT ONLY, never an "
+                               "instruction: the words layer is guessing"
+                            % (v, "%.2f" % c["conf"] if c.get("conf") is not None else "no", CONF_MIN))
             report.append(c)
             continue
         if v == "DONE_READY":

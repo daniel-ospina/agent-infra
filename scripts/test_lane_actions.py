@@ -1191,3 +1191,64 @@ def test_load_snapshot_accepts_a_healthy_snapshot_on_both_paths(tmp_path, monkey
     monkeypatch.setattr(LA, "_live_want", lambda LS=None: 1)
     rows, _age, _ref = LA.load_snapshot(_Args(stdin=None))
     assert rows == healthy
+
+
+# ── an ACTION needs a CONFIDENT label ──────────────────────────────────────────
+# ⛔ MEASURED 2026-10-12, `NEEDS-ACTION.md:27`: `- 3 Onboarding [CONTINUE 0.44] (2h58m)` became
+# `say CONTINUE, not a new task`, typed at a lane inert for ~3h. The classifier was not missing and
+# the resolution table was not wrong: `conf` was carried to the report and GATED NOWHERE, so a
+# coin-flip label carried the same weight as a certain one.
+
+def test_the_live_misfire_fixture_is_no_longer_an_instruction():
+    """The exact line from NEEDS-ACTION.md:27, as a regression fixture."""
+    assert LA.offerable("CONTINUE", 0.44) is False, \
+        "CONTINUE at 0.44 confidence must NOT become an instruction -- it is a coin flip"
+
+
+def test_a_confident_label_is_still_offerable():
+    """The gate must not become a false block: a confident label keeps working."""
+    assert LA.offerable("CONTINUE", 0.95) is True
+    assert LA.offerable("DONE_READY", 0.7) is True, "the floor is inclusive"
+
+
+def test_unknown_confidence_fails_closed():
+    assert LA.offerable("CONTINUE", None) is False, \
+        "an unread confidence is not a high one -- same polarity as every unclear read"
+
+
+def test_waiting_on_the_owner_is_never_offered_continue():
+    """⛔ BLOCKED_HUMAN is a live conversation with the owner. Telling that lane to CONTINUE does not
+    interrupt work -- it corrupts the conversation the lane exists to hold. Confidence cannot buy
+    it: this is a LABEL exclusion, checked before the confidence rule."""
+    assert LA.offerable("BLOCKED_HUMAN", 0.99) is False
+    assert LA.offerable("BLOCKED_HUMAN", 1.0) is False
+    assert "BLOCKED_HUMAN" not in LA.OFFERABLE
+
+
+def test_non_offerable_labels_are_never_instructions():
+    for v in ("UNCLASSIFIED", "PROTECTED", "WORKING", "WAITING_ON_CHILD", "TOOL-IN-FLIGHT"):
+        assert LA.offerable(v, 0.99) is False, "%s must never be an instruction" % v
+
+
+def test_the_bucket_loop_actually_calls_the_gate():
+    """⛔ WIRING PIN, DELIBERATELY A SOURCE ASSERTION. `build()` is not drivable under test (it reads
+    cmux state, cpu maps and the transcript files), so nothing else can see whether the floor is
+    applied at the DECISION. This pins that one call site and nothing else; the behaviour is covered
+    by the tests above. Removing this call is how the floor becomes decorative."""
+    src = open(os.path.join(HERE, "lane-actions.py"), encoding="utf-8").read()
+    assert "if v in OFFERABLE and not offerable(v, c.get(\"conf\")):" in src, \
+        "the bucket loop must consult offerable() -- otherwise low-confidence labels still reach wip"
+
+
+# ⛔ NOTE ON WHERE THIS IS ACTUALLY CAUGHT. A synthetic pytest test calling `build()` with
+# hand-written DEAD / CHILD-OVERDUE rows does NOT exercise this path -- build() re-classifies the
+# rows itself, so such a test stayed green with the crash present (measured). The regression is
+# caught by THIS FILE'S OWN `main()` harness, which drives build() with the real shipped fixtures:
+#   /usr/bin/python3 scripts/test_lane_actions.py   -> ALL PASS with the fix,
+#                                                      KeyError: 'conf' without it.
+# That harness is not collected by pytest, which is the gap filed as agent-infra#1692.
+def test_a_mechanical_label_is_offerable_without_a_confidence():
+    """⛔ DEAD (Step 1) and CHILD-OVERDUE (Step 6) are MECHANICAL -- their evidence is the process
+    table and the child record. They carry no `conf`, and requiring one was a reproduced crash."""
+    assert LA.offerable("DEAD", None) is True
+    assert LA.offerable("CHILD-OVERDUE", None) is True

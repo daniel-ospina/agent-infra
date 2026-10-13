@@ -158,12 +158,25 @@ def has_live_connection(pid):
     unclear read in this file abstains, and this one authorises a kill.
     """
     try:
-        out = subprocess.run(
+        r = subprocess.run(
             ["lsof", "-n", "-P", "-a", "-p", str(pid), "-i", "-sTCP:ESTABLISHED"],
-            capture_output=True, text=True, timeout=30).stdout
+            capture_output=True, text=True, timeout=30)
     except Exception:
         return None
-    return bool(out.strip())
+    # ⛔ `FOUND NOTHING` IS NOT THE SAME AS `FAILED`, AND ONLY ONE OF THEM IS AN ANSWER (2026-10-13).
+    # The body read `bool(out.strip())`, so an lsof that FAILED while printing nothing returned
+    # False — and False is the value that puts a child in the REAP SET. The docstring above states
+    # the contract and the body broke it. ⛔ MEASURED ON THIS HOST (lsof 4.91), because the first
+    # cut of this fix got the polarity INVERTED: a dead pid AND a live pid with no established TCP
+    # BOTH exit **1** with EMPTY stdout AND EMPTY stderr, while a genuine failure (an illegal
+    # option; likewise a missing binary, which raises) exits 1 but WRITES TO STDERR. So a bare
+    # `rc != 0 -> None` would have made this reaper permanently INERT — every child unknown, nothing
+    # ever reapable. The discriminator is therefore the SILENCE ON BOTH STREAMS, not the exit code.
+    if r.returncode == 0 and r.stdout.strip():
+        return True                     # a clean read that FOUND an established connection
+    if r.returncode == 1 and not r.stdout.strip() and not r.stderr.strip():
+        return False                    # lsof ran fine and located nothing: a genuine "no connection"
+    return None                         # failed, timed out, or spoke up: UNKNOWN, and UNKNOWN refuses
 
 
 def frozen_subtrees(table_a, table_b, now=None):

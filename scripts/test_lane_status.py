@@ -352,6 +352,99 @@ def test_the_VETO_is_not_the_discount(L):
     """
     assert L.inbound_discounts_idle(L.WEDGED, 1210, 18858) is False, "the claim rule must not clear a wedge"
     assert L.told_but_silent(1210, 18858) is True, "the action rule must still veto the instruction"
+def test_an_unread_screen_is_never_a_dispatchable_verdict(L):
+    """⛔ `DONE-IDLE` IS A DISPATCH INVITATION, AND IT REQUIRED A POSITIVE READ (2026-10-13).
+
+    The long-tool gate was pinned to `spinner is not False` when the tri-state landed; the four
+    VERDICT sites were left on plain truthiness, where `None` is falsy. The measured effect is
+    exactly ONE error class: `DONE-IDLE` -> `UNKNOWN`. An unread screen became the verdict that
+    invites a new task onto a lane whose state was never established.
+
+    ⛔ AND THE NARROW CLAIM IS THE ONE THAT IS TRUE. An earlier draft of this docstring said the
+    unread screen could also yield `WEDGED`, a kill invitation. A verifier FALSIFIED that against the
+    artifact: every `WEDGED` return is `WEDGED if spinner else DONE_IDLE`, so `None` is falsy and
+    picks `DONE_IDLE` -- an exhaustive 58,320-combination grid over the pre-fix `classify()` with
+    `spinner=None` produced DONE-IDLE 4,082 times and **WEDGED 0 times**. The falsified claim is
+    recorded here rather than deleted, so the next reader does not re-derive it -- and because
+    stating it would have made this fix look broader than it is.
+
+    ⛔ ONE ASSERTION PER CALL SITE, NOT ONE FOR THE HELPER. Three sites route through
+    `_idle_verdict()` and one is inline; a test that only exercised the helper would stay green if a
+    CALL SITE were reverted to `if spinner else`, which is the mutation this must catch.
+    """
+    def c(**kw):
+        args = dict(stale=1200, grew=False, spinner=None, last_kind="assistant", child=None,
+                    child_stale=None, child_grew=None, child_activity_age=None,
+                    tool_inflight=None, last_stop=None, has_sid=True)
+        args.update(kw)
+        return L.classify(**args)
+
+    # site 1 -- an abandoned child record beside a COMPLETED turn (reachable because
+    # `parent_stopped` needs child_stale > 900, which this record does not have)
+    v1 = c(child={"call_id": "x", "age": 99999, "abandoned": True}, child_stale=500,
+           last_stop="stop")
+    assert v1 == L.UNKNOWN, "unread screen + completed turn + abandoned record: got %s" % v1
+    # site 2 -- a stale screen on a COMPLETED turn
+    v2 = c(last_stop="stop")
+    assert v2 == L.UNKNOWN, "unread screen on a completed turn: got %s" % v2
+    # site 3 -- the frozen-pane fallthrough (a call still owed its result)
+    v3 = c(last_kind="bash")
+    assert v3 == L.UNKNOWN, "unread screen on a frozen pane: got %s" % v3
+    # site 4 -- the final assistant branch, reached only below the stale bound
+    v4 = c(stale=120)
+    assert v4 == L.UNKNOWN, "unread screen below the stale bound: got %s" % v4
+    # ⛔ THE FALSE-BLOCK CONTROL. A screen READ with no spinner IS evidence of a finished turn,
+    # and these sites must keep saying so -- otherwise the fix would have made UNREAD the only
+    # reachable answer on a quiet fleet.
+    assert c(spinner=False, last_stop="stop") == L.DONE_IDLE
+    assert c(spinner=True, last_stop="stop") == L.WIP_IDLE
+    assert c(spinner=True, last_kind="bash") == L.WEDGED
+    assert c(spinner=False, last_kind="bash") == L.DONE_IDLE
+
+
+def test_a_missing_lane_registry_is_an_absence_not_a_crash(L, tmp_path, monkeypatch):
+    """⛔ THE REGISTRY OPEN WAS UNGUARDED, SO AN ABSENT FILE RAISED OUT OF THE WHOLE SCAN.
+
+    `_tsv_rows()`'s own docstring states the contract -- never publish a roster it could not read --
+    while `open(REG)` sat outside any `try`. A crash is not the safe direction either: the callers
+    that wrap the scan fall back to publishing a smaller roster, which is the exact failure this
+    file was fixed to stop. An unreadable registry must return NO rows, so `main()` reaches its own
+    `if not rows: raise` and NAMES the unreadable read.
+    """
+    monkeypatch.setattr(L, "REG", str(tmp_path / "nope.tsv"))
+    assert L._tsv_rows() == []
+    # ...and a real file still parses (the false-block control)
+    p = tmp_path / "lane-registry.tsv"
+    p.write_text("# comment\nlabel\tws-uuid\tissue-label\n")
+    monkeypatch.setattr(L, "REG", str(p))
+    assert L._tsv_rows() == [("label", "ws-uuid", "issue-label")]
+
+
+def test_a_degraded_snapshot_is_never_cached(L, tmp_path):
+    """⛔ ONE FAILED READ MUST NOT BECOME A STICKY FAILURE FOR THE WHOLE TTL (2026-10-12, measured).
+
+    The launchd PATH hole made every row `degraded`, and the snapshot was then CACHED for the 420 s
+    TTL -- so after the PATH was fixed `--json` still returned 27/27 degraded rows until the TTL
+    expired, and `lane-actions.py` refuses degraded snapshots, so `pr-doctor` stayed unable to
+    dispatch on a fleet it could no longer see. Deleting the guard left all 152 tests green (found
+    by a VGATE mutation pass), so this test exists specifically to fail without it.
+    """
+    import json
+    cache = tmp_path / "lane-status.cache"
+    # a healthy snapshot IS published (the false-block control)
+    assert L._publish_snapshot([{"verdict": "WORKING", "degraded": False}], str(cache), "k") is True
+    assert json.loads(cache.read_text())["out"][0]["verdict"] == "WORKING"
+    cache.unlink()
+    # the measured degraded shape: EVERY row says degraded, and nothing may be written
+    assert L._publish_snapshot([{"verdict": "WORKING", "degraded": True}], str(cache), "k") is False
+    assert not cache.exists(), "a degraded snapshot must never be cached"
+    # ONE degraded row among many refuses the WHOLE snapshot -- a partial read is still a bad read
+    assert L._publish_snapshot([{"degraded": False}, {"degraded": True}], str(cache), "k") is False
+    assert not cache.exists()
+    # a non-dict row (a malformed snapshot) must not crash the publisher
+    assert L._publish_snapshot(["oops"], str(cache), "k") is True
+
+
 # ── a failed read is retried, and is never rendered as an empty success ───────
 #
 # ⛔ THE FAILURE THESE GUARD (2026-10-12). `cmux list-workspaces --json` timed out at load, the
