@@ -1163,8 +1163,60 @@ validate_timing_knobs() {
 
 resolve_head() {
   local pr="$1"; shift
-  # shellcheck disable=SC2086
-  $GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null
+  # ⛔ A FAILED READ MUST BE ABLE TO FAIL (#1690). This was a bare
+  # `$GH pr view … 2>/dev/null`, so a transient failure (network, TLS, rate limit)
+  # returned the EMPTY STRING, and §4 then read that as "the head moved to ``" — a
+  # confident claim about reality derived from a read that failed. It blocked a
+  # fully-attested PR that had not moved; the identical command re-run landed it.
+  #
+  # Two changes, and both are needed:
+  #   1. RETRY. A transient read must have at least one retry before it is believed.
+  #   2. VALIDATE THE SHAPE. A commit SHA is 40 hex chars. A truncated or garbled
+  #      read is exactly as unusable as an empty one, and ONLY a shape check catches
+  #      that — `[ -n "$out" ]` would happily accept a half-read sha.
+  #
+  # On persistent failure this prints NOTHING and returns NON-ZERO, so no caller can
+  # mistake it for a value. ⛔ Callers must use `require_head` below, never this
+  # directly: the whole defect was a caller that could not tell "empty" from "absent".
+  local attempt out rc
+  for attempt in 1 2 3; do
+    # shellcheck disable=SC2086
+    out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null)" && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    [ "$attempt" -lt 3 ] && sleep "$attempt"
+  done
+  return 1
+}
+
+# ── THE ONE DOOR FOR READING THE HEAD (#1690) ──────────────────────────────────
+# ⛔ THERE IS EXACTLY ONE REASON TO READ THE HEAD, SO THERE IS EXACTLY ONE PLACE
+# THAT FAILS TO. Three call sites (§4 during-re-run, §4 before-evidence, and the
+# opening read) each compared `resolve_head` against `$head` and reported "head
+# moved". Fixing only the read would leave three copies of "is this failure a
+# moved head or an unread one?" to drift apart — the same duplication defect #1684
+# fixed on the DO list. So the discrimination lives HERE, once, and a caller that
+# gets a value has a KNOWN-GOOD 40-hex head.
+#
+# ⛔ THE TWO REFUSALS ARE DIFFERENT SPEECH ACTS AND MUST NOT SHARE A MESSAGE.
+#   * an UNREADABLE head is NOT a claim about reality — it says the instrument
+#     could not answer, and the remedy is to retry the rail;
+#   * a MOVED head IS a claim about reality — the evidence is SHA-bound and void,
+#     and the remedy is to re-run the rail for the new head.
+# Rendering the first as the second is precisely #1690.
+require_head() {
+  local pr="$1"; shift
+  local out
+  if out="$(resolve_head "$pr" "$@")"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  say_err "admin-merge: ✗ BLOCK — could not READ the head of PR #$pr (3 attempts)."
+  say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
+  say_err "   something that is not a commit SHA. Nothing was merged. Re-run the rail."
+  return 1
 }
 
 # resolve_draft <pr> → the PR's `isDraft` flag (`true`/`false`). `commit-workflow`
@@ -3883,7 +3935,7 @@ main() {
 
   local head
   # shellcheck disable=SC2086
-  head="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  head="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
   [ -n "$head" ] || { say_err "admin-merge: ✗ could not resolve the head of PR #$PR"; exit 1; }
   info "admin-merge: PR #$PR head $head"
 
@@ -4536,7 +4588,7 @@ main() {
     # SHA, and a push invalidates it.
     local head_after
     # shellcheck disable=SC2086
-    head_after="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+    head_after="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
     if [ "$head_after" != "$head" ]; then
       say_err "admin-merge: ✗ BLOCK — head moved during re-run ($head → $head_after). Re-run the rail."
       exit 1
@@ -4613,7 +4665,7 @@ main() {
   # and GitHub is asked to enforce it too, via --match-head-commit below.
   local head_final
   # shellcheck disable=SC2086
-  head_final="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  head_final="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
   if [ "$head_final" != "$head" ]; then
     say_err "admin-merge: ✗ BLOCK — head moved before the evidence was posted ($head → $head_final)."
     say_err "   The evidence would be bound to $head; re-run the rail for the new head."
@@ -5287,4 +5339,10 @@ ${parity_forgiven_note}"
   esac
 }
 
-main "$@"
+# ⛔ ENTRY-POINT GUARD (#1690): the read path must be REACHABLE FROM A TEST.
+# Without this a test can only run the WHOLE rail, which needs a live PR, so the
+# empty-read branch — the one that blocked a healthy PR — had no test at all. The
+# guard is the standard form and changes nothing about `bash scripts/admin-merge.sh`.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi
