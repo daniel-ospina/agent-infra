@@ -6,7 +6,7 @@ created: 2026-10-12
 ownedBy: organisation-design-team
 subjects.team: organisation-design-team
 aboutSubjects: organisation-design-team
-aboutObjects: daniel-ospina/tortoise, tortoise#8246, daniel-ospina/agent-infra, agent-infra#1700
+aboutObjects: daniel-ospina/tortoise, tortoise#8246, daniel-ospina/agent-infra, agent-infra#1700, agent-infra#1712
 doc_status: draft
 ---
 
@@ -37,20 +37,40 @@ doc_status: draft
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
 > issue); until that PR lands the old path is a stale duplicate, so do not run it.
 >
-> ⛔ **That follow-up must PORT every post-copy change before it removes anything
-> (agent-infra#1712).** This directory is a point-in-time copy taken at 2026-10-13 05:50 local
-> (= 10:50Z), and the tortoise tree moved **three** times afterwards:
+> ⛔ **Every post-copy change has been PORTED, and the sync point is pinned
+> (agent-infra#1712).** This directory began as a point-in-time copy taken at 2026-10-13 05:50
+> local (= 10:50Z) — tortoise `main` at `0e060082f`, whose newest commit touching
+> `operations/orchestrator-harness/` was `eda7df136`. The source moved **seven** times afterwards;
+> all seven are here:
 >
 > | commit | tortoise | what it carries |
 > |---|---|---|
-> | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected — six of these files |
+> | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected, `res_line()` — six of these files |
 > | `a59858d07` | #8465/#8467 | dispatch pool ordered by **severity**, not issue number — `refresh-candidates.sh` + `selftest.sh` |
 > | `ff6d1bc19` | #8471 | the follow-up that makes #8465's self-tests discriminate — `refresh-candidates.sh` + `selftest.sh` |
+> | `77a0c32bd` | agent-infra#1716 | `checked.txt` recorded only on a **terminal** pre-flight verdict |
+> | `b559cb02a` | agent-infra#1715 | INT/TERM actually stop the loop before the lock is released |
+> | `45dd16cc8` | agent-infra#1705 | a failed PR listing is not an empty one |
+> | `26f6c9488` | agent-infra#1702 | portable load/swap/memory/mtime probes so a Linux cell completes a cycle |
 >
-> None is here, and `sort -n -u` still orders **both** the pool and the backlog (line 104), with
-> issue number as the pool's only key. The safe instruction for the follow-up is **not** a list of
-> shas: diff the tortoise tree against this one and port everything not present. Removing the
-> tortoise copy otherwise deletes the only tree carrying those fixes.
+> The last of them merged at 15:16 local **while this port was being written**, which is the point:
+> a hand-kept list only catches what its author already knew. Two guards exist instead of a list.
+>
+> 1. **`port-provenance.txt`** pins the tortoise blob hash of every file at the port's sync point,
+>    and **`check-port-drift.sh`** fails if the tortoise tree no longer matches it, naming the file.
+>    Run it before the follow-up tortoise PR removes anything:
+>    `./check-port-drift.sh --tortoise /path/to/tortoise`.
+> 2. **The ported `selftest.sh` checks are the anti-regression guard** — each of the seven commits
+>    added checks that are RED on the pre-fix tree (16 for #1702 alone), so a reverted port fails the
+>    suite rather than merely looking different.
+>
+> ⚠️ **The follow-up has a second obligation the sha list never covered.** tortoise's **open**
+> branch `fix/8468-closure-linkage` also rewrites this directory (severity-ordered pool, a
+> `.prio`-keyed P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs`
+> lane brief). It is **not** on `main`, so it is deliberately not ported here — it is still under
+> review, and porting it would create a second home for work that has not landed. The live box is
+> already running an earlier revision of it. Either that branch merges first, or the removal PR
+> must port it; removing the directory while it is open orphans it.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -132,7 +152,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
-| `checked.txt` | issues already pre-flighted; a reaped number is dropped from it too, so the pre-flight re-queues the issue |
+| `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
@@ -227,17 +247,18 @@ by `./selftest.sh` rather than quoted here.
 secret into a world-readable plist, and launchd inherits no shell environment — so an env-only
 `AI_REVIEW_GATE_KEY` is reported as insufficient, not as "present". The box cannot merge without it.
 
-### Tuning (8 GB / 8-core box — the values that were actually used)
+### Tuning (10-core / 32 GB box — the values that were actually used)
 
 | Var | Value | Why |
 |---|---|---|
-| `MAX_LOAD` | `16` | dispatch stops above this 1-min load |
+| `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
 | `MAX_LANES` | `4` | concurrent implementation lanes |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
 | `MERGE_PRIORITY_AT` | `10` | above this many open PRs, **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer headroom rises to `MAX_REVIEW+2` |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MIN_SWAP_FREE` | `600` | MB; **the binding gate in practice** |
+| `MIN_SWAP_FREE` | `600` | MB; with `MAX_LOAD` raised this and `MIN_MEM_FREE_MB` are the binding gates in practice |
+| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
@@ -263,11 +284,42 @@ spawn a `pi` agent with no `MAX_LOAD` read of their own — `chain-<N>` → `mer
 first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `adopt-fix.sh` →
 `fix-one.sh`; tracked as agent-infra#1720.
 
+⚠️ **`can_spawn()` tests load only.** The available-memory gate applies to *lane dispatch*, not to
+these four spawn sites — the two cover different populations. Raising `MAX_LOAD` therefore narrows
+the band in which the spawn sites hold back (`16`–`99` is now permitted, where `16` used to hold).
+Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
+self-test extracts from the shipped file; left as a named follow-up rather than half-done here.
+
 **Swap, not lanes, is what actually throttles this box.** Observed at 15 concurrent workers:
 `swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on 8 GB;
 it just moves the pressure into the compressor. `swap_total=0` right after boot is treated as
 *uninitialised*, not as pressure (that bug silently blocked all dispatch for the first minutes
 after a restart until it was fixed).
+
+**The capacity probes are portable: Linux cell + macOS host.** `#1702`. Every probe used to be a
+macOS primitive, so on a Linux cell `load1()` returned empty (the `MAX_LOAD` gate could never bind),
+swap read as `0` (the gate skipped by its own "uninitialised" rule), and the reaper's
+`stat -f '%m'` became an arithmetic error that killed the controller one cycle after its first
+dispatch — every lane/merge/fix writes the log the reaper stats. Each probe now has a Linux path
+(`/proc/loadavg`, `/proc/meminfo`, `nproc`) and a macOS one (`sysctl`, `vm_stat`), and the reaper's
+mtime probe is a GNU-then-BSD `stat` ladder with a numeric guard (GNU first on purpose: GNU
+`stat -f` writes the filesystem listing to **stdout** before exiting 1, so a BSD-first `||` ladder is
+the bug itself).
+
+⚠️ **Available memory was the fifth macOS-only probe, and the only one that fails CLOSED.** The gate
+is deliberately "UNKNOWN is not ample" (`mem_probe_failed` → do not add work), so with a `vm_stat`-only
+probe every Linux cell set `MEM_UNKNOWN=1` on every cycle: load, lanes and swap could all be healthy
+and the memory gate still bound — the controller completed cycles, logged `mem_probe_failed` and
+dispatched nothing, which is a *different* false green from the one #1702 removes. `mem_avail_mb()`
+therefore reads `/proc/meminfo` (`MemAvailable`, else `MemFree`+`Cached`) on a cell and keeps the
+`vm_stat` `free`+`inactive` parse on macOS. The fail-closed ruling for a genuinely unreadable probe is
+unchanged — only its Linux measurability is.
+
+A load reading that is *unreadable* stays the documented **fail-open** (`can_spawn()` defaults it to
+`0`): both supported platforms are measurable now, and failing closed on an unreadable probe would
+turn "no load back-pressure" into a permanent controller outage. `install.sh` still refuses to run
+off macOS (it renders a launchd plist) — the portability that matters is `orch-loop.sh`, the file
+`cloud-cell-supervisor.sh` starts.
 
 ---
 
@@ -407,12 +459,14 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 
 ```text
 [scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
-[cap]   lanes=4 swap_free=588M swap_total=4096M load=7 max_load=16
+[cap] load=7/100 lanes=4/4 mem_avail=11761M/512M swap_free=588M/600M   ← every gate names its ceiling
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
-[dispatch] skipped (load=7>=max_load=16)  ← and why (names the binding gate)
+...
+[cap] load=104/100 lanes=4/4 mem_avail=11890M/512M swap_free=588M/600M
+[dispatch] skipped (load=104>=max_load=100)   ← and WHY, naming the binding gate
 ```
 
 ---
@@ -437,6 +491,15 @@ still open **and** no PR branch matches the number **and** no `lane-<N>` session
 is removed from `dispatched.txt` **and** `checked.txt` so the pre-flight re-queues it. Four of the
 self-test's checks pin exactly this decision table (`4114` reaped, `8888` kept for its PR, `9999`
 kept because it is closed, `7777` kept for its live lane).
+
+⛔ **A failed listing is not an empty one.** The reaper refuses the whole pass unless both
+`.open_iss` and `.pr_brs` are **present**; the capture deletes a list when `gh` fails, so "the read
+failed" (absent) is distinguishable from "the answer is none" (present but empty). Before the
+guard, a failed `gh pr list` left an empty `.pr_brs`, `has_pr` was false for every issue, and
+`dispatched.txt` was cleared — so `orch-loop.sh` re-spawned a lane for an issue that already had a
+PR (duplicate work against the shared queue, agent-infra#1705). The self-test's failure-path checks
+pin both halves (absent → nothing reaped and `checked.txt` untouched; empty-but-readable → still
+reaps), and the capture site is driven directly with a stub `gh`.
 
 ### 7.2 Draft PRs are invisible to the sweep — **FIXED in this PR**
 
@@ -493,7 +556,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `retired/watch-one.sh` built the fixer prompt from a log the reviewer had not written yet | the fixer always ran against an empty FINDINGS section | build the prompt after the reviewer run |
 | the pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the spawn (`{A\|\|B\|\|C;} \|\| D && echo` parses as `({A\|\|B\|\|C} \|\| D) && echo`) | a stalled drain looked busy | explicit `if/elif` branches |
 | **this file's own self-test** re-implemented the fixed logic instead of reading the shipped scripts | it passed on the broken copy, so it pinned nothing | every check now extracts and drives the real classifier, `sess()`, claim block and reaper, or runs `install.sh`; §9/§7 claims corrected |
-| `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test asserts all 9 limit defaults agree between the two scripts |
+| `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test resolves all 10 limit defaults in both scripts and asserts they agree — including with the limits supplied via the environment, which is how the plist delivers them |
 | the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
@@ -541,10 +604,14 @@ These are kept as a record because each one is a *failure mode of the design*, n
   every merge runs keyless (a false PASS; `record-review.sh` then posts an UNSIGNED marker). The
   same boundary also drops `$O`, so under a non-default `$O` the workers write `state/` the
   controller never reads — recorded with the measurements on that issue.
-- **This directory is older than its source (agent-infra#1712).** Three commits merged after the
-  copy was taken — tortoise#8437 (`8fe1e7b13`, six of these files), tortoise#8465/#8467
-  (`a59858d07`) and tortoise#8471 (`ff6d1bc19`). The tortoise-side removal must port them first or
-  it deletes the only tree carrying those fixes.
+- **This directory was older than its source (agent-infra#1712) — ported, and now pinned.** Seven
+  commits merged on tortoise `main` after the copy was taken (2026-10-13 10:50Z, `eda7df136`); all
+  seven are ported here, listed in the provenance note at the top. `port-provenance.txt` pins every
+  file's tortoise blob hash at that sync point and `check-port-drift.sh` fails if the tortoise tree
+  moves again. ⚠️ Still open, and not fixable from here: tortoise's **unmerged**
+  `fix/8468-closure-linkage` branch rewrites this same directory (P0 bypass, `.prio`,
+  `merged-not-closed.sh`, lane brief). The removal PR must either wait for it to merge or port it —
+  deleting the directory while that branch is open orphans that work.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
@@ -628,6 +695,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
+| `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
 
@@ -643,7 +711,7 @@ a symlink EPERM under launchd, and then probes each tool by executing it):
 
 ```bash
 OR="${OR:-daniel-ospina/tortoise}"
-REPO="${REPO:-/Users/home/eldato/tortoise}"
+REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 O="${O:-$HOME/orchestrator}"
 ```
 
@@ -654,6 +722,14 @@ on drift, because the daemon executes `$O/<script>` — a fix that only lands in
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not
 compared, since the daemon does not run it. If you are adopting this onto an existing box, sync
 them (`cp <harness>/*.sh $O/`) and restart the loop before trusting any §5 invariant.
+
+⛔ **Copying the scripts is not enough when a *limit* changed.** The launchd plist carries its own
+environment block, rendered by `install.sh` from these defaults, and that environment **overrides the
+script's own**. A job already loaded with `MAX_LOAD=16` keeps `16` no matter what `orch-loop.sh` now
+defaults to. `install.sh` overwrites the plist *file* but does not reload an already-loaded job, and
+`launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
+change: re-run `./install.sh`, then `launchctl unload -w <plist> && launchctl load -w <plist>` — or
+reboot, which is the only thing that reliably re-reads it — before trusting the new value.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the
