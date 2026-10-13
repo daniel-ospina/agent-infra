@@ -159,8 +159,12 @@ def ps_readable(table):
     ⛔ `ps_table()` returns `{}` on ANY failure, and `{}` used to be persisted as a definite "no
     processes". That filters every candidate out of `alive` (see `main()`) and so wipes EVERY
     frozen clock: one transient `ps` timeout resets the whole gate, and a persistent failure is an
-    ARMED reaper that never ripens, exits 0, and logs nothing. A real table always contains pid 1
-    and THIS process -- the same non-vacuity check the shared rule uses (`pid_table_nonempty`).
+    ARMED reaper that never ripens, exits 0, and logs nothing.
+
+    A real table always contains pid 1 and THIS process. That bar is deliberately **STRONGER** than
+    the shared rule's own `pid_table_nonempty` (which requires only a non-blank line) -- it is NOT
+    the same check, and calling it the same invited a later edit to "align" the reaper downward.
+    This read feeds a file whose emptiness is destructive, so it takes the stricter test.
     """
     return bool(table) and 1 in table and os.getpid() in table
 
@@ -679,11 +683,15 @@ def main():
     a = ps_table()
     time.sleep(args.window)
     b = ps_table()
-    if not ps_readable(b):
-        # ⛔ AN UNREADABLE `ps` IS NOT AN EMPTY FLEET (#1696, review cycle 1). Persisting `{}` filters
-        # every candidate out of `alive` and so wipes EVERY frozen clock; a persistent failure is an
-        # ARMED reaper that never ripens while reporting success. Abstain loudly, write NOTHING.
-        _log(dict(event="ps-unreadable", ts=int(time.time()), observed=len(b)))
+    if not (ps_readable(a) and ps_readable(b)):
+        # ⛔ BOTH READS, NOT JUST THE LAST ONE (#1696, review cycle 2). A failed FIRST read is the
+        # same defect seen from the other end: `frozen_subtrees(a, b)` finds no `table_a` row for any
+        # pid, so it returns NO candidates, `ticks` comes back empty, and the state file is
+        # overwritten with `{}` -- every frozen clock wiped, while the run reports `state_write: ok`
+        # and exits 0. The first read is taken under load, before the window sleep, so it is not the
+        # more trustworthy of the two for being first.
+        _log(dict(event="ps-unreadable", ts=int(time.time()),
+                  observed=len(a), observed_window=len(b)))
         report = dict(observed=len(b), frozen=0, ripe=0, watching=[], refused=[], reaped=[],
                       ps_readable=False, ts=int(time.time()))
         if args.json:

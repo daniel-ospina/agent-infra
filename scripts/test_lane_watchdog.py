@@ -514,6 +514,30 @@ def test_a_failed_state_write_is_loud_and_loses_no_observation(W, monkeypatch, t
     assert json.loads(capsys.readouterr().out)["state_write"] == "failed"
 
 
+def test_a_failed_FIRST_ps_read_does_not_wipe_the_clock(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 2. Gating only the SECOND read leaves the same defect standing through
+    the first: `frozen_subtrees(a, b)` finds no `table_a` row for any pid, so it returns NO
+    candidates, `ticks` comes back empty, and the state file is overwritten with `{}` -- every frozen
+    clock wiped, while the run reports `state_write: ok` and exits 0. No test covered an `a`-only
+    failure, because the existing one stubs `ps_table` so that BOTH reads fail."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    real = {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+            200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else real          # the FIRST read fails
+    monkeypatch.setattr(W, "ps_table", flaky)
+    assert W.main() == 3, "a failed FIRST read must not report a clean pass"
+    assert json.loads(state.read_text()) == before, "a failed FIRST read must NOT wipe the clock"
+    assert "ps-unreadable" in (tmp_path / "l.jsonl").read_text()
+
+
 def test_a_successful_run_reports_the_state_write(W, monkeypatch, tmp_path, capsys):
     """⛔ THE REPORT MUST SAY THE OBSERVATION WAS PERSISTED. `state_write` was emitted ONLY on
     failure, so a healthy run and a run whose field was absent were indistinguishable -- and an
