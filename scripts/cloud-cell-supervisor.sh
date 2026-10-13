@@ -15,7 +15,10 @@
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
+#   + git/python3/pi on PATH, ~/.pi/agent/scripts/record-review.sh ('start' provisions it)
 #   + the merge authority key (AI_REVIEW_GATE_KEY) if this cell is to MERGE.
+# 'check' refuses to certify a cell missing any of the above: each one, absent, turns a loop step
+# into a silent no-op or an unbounded paid retry (#1717).
 #
 # ⛔ MEASURED 2026-10-13 — A CELL WITHOUT THE MERGE KEY IS **NOT** MERGE-INERT.
 # An earlier draft of this file claimed a keyless cell was a safe "producer cell"
@@ -37,6 +40,14 @@ O="${O:-$CELL_HOME/orchestrator}"
 # (agent-infra#1700 / tortoise#8432), so it is no longer a valid default here. An unresolvable
 # path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
+# The record step (#1717). merge-one.sh EXECUTES this path to mint the signed marker that
+# ai-review-gate verifies, so it is a hard dependency of the ONLY merge path — but a fresh cell does
+# not have it (the file ships in the agent-infra checkout, not in the target repo). Two functions,
+# not two variables, because $ENV_FILE is sourced later in this file and may repoint $CELL_HOME: the
+# consumers must resolve it at call time. NO environment override — a knob that points the record
+# step at another file is a way to defeat the gate, not a configuration.
+recorder_path() { printf '%s\n' "$CELL_HOME/.pi/agent/scripts/record-review.sh"; }
+recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
 SESSION="${SESSION:-orch}"
 # OR is interpolated into the session command string, so it is defaulted here — the guard below reads
 # it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
@@ -129,6 +140,24 @@ cmd_check() {
   [ -d "$HARNESS" ] || die "harness not found at $HARNESS (clone the repo first)"
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
+  # ⛔ RUNTIME DEPENDENCIES, not just the binaries this block already named (#1717). Each one is
+  # INVOKED by the loop, and each one absent turns a step into a silent no-op or an unbounded paid
+  # retry — so a cell missing one must not be certified:
+  #   git     → worktree/fetch/push in fix-one.sh, dispatch-merge.sh, adopt-fix.sh. Nothing else
+  #             tests it: the `-d $REPO/.git` check below passes on a box with no git at all.
+  #   python3 → orch-loop.sh's check classifier and fix-one.sh's FAILING_CHECKS. Absent, the
+  #             classifier's $V is EMPTY, NO case arm matches, and every PR is skipped in silence —
+  #             a dead sweep that is indistinguishable from a quiet queue.
+  #   pi      → the worker runtime (lane.sh, fix-one.sh, merge-one.sh). Absent, every review and
+  #             every fixer fails 127 and the cell produces nothing.
+  # All three are fatal here, exactly as install.sh makes them fatal for the daemon.
+  local dep
+  for dep in git python3 pi; do
+    command -v "$dep" >/dev/null 2>&1 || die "$dep missing on PATH — the loop invokes it (harness README §3)"
+  done
+  # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
+  # and install.sh warns rather than dying for it — so the two surfaces agree.
+  command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || die "no git repo at $REPO"
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
@@ -142,6 +171,22 @@ cmd_check() {
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+
+  # ⛔ THE RECORD STEP IS A HARD DEPENDENCY OF THE ONLY MERGE PATH (#1717). merge-one.sh mints the
+  # signed marker ai-review-gate verifies by RUNNING this file, and neither cell script used to
+  # check or provision it. The pre-fix failure: cmd_check printed "CELL CAN RUN A CONTROLLER", the
+  # cell ran a full fresh-context review (up to REVIEW_TIMEOUT = 1800 s, PAID), record-review.sh
+  # then returned 127, and merge-one.sh exited BEFORE writing a parked marker — so the next cycle
+  # saw an unmarked FAILED:ai-review-gate and spawned another review. One paid review per cycle,
+  # forever, with no terminal state. Refuse the certification instead.
+  # Judge the path the CONSUMER uses: the session forces HOME=$CELL_HOME after sourcing keys.env.
+  local rec; rec="$(recorder_path)"
+  if [ ! -e "$rec" ]; then
+    die "record-review.sh MISSING at $rec — it is the only merge path, so every review would be re-paid for and never recorded. 'start' provisions it from $(recorder_src), or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -x "$rec" ]; then
+    die "record-review.sh at $rec is NOT EXECUTABLE — merge-one.sh runs it directly, so the record step would fail (126) AFTER a paid review. Fix: chmod +x '$rec'"
+  fi
+  say "ok: record step present and executable ($rec)"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -213,6 +258,17 @@ cmd_start() {
   # Idempotent; mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
+  # Provision the record step (#1717), mirroring the $O seed above: hard dependency of the only
+  # merge path, absent on a fresh cell. Copied only when ABSENT, so an operator's newer copy is
+  # never clobbered by the cell checkout — and NEVER overwritten by whatever a keys.env points at.
+  local rec rsrc
+  rec="$(recorder_path)"; rsrc="$(recorder_src)"
+  if [ ! -e "$rec" ]; then
+    mkdir -p "$(dirname "$rec")" || die "cannot create $(dirname "$rec")"
+    cp -p "$rsrc" "$rec" 2>/dev/null || die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"
+    chmod +x "$rec" || die "cannot make $rec executable"
+    say "provisioned record step: $rsrc -> $rec"
+  fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.

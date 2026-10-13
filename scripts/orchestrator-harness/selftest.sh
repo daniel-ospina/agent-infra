@@ -707,7 +707,12 @@ ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
 # PATH — under the very regression this check guards (a validator that passes), the supervisor would
 # otherwise create a REAL session and execute the live controller.
-mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
+mkdir -p "$TMP/cellhome/.pi/agent/scripts" "$TMP/cellrepo/.git"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
+# shapes that do not.
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
@@ -821,6 +826,15 @@ ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" 
 # command it is handed (this is the only place the forwarding can be observed).
 TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -927,6 +941,10 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # ambient one as "present" was a false green on a cell that merges without the key.
 KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
