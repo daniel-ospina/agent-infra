@@ -16,6 +16,7 @@ here exists to prove a specific way it could kill something it must not:
 If a change makes any of these pass for the wrong reason, the change removed a gate.
 """
 import importlib.util
+import json
 import os
 import time
 
@@ -43,6 +44,29 @@ def W():
 def T(ppid, cpu=0.0, stat="Ss", cmd="pi"):
     """One `ps` row."""
     return dict(ppid=ppid, stat=stat, cpu=cpu, cmd=cmd)
+
+
+def stub_rule(tmp_path, status="holder", rc=0):
+    """A stand-in for `scripts/lib/pid-identity.sh`, so a test can put ANY verdict in front of the
+    identity fence without depending on a live process table."""
+    p = tmp_path / f"stub-rule-{status}-{rc}.sh"
+    p.write_text(f'#!/usr/bin/env bash\necho "{status} pid=${{2:-?}}"\nexit {rc}\n')
+    return str(p)
+
+
+def ripen(W, monkeypatch, tmp_path, argv):
+    """Put a genuinely ripe candidate in front of `main()`, with the tick internals stubbed."""
+    (tmp_path / "ripe.json").write_text(json.dumps(
+        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
+                 "subtree": [300]}}))
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
+    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    monkeypatch.setattr(W, "ps_table",
+                        lambda: {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
 
 
 def test_cpu_seconds_parses_every_ps_shape(W):
@@ -266,13 +290,15 @@ def test_one_frozen_sample_is_not_enough(W):
 
 # ── the action ───────────────────────────────────────────────────────────────
 
-def test_reap_terminates_the_subtree_children_first(W, monkeypatch):
+def test_reap_terminates_the_subtree_children_first(W, monkeypatch, tmp_path):
     """Children before parents, so nothing is reparented mid-kill, and the PARENT is never in the
-    signal list."""
+    signal list. The identity fence has to answer `holder` first -- see the fence tests below."""
     killed = []
     monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append((p, s)))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
-    cand = dict(pid=300, ppid=200, subtree=[300, 301], d_cpu=0.0, age_s=99999)
+    cand = dict(pid=300, ppid=200, subtree=[300, 301], d_cpu=0.0, age_s=99999,
+                starts={300: 1.0, 301: 2.0})
     res = W.reap(cand, {}, table, 1)
     assert res["ended"] is True
     assert sorted(p for p, _ in killed) == [300, 301]
@@ -280,14 +306,18 @@ def test_reap_terminates_the_subtree_children_first(W, monkeypatch):
     assert all(s == W.signal.SIGTERM for _, s in killed)
 
 
-def test_a_vanished_process_is_not_an_error(W, monkeypatch):
-    """A candidate can exit between the sample and the signal; that is success, not failure."""
+def test_a_vanished_process_is_not_an_error(W, monkeypatch, tmp_path):
+    """A candidate can exit between the FENCE and the signal. The process being gone is the end state
+    we wanted, so it is neither an error nor counted as a kill."""
     def boom(p, s):
         raise ProcessLookupError()
     monkeypatch.setattr(W.os, "kill", boom)
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
     table = {**BASE, 300: T(200, cpu=1.0)}
-    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=1), {}, table, 1)
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=1,
+                      starts={300: 1.0}), {}, table, 1)
     assert res["ended"] is True and res.get("error") is None
+    assert res["killed"] == [] and res["vanished"] == [300]
 
 
 def test_dry_run_never_signals(W, monkeypatch, capsys, tmp_path):
@@ -333,6 +363,147 @@ def test_a_changed_subtree_resets_the_clock(W):
     assert ripe == [], "a subtree whose composition changed is doing something"
     assert any("changed" in w["reason"] for w in watching)
     assert ticks2["300"]["first_seen"] == 1000.0 + W.FROZEN_MIN + 5, "the clock must restart"
+
+
+# ── THE FENCE ON THE SIGNAL ITSELF (#1696) ───────────────────────────────────
+# ⛔ THE ACTION IS A KILL, SO THE FENCE IS PART OF THE CONTRACT. `reap()` signalled by pid alone, so
+# a pid recycled between the measurement and the `os.kill` received a SIGTERM meant for a corpse.
+# Every case below is a way that signal could land on the wrong process.
+
+def test_a_victim_the_rule_does_not_recognise_is_never_signalled(W, monkeypatch, tmp_path):
+    """A recycled pid is a DIFFERENT process. The shared rule answers `off-fence`, so the signal is
+    withheld -- this is the data-loss case the fence exists for."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "off-fence"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [], "an off-fence victim must NEVER be signalled"
+    assert res["ended"] is False
+    assert res["abstained"][0]["reason"].startswith("off-fence")
+
+
+def test_a_victim_the_rule_recognises_is_signalled(W, monkeypatch, tmp_path):
+    """The mirror: the fence must not degrade into a blanket refusal. `holder` still ends the
+    freeze, so a mutation that makes every victim abstain fails here."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [300] and res["ended"] is True and res["abstained"] == []
+
+
+def test_an_unreadable_rule_abstains_instead_of_signalling(W, monkeypatch, tmp_path):
+    """A missing or broken rule is `unknown`, and unknown withholds the signal. The fail-open
+    alternative -- 'no identity, proceed' -- is the bug class this file has already shipped once.
+    Abstaining costs an inert reaper, which is why the abstention is LOGGED and counted."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", str(tmp_path / "missing-rule.sh"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [], "an unrunnable identity rule must never authorise a kill"
+    assert res["abstained"][0]["reason"].startswith("unknown")
+
+
+def test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation(W):
+    """Integration with the ACTUAL `scripts/lib/pid-identity.sh` -- no stub, because a stub cannot
+    prove we invoke the real rule, with the real argument shape, at the real path."""
+    me = os.getpid()
+    starts = W.start_seconds([me])
+    if me not in starts:
+        pytest.skip("this platform's `ps -o lstart=` is unreadable, so the fence abstains")
+    assert W.probe_pid(me, starts[me])[0] is True, "a live pid's own start must be a holder"
+    assert W.probe_pid(me, starts[me] - 5000)[0] is False, "5000s off is NOT the same process"
+    assert W.probe_pid(me, None)[0] is False, \
+        "no recorded incarnation must never authorise a signal"
+
+
+def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
+    """`absent` is not `holder`."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    table = {**BASE, 200: T(100, cpu=1.0)}
+    res = W.reap(dict(pid=999999, ppid=200, subtree=[999999], d_cpu=0.0, age_s=99999,
+                      starts={999999: 1000.0}), {}, table, 1)
+    assert killed == [] and res["abstained"][0]["reason"].startswith("absent")
+
+
+def test_the_measured_incarnation_is_attached_to_the_candidate(W, monkeypatch):
+    """The fence can only check the incarnation the candidate CARRIES, so the start must be read in
+    the same tick that measures the subtree. Remove the attach and every victim abstains -- i.e. an
+    ARMED reaper that silently never acts, which is the failure mode of #1696-A."""
+    monkeypatch.setattr(W, "start_seconds", lambda pids: {300: 1111.0, 301: 2222.0})
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    cands = W.frozen_subtrees(dict(table), dict(table))
+    assert cands and cands[0]["starts"] == {300: 1111.0, 301: 2222.0}
+
+
+def test_lstart_is_parsed_without_strptime_and_in_either_platform_order(W):
+    """⛔ MEASURED ON THIS HOST: `time.strptime(..., "%a %b ...")` raises `ValueError` for
+    `Sun 11 Oct 23:41:02 2026`, because `LC_TIME` is `(None, None)` and the English abbreviations
+    are not in the loaded locale table. macOS also prints DAY before MONTH and Linux the reverse.
+    Either mistake empties the map, and an empty map means no fence -- no fence means no signal."""
+    assert W._lstart_to_epoch("not a date at all") is None
+    oct13 = W._lstart_to_epoch("Mon Oct 13 09:41:20 2026")
+    assert oct13 is not None, \
+        "the parse must SUCCEED -- a locale-bound `strptime` returns None for this on this host"
+    assert oct13 == W._lstart_to_epoch("Mon 13 Oct 09:41:20 2026"), \
+        "both platform field orders must resolve to the same instant"
+
+
+# ── `main()`: the ARMED dispatch, and a state write that cannot be swallowed (#1696) ────────────
+
+def test_apply_dispatches_to_reap(W, monkeypatch, tmp_path):
+    """⛔ THE WIRING, NOT THE BEHAVIOUR. Stubbing `reap()` used to leave the whole suite green, so a
+    later edit could disconnect the fence from the action with CI still passing. This drives
+    `main()` with `--apply` and a genuinely ripe candidate and asserts the dispatch happens."""
+    seen = []
+
+    def spy(cand, a, b, ts):
+        seen.append(cand["pid"])
+        return dict(pid=cand["pid"], ended=True, killed=[cand["pid"]])
+    monkeypatch.setattr(W, "reap", spy)
+    ripen(W, monkeypatch, tmp_path, ["--apply", "--json"])
+    assert W.main() == 0
+    assert seen == [300], "`--apply` with a ripe candidate MUST dispatch to reap()"
+
+
+def test_without_apply_reap_is_never_dispatched(W, monkeypatch, tmp_path):
+    """The mirror of the test above: the SAME ripe candidate, no `--apply`, no dispatch."""
+    seen = []
+    monkeypatch.setattr(W, "reap", lambda *a, **k: seen.append(a[0]["pid"]))
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0
+    assert seen == [], "a dry run must never reach the kill path"
+
+
+def test_a_failed_state_write_is_loud_and_loses_no_observation(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696-A. The old body swallowed its own failure around a TRUNCATING `open(path, "w")`: a
+    failed write left the file empty or half-written -- indistinguishable from "no prior
+    observation" -- so the frozen clock restarted and the reaper became INERT FOREVER while every
+    run reported success. Now: atomic, loud, non-zero, and the previous observation survives."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    assert json.loads(state.read_text()) == before
+
+    def boom(*a, **k):
+        raise OSError("ENOSPC")
+    monkeypatch.setattr(W.os, "replace", boom)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    rc = W.main()
+
+    assert rc == 3, "a run that could not persist its observation must NOT report a clean pass"
+    assert json.loads(state.read_text()) == before, "the previous observation must survive intact"
+    assert "state-write-failed" in (tmp_path / "l.jsonl").read_text()
+    assert not list(tmp_path.glob(".lane-watchdog-state.*.tmp")), "no temp file may be left behind"
+    assert json.loads(capsys.readouterr().out)["state_write"] == "failed"
 
 
 def test_a_second_run_cannot_double_count_ticks(W, monkeypatch, tmp_path):
