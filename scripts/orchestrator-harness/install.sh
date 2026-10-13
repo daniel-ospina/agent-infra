@@ -201,7 +201,7 @@ KEY_FILE="$HOME/.pi/agent/.ai-review-gate-key"
 # -s, not -f: a ZERO-BYTE key file is not a key. And test the CONTENT, not the size: the consumer
 # (record-review.sh) strips whitespace and treats the result as absent, so a 1-byte newline file —
 # exactly what `echo "$AI_REVIEW_GATE_KEY" > file` writes for an unset variable — must not be blessed.
-KEY_TRIMMED="$(tr -d '[:space:]' < "$KEY_FILE" 2>/dev/null || true)"
+KEY_TRIMMED="$(tr -d '[:space:]' 2>/dev/null < "$KEY_FILE" || true)"
 if [ -n "$KEY_TRIMMED" ]; then
   ok "gate key file present ($KEY_FILE)"
   [ -n "${AI_REVIEW_GATE_KEY:-}" ] && ok "AI_REVIEW_GATE_KEY also exported in this shell"

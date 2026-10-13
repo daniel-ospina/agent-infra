@@ -251,6 +251,25 @@ ck "the rendered plist PATH is resolved, not the pre-fix hardcoded base" $rc
 case ":$PLP:" in *"/shims"*|*"/.pi/"*) rc=1;; *) rc=0;; esac
 ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
 
+# ── 6e) install.sh CREATES the plist directory ─────────────────────────────────
+# Every sandbox above pre-creates $HOME/Library/LaunchAgents, so `mkdir -p "$(dirname "$PLIST")"`
+# was pinned by NOTHING: deleting it left the suite fully green, while on the real path — a fresh
+# HOME has no such directory — the render died with a raw redirect error after $O's state dirs were
+# already created (the pre-fix half-install). Assert the directory is absent first (non-vacuity),
+# then that install succeeds and the plist exists.
+SB4="$TMP/sb4"; mkdir -p "$SB4/.config" "$SB4/.pi/agent/scripts"
+ln -s "$HOME/.config/gh" "$SB4/.config/gh" 2>/dev/null || true
+[ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB4/.pi/agent/scripts/record-review.sh"
+mkdir -p "$SB4/.local/share/pi-node/current/bin"
+printf '#!/bin/bash\nexit 0\n' > "$SB4/.local/share/pi-node/current/bin/pi"; chmod +x "$SB4/.local/share/pi-node/current/bin/pi"
+[ -e "$SB4/Library/LaunchAgents" ] && rc=1 || rc=0
+ck "non-vacuity: the fresh sandbox HOME has no Library/LaunchAgents" $rc
+HOME="$SB4" O="$TMP/plistdir-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst-plistdir.out" 2>&1
+inst_rc=$?
+[ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
+  || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
+ck "install.sh creates the plist directory on a HOME that lacks it" $rc
+
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
 # orch-loop.sh — MAX_REVIEW was 2 in the loop and 4 everywhere else.

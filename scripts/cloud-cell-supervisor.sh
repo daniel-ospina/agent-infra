@@ -68,7 +68,12 @@ safe_argv() {
 keyfile_has_key() {
   local kf="$CELL_HOME/.pi/agent/.ai-review-gate-key"
   [ -s "$kf" ] || return 1
-  [ -n "$(tr -d '[:space:]' < "$kf" 2>/dev/null)" ]
+  # `2>/dev/null` FIRST: redirections apply left to right, so with the input redirect first an
+  # existing-but-UNREADABLE key file (chmod 000) failed at the shell's own open and printed
+  # "Permission denied" to the shell's stderr — the verdict the preflight exists to deliver then
+  # arrived under a raw bash error. Swapping the order is what actually suppresses it; `2>/dev/null`
+  # after the `<` does not.
+  [ -n "$(tr -d '[:space:]' 2>/dev/null < "$kf")" ]
 }
 
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
