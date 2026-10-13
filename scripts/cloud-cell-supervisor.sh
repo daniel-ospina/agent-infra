@@ -161,12 +161,18 @@ cmd_check() {
   elif keyfile_has_key; then
     say "ok: merge authority key present ($CELL_HOME/.pi/agent/.ai-review-gate-key)"
   else
+    local kfpath="$CELL_HOME/.pi/agent/.ai-review-gate-key"
     if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
       say "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
       say "      session will NOT receive it (tmux serves a new session the SERVER's environment)."
-      say "      Write it to $ENV_FILE, or to $CELL_HOME/.pi/agent/.ai-review-gate-key."
+      say "      Write it to $ENV_FILE, or to $kfpath."
+    elif [ -e "$kfpath" ] && [ ! -r "$kfpath" ]; then
+      # EXISTING but UNREADABLE is neither missing nor empty, and the remedy differs: prescribing
+      # "write a key file" for a file that may already hold a valid key reproduces the fault.
+      say "warn: $kfpath exists but is NOT READABLE — treated as absent."
+      say "      It may already hold a valid key: check its mode and its parent directories (want 600)."
     else
-      say "warn: no AI_REVIEW_GATE_KEY and no $CELL_HOME/.pi/agent/.ai-review-gate-key."
+      say "warn: no AI_REVIEW_GATE_KEY and no $kfpath."
     fi
     say "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
     say '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'

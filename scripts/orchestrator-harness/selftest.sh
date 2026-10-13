@@ -745,7 +745,8 @@ ck "the cell supervisor's check refuses a bad SCOPE instead of certifying the ce
 
 # install.sh must refuse the SAME $O its controller refuses: a plist that renders here but is
 # rejected there is worse than a refusal — RunAtLoad+KeepAlive relaunches a guaranteed-fatal
-# controller forever. Both halves are asserted, so the two guards cannot drift apart silently.
+# controller forever. BOTH guards are driven over the same eight values — orch-loop.sh's extracted
+# here, install.sh's END TO END below — so the two cannot drift apart silently.
 # Drive the SHIPPED guard, EXTRACTED — never the live controller: running orch-loop.sh to test it
 # would enter its dispatch loop with the DEFAULT OR (daniel-ospina/tortoise) and could merge PRs if
 # the guard regressed — the very regression this check exists to catch (the suite must stay
@@ -762,14 +763,23 @@ if need "$TMP/oguard.sh" "the \$O guard is extracted from the shipped orch-loop.
   ( O="$TMP/clean-o"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
   ck "orch-loop.sh's \$O guard accepts a clean path (non-vacuity)" $([ "$rc" -eq 0 ] && echo 0 || echo 1)
 fi
-( HOME="$SB" O="$TMP/o space" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.o.err" ); rc=$?
-[ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.o.err" && rc=0 || { rc=1; echo "      install.sh accepted it: $(tail -2 "$TMP/inst.o.err")"; }
-ck "install.sh refuses the same \$O orch-loop.sh refuses" $rc
-# install.sh must refuse the injection character too, not just the space (a narrowed pattern list
-# in either file would otherwise stay green here).
-( HOME="$SB" O="$TMP/o'q" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.oq.err" ); rc=$?
-[ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.oq.err" && rc=0 || { rc=1; echo "      install.sh accepted a quote in \$O: $(tail -2 "$TMP/inst.oq.err")"; }
-ck "install.sh refuses a quote in \$O" $rc
+# install.sh's guard is driven END TO END over the SAME eight values. Driving it for only the space
+# (and the quote) left seven alternatives unpinned: narrowing install.sh's list to quote+space alone
+# kept the whole suite green, while install.sh would render a plist for an $O the controller refuses
+# forever — the exact failure the pair of checks exists to prevent.
+SB5="$TMP/sb5"; mkdir -p "$SB5/Library/LaunchAgents" "$SB5/.config" "$SB5/.pi/agent/scripts"
+ln -s "$HOME/.config/gh" "$SB5/.config/gh" 2>/dev/null || true
+mkdir -p "$SB5/.local/share/pi-node/current/bin"
+printf '#!/bin/bash\nexit 0\n' > "$SB5/.local/share/pi-node/current/bin/pi"; chmod +x "$SB5/.local/share/pi-node/current/bin/pi"
+( HOME="$SB5" O="$TMP/clean-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.clean.err" ); rc=$?
+[ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh refused a clean \$O: $(tail -2 "$TMP/inst.clean.err")"; }
+ck "install.sh accepts a clean \$O (non-vacuity for the guard loop below)" $rc
+for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
+  ( HOME="$SB5" O="$TMP/$bad" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.og.err" ); rc=$?
+  [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.og.err" && rc=0 \
+    || { rc=1; echo "      install.sh accepted \$O='$bad': $(tail -2 "$TMP/inst.og.err")"; }
+  ck "install.sh refuses the same \$O orch-loop.sh refuses: '$bad'" $rc
+done
 
 # --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
 # a misbehaving daemon is exactly who must not be stopped by it.
@@ -795,6 +805,14 @@ ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INS
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed a whitespace-only key file" ;; *) rc=0 ;; esac
 ck "install.sh does not bless a WHITESPACE-ONLY key file" $rc
+# An EXISTING but UNREADABLE key file is neither missing nor empty. The verdict must name it, or the
+# prescribed remedy ("write the key with printf") is given for a file that may already hold one.
+printf 'secret\n' > "$SB/.pi/agent/.ai-review-gate-key"; chmod 000 "$SB/.pi/agent/.ai-review-gate-key"
+ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
+chmod 600 "$SB/.pi/agent/.ai-review-gate-key"
+rm -f "$SB/.pi/agent/.ai-review-gate-key"
+case "$ikout" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      install.sh did not name an unreadable key file: $(printf '%s\n' "$ikout" | grep -i 'key' | head -2)";; esac
+ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" $rc
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
@@ -889,6 +907,19 @@ else
   rc=1; echo "      no session command was recorded to inspect"
 fi
 ck "the session command string does not carry the merge key" $rc
+# The same EXISTING-BUT-UNREADABLE distinction in the preflight: a cell whose key file is mode 000
+# must be told so — "no key" is a different fault with a different remedy. Drive `check` itself
+# (the verdict a cell trusts), with the ambient key unset so the branch under test is reached.
+mkdir -p "$TMP/tm/home/.pi/agent"
+printf 'secret\n' > "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
+chmod 000 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
+supchk="$( env -u AI_REVIEW_GATE_KEY PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own \
+    bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1 )"
+chmod 600 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
+rm -f "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
+case "$supchk" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      the preflight did not name the unreadable key: $(printf '%s\n' "$supchk" | grep -i 'key' | head -2)";; esac
+ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 
 # ── 16f) cmd_check judges the merge key by what the SESSION will receive ────────
 # The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
