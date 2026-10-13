@@ -1179,26 +1179,53 @@ resolve_head() {
   # mistake it for a value. ⛔ Callers must use `require_head` below, never this
   # directly: the whole defect was a caller that could not tell "empty" from "absent".
   local attempt out rc
-  for attempt in 1 2 3; do
+  # ⛔ ENV SEAMS (#1690 review). Every other timing knob in this file is overridable (see
+  # `# Env seams` above), and without one the suite cannot exercise the BOUND itself —
+  # only a read that fails inside it. Validated fail-safe: a garbage value falls back to
+  # the default rather than turning into an arithmetic error inside the rail.
+  local attempts="${ADMIN_MERGE_HEAD_ATTEMPTS:-3}"
+  case "$attempts" in '' | *[!0-9]*) attempts=3 ;; esac
+  [ "$attempts" -ge 1 ] || attempts=3
+  local backoff="${ADMIN_MERGE_HEAD_READ_SLEEP:-1}"
+  case "$backoff" in '' | *[!0-9]*) backoff=1 ;; esac
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
     # shellcheck disable=SC2086
     out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null)" && rc=0 || rc=$?
-    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'; then
-      printf '%s\n' "$out"
-      return 0
+    if [ "$rc" -eq 0 ]; then
+      # ⛔ VALIDATE THE WHOLE VALUE, NOT A LINE OF IT (#1690 review). The first version of
+      # this check was `printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'`, wrong twice:
+      #   * `grep` is an ANY-LINE test — a read that returned a good sha AND a trailing junk
+      #     line PASSED it, and `printf '%s\n' "$out"` then emitted BOTH, so the
+      #     "caller gets a KNOWN-GOOD head" contract stated below was not established by
+      #     the code. A multi-line head then reaches the comparisons, the evidence body and
+      #     `--match-head-commit`.
+      #   * the `writer | grep` shape is the SIGPIPE idiom banned repo-wide (#841): under
+      #     `set -uo pipefail` a writer killed by SIGPIPE makes the pipeline non-zero, which
+      #     classifies a VALID head as UNREADABLE — a false refusal inside the rail itself.
+      # An embedded newline is not a hex character, so rejecting every non-hex character
+      # rejects the multi-line case BY CONSTRUCTION, and needs no pipe at all.
+      case "$out" in
+        "" | *[!0-9a-fA-F]*) ;;   # empty, or anything that is not pure hex
+        *) [ "${#out}" -eq 40 ] && { printf '%s\n' "$out"; return 0; } ;;
+      esac
     fi
-    [ "$attempt" -lt 3 ] && sleep "$attempt"
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$((backoff * attempt))"
+    fi
   done
   return 1
 }
 
 # ── THE ONE DOOR FOR READING THE HEAD (#1690) ──────────────────────────────────
 # ⛔ THERE IS EXACTLY ONE REASON TO READ THE HEAD, SO THERE IS EXACTLY ONE PLACE
-# THAT FAILS TO. Three call sites (§4 during-re-run, §4 before-evidence, and the
-# opening read) each compared `resolve_head` against `$head` and reported "head
-# moved". Fixing only the read would leave three copies of "is this failure a
-# moved head or an unread one?" to drift apart — the same duplication defect #1684
-# fixed on the DO list. So the discrimination lives HERE, once, and a caller that
-# gets a value has a KNOWN-GOOD 40-hex head.
+# THAT FAILS TO. THREE call sites read the head — §4 during-re-run, §4 before-evidence,
+# and the opening read — and TWO of them, the two §4 comparison sites, rendered a failed
+# read as "head moved". (The opening read had a pre-existing emptiness guard and refused
+# with "could not resolve the head", which is precisely why #1690's operator saw the wrong
+# message at one site and not the others.) Fixing only the read would leave three copies
+# of "is this failure a moved head or an unread one?" free to drift apart — the same
+# duplication defect #1684 fixed on the DO list. So the discrimination lives HERE, once,
+# and a caller that gets a value has a KNOWN-GOOD 40-hex head.
 #
 # ⛔ THE TWO REFUSALS ARE DIFFERENT SPEECH ACTS AND MUST NOT SHARE A MESSAGE.
 #   * an UNREADABLE head is NOT a claim about reality — it says the instrument
@@ -1213,7 +1240,7 @@ require_head() {
     printf '%s\n' "$out"
     return 0
   fi
-  say_err "admin-merge: ✗ BLOCK — could not READ the head of PR #$pr (3 attempts)."
+  say_err "admin-merge: ✗ BLOCK — could not READ the head of PR #$pr (${ADMIN_MERGE_HEAD_ATTEMPTS:-3} attempts)."
   say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
   say_err "   something that is not a commit SHA. Nothing was merged. Re-run the rail."
   return 1
@@ -3936,7 +3963,11 @@ main() {
   local head
   # shellcheck disable=SC2086
   head="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
-  [ -n "$head" ] || { say_err "admin-merge: ✗ could not resolve the head of PR #$PR"; exit 1; }
+  # ⛔ NO DEFENCE-IN-DEPTH EMPTINESS CHECK HERE (#1690 review). `require_head` can only
+  # return 0 with a 40-hex value, so an emptiness guard at this site is DEAD CODE — and
+  # keeping this site defended while the two §4 COMPARISON sites (the ones that actually
+  # printed "head moved") ran bare INVERTED the invariant: the least-exposed site was the
+  # guarded one. The guarantee lives in `require_head`, once, and covers every caller.
   info "admin-merge: PR #$PR head $head"
 
   # ── 0. A DRAFT CANNOT BE MERGED — refuse EARLY, by name ──────────────────
@@ -5340,9 +5371,13 @@ ${parity_forgiven_note}"
 }
 
 # ⛔ ENTRY-POINT GUARD (#1690): the read path must be REACHABLE FROM A TEST.
-# Without this a test can only run the WHOLE rail, which needs a live PR, so the
-# empty-read branch — the one that blocked a healthy PR — had no test at all. The
-# guard is the standard form and changes nothing about `bash scripts/admin-merge.sh`.
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  main "$@"
-fi
+# Without this a test cannot call the read path directly at all — it can only run the
+# WHOLE rail through the hermetic fake-gh harness — so the empty-read branch, the one
+# that blocked a healthy PR, had no test that could reach it. The guard changes nothing
+# about `bash scripts/admin-merge.sh`.
+#
+# ⛔ KEEP THIS ON ONE LINE (#1690 review). `tests/admin-merge/run.sh` loads the rail's
+# function definitions with `sed '$d'` — "the `main "$@"` entrypoint stripped". A
+# three-line guard leaves that strip deleting only `fi` and producing an UNTERMINATED
+# `if`, so the suite sources a file that does not parse.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

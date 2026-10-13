@@ -1723,7 +1723,7 @@ for mode in main-union commit; do
 echo "== 5l ($mode). an unreadable log still fails closed on collect_union =="
 new_scen "union-$mode"
 if [ "$mode" = "commit" ]; then
-  sha='aa5511000000000000000000000000000000000'
+  sha='aa55110000000000000000000000000000000000'
   lane_fail "$sha" 8802 > "$SCEN/runs-$sha"
   : > "$SCEN/fail-log-8802"          # log unreadable ...
   printf '3\n' > "$SCEN/jobs-count-8802"   # ... and the run DID have jobs
@@ -1779,7 +1779,7 @@ printf '3\n' > "$SCEN/jobs-count-8803"   # the run DID have jobs
 # `--commit-rows` -> collect_union_rows (the PR-side input). There is no
 # `--main-union-rows`; naming a mode the CLI does not have exits 2 on USAGE and
 # would have passed this test vacuously — asserted below.
-sha8803='aa5511000000000000000000000000000000000'
+sha8803='aa55110000000000000000000000000000000000'
 lane_fail "$sha8803" 8803 > "$SCEN/runs-$sha8803"
 cfs_run --main-union-signatures 10 --repo test-org/test-repo \
   --runs-report "$TMP/zl-sig-rep.txt" --provenance "$TMP/zl-sig-prov.txt"
@@ -1803,7 +1803,7 @@ rc=$?
 # merged, with a new message. This scenario is the one that catches it.
 echo "== #6798. a non-nodeid-only failing run must be EXTRACTED (both doors) =="
 new_scen nonnodeid
-sha_kill='aa6798000000000000000000000000000000000'
+sha_kill='aa67980000000000000000000000000000000000'
 printf '%s\n' "$sha_kill" > "$SCEN/head"
 lane_fail "$sha_kill" 6798 > "$SCEN/runs-$sha_kill"
 # The record's ONLY evidence is the watchdog banner: a genuine SIGKILL (rc=137)
@@ -1835,7 +1835,7 @@ fi
 # that was NOT killed must STILL refuse. If this scenario starts passing, the
 # change has opened the hole #6798 was mis-diagnosed against.
 new_scen nonnodeid-refuse
-sha_plain='aa6799000000000000000000000000000000000'
+sha_plain='aa67990000000000000000000000000000000000'
 printf '%s\n' "$sha_plain" > "$SCEN/head"
 lane_fail "$sha_plain" 6799 > "$SCEN/runs-$sha_plain"
 printf 'test (h)\tRun fast test suite\t2026-10-01T03:00:00.0000000Z ImportError: no module named y\n' > "$SCEN/log-6799"
@@ -1857,7 +1857,7 @@ fi
 # granularity from the jobs API instead of refusing.
 echo "== #7131. a PRUNED log falls back to the JOB-LEVEL failure set =="
 new_scen pruned
-sha_pr='aa7131000000000000000000000000000000000'
+sha_pr='aa71310000000000000000000000000000000000'
 printf '%s\n' "$sha_pr" > "$SCEN/head"
 lane_fail "$sha_pr" 7131 > "$SCEN/runs-$sha_pr"
 : > "$SCEN/pruned-log-7131"                  # the log is PROVEN absent
@@ -1891,7 +1891,7 @@ grep -q 'JOB-LEVEL' "$TMP/cfs-err" \
 # there is no fallback surface left and the run must refuse exactly as before.
 echo "== #7131. pruned log AND unreadable job list → still fail-closed =="
 new_scen pruned-nojobs
-sha_pn='aa7132000000000000000000000000000000000'
+sha_pn='aa71320000000000000000000000000000000000'
 printf '%s\n' "$sha_pn" > "$SCEN/head"
 lane_fail "$sha_pn" 7132 > "$SCEN/runs-$sha_pn"
 : > "$SCEN/pruned-log-7132"                  # log pruned
@@ -1938,7 +1938,7 @@ grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/pl-dec2.out" \
 # asserts the PRODUCER's OWN row shape AND feeds that row to the real decision.
 echo "== #7131. two jobs slugging alike in ONE run must not over-count =="
 new_scen pruned-collide
-sha_pc='aa7133000000000000000000000000000000000'
+sha_pc='aa71330000000000000000000000000000000000'
 printf '%s\n' "$sha_pc" > "$SCEN/head"
 lane_fail "$sha_pc" 7133 > "$SCEN/runs-$sha_pc"
 : > "$SCEN/pruned-log-7133"
@@ -2029,7 +2029,7 @@ fi
 # when it is not. The file-keyed family must group by FILE; the environmental
 # kill, which has no file, must group by its own constant (like a guard step).
 new_scen nonnodeid-resid
-sha_ce='aa6798000000000000000000000000000000001'
+sha_ce='aa67980000000000000000000000000000000010'
 printf '%s\n' "$sha_ce" > "$SCEN/head"
 lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
 printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
@@ -3573,7 +3573,7 @@ out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)
 # rail routes through it.
 echo '== 32b. the shell rail drops+reports at the FAILED-token position =='
 new_scen cfsmay
-HEAD_CM="aa5511000000000000000000000000000000000"
+HEAD_CM="aa55110000000000000000000000000000000000"
 lane_fail "$HEAD_CM" 8801 > "$SCEN/runs-$HEAD_CM"
 { log_failed 'tests/test_ok.py::test_ok'; log_failed 'may'; } > "$SCEN/log-8801"
 cfs_run --commit "$HEAD_CM"; rc=$?
@@ -3597,7 +3597,7 @@ grep -q 'UNATTRIBUTABLE.*may' "$TMP/cfs-err" && pass "the rail REPORTS the dropp
 # (The decision's UNATTRIBUTABLE VERDICT is the consumer side, #1147.)
 echo "== 33. a moved identity is REPORTED across the boundary and not attributed =="
 new_scen cfsrot
-HEAD_RR="bb6622000000000000000000000000000000000"
+HEAD_RR="bb66220000000000000000000000000000000000"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_status_surfaces_last_drill'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_manual_drill_records_measured_time'
 { lane_fail "$HEAD_RR" 8801; lane_fail "$HEAD_RR" 8802; } > "$SCEN/runs-$HEAD_RR"
@@ -4696,7 +4696,7 @@ belt_wait progress 100 1
 # instead. Removing that union turns this test RED (the merge proceeds).
 echo "== 45. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
 new_scen rotation
-HEAD_ROT="ee5500000000000000000000000000000000000"
+HEAD_ROT="ee55000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'

@@ -10,8 +10,10 @@ failure returned the EMPTY STRING and the comparison read `"" != <head>` as "the
 ``". A confident claim about reality, derived from a read that failed — the instrument held the
 exit status and discarded it.
 
-The branch had no test at all, because the ONLY way to reach it was to run the whole rail, which
-needs a live PR. These tests reach it directly: the script now carries the standard
+The branch had no test that could call the read path DIRECTLY. (The rail CAN be driven
+end-to-end hermetically through a fake `gh` — `tests/admin-merge/run.sh` has done so since #931
+— but nothing could invoke `resolve_head`/`require_head` in isolation, so the empty-read branch
+had no focused test.) These tests reach it directly: the script now carries the standard
 `BASH_SOURCE` entry-point guard, so it can be sourced, and `ADMIN_MERGE_GH` (already the script's
 own seam, line ~547) supplies a fake `gh`.
 
@@ -25,6 +27,14 @@ from __future__ import annotations
 import os
 import subprocess
 import textwrap
+
+# ⛔ SET BEFORE ANY SOURCING (#1690 review). `resolve_head` retries with an exponential backoff
+# (`sleep 1`, then `sleep 2`); at the seam's default this suite spends ~13 s of its ~16 s
+# ASLEEP, so the `--timeout=60` budget in both CI lanes is spent waiting rather than asserting.
+# `ADMIN_MERGE_HEAD_READ_SLEEP=0` removes the wait and changes nothing under test: the retry
+# COUNT is still exercised, and a mutation that dropped the retry still fails. `setdefault` so
+# an operator measuring the real backoff can override it from the environment.
+os.environ.setdefault("ADMIN_MERGE_HEAD_READ_SLEEP", "0")
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAIL = os.path.join(REPO_ROOT, "scripts", "admin-merge.sh")
