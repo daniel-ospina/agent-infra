@@ -206,10 +206,11 @@ if [ -n "$KEY_TRIMMED" ]; then
   ok "gate key file present ($KEY_FILE)"
   [ -n "${AI_REVIEW_GATE_KEY:-}" ] && ok "AI_REVIEW_GATE_KEY also exported in this shell"
 elif [ -f "$KEY_FILE" ]; then
-  warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."
   # An EXISTING but UNREADABLE file is neither missing nor empty, and the remedy differs: telling
   # the operator to WRITE a 000-mode file that may already hold a valid key is advice that
-  # reproduces the state it was meant to fix. `[ -r ]` is what separates the two.
+  # reproduces the state it was meant to fix. `[ -r ]` is what separates the two. The shared
+  # CONSEQUENCE is emitted after the branch — ahead of it, an orphaned `→` continuation attaches to
+  # whatever the previous check printed and names neither the file nor the fault.
   if [ -r "$KEY_FILE" ]; then
     warn "$KEY_FILE holds no key (empty or whitespace-only) — treated as absent."
     warn "  → fix: printf '%s' \"\$AI_REVIEW_GATE_KEY\" > $KEY_FILE && chmod 600 $KEY_FILE"
@@ -218,6 +219,7 @@ elif [ -f "$KEY_FILE" ]; then
     warn "  → it may already hold a valid key: check its mode and its parent directories."
     warn "  → fix: chmod 600 $KEY_FILE  (and 700 on its parent directories)"
   fi
+  warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."
 elif [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
   warn "AI_REVIEW_GATE_KEY is set in THIS SHELL ONLY — launchd will not see it."
   warn "  → the daemon will record reviews UNSIGNED and ai-review-gate will fail: no merge role."

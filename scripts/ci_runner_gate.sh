@@ -63,10 +63,10 @@ probe_status() {
 }
 
 evaluate() {
-  local summary queued comp incident
+  local summary queued comp incident parsed
   summary="$(probe_status)" || { log "status probe FAILED (network/status api)"; return 2; }
 
-  read -r comp incident <<<"$(printf '%s' "$summary" | python3 -c '
+  parsed="$(printf '%s' "$summary" | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
 comp="?"
@@ -75,7 +75,15 @@ for c in d.get("components",[]):
         comp=c.get("status","?")
 inc=[i for i in d.get("incidents",[]) if "actions" in (i.get("name","")+i.get("impact","")).lower()]
 print(comp, len(inc))
-' 2>/dev/null)" || return 2
+' 2>/dev/null)" || { log "status summary parse FAILED (python)"; return 2; }
+  # ⛔ SHAPE-CHECK THE CAPTURED VALUE. `read -r a b <<<""` returns 0 for an empty here-string, so the
+  # guard that used to hang off `read` could never fire: a json.load failure left comp="" — which
+  # is NOT "operational", so the gate returned 1 (unhealthy) and ACTED on it, relabelling the pool
+  # and routing CI onto this box. That is the opposite of what the header promises (`2
+  # could-not-measure (fail-closed: changing nothing)`). It also catches python's `comp="?"`
+  # fallback, so a githubstatus schema change is unreadable rather than "not operational".
+  case "$parsed" in ''|*[!A-Za-z0-9_[:space:]]*) log "status summary unreadable: ${parsed:0:120}"; return 2 ;; esac
+  read -r comp incident <<<"$parsed"
 
   queued="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
