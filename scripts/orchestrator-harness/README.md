@@ -27,8 +27,10 @@ doc_status: draft
 > agent-infra#1700). The home is agent-infra because this is fleet/agent operations, not
 > tortoise product code — the merge rail it drives (`admin-merge.sh`) is already in
 > `agent-infra/scripts/`, alongside `atomic-land.sh`, `cadence-nudge.sh`, and the
-> `checkout-hygiene/`, `heartbeats/`, `ci/` tool subdirectories. The old tortoise path is now a
-> stub pointer to this one.
+> `checkout-hygiene/`, `heartbeats/`, `ci/` tool subdirectories. The old tortoise path
+> (`operations/orchestrator-harness/`) is replaced by a stub pointer to this home in a follow-up
+> tortoise PR that opens only after this one merges (tortoise#8432) — until then it is a stale
+> duplicate; do not run it.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -159,10 +161,14 @@ work unless they coordinate (see §5, "broad mode").
 mkdir -p ~/orchestrator && cp scripts/orchestrator-harness/*.sh ~/orchestrator/
 mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 
-# 2. Point it at your box (all three are overridable; defaults are the original box's values)
+# 2. Point it at your box (all overridable; defaults are the original box's values)
 export OR=daniel-ospina/tortoise         # owner/repo
 export REPO=$HOME/eldato/tortoise        # the local main checkout
 export O=$HOME/orchestrator              # the harness state directory
+export SCOPE=own                         # drain scope: auto (default) | own | broad.
+                                         # A fleet runs ONE broad box; the rest pin own (section 5).
+                                         # install.sh renders this into the plist (launchd
+                                         # inherits no shell env) and refuses a bad value.
 
 # 3. Render + install the launchd agent (does NOT load it)
 ./install.sh
@@ -294,10 +300,12 @@ clear about what is and is not enforced:
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
-- **What actually constrains it.** The harness's own gate: only `orch-loop.sh` calls
-  `gh pr merge`, and only after `record-review.sh` has written a signed marker for the exact head
-  (§5.1) — so a rogue *agent* cannot merge through the harness path. It could still `gh pr merge`
-  or `git push` directly if the token permits, which is a property of the token, not this code.
+- **What actually constrains it.** `gh pr merge` is called in exactly two places — the inline
+  sweep in `orch-loop.sh` and `merge-one.sh` (the chain/fixer path) — and **both** are reached only
+  after `record-review.sh` has written a signed marker for the exact head (§5.1), with
+  `merge-one.sh` additionally waiting for `ai-review-gate` to read `SUCCESS`. A rogue *agent* cannot
+  merge through the harness path; it could still `gh pr merge` or `git push` directly if the token
+  permits, which is a property of the token, not this code.
 - **What is deliberately not done:** the gate key is never placed in a prompt, a plist, a log or a
   command line, and no script creates a secret-bearing file.
 - **Open item (tortoise#8246):** contain the workers properly — a read-only key path, no
@@ -353,13 +361,13 @@ is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's
 `$O/logs/orch-loop.log` is the controller's decision log; every line is prefixed by a tag:
 
 ```text
-[scope] open=24 -> BROAD (help drain all)
-[cap]   lanes=4 swap_free=588M swap_total=4096M load=7
+[scope] open=24 -> BROAD (auto)             ← or (pinned SCOPE=own) / (pinned SCOPE=broad)
+[cap]   lanes=4 swap_free=588M swap_total=4096M load=7 max_load=16
 [dispatch] load=7 lanes=4 -> 4429 4489
 [refresh] +#4508 CLEAN -> backlog
 #8219 FAILED:ai-review-gate          ← per-PR verdict for the required checks
 #8192 fixer attempt 1                ← routed to a fixer, not a re-record
-[dispatch] skipped (load=7 lanes=4)  ← and why
+[dispatch] skipped (load=7>=max_load=16)  ← and why (names the binding gate)
 ```
 
 ---
@@ -446,7 +454,7 @@ because the self-test now drives every one of them:
 | the claim-file guard added in the first fix round introduced a permanent stall | the controller treated *the existence of* `mergeclaim-<PR>.lock` as "in flight", but only `merge-one.sh` removes it — a SIGKILLed worker or a reboot mid-merge left the PR skipped forever with no fixer and no re-record | `claim_live()` tests the recorded pid with `kill -0` and removes a dead owner's claim |
 | 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL; each check was then re-proved against the pre-fix tree it pins |
 | **a hung worker held a concurrency slot for 9 hours** | `pi -p` has no timeout and the caps count **tmux sessions**, so a hung reviewer (or a runaway `find /` it spawned) permanently reduced merge throughput while the queue looked busy — three slots were dead weight overnight on 2026-10-12 | portable `run_agent()` wall-clock limit (bash `wait` + watchdog subshell, since macOS ships no `timeout`) plus a `reap_stale_workers()` sweep that kills any worker silent for `STALE_MIN` minutes |
-| **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 had *unresolved conflict markers committed* (caught by the docs job's marker check) and #8193 had a new `MD018` docs-lint finding — both with zero workers for hours | those checks now route to `fix-one.sh` too, capped and parkable like every other fix loop; and `fix-one.sh` now fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all |
+| **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours | those checks now route to `fix-one.sh` too, capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
 
 ### 7.5 Still open, deliberately not fixed here
 
@@ -458,6 +466,13 @@ because the self-test now drives every one of them:
   status, but the pattern is easy to reintroduce — a `exit 0` at the end of each script would pin it.
 - **Worktree reaping.** Every dispatch and every foreign-branch fixer adds a worktree; the box
   carried ~150 by the end of the run. Nothing removes them after their PR merges.
+- **Linux portability of the controller (agent-infra#1702).** `orch-loop.sh` uses `stat -f` (BSD),
+  `sysctl vm.loadavg` and `sysctl vm.swapusage`, which are macOS-only. On a Linux cell the reaper
+  aborts the controller on its first cycle once a worker log exists, and the load/swap gates never
+  bind — `cloud-cell-supervisor.sh` starts a cell that cannot complete a cycle.
+- **The fixer's CI-log fetch (agent-infra#1703).** `fix-one.sh` reads the workflow run's
+  `--log-failed | tail -80` rather than the failed *job's* log, so a multi-failed-job run can feed
+  the fixer the wrong check's output. Raised as a P1 in the tortoise#8298 review and never applied.
 
 ---
 

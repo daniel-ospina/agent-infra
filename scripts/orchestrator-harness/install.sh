@@ -26,6 +26,9 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
+# Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
+# A fleet runs exactly ONE broad box; the rest pin own. Validated below.
+SCOPE="${SCOPE:-auto}"
 
 LABEL="com.eldato.orchestrator-loop"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
@@ -34,6 +37,14 @@ TEMPLATE="$HERE/launchd.plist.template"
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
+
+# SCOPE is operator config: orch-loop.sh treats anything but auto|own|broad (or unset) as FATAL,
+# so a typo rendered into the plist would produce a daemon that dies on its first cycle. Refuse it
+# at install time, where the operator can still see it.
+case "$SCOPE" in
+  auto|own|broad) ;;
+  *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
+esac
 
 # ── uninstall ────────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "--uninstall" ]; then
@@ -231,6 +242,7 @@ sed \
   -e "s|__O__|$(esc "$O")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
   -e "s|__OR__|$(esc "$OR")|g" \
+  -e "s|__SCOPE__|$(esc "$SCOPE")|g" \
   -e "s|__HOME__|$(esc "$HOME")|g" \
   -e "s|__PATH__|$(esc "$DAEMON_PATH")|g" \
   -e "s|__MAX_LOAD__|$MAX_LOAD|g" \

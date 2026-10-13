@@ -1,10 +1,14 @@
 #!/bin/bash
 # cloud-cell-supervisor.sh — run the orchestrator harness on a Linux cloud cell.
 #
-# The harness's ONLY macOS-specific part is how the CONTROLLER is started: install.sh
-# renders a launchd plist. The lanes were never launchd's — orch-loop.sh spawns them with
-# `tmux new-session`, and tmux is on the devbox already. So a Linux cell needs one
-# substitution: launchd → tmux for the controller, and nothing else.
+# The harness's macOS-specific parts are (a) how the CONTROLLER is started — install.sh
+# renders a launchd plist — and (b) three OS primitives inside orch-loop.sh (stat -f, sysctl
+# vm.loadavg, sysctl vm.swapusage) that are BSD-only. The lanes themselves were never
+# launchd's: orch-loop.sh spawns them with `tmux new-session`, and tmux is on the devbox
+# already. So a Linux cell needs this supervisor for (a), plus the portable-primitive fix
+# tracked by agent-infra#1702 for (b). Until #1702 lands the cell controller aborts on its
+# first cycle once a worker log exists, and the load/swap gates never bind — treat a cell as
+# a MERGE ACTOR with incomplete back-pressure, not as a full peer of the laptop.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh start|stop|status|logs|check
@@ -29,8 +33,9 @@ O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
 # not inside the target repo ($REPO) — resolve it from this script's own location, and let an
 # explicit HARNESS override win. It moved out of tortoise's operations/ on 2026-10-13; the old
-# $REPO/operations/orchestrator-harness path is now only a stub pointer, so it is no longer a
-# valid default here. An unresolvable path fails loudly in cmd_check, never silently.
+# $REPO/operations/orchestrator-harness path becomes a stub pointer in a follow-up tortoise PR
+# (agent-infra#1700 / tortoise#8432), so it is no longer a valid default here. An unresolvable
+# path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
 SESSION="${SESSION:-orch}"
 LOCK="$O/.orch.lock"
@@ -50,14 +55,23 @@ cmd_check() {
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || die "no git repo at $REPO"
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
+  # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
+  # from $HARNESS. cmd_start seeds $O from $HARNESS; assert it, so a stale/empty $O is a loud
+  # failure rather than a controller that runs the inline sweep but can never review, fix or
+  # dispatch — a false "CELL CAN RUN A CONTROLLER".
   say "ok: HOME, harness, tmux, gh auth, repo, state dir"
+  local missing="" w
+  for w in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+    [ -f "$O/$w" ] || missing="$missing $w"
+  done
+  [ -z "$missing" ] || die "worker scripts missing from \$O:$missing — run 'start' (it seeds \$O) or: cp '$HARNESS'/*.sh '$O'/"
 
-  if [ -n "${AI_REVIEW_GATE_KEY:-}" ] || [ -s "$HOME/.config/ai-review-gate/key" ]; then
+  if [ -n "${AI_REVIEW_GATE_KEY:-}" ] || [ -s "$HOME/.pi/agent/.ai-review-gate-key" ]; then
     say "ok: merge authority key present"
   else
-    say "warn: no AI_REVIEW_GATE_KEY."
+    say "warn: no AI_REVIEW_GATE_KEY and no ~/.pi/agent/.ai-review-gate-key."
     say "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
-    say "         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started"
+    say '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'
     say "         cell is a MERGE ACTOR regardless of the key."
   fi
   say "⛔ COLLISION: orch-loop.sh takes BROAD scope above 10 open PRs, so an UNPINNED cell drains"
@@ -72,6 +86,11 @@ cmd_check() {
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
+  # Seed the running copy first. orch-loop.sh spawns its workers from $O, not from $HARNESS, so a
+  # cell whose $O is empty runs the inline sweep but can never review, fix or dispatch. Idempotent;
+  # mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
+  mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
+  cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
   cmd_check >/dev/null || exit 1
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "already running (tmux session '$SESSION') — use: status | logs | stop"
@@ -80,8 +99,12 @@ cmd_start() {
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.
+  # SCOPE must be forwarded EXPLICITLY: a tmux server that already exists (normal after `stop`,
+  # or while lanes run) serves a new session from ITS OWN environment, so an exported SCOPE is
+  # silently dropped and the cell falls back to `auto` — the shared-queue drain the pin exists to
+  # prevent. (Measured: `SCOPE=own tmux new-session …` against a live server sees an empty SCOPE.)
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='${SCOPE:-auto}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"

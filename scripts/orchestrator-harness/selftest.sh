@@ -578,6 +578,19 @@ if need "$TMP/scope.sh" "the scope-select block is extracted from the shipped or
   grep -qF '[scope] open=14 -> BROAD (auto)' "$TMP/scope.log" && grepl=true || grepl=false
   [ "$grepp" = true ] && [ "$grepl" = true ] && rc=0 || { rc=1; echo "      auto/14 got '$out' log=$(cat "$TMP/scope.log")"; }
   ck "shipped scope: auto + 14 open -> BROAD, unchanged" $rc
+  # SCOPE UNSET (the real default path — every test above sets SCOPE explicitly) must drive `auto`.
+  # Without this, a mutation of the default itself (e.g. ${SCOPE+x} -> ${SCOPE:-own}) stays green.
+  drive_scope_unset() { # <OPEN_N> -> "<MODE>|<SEL>" with SCOPE genuinely unset
+    : > "$TMP/scope.log"; : > "$TMP/scope.err"
+    ( set -u; unset SCOPE; OPEN_N="$1" LOG="$TMP/scope.log"; . "$TMP/scope.sh"; printf '%s|%s\n' "$SCOPE_MODE" "$SEL" ) 2>"$TMP/scope.err"
+  }
+  out="$(drive_scope_unset 14)"
+  grep -qF '[scope] open=14 -> BROAD (auto)' "$TMP/scope.log" && grepl=true || grepl=false
+  [ "$out" = "BROAD|$S_BROAD" ] && [ "$grepl" = true ] && rc=0 || { rc=1; echo "      unset/14 got '$out' log=$(cat "$TMP/scope.log")"; }
+  ck "shipped scope: SCOPE unset drives the auto default (>10 -> BROAD)" $rc
+  out="$(drive_scope_unset 10)"
+  [ "$out" = "OWN|$S_OWN" ] && rc=0 || { rc=1; echo "      unset/10 got '$out'"; }
+  ck "shipped scope: SCOPE unset drives the auto default (at the threshold -> OWN)" $rc
   out="$(drive_scope auto 10)"
   [ "$out" = "OWN|$S_OWN" ] && grepp=true || grepp=false
   grep -qF '[scope] open=10 -> OWN (auto)' "$TMP/scope.log" && grepl=true || grepl=false
@@ -598,8 +611,30 @@ if need "$TMP/scope.sh" "the scope-select block is extracted from the shipped or
   ck "shipped scope: an unknown SCOPE value fails (does not pick a scope)" $rc
   grep -qF 'SCOPE must be auto|own|broad' "$TMP/scope.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/scope.err")"; }
   ck "shipped scope: the unknown-value failure names the accepted values" $rc
-  unset -f drive_scope
+  # Set-but-EMPTY is an operator typo (a blank plist/keys.env entry), not a silent default.
+  drive_scope '' 14 >/dev/null; rc=$?
+  [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      SCOPE= (empty) exited 0 — silently picked a scope"; }
+  ck "shipped scope: SCOPE set-but-empty fails instead of defaulting" $rc
+  # The SEAM: the sweep must CONSUME the block's $SEL. A build where the jq hardcodes a filter
+  # still logs the scope correctly but never changes what is swept — the override is inert.
+  grep -qF '|$SEL|' "$LOOP" && rc=0 || { rc=1; echo "      the sweep jq does not interpolate \$SEL"; }
+  ck "shipped scope: the sweep actually consumes \$SEL" $rc
+  unset -f drive_scope drive_scope_unset
 fi
+
+# ── 16c) the launchers can actually SET the scope (else the pin is unreachable) ───
+# launchd inherits NO shell env, so a SCOPE that install.sh does not render into the plist cannot
+# be pinned on a second Mac — the pin would be documentation only. The template must carry it,
+# install.sh must render it, and install.sh must refuse a bad value at install time.
+grep -qF '__SCOPE__' "$HERE/launchd.plist.template" && rc=0 || rc=1
+ck "the plist template carries a SCOPE key" $rc
+grep -qF '__SCOPE__' "$INST" && rc=0 || rc=1
+ck "install.sh renders SCOPE into the plist" $rc
+( SCOPE=banana bash "$INST" >/dev/null 2>"$TMP/inst.err" ); rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted SCOPE=banana (rc=$rc)"; }
+ck "install.sh refuses an invalid SCOPE" $rc
+grep -qF 'SCOPE must be auto|own|broad' "$TMP/inst.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.err")"; }
+ck "install.sh names the accepted SCOPE values" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

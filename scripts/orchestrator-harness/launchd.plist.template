@@ -41,6 +41,11 @@
     <key>O</key>
     <string>__O__</string>
 
+    <!-- drain scope: auto (count rule) | own (pin own-only) | broad (pin broad).
+         A fleet runs exactly ONE broad box; the rest pin own (README section 5). -->
+    <key>SCOPE</key>
+    <string>__SCOPE__</string>
+
     <!-- concurrency limits; the swap gate, not MAX_LANES, is what throttles an 8 GB box
          (README section 4). Do not raise MAX_LANES without checking swap headroom. -->
     <key>MAX_LOAD</key>

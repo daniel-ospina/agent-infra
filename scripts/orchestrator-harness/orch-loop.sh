@@ -191,9 +191,10 @@ while true; do
   # BEGIN scope-select (selftest.sh extracts this block verbatim — keep it self-contained)
   # SCOPE pins this box's drain scope: `auto` (DEFAULT — the >10 count rule above, unchanged),
   # `own` (own-only regardless of the count), or `broad` (broad regardless of the count). Any
-  # other value is FATAL operator config — a typo must not silently pick a scope, because the
-  # wrong scope either drains someone else's queue or strands this box's own drafts. Exactly one
-  # machine in a fleet takes BROAD; every other machine pins `SCOPE=own`.
+  # other value — including set-but-EMPTY — is FATAL operator config: a typo (or a blank plist /
+  # keys.env entry) must not silently pick a scope, because the wrong scope either drains someone
+  # else's queue or strands this box's own drafts. Exactly one machine in a fleet takes BROAD;
+  # every other machine pins `SCOPE=own`.
   # ⛔ This is a PARTITION, not a fix for the root. Pinning a second machine to OWN stops it
   # taking BROAD and draining the SHARED queue (measured 2026-10-13: a freshly started cloud cell
   # logged `[scope] open=14 -> BROAD` and was re-recording and auto-arming merges — #8425, #8420 —
@@ -201,13 +202,14 @@ while true; do
   # knowable: the collision pre-flight infers ownership from LOCAL branches/worktrees, which are
   # invisible across machines (#4256), so two OWN-pinned boxes can still race the same PR. The
   # root fix is #5052 (an authoritative expiring claim registry) — do not mistake this pin for it.
-  case "${SCOPE:-auto}" in
+  if [ -z "${SCOPE+x}" ]; then SCOPE=auto; fi
+  case "$SCOPE" in
     auto)
       if [ "$OPEN_N" -gt 10 ]; then SCOPE_MODE=BROAD; else SCOPE_MODE=OWN; fi
       SCOPE_WHY=auto ;;
     own)   SCOPE_MODE=OWN;   SCOPE_WHY="pinned SCOPE=own" ;;
     broad) SCOPE_MODE=BROAD; SCOPE_WHY="pinned SCOPE=broad" ;;
-    *)     echo "[fatal] SCOPE must be auto|own|broad (got '${SCOPE:-}')" >&2; exit 1 ;;
+    *)     echo "[fatal] SCOPE must be auto|own|broad (got '$SCOPE')" >&2; exit 1 ;;
   esac
   if [ "$SCOPE_MODE" = BROAD ]; then
     SEL='select(.headRefName|test("^design/|^scope/|^dependabot/")|not)'
