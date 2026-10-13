@@ -445,6 +445,50 @@ def test_a_degraded_snapshot_is_never_cached(L, tmp_path):
     assert L._publish_snapshot(["oops"], str(cache), "k") is True
 
 
+def test_a_compound_failed_read_cannot_publish_or_cache_an_empty_fleet(L, tmp_path):
+    """⛔ `degraded` IS A PER-ROW FLAG, SO AN EMPTY ROSTER CARRIES NO FLAG AT ALL (2026-10-13).
+
+    `any(r.get("degraded") for r in [])` is vacuously False, so the degraded refusal could not fire
+    on the very input a COMPOUND failed read produces (registry unreadable AND the cmux read
+    failed) — `registry()` returns `[]`, `main()` printed `[]`, exited 0, and cached it. Measured by
+    review: `publish empty snapshot wrote cache?: True; contents {"out": []}`. An empty fleet then
+    looked FRESH for the whole 420 s TTL and the `-s "$SNAP"` freshness test refused to launch the
+    fallback scan. Both halves are now refused, and this test exists because the docstrings that
+    claimed a `main()` guard covered it were FALSE — no such guard existed.
+    """
+    cache = tmp_path / "lane-status.cache"
+    assert L._publish_snapshot([], str(cache), "k") is False, "an empty fleet must not be cached"
+    assert not cache.exists()
+    # and the roster entry point must refuse rather than exit 0 with `[]`
+    src = open(_PATH, encoding="utf-8").read()
+    assert "REFUSING — the roster is EMPTY" in src, "main() must name an empty roster, not publish it"
+
+
+def test_an_unread_screen_never_reaches_the_dispatchable_verdict_at_the_fifth_site(L):
+    """⛔ THE TRI-STATE FIX MISSED A FIFTH SITE, AND REVIEW FOUND IT, NOT THE TESTS (2026-10-13).
+
+    `if last_kind is None: return DONE_IDLE if has_sid else UNBOUND` never consulted `spinner` at
+    all — so a session holding no parseable records PLUS an UNREADABLE screen still returned the one
+    verdict that invites a new task. Reachable from `main()`: a resolved `sid` whose session has no
+    records, with `read-screen` having failed under load (its measured ~10–15 s latency makes that
+    routine). Same absent-read-collapsed-to-a-definite-value class as the four `_idle_verdict()`
+    sites, which is why it belongs in this file's tests rather than in a follow-up.
+    """
+    def c(**kw):
+        args = dict(stale=None, grew=False, spinner=None, last_kind=None, child=None,
+                    child_stale=None, child_grew=None, child_activity_age=None,
+                    tool_inflight=None, last_stop=None, has_sid=True)
+        args.update(kw)
+        return L.classify(**args)
+
+    assert c() == L.UNKNOWN, "an unread screen with no readable records must abstain, got %s" % c()
+    # false-block controls: a POSITIVE read at the same site still decides
+    assert c(spinner=False) == L.DONE_IDLE
+    assert c(spinner=True) == L.WIP_IDLE
+    # ...and a lane with no session at all is still UNBOUND, not UNKNOWN
+    assert c(has_sid=False) == L.UNBOUND
+
+
 # ── a failed read is retried, and is never rendered as an empty success ───────
 #
 # ⛔ THE FAILURE THESE GUARD (2026-10-12). `cmux list-workspaces --json` timed out at load, the

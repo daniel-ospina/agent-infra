@@ -219,9 +219,14 @@ def frozen_subtrees(table_a, table_b, now=None):
         # This is strictly narrower than the shell rule, which is the safe direction here.
         if any(not is_pi(table_b[q]) for q in subtree[1:]):
             continue
-        # ⛔ AN ESTABLISHED CONNECTION IS LIVENESS. This is the gate that keeps a child in a long
-        # provider call out of the reap set; see `has_live_connection`. Unknown refuses.
-        if has_live_connection(pid) is not False:
+        # ⛔ AN ESTABLISHED CONNECTION IS LIVENESS — AND THE GATE MUST COVER THE WHOLE SUBTREE, NOT
+        # JUST THE ROOT (2026-10-13). `reap()` signals EVERY pid in `subtree`, while this gate asked
+        # only about `pid`. A nested dispatch (`pi -> pi`, explicitly permitted by the `is_pi` rule
+        # above) is therefore reachable in exactly the shape the gate exists to spare: a PARKED
+        # middle `pi` whose GRANDCHILD holds the provider connection. Measured by review: candidates
+        # `[(200, [200, 300])]` with 300 holding an ESTABLISHED connection — 300 was correctly
+        # excluded as its own candidate, and was then dragged into 200's kill list anyway.
+        if any(has_live_connection(q) is not False for q in subtree):
             continue
         # The whole subtree is parked. `age_s` comes from the child's own process age.
         out.append(dict(pid=pid, ppid=b["ppid"], age_s=_age_seconds(pid, table_b),
@@ -316,6 +321,7 @@ def evaluate(cands, table, state, now=None, min_age=MIN_AGE):
     now = now or time.time()
     ripe, watching, refused = [], [], []
     seen = {}
+    meta = {}
     for c in cands:
         pid = c["pid"]
         if human_above(pid, table):
@@ -332,6 +338,15 @@ def evaluate(cands, table, state, now=None, min_age=MIN_AGE):
         prev_birth = prev.get("birth")
         recycled = (prev_birth is not None and birth is not None
                     and abs(prev_birth - birth) > 60)
+        # ⛔ BIRTH AND `recycled` ARE PER-PID, NOT PER-RUN (2026-10-13). Both were bound in THIS
+        # loop and then read again in the separate persistence loop below, so every entry carried
+        # the LAST candidate's values — poisoning the recycle baseline for every other pid. A
+        # sibling child spawned in the same parallel `task` round is born within seconds of its
+        # peers, i.e. precisely close enough to mask a recycle, so a genuinely reused pid could
+        # inherit the dead process's `first_seen` and ripen on a three-day-old clock. Measured by
+        # review: `birth[300]` persisted as 1999300.0 (its true value was 1995000.0). The single-
+        # candidate test could not see it. Keep them paired with the pid they belong to.
+        meta[pid] = (birth, recycled)
         if recycled:
             first = None
             watching.append(dict(pid=pid, age_s=c["age_s"],
@@ -377,6 +392,7 @@ def evaluate(cands, table, state, now=None, min_age=MIN_AGE):
         sub = sorted(next((c["subtree"] for c in cands if c["pid"] == pid), []))
         # a composition change must reset the TICK count too, or "N runs" is not really N runs
         changed = prev.get("subtree") is not None and prev.get("subtree") != sub
+        birth, recycled = meta.get(pid, (None, False))
         ticks[str(pid)] = dict(first_seen=first,
                                ticks=1 if changed or recycled else prev.get("ticks", 0) + 1,
                                last_seen=now, ppid=table.get(pid, {}).get("ppid"),

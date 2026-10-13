@@ -443,6 +443,52 @@ def test_the_connection_probe_still_licenses_a_reap(W, monkeypatch):
     assert [c["pid"] for c in W.frozen_subtrees(a, b)] == [300]
 
 
+def test_a_live_connection_anywhere_in_the_subtree_refuses_the_candidate(W, monkeypatch):
+    """⛔ THE CONNECTION GATE MUST COVER THE SUBTREE, NOT JUST THE CANDIDATE ROOT (2026-10-13).
+
+    `reap()` signals EVERY pid in `cand["subtree"]`, but the gate asked only about `cand["pid"]`.
+    A nested dispatch (`pi -> pi`, which the `is_pi` rule above explicitly permits) is exactly the
+    shape where that matters. ⛔ MEASURED against this function, cmux(100) <- pi(10) <- pi(50) <- pi(60):
+
+        no connection held  -> candidates [(50, [50, 60]), (60, [60])]
+        60 holds one        -> []                     <- BEFORE the fix: [(50, [50, 60])]
+        50 holds one        -> [(60, [60])]           <- 60 is judged on itself, still eligible
+
+    So 60 — correctly excluded as its OWN candidate — was dragged into 50's kill list, i.e. the
+    provider call this gate exists to protect was killed through its parent.
+    """
+    tbl = {**BASE, 10: T(100, cpu=1.0), 50: T(10, cpu=1.0), 60: T(50, cpu=1.0)}
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 60)
+    assert W.frozen_subtrees(tbl, tbl) == [], (
+        "a live connection in the subtree must refuse the candidate that would signal it")
+    # ⛔ FALSE-BLOCK CONTROL: a connection on 50 refuses 50 only -- 60 is judged on 60 and stays
+    # eligible, or the reaper would be inert whenever any ancestor happened to hold one.
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 50)
+    assert [c["pid"] for c in W.frozen_subtrees(tbl, tbl)] == [60]
+
+
+def test_the_recycle_baseline_is_recorded_per_pid(W):
+    """⛔ `birth`/`recycled` LEAKED ACROSS CANDIDATES, DEFEATING THE RECYCLE GUARD (2026-10-13).
+
+    Both were bound in the candidate loop and then read again in the separate persistence loop, so
+    EVERY entry carried the LAST candidate's values. MEASURED by review: `birth[300]` persisted as
+    1999300.0 when its true value was 1995000.0. The recycle check is the only thing that resets
+    `first_seen` for a reused pid, so a poisoned baseline lets a genuinely recycled pid inherit the
+    dead process's clock and ripen on a three-day-old `frozen_for` — the exact P0 the guard and its
+    own test were written for. Siblings spawned in one parallel `task` round are born within seconds
+    of each other, i.e. the one moment the leaked baseline is close enough to mask a recycle. The
+    existing test could not see this: it supplies a SINGLE candidate.
+    """
+    tbl = {**BASE, 200: T(100, cpu=1.0), 300: T(100, cpu=1.0)}
+    now = 1_000_000.0
+    cands = [dict(pid=200, subtree=[200], age_s=1000, ppid=100, d_cpu=0.0),
+             dict(pid=300, subtree=[300], age_s=9000, ppid=100, d_cpu=0.0)]
+    _ripe, _watching, _refused, ticks = W.evaluate(cands, tbl, {}, now=now, min_age=1)
+    assert ticks["200"]["birth"] == now - 1000, (
+        "pid 200's baseline was poisoned by another candidate: %r" % ticks["200"]["birth"])
+    assert ticks["300"]["birth"] == now - 9000
+
+
 # ── fail-open P2s found by review cycle 3 ────────────────────────────────────
 
 def test_an_unreadable_age_refuses_rather_than_skipping_min_age(W, monkeypatch):

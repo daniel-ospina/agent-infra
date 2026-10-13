@@ -469,8 +469,10 @@ def _tsv_rows():
         # open() was unguarded, so an absent file raised out of the whole scan instead of
         # abstaining. A crash is not the safe direction here either: callers that catch and fall
         # back publish the TSV as the roster, which is exactly the failure this file was fixed to
-        # stop. Returning nothing lets `main()` hit its own `if not rows: raise`, which names the
-        # unreadable read instead of silently asserting an empty fleet.
+        # stop. Returning nothing is what makes the EMPTY case visible instead of plausible: `main()`
+        # refuses an empty roster (see its own guard), which names the unreadable read rather than
+        # publishing an empty fleet. (This comment previously credited a `main()` guard that did not
+        # exist — corrected 2026-10-13 when the guard was actually added.)
         return []
     with fh:
         for line in fh:
@@ -1378,8 +1380,17 @@ def _idle_verdict(spinner):
     screen we could not read returned `DONE-IDLE` — a DISPATCH invitation, the exact action the
     read layer exists to make safe. The long-tool guard above already used the correct polarity;
     these sites were never brought to it. MEASURED: `classify(stale=1200, grew=False,
-    spinner=None, ...)` -> `DONE-IDLE` before, -> `UNKNOWN` after. `UNKNOWN` is not in
-    `lane-actions.OFFERABLE`, so it routes to REPORT ONLY.
+    spinner=None, ...)` -> `DONE-IDLE` before, -> `UNKNOWN` after.
+
+    ⛔ WHAT ACTUALLY PROTECTS THE LANE — CORRECTED 2026-10-13. This docstring first claimed
+    "`UNKNOWN` is not in `lane-actions.OFFERABLE`, so it routes to REPORT ONLY". That is FALSE of
+    the consumer: `lane-actions.classify_row()` places every unresolved lane on `step="5"`, and
+    `build()` then REPLACES the verdict with the JEV words-layer label — so a lane-status verdict
+    is `why` TEXT, not the bucket. An unread screen can therefore still reach the beat's DO list;
+    what stands in the way is the confidence floor (a low-confidence label is not emitted as an
+    instruction) and `queue-dispatch.py`, which gates on this verdict directly. The routing gap is
+    filed rather than papered over: the abstention here is still the correct producer behaviour,
+    and it does bite for every consumer that reads the verdict directly.
     """
     if spinner is None:
         return UNKNOWN
@@ -1413,7 +1424,15 @@ def classify(stale, grew, spinner, last_kind, child, child_stale, child_grew,
         # orchestrator's own (`01a10486`, `01a10487` vs `01a102a3`), i.e. freshly relaunched panes
         # that had never received a task. `dispatched 0` was reported while 6 landing rows and 12
         # conflicts waited. `has_sid` is the fact that separates the two cases.
-        return DONE_IDLE if has_sid else UNBOUND
+        #
+        # ⛔ BUT `DONE-IDLE` HERE STILL REQUIRES A POSITIVE READ (2026-10-13). This FIFTH site was
+        # missed when the tri-state landed: it returned the dispatchable verdict without consulting
+        # `spinner` AT ALL, so an UNREADABLE screen on a session holding no parseable records still
+        # invited a new task onto a lane whose state nobody read. Same absent-read-collapsed-to-a-
+        # definite-value class as the four sites `_idle_verdict()` covers; found by review, not by
+        # the tests. Measured: `classify(stale=None, grew=False, spinner=None, last_kind=None,
+        # has_sid=True)` -> `DONE-IDLE` before, -> `UNKNOWN` after.
+        return _idle_verdict(spinner) if has_sid else UNBOUND
     if grew:
         return WORKING
     # ⛔ A RECORD THAT KNOWS NOTHING ABOUT ITS CHILD MUST NOT DECIDE THE VERDICT.
@@ -1566,6 +1585,14 @@ def _publish_snapshot(out, cache_path, key):
     to dispatch on a fleet it could no longer see. Cache a SUCCESS or nothing: a missing cache costs
     one real scan, which is the safe direction. Returns True iff a snapshot was written.
     """
+    if not out:
+        # ⛔ AN EMPTY SNAPSHOT IS NOT A HEALTHY FLEET (2026-10-13). `degraded` is a PER-ROW flag, so
+        # on an empty row set `any(...)` is vacuously False and this publisher cached `[]` — exactly
+        # what a COMPOUND failed read produces (registry unreadable AND cmux unreadable). Caching it
+        # presents an empty fleet as a FRESH published read for the whole TTL, and the freshness
+        # test (`-s "$SNAP"`) then refuses to launch the fallback scan: the fleet goes DARK while
+        # every read-quality flag says healthy. A missing cache costs one real scan.
+        return False
     if any(isinstance(r, dict) and r.get("degraded") for r in out):
         return False
     _tmp = cache_path + ".tmp"
@@ -1627,6 +1654,20 @@ def main():
             pass      # a broken or absent cache must never break the scan -- fall through to a real read
 
     rows = registry()
+    # ⛔ AN EMPTY ROSTER IS NOT AN ANSWER, AND `registry()` CAN RETURN ONE (2026-10-13). The
+    # docstring on `_tsv_rows()` (and a test docstring) asserted that "returning nothing lets `main()`
+    # hit its own `if not rows: raise`". No such guard existed here — `grep -n 'not rows'` matched
+    # only `_live_workspaces()`. So the COMPOUND failure (registry unreadable AND cmux unreadable)
+    # produced `rows=[]`, printed `[]`, exited 0, and cached it: a healthy-looking EMPTY fleet. The
+    # two artifacts that claimed this guard existed were false; one of them was written by the same
+    # change that added `_tsv_rows`'s `except OSError`. Enforce it here, and refuse to publish.
+    if not rows:
+        sys.stderr.write(
+            "lane-status: REFUSING — the roster is EMPTY (registry unreadable and/or the cmux read\n"
+            "  failed). An empty fleet is not a read; publishing it would make the fleet look\n"
+            "  healthy-and-idle for the whole cache TTL. Check ~/.pi/agent/state/lane-registry.tsv\n"
+            "  and the cmux socket.\n")
+        raise SystemExit(3)
     if a.only:
         _want = {x.strip().lower() for x in a.only.split(",") if x.strip()}
         rows = [r for r in rows
@@ -1806,8 +1847,16 @@ def main():
         # STALL), two of them while the pane showed a live child. WEDGED is the costly one: its
         # instruction invites a kill/respawn of a HEALTHY lane.
         #
-        # The bound is ABANDON_S, the SAME one pending_child already applies: a `task` child
-        # cannot outlive the harness's in-flight bound, so past it the open call is a stale RECORD
+        # The bound is ABANDON_S, the SAME one pending_child already applies.
+        # ⛔ CORRECTED 2026-10-13 — THIS COMMENT USED TO STATE THE PREMISE THAT `ABANDON_S`'s OWN
+        # DOCSTRING RETRACTS. It read: "a `task` child cannot outlive the harness's in-flight
+        # bound, so past it the open call is a stale RECORD". That is FALSE of the artifact and
+        # measured false in production (three `task` children alive and running pytest at 2h26m, a
+        # child polling CI at 1h30m — cited verbatim by ABANDON_S's docstring 30 lines above, which
+        # this file already retracts). Leaving the two claims in one file is how the retraction gets
+        # re-derived backwards. What actually makes an old record safe to discount here is that the
+        # child's OWN transcript and on-disk effect are consulted FIRST
+        # (`most_live_child` / `child_suppresses`) — not the mere passage of time.
         # and must not mask a real wedge. Absence is preferred to a wrong class everywhere else in
         # this test -- here too: a missing child_file (child_stale is None) does NOT count against
         # the child, because an unreadable stat is not evidence the child is dead.

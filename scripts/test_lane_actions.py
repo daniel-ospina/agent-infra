@@ -1028,10 +1028,19 @@ class TestResourceBands:
 
 
 # ── a degraded snapshot is refused on EVERY path ──────────────────────────────
-# ⛔ Review 2026-10-12: this refusal existed only inside the `--stdin` branch, so the default invoke
-# path -- which is how heartbeat-loop.sh calls this tool -- accepted a degraded snapshot and acted
-# on a fleet read missing every live-only lane. These two tests exist so the refusal cannot drift
-# back into one branch.
+# ⛔ Review 2026-10-12: the refusal must hold on BOTH the `--stdin` and the invoke path, and these
+# two tests exist so it cannot drift back into one branch.
+#
+# ⚠️ CORRECTED 2026-10-13 (found by review). This comment previously added a reason that was FALSE
+# on both counts: "this refusal existed only inside the `--stdin` branch, so the default invoke path
+# -- which is how heartbeat-loop.sh calls this tool -- accepted a degraded snapshot".
+#   • `heartbeat-loop.sh:315` calls `/usr/bin/python3 "$SCRIPTS/lane-actions.py" --stdin "$SNAP"`,
+#     i.e. the branch this comment called "the other path" is the one production actually uses.
+#   • Neither call site predates this PR: `git show 42f0b14:scripts/lane-actions.py | grep -c
+#     degraded` -> 0. Nothing was "left" unguarded; both arrived together.
+# A reader who followed the old text would guard the wrong branch -- the exact failure that
+# `_refuse_if_degraded`'s own docstring (lane-actions.py) says was already fixed. The TESTS were
+# right; only the reason attached to them was wrong.
 
 def test_a_degraded_snapshot_is_refused():
     rows = [{"lane": "a", "verdict": "WORKING"}, {"lane": "b", "degraded": True}]
