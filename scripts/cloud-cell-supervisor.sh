@@ -38,6 +38,10 @@ O="${O:-$CELL_HOME/orchestrator}"
 # path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
 SESSION="${SESSION:-orch}"
+# OR and the merge key are interpolated into the session command string, so they are defaulted
+# here — the guard below reads them with `${!v}` under `set -u`, which errors on an unset name, and
+# the string must not depend on the guard running first. `${OR:-…}` keeps today's default.
+OR="${OR:-daniel-ospina/tortoise}"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
@@ -58,6 +62,11 @@ safe_argv() {
 export HOME="$CELL_HOME"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
 LOCK="$O/.orch.lock"
+# Does the ENV FILE itself carry the merge key? cmd_check must judge what the SESSION will see, not
+# what this shell happens to hold: the session re-sources $ENV_FILE, so a keys.env key reaches it
+# while an ambient-only export does not (tmux serves the session from the server's environment).
+KEY_IN_FILE=""
+[ -f "$ENV_FILE" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?AI_REVIEW_GATE_KEY=' "$ENV_FILE" && KEY_IN_FILE=1
 
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated in cmd_start and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}` here
@@ -84,10 +93,22 @@ cmd_check() {
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
 
-  if [ -n "${AI_REVIEW_GATE_KEY:-}" ] || [ -s "$HOME/.pi/agent/.ai-review-gate-key" ]; then
-    say "ok: merge authority key present"
+  # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
+  # FILE is authoritative (as install.sh treats it), and a key in $ENV_FILE reaches the session
+  # because the session re-sources it. An ambient-only export does NOT — tmux serves a new session
+  # from the server's environment — so it is named rather than silently counted as present.
+  if [ -s "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+    say "ok: merge authority key present (~/.pi/agent/.ai-review-gate-key)"
+  elif [ -n "$KEY_IN_FILE" ]; then
+    say "ok: merge authority key present in $ENV_FILE (the session re-sources it)"
   else
-    say "warn: no AI_REVIEW_GATE_KEY and no ~/.pi/agent/.ai-review-gate-key."
+    if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
+      say "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
+      say "      session will NOT receive it (tmux serves a new session the SERVER's environment)."
+      say "      Write it to $ENV_FILE, or to ~/.pi/agent/.ai-review-gate-key."
+    else
+      say "warn: no AI_REVIEW_GATE_KEY and no ~/.pi/agent/.ai-review-gate-key."
+    fi
     say "      ⛔ This does NOT make the cell safe to co-run: absence of the key does not stop"
     say '         `gh pr merge --auto` (measured: it armed auto-merge on #8425/#8420). A started'
     say "         cell is a MERGE ACTOR regardless of the key."
@@ -121,7 +142,7 @@ cmd_start() {
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
   local v
-  for v in O REPO CELL_HOME ENV_FILE HARNESS; do
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
@@ -139,11 +160,12 @@ cmd_start() {
   # measured for SCOPE, and the same mechanism applies to every other variable (a rotated
   # key in $ENV_FILE would be ignored, and a pinned MAX_LANES would revert to its default). So the
   # session re-sources $ENV_FILE itself and the values below are set inside the session, AFTER it.
-  # The merge authority key rides WITH the session for the same reason: cmd_check must not report
-  # it present from THIS shell's env while the controller runs keyless (a false green).
+  # The merge key is NOT passed on this command line: a secret in an argv string is visible to
+  # `ps`/tmux, and it would have to be interpolated unguarded. It reaches the session through
+  # $ENV_FILE instead — which is why cmd_check judges the key by the file, not by this shell's env.
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='${OR:-daniel-ospina/tortoise}' SCOPE='$SCOPE' AI_REVIEW_GATE_KEY='${AI_REVIEW_GATE_KEY:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"

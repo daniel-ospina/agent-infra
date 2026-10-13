@@ -21,6 +21,13 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
+# OFFLINE: install.sh probes the REAL `gh` (`gh auth status`) and dies without a live authenticated
+# session, so the install/render checks below would need network. A `gh` stub that reports success
+# is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
+# need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
+GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
+printf '#!/bin/bash\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
+PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
 # ── 1) every script parses ───────────────────────────────────────────────────────
@@ -677,11 +684,24 @@ ck "an UNSET SCOPE renders the auto default" $rc
 [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted a set-but-empty SCOPE"; }
 ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # ... and the cell supervisor, which forwards it into the tmux session's command string. Provision
-# CELL_HOME and the repo so a non-zero rc cannot come from cmd_check's preflight, and require the
-# SCOPE message so a neutered validator cannot pass on the preflight failure's rc.
+# CELL_HOME and the repo so a non-zero rc cannot come from cmd_check's preflight, require the SCOPE
+# message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
+# PATH — under the very regression this check guards (a validator that passes), the supervisor would
+# otherwise create a REAL session and execute the live controller.
 mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
-( SCOPE= HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+cat > "$STUB_TM/tmux" <<'STUB'
+#!/bin/bash
+case "$1" in
+  has-session) [ -f "$TM_STATE/up" ] && exit 0 || exit 1 ;;
+  new-session) shift; printf '%s\n' "$*" > "$TM_STATE/cmd"; : > "$TM_STATE/up"; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$STUB_TM/tmux"
+( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
+[ ! -f "$TMP/sup-empty/cmd" ] || { rc=1; echo "      a session was created despite a set-but-empty SCOPE"; }
 [ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.empty.err" && rc=0 \
   || { rc=1; echo "      rc=$rc; stderr: $(tail -2 "$TMP/sup.empty.err")"; }
 ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted values" $rc
@@ -695,16 +715,24 @@ ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted value
 # offline: "No network, no tmux server, no git writes").
 awk '/^case "\$O" in/{f=1} f{print} f&&/^esac/{exit}' "$HERE/orch-loop.sh" > "$TMP/oguard.sh"
 if need "$TMP/oguard.sh" "the \$O guard is extracted from the shipped orch-loop.sh"; then
-  ( O="$TMP/o space"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
-  [ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      the guard accepted an \$O containing a space"; }
-  ck "orch-loop.sh's \$O guard refuses a space" $rc
+  # Every member of the class, not just a space: the guard has eight alternatives and the SPACE is
+  # inert — the quote and the metacharacters are the ones that enable the sh -c break-out, so a
+  # mutated guard that lost them must not stay green.
+  for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
+    ( O="$TMP/$bad"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
+    ck "orch-loop.sh's \$O guard refuses '$bad'" $([ "$rc" -ne 0 ] && echo 0 || echo 1)
+  done
   ( O="$TMP/clean-o"; . "$TMP/oguard.sh" ) >/dev/null 2>&1; rc=$?
-  [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      the guard rejected a clean \$O (rc=$rc)"; }
-  ck "orch-loop.sh's \$O guard accepts a clean path (non-vacuity)" $rc
+  ck "orch-loop.sh's \$O guard accepts a clean path (non-vacuity)" $([ "$rc" -eq 0 ] && echo 0 || echo 1)
 fi
 ( HOME="$SB" O="$TMP/o space" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.o.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.o.err" && rc=0 || { rc=1; echo "      install.sh accepted it: $(tail -2 "$TMP/inst.o.err")"; }
 ck "install.sh refuses the same \$O orch-loop.sh refuses" $rc
+# install.sh must refuse the injection character too, not just the space (a narrowed pattern list
+# in either file would otherwise stay green here).
+( HOME="$SB" O="$TMP/o'q" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.oq.err" ); rc=$?
+[ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.oq.err" && rc=0 || { rc=1; echo "      install.sh accepted a quote in \$O: $(tail -2 "$TMP/inst.oq.err")"; }
+ck "install.sh refuses a quote in \$O" $rc
 
 # --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
 # a misbehaving daemon is exactly who must not be stopped by it.
@@ -759,13 +787,59 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # Every interpolated value must be metacharacter-free (the session string is handed to tmux, which
 # runs it with sh -c), so a quote in $O must be refused BEFORE a session exists — and before any
 # injected command could run. The sibling guards in orch-loop.sh and install.sh are asserted above.
+# The payload is a quote with NO literal space (${IFS} stands in for it): a guard that kept only the
+# space alternative would accept this, so the check pins the quote member — the one that actually
+# enables the break-out — not merely the class as a whole.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it'; touch $TMP/tm/INJECTED; #" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$TMP/tm/harness" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
 ck "a metacharacter in \$O is refused before any session is created" $rc
+
+# The session string carries OR too, and the guard must cover it — this is the value whose omission
+# was a live injection (a quote in OR broke out of the sh -c string and executed a command).
+rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
+    bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
+[ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
+  || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
+ck "a metacharacter in \$OR is refused before any session is created" $rc
+# The merge key must NOT be interpolated into the session string at all: a secret in an argv string
+# is visible to ps/tmux, and it was the other unguarded member of this same class. It reaches the
+# session through \$ENV_FILE (which the session re-sources).
+sup_start own
+if [ -s "$TMP/tm/cmd" ]; then
+  grep -qF 'AI_REVIEW_GATE_KEY' "$TMP/tm/cmd" && rc=1 || rc=0
+else
+  rc=1; echo "      no session command was recorded to inspect"
+fi
+ck "the session command string does not carry the merge key" $rc
+
+# ── 16f) cmd_check judges the merge key by what the SESSION will receive ────────
+# The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
+# ambient-only export does NOT (tmux serves a new session the server's environment). Reporting the
+# ambient one as "present" was a false green on a cell that merges without the key.
+KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
+cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
+printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
+kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
+  if [ -n "$2" ]; then
+    env "$2" PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
+      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+  else
+    PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
+      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+  fi
+}
+out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys.env" '' )"
+case "$out" in *'merge authority key present'*) rc=0 ;; *) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; esac
+ck "cmd_check reports the key present when keys.env carries it" $rc
+out="$(kc_check "$KC/home/keys-empty.env" 'AI_REVIEW_GATE_KEY=AMBIENT')"
+case "$out" in *'will NOT receive it'*) rc=0 ;; *) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;; esac
+ck "cmd_check warns that an ambient-only key does not reach the session" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

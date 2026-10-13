@@ -26,10 +26,11 @@ doc_status: draft
 > **Where it lives now.** `agent-infra/scripts/orchestrator-harness/` (relocation:
 > agent-infra#1700). The home is agent-infra because this is fleet/agent operations, not
 > tortoise product code — the merge rail it sits alongside (`admin-merge.sh`, `atomic-land.sh`)
-> and the fleet script it is launched by (`cadence-nudge.sh`) are already in
+> and the fleet's box-level scripts (`cadence-nudge.sh`, `ci_runner_gate.sh`) are already in
 > `agent-infra/scripts/`, as are the multi-file tool subdirectories `checkout-hygiene/`, `ci/`
-> and `gh-shim/`. The per-cell launchers `ci_runner_gate.sh` and `cloud-cell-supervisor.sh` are
-> versioned into that directory by this same change (they existed only in local config before).
+> and `gh-shim/`. The per-cell launcher `cloud-cell-supervisor.sh` is versioned into that
+> directory by this same change (it existed only in local config before; on a cell it is what starts
+> this controller, since launchd is macOS-only).
 > The old tortoise path
 > (`operations/orchestrator-harness/`) is replaced by a stub pointer to this home in a follow-up
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
