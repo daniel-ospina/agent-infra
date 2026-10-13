@@ -46,6 +46,27 @@ die()  { say "FATAL: $*" >&2; exit 1; }
 ok()   { say "ok: $*"; }
 warn() { say "warn: $*"; }
 
+# ── $ENV_FILE is SOURCED, so a top-level `exit`/`exec` in it ENDS THIS SCRIPT (agent-infra#1713) ──
+# The same root measured in cloud-cell-supervisor.sh reproduces here: sourced directly with no
+# `set -e`, a `keys.env` containing `exit 0` makes `--check` return 0 having printed NO `CELL
+# READY` — bring-up "succeeds" by never reporting, and the operator reads the 0 as readiness. The
+# assignments must still land in THIS shell (keys.env may set HOME and the provider keys), so the
+# file is parsed, then evaluated in a throwaway subshell whose LAST action is a sentinel — the
+# sentinel's ABSENCE means the file terminated its shell, `exit 0` included — and only then sourced
+# for real. `set -e` is no help: `exit 0` IS a success status. Duplicated rather than shared:
+# both scripts are pushed standalone onto a cell, with no library to source.
+ENV_SENTINEL='__ai1713_env_sourced__'
+source_env_file() {
+  [ -f "$ENV_FILE" ] || return 0
+  # A file bash cannot PARSE never terminates the shell: `.` fails and the script carries on, so
+  # every variable it meant to set is missing while bring-up reports healthy. Refuse it here.
+  bash -n "$ENV_FILE" || die "$ENV_FILE cannot be parsed (or read) as shell — sourcing it would silently drop every variable it sets"
+  local probe
+  probe="$(set -a; . "$ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "$ENV_SENTINEL")" || true
+  [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which ends this script and reports success (rc=0) having verified nothing. Remove it."
+  set -a; . "$ENV_FILE"; set +a
+}
+
 # ── (1) a writable HOME ──────────────────────────────────────────────────────────
 setup_home() {
   if [ ! -d "$CELL_HOME" ]; then
@@ -86,7 +107,7 @@ check_network() {
 # ── (2) provider key, verified by a REAL call ───────────────────────────────────
 check_provider() {
   if [ -f "$ENV_FILE" ]; then
-    set -a; . "$ENV_FILE"; set +a
+    source_env_file
     ok "sourced $ENV_FILE"
     # ⛔ keys.env may carry a HOME= line, and every check below (check_gh reads $HOME/.config/gh,
     # check_repo resolves paths) must run under the same home the cell will use — the session
