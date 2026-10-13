@@ -79,7 +79,31 @@ keyfile_has_key() {
 # LOCK is recomputed AFTER $ENV_FILE is sourced (below): keys.env may set $O, and a lock derived
 # from a stale $O makes `stop` release and announce the wrong path.
 export HOME="$CELL_HOME"
-[ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+
+# ── $ENV_FILE is SOURCED, so a top-level `exit`/`exec` in it ended THIS SCRIPT (agent-infra#1713) ──
+# keys.env is operator-authored and is sourced into this shell, with no `set -e`, so `. "$ENV_FILE"`
+# does NOT return to its caller when the file exits — the FILE's status becomes the SCRIPT's.
+# Measured (`keys.env` = `exit 0`): `status`, `check` AND `start` each printed NOTHING and returned
+# 0, so `start` reported success having created no session — a false green on the one command that
+# launches a cell. `set -e` cannot see this: `exit 0` IS a success status. The assignments must
+# still land in THIS shell (keys.env may set $O), so the file is parsed, then evaluated in a
+# throwaway subshell whose LAST action is a sentinel — the sentinel's ABSENCE is the signal that
+# the file terminated its shell, `exit 0` included — and only then sourced for real. The file is
+# evaluated more than once (the key probes below already did this): it must be a plain
+# assignment file, since its side effects run once per evaluation.
+ENV_SENTINEL='__ai1713_env_sourced__'
+source_env_file() {
+  [ -f "$ENV_FILE" ] || return 0
+  # A file bash cannot PARSE never terminates the shell: `.` fails at the open/parse and the script
+  # carries on, so every variable the file meant to set is missing while the cell still reports
+  # healthy (a fail-open of the same class). Refuse it here instead.
+  bash -n "$ENV_FILE" || die "$ENV_FILE cannot be parsed (or read) as shell — sourcing it would silently drop every variable it sets"
+  local probe
+  probe="$(set -a; . "$ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "$ENV_SENTINEL")" || true
+  [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which would end this script and report success (rc=0) having done nothing. Remove it; put the work in a script, not in keys.env."
+  set -a; . "$ENV_FILE"; set +a
+}
+source_env_file
 # ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
 # the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
 # forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
@@ -98,7 +122,11 @@ LOCK="$O/.orch.lock"
 KEY_IN_FILE_RAW=""
 KEY_IN_FILE_SET=0
 if [ -f "$ENV_FILE" ]; then
-  env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${AI_REVIEW_GATE_KEY:-}" ]' _ "$ENV_FILE" 2>/dev/null && KEY_IN_FILE_SET=1
+  # The `&& printf x` (and the capture it needs) is the SAME completion guard as source_env_file()
+  # above: without it, a top-level `exit` in $ENV_FILE ends this probe having evaluated NOTHING, and
+  # its status (0 for `exit 0`) is read as "key present" — a false PASS. Unreachable today because
+  # source_env_file() dies first, but kept sound so a later refactor of that guard cannot re-open it.
+  [ "$(env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; [ -n "${AI_REVIEW_GATE_KEY:-}" ] && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && KEY_IN_FILE_SET=1
   KEY_IN_FILE_RAW="$(env -u AI_REVIEW_GATE_KEY bash -c 'set -a; . "$1" >/dev/null 2>&1; printf %s "${AI_REVIEW_GATE_KEY:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
 fi
 KEY_IN_FILE="$(printf '%s' "$KEY_IN_FILE_RAW" | tr -d '[:space:]')"
@@ -236,8 +264,13 @@ cmd_start() {
   # `ps`/tmux, and it would have to be interpolated unguarded. It reaches the session through
   # $ENV_FILE instead — which is why cmd_check judges the key by the file, not by this shell's env.
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
+  # The session re-sources $ENV_FILE in ITS shell (same uncontrolled file). The `[ -f ]` guard keeps
+  # an absent file from printing an open error, and `2>/dev/null` is GONE: suppressing it also hid
+  # a keys.env that fails to parse, so the controller ran on a partially-set environment with no
+  # signal in the log. A top-level `exit` here still ends the session, which the `sleep 3`
+  # has-session check below already turns into a loud failure.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; . '$ENV_FILE' 2>/dev/null; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -248,7 +281,10 @@ cmd_start() {
 
 cmd_stop() {
   tmux has-session -t "$SESSION" 2>/dev/null || { say "not running"; return 0; }
-  tmux kill-session -t "$SESSION" && say "controller stopped (tmux '$SESSION')"
+  # A failed kill must NOT fall through to the lock release and a 0 exit: `stop` would report
+  # success while the controller is still running (the same "failed precondition as success" shape).
+  tmux kill-session -t "$SESSION" || die "tmux kill-session failed for '$SESSION' — the controller may still be running"
+  say "controller stopped (tmux '$SESSION')"
   rm -f "$LOCK" && say "released lock $LOCK"
 }
 
