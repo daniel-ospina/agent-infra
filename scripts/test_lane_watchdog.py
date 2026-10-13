@@ -63,7 +63,8 @@ def ripen(W, monkeypatch, tmp_path, argv):
     monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
     monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
     monkeypatch.setattr(W, "ps_table",
-                        lambda: {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+                        lambda: {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+                                 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
     monkeypatch.setattr(W.time, "sleep", lambda s: None)
     monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
     monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
@@ -328,7 +329,8 @@ def test_dry_run_never_signals(W, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
     monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
     monkeypatch.setattr(W, "ps_table", lambda: {
-        **BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+        **BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+        200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
     monkeypatch.setattr(W.time, "sleep", lambda s: None)
     monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
     # ⛔ DRIVE IT ALL THE WAY TO `ripe`, or the test passes vacuously: with an empty state a
@@ -414,11 +416,12 @@ def test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation(W
     """Integration with the ACTUAL `scripts/lib/pid-identity.sh` -- no stub, because a stub cannot
     prove we invoke the real rule, with the real argument shape, at the real path."""
     me = os.getpid()
-    starts = W.start_seconds([me])
-    if me not in starts:
+    starts = W.ps_table().get(me, {})
+    start = starts.get("start")
+    if start is None:
         pytest.skip("this platform's `ps -o lstart=` is unreadable, so the fence abstains")
-    assert W.probe_pid(me, starts[me])[0] is True, "a live pid's own start must be a holder"
-    assert W.probe_pid(me, starts[me] - 5000)[0] is False, "5000s off is NOT the same process"
+    assert W.probe_pid(me, start)[0] is True, "a live pid's own start must be a holder"
+    assert W.probe_pid(me, start - 5000)[0] is False, "5000s off is NOT the same process"
     assert W.probe_pid(me, None)[0] is False, \
         "no recorded incarnation must never authorise a signal"
 
@@ -433,21 +436,26 @@ def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
     assert killed == [] and res["abstained"][0]["reason"].startswith("absent")
 
 
-def test_the_measured_incarnation_is_attached_to_the_candidate(W, monkeypatch):
-    """The fence can only check the incarnation the candidate CARRIES, so the start must be read in
-    the same tick that measures the subtree. Remove the attach and every victim abstains -- i.e. an
-    ARMED reaper that silently never acts, which is the failure mode of #1696-A."""
-    monkeypatch.setattr(W, "start_seconds", lambda pids: {300: 1111.0, 301: 2222.0})
+def test_the_measured_incarnation_is_attached_to_the_candidate(W):
+    """The fence can only check the incarnation the candidate CARRIES, and it must come from the
+    SAME snapshot that judged the subtree parked: a later read would record the REPLACEMENT's start,
+    so a recycled pid would answer `holder` and be signalled. Remove the attach and every victim
+    abstains -- an ARMED reaper that silently never acts."""
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    table[300]["start"] = 1111.0
+    table[301]["start"] = 2222.0
     cands = W.frozen_subtrees(dict(table), dict(table))
     assert cands and cands[0]["starts"] == {300: 1111.0, 301: 2222.0}
 
 
 def test_lstart_is_parsed_without_strptime_and_in_either_platform_order(W):
-    """⛔ MEASURED ON THIS HOST: `time.strptime(..., "%a %b ...")` raises `ValueError` for
-    `Sun 11 Oct 23:41:02 2026`, because `LC_TIME` is `(None, None)` and the English abbreviations
-    are not in the loaded locale table. macOS also prints DAY before MONTH and Linux the reverse.
-    Either mistake empties the map, and an empty map means no fence -- no fence means no signal."""
+    """⛔ MEASURED: one `strptime` format string cannot express BOTH field orders `ps` emits --
+    macOS prints `Sun 11 Oct 23:41:02 2026` (day first) and Linux `Mon Oct 13 09:41:20 2026`
+    (month first) -- and the day-first one raises `ValueError`. Either mistake empties the map, and
+    an empty map means no fence, which means no signal.
+
+    ⚠️ CORRECTED (review cycle 1): this test used to attribute the `ValueError` to the LOCALE. That
+    was false -- with `LC_TIME` unset the month-first string parses FINE; only the ORDER fails."""
     assert W._lstart_to_epoch("not a date at all") is None
     oct13 = W._lstart_to_epoch("Mon Oct 13 09:41:20 2026")
     assert oct13 is not None, \
@@ -506,18 +514,106 @@ def test_a_failed_state_write_is_loud_and_loses_no_observation(W, monkeypatch, t
     assert json.loads(capsys.readouterr().out)["state_write"] == "failed"
 
 
+def test_a_successful_run_reports_the_state_write(W, monkeypatch, tmp_path, capsys):
+    """⛔ THE REPORT MUST SAY THE OBSERVATION WAS PERSISTED. `state_write` was emitted ONLY on
+    failure, so a healthy run and a run whose field was absent were indistinguishable -- and an
+    evidence line quoting `state_write=ok` was not producible by the code at all (#1696, cycle 1)."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0
+    assert json.loads(capsys.readouterr().out)["state_write"] == "ok"
+
+
+def test_an_unreadable_ps_is_not_persisted_as_an_empty_fleet(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 1. `ps_table()` returns `{}` on ANY failure, and `{}` was written as a
+    definite "no processes" -- filtering every candidate out of `alive` and wiping EVERY frozen
+    clock. One transient `ps` timeout reset the whole gate; a persistent one was an ARMED reaper
+    that never ripens while exiting 0 and logging nothing."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    monkeypatch.setattr(W, "ps_table", lambda: {})          # the read FAILED
+    rc = W.main()
+    assert rc == 3, "an unreadable `ps` must not report a clean pass"
+    assert json.loads(state.read_text()) == before, "a failed read must NOT wipe the frozen clock"
+    assert json.loads(capsys.readouterr().out)["ps_readable"] is False
+    assert "ps-unreadable" in (tmp_path / "l.jsonl").read_text()
+
+
+def test_an_uncreated_lock_is_loud_and_non_zero(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 1. Contention is normal and silent; an UNCREATABLE lock is an
+    environmental failure that makes the reaper inert -- and in the production invocation
+    (`nohup ... --apply >> "$LOG"`) it printed nothing and exited 0, never reaching the loud
+    state-write path because it returns before it."""
+    ripen(W, monkeypatch, tmp_path, ["--apply"])
+    blocker = tmp_path / "afile"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(W, "LOCK", str(blocker / "lock"))
+    assert W.main() == 3, "an inert run for an environmental reason must NOT look healthy"
+    assert "lock-unavailable" in (tmp_path / "l.jsonl").read_text()
+    assert "LOCK UNAVAILABLE" in capsys.readouterr().err
+
+
+def test_reap_fences_on_the_RECORDED_incarnation(W, monkeypatch):
+    """⛔ THE ARGUMENT, NOT JUST THE CALL (#1696, review cycle 1). A stub rule that ignores the start
+    cannot distinguish "we passed the incarnation we measured" from "we passed `None`, or re-read
+    `lstart` at signal time" -- and both of those one-line edits kept all 45 tests green while
+    turning the fence into a tautology. This uses the REAL rule and a LIVE pid: the recorded start
+    authorises, an off-by-5000s record does not, and no record at all does not."""
+    me = os.getpid()
+    start = W.ps_table().get(me, {}).get("start")
+    if start is None:
+        pytest.skip("this platform's `ps -o lstart=` is unreadable")
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    table = {**BASE, 200: T(100, cpu=1.0), me: T(200, cpu=1.0)}
+
+    def candidate(recorded):
+        return dict(pid=me, ppid=200, subtree=[me], d_cpu=0.0, age_s=99999, starts=recorded)
+
+    assert W.reap(candidate({me: start}), {}, table, 1)["killed"] == [me]
+    killed.clear()
+    res = W.reap(candidate({me: start - 5000}), {}, table, 1)
+    assert killed == [], "a record 5000s off must NOT authorise a signal"
+    assert res["abstained"][0]["reason"].startswith("off-fence")
+    res = W.reap(candidate({}), {}, table, 1)
+    assert killed == [], "no recorded incarnation must NOT authorise a signal"
+    assert res["abstained"][0]["reason"].startswith("unknown")
+
+
+def test_a_partly_abstained_candidate_has_not_ended(W, monkeypatch):
+    """⛔ #1696, review cycle 1: `ended` was true when NOTHING was signalled but a sibling abstained.
+    An abstained victim is still frozen, so the freeze did not provably end."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "probe_pid",
+                        lambda pid, start, lib=None: (pid == 301,
+                                                      "holder" if pid == 301 else "off-fence"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300, 301], d_cpu=0.0, age_s=99999,
+                      starts={300: 1.0, 301: 2.0}), {}, table, 1)
+    assert killed == [301] and res["abstained"][0]["pid"] == 300
+    assert res["ended"] is False, "an abstained victim is still frozen -- it has not ended"
+
+
 def test_a_second_run_cannot_double_count_ticks(W, monkeypatch, tmp_path):
     """⛔ THE LOCK IS A GATE, NOT A NICETY. Two concurrent runs would both read the same state and
     both see the other's `first_seen`, so a candidate could reach FROZEN_TICKS in seconds instead of
     minutes -- collapsing the rule that separates a stuck child from one in a long model call."""
     monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
-    first = W.acquire_lock()
-    assert first is not None, "the first run must acquire"
-    assert W.acquire_lock() is None, "a concurrent run must be refused"
+    first, why = W.acquire_lock()
+    assert first is not None and why is None, "the first run must acquire"
+    second, why2 = W.acquire_lock()
+    assert second is None, "a concurrent run must be refused"
+    # ⛔ CONTENTION IS NOT AN ENVIRONMENTAL FAILURE, and the two must stay distinguishable: `held` is
+    # normal and silent, `unavailable` is an inert reaper that must be loud (#1696, cycle 1).
+    assert why2 == "held", "a held lock must not be reported as an unusable one"
     # released, a later run acquires again (a killed run cannot leave the fleet wedged)
     import fcntl
     fcntl.flock(first, fcntl.LOCK_UN)
-    assert W.acquire_lock() is not None
+    third, _ = W.acquire_lock()
+    assert third is not None
 
 
 def test_a_locked_run_observes_nothing_and_signals_nothing(W, monkeypatch, capsys, tmp_path):
@@ -527,7 +623,7 @@ def test_a_locked_run_observes_nothing_and_signals_nothing(W, monkeypatch, capsy
     monkeypatch.setattr(W, "STATE", str(tmp_path / "s.json"))
     # ⛔ KEEP THE HANDLE. `main` holds its own for the whole run; a dropped reference closes the fd
     # and silently releases the lock, so a test that discards it proves nothing.
-    held = W.acquire_lock()                            # a run is already in progress
+    held, _ = W.acquire_lock()                          # a run is already in progress
     assert held is not None
     monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py", "--apply", "--json"])
     assert W.main() == 0

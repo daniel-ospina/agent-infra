@@ -122,23 +122,47 @@ def cpu_seconds(tok):
 
 
 def ps_table():
-    """{pid: dict(ppid, stat, cpu, cmd)} for every process, one snapshot."""
+    """{pid: dict(ppid, stat, cpu, start, cmd)} for every process, ONE snapshot.
+
+    ⛔ `lstart` IS READ IN THIS SAME SNAPSHOT, NOT IN A SECOND ONE (#1696, review cycle 1). The
+    incarnation a signal is fenced against must belong to the process that was MEASURED. Reading it
+    afterwards -- even milliseconds later, after the per-candidate `lsof` and `ps -o etime` calls --
+    leaves a window in which the pid can be recycled, and the fence would then be checking the
+    REPLACEMENT's start, answer `holder`, and signal it. One snapshot closes the window: identity
+    and the CPU/ancestry evidence then come from the same read.
+
+    `lstart` sits BEFORE `command=` because `command=` consumes the rest of the line, and `lstart`
+    is five whitespace-separated tokens (`Mon Oct 13 09:41:20 2026`), hence the bounded split.
+    """
     try:
-        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,stat=,time=,command=", "-ww"],
+        out = subprocess.run(["ps", "-Ao", "pid=,ppid=,stat=,time=,lstart=,command=", "-ww"],
                              capture_output=True, text=True, timeout=60).stdout
     except Exception:
         return {}
     table = {}
     for line in out.splitlines():
-        f = line.split(None, 4)
-        if len(f) < 5:
+        f = line.split(None, 9)
+        if len(f) < 10:
             continue
         try:
-            pid = int(f[0])
+            pid, ppid = int(f[0]), int(f[1])
         except ValueError:
             continue
-        table[pid] = dict(ppid=int(f[1]), stat=f[2], cpu=cpu_seconds(f[3]), cmd=f[4])
+        table[pid] = dict(ppid=ppid, stat=f[2], cpu=cpu_seconds(f[3]),
+                          start=_lstart_to_epoch(" ".join(f[4:9])), cmd=f[9])
     return table
+
+
+def ps_readable(table):
+    """Is this a READ, or a FAILED read shaped like an empty fleet?
+
+    ⛔ `ps_table()` returns `{}` on ANY failure, and `{}` used to be persisted as a definite "no
+    processes". That filters every candidate out of `alive` (see `main()`) and so wipes EVERY
+    frozen clock: one transient `ps` timeout resets the whole gate, and a persistent failure is an
+    ARMED reaper that never ripens, exits 0, and logs nothing. A real table always contains pid 1
+    and THIS process -- the same non-vacuity check the shared rule uses (`pid_table_nonempty`).
+    """
+    return bool(table) and 1 in table and os.getpid() in table
 
 
 _MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
@@ -148,18 +172,20 @@ _MONTHS = ("jan", "feb", "mar", "apr", "may", "jun",
 def _lstart_to_epoch(text):
     """An `lstart` line -> epoch seconds, WITHOUT `strptime`, and order-agnostically.
 
-    ⛔ WHY NOT `strptime` (#1696). `time.strptime(t, "%a %b %d %H:%M:%S %Y")` is LOCALE-DEPENDENT,
-    and it FAILS on this host: `locale.getlocale(LC_TIME)` is `(None, None)`, the abbreviated
-    English names are not in the loaded table, and the call raises `ValueError` on
-    `Sun 11 Oct 23:41:02 2026` -- so EVERY pid silently drops out of the map. That is the dangerous
-    failure: no start seconds means no fence, no fence means no signal, i.e. an INERT reaper that
-    reports success. `ps` prints these fields in English unconditionally, so they are parsed here
-    as fixed English tokens.
+    ⛔ WHY NOT `strptime` (#1696). Its format string cannot express BOTH of the field orders `ps`
+    emits: macOS prints `Sun 11 Oct 23:41:02 2026` (weekday, DAY, MONTH) and Linux prints
+    `Mon Oct 13 09:41:20 2026` (weekday, MONTH, DAY). One format string therefore raises
+    `ValueError` on one of the two platforms, which would drop every pid out of the map -- no start
+    seconds, no fence, no signal, i.e. an INERT reaper that reports success.
 
-    ⛔ AND THE FIELD ORDER DIFFERS BY PLATFORM: macOS prints `Sun 11 Oct 23:41:02 2026`
-    (weekday, DAY, MONTH) while Linux prints `Mon Oct 13 09:41:20 2026` (weekday, MONTH, DAY).
-    Positional parsing is therefore wrong on one of them; the month is found by NAME, the day is
-    the remaining short numeric token, and the weekday is discarded (it carries nothing we need).
+    ⚠️ CORRECTED 2026-10-13 (review cycle 1): this docstring used to blame the LOCALE -- "the
+    abbreviated names are not in the loaded locale table". That was FALSE, and the measurement is
+    one line: with `LC_TIME` unset, `strptime("Mon Oct 13 09:41:20 2026", "%a %b %d %H:%M:%S %Y")`
+    SUCCEEDS; only the day-first string raises. The real cause is the field order, which is the
+    reason the parse is order-agnostic. The locale plays no part in it.
+
+    So the month is found by NAME, the day is the remaining short numeric token, the weekday is
+    discarded, and `ps` prints these in English unconditionally.
     """
     parts = text.split()
     month = None
@@ -178,42 +204,6 @@ def _lstart_to_epoch(text):
         return time.mktime((int(year), month, int(day), hh, mm, ss, 0, 1, -1))
     except ValueError:
         return None
-
-
-def start_seconds(pids):
-    """{pid: lstart-as-epoch} from ONE fresh read. A pid we cannot read is simply absent.
-
-    This is the incarnation half of the fence: `probe` needs the start the record claims, and for a
-    dispatched child the record is this reaper's own observation. Read once, for every pid in every
-    candidate subtree, in the same tick that MEASURES the subtree -- so the value the fence later
-    checks against is the one that belonged to the process that was actually seen parked.
-    """
-    pids = sorted({int(p) for p in pids})
-    if not pids:
-        return {}
-    try:
-        out = subprocess.run(["ps", "-o", "pid=,lstart=", "-p", ",".join(str(p) for p in pids)],
-                             capture_output=True, text=True, timeout=60).stdout
-    except Exception:
-        return {}
-    starts = {}
-    for line in out.splitlines():
-        fields = line.split(None, 1)
-        if len(fields) != 2:
-            continue
-        try:
-            pid = int(fields[0])
-        except ValueError:
-            continue
-        try:
-            # `lstart` prints e.g. `Mon Oct 13 09:41:20 2026`; the single-space join repairs the
-            # double space macOS emits for a single-digit day.
-            epoch = _lstart_to_epoch(" ".join(fields[1].split()))
-        except Exception:
-            epoch = None
-        if epoch is not None:
-            starts[pid] = epoch
-    return starts
 
 
 def write_state(path, data):
@@ -396,11 +386,11 @@ def frozen_subtrees(table_a, table_b, now=None):
         # The whole subtree is parked. `age_s` comes from the child's own process age.
         out.append(dict(pid=pid, ppid=b["ppid"], age_s=_age_seconds(pid, table_b),
                         d_cpu=round(d, 3), subtree=subtree))
-    # The incarnation of every pid that could be signalled later, read in the SAME tick that judged
-    # the subtree parked. One extra `ps` call, and only when there is at least one candidate.
-    starts = start_seconds(q for c in out for q in c["subtree"])
+    # The incarnation of every pid that could be signalled later, taken from the SAME snapshot that
+    # judged the subtree parked -- never a second read (see `ps_table`).
     for c in out:
-        c["starts"] = {q: starts[q] for q in c["subtree"] if q in starts}
+        c["starts"] = {q: table_b[q]["start"] for q in c["subtree"]
+                       if table_b.get(q, {}).get("start") is not None}
     return out
 
 
@@ -614,12 +604,23 @@ def reap(cand, table_a, table_b, ts, *, lib=None):
         except Exception as e:
             return dict(pid=cand["pid"], ended=False, killed=killed, vanished=vanished,
                         abstained=abstained, error=str(e))
-    return dict(pid=cand["pid"], ended=bool(killed or vanished), killed=killed,
+    # ⛔ CONSERVATIVE (#1696, review cycle 1): an abstained victim is still frozen, so a candidate
+    # whose sibling was withheld has NOT provably ended.
+    return dict(pid=cand["pid"], ended=bool(killed or vanished) and not abstained, killed=killed,
                 vanished=vanished, abstained=abstained, parent=cand["ppid"])
 
 
 def acquire_lock():
-    """Hold the single-run lock, or return None when another run already holds it.
+    """Hold the single-run lock, or report WHY not.
+
+    Returns `(fh, None)` on success, `(None, "held")` when another run holds it, and
+    `(None, "unavailable")` when the lock could not even be created.
+
+    ⛔ THE TWO FAILURES ARE NOT THE SAME (#1696, review cycle 1). Contention is normal, expected, and
+    silent. An UNOPENABLE lock is an environmental failure that makes the reaper inert -- and under
+    the production invocation (`nohup ... --apply >> "$LOG"`) it used to print nothing and exit 0,
+    never reaching the loud state-write path, because it returns before it. A silent no-op is the
+    failure this whole file exists to avoid; the healthy-looking one is the dangerous one.
 
     ⛔ REQUIRED, NOT A NICETY. The tick may launch this detached on consecutive passes, and the
     "frozen ACROSS TICKS" rule is exactly what two concurrent runs would corrupt: both would read
@@ -636,17 +637,17 @@ def acquire_lock():
         # from one in a long model call. Returning True here was fail-open on the one mechanism the
         # docstring calls "REQUIRED, NOT A NICETY" -- for a process-killer the safe direction is to
         # do nothing.
-        return None
+        return None, "unavailable"
     try:
         os.makedirs(os.path.dirname(LOCK), exist_ok=True)
         fh = open(LOCK, "w")
     except Exception:
-        return None
+        return None, "unavailable"
     try:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        return None
-    return fh
+        return None, "held"
+    return fh, None
 
 
 def main():
@@ -660,8 +661,16 @@ def main():
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
-    hold = acquire_lock()
+    hold, lock_why = acquire_lock()
     if hold is None:
+        if lock_why == "unavailable":
+            # ⛔ NOT CONTENTION: the lock could not be created, so this run is inert for an
+            # environmental reason. Silent by default in production, which is why it is logged and
+            # returns non-zero instead.
+            _log(dict(event="lock-unavailable", ts=int(time.time())))
+            print("\u26d4 LOCK UNAVAILABLE -- the lock file could not be created, so the reaper "
+                  "did NOT run", file=sys.stderr)
+            return 3
         # Another run owns the observation state; observe nothing rather than double-count ticks.
         if args.json:
             print(json.dumps(dict(skipped="another run holds the lock")))
@@ -670,6 +679,19 @@ def main():
     a = ps_table()
     time.sleep(args.window)
     b = ps_table()
+    if not ps_readable(b):
+        # ⛔ AN UNREADABLE `ps` IS NOT AN EMPTY FLEET (#1696, review cycle 1). Persisting `{}` filters
+        # every candidate out of `alive` and so wipes EVERY frozen clock; a persistent failure is an
+        # ARMED reaper that never ripens while reporting success. Abstain loudly, write NOTHING.
+        _log(dict(event="ps-unreadable", ts=int(time.time()), observed=len(b)))
+        report = dict(observed=len(b), frozen=0, ripe=0, watching=[], refused=[], reaped=[],
+                      ps_readable=False, ts=int(time.time()))
+        if args.json:
+            print(json.dumps(report, indent=1))
+        elif not args.quiet:
+            print("\u26d4 ps UNREADABLE -- refusing to judge, and refusing to overwrite the "
+                  "observation state")
+        return 3
     cands = frozen_subtrees(a, b)
 
     try:
@@ -697,6 +719,7 @@ def main():
     state_error = None
     try:
         write_state(STATE, alive)
+        report["state_write"] = "ok"
     except Exception as e:
         # ⛔ NOT SWALLOWED (#1696). A failed state write means the frozen clock did NOT advance;
         # the previous observation stands on disk (the write is atomic), so nothing restarts --
