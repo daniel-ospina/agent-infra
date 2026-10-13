@@ -26,7 +26,7 @@ need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
 # is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
-printf '#!/bin/bash\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
+printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -887,7 +887,7 @@ rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
     REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
-case "$serr" in *'will NOT receive it'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
+case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # ... and the OTHER branch: an empty keys.env with NO ambient key must also reach start's stderr
 # (filtering on just the two easy-to-grep verdicts left this one silent).
@@ -910,8 +910,11 @@ printf 'AI_REVIEW_GATE_KEY="   "\n' > "$KC/home/keys-ws-value.env"
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys-ws-value.env" '' )"
 case "$out" in
   *'merge authority key present'*) rc=1; echo "      out: $(printf '%s' "$out" | tail -2)" ;;
-  *'WHITESPACE-ONLY'*) rc=0 ;;
-  *) rc=1; echo "      no whitespace verdict: $(printf '%s' "$out" | tail -2)" ;;
+  # The verdict must name the path the check ACTUALLY reads: the message is the operator's only
+  # instruction, and on a real cell $HOME is not $CELL_HOME, so "~/.pi/..." would send them to a home
+  # the session never reads.
+  *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;;
+  *) rc=1; echo "      no whitespace verdict naming the path: $(printf '%s' "$out" | tail -2)" ;;
 esac
 ck "a WHITESPACE-ONLY key in keys.env is not reported present, and is named" $rc
 # …and it SHADOWS a valid key file (the consumer's fallback is on the raw value), so a real file
@@ -927,7 +930,7 @@ rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
     REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
-case "$serr3" in *'WHITESPACE-ONLY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
+case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
 # keys.env may set HOME, and the session forces HOME back to $CELL_HOME afterwards — so the key
 # verdict must read $CELL_HOME, the home the session will actually use. A keys.env HOME= that
@@ -963,6 +966,21 @@ case "$out" in
   *) rc=1; echo "      no whitespace verdict: $(printf '%s' "$out" | tail -2)" ;;
 esac
 ck "a NEWLINE-ONLY key in keys.env is judged whitespace-only, not present via the file" $rc
+# The gh-credential lookup is HOME-dependent (`gh` reads $HOME/.config/gh), and keys.env may carry
+# a HOME= line — so the preflight must ask that question under the SAME home the session will use
+# ($CELL_HOME, forced by the session command). Sourcing keys.env last left cmd_check validating a
+# home the session never uses: credentials there made it say "ok: gh auth" and the cell started,
+# after which every gh call in the session failed.
+printf 'HOME=%s\n' "$KH" > "$KC/home/keys-home2.env"
+GH_HOME_RECORD="$TMP/gh-home.txt"; rm -f "$GH_HOME_RECORD"; export GH_HOME_RECORD
+kc_check "$KC/home/keys-home2.env" '' >/dev/null 2>&1 || true
+unset GH_HOME_RECORD
+if [ -s "$TMP/gh-home.txt" ]; then
+  [ "$(cat "$TMP/gh-home.txt")" = "$KC/home" ] && rc=0 || { rc=1; echo "      gh saw HOME=$(cat "$TMP/gh-home.txt"), cell home is $KC/home"; }
+else
+  rc=1; echo "      gh was never invoked with a recorded HOME"
+fi
+ck "cmd_check runs gh under \$CELL_HOME, not a keys.env HOME=" $rc
 
 # ── 17) the daemon PATH never contains a shim / ~/.pi directory ──────────────────
 # macOS TCC blocks LAUNCHD from reading ~/Documents, so ~/.pi/agent/shims/gh (a symlink into

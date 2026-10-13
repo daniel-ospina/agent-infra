@@ -79,6 +79,12 @@ keyfile_has_key() {
 # from a stale $O makes `stop` release and announce the wrong path.
 export HOME="$CELL_HOME"
 [ -f "$ENV_FILE" ] && { set -a; . "$ENV_FILE"; set +a; }
+# ⛔ Re-assert HOME AFTER the source: keys.env may carry a HOME= line, and everything BELOW here —
+# the gh-credential lookup in cmd_check (gh reads $HOME/.config/gh), and the session itself, which
+# forces HOME=$CELL_HOME — must run under the cell's home. Sourcing first left cmd_check validating
+# a home the session never uses: with credentials in the repointed home the preflight said "ok:
+# gh auth" and the cell started, and then every gh call in the session failed.
+export HOME="$CELL_HOME"
 LOCK="$O/.orch.lock"
 # Does the ENV FILE itself carry a NON-EMPTY merge key? cmd_check must judge what the SESSION will
 # see, not what this shell holds: the session re-sources $ENV_FILE (so a keys.env key reaches it)
@@ -198,7 +204,9 @@ cmd_start() {
   if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
   # All FOUR verdicts, including "no AI_REVIEW_GATE_KEY and no key file": filtering on the two that
   # happen to be easy to grep would leave the empty-keys.env case silent again.
-  printf '%s\n' "$chk" | grep -Ei 'merge authority|AI_REVIEW_GATE_KEY|will NOT receive it' >&2 || true
+  # The path cue keeps each verdict's SECOND line — the instruction naming the path the session
+  # actually reads — so the operator is not shown a diagnosis with the remedy filtered out.
+  printf '%s\n' "$chk" | grep -Ei 'merge authority|AI_REVIEW_GATE_KEY|will NOT receive it|\.ai-review-gate-key' >&2 || true
   # The harness's own single-instance lock is per-cell ($O/.orch.lock), so this tmux guard
   # is what stops two controllers on THIS cell; cross-cell duplication is a separate
   # problem (#5052) and is NOT solved here.

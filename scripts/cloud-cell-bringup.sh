@@ -88,6 +88,11 @@ check_provider() {
   if [ -f "$ENV_FILE" ]; then
     set -a; . "$ENV_FILE"; set +a
     ok "sourced $ENV_FILE"
+    # ⛔ keys.env may carry a HOME= line, and every check below (check_gh reads $HOME/.config/gh,
+    # check_repo resolves paths) must run under the same home the cell will use — the session
+    # forces HOME=$CELL_HOME after its own source. Without this, a repointed home could make the
+    # bring-up report "CELL READY" for a home the cell never uses.
+    export HOME="$CELL_HOME"
   else
     warn "no $ENV_FILE — push one with: cmux vm push --secret <m> <local> $ENV_FILE --mode 600"
   fi
