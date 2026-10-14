@@ -2505,6 +2505,18 @@ test("E279f: diagnostics — latch in all alive summaries + effective-bound head
     src.includes("(decision.firstMessageMs ?? hbThresholds.firstMessageMs)"),
     "first-message headline prints the EFFECTIVE (latched) bound, not the base (905s display bug)",
   );
+  // #5389: the decision-time CPU sample must be READABLE beside the live one.
+  // The `tool-silence`/`tool-dead` headline prints `decision.toolCpuStallMs`,
+  // and it ships in the SAME message as one of these summaries — so if the summary
+  // shows only the live `toolCpuStallMs`, a `tool_start`/`tool_end`/`turn_end`
+  // marker ingested while the kill path awaits its network probe resets the live
+  // pair to 0/false and the message contradicts its own headline. `.some()`, not a
+  // loop: only the heartbeat-kill site pairs with a decision, and a 5th site must
+  // not be forced to carry a field it has no decision to read.
+  ok(
+    aliveTemplates.some((s) => s.includes("decToolCpuStallMs=")),
+    "the heartbeat-kill alive summary carries the DECISION-TIME CPU sample, not only the live one",
+  );
 });
 
 section("#282 first-message-stall triage — tick/marker history instrumentation (E282 series)");

@@ -287,7 +287,7 @@ Compares Pro ($29/$49/$79) and Team ($99 flat / $199 flat / $99+$20-per-seat) pr
 Compares 3 license options (AGPLv3-dual, BSL+AGPL, SSPL) using 7 criteria and 20+ findings. Full pattern: criteria → options → findings → edges → compute_confidence → ranked output. Run as:
 
 ```bash
-TORTOISE_DB_URI=docker://:@localhost:16379/tortoise python3 graph-scripts/decide_licensing.py
+TORTOISE_DB_URI=docker://:@127.0.0.1:16379/tortoise python3 graph-scripts/decide_licensing.py
 ```
 
 ### `graph-scripts/decide.py`
@@ -464,11 +464,24 @@ sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 
 | Source | URI resolution | Behavior when unset |
 |--------|----------------|---------------------|
-| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@localhost:16379/tortoise`; a repo-root `.env` only fills keys `.mcp.json` does **not** set (useful for SDK scripts / direct launches — `.mcp.json` env always wins for the MCP server) | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
+| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@127.0.0.1:16379/tortoise`; a repo-root `.env` only fills keys `.mcp.json` does **not** set (useful for SDK scripts / direct launches — `.mcp.json` env always wins for the MCP server) | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
 | **SDK / graph-scripts** | `os.environ["TORTOISE_DB_URI"]` (or `FalkorProjection.from_uri`) | Embedded redislite (dev/test only) |
 | **Hosted API** | `FALKORDB_CLOUD_URI` secret → `TORTOISE_DB_URI` via entrypoint | Refuses to start without it |
 
 Supported URI schemes: `docker://` (local), `redis://` / `rediss://` (accepted so the hosted API can consume cloud connection strings).
+
+> ❗ **Use `127.0.0.1`, never `localhost`, for the local port `16379`.** `localhost` is **not** a
+> synonym for `127.0.0.1` here, because it resolves **IPv6-first** (`::1` before `127.0.0.1` on
+> macOS). If a second FalkorDB is ever bound on `::1:16379` — an ephemeral dev container,
+> another OrbStack service, a re-created sandbox — then `localhost:16379` reaches **that**
+> near-empty instance instead of the canonical one, and the failure is silent: writes **report
+> success** and the node is then "gone", because it landed on the other server. The canonical
+> local instance is **`127.0.0.1:16379`**. Bind to the address, never to the name.
+>
+> A connectivity check cannot tell the two apart — a bare connect succeeds against **either**
+> server. Verify by **reading back a point that must exist** (the objective cascade), never by
+> connecting. A connectivity test is not a persistence test, and a successful write is not a
+> durable one. (Root cause and measurement: tortoise#6666.)
 
 ## Always Verify First
 
@@ -494,11 +507,11 @@ Agent: "The graph has no licensing data. I'll create evidence from scratch."
        (files 20+ duplicate points on the wrong graph)
 ```
 
-**Fix:** point local tooling at the local FalkorDB. The default in `.mcp.json` is `docker://:@localhost:16379/tortoise` (the designated local container); override in the repo-root `.env` (gitignored — never commit credentials) if your local target differs.
+**Fix:** point local tooling at the local FalkorDB. The default in `.mcp.json` is `docker://:@127.0.0.1:16379/tortoise` (the designated local container, addressed by IP — see the `127.0.0.1` note above); override in the repo-root `.env` (gitignored — never commit credentials) if your local target differs.
 
 ```bash
 # .env (repo root, gitignored) — LOCAL target only
-TORTOISE_DB_URI=docker://:@localhost:16379/tortoise
+TORTOISE_DB_URI=docker://:@127.0.0.1:16379/tortoise
 ```
 
 Restart the MCP server after changing the URI — the connection is resolved once at startup. Do **not** point local tooling at the hosted (cloud) instance.
