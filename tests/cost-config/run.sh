@@ -1677,6 +1677,48 @@ code=$?
 if [ "$code" -eq 2 ]; then pass "an out-of-range watcher floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an out-of-range floor, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the guard's execution read refuses the out-of-range floor"; else fail "expected the guard's unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (i) the band's THIRD constant, REGIME_TB_DRIFT_FLOOR, must carry the SAME validation as the
+# floor/ceiling pair. It was left unvalidated by #1342's first pass: it is interpolated into the
+# triage as `int()`, so a non-integer makes the heredoc raise (rc=1 — this instrument's documented
+# "TRIGGERED (rollback procedure printed)" code, so a typo reaches the weekly driver as a rollback
+# trigger with no procedure printed) while `--print-regime-floor` short-circuits and still certifies
+# a floor. Pre-fix the print path answers 283616 rc=0, so the arm is red pre-fix.
+sed -i.bak 's/^REGIME_TB_DRIFT_FLOOR=900000$/REGIME_TB_DRIFT_FLOOR=abc/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_DRIFT_FLOOR=abc$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (i): the non-integer drift-floor mutation took effect"; else fail "37 fixture (i): the drift-floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor with an unvalidated non-integer drift floor"; else pass "watch-truncation --print-regime-floor refuses a non-integer drift floor"; fi
+if grep -q "drift floor must be a plain integer" "$OUT"; then pass "the non-integer drift-floor refusal is explicit"; else fail "expected an explicit drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a non-integer drift floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on a non-integer drift floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the guard's execution read refuses a non-integer drift floor"; else fail "expected the guard's unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (j) an out-of-range DRIFT_FLOOR gets the same representable-range refusal as the pair above.
+sed -i.bak 's/^REGIME_TB_DRIFT_FLOOR=900000$/REGIME_TB_DRIFT_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_DRIFT_FLOOR=99999999999999999999999999$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (j): the out-of-range drift-floor mutation took effect"; else fail "37 fixture (j): the drift-floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed an out-of-range drift floor"; else pass "watch-truncation --print-regime-floor refuses an out-of-range drift floor"; fi
+if grep -q "drift floor is outside the representable integer range" "$OUT"; then pass "the out-of-range drift-floor refusal is explicit"; else fail "expected an explicit out-of-range drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (k) a drift floor STRADDLED by the current bucket (floor < drift < ceiling) is incoherent: the
+# triage tests the current bucket first, so records at/above the 1M-drift floor would be attributed
+# to the CURRENT clamp regime. A plain `ceiling < drift` ordering rule is deliberately NOT used —
+# the documented 1M revert is legitimately `ceiling >= drift` (test 40: floor 983616, drift 900000)
+# and such a rule would false-block it. Pre-fix the print path answers 283616 rc=0, so the arm is
+# red pre-fix.
+sed -i.bak 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=950000/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_ERA_CEIL=950000$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k): the straddling-ceiling mutation took effect"; else fail "37 fixture (k): the ceiling mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor for a band that straddles the drift floor"; else pass "watch-truncation --print-regime-floor refuses a band that straddles the drift floor"; fi
+if grep -q "straddles the 1M-drift floor" "$OUT"; then pass "the straddled-drift-floor refusal is explicit"; else fail "expected an explicit straddled-drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a straddled drift floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on a straddled drift floor, got $code"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# …and the documented 1M revert (ceiling >= drift) is NOT straddled, so the new rule does not
+# false-block it: floor 983616 > drift 900000 is outside the `floor < drift < ceiling` shape.
+cp "$TMP37/scripts/watch-truncation.sh" "$TMP37/scripts/watch-truncation.sh.orig"
+sed -i 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
+sed -i 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=1000000/' "$TMP37/scripts/watch-truncation.sh"
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then pass "the documented 1M revert band (floor 983616 > drift 900000) is not refused as straddling"; else fail "the straddle rule false-blocked the documented 1M revert band"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.orig" "$TMP37/scripts/watch-truncation.sh"
 rm -rf "$TMP37"
 
 echo ""

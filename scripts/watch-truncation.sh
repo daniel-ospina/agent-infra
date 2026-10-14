@@ -153,8 +153,35 @@ case "$REGIME_TB_ERA_CEIL" in
     ''|*[!0-9]*) echo "ERROR: the clamp-regime band ceiling must be a plain integer (got '$REGIME_TB_ERA_CEIL')" >&2; exit 2 ;;
     ????????????????*) echo "ERROR: the clamp-regime band ceiling is outside the representable integer range (got '$REGIME_TB_ERA_CEIL') — bash cannot compare it, so the inverted-band refusal would be silently disarmed" >&2; exit 2 ;;
 esac
+# DRIFT_FLOOR is the band's THIRD constant and was left unvalidated by #1342's
+# first pass: it is interpolated into the triage as `int()` and bounds the
+# legacy bucket above, so a non-integer makes the heredoc raise — rc=1, which is
+# this instrument's documented "TRIGGERED (rollback procedure printed)" code, so
+# a typo would be reported to the weekly driver as a rollback trigger with no
+# procedure printed — and an out-of-int64 literal disarms the comparisons below
+# for the same reason the bound is required on the pair above. Validate it with
+# the others, before ANY use (the print path short-circuits the triage, so
+# validating only at the heredoc would leave `--print-regime-floor` certifying a
+# floor for a band this instrument cannot actually run).
+case "$REGIME_TB_DRIFT_FLOOR" in
+    ''|*[!0-9]*) echo "ERROR: the clamp-regime drift floor must be a plain integer (got '$REGIME_TB_DRIFT_FLOOR')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime drift floor is outside the representable integer range (got '$REGIME_TB_DRIFT_FLOOR') — bash cannot compare it, so the band coherence refusal would be silently disarmed" >&2; exit 2 ;;
+esac
 if [ "$REGIME_TB_FLOOR" -ge "$REGIME_TB_ERA_CEIL" ]; then
     echo "ERROR: the clamp-regime band is empty or inverted (floor $REGIME_TB_FLOOR >= ceiling $REGIME_TB_ERA_CEIL) — the triage cannot band a record into the current regime" >&2
+    exit 2
+fi
+# A drift floor STRADDLED by the current bucket (floor < drift < ceiling) is
+# incoherent, and it is NOT the `ceiling >= drift` shape a plain ordering rule
+# would reject: the triage tests the current bucket FIRST, so every record at or
+# above the 1M-drift floor but below the ceiling is attributed to the CURRENT
+# clamp regime — 1M-era records counted as this clamp's overruns, exactly the
+# mis-triage this gate exists to prevent. (The documented 1M revert is
+# legitimately `ceiling >= drift` — floor 983616 > drift 900000 — so rejecting
+# `ceiling >= drift` would false-block the pre-committed rollback; the hazard is
+# the drift floor being straddled, not the legacy bucket being empty.)
+if [ "$REGIME_TB_FLOOR" -lt "$REGIME_TB_DRIFT_FLOOR" ] && [ "$REGIME_TB_DRIFT_FLOOR" -lt "$REGIME_TB_ERA_CEIL" ]; then
+    echo "ERROR: the clamp-regime band straddles the 1M-drift floor (floor $REGIME_TB_FLOOR < drift $REGIME_TB_DRIFT_FLOOR < ceiling $REGIME_TB_ERA_CEIL) — records at/above the drift floor would be attributed to the current clamp regime" >&2
     exit 2
 fi
 

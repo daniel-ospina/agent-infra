@@ -331,8 +331,12 @@ property; this guard is the pattern to copy, not a substitute for it.
     false-BLOCK.) The watcher's owner-facing bucket LABEL is not an anchor — a
     correct relabel no longer blocks the pre-committed rollback. The watcher OWNS
     its band and refuses to print a floor when the band is empty or inverted
-    (`floor >= ceiling`, or a literal outside the representable range), which
-    would certify a floor no record can reach. The **same exit-2 class** covers a
+    (`floor >= ceiling`), when a band constant is not a plain integer or is
+    outside the representable range, or when the 1M-drift floor lies strictly
+    inside the current bucket (`floor < drift < ceiling`, which would attribute
+    records at/above the drift floor to the current clamp regime) — any of which
+    would certify a floor no record can reach or mis-triage the records it can.
+    The **same exit-2 class** covers a
     `models.json` in which no deepseek-served entry is recognised — a geometry
     anchor with nothing to assert must not read green. This class is **not**
     covered by `COST_CLAMP_OVERRIDE=1`.
