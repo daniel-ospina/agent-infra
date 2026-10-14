@@ -5183,6 +5183,88 @@ async function main() {
       "1660: the diagnosis must log BOTH roots (recorded + this op)");
   });
 
+  // ── #1660 Finding 1: a STALE recorded set must not shadow a NEWLY staged file
+  // in that same root (the union scope) ──
+  // The per-root registry can itself go stale: root A blocks on f.ts and records
+  // {f.ts}; a LATER block in root B moves the single-slot stash; the agent then
+  // stages a brand-new file g.ts in root A and dispatches the documented remedy
+  // prompt for g.ts. Scoping ONLY against A's recorded set drops g.ts
+  // (zero-merge) and the op re-blocks although the verifier just PASSed the file
+  // that is staged. The merge scope must be the UNION of the recorded set and
+  // the root's CURRENT staged diff. Pre-fix (recorded-set-only) this test is RED.
+  function setupTwoRootsWithStaleRecordedSet(hubName: string) {
+    const hub = join(TEST_ROOT, hubName);
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base.txt"), "b\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m base");
+    const wtA = join(hub, ".worktrees", "wt-a");
+    const wtB = join(hub, ".worktrees", "wt-b");
+    git(hub, `worktree add ${wtA} -b feat-a`);
+    git(hub, `worktree add ${wtB} -b feat-b`);
+    for (const [wt, name, content] of [[wtA, "f.ts", "f\n"], [wtB, "h.ts", "h\n"]] as const) {
+      mkdirSync(join(wt, "src"), { recursive: true });
+      writeFileSync(join(wt, "src", name), content);
+      git(wt, `add src/${name}`);
+    }
+    const opA = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtA} && git commit -m a`, cwd: wtA } };
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtB} && git commit -m b`, cwd: wtB } };
+    return { wtA, wtB, opA, opB };
+  }
+
+  // Block root A (records {src/f.ts}), then block root B — which moves the
+  // single-slot stash off root A and leaves A's recorded set stale. In root A,
+  // unstage the old file and stage a BRAND-NEW one, so the retried op's diff is
+  // src/g.ts only.
+  async function staleRecordedSetSetup(hubName: string, newFile: string, newContent: string) {
+    const { wtA, opA, opB } = setupTwoRootsWithStaleRecordedSet(hubName);
+    await fire("session_start", {});
+    const blockA = await fire("tool_call", opA);
+    ok(blockA && blockA.block === true, "1660b/c: root A must block first (src/f.ts unverified)");
+    const blockB = await fire("tool_call", opB);
+    ok(blockB && blockB.block === true, "1660b/c: root B must block too (moves the single slot away from A)");
+    git(wtA, "reset -q");
+    mkdirSync(join(wtA, "src"), { recursive: true });
+    writeFileSync(join(wtA, "src", newFile), newContent);
+    git(wtA, `add src/${newFile}`);
+    return { wtA, opA };
+  }
+
+  test("scenario 1660b: a newly staged file in root A still merges after A's recorded set went stale (union scope, plain-text PASS)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660b-hub", "g.ts", "g\n");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660b: the PASS for the newly staged file must be honored — pre-fix A's stale recorded set shadowed src/g.ts, zero-merged, and the retry re-blocked (convergence regression)");
+  });
+
+  test("scenario 1660c: a newly staged file in root A still merges after A's recorded set went stale (union scope, JSON verified_files PASS)", async () => {
+    const content = "g2\n";
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660c-hub", "g2.ts", content);
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g2.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          status: "PASS",
+          failures: [],
+          verified_files: [{ path: join(realpathSync(wtA), "src", "g2.ts"), hash: sha(content) }],
+        }),
+      }],
+    });
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660c: the JSON PASS for the newly staged file must be honored — pre-fix `scopeFiles`/`mergeVerifiedFiles` scoped against A's stale recorded set only, skipped src/g2.ts, and the retry re-blocked");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
