@@ -4505,7 +4505,6 @@ export default function (pi: ExtensionAPI) {
         // #1660/#190: scope against the root's recorded set UNION its current
         // staged diff — a stale recorded set must not shadow a newly staged file.
         const mergeScope = mergeScopeFor(projectRoot, blockFiles);
-        const blockedSnapshot = [...blockFiles];
 
         // Extract file list from the prompt. #190: broadened regex accepts
         // `\n\nClassification:` and no-period separators (incident dispatch #1).
@@ -4513,12 +4512,17 @@ export default function (pi: ExtensionAPI) {
         const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
         const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
         // Expand directory paths: if a path ends with / or doesn't contain a dot,
-        // treat it as a directory and include all staged files under that directory.
+        // treat it as a directory and include all files under that directory.
+        // #1660: expand against the UNION scope (this root's recorded set ∪ its
+        // current staged diff) — expanding against the stale recorded set alone
+        // silently drops a newly staged file under the named directory, so the
+        // PASS records only the stale entry and the retry re-blocks (the same
+        // non-convergence class mergeScopeFor exists to fix).
         const promptFiles = new Set<string>();
         for (const f of rawFiles) {
           const isDir = f.endsWith('/') || !f.includes('.');
-          if (isDir && blockedSnapshot.length > 0) {
-            for (const blocked of blockedSnapshot) {
+          if (isDir && mergeScope.length > 0) {
+            for (const blocked of mergeScope) {
               if (blocked.startsWith(f)) promptFiles.add(blocked);
             }
           } else {
@@ -4605,8 +4609,10 @@ export default function (pi: ExtensionAPI) {
       const promptFiles = new Set<string>();
       for (const f of rawFiles) {
         const isDir = f.endsWith('/') || !f.includes('.');
-        if (isDir && blockFiles.length > 0) {
-          for (const blocked of blockFiles) {
+        // #1660: union scope here too — a stale recorded set must not drop a
+        // newly staged file under the named directory (see the plain-text site).
+        if (isDir && mergeScope.length > 0) {
+          for (const blocked of mergeScope) {
             if (blocked.startsWith(f)) promptFiles.add(blocked);
           }
         } else {

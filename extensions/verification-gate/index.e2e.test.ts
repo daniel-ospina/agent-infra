@@ -5310,6 +5310,49 @@ async function main() {
       "1660e: the retry on root A must be ALLOWED — pre-fix the #336 fallback recorded A's stale set and the retry blocked on src/g4.ts");
   });
 
+  // #1660 directory-expansion sites: a `verify files:` DIRECTORY (no dot, no
+  // trailing slash) is expanded against the block context. If that expansion
+  // iterates the stale RECORDED set instead of the UNION scope, a newly staged
+  // file under the named directory is dropped from promptFiles — the PASS
+  // records only the stale entry and the retry re-blocks on the file the agent
+  // explicitly named. These two scenarios are RED at the pre-fix head and pin
+  // the expansion against the union at both sites (plain-text + fail-open).
+  test("scenario 1660f: a DIRECTORY-form 'verify files:' prompt must expand against the union scope (plain-text PASS)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660f-hub", "g5.ts", "g5\n");
+    // The agent names the DIRECTORY that contains the newly staged file, exactly
+    // as the printed remedy allows. Expanding against the stale recorded set
+    // yields only src/f.ts (stale, unstaged) and drops src/g5.ts.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g5.ts")) || bridge.includes("::src/g5.ts"),
+      "1660f: the directory expansion must record the newly staged src/g5.ts (pre-fix: expansion iterated the stale recorded set, dropping it)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660f: the retry on root A must be ALLOWED — pre-fix the directory expansion dropped src/g5.ts and the retry blocked on it");
+  });
+
+  test("scenario 1660g: a DIRECTORY-form 'verify files:' prompt must expand against the union scope (fail-open path)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660g-hub", "g6.ts", "g6\n");
+    // Same directory form, but the verifier response is unparseable so the
+    // #5724 fail-open prompt-merge path runs (interactive mode — the harness
+    // clears the sub-agent markers). That path has its OWN isDir loop.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "Verification report unavailable — no structured verdict emitted.\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g6.ts")) || bridge.includes("::src/g6.ts"),
+      "1660g: the fail-open directory expansion must record the newly staged src/g6.ts (pre-fix: expansion iterated the stale recorded set, dropping it)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660g: the retry on root A must be ALLOWED — pre-fix the fail-open directory expansion dropped src/g6.ts and the retry blocked on it");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()
