@@ -37,22 +37,31 @@ doc_status: draft
 > tortoise PR that opens only after this one merges — tracked by tortoise#8432 (the relocation
 > issue); until that PR lands the old path is a stale duplicate, so do not run it.
 >
-> ⛔ **Every post-copy change has been PORTED, and the sync point is pinned
-> (agent-infra#1712).** This directory began as a point-in-time copy taken at 2026-10-13 05:50
-> local (= 10:50Z) — tortoise `main` at `0e060082f`, whose newest commit touching
-> `operations/orchestrator-harness/` was `eda7df136`. The source moved **seven** times afterwards;
-> all seven are here:
+> ⛔ **Every post-copy change through tortoise `ef59f6d6f` has been PORTED here (agent-infra#1712),
+> and that port is the precondition for removing the tortoise copy.** This directory is a
+> point-in-time copy taken at 2026-10-13 05:50 local (= 10:50Z) from tortoise `0e060082f`. **Eight**
+> tortoise commits touching this directory merged between `0e060082f` and `ef59f6d6f`
+> (2026-10-13T15:48:33 local) — the declared port point — and all eight are present here:
 >
 > | commit | tortoise | what it carries |
 > |---|---|---|
-> | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected, `res_line()` — six of these files |
+> | `8fe1e7b13` | #8437 | core-derived load ceiling, `MIN_MEM_FREE_MB`, the dead `REPO` default corrected — `orch-loop.sh`, `install.sh`, `refresh-candidates.sh`, `launchd.plist.template`, `README.md`, `selftest.sh` |
 > | `a59858d07` | #8465/#8467 | dispatch pool ordered by **severity**, not issue number — `refresh-candidates.sh` + `selftest.sh` |
 > | `ff6d1bc19` | #8471 | the follow-up that makes #8465's self-tests discriminate — `refresh-candidates.sh` + `selftest.sh` |
-> | `77a0c32bd` | agent-infra#1716 | `checked.txt` recorded only on a **terminal** pre-flight verdict |
-> | `b559cb02a` | agent-infra#1715 | INT/TERM actually stop the loop before the lock is released |
-> | `45dd16cc8` | agent-infra#1705 | a failed PR listing is not an empty one |
-> | `26f6c9488` | agent-infra#1702 | portable load/swap/memory/mtime probes so a Linux cell completes a cycle |
+> | `77a0c32bd` | #8515 | `checked.txt` written only on the terminal CLEAN verdict (agent-infra#1716) — `refresh-candidates.sh`, `selftest.sh`, `README.md` |
+> | `b559cb02a` | #8516 | INT/TERM `exit` rather than returning from the trap, so the lock and the process end together (agent-infra#1715) — `orch-loop.sh` + `merge-one.sh` + `selftest.sh` |
+> | `45dd16cc8` | #8519 | a FAILED PR listing is not an EMPTY one; the reaper fails closed (agent-infra#1705) — `refresh-candidates.sh`, `selftest.sh`, `README.md` |
+> | `26f6c9488` | #8514 | portable load/swap/mtime/memory probes and `nproc` core count, so the Linux cell controller runs (agent-infra#1702) — `orch-loop.sh`, `install.sh`, `selftest.sh`, `README.md` |
+> | `ef59f6d6f` | #8518 | required checks classified by **allow-list polarity**, not a deny-list, so an unrecognised or null conclusion is red rather than reading `PENDING` (agent-infra#1714) — `orch-loop.sh`, `fix-one.sh`, `selftest.sh`, `README.md` |
 >
+> ⚠️ **A COUNT is the wrong anchor; the SHA is.** Three different counts were each correct at a
+> different moment while this port was being written: `26f6c9488` and `ef59f6d6f` both landed
+> *between* a fetch of `origin/main` and the commit built on that fetch, so even a freshly-read ref
+> was stale by the time it was used. The instruction for any future copy is therefore: **re-fetch,
+> diff the tortoise tree against this one at that moment, port everything not present, and record
+> the SHA you ported to here.** The removal PR must re-run that diff against the then-current
+> tortoise tip: a port is only complete *relative to a declared sha*, and removing the tortoise copy
+> while any delta remains deletes the only tree carrying that fix.
 > The last of them merged at 15:16 local **while this port was being written**, which is the point:
 > a hand-kept list only catches what its author already knew. Two guards exist instead of a list.
 >
@@ -71,6 +80,24 @@ doc_status: draft
 > review, and porting it would create a second home for work that has not landed. The live box is
 > already running an earlier revision of it. Either that branch merges first, or the removal PR
 > must port it; removing the directory while it is open orphans it.
+>
+> ⚠️ **This port is faithful EXCEPT for a declared set of fail-open / false-PASS fixes.** These are
+> agent-infra's, not tortoise's — a later diff between the two trees WILL show them, and they must not
+> be read as lost work in either direction:
+>
+> | divergence | why it is here |
+> |---|---|
+> | `orch-loop.sh` guards **every** limit with `is_limit` (digits **and** at most nine of them) before its first arithmetic read — `MAX_LANES`, `MAX_REVIEW`, `MERGE_PRIORITY_AT`, `MAX_FIX`, `MAX_FIX_TRIES`, `BATCH`, `CYC`, `STALE_MIN` (and `MAX_LOAD`/`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB`, which had `is_num`: the first two are plist-supplied gates that `[` would ERR on at or above 2**63, the last is plist-supplied too, so all three moved to `is_limit`) | two failure modes, both fail-**OPEN**: `[ -ge ]` on a non-number is FALSE and FALSE in the gate chain ALLOWS, so `MAX_LANES=4x` dropped the lane cap, `MERGE_PRIORITY_AT=notanum` removed the drain-before-dispatch gate, `BATCH=abc` dispatched the whole backlog in one cycle, and `MAX_FIX_TRIES=abc` let fixer attempt 10 run past a cap of 3. `[` also ERRORS at or above 2**63, so an absurd-but-numeric limit opened them the same way. `is_num` itself is deliberately left unbounded: it also validates an **epoch mtime**, which is already 10 digits, and `_NCPU`, whose source is `nproc` on this host rather than the plist |
+> | `orch-loop.sh` reads base 10 where it read base 8 | `$((MAX_REVIEW + 2))` read `030` as **octal** (26, not 30) and `$((STALE_MIN * 60))` did the same. `MERGE_PRIORITY_AT` already normalised with `10#` |
+> | `install.sh` refuses a non-integer, an out-of-range value, or a value carrying a `__TOKEN__` | `MAX_LANES=4x` was written into the live launchd plist and `install.sh` exited 0, so the plist lied about the ceiling; and the sed rules run in order, so `OR=__MAX_LANES__` rendered as `4` — exit 0, valid XML, and the daemon then ran `gh --repo 4` |
+> | `install.sh` renders to a temp file and `mv`s it into place, and asserts no `__…__` survived | the redirect truncates `$PLIST` **before** `sed` runs, so rejecting after writing straight to it left the live plist empty or poisoned — and §9's next step (`launchctl unload && load`) then failed, so a rejected re-install destroyed a working daemon config. `plutil -lint` cannot see a substitution that did not take |
+> | `install.sh` creates the plist's directory (`mkdir -p "$(dirname "$PLIST")"`) | an agent-infra addition, not a lost tortoise line: a sandboxed or first-time `HOME` has no `Library/LaunchAgents` and the redirect then died |
+> | `selftest.sh` pins the documented default of every host-independent limit, drives the swap gate with real swap (`SWTOTAL` != 0) **and** a non-default ceiling, drives `install.sh` instead of grepping it, and extracts the coercion lines to RUN them | the default-agreement check could not see both files drifting **together**; `SWTOTAL=0` short-circuits the swap gate before the comparison; a source-text pin survives the guard being disabled (`if false && grep …`); and a fixture that re-implements the pattern in the test asserts nothing about the shipped code |
+>
+> The upstream-logic defects found in the same review are **not** diverged here; they are tracked
+> instead — `fix-one.sh`'s spaced-check-name word-splitting (agent-infra#1703), `can_spawn()`'s
+> load-only gate (agent-infra#1732) and the classifier's inert `(app, name)` grouping
+> (agent-infra#1733) are all still present, matching tortoise.
 >
 > **Status: evaluation artifact.** Nothing here installs or runs on its own. `install.sh`
 > renders a launchd plist and *prints* the load command; it does not execute it.
@@ -267,11 +294,27 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `FIX_TIMEOUT` | `2400` | wall-clock limit on a fixer `pi` run (s) |
 
 ⛔ **`STALE_MIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries 15 placeholders — the nine limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+carries 16 placeholders — the ten limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these four and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
+
+⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
+The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
+number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
+nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
+configures), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
+therefore rendered as `4` and still exited 0. It then renders to a **temp file**, lints that, asserts
+no placeholder survived, and only then moves it into place — the redirect truncates its target before
+`sed` runs, so rejecting after writing straight to `$PLIST` left the live plist empty and the next
+`launchctl unload && load` failed. The loop coerces the same values on its own, so a bad plist is
+refused at both ends, and every limit is coerced *before* its first arithmetic read, because `[ -ge ]`
+on a non-number is FALSE and a false test in the gate chain OPENS the gate.
+
+⚠️ **`0` is a valid integer and passes every guard above.** It is not a typo they can catch: for
+`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the gate can never bind (disabled), and `CYC=0` makes the
+cycle delay zero, so the controller spins. Set one of those only when that is what you mean.
 
 **The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
@@ -288,10 +331,11 @@ first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `
 these four spawn sites — the two cover different populations. Raising `MAX_LOAD` therefore narrows
 the band in which the spawn sites hold back (`16`–`99` is now permitted, where `16` used to hold).
 Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
-self-test extracts from the shipped file; left as a named follow-up rather than half-done here.
+self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
 
 **Swap, not lanes, is what actually throttles this box.** Observed at 15 concurrent workers:
-`swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on 8 GB;
+`swap_free=588M` → dispatch correctly refused. Raising `MAX_LANES` alone buys nothing on the box
+this was measured on (the original 8 GB host — the current one is 32 GB);
 it just moves the pressure into the compressor. `swap_total=0` right after boot is treated as
 *uninitialised*, not as pressure (that bug silently blocked all dispatch for the first minutes
 after a restart until it was fixed).
@@ -561,12 +605,31 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
 | **a PR branch name was interpolated into the `sh -c` string `tmux new-session` executes** | **arbitrary command execution on the unattended host that holds the merge key.** git permits `'` `;` `$` `` ` `` `&` `\|` `(` `)` `{` `}` `"` `<` `>` `#` in a ref name, so a fork PR on `fix/x';touch${IFS}/tmp/x;#` broke out of the quotes. Reproduced end-to-end before fixing | `safe_ref` allowlist + `check-ref-format`; numeric-only PR ids; and worker args now travel in a file (`--argv`) so no PR-derived value is interpolated at all |
+| **the check classifier was a deny-list** (`bad = FAILURE\|ERROR\|CANCELLED\|TIMED_OUT\|ACTION_REQUIRED`) | a conclusion in **neither** list — one GitHub has not documented, or a **null** one — read `PENDING`, and `PENDING` arms the merge (`gh pr merge --auto`): the merge decision failed **open**. At the same time `CANCELLED` was named *red*, so a normally-superseded run (`cancel-in-progress: true`) was routed to `fix-one.sh` or to `gh run rerun` — failing **closed** on a green PR. `fix-one.sh`'s failing-check list named `CANCELLED` too, so such a run burned a capped fixer attempt (agent-infra#1714) | the classifier is an **allow-list with polarity**, the rule `admin-merge.sh` and `record-review.sh` already implement: non-red only for a NAMED conclusion (`success`/`neutral`/`skipped`/`cancelled`/`stale`), in-flight only for a NAMED status, and **everything else RED** — so an unrecognised or null conclusion blocks instead of arming; grouping is per `(app, name)` (newest attempt by `id`) so one app cannot mask another's — ⚠️ but the only call site feeds it `gh pr checks --json name,state,workflow`, which carries neither `id` nor `app`, so the grouping is in force only for a surface that carries them (agent-infra#1733); and an **empty** surface is `NOCHECKS`, never `GREEN`. `fix-one.sh` uses the same allow-list (agent-infra#1714) |
 | the claim-file guard added in the first fix round introduced a permanent stall | the controller treated *the existence of* `mergeclaim-<PR>.lock` as "in flight", but only `merge-one.sh` removes it — a SIGKILLed worker or a reboot mid-merge left the PR skipped forever with no fixer and no re-record | `claim_live()` tests the recorded pid with `kill -0` and removes a dead owner's claim |
 | 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL |
 | **a hung worker held a concurrency slot for 9 hours** | `pi -p` has no timeout and the caps count **tmux sessions**, so a hung reviewer (or a runaway `find /` it spawned) permanently reduced merge throughput while the queue looked busy — three slots were dead weight overnight on 2026-10-12 | portable `run_agent()` wall-clock limit (bash `wait` + watchdog subshell, since macOS ships no `timeout`) plus a `reap_stale_workers()` sweep that kills any worker silent for `STALE_MIN` minutes |
 | **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours | those checks now route to `fix-one.sh` too, capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
 
 ### 7.5 Still open, deliberately not fixed here
+
+> **Six entries that were here are now FIXED by the #1712 port** and have been removed from
+> this list: the fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519),
+> `checked.txt` written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the
+> returning INT/TERM trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516),
+> the controller's macOS-only capacity probes (agent-infra#1702, tortoise#8514), the deny-list
+> check classifier in `orch-loop.sh` (agent-infra#1714, tortoise#8518), and this directory being
+> older than its source (agent-infra#1712 — see the provenance note at the top of this file).
+
+- **`can_spawn()` gates on load only, so the memory ceiling does not cover the four controller spawn
+  sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the four spawn
+  sites are bounded by load alone, so raising `MAX_LOAD` widens the band in which they proceed while
+  memory is already the binding gate. §4 states the gap; this is its tracker item.
+- **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
+  at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
+  no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a
+  name collapse into one bucket — the masking the grouping exists to prevent. §7.4's grouping claim
+  holds only for a surface that carries `id`/`app`.
 
 - **`state/` and `wip/` grow without bound.** There is no time- or size-based retention: nothing
   expires `merged-*.done`, `fixcount-*`, `parked-*` or stale `rerun-*`. (`mergeclaim-*.lock` and
@@ -578,10 +641,12 @@ These are kept as a record because each one is a *failure mode of the design*, n
   status, but the pattern is easy to reintroduce — a `exit 0` at the end of each script would pin it.
 - **Worktree reaping.** Every dispatch and every foreign-branch fixer adds a worktree; the box
   carried ~150 by the end of the run. Nothing removes them after their PR merges.
-- **Linux portability of the controller (agent-infra#1702).** `orch-loop.sh` uses `stat -f` (BSD),
-  `sysctl vm.loadavg` and `sysctl vm.swapusage`, which are macOS-only. On a Linux cell the reaper
-  aborts the controller on its first cycle once a worker log exists, and the load/swap gates never
-  bind — `cloud-cell-supervisor.sh` starts a cell that cannot complete a cycle.
+- **A persistently-colliding issue can consume the whole refresh window (agent-infra#1729).**
+  `refresh-candidates.sh` spends its pre-flight budget *before* it reads the verdict, and since
+  agent-infra#1716 a `COLLISION`/no-verdict pre-flight writes no `checked.txt` — so while the first
+  `LIMIT` pool entries keep colliding, the entries behind them are never pre-flighted and the
+  backlog silently stops refilling (the log still reports a normal `checked N; backlog now M`).
+  Faithful to upstream tortoise#8515, not a porting defect; bounded by `LIMIT` (6 from the loop).
 - **The fixer's CI-log fetch (agent-infra#1703).** `fix-one.sh` reads the workflow run's
   `--log-failed | tail -80` rather than the failed *job's* log, so a multi-failed-job run can feed
   the fixer the wrong check's output. Raised as a P1 in the tortoise#8298 review and never applied.
@@ -615,22 +680,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
-- **`orch-loop.sh` classifies checks by a deny-list (agent-infra#1714).** An unrecognised or null
-  conclusion is neither red nor explicitly pending in its list, so it reads `PENDING` and reaches
-  `gh pr merge --auto`; `cancelled` is treated as a failure and routed to a fixer. `record-review.sh`
-  and `admin-merge.sh` implement the opposite (allow-list) polarity, adopted after a merge went ahead
-  on a conclusion neither red nor pending.
-- **A returning INT/TERM trap does not stop the controller or a worker (agent-infra#1715).**
-  `trap 'rm -f "$LOCKF"' EXIT INT TERM` runs its handler and **resumes** — a non-interactive bash
-  terminates only on `EXIT`. So `pkill -f orch-loop.sh` (§6 step 2, and the stop block `install.sh`
-  prints) deletes `.orch.lock` while the loop keeps sweeping and merging, and the next start passes
-  `acq()`: the documented stop-then-start yields **two controllers on one queue**. Same pattern at
-  `merge-one.sh:60`, where the per-PR claim is released while the merge worker runs on.
-- **`refresh-candidates.sh` records `checked.txt` before the pre-flight verdict (agent-infra#1716).**
-  The append precedes the pre-flight, and nothing prunes a `checked.txt` entry that never reached
-  `dispatched.txt` — the reaper walks `dispatched.txt` only. So an errored pre-flight (a broken
-  scout venv: the failure this file's own comment records) permanently blacklists a dispatchable
-  issue, and the backlog stops refilling with no signal.
 - **`cmd_check` never tests `record-review.sh` (agent-infra#1717).** `merge-one.sh` calls it at
   `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
   prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
@@ -670,7 +719,7 @@ Hourly histogram (00:00Z–23:00Z on 2026-10-11, merged / this-box):
 20: 3/1   21: 3/1   22: 5/4   23: 2/1
 ```
 
-Observed steady state at 8 GB: 15 concurrent workers (4 lanes + 4 chains + 3 fixers +
+Observed steady state on the original 8 GB host: 15 concurrent workers (4 lanes + 4 chains + 3 fixers +
 4 reviewers), load 7–18, swap 588 M–832 M free, dispatch throttled by the swap gate.
 
 **Honest caveat on the comparison.** Two boxes running this harness against one repo
@@ -730,6 +779,13 @@ defaults to. `install.sh` overwrites the plist *file* but does not reload an alr
 `launchctl load -w` on a job that is already loaded does not reliably re-read it. So for a limits
 change: re-run `./install.sh`, then `launchctl unload -w <plist> && launchctl load -w <plist>` — or
 reboot, which is the only thing that reliably re-reads it — before trusting the new value.
+
+⚠️ **And `launchctl unload` touches nothing when the controller was not started by launchd.** On this
+box the loop runs as `nohup … orch-loop.sh` from a session — `launchctl list | grep orchestrator` is
+empty even though the plist exists — so the unload/load pair is a no-op and the old process keeps the
+old limits: the operator believes a limits change took effect when it did not. Check with
+`launchctl list` before trusting the pair, and stop a session-started controller with
+`pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the
