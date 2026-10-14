@@ -398,7 +398,7 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — resolvable PER DISPATCH from the task tool's stream_stall_ms arg (#1030) via resolveStreamStallMs, 60 s floor on every path",
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
-  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition; the dispatch override (stream_stall_ms, #1030) moves this clause too",
+  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition; the dispatch override (stream_stall_ms, #1030) moves this clause too. Since #5389 it fires CONJUNCTIVELY with C as well (positive no-progress evidence from the CPU channel), so `TASK_CPU_STALL_MS=0` stands it down too and at the shipped defaults the binding condition is max(S, C) = C",
   // #928: the CPU-liveness bound (C) for a SILENT in-flight tool. The effective
   // value is resolved by getCpuStallMs (env override, 60 s floor, blank → the
   // default — never disabled by a typo), and 0 is the explicit off switch.
