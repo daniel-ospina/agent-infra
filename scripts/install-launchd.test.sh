@@ -136,6 +136,12 @@ mkfakehome() { # $1 = home dir
     # Two real dirs exist so an expansion has something to match; the assertion below reads the
     # RENDERED PATH and fails if either fabricated entry appears.
     mkdir -p "$1/.pi/agent/globs/aa" "$1/.pi/agent/globs/ab"
+    # #1719 (review B4-2/E5) — the `CDPATH= cd` fix needs a CASE, not just code: `cd` honours CDPATH,
+    # so a bare `cd` KEEPS a relative PATH entry that does not resolve from the installer's cwd, as
+    # long as some CDPATH directory happens to carry that name. run_installer exports CDPATH here and
+    # puts the relative name on PATH; the entry must come out DROPPED (the helper drops whatever does
+    # not resolve), so its presence in a rendered plist means the fix was reverted.
+    mkdir -p "$1/.pi/agent/cdpath/cdpathphantom"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -190,7 +196,8 @@ run_installer() { # <home> [extra env assignments...]
         # PATH assertion below would be vacuous). A SYMLINK to it and the real-binary dir
         # (~/.pi/agent/bin, holding fd/rg) are on PATH too: the first must be dropped by physical
         # path, the second must be KEPT (review E2).
-        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$HOME/.pi/agent/globs/a*:$PATH"
+        export CDPATH="$HOME/.pi/agent/cdpath"
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$HOME/.pi/agent/globs/a*:cdpathphantom:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -306,6 +313,11 @@ assert_contains "$GATE_PATH_VAL" "r&amp;d" "a PATH entry containing & is XML-esc
 # other unresolvable entry. What is asserted below is that the FABRICATED matches never appear).
 assert_not_contains "$GATE_PATH_VAL" "globs/aa" "a glob-char PATH entry is not expanded into its matches (review D3)"
 assert_not_contains "$GATE_PATH_VAL" "globs/ab" "…nor into its second match (review D3)"
+# #1719 (review E5) — the `CDPATH= cd` fix in `launchd_path` is otherwise untested: every other PATH
+# entry in this suite is absolute, and CDPATH only affects RELATIVE entries, so reverting the fix left
+# the suite green while the installer rendered an unresolvable relative entry into every plist.
+assert_not_contains "$GATE_PATH_VAL" "cdpathphantom" \
+  "a RELATIVE PATH entry that only CDPATH can resolve is DROPPED, not rendered (review B4-2/E5)"
 
 # #1719 (review D3, run as a RUN not a grep — review E3-5 corrected the earlier claim) — the guard
 # that refuses a job whose rendered PATH came out EMPTY. It IS dynamically reachable: with PATH

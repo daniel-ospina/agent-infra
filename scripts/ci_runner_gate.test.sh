@@ -399,21 +399,27 @@ else
   # while the gate was wired to nothing, and renaming `<key>HOME</key>` to `<key>HOMEDIR</key>` left
   # the old value-only grep green too. All three were reproduced by mutation.
   GATE_PLIST="$(python3 - "$TEMPLATE" <<'PY'
-import plistlib, sys
+import json, plistlib, sys
 d = plistlib.load(open(sys.argv[1], "rb"))
-print("ARGS=" + "|".join(d.get("ProgramArguments", [])))
+print("ARGS=" + json.dumps(d.get("ProgramArguments", []), separators=(",", ":")))
+print("ENVKEYS=" + json.dumps(sorted(d.get("EnvironmentVariables", {})), separators=(",", ":")))
 for k, v in sorted(d.get("EnvironmentVariables", {}).items()):
     print("ENV=%s=%s" % (k, v))
 PY
 )" || GATE_PLIST=""
   GATE_ARGS="$(printf '%s\n' "$GATE_PLIST" | sed -n 's/^ARGS=//p')"
-  # ⛔ EQUALITY on the whole argument list, not containment (review B4-1/E4-2). `assert_contains`
-  # passed on a SUFFIX-renamed target (`ci_runner_gate.sh.old` contains the needle) and on a
-  # retargeted interpreter (`/bin/echo` leaves the path untouched) — both left the suite green while
-  # the job was once again wired to nothing, one of them executing nothing at all. Every element and
-  # the element COUNT are pinned here.
-  assert_eq "$GATE_ARGS" "/bin/bash|{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
-    "ProgramArguments IS exactly [/bin/bash, the farmed path] — a retargeted interpreter or a suffix-renamed path cannot pass"
+  # ⛔ EQUALITY on the whole argument list, and JSON so the encoding is INJECTIVE (review B4-1/E4-2,
+  # hardened after B5-1). A `|`-joined line is not: an element CONTAINING `|` or a newline could
+  # forge the expected string, and a single-element list could join to exactly two elements' worth of
+  # text — each left the suite GREEN on a job wired to nothing. `json.dumps` escapes both, so the
+  # COUNT and every element are pinned and no element's content can re-encode into the comparison.
+  # The old containment form was weaker still: a SUFFIX-renamed target (`…ci_runner_gate.sh.old`)
+  # contains the needle, and `/bin/echo` for the interpreter left the path untouched — both passed.
+  WANT_ARGS="[\"/bin/bash\",\"{{HOME}}/.pi/agent/scripts/$(basename "$GATE")\"]"
+  assert_eq "$GATE_ARGS" "$WANT_ARGS" \
+    "ProgramArguments IS exactly [/bin/bash, the farmed path] — retargeted interpreter, renamed path, extra element and forged delimiter all fail"
+  assert_eq "$(printf '%s\n' "$GATE_PLIST" | sed -n 's/^ENVKEYS=//p')" '["HOME","PATH"]' \
+    "EnvironmentVariables is exactly {HOME, PATH} — an ADDED key is as wrong as a renamed one"
   assert_contains "$GATE_PLIST" "ENV=HOME={{HOME}}" \
     "EnvironmentVariables.HOME pins HOME for the job (the KEY, not just the value)"
   assert_contains "$GATE_PLIST" "ENV=PATH={{PATH}}" \
