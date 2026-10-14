@@ -277,6 +277,19 @@ sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
 # (needsfix-<PR>-<head>, fixcount-<PR>) is only written on a SUCCESSFUL spawn.
 can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
 
+# ⛔ THE CONTROLLER'S PARK MUST CARRY ITS OWN REASON, IN THE SAME WRITE AS THE MARKER (#1717).
+# `parkreason-<PR>` is what merge-one.sh's exit-5 refusal prints, and that log line is the ONLY
+# in-band remedy on the chain-<N>/fix-one.sh paths (which never consult the controller). Before this,
+# the controller wrote `parked-<PR>` at three sites and never touched the reason, so a park that
+# replaced an earlier head's park -- a push moved the head, the controller later parked at the NEW
+# head -- left the OLD head's reason beside it: the operator was told to "re-provision the recorder /
+# re-record by hand" for a PR actually parked for an unrelated cause. Write the pair together,
+# always, so a reason can never outlive the head it describes.
+park_ctrl() { # park_ctrl <pr> <head> <reason…>
+  printf '%s\n' "$3" > "$O/state/parkreason-$1"
+  printf '%s\n' "$2" > "$O/state/parked-$1"
+}
+
 # Merge priority: a merge backlog means the box's scarce capacity belongs to review+merge, not to
 # opening more PRs. These two functions hold the rule so it is directly testable (and so a
 # regression cannot hide behind a comment):
@@ -533,7 +546,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
+            [ -f "$O/state/parked-$PR" ] || { park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
           elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
@@ -583,7 +596,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
-              echo "${HEAD_N:-}" > "$O/state/parked-$PR"
+              park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -601,7 +614,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
+            [ -f "$O/state/parked-$PR" ] || { park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
           elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then

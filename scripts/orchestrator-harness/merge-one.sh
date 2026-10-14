@@ -206,6 +206,26 @@ case "$LAST" in
       park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
       echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
     fi
+    # ⛔ `rc=0` IS NOT PROOF THE SIGNED MARKER REACHED THE PR BODY (#1717, fail-open).
+    # record-review.sh posts the marker into the PR body BEST-EFFORT and never fails the record, so
+    # it has reachable rc=0 paths with NO post at all: the body GET failed ("evidence post skipped;
+    # record still saved"), the body PATCH failed ("could not post review evidence … record still
+    # saved"), or gh is missing / the repo is undetectable ("the ai-review-gate required check will
+    # fail until evidence is posted manually"). Trusting rc=0 there means the gate can NEVER go
+    # green, the `gate != SUCCESS` arm below exits 4 WITHOUT a park, and the controller re-spawns a
+    # fresh PAID review every cycle — the exact #1717 loop, one state over. So verify the artifact
+    # the gate actually reads: the SIGNED marker for THIS head in the PR body. Absence (or an
+    # unsigned marker, which the gate also rejects) is the same terminal failure as a non-zero rc.
+    LIVE_HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # record-review.sh re-binds a carried record to the LIVE head, so the artifact is keyed to the
+    # head the gate will judge; fall back to the reviewed head when that read itself fails.
+    [ -n "$LIVE_HEAD" ] || LIVE_HEAD="$HEAD"
+    BODY="$(gh pr view "$PR" --repo "$OR" --json body --jq .body 2>/dev/null)"
+    if ! printf '%s\n' "$BODY" \
+         | grep -qE "review recorded: reviews/${PR}[.]json verdict=clean @ ${LIVE_HEAD} .*sig=[0-9a-f]{64}"; then
+      park "record-review.sh returned rc=0 but NO signed marker for head=$LIVE_HEAD reached the PR body — its evidence post is best-effort and skips silently when the body read/PATCH fails or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      echo "[merge $PR] ABORT: rc=0 but no signed marker in the PR body" >> "$L.log"; exit 3
+    fi
     # ── 3) wait for the required ai-review-gate to go green (read the LATEST check row) ──
     gate=""
     for i in $(seq 1 30); do
@@ -215,7 +235,8 @@ case "$LAST" in
       sleep 30
     done
     # ⛔ NOT parked, deliberately (verified by reading the controller, not assumed): the signed
-    # marker IS in the PR body by here, so this head can still merge. A park would make the loop's
+    # marker IS in the PR body by here (the check above proved it, rather than trusting rc=0), so
+    # this head can still merge. A park would make the loop's
     # top-of-cycle parked guard `continue` past a PR whose gate turns green a minute later — a
     # stranded merge, strictly worse than the cost of the retry. A record failure cannot be
     # stranded, which is why THAT is parked.
