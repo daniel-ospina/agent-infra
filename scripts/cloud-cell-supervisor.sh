@@ -213,6 +213,17 @@ KEY_IN_FILE="$(printf '%s' "$KEY_IN_FILE_RAW" | tr -d '[:space:]')"
 # fallback is `[ -z "$GATE_KEY" ]` on the raw value). If that value normalizes to empty, the file
 # check is SHADOWED — so this state must be judged absent-and-dead, never present.
 
+# Does $ENV_FILE itself carry a tortoise checkout (the pre-flight tool's fallback source)? Same
+# delivery reasoning as the key probe above: the controller session re-sources $ENV_FILE (so a value
+# it carries reaches the session) while an ambient-only export does not — the session command line
+# carries only HOME REPO O OR SCOPE, and tmux serves a session the SERVER's environment, which on a
+# pre-existing server is the normal relaunch after `stop`. cmd_check uses this to warn about a
+# dispatch-provisioning verdict that holds only in THIS shell (agent-infra#1748 review).
+TORTOISE_IN_FILE=0
+if [ -f "$ENV_FILE" ]; then
+  [ "$(env -u TORTOISE_REPO -u TORTOISE bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TORTOISE_REPO:-}" ] || [ -n "${TORTOISE:-}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && TORTOISE_IN_FILE=1
+fi
+
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated by validate_scope() and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}`
 # here would coerce a blank keys.env entry to auto and evaporate the pin this override exists for.
@@ -227,6 +238,15 @@ validate_scope() {
     auto|own|broad) ;;
     *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
   esac
+}
+
+# Does the TARGET repo carry its own pre-flight tool? When it does, the provisioning verdict does
+# not depend on a tortoise checkout at all, so an operator's TORTOISE_REPO is irrelevant and must not
+# draw the ambient-only warning below. Mirrors resolve_preflight() in refresh-candidates.sh (the
+# scout worktree wins when it exists, else the main checkout).
+repo_vendors_tool() {
+  [ -f "$REPO/tools/collision_preflight.py" ] \
+    || [ -f "$REPO/.worktrees/dispatch-scout/tools/collision_preflight.py" ]
 }
 
 # ── check: can this cell actually run a controller? ─────────────────────────────
@@ -305,6 +325,45 @@ cmd_check() {
     die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
   fi
   say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
+
+  # ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ──────────────────
+  # The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
+  # subshell — so a refresh that aborts every cycle cannot fail the loop: the controller reports
+  # RUNNING with `lanes: 0` forever and the cell is MERGE-ONLY (measured 2026-10-14 on the first
+  # cmux cloud cell, pointed at agent-infra). This is the last gate before a cell is started, so a
+  # repo that cannot be provisioned for dispatch is refused HERE, with the reason, instead of
+  # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
+  [ -f "$HARNESS/refresh-candidates.sh" ] \
+    || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
+  local pv
+  if ! pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)"; then
+    printf '%s\n' "$pv" >&2
+    die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+  fi
+  printf '%s\n' "$pv" | sed 's/^/    /'
+  say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
+  # ⛔ The probe above runs in THIS shell, so an AMBIENT TORTOISE_REPO makes it pass — but the
+  # controller session will NOT receive it: the session re-sources $ENV_FILE and its command line
+  # carries only HOME REPO O OR SCOPE, and on a PRE-EXISTING tmux server a session is served the
+  # SERVER's environment (measured on tmux 3.4). The refresh would then resolve no checkout, exit
+  # rc=3, and the cell would be MERGE-ONLY — after `check` and `start` both blessed it. This is the
+  # same trap cmd_check already guards for the gate key (an ambient-only key is named as NOT
+  # delivered); the provisionability verdict had no equivalent guard. Warn while the operator can
+  # still fix it, and only when the verdict actually DEPENDED on that checkout: a repo that vendors
+  # its own tool does not care, and a value $ENV_FILE carries is delivered by the session's own
+  # source. (agent-infra#1748 review)
+  if ! repo_vendors_tool && [ "$TORTOISE_IN_FILE" != 1 ]; then
+    local ambient=""
+    [ -n "${TORTOISE_REPO:-}" ] && ambient="TORTOISE_REPO"
+    [ -n "${TORTOISE:-}" ] && ambient="${ambient:+$ambient and }TORTOISE"
+    if [ -n "$ambient" ]; then
+      say "warn: the dispatch-provisioning probe passed using this shell's ambient $ambient, which"
+      say "      $ENV_FILE does not carry. The controller session re-sources $ENV_FILE and does not"
+      say "      receive an ambient export on a pre-existing tmux server, so it would resolve no"
+      say "      tortoise checkout, refuse with rc=3, and leave the cell MERGE-ONLY."
+      say "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
+    fi
+  fi
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -423,6 +482,10 @@ cmd_start() {
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
   local chk
   if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
+  # A probe that just PASSED makes a stale MERGE-ONLY marker wrong: clear it here, so an operator
+  # who fixed the repo (or the TORTOISE path) is not left blocked by a flag recording a past state
+  # until they remember to delete it. (agent-infra#1736)
+  rm -f "$O/.refresh-blocked"
   # ⛔ Print the WHOLE verdict — do NOT filter it by matching the verdict prose. Line-matching was
   # tried and failed three times: each verdict is several lines, and any pattern keyed on the first
   # line silently drops the continuation — the remedy ("Fix: remove the key line…") and the warning
@@ -497,6 +560,13 @@ cmd_status() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
   else say "controller: STOPPED"; fi
   say "state dir: $O"
+  # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
+  # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
+  # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
+  if [ -f "$O/.refresh-blocked" ]; then
+    say "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
+    sed 's/^/    /' "$O/.refresh-blocked"
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"

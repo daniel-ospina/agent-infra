@@ -208,11 +208,11 @@ the fact: the PR body names the comment it was signed against.
 | `git` on `PATH` | worktree/fetch/push in `fix-one.sh`, `dispatch-merge.sh`, `adopt-fix.sh`; `safe_ref` also runs `git check-ref-format` | nothing else tests it — the supervisor's `-d $REPO/.git` check passes on a box with no `git` at all |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
-| `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific |
+| `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
 | `~/.pi/agent/scripts/record-review.sh` + `~/.pi/agent/scripts/lib/diff-normalize.py` | write the HMAC-signed review marker the `ai-review-gate` check verifies, and normalize the diff digest the marker binds (the recorder resolves the normalizer as its own sibling) | shipped by `agent-infra`; a cell's `start` provisions the PAIR — see below |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge without it.** Treat as a secret; never commit it |
-| the target repo's `tools/collision_preflight.py` | `refresh-candidates.sh` refuses overlapping dispatches | tortoise-specific path |
+| a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
 **`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
@@ -285,7 +285,9 @@ by `./selftest.sh` rather than quoted here.
                        # the reaper's keep/reap decisions, rejection of a hostile branch name,
                        # install.sh rendering with a hostile path, limit-default consistency,
                        # placeholder parity, the daemon PATH (shim exclusion + execute-probe) and
-                       # the failed-count fallback, README overclaim guards, credential scan
+                       # the failed-count fallback, README overclaim guards, credential scan,
+                       # repo-aware scout provisioning and the permanent/transient refresh split
+                       # (refresh-scout.test.sh, #1736)
 ```
 
 **The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
@@ -612,6 +614,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
+| **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |
 | Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
 | `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
@@ -772,6 +775,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
+| `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
@@ -816,10 +820,13 @@ old limits: the operator believes a limits change took effect when it did not. C
 `pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
-suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the
-`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, the
-`tools/collision_preflight.py` path, and the seven required check names
+suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the
+`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, and the seven required check names
 (`ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact`).
+Two things that were on this list are now repo-aware: the collision pre-flight tool is resolved per
+repo (the target repo's own copy, else a `TORTOISE_REPO` checkout) and the scout venv step is skipped for
+a repo with no `pyproject.toml` — and a repo that can be provisioned is verified at `check` time —
+agent-infra#1736.
 
 ---
 
