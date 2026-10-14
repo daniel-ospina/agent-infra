@@ -521,6 +521,18 @@ for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chai
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
+# #1717: cmd_check now also refuses a cell without the record step (and its declared sibling), so a
+# dispatch-provisioning fixture must be a cell that PASSES that earlier probe — otherwise every
+# assertion below is decided by the recorder refusal, not by the probe under test. Same treatment
+# as §7: the pair (one directory up from the harness AND in the cell's HOME), plus the
+# `pi`/`git`/`python3` runtime stubs the CI runner does not install.
+mkdir -p "$F/home/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$F/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$F/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$F/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$F/record-review.sh"; chmod +x "$F/record-review.sh"
+mkdir -p "$F/lib"; printf '#!/usr/bin/env python3\n' > "$F/lib/diff-normalize.py"
+for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$F/bin/$c"; chmod +x "$F/bin/$c"; done
 # Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
 # against the wrong repo cannot pass silently) and exits with $PROBE_RC.
 cat > "$F/harness/refresh-candidates.sh" <<'SH'
