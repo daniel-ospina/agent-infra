@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, stageSetCode } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
@@ -615,6 +615,55 @@ async function main() {
     ok(!dd.some((l) => l.includes("checkout")), "DD has no stage 2/3 → no checkout");
   });
 
+  await test("stageSetCode: full index-stage set → porcelain conflict code (#1661 review)", () => {
+    // The ls-files fallback vocabulary. Verified against live git: a both-sides
+    // UU conflict writes stages 1,2,3; AU/UA are stage 2/3 only; DD is stage 1.
+    equal(stageSetCode([1]), "DD");
+    equal(stageSetCode([2]), "AU");
+    equal(stageSetCode([3]), "UA");
+    equal(stageSetCode([1, 2]), "UD");
+    equal(stageSetCode([1, 3]), "DU");
+    equal(stageSetCode([2, 3]), "AA");
+    equal(stageSetCode([3, 1, 2]), "UU", "order must not matter");
+    equal(stageSetCode([]), undefined);
+  });
+
+  await test("unmergedBanner: a bare `stage 1` detail never recommends `git rm` (#1661 review)", () => {
+    // Stage 1 exists in UU/UD/DU/AA as well as DD, so a lone "stage 1" cannot
+    // prove the path is base-only — the old fallback said "base-only entry:
+    // git rm", which on a UU conflict destroys a side the user still wants.
+    const lines = unmergedBanner("/r", [{ path: "f.txt", detail: "stage 1" }]);
+    ok(!lines.some((l) => l.includes(" rm ")), `a lone stage 1 cannot prove base-only: ${lines.join("\n")}`);
+  });
+
+  await test("unmergedEntries: porcelain failure (ENOBUFS) falls back to the REAL code, not `git rm` (#1661 review)", () => {
+    // A real index-only both-sides conflict (stages 1/2/3). Then blow past
+    // `git status --porcelain -z`'s 1 MiB maxBuffer with long untracked names,
+    // so the porcelain pass throws and `git ls-files -u` is the only source.
+    const origin = seededOrigin();
+    const repo = makeClone(origin);
+    const base = git(repo, "rev-parse HEAD:file.txt").trim();
+    const ours = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "ours\n", encoding: "utf-8" }).trim();
+    const theirs = execFileSync("git", ["-C", repo, "hash-object", "-w", "--stdin"], { input: "theirs\n", encoding: "utf-8" }).trim();
+    execFileSync("git", ["-C", repo, "update-index", "--index-info"], {
+      input: `100644 ${base} 1\tfile.txt\n100644 ${ours} 2\tfile.txt\n100644 ${theirs} 3\tfile.txt\n`,
+      encoding: "utf-8",
+    });
+    git(repo, "config status.showUntrackedFiles all");
+    const long = "x".repeat(230);
+    for (let i = 0; i < 5000; i++) writeFileSync(join(repo, long + i), "");
+    let porcelainFailed = false;
+    try { execFileSync("git", ["-C", repo, "status", "--porcelain", "-z"], { encoding: "utf-8", timeout: 15_000 }); }
+    catch { porcelainFailed = true; }
+    ok(porcelainFailed, "fixture must make the porcelain source throw (ENOBUFS)");
+    const entries = unmergedEntries(repo);
+    equal(entries.length, 1, `expected one unmerged path, got ${JSON.stringify(entries)}`);
+    equal(entries[0].detail, "UU", `stages 1+2+3 is a both-sides conflict, got "${entries[0].detail}"`);
+    const remedy = unmergedBanner(repo, entries).filter((l) => l.includes("git -C"));
+    ok(remedy.some((l) => l.includes("checkout --theirs")), `UU must offer --theirs: ${remedy.join("\n")}`);
+    ok(!remedy.some((l) => l.includes(" rm ")), `must NOT recommend git rm on a both-sides conflict: ${remedy.join("\n")}`);
+  });
+
   await test("stuck index ALSO behind (mode auto) → early return keeps sync.sh from running (#1661 review)", async () => {
     const stuck = makeBehindStuckConflict();
     equal(syncState(stuck), "behind", "fixture must be behind, not diverged");
@@ -692,6 +741,23 @@ async function main() {
     git(repoCurrent, "fetch -q origin");
     const lines = await runSession(repoCurrent, { print: true });
     equal(lines.length, 0, `expected no output, got: ${lines.join("\n")}`);
+  });
+
+  await test("print mode + diverged → NO staleness banner (#1661 review — classify the state, not just behindCount)", async () => {
+    // behindCount() is `rev-list --count HEAD..origin/main`, which is non-zero
+    // for a diverged checkout too. Reporting that as "behind" hands the
+    // sub-agent `./sync.sh`, whose `git pull --ff-only` cannot succeed here.
+    const o = seededOrigin();
+    const repo = makeClone(o);
+    commit(repo, "local branch commit");
+    const other = makeClone(o);
+    commit(other, "remote branch commit");
+    git(other, "push -q origin main");
+    git(repo, "fetch -q origin");
+    equal(syncState(repo), "diverged", "fixture must be diverged");
+    ok(behindCount(repo) > 0, "behindCount is non-zero on a diverged checkout — the trap this pins");
+    const lines = await runSession(repo, { print: true });
+    ok(!lines.some((l) => l.includes("behind origin/main")), `diverged must not be reported as merely behind: ${lines.join("\n")}`);
   });
 
   await test("behindCount: current = 0, behind = 3", () => {

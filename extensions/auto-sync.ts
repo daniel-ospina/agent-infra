@@ -85,6 +85,31 @@ export function stalenessBanner(repo: string, behind: number, threshold: number)
 /** Unmerged porcelain codes — the `U*`/`AA`/`DD` conflict shapes (#1661). */
 const UNMERGED_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
 
+/** #1661 (review): index STAGE SET → porcelain conflict code. The `git ls-files
+ * -u` half of `unmergedEntries` is the fallback when `git status --porcelain -z`
+ * throws (it exceeds its 1 MiB maxBuffer — ENOBUFS — on a large working tree),
+ * and a single stage record is not enough: stage 1 appears in `DD` (base only)
+ * AND in every both-sides shape (`UU`/`UD`/`DU`/`AA`), so recording only the
+ * first record made a real `UU` look like "stage 1" and `remedyCommands`
+ * recommended `git rm` — deleting a path that still had a live side. Each
+ * stage-set → code mapping below was verified against live git output:
+ * `UU`={1,2,3} `UD`={1,2} `DU`={1,3} `AA`={2,3} `AU`={2} `UA`={3} `DD`={1}. */
+const STAGE_SET_CODES: Record<string, string> = {
+  "1": "DD",
+  "2": "AU",
+  "3": "UA",
+  "1,2": "UD",
+  "1,3": "DU",
+  "2,3": "AA",
+  "1,2,3": "UU",
+};
+
+/** Map a path's full index-stage set to its porcelain conflict code (undefined
+ * for an unrecognised set). Exported for direct unit testing. */
+export function stageSetCode(stages: Iterable<number>): string | undefined {
+  return STAGE_SET_CODES[[...stages].sort((a, b) => a - b).join(",")];
+}
+
 export interface UnmergedEntry { path: string; detail: string }
 
 /**
@@ -120,12 +145,25 @@ export function unmergedEntries(repo: string): UnmergedEntry[] {
     }
   } catch { /* git unavailable / not a repo — no signal */ }
   try {
+    // #1661 (review): collect the FULL stage set per path, then map it to the
+    // porcelain code — see `STAGE_SET_CODES`. Reading only the first record
+    // (stages are emitted ascending, so always "stage 1") downgraded a
+    // both-sides conflict to a base-only one and recommended `git rm`.
+    const stages = new Map<string, Set<number>>();
     for (const rec of execFileSync("git", ["-C", repo, "ls-files", "-u", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0")) {
       const tab = rec.indexOf("\t");
       if (tab === -1) continue;
       const path = rec.slice(tab + 1);
-      if (!path || found.has(path)) continue;
-      found.set(path, `stage ${rec.slice(0, tab).trim().split(/\s+/).pop() ?? "?"}`);
+      if (!path) continue;
+      const stage = Number(rec.slice(0, tab).trim().split(/\s+/).pop());
+      if (!Number.isInteger(stage)) continue;
+      const set = stages.get(path) ?? new Set<number>();
+      set.add(stage);
+      stages.set(path, set);
+    }
+    for (const [path, set] of stages) {
+      if (found.has(path)) continue; // porcelain's code wins when it is available
+      found.set(path, stageSetCode(set) ?? `stages ${[...set].sort((a, b) => a - b).join(",")}`);
     }
   } catch { /* ignore */ }
   return [...found.entries()]
@@ -211,10 +249,14 @@ function remedyCommands(repo: string, e: UnmergedEntry): string[] {
     case "UU":
     case "AA":
       return [`keep origin's version: ${keepTheirs}`, `or keep yours: ${keepOurs}`];
-    default: // ls-files fallback detail ("stage 1"/"stage 2"/"stage 3"/"stage ?")
+    default: // unknown detail (legacy "stage N" shape / unrecognised stage set)
       if (e.detail.includes("2")) return [`keep yours (stage 2): ${keepOurs}`];
       if (e.detail.includes("3")) return [`keep origin's version (stage 3): ${keepTheirs}`];
-      if (e.detail.includes("1")) return [`base-only entry: ${remove}`];
+      // #1661 (review): a bare "stage 1" is NOT proof of a base-only entry —
+      // stage 1 also exists in UU/UD/DU/AA, where `git rm` destroys a side the
+      // user still wants. `unmergedEntries` now maps the full stage set to a
+      // porcelain code (a genuine DD still hits `case "DD"` above), so an
+      // ambiguous shape is inspected, never removed on a guess.
       return [`inspect: git -C ${r} status`, `then keep origin's version: ${keepTheirs}`];
   }
 }
@@ -726,7 +768,15 @@ export default function (pi: ExtensionAPI) {
     // (no fetch here: the count uses the last-fetched origin/main ref, a lower
     // bound, so print-mode startup stays network-free).
     if (isPrintMode()) {
-      const behind = behindCount(infraPath);
+      // #1661 (review): `behindCount()` is non-zero for a DIVERGED checkout
+      // too, so the state must be classified first — exactly as the interactive
+      // path below does (`state === "behind" ? behindCount(...) : 0`). Without
+      // this gate, print mode told a diverged sub-agent it was merely "behind"
+      // and handed it `./sync.sh`, whose `git pull --ff-only` cannot succeed on
+      // a diverged checkout (and on a non-main branch exits 0 after refusing —
+      // #1663), so the hinted remedy was inert.
+      const state = syncState(infraPath);
+      const behind = state === "behind" ? behindCount(infraPath) : 0;
       if (behind > 0) {
         const loud = stalenessBanner(infraPath, behind, stalenessThreshold());
         if (loud.length > 0) for (const line of loud) console.log(line);
