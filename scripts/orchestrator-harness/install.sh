@@ -247,9 +247,26 @@ git -C "$REPO" check-ignore -q .worktrees/ \
   && ok "$REPO/.worktrees is gitignored" \
   || die "$REPO/.worktrees is NOT gitignored — worktrees would be committed. Fix .gitignore first."
 [ -f "$REPO/tools/collision_preflight.py" ] \
-  && ok "collision pre-flight present" \
-  || warn "tools/collision_preflight.py missing — refresh-candidates.sh will add nothing to the backlog"
-if [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then
+  && ok "collision pre-flight present in the repo" \
+  || true
+# ── dispatch provisioning, judged ONCE here (agent-infra#1736) ───────────────────
+# The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
+# subshell — so a refresh that aborts every cycle cannot fail the loop: the controller reports
+# RUNNING with `lanes: 0` forever and the cell is MERGE-ONLY. Surface it at install time, with the
+# reason, by running refresh-candidates.sh's own read-only `--check` (the same probe the cell's
+# `start` runs). Warn, not die: a deliberately merge-only install is a legitimate configuration,
+# and the hard gate is the cell supervisor's `check`, which refuses to START such a cell.
+if PV="$(REPO="$REPO" OR="$OR" O="$O" bash "$HERE/refresh-candidates.sh" --check 2>&1)"; then
+  printf '%s\n' "$PV" | sed 's/^/    /'
+  ok "dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
+else
+  printf '%s\n' "$PV" >&2
+  warn "this repo cannot be provisioned for dispatch — a cell on it could only MERGE;"
+  warn "  refresh-candidates.sh would add nothing to the backlog (agent-infra#1736)."
+  warn "  Fix: set TORTOISE=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO."
+fi
+# The scout VENV is a uv-Python step: warn about it only for a repo that declares one.
+if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then
   warn "scout worktree/venv not provisioned at $REPO/.worktrees/dispatch-scout"
   warn "  → refresh-candidates.sh will provision it on first run (git worktree add + uv sync),"
   warn "    which takes a couple of minutes and needs network access."

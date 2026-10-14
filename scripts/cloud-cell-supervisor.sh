@@ -231,6 +231,23 @@ cmd_check() {
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
 
+  # ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ──────────────────
+  # The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
+  # subshell — so a refresh that aborts every cycle cannot fail the loop: the controller reports
+  # RUNNING with `lanes: 0` forever and the cell is MERGE-ONLY (measured 2026-10-14 on the first
+  # cmux cloud cell, pointed at agent-infra). This is the last gate before a cell is started, so a
+  # repo that cannot be provisioned for dispatch is refused HERE, with the reason, instead of
+  # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
+  [ -f "$HARNESS/refresh-candidates.sh" ] \
+    || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
+  local pv
+  if ! pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)"; then
+    printf '%s\n' "$pv" >&2
+    die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+  fi
+  printf '%s\n' "$pv" | sed 's/^/    /'
+  say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
+
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
   # it. An ambient-only export does NOT — tmux serves a new session from the server's environment —
@@ -313,6 +330,10 @@ cmd_start() {
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
   local chk
   if ! chk="$(cmd_check 2>&1)"; then printf '%s\n' "$chk" >&2; exit 1; fi
+  # A probe that just PASSED makes a stale MERGE-ONLY marker wrong: clear it here, so an operator
+  # who fixed the repo (or the TORTOISE path) is not left blocked by a flag recording a past state
+  # until they remember to delete it. (agent-infra#1736)
+  rm -f "$O/.refresh-blocked"
   # ⛔ Print the WHOLE verdict — do NOT filter it by matching the verdict prose. Line-matching was
   # tried and failed three times: each verdict is several lines, and any pattern keyed on the first
   # line silently drops the continuation — the remedy ("Fix: remove the key line…") and the warning
@@ -387,6 +408,13 @@ cmd_status() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
   else say "controller: STOPPED"; fi
   say "state dir: $O"
+  # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
+  # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
+  # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
+  if [ -f "$O/.refresh-blocked" ]; then
+    say "⛔ MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched"
+    sed 's/^/    /' "$O/.refresh-blocked"
+  fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
   say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"

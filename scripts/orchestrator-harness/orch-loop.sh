@@ -696,10 +696,27 @@ PY
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
   BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
   if [ "$BL" -lt 6 ]; then
-    if [ ! -d "$O/.refresh.lock" ]; then
+    if [ -f "$O/.refresh-blocked" ]; then
+      # agent-infra#1736: a PERMANENT provisioning failure (exit 3) is recorded here so it is
+      # neither retried forever nor silent. `lanes: 0` alone also describes a healthy idle cell,
+      # so the reason is printed every cycle AND surfaced by `cloud-cell-supervisor.sh status`.
+      echo "[refresh] blocked (not retrying): $(head -1 "$O/.refresh-blocked")" >> "$LOG"
+    elif [ ! -d "$O/.refresh.lock" ]; then
       mkdir -p "$O/.refresh.lock"
       echo "[refresh] spawning (backlog=$BL)" >> "$LOG"
-      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rm -rf "$O/.refresh.lock" ) &
+      # ⛔ `&` discards the refresh's exit status, so a refresh that aborts EVERY cycle reads as a
+      # healthy cell with `lanes: 0` forever (#1736, measured on the first cmux cloud cell).
+      # Capture rc: 3 is refresh-candidates.sh's NOT_PROVISIONABLE code — permanent, so retrying
+      # cannot help; record it and stop re-spawning. Any OTHER non-zero is transient (network, a
+      # failed listing) and IS retried next cycle.
+      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
+        rm -rf "$O/.refresh.lock"
+        if [ "$rc" -eq 3 ]; then
+          echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
+          echo "MERGE-ONLY: this repo cannot be provisioned for dispatch (agent-infra#1736) — no implementation lane will be dispatched until this is fixed. Reason and evidence: $LOG (search 'NOT PROVISIONABLE'). Fix: set TORTOISE=<a tortoise checkout>, or vendor tools/collision_preflight.py into the repo — then delete this file and re-run 'check'." > "$O/.refresh-blocked"
+        elif [ "$rc" -ne 0 ]; then
+          echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
+        fi ) &
     else
       # stale lock guard (>20 min)
       if [ -n "$(find "$O/.refresh.lock" -mmin +20 2>/dev/null)" ]; then rm -rf "$O/.refresh.lock"; echo "[refresh] cleared stale lock" >> "$LOG"; fi

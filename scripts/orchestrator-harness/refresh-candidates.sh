@@ -1,21 +1,124 @@
 #!/bin/bash
 # refresh-candidates.sh — pre-flight a pool of open P0/P1/P2 issues and append the CLEAN ones
 # to ~/orchestrator/candidates.txt (the dispatch backlog). Skips anything already checked.
+#
+#   refresh-candidates.sh [LIMIT]     # refill the backlog (called by orch-loop.sh, BACKGROUNDED)
+#   refresh-candidates.sh --check     # read-only: CAN this repo be provisioned for dispatch?
+#
+# ⛔ WHY `--check` EXISTS (agent-infra#1736). The scout provisioning below used to be a
+# TORTOISE-shaped spec: `uv sync --extra embeddings --extra parity` (tortoise extras, and a
+# `pyproject.toml` the target repo may not have) plus tortoise's `tools/collision_preflight.py`
+# (which agent-infra does not carry). A cell pointed at a repo that is neither aborted every
+# cycle, and orch-loop.sh runs this script in a BACKGROUNDED subshell — so the non-zero exit could
+# not fail the loop and the controller reported RUNNING with `lanes: 0` forever: a cell that looks
+# alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
+# so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 O="${O:-$HOME/orchestrator}"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
-LIMIT="${1:-24}"
+
+# ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
+# `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
+# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
+# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
+# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
+EXIT_TRANSIENT=1
+EXIT_NOT_PROVISIONABLE=3
+
+MODE=refresh
+LIMIT=24
+case "${1:-}" in
+  --check) MODE=check ;;
+  '')      ;;
+  *[!0-9]*) echo "[refresh] FATAL: unknown argument '$1' (usage: refresh-candidates.sh [LIMIT] | --check)" >&2; exit 2 ;;
+  *)       LIMIT="$1" ;;
+esac
+
+# ── the collision pre-flight tool, resolved PER REPO (agent-infra#1736) ────────────────────────
+# The gate is a TORTOISE product: tortoise is the only repo that ships tools/collision_preflight.py
+# and it applies to ANY issue's repo through --repo. A repo that carries its own copy wins (it pins
+# the version that repo reviewed against); otherwise a tortoise checkout is used; otherwise there
+# is NOTHING to run, and "nothing to run" must be a loud refusal, never an empty backlog. The old
+# code hardcoded `$SC/tools/collision_preflight.py`, so a cell on agent-infra (no such file) ran a
+# tool that did not exist, emitted no VERDICT, and queued nothing — forever, and silently.
+PREFLIGHT=""
+find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
+  local cand common
+  if [ -n "${TORTOISE:-}" ] && [ -f "${TORTOISE}/tools/collision_preflight.py" ]; then
+    (cd "$TORTOISE" && pwd -P); return 0
+  fi
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  for cand in \
+    "$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)" \
+    "$([ -n "$common" ] && dirname "${common%/.git}")/tortoise" \
+    "${HOME:-/nonexistent}/Documents/GitHub/tortoise" \
+    "${HOME:-/nonexistent}/eldato/tortoise" \
+  ; do
+    [ -n "$cand" ] || continue
+    [ -f "$cand/tools/collision_preflight.py" ] || continue
+    (cd "$cand" && pwd -P); return 0
+  done
+  return 1
+}
+
+resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if none
+  local repo_dir t
+  # The TARGET repo's own copy — the scout worktree when it exists, else the main checkout.
+  # `--check` must not create the worktree, so the main checkout is what it reads there.
+  repo_dir="$REPO"; [ -d "$SC" ] && repo_dir="$SC"
+  if [ -f "$repo_dir/tools/collision_preflight.py" ]; then
+    PREFLIGHT="$repo_dir/tools/collision_preflight.py"; return 0
+  fi
+  if t="$(find_tortoise)"; then
+    PREFLIGHT="$t/tools/collision_preflight.py"; return 0
+  fi
+  return 1
+}
+
+# ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
+cmd_check() {
+  local scout tool_dir
+  [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
+  tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
+  if ! resolve_preflight; then
+    echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE='${TORTOISE:-}')"
+    echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
+    echo "[refresh]   fix: set TORTOISE=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] check: repo=$REPO"
+  echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # The venv is needed only for a UV PYTHON PROJECT: the tool itself is stdlib-only, so a repo with
+  # no pyproject.toml (agent-infra) is served by a bare python3. That is NOT a failure.
+  scout="$tool_dir"
+  if [ -x "$scout/.venv/bin/python" ]; then
+    echo "[refresh] check: interpreter=$scout/.venv/bin/python"
+  elif [ -f "$scout/pyproject.toml" ]; then
+    command -v uv >/dev/null 2>&1 \
+      || { echo "[refresh] check: FAIL $scout/pyproject.toml is present but 'uv' is not on PATH — the scout venv cannot be provisioned"; return "$EXIT_TRANSIENT"; }
+    echo "[refresh] check: interpreter=$scout/.venv/bin/python (to be provisioned with uv sync)"
+  elif command -v python3 >/dev/null 2>&1; then
+    echo "[refresh] check: no pyproject.toml in $scout — the scout venv step is NOT APPLICABLE; interpreter=python3"
+  else
+    echo "[refresh] check: FAIL no pyproject.toml and no python3 on PATH — nothing can run the pre-flight tool"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] CHECK OK: this repo can be provisioned for dispatch"
+  return 0
+}
+
+if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 mkdir -p "$O"
 
-# The scout is a dedicated throwaway worktree used only to run tools/collision_preflight.py.
+# The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
 if [ ! -d "$SC" ]; then
   echo "[refresh] provisioning scout worktree at $SC"
-  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit 1; }
+  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit "$EXIT_TRANSIENT"; }
   git fetch origin main --quiet 2>/dev/null || true
   if git rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
     git worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1
@@ -23,14 +126,61 @@ if [ ! -d "$SC" ]; then
     git worktree add "$SC" -b chore/dispatch-scout origin/main >/dev/null 2>&1
   fi
 fi
-cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit 1; }
+cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit "$EXIT_TRANSIENT"; }
 
-# collision_preflight.py needs the project's dev environment; without it every check errors and
-# the backlog stays empty. Provision once, fail loudly if that is impossible.
-if [ ! -x "$SC/.venv/bin/python" ]; then
-  echo "[refresh] provisioning scout venv (uv sync)"
-  ( uv sync --extra embeddings --extra parity ) >/dev/null 2>&1 \
-    || { echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"; exit 1; }
+# Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
+# its environment, and the reason must be the one an operator sees.
+if ! resolve_preflight; then
+  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE='${TORTOISE:-}')"
+  echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
+  echo "[refresh]   fix: set TORTOISE=<a tortoise checkout> or vendor tools/collision_preflight.py into the repo"
+  exit "$EXIT_NOT_PROVISIONABLE"
+fi
+
+# ── the scout venv: ONLY for a repo that declares a Python/uv environment ─────────────────────
+# `uv sync` is a UV-PYTHON step. A repo with no pyproject.toml at all (agent-infra: package.json,
+# bin/, scripts/, mcp-servers/) cannot run it — measured on the live cell: "No `pyproject.toml`
+# found in current directory or any parent".
+# ⛔ That is NOT a provisioning failure: there is NOTHING TO PROVISION. Reporting it as one
+# (`ABORT: uv sync failed`) was the silent-loop defect (#1736). Only the genuinely
+# not-applicable case is skipped; a `uv sync` that fails on a REAL pyproject is still fatal, still
+# loud, and its output is printed — nothing else is swallowed.
+PY="$SC/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  if [ ! -f "$SC/pyproject.toml" ]; then
+    echo "[refresh] no pyproject.toml in $SC — not a uv/Python project; skipping the scout venv step (the pre-flight tool is stdlib-only)"
+    PY="$(command -v python3 || true)"
+  else
+    # Read the extras from the PROJECT rather than hardcoding tortoise's: `uv sync --extra X`
+    # ERRORS on an extra the pyproject does not declare, so inheriting `embeddings`/`parity` into a
+    # non-tortoise Python repo would fail every cycle for a spec that does not apply to it.
+    # SCOUT_UV_EXTRAS overrides the detection entirely (set it empty for a bare `uv sync`).
+    EXTRAS=""
+    if [ -n "${SCOUT_UV_EXTRAS+x}" ]; then
+      EXTRAS="$SCOUT_UV_EXTRAS"
+    else
+      for e in embeddings parity; do
+        awk -v want="$e" '
+          /^\[/ { sec = ($0 ~ /^\[project\.optional-dependencies\]/) ; next }
+          sec { line = $0; sub(/[[:space:]]*=.*/, "", line); gsub(/[[:space:]\"]/, "", line)
+                if (line == want) { print "declared"; exit } }
+        ' "$SC/pyproject.toml" 2>/dev/null | grep -q declared && EXTRAS="$EXTRAS --extra $e"
+      done
+      EXTRAS="${EXTRAS# }"
+    fi
+    echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
+    # shellcheck disable=SC2086  # $EXTRAS is a deliberate, space-separated argv list
+    if ! UVOUT="$(cd "$SC" && uv sync $EXTRAS 2>&1)"; then
+      echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"
+      printf '%s\n' "$UVOUT" | tail -5 | sed 's/^/[refresh]   /'
+      exit "$EXIT_TRANSIENT"
+    fi
+    [ -x "$PY" ] || { echo "[refresh] ABORT: uv sync reported success but $PY is missing"; exit "$EXIT_TRANSIENT"; }
+  fi
+fi
+if [ -z "$PY" ] || ! "$PY" -c '' >/dev/null 2>&1; then
+  echo "[refresh] NOT PROVISIONABLE: no usable python to run the pre-flight tool (no scout venv, no python3)"
+  exit "$EXIT_NOT_PROVISIONABLE"
 fi
 git fetch origin --quiet 2>/dev/null || true
 
@@ -139,7 +289,7 @@ while read -r N; do
   # work lands). checked.txt is therefore written ONLY on the verdict that terminates the issue —
   # CLEAN, which is queued. Everything else is left unchecked, so the next pass re-attempts it.
   # (agent-infra#1716)
-  PRE="$("$SC/.venv/bin/python" tools/collision_preflight.py "$N" --repo . 2>&1)"
+  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
   case "$V" in
     CLEAN)
