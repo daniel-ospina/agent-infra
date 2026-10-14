@@ -392,7 +392,11 @@ while read -r N; do
   # exit code is read IMMEDIATELY after the command, with no `$(...)` in between (the retired
   # do-merge.sh bug class). EXIT_INCOMPLETE (2) and the verdict-less open-PR / ambiguous-target
   # refusals are per-issue and transient by nature; 3 is the tool's usage/environment code.
-  if [ "$PRE_RC" -eq 3 ] && ! printf '%s\n' "$PRE" | grep -qE '^VERDICT'; then
+  # A here-string, not `printf … | grep -q`: under `pipefail` the quiet grep exits at its first
+  # match while the writer is still pushing bytes, the writer takes SIGPIPE (141), and pipeline
+  # status becomes non-zero — so this fail-closed gate would report NOT-PROVISIONABLE on output
+  # that DID carry a verdict (#841; scripts/check-no-sigpipe-grep.sh is the guard).
+  if [ "$PRE_RC" -eq 3 ] && ! grep -qE '^VERDICT' <<<"$PRE"; then
     echo "[refresh] NOT PROVISIONABLE: the pre-flight tool exited 3 (usage/environment) with no VERDICT — a cell on this repo could only MERGE (#1736)"
     printf '%s\n' "$PRE" | tail -3 | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: make the interpreter runnable (the tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR) or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
