@@ -307,9 +307,16 @@ class Tool:
     ``cpu_advanced`` / ``cpu_stall_ms`` are the ALREADY-COMPUTED tick fields
     (builtin-tools/index.ts:2274-2275, task-heartbeat.ts:226) — this module does
     NOT re-derive CPU attribution.
+
+    ``call_label`` is the transcript's own label for the open call
+    (``bash(call_00_…)``). It is EVIDENCE, not a verdict input: the
+    ``tool-in-flight`` row names the unwritten call so a reader can tell *which*
+    step is holding the lane, exactly as the ``wedged`` row does (#5389 review
+    cycle 1 P1 — the two rows must not disagree about what the tail shows).
     """
 
     name: str = ""
+    call_label: str = ""
     tools_in_flight: int = 0
     tool_updates: bool = False
     silence_age_ms: Optional[int] = None
@@ -662,8 +669,14 @@ def evaluate(ev: Evidence) -> Verdict:
     if ev.tool is not None and ev.tool.tools_in_flight > 0 and not tool_veto_expired(ev.tool):
         # Quiet is never a stall: the tool veto holds until the watchdog's own
         # per-shape bound (T9, C5) — and never for a legitimately CPU-flat
-        # nested `task` (T11, C8).
-        return Verdict("running-quiet", "tool-in-flight", holder_pid=holder.pid)
+        # nested `task` (T11, C8). The detail names the UNWRITTEN call the veto
+        # is holding on (#5389 review cycle 1 P1): a report row that says only
+        # `tool-in-flight` cannot distinguish the bash it is waiting on, and the
+        # markdown-escape leg of the delivery suite needs the same
+        # transcript-derived value the `wedged` row renders.
+        held = ev.tool.call_label or ev.tool.name
+        return Verdict("running-quiet", "tool-in-flight", holder_pid=holder.pid,
+                       detail=("in-flight %s" % held) if held else "")
 
     # (4) The bounded input-consumption veto. It gates `idle`/`wedged` ONLY —
     #     `dead` was decided above and NO record can veto it (C9, T10).
@@ -1153,6 +1166,7 @@ def tool_from_jsonl(
     age = max(0, now_ms - started)
     return Tool(
         name=str(calls[0].get("name") or ""),
+        call_label=", ".join(_tool_call_labels(msg)),
         tools_in_flight=len(calls),
         tool_updates=False,
         silence_age_ms=silence_age_ms,

@@ -1160,6 +1160,11 @@ def t23_false_cut_reproduced():
         v = liv.evaluate(e)
         check(v.state == "running-quiet" and v.reason == "tool-in-flight",
               "a lane inside one long read is quiet, never wedged; got %s/%s" % (v.state, v.reason))
+        # The row must name the UNWRITTEN call the veto holds on — the same
+        # evidence the `wedged` row renders — or the report cannot say which
+        # step it is waiting for (#5389 review cycle 1 P1).
+        check("call_A" in v.detail,
+              "the tool-in-flight verdict names the in-flight call; got %r" % v.detail)
 
         # THE CONTROL: strip the derived tool (today's wiring, 0 of 1011 records)
         # and the same evidence reads `wedged`. Without this the test could pass
