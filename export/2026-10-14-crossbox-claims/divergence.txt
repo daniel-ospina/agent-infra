@@ -1,0 +1,22 @@
+Divergence report — this box's ~/orchestrator vs agent-infra scripts/orchestrator-harness (origin/main)
+generated: 2026-10-14T12:58:02Z   host: Daniels-MacBook-Air.local
+agent-infra origin/main: 8e2daf3
+
+FILE             agent-infra my-box     tortoise   ai->mine my-edits
+orch-loop.sh     08ab705f   df201b67   4228b306        456       12
+merge-one.sh     eb0e2bc5   4cef58a4   78cfc98d         68        7
+lane.sh          c3a18518   bc5f9fc1   a6444d58         15        7
+fix-one.sh       b68ac493   53dbdaf9   45c24513         29        7
+chain-merge.sh   8fade1f0   8fade1f0   ddd79253          0      n/a
+
+NEW FILES (exist only on this box; not in either repo):
+  claims.sh          sha256=7074ca72221138a4  11395 bytes
+  test-claims.sh     sha256=f1f00065c64cffbc  5461 bytes
+  test-crossbox.sh   sha256=710f414728dc39f1  3048 bytes
+  test-gates.sh      sha256=0dc3d3473485133f  2781 bytes
+
+FEATURE PRESENCE (does the file contain the cross-box machinery?)
+  refs/claims        agent-infra=/tmp/x_ai:0  my-box=1
+  claim_snapshot     agent-infra=/tmp/x_ai:0  my-box=1
+  force-with-lease   agent-infra=/tmp/x_ai:0  my-box=0
+  claim_acquire      agent-infra=/tmp/x_ai:0  my-box=1

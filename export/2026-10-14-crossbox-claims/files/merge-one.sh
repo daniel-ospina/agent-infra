@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# merge-one.sh <repo-path> <owner/repo> <pr> <branch>
+# merge-one.sh --argv <file>            (4 lines: repo, owner/repo, pr, branch)
+# Full chain for ONE PR: fresh-context review -> evidence comment -> record-review -> wait green -> merge.
+# This box holds the AI_REVIEW_GATE_KEY, so it owns the merge authority for its own PRs.
+set -u
+# --argv exists because these values are attacker-influenced (a PR branch name may contain quotes,
+# semicolons, $ and backticks) and the controller must launch us from a tmux `sh -c` string.
+# Passing them through a file keeps every PR-derived value out of that string entirely.
+if [ "${1:-}" = "--argv" ]; then
+  ARGV="${2:-}"
+  [ -f "$ARGV" ] || { echo "[merge] missing argv file: $ARGV" >&2; exit 1; }
+  { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
+  rm -f "$ARGV"
+else
+  REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+fi
+case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
+KIND=reviewer; TAG="$PR"
+O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+L="$O/logs/merge-$PR"
+export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
+export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~25 processes/run
+export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
+cd "$REPO" || exit 1
+
+# Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
+# model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
+# silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
+# agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
+# reaper in orch-loop.sh is the second line of defence.
+run_agent() { # run_agent <seconds> <logfile> <promptfile>
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  start="$(date +%s)"
+  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  pid=$!
+  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$pid" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
+  # reviewer wall-time — the load-bearing number for fleet capacity (it was unmeasured).
+  elapsed=$(( $(date +%s) - start ))
+  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
+  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
+  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
+  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
+  mkdir -p "$O/state"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
+  return "$rc"
+}
+git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
+
+# HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha>, not <PR>
+# (agent-infra#1709 rec 1). It is also the key record-review/needsfix already use.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+
+# The log is TRUNCATED here, before any claim evidence is appended. It used to be truncated at
+# the end of the claim block, which silently deleted the "cross-box claim: acquired …" line on
+# every run — the feature worked and left no evidence that it had.
+echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
+
+# ── single-owner claim: local lock, then the cross-box git-ref claim ──────────
+# Three paths reach this script: chain-<N> (waits for a lane's PR), fix-<PR>, and the
+# controller's merge sweep. Only the last two are visible to the controller by session name,
+# so without a shared claim a freshly opened PR gets TWO concurrent reviewers racing the same
+# head: duplicate evidence comments, duplicate record-review writes, and an
+# ISSUES/CLEAN interleaving where one worker's needsfix marker lands after the other merged.
+# Atomic noclobber create is the lock; the controller also tests this file.
+CLAIM="$O/state/mergeclaim-$PR.lock"
+claim() { ( set -o noclobber; echo $$ > "$CLAIM" ) 2>/dev/null; }
+if ! claim; then
+  OPID="$(cat "$CLAIM" 2>/dev/null || echo 0)"
+  if [ "${OPID:-0}" -gt 0 ] && kill -0 "$OPID" 2>/dev/null; then echo "[merge $PR] pid $OPID already owns this PR — exiting" >> "$L.log"; exit 0; fi
+  rm -f "$CLAIM"
+  claim || { echo "[merge $PR] claim race — exiting" >> "$L.log"; exit 0; }
+fi
+
+# ── cross-box claim (agent-infra#1709 recs 1-3) ───────────────────────────────
+# The noclobber lock above is atomic on ONE box only: three boxes driving this repo are three
+# independent filesystems, so it stops nothing between them. The boxes share exactly one
+# durable store — the repository — and creating a ref with `git push` is an atomic CAS.
+#
+# FAIL-OPEN, ON PURPOSE. If the claim store is unreachable (network blip, a rejected push for
+# an unrelated reason) we proceed and SAY SO in the log. #1709's headline finding is that
+# no mechanism guarantees two machines never run the same job, so the design must tolerate
+# duplicates: every side effect on this path is idempotent per head (one evidence comment, a
+# record-review marker keyed on $HEAD, and `gh pr merge` twice is a no-op). Failing CLOSED
+# would stall the whole fleet on one transient error — the strictly worse failure. The log
+# line makes the fallback visible rather than silent.
+CROSS_OWN=""
+CROSS_RC=0
+if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$O/claims.sh"
+  # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
+  # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the 30x30s gate
+  # wait below (900) + the merge itself. Derived, not a bare constant — and passed explicitly,
+  # because sourcing claims.sh above sets CLAIM_TTL=1800 and would silently win over a default.
+  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+  claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
+  CROSS_RC=$?
+  case "$CROSS_RC" in
+    0) CROSS_OWN="$CLAIM_COMMIT"
+       echo "[merge $PR] cross-box claim: $CLAIM_RESULT" >> "$L.log" ;;
+    1) echo "[merge $PR] cross-box claim REFUSED: $CLAIM_RESULT — another box owns head $HEAD; exiting" >> "$L.log"
+       rm -f "$CLAIM"; exit 0 ;;
+    *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log" ;;
+  esac
+fi
+trap 'rm -f "$CLAIM"; [ -n "${CROSS_OWN:-}" ] && claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1' EXIT INT TERM
+
+
+# ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
+cat > "$L-reviewer.txt" <<EOF
+You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
+    cd $REPO && git fetch origin main --quiet
+    gh pr view $PR --repo $OR --json title,body,files
+    gh pr diff $PR --repo $OR
+Read the changed files IN FULL at the PR head (\`git show origin/$BR:<path>\`), not just the diff hunks. Read skills/code-review/SKILL.md for the discipline.
+Report ONLY HIGH-confidence real issues: correctness bugs; security (injection/auth bypass/secrets); VACUOUS tests (would pass on the pre-fix code — prove it); scope/claim mismatch; regressions; fail-open paths; repo-rule violations — especially a NEW test file missing from config/ci-surfaces.yml (the manifest-integrity leg fails and the file is never selected).
+If you need to run tests, use your own throwaway checkout: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`. Bound every command; never run the whole suite.
+
+## REQUIRED: post your review as a PR comment (this is the merge-gate audit artifact)
+Write your review to a file, then:
+    gh pr comment $PR --repo $OR --body-file <your-review-file>
+Your comment MUST state the outcome plainly and MUST NOT contain an unresolved assertion. Forbidden phrases in a CLEAN comment: "issues remain", "NOT CLEAN", "requires human attention", "auto-fix stalled/failed/reached cap".
+
+## FINAL MESSAGE — exactly one line:
+    CLEAN <the comment URL that gh pr comment printed>
+  or, if you found real issues:
+    ISSUES <n>
+Do NOT modify code, commit, or merge.
+EOF
+run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
+LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
+echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
+
+case "$LAST" in
+  CLEAN*)
+    URL="$(printf '%s' "$LAST" | grep -oE 'https?://[^ ]+' | head -1)"
+    CID="$(printf '%s' "$URL" | grep -oE '[0-9]+$')"
+    echo "[merge $PR] evidence comment id=${CID:-?} url=$URL" >> "$L.log"
+    if [ -z "${CID:-}" ]; then echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2; fi
+    # ── 2) record the review (writes the signed marker into the PR body) ──
+    "$HOME/.pi/agent/scripts/record-review.sh" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
+    rc=$?
+    echo "[merge $PR] record-review rc=$rc" >> "$L.log"
+    [ $rc -ne 0 ] && { echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3; }
+    # ── 3) wait for the required ai-review-gate to go green (read the LATEST check row) ──
+    gate=""
+    for i in $(seq 1 30); do
+      gate="$(gh pr checks "$PR" --repo "$OR" --json name,state --jq '[.[]|select(.name=="ai-review-gate")][0].state' 2>/dev/null)"
+      echo "[merge $PR] gate=$gate (try $i)" >> "$L.log"
+      [ "$gate" = "SUCCESS" ] && break
+      sleep 30
+    done
+    if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
+    # ── 4) merge ──
+    if gh pr merge "$PR" --repo "$OR" --squash >> "$L.log" 2>&1; then
+      echo "[merge $PR] MERGED $(date)" >> "$L.log"
+      touch "$O/state/merged-$PR.done"
+    else
+      echo "[merge $PR] merge command failed" >> "$L.log"
+    fi
+    ;;
+  *)
+    # The reviewer found real issues (or the reviewer failed) at this exact head. Leave a
+    # marker so the loop knows to spawn a FIXER (not another re-record) on its next cycle.
+    echo "[merge $PR] NOT CLEAN or reviewer failed — needs a fixer at head=$HEAD" >> "$L.log"
+    [ -n "${HEAD:-}" ] && touch "$O/state/needsfix-$PR-$HEAD"
+    ;;
+esac
+echo "[merge $PR] end $(date)" >> "$L.log"

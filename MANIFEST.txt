@@ -1,0 +1,13 @@
+5e16207bc638edb2  ./export/2026-10-14-crossbox-claims/crossbox-changes.patch
+e0ef5ceb845f5130  ./export/2026-10-14-crossbox-claims/divergence.txt
+50404c95c4538ae6  ./export/2026-10-14-crossbox-claims/files/chain-merge.sh
+7074ca72221138a4  ./export/2026-10-14-crossbox-claims/files/claims.sh
+487acbfcf721475f  ./export/2026-10-14-crossbox-claims/files/fix-one.sh
+c03a610939035b19  ./export/2026-10-14-crossbox-claims/files/lane.sh
+09496328945d0319  ./export/2026-10-14-crossbox-claims/files/merge-one.sh
+0bf55ab02444ca93  ./export/2026-10-14-crossbox-claims/files/orch-loop.sh
+f1f00065c64cffbc  ./export/2026-10-14-crossbox-claims/files/test-claims.sh
+710f414728dc39f1  ./export/2026-10-14-crossbox-claims/files/test-crossbox.sh
+0dc3d3473485133f  ./export/2026-10-14-crossbox-claims/files/test-gates.sh
+846a2bb92e1eb538  ./export/2026-10-14-crossbox-claims/README.md
+87d3be2ce12a99fd  ./MANIFEST.txt
