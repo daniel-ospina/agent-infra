@@ -363,6 +363,10 @@ unset -f tmux
 # collision_preflight.py for it. checked.txt suppresses that issue forever and the §7.1 reaper
 # only un-blacklists dispatched.txt entries — so one dispatchable issue was lost per refresh.
 awk '/^n=0$/{f=1} f{print} /^done < /{f=0}' "$REFRESH" > "$TMP/refreshloop.sh"
+# ⛔ The loop body reads TWO variables the shipped script defines earlier in its flow: $PY (the
+# interpreter) and $PREFLIGHT (the resolved tool path). agent-infra#1736 replaced the hardcoded
+# `"$SC/.venv/bin/python" tools/collision_preflight.py` with those, so the extraction must supply
+# them or the check would pass by running an empty command (no VERDICT) rather than the stub.
 if need "$TMP/refreshloop.sh" "the refresh loop body is extracted from the shipped refresh-candidates.sh"; then
   RL="$TMP/refresh"; mkdir -p "$RL/fakesc/.venv/bin"
   printf '10\n20\n30\n40\n50\n' > "$RL/.pool"
@@ -373,7 +377,7 @@ if need "$TMP/refreshloop.sh" "the refresh loop body is extracted from the shipp
 echo "VERDICT: CLEAN"
 PY
   chmod +x "$RL/fakesc/.venv/bin/python"
-  O="$RL" LIMIT=3 SC="$RL/fakesc" bash "$TMP/refreshloop.sh" > "$TMP/refreshloop.out" 2>&1
+  O="$RL" LIMIT=3 SC="$RL/fakesc" PY="$RL/fakesc/.venv/bin/python" PREFLIGHT="$RL/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/refreshloop.out" 2>&1
   checked="$(tr '\n' ' ' < "$RL/checked.txt")"
   case "$checked" in *40*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: the candidate past LIMIT is NOT marked checked" $rc
@@ -398,7 +402,7 @@ echo "boom: could not reach the graph" >&2
 exit 1
 PY
   chmod +x "$RV/fakesc/.venv/bin/python"
-  O="$RV" LIMIT=5 SC="$RV/fakesc" bash "$TMP/refreshloop.sh" > "$TMP/verdict.out" 2>&1
+  O="$RV" LIMIT=5 SC="$RV/fakesc" PY="$RV/fakesc/.venv/bin/python" PREFLIGHT="$RV/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/verdict.out" 2>&1
   case "$(tr '\n' ' ' < "$RV/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: an ERRORED pre-flight does NOT blacklist the issue" $rc
   case "$(tr '\n' ' ' < "$RV/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
@@ -418,12 +422,12 @@ S="$(dirname "$0")/.pass"
 if [ -f "$S" ]; then echo "VERDICT: CLEAN"; else : > "$S"; echo "VERDICT: COLLISION"; fi
 PY
   chmod +x "$RC/fakesc/.venv/bin/python"
-  O="$RC" LIMIT=5 SC="$RC/fakesc" bash "$TMP/refreshloop.sh" > "$TMP/collide-1.out" 2>&1
+  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-1.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: a COLLISION does not permanently blacklist the issue" $rc
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "shipped refresh loop: a COLLISION is not queued" $rc
-  O="$RC" LIMIT=5 SC="$RC/fakesc" bash "$TMP/refreshloop.sh" > "$TMP/collide-2.out" 2>&1
+  O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-2.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the COLLISION is re-attempted and queued once it clears" $rc
 fi
@@ -1296,6 +1300,10 @@ ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" 
 # command it is handed (this is the only place the forwarding can be observed).
 TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
+# The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
+# must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
+# Without it `start` dies in cmd_check and no session command is ever recorded.
+mkdir -p "$TMP/tm/repo/tools"; : > "$TMP/tm/repo/tools/collision_preflight.py"
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1402,6 +1410,9 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # ambient one as "present" was a false green on a cell that merges without the key.
 KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
+# Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
+# repo must carry a pre-flight tool or the key verdicts below are never reached.
+mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
@@ -2342,6 +2353,23 @@ if command -v git >/dev/null 2>&1; then
   fi
 else
   ck "port-drift: git is available to drive the check" 1
+fi
+
+# ── N) refresh-candidates.sh is REPO-AWARE, and a permanent failure is not a silent loop (#1736) ──
+# The full contract — a repo with no pyproject.toml PROCEEDS (the venv step is not applicable, not a
+# swallowed failure), the pre-flight tool is resolved per repo, `--check` gives the read-only
+# verdict the cell's `start` gate uses, and orch-loop.sh distinguishes PERMANENT (stop, mark, be
+# loud) from TRANSIENT (retry) — lives in its own hermetic suite. Run it here so `./selftest.sh`
+# stays the one command that pins the harness; run-bash-shards.sh runs it directly in CI too.
+if [ -f "$HERE/refresh-scout.test.sh" ]; then
+  if bash "$HERE/refresh-scout.test.sh" > "$TMP/refresh-scout.out" 2>&1; then
+    ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 0
+  else
+    ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 1
+    grep -E '❌|Summary|PASS=' "$TMP/refresh-scout.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "refresh-scout.test.sh: the #1736 suite is present" 1
 fi
 
 echo
