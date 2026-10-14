@@ -85,7 +85,15 @@ cur_state() {
 
 case "${1:-} ${2:-}" in
   "repo view")
-    printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
+    # The rail asks for the slug AND the canonical URL; the URL is what pins the
+    # drift predicate's HOST (#7727), so the fixture must speak both shapes.
+    case "$*" in
+      *--json*url*)
+        # A scenario may pin the web url the CLI reports (e.g. an IPv6-literal host).
+        [ -n "${SCEN:-}" ] && [ -f "$SCEN/cwd-url" ] && { cat "$SCEN/cwd-url"; exit 0; }
+        printf 'https://github.com/%s\n' "${REPO_FIXTURE:-$REPO}"; exit 0 ;;
+      *) printf '%s\n' "$REPO_FIXTURE"; exit 0 ;;
+    esac ;;
   "pr update-branch")
     # Model the branch update: the head moves to head-new.
     [ "${SCEN_UPDATE_FAIL:-0}" = 1 ] && exit 1
@@ -169,6 +177,13 @@ case "${1:-} ${2:-}" in
             if [ -f "$SCEN/base-tip-seq" ]; then
               n=$(( $(cat "$SCEN/base-tip-count" 2>/dev/null || echo 0) + 1 ))
               printf '%s' "$n" > "$SCEN/base-tip-count"
+              # Past the end, REPEAT the last line. An extra read anywhere in the rail
+              # must not silently return EMPTY — an empty tip reads as "unreadable" and
+              # fires a different arm than the fixture intended, so a scenario that
+              # happens to combine a sequence fixture with a new read would pass (or
+              # fail) for a reason that has nothing to do with what it tests.
+              _total="$(wc -l < "$SCEN/base-tip-seq" | tr -d ' ')"
+              [ "$n" -gt "$_total" ] && n="$_total"
               sed -n "${n}p" "$SCEN/base-tip-seq"
               exit 0
             fi
@@ -228,6 +243,107 @@ exit "${SCEN_ADMIN_RC:-0}"
 ADMEOF
 chmod +x "$ADM"
 
+# ── fake drift predicate (#7727) ───────────────────────────────────────────
+# The rail CALLS the target repo's own `tools/drift-guard.py`. A repo with no such
+# tool has no drift gate, so the rail's no-gate branch keeps the #7230 skip and
+# every pre-existing scenario is unaffected. These scenarios inject the predicate
+# via ATOMIC_LAND_DRIFT_GUARD and model its three REAL outcomes, EXIT CODES
+# INCLUDED (the real tool exits 0 green, 1 on a revert, 2 on an environment error):
+#   $SCEN/drift-status = ok     ⇒ exit 0, `"status": "ok"`    (green ⇒ skip stands)
+#   $SCEN/drift-status = drift  ⇒ exit 1, `"status": "drift"` (unsafe ⇒ MUST refresh)
+#   the fixture ABSENT          ⇒ exit 2, no output            (unmeasurable ⇒ refresh)
+# Faithful exit codes are the point: the scenario that must refresh does so on a red
+# MEASUREMENT, not merely on a failing process.
+DRIFT="$TMP/fake-drift-guard"
+cat > "$DRIFT" <<'DRIFTEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'drift-guard %s\n' "$*" >> "$SCEN/drift-calls"
+if [ -f "$SCEN/drift-status" ]; then
+  st="$(cat "$SCEN/drift-status")"
+  printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+  [ "$st" = ok ] && exit 0
+  exit 1
+fi
+echo "drift-guard: could not fetch the base — its freshness cannot be proven" >&2
+exit 2
+DRIFTEOF
+chmod +x "$DRIFT"
+
+# A SECOND fixture whose EXIT CODE is DECOUPLED from its JSON status. The fixture
+# above keeps them faithful (exit 0 iff status ok), which is realistic but makes
+# trap 1 UNTESTABLE: a rail that reads the process exit code instead of the JSON
+# `status` passes every scenario, so a regression to exit-code keying ships green.
+# This fixture can CONTRADICT itself, which is the only way to pin trap 1 (#7727).
+DRIFT_EXITCODE="$TMP/fake-drift-guard-decoupled"
+cat > "$DRIFT_EXITCODE" <<'DRIFTEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+printf 'drift-guard %s\n' "$*" >> "$SCEN/drift-calls"
+st="$(cat "$SCEN/drift-status")"
+printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+exit "$(cat "$SCEN/drift-exit")"
+DRIFTEOF
+chmod +x "$DRIFT_EXITCODE"
+
+# A FAKE `uv` ON PATH — the suite must not depend on a real TOOLCHAIN for the rail's
+# default predicate argv (`uv run python <tool>`). CI has no guaranteed `uv`, and no
+# interpreter it can fetch for a scratch checkout, so a scenario that needs the default
+# argv read "unmeasurable" → refresh → RED for a reason that has nothing to do with the
+# code: measured, 17g-E29 and 17g-E36 failed in CI while passing locally — a test
+# measuring the HOST, not the change. The shim reproduces the fixture contract exactly
+# (consult $SCEN/drift-status, log the call, exit 0/1/2 by status) and RECORDS the tool
+# path the rail resolved, so the root-anchored path assertion is observable rather than
+# inferred from a refresh (see 17g-E9).
+FAKEBIN="$TMP/fakebin"; mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/uv" <<'UVEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+SCEN="${SCEN:?SCEN must be set}"
+tool=""
+# The rail invokes `uv run python <tool> --json --base ... --head <sha>`, so the
+# TOOL is the first *.py argument — the LAST argument is the head sha (taking it
+# as the tool made every default-argv scenario read "unmeasurable", which is the
+# CI symptom this shim exists to remove).
+for a in "$@"; do case "$a" in *.py) tool="$a"; break ;; esac; done
+printf 'drift-guard tool=%s\n' "$tool" >> "$SCEN/drift-calls"
+if [ ! -f "$tool" ]; then
+  echo "drift-guard: no tool at $tool" >&2
+  exit 2
+fi
+if [ -f "$SCEN/drift-status" ]; then
+  st="$(cat "$SCEN/drift-status")"
+  printf '{"status": "%s", "branch": "(detached HEAD)", "base": "origin/main"}\n' "$st"
+  [ "$st" = ok ] && exit 0
+  exit 1
+fi
+echo "drift-guard: could not fetch the base — its freshness cannot be proven" >&2
+exit 2
+UVEOF
+chmod +x "$FAKEBIN/uv"
+PATH="$FAKEBIN:$PATH"; export PATH
+
+# The DEFAULT run directory for every scenario. It must be a real git checkout whose
+# `origin` carries the target slug, because the rail asserts the remote its predicate
+# fetches: defaulting to the CALLER's cwd made each no-override scenario depend on
+# that checkout's origin, so a fork clone false-redded for a reason unrelated to the
+# code (review round 8). This one is the suite's own and hermetic.
+git init -q "$TMP/default-cwd" 2>/dev/null || true
+git -C "$TMP/default-cwd" remote add origin "https://github.com/$REPO.git" 2>/dev/null || true
+# A readable `origin/main` WITH NO tool in it. The no-gate exception asks the BASE REF
+# whether a gate exists (a stale checkout must not read "no gate" for a repo that has
+# one), so the hermetic checkout needs the ref it asks for. `git init` alone leaves
+# `origin/main` unborn, which the exception correctly reads as unprovable — and every
+# no-override scenario would then refresh for a reason unrelated to what it tests.
+printf 'x\n' > "$TMP/default-cwd/README.md"
+git -C "$TMP/default-cwd" -c user.email=suite@example.invalid -c user.name=suite \
+  add README.md >/dev/null 2>&1
+git -C "$TMP/default-cwd" -c user.email=suite@example.invalid -c user.name=suite \
+  commit -q -m init >/dev/null 2>&1
+git -C "$TMP/default-cwd" update-ref refs/remotes/origin/main HEAD
+
 # ── harness ───────────────────────────────────────────────────────────────
 # new_scen: a scenario dir + a temp HOME carrying the review record fixture.
 # A fixture gate key and a marker that is GENUINELY signed with it. The rail verifies
@@ -253,6 +369,24 @@ new_scen() {
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
+  # #7727: the drift predicate is injected per-scenario; absent ⇒ the rail's
+  # no-gate branch (no override AND no tools/drift-guard.py in this repo), which
+  # keeps every pre-existing scenario's skip behaviour bit-for-bit.
+  SCEN_DRIFT_CMD=
+  rm -f "$SCEN/drift-status" 2>/dev/null || true
+  # #7727: the cwd's repo slug. Defaults to the target repo, so the drift exception
+  # applies; a scenario that sets it to ANOTHER slug models `--repo owner/name`
+  # naming a different repo while the cwd holds the wrong `tools/`.
+  SCEN_CWD_REPO=
+  # #7727: where the rail is RUN from. Empty ⇒ $TMP/default-cwd, a HERMETIC checkout
+  # whose `origin` carries the target slug (the rail asserts the remote its predicate
+  # fetches). A scenario sets it to a SUBDIRECTORY of a repo whose root holds
+  # `tools/drift-guard.py`, which is the only way to tell a root-anchored tool test
+  # from a cwd-relative one.
+  SCEN_CWD=
+  # #7727: the drift threshold. 0 is the production default; a non-zero value is how
+  # the "distance below the threshold" arms are reached at all.
+  SCEN_DRIFT_TRIGGER=
   mkdir -p "$SCEN" "$SCEN/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_OLD" > "$SCEN/head-old"
   printf '%s\n' "$HEAD_NEW" > "$SCEN/head-new"
@@ -264,10 +398,16 @@ new_scen() {
   printf '5\n' > "$SCEN/completed"
   printf 'MERGED\n' > "$SCEN/merged"
   printf 'cccccccccccccccccccccccccccccccccccccccc\n' > "$SCEN/merge-base"
-  printf '9999999999999999999999999999999999999999\n' > "$SCEN/base-tip"
+  # #7727: the base tip the CLI reports. The no-gate exception requires the local base
+  # ref to MATCH this (a ref that cannot be dated is not a measurement), and the
+  # hermetic checkout's `origin/main` is what every scenario without its own cwd reads.
+  # A made-up sha here made the freshness test refuse in 17g-A/D1/D6 — scenarios that
+  # reach the no-gate skip — so they refreshed for a reason unrelated to what they test.
+  printf '%s\n' "$(git -C "$TMP/default-cwd" rev-parse origin/main)" > "$SCEN/base-tip"
   printf '0\n' > "$SCEN/behind"
   mkdir -p "$SCEN/tmp"
   : > "$SCEN/calls"
+  : > "$SCEN/drift-calls"
   # default fixture record: verdict clean at the OLD head
   SCEN_RECORD_FILE="$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
   printf '{"pr":42,"head_sha":"%s","verdict":"clean","repo":"%s"}\n' "$HEAD_OLD" "$REPO" \
@@ -287,7 +427,16 @@ new_scen() {
 # with PPID 1). This helper is only ever called in a subshell or backgrounded, so
 # the `exec` cannot replace this test script.
 rail_exec() { # <extra args...>
-  SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="$REPO" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
+  # #7727: run the rail from a DETERMINISTIC directory — the suite's own hermetic
+  # checkout (whose origin carries the target slug), unless the scenario names
+  # another. Inheriting the caller's cwd made the identity assertions depend on
+  # ambient state: launched from a checkout that HAS `tools/drift-guard.py` (tortoise,
+  # the repo this rail lands) the rail ran that FOREIGN tool, and launched from a
+  # clone whose origin differs it read as unidentifiable — either way every
+  # no-override scenario false-redded for a reason unrelated to the code (review
+  # rounds 6 and 8, both measured).
+  cd "${SCEN_CWD:-$TMP/default-cwd}"
+  SCEN="$SCEN" HOME="$SCEN/home" REPO_FIXTURE="${SCEN_CWD_REPO:-$REPO}" HEAD_MOVED="$HEAD_MOVED" TMPDIR="$SCEN/tmp" \
   SCEN_RECORD_RC="${SCEN_RECORD_RC:-0}" SCEN_RECORD_LOG="${SCEN_RECORD_LOG:-}" \
   SCEN_RECORD_FILE="$SCEN_RECORD_FILE" \
   SCEN_RECORD_NO_WRITE="${SCEN_RECORD_NO_WRITE:-0}" \
@@ -295,6 +444,8 @@ rail_exec() { # <extra args...>
   SCEN_RECORD_REPOINTS_BASE="${SCEN_RECORD_REPOINTS_BASE:-0}" \
   SCEN_ADMIN_RC="${SCEN_ADMIN_RC:-0}" ATOMIC_LAND_CONFIRM_MAX="${ATOMIC_LAND_CONFIRM_MAX:-60}" \
   ATOMIC_LAND_GH="$FAKE" ATOMIC_LAND_RECORD_SH="$REC" ATOMIC_LAND_ADMIN_MERGE="$ADM" \
+  ATOMIC_LAND_DRIFT_GUARD="${SCEN_DRIFT_CMD:-}" \
+  ATOMIC_LAND_DRIFT_TRIGGER="${SCEN_DRIFT_TRIGGER:-0}" \
     exec bash "$RAIL" "$@"
 }
 
@@ -481,12 +632,21 @@ printf '3\n' > "$SCEN/pending"
 # The bound is tested BEFORE the sleep, so an unclamped `sleep "$POLL"` lets the
 # rail outlive its documented bound by up to a whole poll interval — measured on
 # the revision before the clamp: `--wait-timeout 2 --poll 8` ran 10 s wall while
-# printing "waiting (≤2s)". A watchdog at 6 s separates the clamped stop (~2 s)
-# from the unclamped one (~8 s), and turns the regression into a FAILED TEST.
-run_rail_watchdog 6 42 --repo "$REPO" --poll 8 --wait-timeout 2
+# printing "waiting (≤2s)". A watchdog separates the clamped stop from the
+# unclamped one, and turns the regression into a FAILED TEST.
+#
+# The interval is deliberately WIDE (poll 60, watchdog 30, bound 2) rather than the
+# original 8/6/2. The ratio is what carries the assertion — the watchdog must sit
+# ABOVE a legitimate stop and BELOW a full poll interval — but the original margin
+# was so thin that on a loaded host (measured: load avg 258 on 10 CPUs) a
+# CLAMPED stop cost 5–7 s of wall time in subprocess overhead alone and straddled
+# the 6 s watchdog, so a correct rail was killed as if it had overshot. That was a
+# false red on 7 of 9 runs. Widening the interval restores the separation without
+# weakening anything: an unclamped `sleep 60` is still caught, just later.
+run_rail_watchdog 30 42 --repo "$REPO" --poll 60 --wait-timeout 2
 rc=$?
 if [ "$rc" -eq 124 ]; then
-  fail "the rail overshot its 2s bound — --poll 8 pushed the stop past the bound"
+  fail "the rail overshot its 2s bound — --poll 60 pushed the stop past the bound"
 elif [ "$rc" -eq 1 ]; then
   pass "stops at the bound, not a full poll interval later (rc 1)"
 else
@@ -1018,7 +1178,13 @@ called "pr update-branch" \
 # Contract pin (the #1565 review P0): the tokens the rail maps must be the CLI's enum
 # tokens. Scenario A exercises MERGEABLE, so a predicate that only accepted `true`
 # fails there; this states the contract once more in its own right.
-grep -q 'MERGEABLE' "$RAIL" && grep -q 'CONFLICTING' "$RAIL" \
+# Anchored to the MAPPING ARMS, not to any occurrence of the token: both tokens
+# ALSO appear in the comment above naming the CLI's enum, so the earlier bare
+# `grep -q MERGEABLE` was satisfied by the comment alone — deleting both mapping
+# arms left it green (measured, round 4). The behavioural coverage is 17g-A (a
+# predicate that accepted only `true` would fail there); this only states the token
+# contract, so it must read the arms themselves.
+grep -qE '^[[:space:]]*MERGEABLE\)' "$RAIL" && grep -qE '^[[:space:]]*CONFLICTING\)' "$RAIL" \
   && pass "the mergeable mapping names the CLI's enum tokens (MERGEABLE/CONFLICTING)" \
   || fail "the mergeable mapping does not name the CLI's enum tokens"
 
@@ -1156,12 +1322,946 @@ called "pr update-branch" \
   && pass "refreshed despite the landable state (the fail-safe reaches the drift arm)" \
   || fail "the fail-safe did NOT restore the refresh — the skip is un-disableable"
 
+# ═══ 17g-E. #7727 — a mergeable head is not necessarily a LANDABLE one ═════
+# `mergeable` answers "no text conflict", a different question from "would the merge
+# KEEP the base's content". The skip above takes the second for granted. When it is
+# false the skip leaves the head permanently unlandable: the drift red cannot clear
+# without a refresh, and the skip keeps refusing to do it. Live instance: PR #7703
+# (CLEAN, mergeable, 14 behind) — drift-guard reported 776 lines of silent revert, a
+# zero-conflict rebase made it green, and the refresh WAS the fix.
+# NOTE: SCEN_DRIFT_CMD must be set AFTER each new_scen (which resets it), like every
+# other per-scenario fixture here.
+
+echo "── 17g-E1. CLEAN + behind>0 + strict=false + mergeable + drift RED ⇒ the refresh HAPPENS (#7727)"
+new_scen cleandriftunsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0) after the refresh" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && pass "refreshed: the merge would not keep main's content, so the drift IS what blocks it" \
+  || fail "SKIPPED a drift-unsafe head — the #7230 skip left it unlandable (#7703's shape)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "the drift predicate was consulted at all" \
+  || fail "the predicate was never called"
+# The rail's stdout is the human's evidence for WHY a head moved, so the reason must
+# be attributed to the branch that was actually taken. NOTE the count is not the
+# assertion: the DECISION line (here) and the ACTION line at the update call are both
+# `[1/4] update`, so a refresh legitimately emits two. What must never appear is the
+# sibling arm's line — true of that arm, false here (mergeable IS true) — which a
+# fall-through printed as well: a fresh misattribution inside the fix for one.
+grep -q "drift predicate is NOT positively green" "$SCEN/out" \
+  && pass "the refresh names the drift predicate as the reason" \
+  || fail "the decision line does not name the drift predicate"
+grep -q "not positively mergeable" "$SCEN/out" \
+  && fail "the drift-red path claimed the PR was not mergeable — it IS (false attribution)" \
+  || pass "and it does NOT claim the PR is unmergeable (no fall-through misattribution)"
+
+# ── DIRECTION B — a GREEN predicate must still take the skip ─────────────
+echo "── 17g-E2. …and with the predicate GREEN the head is KEPT (the #7230 fix is preserved)"
+new_scen cleandriftsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a head whose merge WOULD keep main's content — the O3 waste (#7230)" \
+  || pass "did NOT refresh (safe drift ⇒ nothing to repair)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was" \
+  || fail "the head moved for a safe drift"
+
+# ── FAIL-CLOSED — unmeasurable must never stand in for green ─────────────
+echo "── 17g-E3. …and an UNMEASURABLE predicate REFRESHES (fail-closed)"
+new_scen cleandriftunmeasured
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+# NO $SCEN/drift-status: the fake exits 2 with no output, exactly as the real tool
+# does when it cannot prove the base's freshness (#4174).
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on an unmeasurable predicate (a possibly-stale base is never a pass)" \
+  || fail "an unmeasurable predicate was read as GREEN — fail-open"
+
+# ── THE BASE REF SHAPE — a MEASURED trap (#7727) ─────────────────────────
+echo "── 17g-E4. the predicate is passed a FETCHABLE base ref (origin/<base>), not the bare branch"
+# MEASURED: `--base main` exits 2 (`status: error`, "not a remote-tracking ref — the
+# gate cannot prove its freshness") while `--base origin/main` measures. The rail's
+# $BASE is the bare branch name, so passing it would make EVERY read an error and
+# disable the skip permanently — a silent failure of this whole arm.
+# Self-contained (its own scenario): it previously grepped the PREVIOUS scenario's
+# log, so its result depended on E3 existing and running first (round-3 finding).
+new_scen drifte4
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+run_rail 42 --repo "$REPO" --poll 0
+grep -qF -- "origin/main" "$SCEN/drift-calls" \
+  && pass "invoked with origin/main" \
+  || fail "not passed a fetchable base ref (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
+grep -qF -- "--json" "$SCEN/drift-calls" \
+  && pass "invoked with --json (the JSON status, not the exit code, is the decision basis)" \
+  || fail "not passed --json — the decision basis would be the tool's unspecified human output"
+grep -qF -- "--head $HEAD_OLD" "$SCEN/drift-calls" \
+  && pass "invoked with the head under review ($HEAD_OLD)" \
+  || fail "the head under review was not passed to the predicate (got: $(head -1 "$SCEN/drift-calls" 2>/dev/null))"
+
+# ── THE EXIT CODE IS NOT THE DECISION BASIS — trap 1, pinned in BOTH directions ──
+echo "── 17g-E13. status=drift with exit 0 ⇒ REFRESH (a green must be a MEASUREMENT, not a return code)"
+# The main fixture couples code to payload, so it cannot tell a JSON-keyed rail from
+# an exit-code-keyed one. Trap 1 says the tool exits 1 for a revert AND for an
+# unusable interpreter, so the exit code cannot be the decision — but only a fixture
+# whose code CONTRADICTS its payload can prove the rail obeys that.
+new_scen driftexitcode
+SCEN_DRIFT_CMD="$DRIFT_EXITCODE"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+printf '0\n'         > "$SCEN/drift-exit"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed — a drift measurement was not read as green for exiting 0" \
+  || fail "SKIPPED on exit 0 while the payload said status=drift (the exit-code trap, unpinned)"
+
+echo "── 17g-E14. status=ok with exit 1 ⇒ SKIP (the same trap, the other direction)"
+new_scen driftexitcode2
+SCEN_DRIFT_CMD="$DRIFT_EXITCODE"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+printf '1\n'         > "$SCEN/drift-exit"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "REFRESHED on a green MEASUREMENT because the process exited 1" \
+  || pass "did NOT refresh (a green measurement is kept, whatever the exit code)"
+
+# ── NO GATE — the one deliberate exception ───────────────────────────────
+echo "── 17g-E5. a repo with NO drift gate keeps the skip (nothing to leave unlandable)"
+new_scen cleandriftnogate
+# `new_scen` already defaults the reported base tip to THIS checkout's `origin/main`
+# (the no-gate exception requires the local base ref to match it), so E5 needs no
+# override of its own — the default IS this scenario's fixture.
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_DRIFT_CMD=          # no override, and this repo has no tools/drift-guard.py
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed although no drift gate exists to leave the head unlandable" \
+  || pass "did NOT refresh (no gate ⇒ the drift is harmless by construction)"
+
+# ── THE CWD IS NOT THE TARGET REPO — a fail-OPEN the review found ─────────
+echo "── 17g-E6. a missing tool with --repo naming ANOTHER repo ⇒ REFRESH (absence proves nothing)"
+# The rail never `cd`s and `--repo owner/name` is supported, so `./tools/` can belong
+# to a DIFFERENT repo. Inferenceing "no gate" from its absence then skips a head whose
+# target DOES have the gate — the exact unlandable-head failure #7727 exists to stop.
+# The exception therefore needs positive evidence that the cwd IS the target repo.
+new_scen driftwrongcwd
+SCEN_CWD_REPO="daniel-ospina/some-other-repo"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_DRIFT_CMD=          # no override and no local tool: the case that used to skip
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (an unverifiable cwd is unmeasurable ⇒ fail-closed)" \
+  || fail "SKIPPED on a missing tool in the WRONG repo — fail-OPEN (the review's P1)"
+
+# ── A PRESENT TOOL IN A CHECKOUT THAT IS NOT THE TARGET — the round-4 fail-OPEN ──
+echo "── 17g-E15. a PRESENT tool in a checkout that is NOT the target ⇒ REFRESH (its green is about the WRONG repo)"
+# The identity test used to sit INSIDE the missing-tool branch, so when the tool WAS
+# present it ran from ANY checkout and its green was attributed to the target. The
+# tool measures its OWN checkout's repo (`git rev-parse --show-toplevel` +
+# `origin/<base>`), so a green here is a statement about a DIFFERENT repo — the same
+# unlandable-head fail-OPEN the missing-tool branch was fixed for, one branch over.
+new_scen driftwrongcwdwithtool
+git init -q "$TMP/e15repo"
+# An origin that SATISFIES the remote assertions (slug at a boundary, same host), so
+# the SCEN_CWD_REPO mismatch below is the ONLY thing that can reject this checkout.
+# Without it the origin read is empty and this scenario refreshes for that reason
+# instead, leaving mutation B28 (identity gate inert) undetected here (review round 9).
+git -C "$TMP/e15repo" remote add origin "https://github.com/$REPO.git"
+mkdir -p "$TMP/e15repo/tools" "$TMP/e15repo/sub"
+cat > "$TMP/e15repo/tools/drift-guard.py" <<'E15EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E15EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e15repo/sub"                    # the tool IS here, at the scratch root
+SCEN_CWD_REPO="daniel-ospina/some-other-repo"  # ...but the checkout is NOT the target
+SCEN_DRIFT_CMD=                                # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — a green measured against ANOTHER repo is not evidence about the target" \
+  || fail "SKIPPED on a green from another repo's tool (the round-4 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate RAN before the identity was established — its wrong-repo green was used" \
+  || pass "and it was never consulted: identity failed before any measurement"
+
+# ── A FORK LAYOUT — `gh` and the tool DISAGREE about which repo this is ──
+echo "── 17g-E16. a fork layout (origin=fork, upstream=target) ⇒ REFRESH (the tool fetches origin, not what gh resolves)"
+# The tool fetches the checkout's `origin` remote. `gh repo view` resolves the "base
+# repo" and PREFERS a remote named `upstream`. MEASURED on this box: with
+# origin=https://github.com/daniel-ospina/agent-infra.git and
+# upstream=https://github.com/daniel-ospina/tortoise.git, `gh repo view --json
+# nameWithOwner -q .nameWithOwner` prints `daniel-ospina/tortoise`. So the CWD_REPO
+# check passes (gh named the target) while the measurement is of the FORK — the
+# round-4 fail-OPEN one layer down (review round 7).
+# The fork's name is deliberately the TARGET'S plus a suffix: `owner/name-fork`
+# CONTAINS `owner/name`, so a substring test passes it and the slug must be matched
+# at a PATH BOUNDARY instead.
+new_scen driftforklayout
+git init -q "$TMP/e16repo"
+mkdir -p "$TMP/e16repo/tools" "$TMP/e16repo/sub"
+git -C "$TMP/e16repo" remote add origin   "https://github.com/${REPO}-fork.git"
+git -C "$TMP/e16repo" remote add upstream "https://github.com/$REPO.git"
+cat > "$TMP/e16repo/tools/drift-guard.py" <<'E16EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E16EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e16repo/sub"
+SCEN_CWD_REPO="$REPO"     # gh resolves the UPSTREAM, which IS the target, so that check passes
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the tool fetches origin (the fork), so its green is not about the target" \
+  || fail "SKIPPED on a green measured from a FORK's origin (the round-7 wrong-repo green)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the remote it fetches is not the target" \
+  || pass "and it was never consulted: the remote assertion failed before any measurement"
+
+# ── A SAME-SLUG REMOTE ON ANOTHER HOST — round 8 ──
+echo "── 17g-E17. origin on a DIFFERENT host with the same owner/name ⇒ REFRESH (a remote is host+owner+name)"
+# The path-boundary check pins owner/name. A remote is (host, owner, name), so a
+# mirror on another host with the SAME owner/name is a DIFFERENT repository; its green
+# must not be attributed to the target (review round 8). The path here is IDENTICAL to
+# the slug on purpose — review round 15 found the fixture carried an extra `grp/`
+# segment, so the PATH test refused it and the HOST test was never exercised: the
+# scenario passed for a reason other than the one it named. 17g-E21 is the extra-segment
+# case; this one must rest on the host alone.
+new_scen driftforeignhost
+git init -q "$TMP/e17repo"
+mkdir -p "$TMP/e17repo/tools" "$TMP/e17repo/sub"
+git -C "$TMP/e17repo" remote add origin "https://gitlab.com/$REPO.git"
+cat > "$TMP/e17repo/tools/drift-guard.py" <<'E17EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E17EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e17repo/sub"
+SCEN_CWD_REPO="$REPO"     # gh names the target, so the slug check passes; the HOST must stop it
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — a same-slug remote on another host is a different repository" \
+  || fail "SKIPPED on a green from a mirror on a FOREIGN host (the round-8 wrong-repo green)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its HOST is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
+# ── AN IPv6-LITERAL HOST — round 9 ───────────────────────────────────────
+echo "── 17g-E18. two IPv6-literal hosts, same owner/name ⇒ REFRESH (a colon is not always a port separator)"
+# The host parser cuts at the first colon to drop `:port`. For `[2001:db8::1]` that
+# colon is INSIDE the brackets, so both sides reduce to `[2001` and two DIFFERENT
+# hosts compare EQUAL — the silent wrong-repo fail-OPEN, reachable whenever gh and
+# origin are both IP-literal (a self-hosted GHE addressed by address). The parser
+# must cut at the closing bracket instead. Reverting `remote_host_of`'s `\[*` arm to
+# a first-colon cut reddens THIS scenario (and only it).
+new_scen driftipv6host
+git init -q "$TMP/e18repo"
+mkdir -p "$TMP/e18repo/tools" "$TMP/e18repo/sub"
+git -C "$TMP/e18repo" remote add origin "https://[2001:dead::9]/$REPO.git"
+printf 'https://[2001:db8::1]/%s\n' "$REPO" > "$SCEN/cwd-url"
+cat > "$TMP/e18repo/tools/drift-guard.py" <<'E18EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E18EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e18repo/sub"
+SCEN_CWD_REPO="$REPO"     # the slug passes; only the HOST separates these two
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — [2001:db8::1] and [2001:dead::9] are different hosts, not one [2001" \
+  || fail "SKIPPED: two DIFFERENT IPv6 hosts collapsed to the same prefix (the round-9 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its HOST is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
+# ── STALE CHECKOUT — the no-gate exception must ask the BASE REF ────────
+echo "── 17g-E19. the base ref HAS the tool but this checkout does not ⇒ REFRESH (a stale tree is not evidence of no gate)"
+# "No local file" is not "no gate". A checkout one commit behind the base, or a file
+# deleted locally, reads "no gate" for a repo that HAS one — and that skip is
+# unmeasured. The exception therefore asks `origin/<base>` (the same ref the predicate
+# measures against) and takes the skip only when the ref is READABLE and lacks the
+# tool. Here the ref has it and the tree does not.
+new_scen driftstalegatetree
+rm -rf "$TMP/e19repo"; git init -q "$TMP/e19repo"
+mkdir -p "$TMP/e19repo/tools" "$TMP/e19repo/sub"
+git -C "$TMP/e19repo" remote add origin "https://github.com/$REPO.git"
+cat > "$TMP/e19repo/tools/drift-guard.py" <<'E19EOF'
+import json
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E19EOF
+printf 'x\n' > "$TMP/e19repo/README.md"
+git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e19repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e19repo" update-ref refs/remotes/origin/main HEAD
+rm -f "$TMP/e19repo/tools/drift-guard.py"      # the base ref HAS it; this tree does not
+# ...and the API must report that same tip, or E19 would refresh on the freshness
+# precondition before reaching the absence test it exists to exercise.
+printf '%s\n' "$(git -C "$TMP/e19repo" rev-parse origin/main)" > "$SCEN/base-tip"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e19repo/sub"
+SCEN_CWD_REPO="$REPO"     # identity and host pass; only the base-ref read separates these
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the base ref carries a gate this checkout cannot run" \
+  || fail "SKIPPED: a stale working tree read as 'the target has no drift gate'"
+
+# ── A SCHEME-LESS ORIGIN WITH A COLON BEFORE THE `@` — round 10 ─────────
+echo "── 17g-E20. scheme-less origin 'user:pw@github.com/o/n' ⇒ REFRESH (git reads the host as 'user', not github.com)"
+# git's scp-like form is `[user@]host:path`, and github's own scp form is
+# `git@github.com:owner/name`. Writing userinfo into THAT form gives
+# `user:pw@github.com:owner/name` — which git still reads as scp-like, because no
+# slash precedes the first colon, so its host is `user` and its path is
+# `pw@github.com:owner/name`. The rail's first-`@` read instead named the TARGET's host
+# and took the skip on a fetch that ssh's elsewhere. NOTE the colon on BOTH sides is
+# what makes this shape discriminating: without the trailing colon the fallback arm
+# does not match either and the authority is empty for the right reason.
+new_scen driftscplikeuserinfo
+git init -q "$TMP/e20repo"
+mkdir -p "$TMP/e20repo/tools" "$TMP/e20repo/sub"
+git -C "$TMP/e20repo" remote add origin "user:pw@github.com:$REPO"
+cat > "$TMP/e20repo/tools/drift-guard.py" <<'E20EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E20EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e20repo/sub"
+SCEN_CWD_REPO="$REPO"     # the slug and the naive host parse BOTH pass; git's parse disagrees
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the remote's authority is unreadable, so its green is not about the target" \
+  || fail "SKIPPED on a fetch whose host git parses as 'user', not the target (the round-10 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the authority it would fetch is unreadable" \
+  || pass "and it was never consulted: the authority check failed before any measurement"
+
+# ...and the OTHER scp-like form: the colon is followed by a SLASH, not by another
+# colon, so the path is the userinfo plus the slug. The authority git takes is `user`
+# (the text before the first colon), which is not the target's host, so the HOST test
+# refuses it — the PATH test would refuse it too. It needs its OWN scenario: sharing one
+# with the form above would let the first sub-case's refresh satisfy a "did the rail
+# refresh?" assertion for the second, which is how a vacuous assertion passes (round 15).
+new_scen driftscpnouser
+git init -q "$TMP/e20crepo"
+mkdir -p "$TMP/e20crepo/tools" "$TMP/e20crepo/sub"
+git -C "$TMP/e20crepo" remote add origin "user:pw@github.com/$REPO"
+cat > "$TMP/e20crepo/tools/drift-guard.py" <<'E20CEOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E20CEOF
+SCEN_CWD="$TMP/e20crepo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — no arm matches that form, so the authority is empty and the HOST test refuses it" \
+  || fail "SKIPPED: the one-colon scp-like form produced a readable authority"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the authority could not be read" \
+  || pass "and it was never consulted there either"
+
+# ── A FOREIGN OWNER WITH AN EXTRA LEADING PATH SEGMENT — round 11 ────────
+echo "── 17g-E21. origin '.../evil/<owner>/<name>' ⇒ REFRESH (the path must BE the target's, not end with it)"
+# A suffix test (`*/owner/name`) accepts this: the string does end with the target
+# slug. But the repository path is `evil/owner/name`, so the owner is not ours. E16
+# covers the same assertion from the other side — a different NAME under the same
+# owner — so both shapes are pinned, and both redden under B30.
+new_scen driftforeignowner
+git init -q "$TMP/e21repo"
+mkdir -p "$TMP/e21repo/tools" "$TMP/e21repo/sub"
+git -C "$TMP/e21repo" remote add origin "https://github.com/evil/$REPO.git"
+cat > "$TMP/e21repo/tools/drift-guard.py" <<'E21EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E21EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e21repo/sub"
+SCEN_CWD_REPO="$REPO"     # the host matches; only the extra leading segment separates these
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — 'evil/<owner>/<name>' ends with the slug but is not the target's path" \
+  || fail "SKIPPED: a foreign owner's path was accepted because it ENDS with owner/name (the round-11 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although the remote's path is not the target's" \
+  || pass "and it was never consulted: the path assertion failed before any measurement"
+
+# ── AN UNREADABLE BASE REF — round 11 ────────────────────────────────────
+echo "── 17g-E22. the base ref is UNREADABLE ⇒ REFRESH (unmeasurable is not absent)"
+# The no-gate exception is the one skip with NO measurement, so absence must be
+# MEASURED. `git ls-tree` reports three outcomes apart: an entry (present), no output
+# at rc 0 (absent), and a non-zero rc (unreadable). Here `origin/main` names a BLOB,
+# not a tree, so ls-tree fails — the shape a corrupt object or an unfetched promisor
+# blob produces. Only rc 0 WITH NO OUTPUT may take the skip.
+new_scen driftunreadableref
+git init -q "$TMP/e22repo"
+mkdir -p "$TMP/e22repo/sub"
+git -C "$TMP/e22repo" remote add origin "https://github.com/$REPO.git"
+printf 'not a tree\n' > "$SCEN/blobbody"
+git -C "$TMP/e22repo" update-ref refs/remotes/origin/main \
+  "$(git -C "$TMP/e22repo" hash-object -w --stdin < "$SCEN/blobbody")"
+# The freshness precondition must hold here too, or E22 would refresh before reaching
+# the unreadability it exists to test.
+printf '%s\n' "$(git -C "$TMP/e22repo" rev-parse origin/main)" > "$SCEN/base-tip"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e22repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — an unreadable base ref is 'no measurement', not 'no gate'" \
+  || fail "SKIPPED: an unreadable base ref read as 'the target has no drift gate' (a T1 skip with no measurement)"
+
+# ── A STALE BASE REF — round 12 ──────────────────────────────────────────
+echo "── 17g-E23. the local base ref is STALE ⇒ REFRESH (a ref we cannot date is not a measurement)"
+# The predicate this skip bypasses FETCHES the base, because a worktree that never
+# fetched holds a stale `origin/<base>` and "a local ref cannot be proven fresh"
+# (#4174). A local ABSENCE read is exactly that ref, so it may skip only while the
+# local tip equals the tip the API reports. Here it does not.
+new_scen driftstaleref
+rm -rf "$TMP/e23repo"; git init -q "$TMP/e23repo"
+mkdir -p "$TMP/e23repo/sub"
+git -C "$TMP/e23repo" remote add origin "https://github.com/$REPO.git"
+printf 'x\n' > "$TMP/e23repo/README.md"
+git -C "$TMP/e23repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e23repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e23repo" update-ref refs/remotes/origin/main HEAD
+printf '0000000000000000000000000000000000000000\n' > "$SCEN/base-tip"   # the API reports a DIFFERENT tip
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e23repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the local base ref is not the tip the API reports, so its absence proves nothing" \
+  || fail "SKIPPED on a base ref that cannot be shown to be the target's current one (the round-12 T1 fail-OPEN)"
+
+# ── A FRAGMENT IN THE ORIGIN URL — round 13 ───────────────────────────────
+echo "── 17g-E24. origin with a '#' fragment ⇒ REFRESH (the fragment ends the URL for git, not for a naive authority split)"
+# `https://evil.invalid#@github.com/<slug>` — a browser and curl end the URL at `#`,
+# so its host is `evil.invalid`; a naive authority/path split reads the userinfo as
+# `evil.invalid#` and the host as `github.com`, i.e. the TARGET, and attributes the
+# foreign tool's green to it. The authority is cut at `#` before the split.
+new_scen driftfragmentauthority
+git init -q "$TMP/e24repo"
+mkdir -p "$TMP/e24repo/tools" "$TMP/e24repo/sub"
+git -C "$TMP/e24repo" remote add origin "https://evil.invalid#@github.com/$REPO"
+cat > "$TMP/e24repo/tools/drift-guard.py" <<'E24EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E24EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e24repo/sub"
+SCEN_CWD_REPO="$REPO"     # the CLI still names the target (the upstream/fork layout)
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — the fragment ends the authority, so the host is evil.invalid" \
+  || fail "SKIPPED: a '#' fragment let a foreign host read as the target's (the round-13 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its host is not the target's" \
+  || pass "and it was never consulted: the host assertion failed before any measurement"
+
+# ── THE FRAGMENT CUT IS TRANSPORT-DEPENDENT — round 14 ───────────────────
+echo "── 17g-E25. an ssh origin with a '#' ⇒ REFRESH (git keeps the fragment in the repository PATH)"
+# The cut is right for http(s), where curl ends the URL at `#`. It is WRONG for ssh:
+# git passes the fragment as part of the path, so cutting it would read
+# `ssh://host/<slug>#x` as the target while the fetch goes to `<slug>#x`.
+new_scen driftsshfragment
+git init -q "$TMP/e25repo"
+mkdir -p "$TMP/e25repo/tools" "$TMP/e25repo/sub"
+git -C "$TMP/e25repo" remote add origin "ssh://git@github.com/$REPO#x"
+cat > "$TMP/e25repo/tools/drift-guard.py" <<'E25EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E25EOF
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e25repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — ssh does not end the URL at '#', so the path is <slug>#x, not <slug>" \
+  || fail "SKIPPED: the fragment was cut for ssh, where git keeps it in the path (the round-14 fail-OPEN)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+  && fail "the predicate was CONSULTED although its path is not the target's" \
+  || pass "and it was never consulted: the path assertion failed before any measurement"
+
+# ── A REPLACED BASE OBJECT — round 14 ────────────────────────────────────
+echo "── 17g-E26. the base ref's object is REPLACED by a tree without the tool ⇒ REFRESH (indirection must not undo the tip check)"
+# `git rev-parse <ref>` IGNORES replace refs; `git ls-tree <ref>` HONOURS them. So a
+# `git replace` mapping the base sha to an empty tree passes the freshness test and then
+# reports "no gate" — the two reads naming DIFFERENT objects for the same ref. The
+# absence read therefore runs with `--no-replace-objects`, on the sha the tip check just
+# verified.
+new_scen driftreplacedref
+rm -rf "$TMP/e26repo"; git init -q "$TMP/e26repo"
+mkdir -p "$TMP/e26repo/tools" "$TMP/e26repo/sub"
+git -C "$TMP/e26repo" remote add origin "https://github.com/$REPO.git"
+printf 'x\n' > "$TMP/e26repo/README.md"
+printf 'x\n' > "$TMP/e26repo/tools/drift-guard.py"
+git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite add -A >/dev/null 2>&1
+git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite commit -q -m init >/dev/null 2>&1
+git -C "$TMP/e26repo" update-ref refs/remotes/origin/main HEAD
+E26_SHA="$(git -C "$TMP/e26repo" rev-parse origin/main)"
+E26_TREE="$(git -C "$TMP/e26repo" hash-object -t tree /dev/null)"
+E26_REPL="$(git -C "$TMP/e26repo" -c user.email=suite@example.invalid -c user.name=suite commit-tree "$E26_TREE" -m replaced)"
+git -C "$TMP/e26repo" replace "$E26_SHA" "$E26_REPL"
+rm -f "$TMP/e26repo/tools/drift-guard.py"          # no LOCAL tool either
+printf '%s\n' "$E26_SHA" > "$SCEN/base-tip"         # the API reports the same sha
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e26repo/sub"
+SCEN_CWD_REPO="$REPO"
+SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+SCEN_CWD=
+called "pr update-branch" \
+  && pass "refreshed — replace refs are ignored, so the base object really does carry the tool" \
+  || fail "SKIPPED: a replace ref hid the tool from the absence read while the tip check passed (a T1 skip with no measurement)"
+
+# ── THE URL FORM IS DECIDED BY GIT'S GRAMMAR, NOT BY THE STRING'S SHAPE — r15 ───
+# The `case` arms that split the remote used to be chosen by SHAPE. A shape that git
+# resolves differently is a wrong-subject read, and round 15 found two: a string with a
+# slash before its colon is a LOCAL PATH to git, and a `://` whose scheme is not a legal
+# scheme is not a URL at all — yet both named the TARGET's host and path.
+cat > "$TMP/e2x-tool.py" <<'E2XEOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard\n")
+print(json.dumps({"status": "ok", "base": "origin/main"}))
+E2XEOF
+
+origin_form_case() { # <name> <origin-url> <expect: refresh|skip> <why>
+  local name="$1" url="$2" expect="$3" why="$4" dir="$TMP/e27-$1"
+  new_scen "driftform$name"
+  rm -rf "$dir"; git init -q "$dir"
+  mkdir -p "$dir/tools" "$dir/sub"
+  git -C "$dir" remote add origin "$url"
+  cp "$TMP/e2x-tool.py" "$dir/tools/drift-guard.py"   # PRESENT: a skip would consult it
+  # The predicate's VERDICT, in the same contract every other scenario uses. It must
+  # not come from running the fixture through the ambient toolchain: CI has no `uv`,
+  # so a scenario that needed the real default argv red "unmeasurable" → refresh for a
+  # reason that has nothing to do with the grammar under test (measured: E29/E36).
+  # `drift` for the refresh cases too, so that a leak past the identity gate still
+  # LOGS a call and trips the "never consulted" assertion instead of passing quietly.
+  if [ "$expect" = skip ]; then printf 'ok\n' > "$SCEN/drift-status"
+  else                          printf 'drift\n' > "$SCEN/drift-status"; fi
+  printf 'CLEAN\n'     > "$SCEN/state"
+  printf '14\n'        > "$SCEN/behind"
+  printf 'false\n'     > "$SCEN/strict"
+  printf 'MERGEABLE\n' > "$SCEN/mergeable"
+  SCEN_CWD="$dir/sub"
+  SCEN_CWD_REPO="$REPO"
+  SCEN_DRIFT_CMD=           # NO override: exercise the real default path
+  SCEN_RECORD_LOG=1
+  run_rail 42 --repo "$REPO" --poll 0
+  SCEN_CWD=
+  if [ "$expect" = refresh ]; then
+    called "pr update-branch" \
+      && pass "$name refreshed — $why" \
+      || fail "$name SKIPPED: $why"
+    grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+      && fail "$name: the predicate was CONSULTED on a remote that is not the target's" \
+      || pass "$name: and it was never consulted"
+  else
+    called "pr update-branch" \
+      && fail "$name refreshed although $why" \
+      || pass "$name did NOT refresh — $why"
+    grep -qF -- "drift-guard" "$SCEN/drift-calls" 2>/dev/null \
+      && pass "$name: and the predicate WAS consulted" \
+      || fail "$name: never consulted the predicate — the remote was rejected before any measurement"
+  fi
+}
+
+echo "── 17g-E27. origin 'foo/bar@github.com:<slug>' ⇒ REFRESH (a slash before the colon makes it a LOCAL PATH)"
+# `git-upload-pack` runs on a DIRECTORY here, so no part of that string is a host — but
+# the old `*@*:*` arm read host `github.com` and path `<slug>` straight out of it.
+origin_form_case slashpath "foo/bar@github.com:$REPO" refresh "a slash before the colon makes it a local path, not the target's remote"
+
+echo "── 17g-E28. origin './weird://github.com/<slug>' ⇒ REFRESH (not a legal scheme, so not a URL)"
+# Measured: git splits at `://` anyway and dies on the unknown protocol —
+# `fatal: protocol './weird' is not supported` — so it does NOT read the string as a
+# path. Classifying it as one is this code's conservative simplification, and the
+# refresh is the safe direction either way.
+origin_form_case badscheme "./weird://github.com/$REPO" refresh "'.' cannot start a scheme, so it is not a URL"
+
+echo "── 17g-E29. origin '<host>:<owner>/<name>' ⇒ the skip STILL applies (git's scp form needs no user)"
+# The fail-CLOSED half: `[user@]host:path` is a documented git remote form. Reading it
+# as unidentifiable disabled the skip — and with it the no-gate exception — for every
+# repo whose origin uses it.
+origin_form_case scplike "github.com:$REPO" skip "git's scp-like form names the target, and the predicate is green"
+
+echo "── 17g-E30. origin 'file://github.com/<slug>' ⇒ REFRESH (git cannot fetch that URL at all)"
+# git rejects a `file://` URL with a non-empty host other than `localhost` ("URL using
+# bad/illegal format"), so the URL has no fetchable subject and cannot be compared.
+origin_form_case filehost "file://github.com/$REPO" refresh "a file:// URL with a foreign host is not fetchable at all"
+
+echo "── 17g-E31. origin 'ssh://[evil.invalid]@github.com/<slug>' ⇒ REFRESH (git's host is the BRACKETED literal, not the text after the '@')"
+# Measured: `git-upload-pack evil.invalid '/<slug>'`. git's `host_end()` searches for
+# `@[` FIRST, so an authority that BEGINS with `[` is a bracketed literal whose host
+# ends at `]` and everything after the `]` is discarded. A first-`@` cut names the
+# target instead — the round-7 fail-OPEN one grammar rule further in.
+origin_form_case bracurl "ssh://[evil.invalid]@github.com/$REPO" refresh "git's host is the bracketed literal and everything after ']' is discarded"
+
+echo "── 17g-E32. origin '[evil.invalid]@github.com:<slug>' ⇒ REFRESH (the same rule in the scp-like form)"
+origin_form_case bracescp "[evil.invalid]@github.com:$REPO" refresh "the scp-like form applies git's host_end() too"
+
+echo "── 17g-E33. origin 'git://evil.invalid@github.com/<slug>' ⇒ REFRESH (the git:// transport has NO userinfo)"
+# Measured: `fatal: unable to look up evil.invalid@github.com (port 9418)` — the `@` is
+# part of the HOSTNAME there, so cutting at it names the target.
+origin_form_case gituserinfo "git://evil.invalid@github.com/$REPO" refresh "the git:// transport has no userinfo, so the '@' is part of the hostname"
+
+echo "── 17g-E34. origin 'ssh://github.com:evil/<slug>' ⇒ REFRESH (a non-numeric suffix is part of the HOSTNAME, not a port)"
+# Measured: git looks up host `github.com:evil` — and an `ssh_config` `Host
+# github.com:evil` alias makes that a DIFFERENT MACHINE, so a first-colon cut is a real
+# wrong-subject read and not a theoretical one.
+origin_form_case portnotnum "ssh://github.com:evil/$REPO" refresh "git's hostname is github.com:evil, not github.com"
+
+echo "── 17g-E35. origin 'ssh://github.com:65536/<slug>' ⇒ REFRESH (a port above 65535 is not a port)"
+origin_form_case porttoobig "ssh://github.com:65536/$REPO" refresh "65536 is not a port, so it stays part of the hostname"
+
+echo "── 17g-E36. origin 'ssh://github.com:22/<slug>' ⇒ the skip STILL applies (a REAL port is stripped)"
+# The other direction, so the rule cannot be "refuse every colon": git strips `:22` and
+# contacts `github.com`, which IS the target.
+origin_form_case portreal "ssh://github.com:22/$REPO" skip "a real port is stripped, so the host is the target's"
+
+echo "── 17g-E37. origin 'ftp://evil.invalid#@github.com/<slug>' ⇒ REFRESH (the fragment cut is not http-only)"
+# Measured: curl resolves `evil.invalid` for ftp exactly as for https, while git's own
+# error line prints the post-fragment URL — so a cut covering only http(s) named the
+# TARGET for a fetch that went to a foreign host (review round 18).
+origin_form_case ftpfragment "ftp://evil.invalid#@github.com/$REPO" refresh "curl ends the URL at '#' for ftp too, so the host is evil.invalid"
+
+echo "── 17g-E38. a remote carrying a QUERY ⇒ REFRESH (both directions are unmeasurable)"
+# Measured: `https://github.com/<slug>?x=1` makes git request `/…?x=1/info/refs` — a
+# repository path that is NOT the slug — and `https://evil.invalid?@github.com/<slug>`
+# makes curl contact `evil.invalid` while the text after the `@` names the TARGET (the
+# same fail-OPEN as the fragment, one delimiter over). The rail refuses to reason about
+# either, for every scheme.
+origin_form_case queryauth "https://evil.invalid?@github.com/$REPO" refresh "curl contacts evil.invalid, so the '@'-suffix must not name the target"
+origin_form_case querypath "https://github.com/$REPO?x=1" refresh "git keeps the query in the request path, so the repository is not the slug's"
+
+# ── THE SIBLING ARM — the same inference one arm over ─────────────────────
+echo "── 17g-E7. BEHIND + behind>0 + strict=false + mergeable + drift RED ⇒ REFRESH too"
+# The `BEHIND` enum routes to its own arm, which skipped on `mergeable` alone. Same
+# root cause: `mergeable` answers "no text conflict", not "the merge keeps the content".
+new_scen behinddriftunsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'BEHIND\n'    > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on a drift-red BEHIND head (the other arm consulted the predicate too)" \
+  || fail "SKIPPED a drift-unsafe BEHIND head — the same inference, one arm over"
+
+echo "── 17g-E8. …and BEHIND with a GREEN predicate still SKIPS (#1565 preserved)"
+new_scen behinddriftsafe
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'BEHIND\n'    > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'ok\n'        > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+# Assert the rail is HEALTHY, not merely quiet. Absence of an update call is
+# satisfied by a rail that crashed before reaching it, so E8 would report a skip on
+# a dead run — the sibling E2 (rc + head) and E5 (rc) both check this, and the
+# asymmetry was the gap. A "did not refresh" verdict must mean "chose not to".
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a BEHIND head with safe drift — #1565's skip was reversed" \
+  || pass "did NOT refresh (safe drift ⇒ the BEHIND skip stands)"
+[ "$(cat "$SCEN/head")" = "$HEAD_OLD" ] \
+  && pass "the head was left where it was" \
+  || fail "the head moved for a safe drift"
+
+# ── ROOT ANCHORING — the round-2 fail-OPEN ─────────────────────────────
+echo "── 17g-E9. the tool is found from a SUBDIRECTORY: the path is anchored to the repo ROOT"
+# BEHAVIOURAL, not a source-text grep. Round 3 showed a grep is satisfied by leaving
+# the anchored string in a COMMENT while the code reverts to a relative path. The
+# rail resolves its tool against `git rev-parse --show-toplevel`, so the only honest
+# test runs the rail somewhere the repo root DIFFERS from the process cwd: a real git
+# checkout whose ROOT holds tools/drift-guard.py, with the rail started in `sub/`.
+# A cwd-relative test would miss the tool at the root, read "no gate", and SKIP a
+# drift-red head — which is exactly what this scenario must NOT do.
+new_scen driftsubdir
+git init -q "$TMP/e9repo"
+mkdir -p "$TMP/e9repo/tools" "$TMP/e9repo/sub"
+# An `origin` remote whose URL carries the target slug: the gate now also asserts the
+# remote the tool FETCHES, so a scratch repo without one reads as unidentifiable and
+# refreshes before the predicate is ever consulted (see 17g-E16).
+git -C "$TMP/e9repo" remote add origin "https://github.com/$REPO.git"
+# The tool must be PYTHON: the default argv is `uv run python <tool>`.
+cat > "$TMP/e9repo/tools/drift-guard.py" <<'E9EOF'
+import json, os, pathlib, sys
+scen = os.environ["SCEN"]
+pathlib.Path(scen, "drift-calls").open("a").write("drift-guard " + " ".join(sys.argv[1:]) + "\n")
+p = pathlib.Path(scen, "drift-status")
+if not p.exists():
+    print("drift-guard: no fixture", file=sys.stderr); sys.exit(2)
+st = p.read_text().strip()
+print(json.dumps({"status": st, "base": "origin/main"}))
+sys.exit(0 if st == "ok" else 1)
+E9EOF
+printf 'drift\n'     > "$SCEN/drift-status"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+SCEN_CWD="$TMP/e9repo/sub"   # the rail runs HERE; the tool is at $TMP/e9repo/tools/
+SCEN_CWD_REPO="$REPO"        # identity matches, so the no-gate exception would apply if it were missed
+SCEN_DRIFT_CMD=              # NO override — the default argv must find the root-anchored tool
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed — the tool was found from a subdirectory (root-anchored)" \
+  || fail "SKIPPED from a subdirectory: a present gate read as absent (the round-2 fail-OPEN)"
+grep -qF -- "/e9repo/tools/drift-guard.py" "$SCEN/drift-calls" 2>/dev/null \
+  && pass "and the tool the rail resolved is the ROOT-anchored path, not a cwd-relative one" \
+  || fail "the rail resolved a different tool path: $(tail -1 "$SCEN/drift-calls" 2>/dev/null)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate actually RAN (not merely 'found')" \
+  || fail "the predicate never ran — found-by-accident or not at all"
+SCEN_CWD=                    # restore for later scenarios
+
+# ── THE TRIGGER BOUNDARY — the round-3 P1 ───────────────────────────────
+echo "── 17g-E12. a MEASURED distance below a non-zero drift threshold still consults the predicate"
+# The skip arms asked "is `behind` non-empty?" where the real question is "is it
+# ZERO?". With the default trigger only 0 reached them, so the difference was
+# invisible; with a non-zero ATOMIC_LAND_DRIFT_TRIGGER a REAL distance lands in
+# them, and the old form skipped a drift-red head WITHOUT calling the predicate
+# while printing "measured current (0 behind)" — a false statement (measured in
+# review round 3). Both arms must fail closed. The trigger is `0` in production;
+# this scenario exercises the boundary the knob exists to make testable.
+new_scen driftbelowtrigger
+SCEN_DRIFT_CMD="$DRIFT"
+SCEN_DRIFT_TRIGGER=20
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"   # A REAL distance, but below the threshold
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (CLEAN arm) — a non-zero distance is never read as current" \
+  || fail "SKIPPED a drift-red head below the threshold and called it 'measured current (0 behind)'"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate was consulted" \
+  || fail "skipped without consulting the predicate (the round-3 P1)"
+
+# The other arm: a NON-CLEAN state below the threshold takes the final `else`.
+new_scen driftbelowtriggerblocked
+SCEN_DRIFT_CMD="$DRIFT"
+SCEN_DRIFT_TRIGGER=20
+printf 'BLOCKED\n'   > "$SCEN/state"
+printf '14\n'        > "$SCEN/behind"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed (the final arm) — the same question, one arm over" \
+  || fail "SKIPPED a drift-red BLOCKED head below the threshold (the same 0/empty confusion)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "and the predicate was consulted there too" \
+  || fail "the final arm skipped without consulting the predicate"
+SCEN_DRIFT_TRIGGER=
+
+# ── THE THIRD SKIP PATH — CLEAN with an UNREADABLE distance ───────────────
+echo "── 17g-E10. CLEAN with an UNREADABLE distance + drift RED ⇒ REFRESH (else it skips unmeasured)"
+# `behind` is empty when the compare read fails. The `elif CLEAN` no-op used to absorb
+# that case and return without ever reading the predicate — the one skip that assumed a
+# state name was evidence about content. Under strict=false a genuinely-behind head
+# reports CLEAN, so this is PR #7703's shape one unreadable read away.
+new_scen cleannodistance
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '\n'          > "$SCEN/behind"   # empty = the compare API could not be read
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+called "pr update-branch" \
+  && pass "refreshed on an unreadable distance with a red predicate" \
+  || fail "SKIPPED a drift-red CLEAN head on an unreadable distance (the third skip path)"
+# The predicate must have been the REASON: a rail that refreshed on some other
+# ground would also pass the line above (round-3 finding).
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && pass "the predicate was consulted, not bypassed" \
+  || fail "refreshed without consulting the predicate — the third skip path is not gated"
+
+# ── …and the measured-current case must still be a cheap no-op ───────────
+echo "── 17g-E11. CLEAN with a MEASURED-CURRENT head (0 behind) ⇒ no-op, no predicate call"
+# behind=0 means the head contains the base, so no revert is possible and the no-op is
+# correct WITHOUT a subprocess. Pins that the P2 fix did not turn every clean landing
+# into a drift measurement (the cost the predicate adds).
+new_scen cleancurrent
+SCEN_DRIFT_CMD="$DRIFT"
+printf 'CLEAN\n'     > "$SCEN/state"
+printf '0\n'         > "$SCEN/behind"
+printf 'false\n'     > "$SCEN/strict"
+printf 'MERGEABLE\n' > "$SCEN/mergeable"
+printf 'drift\n'     > "$SCEN/drift-status"
+SCEN_RECORD_LOG=1
+run_rail 42 --repo "$REPO" --poll 0
+rc=$?
+[ "$rc" -eq 0 ] && pass "lands (rc 0)" || fail "expected rc 0, got $rc"
+called "pr update-branch" \
+  && fail "refreshed a measured-current head" \
+  || pass "no refresh (0 behind ⇒ nothing can revert)"
+grep -qF -- "drift-guard" "$SCEN/drift-calls" \
+  && fail "consulted the predicate for a measured-current head (needless subprocess)" \
+  || pass "and did NOT spend a predicate call on it"
+
 # ═══ 18. mutation coverage for the declared threat surface ═══════════════
 # The adversarial bound is the DECLARED surface, not reviewer exhaustion: every
 # class B1-B12 must be covered by a test that FAILS against the revision before
 # its fix. This section mutates the rail and asserts the suite reddens. A mutation
 # that leaves the suite green means the class is NOT covered.
-if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
+if true; then
+  # ⛔ THIS BLOCK IS ENTERED IN BOTH MODES, on purpose. The anchor check inside
+  # `mutate_and_expect_fail` is cheap (perl + cmp, no suite run) and is the only thing
+  # that catches a DEAD ENFORCER — a pattern that stopped matching because the line it
+  # anchored to was edited. That happened for real: an inline comment appended to the
+  # `*:*@*)` arm silently killed B33, and because CI runs with the default
+  # ATOMIC_LAND_MUTATIONS=1 the suite went RED there while every local run at
+  # ATOMIC_LAND_MUTATIONS=0 stayed green. Gating the anchor check behind the mutation
+  # mode is what let that gap exist; RUN_MUTATIONS now gates only the suite re-runs.
+  RUN_MUTATIONS="${ATOMIC_LAND_MUTATIONS:-1}"
   echo "── 18. mutation coverage — each declared bypass class must be caught"
   MUT="$TMP/mut"; mkdir -p "$MUT"
   # Two perl traps have cost this harness real coverage (all four instances fixed
@@ -1175,6 +2275,15 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # harness still prints "class covered". Trap (1) is caught only by reading the
   # diff, which is why every expression here is hand-audited.
   mutate_and_expect_fail() { # <name> <perl-expr>
+    # A CHILD run (`ATOMIC_LAND_ANCHORS=0`) must not assert anchors at all: it is
+    # handed an ALREADY-mutated rail, so the mutation's own pattern by definition no
+    # longer applies there. Failing on that would make the child exit non-zero for a
+    # reason unrelated to the scenarios, and a non-zero child is read below as "class
+    # covered" — a FALSE POSITIVE for every mutation whose anchor line it rewrote.
+    # (Measured: B32/B34 share one line, so each one's child tripped the other's
+    # anchor.) The anchor pass belongs to the top-level run only; `ANCHORS` gates it
+    # separately from `RUN_MUTATIONS`, which gates the suite re-runs in THAT run.
+    [ "${ATOMIC_LAND_ANCHORS:-1}" = "0" ] && return 0
     local name="$1"
     local expr="$2"
     local src="$MUT/$name.sh"
@@ -1191,13 +2300,41 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
       fail "mutation $name produced a file that does not PARSE — corrupt mutation, not coverage"
       return
     fi
-    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
+    if [ "$RUN_MUTATIONS" = "0" ]; then
+      # Anchor-only mode: the pattern applied and still parses. Do NOT re-run the suite.
+      pass "anchor $name applies"
+      return
+    fi
+    ATOMIC_LAND_MUTATIONS=0 ATOMIC_LAND_ANCHORS=0 ATOMIC_LAND_SUITE_RAIL="$src" bash "$0" >"$MUT/$name.log" 2>&1
     if [ $? -ne 0 ]; then
       pass "mutation $name reddens the suite (class covered)"
     else
       fail "mutation $name did NOT redden the suite (class NOT covered)"
     fi
   }
+  # The four predicate anchors below are separated by INDENTATION, not by content:
+  # the same predicate text sits at four sites. If two ever share a
+  # leading-whitespace run, an anchored pattern mutates the FIRST only while the
+  # suite still prints "class covered" — the second site ships unpinned (the
+  # B19b/B20b trap, recorded above). "class covered" is an exit code and cannot say
+  # WHICH site it covered, so pin the invariant the anchors rest on: each must
+  # match exactly ONE line. ⛔ GATED ON `ATOMIC_LAND_ANCHORS`, like
+  # `mutate_and_expect_fail` itself: a CHILD run is handed an already-MUTATED rail, so
+  # the four predicate lines it asserts on are exactly the lines those mutations
+  # rewrite — the loop then fails by construction, the child exits non-zero, and the
+  # parent reads that as "class covered". Ungated, B24/B25/B26/B27 would report
+  # coverage whether or not a single scenario detected them.
+  if [ "${ATOMIC_LAND_ANCHORS:-1}" != "0" ]; then
+  for _ind in 14 12 10 8; do
+    _n="$(awk -v n="$_ind" '
+      { ind=0; while (substr($0, ind+1, 1) == " ") ind++
+        if (ind == n && index($0, "drift_safe_of") && index($0, "= 1 ]")) c++ }
+      END { print c+0 }' "$RAIL")"
+    [ "$_n" = 1 ] \
+      && pass "the ${_ind}-space predicate anchor matches exactly one line" \
+      || fail "the ${_ind}-space predicate anchor matches $_n line(s) — a mutation could cover a different site and still report class covered"
+  done
+  fi
   # B1: pass the CURRENT head to record-review instead of the prior head
   mutate_and_expect_fail B1   's/"\$RECORD_SH" "\$PR" "\$prior"/"\044RECORD_SH" "\044PR" "\044HEAD"/'
   # B2a: drop the record precondition
@@ -1242,7 +2379,8 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   mutate_and_expect_fail B15  's/^\[ "\$WAIT_TIMEOUT" -le 86400 \].*$/true/m'
   # B16 (#1395 item 1, third door): drop the clamp on the final sleep, so the
   # rail overshoots its own bound by up to a whole poll interval (the bound is
-  # tested before the sleep). 7d's 6 s watchdog then fires at 8 s.
+  # tested before the sleep). 7d's 30 s watchdog then fires, because an unclamped
+  # `sleep "$POLL"` waits the full 60 s interval.
   mutate_and_expect_fail B16  's/^    remaining=\$\(\( 10#\$WAIT_TIMEOUT - elapsed \)\)\n    if \[ "\$remaining" -gt "\$POLL" \]; then remaining="\$POLL"; fi\n    sleep "\$remaining"/    sleep "\044POLL"/m'
   # B17 (#1395 item 1, fourth door): drop the `--poll` cap, so an oversized
   # interval reaches /bin/sleep and multiplies the count-bounded waits as well.
@@ -1298,6 +2436,133 @@ if [ "${ATOMIC_LAND_MUTATIONS:-1}" != 0 ]; then
   # failure it prevents: closing #7230 for one landable state and leaving the other's
   # population (measured at 10 heads) with the same non-termination. 17g-D6 must redden.
   mutate_and_expect_fail B23  's/in CLEAN\|UNSTABLE\) drift_landable=1/in CLEAN\) drift_landable=1/'
+  # B24 (#7727): make the DRIFT arm's predicate INERT — the skip fires on
+  # `mergeable` alone there, i.e. the revision before this fix. The failure it
+  # prevents: a head whose merge would silently REVERT a path the base moved is
+  # skipped forever, so the drift red can never clear and the PR is unlandable by
+  # the rail's own action (live: PR #7703, 776 lines of silent revert; the refresh
+  # was the whole fix). 17g-E1 must redden.
+  # ⛔ ANCHORED TO 14 SPACES ON PURPOSE. `drift_safe_of` now appears in TWO arms, and
+  # the BEHIND one comes FIRST in the file, so an unanchored pattern replaces THAT
+  # arm instead — which is exactly what happened on the first cut of this pair: both
+  # mutations mutated the same line, so the drift arm shipped UNPINNED while the suite
+  # still reported both "covered". This is the B19b/B20b lesson repeating, one level
+  # down: extending a predicate's use quietly narrows an unanchored mutation set.
+  # `mutate_and_expect_fail` reports "reddened nothing — the mutation did not apply"
+  # when the pattern stops matching, so re-indenting either arm fails LOUDLY.
+  mutate_and_expect_fail B24  's/^              if \[ "\$\(drift_safe_of\)" = 1 \]; then/              if true; then/m'
+  # B25 (#7727): the SIBLING arm must consult the predicate too. The failure it
+  # prevents: fixing one arm and leaving the other — the same "mergeable means
+  # landable" inference — skipping a drift-red head. Anchored to the BEHIND arm's
+  # 12 spaces so it cannot silently mutate the drift arm instead. 17g-E7 must redden.
+  mutate_and_expect_fail B25  's/^            if \[ "\$\(drift_safe_of\)" = 1 \]; then/            if true; then/m'
+  # B26 (#7727): the THIRD skip path — the CLEAN arm's predicate, reached when the
+  # distance is UNREADABLE or below a non-zero threshold. The failure it prevents:
+  # gating two arms and leaving the third, so a CLEAN head whose compare read failed
+  # is skipped unmeasured — the #7703 shape one unreadable read away. 17g-E10 and
+  # 17g-E12 must redden.
+  # ⛔ 8 SPACES, NOT 10: the final `else` arm's predicate is deliberately nested one
+  # level deeper so that B26 and B27 cannot both match the same line. Two same-indent
+  # sites would make one of these mutations cover only the first (the B19b/B20b trap).
+  mutate_and_expect_fail B26  's/^        if \[ "\$\(drift_safe_of\)" = 1 \]; then/        if true; then/m'
+  # B27 (#7727): the FOURTH site — the final `else` arm, reached by a non-CLEAN state
+  # whose distance is below a non-zero threshold. Anchored to its 10 spaces (see B26).
+  mutate_and_expect_fail B27  's/^          if \[ "\$\(drift_safe_of\)" = 1 \]; then/          if true; then/m'
+  # B28 (#7727): the IDENTITY HOIST — the round-4 fail-OPEN. The failure it prevents:
+  # the tool's measurement (or its absence) is attributed to a repo the cwd checkout
+  # is NOT, so a wrong-repo green takes a skip. 17g-E6 and 17g-E15 must redden.
+  mutate_and_expect_fail B28  's/^    if \[ -z "\$cwd_l" \] \|\| \[ "\$cwd_l" != "\$target_l" \]; then$/    if false; then/m'
+  # B29 (#7727): the CLEAN arm's VALUE test. The failure it prevents: testing the
+  # distance for EMPTINESS where the question is whether it is ZERO, so a measured
+  # distance below a non-zero trigger is skipped unmeasured (the round-3 P1). 17g-E12
+  # must redden.
+  mutate_and_expect_fail B29  's/^        if \[ "\$\{behind:-\}" = "0" \]; then$/        if [ -n "\044behind" ]; then/m'
+  # B30 (#7727): the ORIGIN-REMOTE PATH assertion — the round-7 wrong-repo green. The
+  # failure it prevents: the tool fetches the checkout's `origin` remote while
+  # `gh repo view` prefers `upstream`, so a fork checkout passes the identity check and
+  # its green is attributed to the target. With the path test inert the fork's
+  # `owner/name-fork` is accepted. 17g-E16 and 17g-E21 must redden.
+  mutate_and_expect_fail B30  's/^    if \[ "\$origin_path_l" != "\$target_l" \]; then$/    if false; then/m'
+  # B32 (#7727): the no-gate exception's ABSENCE test. The failure it prevents: a
+  # base ref that DOES contain the tool being read as "no gate" — a stale checkout, or
+  # a locally deleted file — so the skip is taken unmeasured (T1). 17g-E19 must redden.
+  mutate_and_expect_fail B32  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ "\$tree_rc" -eq 0 ]; then/m'
+  # B35 (#7727): the no-gate exception's FRESHNESS precondition. The failure it
+  # prevents: a local `origin/$BASE` that predates the gate being read as "the target
+  # has no gate" — the predicate this skip bypasses fetches the base precisely because
+  # a ref that was never re-fetched cannot be proven fresh (#4174). 17g-E23 must redden.
+  mutate_and_expect_fail B35  's/^      if \[ -n "\$live_tip" \] && \[ "\$local_tip" = "\$live_tip" \]; then$/      if [ -n "\$live_tip" ]; then/m'
+  # B34 (#7727): the UNREADABILITY test. The failure it prevents: an unreadable ref or
+  # tree (a partial clone whose promisor blob was never fetched, a corrupt object)
+  # collapsing into "the target has no gate", so the skip is taken on a repo that HAS
+  # one. rc 0 + no output is the ONLY shape that may skip. 17g-E22 must redden, and
+  # 17g-E5 must stay green.
+  mutate_and_expect_fail B34  's/^        if \[ "\$tree_rc" -eq 0 \] && \[ -z "\$tree_out" \]; then$/        if [ -z "\$tree_out" ]; then/m'
+  # B36 (#7727): the FRAGMENT cut. The failure it prevents:
+  # `https://evil.invalid#@github.com/<slug>`, whose host is `evil.invalid` for curl —
+  # and so for git over http(s) — but which reads as the TARGET when the authority is
+  # split naively: a T6 wrong-repo MATCH. 17g-E24 must redden.
+  mutate_and_expect_fail B36  's/origin_l="\$\{origin_l%%#\*\}"/:/'
+  # B37 (#7727): applying that cut to the transports where git does NOT end the URL at
+  # `#`. The failure it prevents: `ssh://host/<slug>#x` reads as the target while the
+  # fetch goes to the path `<slug>#x` — the same wrong-repo MATCH, one transport over.
+  # 17g-E25 must redden.
+  mutate_and_expect_fail B37  's/^      \*\) : ;;.*ssh and git:\/\/ keep it.*$/      *) origin_l="\044{origin_l%%#*}";;/m'
+  # B38 (#7727): the replace-ref defence. The failure it prevents: `git rev-parse`
+  # IGNORES replace refs and `git ls-tree` HONOURS them, so a `git replace` redirecting
+  # the base sha to an empty tree passes the freshness test and then reports "no gate" —
+  # a skip with no measurement on a repo whose base HAS the gate. 17g-E26 must redden.
+  mutate_and_expect_fail B38  's/ --no-replace-objects//'
+  # B39 (#7727): git's "no slash before the colon" rule for the scp-like form. The
+  # failure it prevents: `foo/bar@github.com/<slug>`, a LOCAL PATH to git, read as the
+  # target's host and path — a T6 wrong-repo MATCH. 17g-E27 must redden.
+  mutate_and_expect_fail B39  's#^            \*/\*\).*$#            zzz) : ;;#m'
+  # B40 (#7727): the scheme must be a legal scheme. The failure it prevents:
+  # `./weird://github.com/<slug>`, which git treats as a path, read as a URL — the same
+  # T6 MATCH, one shape over. 17g-E28 must redden.
+  mutate_and_expect_fail B40  "s#^( *).*origin_scheme_l=\"\" ;;.*\$#\$1'') origin_scheme_l=\"\" ;;#m"
+  # B41 (#7727): the `file://` host rule. The failure it prevents: a URL git cannot
+  # fetch at all being compared as though it had a fetchable subject, so a foreign
+  # `file://` host reads as the target's. 17g-E30 must redden.
+  mutate_and_expect_fail B41  's#^          \*\) return 0 ;;.*$#          *) : ;;#m'
+  # B42 (#7727): the scp-like arm itself — the fail-CLOSED half. The failure it
+  # prevents: `host:<slug>` (git's documented form, no user) rejected as unidentifiable,
+  # which disables the skip AND the no-gate exception for every such remote. 17g-E29
+  # must redden.
+  mutate_and_expect_fail B42  's#^            \*\) origin_authority_l=.*$#            *) : ;;#m'
+  # B43 (#7727): the bracketed-literal host rule. The failure it prevents:
+  # `ssh://[evil.invalid]@github.com/<slug>`, whose host git takes from INSIDE the
+  # brackets, read as the TARGET by a first-`@` cut — a T6 wrong-repo MATCH. 17g-E31
+  # and 17g-E32 must redden.
+  # `|` is the delimiter, NOT `#`: the replacement contains `${1##*@}`, and a `#`
+  # delimiter truncates there and silently substitutes NOTHING at exit 0 — the anchor
+  # pass then reports "the mutation did not apply", which is how this was caught.
+  mutate_and_expect_fail B43  's/^.*the literal IS the host.*$/    [*) printf %s "\${2##*@}" ;;/m'
+  # B44 (#7727): userinfo belongs to the TRANSPORT. The failure it prevents:
+  # `git://evil.invalid@github.com/<slug>`, whose hostname git takes WHOLE (the git://
+  # transport has no userinfo), read as the TARGET by a last-`@` cut. 17g-E33 must redden.
+  # The delimiter is `/`, NOT `|`: these patterns contain literal pipes, and with `|` as
+  # the delimiter an escaped `\|` collapses to regex ALTERNATION instead of a literal
+  # pipe (measured). `%%:*}` is avoided by letting `.*$` consume the rest of the line.
+  mutate_and_expect_fail B44  's/^ *git\|file\) printf .%s. "\$2" ;;.*$/         git|file) printf %s "\${2##*@}" ;;/m'
+  # B45 (#7727): a suffix is a port only when it IS one. The failure it prevents:
+  # `ssh://github.com:evil/<slug>`, whose hostname git takes as `github.com:evil` (and
+  # an `ssh_config` alias can point that at another machine), read as the TARGET by a
+  # first-colon cut. 17g-E34 and 17g-E35 must redden; 17g-E36 must stay green.
+  mutate_and_expect_fail B45  's/^ *case "\$p" in.*$/         printf %s "\${a%%:*}";;/m'
+  # B47 (#7727): the QUERY refusal. The failure it prevents:
+  # `https://evil.invalid?@github.com/<slug>`, where curl contacts `evil.invalid` but
+  # the text after the `@` names the TARGET. 17g-E38 must redden.
+  mutate_and_expect_fail B47  's/^ *\*\\\?\*\) return 0 ;;.*$/      *) : ;;/m'
+  # B33 was DELETED: it pinned the `*:*@*)` arm, which review round 12 showed to be
+  # verdict-NEUTRAL once the path is compared exactly (the fall-through arm extracts
+  # the path from the same first colon, so it disagrees with the slug anyway). A
+  # mutation of a redundant arm cannot redden anything, which made 17g-E20 a vacuous
+  # scenario; the arm is gone and E20 is now pinned by B30 like E16 and E21.
+  # B31 (#7727): the HOST assertion. The failure it prevents: a same-slug remote on a
+  # DIFFERENT host (a mirror, a GitLab/GHE path) is a different repository, and its
+  # green would be attributed to the target. 17g-E17 and 17g-E18 must both redden.
+  mutate_and_expect_fail B31  's/^    if \[ -z "\$target_host_l" \] \|\| \[ "\$origin_host_l" != "\$target_host_l" \]; then$/    if false; then/m'
   # B7: make --dry-run a no-op (the inspection path starts mutating)
   mutate_and_expect_fail B7   's/--dry-run\)      DRY_RUN=1; shift ;;/--dry-run)      DRY_RUN=0; shift ;;/'
   # B8: treat every record as fresh

@@ -41,6 +41,10 @@ import {
   getPrHeadShaViaRest,
   getPrMergeBaseSha,
   getPrHeadSha,
+  getPrLiveDiffHash,
+  resolveDiffHashHelper,
+  parseDiffHashHelperOutput,
+  _setPrDiffHashOverride,
   hasAdminMergeFlag,
   isGhPrMergeCommand,
   isAdminMergeCommand,
@@ -53,6 +57,8 @@ import {
   getPrComments,
   ACCEPTED_VERDICTS,
   isAcceptedVerdict,
+  isDiffSha256,
+  EMPTY_BYTE_SHA256,
   _setRunGhOverride,
   BLOCK_MESSAGE,
   MICRO_BLOCK_MESSAGE,
@@ -263,6 +269,162 @@ test("allow: clean-micro verdict with matching head", () => {
   const rec = { ...cleanRecord, verdict: "clean-micro" };
   const r = evaluateMergeGate(138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" });
   equal(r.status, "allow");
+});
+
+// ── #1351: the DIFF-keyed carry (parity with the GitHub ai-review-gate) ──
+// The GitHub gate accepts a signed record when its `@ <sha>` matches the head OR
+// its signed `diff=<sha256>` matches the PR's live diff. The local gate was
+// HEAD-only, so a merge-only `gh pr update-branch` left a green required check
+// and a locally blocked merge. These pin the mirrored arm — and, above all, that
+// it fails CLOSED on every way of not having an identity.
+section("#1351 — a moved head carries on diff identity (local/gate parity)");
+
+const DIFF_A = "1".repeat(64);
+const DIFF_B = "2".repeat(64);
+const diffRecord: ReviewRecord = { ...cleanRecord, diff_sha256: DIFF_A };
+
+test("stale head + MATCHING diff hash → allow, carried on content identity", () => {
+  const r = evaluateMergeGate(
+    138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+  );
+  equal(r.status, "allow");
+  equal((r as any).carried, true, "the carry is flagged so the audit trail can tell it apart");
+  ok(/CARRIED FORWARD/.test((r as any).message), `message names the carry: ${(r as any).message}`);
+  ok((r as any).message.includes(DIFF_A.slice(0, 12)), "message names the digest that carried it");
+});
+
+test("NEGATIVE CONTROL: stale head + DIFFERING/unreadable live hash → block head_advanced", () => {
+  // The one that matters: a stale head whose content DIFFERS (or whose identity
+  // could not be read) must keep today's refusal. "Could not read" is not "read
+  // and matched": the empty body, the 300-file API cap, a non-diff body and a
+  // network failure all arrive here as null.
+  const unreadable: Array<string | null> = [
+    DIFF_B, null, "", "not-a-hash", DIFF_A.slice(0, 63), DIFF_A + "0", "A".repeat(64),
+  ];
+  for (const live of unreadable) {
+    const r = evaluateMergeGate(
+      138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, live
+    );
+    equal(r.status, "block", `live=${JSON.stringify(live)} must block`);
+    equal((r as any).reasonTag, "head_advanced", `live=${JSON.stringify(live)} blocks on the head binding`);
+  }
+});
+
+test("stale head + MISSING/unusable diff_sha256 → block head_advanced (absence is not identity)", () => {
+  const noId: Array<ReviewRecord> = [
+    { ...cleanRecord },
+    { ...cleanRecord, diff_sha256: "" },
+    { ...cleanRecord, diff_sha256: "not-a-sha" },
+    { ...cleanRecord, diff_sha256: DIFF_A.slice(0, 63) },
+    { ...cleanRecord, diff_sha256: "A".repeat(64) },
+  ];
+  for (const rec of noId) {
+    const r = evaluateMergeGate(
+      138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+    );
+    equal(r.status, "block", `record diff_sha256=${JSON.stringify(rec.diff_sha256)} must not carry`);
+    equal((r as any).reasonTag, "head_advanced");
+  }
+});
+
+test("the EMPTY-BODY digest can never authorize a carry (on either side)", () => {
+  // sha256("") is a CONSTANT, so hashing an empty/non-diff body would make EVERY
+  // stale record "match" every PR. A value equal to it is not an identity.
+  const emptyRec = { ...cleanRecord, diff_sha256: EMPTY_BYTE_SHA256 };
+  equal(isDiffSha256(EMPTY_BYTE_SHA256), false, "the constant is not a valid digest");
+  equal(
+    evaluateMergeGate(138, emptyRec, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, EMPTY_BYTE_SHA256).status,
+    "block"
+  );
+  equal(
+    evaluateMergeGate(138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, EMPTY_BYTE_SHA256).status,
+    "block"
+  );
+});
+
+test("matching head → allow on the HEAD binding, never counted as a carry", () => {
+  const r = evaluateMergeGate(
+    138, diffRecord, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+  );
+  equal(r.status, "allow");
+  equal((r as any).carried, undefined, "a matching head is not a content-identity carry");
+});
+
+test("equality is FULL 64-hex, never a prefix or a substring", () => {
+  for (const live of [DIFF_A.slice(0, 32) + DIFF_B.slice(0, 32), DIFF_B.slice(0, 32) + DIFF_A.slice(0, 32)]) {
+    const r = evaluateMergeGate(
+      138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, live
+    );
+    equal(r.status, "block", `a 64-hex non-equal value must not match: ${live}`);
+  }
+  equal(isDiffSha256(DIFF_A), true);
+  equal(isDiffSha256(DIFF_A.slice(0, 63)), false, "63 hex is not a digest");
+  equal(isDiffSha256(DIFF_A + "1"), false, "65 hex is not a digest");
+  equal(isDiffSha256("A".repeat(64)), false, "uppercase is not this digest shape");
+});
+
+test("UNCHANGED: the #1348 clean-low merge-base binding still governs a matching head", () => {
+  // The carry arm is gated on a STALE head, so a matching head falls through to
+  // the merge-base check exactly as before — a repointed base at the SAME head
+  // still blocks, whether or not the record carries a digest.
+  for (const rec of [cleanLowRecord, { ...cleanLowRecord, diff_sha256: DIFF_A }]) {
+    const r = evaluateMergeGate(
+      138, rec, "a".repeat(40), { source: "record", repo: "owner/repo" }, false, "d".repeat(40), DIFF_A
+    );
+    equal(r.status, "block");
+    equal((r as any).reasonTag, "base_advanced");
+  }
+});
+
+test("a clean-low record carried on a stale head never reaches the merge-base branch", () => {
+  // A matching digest proves the CONTENT is unchanged and clean-low's claim is
+  // about that content's shape, so the carry is sound. The caller's
+  // currentMergeBase is deliberately null here (it is not fetched on the stale
+  // path) — this must ALLOW, not block base_unverifiable.
+  const rec = { ...cleanLowRecord, diff_sha256: DIFF_A };
+  const r = evaluateMergeGate(
+    138, rec, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+  );
+  equal(r.status, "allow");
+  equal((r as any).carried, true);
+});
+
+test("the diff arm cannot short-circuit the verdict check", () => {
+  const r = evaluateMergeGate(
+    138, { ...diffRecord, verdict: "fail" }, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+  );
+  equal(r.status, "block");
+  ok((r as any).reason.includes('verdict "fail"'));
+});
+
+test("the diff arm sits AFTER the head-unverifiable branch (its semantics are unchanged)", () => {
+  // currentHead null: interactive fail-open, task sub-agent fail-closed —
+  // regardless of a matching diff digest. Widening either would be a P0.
+  equal(
+    evaluateMergeGate(138, diffRecord, null, { source: "record", repo: "owner/repo" }, false, null, DIFF_A).status,
+    "failopen"
+  );
+  equal(
+    evaluateMergeGate(138, diffRecord, null, { source: "record", repo: "owner/repo" }, true, null, DIFF_A).status,
+    "block"
+  );
+});
+
+test("audit: a carried allow is a merge_gate_pass with carried:true; a head-bound allow is not", () => {
+  const file = tempAuditFile();
+  const carried = evaluateMergeGate(
+    138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }, false, null, DIFF_A
+  );
+  logMergeGateDecision(138, carried as any, diffRecord, file);
+  const [e] = readAuditLines(file);
+  equal(e.event, "merge_gate_pass");
+  equal(e.carried, true);
+  equal(e.verdict, "clean");
+
+  const f2 = tempAuditFile();
+  const headBound = evaluateMergeGate(138, diffRecord, "a".repeat(40), { source: "record", repo: "owner/repo" });
+  logMergeGateDecision(138, headBound as any, diffRecord, f2);
+  equal(readAuditLines(f2)[0].carried, undefined, "a matching-head allow records no carry flag");
 });
 
 // ── #1348: the clean-low verdict (C7 head binding + C8 content binding) ──
@@ -1013,6 +1175,68 @@ test("null without any gh call when the head is null or not a full sha", () => {
   equal(cmds.length, 0, "an unusable head issues no API call at all");
 });
 
+// ── #1351: the live-diff-digest seam ─────────────────
+// The gate takes `currentDiffHash` as an argument, so the digest's provenance is
+// this resolver + parser. Both must fail CLOSED: an unreadable diff is not a
+// matching diff, and the ONE implementation of the digest (record-review.sh's
+// `--print-diff-hash`, which owns the shared normalizer) must be the one called.
+section("#1351 — the live-diff-digest helper seam (fail-closed parse)");
+
+test("resolveDiffHashHelper resolves THIS checkout's record-review.sh", () => {
+  const p = resolveDiffHashHelper();
+  ok(p !== null && p.endsWith("/scripts/record-review.sh"), `resolved: ${String(p)}`);
+  ok(fs.existsSync(p as string), "the resolved script exists");
+});
+
+test("parseDiffHashHelperOutput: ONLY `ok` + a full 64-hex digest is a digest", () => {
+  equal(parseDiffHashHelperOutput(`ok\t${DIFF_A}\n`), DIFF_A);
+  // The last non-empty line is the contract line (the script prints exactly one
+  // line and exits; taking the last non-empty is robust to any preamble).
+  equal(parseDiffHashHelperOutput(`noise\nok\t${DIFF_A}\n`), DIFF_A);
+  const refused: string[] = [
+    "",
+    "\n",
+    "ok\n",                                   // no tab/hash at all
+    "ok \n",
+    `ok  ${DIFF_A}\n`,                        // spaces, not the tab contract
+    "ok\t\n",                                 // ok but NO digest
+    `ok\tdeadbeef\n`,                          // ok but a truncated digest
+    `ok\t${EMPTY_BYTE_SHA256}\n`,              // ok but the empty-body constant
+    `ok\t${"A".repeat(64)}\n`,
+    `empty\t${DIFF_A}\n`,                      // the DIFF is empty — not an identity
+    `too_large\t${DIFF_A}\n`,                  // 300-file API cap — no identity
+    `nondiff\t${DIFF_A}\n`,                    // an error body is not a diff
+    `unavailable\t${DIFF_A}\n`,                // a failed read is not a match
+    `ok\t${DIFF_A}\ngarbage\n`,                // a later line breaks the contract
+  ];
+  for (const bad of refused) {
+    equal(parseDiffHashHelperOutput(bad), null, `must refuse: ${JSON.stringify(bad)}`);
+  }
+});
+
+test("getPrLiveDiffHash fails closed without a resolvable, re-validated repo", () => {
+  // A `--repo` flag is user-controlled text; it must never reach an argv element
+  // unvalidated. No repo, or a malformed one, means no digest → the gate blocks.
+  equal(getPrLiveDiffHash(138, { source: "fallback" }), null);
+  equal(getPrLiveDiffHash(138, { source: "record", repo: "bad repo" }), null);
+  equal(getPrLiveDiffHash(138, { source: "record", repo: "owner/repo; rm -rf /" }), null);
+});
+
+test("getPrLiveDiffHash uses the injected seam (and returns null through it)", () => {
+  _setPrDiffHashOverride(() => DIFF_A);
+  try {
+    equal(getPrLiveDiffHash(138, { source: "record", repo: "owner/repo" }), DIFF_A);
+  } finally {
+    _setPrDiffHashOverride(null);
+  }
+  _setPrDiffHashOverride(() => null);
+  try {
+    equal(getPrLiveDiffHash(138, { source: "record", repo: "owner/repo" }), null);
+  } finally {
+    _setPrDiffHashOverride(null);
+  }
+});
+
 section("getPrHeadShaViaRest — REST-pool head lookup (#192)");
 
 test("resolves the head SHA via the REST pulls endpoint", () => {
@@ -1487,6 +1711,118 @@ testAsync("clean-low merge with a MATCHING head does read the merge base (the la
       if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
     }
   });
+});
+
+testAsync("#1351 call site: a stale head with a MATCHING live diff digest is CARRIED, not blocked", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999991;
+    const reviewed = "b".repeat(40);
+    const live = "c".repeat(40);
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(
+      resolvePath(reviews, `${pr}.json`),
+      JSON.stringify({ pr, head_sha: reviewed, verdict: "clean", diff_sha256: DIFF_A })
+    );
+    _setRunGhOverride(() => live); // the head ADVANCED (merge-only base refresh)
+    let diffReads = 0;
+    _setPrDiffHashOverride(() => { diffReads++; return DIFF_A; });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      equal(res, undefined, "an unchanged reviewed diff carries the verdict across the moved head");
+      equal(diffReads, 1, "the live digest was read exactly once, and only because the head was stale");
+    } finally {
+      _setRunGhOverride(null);
+      _setPrDiffHashOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("#1351 call site: a stale head with a DIFFERING live digest still BLOCKS head_advanced", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    const pr = 99999990;
+    const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+    fs.mkdirSync(reviews, { recursive: true });
+    fs.writeFileSync(
+      resolvePath(reviews, `${pr}.json`),
+      JSON.stringify({ pr, head_sha: "b".repeat(40), verdict: "clean", diff_sha256: DIFF_A })
+    );
+    _setRunGhOverride(() => "c".repeat(40));
+    _setPrDiffHashOverride(() => DIFF_B); // the diff CHANGED
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && (res as any).block === true, "a changed diff at a moved head is still refused");
+      ok(
+        String((res as any).reason).includes("head has advanced"),
+        `blocked by the HEAD binding: ${JSON.stringify((res as any).reason).slice(0, 120)}`
+      );
+    } finally {
+      _setRunGhOverride(null);
+      _setPrDiffHashOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+      if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+    }
+  });
+});
+
+testAsync("#1351 call site: a matching head — or a record with no diff_sha256 — pays for NO diff read", async () => {
+  for (const recordDiff of [DIFF_A, undefined]) {
+    await withTempHome(async () => {
+      const prevMode = process.env.PI_MODE;
+      const prevHeartbeat = process.env.TASK_HEARTBEAT;
+      const prevSkip = process.env.AGENT_SKIP_REVIEW_GATE;
+      process.env.PI_MODE = "print";
+      process.env.TASK_HEARTBEAT = "1";
+      process.env.AGENT_SKIP_REVIEW_GATE = "1";
+      const pr = recordDiff === undefined ? 99999989 : 99999988;
+      const head = recordDiff === undefined ? "c".repeat(40) : "b".repeat(40);
+      const reviews = resolvePath(os.homedir(), ".pi", "agent", "reviews");
+      fs.mkdirSync(reviews, { recursive: true });
+      const rec: Record<string, unknown> = { pr, head_sha: head, verdict: "clean" };
+      if (recordDiff !== undefined) rec.diff_sha256 = recordDiff;
+      fs.writeFileSync(resolvePath(reviews, `${pr}.json`), JSON.stringify(rec));
+      // recordDiff undefined → the head MATCHES (head read returns the record's
+      // head); recordDiff DIFF_A → the head is STALE but the record has no field.
+      _setRunGhOverride(() => head);
+      let diffReads = 0;
+      _setPrDiffHashOverride(() => { diffReads++; return DIFF_A; });
+      try {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        void (await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } }));
+        equal(diffReads, 0, `no diff read for recordDiff=${String(recordDiff)}`);
+      } finally {
+        _setRunGhOverride(null);
+        _setPrDiffHashOverride(null);
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+        if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+        if (prevSkip === undefined) delete process.env.AGENT_SKIP_REVIEW_GATE; else process.env.AGENT_SKIP_REVIEW_GATE = prevSkip;
+      }
+    });
+  }
 });
 
 testAsync("cd-chain merge resolves envRepo from the cd target's git remote → qualified record allows (P0-1 regression)", async () => {
