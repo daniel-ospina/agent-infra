@@ -5,7 +5,7 @@
  * found 23 defects (unanchored patterns, the memoised traversal, Map keys, byte
  * payloads, leaf-scoped key matching, the fail-open), and NOTHING enforced any of
  * them — a future edit could silently reintroduce every one. This suite pins the
- * redaction behaviours and, specifically, the shape fixes of review rounds 4–6:
+ * redaction behaviours and, specifically, the shape fixes of review rounds 4–7:
  *
  *   - byte payloads are redacted at BYTE precision and keep their container type
  *     (the old path UTF-8-decoded the whole buffer, turning `ff fe` into `ef bf bd`,
@@ -18,7 +18,15 @@
  *   - ordinary snake_case `*_key` data (`sort_key`, `foreign_key`, `primary_key`, …)
  *     is NOT collected — the over-redaction the `_key$` widening introduced; and
  *   - a `*_SIGNING_KEY` leaf/env var IS collected (it is a private signing secret,
- *     not public key material — the unanchored `PUBLIC_RE` exempted every one).
+ *     not public key material — the unanchored `PUBLIC_RE` exempted every one);
+ *   - a secret under a secret-marked PATH (`credentials.key`, `secrets.primary_key`,
+ *     `apiKeys.key`) IS collected, while a path SEGMENT that merely STARTS with
+ *     `token`/`secret` (`tokenizer`, `secretary`) is NOT a secret store;
+ *   - a PREFIXED public-key leaf (`gpg_public_key`, `rsa_public_key`) is NOT
+ *     collected, and an env name the relational veto used to drop (`PRIMARY_KEY`,
+ *     `SECONDARY_KEY`, `CACHE_KEY`, `ID_KEY`) IS collected; and
+ *   - an own `__proto__` key survives redaction and does not reparent the result
+ *     (it was dropped by the prototype setter and its value became the prototype).
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -40,6 +48,21 @@ const SIGNING_KEY_SECRET = "signingkeysecretvalue0005";
 const SIGNING_ENV_SECRET = "signingenvironmentsecret06";
 const PUBLIC_KEY_MATERIAL = "not-a-secret-public-key-material";
 const SSH_PUBLIC_KEY_MATERIAL = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ public";
+// Review round 7: the relational veto cancelled a secret-marked PATH; the path
+// matcher was unanchored (over-redaction); the public-key exemption was leaf-anchored.
+const CREDENTIALS_PATH_SECRET = "credentialspathsecretvalue1";
+const SECRETS_PATH_SECRET = "secretspathprimarykeyvalue2";
+const API_KEYS_PATH_SECRET = "apikeyspathkeyvalue000003";
+const TOKENIZER_MODEL = "meta-llama/Llama-3-8B-Instruct";
+const SECRETARY_NAME = "meeting-notes-document-value";
+const GPG_PUBLIC_KEY_MATERIAL = "gpg-public-key-material-not-secret";
+const RSA_PUBLIC_KEY_MATERIAL = "rsa-public-key-material-not-secret";
+const APP_PUBLIC_KEY_MATERIAL = "app-public-key-material-not-secret";
+const STRIPE_PUBLIC_KEY_MATERIAL = "stripe-public-key-material-notsecre";
+const PRIMARY_ENV_SECRET = "primaryenvsecretvalue0001";
+const SECONDARY_ENV_SECRET = "secondaryenvsecretvalue02";
+const CACHE_ENV_SECRET = "cacheenvsecretvalue00003";
+const ID_ENV_SECRET = "idenvsecretvalue000000004";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -85,12 +108,34 @@ writeFileSync(
     partition_key: "ordinary-partition-key-05",
     dedup_key: "ordinary-dedup-key-value06",
     key: "ordinary-bare-key-value-0007",
+    // A secret under a secret-marked PATH must be collected even when its leaf is a
+    // relational word (`key`, `primary_key`) — the veto used to cancel the PATH match
+    // and these were emitted verbatim (review round 7).
+    credentials: { key: CREDENTIALS_PATH_SECRET },
+    secrets: { primary_key: SECRETS_PATH_SECRET },
+    apiKeys: { key: API_KEYS_PATH_SECRET },
+    // ...and a segment that merely STARTS with a secret word is NOT a secret store:
+    // the unanchored path matcher redacted ordinary config data (review round 7).
+    tokenizer: { model: TOKENIZER_MODEL },
+    secretary: { name: SECRETARY_NAME },
+    // Prefixed public-key leaves are public material, not credentials — the
+    // leaf-anchored exemption collected all of them (review round 7).
+    gpg_public_key: GPG_PUBLIC_KEY_MATERIAL,
+    rsa_public_key: RSA_PUBLIC_KEY_MATERIAL,
+    app_public_key: APP_PUBLIC_KEY_MATERIAL,
+    stripe_public_key: STRIPE_PUBLIC_KEY_MATERIAL,
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
 // A signing secret in the ENVIRONMENT must be collected too — `PUBLIC_ANY_RE`
 // carried the same unanchored `signing_?key` exemption (review round 6).
 process.env.JWT_SIGNING_KEY = SIGNING_ENV_SECRET;
+// A relational `*_KEY` env name is a credential signal, not a JSON column: the veto
+// dropped these four from the env set entirely (review round 7).
+process.env.PRIMARY_KEY = PRIMARY_ENV_SECRET;
+process.env.SECONDARY_KEY = SECONDARY_ENV_SECRET;
+process.env.CACHE_KEY = CACHE_ENV_SECRET;
+process.env.ID_KEY = ID_ENV_SECRET;
 delete process.env.ZAI_API_KEY;
 
 let passed = 0;
@@ -310,6 +355,56 @@ async function main(): Promise<void> {
       out && JSON.stringify(out).includes("[REDACTED:tortoise-config:apiKey]"),
       "the label is store:path, not store:store.path",
     );
+  });
+
+  // ── review round 7: path matcher (both directions) + env veto + `__proto__` ──
+  await test("a secret under a secret-marked PATH is collected (the veto cancelled the path match)", async () => {
+    for (const [line, value] of [
+      [`credentials.key=${CREDENTIALS_PATH_SECRET}`, CREDENTIALS_PATH_SECRET],
+      [`secrets.primary_key=${SECRETS_PATH_SECRET}`, SECRETS_PATH_SECRET],
+      [`apiKeys.key=${API_KEYS_PATH_SECRET}`, API_KEYS_PATH_SECRET],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: line }] });
+      ok(out && !JSON.stringify(out).includes(value), `${line} must be redacted (used to leak)`);
+    }
+  });
+
+  await test("a path SEGMENT that merely STARTS with a secret word is NOT a secret store", async () => {
+    strictEqual(await run({ toolName: "x", content: [{ type: "text", text: `model=${TOKENIZER_MODEL}` }] }), undefined);
+    strictEqual(await run({ toolName: "x", content: [{ type: "text", text: `name=${SECRETARY_NAME}` }] }), undefined);
+  });
+
+  await test("prefixed public-key leaves are NOT collected (over-redaction guard)", async () => {
+    for (const line of [
+      `gpg_public_key=${GPG_PUBLIC_KEY_MATERIAL}`,
+      `rsa_public_key=${RSA_PUBLIC_KEY_MATERIAL}`,
+      `app_public_key=${APP_PUBLIC_KEY_MATERIAL}`,
+      `stripe_public_key=${STRIPE_PUBLIC_KEY_MATERIAL}`,
+    ]) {
+      strictEqual(await run({ toolName: "x", content: [{ type: "text", text: line }] }), undefined, line);
+    }
+  });
+
+  await test("an env name the relational veto used to drop is still collected", async () => {
+    for (const [name, value] of [
+      ["PRIMARY_KEY", PRIMARY_ENV_SECRET],
+      ["SECONDARY_KEY", SECONDARY_ENV_SECRET],
+      ["CACHE_KEY", CACHE_ENV_SECRET],
+      ["ID_KEY", ID_ENV_SECRET],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `${name}=${value}` }] });
+      ok(out && !JSON.stringify(out).includes(value), `${name} env value must be redacted (used to leak)`);
+    }
+  });
+
+  await test("an own `__proto__` key survives redaction and does not reparent the result", async () => {
+    const details = JSON.parse('{"keep":"v","__proto__":{"x":"' + CONFIG_SECRET + '"}}') as Record<string, unknown>;
+    equal(Object.getPrototypeOf(details), Object.prototype, "sanity: JSON.parse does not reparent");
+    const out = await run({ toolName: "x", content: [{ type: "text", text: "no-secret" }], details });
+    ok(out, "the secret under __proto__ must produce a patch");
+    equal(Object.getPrototypeOf(out.details), Object.prototype, "the rebuilt object must not be reparented");
+    ok(Object.prototype.hasOwnProperty.call(out.details, "__proto__"), "the __proto__ entry must survive");
+    ok(!JSON.stringify(out.details).includes(CONFIG_SECRET), "the secret must be redacted");
   });
 
   // ── negatives: no over-redaction, no touch when clean ──────────────────────

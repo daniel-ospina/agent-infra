@@ -89,20 +89,31 @@ const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|s
 /** Leaves that END in `key` but hold ordinary relational/identity data, not a
  *  credential (`sort_key`, `foreign_key`, `primary_key`, `cache_key`, `partition_key`,
  *  `dedup_key`, …) plus the bare, ambiguous `key`. Vetoed from `SECRET_LEAF_RE`'s
- *  `_key$` alternative (and from the env collector's `_KEY` suffix in
- *  `loadSecrets`), so the widened rule cannot over-redact ordinary data. */
+ *  `_key$` alternative ONLY — never from a `SECRET_PATH_RE` match and never from
+ *  the env collector: a relational vocabulary describes JSON columns, not env var
+ *  names or an explicitly secret-marked path. Applying it to the whole disjunction
+ *  emitted `secrets.primary_key` / `credentials.key` / `apiKeys.key` verbatim and
+ *  dropped `PRIMARY_KEY` / `SECONDARY_KEY` / `CACHE_KEY` / `ID_KEY` from the env
+ *  set entirely (review round 7). */
 const NON_SECRET_KEY_RE = /(^key$|^(foreign|primary|secondary|sort|cache|partition|dedup|shard|id)[_-]?key$)/i;
-const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|passwd|token|api[_-]?key)/i;
+/** A path SEGMENT that names a secret store. Anchored at the segment END
+ *  (`(\.|$)`) so the word must be the WHOLE segment: the unanchored form also
+ *  matched `tokenizer` / `secretary` and redacted ordinary config data (review
+ *  round 7). */
+const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|passwd|token|tokens|api[_-]?keys?)(\.|$)/i;
 /** PUBLIC values are not secrets. Tested on the LEAF only — a `publicProfile.apiKey`
  *  must still be collected (testing the whole path excluded the subtree). The
  *  `*_key` forms are widened here because `SECRET_LEAF_RE` now collects `_KEY`
  *  leaves: without this, `public_key` / `ssh_public_key` would be redacted as if
- *  they were credentials (review round 5). The widening is ANCHORED at both ends:
- *  the round-5 form dropped the leading `^`, so ANY leaf *ending* in `signing_key`
- *  was exempted — and `TOKEN_SIGNING_KEY` / `JWT_SIGNING_KEY` is a PRIVATE HMAC/JWT
- *  signing secret, not public key material, so it was emitted verbatim (review
- *  round 6). `signing` is therefore no longer treated as a public-key word. */
-const PUBLIC_RE = /(^public$|^(ssh[_-]?)?(public|pub|gpg)[_-]?key$)/i;
+ *  they were credentials (review round 5). The exemption is a SUFFIX test
+ *  (`(^|[_-])(public|pub|gpg)[_-]?key$`), so a PREFIXED spelling —
+ *  `gpg_public_key`, `rsa_public_key`, `app_public_key`, `stripe_public_key` — is
+ *  exempt too (the leaf-anchored form collected all of them as credentials; review
+ *  round 7). `signing` is deliberately NOT a public-key word: the round-5 form
+ *  dropped its leading `^`, so ANY leaf *ending* in `signing_key` was exempted — and
+ *  `TOKEN_SIGNING_KEY` / `JWT_SIGNING_KEY` is a PRIVATE HMAC/JWT signing secret,
+ *  not public key material, so it was emitted verbatim (review round 6). */
+const PUBLIC_RE = /(^public$|(^|[_-])(public|pub|gpg)[_-]?key$)/i;
 const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key/i;
 
 /** A value that is a REFERENCE to an env var, not a credential (tested trimmed). */
@@ -136,8 +147,12 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
   const walk = (node: unknown, path: string): void => {
     if (typeof node === "string") {
       const leaf = leafOf(path);
+      // The relational veto applies to the widened `_key$` LEAF rule only: a path
+      // match is an explicit secret marker and must not be cancelled by a leaf name
+      // (`secrets.primary_key`, `credentials.key`, `apiKeys.key` were emitted
+      // verbatim when the veto covered the whole disjunction; review round 7).
       const secretKey =
-        (SECRET_LEAF_RE.test(leaf) || SECRET_PATH_RE.test(path)) && !NON_SECRET_KEY_RE.test(leaf);
+        (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) || SECRET_PATH_RE.test(path);
       if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
         // The label is `store:path` — the traversal ROOT is the store label, so it must
         // be stripped from the display path or it repeats (`store:store.apiKey`).
@@ -187,8 +202,11 @@ function loadSecrets(): Secret[] {
       v.length >= MIN_LEN &&
       !isReference(v) &&
       /(API_KEY|_KEY|_TOKEN|_SECRET|_CREDENTIALS?|PASSWORD)$/i.test(k) &&
-      !PUBLIC_ANY_RE.test(k) &&
-      !NON_SECRET_KEY_RE.test(k)
+      // The relational veto is NOT applied here: it is a JSON-column vocabulary, and
+      // on a variable name the `_KEY$` shape is itself the credential signal — the
+      // veto dropped `PRIMARY_KEY`/`SECONDARY_KEY`/`CACHE_KEY`/`ID_KEY` from the env
+      // set entirely (review round 7).
+      !PUBLIC_ANY_RE.test(k)
     ) {
       out.push({ label: `env:${k}`, value: v });
     }
@@ -379,7 +397,11 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
     const rk = redactString(k, secrets, hits);
     const r = redactDeep(v, secrets, hits, memo);
     if (rk !== k || r !== v) changed = true;
-    rebuilt[rk] = r;
+    // `defineProperty`, NOT `rebuilt[rk] = r`: an own `__proto__` key (which
+    // `JSON.parse` produces) would hit the inherited prototype setter instead — the
+    // entry was SILENTLY DROPPED and the rebuilt object's prototype was replaced by
+    // its value (review round 7).
+    Object.defineProperty(rebuilt, rk, { value: r, enumerable: true, writable: true, configurable: true });
   }
   if (!changed) {
     memo.set(obj, node);
