@@ -26,9 +26,11 @@
 # WORKERS, which orch-loop.sh spawns through a SECOND tmux boundary — so `cmd_check` could print ok
 # while every review was recorded UNSIGNED.
 #
-# Hermetic: temp HOME + temp state dir, no network, and no session on the OPERATOR's tmux server —
-# §1–§6 refuse before tmux is reached, and §7's optional real-tmux half uses private `tmux -L`
-# servers that the EXIT trap kills. Run:  bash scripts/cloud-cell-supervisor.test.sh
+# Hermetic: temp HOME + temp state dir, no network, and no session on the OPERATOR's tmux server.
+# §1–§3 are refused while sourcing, before any tmux call; §4–§5 issue only read-only
+# `tmux has-session`/`tmux ls` against the default server; §6 stubs tmux; and §7's optional real-tmux
+# half uses private `tmux -L` servers that the EXIT trap kills.
+# Run:  bash scripts/cloud-cell-supervisor.test.sh
 
 set -uo pipefail
 

@@ -251,8 +251,9 @@ cmd_check() {
     say "      Fix: remove the key line from $ENV_FILE, or give it a real value."
   elif keyfile_has_key; then
     say "ok: merge authority key present ($CELL_HOME/.pi/agent/.ai-review-gate-key) — the MERGE"
-    say "    WORKERS read it at \$HOME, and 'start' carries HOME as one of $WORKER_ENV_NAMES into tmux"
-    say "    update-environment, so \$HOME is $CELL_HOME inside every spawned worker."
+    say "    WORKERS read it at \$HOME: 'start' carries HOME as one of $WORKER_ENV_NAMES into tmux"
+    say "    update-environment, and a server it CREATES inherits it, so \$HOME is $CELL_HOME in every"
+    say "    spawned worker."
   else
     local kfpath="$CELL_HOME/.pi/agent/.ai-review-gate-key"
     if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
@@ -348,8 +349,10 @@ cmd_start() {
   # `record-review.sh` resolves the key env-FIRST, so a stale ambient export would SHADOW an
   # authoritative key FILE in every worker and sign reviews with the wrong value while the preflight
   # printed ok — a false PASS of exactly the class this fix exists to remove. keys.env was ALREADY
-  # sourced above, so a key from there is present legitimately and is KEPT; only a key backed by
-  # NEITHER source is dropped. The `unset` also strips the name from a session whose SERVER still
+  # sourced above, so a key IT carries — a real value, or a whitespace-only one — is KEPT, and is
+  # what makes `cmd_check`'s verdict true. Only a key `$ENV_FILE` does NOT carry is dropped: the key
+  # FILE is deliberately NOT consulted in this condition, because an ambient export would shadow that
+  # very file in every worker. The `unset` also strips the name from a session whose SERVER still
   # carries an older value: `update-environment` REMOVES a listed name the creating client lacks.
   # A whitespace-only keys.env value is deliberately NOT dropped — it is a state `cmd_check` names
   # explicitly, and leaving it is what makes that warning true.
