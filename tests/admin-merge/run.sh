@@ -385,18 +385,23 @@ case "$key" in
     # file models the unfiltered one (the bogus-zero window).
     if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
     # ── #1417 S2: THE RAIL'S OWN BODY-EDIT PROBE ─────────────────────────────
-    # Recognised by the ONLY field combination no other caller asks for — event
-    # AND status AND conclusion AND workflowName. (The #1261 map arm has `event`
-    # WITHOUT status/conclusion; the raw supersede arm is keyed on
-    # `workflowDatabaseId`.) The output is the 5-field projection
-    # `LANE_RUN_EVENT_JQ` produces (`status  conclusion  id  event  workflowName`),
-    # derived from the SAME fixture the lane listing reads, so the two can never
-    # disagree about a run's state. `event-gen-<n>` is a per-call sequence for a
-    # generation that FINISHES while the rail waits; absent, the single fixture
-    # is served (and every pre-existing scenario is byte-identical).
+    # Recognised by the ONLY field combination no other caller asks for — status
+    # AND conclusion AND workflowName. (The #1261 map arm has `event` WITHOUT
+    # status/conclusion; the raw supersede arm is keyed on `workflowDatabaseId`.)
+    # The output is the 4-field projection `LANE_RUN_GUARD_JQ` produces
+    # (`status  conclusion  id  normalized-workflow-name`), derived from the SAME
+    # fixture the lane listing reads, so the two can never disagree about a run's
+    # state. `event-gen-<n>` is a per-call sequence for a generation that FINISHES
+    # while the rail waits; absent, the single fixture is served (and every
+    # pre-existing scenario is byte-identical).
+    #
+    # ⛔ THE PROBE IS KEYED ON THE WORKFLOW NAME, NOT `event` (review, PR #1640).
+    # A run's `event` is the webhook NAME (`pull_request`), never the activity
+    # type (`edited`), so the section-70 fixtures carry the REAL event values and
+    # this projection ignores that column entirely.
     want_event=0
     case "$fields" in
-      *event*) case "$fields" in *status*|*conclusion*) case "$fields" in *workflowName*) [ "$want_raw" -eq 0 ] && want_event=1 ;; esac ;; esac ;;
+      *status*) case "$fields" in *conclusion*) case "$fields" in *workflowName*) [ "$want_raw" -eq 0 ] && want_event=1 ;; esac ;; esac ;;
     esac
     if [ "$want_event" = 1 ]; then
       if [ "$mode" = "commit" ] && [ -f "$SCEN/event-gen-1" ]; then
@@ -406,15 +411,11 @@ case "$key" in
         f="$SCEN/event-gen-$en"
       fi
       if [ -f "$f" ]; then
-        awk -F'\t' 'NF>=6 { split($3,p,":"); printf "%s\t%s\t%s\t%s\t%s\n", $1, ($2==""?"-":$2), p[2], $6, $5 }' "$f" \
+        awk -F'\t' 'NF>=6 { split($3,p,":"); k=tolower($5); gsub(/[^a-z0-9]/,"",k); printf "%s\t%s\t%s\t%s\n", $1, ($2==""?"-":$2), p[2], k }' "$f" \
           | { if [ -n "$limit" ]; then head -n "$limit"; else cat; fi; }
       fi
       exit 0
     fi
-    if [ "$mode" = "commit" ]; then f="$SCEN/runs-$val"; else f="$SCEN/runs-main"; fi
-    # A per-lane fixture, when present, models the FILTERED listing; the bare
-    # file models the unfiltered one (the bogus-zero window).
-    if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
     # ── #1417 S1: A SURFACE THAT CHANGES BETWEEN READS ───────────────────────
     # The rail waits for the generation its own PR-body edit created and then
     # RE-READS this surface (the whole point: a guard run that FAILS must be in
@@ -10692,6 +10693,14 @@ fi
 # generation and RE-READS the surface, so a guard run that FAILS is in the
 # re-read failing set — the wait defers a refusal on an UNFINISHED run set, it
 # never excludes a failure.
+#
+# ⛔ THE FIXTURES CARRY THE EVENT VALUES THE LIVE SURFACE REPORTS (review, PR
+# #1640). A workflow RUN's `event` is the webhook NAME — `pull_request` for
+# `pipeline-compliance`, `pull_request_target` for `workflow-lock` — NEVER the
+# activity type `edited`. An earlier version of this section encoded `edited` and
+# therefore certified a code path (and a fixture input) production cannot
+# produce. The wait is keyed on the guard WORKFLOW NAME, and the event column is
+# now the real value for fidelity only.
 echo "== 70. #1417: the rail's own body-edit run generation is waited for =="
 
 # (a) THE MEASURED SHAPE — the observation that must STOP being a refusal. The
@@ -10706,13 +10715,13 @@ printf '%s\n' "$HEAD_SE" > "$SCEN/head"
 # The lane's own passing run is present in BOTH generations: the surface changes,
 # the lane does not.
 { lane_pass "$HEAD_SE" 41001
-  lane_ev queued - "$HEAD_SE" 41002 'Pipeline Compliance' edited
-  lane_ev in_progress - "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' edited
+  lane_ev queued - "$HEAD_SE" 41002 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' pull_request_target
 } > "$SCEN/surface-gen-1"
 # read 2+ — the generation finished GREEN
 { lane_pass "$HEAD_SE" 41001
-  lane_ev completed success "$HEAD_SE" 41002 'Pipeline Compliance' edited
-  lane_ev completed success "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' edited
+  lane_ev completed success "$HEAD_SE" 41002 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' pull_request_target
 } > "$SCEN/surface-gen-2"
 cp "$SCEN/surface-gen-1" "$SCEN/runs-$HEAD_SE"
 cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
@@ -10740,17 +10749,25 @@ new_scen selfedit-fail
 HEAD_SF="f141700000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SF" > "$SCEN/head"
 GUARD_ID='tests/test_guard.py::test_marker_binding'
-lane_pass "$HEAD_SF" 41101 > "$SCEN/runs-$HEAD_SF"
 lane_pass mainsf 41105 > "$SCEN/runs-main"
-lane_jobs 41101 'test (a):success' 'test (b):success'
 lane_jobs mainsf 'test (a):success' 'test (b):success'
 log_failed "$GUARD_ID" > "$SCEN/log-41102"
 cp "$SCEN/log-41102" "$SCEN/log-after-41102"   # the guard run keeps failing on the re-run
-lane_ev queued - "$HEAD_SF" 41102 'Pipeline Compliance' edited > "$SCEN/surface-gen-1"
-lane_ev completed failure "$HEAD_SF" 41102 'Pipeline Compliance' edited > "$SCEN/surface-gen-2"
+# BOTH guard legs, so the generation is COMPLETE and the wait settles: the point
+# of this scenario is the re-read VERDICT on a red guard run, not the wait.
+{ lane_pass "$HEAD_SF" 41101
+  lane_ev queued - "$HEAD_SF" 41102 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SF" 41103 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-1"
+{ lane_pass "$HEAD_SF" 41101
+  lane_ev completed failure "$HEAD_SF" 41102 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SF" 41103 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-2"
 cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
 cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_jobs 41101 'test (a):success' 'test (b):success'
 lane_jobs 41102 'pipeline-compliance:failure'
+lane_jobs 41103 'workflow-lock:success'
 run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(b) a FAILING pipeline-compliance run still BLOCKS (exit $rc)" \
@@ -10763,14 +10780,16 @@ grep -q "test_marker_binding" "$SCEN/err" \
   && pass "(b) …and the guard run's failure is NAMED in the refusal" \
   || { fail "(b) the guard run's failure did not reach the decision"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
 
-# (c) THE OTHER SAFETY CONSTRAINT — A RUN THE RAIL DID NOT CREATE IS STILL
-# COUNTED. A push (`synchronize`) is not a body edit and must never be waited
-# for; §1b's unchanged lane-terminal refusal decides.
+# (c) THE OTHER SAFETY CONSTRAINT — A RUN OF A NON-GUARD WORKFLOW IS STILL
+# COUNTED. A push is not a body edit and must never be waited for; §1b's
+# unchanged lane-terminal refusal decides. The event value is `pull_request` —
+# what the live surface reports for a PR-triggered run (`synchronize` is an
+# activity type, not a run event).
 new_scen selfedit-foreign
 HEAD_SX="a141700000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SX" > "$SCEN/head"
 lane_pass "$HEAD_SX" 41201 > "$SCEN/runs-$HEAD_SX"
-lane_ev in_progress - "$HEAD_SX" 41202 'Python CI' synchronize >> "$SCEN/runs-$HEAD_SX"
+lane_ev in_progress - "$HEAD_SX" 41202 'Python CI' pull_request >> "$SCEN/runs-$HEAD_SX"
 lane_pass mainsfx 41205 > "$SCEN/runs-main"
 printf 'in_progress\n' > "$SCEN/status-41202"
 run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
@@ -10793,7 +10812,7 @@ HEAD_SB="b141700000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SB" > "$SCEN/head"
 lane_pass "$HEAD_SB" 41301 > "$SCEN/runs-$HEAD_SB"
 lane_pass mainsb 41305 > "$SCEN/runs-main"
-lane_ev in_progress - "$HEAD_SB" 41302 'Pipeline Compliance' edited > "$SCEN/surface-gen-1"
+lane_ev in_progress - "$HEAD_SB" 41302 'Pipeline Compliance' pull_request > "$SCEN/surface-gen-1"
 cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
 SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
   ADMIN_MERGE_SELF_EDIT_WAIT=1 bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
@@ -10804,6 +10823,47 @@ grep -q "STILL pending after 1s" "$SCEN/err" \
   && pass "(d) …and the bound is what refused it, named with the knob" \
   || { fail "(d) the refusal was not the wait bound"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
 grep -q "pr merge" "$SCEN/calls" && fail "(d) no merge may be attempted at the bound" || pass "(d) no merge attempted"
+
+# (f) A PARTIAL GENERATION MUST NOT SETTLE (review P1, PR #1640). The two guard
+# legs come from two DIFFERENT workflows with an 11-87s spread, so leg A can
+# finish before leg B exists. A subset-only predicate would settle at read 2 and
+# merge inside the window the pre-#1417 rail refused; the COMPLETENESS test keeps
+# waiting for the missing leg. Reads: 1 = pipeline pending; 2 = pipeline done,
+# lock absent; 3 = lock pending (the late leg appears); 4 = both done. The merge
+# must happen only after read 4, and the rail must NOT settle on read 2.
+new_scen selfedit-partial
+HEAD_SP="c141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SP" > "$SCEN/head"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev queued - "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+} > "$SCEN/surface-gen-1"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+} > "$SCEN/surface-gen-2"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SP" 41403 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-3"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SP" 41403 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-4"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+cp "$SCEN/surface-gen-3" "$SCEN/event-gen-3"
+cp "$SCEN/surface-gen-4" "$SCEN/event-gen-4"
+lane_pass mainsp 41405 > "$SCEN/runs-main"
+lane_jobs 41402 'pipeline-compliance:success'
+lane_jobs 41403 'workflow-lock:success'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(f) a guard generation whose second leg appears late still merges (exit 0)" \
+  || { fail "(f) the rail refused a guard generation it should have waited for (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "not every guard workflow has been observed yet" "$SCEN/out" \
+  && pass "(f) …but it did NOT settle on the partial generation — it waited for the missing leg" \
+  || fail "(f) the wait SETTLED on a partial generation — the completeness test is missing"
+grep -q "pr merge" "$SCEN/calls" && pass "(f) …and merged only after both legs were seen" || fail "(f) no merge attempted"
 
 # (e) THE KNOB IS VALIDATED LIKE EVERY OTHER TIMING KNOB — an unreadable bound
 # makes the comparison ERROR (test returns 2, the body is SKIPPED), and a skipped
@@ -10820,6 +10880,10 @@ SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=0300 bash "$ADM" 
 rc=$?
 [ "$rc" -eq 2 ] && pass "(e) a LEADING-ZERO bound is refused (the octal/decimal split)" \
   || fail "(e) a leading-zero bound was accepted (exit $rc)"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=300000 bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a POLICY-oversized bound (300000s, ~3.5 days) is refused (exit 2)" \
+  || fail "(e) an oversized wait bound was accepted (exit $rc) — a typo would hold the rail for days"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
