@@ -108,7 +108,7 @@ Every infra issue, gate, guard, workflow step, or refactor is classified **A** o
 
 **#8175 is the model answer.** `tools/collision_preflight.py`'s claim gate refused dispatch on a claim whose artifacts were long gone, so a P1 issue was blocked from dispatch forever, and the only way through was a human hand-editing a stale GitHub comment. The correct response is to make the gate re-verify its own evidence — not to ask the owner to unblock the issue.
 
-**What this does NOT cover, and what still goes to the owner:** a P0-consequence decision (data loss, deletion, spend), and any **recorded decision** the fix would reverse. Reversing a recorded decision is a **reopen**: argue it in the decision's own home, with the evidence in front of the owner, per the contradiction test above. An `OVERRIDES:` marker makes such a departure *findable* — it does **not** authorize it.
+**What this does NOT cover, and what still goes to the owner:** a P0-consequence decision (data loss, deletion, spend), and any **recorded decision** the fix would reverse. Reversing a recorded decision is a **reopen**: argue it in the decision's own home, with the evidence in front of the owner, per the contradiction test below. An `OVERRIDES:` marker makes such a departure *findable* — it does **not** authorize it.
 
 ### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
 
@@ -130,12 +130,14 @@ own reading, and it landed in seconds once applied.
 
 **The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
 and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
-approving. **Unsure which diff was approved** → state the diff you believe is approved and apply
-that; this question is answered by *naming the diff*, never by stopping.
+approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
 
-⛔ This relaxes nothing else. Content a lane invented is still not adoptable, a decision this would
-reverse is still a **reopen**, and consistency between a pack manifest and the ontology doc is still
-the guard's verdict to return — not the lane's judgement.
+⛔ This relaxes nothing else. An approval the lane cannot point to is not an approval: uncertainty
+resolves to a one-line confirmation, never to a write. Content a lane invented is still not adoptable,
+a decision this would reverse is still a **reopen**, and consistency between a pack manifest and the
+ontology doc is still the guard's verdict to return — not the lane's judgement.
 
 ---
 

@@ -7,7 +7,8 @@
 #   T3 base-owned line modified                → drift reported
 #   T4 repo-specific ADDITION                  → NOT drift (appended AND interleaved)
 # plus the pipefail control, the marker-file path, the skip path, the hook-level
-# case, the real-repo regression pin, the adversarial-anchor pin, and the
+# case, the real-repo regression pin, the adversarial-anchor pin, the #1681
+# process-problems rule pins, and the
 # fail-closed MD026 heading pin with its own self-test.
 #
 # Fixtures are self-contained: each gets its own copy of the materializer under
@@ -350,6 +351,114 @@ for f in "$ROOT/AGENTS.md" "$BASE"; do
   else
     fail "filing-prose carve-out missing in ${f#"$ROOT"/} — File Pre-Existing Bugs no longer reconciles with the symptom check"
   fi
+done
+
+# ── Process-problems rule pins (agent-infra#1681 review) ───────────────────
+# Two defects were found in the new "Process Problems" / owner-approval text:
+#   R1  the "Unsure which diff was approved" branch resolved to *applying* the
+#       diff, while the branch beside it said a diff that changed since approval
+#       "needs approving". On an owner-gated artifact (/AGENTS.md is
+#       CODEOWNERS-owned; the subsection's own incident is an owner-gated
+#       docs/ONTOLOGY.md) that is an unauthorized-write path reachable merely by
+#       asserting uncertainty — a fail-open, category A by the
+#       Product-Over-Process falsifier ("can an agent DEFEAT it?"). Invariant:
+#       uncertainty resolves to a CONFIRMATION, and the branch carries no
+#       unconditional apply directive nor a clause foreclosing the ask.
+#   R2  the section cross-referenced the contradiction test as "above" while the
+#       test is defined BELOW, in USER QUESTIONS PROTOCOL; the file's own
+#       convention for a forward reference is explicit about direction.
+#
+# These are word pins, so a legitimate REWORD of the subsection trips them. That
+# is the cheap direction (a false flag is caught by whoever edits the text),
+# same as the MD026 pin — widen the predicate rather than delete the arm. Each
+# RED fixture is the PRE-FIX text, so the pin is non-vacuous; the GREEN fixture
+# is the post-fix control.
+rule_scan() {  # <file> → one finding per line on stdout
+  local f="$1" findings="" br
+  if sed -n '/^## ⛔ HARD RULE: Process Problems Are Yours To Fix/,/^---$/p' "$f" \
+       | grep -q 'contradiction test above'; then
+    findings+="R2: contradiction test referenced as 'above' in the Process Problems rule (it is defined below)"$'\n'
+  fi
+  br="$(awk '/\*\*Unsure which diff was approved\*\*/{f=1} f{print} f && /^$/ {exit}' "$f" | tr '\n' ' ')"
+  if [ -z "$br" ]; then
+    findings+="R1: no 'Unsure which diff was approved' branch found — the uncertainty rule cannot be established"$'\n'
+  else
+    grep -qi 'confirm' <<<"$br" \
+      || findings+="R1: the uncertainty branch does not require a confirmation"$'\n'
+    if grep -Eq 'and apply|apply that|never by stopping' <<<"$br"; then
+      findings+="R1: the uncertainty branch still carries an unconditional apply directive"$'\n'
+    fi
+  fi
+  printf '%s' "$findings"
+}
+
+rule_fixture() {  # <name> ; fixture body on stdin → path on stdout
+  local f="$TMP/rule-$1.md"; cat > "$f"; printf '%s' "$f"
+}
+rule_expect() {  # <file> hits|clean <label>
+  local f="$1" want="$2" label="$3" hits
+  hits="$(rule_scan "$f")"
+  if [ "$want" = hits ]; then
+    if [ -n "$hits" ]; then pass "rule pin: $label → flagged"
+    else fail "rule pin: $label → NOT flagged (false PASS)"; fi
+  else
+    if [ -z "$hits" ]; then pass "rule pin: $label → clean"
+    else fail "rule pin: $label → flagged: $(head -1 <<<"$hits")"; fi
+  fi
+}
+
+# RED: the pre-fix uncertainty branch (commit 2341d76bd) — applies on uncertainty.
+rule_expect "$(rule_fixture red-unsure-apply <<'EOF'
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
+approving. **Unsure which diff was approved** → state the diff you believe is approved and apply
+that; this question is answered by *naming the diff*, never by stopping.
+EOF
+)" hits "pre-fix uncertainty branch resolves to applying"
+
+# GREEN control: the post-fix uncertainty branch must NOT be flagged.
+rule_expect "$(rule_fixture green-unsure-confirm <<'EOF'
+approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+EOF
+)" clean "post-fix uncertainty branch requires a confirmation"
+
+# RED for R2 specifically: the pre-fix cross-reference, with a clean uncertainty branch
+# so the R1 arm stays silent and the assertion names the R2 arm.
+r2_red="$(rule_fixture red-above-ref <<'EOF'
+## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
+
+Reversing a recorded decision is a **reopen**: argue it in the decision's own home, per the contradiction test above.
+
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation.
+
+---
+EOF
+)"
+r2_hits="$(rule_scan "$r2_red")"
+if grep -q '^R2' <<<"$r2_hits" && ! grep -q '^R1' <<<"$r2_hits"; then
+  pass "rule pin: cross-reference 'above' flagged by the R2 arm alone"
+else
+  fail "rule pin: pre-fix 'above' cross-reference not isolated to R2 (got: $(head -1 <<<"$r2_hits"))"; fi
+
+# GREEN: the post-fix reference direction must NOT be flagged.
+rule_expect "$(rule_fixture green-below-ref <<'EOF'
+## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
+
+Reversing a recorded decision is a **reopen**, per the contradiction test below.
+
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation.
+
+---
+EOF
+)" clean "cross-reference to the contradiction test says 'below'"
+
+# The shipped surfaces must be clean — the pin is not vacuous on the real file.
+for f in "$BASE" "$ROOT/AGENTS.md"; do
+  hits="$(rule_scan "$f")"
+  if [ -z "$hits" ]; then pass "rule pins clean in ${f#"$ROOT"/}"
+  else fail "rule pins in ${f#"$ROOT"/}: $(head -1 <<<"$hits")"; fi
 done
 
 # ── MD026 pin: no heading in the base template may end in punctuation ──────
