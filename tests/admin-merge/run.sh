@@ -2411,6 +2411,28 @@ grep -qF '[head_unreadable]' "$TMP/err" && fail "a MOVED head carried the [head_
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a moved head" || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
+# post_read_call_made — 0 when the rail made a `isDraft` probe, i.e. it CONTINUED past a
+# successful head read. The discriminator §13b/§13c/§13d/§13e rest on.
+#
+# ⛔ NO PIPE (#841) — AND THIS IS NOT A STYLE POINT. The first version of this anchor was
+# `grep 'isDraft' "$SCEN/calls" | grep -qv 'headRefOid'`, which is the `writer | grep` shape this
+# file explicitly forbids further down (see the note at the §~7000 belt: under `set -uo pipefail`
+# the upstream takes SIGPIPE and the pipeline returns 141, so at a `pipeline && fail || pass`
+# site the FAILURE ARM IS SKIPPED — a FAIL-OPEN enforcer that reports green on a regressed rail).
+# That is the precise failure these four scenarios exist to prevent, so shipping it inside them
+# would have been the joke telling itself. The repo's own `check-no-sigpipe-grep.sh` cannot see it
+# (it scans `scripts .husky pi-bootstrap` and its predicate is builtin-writer-into-quiet-grep, not
+# `grep | grep -q`). Capture-independent, per-line, pipe-free:
+post_read_call_made() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      *isDraft*) case "$l" in *headRefOid*) ;; *) return 0 ;; esac ;;
+    esac
+  done < "$SCEN/calls"
+  return 1
+}
+
 # ── 13b. a head READ THAT FAILS is UNREADABLE, never "moved" (#1690) ───────────
 # ⛔ THIS SCENARIO IS THE DURABLE HALF OF THE COMPOSITION PIN, AND IT EXISTS BECAUSE A
 # SOURCE SCAN IS NOT ONE. The unit suite (scripts/test_admin_merge_head.py) pins
@@ -2457,7 +2479,7 @@ grep -qF '[head_unreadable]' "$SCEN/err" && pass "the refusal carries the machin
 # guard that a reworded log line can delete is the same defect these scenarios exist to close.
 # So the assertion is anchored on the artifact the rail cannot reword: the fake-`gh` CALL LEDGER.
 # `isDraft` is probed only AFTER a successful head read, so its presence proves the rail continued.
-grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+post_read_call_made \
   && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
   || pass "the rail never proceeded past the unread head (no post-read call was made)"
 # ⛔ THE ASSERTION 13b EXISTS FOR. #1690 was an operator reading THIS sentence on a PR that
@@ -2483,7 +2505,7 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an EMPTY head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ was unusable" \
   || fail "expected the unreadable-head refusal on stderr"
-grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+post_read_call_made \
   && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
   || pass "the rail never proceeded past the empty head (no post-read call was made)"
 grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED HEAD — this is #1690 itself" \
@@ -2514,7 +2536,7 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — a CORRUPT head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the read was unusable" \
   || fail "expected the unreadable-head refusal for a corrupt value"
-grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+post_read_call_made \
   && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
   || pass "the rail never proceeded past the corrupt read"
 grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED HEAD — this is #1690 itself" \
@@ -2553,7 +2575,7 @@ rc=$?
 # BETWEEN the opening read and §4, so its presence proves the opening read succeeded and the §4
 # read is therefore the one that failed. (The `grep -v headRefOid` guard keeps this from being
 # satisfied by an argv that happens to name isDraft on the head read itself.)
-grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+post_read_call_made \
   && pass "§13e VERIFIABLY reached the §4 comparison (the opening read succeeded)" \
   || fail "§13e never reached §4 — the opening read did not succeed, so this scenario proved NOTHING about the §4 site"
 # ⛔ THE ASSERTION 13e EXISTS FOR. This is the exact sentence #1690's operator read on a PR that

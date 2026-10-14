@@ -356,24 +356,36 @@ def test_the_SOURCED_path_refuses_a_bad_knob_instead_of_claiming_an_unread_head(
     and why the guard, the round-4/5 delta's only production change, was unenforced. A fix that no
     test exercises is not a fix, which is the same sentence this PR keeps rediscovering.
     """
-    for bad, why in (("0", "permits no read at all"),
-                     ("08", "is invalid octal to the arithmetic"),
-                     ("abc", "is not a number")):
-        r = _drive(tmp_path, "exit 1", 'require_head 1; echo "rc=$?"',
-                   extra_env={"ADMIN_MERGE_HEAD_ATTEMPTS": bad})
+    # ⛔ BOTH ENTRY POINTS AND BOTH KNOBS. The delta's claim is ONE helper called by BOTH
+    # resolvers, and the SLEEP knob has its own predicates (a NUMBER, so 0 is legal, unlike the
+    # ATTEMPTS budget which must be POSITIVE). Review round 5 MEASURED that varying only
+    # `require_head` + `ATTEMPTS` pinned HALF the change: deleting the `resolve_head` guard left
+    # 16/16 green, and deleting all three SLEEP predicates left 16/16 green — after which a sourced
+    # `ADMIN_MERGE_HEAD_READ_SLEEP=abc` died on `abc: unbound variable` inside the arithmetic and
+    # STILL emitted `[head_unreadable]`. That is what this matrix exists to catch.
+    for fn, knob, bad, why in (
+        ("require_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "0", "permits no read at all"),
+        ("require_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "08", "is invalid octal to the arithmetic"),
+        ("require_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "abc", "is not a number"),
+        ("require_head", "ADMIN_MERGE_HEAD_READ_SLEEP", "abc", "is not a number"),
+        ("require_head", "ADMIN_MERGE_HEAD_READ_SLEEP", "010", "is a leading zero (octal)"),
+        ("resolve_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "0", "permits no read at all"),
+        ("resolve_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "08", "is invalid octal to the arithmetic"),
+        ("resolve_head", "ADMIN_MERGE_HEAD_READ_SLEEP", "abc", "is not a number"),
+    ):
+        r = _drive(tmp_path, "exit 1", f'{fn} 1; echo "rc=$?"', extra_env={knob: bad})
         assert "refusing a bad head-read knob" in r.stderr, (
-            f"ADMIN_MERGE_HEAD_ATTEMPTS={bad} ({why}) was NOT refused on the SOURCED path: "
-            f"{r.stderr!r}")
+            f"{fn} with {knob}={bad} ({why}) was NOT refused on the SOURCED path: {r.stderr!r}")
         assert "[head_unreadable]" not in r.stderr, (
-            f"ADMIN_MERGE_HEAD_ATTEMPTS={bad} produced an UNREADABLE-HEAD claim on the sourced "
-            "path — #1690's symptom, emitted by the instrument on a run whose budget may permit "
-            "zero reads")
+            f"{fn} with {knob}={bad} produced an UNREADABLE-HEAD claim on the sourced path — "
+            "#1690's symptom, emitted by the instrument on a run whose budget may permit zero "
+            "reads")
         # ⛔ ASSERT ON THE FUNCTION'S OWN STATUS, NOT THE SCRIPT'S. A bash body that ends in
         # `echo` exits 0 whatever happened, and the FIRST version of this test wrote
         # `require_head 1 || true`, which FORCES 0 — so `assert r.returncode != 0` was
         # unsatisfiable and the test was red on a CORRECT rail (review round 5 measured it).
         assert "rc=0" not in r.stdout, (
-            f"a bad knob ({bad}, {why}) must make require_head return non-zero: {r.stdout!r}")
+            f"{fn} must return non-zero for {knob}={bad} ({why}): {r.stdout!r}")
 
 
 def test_the_SOURCED_path_accepts_a_valid_knob(tmp_path):
