@@ -19,10 +19,13 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 it rests (short of the 24h retirement proof; this fixture's row
                 reason is `turn-ended`, but the emitted POLICY sentence asserts
                 only the state, since several paths reach it), while a
-                lane frozen with an OPEN turn is still `wedged` — the #1254
-                contract at the report layer. The child-exclusion scenario (a
-                task child's newer record must not become the parent's verdict)
-                is asserted inside CLEAN, paired with its own RED control.
+                lane frozen with an OPEN turn whose call is still in flight is
+                held `running-quiet`/`tool-in-flight` by the transcript-derived
+                Tool veto (#5389 a) and an OPEN turn with NO in-flight tool is
+                still `wedged` — the #1254 contract at the report layer. The
+                child-exclusion scenario (a task child's newer record must not
+                become the parent's verdict) is asserted inside CLEAN, paired
+                with its own RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
     MD-ESCAPE   no store/transcript-derived value (the `reason` cell's
@@ -132,6 +135,12 @@ SID_TURN_DONE = "eeeeeeee-0000-4000-8000-000000000005"
 SID_TURN_OPEN = "ffffffff-0000-4000-8000-000000000006"
 PID_TURN_DONE = 5555
 PID_TURN_OPEN = 6666
+# #1254's open-turn shape that is NOT an in-flight tool: a `toolResult` whose
+# assistant reply never arrived. The Tool veto cannot hold it (#5389 a derives a
+# tool only from an assistant `toolCall`), so the turn boundary alone decides.
+WS_TURN_RESULT = "66666666-6666-4666-8666-666666666666"
+SID_TURN_RESULT = "11111111-0000-4000-8000-000000000007"
+PID_TURN_RESULT = 6667
 # #1272 — hostile fixture values for the markdown-escape leg. ``Lane.name`` is
 # ``os.path.basename(cwd)`` (a directory name) and ``Lane.workspace`` / ``Lane.sid``
 # are store keys — none is validated as a UUID — so all three reach the report
@@ -335,6 +344,19 @@ def turn_open_lane():
     return ("turn-open", WS_TURN_OPEN, SID_TURN_OPEN,
             record(SID_TURN_OPEN, WS_TURN_OPEN, PID_TURN_OPEN, updated_at=NOW_S,
                    non_idle=False, cwd="/tmp/turn-open"))
+
+
+def turn_result_lane():
+    """OPEN turn with no in-flight tool: a `toolResult` and no assistant reply.
+
+    `tool_from_jsonl` derives a Tool only from an assistant message carrying
+    `toolCall`s, and this tail is a `toolResult`, so no veto can hold it. The
+    #1254 turn boundary is therefore the only thing that decides — and it is
+    `wedged` at a frozen age.
+    """
+    return ("turn-result", WS_TURN_RESULT, SID_TURN_RESULT,
+            record(SID_TURN_RESULT, WS_TURN_RESULT, PID_TURN_RESULT, updated_at=NOW_S,
+                   non_idle=False, cwd="/tmp/turn-result"))
 
 
 def md_active_dead_lane():
@@ -549,18 +571,30 @@ def leg_closed_workspace(module=None):
 
 def leg_turn_boundary(module=None):
     print("── TURN-BOUNDARY — resting is not wedged; an open turn still is (#1254) ──")
-    fx = Fixture([turn_done_lane(), turn_open_lane()],
-                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
+    fx = Fixture([turn_done_lane(), turn_open_lane(), turn_result_lane()],
+                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN),
+                          ps_row(PID_TURN_RESULT)])
     try:
-        # Both transcripts are frozen 30 min (past S = 20 min, inside the 24h
-        # idle proof). The ONLY difference is the turn boundary.
+        # All three transcripts are frozen 30 min (past S = 20 min, inside the
+        # 24h idle proof). The ONLY difference is the shape of the last turn.
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
                          [msg_entry("assistant", stopReason="stop",
                                     content=[{"type": "text", "text": "done"}])])
+        # #5389 (a): an assistant `toolCall` with no `toolResult` after it IS a
+        # tool in flight, so the transcript-derived Tool veto holds this lane
+        # `running-quiet`/`tool-in-flight` until the watchdog's own per-shape
+        # bound. The turn is still OPEN (the boundary is what licenses the
+        # veto); it is the veto, not the boundary, that decides the STATE.
         write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
                          [msg_entry("assistant", stopReason="toolUse",
                                     content=[{"type": "toolCall", "name": "bash",
                                               "id": "call_00_OPEN"}])])
+        # The #1254 pin, kept honest by the veto lane above: an OPEN turn with
+        # NO in-flight tool has nothing to hold it, so the boundary decides and
+        # it is still `wedged` at this age.
+        write_transcript(fx, SID_TURN_RESULT, "/tmp/turn-result",
+                         [msg_entry("toolResult", toolName="bash",
+                                    toolCallId="call_00_RESULT")])
         rc, out, gh = run_report(fx, "--json", module=module)
         assert_eq(rc, 0, "neither lane escalates (both have a live holder)")
         parsed = json.loads(out.splitlines()[0])
@@ -574,15 +608,23 @@ def leg_turn_boundary(module=None):
         else:
             bad("the report must say WHY the lane is resting (terminal stopReason absent)")
         opened = verdicts.get("turn-open", {})
-        assert_eq(opened.get("state"), "wedged", "a frozen OPEN turn is still wedged")
-        assert_eq(opened.get("reason"), "turn-open:pending-tool-call",
+        assert_eq(opened.get("state"), "running-quiet",
+                  "the derived Tool veto holds a pending-call lane off wedged (#5389 a)")
+        assert_eq(opened.get("reason"), "tool-in-flight",
+                  "the running-quiet reason names the tool veto, not a turn reason")
+        wedged = verdicts.get("turn-result", {})
+        assert_eq(wedged.get("state"), "wedged",
+                  "a frozen OPEN turn with no in-flight tool is still wedged (#1254)")
+        assert_eq(wedged.get("reason"), "turn-open:awaiting-assistant",
                   "the wedged reason names the open turn")
-        if "call_00_OPEN" in out:
+        if "call_00_RESULT" in out:
             ok("the report names the unanswered call")
         else:
             bad("the wedged row must name the open call")
         assert_eq(parsed["counts"].get("wedged"), 1,
-                  "exactly one wedged lane: the open turn, not the resting one")
+                  "exactly one wedged lane: the open turn with no in-flight tool")
+        assert_eq(parsed["counts"].get("running-quiet"), 2,
+                  "the resting lane and the tool-vetoed lane are both running-quiet")
         # P2: the emitted policy text must say what the code does — a resting
         # lane is running-quiet only SHORT OF the 24h retirement proof (past it
         # the `idle`/`jsonl-old` branch returns first).
@@ -660,13 +702,17 @@ def leg_md_escape(module=None):
         # name and call id — with a backslash, pinning that it is NOT doubled), the
         # lane label (a cwd basename), the workspaceId, and the sid. None may add a
         # cell, close a code span, open a link, or start a heading line.
+        # The open-turn lane is the `toolResult`/awaiting-assistant shape, not a
+        # pending `toolCall`: since #5389 (a) an in-flight call is VETOED to
+        # `running-quiet`/`tool-in-flight` and its tool name no longer reaches the
+        # evidence cell, so the tool name/call id must be pinned through the shape
+        # that still emits them.
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
                          [msg_entry("assistant", stopReason="R|a`b\r\n### forged-reason",
                                     content=[{"type": "text", "text": "x"}])])
         write_transcript(fx, SID_TURN_OPEN, "/tmp/turn-open",
-                         [msg_entry("assistant", stopReason="toolUse",
-                                    content=[{"type": "toolCall", "name": "E|x`y\\z",
-                                              "id": "call_00_\r\n### forged-detail"}])])
+                         [msg_entry("toolResult", toolName="E|x`y\\z",
+                                    toolCallId="call_00_\r\n### forged-detail")])
         rc, out, gh = run_report(fx, module=module)
         assert_eq(rc, 1, "the active dead lane escalates (its body is what gh posts)")
         assert_contains(gh, "issue create", "the dead lane filed an issue")

@@ -493,7 +493,7 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
         ``effToolAge > streamStallMs`` (:3058, 20 min). 30 min binds only when the
         CPU-stall and tool-age clocks start together.
       * ``"progressing"``, ``"unknown"``, or a non-attributable tool kind — the
-        AGE backstop, ``tool-stall`` (index.ts:3063-3071): ``toolStallMs`` (4h
+        AGE backstop, ``tool-stall`` (index.ts:3065-3073, kill at :3072): ``toolStallMs`` (4h
         at the 6h cap) while the turn is ACTIVE, and
         ``min(toolStallMs, heartbeatTimeoutMs)`` (30 min) when it is NOT. The
         turn-inactive branch is the one v4 missed, and missing it is the
@@ -544,7 +544,7 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
     # `"progressing"`, `"unknown"`, a non-attributable tool kind, and a
     # `no-progress` shape whose clause is not yet due ALL reach the watchdog's
     # AGE backstop, and that is the faithful mirror: the watchdog's `tool-stall`
-    # clause (index.ts:3068-3072) has NO CPU or progress conjunct —
+    # clause (index.ts:3065-3073, kill at :3072) has NO CPU or progress conjunct —
     # `effToolAge > bound` alone — so it cuts a tool whose CPU is STILL ADVANCING
     # once the age backstop is passed. Progress evidence buys a reprieve from
     # `tool-silence`/`tool-dead` (S = 20 min), never an exemption from the
