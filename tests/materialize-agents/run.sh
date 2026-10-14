@@ -368,26 +368,51 @@ done
 #       test is defined BELOW, in USER QUESTIONS PROTOCOL; the file's own
 #       convention for a forward reference is explicit about direction.
 #
-# These are word pins, so a legitimate REWORD of the subsection trips them. That
-# is the cheap direction (a false flag is caught by whoever edits the text),
-# same as the MD026 pin — widen the predicate rather than delete the arm. Each
-# RED fixture is the PRE-FIX text, so the pin is non-vacuous; the GREEN fixture
-# is the post-fix control.
+# BOTH ARMS ARE FAIL-CLOSED ALLOW-LISTS. The first version of R1 enforced the
+# apply half with a 3-phrase deny-list (`and apply|apply that|never by stopping`)
+# and the ask half with a polarity-blind substring (`confirm`); #1681's review
+# then proved it false-PASSed a reworded re-introduction of the very path it
+# guards — `confirm the diff … then apply it`, and `apply …; the confirmation
+# never gates the write`. A deny-list of a rule's WORDING lags the rule; the
+# same lesson the MD026 pin records further down (an allow-list cannot, since
+# anything unrecognised is reported). R1 therefore reports unless the branch
+# BOTH asks for the one-line confirmation AND negates the write: the ask arm
+# fires alone on a branch that only negates, the negation arm fires alone on a
+# branch that only asks (a bare `confirm`).
+#
+# R2 was anchored to the exact section H1, so renaming that heading emptied its
+# `sed` range and silently disabled the arm; it is now anchored to the SENTENCE
+# carrying the cross-reference (heading-agnostic) and fails closed when that
+# sentence cannot be located. R2 must stay paragraph-scoped: a whole-file scan
+# would false-flag the legitimate `contradiction test above` inside USER
+# QUESTIONS PROTOCOL (AGENTS.md:160), which IS above its own text.
+#
+# These are word pins, so a legitimate REWORD still trips them. That is the cheap
+# direction here (a false flag is caught by whoever edits the text) — widen the
+# predicate rather than delete the arm, exactly as with the MD026 pin. Each RED
+# fixture is the PRE-FIX text (or the reworded false-PASS the review reproduced),
+# so the pin is non-vacuous; the GREEN fixtures are post-fix controls.
 rule_scan() {  # <file> → one finding per line on stdout
-  local f="$1" findings="" br
-  if sed -n '/^## ⛔ HARD RULE: Process Problems Are Yours To Fix/,/^---$/p' "$f" \
-       | grep -q 'contradiction test above'; then
-    findings+="R2: contradiction test referenced as 'above' in the Process Problems rule (it is defined below)"$'\n'
+  local f="$1" findings="" br ref
+
+  # R2: the sentence carrying the reopen cross-reference. Heading-agnostic and
+  # fail-closed — an unlocatable sentence is a finding, not a skip.
+  ref="$(awk '/recorded decision is a \*\*reopen\*\*/{f=1} f{print} f && /^$/ {exit}' "$f" | tr '\n' ' ')"
+  if [ -z "$ref" ]; then
+    findings+="R2: no 'recorded decision is a reopen' cross-reference found — its direction cannot be established"$'\n'
+  elif ! grep -Eq 'contradiction test below|contradiction test in USER QUESTIONS PROTOCOL' <<<"$ref"; then
+    findings+="R2: the reopen cross-reference does not point at the contradiction test 'below' (got: $(grep -oE 'contradiction test (above|below|in USER QUESTIONS PROTOCOL)' <<<"$ref" || true))"$'\n'
   fi
+
+  # R1: the uncertainty branch, failed closed on the positive shape.
   br="$(awk '/\*\*Unsure which diff was approved\*\*/{f=1} f{print} f && /^$/ {exit}' "$f" | tr '\n' ' ')"
   if [ -z "$br" ]; then
     findings+="R1: no 'Unsure which diff was approved' branch found — the uncertainty rule cannot be established"$'\n'
   else
-    grep -qi 'confirm' <<<"$br" \
-      || findings+="R1: the uncertainty branch does not require a confirmation"$'\n'
-    if grep -Eq 'and apply|apply that|never by stopping' <<<"$br"; then
-      findings+="R1: the uncertainty branch still carries an unconditional apply directive"$'\n'
-    fi
+    grep -q 'ask for the one-line confirmation' <<<"$br" \
+      || findings+="R1: the uncertainty branch does not ask for the one-line confirmation before writing"$'\n'
+    grep -Eq 'never apply|not apply|never to a write|do not write' <<<"$br" \
+      || findings+="R1: the uncertainty branch carries no negation of the write — a bare 'confirm' does not gate it"$'\n'
   fi
   printf '%s' "$findings"
 }
@@ -418,22 +443,68 @@ EOF
 
 # GREEN control: the post-fix uncertainty branch must NOT be flagged.
 rule_expect "$(rule_fixture green-unsure-confirm <<'EOF'
+Reversing a recorded decision is a **reopen**: argue it in the decision's own home, per the contradiction test below.
+
 approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
 confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
 your own reading of what was approved — and never merely wait in silence.
 EOF
 )" clean "post-fix uncertainty branch requires a confirmation"
 
+# RED, isolated to R1: the reworded false-PASS #1681's review reproduced — it keeps
+# the word 'confirm' while still directing the write, which the old deny-list missed
+# and the old polarity-blind `grep -qi confirm` accepted. The cross-reference is clean
+# so the assertion names the R1 arms.
+r1_reword_red="$(rule_fixture red-reworded-apply <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+**Unsure which diff was approved** → apply the diff you believe was approved and confirm it
+afterwards in the same comment; the confirmation never gates the write.
+EOF
+)"
+r1_reword_hits="$(rule_scan "$r1_reword_red")"
+if grep -q '^R1' <<<"$r1_reword_hits" && ! grep -q '^R2' <<<"$r1_reword_hits"; then
+  pass "rule pin: reworded apply-on-uncertainty flagged by the R1 arms alone"
+else
+  fail "rule pin: reworded false-PASS not isolated to R1 (got: $(head -1 <<<"$r1_reword_hits"))"; fi
+
+# RED, isolated to R1's ASK arm: the branch negates the write but never ASKS for
+# the confirmation. Delete the ask conjunct and this case goes red.
+r1_ask_red="$(rule_fixture red-unsure-no-ask <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+**Unsure which diff was approved** → do not apply on your own reading; wait for the owner.
+EOF
+)"
+r1_ask_hits="$(rule_scan "$r1_ask_red")"
+if grep -q 'does not ask for the one-line confirmation' <<<"$r1_ask_hits" \
+   && ! grep -q 'carries no negation of the write' <<<"$r1_ask_hits"; then
+  pass "rule pin: branch that negates but never asks → ask arm alone flags it"
+else
+  fail "rule pin: R1 ask arm not isolated (got: $(head -1 <<<"$r1_ask_hits"))"; fi
+
+# RED, isolated to R1's NEGATION arm: the branch ASKS but still applies — exactly
+# the shape a bare `confirm` token used to satisfy. Delete the negation conjunct
+# and this case goes red.
+r1_neg_red="$(rule_fixture red-unsure-no-negation <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+**Unsure which diff was approved** → ask for the one-line confirmation, then apply what you believe was approved.
+EOF
+)"
+r1_neg_hits="$(rule_scan "$r1_neg_red")"
+if grep -q 'carries no negation of the write' <<<"$r1_neg_hits" \
+   && ! grep -q 'does not ask for the one-line confirmation' <<<"$r1_neg_hits"; then
+  pass "rule pin: branch that asks but still applies → negation arm alone flags it"
+else
+  fail "rule pin: R1 negation arm not isolated (got: $(head -1 <<<"$r1_neg_hits"))"; fi
+
 # RED for R2 specifically: the pre-fix cross-reference, with a clean uncertainty branch
 # so the R1 arm stays silent and the assertion names the R2 arm.
 r2_red="$(rule_fixture red-above-ref <<'EOF'
-## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
-
 Reversing a recorded decision is a **reopen**: argue it in the decision's own home, per the contradiction test above.
 
-**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation.
-
----
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
 )"
 r2_hits="$(rule_scan "$r2_red")"
@@ -442,15 +513,38 @@ if grep -q '^R2' <<<"$r2_hits" && ! grep -q '^R1' <<<"$r2_hits"; then
 else
   fail "rule pin: pre-fix 'above' cross-reference not isolated to R2 (got: $(head -1 <<<"$r2_hits"))"; fi
 
+# RED for R2's de-anchoring: the pre-fix cross-reference under a RENAMED section
+# heading. The old range was anchored to the exact H1, so this exact input used to
+# report clean (the arm was disabled by the rename).
+r2_rename_red="$(rule_fixture red-above-renamed-heading <<'EOF'
+## ⛔ HARD RULE: Process Problems — Do Not Escalate Them
+
+Reversing a recorded decision is a **reopen**: per the contradiction test above.
+
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
+EOF
+)"
+r2_rename_hits="$(rule_scan "$r2_rename_red")"
+if grep -q '^R2' <<<"$r2_rename_hits" && ! grep -q '^R1' <<<"$r2_rename_hits"; then
+  pass "rule pin: R2 survives a section-heading rename"
+else
+  fail "rule pin: R2 disabled by a heading rename (got: $(head -1 <<<"$r2_rename_hits"))"; fi
+
+# RED for R2's fail-closed anchor: no cross-reference sentence at all.
+r2_missing_red="$(rule_fixture red-missing-ref <<'EOF'
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
+EOF
+)"
+if grep -q 'R2: no' <<<"$(rule_scan "$r2_missing_red")"; then
+  pass "rule pin: missing cross-reference fails closed"
+else
+  fail "rule pin: missing cross-reference reported clean (fail-open)"; fi
+
 # GREEN: the post-fix reference direction must NOT be flagged.
 rule_expect "$(rule_fixture green-below-ref <<'EOF'
-## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
-
 Reversing a recorded decision is a **reopen**, per the contradiction test below.
 
-**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation.
-
----
+**Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
 )" clean "cross-reference to the contradiction test says 'below'"
 
