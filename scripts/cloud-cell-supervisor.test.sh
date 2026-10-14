@@ -219,7 +219,10 @@ esac
 say_case "the merge key reaches a WORKER across the second tmux boundary"
 
 W="$T/wk"; mkdir -p "$W/harness" "$W/repo/.git" "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
-for f in dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+# Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
+# required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
+# dies in cmd_check with "worker scripts missing from …: claims.sh".
+for f in claims.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.

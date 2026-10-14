@@ -168,7 +168,8 @@ after3="$(git -C "$A" ls-remote origin "$REF2" | wc -l | tr -d ' ')"
 t="$(trap -p EXIT INT TERM)"
 for s in EXIT INT TERM; do
   # bash 3.2 prints SIGINT/SIGTERM, later bashes print INT/TERM — a substring match covers both.
-  printf '%s' "$t" | grep -q "$s" && ok "trap registered for $s" || bad "no trap for $s"
+  # here-string, not a pipe — `printf … | grep -q` takes SIGPIPE under pipefail (#841).
+  grep -q "$s" <<<"$t" && ok "trap registered for $s" || bad "no trap for $s"
 done
 
 echo
@@ -192,6 +193,28 @@ gone=$([ -z "$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')" ] && 
 [ "$gone" = "yes" ] && ok "fixer claim released (no orphan after the merge chain)" || bad "fixer claim leaked"
 fixref_clear
 rm -rf "$O2"
+
+echo
+echo "=== step 7b (P2): a FAILED final release must keep the retry latch, so the EXIT trap retries ==="
+# Pre-fix `release_fix_claim >/dev/null 2>&1` discarded the rc and then ran an unconditional
+# `CROSS_OWN=""`, so a failing release was never retried and the claim stranded on the remote for
+# the whole fixer lease. Make every claim_release FAIL and count invocations: the explicit release
+# is call 1, and ONLY a retained latch lets the EXIT trap make call 2.
+O3="/tmp/xb-crossbox-fixorch-retry.$$"
+rm -rf "$O3"; mkdir -p "$O3/logs" "$O3/state"
+cp "$HERE/claims.sh" "$O3/claims.sh"
+printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O3/merge-one.sh"
+CNT="$O3/release-calls"
+printf '\nclaim_release() { echo x >> "%s"; return 1; }\n' "$CNT" >> "$O3/claims.sh"
+fixref_clear
+( cd "$A" && exec env O="$O3" FIX_TIMEOUT=60 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 ) &
+F1b=$!
+wait "$F1b" 2>/dev/null; echo "  fix-one exit=$?"
+calls="$(wc -l < "$CNT" 2>/dev/null | tr -d ' ')"
+[ "${calls:-0}" -ge 2 ] && ok "failed release RETRIED by the EXIT trap ($calls claim_release call(s))" \
+                        || bad "failed release NOT retried — latch cleared ($calls call(s))"
+fixref_clear
+rm -rf "$O3"
 
 echo
 echo "=== step 8 (P3.4): a BLACK-HOLED release cannot hang the exit path, and the lock survives it ==="

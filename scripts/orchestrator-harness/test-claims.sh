@@ -87,7 +87,11 @@ OTHER_SHA=1111111111111111111111111111111111111111
 OTHER_REF="refs/claims/$PR-${OTHER_SHA:0:12}"
 PASS=0; FAIL=0
 ck() { # ck <label> <expected-regex> <actual>
-  if printf '%s' "$3" | grep -q "$2"; then echo "  ✅ $1"; PASS=$((PASS+1));
+  # ⛔ here-string, not a pipe: `printf … | grep -q` lets grep exit at its first match while the
+  # writer is still writing, so the writer takes SIGPIPE — under `set -o pipefail` the pipeline then
+  # reports the writer's 141 instead of a match (#841). scripts/check-no-sigpipe-grep.sh fails the
+  # build on the piped form.
+  if grep -q "$2" <<<"$3"; then echo "  ✅ $1"; PASS=$((PASS+1));
   else echo "  ❌ $1 — expected /$2/ in: $3"; FAIL=$((FAIL+1)); fi
 }
 cleanup_ref() {
@@ -346,7 +350,7 @@ else echo "  ❌ cleanup_remote did not delete it ($before -> $after)"; FAIL=$((
 tr="$(trap -p EXIT INT TERM)"
 for s in EXIT INT TERM; do
   # bash 3.2 prints SIGINT/SIGTERM, later bashes print INT/TERM — a substring match covers both.
-  if printf '%s' "$tr" | grep -q "$s"; then echo "  ✅ trap registered for $s"; PASS=$((PASS+1));
+  if grep -q "$s" <<<"$tr"; then echo "  ✅ trap registered for $s"; PASS=$((PASS+1));
   else echo "  ❌ no trap for $s"; FAIL=$((FAIL+1)); fi
 done
 

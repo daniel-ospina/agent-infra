@@ -168,8 +168,12 @@ echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
 # Release BEFORE the merge chain. If the fixer pushed, merge-one.sh claims the NEW head. If it did
 # NOT push, the SAME head is still claimed by us and merge-one.sh would refuse it as "another box
 # owns head" — so the release is mandatory, not tidiness.
-release_fix_claim >/dev/null 2>&1
-CROSS_OWN=""
+# ⛔ `&& CROSS_OWN=""`: ONLY clear the latch when the release actually succeeded. A failed release
+# (rc=1: fenced/torn push) must leave CROSS_OWN set so the EXIT trap (`trap 'release_fix_claim' EXIT`,
+# line 88) retries it at process exit — otherwise the claim strands on the remote for the whole
+# fixer lease (FIX_TIMEOUT+1200, up to ~1 h) and the controller, reading the live lease as data,
+# stops re-dispatching that head. Same try-then-clear idiom as line 109 and merge-one.sh's rc=2 arm.
+release_fix_claim >/dev/null 2>&1 && CROSS_OWN=""
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"
