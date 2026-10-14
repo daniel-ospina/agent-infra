@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# cloud-cell-supervisor.test.sh — the regression contract for agent-infra#1713.
+# cloud-cell-supervisor.test.sh — the regression contract for agent-infra#1713 and agent-infra#1711.
 #
-# $ENV_FILE (keys.env) is SOURCED into the running shell, so a top-level `exit`/`exec` in it ends
-# the CALLER. Measured before the fix, with keys.env = `exit 0`:
+# §1–§6 cover agent-infra#1713: $ENV_FILE (keys.env) is SOURCED into the running shell, so a
+# top-level `exit`/`exec` in it ends the CALLER. Measured before the fix, with keys.env = `exit 0`:
 #
 #     $ bash scripts/cloud-cell-supervisor.sh status   # -> no output
 #     rc=0
@@ -22,6 +22,10 @@
 #     (a completion guard that refused that would be a false block);
 #   * the same root in cloud-cell-bringup.sh `--check` is refused (it exited 0 with no `CELL READY`).
 #
+# §7 covers agent-infra#1711: the merge authority key reaches the CONTROLLER but not the merge
+# WORKERS, which orch-loop.sh spawns through a SECOND tmux boundary — so `cmd_check` could print ok
+# while every review was recorded UNSIGNED.
+#
 # Hermetic: temp HOME + temp state dir, no network, no tmux session is ever created (the refusal
 # happens before tmux is reached). Run:  bash scripts/cloud-cell-supervisor.test.sh
 
@@ -36,7 +40,15 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
-trap 'rm -rf "$T"' EXIT
+# §7's optional real-tmux half starts private servers (`tmux -L <socket>`); they are killed here so
+# no server survives the suite. The stub half needs no cleanup beyond $T.
+AI1711_SOCKS=""
+ai1711_cleanup() {
+  local s
+  [ -n "${AI1711_SOCKS:-}" ] || return 0
+  for s in $AI1711_SOCKS; do tmux -L "$s" kill-server >/dev/null 2>&1 || true; done
+}
+trap 'ai1711_cleanup; rm -rf "$T"' EXIT
 
 for f in "$SUP" "$BRINGUP"; do
   [ -f "$f" ] && ok "shipped script present: $(basename "$f")" || { bad "missing $f"; exit 1; }
@@ -180,6 +192,199 @@ case "$BR_OUT" in
   *"did not finish sourcing"*) bad "bringup --check: the completion guard fired on a normal file" ;;
   *) ok "bringup --check: the completion guard did not fire on a normal file" ;;
 esac
+
+# ── 7) the SECOND tmux boundary: the key must reach the MERGE WORKERS (agent-infra#1711) ─────────
+# `start` re-sources $ENV_FILE into the CONTROLLER's shell, but orch-loop.sh spawns each merge
+# worker through a SECOND `tmux new-session`. A session is served from the SERVER's environment plus
+# the names in tmux's `update-environment` (which tmux copies out of the CREATING CLIENT's
+# environment), so on a PRE-EXISTING server the worker got neither the key nor the cell's HOME:
+# record-review.sh found no $AI_REVIEW_GATE_KEY and no $HOME/.pi/agent/.ai-review-gate-key, posted an
+# UNSIGNED marker, and the required ai-review-gate check went red — while this preflight printed ok.
+#
+# The scenario below IS the failing one the issue names: the tmux server is created FIRST, by an
+# operator session carrying the operator's HOME and no key (a server that survived `stop`, an
+# operator's own session on the VM, or a key rotated into keys.env after the server came up). It
+# drives the SHIPPED `start`, then a controller that spawns a worker exactly as orch-loop.sh does
+# (`tmux new-session -d -s merge-1 …`), through a tmux double that models that one rule and nothing
+# else. The same scenario is re-run against a REAL tmux when one is installed (the delivery rule was
+# confirmed empirically on tmux 3.4 — the cloud cell's version — and 3.8); ubuntu-latest ships no
+# tmux, so the double is what keeps the assertion running on the runner.
+#
+# The COLD variant (no server at all) runs too: there, `show-options`/`set-option` cannot reach a
+# server and FAIL (measured — they do not start one), so a publish that is not guarded by a
+# server-existence probe makes `start` die on every cold cell, which is the common path.
+say_case "the merge key reaches a WORKER across the second tmux boundary"
+
+W="$T/wk"; mkdir -p "$W/harness" "$W/repo/.git" "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
+for f in dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
+# The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
+# past cmd_start's own `sleep 3` has-session check.
+cat > "$W/harness/orch-loop.sh" <<EOF
+#!/bin/bash
+tmux new-session -d -s merge-1 "bash '$W/harness/merge-one.sh'"
+sleep 4
+EOF
+# record-review.sh's own key resolution, verbatim: env first, else the key file under \$HOME.
+cat > "$W/harness/merge-one.sh" <<EOF
+#!/bin/bash
+k="\${AI_REVIEW_GATE_KEY:-}"
+if [ -z "\$k" ] && [ -f "\$HOME/.pi/agent/.ai-review-gate-key" ]; then k="\$(cat "\$HOME/.pi/agent/.ai-review-gate-key")"; fi
+printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
+printf 'HOME=%s\\nO=%s\\n' "\${HOME:-}" "\${O:-}" > '$W/worker-env'
+EOF
+chmod +x "$W/harness/orch-loop.sh" "$W/harness/merge-one.sh"
+
+# A tmux double for the rules under test. The first `new-session` starts the SERVER, which inherits
+# ITS client's environment — including the operator's HOME and whatever key it did or did not have;
+# that snapshot IS the pre-existing server the defect lives on. Each subsequent `new-session` builds
+# the session environment from the server snapshot plus the `update-environment` names taken from the
+# CREATING CLIENT (a name absent from the client is REMOVED), and runs the session command with it.
+# ⛔ `show-options`/`set-option` FAIL when no server exists — they do not start one (measured on
+# tmux 3.8). Without that, the cold case below would model a server that is not there, and the
+# regression that broke it would stay invisible. Every argv is recorded, so "the secret never reaches
+# a tmux command line" is asserted over ALL tmux calls, not just the session command.
+cat > "$W/stub/tmux" <<'STUB'
+#!/bin/bash
+S="${AI1711_STATE:?}"
+printf '%s\n' "$*" >> "$S/argv"
+no_server() { [ ! -f "$S/server-env" ]; }
+sub="${1:-}"; shift
+case "$sub" in
+  has-session)
+    n=""; while [ $# -gt 0 ]; do case "$1" in -t) n="$2"; shift 2 ;; *) shift ;; esac; done
+    no_server && exit 1
+    [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
+  show-options)
+    no_server && exit 1
+    [ -f "$S/update-env" ] && cat "$S/update-env"; exit 0 ;;
+  set-option)
+    no_server && exit 1
+    [ "${1:-}" = "-g" ] && shift
+    [ "${1:-}" = "update-environment" ] && shift
+    printf '%s' "${1:-}" | tr ' ' '\n' | grep . > "$S/update-env" || true
+    exit 0 ;;
+  new-session)
+    if no_server; then
+      for v in PATH HOME O AI_REVIEW_GATE_KEY AI1711_STATE; do
+        declare -p "$v" 2>/dev/null || printf 'unset %s\n' "$v"
+      done > "$S/server-env"
+    fi
+    sess=""; cmd=""
+    while [ $# -gt 0 ]; do case "$1" in
+      -d) shift ;; -s) sess="$2"; shift 2 ;; -c) shift 2 ;; *) cmd="$1"; shift ;; esac; done
+    : > "$S/up.$sess"
+    printf '%s\n' "$cmd" > "$S/cmd.$sess"
+    {
+      cat "$S/server-env"
+      if [ -f "$S/update-env" ]; then
+        while IFS= read -r n; do
+          [ -n "$n" ] || continue
+          declare -p "$n" 2>/dev/null || printf 'unset %s\n' "$n"
+        done < "$S/update-env"
+      fi
+    } > "$S/env.$sess"
+    ( env -i /bin/bash -c '. "$1"; eval "$2"' _ "$S/env.$sess" "$cmd" >/dev/null 2>&1 & )
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$W/stub/tmux"
+
+# A real tmux is optional: this suite must run on a runner that ships none (ubuntu-latest). Where
+# one exists the SAME scenario is re-run for real, through a shim that pins a private socket and
+# skips the user's tmux.conf, so the assertion is never only the double's opinion.
+REAL_TMUX="$(command -v tmux || true)"
+if [ -n "$REAL_TMUX" ]; then
+  cat > "$W/realbin/tmux" <<EOF
+#!/bin/bash
+exec "$REAL_TMUX" -L "\${AI1711_SOCK:?}" -f /dev/null "\$@"
+EOF
+  chmod +x "$W/realbin/tmux"
+else
+  echo "  ⏭ SKIP: no tmux on this host — §7 asserts against the double only"
+fi
+
+K_ENV="KEY-ENV-$$"; K_FILE="KEY-FILE-$$"
+printf 'AI_REVIEW_GATE_KEY=%s\n' "$K_ENV" > "$W/keys-env.env"
+printf '# deliberately carries no key\n' > "$W/keys-file.env"
+printf '%s\n' "$K_FILE" > "$W/cellhome/.pi/agent/.ai-review-gate-key"
+
+# wk_case <kind:stub|real> <route:env|file> <server:pre|cold>
+#   pre  — an OPERATOR server already exists (the scenario the issue names: it supplies the session
+#          environment, so without publication the worker gets the operator's HOME and no key)
+#   cold — no server at all; `start` CREATES one, and it inherits the supervisor's own environment
+wk_case() {
+  local kind="$1" route="$2" server="$3" bin st="" sock="" envf sess rc=0 i got want tag
+  tag="$kind/$route/$server"
+  bin="$W/$([ "$kind" = real ] && echo realbin || echo stub)"
+  rm -f "$W/worker-key" "$W/worker-env"
+  if [ "$kind" = real ]; then
+    sock="ai1711-$$-$route-$server"; AI1711_SOCKS="$AI1711_SOCKS $sock"
+    if [ "$server" = pre ]; then
+      env -i PATH="$bin:$PATH" HOME="$W/otherhome" AI1711_SOCK="$sock" "$bin/tmux" \
+        new-session -d -s operator "sleep 600" >/dev/null 2>&1 || true
+    fi
+  else
+    st="$W/state.$route.$server"; rm -rf "$st"; mkdir -p "$st"
+    if [ "$server" = pre ]; then
+      env -i PATH="$bin:$PATH" HOME="$W/otherhome" AI1711_STATE="$st" "$bin/tmux" \
+        new-session -d -s operator "true" >/dev/null 2>&1 || true
+      [ -s "$st/server-env" ] || bad "$tag: fixture broken — the pre-existing server was not created"
+    fi
+  fi
+  envf="$W/keys-$route.env"; sess="ai1711-$kind-$route-$server"
+  env PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
+      CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
+      SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" SCOPE=own \
+      bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
+  for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
+  if [ "$rc" -ne 0 ]; then
+    bad "$tag: start failed (rc=$rc): $(tail -2 "$W/start.$kind.$route.$server.out" | tr '\n' ' ')"
+    return
+  fi
+  got="$(cat "$W/worker-key" 2>/dev/null || true)"
+  [ "$route" = env ] && want="$K_ENV" || want="$K_FILE"
+  [ "$got" = "$want" ] \
+    && ok "$tag: the WORKER resolved the merge key across the second tmux boundary" \
+    || bad "$tag: the worker got '${got:-<none>}' (want $want) — the delivery did not cross; start said: $(grep -i 'key\|FATAL' "$W/start.$kind.$route.$server.out" | head -2 | tr '\n' ' ')"
+  grep -q "^HOME=$W/cellhome$" "$W/worker-env" 2>/dev/null \
+    && ok "$tag: the worker's \$HOME is \$CELL_HOME (so the key FILE resolves too)" \
+    || bad "$tag: worker HOME was not \$CELL_HOME — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
+  # The NAMES are published (the mechanism) — but ONLY when there was a server to publish into. A
+  # cold start must not lose the option, and must not die trying: the server it creates inherits the
+  # same three names from this shell (the delivery assertion above is what proves that).
+  if [ "$kind" = stub ]; then
+    if [ "$server" = pre ]; then
+      grep -qx 'AI_REVIEW_GATE_KEY' "$st/update-env" 2>/dev/null \
+        && ok "$tag: start published AI_REVIEW_GATE_KEY into tmux update-environment" \
+        || bad "$tag: update-environment does not carry the key name"
+    else
+      [ ! -f "$st/update-env" ] \
+        && ok "$tag: cold start did not try to publish into a server that does not exist" \
+        || bad "$tag: a cold start published into a server that was not there"
+    fi
+  fi
+  # The secret VALUE must never reach a tmux command line — over EVERY argv the double saw (the
+  # session command, `set-option`, `set-environment`, anything), plus the operator-visible output.
+  if grep -qF "$K_ENV" "$W/start.$kind.$route.$server.out" 2>/dev/null \
+     || { [ "$kind" = stub ] && grep -qF "$K_ENV" "$st/argv" 2>/dev/null; }; then
+    bad "$tag: the secret VALUE reached a tmux argv / operator-visible output"
+  else
+    ok "$tag: the secret VALUE is not on any tmux argv"
+  fi
+}
+
+wk_case stub env pre
+wk_case stub file pre
+wk_case stub env cold
+wk_case stub file cold
+if [ -n "$REAL_TMUX" ]; then
+  wk_case real env pre
+  wk_case real file pre
+  wk_case real env cold
+  wk_case real file cold
+fi
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
