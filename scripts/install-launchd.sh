@@ -129,16 +129,35 @@ launchd_path() {
     printf '%s' "$out"
 }
 
+# sed_repl — make a string safe as the REPLACEMENT half of `s|…|…|g` AND safe in the XML text node it
+# lands in.
+#
+# agent-infra#1719 (review D2-3). TWO escapes are needed, and the XML one is not optional:
+#   * `&` in a sed replacement expands to the WHOLE MATCH and `\` starts an escape, so a value
+#     carrying either is silently corrupted into the rendered plist (a PATH entry containing `&`
+#     rendered as `a{{PATH}}b`, with nothing to catch it — `verify_targets` inspects ProgramArguments
+#     only, and the pre-render placeholder guard greps the TEMPLATE, not the output).
+#   * the value lands inside `<string>`, so `&` is the XML entity introducer: an unescaped one makes
+#     the plist MALFORMED. Measured — a `&` in a PATH entry failed `plutil -lint`, i.e. the installer
+#     would have written a plist launchd cannot parse.
+# XML-escape FIRST (so the entity's own `&` is then sed-escaped, not re-expanded), then sed-escape.
+# The `|` delimiter must be escaped too, since that is the separator this file's sed uses.
+sed_repl() {
+    printf '%s' "$1" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        | sed -e 's/[&\\|]/\\&/g'
+}
+
 render() {
     # $1 = template path → stdout rendered plist
-    sed -e "s|{{HOME}}|$HOME|g" \
-        -e "s|{{PATH}}|$(launchd_path)|g" \
-        -e "s|{{AGENT_INFRA_PATH}}|$AGENT_INFRA_PATH|g" \
-        -e "s|{{TORTOISE_REPO}}|$TORTOISE_REPO|g" \
-        -e "s|{{SWARM_ROOT}}|$SWARM_ROOT|g" \
-        -e "s|{{SWARM_ENV_FILE}}|$SWARM_ENV_FILE|g" \
-        -e "s|{{PYTHON_BIN}}|$PYTHON_BIN|g" \
-        -e "s|{{PI_BIN_DIR}}|$PI_BIN_DIR|g" \
+    sed -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
+        -e "s|{{PATH}}|$(sed_repl "$(launchd_path)")|g" \
+        -e "s|{{AGENT_INFRA_PATH}}|$(sed_repl "$AGENT_INFRA_PATH")|g" \
+        -e "s|{{TORTOISE_REPO}}|$(sed_repl "$TORTOISE_REPO")|g" \
+        -e "s|{{SWARM_ROOT}}|$(sed_repl "$SWARM_ROOT")|g" \
+        -e "s|{{SWARM_ENV_FILE}}|$(sed_repl "$SWARM_ENV_FILE")|g" \
+        -e "s|{{PYTHON_BIN}}|$(sed_repl "$PYTHON_BIN")|g" \
+        -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
         "$1"
 }
 
@@ -193,7 +212,7 @@ job_loaded() {
 }
 
 install_job() {
-    local template="$1" label installed rendered tmp left ph unset_ph="" logkey logdir
+    local template="$1" label installed rendered tmp left ph unset_ph=""
     label="$(job_label "$template")"
     installed="$AGENTS_DIR/$label.plist"
 
@@ -240,25 +259,6 @@ install_job() {
 
     mkdir -p "$AGENTS_DIR"
     mv "$tmp" "$installed"
-    # ⛔ launchd creates the log FILE but NOT its parent directory, so a job rendered with a
-    # StandardOutPath under a directory this box has not created yet can load without running — the
-    # #1719 failure mode (a launcher wired to nothing) on the fresh second box that fix exists to
-    # equip. `~/.pi/agent/state` is created by pi ACTIVITY, not by this installer or the farm.
-    # Create every rendered log directory before bootstrap; a no-op for templates without the keys.
-    for logkey in StandardOutPath StandardErrorPath; do
-        # Portable by design: /usr/libexec/PlistBuddy does not exist on the ubuntu lane, so a
-        # PlistBuddy read would make this a silent no-op there — the same read that the
-        # broken-target guard above already depends on. The rendered plist puts the value on the
-        # line after its key, which is what the templates emit.
-        logdir="$(sed -n "/<key>$logkey<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}" "$installed")"
-        if [ -n "$logdir" ] && ! mkdir -p "$(dirname "$logdir")" 2>/dev/null; then
-            # NAMED, never swallowed: an unopenable StandardOutPath is the "loaded but never ran"
-            # shape this whole section exists to prevent, so a failure here must not read as success.
-            # It is not fatal — the job's own log (the script's `mkdir -p "$STATE_DIR"`) may still
-            # work — but it must be visible.
-            echo "    WARNING: $label cannot create $logkey dir $(dirname "$logdir") — the job may load inert" >&2
-        fi
-    done
     # Clear any disabled override, then reload. bootout is tolerated (a job
     # that was never loaded exits nonzero — fine). bootstrap must succeed.
     launchctl enable "$DOMAIN/$label" 2>/dev/null || true

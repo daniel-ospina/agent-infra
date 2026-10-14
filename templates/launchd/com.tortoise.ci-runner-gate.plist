@@ -30,7 +30,15 @@
          pi-bootstrap/setup.sh (fleet_srcs) - outside ~/Documents, so launchd can
          read it - and the installer's broken-target guard refuses to install a
          job whose target has not landed. Rendered by scripts/install-launchd.sh
-         (#304) on every sync; placeholders only. -->
+         (#304) on every sync; placeholders only.
+
+         No StandardOutPath/StandardErrorPath: every pass writes its own log at
+         ~/.pi/agent/state/ci-runner-gate.log and tees the same lines to stderr,
+         so a launchd capture would be a byte-identical SECOND, uncapped copy of
+         the same lines (the script already mkdir -p's its state dir, so the log
+         always lands). The three sibling self-logging jobs omit the keys for the
+         same reason - an unbounded launchd capture is the twin of the
+         symlink-truncation surface they guard. -->
     <key>Label</key>
     <string>com.tortoise.ci-runner-gate</string>
     <key>ProgramArguments</key>
@@ -53,9 +61,5 @@
     <integer>300</integer>
     <key>ProcessType</key>
     <string>Background</string>
-    <key>StandardOutPath</key>
-    <string>{{HOME}}/.pi/agent/state/ci-runner-gate.launchd.log</string>
-    <key>StandardErrorPath</key>
-    <string>{{HOME}}/.pi/agent/state/ci-runner-gate.launchd.log</string>
 </dict>
 </plist>

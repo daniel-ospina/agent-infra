@@ -66,7 +66,10 @@ cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:?}"
 case "$*" in
-  *"-X PUT"*) exit 0 ;;
+  *"-X PUT"*)
+    # GH_PUT_FAIL_ID lets a case fail ONE runner's PUT, which is how a PARTIAL relabel is built.
+    case "$*" in *"/runners/${GH_PUT_FAIL_ID:-none}/labels"*) exit 1 ;; esac
+    exit 0 ;;
   *"--jq .total_count"*)
     case "${GH_MODE:-ok}" in
       queued-null)  printf 'null\n' ;;
@@ -120,6 +123,7 @@ chmod +x "$BIN/cmux"
 RC=0
 OUT=""
 STATE_DIR=""
+KEEP_STATE=0
 GH_THRESHOLD_DEFAULT=60
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
@@ -132,7 +136,9 @@ run_gate() {
   local name="$1"; shift
   local home="$T/home-$name"
   STATE_DIR="$T/state-$name"
-  mkdir -p "$STATE_DIR" "$home"
+  # KEEP_STATE=1 makes the next call a REPEAT pass against the SAME home + state dir, for cases
+  # whose whole point is what the NEXT tick does (a retried relabel). It is one-shot.
+  if [ "$KEEP_STATE" = 1 ]; then KEEP_STATE=0; else mkdir -p "$STATE_DIR" "$home"; fi
   : > "$GH_LOG"
   # ⛔ CMUX_LOG is NOT truncated per run (review: the truncation made the suite's closing
   # "no run invoked cmux" assertion VACUOUS — every invocation wiped the previous run's line, and
@@ -172,7 +178,10 @@ assert_contains "$OUT" "queued=5" "healthy run logs the value it read"
 assert_contains "$OUT" "TRANSITION unknown -> github" "healthy run records the transition into github"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "healthy run records mode=github"
 assert_not_contains "$OUT" "WARNING" "healthy run raises no warning"
-assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "healthy run (mode==want) relabels nothing"
+# A FRESH box (no recorded mode) CONVERGES the pool before recording, even when the observed mode
+# already equals the desired one (review B2-3): the state file is the record of convergence, so its
+# absence is the trigger to converge. The `steady` control below is the no-churn case.
+assert_contains "$(cat "$GH_LOG")" "-X PUT" "a fresh box converges the labels before recording the transition"
 
 echo "── no-change control: the recorded mode is not re-notified ──"
 seed_state() { # <case> <mode> — pre-record a mode so the next run sees prev == want
@@ -203,6 +212,37 @@ assert_contains "$OUT" "UNREADABLE" "empty queue count names the read failure"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "empty queue count advanced no state file"
 assert_not_contains "$OUT" "TRANSITION" "empty queue count sent no transition notification"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "empty queue count relabelled no runner"
+
+# ⛔ A digit string longer than `intmax` passes a character-class guard and STILL errors the `-ge`
+# comparison (review B2-2), and the `||` chain reads that error as false — HEALTHY — relabelling the
+# pool, advancing the state file and notifying, exit 0, on a comparison that never ran.
+echo "── #1704(3): an unreadable or out-of-range queue THRESHOLD must FAIL CLOSED ──"
+run_gate qt-junk GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=abc --
+assert_eq "$RC" "2" "a non-numeric threshold → exit 2 (could-not-measure)"
+assert_contains "$OUT" "queue threshold UNREADABLE" "a non-numeric threshold names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a non-numeric threshold advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "a non-numeric threshold sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a non-numeric threshold relabelled no runner"
+
+run_gate qt-huge GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=99999999999999999999999999 --
+assert_eq "$RC" "2" "an over-intmax threshold → exit 2 (the comparison cannot run)"
+assert_contains "$OUT" "queue threshold OUT OF RANGE" "an over-intmax threshold names the range failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an over-intmax threshold advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "an over-intmax threshold sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an over-intmax threshold relabelled no runner"
+
+run_gate q-huge GH_QUEUED=99999999999999999999999999 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "an over-intmax queue count → exit 2 (the other operand)"
+assert_contains "$OUT" "queued count OUT OF RANGE" "an over-intmax queue count names the range failure"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an over-intmax queue count relabelled no runner"
+
+# ⛔ `[:space:]` alone admitted a pool read containing NO number at all (review B2-1): the `awk`
+# reduction summed nothing to 0, the mode resolved `github`, and the run exited 0 with a recorded
+# transition — a verdict from a read with no value in it.
+echo "── #1704(5): a pool read containing no count must FAIL CLOSED ──"
+run_gate pages-blank GH_FALLBACK_N=' ' -- --status
+assert_eq "$RC" "2" "a whitespace-only pool read → exit 2 (--status never guesses a mode)"
+assert_contains "$OUT" "NO COUNT" "a count-free pool read names the read failure"
 
 # ⛔ The threshold is the other operand of the SAME numeric test (review D1). An unreadable value
 # made the comparison ERROR, and the `||` chain read that as false — HEALTHY. The gate relabelled
@@ -299,6 +339,29 @@ assert_eq "$RC" "0" "a successful EMPTY enumeration exits 0 (a readable zero is 
 assert_contains "$OUT" "set_labels ok=0 fail=0" "empty pool counts zero relabels, not a swallow"
 assert_not_contains "$OUT" "WARNING" "empty pool raises no enumeration warning"
 
+# ⛔ A PARTIAL relabel must be RETRIED, not silently recorded (review B2-3). Run 1 fails one PUT, so
+# it exits 2 without advancing state — correct. But one runner now carries the label, so the next
+# pass reads `mode == want` and, before the fix, skipped the relabel entirely and recorded the
+# transition: the runner whose PUT failed was never retried and never mentioned. The re-converge
+# condition (`prev != want`) makes pass 2 re-apply the idempotent labels before recording.
+echo "── #1704(6): a PARTIAL relabel is retried until the transition is recorded ──"
+run_gate partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="101 102" GH_PUT_FAIL_ID=101 \
+  CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "2" "a partial relabel → exit 2 (not recorded as done)"
+assert_contains "$OUT" "set_labels ok=1 fail=1" "a partial relabel counts the failure"
+assert_contains "$OUT" "relabel FAILED" "a partial relabel names the failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a partial relabel advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "a partial relabel sent no transition notification"
+
+# pass 2: the pool now reads `local` (one labelled runner), so `mode == want` — the re-converge path.
+KEEP_STATE=1
+run_gate partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=1 GH_POOL_IDS="101 102" \
+  CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "the retry pass exits 0"
+assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the WHOLE pool"
+assert_contains "$OUT" "TRANSITION unknown -> local" "the retry pass records the transition once it converged"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the retry pass records mode=local"
+
 echo "── --dry-run and --status stay read-only ──"
 run_gate dry GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 -- --dry-run
 assert_eq "$RC" "0" "dry-run exits 0"
@@ -322,21 +385,32 @@ echo "── #1719: the scheduled job, the farm and the script must agree ──
 # The #1719 defect was two surfaces that never met: a template nothing rendered and a farm list the
 # repo copy was absent from. Assert the AGREEMENT (same basename at the same land path), which
 # neither the installer suite nor the setup suite can see on its own.
+#
+# ⛔ Both assertions read the STRUCTURAL element, not the whole file (review E2-1/E2-2). A
+# whole-file `grep -F` for the basename is satisfied by this PR's own explanatory COMMENT in
+# setup.sh, and a whole-file grep for the template path is satisfied by the template's own comment —
+# so deleting the farm entry, or retargeting ProgramArguments, left both GREEN while the gate was
+# once again wired to nothing. Both were reproduced by mutation.
 TEMPLATE="$REPO_ROOT/templates/launchd/com.tortoise.ci-runner-gate.plist"
 if [ -f "$TEMPLATE" ]; then
   ok "launchd template exists for the runner gate (#1719)"
-  assert_contains "$(cat "$TEMPLATE")" "{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
-    "template executes the path the pi-bootstrap farm lands"
-  assert_contains "$(cat "$TEMPLATE")" "{{PATH}}" \
-    "template takes PATH from the installer's (shim-filtered) renderer"
-  assert_not_contains "$(cat "$TEMPLATE")" "/shims" \
-    "template hardcodes no shim directory (launchd cannot exec into ~/Documents, #427)"
+  GATE_ARGS="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$TEMPLATE")"
+  assert_contains "$GATE_ARGS" "{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
+    "ProgramArguments executes the path the pi-bootstrap farm lands (parsed, not whole-file)"
+  # Same reason as the two assertions above: read the EnvironmentVariables BLOCK, not the file — the
+  # template's own comment discusses {{PATH}}, so a whole-file grep would be satisfied by prose.
+  GATE_ENV="$(sed -n '/<key>EnvironmentVariables<\/key>/,/<\/dict>/p' "$TEMPLATE")"
+  assert_contains "$GATE_ENV" "{{PATH}}" \
+    "EnvironmentVariables takes PATH from the installer's (shim-filtered) renderer (parsed)"
+  assert_contains "$GATE_ENV" "{{HOME}}" "EnvironmentVariables pins HOME for the job (parsed)"
 else
   bad "no templates/launchd/com.tortoise.ci-runner-gate.plist — the gate is wired to nothing (#1719)"
 fi
 SETUP="$REPO_ROOT/pi-bootstrap/setup.sh"
-assert_contains "$(cat "$SETUP")" "$(basename "$GATE")" \
-  "pi-bootstrap farm list carries the gate (#1719)"
+# The farm LINE, not the file: `fleet_srcs=(…)` is the declaration that delivers the script.
+FARM_LINE="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")"
+assert_contains "$FARM_LINE" "$(basename "$GATE")" \
+  "the fleet_srcs ARRAY carries the gate (parsed, not the file's own comment)"
 
 # ⛔ HERMETICITY: the whole suite must never reach the real cmux / the live orchestrator lane
 # (review E1). Every run above sets CI_GATE_ORCH_WS="", and the gate reads it with `${VAR-…}` so an

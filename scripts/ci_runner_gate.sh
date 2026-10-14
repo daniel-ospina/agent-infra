@@ -104,7 +104,6 @@ print(comp, len(inc))
     *) log "actions component UNREADABLE ('${comp}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
   case "$incident" in '' | *[!0-9]*) log "incident count UNREADABLE ('${incident}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-
   queued="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
 
@@ -126,8 +125,17 @@ print(comp, len(inc))
   # that was never read. The launchd job never sets CI_GATE_QUEUE_THRESHOLD (the plist carries only
   # PATH/HOME), so this is reachable from an env-overriding caller rather than from the schedule;
   # the read is refused either way.
+  #
+  # ⛔ DIGITS ALONE IS NOT THE PREDICATE `[ -ge ]` NEEDS (review B2-2). A digit string longer than
+  # `intmax` passes a character-class guard and STILL errors the comparison, which the `||` chain
+  # reads as false — the same fail-open one step later (measured: a 26-digit threshold relabelled
+  # the pool, advanced the state file and notified, exit 0). So the bound is the number of digits,
+  # on BOTH operands: 9 digits cannot exceed intmax on any platform bash's `[` supports, and no real
+  # queued-run count approaches it. Anything larger is out of range, not a measurement.
+  case "$queued" in ??????????*) log "queued count OUT OF RANGE ('${queued}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
   case "$QUEUE_THRESHOLD" in
     '' | *[!0-9]*) log "queue threshold UNREADABLE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
@@ -188,9 +196,17 @@ current_mode() {  # github | local | unknown
   local n pages
   pages="$(gh api --paginate "repos/$REPO/actions/runners" \
         --jq "[.runners[] | select([.labels[].name] | index(\"$FALLBACK_LABEL\"))] | length" 2>&1)" || { log "gh api failed: ${pages:0:300}"; return 1; }
+  # ⛔ SHAPE-CHECK, AND REQUIRE A DIGIT (review B2-1). `[:space:]` alone admits a read that contains
+  # NO number at all (a blank/whitespace body from a proxy or a gh change) — the `awk` reduction then
+  # sums nothing to 0 and the mode resolves `github` at exit 0, i.e. a verdict AND a recorded
+  # transition from a read with no value in it. The line below it promises the opposite ("a failed or
+  # non-numeric read still returns 1 (unknown), never a guessed mode"). The `awk` SUBSTITUTION's
+  # status is captured too: a broken/absent `awk` left `${n:-0}` to read as `0`.
   case "$pages" in ''|*[!0-9[:space:]]*) log "gh api returned non-numeric: ${pages:0:300}"; return 1 ;; esac
-  n="$(printf '%s\n' "$pages" | awk '{s+=$1} END{printf "%d", s+0}')"
-  if [ "${n:-0}" -gt 0 ]; then echo local; else echo github; fi
+  case "$pages" in *[0-9]*) : ;; *) log "gh api returned NO COUNT: ${pages:0:300}"; return 1 ;; esac
+  n="$(printf '%s\n' "$pages" | awk '{s+=$1} END{printf "%d", s+0}')" || { log "runner-count reduction FAILED (awk)"; return 1; }
+  case "$n" in ''|*[!0-9]*) log "runner-count reduction unreadable: '${n}'"; return 1 ;; esac
+  if [ "$n" -gt 0 ]; then echo local; else echo github; fi
 }
 
 # ── notify ──────────────────────────────────────────────────────────────────────
@@ -249,7 +265,13 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-if [ "$mode" != "$want" ]; then
+# ⛔ RE-CONVERGE UNTIL THE TRANSITION IS RECORDED (review B2-3). `mode != want` is a cheap
+# approximation of "the pool matches the desired labels", and it is not equivalent: a PARTIAL relabel
+# (one PUT failed) leaves one runner labelled, so the next pass reads `mode == want` and would skip
+# the relabel entirely — recording the transition while the un-relabelled runner is never retried
+# and never mentioned. The state file records convergence, so its absence is the trigger to converge:
+# `prev != want` re-applies the (idempotent) labels until the transition is actually recorded.
+if [ "$mode" != "$want" ] || [ "$prev" != "$want" ]; then
   relabel_ok=1
   if [ "$want" = local ]; then fallback_on || relabel_ok=0; else fallback_off || relabel_ok=0; fi
   # ⛔ DO NOT RECORD A TRANSITION THAT DID NOT HAPPEN (agent-infra#1704). The old code logged a

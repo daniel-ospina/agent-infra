@@ -126,6 +126,10 @@ mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/bin"
     touch "$1/.pi/agent/bin/rg"
     chmod +x "$1/.pi/agent/bin/rg"
+    # #1719 (review D2-3) — a PATH entry containing `&`, the sed replacement's "whole match" token.
+    # Without escaping, `render` turns it into a corrupted entry with a literal {{PATH}} left in the
+    # middle of it, and nothing downstream notices (verify_targets inspects ProgramArguments only).
+    mkdir -p "$1/.pi/agent/r&d"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -180,7 +184,7 @@ run_installer() { # <home> [extra env assignments...]
         # PATH assertion below would be vacuous). A SYMLINK to it and the real-binary dir
         # (~/.pi/agent/bin, holding fd/rg) are on PATH too: the first must be dropped by physical
         # path, the second must be KEPT (review E2).
-        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$PATH"
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -276,18 +280,20 @@ assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "$HOME1/.pi/agent/scripts
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "<integer>300</integer>" "runner-gate every 5 min (StartInterval 300)"
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "RunAtLoad" "runner-gate runs once at load (a freshness kick)"
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-version: 0.1.0" "runner-gate template carries version marker"
-assert_not_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
-assert_not_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
-assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
-# #1719 (review D2) — launchd creates the log FILE, not its parent directory, and nothing in the
-# install path created ~/.pi/agent/state (pi ACTIVITY does). A job rendered with StandardOutPath
-# under a non-existent dir can load without running — the very "wired to nothing" failure #1719 is
-# about — so the installer must create every rendered log directory before bootstrap.
-if [ -d "$HOME1/.pi/agent/state" ]; then
-  ok "installer created the rendered log directory before bootstrap (review D2)"
-else
-  bad "installer did NOT create ~/.pi/agent/state — a fresh box's gate job may load inert (review D2)"
-fi
+# #1719 — these assertions read the RENDERED PATH VALUE, not the whole plist (review E2-3). The
+# rendered plist keeps the template's comments, and a purely documentary edit that NAMES the shim
+# path (e.g. `~/.pi/agent/shims`, which the installer's own comment uses) would red a whole-file
+# `assert_not_contains "/shims"` while the PATH was correct — a false RED. Extract the value.
+installed_path() { # $1 = plist → the PATH string from EnvironmentVariables
+  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1"
+}
+GATE_PATH_VAL="$(installed_path "$GATE_INSTALLED")"
+assert_contains "$GATE_PATH_VAL" "/usr/bin" "runner-gate plist PATH is rendered from the installer's PATH (non-empty)"
+assert_not_contains "$GATE_PATH_VAL" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
+assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
+assert_contains "$GATE_PATH_VAL" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
+assert_not_contains "$GATE_PATH_VAL" "{{PATH}}" "no placeholder survives into the rendered PATH value (review D2-3)"
+assert_contains "$GATE_PATH_VAL" "r&amp;d" "a PATH entry containing & is XML-escaped in the rendered value (sed replacement escaped, review D2-3)"
 
 # #1719 (review D3) — the guard that refuses a template whose rendered PATH came out EMPTY. It is
 # only reachable when `launchd_path` filters everything away, which cannot happen while the installer
@@ -299,7 +305,7 @@ if grep -q "unresolved placeholder(s) {{PATH}}" "$INSTALLER"; then
 else
   bad "the empty-rendered-PATH guard is gone — a filtered-away PATH would install an inert job (review D3)"
 fi
-assert_not_contains "$(cat "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
+assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
