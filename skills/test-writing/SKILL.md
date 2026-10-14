@@ -149,7 +149,7 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 **Cap protocol (test-review's 10-cycle cap, not 3):**
 - CAPPED + only P1/P2 issues → **WARN** — proceed to Green phase. Document remaining issues.
 - CAPPED + any P0 issue → **escalate to human gate.** Do NOT proceed. Present issues for decision.
-- CLEAN (all applicable merged reviewers return NO ISSUES FOUND — A and B, plus C when it fires) → proceed to Green phase.
+- CLEAN (Reviewer A's combined verdict is `REVIEWER A VERDICT: CLEAN` — both its ordered passes clean — and Reviewer B, plus Reviewer C when it fires, return `NO ISSUES FOUND`) → proceed to Green phase.
 
 **Wrong-layer P0 escalation:** If Reviewer B's part 1 flags "SQL business logic tested with TS mocks (should be pgTAP)":
 1. Escalate to implementer with pgTAP guidance: file path convention (`supabase/tests/`), assertion patterns, link to test-writing pgTAP-specific checks (#8-10)
