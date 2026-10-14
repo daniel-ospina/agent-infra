@@ -387,6 +387,21 @@ done
 # would false-flag the legitimate `contradiction test above` inside USER
 # QUESTIONS PROTOCOL (AGENTS.md:160), which IS above its own text.
 #
+# R1 IS SECTION-SCOPED, NOT PARAGRAPH-SCOPED. Its first version extracted the
+# uncertainty branch as the range from the `**Unsure which diff was approved**`
+# line to the first blank line, so a write-on-uncertainty directive reworded
+# into the PARAGRAPH IMMEDIATELY AFTER it was never scanned. #1681's third review
+# reproduced that end to end — `If you are unsure, apply the diff you believe was
+# approved and note it afterwards; a one-line confirmation can follow later.`
+# inserted after the branch left both shipped surfaces reporting clean, while the
+# text again authorized a write on self-asserted uncertainty. R1 now scans the
+# whole owner-approval subsection (heading → next `---`; falling back to the
+# marker→EOF region when the heading is absent, never a skip): the ask and the
+# write negation must appear in the branch, and NO un-negated apply directive may
+# survive anywhere in the subsection. The only allow-listed apply directives are
+# the two legitimate ones — the opening rule and the affirmative `**Yes**`
+# branch; every other occurrence is a finding.
+#
 # These are word pins, so a legitimate REWORD still trips them. That is the cheap
 # direction here (a false flag is caught by whoever edits the text) — widen the
 # predicate rather than delete the arm, exactly as with the MD026 pin. Each RED
@@ -404,15 +419,49 @@ rule_scan() {  # <file> → one finding per line on stdout
     findings+="R2: the reopen cross-reference does not point at the contradiction test 'below' (got: $(grep -oE 'contradiction test (above|below|in USER QUESTIONS PROTOCOL)' <<<"$ref" || true))"$'\n'
   fi
 
-  # R1: the uncertainty branch, failed closed on the positive shape.
-  br="$(awk '/\*\*Unsure which diff was approved\*\*/{f=1} f{print} f && /^$/ {exit}' "$f" | tr '\n' ' ')"
-  if [ -z "$br" ]; then
-    findings+="R1: no 'Unsure which diff was approved' branch found — the uncertainty rule cannot be established"$'\n'
+  # R1: the owner-approval SUBSECTION, failed closed on the positive shape. The
+  # scope is the subsection (heading → next `---`), so a write-on-uncertainty
+  # reworded into a NEIGHBOURING paragraph cannot escape the branch anchored at
+  # the `Unsure` marker. Without the heading the scope falls back to the region
+  # from that marker to EOF — still fail-closed, never a skip — and when neither
+  # is present R1 reports rather than passes.
+  sec="$(awk '/^### .*owner-APPROVED diff is yours to APPLY/{f=1} f{print} f && /^---$/ {exit}' "$f")"
+  if [ -z "$sec" ]; then
+    sec="$(awk '/\*\*Unsure which diff was approved\*\*/{f=1} f{print}' "$f")"
+  fi
+  if [ -z "$sec" ]; then
+    findings+="R1: no owner-APPROVED-diff subsection and no 'Unsure which diff was approved' branch found — the uncertainty rule cannot be established"$'\n'
   else
-    grep -q 'ask for the one-line confirmation' <<<"$br" \
-      || findings+="R1: the uncertainty branch does not ask for the one-line confirmation before writing"$'\n'
-    grep -Eq 'never apply|not apply|never to a write|do not write' <<<"$br" \
-      || findings+="R1: the uncertainty branch carries no negation of the write — a bare 'confirm' does not gate it"$'\n'
+    plain="$(printf '%s' "$sec" | tr '\n' ' ')"
+    if ! grep -qF 'Unsure which diff was approved' <<<"$plain"; then
+      findings+="R1: the owner-approval subsection carries no 'Unsure which diff was approved' branch — the uncertainty rule cannot be established"$'\n'
+    else
+      br="$(sed -E 's/^.*[*][*]Unsure which diff was approved[*][*]//' <<<"$plain")"
+      grep -q 'ask for the one-line confirmation' <<<"$br" \
+        || findings+="R1: the uncertainty branch does not ask for the one-line confirmation before writing"$'\n'
+      grep -Eq 'never apply|not apply|do not apply|never to a write|not to a write|not a write' <<<"$br" \
+        || findings+="R1: the uncertainty branch carries no negation of the write — a bare 'confirm' does not gate it"$'\n'
+    fi
+    # Section-scoped write-directive sweep. Strip the two legitimate apply
+    # directives (the opening rule and the affirmative `**Yes**` branch) and every
+    # negated write; ANY surviving directive `apply` in the subsection is a write
+    # path. Fail-closed — an unrecognised reword of the allow-listed clauses trips
+    # this, which the comment above declares the cheap direction.
+    residual="$(
+      printf '%s' "$plain" \
+        | sed -E \
+            -e 's/[*][*]When the owner approves the CONTENT of an exact change, apply it[.][*][*]//' \
+            -e 's/[*][*]Yes[*][*][^*]*apply it, and do not ask again[.]//' \
+            -e 's/(never|do not|don.t|cannot|can not) apply[^.;]*//g' \
+            -e 's/not apply//g' \
+            -e 's/never (to a|a) write//g' \
+            -e 's/not (to a|a) write//g' \
+            -e 's/applying//g; s/applies//g; s/applied//g; s/to apply//g' \
+        | grep -m1 -oE 'apply' || true
+    )"
+    if [ -n "$residual" ]; then
+      findings+="R1: the owner-approval subsection carries an un-negated write directive outside the affirmative 'Yes' branch — a write-on-uncertainty reworded into a neighbouring paragraph is not gated by a confirmation"$'\n'
+    fi
   fi
   printf '%s' "$findings"
 }
@@ -498,6 +547,62 @@ if grep -q 'carries no negation of the write' <<<"$r1_neg_hits" \
   pass "rule pin: branch that asks but still applies → negation arm alone flags it"
 else
   fail "rule pin: R1 negation arm not isolated (got: $(head -1 <<<"$r1_neg_hits"))"; fi
+
+# RED, isolated to the SECTION-SCOPED sweep: the uncertainty branch is the
+# shipped (clean) one — it asks and negates, so the ask and negation arms stay
+# silent — but a NEIGHBOURING paragraph rewords the write back in. #1681's third
+# review reproduced exactly this end to end: the old paragraph-scoped R1 returned
+# clean on both shipped surfaces. The false-PASS sentence is used verbatim.
+r1_neighbour_red="$(rule_fixture red-neighbouring-apply <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
+
+**When the owner approves the CONTENT of an exact change, apply it.**
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
+approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+
+If you are unsure, apply the diff you believe was approved and note it afterwards; a one-line
+confirmation can follow later.
+
+---
+EOF
+)"
+r1_neighbour_hits="$(rule_scan "$r1_neighbour_red")"
+if grep -q 'neighbouring paragraph' <<<"$r1_neighbour_hits" \
+   && ! grep -q 'does not ask' <<<"$r1_neighbour_hits" \
+   && ! grep -q 'no negation of the write' <<<"$r1_neighbour_hits" \
+   && ! grep -q '^R2' <<<"$r1_neighbour_hits"; then
+  pass "rule pin: write-on-uncertainty reworded into a neighbouring paragraph → section sweep flags it"
+else
+  fail "rule pin: neighbouring-paragraph write escaped the section sweep (got: $(head -1 <<<"$r1_neighbour_hits"))"; fi
+
+# GREEN control for the sweep: the shipped subsection shape, clear of any
+# neighbouring write, must stay clean — a legitimate reword of the two
+# allow-listed apply clauses is the only thing this arm may false-flag.
+rule_expect "$(rule_fixture green-subsection-clean <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
+
+**When the owner approves the CONTENT of an exact change, apply it.**
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
+approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+
+⛔ An approval the lane cannot point to is not an approval: uncertainty resolves to a one-line
+confirmation, never to a write.
+
+---
+EOF
+)" clean "subsection with a clean neighbouring paragraph stays clean"
 
 # RED for R2 specifically: the pre-fix cross-reference, with a clean uncertainty branch
 # so the R1 arm stays silent and the assertion names the R2 arm.
