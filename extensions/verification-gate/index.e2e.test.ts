@@ -5404,6 +5404,30 @@ async function main() {
     equal(retryA2, undefined, "1660h: a follow-up PASS naming src/g7.ts must converge (remedy, not loop)");
   });
 
+  // #1660x: the directory expansion must match on a PATH BOUNDARY, not a bare
+  // string prefix. A prompt naming `src` must not expand to a staged
+  // `src2/h8.ts` — that file is neither under the named directory nor in the
+  // gate's blocked set, and no verifier was ever told about it. Pre-fix
+  // (`blocked.startsWith(f)`) blessed it (a fail-open introduced by the union
+  // scope), because `"src2/h8.ts".startsWith("src")` is true.
+  test("scenario 1660x: a dir-form prompt naming 'src' must NOT bless a staged file under the prefix-colliding 'src2'", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660x-hub", "g8.ts", "g8\n");
+    mkdirSync(join(wtA, "src2"), { recursive: true });
+    writeFileSync(join(wtA, "src2", "h8.ts"), "h8\n");
+    git(wtA, "add src2/h8.ts");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(!bridge.includes("::src2/h8.ts"),
+      "1660x: the prefix-colliding src2/h8.ts must not be recorded — no verifier was told about it (fail-open containment)");
+    const retryA = await fire("tool_call", opA);
+    ok(retryA && retryA.block === true && String(retryA.reason).includes("src2/h8.ts"),
+      "1660x: src2/h8.ts is not under the named dir 'src' and must stay BLOCKED (pre-fix prefix match blessed it and the retry was allowed)");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

@@ -141,8 +141,15 @@ function promptFileList(prompt: string, mergeScope: string[]): Set<string> {
   for (const f of rawFiles) {
     const isDir = f.endsWith('/') || !f.includes('.');
     if (isDir && mergeScope.length > 0) {
+      // #1660x: match on a PATH BOUNDARY, not a bare string prefix. `src` must
+      // not expand to a staged `src2/h8.ts` — that file is neither under the
+      // named directory nor in the gate's blocked set, so blessing it is the
+      // fail-open class the hash-less PASS bound exists to close. `src/` and a
+      // bare `src` both normalize to the `src/` boundary; `blocked === f`
+      // covers a prompt that names a file without a dot (isDir false-negative).
+      const dir = f.endsWith('/') ? f : `${f}/`;
       for (const blocked of mergeScope) {
-        if (blocked.startsWith(f)) promptFiles.add(blocked);
+        if (blocked === f || blocked.startsWith(dir)) promptFiles.add(blocked);
       }
     } else {
       promptFiles.add(f);
