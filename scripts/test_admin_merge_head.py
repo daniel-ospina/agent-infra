@@ -169,3 +169,93 @@ def test_every_head_comparison_goes_through_require_head():
     assert "resolve_head \"$pr\"" in inside, (
         "require_head no longer performs the read — the guard above would pass for the "
         "wrong reason")
+
+
+# ── THE COMPOSITION (#1690, review round 2) ───────────────────────────────────
+# ⛔ WHY THESE EXIST. The first version of this suite pinned `require_head` itself and the
+# call-site ROUTING, and its author reported that as sufficient. A reviewer then MEASURED the
+# refusal composition instead of reading it: with `require_head` keeping its full, correct
+# message but returning 0, or with either comparison site dropping `|| exit 1`, **0 of the 8
+# tests failed** — and with one site's guard changed to `|| true`, the rail printed the correct
+# refusal AND THEN the original `head moved ... ( ... -> )`. So the bug this file was written
+# for was still reachable with every test green. A correct function whose failure nothing
+# checks is the original defect under a new name.
+
+
+def test_a_failed_read_that_is_not_propagated_CAN_reprint_the_moved_head(tmp_path):
+    """The composition, run as the call sites actually run it.
+
+    This drives the same two-line pattern the real comparison sites use, with a fake `gh`
+    whose read ALWAYS fails. The assertion is on the OUTCOME the operator sees: the process
+    must abort, and the moved-head sentence must never be printed. That is what was measured
+    to survive all 8 original tests.
+    """
+    r = _drive(
+        tmp_path,
+        "exit 1",
+        'h="$(require_head 1)" || exit 1; '
+        '[ "$h" = "deadbeef" ] || echo "admin-merge: BLOCK - head moved before the evidence was posted (deadbeef -> $h)"',
+    )
+    assert "head moved" not in r.stdout, (
+        "a FAILED HEAD READ reached the moved-head message — this is #1690 itself, and it "
+        f"means the `|| exit 1` that is supposed to abort was not honoured: {r.stdout!r}")
+    assert r.returncode != 0, (
+        "the process exited 0 after a failed head read — the failure was swallowed, so every "
+        "downstream comparison runs against an EMPTY head")
+    assert "could not READ" in r.stderr, (
+        f"no unreadable-head refusal reached stderr: {r.stderr!r}")
+
+
+def test_the_unreadable_refusal_carries_a_machine_readable_tag(tmp_path):
+    """⛔ SEPARATING THE TWO SPEECH ACTS MUST NOT DEPEND ON PROSE.
+
+    The rail's two refusals mean different things — "the instrument could not answer" vs
+    "the evidence is void because the head really moved" — and the first version separated
+    them by WORDING only. A consumer that must tell them apart would have to parse prose, and
+    a future rewording would silently destroy the distinction. `[head_unreadable]` is the tag
+    the moved-head refusals do NOT carry, so its PRESENCE is now pinned, not just the absence
+    of the other phrase.
+    """
+    r = _drive(tmp_path, "exit 1", "require_head 1 || true")
+    assert "[head_unreadable]" in r.stderr, (
+        "the unreadable-head refusal carries no machine-readable tag, so distinguishing it "
+        f"from a moved head requires parsing prose: {r.stderr!r}")
+
+
+def test_a_MULTI_LINE_read_is_rejected(tmp_path):
+    """⛔ THE WHOLE VALUE MUST BE VALIDATED, NOT A LINE OF IT.
+
+    The first version of the shape check was `printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'`,
+    which is an ANY-LINE test: a read returning a good sha AND a trailing junk line PASSED it,
+    and `printf '%s\n' "$out"` then emitted BOTH lines — so a multi-line value flowed into the
+    comparisons, the evidence body and `--match-head-commit`. An embedded newline is not a hex
+    character, so the whole-value check rejects this by construction. This test pins that.
+    """
+    r = _drive(
+        tmp_path,
+        f"printf '%s\\n' '{VALID}' 'JUNK-SECOND-LINE'; exit 0",
+        'resolve_head 1; echo "rc=$?"',
+    )
+    assert "rc=0" not in r.stdout, (
+        "a MULTI-LINE read (valid sha + a junk line) was accepted as a head — the shape check "
+        f"is matching a LINE rather than the whole value: {r.stdout!r}")
+
+
+def test_every_head_read_that_is_assigned_is_guarded(tmp_path):
+    """The structural half of the composition pin.
+
+    Every `require_head` whose result is ASSIGNED must propagate its failure on the same line.
+    A non-zero return that nothing checks is invisible: the assignment succeeds, `$head` is
+    empty, and the next comparison reports a moved head. `|| true` is included in the check
+    because it is the mutation a reviewer used to reproduce #1690 with the suite green.
+    """
+    with open(RAIL) as fh:
+        src = fh.read()
+    calls = [ln.strip() for ln in src.splitlines()
+             if "require_head " in ln and "$(" in ln and not ln.lstrip().startswith("#")]
+    assert calls, "detector is vacuous: no assigning require_head call site was found"
+    unguarded = [c for c in calls if "|| exit 1" not in c]
+    assert unguarded == [], (
+        "these call sites assign require_head WITHOUT propagating its failure, so a failed "
+        "read flows on as an empty head and is rendered as a MOVED head (#1690): "
+        f"{unguarded}")

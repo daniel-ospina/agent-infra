@@ -1240,7 +1240,15 @@ require_head() {
     printf '%s\n' "$out"
     return 0
   fi
-  say_err "admin-merge: ✗ BLOCK — could not READ the head of PR #$pr (${ADMIN_MERGE_HEAD_ATTEMPTS:-3} attempts)."
+  # ⛔ A MACHINE-READABLE TOKEN, NOT JUST PROSE (#1690 review). The rail separated the two
+  # speech acts by WORDING alone, so any consumer had to parse prose — and any future
+  # rewording would silently destroy the distinction (nothing pinned the PRESENCE of a
+  # stable marker, only the absence of a phrase). `extensions/review-enforcer` already models
+  # the right answer: `reasonTag: base_unverifiable` vs `head_advanced`, recorded in
+  # `gate-events.jsonl` so block rates can be reconstructed BY REASON. `[head_unreadable]` is
+  # the tag the moved-head refusals do NOT carry, so `grep -F '[head_unreadable]'` answers
+  # "could the instrument read the head?" without depending on how the sentence is worded.
+  say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${ADMIN_MERGE_HEAD_ATTEMPTS:-3} attempts)."
   say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
   say_err "   something that is not a commit SHA. Nothing was merged. Re-run the rail."
   return 1
