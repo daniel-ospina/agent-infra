@@ -1,6 +1,6 @@
 ---
 name: google-slides
-description: "Creates branded Google Slides presentations for El Dato. 3-phase pipeline: Brief → Generate → Review. Uses Composio Google Slides integration for markdown→Slides conversion with El Dato brand tokens. Supports optional image generation for storyboarding. Vision-model design critique via read_image (Opus-class) for visual quality."
+description: "Creates branded Google Slides presentations for El Dato. 3-phase pipeline: Brief → Generate → Review. Uses Composio Google Slides integration for markdown→Slides conversion with El Dato brand tokens. Supports optional image generation for storyboarding. Vision-model design critique via `read` on thumbnails (Opus-class) for visual quality."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 ---
@@ -94,7 +94,7 @@ Claiming the presentation is "simple" or "good enough" is not a valid reason to 
 4. Fix ALL programmatic issues via `GOOGLESLIDES_PRESENTATIONS_BATCH_UPDATE` before proceeding to Pass 2
 
 **Pass 2 — Vision-model design critique (Opus-class, sees thumbnails):**
-1. Feed ALL slide thumbnails to vision model via `read_image` with `purpose="design-critique"`
+1. Read ALL slide thumbnails with `read` (image attached to the multimodal session) and critique
 2. Model critiques: visual balance, text-image interplay, color harmony, information hierarchy, white space
 3. Map EVERY issue to a BATCH_UPDATE operation or markdown regeneration
 4. Fix ALL P0 and P1 issues -> re-render thumbnails -> re-critique
@@ -224,7 +224,7 @@ For each issue found, specify:
 Be specific about what to change. Format as ISSUE blocks.
 ```
 
-Use `read_image` with `purpose="design-critique"` and Opus-class model.
+Use `read` on each thumbnail, with an Opus-class model, and critique against the dimensions above.
 
 **Loop mechanics:**
 1. Apply fixes from vision model critique
@@ -269,7 +269,7 @@ skills/google-slides/            # Canonical in agent-infra; consumers hard-link
 - **Brand tokens:** `skills/carousel-b2b-design/scripts/tokens.json` (canonical; consumer repos resolve via `$SKILLS_PREFIX`)
 - **Cloudinary:** Image uploads (optional, storyboarding only)
 - **OpenRouter:** Image generation (optional, storyboarding only)
-- **Vision model:** Opus-class via `read_image` (design critique)
+- **Vision model:** Opus-class via `read` on each thumbnail (design critique)
 
 ## V2 Roadmap
 

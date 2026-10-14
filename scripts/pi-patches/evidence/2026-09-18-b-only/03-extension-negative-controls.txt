@@ -1,0 +1,47 @@
+### VERIFY 3 — npx tsx extensions/clamp-output-floor.test.ts (current MANIFEST applied)
+### negative controls: a healthy ceiling, a missing/non-numeric field, and a floor-or-above
+### payload must be left byte-identical
+
+
+planFloorRepair — the boundary
+  ✅ max_tokens: 1 → raised to the floor (the death case)
+  ✅ max_tokens: 16 → raised (the openai-responses floor)
+  ✅ max_tokens: 0 → raised
+  ✅ NEGATIVE CONTROL max_tokens: 17 → untouched
+  ✅ NEGATIVE CONTROL healthy max_tokens: 8192 → untouched
+  ✅ NEGATIVE CONTROL no known ceiling field → untouched
+  ✅ NEGATIVE CONTROL non-object payloads → untouched (fail closed)
+  ✅ NEGATIVE CONTROL a non-numeric ceiling → untouched
+
+field resolution
+  ✅ resolves the field the provider will actually send
+  ✅ resolves nested Bedrock / Google ceilings
+  ✅ fixed field order — max_tokens wins over max_completion_tokens
+  ✅ a low but usable caller cap is honoured when the floor is lowered
+
+applyFloorRepair
+  ✅ does not mutate the caller's payload
+  ✅ preserves every sibling field
+  ✅ repairs a nested ceiling without dropping siblings
+
+before_provider_request handler
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ THE FIX: a 1-token request leaves with a usable ceiling
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ the repair is recorded in the session file and the fleet log
+  ✅ loud ONCE per session — a repair loop does not spam the pane
+[clamp-output-floor] output ceiling was about to go out as 1 (max_tokens); raised to 1024 context=296000/300000. The provider will reject the request if the prompt is genuinely too long — that is loud and recoverable; asking for 1 token(s) is not.
+  ✅ a new session re-arms the announcement
+  ✅ NEGATIVE CONTROL a healthy turn returns undefined and records NOTHING
+  ✅ unreadable context usage does not stop the repair
+  ✅ gate: CLAMP_OUTPUT_FLOOR=0 registers nothing
+
+source-patch self-check
+  ✅ resolvePiRoot realpaths the pi SHIM before stripping dist/bundle
+  ✅ resolvePiRoot honors an explicit PI_ROOT
+  ✅ detectSourcePatch reports PRESENT on this install (the patch is applied)
+  ✅ NEGATIVE CONTROL detectSourcePatch reports ABSENT for an unpatched bundle
+
+✅ 26 passed, 0 failed
+
+EXIT=0

@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-28
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, pi-config, cost-config-policy
+aboutObjects: agent-infra, issue-341, issue-1088, issue-1078, issue-1110, issue-1227, issue-1316, pi-config, cost-config-policy
 ---
 
 # Cost-Config Policy — deepseek context clamp @300K & drift guard (#341)
@@ -259,8 +259,34 @@ property; this guard is the pattern to copy, not a substitute for it.
   4h refresh may re-write the live store back to 1M, and that is **DETECTED,
   not blocked**.
 - **Guard classes** (`scripts/check-cost-config.sh`):
-  - `models.json` drift (any deepseek-served id > 300K) → **BLOCK (exit 1)**.
-  - `settings.json` drift (compaction block: enabled + `reserveTokens` 16384 +
+  - `models.json` drift (any deepseek-served id > 300K), **or** a
+    deepseek-served entry whose `contextWindow` is absent, non-numeric, or not
+    equal to `300000` (the geometry anchor below) → **BLOCK (exit 1)**.
+  - `settings.json` drift (compaction block: enabled + `reserveTokens` **16384**
+    (the reviewed value — asserted independently, see the `#1227` note below) +
+    a geometry check that `300000 − reserveTokens` equals the fleet regime floor
+    the instruments band on (READ from `scripts/fleet-cost-report.sh` and
+    `scripts/watch-truncation.sh`, never restated in the guard), **anchored** on
+    every deepseek-served `contextWindow` EQUALLING `300000`: the models check
+    above is only an upper bound (`≤ CLAMP`), so without that anchor a window
+    *below* the ceiling left the real trigger at `window − reserve` while the
+    geometry leg certified `300000 − reserve` — a false PASS, closed 2026-09-22
+    (`scripts/check-cost-config.sh`'s `check_models_window_anchor`). The anchor
+    is carried on the **shipped** `models.json` only (the live file stays
+    WARN-class, and its geometry is not certified); it treats an **absent or
+    non-numeric** `contextWindow` as a violation rather than a skip — pi resolves
+    an absent one to `128000` (a `providers.*.models[]` row) or to the
+    4h-refreshed catalog (a `modelOverrides` value), and rejects the *whole*
+    file on a non-numeric one, leaving an empty provider map. The walk is
+    **per-entry and does not model same-file inheritance**, so a `models[]` row
+    that omits the window while the same provider's `modelOverrides[<id>]`
+    supplies `contextWindow: 300000` is refused too, and the message says so
+    rather than inventing a cause: reproducing pi's per-provider override
+    lookup inside the guard risks a wrong answer, and a wrong answer here is a
+    false PASS, which is worse than the false block. It also refuses
+    with exit 2 when **no** deepseek-served entry is recognised at all, because
+    "every deepseek-served window equals the anchor" over an empty set asserts
+    nothing (its green line names the entry count it checked); and
     `keepRecentTokens` 12000; or the `retry`/`httpIdleTimeoutMs` contract —
     the keys are `retry.maxRetries`, `httpIdleTimeoutMs`, `retry.baseDelayMs`,
     `retry.provider.timeoutMs`, `retry.provider.maxRetries`; **the table in §2
@@ -277,6 +303,30 @@ property; this guard is the pattern to copy, not a substitute for it.
     contract cap is **BLOCK (exit 1)**: the guard reads the DEFAULT cap, so
     without this the environment could install a different cap while the guard
     stayed green.
+  - **The reserve is pinned AND derived — both legs are required** (#1316,
+    `#1227`). The independent leg (reserve == 16384) is the only constraint that
+    survives a coordinated move of the window and the reserve; the derived leg
+    (`CLAMP − reserve ==` the floor read from the two instruments) catches a
+    `CLAMP` drift or an instrument drift. Removing the independent leg made the
+    guard read green on `contextWindow 1000000 / reserveTokens 716384`, which
+    preserves the 283616 trigger while inflating the summarization cap to
+    `0.8 × 716384` — the reserve-inflation workaround the recorded owner
+    directive on #1227 forbids.
+  - **Fleet regime floor unreadable, ambiguous, or inconsistent → BLOCK
+    (exit 2)**: if the guard cannot read exactly one floor value from EACH of
+    `scripts/fleet-cost-report.sh` and `scripts/watch-truncation.sh`, or the two
+    disagree, it refuses rather than picks — and it also refuses when the
+    watcher's band is empty or inverted (`floor >= ceiling`), which would certify
+    a floor no record can reach. A bare source-order pick would let a second
+    statement the label anchor also matches (a re-labelled band, a duplicated
+    boundary) read as an instrument disagreement, which points the reader at the
+    wrong root cause; an *unlabelled* `if N <= tb <` line cannot match the
+    label-anchored pattern at all. The numeric capture is bounded to 15 digits,
+    so an unrepresentable literal cannot slip past the coherence comparison as
+    a bash integer-comparison error. The **same exit-2 class** covers a
+    `models.json` in which no deepseek-served entry is recognised — a geometry
+    anchor with nothing to assert must not read green. This class is **not**
+    covered by `COST_CLAMP_OVERRIDE=1`.
   - **Missing shipped `models.json` / `settings.json` → BLOCK (exit 1)**:
     deletion of the clamp authority is itself terminal drift (clamp gone while
     CI stays green). Store-class and live-dir-missing (first-install) stay
@@ -323,6 +373,24 @@ property; this guard is the pattern to copy, not a substitute for it.
   the SAME commit** — a reverted clamp with a stale 300K guard would block
   every sync/commit (or force override usage indefinitely, which is exactly
   the drift the guard exists to surface).
+- **The revert must move the whole geometry, or the escape does not work
+  (#1316).** Since the guard asserts both `CLAMP − reserveTokens ==` the floor
+  the two instruments band on **and** `reserveTokens ==` the reviewed 16384,
+  a 1M revert updates, in one commit: `contextWindow` in `models.json`, the
+  guard's `CLAMP`, and the floor literal in **both** instruments —
+  `scripts/fleet-cost-report.sh` (`FLEET_REGIME_TB:-<n>`) and
+  `scripts/watch-truncation.sh`'s clamp-bucket boundary. `settings.json`'s
+  `reserveTokens` **stays at the reviewed 16384**: the 1M geometry only needs
+  the window, the guard clamp, and the two floors to move, and moving the
+  reserve is exactly the inflation the `#1227` directive forbids. If the
+  reserve ever legitimately moves, the guard's `REVIEWED_RESERVE` must be
+  updated in the same commit. The guard's `"300K-clamp"` label anchor must
+  also move with the bucket label (or stay if the label stays) — an unlabelled
+  or re-labelled bucket makes the floor unreadable and the guard refuses
+  (exit 2). Flipping only `CLAMP` trips a **settings-class** block that
+  `COST_CLAMP_OVERRIDE=1` does **not** silence — it covers the `models.json`
+  clamp block only — so the guard must be green *before* the revert commit.
+  `watch-truncation.sh`'s printed procedure states the same list.
 - Trigger (pre-committed, owner = weekly report reader): re-read volume or
   LLM call count per compacting session > 2× the regenerated Aug baseline over
   any 3 consecutive days, **or** ≥ 1 `stopReason:"length"` truncation record
@@ -330,3 +398,40 @@ property; this guard is the pattern to copy, not a substitute for it.
   < 1.5x cost reduction over compacting sessions.
 - Re-clamping after a revert requires **re-approval** (the same
   human-gated decision as the original clamp).
+- **Withdrawal record (2026-09-21).** The 2026-09-18 dial **300K→700K** (#1213,
+  PR #1226) is **withdrawn**; the shipped numbers are back at clamp **300K**,
+  trigger **~283,616**, `reserveTokens` **16384**, guard `CLAMP` **300000**.
+  Reason: the wider window published its own sequencing — *withdraw only after
+  the floor fix deploys* — and that condition is now met. The installed
+  `pi-ai` carries `MIN_USABLE_MAX_TOKENS = 1024` with
+  `clampMaxTokensToContext()` returning `min(maxTokens, 1024)` whenever the
+  available budget falls under it (`pi-patch:#1214(b)` — never clamp below a
+  usable output budget), so the one mechanism the window was bought for —
+  `estimate ≥ contextWindow − 4096` → a single-token `stopReason:"length"`
+  turn, silently un-answerable — is closed in code. Against that, the window
+  costs roughly **+20% fleet-level model spend, recurring** (trigger
+  283,616→650,000; summary cap 13,107→40,000; ceiling re-ingestion ~2.3×).
+  **The corpus scan that motivated the wider window, kept here because
+  withdrawing the window deleted its old home:** the session corpus carried
+  **188 `stopReason:"length"` records across 49 sessions**, in four window
+  eras, each sitting at `configured window − ~4,082` — the clamp's own reserve
+  (`contextWindow − estimate − 4096`). That is the measurement §7's
+  pre-committed trigger fired on; the owner's response to it was the 700K
+  re-clamp and then this withdrawal, because the floor fix, not a wider
+  window, closes that class.
+  **Residual, stated plainly:** it has **not** been verified that the floor fix
+  subsumes *every* failure the wider window covered — only the silent-death
+  one. The retired regime left **no** truncation records — 0
+  `stopReason:"length"` across its session files (2026-09-18..21; measured
+  2026-09-21) — so
+  `watch-truncation.sh`'s `700K-clamp-era(650-900K)` bucket is **empty**: it
+  exists so a record from that era cannot be mislabelled, not because one is
+  waiting there. What the era did leave is **compaction** records — 3
+  at/above the 650,000 trigger (650,134–650,426) — which put their 2 sessions
+  into `fleet-cost-report.sh`'s clamp population for one window. §7's trigger
+  above is unchanged.
+
+  **OVERRIDES:** the vendor's full deepseek window (1,000,000) — clamped at
+  300,000, because cold re-ingestion at the 1M ceiling is the cost amplifier
+  the clamp exists to stop, and the mechanism that once justified widening it
+  (the single-token clamp death) is now closed in code.

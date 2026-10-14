@@ -474,7 +474,7 @@ The review loop: Opus sees rendered PNGs → critiques → regenerates HTML → 
 
 <HARD-GATE id="universal-review">
 **Review Loop Mandate:** EVERY carousel — Opus HTML or build_carousel.cjs — must go through the full review loop. No carousel is exempt based on complexity, template path, or agent judgment. The review loop includes:
-1. carousel-designer: read_image on each slide PNG, critique against tokens.json
+1. carousel-designer: `read` each slide PNG (image attached to the multimodal session), critique against tokens.json
 2. Linter: node linter.mjs on carousel.html
 3. Art Director Gate 2: post-render QA
 
@@ -536,7 +536,7 @@ The design skill has rendered PNGs to docs/carousels/<slug>/slides/.
 Run:
 1. linter.mjs: node skills/carousel-b2b-design/scripts/linter.mjs docs/carousels/<slug>/carousel.html
 2. Visual regression: npx playwright test skills/carousel-b2b-design/scripts/visual-regression.spec.ts (if baselines exist)
-3. carousel-designer: read_image on each slide PNG, critique against tokens.json (brand, typography, contrast, safe zones, composition, rendering)
+3. carousel-designer: `read` each slide PNG (image attached to the multimodal session), critique against tokens.json (brand, typography, contrast, safe zones, composition, rendering)
 4. Image-script cross-reference: every needs_image slide has an image in selected-images.yaml
 Aggregate results. Return pass/fail with specific issues."
 ```

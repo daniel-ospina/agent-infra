@@ -39,11 +39,15 @@
 # EPHEMERAL ALLOWLIST — the measured sweep treated a per-worktree `.venv` as
 # disposable (14 worktrees removed on that basis). The allowlist is the ONLY
 # dirt the clean gate tolerates, and it is deliberately narrow: a
-# reproducible-from-manifest artifact at the worktree ROOT. Anything else
-# ignored (`!! path`) is `ignored-artifact` => PRESERVE. This matters because
+# reproducible-from-manifest artifact at the worktree ROOT. Ignored
+# (`!! path`) entries are tolerated ONE STEP FURTHER and only for the named
+# regenerable-cache classes (IGNORED_REGENERABLE): everything else ignored is
+# `ignored-artifact` => PRESERVE. This matters because
 # `git worktree remove` does NOT refuse ignored files (verified): without the
 # ignored half of the gate, a worktree holding only a gitignored `.env` or
-# experiment output would look "clean" and be silently destroyed.
+# experiment output would look "clean" and be silently destroyed. The
+# regenerable half exists because that protection, applied to `__pycache__`,
+# held 212 worktrees on the live estate forever (measured 2026-10-11).
 #   Allowlisted UNTRACKED (`??`) entries are deleted explicitly before removal
 # because git WILL refuse on them; a refusal is reported, never swallowed.
 #   `--force` is never passed and `git branch -D` is never called.
@@ -212,6 +216,28 @@ REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}"
 # `##*/`), and a slash here silently disables the whole allowlist.
 EPHEMERAL=" .venv node_modules __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .cache .DS_Store "
 
+# IGNORED-REGENERABLE ALLOWLIST — the ignored (`!!`) half of the tolerance.
+# An ignored entry is NON-BLOCKING only when it is pure build/test cache any
+# checkout reproduces from its own manifests. Everything else ignored is DATA
+# the operator put there deliberately and MUST stay protected: `git worktree
+# remove` does NOT refuse ignored files (verified), so this allowlist is the
+# only thing between a gitignored `.env` and silent destruction (test G2b pins
+# exactly that case).
+# MEASURED 2026-10-11 over the live 294-worktree estate: 261 worktrees held
+# ignored entries — 212 of them ONLY a class listed below, 49 carrying at least
+# one non-regenerable entry (`/private/tmp/fix7773`'s
+# `longmemeval_*.report.json`, `tortoise.db`, `data/kind_index/*.npz`,
+# `operations/logs/code-review-errors.jsonl`, `supabase-session.js`,
+# `website/apps/dashboard/dist/`). That 49 is why "ignored is clean" is wrong
+# and why this is a narrow allowlist rather than a blanket rule.
+# `*.egg-info` is a suffix rule and is handled in is_regenerable_ignored().
+# `.cache` is DELIBERATELY ABSENT: it is the one generic name in the old
+# EPHEMERAL list, and the ROOT-only rule it replaced existed precisely to keep a
+# NESTED `src/.cache/` out of the tolerant set (operator data, not build junk).
+# Every name here is instead tool-scoped, so a nested match is still provably
+# regenerable.
+IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store node_modules .venv .ci-selection .longmemeval_cache .wrangler .playwright-mcp .ipynb_checkpoints htmlcov :memory: "
+
 MODE=unknown
 LIST_ONLY=0
 REPO=""
@@ -379,6 +405,20 @@ is_self_or_ancestor() {
 
 is_ephemeral_name() {
     case "$EPHEMERAL" in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# is_regenerable_ignored <entry> — true when an ignored (`!!`) entry is pure
+# regenerable build/test cache. Matched on the BASENAME so a nested
+# `tortoise/__pycache__/` counts, which is the measured dominant class (2044 of
+# the 3045 ignored entries on the live estate are `__pycache__`).
+is_regenerable_ignored() {
+    local base
+    base="${1%/}"; base="${base##*/}"
+    case "$base" in
+        *.egg-info) return 0 ;;
+    esac
+    case "$IGNORED_REGENERABLE" in *" $base "*) return 0 ;; esac
     return 1
 }
 
@@ -651,12 +691,34 @@ clean_gate() {
         base="${p%/}"; base="${base##*/}"
         case "$xy" in
             '??'|'!!')
-                # ROOT-level ephemeral allowlist only: `src/.cache/` is NOT
-                # tolerated (nested ignored artifacts are operator data).
+                # ROOT-level ephemeral allowlist ONLY. A NESTED `src/.cache/`
+                # is tolerated by NOTHING: `.cache` is deliberately absent from
+                # IGNORED_REGENERABLE (a nested cache is operator data). This
+                # branch is also what keeps the `clean` payload safe — it admits
+                # nothing but space-free ROOT names, and remove_one expands that
+                # payload UNQUOTED.
                 if [ "${p%/}" = "$base" ] && is_ephemeral_name "$base"; then
                     eph="$eph$p "
                 elif [ "$xy" = '!!' ]; then
-                    n=$((n + 1)); [ "$n" -le 3 ] && ignored="$ignored$p "
+                    # Ignored: non-blocking ONLY for pure regenerable cache.
+                    # Anything else is operator data and PRESERVES (G2b).
+                    if is_regenerable_ignored "$p"; then
+                        # TOLERATED AND DELIBERATELY NOT COLLECTED. Anything
+                        # appended to the `clean` payload is later expanded
+                        # UNQUOTED by remove_one (`for entry in $eph`) and
+                        # `rm -rf`'d, so the payload MUST stay limited to the
+                        # space-free ROOT names the branch above admits: a
+                        # nested path with a space would split into fragments
+                        # and delete an unrelated, possibly TRACKED directory
+                        # (`website (copy)/…` -> `rm -rf $wt/website`).
+                        # Ignored entries need no pre-delete anyway — verified:
+                        # `git worktree remove` (no --force) returns rc=0 with
+                        # an ignored `__pycache__/` present, which is exactly why
+                        # the ignored half of this gate exists at all.
+                        :
+                    else
+                        n=$((n + 1)); [ "$n" -le 3 ] && ignored="$ignored$p "
+                    fi
                 else
                     n=$((n + 1)); [ "$n" -le 3 ] && bad="$bad$p "
                 fi ;;
@@ -932,17 +994,20 @@ classify_one() {
         return 0
     fi
 
-    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=ephemeral-only unref=no-proc,no-pr\n' \
+    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=no-proc,no-pr\n' \
         "$eph" "$refs" "$(((now - head_ts) / 86400))"
     return 0
 }
 
 # ── removal ────────────────────────────────────────────────────────────
 # remove_one <path>
-# Never --force. Deletes ONLY declared-ephemeral UNTRACKED (??) entries first
-# (git refuses a worktree containing untracked files); ignored (`!!`)
-# ephemerals are handled by git itself. A refusal/timeout is REPORTED as
-# REMOVE-FAILED, never swallowed.
+# Never --force. Deletes the declared-ephemeral ROOT names first, whether
+# UNTRACKED (`??`, which git DOES refuse on) or IGNORED (`!!`) — clean_gate's
+# root branch collects both, so both are pre-deleted here. NESTED ignored
+# regenerable caches are NOT collected and are left to git, which removes them
+# with the checkout: `git worktree remove` does not refuse ignored files
+# (verified — that fact is the whole reason the ignored gate exists).
+# A refusal/timeout is REPORTED as REMOVE-FAILED, never swallowed.
 #
 # The pre-delete is a recursive filesystem delete over a checkout this script
 # does not control, so it runs under the SAME watchdog as the removal — it was

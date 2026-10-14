@@ -7,7 +7,8 @@
 #   T3 base-owned line modified                → drift reported
 #   T4 repo-specific ADDITION                  → NOT drift (appended AND interleaved)
 # plus the pipefail control, the marker-file path, the skip path, the hook-level
-# case, the real-repo regression pin and the adversarial-anchor pin.
+# case, the real-repo regression pin, the adversarial-anchor pin, and the
+# fail-closed MD026 heading pin with its own self-test.
 #
 # Fixtures are self-contained: each gets its own copy of the materializer under
 # <fixture>/scripts/ so the read-only template resolution (physical script
@@ -334,6 +335,157 @@ for f in "$ROOT/AGENTS.md" "$BASE"; do
   n="$(grep -c 'adversarial-bound: cap=2' "$f" || true)"
   if [ "${n:-0}" -eq 1 ]; then pass "anchor ×1 in ${f#"$ROOT"/}"; else fail "anchor count ${n} in ${f#"$ROOT"/}"; fi
 done
+
+# ── MD026 pin: no heading in the base template may end in punctuation ──────
+# A trailing period sat on the SESSION RECAP heading and rode into every repo
+# that materialized the base, where markdownlint reports it as MD026 and the
+# repo's REQUIRED `docs` check fails on a line the consumer never wrote.
+# Reproduced on tortoise#7976 (verbatim restoration of that heading) and filed
+# as agent-infra#1668; fixing it in the consumer alone regresses, because the
+# supported remedy for base-owned drift is a re-materialize.
+#
+# THE PREDICATE IS FAIL-CLOSED: a heading is a finding unless its last
+# significant character is a KNOWN-SAFE closer. The first version of this pin
+# was a deny-list (`[.,;:!?]$`) anchored at `^#{1,6}`, and #1668's scoping
+# review proved it false-PASSed the very class it was added to catch — it
+# modelled neither markdownlint's fullwidth punctuation (MD026's default
+# `punctuation` is `allPunctuationNoQuestion`, i.e. `. , ; : !` PLUS `。，；：！`)
+# nor the rule's setext scope, and it had `?` in the wrong direction. A
+# deny-list of a rule's punctuation lags the rule; an allow-list cannot, since
+# anything unrecognised is reported. The residual error becomes a false flag,
+# which is the cheap direction here: a false PASS ships into every consumer
+# repo, a false flag is caught by whoever edits this template.
+#
+# Modelled: ATX headings indented 0-3 spaces, repeated blockquote prefixes, an
+# ATX closing sequence (`## Foo ##` is clean), setext headings, code fences
+# (backtick and tilde, opener indented <= 3 spaces, closer repeating the same
+# character at least as many times), and indented code blocks (4+ spaces is
+# code, not a fence, so a column-0 heading after one is still checked).
+#
+# DELIBERATELY NOT MODELLED, with the direction each errs in:
+#   * a trailing HTML entity or gemoji is not suppressed (`## Foo &amp;` is
+#     reported although markdownlint suppresses it) — over-block, declared
+#   * a heading written as a list item is not detected — under-detection
+#   * a consumer that overrides MD026's `punctuation` is not modelled
+#   * non-ASCII final characters are reported (awk has no Unicode properties)
+# The safe set is ASCII alphanumerics plus `_` `)` `?`, a backtick, and `*`.
+# If a legitimate heading trips this, widen the set in `md026_scan` — do NOT
+# narrow the class of reported characters back into a deny-list.
+md026_scan() {
+  LC_ALL=C awk '
+    BEGIN { BT = sprintf("%c", 96) }
+    { L[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        line = L[i]
+        ind = 0
+        while (substr(line, ind + 1, 1) == " ") ind++
+        ch = substr(line, ind + 1, 1)
+
+        if (fence != "") {
+          if (ch == fence) {
+            run = 0
+            while (substr(line, ind + 1 + run, 1) == ch) run++
+            if (run >= flen && substr(line, ind + 1 + run) ~ /^[ \t]*$/) fence = ""
+          }
+          continue
+        }
+        if (ind >= 4) continue                 # indented code block (not a fence)
+        if (ch == BT || ch == "~") {
+          run = 0
+          while (substr(line, ind + 1 + run, 1) == ch) run++
+          if (run >= 3) { fence = ch; flen = run; continue }
+        }
+
+        t = substr(line, ind + 1)
+        while (t ~ /^>/) sub(/^>[ \t]?/, "", t)
+        if (t ~ /^#{1,6}([ \t]|$)/) {
+          sub(/^#{1,6}[ \t]*/, "", t)
+          sub(/[ \t]+#+[ \t]*$/, "", t)       # closing sequence is not heading text
+        } else {
+          # setext: a text line whose NEXT line is an underline. The underline
+          # is de-quoted the same way the text line is, so a blockquoted setext
+          # heading (`> Heading.` / `> ===`) is checked rather than skipped.
+          if (t ~ /^[ \t]*$/ || t ~ /^[ \t]*[-=]+[ \t]*$/) continue
+          nx = L[i + 1]
+          while (nx ~ /^[ ]{0,3}>/) sub(/^[ ]{0,3}>[ \t]?/, "", nx)
+          if (nx !~ /^[ ]{0,3}[-=]+[ \t]*$/) continue
+        }
+        sub(/[ \t]+$/, "", t)
+        if (t == "") continue
+        last = substr(t, length(t), 1)
+        if (last ~ /[0-9A-Za-z_?)]/) continue
+        if (last == BT || last == "*") continue
+        print "line " i ": " t
+      }
+    }
+  ' "$1"
+}
+
+md026_hits="$(md026_scan "$BASE")"; md026_rc=$?
+if [ "$md026_rc" -ne 0 ]; then
+  # A scanner that could not RUN is not a clean result — same doctrine as the
+  # "compare could not run" branch above. Without this, awk's failure (absent,
+  # or without interval-expression support) leaves empty stdout, which the
+  # `-z` test below would read as "no findings".
+  fail "base template: MD026 scan could not run (awk rc $md026_rc) — NOT a clean result"
+elif [ -z "$md026_hits" ]; then
+  pass "base template: no heading ends in punctuation (MD026)"
+else
+  fail "base template: heading(s) end in punctuation (MD026) — consumers inherit this as their own required docs-check failure"
+  printf '%s\n' "$md026_hits" | sed -n '1,5p'
+fi
+
+# ── MD026 pin self-test ────────────────────────────────────────────────────
+# Each RED fixture is a shape the FIRST predicate (a `[.,;:!?]$` deny-list at
+# `^#{1,6}`) reported clean — a false PASS of exactly the class the pin exists
+# to prevent, so these are the pin's falsifiers: delete an arm of `md026_scan`
+# and the corresponding fixture goes red. The GREEN fixtures are controls: the
+# allow-list must not be satisfiable by flagging everything.
+md026_fixture() {  # <name> <line>... → writes the file, prints its path
+  local f="$TMP/md026-$1.md"; shift
+  printf '%s\n' "$@" > "$f"
+  printf '%s' "$f"
+}
+md026_expect() {  # <file> hits|clean <label>
+  local f="$1" want="$2" label="$3" hits
+  hits="$(md026_scan "$f")"
+  if [ "$want" = hits ]; then
+    if [ -n "$hits" ]; then pass "MD026 $label → flagged"
+    else fail "MD026 $label → NOT flagged (false PASS)"; fi
+  else
+    if [ -z "$hits" ]; then pass "MD026 $label → clean"
+    else fail "MD026 $label → flagged: $(head -1 <<<"$hits")"; fi
+  fi
+}
+
+md026_expect "$(md026_fixture red-cjk '## Ends in a fullwidth stop。')" \
+  hits "ideographic full stop"
+md026_expect "$(md026_fixture red-setext 'Setext heading.' '===')" \
+  hits "setext heading"
+md026_expect "$(md026_fixture red-bq-setext '> Blockquoted setext heading.' '> ===')" \
+  hits "blockquoted setext heading"
+md026_expect "$(md026_fixture red-indent '   ## Indented ATX heading.')" \
+  hits "1-3 space indented ATX"
+md026_expect "$(md026_fixture red-quote '> ## Blockquoted heading.')" \
+  hits "blockquoted ATX"
+md026_expect "$(md026_fixture red-closing '## Flagged, with a period. ##')" \
+  hits "closing sequence cannot hide a finding"
+# A 4-space-indented backtick run is an INDENTED CODE BLOCK, not a fence, so a
+# column-0 heading after it is real and must be checked. (The first predicate
+# treated any indent as a fence opener and skipped the heading.)
+md026_expect "$(md026_fixture red-indented-code '    ```' '    not a fence' '## Real heading.' '    ```')" \
+  hits "indented code block is not a fence"
+md026_expect "$(md026_fixture green-question '## Question mark?')" \
+  clean "question mark (MD026 default excludes it)"
+md026_expect "$(md026_fixture green-close '## Closing hashes ##')" \
+  clean "ATX closing sequence"
+md026_expect "$(md026_fixture green-fence '```' '## Inside a fence.' '```')" \
+  clean "fenced code"
+md026_expect "$(md026_fixture green-fence4 '````' '```' '## Inside a fence.' '````')" \
+  clean "a shorter run does not close a longer fence"
+md026_expect "$(md026_fixture green-hr 'Prose line' '' '---' '## Heading after a rule')" \
+  clean "thematic break is not a setext underline"
 
 echo ""
 if [ "$failures" -eq 0 ]; then

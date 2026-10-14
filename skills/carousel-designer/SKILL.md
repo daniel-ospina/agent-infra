@@ -39,7 +39,7 @@ Additional inputs read from carousel directory:
 │            design direction + narrative roles             │
 │  ↓                                                        │
 │  For each slide: critiques composite image                │
-│  (vision: 98.5% acuity, 3.75MP at 2576px)                │
+│  (vision: model reads the rendered PNG directly)         │
 │  ↓                                                        │
 │  Generates CSS fixes as JSON map (schema-validated)       │
 │  ↓                                                        │
@@ -84,7 +84,7 @@ Writes review-status.yaml (clean + content hash)
 Launch ONE Opus session. Within that session, iterate:
 
 **2a — Critique composite slides:**
-For each rendered PNG in `slides/`, Opus (via `read_image`) critiques against:
+For each rendered PNG in `slides/`, Opus reads the PNG with `read` (the image is attached to the multimodal session) and critiques against:
 1. Copy accuracy — does rendered text match script.yaml exactly? (P0 if mismatch)
 2. Brand fit — within design direction? Purple family? Yellow accent? Outfit/Inter feel? (P1)
 3. Typography — appropriate for content density, clear hierarchy (P1)
@@ -188,7 +188,7 @@ Exit condition: After 5 carousels, if no structural fix repeats across entries, 
 
 | Role | Model | Why |
 |------|-------|-----|
-| Visual critique + CSS fix | Claude Opus (read_image) | 98.5% visual acuity, 3.75MP resolution, can see text at 2576px |
+| Visual critique + CSS fix | Claude Opus (`read` on each PNG) | Multimodal — reads the 1080×1080 PNG that render.cjs produces, directly |
 | Cold copy verification | DeepSeek (text comparison) | Separate session catches blind spots Opus missed |
 | Excluded | llama, stable-diffusion, any model below Gemini Flash | Too low quality — hallucinates text on non-English slides (#4599) |
 
@@ -266,7 +266,7 @@ Every design review dispatch prompt to Claude Opus MUST include this instruction
 You are NOT done when you generate CSS fixes. You are done ONLY when:
 
 1. You have REBUILT and RE-RENDERED the slides with your fixes applied
-2. You have RE-READ the re-rendered PNGs with read_image
+2. You have RE-READ the re-rendered PNGs with `read`
 3. Your re-critique of the re-rendered PNGs returns NO ISSUES FOUND
 
 If step 3 finds ANY issue → go back to fix, rebuild, re-render, re-read, re-critique.
