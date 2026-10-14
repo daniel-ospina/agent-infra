@@ -3,6 +3,7 @@
 #   lane.sh <issue> <branch> <owner/repo>
 set -u
 N="$1"; BR="$2"; OR="$3"
+KIND=lane; TAG="$N"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
@@ -14,14 +15,24 @@ export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
-  echo "[timeout] agent pid=$pid wall_limit=${t}s rc=$rc" >> "$log"
+  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
+  # reviewer/agent wall-time — the load-bearing number for fleet capacity (it was unmeasured).
+  elapsed=$(( $(date +%s) - start ))
+  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
+  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
+  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
+  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
+  mkdir -p "$O/state"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
   return "$rc"
 }
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
