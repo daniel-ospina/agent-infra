@@ -197,6 +197,15 @@ claim_acquire() {
     echo "$CLAIM_RESULT"; return 0
   fi
   if [ -z "$after" ] || [ "$after" = "$cur" ]; then
+    # ⛔ Set CLAIM_COMMIT BEFORE this return (P2, second review round, 2026-10-14). The push exited
+    # non-zero, but it may have LANDED and only the immediate re-read failed (`after` is unreadable
+    # in exactly that window). Returning 2 without the commit left merge-one.sh's
+    # `if [ -n "${CLAIM_COMMIT:-}" ]` false, so it never attempted the fenced release — and the box
+    # PROCEEDED fail-open while genuinely owning the ref, so every other box refused that head until
+    # the lease expired (up to REVIEW_TIMEOUT+1200 = 50 min). Safe to set unconditionally: the
+    # fenced release is a no-op when the ref is still `$cur` (the lease does not match), so it can
+    # never delete another box's claim.
+    CLAIM_COMMIT="$commit"
     CLAIM_RESULT="reclaim push failed and $CLAIM_REF is ${after:-unreadable} (still $cur) — infrastructure failure, not a lost race: ${perr:-no stderr}"
     echo "$CLAIM_RESULT"; return 2
   fi
@@ -266,7 +275,7 @@ claim_snapshot() {
   mv -f "$tmp" "$out" 2>/dev/null || true
 }
 
-# claim_prune — delete expired claim refs (git refs are unbounded).
+# claim_prune — delete expired claim refs (git refs are unbounded), and reap LEAKED temp refs.
 claim_prune() {
   local now ref lease until owner; now="$(date +%s)"
   _git ls-remote origin "$CLAIM_NS/*" 2>/dev/null | awk '{print $2}' | while read -r ref; do
@@ -280,6 +289,38 @@ claim_prune() {
     until="${lease##*$'\t'}"
     if [ -n "$until" ] && [ "$until" != "0" ] && [ "$now" -gt "$until" ]; then
       _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && echo "pruned expired $ref"
+    fi
+  done
+
+  # ── leaked CLAIM_TMP_NS refs (P3.4, second review round, 2026-10-14) ─────────
+  # Every lease READ/STATUS creates a local ref here and deletes it with `update-ref -d`. A SIGKILL,
+  # a Ctrl-C or a reboot between the fetch and the delete leaks that ref FOREVER: it is local-only,
+  # so no `ls-remote` sweep can ever see it, and this namespace was unbounded until now.
+  # ⛔ The age is the REF FILE's mtime — when THIS box wrote the ref — NOT the claim commit's date.
+  # The commit may be minutes old while the read ref was created a second ago, so a commit-date bound
+  # would delete the ref underneath a LIVE concurrent read; `_lease_of` would then return "?\t0"
+  # (unparseable = treated as LIVE) and the merge would be falsely refused — the exact race this
+  # namespace exists to avoid. A read takes seconds, so a 2-hour bound cannot touch a live one.
+  _git for-each-ref --format='%(refname)' "$CLAIM_TMP_NS" 2>/dev/null | while read -r ref; do
+    [ -n "$ref" ] || continue
+    local tpath gdir
+    # ⛔ Resolve the ref FILE absolutely. Plain `--git-path` can return a path relative to the REPO
+    # ROOT (measured: `git -C /tmp/r rev-parse --git-path refs/x` -> `.git/refs/x` even from another
+    # cwd), so prefixing the GIT DIR resolves `.git/.git/refs/...` and the file is never found —
+    # the reaper then no-ops silently. `--path-format=absolute` (git >= 2.31) is authoritative; the
+    # fallback (`<gitdir>/<ref>`) is correct for the non-worktree repos these scripts run in, and an
+    # empty result skips the ref rather than guessing.
+    tpath="$(_git rev-parse --path-format=absolute --git-path "$ref" 2>/dev/null)"
+    if [ -z "$tpath" ]; then
+      gdir="$(_git rev-parse --absolute-git-dir 2>/dev/null)"
+      [ -n "$gdir" ] || continue
+      tpath="$gdir/$ref"
+    fi
+    [ -e "$tpath" ] || continue
+    # NOTE the `[ -n "$(find ...)" ]` form: `find <file> -mmin +N` exits 0 whether or not it
+    # matches, so a bare `find ... && echo` would reap EVERY temp ref, live ones included.
+    if [ -n "$(find "$tpath" -mmin +120 2>/dev/null)" ]; then
+      _git update-ref -d "$ref" 2>/dev/null && echo "pruned leaked temp ref $ref"
     fi
   done
 }

@@ -32,7 +32,18 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
 # so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ LEADING ZEROS ARE NOT NUMBERS HERE (P2, second review round, 2026-10-14). `''|*[!0-9]*`
+# ACCEPTED `08`, and `$(( ))` parses base 0 (a leading 0 means OCTAL; `08`/`09` are not octal).
+# On /bin/bash 3.2.57 — what the launchd plist invokes — the failed arithmetic ASSIGNMENT aborts
+# the rest of the enclosing block and resumes after it with status 0, silently. Inside `while true`
+# it is worse: the whole loop is discarded and the script exits 0 after one cycle. Two shipped
+# consequences: `CYC=08` reached `JIT=$(( CYC / 5 ))` and turned the controller into a
+# relaunch-per-cycle loop under KeepAlive, and a leading-zero timeout reached the lease arithmetic in
+# the merge/fix workers. Accept only `0` or `[1-9][0-9]*`.
+# NOTE this also tightens `is_limit` below (it delegates here), which is how CYC=08 is coerced to
+# 240 before any arithmetic sees it. `is_num` must stay otherwise generous: it also validates a
+# 10-digit epoch mtime, and a tighter DIGIT bound silently rejected every file as un-stat-able.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # A digit string is not enough for a TUNABLE: `[` errors at or above 2**63, and an errored test is
 # FALSE, which OPENS the very gate the value configures (MAX_LANES=99999999999999999999 passed the
 # class test, then `[ "$LANES" -ge "$MAX_LANES" ]` errored and the lane cap was gone). So the limits
@@ -212,6 +223,36 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   [ -n "${until:-}" ] && [ "$until" != "0" ] || return 1
   [ "$(date +%s)" -le "$until" ] && return 0
   return 1
+}
+
+# refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
+# already owns this head). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
+# used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
+# refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
+# 2026-10-14). This refunds the attempt and restores the marker. `restore-findings` is 1 only on the
+# ai-review-gate arm, because that is the only arm that deletes the marker at spawn — the CI-red and
+# CONFLICTING arms never touch it, so restoring there would invent a findings record.
+refund_bailed_fixer() {
+  local pr="$1" head="$2" restore="${3:-0}" b f n
+  [ -n "${head:-}" ] || return 0
+  b="$O/state/fixbail-$pr-$head"
+  [ -f "$b" ] || return 0
+  rm -f "$b"
+  f="$O/state/fixcount-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
+  is_num "$n" || n=0
+  [ "$n" -gt 0 ] && n=$(( n - 1 ))
+  echo "$n" > "$f"
+  if [ "$restore" = "1" ]; then
+    touch "$O/state/needsfix-$pr-$head"
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+  else
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
+  fi
+  # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
+  rm -f "$O/state/parked-$pr"
+  return 0
 }
 
 # single-instance lock (atomic: noclobber create fails if the file exists)
@@ -566,8 +607,10 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
       GREEN|PENDING:*)
         MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
+          # A bailed fixer must not have consumed an attempt here (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
-          case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
+          is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
@@ -590,13 +633,16 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
         if grep -q ai-review-gate <<<"$V"; then
+          # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
+          # marker at spawn — so restore it too (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
-            case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
+            is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
@@ -635,7 +681,10 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
           # which now also receives the failing CI log, capped like every other fix loop.
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
-          case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
+          is_num "$NFC2" || NFC2=0
+          # A bailed fixer must not have consumed an attempt here either. This arm never deleted a
+          # findings marker, so restore is 0 (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
@@ -752,10 +801,14 @@ PY
   # Spread each box's wake-up by up to ±20% of the cycle. Cheap, and it matters more at 3 boxes
   # than at 2: the claim CAS resolves the collision, but jitter means far fewer collisions to
   # resolve at all.
-  JIT=$(( CYC / 5 ))
+  JIT=$(( 10#${CYC} / 5 ))
   # `& wait`, not a bare sleep: bash runs a trap only AFTER the current foreground command
   # completes, so `sleep 240` deferred the stop for up to a whole cycle — measured 5.07s of a 6s
   # sleep, vs 0.09s with the background form. The lock is held either way, but "kill -TERM ends
   # the process" (agent-infra#1715's indicator) is then true in ~0.1s, not in four minutes.
-  sleep $(( CYC - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
+  # ⛔ `10#` on BOTH arithmetic sites (P1, second review round, 2026-10-14): the predicate above
+  # coerces CYC=08 to 240, but this is defence in depth — this line is where a leading zero used to
+  # DISCARD the entire `while true` loop and exit 0 after one cycle (relaunch-per-cycle under
+  # KeepAlive). `10#${CYC}` reads it base 10 whatever the predicate did.
+  sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
 done

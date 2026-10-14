@@ -78,6 +78,31 @@ trap 'exit 143' TERM
 runA() { ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH" && "$@" ); }
 runB() { ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && "$@" ); }
 
+# A pass-through for the `_git` failure seams below. ⛔ NOT a plain `git`-with-a-positional-args
+# wrapper: the fleet's checkout guard statically classifies an unresolved git VERB (a positional
+# parameter used as the verb) as an unverifiable working-tree discard and fails closed, which refused
+# to even RUN this suite (`bash test-claims.sh` — guard form `unverifiable-verb`). Writing each
+# delegated verb LITERALLY keeps the seam statically visible, so the guard can verify it is not a
+# discard, and the suite runs. The verb set is exactly what claims.sh's `_git` call sites use.
+_git_delegate() { # <git-args...> — dispatch the VERB literally so the guard can classify it
+  local a1="${1:-}" a2="${2:-}" a3="${3:-}" a4="${4:-}" v
+  # `_cg` prefixes the deterministic author identity (`-c user.name=… -c user.email=… <verb> …`),
+  # so the verb is the 5th token in that shape and the 1st otherwise.
+  if [ "$a1" = "-c" ] && [ "$a3" = "-c" ]; then v="${5:-}"; shift 5 2>/dev/null || true
+  else v="$a1"; shift 2>/dev/null || true; fi
+  case "$v" in
+    commit-tree)  command git -C "$CLAIM_REPO" -c "$a2" -c "$a4" commit-tree "$@" ;;
+    push)         command git -C "$CLAIM_REPO" push "$@" ;;
+    ls-remote)    command git -C "$CLAIM_REPO" ls-remote "$@" ;;
+    fetch)        command git -C "$CLAIM_REPO" fetch "$@" ;;
+    cat-file)     command git -C "$CLAIM_REPO" cat-file "$@" ;;
+    update-ref)   command git -C "$CLAIM_REPO" update-ref "$@" ;;
+    for-each-ref) command git -C "$CLAIM_REPO" for-each-ref "$@" ;;
+    rev-parse)    command git -C "$CLAIM_REPO" rev-parse "$@" ;;
+    *) echo "_git_delegate: unexpected git invocation '${v:-}'" >&2; return 2 ;;
+  esac
+}
+
 PR=999999
 SHA=deadbeefcafebabe0123456789abcdef01234567
 REF="refs/claims/$PR-${SHA:0:12}"
@@ -241,7 +266,7 @@ seed_expired() { # <owner> -> prints the commit it pushed
 infra_reclaim() { # <box-dir>
   ( cd "$1" && export CLAIM_OWNER_ID=probe \
     && . "$CLAIMS_SH" \
-    && _git() { case "$*" in *"--force-with-lease"*) return 1 ;; *) command git -C "$CLAIM_REPO" "$@" ;; esac; } \
+    && _git() { case "$*" in *"--force-with-lease"*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 )
 }
 cleanup_ref
@@ -250,6 +275,37 @@ outI=$(infra_reclaim "$A"); rcI=$?
 echo "  rc=$rcI :: $outI"
 ck "failed push with an UNCHANGED ref => infra rc=2 (fail-open)" "^2$" "$rcI"
 ck "the reason names infrastructure, not a lost race" "infrastructure failure" "$outI"
+cleanup_ref
+
+echo
+echo "=== P2c2. the reclaim infra-failure path SURFACES the commit (fenced release possible) ==="
+# Same defect as P2a, on the RECLAIM path (P2, second review round, 2026-10-14): it returned rc=2
+# without setting CLAIM_COMMIT, so merge-one.sh's `if [ -n "$CLAIM_COMMIT" ]` never attempted the
+# fenced release. If the reclaim push HAD landed and only the immediate re-read failed, the box
+# proceeded fail-open while genuinely owning the ref and every other box refused that head until the
+# lease expired (up to 50 min). Setting it is safe: the fenced release is a no-op while the ref is
+# still the seeded `$cur`.
+cleanup_ref
+E3="$(seed_expired oldowner3)"; echo "  seeded expired claim $E3"
+infra_reclaim_commit() { # <box-dir> -> "rc=<n> commit=<sha>"
+  ( cd "$1" && export CLAIM_OWNER_ID=probe \
+    && . "$CLAIMS_SH" \
+    && _git() { case "$*" in *"--force-with-lease"*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
+    && claim_acquire "$1" "$PR" "$SHA" 600 >/dev/null; rc=$?; printf 'rc=%s commit=%s\n' "$rc" "$CLAIM_COMMIT" )
+}
+ir="$(infra_reclaim_commit "$A")"
+echo "  $ir"
+ck "reclaim infra failure => rc=2" "rc=2" "$ir"
+irc="$(printf '%s' "$ir" | sed -n 's/.*commit=\([0-9a-f]*\).*/\1/p')"
+if [ -n "$irc" ]; then echo "  ✅ CLAIM_COMMIT set on the reclaim infra-failure path ($irc)"; PASS=$((PASS+1));
+else echo "  ❌ CLAIM_COMMIT empty — merge-one.sh cannot attempt the fenced release (orphan)"; FAIL=$((FAIL+1)); fi
+# And the surfaced commit must NOT delete the seed: the fence rejects it, so the ref is unchanged.
+beforeIR="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
+( cd "$A" && . "$CLAIMS_SH" && claim_release "$A" "$PR" "$SHA" "$irc" ) >/dev/null 2>&1
+afterIR="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
+if [ -n "$beforeIR" ] && [ "$beforeIR" = "$E3" ] && [ "$afterIR" = "$E3" ]; then
+  echo "  ✅ the surfaced commit cannot delete a claim it does not own (fenced no-op)"; PASS=$((PASS+1))
+else echo "  ❌ the surfaced release changed the ref ($beforeIR -> $afterIR, seed=$E3)"; FAIL=$((FAIL+1)); fi
 cleanup_ref
 
 echo
@@ -270,9 +326,9 @@ moved_reclaim() { # <box-dir> <counter-file>
            *"--force-with-lease"*) return 1 ;;
            *ls-remote*)
              local n; n="$(cat "$CNT" 2>/dev/null || echo 0)"; n=$((n+1)); echo "$n" > "$CNT"
-             if [ "$n" -le 1 ]; then command git -C "$CLAIM_REPO" "$@"
+             if [ "$n" -le 1 ]; then _git_delegate "$@"
              else printf '1111111111111111111111111111111111111111\t%s\n' "$CLAIM_REF"; fi ;;
-           *) command git -C "$CLAIM_REPO" "$@" ;;
+           *) _git_delegate "$@" ;;
          esac
        } \
     && claim_acquire "$1" "$PR" "$SHA" 600 )
@@ -309,6 +365,33 @@ ck "snapshot --prune did NOT delete the temp ref" "^SURVIVED" "$outS"
 cleanup_ref
 
 echo
+echo "=== P3.4. claim_prune reaps a LEAKED temp ref but leaves a FRESH one alone ==="
+# `claim_prune` used to sweep only CLAIM_NS, while every lease READ/STATUS creates a local ref under
+# CLAIM_TMP_NS and deletes it with `update-ref -d`. A SIGKILL between the fetch and the delete leaks
+# that ref FOREVER — it is local-only, so no ls-remote sweep can ever see it (P3.4, second review
+# round, 2026-10-14). The age bound is the REF FILE's mtime, so a 2h bound cannot touch a live read.
+# CLAIM_NS is scoped to a private namespace so this cannot disturb a concurrent suite's live refs.
+prune_tmp() { # <box-dir> -> "OLD=<survived|pruned> NEW=<survived|pruned>"
+  ( cd "$1" && export CLAIM_NS="refs/claims-xbprune-$$" && . "$CLAIMS_SH" \
+    && c="$(_claim_commit probe $(( $(date +%s) + 600 )))" \
+    && command git -C "$1" update-ref "$CLAIM_TMP_NS/old-$$" "$c" \
+    && command git -C "$1" update-ref "$CLAIM_TMP_NS/new-$$" "$c" \
+    && op="$(command git -C "$1" rev-parse --git-path "$CLAIM_TMP_NS/old-$$")" \
+    && touch -t 202001010000 "$op" \
+    && claim_prune >/dev/null 2>&1 \
+    && { command git -C "$1" show-ref --verify --quiet "$CLAIM_TMP_NS/old-$$" && o=survived || o=pruned; } \
+    && { command git -C "$1" show-ref --verify --quiet "$CLAIM_TMP_NS/new-$$" && n=survived || n=pruned; } \
+    && command git -C "$1" update-ref -d "$CLAIM_TMP_NS/new-$$" 2>/dev/null; \
+    printf 'OLD=%s NEW=%s\n' "$o" "$n" )
+}
+cleanup_ref
+outP="$(prune_tmp "$A")"
+echo "  $outP"
+ck "an OLD leaked temp ref is reaped by claim_prune" "OLD=pruned" "$outP"
+ck "a FRESH temp ref (a live read) is NOT reaped" "NEW=survived" "$outP"
+cleanup_ref
+
+echo
 echo "=== P2a. a read-back failure on CREATE surfaces the commit (no orphan) ==="
 # The push can SUCCEED on the remote and fail only the read-back. Before the fix claims.sh returned
 # rc=2 with CLAIM_COMMIT empty, so merge-one.sh fail-opened with CROSS_OWN="" and the EXIT trap never
@@ -317,7 +400,7 @@ echo "=== P2a. a read-back failure on CREATE surfaces the commit (no orphan) ===
 readback_fail() { # <box-dir> -> "rc=<n> commit=<sha> ref=<ref>"
   ( cd "$1" && export CLAIM_OWNER_ID=probe \
     && . "$CLAIMS_SH" \
-    && _git() { case "$*" in *ls-remote*) return 1 ;; *) command git -C "$CLAIM_REPO" "$@" ;; esac; } \
+    && _git() { case "$*" in *ls-remote*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 >/dev/null; rc=$?; printf 'rc=%s commit=%s ref=%s\n' "$rc" "$CLAIM_COMMIT" "$CLAIM_REF" )
 }
 cleanup_ref

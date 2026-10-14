@@ -19,7 +19,13 @@ case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<emp
 # Guard-before-use for env tunables. Every OTHER limit in this file is validated before it is
 # used; `REVIEW_TIMEOUT` was the lone exception and it fed ARITHMETIC (P1, 2026-10-14 adversarial
 # review — see the coercion note at the claim block).
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ REJECT LEADING ZEROS (P2, second review round, 2026-10-14): the first fix used
+# `''|*[!0-9]*`, which ACCEPTS `08` — so `CLAIM_LEASE=$(( 08 + 1200 ))` still reached the arithmetic.
+# On /bin/bash 3.2.57 `$(( ))` parses base 0, where a leading 0 means OCTAL, and `08`/`09` are not
+# octal; the failed assignment ABORTS the rest of the enclosing `if` body and resumes after `fi`
+# with status 0, so claim_acquire never ran and the worker reported success. Accept only `0` or
+# `[1-9][0-9]*`.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 KIND=reviewer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
@@ -111,6 +117,14 @@ CROSS_RC=0
 # black-holed connection can hang for minutes; this runs on the EXIT path, so it must not hold the
 # process open (P3, 2026-10-14 adversarial review). Returns claim_release's status (1 = nothing to
 # release), so a caller can tell a fenced release from a refusal.
+# ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
+# release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the fenced
+# push leaves the ref intact, and every box then refuses that head until the lease expires (up to
+# REVIEW_TIMEOUT+1200 = 50 min). That is accepted because the alternative is strictly worse: an
+# UNBOUNDED exit path (and, before the ordering fix above, one that dropped the local lock FIRST)
+# lets the controller spawn a second worker for the same head. DO NOT remove the bound — the
+# ordering defect it fixes is real. A future improvement is to move the release OFF the exit path
+# (a detached retry), not to wait longer here.
 release_claim_bounded() {
   local p w rc
   [ -n "${CROSS_OWN:-}" ] || return 1

@@ -658,9 +658,15 @@ ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped file
 GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
-mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM
+mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
   ( L=$1; LANES=$2; SWTOTAL=$3; SWFREE=$4; MEM_UNKNOWN=$5; MEMAVAIL_MB=$6
     MAX_LOAD=$7; MAX_LANES=$8; MIN_SWAP_FREE=$9; MIN_MEM_FREE_MB=${10}; OPEN_N=0
+    # ⛔ WORKERS IS REQUIRED (P3.2, second review round, 2026-10-14). It was omitted, so
+    # `eval "$GATE_BLOCK"` emitted `WORKERS: unbound variable` SIX times on stderr and its FIRST
+    # line — `GATE_WHY="$(mp_reason … "$WORKERS")"` — never executed. Every assertion still passed
+    # because the gates below it produced the same GATE_WHY, so the gate chain's entry line was
+    # UNTESTED. The `WORKERS=${11:-0}` default and the stderr assertion below are the fix.
+    WORKERS=${11:-0}
     GATE_WHY=""; mp_reason() { :; }
     eval "$GATE_BLOCK"; printf '%s' "${GATE_WHY:-}" )
 }
@@ -668,6 +674,13 @@ mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_
 ck "the memory gate FIRES below the ceiling and names it (mem_avail<=min_mem_free_mb)" $rcw
 [ -z "$(mrw 1 0 0 9999 0 9999 100 4 600 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the memory gate does NOT fire when available memory is above the ceiling" $rcw
+# ⛔ The fixture omitted WORKERS, so the extracted chain's first line (`GATE_WHY="$(mp_reason …
+# "$WORKERS")"`) never ran and `WORKERS: unbound variable` went to stderr — silently, because a
+# command substitution's stderr is not captured by the assertions. Assert clean stderr, so the
+# entry line is actually exercised.
+mrw_err="$( { mrw 1 0 0 9999 0 9999 100 4 600 "$mem_def" >/dev/null; } 2>&1 )"
+[ -z "$mrw_err" ] && rc=0 || { rc=1; echo "      mrw stderr: $mrw_err"; }
+ck "the extracted gate-chain fixture runs with NO unbound-variable noise (WORKERS is set)" $rc
 # ⛔ The swap gate is the other half of "the binding gates in practice", and it was UNTESTED: §7's
 # default-agreement check only requires a limit to be NOT-UNSET, so setting MIN_SWAP_FREE to 0 in
 # BOTH files left the suite at 284/0 while the gate became `[ "$SWFREE" -le 0 ]`, which can never
@@ -855,6 +868,38 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   ck "shipped claim_live(): a dead owner is not in flight" $rc
   [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
   ck "shipped claim_live(): the stale claim file is removed" $rc
+fi
+
+# ── 15) a BAILED fixer refunds its attempt and restores the findings marker ─────
+# fix-one.sh exits 0 when the cross-box CAS refuses it, having done NO work. The controller booked
+# the attempt at spawn and (on the reviewer-findings arm) deleted the findings marker there, so
+# before this refund three refusals PARKED a PR no fixer ever touched, with the reviewer's findings
+# gone. The function is EXTRACTED and DRIVEN, not grepped (P2, second review round, 2026-10-14).
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
+if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted from the shipped orch-loop.sh"; then
+  mkdir -p "$TMP/RB/state"; O="$TMP/RB"; LOG="$TMP/RB/loop.log"; : > "$LOG"
+  # shellcheck disable=SC1090
+  . "$TMP/refund-all.sh"
+  # (a) reviewer-findings arm: booked to 2, findings marker deleted at spawn, bail recorded.
+  echo 2 > "$O/state/fixcount-77"; : > "$O/state/fixbail-77-abc"; : > "$O/state/parked-77"
+  refund_bailed_fixer 77 abc 1
+  if [ "$(cat "$O/state/fixcount-77" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-77-abc" ] \
+     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no)"; fi
+  ck "a bailed fixer refunds the attempt AND restores the findings marker" $rc
+  # (b) CI-red / CONFLICTING arm: no findings marker was deleted, so NONE may be invented.
+  rm -f "$O/state/needsfix-88-abc" "$O/state/parked-88"; echo 1 > "$O/state/fixcount-88"; : > "$O/state/fixbail-88-abc"
+  refund_bailed_fixer 88 abc 0
+  [ "$(cat "$O/state/fixcount-88" 2>/dev/null)" = "0" ] && [ ! -f "$O/state/needsfix-88-abc" ] && rc=0 || rc=1
+  ck "a bail on an arm that deleted no findings marker does not invent one" $rc
+  # (c) NO bail marker -> nothing to refund. Non-vacuity: the refund is conditional on a real bail.
+  echo 3 > "$O/state/fixcount-99"; refund_bailed_fixer 99 abc 1
+  [ "$(cat "$O/state/fixcount-99" 2>/dev/null)" = "3" ] && [ ! -f "$O/state/needsfix-99-abc" ] && rc=0 || rc=1
+  ck "no bail marker means no refund (the refund is not unconditional)" $rc
+  # (d) a leading-zero fixcount must not reach `$(( 08 ))` — is_num normalises it first.
+  echo 08 > "$O/state/fixcount-55"; : > "$O/state/fixbail-55-abc"; refund_bailed_fixer 55 abc 0
+  [ "$(cat "$O/state/fixcount-55" 2>/dev/null)" = "0" ] && rc=0 || { rc=1; echo "      got '$(cat "$O/state/fixcount-55" 2>/dev/null)'"; }
+  ck "a leading-zero fixcount is normalised by is_num (no arithmetic abort)" $rc
 fi
 
 grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
@@ -1954,6 +1999,33 @@ ck "numeric plist limits survive the coercion unchanged" $rc
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
 [ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
+# ⛔ LEADING ZEROS — the third failure mode, and the one the FIRST fix missed (P1/P2, second review
+# round, 2026-10-14). `is_num` used `''|*[!0-9]*`, which ACCEPTS `08`; that reached `$(( 08 + … ))`,
+# where bash parses base 0 (leading 0 = OCTAL) and `08` is not octal. On /bin/bash 3.2.57 the failed
+# arithmetic ASSIGNMENT aborts the rest of the enclosing block and resumes after it with status 0 —
+# so `CYC=08` DISCARDED the controller's `while true` loop (exit 0 after one cycle, relaunch-per-cycle
+# under KeepAlive) and `REVIEW_TIMEOUT=08` silently skipped claim_acquire. `is_limit` delegates to
+# `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
+# that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
+# single `0`-followed-by-digit forms.)
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
+# And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
+# `is_num 08` must be FALSE, while `0` and a real number stay true.
+{ grep -m1 '^is_num() {' "$LOOP"; } > "$TMP/isnum.sh"
+_isnum_ok=1
+( . "$TMP/isnum.sh"
+  is_num 08 && exit 1
+  is_num 09 && exit 1
+  is_num 030 && exit 1
+  is_num 0  || exit 1
+  is_num 8  || exit 1
+  is_num 1800 || exit 1
+  is_num '' && exit 1
+  is_num abc && exit 1
+  exit 0 ) || _isnum_ok=0
+[ "$_isnum_ok" = "1" ] && rc=0 || { rc=1; echo "      the shipped is_num() still accepts a leading-zero or non-number value"; }
+ck "the shipped is_num() rejects leading zeros and non-numbers, accepts 0 and real numbers" $rc
 # ⛔ MAX_LOAD's DEFAULT -- not its coercion -- decides the value when the plist does not set one, and
 # every other fixture passes MAX_LOAD explicitly, so `_NCPU * 10` -> `_NCPU * 5` in BOTH files stayed
 # green. Pin the FORMULA, which is host-independent even though its evaluation is not.
@@ -1998,6 +2070,13 @@ ck "install.sh refuses a non-integer limit AND leaves the live plist untouched" 
 out="$(run_inst "$(mk_sb)" MAX_LANES=99999999999999999999)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      huge MAX_LANES -> '$out'"; }
 ck "install.sh refuses an out-of-range limit (>=2**63, where [ errors and the gate fails OPEN)" $rc
+# ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14): install.sh's `''|*[!0-9]*` accepted
+# `08`, rendered it into the plist and exited 0 — while the loop now COERCES it to the default, so
+# the plist would LIE about the ceiling. Refusing loudly is the only consistent behaviour: a value
+# this installer accepts must be the value the loop uses. Pre-fix this case exits 0 (RED).
+out="$(run_inst "$(mk_sb)" CYC=08)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=08 -> '$out'"; }
+ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched" $rc
 out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
@@ -2159,6 +2238,24 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     [ "$ydead" = "1" ] && rc=0 || { rc=1; kill -9 "$ypid" 2>/dev/null; }
     wait "$ypid" 2>/dev/null
     ck "the shipped cycle sleep is interrupted by TERM inside CYC (stopped <4s, not 8s)" $rc
+    # ⛔ DEFENCE IN DEPTH (P1, second review round, 2026-10-14). The predicate now coerces CYC=08
+    # to 240 before the loop, but that is not the only guard: give the EXTRACTED shipped lines
+    # CYC=08 DIRECTLY and wrap them in the shipped `while true` shape. With the old
+    # `JIT=$(( CYC / 5 ))`, /bin/bash 3.2.57 printed `08: value too great for base` and DISCARDED
+    # the loop — the driver echoed CYCLES=1 and exited 0, i.e. a relaunch-per-cycle controller
+    # under KeepAlive. `10#${CYC}` keeps it cycling. Break at 3 so a failure (1) is distinguishable
+    # from a pass (3); `sleep` is stubbed so the driver is instant.
+    { echo 'set -u'; echo 'CYC=08'; echo 'sleep() { :; }'; echo 'n=0'
+      echo 'while true; do'
+      echo '  n=$((n+1))'
+      cat "$TMP/cycsleep.sh"
+      echo '  [ "$n" -ge 3 ] && break'
+      echo 'done'
+      echo 'echo "CYCLES=$n"'
+    } > "$LK/cyc08.sh"
+    out08="$(bash "$LK/cyc08.sh" 2>&1)"
+    case "$out08" in *CYCLES=3*) rc=0;; *) rc=1; echo "      CYC=08 did not keep the loop alive: $out08";; esac
+    ck "CYC=08 does not discard the controller's while loop (arithmetic read in base 10)" $rc
   fi
 
   # Reclamation must be REAL, not silently skipped: a lock whose PID is dead is reclaimed by the

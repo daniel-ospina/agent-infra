@@ -138,6 +138,26 @@ else
 fi
 
 echo
+echo "=== step 4b (P2): a LEADING-ZERO REVIEW_TIMEOUT must NOT disable the claim ==="
+# `is_num` used `''|*[!0-9]*`, which ACCEPTS `08` — so `CLAIM_LEASE=$(( 08 + 1200 ))` reached the
+# arithmetic, and on /bin/bash 3.2.57 the failed assignment ABORTED the claim block with status 0:
+# claim_acquire never ran, the log had no 'cross-box claim' line, and the worker reported success.
+# Rejecting leading zeros (accept only `0` or `[1-9][0-9]*`) coerces these to 1800 so the claim is
+# genuinely taken. RED on the pre-fix predicate for BOTH values.
+for rt in 08 09; do
+  clear_ref "$REF2"
+  rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
+  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+  if grep -qa 'cross-box claim: acquired' "$O/logs/merge-888888.log"; then
+    ok "REVIEW_TIMEOUT=$rt acquired the claim (leading zero rejected, coerced to 1800)"
+  else
+    bad "REVIEW_TIMEOUT=$rt did NOT acquire — a leading-zero lease silently disabled the claim"
+    grep -a 'cross-box\|REVIEW_TIMEOUT' "$O/logs/merge-888888.log" 2>/dev/null | sed 's/^/     /'
+  fi
+done
+clear_ref "$REF2"
+
+echo
 echo "=== step 5 (P3.4): a TERM'd worker releases the claim on the way out ==="
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
@@ -191,6 +211,10 @@ fixflight="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
 wait "$F1" 2>/dev/null; echo "  fix-one exit=$?"
 gone=$([ -z "$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')" ] && echo yes || echo no)
 [ "$gone" = "yes" ] && ok "fixer claim released (no orphan after the merge chain)" || bad "fixer claim leaked"
+# Non-vacuity for step 7c's marker: a CLEAN acquire must leave NO bail marker, or a future change
+# that writes it unconditionally would refund an attempt that was genuinely consumed.
+[ ! -f "$O2/state/fixbail-666666-$SHA" ] && ok "the ACQUIRE path leaves no bail marker (refusal-only)" \
+                                         || bad "a bail marker exists after a CLEAN acquire"
 fixref_clear
 rm -rf "$O2"
 
@@ -213,8 +237,37 @@ wait "$F1b" 2>/dev/null; echo "  fix-one exit=$?"
 calls="$(wc -l < "$CNT" 2>/dev/null | tr -d ' ')"
 [ "${calls:-0}" -ge 2 ] && ok "failed release RETRIED by the EXIT trap ($calls claim_release call(s))" \
                         || bad "failed release NOT retried — latch cleared ($calls call(s))"
+# P3.1 (second review round): the failed release must also be LOGGED, not silent — otherwise the
+# retained latch is invisible and nobody can tell a torn release from a released claim.
+grep -qa 'could not release' "$O3/logs/fix-666666.log" 2>/dev/null && ok "the failed release is LOGGED, not silent" \
+                        || bad "a failed release is not logged (the retry is invisible)"
 fixref_clear
 rm -rf "$O3"
+
+echo
+echo "=== step 7c (P2): a REFUSED fixer records a bail marker so the attempt can be refunded ==="
+# The controller books the attempt (fixcount+1) and deletes the reviewer's findings marker at SPAWN,
+# so a cross-box refusal — which does NO work — used to burn one of MAX_FIX_TRIES and destroy the
+# findings record. Three refusals PARK the PR as needs-a-human although no fixer ever ran. fix-one.sh
+# now records the refusal in $O/state/fixbail-<pr>-<head>; orch-loop.sh refunds both.
+O4="/tmp/xb-crossbox-fixorch-bail.$$"
+rm -rf "$O4"; mkdir -p "$O4/logs" "$O4/state"
+cp "$HERE/claims.sh" "$O4/claims.sh"
+printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O4/merge-one.sh"
+fixref_clear
+# another box holds the head with a LIVE lease, so our acquire must be REFUSED (rc=1)
+( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_ID=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
+  || bad "could not seed the other box's live claim"
+( cd "$A" && exec env O="$O4" FIX_TIMEOUT=12 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+echo "  fix-one exit=$?"
+if [ -f "$O4/state/fixbail-666666-$SHA" ]; then
+  ok "a REFUSED fixer wrote the bail marker (the controller can refund the attempt)"
+else
+  bad "no bail marker — a cross-box refusal still burns a capped attempt"
+  grep -a 'REFUSED' "$O4/logs/fix-666666.log" 2>/dev/null | sed 's/^/     /'
+fi
+fixref_clear
+rm -rf "$O4"
 
 echo
 echo "=== step 8 (P3.4): a BLACK-HOLED release cannot hang the exit path, and the lock survives it ==="
