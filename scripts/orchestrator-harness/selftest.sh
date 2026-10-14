@@ -1400,7 +1400,15 @@ git init -q "$TMP/cellrepo"
 mkdir -p "$TMP/cellhome/.pi/agent/scripts"
 printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the CI runner `pi` is not
+# installed, so every fixture that reaches that probe must stub it instead of leaning on the host
+# PATH — otherwise the suite reddens on the runner only (the #1348/#1369 lane-split class). git and
+# python3 are stubbed too so the probe is hermetic rather than host-dependent.
+for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1538,6 +1546,11 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.s
 chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
 printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
 chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi` (absent on the CI runner) and the other two, stubbed.
+for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; done
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1657,6 +1670,9 @@ mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
 mkdir -p "$KC/home/.pi/agent/scripts"
 printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
