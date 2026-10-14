@@ -432,7 +432,7 @@ is detected, the merge step refreshes the branch against main and re-runs the af
 tests before merging — the safety net for cross-PR breakage without blocking on the signal itself.
 
 
-### Step 0.10 — Process-Weight Check (advisory by default; P1 only on the three triggers)
+### Step 0.10 — Process-Weight Check (advisory by default; P1 only on the two A-category triggers)
 
 Run this when the diff **ADDS MACHINERY** rather than changing behaviour: a new guard/checker
 script, a new test file, a new assertion family, a new config surface, or a new CI job. It answers
@@ -442,18 +442,32 @@ it accumulation?**
 This is **not** an anti-test step. "This adds too many tests" is NOT a valid finding: a test that
 proves a behaviour is product work. The judgement is about machinery *around* behaviour.
 
+**The canonical owner of the admission question is `AGENTS.md` §Product Over Process (hard rule),
+implemented as Gate 0 in `skills/issue-workflow/SKILL.md`.** Those two decide the CATEGORY (A/B),
+and therefore what may block a merge; this step decides only the MEASUREMENT — what the machinery
+costs, what it duplicates, and whether a cheaper seam already owns the invariant. When they
+disagree, the A/B rule wins. This step does not create a second severity taxonomy.
+
 **Measure first — raw size is the wrong number.** This repo is prose-heavy, so a 1,300-line file
 can be ~690 code lines and 629 comment/docstring lines. Count non-blank lines that are neither
 comments nor docstrings, then take three measurements:
 
 1. **Code size** — code lines added, and what family it joins (an existing guard's code lines).
-2. **CI cost** — is the new test registered in a surface, and what is its *measured* duration?
-   `rg -n "<new_test_file>" config/ci-surfaces.yml`
-3. **Duplication** — does machinery ALREADY own this invariant?
-   `rg -l "<the invariant's key symbol>" tools/ .github/scripts/ | sort`
+2. **CI cost** — is the new test registered in the repo's own **test-shard/surface registry**, and
+   what is its *measured* duration? The registry is repo-specific, so name the one you read:
+   tortoise — `config/ci-surfaces.yml`; agent-infra — `scripts/run-bash-shards.sh` (its shard list
+   IS the CI surface; pinned by `scripts/check-ci-lane-parity.sh`). If the repo has none (eldato,
+   premise-labs), **say so and drop this measurement — never read "no output" as "not registered".**
+   `rg -n "<new_test_file>" <the repo's registry>`
+3. **Duplication** — does machinery ALREADY own this invariant? Search the repo's own
+   guard/assertion trees and **name the trees you searched**: agent-infra — `scripts/`,
+   `extensions/`; tortoise — `tools/`, `.github/scripts/`. A path that does not exist makes `rg`
+   exit 2 and print nothing — that is an **unavailable search, not "no duplicate"**.
+   `rg -l "<the invariant's key symbol>" <the repo's guard trees> | sort`
    Then check whether the new file even *names* what it overlaps. Zero mentions is a finding.
 
-**The three P1 triggers — only these block:**
+**The two P1 triggers — only these block** (both are category **A** under `AGENTS.md` §Product Over
+Process: each can produce a false PASS or a bypass):
 
 1. **A DUPLICATE OWNER exists.** Another guard/checker already asserts the same invariant,
    especially when the new one does not name it. Cite the existing file **and its clause id**.
@@ -462,9 +476,23 @@ comments nor docstrings, then take three measurements:
    report their exit codes verbatim. If one goes red *because of the new machinery* — not because
    of a missing re-cut — that clause IS this project's recorded decision not to accumulate, and
    the diff is re-litigating a decision. Report it as such.
+
+**The one advisory trigger — reported, never blocking.** Added CI wall-clock is **friction**, which
+`AGENTS.md` §Product Over Process classifies as category **B** (*"Fail-closed / over-block —
+something right is refused"*), and *"a B item … is still only a note — never routed, never
+planned"*, so it can never hold a merge:
+
 3. **It lands on the binding constraint.** The machinery adds wall-clock to the critical CI path
-   (a shard's `max`, or a gate every merge waits on) beyond the stated budget. Cite the measured
-   delta and the budget. CI cost is a real cost — but it is NOT a pass/fail on speed alone.
+   (a shard's `max`, or a gate every merge waits on). **Report** the measured delta, and compare it
+   to the repo's CI-duration *guideline* if it declares one — this repo does not gate on one: owner
+   ruling **#6792** demoted `GUIDELINE_CI_MIN` out of the verdict precisely because *"a slow suite
+   is a reason to improve the suite, not a verdict"* (`scripts/objective.py`). Emit it as
+   `severity: P2, advisory: true` — the shape Step 0.9 gives `cross-pr-overlap`. CI cost is a real
+   cost, and the author decides.
+
+> **OVERRIDES:** the common practice of gating a merge on CI wall-clock — a CI-duration figure is
+> context, never a verdict (owner ruling #6792, 2026-09-30; `AGENTS.md` §Product Over Process: an
+> over-block of a correct change is category B).
 
 **Otherwise: advisory only.** Report the ratio and the measurements; the author decides. Never
 block on a lopsided ratio by itself.
@@ -491,7 +519,8 @@ invariant. That seam is usually the real fix; the second checker is the symptom.
 ```
 ISSUE:
   check_type: process-weight
-  severity: P1   # only for the three triggers; otherwise P2, advisory: true
+  severity: P1   # only for the two A-category triggers; otherwise P2, advisory: true
+  location: <the file/clause the finding is about — the duplicate owner, or the new file>
   description: <the duplicate owner, or the firing clause, or the measured CI delta>
   measurement: code_lines=<n> (of total=<n>); ci_surface=<name> measured=<s>s; overlap=<file + clause id>
   suggestion: <the seam — or "fold into <existing file> and delete <new file>">
