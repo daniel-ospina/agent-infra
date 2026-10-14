@@ -91,7 +91,7 @@ looks, and annotation when the connection's quality is known and should be grade
 |---|---|---|
 | `bias` | How one-sided the source's stake is (hidden agenda) | **Inverted** — high bias reads WORSE |
 | `precision` | How sharply the claim is defined | High reads BETTER |
-| `consistency` | How well it agrees with the rest of the graph | High reads BETTER |
+| `consistency` | How stable this relevance is across contexts | High reads BETTER |
 | `directness` | How directly the evidence bears on the claim | High reads BETTER |
 
 Each is a number in `0.0–1.0`. Set all four together:
@@ -130,7 +130,11 @@ Four rules that decide how to use it:
 
 On a **NAND** the top of the band is partly absorbed: `NAND_BASE_WEIGHT` is
 8.0 and the final clamp is `[0.1, 10.0]`, so `8.0 × 2.0 = 16.0` clamps to
-`10.0`. Strengthening is fully effective on IMPL and only partly on NAND.
+`10.0`. Strengthening is fully effective on IMPL and only partly on a
+**top-level** NAND. It is **not effective at all** on a NAND whose target is
+itself an operator: that NAND's base doubles to 16.0 *before* the rating, so
+even unrated it already clamps to `10.0` and a best rating gains nothing
+(weakening still lands — `16.0 × 0.5 = 8.0`).
 
 > **Do not confuse these with source credibility tiers.** `sourceKind`
 > (T0–T4) and the `credibility` kwarg set a **Point's** Beta prior — how much
