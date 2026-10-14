@@ -126,6 +126,31 @@ function mergeScopeFor(projectRoot: string, blockedFiles: string[]): string[] {
   return scope;
 }
 
+// #1660/#190: extract the prompt's `verify files:` list, expanding a
+// DIRECTORY-form entry (no dot, optional trailing slash) against `mergeScope`.
+// Expanding against a stale recorded set alone drops a newly staged file under
+// the named directory; expanding against the union keeps it. Shared by the
+// plain-text, fail-open and JSON #336 fallback merge sites so they cannot drift.
+// #190: the broadened regex accepts `\n\nClassification:` and no-period
+// separators (incident dispatch #1). Format: "[VGATE] verify files: path1
+// path2. Classification: ... Project root: /path".
+function promptFileList(prompt: string, mergeScope: string[]): Set<string> {
+  const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
+  const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
+  const promptFiles = new Set<string>();
+  for (const f of rawFiles) {
+    const isDir = f.endsWith('/') || !f.includes('.');
+    if (isDir && mergeScope.length > 0) {
+      for (const blocked of mergeScope) {
+        if (blocked.startsWith(f)) promptFiles.add(blocked);
+      }
+    } else {
+      promptFiles.add(f);
+    }
+  }
+  return promptFiles;
+}
+
 // Every root `verifiedSet` holds a record for under `relPath`, other than
 // `normRoot`. Distinguishes a ROOT MISMATCH (a verifier recorded this path, but
 // for a different tree) from a genuine NO RECORD at block time (#1660) — the
@@ -146,7 +171,6 @@ function rootsHoldingPath(normRoot: string, relPath: string): string[] {
 function noteVerifierDisposition(projectRoot: string, promptFiles: number, recorded: number, cause: string): void {
   lastVerifierNote = {
     root: normalizeWorktreeRoot(projectRoot),
-    blockRoot: lastBlockedCwd === null ? null : normalizeWorktreeRoot(lastBlockedCwd),
     text:
       `  ⚠ #1660 verifier disposition: verifier root=${normalizeWorktreeRoot(projectRoot)}, ` +
       `blocked-op root=${lastBlockedCwd === null ? "<none>" : normalizeWorktreeRoot(lastBlockedCwd)}, ` +
@@ -280,7 +304,7 @@ const blockedFilesByRoot = new Map<string, string[]>();
 // #1660: the last verifier disposition, so a retry block can say WHY nothing
 // was recorded (root mismatch vs no record vs zero-merge) and name BOTH roots,
 // instead of repeating the generic "not checked by verifier sub-agent".
-let lastVerifierNote: { root: string; blockRoot: string | null; text: string } | null = null;
+let lastVerifierNote: { root: string; text: string } | null = null;
 // #7574: when VGATE allows a git commit, lint-staged (pre-commit hook) may modify files
 // on disk (ESLint --fix). The stored verified hash is pre-lint, but the committed version
 // is post-lint. Re-hash on the next git op to capture the post-lint state.
@@ -4506,29 +4530,10 @@ export default function (pi: ExtensionAPI) {
         // staged diff — a stale recorded set must not shadow a newly staged file.
         const mergeScope = mergeScopeFor(projectRoot, blockFiles);
 
-        // Extract file list from the prompt. #190: broadened regex accepts
-        // `\n\nClassification:` and no-period separators (incident dispatch #1).
-        // Format: "[VGATE] verify files: path1 path2. Classification: ... Project root: /path"
-        const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
-        const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
-        // Expand directory paths: if a path ends with / or doesn't contain a dot,
-        // treat it as a directory and include all files under that directory.
-        // #1660: expand against the UNION scope (this root's recorded set ∪ its
-        // current staged diff) — expanding against the stale recorded set alone
-        // silently drops a newly staged file under the named directory, so the
-        // PASS records only the stale entry and the retry re-blocks (the same
-        // non-convergence class mergeScopeFor exists to fix).
-        const promptFiles = new Set<string>();
-        for (const f of rawFiles) {
-          const isDir = f.endsWith('/') || !f.includes('.');
-          if (isDir && mergeScope.length > 0) {
-            for (const blocked of mergeScope) {
-              if (blocked.startsWith(f)) promptFiles.add(blocked);
-            }
-          } else {
-            promptFiles.add(f);
-          }
-        }
+        // Extract the prompt's file list, expanding a named DIRECTORY against
+        // the union scope (a stale recorded set must not shadow a newly staged
+        // file under it — see promptFileList).
+        const promptFiles = promptFileList(prompt, mergeScope);
 
         // #336: when the prompt names files, merge those (diff-scoped). When it
         // names none (deviant prompt, or a verifier dispatched without
@@ -4544,14 +4549,17 @@ export default function (pi: ExtensionAPI) {
         if (promptFiles.size > 0) {
           mergeFiles = [...promptFiles];
         } else if (blockFiles.length > 0) {
-          // #1660 P2: the #336 fallback scopes the UNION (recorded ∪ current
-          // staged diff), not the recorded set alone — a STALE recorded entry
-          // must not drop a file this root has newly staged for the op being
-          // retried. The fallback still fires ONLY when a block context exists,
-          // so a root that never blocked cannot bless its staged diff on a
-          // no-files PASS (pre-fix zero-merge preserved).
-          mergeFiles = [...mergeScope];
-          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${mergeScope.length} file(s) in this root's scope (recorded ∪ staged)`);
+          // #1660 fail-open bound: this fallback fires only when the PASS named
+          // NO files, so its SOURCE is the set the gate is CURRENTLY blocking
+          // for this root (the authoritative set) — never the union scope's
+          // staged-diff component alone. A hash-less PASS must not infer (and
+          // bless) a file no verifier was told about. `mergeScope` stays the
+          // FILTER in `scopeFiles` below, so a prompt-NAMED staged file still
+          // converges (the #1660/#190 union), while an un-named staged file
+          // stays blocked one round and the agent re-dispatches naming it —
+          // a converged remedy, not an inferred bless.
+          mergeFiles = [...blockFiles];
+          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${blockFiles.length} blocked file(s) for this root (no file list to infer from)`);
         } else {
           mergeFiles = [];
         }
@@ -4597,28 +4605,13 @@ export default function (pi: ExtensionAPI) {
       // and mark them as verified anyway. Better to allow the commit than
       // block on a model JSON-compliance issue (#5724).
       // #190: broadened regex + wrong-root guard + staged-diff scoping, same as
-      // the plain-text branch (never a blind pass-through).
-      const fileMatch = prompt.match(/verify files:\s*(.+?)(?=(?:\.|\n)\s*(?:Classification:|Project root:|$))/);
-      const rawFiles = fileMatch ? fileMatch[1].split(/\s+/).filter(Boolean) : [];
-      // #1660: resolve the root FIRST and expand a named directory against
-      // THIS root's blocked set (not the mutable single slot).
+      // the plain-text branch (never a blind pass-through). The named directory
+      // expands against THIS root's union scope (see promptFileList).
       const { root: projectRoot } = resolveMergeRoot(lastBlockedCwd, prompt);
       const blockFiles = blockedContextFor(projectRoot); // #1660: per-root context, not the mutable slot
       // #1660/#190: union with the current staged diff (see mergeScopeFor).
       const mergeScope = mergeScopeFor(projectRoot, blockFiles);
-      const promptFiles = new Set<string>();
-      for (const f of rawFiles) {
-        const isDir = f.endsWith('/') || !f.includes('.');
-        // #1660: union scope here too — a stale recorded set must not drop a
-        // newly staged file under the named directory (see the plain-text site).
-        if (isDir && mergeScope.length > 0) {
-          for (const blocked of mergeScope) {
-            if (blocked.startsWith(f)) promptFiles.add(blocked);
-          }
-        } else {
-          promptFiles.add(f);
-        }
-      }
+      const promptFiles = promptFileList(prompt, mergeScope);
       if (promptFiles.size > 0) {
         // #285 P2-B: refuse the #5724 fail-open prompt-merge for task
         // sub-agents — an unparseable verifier response must NOT silently
@@ -4711,19 +4704,30 @@ export default function (pi: ExtensionAPI) {
     // #336: a schema-valid PASS with EMPTY verified_files carries no
     // verifier-supplied hashes — the pre-#336 code zero-merged here (records
     // nothing) and every commit/PR create re-blocked despite a fresh PASS.
-    // Fall back to the files the gate is CURRENTLY blocking: hash them at
-    // merge time (current disk state) so a post-PASS edit still re-blocks
-    // (fail-closed), and diff-scope them so a hash-less PASS can never mark
-    // arbitrary files verified. A root with no block context → zero-merge (the
-    // staged-diff component ALONE is never blessed here: a hash-less PASS names
-    // no files, so only the gate's own blocked set may stand in for its intent).
+    // Fall back to the files the prompt NAMED, else the files the gate is
+    // CURRENTLY blocking: hash them at merge time (current disk state) so a
+    // post-PASS edit still re-blocks (fail-closed), and diff-scope them against
+    // `mergeScope` so a hash-less PASS can never mark arbitrary files verified.
+    // The staged diff is used only as the SCOPE filter — never as a SOURCE — so
+    // a hash-less PASS cannot infer (and bless) a file no verifier was told
+    // about. A root with nothing blocked and nothing named → zero-merge.
     if (result.verified_files.length === 0) {
-      const fallbackScope = blockFiles.length > 0 ? mergeScope : [];
+      // #336/#1660 fail-open bound: a PASS with no per-file hashes carries no
+      // file list of its own. Source the fallback from the PROMPT's file list
+      // when the agent named one (the verifier was shown those paths and
+      // passed them), otherwise from the set the gate is CURRENTLY blocking for
+      // this root. NEVER from the union scope's staged-diff component alone: a
+      // hash-less PASS must not infer a file no verifier was told about.
+      // `mergeScope` stays the FILTER, so a prompt-NAMED staged file still
+      // converges while an un-named staged file stays blocked one round.
+      const promptFiles = promptFileList(prompt, mergeScope);
+      const fallbackSource = promptFiles.size > 0 ? [...promptFiles] : [...blockFiles];
+      const { kept: fallbackScope } = scopeFiles(fallbackSource, projectRoot, mergeScope, verifiedSet);
       const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, fallbackScope, projectRoot);
       if (fallbackMerged > 0) {
         vgateFailures = 0;
         recordDispatchSuccess(); // #561
-        console.log(`[verification-gate] ✅ PASS (empty verified_files) — recorded ${fallbackMerged} blocked files from disk (${verifiedSet.size} total)`);
+        console.log(`[verification-gate] ✅ PASS (empty verified_files) — recorded ${fallbackMerged} ${promptFiles.size > 0 ? "prompt-named" : "blocked"} file(s) from disk (${verifiedSet.size} total)`);
         writeBridge(projectRoot, Array.from(verifiedSet.keys()));
         lastBlockedCwd = null; // consume on successful merge (#5607)
       } else {
@@ -4732,9 +4736,9 @@ export default function (pi: ExtensionAPI) {
         // #1660: name both roots + why nothing recorded. P2: the cause must not
         // assert "no block context" when a block context existed but its files
         // could not be read (deleted/unreadable) — that is a different remedy.
-        const cause = blockFiles.length === 0
-          ? "no blocked-file context for this root — a hash-less PASS has nothing to record"
-          : `none of the ${fallbackScope.length} file(s) in this root's scope (recorded ∪ staged) could be hashed (unreadable or deleted from disk)`;
+        const cause = fallbackSource.length === 0
+          ? "no blocked-file context for this root and no prompt file list — a hash-less PASS has nothing to record"
+          : `none of the ${fallbackSource.length} ${promptFiles.size > 0 ? "prompt-named" : "blocked"} file(s) could be hashed (unreadable or deleted from disk, or outside this root's scope)`;
         console.error(`[verification-gate] ⚠️ PASS with empty verified_files — zero-merge (${cause}), failure streak NOT reset (#132)`);
         console.error(`[verification-gate] ⚠️ #1660 zero-merge: verifier root=${projectRoot}, blocked-op root=${lastBlockedCwd ?? "<none>"}, blocked files for root=${blockFiles.length}`);
         noteVerifierDisposition(projectRoot, 0, fallbackMerged, cause);
