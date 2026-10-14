@@ -136,12 +136,14 @@ itself an operator: that NAND's base doubles to 16.0 *before* the rating, so
 even unrated it already clamps to `10.0` and a best rating gains nothing
 (weakening still lands — `16.0 × 0.5 = 8.0`).
 
-> **Do not confuse these with source credibility tiers.** `sourceKind`
-> (T0–T4) and the `credibility` kwarg set a **Point's** Beta prior — how much
-> we trust the claim itself. The annotation dimensions grade an
-> **Operator's** weight — how much this connection contributes. They are
-> separate systems: a T0 source on a heavily-biased connection is still a
-> heavily-biased connection.
+> **Do not confuse these with source credibility tiers.** A **Point's** Beta
+> prior — how much we trust the claim itself — comes from its sources'
+> `sourceKind` (T0–T4), not from the `credibility` kwarg. That kwarg is a
+> validated *label*, not a strength: it adds one weak evidence body, the same
+> for every ladder word, and does not select the tier prior. The annotation
+> dimensions grade an **Operator's** weight — how much this connection
+> contributes. They are separate systems: a T0 source on a heavily-biased
+> connection is still a heavily-biased connection.
 
 ## The Critical Semantic: Truth vs Weight
 
