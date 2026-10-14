@@ -126,10 +126,13 @@ report_survivor() {
     [ "$seen" = "$f" ] && return 0
   done
   SECRET_REPORTED+=("$f")
-  # "or even inspected": `rm -f` also fails when the PARENT denies traversal and the file was never
-  # there, so the honest claim is that we could neither remove nor verify — not that a credential is
-  # definitely on disk. The direction is deliberately fail-closed.
-  say "SECURITY: $f could not be removed (or even inspected — its directory denies access); delete it by hand before handing this VM on" >&2
+  # No CAUSE is claimed, deliberately: `rm -f` fails for a denied parent directory, but equally for
+  # EROFS, an immutable file, EBUSY on a mount point, or EISDIR (the path is a directory). Naming
+  # one would send an operator to `chmod` a directory on a read-only filesystem. "or even inspected":
+  # a denied parent also hides the file from the stat above, so the honest claim is that we could
+  # neither remove nor verify — not that a credential is definitely on disk. The direction is
+  # deliberately fail-closed, and the operator is told to verify by hand.
+  say "SECURITY: $f could not be removed (or even inspected); delete it by hand before handing this VM on" >&2
 }
 
 # remove_secrets — remove every registered secret. Non-zero if ANY survived.
@@ -159,11 +162,16 @@ install_secret_traps() {
   # `trap - EXIT` first stops a re-entry from the demotion below; signals are then IGNORED
   # (`trap "" …`, NOT `trap - …`, which would merely restore the fatal default) so a SECOND signal
   # cannot kill the shell half-way through the cleanup and leave the rest of the list behind.
+  # PIPE is in that list for the same reason, and it is the one that actually bites: the cleanup LOGS
+  # each removal, so when stdout is a pipe whose reader is gone the log write itself raises SIGPIPE.
+  # Measured on bash 3.2.57 with only INT/TERM/HUP ignored — two registered secrets and a dead
+  # stdout left the SECOND on disk, because the shell died on the first entry's log line before the
+  # loop reached it. ⛔ The silence is scoped to this trap: outside it SIGPIPE keeps its default.
   # The handler is DEMOTE-ONLY: it never invents a status. A surviving secret turns a would-be 0 into
   # 1 (so `CELL READY` can never accompany a leftover credential); anything else FALLS THROUGH,
   # leaving bash's own status untouched. An explicit `exit "$?"` here would be wrong — `$?` inside
   # an EXIT trap after a fatal signal is 0, not 128+signo.
-  trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP; if ! remove_secrets && [ "$rc" -eq 0 ]; then exit 1; fi' EXIT
+  trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP PIPE; if ! remove_secrets && [ "$rc" -eq 0 ]; then exit 1; fi' EXIT
 }
 
 install_secret_traps
