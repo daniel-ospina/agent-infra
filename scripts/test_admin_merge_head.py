@@ -372,6 +372,10 @@ def test_the_SOURCED_path_refuses_a_bad_knob_instead_of_claiming_an_unread_head(
         ("resolve_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "0", "permits no read at all"),
         ("resolve_head", "ADMIN_MERGE_HEAD_ATTEMPTS", "08", "is invalid octal to the arithmetic"),
         ("resolve_head", "ADMIN_MERGE_HEAD_READ_SLEEP", "abc", "is not a number"),
+        # Symmetry: `require_head` is pinned for `010` above, so `resolve_head` is too. The owner
+        # of the arithmetic is `resolve_head`, and a leading-zero knob is the case where the two
+        # disagree — testing the delegator but not the owner is how round 5's guard went uncovered.
+        ("resolve_head", "ADMIN_MERGE_HEAD_READ_SLEEP", "010", "is a leading zero (octal)"),
     ):
         r = _drive(tmp_path, "exit 1", f'{fn} 1; echo "rc=$?"', extra_env={knob: bad})
         assert "refusing a bad head-read knob" in r.stderr, (

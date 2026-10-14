@@ -2414,6 +2414,17 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # post_read_call_made — 0 when the rail made a `isDraft` probe, i.e. it CONTINUED past a
 # successful head read. The discriminator §13b/§13c/§13d/§13e rest on.
 #
+# A MISSING OR EMPTY LEDGER is a fail-open direction in a fail-closed guard, recorded here rather
+# than guarded. `post_read_call_made` returns 1 — the correct value — but at the `&& fail || pass`
+# sites (§13b/§13c/§13d) that is the PASS arm, so such a scenario reports green without ever
+# having shown the rail reached the head read. With the suite's fake `gh` in place it cannot
+# arise: the head read IS a `gh` call and `new_scen` creates the ledger, so any attempted read
+# leaves a line. It is recorded and not guarded because a third return status would put machinery
+# on the one state the harness cannot reach, and this file's standard is the LEAST machinery that
+# makes the behaviour trustworthy. (§13e inverts the arms, so it would go RED — the asymmetry is
+# right.) THE LIMIT: a rail that refused with zero `gh` invocations at all would satisfy §13b's
+# assertions on an empty ledger.
+#
 # ⛔ NO PIPE (#841) — AND THIS IS NOT A STYLE POINT. The first version of this anchor was
 # `grep 'isDraft' "$SCEN/calls" | grep -qv 'headRefOid'`, which is the `writer | grep` shape this
 # file explicitly forbids further down (see the note at the §~7000 belt: under `set -uo pipefail`
