@@ -2130,8 +2130,10 @@ function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: a
     "   → Permitted without a hatch: `git pull --ff-only` / `git merge --ff-only`",
     "     (a fast-forward cannot move the tip backwards or rewrite a commit).",
     "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
-    "   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for",
-    "     deliberate solo sessions.",
+    "   → Or stamp the ~/.pi/agent/.allow-main-edits marker (15-min TTL) —",
+    "     reachable from an ALREADY-RUNNING session — or set",
+    "     AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for deliberate",
+    "     solo sessions.",
   ].join("\n");
 }
 
@@ -2725,6 +2727,13 @@ export default function (pi: ExtensionAPI) {
             // origin/main` (and `… && git rebase origin/main`) ran with the
             // sanctioned return's blessing. Otherwise fall through to the
             // remaining gates, which see the command's real verdict.
+            // #1144 (cycle-3 reviewer P0): `stateCarveOutClean` is a claim about
+            // the WHOLE command's invocation list, so the classifier folds
+            // `hiddenStateSubst` into it — a hidden shell payload (`eval "git
+            // reset --hard …"`, `$(…)`, backticks) contributes no invocation and
+            // would otherwise leave the list looking clean. The flag is consulted
+            // at classification time, the same way `syncOnlyInvocation` and
+            // `_allInvocationsWorktreeScoped` consult it.
             if (det.stateCarveOutClean === true) return undefined;
           }
         }

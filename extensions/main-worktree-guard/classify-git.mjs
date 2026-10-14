@@ -3404,10 +3404,26 @@ export function classifyGitCommandDetailed(command) {
   // HUB_READONLY_VERBS set, plus a refspec-less `fetch`).
   // #1144 (cycle-2 reviewer P3): `fetch` IS read-only for the carve-out's
   // purpose UNLESS it carries a refspec (`+src:dst` / `:dst` writes refs).
-  out.stateCarveOutClean = invocations.every((v) =>
-    ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb) ||
-    HUB_READONLY_VERBS.has(v.verb) ||
-    (v.verb === "fetch" && !(v.args || []).some((x) => _stripQuotes(x).includes(":"))));
+  //
+  // #1144 (cycle-3 reviewer P0): `!hiddenStateSubst` is REQUIRED here. This
+  // predicate is a claim about the WHOLE command's invocation list, so it is
+  // unsound without the same hidden-substitution guard `syncOnlyInvocation`
+  // (above) and `_allInvocationsWorktreeScoped` (index.ts) already carry — and
+  // this is the THIRD consumer of that invariant. A shell payload
+  // (`eval "git reset --hard …"`, `$(…)`, backticks) EXECUTES git but
+  // contributes NO invocation, so the visible list looks clean and the carve-out
+  // closed the whole command: `git checkout main && eval "git reset --hard
+  // origin/main"` ran in the shared hub with the sanctioned return's blessing
+  // while its visible twin was refused. Hidden substitution ⇒ the list is
+  // incomplete ⇒ not provably clean.
+  //
+  // #1144 (cycle-3 reviewer P2): the read-only test is ARGUMENT-scoped
+  // (`_isCarveOutReadOnlyInvocation`), not just the verb-only HUB_READONLY_VERBS
+  // set, so the pure-query forms of mixed verbs (`worktree list`, `stash list`,
+  // bare `tag`) no longer false-block the sanctioned `checkout main && …`
+  // ceremony.
+  out.stateCarveOutClean = !hiddenStateSubst && invocations.every((v) =>
+    _isCarveOutReadOnlyInvocation(v));
 
   // #1144 (cycle-2 reviewer P0): per-invocation repo hints. The LEGACY_BLOCK
   // arm exempts worktree-isolated destructive ops from `eff.isWorktree`, but
@@ -4204,6 +4220,40 @@ const HUB_READONLY_VERBS = new Set([
   // arg-taking scripts).
   "check-ignore",
 ]);
+
+/**
+ * #1144 (cycle-3 reviewer P2): is this invocation provably a PURE QUERY, for
+ * the M3 carve-out's "every OTHER git invocation is read-only" test?
+ *
+ * A verb-only set (HUB_READONLY_VERBS) misses every verb with a read-only FORM
+ * and a mutating form, so the common post-ceremony pattern
+ * `git checkout main && git worktree list` / `… && git stash list` /
+ * `… && git tag` was false-blocked (safe direction, but a regression against
+ * base and against the README's stated contract). Argument-scoped and
+ * fail-closed: anything not PROVEN to be a query returns false, so the mutating
+ * cousins (`worktree add|prune|remove`, bare `stash` = push, `tag <name>`,
+ * `stash push/drop`) stay gated.
+ * @param {{verb: string, args?: string[]}} v
+ * @returns {boolean}
+ */
+function _isCarveOutReadOnlyInvocation(v) {
+  const verb = v.verb;
+  const args = v.args || [];
+  // The carve-out's own branch-state verbs (pre-existing allowance — the
+  // sanctioned return itself, plus the state-verb family it already admitted).
+  if (["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(verb)) return true;
+  if (HUB_READONLY_VERBS.has(verb)) return true;
+  // A refspec-less fetch cannot write refs/heads/* (cycle-2 reviewer P3).
+  if (verb === "fetch") return !args.some((x) => _stripQuotes(x).includes(":"));
+  const pos = args.filter((x) => !x.startsWith("-"));
+  // `worktree` bare and `worktree list` are queries; add/prune/remove mutate.
+  if (verb === "worktree") return pos.length === 0 || pos[0] === "list";
+  // `tag` bare lists; `tag <name>` creates, delete/verify forms are not queries.
+  if (verb === "tag") return pos.length === 0;
+  // `stash list`/`stash show` are queries; bare `stash` = push, drop/pop apply.
+  if (verb === "stash") return pos[0] === "list" || pos[0] === "show";
+  return false;
+}
 
 /** Mutating git verbs with NO sanctioned recovery form — always blocked. */
 const HUB_MUTATING_VERBS = new Set([

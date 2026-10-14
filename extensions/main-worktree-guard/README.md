@@ -310,7 +310,11 @@ one level down:
   `git checkout main && git reset --hard origin/main` ran with its blessing. It
   now closes the command only when every OTHER invocation is read-only — where
   "read-only" includes a refspec-less `git fetch`, which cannot write
-  `refs/heads/*`.
+  `refs/heads/*`, and is decided **per argument** for verbs with a read-only
+  FORM and a mutating form (`worktree list` is a query, `worktree add` is not;
+  bare `tag`/`stash list` are queries, `tag <name>`/bare `stash` are not), so
+  the ordinary `git checkout main && git worktree list` ceremony is not
+  false-blocked.
 
 A second adversarial review cycle then found the same two rules **incompletely
 closed**, and they are enforced here rather than deferred:
@@ -334,6 +338,19 @@ closed**, and they are enforced here rather than deferred:
   `hiddenStateSubst` (`eval`, `$(…)`, backticks, piped-stdin shells, heredocs —
   the hub gate's hardened shape set) now forces `syncOnlyInvocation` false and
   the worktree exemption false: absent/partial evidence fails closed.
+
+A third fresh-context adversarial review cycle found the same hidden-payload
+rule **incompletely closed one consumer over**, and it is enforced here rather
+than deferred:
+
+- **The M3 carve-out is the THIRD consumer of "the invocation list is the whole
+  command".** A hidden payload contributes no invocation, so the visible list
+  still looked clean and the carve-out closed the command even while the
+  classifier's own verdict was `block:reset` — `git checkout main && eval "git
+  reset --hard origin/main"` (and the own-baseline rename arm, and the `$(…)`
+  twin) reached the shared hub through the sanctioned return. `stateCarveOutClean`
+  now requires `!hiddenStateSubst`, exactly as `syncOnlyInvocation` and the
+  worktree exemption do: absent/partial evidence fails closed.
 
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so

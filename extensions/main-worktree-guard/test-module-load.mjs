@@ -414,6 +414,13 @@ async function partB() {
       && /git merge --ff-only/.test(rebaseShared.reason ?? "")
       && /AGENT_ALLOW_MAIN_EDITS=1/.test(rebaseShared.reason ?? ""),
       `reason=${JSON.stringify(rebaseShared?.reason ?? "")}`);
+    // #1239 (cross-lane): the env hatch cannot be set on a RUNNING pi process,
+    // so the reachable remedy for an already-blocked agent is the TTL'd marker.
+    // The refusal must name it (the pre-fix message offered only the unreachable
+    // env form, leaving a blocked agent with no discoverable hatch).
+    expectTrue("B9a-msg2: the refusal names the REACHABLE hatch (~/.pi/agent/.allow-main-edits) (#1239)",
+      !!rebaseShared && /\.allow-main-edits/.test(rebaseShared.reason ?? ""),
+      `reason=${JSON.stringify(rebaseShared?.reason ?? "")}`);
     // Print the new refusal verbatim — reviewers should read the text an agent
     // actually sees, not just the assertion name.
     console.log((rebaseShared?.reason ?? "(no reason)").split("\n").map((l) => `     | ${l}`).join("\n"));
@@ -612,6 +619,68 @@ async function partB() {
     const wtOnlyAgain = await callBash(`git -C ${leadWt} reset --hard origin/main`);
     expectTrue("B9r-cont: a wholly worktree-isolated `reset --hard` stays ALLOWED (#1144 B8-hidden control)",
       wtOnlyAgain === undefined, `handler returned ${JSON.stringify(wtOnlyAgain)}`);
+
+    // ── B9s–B9t: #1144 cycle-3 reviewer closures ─────────────────────────
+    // A third fresh-context adversarial reviewer reproduced the declared
+    // classes one consumer over: `stateCarveOutClean` (the M3 #376
+    // return-to-original carve-out) reasoned "the invocation list is the whole
+    // command" WITHOUT consulting `hiddenStateSubst`, so a shell-hidden payload
+    // rode the sanctioned return into the shared hub; and its read-only sibling
+    // test was verb-only, so pure queries false-blocked the same ceremony.
+
+    // B9s — the hidden payload riding the carve-out. `eval "…"`/`$(…)`
+    // contributes NO invocation, so the visible list looked clean and the
+    // carve-out closed the WHOLE command while the classifier's own verdict was
+    // `block:reset`/`block:clean`/`block:rebase` — i.e. the evidence was
+    // detected and the carve-out did not consult it. No `#1144` marker on the
+    // reset/clean twins: they are refused by the legacy destructive arm.
+    const evalResetReturn = await callBash('git checkout main && eval "git reset --hard origin/main"');
+    expectTrue("B9s: `checkout main && eval \"reset --hard\"` is BLOCKED (#1144 B9-carve-out-hidden)",
+      !!evalResetReturn && evalResetReturn.block === true,
+      `handler returned ${JSON.stringify(evalResetReturn)} — the carve-out laundered a hidden reset`);
+    const evalCleanReturn = await callBash('git checkout main && eval "git clean -fdx"');
+    expectTrue("B9s2: `checkout main && eval \"clean -fdx\"` is BLOCKED (#1144 B9-carve-out-hidden)",
+      !!evalCleanReturn && evalCleanReturn.block === true,
+      `handler returned ${JSON.stringify(evalCleanReturn)} — the carve-out laundered a hidden clean`);
+    const evalRebaseReturn = await callBash('git checkout main && eval "git rebase origin/main"');
+    expectTrue("B9s3: `checkout main && eval \"rebase\"` is BLOCKED (#1144 B9-carve-out-hidden)",
+      !!evalRebaseReturn && evalRebaseReturn.block === true,
+      `handler returned ${JSON.stringify(evalRebaseReturn)} — the carve-out laundered a hidden branch move`);
+    const subResetReturn = await callBash('git checkout main && $(git reset --hard origin/main)');
+    expectTrue("B9s4: the `$(…)` twin riding the carve-out is BLOCKED (#1144 B9-carve-out-hidden)",
+      !!subResetReturn && subResetReturn.block === true,
+      `handler returned ${JSON.stringify(subResetReturn)}`);
+    // The own-baseline RENAME arm re-baselines through the same carve-out, so it
+    // was blind identically (`git branch -M main tmpname && eval "…"`).
+    const renameEvalReset = await callBash('git branch -M main tmpname && eval "git reset --hard origin/main"');
+    expectTrue("B9s5: the own-baseline RENAME arm does not launder a hidden payload (#1144 B9-carve-out-hidden)",
+      !!renameEvalReset && renameEvalReset.block === true,
+      `handler returned ${JSON.stringify(renameEvalReset)} — the rename re-baseline arm was blinded too`);
+
+    // B9t — cycle-3 reviewer P2 (regression introduced by the carve-out
+    // closure): `HUB_READONLY_VERBS` is verb-only, so the pure-query forms of
+    // mixed verbs false-blocked the sanctioned return. These were ALLOWED at
+    // base; the closure must not refuse them.
+    const wtList = await callBash("git checkout main && git worktree list");
+    expectTrue("B9t: `checkout main && worktree list` stays ALLOWED — no false block (#1144 P2)",
+      wtList === undefined, `handler returned ${JSON.stringify(wtList)}`);
+    const stashList = await callBash("git checkout main && git stash list");
+    expectTrue("B9t2: `checkout main && stash list` stays ALLOWED — no false block (#1144 P2)",
+      stashList === undefined, `handler returned ${JSON.stringify(stashList)}`);
+    const tagList = await callBash("git checkout main && git tag");
+    expectTrue("B9t3: `checkout main && tag` (list form) stays ALLOWED — no false block (#1144 P2)",
+      tagList === undefined, `handler returned ${JSON.stringify(tagList)}`);
+    // …while the MUTATING cousins of those same verbs stay gated (the
+    // argument-scoped form is the discriminator, not the verb).
+    const wtAdd = await callBash(`git checkout main && git worktree add ${join(tmp, "p2-wt")}`);
+    expectTrue("B9t-cont: `checkout main && worktree add` stays BLOCKED (#1144 P2 control)",
+      !!wtAdd && wtAdd.block === true, `handler returned ${JSON.stringify(wtAdd)}`);
+    const tagCreate = await callBash("git checkout main && git tag v1");
+    expectTrue("B9t-cont2: `checkout main && tag v1` (create) stays BLOCKED (#1144 P2 control)",
+      !!tagCreate && tagCreate.block === true, `handler returned ${JSON.stringify(tagCreate)}`);
+    const stashPush = await callBash("git checkout main && git stash");
+    expectTrue("B9t-cont3: `checkout main && stash` (bare = push) stays BLOCKED (#1144 P2 control)",
+      !!stashPush && stashPush.block === true, `handler returned ${JSON.stringify(stashPush)}`);
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE

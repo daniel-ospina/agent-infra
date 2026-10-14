@@ -1118,6 +1118,34 @@ expectBool("#1144: `checkout main && fetch` (bare, no refspec) → stateCarveOut
   classifyGitCommandDetailed("git checkout main && git fetch").stateCarveOutClean === true, true);
 expectBool("#1144: `checkout main && fetch --depth 1 --quiet origin` → stateCarveOutClean true (no refspec)",
   classifyGitCommandDetailed("git checkout main && git fetch --depth 1 --quiet origin").stateCarveOutClean === true, true);
+// #1144 cycle-3 reviewer P0: the carve-out predicate is a claim about the WHOLE
+// command's invocation list, so it must consult `hiddenStateSubst` exactly as
+// the sync arm and the worktree exemption do. A shell payload contributes no
+// invocation, so the visible list can look clean while the classifier's own
+// verdict is block:reset — the carve-out would close a command it never saw.
+expectBool("#1144 B9-carve-out-hidden: `checkout main && eval \"reset --hard\"` → stateCarveOutClean FALSE (hidden payload)",
+  classifyGitCommandDetailed('git checkout main && eval "git reset --hard origin/main"').stateCarveOutClean === false, true);
+expectBool("#1144 B9-carve-out-hidden: its visible twin is also FALSE (the discriminator is the visible list)",
+  classifyGitCommandDetailed("git checkout main && git reset --hard origin/main").stateCarveOutClean === false, true);
+expectBool("#1144 B9-carve-out-hidden: hiddenStateSubst is the evidence the clean claim is unprovable",
+  classifyGitCommandDetailed('git checkout main && eval "git reset --hard origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B9-carve-out-hidden: a hidden git QUERY also clears the clean claim (fail closed — the list is incomplete either way)",
+  (() => { const d = classifyGitCommandDetailed('git checkout main && eval "git status"'); return d.hiddenStateSubst === true && d.stateCarveOutClean === false; })(), true);
+// #1144 cycle-3 reviewer P2: the read-only sibling test is argument-scoped for
+// verbs with a read-only FORM and a mutating form — the pure queries that
+// false-blocked the ceremony are admitted, their mutating cousins stay gated.
+expectBool("#1144 P2: `checkout main && worktree list` → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git worktree list").stateCarveOutClean === true, true);
+expectBool("#1144 P2: `checkout main && stash list` → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git stash list").stateCarveOutClean === true, true);
+expectBool("#1144 P2: `checkout main && tag` (list form) → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git tag").stateCarveOutClean === true, true);
+expectBool("#1144 P2 control: `checkout main && worktree add` → stateCarveOutClean false (mutating form)",
+  classifyGitCommandDetailed("git checkout main && git worktree add /tmp/x").stateCarveOutClean === false, true);
+expectBool("#1144 P2 control: `checkout main && tag v1` → stateCarveOutClean false (creates a ref)",
+  classifyGitCommandDetailed("git checkout main && git tag v1").stateCarveOutClean === false, true);
+expectBool("#1144 P2 control: `checkout main && stash` (bare = push) → stateCarveOutClean false (mutating form)",
+  classifyGitCommandDetailed("git checkout main && git stash").stateCarveOutClean === false, true);
 
 // ── #1144 follow-up closures: B6o (short value slot) · B9d-hidden (eval payload
 // riding a visible sync) · B8-hidden (eval payload riding a worktree-exempt
