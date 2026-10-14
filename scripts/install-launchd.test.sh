@@ -24,6 +24,10 @@
 #   --status               installed/loaded/drift reporting
 #   --uninstall            bootout + remove; re-run reports NOT INSTALLED
 #   template lint          plutil -lint the rendered plists (when plutil exists)
+#   #1719 runner gate      templates/launchd/com.tortoise.ci-runner-gate.plist installs
+#                          the farmed ci_runner_gate.sh under the label the hand-made
+#                          duplicate used, AND no rendered plist PATH carries the pi
+#                          shim dir (launchd cannot exec into ~/Documents, #427)
 #
 # Vehicle job for reload/fail/broken-target/status sections = the latency
 # tripwire (com.eldato.provider-latency-tripwire, StartInterval 3600); the
@@ -102,10 +106,42 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
+    # #1719 — the gate job's plist target. Its farm entry is `fleet_srcs` (setup.sh copies it to
+    # scripts/), so it must resolve here or the broken-target guard refuses the install.
+    # The shim dir is created too: it is the path the installer must NOT hand to a launchd job
+    # (symlinks into ~/Documents → EPERM under TCC, #427), and run_installer puts it on PATH.
+    mkdir -p "$1/.pi/agent/shims"
+    touch "$1/.pi/agent/shims/gh"
+    # #1719 (review E2) — a PATH entry that is a SYMLINK to the shim dir matches no literal name
+    # pattern, so the helper must resolve the PHYSICAL path to drop it. Created here so run_installer
+    # can put it on PATH; its presence in a rendered plist is a failure.
+    ln -sfn "$1/.pi/agent/shims" "$1/.pi/agent/shimlink"
+    # #1719 (review E2) — the REVERSE control: ~/.pi/agent/bin holds REAL fd/rg binaries and is
+    # outside the TCC-protected tree, so it must SURVIVE the filter. Mirrors install.sh:add_dir(),
+    # whose blanket `*/.pi/*` exclusion would wrongly drop it here.
+    mkdir -p "$1/.pi/agent/bin"
+    touch "$1/.pi/agent/bin/rg"
+    chmod +x "$1/.pi/agent/bin/rg"
+    # #1719 (review D2-3) — a PATH entry containing `&`, the sed replacement's "whole match" token.
+    # Without escaping, `render` turns it into a corrupted entry with a literal {{PATH}} left in the
+    # middle of it, and nothing downstream notices (verify_targets inspects ProgramArguments only).
+    mkdir -p "$1/.pi/agent/r&d"
+    # #1719 (review D3) — a PATH entry carrying a GLOB character. `for p in $PATH` splits on IFS=: as
+    # intended, but it ALSO pathname-expands each entry, so `.../globs/a*` was silently rewritten as
+    # the entries it matched — a job PATH the installer's own shell never had, and no test noticed.
+    # Two real dirs exist so an expansion has something to match; the assertion below reads the
+    # RENDERED PATH and fails if either fabricated entry appears.
+    mkdir -p "$1/.pi/agent/globs/aa" "$1/.pi/agent/globs/ab"
+    # #1719 (review B4-2/E5) — the `CDPATH= cd` fix needs a CASE, not just code: `cd` honours CDPATH,
+    # so a bare `cd` KEEPS a relative PATH entry that does not resolve from the installer's cwd, as
+    # long as some CDPATH directory happens to carry that name. run_installer exports CDPATH here and
+    # puts the relative name on PATH; the entry must come out DROPPED (the helper drops whatever does
+    # not resolve), so its presence in a rendered plist means the fix was reverted.
+    mkdir -p "$1/.pi/agent/cdpath/cdpathphantom"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -155,7 +191,13 @@ LOG2="$T/launchctl-retire.log"  # isolated log for the HOME2 retirement section
 run_installer() { # <home> [extra env assignments...]
     (
         export HOME="$1"
-        export PATH="$T/bin:$PATH"
+        # #1719: the shim dir is FIRST on an interactive session's PATH, exactly as it is on a real
+        # box — the renderer must strip it, so the suite puts it there deliberately (otherwise the
+        # PATH assertion below would be vacuous). A SYMLINK to it and the real-binary dir
+        # (~/.pi/agent/bin, holding fd/rg) are on PATH too: the first must be dropped by physical
+        # path, the second must be KEPT (review E2).
+        export CDPATH="$HOME/.pi/agent/cdpath"
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$HOME/.pi/agent/globs/a*:cdpathphantom:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -178,6 +220,7 @@ assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reape
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
+assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
@@ -238,6 +281,80 @@ assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "ba
 assert_contains "$(cat "$DBW_INSTALLED")" "<integer>900</integer>" "balance-watch runs every 15min (StartInterval 900)"
 assert_not_contains "$(cat "$DBW_INSTALLED")" "StartCalendarInterval" "balance-watch is interval-scheduled, not calendar"
 assert_contains "$(cat "$DBW_INSTALLED")" "<key>PATH</key>" "balance-watch plist carries an explicit PATH env"
+# #1719 — the runner-label gate: the repo's copy must be the one launchd executes, on the SAME
+# label the hand-made duplicate occupied, and it must never be handed the shim dir.
+GATE_INSTALLED="$HOME1/Library/LaunchAgents/com.tortoise.ci-runner-gate.plist"
+if [ -f "$GATE_INSTALLED" ]; then
+  ok "runner-gate plist installed at the hand-made duplicate's own label (#1719)"
+else
+  bad "runner-gate plist NOT installed — the versioned template is wired to nothing (#1719)"
+fi
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "$HOME1/.pi/agent/scripts/ci_runner_gate.sh" "runner-gate plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "<integer>300</integer>" "runner-gate every 5 min (StartInterval 300)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "RunAtLoad" "runner-gate runs once at load (a freshness kick)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-version: 0.1.0" "runner-gate template carries version marker"
+# #1719 — these assertions read the RENDERED PATH VALUE, not the whole plist (review E2-3). The
+# rendered plist keeps the template's comments, and a purely documentary edit that NAMES the shim
+# path (e.g. `~/.pi/agent/shims`, which the installer's own comment uses) would red a whole-file
+# `assert_not_contains "/shims"` while the PATH was correct — a false RED. Extract the value.
+installed_path() { # $1 = plist → the PATH string from EnvironmentVariables
+  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1"
+}
+GATE_PATH_VAL="$(installed_path "$GATE_INSTALLED")"
+assert_contains "$GATE_PATH_VAL" "/usr/bin" "runner-gate plist PATH is rendered from the installer's PATH (non-empty)"
+assert_not_contains "$GATE_PATH_VAL" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
+assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
+assert_contains "$GATE_PATH_VAL" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
+assert_not_contains "$GATE_PATH_VAL" "{{PATH}}" "no placeholder survives into the rendered PATH value (review D2-3)"
+assert_contains "$GATE_PATH_VAL" "r&amp;d" "a PATH entry containing & is XML-escaped in the rendered value (sed replacement escaped, review D2-3)"
+# #1719 (review D3) — a PATH entry containing a GLOB character must never be EXPANDED into its
+# matches (review E4-4 corrected this comment: it does not "reach the plist unexpanded" — with
+# globbing suppressed the literal `globs/a*` no longer resolves, so it is DROPPED, exactly like any
+# other unresolvable entry. What is asserted below is that the FABRICATED matches never appear).
+assert_not_contains "$GATE_PATH_VAL" "globs/aa" "a glob-char PATH entry is not expanded into its matches (review D3)"
+assert_not_contains "$GATE_PATH_VAL" "globs/ab" "…nor into its second match (review D3)"
+# #1719 (review E5) — the `CDPATH= cd` fix in `launchd_path` is otherwise untested: every other PATH
+# entry in this suite is absolute, and CDPATH only affects RELATIVE entries, so reverting the fix left
+# the suite green while the installer rendered an unresolvable relative entry into every plist.
+assert_not_contains "$GATE_PATH_VAL" "cdpathphantom" \
+  "a RELATIVE PATH entry that only CDPATH can resolve is DROPPED, not rendered (review B4-2/E5)"
+
+# #1719 (review D3, run as a RUN not a grep — review E3-5 corrected the earlier claim) — the guard
+# that refuses a job whose rendered PATH came out EMPTY. It IS dynamically reachable: with PATH
+# pointing ONLY at a directory literally NAMED `shims`, every entry is filtered by PHYSICAL path while
+# the installer's own `sed`/`grep`/`mktemp` still resolve THROUGH that directory (they are symlinks
+# inside it) — so `launchd_path` is empty for every {{PATH}} template and the guard must fire. The
+# earlier version of this pin grepped the installer for the guard's MESSAGE, which a deleted guard
+# would satisfy for as long as the string remained anywhere in the file, and it justified the grep
+# with the false claim that the guard could never be reached.
+HOME_GUARD="$T/home-guard"; mkfakehome "$HOME_GUARD"
+SHIMONLY="$T/shimonly/shims"; mkdir -p "$SHIMONLY"
+for tool in bash sh sed grep mktemp cmp cat dirname basename mkdir rm mv chmod awk tr cut head sort stat id; do
+    src="$(command -v "$tool" 2>/dev/null)" || continue
+    ln -sfn "$src" "$SHIMONLY/$tool"
+done
+ln -sfn "$T/bin/launchctl" "$SHIMONLY/launchctl"
+LOG_GUARD="$T/launchctl-emptypath.log"; : > "$LOG_GUARD"
+set +e
+OUT="$(HOME="$HOME_GUARD" PATH="$SHIMONLY" FAKE_LAUNCHCTL_LOG="$LOG_GUARD" \
+    TEMPLATES_DIR="$TEMPLATES" AGENTS_DIR="$HOME_GUARD/Library/LaunchAgents" \
+    AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" TORTOISE_REPO="$HOME_GUARD/tortoise" \
+    SWARM_ROOT="$HOME_GUARD/swarm" PYTHON_BIN="$HOME_GUARD/swarm/.venv/bin/python" \
+    ELDATO_ALLOW_TEST_HOME=1 bash "$INSTALLER" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "0" "an all-shim PATH is a clean SKIP, not a failure (exit 0)"
+assert_contains "$OUT" "SKIP com.tortoise.ci-runner-gate: unresolved placeholder(s) {{PATH}} — every PATH entry is unreadable" \
+  "the empty-rendered-PATH guard FIRES (review D3) — a filtered-away PATH never installs an inert job"
+[ ! -f "$HOME_GUARD/Library/LaunchAgents/com.tortoise.ci-runner-gate.plist" ] \
+  && ok "no runner-gate plist installed while every rendered PATH was empty" \
+  || bad "the runner-gate plist WAS installed with an empty PATH (the guard did not fire)"
+# Positive control — the one template with no {{PATH}} must still install through the SAME run, or
+# the two assertions above could pass because the run did nothing at all.
+[ -f "$HOME_GUARD/Library/LaunchAgents/com.eldato.corruption-canary.plist" ] \
+  && ok "control: the {{PATH}}-free canary still installs in that run (the guard is scoped to {{PATH}})" \
+  || bad "control: the canary did not install — that run proved nothing about the PATH guard"
+assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
@@ -246,7 +363,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "7" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness)"
+assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

@@ -554,6 +554,33 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
+# ── THE HEAD READ'S RETRY BUDGET (#1690) ────────────────────────────────
+# Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
+# exactly like POLL_INTERVAL — NOT inline in `resolve_head`, which is how the first
+# version did it and why `ADMIN_MERGE_HEAD_ATTEMPTS=08` reached the loop: `08` contains
+# no non-digit, so an inline `case '' | *[!0-9]*)` guard passes it, and bash ARITHMETIC
+# then reads it as an invalid OCTAL and errors. The refusal that followed still carried
+# `[head_unreadable]` — so the rail asserted "could not read the head" on a run where
+# ZERO reads were attempted. That is #1690's own symptom, machine-readably, on the
+# instrument whose job is not to make it.
+#
+# ⛔ THE WINDOW IS SIZED FOR A BLIP AND THE SIZE IS STATED (#1690 review). The loop sleeps
+# `HEAD_READ_SLEEP * attempt` BETWEEN attempts, so the old defaults gave 1s + 2s = 3s — and a
+# review measured exactly that, making the point sharply: the incident #1690 reports did not
+# clear inside 3s, so the retry as first written would NOT have recovered it. Now 5 attempts
+# over 2s + 4s + 6s + 8s = 20s.
+#
+# The number is deliberately TENS OF SECONDS, not minutes, and that is the judgement rather
+# than an oversight: a blip (a dropped connection, a DNS hiccup, a TLS retry) clears in
+# seconds, while a rate limit or a credential problem is NOT something to wait out — waiting
+# minutes would hang the rail on a condition it cannot fix. The diagnostic channel below is
+# what covers that case: the operator is told the actual cause and can act, instead of
+# watching a retry exhaust itself against a permanent failure. Both halves are needed;
+# neither replaces the other. A caller that does not want the wait sets
+# ADMIN_MERGE_HEAD_READ_SLEEP=0 — the rail's own test scenarios do exactly that, so the wider
+# default costs the suite no wall-clock time.
+HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-5}"
+HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-2}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -622,6 +649,245 @@ LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .co
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
 info() { printf '%s\n' "$*"; }
+
+# pr_review_record_blocks_update <pr> <expected-head> — 0 when updating would leave a
+# review record stale with nothing able to carry it, 1 when the update is safe.
+#
+# ⛔ THE PATH IS LITERAL, SO THE SLUG MUST BE RESOLVED. `gh` fills `{owner}/{repo}`
+# for API calls, but a record is a FILE at `~/.pi/agent/reviews/<owner>-<repo>-<pr>.json`,
+# and `record-review.sh` AUTO-DETECTS the repo when none is passed — writing the
+# repo-qualified name and deleting the legacy `<pr>.json`. Deriving the path from
+# `$REPO` alone therefore read `reviews/--<pr>.json` plus the legacy name the writer
+# removes, in the documented invocation that sets no `--repo`: the guard silently
+# never fired and the update went ahead. Hence the explicit resolution.
+#
+# ⛔ A RECORD BOUND TO THE HEAD BLOCKS THE UPDATE, FULL STOP. `atomic-land.sh`'s B5
+# permits the update when the PR carries a VERIFIED signed marker — it recomputes
+# the HMAC with the gate key, and the carry arm then re-binds the verdict to the new
+# head. This rail has no gate-key or `openssl` path, and the PR body is
+# attacker-writable, so a shape match is not evidence: a forged or rotated-key
+# `sig=` would read as carryable and the guard would wave through the very move it
+# exists to stop. Rather than reimplement a cryptographic check here, every bound
+# case is refused and the remedy that does not move the head is named. This is
+# therefore STRICTER than B5, never looser: the whole cost is re-triggering the PR's
+# checks by an event that does not move the head (`gh run rerun` is NOT that event — it
+# re-executes the SAME merge commit, so it re-measures the old merge ref).
+#
+# pr_review_record_blocks_update <pr> <expected-head> — 0 when updating would strand a
+# review record, 1 when the update is safe. Prints the specific condition on each block arm.
+#
+# ⛔ BOTH SPELLINGS OF THE REPO KEY MUST BE CHECKED. A record is a FILE at
+# `~/.pi/agent/reviews/<owner>-<repo>-<pr>.json`, and the key is whatever repo string the
+# writer was handed: `record-review.sh` uses the `--repo`/positional repo VERBATIM when it is
+# given one, and the canonical `gh repo view` slug only when it is not. `gh` itself accepts a
+# `--repo` spelling in any case and a PR number with a leading zero, and the merge gate reads
+# the record under the spelling the rail forwards — so a guard that checked a single spelling
+# would miss the other and let the update strand a record the gate still reads.
+#
+# ⛔ CHECK EVERY CANDIDATE, NOT THE FIRST THAT EXISTS. `record-review.sh` deletes a legacy
+# `<pr>.json` only when its embedded `repo` matches, and a repo-less run can leave a stale
+# qualified record beside a fresh legacy one — reading only the first that exists lets the
+# fresh one be shadowed. The legacy name is shared between repos, so it is honoured only when
+# it names no repo or THIS repo, mirroring `atomic-land.sh`'s `read_record` (#426).
+#
+# ⛔ FAIL CLOSED WHEN A RECORD CANNOT BE INTERPRETED. No file at all is genuinely safe. A file
+# that EXISTS whose `head_sha` is missing, unreadable, non-hex or too short is not: the guard
+# cannot tell whether it is bound to this head, and the sibling `atomic-land.sh` refuses on
+# exactly that condition (`stop "the record … carries no usable head_sha"`).
+#
+# Reads records with `$PYTHON_BIN` rather than a new `jq` dependency: every other JSON read in
+# this script goes through it, and a missing `jq` would make the guard fail OPEN behind a
+# `2>/dev/null || true`.
+pr_review_record_blocks_update() {
+  local pr="$1" expected="$2"
+  local rargs=() slug="" cands=() f="" rec_head="" rec_repo="" rec_bound=0
+  [ -n "${REPO:-}" ] && rargs=(--repo "$REPO")
+  slug="$($GH repo view ${rargs[@]+"${rargs[@]}"} --json nameWithOwner \
+      --jq .nameWithOwner 2>/dev/null || true)"
+  # ⛔ AN UNRESOLVED IDENTITY IS NOT A REASON TO SKIP THE CHECK. Both record paths are
+  # named after the canonical slug, so failing to resolve it would leave the qualified
+  # file unchecked and let the update strand the record this guard exists to protect.
+  # Refuse instead: the cost is one re-run, and every other step of this rail needs a
+  # working `gh` against this repo anyway.
+  if [ -z "$slug" ]; then
+    say_err "   ⛔ the repo identity could not be resolved ('gh repo view' returned nothing),"
+    say_err "      so an existing review record cannot be ruled out — refusing to move the head."
+    return 0
+  fi
+  # — THE NUMBER IS KEPT AS GIVEN *AND* STRIPPED. `record-review.sh` names the file with
+  # `$PR` VERBATIM (it only validates `^[0-9]+$`), so a record written for `01631` lives at
+  # `…-01631.json`, while this rail accepts `01631` as the PR argument because GitHub does.
+  # Normalizing in one direction only would read a path the writer never wrote.
+  local nums=("${pr:-0}") n="" keys=("$slug") k=""
+  [ -n "${nums[0]}" ] || nums[0]="0"
+  n="${nums[0]#"${nums[0]%%[!0]*}"}"
+  [ -n "$n" ] || n="0"
+  [ "$n" != "${nums[0]}" ] && nums+=("$n")
+  # ...and the spelling the caller gave, which `record-review.sh` writes verbatim
+  [ -n "${REPO:-}" ] && keys+=("$REPO")
+  # `record-review.sh` also writes the qualified name from `GH_REPO` (that is its repo
+  # resolution), and the merge gate resolves the record through `GH_REPO` as well — so an
+  # environment-only spelling is a real key, exactly like `--repo`.
+  [ -n "${GH_REPO:-}" ] && keys+=("$GH_REPO")
+  for k in "${keys[@]}"; do
+    for n in "${nums[@]}"; do
+      cands+=("$HOME/.pi/agent/reviews/${k%/*}-${k#*/}-$n.json")
+    done
+  done
+  for n in "${nums[@]}"; do
+    cands+=("$HOME/.pi/agent/reviews/$n.json")
+  done
+  expected="$(printf '%s' "$expected" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+
+  # ⛔ A STORE — OR ANY ANCESTOR OF IT — THAT CANNOT BE SEARCHED IS NOT AN ABSENT STORE.
+  # `stat` fails with EACCES when a path component denies search, so every candidate below
+  # would look absent and the update would strand a record the rail never saw. The walk is
+  # over the components: hardening only the store's own bits still reads as "no store at
+  # all" when `~/.pi` or `~/.pi/agent` is what denies search.
+  local rdir="$HOME/.pi/agent/reviews" anc=""
+  for anc in "$HOME" "$HOME/.pi" "$HOME/.pi/agent"; do
+    if [ -d "$anc" ] && [ ! -x "$anc" ]; then
+      say_err "   ⛔ the path to the review store cannot be searched ($anc) — refusing,"
+      say_err "      because a record bound to this head cannot be ruled out."
+      return 0
+    fi
+    if [ -L "$anc" ] && [ ! -e "$anc" ]; then
+      say_err "   ⛔ the path to the review store runs through a dangling symlink ($anc) — refusing."
+      return 0
+    fi
+  done
+  if [ -d "$rdir" ]; then
+    # Only SEARCH is required: the candidates are read by name, so the store need not be
+    # listable (mode 111 is enough). Requiring read made an unlistable-but-searchable
+    # store a refusal for a condition that is false.
+    if [ ! -x "$rdir" ]; then
+      say_err "   ⛔ the review store at $rdir exists but cannot be searched — refusing,"
+      say_err "      because a record bound to this head cannot be ruled out."
+      return 0
+    fi
+  elif [ -e "$rdir" ] || [ -L "$rdir" ]; then
+    say_err "   ⛔ a path exists at $rdir but it is not a directory — refusing, because a"
+    say_err "      record store cannot be read through it."
+    return 0
+  fi
+  for f in "${cands[@]}"; do
+    [ -e "$f" ] || [ -L "$f" ] || continue
+    # ⛔ "EXISTS BUT IS NOT A READABLE REGULAR FILE" IS NOT "NO RECORD". A directory, a
+    # dangling symlink, or a record store this process cannot read would otherwise make
+    # `-f` false and be read as an absent record — the fail-open this guard exists to stop.
+    if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+      say_err "   ⛔ a path exists at $f but it is not a readable regular file — refusing,"
+      say_err "      because the rail cannot tell whether a record is bound to this head."
+      return 0
+    fi
+    rec_bound=0
+    case "${f##*/}" in
+      *-*) : ;;                        # qualified name: the repo is in the FILENAME
+      *)                               # bare <pr>.json: the repo is a FIELD, so check it
+        rec_repo="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("repo") or "")' "$f" 2>/dev/null || true)"
+        rec_repo="$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')"
+        if [ -n "$rec_repo" ] \
+           && [ "$rec_repo" != "$(printf '%s' "$slug" | tr 'A-Z' 'a-z')" ] \
+           && { [ -z "${REPO:-}" ] \
+                || [ "$rec_repo" != "$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')" ]; }; then
+          continue                      # a different repo's PR of the same number
+        fi ;;
+    esac
+    rec_head="$($PYTHON_BIN -c 'import json,sys;print(json.load(open(sys.argv[1])).get("head_sha") or "")' "$f" 2>/dev/null || true)"
+    rec_head="$(printf '%s' "$rec_head" | tr 'A-Z' 'a-z' | tr -d '[:space:]')"
+    if [ -z "$rec_head" ]; then
+      say_err "   ⛔ a review record exists at $f and its head could not be read — refusing,"
+      say_err "      because the rail cannot tell whether it is bound to this head."
+      return 0
+    fi
+    case "$rec_head" in
+      *[!0-9a-f]*)
+        say_err "   ⛔ a review record exists at $f but its head_sha is not a usable commit sha —"
+        say_err "      refusing, because the rail cannot tell what it attests."
+        return 0 ;;
+    esac
+    if [ "${#rec_head}" -lt 7 ]; then
+      say_err "   ⛔ a review record exists at $f but its head_sha is too short to identify a commit."
+      return 0
+    fi
+    case "$expected" in "$rec_head"*) rec_bound=1 ;; esac
+    case "$rec_head" in "$expected"*) rec_bound=1 ;; esac
+    if [ "$rec_bound" -eq 1 ]; then
+      # ⛔ STATE THE CONDITION. The caller's refusal points at "the ⛔ line above", so
+      # every arm that blocks must print one — including this, the commonest arm.
+      say_err "   ⛔ a review record exists at $f and is bound to the head an update would move"
+      say_err "      ($rec_head), so the branch is not moved out from under it."
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ── refresh_pr_branch <pr> <expected-head> ──────────────────────────────────
+# Ask GitHub to bring the PR's head up to date with its base.
+#
+# WHY THE RAIL PERFORMS THE REMEDY IT PRINTS (#4764). Steps 4.6 and 4.7 both
+# refuse because the PR's checks were produced against a base that is not the
+# current one, and both name "update the branch / push an empty commit" as the
+# remedy. That is a fully-specified, mechanical operation handed to whoever runs
+# the rail at the exact moment the rail has already PROVEN it is needed. Doing it
+# here removes the round trip and certifies nothing: the refreshed head carries
+# no completed check, so THIS invocation still refuses exactly as before and the
+# lane re-runs once CI has measured the new head. The refusal is a re-measurement
+# request, and this is the re-measurement.
+#
+# THE GREEN-BASE CASE IS DELIBERATELY NOT REFRESHED. Step 4.7 refuses a lagging
+# merge ref ONLY when the base is red, because a lag onto a green base has
+# nothing the PR failed to measure and refusing on movement alone would refuse
+# essentially every open PR (its comment measures 12 of 12 open tortoise PRs
+# lagging while main was green). A refresh re-runs every check, so performing one
+# where the rail has already decided the lag is harmless would buy nothing and
+# cost a full CI cycle. It is called only where the rail refuses BECAUSE of the
+# lag.
+#
+# `expected_head_sha` is pinned to the head THIS refusal was computed against: a
+# concurrent push makes GitHub refuse the call rather than silently folding a
+# commit nobody analysed into the branch that is about to be merged.
+#
+# Returns 0 when GitHub accepted the request (the new head appears
+# asynchronously, so the caller must NOT report a sha it has not read), 1 when it
+# did not — in which case the printed manual remedy still stands.
+refresh_pr_branch() {
+  local pr="$1" expected="$2"
+  local slug
+  if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
+
+  if pr_review_record_blocks_update "$pr" "$expected"; then
+    say_err "   ⛔ NOT updating: the branch is not moved while a review record could be stranded"
+    say_err "      (the ⛔ line above states the condition found). This rail does not verify carry"
+    say_err "      markers (atomic-land.sh does, with the gate key), so it will not move a head out"
+    say_err "      from under an attestation."
+    say_err "      Clearing this refusal depends on the ⛔ line: for a record BOUND to this head,"
+    say_err "      re-review and re-record at a new head, or re-trigger this PR's checks by an"
+    say_err "      event that does not move it — a re-run re-executes the SAME merge commit, and an"
+    say_err "      update or empty commit moves the head and strands the record. For a store, path or"
+    say_err "      JSON the rail could not read, repair that first: neither action above clears it."
+    return 1
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "admin-merge: would bring the branch up to date with its base (--dry-run mutates nothing)."
+    return 1
+  fi
+  local out
+  out="$($GH api -X PUT "$slug/pulls/$pr/update-branch" \
+            -f "expected_head_sha=$expected" 2>&1)" || {
+    say_err "   (the rail asked GitHub to bring the branch up to date and the call did not succeed:"
+    say_err "    $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-240))"
+    say_err "   The manual remedy below still applies."
+    return 1
+  }
+  info "admin-merge: ⇡ the rail asked GitHub to bring the branch up to date with its base."
+  info "   GitHub recomputes the merge-ref evaluation from this, which is a full check"
+  info "   re-run on the new head. Re-run this rail once those checks complete — the update"
+  info "   itself certifies nothing."
+  return 0
+}
 
 # ── write_merge_retraction <pr> <head> <reason> <detail-file> <detail-label> ──
 #
@@ -904,6 +1170,36 @@ validate_timing_knobs() {
     say_err "   on EVERY poll, so the wait becomes a tight BUSY SPIN of gh calls instead of a paced"
     say_err "   poll — and an interval beyond an hour paces nothing."
   fi
+  if counter_has_leading_zero "$HEAD_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL, so '08' is not 8 but an ERROR that"
+    say_err "   aborts the loop body. The rail would then refuse the PR while reporting that it"
+    say_err "   could not READ the head — a claim about the instrument on a run where the instrument"
+    say_err "   never ran. Write it without the leading zero (e.g. '3')."
+  elif ! counter_is_positive "$HEAD_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — the head-read retry"
+    say_err "   budget must be a POSITIVE integer. A non-numeric value errors the loop's arithmetic,"
+    say_err "   and a non-positive one attempts no read at all before refusing."
+  elif counter_exceeds_max "$HEAD_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — beyond the usable range"
+    say_err "   (max ${TIMING_KNOB_MAX})."
+  fi
+  if counter_has_leading_zero "$HEAD_READ_SLEEP"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — a LEADING ZERO is"
+    say_err "   ambiguous: arithmetic reads it as OCTAL while 'sleep' sleeps the decimal value."
+  elif ! counter_is_number "$HEAD_READ_SLEEP"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — the backoff base"
+    say_err "   must be a NON-NEGATIVE integer number of seconds (0 is legal: the test seam)."
+  elif counter_exceeds_max "$HEAD_READ_SLEEP" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX}s)."
+  fi
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
   # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
@@ -922,10 +1218,170 @@ validate_timing_knobs() {
   return 0
 }
 
+# ── THE HEAD READ'S KNOB INVARIANT BELONGS TO THE READ (#1690 review rounds 4-5) ─────
+# `validate_timing_knobs` runs only inside `main()`, so ANY path that sources the rail bypassed
+# it — the unit suite's `_drive`, the rail suite's `sed '$d'` loader — and then the arithmetic
+# read an unvalidated global. Measured on the sourced path with the guard absent:
+#   ADMIN_MERGE_HEAD_ATTEMPTS=0   → the loop body never executes: ZERO reads, yet the rail
+#                                    printed `[head_unreadable] — could not READ the head (0 attempts)`;
+#   ADMIN_MERGE_HEAD_ATTEMPTS=08  → `value too great for base`, then the same tag;
+#   ADMIN_MERGE_HEAD_READ_SLEEP=abc → `abc: unbound variable` inside the arithmetic;
+#   ADMIN_MERGE_HEAD_READ_SLEEP=010 → slept 8 (OCTAL) instead of 10.
+# Round 4 guarded `require_head` only, which left `resolve_head` — the function that OWNS the
+# arithmetic — still unguarded for a direct caller. One helper, called by BOTH, so the invariant
+# cannot be bypassed by choosing a different way in. It REJECTS rather than defaulting: the old
+# inline `case …) attempts=3` defaulted, which silently turned a typo into a different budget.
+head_read_knobs_ok() {
+  counter_is_positive "$HEAD_ATTEMPTS" \
+    && ! counter_has_leading_zero "$HEAD_ATTEMPTS" \
+    && ! counter_exceeds_max "$HEAD_ATTEMPTS" "$TIMING_KNOB_MAX" \
+    && counter_is_number "$HEAD_READ_SLEEP" \
+    && ! counter_has_leading_zero "$HEAD_READ_SLEEP" \
+    && ! counter_exceeds_max "$HEAD_READ_SLEEP" "$TIMING_KNOB_MAX"
+}
+
+# refuse_bad_head_knobs -> 1 (having said why) when either knob is unusable.
+refuse_bad_head_knobs() {
+  say_err "admin-merge: ✗ refusing a bad head-read knob (ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}',"
+  say_err "   ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}') — refusing to report on a head read"
+  say_err "   whose retry budget is not a validated positive integer. Fix the value and re-run."
+  return 1
+}
+
 resolve_head() {
   local pr="$1"; shift
-  # shellcheck disable=SC2086
-  $GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null
+  # ⛔ BEFORE ANY ARITHMETIC (#1690 review round 5). This is the function that evaluates the
+  # knobs, so it is where the invariant has to hold — a caller cannot reach the loop without
+  # passing this.
+  head_read_knobs_ok || { refuse_bad_head_knobs; return 1; }
+  # ⛔ A FAILED READ MUST BE ABLE TO FAIL (#1690). This was a bare
+  # `$GH pr view … 2>/dev/null`, so a transient failure (network, TLS, rate limit)
+  # returned the EMPTY STRING, and §4 then read that as "the head moved to ``" — a
+  # confident claim about reality derived from a read that failed. It blocked a
+  # fully-attested PR that had not moved; the identical command re-run landed it.
+  #
+  # Two changes, and both are needed:
+  #   1. RETRY. A transient read must have at least one retry before it is believed.
+  #   2. VALIDATE THE SHAPE. A commit SHA is 40 hex chars. A truncated or garbled
+  #      read is exactly as unusable as an empty one, and ONLY a shape check catches
+  #      that — `[ -n "$out" ]` would happily accept a half-read sha.
+  #
+  # On persistent failure this prints NOTHING and returns NON-ZERO, so no caller can
+  # mistake it for a value. ⛔ Callers must use `require_head` below, never this
+  # directly: the whole defect was a caller that could not tell "empty" from "absent".
+  local attempt out rc errtmp err
+  # ⛔ THE READ'S DIAGNOSTIC IS NOT DISCARDED (#1690 review). `2>/dev/null` was the
+  # defect's own shape: it is why a transient blip and a permanent cause (bad
+  # credentials, wrong `--repo`, PR not found) produced the SAME refusal, with a
+  # remedy ("re-run") that can never help the permanent ones. The last attempt's
+  # stderr is kept here and quoted by `require_head`, so the operator can tell a
+  # re-runnable transient from a configuration error. It is a GLOBAL, not a local,
+  # because `resolve_head` must still print NOTHING on failure — the value channel
+  # stays empty and the diagnostic travels on its own channel.
+  HEAD_READ_DIAG=""
+  errtmp="${TMPDIR:-/tmp}/admin-merge-head.$$.err"
+  # ⛔ THE RETRY BUDGET IS A VALIDATED STARTUP KNOB, NOT AN INLINE `case` (#1690 review).
+  # `HEAD_ATTEMPTS` / `HEAD_READ_SLEEP` are checked by `validate_timing_knobs` before any
+  # CI work, with the rail's own primitives (leading-zero, positive, range) — see their
+  # declaration site and that function. Inline validation here was WRONG, not merely
+  # redundant: it accepted `08`, which bash arithmetic then errors on.
+  for ((attempt = 1; attempt <= HEAD_ATTEMPTS; attempt++)); do
+    # shellcheck disable=SC2086
+    out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>"$errtmp")" && rc=0 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      # ⛔ VALIDATE THE WHOLE VALUE, NOT A LINE OF IT (#1690 review). The first version of
+      # this check was `printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'`, wrong twice:
+      #   * `grep` is an ANY-LINE test — a read that returned a good sha AND a trailing junk
+      #     line PASSED it, and `printf '%s\n' "$out"` then emitted BOTH, so the
+      #     "caller gets a KNOWN-GOOD head" contract stated below was not established by
+      #     the code. A multi-line head then reaches the comparisons, the evidence body and
+      #     `--match-head-commit`.
+      #   * the `writer | grep` shape is the SIGPIPE idiom banned repo-wide (#841): under
+      #     `set -uo pipefail` a writer killed by SIGPIPE makes the pipeline non-zero, which
+      #     classifies a VALID head as UNREADABLE — a false refusal inside the rail itself.
+      # An embedded newline is not a hex character, so rejecting every non-hex character
+      # rejects the multi-line case BY CONSTRUCTION, and needs no pipe at all.
+      case "$out" in
+        "" | *[!0-9a-fA-F]*) ;;   # empty, or anything that is not pure hex
+        *) [ "${#out}" -eq 40 ] && { rm -f "$errtmp"; printf '%s\n' "$out"; return 0; } ;;
+      esac
+    fi
+    # Keep the LAST attempt's diagnostic (one line, bounded): a later attempt's error
+    # is the one closest to the refusal the operator actually reads.
+    err="$(tail -n 1 "$errtmp" 2>/dev/null)"
+    [ -n "$err" ] && HEAD_READ_DIAG="${err:0:200}"
+    if [ "$attempt" -lt "$HEAD_ATTEMPTS" ]; then
+      sleep "$((HEAD_READ_SLEEP * attempt))"
+    fi
+  done
+  rm -f "$errtmp"
+  return 1
+}
+
+# ── THE ONE DOOR FOR READING THE HEAD (#1690) ──────────────────────────────────
+# ⛔ THERE IS EXACTLY ONE REASON TO READ THE HEAD, SO THERE IS EXACTLY ONE PLACE
+# THAT FAILS TO. THREE call sites read the head — §4 during-re-run, §4 before-evidence,
+# and the opening read — and TWO of them, the two §4 comparison sites, rendered a failed
+# read as "head moved". (The opening read had a pre-existing emptiness guard and refused
+# with "could not resolve the head", which is precisely why #1690's operator saw the wrong
+# message at one site and not the others.) Fixing only the read would leave three copies
+# of "is this failure a moved head or an unread one?" free to drift apart — the same
+# duplication defect #1684 fixed on the DO list. So the discrimination lives HERE, once,
+# and a caller that gets a value has a KNOWN-GOOD 40-hex head.
+#
+# ⛔ THE TWO REFUSALS ARE DIFFERENT SPEECH ACTS AND MUST NOT SHARE A MESSAGE.
+#   * an UNREADABLE head is NOT a claim about reality — it says the instrument
+#     could not answer, and the remedy is to retry the rail;
+#   * a MOVED head IS a claim about reality — the evidence is SHA-bound and void,
+#     and the remedy is to re-run the rail for the new head.
+# Rendering the first as the second is precisely #1690.
+require_head() {
+  local pr="$1"; shift
+  # ⛔ NO `local out` ANY MORE (#1690 review): the head is no longer captured and reprinted —
+  # `resolve_head`'s stdout IS the return value now (see the note at the call below).
+  # ⛔ THE INVARIANT TRAVELS WITH THE FUNCTION, NOT THE ENTRY POINT (#1690 review round 4).
+  # `validate_timing_knobs` runs only inside `main()`, so anything that SOURCES the rail — the
+  # unit suite's `_drive`, the rail suite's `sed '$d'` loader — bypassed it entirely. (Round 5
+  # additionally guards `resolve_head`, which owns the arithmetic; this one is kept because
+  # `require_head` also FORMATS the attempt count into its refusal, so it must not build a
+  # message from an unvalidated value either.) Rejecting, never defaulting.
+  head_read_knobs_ok || { refuse_bad_head_knobs; return 1; }
+  # ⛔ NO COMMAND SUBSTITUTION AROUND THIS CALL (#1690 review). The first version read
+  # `out="$(resolve_head "$pr" "$@")"`, and a variable assigned inside `$( )` is assigned in a
+  # SUBSHELL and destroyed with it — so `HEAD_READ_DIAG` never reached this function, the
+  # refusal always took its "no diagnostic" branch, and the two tests asserting the diagnostic
+  # is QUOTED failed while the two asserting its ABSENCE passed VACUOUSLY (the channel was dead
+  # on every path, including success). Calling it directly keeps the diagnostic in THIS shell,
+  # and `resolve_head`'s stdout — the head, and nothing else — passes straight through to our
+  # caller, which is exactly what the old capture-then-reprint did.
+  if resolve_head "$pr" "$@"; then
+    return 0
+  fi
+  # ⛔ A MACHINE-READABLE TOKEN, NOT JUST PROSE (#1690 review). The rail separated the two
+  # speech acts by WORDING alone, so any consumer had to parse prose — and any future
+  # rewording would silently destroy the distinction (nothing pinned the PRESENCE of a
+  # stable marker, only the absence of a phrase). `extensions/review-enforcer` already models
+  # the right answer: `reasonTag: base_unverifiable` vs `head_advanced`, recorded in
+  # `gate-events.jsonl` so block rates can be reconstructed BY REASON. `[head_unreadable]` is
+  # the tag the moved-head refusals do NOT carry, so `grep -F '[head_unreadable]'` answers
+  # "could the instrument read the head?" without depending on how the sentence is worded.
+  say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${HEAD_ATTEMPTS} attempts)."
+  say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
+  say_err "   something that is not a commit SHA. Nothing was merged."
+  # ⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES (#1690 review).
+  # "Re-run the rail" is right for a transient blip and useless for a permanent
+  # cause; without the read's own words the two were indistinguishable here. So the
+  # diagnostic is QUOTED when there is one, and its absence is stated rather than
+  # papered over — the operator learns which case they are in, or that we cannot say.
+  if [ -n "${HEAD_READ_DIAG:-}" ]; then
+    say_err "   the read reported: ${HEAD_READ_DIAG}"
+    say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
+    say_err "   probably not transient — check credentials, --repo, and the PR number."
+  else
+    say_err "   the read produced no diagnostic (gh exited 0 with an unusable value, or wrote"
+    say_err "   nothing to stderr). Re-run the rail."
+  fi
+  return 1
 }
 
 # resolve_draft <pr> → the PR's `isDraft` flag (`true`/`false`). `commit-workflow`
@@ -3640,12 +4096,21 @@ main() {
   # ran (729 stale `admin-merge.*` directories, 21 MB, on the reviewing machine).
   # Assign the FILE-SCOPE `TMP` declared below and expand it at trap-set time.
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
-  trap 'rm -rf "${TMP:-}"' EXIT
+  # ⛔ THE READ'S OWN TEMP FILE IS IN THE EXIT TRAP (#1690 review). `resolve_head` removes it on
+  # both normal exits, but a process-group signal (what a terminal Ctrl-C actually delivers)
+  # kills the subshell before its `rm` runs, and the file leaks. SIGKILL can still leak it —
+  # nothing can trap that — so this narrows the window rather than closing it to zero, and the
+  # name is PID-scoped so a leak is one file per killed run, not a shared collision.
+  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err"' EXIT
 
   local head
   # shellcheck disable=SC2086
-  head="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
-  [ -n "$head" ] || { say_err "admin-merge: ✗ could not resolve the head of PR #$PR"; exit 1; }
+  head="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
+  # ⛔ NO DEFENCE-IN-DEPTH EMPTINESS CHECK HERE (#1690 review). `require_head` can only
+  # return 0 with a 40-hex value, so an emptiness guard at this site is DEAD CODE — and
+  # keeping this site defended while the two §4 COMPARISON sites (the ones that actually
+  # printed "head moved") ran bare INVERTED the invariant: the least-exposed site was the
+  # guarded one. The guarantee lives in `require_head`, once, and covers every caller.
   info "admin-merge: PR #$PR head $head"
 
   # ── 0. A DRAFT CANNOT BE MERGED — refuse EARLY, by name ──────────────────
@@ -4297,7 +4762,7 @@ main() {
     # SHA, and a push invalidates it.
     local head_after
     # shellcheck disable=SC2086
-    head_after="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+    head_after="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
     if [ "$head_after" != "$head" ]; then
       say_err "admin-merge: ✗ BLOCK — head moved during re-run ($head → $head_after). Re-run the rail."
       exit 1
@@ -4374,7 +4839,7 @@ main() {
   # and GitHub is asked to enforce it too, via --match-head-commit below.
   local head_final
   # shellcheck disable=SC2086
-  head_final="$(resolve_head "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  head_final="$(require_head "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
   if [ "$head_final" != "$head" ]; then
     say_err "admin-merge: ✗ BLOCK — head moved before the evidence was posted ($head → $head_final)."
     say_err "   The evidence would be bound to $head; re-run the rail for the new head."
@@ -4540,10 +5005,24 @@ main() {
       say_err "   were produced, so the PR's green surface is STALE for it — it certifies a tree"
       say_err "   that no longer includes this red. This is the #1261 incident (a PR opened before"
       say_err "   the base went red and merged after)."
-      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-      say_err "   ('gh run rerun' the PR's runs, or push an empty commit) so the merge-ref"
-      say_err "   evaluation covers the base's red. If this PR is the REPAIR, its own checks pass"
-      say_err "   on the re-measured tree and the merge then proceeds."
+      # #4764: PERFORM the remedy this refusal names — and then say which of the two
+      # outcomes actually happened. The helper returns 1 on --dry-run AND on a refused
+      # API call, so an unconditional "the update above …" would tell the lane a
+      # re-measurement is under way on a path where no new head was created and no
+      # check will ever run. THIS invocation still refuses either way (the refreshed
+      # head has no completed check yet), so the refusal above is unchanged.
+      if refresh_pr_branch "$PR" "$head"; then
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+        say_err "   recomputes the merge-ref evaluation and its checks re-run against the base's"
+        say_err "   current head. No review record was left stale by this update — checked BEFORE"
+        say_err "   updating, since an update cannot be undone."
+      else
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
+        say_err "   states why the rail did not do it for you: a record it refused to strand, a"
+        say_err "   dry run, an unresolved repo identity, or a failed update call. Note that"
+        say_err "   pushing an empty commit moves the head and strands any record bound to it."
+        say_err "   If this PR is the REPAIR, its own checks pass on the re-measured tree."
+      fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
@@ -4577,10 +5056,15 @@ main() {
   #
   # WHY IT DOES NOT OVER-BLOCK THE REPAIR. A PR that repairs a red base must be
   # evaluated against a base that CONTAINS the red; if its merge ref lags, the
-  # refusal names the re-run as the remedy, and re-running recomputes the merge
-  # ref against the current base — at which point a genuine repair is green on
-  # its own tree (step 4.5) and 4.6 sees a surface that postdates the red, so it
-  # lands. The refusal is a re-measurement request, never a verdict on the PR.
+  # remedy is a RE-MEASUREMENT against the current base — the refusals below say
+  # "RE-MEASURE … then re-run the rail", and a re-triggering event that does not move
+  # the head is named where the guard declines to move one. Re-measuring recomputes
+  # the merge ref against the current
+  # base. A `gh run rerun` does NOT: it re-executes the SAME merge commit, so it
+  # re-measures the ref that was already lagging. Once the checks have re-measured
+  # the current base, a genuine repair is green on its own tree (step 4.5) and 4.6
+  # sees a surface that postdates the red, so it lands. The refusal is a
+  # re-measurement request, never a verdict on the PR.
   #
   # FAIL CLOSED ON AN UNREADABLE PARENT. The probe runs ONLY when the base is red
   # (so a green base costs no extra call), and if it cannot read the parent there
@@ -4609,10 +5093,21 @@ main() {
       say_err "   base moves but does NOT re-run the PR's checks. This is the #1261 merge-ref-lag case."
       say_err "   Base red(s) this PR has not measured:"
       printf '%s\n' "$BASE_REDS" >&2
-      say_err "   RE-MEASURE against the current base, then re-run the rail: re-run this PR's checks"
-      say_err "   ('gh run rerun' the PR's runs, or update the branch / push an empty commit) so the"
-      say_err "   merge ref is recomputed against $BASE_SHA and the PR's checks evaluate it. If this PR"
-      say_err "   is the REPAIR, its own checks then pass on the re-measured tree and the merge proceeds."
+      # #4764: the same performed remedy as step 4.6, with the same branch on its
+      # return — the lag this refusal names is exactly what update-branch clears, and
+      # the refusal still stands for THIS run.
+      if refresh_pr_branch "$PR" "$head"; then
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the update above"
+        say_err "   recomputes the merge ref against $BASE_SHA and its checks re-run against it."
+        say_err "   No review record was left stale by this update — checked BEFORE updating,"
+        say_err "   since an update cannot be undone."
+      else
+        say_err "   RE-MEASURE against the current base, then re-run the rail: the helper above"
+        say_err "   states why the rail did not do it for you: a record it refused to strand, a"
+        say_err "   dry run, an unresolved repo identity, or a failed update call. Note that"
+        say_err "   pushing an empty commit moves the head and strands any record bound to it."
+        say_err "   If this PR is the REPAIR, its own checks then pass on the re-measured tree."
+      fi
       say_err "   No evidence was posted and no merge attempted."
       exit 1
     fi
@@ -5018,4 +5513,14 @@ ${parity_forgiven_note}"
   esac
 }
 
-main "$@"
+# ⛔ ENTRY-POINT GUARD (#1690): the read path must be REACHABLE FROM A TEST.
+# Without this a test cannot call the read path directly at all — it can only run the
+# WHOLE rail through the hermetic fake-gh harness — so the empty-read branch, the one
+# that blocked a healthy PR, had no test that could reach it. The guard changes nothing
+# about `bash scripts/admin-merge.sh`.
+#
+# ⛔ KEEP THIS ON ONE LINE (#1690 review). `tests/admin-merge/run.sh` loads the rail's
+# function definitions with `sed '$d'` — "the `main "$@"` entrypoint stripped". A
+# three-line guard leaves that strip deleting only `fi` and producing an UNTERMINATED
+# `if`, so the suite sources a file that does not parse.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then main "$@"; fi

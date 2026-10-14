@@ -291,7 +291,11 @@ fi
 # ~/.pi/agent/scripts so
 # the drivers' sibling calls resolve and the plists' ProgramArguments targets
 # exist (broken-target guard). Same idempotent real-copy refresh model.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py)
+# #1719 adds ci_runner_gate.sh: the launchd job com.tortoise.ci-runner-gate
+# executes $DEST/scripts/ci_runner_gate.sh, so farming it is what makes the REPO
+# copy the copy that runs — without it a box keeps executing a hand-copied
+# duplicate (a merged fix never reaches it) and a second box has no fallback gate.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -306,7 +310,7 @@ for base in "${fleet_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   fleet_copied=$((fleet_copied+1))
 done
-echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373)"
+echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
 
 # Shared-library farm (#1178): the fleet-scripts farm above copies pi-reap-idle.sh
 # FLAT into $DEST/scripts/, and that reaper resolves its process-identity rule
