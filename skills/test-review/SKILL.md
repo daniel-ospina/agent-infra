@@ -46,6 +46,8 @@ steps:
 >
 > **A's combined verdict — the clean exit is a verdict, not a token match.** A emits per-pass verdicts **and exactly one overall verdict line**: `REVIEWER A VERDICT: CLEAN` only when **both** passes returned `NO ISSUES FOUND`; otherwise `REVIEWER A VERDICT: ISSUES`. A response that prints `NO ISSUES FOUND` for pass 1 and `ISSUE:` blocks for pass 2 is `REVIEWER A VERDICT: ISSUES` and is **not** clean — see Phase 4's exit conditions.
 >
+> **B's combined verdict — the same rule, for the same reason.** B has the same two-parts-one-dispatch structure as A (part 1 coverage/surface, part 2 journey alignment — the latter skipped only when no Journey Test Map was provided), so a bare part-1 `NO ISSUES FOUND` must not be readable as B's verdict. B emits **exactly one overall verdict line**: `REVIEWER B VERDICT: CLEAN` only when **every part it ran** returned `NO ISSUES FOUND`; otherwise `REVIEWER B VERDICT: ISSUES`. Part 1 clean plus part 2's `ISSUE:` blocks is `REVIEWER B VERDICT: ISSUES`, never clean — a `NO ISSUES FOUND` from one part is not B's verdict. See Phase 4's exit conditions.
+>
 > **The count.** `proportional-gates` §Review Cycles **owns** the reviewer-count table and is unchanged. `test-review`'s merged panel is **2** (3 when C fires), so a High-risk test review fields at most 3; the table's "4" is an upper bound this panel cannot reach, and depth is scaled *inside* A and B instead (A's two passes always run). Deliberate — see the `OVERRIDES:` line on #1538.
 >
 > **Precedence change (intentional).** With the grouping, Phase 2's tie-break sort becomes pass 1 > pass 2 > coverage/surface > journey; it was correctness > coverage > journey > test-quality. `test-quality` moves from last to second and `journey` to last, so the semantic-strength pass is never filed below the coverage or journey lenses at equal severity.
@@ -82,7 +84,7 @@ Phase 3: Fix (research-backed, surgical edits)
     ↓
 Phase 4: Re-review (fresh sub-agents, no memory of prior cycle)
     ↓
-Loop until NO ISSUES FOUND or convergence (safety cap: 10 cycles)
+Loop until every dispatched reviewer returns its clean verdict or convergence (safety cap: 10 cycles)
 ```
 
 ### Phase 0 — Research Intake (Proactive Testing Knowledge)
@@ -176,7 +178,7 @@ Produce a `### Testing Knowledge` block with ALL findings (from knowledge base +
 
 ### Phase 1 — Review (2 merged reviewers, by concern)
 
-Launch the merged reviewers **in parallel** via Pi `task` — **A** and **B**, plus **C** when the change touches e2e surfaces. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or `NO ISSUES FOUND`.
+Launch the merged reviewers **in parallel** via Pi `task` — **A** and **B**, plus **C** when the change touches e2e surfaces. Each receives the full test file(s), surface map (if available), and journey map (if available). Each returns `ISSUE:` blocks or its clean verdict — A and B each emit one combined verdict line (`REVIEWER A VERDICT:` / `REVIEWER B VERDICT:`), C returns `NO ISSUES FOUND` — as specified below.
 
 **A runs two ORDERED passes in one dispatch** — mechanical correctness, then semantic strength. The passes are never collapsed into one judgement: a test can pass the first and still be a weak test that provides zero confidence (`skills/reviewers/test-quality/SKILL.md`, Boundary).
 
@@ -410,6 +412,11 @@ If no issues: NO ISSUES FOUND
 
 **If no Journey Test Map is provided:** skip B's part 2. B's part 1 still runs.
 
+**B's required output — both parts, then one verdict.** Print part 1's `ISSUE:` blocks (or `NO ISSUES FOUND`) first, then part 2's — or the line `part 2: skipped (no Journey Test Map)` when it was skipped — then exactly one line:
+`REVIEWER B VERDICT: CLEAN` — only when **every part B ran** returned `NO ISSUES FOUND`
+`REVIEWER B VERDICT: ISSUES` — otherwise, with every part's issues listed above
+A part-1 `NO ISSUES FOUND` followed by part-2 `ISSUE:` blocks is `REVIEWER B VERDICT: ISSUES`, never clean.
+
 ---
 
 **Reviewer C — E2E & Reproducibility** (conditional — dispatch ONLY when the change touches e2e surfaces: an E2E scenario, a Playwright/browser surface, or the failure-reproduction path of an e2e/browser test. A unit-test pin that is not part of an e2e surface does NOT fire C):
@@ -459,7 +466,7 @@ If no issues: NO ISSUES FOUND
 1. Parse all `ISSUE:` blocks from reviewer outputs
 2. Dedup: same location + similar description → keep higher severity
 3. Sort: P0 > P1 > P2, then pass 1 (mechanical correctness) > pass 2 (semantic strength) > coverage/surface > journey (pre-merge this was correctness > coverage > journey > test-quality — the change is intentional, see the v1.1.0 note)
-4. If zero issues → tests are clean, exit with `NO ISSUES FOUND`
+4. If zero issues across every reviewer and every pass → tests are clean; exit is by per-reviewer verdict (`REVIEWER A VERDICT: CLEAN`, `REVIEWER B VERDICT: CLEAN`, C `NO ISSUES FOUND`) — a bare `NO ISSUES FOUND` token is not an exit, see Phase 4
 
 ### Phase 3 — Fix (Research-Backed)
 
@@ -489,11 +496,11 @@ For each cycle:
 2. Parse responses: every dispatched reviewer must return its clean verdict → exit clean. Issues found → Phase 2-3.
 3. After fixes applied, go to step 1 (repeat cycle)
 
-**The clean verdict is per-reviewer and unambiguous — a bare `NO ISSUES FOUND` is NOT enough.** Reviewer A returns **one overall verdict**, `REVIEWER A VERDICT: CLEAN`, which requires *both* of its ordered passes to be clean. A response that prints `NO ISSUES FOUND` for pass 1 and `ISSUE:` blocks for pass 2 is `REVIEWER A VERDICT: ISSUES` and does **not** exit the loop — this is the fail-open the per-pass combination rule closes. Reviewer B returns `NO ISSUES FOUND`; Reviewer C, when dispatched, returns `NO ISSUES FOUND`.
+**The clean verdict is per-reviewer and unambiguous — a bare `NO ISSUES FOUND` is NOT enough.** Reviewer A returns **one overall verdict**, `REVIEWER A VERDICT: CLEAN`, which requires *both* of its ordered passes to be clean. A response that prints `NO ISSUES FOUND` for pass 1 and `ISSUE:` blocks for pass 2 is `REVIEWER A VERDICT: ISSUES` and does **not** exit the loop — this is the fail-open the per-pass combination rule closes. Reviewer B is built the same way: it returns **one overall verdict**, `REVIEWER B VERDICT: CLEAN`, which requires *every part it ran* to be clean — part 1 clean plus part 2 `ISSUE:` blocks is `REVIEWER B VERDICT: ISSUES` and does **not** exit the loop. Reviewer C, when dispatched, returns `NO ISSUES FOUND`.
 
 **Exit conditions — ALL must be true:**
 
-- [ ] Last cycle's every dispatched reviewer returned its clean verdict **verbatim** (not paraphrased): Reviewer A → `REVIEWER A VERDICT: CLEAN` (both passes clean), Reviewer B → `NO ISSUES FOUND`, and Reviewer C → `NO ISSUES FOUND` if it was dispatched
+- [ ] Last cycle's every dispatched reviewer returned its clean verdict **verbatim** (not paraphrased): Reviewer A → `REVIEWER A VERDICT: CLEAN` (both passes clean), Reviewer B → `REVIEWER B VERDICT: CLEAN` (every part it ran clean), and Reviewer C → `NO ISSUES FOUND` if it was dispatched
 - [ ] The cycle log records whether C was dispatched: `C: dispatched` or `C: skipped (<reason>)` — an unrecorded skip counts as C not having run
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
@@ -525,7 +532,8 @@ After all reviewers return clean, output:
 ✅ Test review complete:
   - Review cycles: N
   - Reviewers per cycle: 2 (A, B) — or 3 when C fires (e2e)
-  - Reviewer A: pass 1 <CLEAN | N issues>, pass 2 <CLEAN | N issues> — combined verdict CLEAN
+  - Reviewer A: pass 1 <CLEAN | N issues>, pass 2 <CLEAN | N issues> — combined verdict <CLEAN | ISSUES>
+  - Reviewer B: part 1 <CLEAN | N issues>, part 2 <CLEAN | N issues | skipped (no Journey Test Map)> — combined verdict <CLEAN | ISSUES>
   - Reviewer C: dispatched | skipped (<reason>)
   - Issues found and fixed: N
   - Final status: CLEAN
