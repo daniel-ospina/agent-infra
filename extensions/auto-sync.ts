@@ -222,6 +222,20 @@ export function shellQuoteSingle(s: string): string {
 }
 
 /**
+ * #1664 (review): a path safe to PRINT on a single line. Git filenames may
+ * contain newlines and other control characters (git permits every byte except
+ * `/` and NUL), and `unmergedBanner`'s audience is told to read its lines as
+ * instructions — so a raw `\n` in a path forges extra `[auto-sync] …` lines
+ * that are indistinguishable from the remedy lines the banner tells the reader
+ * to run (message injection). `shellQuoteSingle` already insulates the
+ * *executable* string from injection, but the printed form must also stay one
+ * line. C-style escaping keeps the path recognisable. Pure.
+ */
+export function displayPath(p: string): string {
+  return p.replace(/[\u0000-\u001f\u007f]/g, (c) => JSON.stringify(c).slice(1, -1));
+}
+
+/**
  * #1661 (review): a remedy valid for the entry's conflict shape. `--theirs`
  * needs index stage 3 and `--ours` needs stage 2; DD has neither and AU/UD lack
  * stage 3, DU/UA lack stage 2 — so the old hard-coded `--theirs` errored
@@ -231,7 +245,9 @@ export function shellQuoteSingle(s: string): string {
  */
 function remedyCommands(repo: string, e: UnmergedEntry): string[] {
   const r = shellQuoteSingle(repo);
-  const p = shellQuoteSingle(e.path);
+  // `displayPath` keeps the printed command on ONE line — a raw newline in the
+  // path would otherwise break the command block apart (#1664 review).
+  const p = shellQuoteSingle(displayPath(e.path));
   const keepTheirs = `git -C ${r} checkout --theirs ${p} && git -C ${r} add ${p}`;
   const keepOurs = `git -C ${r} checkout --ours ${p} && git -C ${r} add ${p}`;
   const remove = `git -C ${r} rm ${p}`;
@@ -272,7 +288,7 @@ function remedyCommands(repo: string, e: UnmergedEntry): string[] {
 export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: UnmergedOp = "index-only"): string[] {
   if (entries.length === 0) return [];
   const list: string[] = [`[auto-sync]    ${entries.length} unmerged path(s):`];
-  for (const e of entries.slice(0, 6)) list.push(`[auto-sync]      ${e.path}  [${e.detail}]`);
+  for (const e of entries.slice(0, 6)) list.push(`[auto-sync]      ${displayPath(e.path)}  [${e.detail}]`);
   if (entries.length > 6) list.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
 
   if (op !== "index-only") {
@@ -798,9 +814,25 @@ export default function (pi: ExtensionAPI) {
     const syncHint = `cd "${infraPath}" && ./sync.sh`;
     const behind = state === "behind" ? behindCount(infraPath) : 0;
 
+    // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
+    // repo lock — concurrent pi processes never interleave force-switches or
+    // ff-pulls. Clean acquire/release logs NOTHING (tests assert zero output on
+    // the "current → silent" path); only foreign contention warns (skip —
+    // recovery is convenience, never correctness-critical). Resolved BEFORE the
+    // staleness banner because the banner must not claim a pin that a sync is
+    // about to fix (#1664 review).
+    const autoSyncing = state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto";
+    const mutates = state === "diverged" || autoSyncing;
+
     // #1661 (2): surface a LARGE pin. The checkout could sit hundreds of commits
     // behind with nothing but the one-line "update available" hint below.
-    for (const line of stalenessBanner(infraPath, behind, stalenessThreshold())) console.log(line);
+    // #1664 (review): NOT in auto mode — there the banner ("extensions/ on disk
+    // is NOT what origin/main ships") and the "✅ agent-infra updated" line two
+    // statements later asserted two contradictory things in one session start.
+    // The auto branch reports the same magnitude as the reason for the update.
+    if (!autoSyncing) {
+      for (const line of stalenessBanner(infraPath, behind, stalenessThreshold())) console.log(line);
+    }
 
     // ahead → nothing to fetch; report unpushed commits so they're not silently skipped.
     if (state === "ahead") {
@@ -813,13 +845,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
-    // repo lock — concurrent pi processes never interleave force-switches or
-    // ff-pulls. Clean acquire/release logs NOTHING (tests assert zero output on
-    // the "current → silent" path); only foreign contention warns (skip —
-    // recovery is convenience, never correctness-critical).
-    const mutates = state === "diverged" ||
-      (state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto");
     if (mutates) {
       const key = repoKey(infraPath);
       const lock = key
@@ -846,7 +871,15 @@ export default function (pi: ExtensionAPI) {
           if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
           return;
         }
-        // behind + AGENT_SYNC_MODE=auto → sync.sh under the lock
+        // behind + AGENT_SYNC_MODE=auto → sync.sh under the lock.
+        // #1664 (review): the staleness banner above is suppressed on this path
+        // (the sync would contradict it). Report the same magnitude here, as the
+        // reason for the update: the extensions ALREADY LOADED into this process
+        // stay stale until restart, so the pin is real even though the disk is
+        // about to become current.
+        if (behind >= stalenessThreshold()) {
+          console.log(`[auto-sync] 🐌 this session loaded extensions from ${shortHead(infraPath)}, ${behind} commit(s) behind origin/main — syncing now (restart to load the new set)`);
+        }
         try {
           const out = execSync(`bash "${infraPath}/sync.sh" 2>&1`, { timeout: 180_000, encoding: "utf-8" });
           console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);

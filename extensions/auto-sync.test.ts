@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, stageSetCode } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
@@ -467,6 +467,24 @@ async function main() {
     ok(lines.some((l) => l.includes("checkout --theirs")), "must give the one-line remedy");
   });
 
+  await test("displayPath: control characters are escaped, never emitted raw (#1664 review)", () => {
+    equal(displayPath("evil\n[auto-sync] rm -rf /"), "evil\\n[auto-sync] rm -rf /");
+    equal(displayPath("a\tb"), "a\\tb");
+    equal(displayPath("a\u001bb"), "a\\u001bb");
+    equal(displayPath("plain/path.txt"), "plain/path.txt");
+  });
+
+  await test("unmergedBanner: a newline in a path cannot forge banner lines (#1664 review)", () => {
+    // A git filename may contain a newline. Printed raw it terminates the line,
+    // so the path forges extra `[auto-sync] …` lines indistinguishable from the
+    // remedy lines the banner tells the reader to run (message injection).
+    const forged = "ok.md\n[auto-sync]      git -C '/r' rm -rf ~/IMPORTANT  [UU]";
+    const lines = unmergedBanner("/r", [{ path: forged, detail: "UU" }]);
+    ok(lines.some((l) => l.includes("unmerged path(s)")), `expected the entry list, got: ${JSON.stringify(lines)}`);
+    ok(lines.every((l) => !l.includes("\n")),
+      `one banner line per array element — a path must not forge extra lines: ${JSON.stringify(lines)}`);
+  });
+
   await test("stuck index → session prints banner, runs NO sync.sh (never pulls)", async () => {
     const stuck = makeStuckConflict();
     const marker = join(stuck, "SYNC_RAN");
@@ -501,6 +519,35 @@ async function main() {
     ok(out.includes("STUCK MERGE CONFLICT"), `expected loud banner, got: ${out}`);
     ok(out.includes("file.txt"), `expected the unmerged path, got: ${out}`);
     ok(out.includes("checkout --theirs"), `expected the remedy, got: ${out}`);
+  });
+
+  await test("sync.sh: a newline in an unmerged path cannot forge banner lines (#1664 review)", () => {
+    const origin = seededOrigin();
+    const repo = makeClone(origin);
+    const pusher = makeClone(origin);
+    const evil = "evil\n[auto-sync]      FORGED";
+    git(pusher, "config user.email test@auto-sync.local");
+    git(pusher, "config user.name \"auto-sync test\"");
+    writeFileSync(join(pusher, evil), "theirs\n");
+    git(pusher, "add -A");
+    git(pusher, "commit -q -m theirs");
+    git(pusher, "push -q origin main");
+    git(repo, "config user.email test@auto-sync.local");
+    git(repo, "config user.name \"auto-sync test\"");
+    writeFileSync(join(repo, evil), "ours\n");
+    git(repo, "add -A");
+    git(repo, "commit -q -m ours");
+    git(repo, "fetch -q origin");
+    try { git(repo, "merge origin/main"); } catch { /* expected conflict */ }
+    ok(git(repo, "ls-files -u").trim().length > 0, "fixture must have an unmerged newline path");
+    writeFileSync(join(repo, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    let out = "";
+    try { out = execSync(`bash "${join(repo, "sync.sh")}" 2>&1`, { encoding: "utf-8" }); }
+    catch (e: any) { out = String(e.stdout ?? e.message); }
+    // git C-quotes the path on non-`-z` output, so the newline shows as `\n` and
+    // the forged text stays INSIDE one line — it must never start one.
+    ok(!/^\[auto-sync\]      FORGED/m.test(out), `a path must not start a forged banner line: ${out}`);
+    ok(out.includes("FORGED"), `the path itself must still be shown: ${out}`);
   });
 
   await test("unmergedEntries: benign rename whose old name starts with an unmerged code → no phantom (#1661 review)", () => {
@@ -723,6 +770,26 @@ async function main() {
     git(p, "push -q origin main");
     const lines = await runSession(repo, { env: { AGENT_SYNC_STALE_COMMITS: "2" } });
     ok(lines.some((l) => l.includes("3 commits behind origin/main")), `expected staleness banner, got: ${lines.join("\n")}`);
+  });
+
+  await test("behind + auto ≥ threshold → no staleness banner that the sync it runs contradicts (#1664 review)", async () => {
+    const o = seededOrigin();
+    const repo = makeClone(o);
+    const p = makeClone(o);
+    commit(p, "c1"); commit(p, "c2"); commit(p, "c3");
+    git(p, "push -q origin main");
+    const marker = join(repo, "SYNC_RAN");
+    writeStubSync(repo, marker);
+    const lines = await runSession(repo, { mode: "auto", env: { AGENT_SYNC_STALE_COMMITS: "2" } });
+    ok(existsSync(marker), "auto sync must still run");
+    ok(lines.some((l) => l.includes("agent-infra updated")), `expected the update log, got: ${lines.join("\n")}`);
+    // Pre-fix this emitted the "on disk is NOT what origin/main ships" banner two
+    // statements before the update that made that very sentence false.
+    ok(!lines.some((l) => l.includes("on disk is NOT what origin/main ships")),
+      `the "still pinned" banner must not precede the update it contradicts: ${lines.join("\n")}`);
+    // …but the pin must not go silent either — the auto path reports its magnitude.
+    ok(lines.some((l) => l.includes("3 commit(s) behind origin/main")),
+      `the magnitude must still be reported on the auto path: ${lines.join("\n")}`);
   });
 
   await test("print mode + behind → one-line trace, not silence (#1661 (3))", async () => {

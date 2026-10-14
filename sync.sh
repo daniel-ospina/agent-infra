@@ -26,7 +26,11 @@ if [ -n "$(git ls-files -u)" ]; then
   if [ -n "$op" ]; then
     echo "⛔ sync.sh: ${op} IN PROGRESS with unmerged paths — sync is impossible until it is concluded."
     echo "   Unmerged paths:"
-    git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
+    # #1664 (review): force C-quoting so a path carrying a newline/control
+    # character can never forge an extra banner line — one line per path.
+    # (Belt-and-braces: non-`-z` ls-files output is C-quoted today; the explicit
+    # flag removes the reliance on that implicit behaviour.)
+    git -c core.quotePath=true ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
     echo "   Finish: resolve each path, then: git ${op} --continue"
     echo "   Or abort: git ${op} --abort"
     if [ "$op" = "rebase" ]; then
@@ -40,7 +44,7 @@ if [ -n "$(git ls-files -u)" ]; then
   echo "⛔ sync.sh: STUCK MERGE CONFLICT in the index — sync is impossible until it is resolved."
   echo "   (index-only stuck state: no MERGE_HEAD, so a plain sync can never recover)"
   echo "   Unmerged paths:"
-  git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
+  git -c core.quotePath=true ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
   echo "   Remedy (per path — pick the side that exists:"
   echo "     --theirs needs stage 3; --ours needs stage 2; git rm for a deleted side):"
   echo "     git checkout --theirs <path> && git add <path>"
