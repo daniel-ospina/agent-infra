@@ -215,7 +215,13 @@ the fact: the PR body names the comment it was signed against.
 | the target repo's `tools/collision_preflight.py` | `refresh-candidates.sh` refuses overlapping dispatches | tortoise-specific path |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
-**`cloud-cell-supervisor.sh check` verifies these, and refuses to certify a cell missing one.**
+**`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
+a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
+`~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
+table is *not* a refusal: a missing `AI_REVIEW_GATE_KEY` is a **warning** (a keyless cell can run a
+controller but cannot merge), and `tools/collision_preflight.py` and the `.worktrees/` gitignore are
+not probed by `check` at all.
 Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
 fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
 `git`, `python3`, `pi`, `~/.pi/agent/scripts/record-review.sh` and its sibling
@@ -701,26 +707,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
-- **`orch-loop.sh` classifies checks by a deny-list (agent-infra#1714).** An unrecognised or null
-  conclusion is neither red nor explicitly pending in its list, so it reads `PENDING` and reaches
-  `gh pr merge --auto`; `cancelled` is treated as a failure and routed to a fixer. `record-review.sh`
-  and `admin-merge.sh` implement the opposite (allow-list) polarity, adopted after a merge went ahead
-  on a conclusion neither red nor pending.
-- **A returning INT/TERM trap does not stop the controller or a worker (agent-infra#1715).**
-  `trap 'rm -f "$LOCKF"' EXIT INT TERM` runs its handler and **resumes** — a non-interactive bash
-  terminates only on `EXIT`. So `pkill -f orch-loop.sh` (§6 step 2, and the stop block `install.sh`
-  prints) deletes `.orch.lock` while the loop keeps sweeping and merging, and the next start passes
-  `acq()`: the documented stop-then-start yields **two controllers on one queue**. Same pattern at
-  `merge-one.sh:60`, where the per-PR claim is released while the merge worker runs on.
-- **`refresh-candidates.sh` records `checked.txt` before the pre-flight verdict (agent-infra#1716).**
-  The append precedes the pre-flight, and nothing prunes a `checked.txt` entry that never reached
-  `dispatched.txt` — the reaper walks `dispatched.txt` only. So an errored pre-flight (a broken
-  scout venv: the failure this file's own comment records) permanently blacklists a dispatchable
-  issue, and the backlog stops refilling with no signal.
-- **`cmd_check` never tests `record-review.sh` (agent-infra#1717).** `merge-one.sh` calls it at
-  `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
-  prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
-  marker is written — one fresh review per cycle, forever, with no terminal state.
 - **`cloud-cell-bringup.sh` deletes the pushed gh token only on the success branch (agent-infra#1718).**
   `die` on a failed `gh auth login` exits before `rm -f "$tokfile"`, leaving a push-capable token at
   `/tmp/.gh-tok` on the VM.
