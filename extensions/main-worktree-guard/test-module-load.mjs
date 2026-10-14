@@ -712,6 +712,12 @@ async function partB() {
     const symrefWrite = await callBash("git checkout main && git symbolic-ref refs/heads/other HEAD");
     expectTrue("B9u6: `checkout main && symbolic-ref refs/heads/other HEAD` (ref write) is BLOCKED (#1144 F1)",
       !!symrefWrite && symrefWrite.block === true, `handler returned ${JSON.stringify(symrefWrite)}`);
+    const branchForce = await callBash("git checkout main && git branch -f victim HEAD");
+    expectTrue("B9u7: `checkout main && branch -f <victim> HEAD` is BLOCKED (force-create sibling) (#1144 F1)",
+      !!branchForce && branchForce.block === true, `handler returned ${JSON.stringify(branchForce)}`);
+    const branchDelete = await callBash("git checkout main && git branch -D victim9");
+    expectTrue("B9u8: `checkout main && branch -D <victim>` is BLOCKED (delete sibling) (#1144 F1)",
+      !!branchDelete && branchDelete.block === true, `handler returned ${JSON.stringify(branchDelete)}`);
     // Positive controls: the sanctioned return ITSELF and its provably
     // read-only siblings must keep passing (the exemption is identity-scoped,
     // not a blanket refusal of the state-verb family).
@@ -727,6 +733,41 @@ async function partB() {
     const returnSymrefQuery = await callBash("git checkout main && git symbolic-ref HEAD");
     expectTrue("B9u-cont4: `checkout main && symbolic-ref HEAD` (query) stays ALLOWED (#1144 F1 control)",
       returnSymrefQuery === undefined, `handler returned ${JSON.stringify(returnSymrefQuery)}`);
+
+    // ── B9v: #1144 cycle-3 reviewer F3 — a REFUSED command must not re-baseline ──
+    // `_rebaseline` used to run as soon as decideM3 sanctioned the carve-out,
+    // BEFORE the later gates had decided. A refused compound therefore moved
+    // `baselines[pid].branch` to the branch the refused checkout never selected,
+    // and every later M1/M2/M3 decision keyed on that stale field. The
+    // own-baseline RENAME arm is the observable: it re-baselines to the
+    // renamed-to name, so a following 1-positional rename — git renames the
+    // CURRENT branch, and the harness repo stays on `main` — is admitted iff the
+    // recorded baseline is back to `main`.
+    const renameOwn = await callBash("git branch -m main renamed");
+    expectTrue("B9v-pre: own-baseline rename is ALLOWED and re-baselines to 'renamed' (#1144 F3 precondition)",
+      renameOwn === undefined, `handler returned ${JSON.stringify(renameOwn)}`);
+    const refusedReturn = await callBash("git checkout main && git reset --hard origin/main");
+    expectTrue("B9v1: the refused return-compound is BLOCKED (#1144 F3 precondition)",
+      !!refusedReturn && refusedReturn.block === true, `handler returned ${JSON.stringify(refusedReturn)}`);
+    const renameAfterRefusal = await callBash("git branch -m renamed2");
+    expectTrue("B9v2: a REFUSED compound did NOT re-baseline (baseline is still 'renamed') (#1144 F3)",
+      !!renameAfterRefusal && renameAfterRefusal.block === true,
+      `handler returned ${JSON.stringify(renameAfterRefusal)} — the refused checkout re-baselined to 'main'`);
+    // Positive control: an ADMITTED return DOES apply the re-baseline (the
+    // pending closure is deferred, never dropped). `checkout main` alone is the
+    // sanctioned return, so the following 1-positional rename (from the current
+    // branch `main`) is admitted because the baseline is `main` again.
+    const admittedReturn = await callBash("git checkout main");
+    expectTrue("B9v-cont1: the sanctioned return itself is ALLOWED (#1144 F3 control)",
+      admittedReturn === undefined, `handler returned ${JSON.stringify(admittedReturn)}`);
+    const renameAfterAdmitted = await callBash("git branch -m renamed3");
+    expectTrue("B9v-cont2: an ADMITTED return DOES apply the re-baseline (rename from 'main' is admitted) (#1144 F3 control)",
+      renameAfterAdmitted === undefined,
+      `handler returned ${JSON.stringify(renameAfterAdmitted)} — the admitted return's re-baseline was dropped`);
+    // Restore the original baseline for the remaining suites.
+    const restoreBaseline = await callBash("git checkout main");
+    expectTrue("B9v-cont3: baseline restored to the original for the remaining suites (#1144 F3 control)",
+      restoreBaseline === undefined, `handler returned ${JSON.stringify(restoreBaseline)}`);
 
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE

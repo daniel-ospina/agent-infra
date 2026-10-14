@@ -2882,6 +2882,29 @@ export default function (pi: ExtensionAPI) {
       }
       const allowActive = _isAllowMainEdits();
 
+      // #1144 (cycle-3 reviewer F3): a branch-state op's re-baseline is an
+      // EFFECT of the command RUNNING, so it may only be APPLIED when the
+      // command is actually admitted. Pre-fix, `_rebaseline` ran as soon as
+      // `decideM3` sanctioned the carve-out — before the later gates had
+      // decided — so a REFUSED compound (`git checkout main && git reset
+      // --hard origin/main`, `… && git rebase origin/main`) still moved
+      // `baselines[pid].branch` to the branch the refused checkout never
+      // selected. Every later M1/M2/M3 decision keys on that field, so the
+      // guard's own state named a branch the session is not on (a
+      // stale-baseline false block, and a misleading `baseline "x" → current
+      // …` M1 warning). The pending closure is applied exactly once, at the
+      // admission returns below — the carve-out's own early return, or any
+      // later gate that allows.
+      let pendingRebaseline: (() => void) | null = null;
+      const admitAfterM3 = (): undefined => {
+        if (pendingRebaseline) {
+          const apply = pendingRebaseline;
+          pendingRebaseline = null;
+          apply();
+        }
+        return undefined;
+      };
+
       // M3: branch-state gate — applies in ANY main checkout (resolved,
       // target-aware). Worktree-effective commands are exempt (cycle-4
       // verified: -C <wt> --git-dir=<main>/.git checkout operates on MAIN →
@@ -2980,19 +3003,27 @@ export default function (pi: ExtensionAPI) {
           });
           if (m3?.block) return { block: true, reason: m3.reason };
           if (m3?.reBaseline) {
-            // Synchronous re-baseline: the own-baseline RENAME (create-new
-            // never re-baselines since #626 — in-hub create-new is blocked)
-            // adopts the new branch NOW — the next tool_call emits ZERO M1
-            // warns (AC3). Record the renamed-to branch — scoped to the
-            // BASELINE repo — so its post-ceremony LOCAL delete is still
-            // allowed after the #376 return re-baselines to the original
-            // (#376 review fold-in).
-            if (branchOp.op === "rename" && branchOp.to) {
-              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+            // The re-baseline records the branch this sanctioned state op moves
+            // the session to — the own-baseline RENAME (create-new never
+            // re-baselines since #626 — in-hub create-new is blocked) adopts
+            // the new branch NOW — the next tool_call emits ZERO M1 warns
+            // (AC3) — and the renamed-to branch is recorded scoped to the
+            // BASELINE repo, so its post-ceremony LOCAL delete is still allowed
+            // after the #376 return re-baselines to the original (#376 review
+            // fold-in). Both are applied only on ADMISSION (see below).
+            const reBaseline = m3.reBaseline;
+            // #1144 (cycle-3 reviewer F3): the re-baseline and the rename's
+            // owned-branch record are consequences of the command RUNNING, so
+            // they are applied only when a gate actually admits the command —
+            // never here, where the later gates have not decided yet.
+            const applyRebaseline = () => {
+              if (branchOp.op === "rename" && branchOp.to) {
+                if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
+                  _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+                }
               }
-            }
-            _rebaseline(pid, m3.reBaseline);
+              _rebaseline(pid, reBaseline);
+            };
             // #1144 (reviewer P1): the carve-out may only close the WHOLE
             // command when every other git invocation is read-only. Pre-fix
             // this `return undefined` laundered a destructive LATER segment in
@@ -3007,7 +3038,15 @@ export default function (pi: ExtensionAPI) {
             // would otherwise leave the list looking clean. The flag is consulted
             // at classification time, the same way `syncOnlyInvocation` and
             // `_allInvocationsWorktreeScoped` consult it.
-            if (det.stateCarveOutClean === true) return undefined;
+            if (det.stateCarveOutClean === true) {
+              applyRebaseline();
+              return undefined;
+            }
+            // Not closed by the carve-out — the later gates decide. Defer the
+            // re-baseline until one of them admits: a REFUSED command must not
+            // move the baseline every later M1/M2/M3 decision keys on (#1144
+            // F3). `admitAfterM3()` applies it at each admission return.
+            pendingRebaseline = applyRebaseline;
           }
         }
       }
@@ -3020,7 +3059,7 @@ export default function (pi: ExtensionAPI) {
       // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
 
-      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return undefined;
+      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
 
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
@@ -3096,7 +3135,7 @@ export default function (pi: ExtensionAPI) {
           // Unknown baseline (no way to tell own from foreign) → keep the
           // allowance's base decision exactly as before.
           const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
-          if (!foreignDelete) return undefined;
+          if (!foreignDelete) return admitAfterM3();
           // foreign later-segment delete present → fall through to the #73 arms.
         } else if (isSyncKind && syncEff?.isWorktree !== true) {
           // #1144: the sync allowance DENIED. Fall to the legacy arm for the
@@ -3126,7 +3165,7 @@ export default function (pi: ExtensionAPI) {
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
         const blocked = _coordinatedDeleteBlock(det.pushTargets);
         if (blocked) return blocked;
-        return undefined; // foreign deletes with no checked-out targets — allowed (today's behavior)
+        return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
         const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
@@ -3196,7 +3235,7 @@ export default function (pi: ExtensionAPI) {
           }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
-        return undefined; // on-baseline or unverifiable-but-exempt
+        return admitAfterM3(); // on-baseline or unverifiable-but-exempt
       }
 
       // ── Legacy destructive blocks (main checkout only) ──
@@ -3213,7 +3252,7 @@ export default function (pi: ExtensionAPI) {
         // that actually runs at the shell cwd (`git -C <wt> status && git reset
         // --hard origin/main`). `undefined` (no per-invocation data) keeps the
         // previous single-invocation behaviour.
-        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return undefined;
+        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return admitAfterM3();
         const kind = det.verdict.slice("block:".length);
         return {
           block: true,
@@ -3223,7 +3262,7 @@ export default function (pi: ExtensionAPI) {
           ].join("\n"),
         };
       }
-      return undefined;
+      return admitAfterM3();
     }
 
     // ── write/edit: TARGET-aware hub-main gate (#618/#621) ──
