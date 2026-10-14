@@ -389,10 +389,24 @@ fi
 # PAID) and only then failed — and its `exit 3` skipped the `*)` arm that writes the fixer marker,
 # so the next cycle saw an unmarked FAILED:ai-review-gate and spawned another review. One paid
 # review per cycle, forever. Refuse BEFORE the paid step, and leave the terminal marker.
+# The probe must require a NON-EMPTY REGULAR FILE, not merely presence + executability: `[ -x ]` is
+# true for a directory (the paid review is then bought, and the record step fails 126), and an EMPTY
+# file is executable and exits 0 WITHOUT minting the marker — so nothing is parked and the loop
+# re-pays, which is the #1717 loop one input over. Same shape cmd_check enforces.
 RECORDER="$HOME/.pi/agent/scripts/record-review.sh"
 if [ ! -e "$RECORDER" ]; then
   park "record-review.sh MISSING at $RECORDER — the record step cannot run, so this PR can never be signed or merged. Provision it (cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
   echo "[merge $PR] ABORT: $RECORDER missing — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+if [ ! -f "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) after a PAID review. Remove it and re-provision (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER not a regular file — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+if [ ! -s "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so ai-review-gate can never go green and the loop would re-pay for a fresh review every cycle. Re-provision it (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER is empty — not paying for a review whose record step cannot sign" >> "$L.log"
   exit 3
 fi
 if [ ! -x "$RECORDER" ]; then

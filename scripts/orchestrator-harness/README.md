@@ -224,7 +224,13 @@ the fact: the PR body names the comment it was signed against.
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
-**`cloud-cell-supervisor.sh check` verifies these, and refuses to certify a cell missing one.**
+**`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
+a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
+`~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
+table is *not* a refusal: a missing `AI_REVIEW_GATE_KEY` is a **warning** (a keyless cell can run a
+controller but cannot merge), and `tools/collision_preflight.py` and the `.worktrees/` gitignore are
+not probed by `check` at all.
 Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
 fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
 `git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does

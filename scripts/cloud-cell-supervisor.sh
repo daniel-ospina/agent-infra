@@ -814,9 +814,19 @@ cmd_check() {
   # saw an unmarked FAILED:ai-review-gate and spawned another review. One paid review per cycle,
   # forever, with no terminal state. Refuse the certification instead.
   # Judge the path the CONSUMER uses: the session forces HOME=$CELL_HOME after sourcing keys.env.
+  # Presence + executability are NOT enough: the file must be a non-empty REGULAR file. `[ -x ]` is
+  # true for a directory (`merge-one.sh` then buys the paid review and fails 126), and an EMPTY file
+  # is executable too — bash runs a shebang-less empty script and it exits 0, minting no marker. So
+  # an empty recorder would be certified, the gate would never go green, nothing would be parked,
+  # and the loop would re-pay for a fresh review every cycle: the same #1717 loop, one input over.
+  # The sibling check below already reasons about the zero-byte shape; judge the recorder the same way.
   local rec; rec="$(recorder_path)"
   if [ ! -e "$rec" ]; then
     die "record-review.sh MISSING at $rec — it is the only merge path, so every review would be re-paid for and never recorded. 'start' provisions it from $(recorder_src), or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -f "$rec" ]; then
+    die "record-review.sh at $rec is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) AFTER a paid review. Remove it and re-run 'start', or: rm -rf '$rec' && cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -s "$rec" ]; then
+    die "record-review.sh at $rec is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so the gate could never go green, nothing would be parked, and the loop would re-pay for a fresh review every cycle. Re-provision it: 'start', or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
   elif [ ! -x "$rec" ]; then
     die "record-review.sh at $rec is NOT EXECUTABLE — merge-one.sh runs it directly, so the record step would fail (126) AFTER a paid review. Fix: chmod +x '$rec'"
   fi
@@ -827,8 +837,8 @@ cmd_check() {
   # buys a fresh PAID review. Certifying a cell in that state is the same false PASS this block
   # exists to remove, one step down the cost ladder. Judge it beside the recorder it belongs to.
   local reclib; reclib="$(recorder_lib_path)"
-  if [ ! -s "$reclib" ]; then
-    die "diff-normalize.py MISSING (or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
+  if [ ! -f "$reclib" ] || [ ! -s "$reclib" ]; then
+    die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
   fi
   say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
@@ -940,26 +950,38 @@ cmd_start() {
   safe_argv "$HARNESS" || die "\$HARNESS must not contain a quote or shell metacharacter: $HARNESS"
   # Provision the record step (#1717). The seed itself is main's `seed_and_stamp` above (#1745), so
   # only the recorder is added here: a hard dependency of the ONLY merge path, and absent on a fresh
-  # cell. Copied only when ABSENT, so an operator's newer copy is never clobbered by the cell
-  # checkout — and NEVER overwritten by whatever a keys.env points at. Resolved AFTER harness_apply:
+  # cell. Provisioned when ABSENT OR EMPTY (never merely because an `-e` test failed), so an
+  # operator's complete newer copy is never clobbered — while a partial/zero-byte one cannot persist
+  # across restarts. NEVER overwritten by whatever a keys.env points at. Resolved AFTER harness_apply:
   # recorder_src() follows $HARNESS, which harness_apply may have repointed at the pinned worktree.
-  local rec rsrc rlib rlibsrc
+  local rec rsrc rlib rlibsrc rtmp ltmp
   rec="$(recorder_path)"; rsrc="$(recorder_src)"
   rlib="$(recorder_lib_path)"; rlibsrc="$(recorder_lib_src)"
-  if [ ! -e "$rec" ]; then
+  # `[ ! -s ]`, not `[ ! -e ]`: a ZERO-BYTE recorder (a copy killed mid-write, or a full disk) is
+  # the same fault as an absent one and must not survive a retry — it is worse than absent, because
+  # it exits 0 without minting a marker, so nothing is parked and the loop re-pays (#1717).
+  if [ ! -s "$rec" ]; then
+    [ -e "$rec" ] && [ ! -f "$rec" ] && die "$rec exists but is not a regular file — remove it, then re-run 'start'"
     mkdir -p "$(dirname "$rec")" || die "cannot create $(dirname "$rec")"
-    cp -p "$rsrc" "$rec" 2>/dev/null || die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"
-    chmod +x "$rec" || die "cannot make $rec executable"
+    # Atomic: write a sibling tmp then rename into place, so a concurrent reader can never observe a
+    # half-written recorder (the same reason pi-bootstrap/setup.sh farms its libs to a tmp + mv).
+    rtmp="${rec}.tmp.$$"
+    cp -p "$rsrc" "$rtmp" 2>/dev/null || { rm -f "$rtmp"; die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$rtmp" || { rm -f "$rtmp"; die "cannot make $rec executable"; }
+    mv -f "$rtmp" "$rec" || { rm -f "$rtmp"; die "cannot install the provisioned recorder at $rec"; }
     say "provisioned record step: $rsrc -> $rec"
   fi
   # …and its declared sibling, ALWAYS (not only when the recorder was absent): an operator's older
   # recorder copy can sit beside a missing lib, and cmd_check below refuses that cell. Preserve the
   # relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py) and refresh only
   # when ABSENT, so a newer operator copy is never clobbered — same rule as the recorder above.
-  if [ ! -s "$rlib" ]; then
+  if [ ! -f "$rlib" ] || [ ! -s "$rlib" ]; then
+    [ -e "$rlib" ] && [ ! -f "$rlib" ] && die "$rlib exists but is not a regular file — remove it, then re-run 'start'"
     mkdir -p "$(dirname "$rlib")" || die "cannot create $(dirname "$rlib")"
-    cp -p "$rlibsrc" "$rlib" 2>/dev/null || die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"
-    chmod +x "$rlib" || die "cannot make $rlib executable"
+    ltmp="${rlib}.tmp.$$"
+    cp -p "$rlibsrc" "$ltmp" 2>/dev/null || { rm -f "$ltmp"; die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$ltmp" || { rm -f "$ltmp"; die "cannot make $rlib executable"; }
+    mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
     say "provisioned record-step library: $rlibsrc -> $rlib"
   fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who

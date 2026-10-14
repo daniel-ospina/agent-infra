@@ -50,7 +50,7 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
 # The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
 # under test are trivial `exit 0` stubs.
-COREUTILS="date tr mkdir cp rm ls cat dirname env sed grep chmod head tail awk seq sleep diff stat touch true false"
+COREUTILS="date tr mkdir cp rm mv ls cat dirname env sed grep chmod head tail awk seq sleep diff stat touch true false"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -151,7 +151,28 @@ case "$out" in *'NOT EXECUTABLE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" |
 ck "the refusal names executability, not absence" $rc
 chmod +x "$RECORDER"
 
-# 3b) THE RECORDER'S OWN RUNTIME DEPENDENCY (#1362/#1717). record-review.sh resolves
+# 3c) A ZERO-BYTE recorder is the P1 shape of this same class: it IS a regular file, IS executable
+# and runs — but it exits 0 WITHOUT minting the signed marker. So the gate could never go green,
+# merge-one.sh's `rc=0` would write no park, and the loop would re-pay for a fresh review every
+# cycle: the #1717 loop with one input shifted. Presence + executability are not enough.
+: > "$RECORDER"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "RED→GREEN: a ZERO-BYTE record-review.sh is not certified" $rc
+case "$out" in *'EMPTY (0 bytes)'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the zero-byte shape, not absence or executability" $rc
+chmod +x "$RECORDER"
+
+# 3d) A DIRECTORY at the recorder path: `[ -x dir ]` is true, so a presence+executability probe
+# blesses it, merge-one.sh buys the paid review, and the record step fails 126 — the exact
+# "paid to discover it cannot run" sequence this PR closes. Require a regular file.
+rm -f "$RECORDER"; mkdir -p "$RECORDER"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "a DIRECTORY at the recorder path is not certified" $rc
+case "$out" in *'NOT A REGULAR FILE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the non-regular-file shape" $rc
+rmdir "$RECORDER"; printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER" record-review.sh resolves
 # lib/diff-normalize.py from its OWN directory; without it it silently takes the RAW pre-#1362 digest
 # arm, so every base-only `gh pr update-branch` refuses carry-forward and buys a fresh PAID review.
 # A cell certified in that state is the same false-PASS/paid-loop class this PR exists to close — one
@@ -165,6 +186,15 @@ ck "the refusal names the missing normalizer path" $rc
 case "$out" in *'provisions it from'*"$CELL_HARNESS/../lib/diff-normalize.py"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
 ck "the refusal names where the normalizer can be provisioned from" $rc
 mv "$CELL/normalizer.stash" "$RECORDER_LIB"
+
+# 3e) The SIBLING check must require a regular file too: `[ -s dir ]` is true for a non-empty
+# directory, so a directory at the normalizer path would slip past a bare `-s`.
+mv "$RECORDER_LIB" "$CELL/normalizer.stash"
+mkdir -p "$RECORDER_LIB"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "a DIRECTORY at the normalizer path is not certified" $rc
+rmdir "$RECORDER_LIB"; mv "$CELL/normalizer.stash" "$RECORDER_LIB"
 
 # 4) THE SIBLINGS THE ISSUE DID NOT NAME. Each of these, absent, turns a loop step into a silent
 # no-op (python3 → an empty check classification, so no case arm matches and every PR is skipped in
@@ -202,6 +232,20 @@ rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
 [ "$rc" -eq 0 ] && [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "rc=$rc normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
+
+# 5b) A ZERO-BYTE recorder must be RE-provisioned by `start`, not left in place: the old provision
+# ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
+# across every restart and then be blessed by `cmd_check`. The write is atomic (tmp + mv), so a
+# concurrent reader cannot observe a half-written recorder either.
+printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
+: > "$RECORDER"          # a truncated/zero-byte operator copy
+rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+out="$(cell_start)"; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$RECORDER" ] && rc=0 || { rc=1; note "rc=$rc recorder=$([ -s "$RECORDER" ] && echo nonempty || echo empty) out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: start re-provisions a ZERO-BYTE recorder" $rc
+out="$(cell_check)"; rc=$?
+[ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
+ck "the re-provisioned cell is then certified" $rc
 
 # 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
 # can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
@@ -293,6 +337,30 @@ ck "RED→GREEN: a missing recorder is caught BEFORE the paid review" $rc
 ck "a missing recorder still reaches the terminal state" $rc
 case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'MISSING at'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
 ck "the reason names the missing path" $rc
+
+# 8d) RED→GREEN — a recorder that EXISTS but is EMPTY. It is executable and exits 0 without
+# minting the signed marker, so the pre-fix `[ ! -e ]`/`[ ! -x ]` probe admits it, the worker takes
+# `rc=0`, writes NO park, waits out the gate and exits 4 — one paid review per cycle forever. Refuse
+# it BEFORE the paid review, exactly like the missing case.
+mkmrg
+: > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with an empty recorder"; }
+ck "RED→GREEN: an EMPTY recorder is caught BEFORE the paid review" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "an empty recorder reaches the terminal state (no silent rc=0 fall-through)" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'EMPTY (0 bytes)'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason names the zero-byte shape, so the park is actionable" $rc
+
+# 8e) …and a DIRECTORY at the recorder path is refused the same way (`[ -x dir ]` is true).
+mkmrg
+mkdir -p "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with a directory at the recorder path"; }
+ck "a DIRECTORY at the recorder path is caught BEFORE the paid review" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NOT A REGULAR FILE'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the reason names the non-regular-file shape" $rc
 
 # 8b) A CLEAN verdict with NO comment URL is the ONE terminal state a human reaches with no in-band
 # route out: the controller `continue`s past the PR at that head, and merge-one.sh's own `exit 5`
