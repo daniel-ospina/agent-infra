@@ -133,6 +133,7 @@ run_shard scripts/record-review.test.sh                                    # #13
 run_shard scripts/ci_runner_gate.test.sh                                   # #1704 an unreadable queue count / a failed runner enumeration must not read as healthy; #1719 the launcher, the farm and the script must agree
 run_shard scripts/diff-normalize.test.sh                                  # #1362 D1 review-evidence diff normalizer (one impl, shared with the gate) (also a per-PR job in ci.yml)
 run_shard scripts/cloud-cell-supervisor.test.sh                            # #1713 a keys.env top-level exit must not turn a failed cell start into a silent success
+run_shard scripts/orchestrator-harness/refresh-scout.test.sh               # #1736 a cell on a non-Python repo must provision dispatch (or refuse loudly), never merge-only-and-silent
 run_shard tests/admin-merge/run.sh                                         # #930 safe-admin-merge rail (also a per-PR job in ci.yml)
 run_shard tests/atomic-land/run.sh                                         # #1367 atomic land unit (also a per-PR job in ci.yml)
 run_shard tests/record-review/run.sh                                       # the lane-dimension carry (#6072/#6213/#4823): a base-only head move must CARRY, lane work must REFUSE, and a lying local base ref must REFUSE
