@@ -897,11 +897,9 @@ precise-looking number that can invert the verdict: on `daniel-ospina/tortoise#8
 at 84px where it renders at 152px.
 
 So read **all** rects, never `[0]` — and before any line-level number goes into a finding, confirm it against
-a **screenshot of the rendered block**, the artifact a reader can check. Grouping rects into lines by `top` is
-itself a source of error, and no fixed tolerance is safe: it must exceed the largest intra-line fragment
-offset (an inline box with its own font-size or vertical-align gets its own top) and stay below the leading —
-and those bounds cross once a box's offset reaches the leading, leaving no tolerance that works at all. That
-is why the screenshot, not the grouping, corroborates the number.
+a **screenshot of the rendered block**, the artifact a reader can check. A bad line-level number cannot be
+told from a good one by re-reading it, which is why it needs a check that does not come from the same
+reading. Report the method alongside the numbers.
 
 *Section D2 — Config* (`CONFIG_TOUCHED`):
 ```
