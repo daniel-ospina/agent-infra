@@ -12,7 +12,10 @@
 # Placeholders substituted from env (with machine defaults):
 #   {{HOME}}              $HOME (required)
 #   {{PATH}}              the installer's PATH (launchd's default PATH lacks
-#                         homebrew/bin — the alert jobs need `gh` on it)
+#                         homebrew/bin — the alert jobs need `gh` on it), with the
+#                         pi shim directory removed: launchd cannot exec into
+#                         ~/.pi/agent/shims (symlinks into ~/Documents, TCC EPERM,
+#                         #427/#1719)
 #   {{AGENT_INFRA_PATH}}  this repo's MAIN checkout (env overrides; worktree-safe)
 #   {{TORTOISE_REPO}}     env, else ~/Documents/GitHub/tortoise, else sibling ../tortoise
 #   {{SWARM_ROOT}}        env only ("if present" — no auto-detect; canary is
@@ -47,7 +50,9 @@ TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd}"
 AGENTS_DIR="${AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# The range is literal and moves with the header: it ends on `set -uo pipefail`,
+# exactly as it did before the {{PATH}} note above was added.
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Resolve this repo's MAIN checkout (not a worktree) so installed jobs point
 # at a stable path that survives worktree teardown. `git worktree list
@@ -92,10 +97,31 @@ resolve_env() {
     fi
 }
 
+# launchd_path — the PATH a rendered plist receives: {{PATH}} minus the pi SHIM directory.
+#
+# agent-infra#1719. `~/.pi/agent/shims` holds symlinks INTO ~/Documents (e.g.
+# shims/gh -> <repo>/scripts/gh-shim/gh), a tree launchd cannot read: macOS TCC refuses the exec
+# with EPERM (#427). It is FIRST on an interactive session's PATH — and sync.sh runs this installer
+# FROM such a session — so every plist rendered from {{PATH}} began with a directory no launchd job
+# can execute from, and a job's `gh` resolved to an unrunnable symlink. A scheduled job must never
+# be handed a PATH element launchd cannot use, so the shim dir is dropped at render time; the real
+# binaries later in PATH are what the jobs are meant to find.
+launchd_path() {
+    local out="" p
+    local IFS=:
+    for p in $PATH; do
+        case "$p" in
+            "" | */.pi/agent/shims) continue ;;
+        esac
+        out="${out:+$out:}$p"
+    done
+    printf '%s' "$out"
+}
+
 render() {
     # $1 = template path → stdout rendered plist
     sed -e "s|{{HOME}}|$HOME|g" \
-        -e "s|{{PATH}}|$PATH|g" \
+        -e "s|{{PATH}}|$(launchd_path)|g" \
         -e "s|{{AGENT_INFRA_PATH}}|$AGENT_INFRA_PATH|g" \
         -e "s|{{TORTOISE_REPO}}|$TORTOISE_REPO|g" \
         -e "s|{{SWARM_ROOT}}|$SWARM_ROOT|g" \

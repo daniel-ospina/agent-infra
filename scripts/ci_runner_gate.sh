@@ -25,7 +25,7 @@
 #   ci_runner_gate.sh --dry-run  # evaluate and report, change nothing
 #   ci_runner_gate.sh --status   # print current mode, exit 0
 #
-# EXIT: 0 ok · 1 usage · 2 could-not-measure (fail-closed: changes nothing)
+# EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
 set -uo pipefail
 
 REPO="${CI_GATE_REPO:-daniel-ospina/tortoise}"
@@ -90,7 +90,17 @@ print(comp, len(inc))
 
   log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD"
 
-  if [ "$comp" != "operational" ] || [ "${incident:-0}" != "0" ] || [ "${queued:-0}" -ge "$QUEUE_THRESHOLD" ]; then
+  # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
+  # a successful probe that yielded `null`/empty (a schema change, a proxy body, a truncated read)
+  # made `[ "$queued" -ge "$QUEUE_THRESHOLD" ]` ERROR (status 2) — and the `||` chain reads a failed
+  # test as FALSE, i.e. HEALTHY. "Healthy" means want=github -> `fallback_off`, which RELABELS the
+  # local pool: a state change taken on a value that was never read. A count that is not a
+  # non-negative integer is unreadable, so this is could-not-measure (return 2) — never healthy.
+  case "$queued" in
+    '' | *[!0-9]*) log "queued count UNREADABLE ('${queued}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+
+  if [ "$comp" != "operational" ] || [ "${incident:-0}" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
     return 1   # unhealthy -> prefer local
   fi
   return 0     # healthy   -> prefer GitHub
@@ -99,11 +109,30 @@ print(comp, len(inc))
 # ── label control ───────────────────────────────────────────────────────────────
 # ⛔ --paginate is REQUIRED: `gh api` returns at most 30 runners per page, so a pool larger than
 # that was relabelled only in part, and `set_labels` reported ok=N over a truncated set.
-runner_ids() { gh api --paginate "repos/$REPO/actions/runners" --jq '.runners[].id' 2>/dev/null; }
+runner_ids() { gh api --paginate "repos/$REPO/actions/runners" --jq '.runners[].id'; }
 
+# set_labels <json-array body> — relabel every runner in the pool.
+#
+# ⛔ THE ENUMERATION'S FAILURE MUST SURVIVE TO THE RETURN VALUE (agent-infra#1704). The shape
+# `for id in $(runner_ids)` DISCARDED the command-substitution status, so a failed `gh api` iterated
+# zero ids, left ok=0 fail=0, and `[ "$fail" -eq 0 ]` reported SUCCESS. `main` then wrote the new
+# mode to the state file and sent a TRANSITION notification — as if the pool had been relabelled.
+# So the read is captured FIRST: a non-zero status is a named failure and NOTHING is relabelled,
+# and a payload that is not a list of ids (gh's error text, an API error body) is refused the same
+# way rather than iterated as a runner id. "The pool has zero runners" is still a success — that is
+# a readable zero, not a failed read.
 set_labels() { # $1 = json array body
-  local body="$1" id ok=0 fail=0
-  for id in $(runner_ids); do
+  local body="$1" id ok=0 fail=0 ids
+  if ! ids="$(runner_ids 2>&1)"; then
+    log "WARNING: runner enumeration FAILED — no labels changed; ${ids:0:300}"
+    return 1
+  fi
+  case "$ids" in
+    *[!0-9[:space:]]*)
+      log "WARNING: runner enumeration unreadable — no labels changed; ${ids:0:300}"
+      return 1 ;;
+  esac
+  for id in $ids; do
     if printf '%s' "$body" | gh api -X PUT "repos/$REPO/actions/runners/$id/labels" --input - >/dev/null 2>&1; then
       ok=$((ok+1))
     else
@@ -187,7 +216,16 @@ if [ "$DRY" = 1 ]; then
 fi
 
 if [ "$mode" != "$want" ]; then
-  if [ "$want" = local ]; then fallback_on || log "WARNING: some runners not relabeled"; else fallback_off || log "WARNING: some runners not relabeled"; fi
+  relabel_ok=1
+  if [ "$want" = local ]; then fallback_on || relabel_ok=0; else fallback_off || relabel_ok=0; fi
+  # ⛔ DO NOT RECORD A TRANSITION THAT DID NOT HAPPEN (agent-infra#1704). The old code logged a
+  # WARNING and CONTINUED, so a failed enumeration still wrote the new mode to $STATE_FILE and sent
+  # the transition notification — a state file and an alert claiming the pool had been relabelled.
+  # Stop here instead: mode not advanced, nothing notified, fail-closed.
+  if [ "$relabel_ok" -ne 1 ]; then
+    log "relabel FAILED — mode NOT advanced (mode=$mode want=$want prev=$prev), state file unchanged"
+    exit 2
+  fi
 fi
 
 # Notify only on TRANSITION into a new desired mode (dedupe by state file).

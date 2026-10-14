@@ -24,6 +24,10 @@
 #   --status               installed/loaded/drift reporting
 #   --uninstall            bootout + remove; re-run reports NOT INSTALLED
 #   template lint          plutil -lint the rendered plists (when plutil exists)
+#   #1719 runner gate      templates/launchd/com.tortoise.ci-runner-gate.plist installs
+#                          the farmed ci_runner_gate.sh under the label the hand-made
+#                          duplicate used, AND no rendered plist PATH carries the pi
+#                          shim dir (launchd cannot exec into ~/Documents, #427)
 #
 # Vehicle job for reload/fail/broken-target/status sections = the latency
 # tripwire (com.eldato.provider-latency-tripwire, StartInterval 3600); the
@@ -102,10 +106,16 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
+    # #1719 — the gate job's plist target. Its farm entry is `fleet_srcs` (setup.sh copies it to
+    # scripts/), so it must resolve here or the broken-target guard refuses the install.
+    # The shim dir is created too: it is the path the installer must NOT hand to a launchd job
+    # (symlinks into ~/Documents → EPERM under TCC, #427), and run_installer puts it on PATH.
+    mkdir -p "$1/.pi/agent/shims"
+    touch "$1/.pi/agent/shims/gh"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -155,7 +165,10 @@ LOG2="$T/launchctl-retire.log"  # isolated log for the HOME2 retirement section
 run_installer() { # <home> [extra env assignments...]
     (
         export HOME="$1"
-        export PATH="$T/bin:$PATH"
+        # #1719: the shim dir is FIRST on an interactive session's PATH, exactly as it is on a real
+        # box — the renderer must strip it, so the suite puts it there deliberately (otherwise the
+        # PATH assertion below would be vacuous).
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -178,6 +191,7 @@ assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reape
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
+assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
@@ -238,6 +252,20 @@ assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "ba
 assert_contains "$(cat "$DBW_INSTALLED")" "<integer>900</integer>" "balance-watch runs every 15min (StartInterval 900)"
 assert_not_contains "$(cat "$DBW_INSTALLED")" "StartCalendarInterval" "balance-watch is interval-scheduled, not calendar"
 assert_contains "$(cat "$DBW_INSTALLED")" "<key>PATH</key>" "balance-watch plist carries an explicit PATH env"
+# #1719 — the runner-label gate: the repo's copy must be the one launchd executes, on the SAME
+# label the hand-made duplicate occupied, and it must never be handed the shim dir.
+GATE_INSTALLED="$HOME1/Library/LaunchAgents/com.tortoise.ci-runner-gate.plist"
+if [ -f "$GATE_INSTALLED" ]; then
+  ok "runner-gate plist installed at the hand-made duplicate's own label (#1719)"
+else
+  bad "runner-gate plist NOT installed — the versioned template is wired to nothing (#1719)"
+fi
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "$HOME1/.pi/agent/scripts/ci_runner_gate.sh" "runner-gate plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "<integer>300</integer>" "runner-gate every 5 min (StartInterval 300)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "RunAtLoad" "runner-gate runs once at load (a freshness kick)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-version: 0.1.0" "runner-gate template carries version marker"
+assert_not_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
+assert_not_contains "$(cat "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
@@ -246,7 +274,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "7" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness)"
+assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- ci-runner-gate (agent-infra#1719): the CI runner-label FALLBACK gate.
+         It evaluates githubstatus + the queued backlog and re-adds `ubuntu-latest`
+         to the self-hosted pool when GitHub-hosted is unhealthy, so workflows
+         land locally instead of queueing forever; it also reverts that label
+         when GitHub recovers. See the script header for the full rationale.
+
+         WHY A SCHEDULED JOB AND NOT A WORKFLOW: this is the fallback for
+         GitHub-hosted CAPACITY problems. Anything scheduled INSIDE Actions
+         inherits the same degradation, so the gate must run outside Actions.
+
+         WHY THIS TEMPLATE EXISTS (#1719): the script was versioned into
+         scripts/ci_runner_gate.sh while the copy launchd actually executed was a
+         hand-made plist + hand-copied script at ~/.pi/agent/scripts/. Nothing
+         rendered a job for it and no farm delivered it, so a merged fix could
+         never reach the executed copy, and no second box had the gate at all.
+         The label is deliberately the one the hand-made job already used, so the
+         installer CONVERGES that machine rather than stranding a duplicate.
+
+         {{PATH}} is the installer's PATH with the pi shim directory removed
+         (scripts/install-launchd.sh launchd_path): shims are symlinks into
+         ~/Documents and launchd cannot exec them (TCC EPERM, #427), and the shim
+         dir is first on an interactive PATH.
+
+         The script is farmed to {{HOME}}/.pi/agent/scripts/ci_runner_gate.sh by
+         pi-bootstrap/setup.sh (fleet_srcs) - outside ~/Documents, so launchd can
+         read it - and the installer's broken-target guard refuses to install a
+         job whose target has not landed. Rendered by scripts/install-launchd.sh
+         (#304) on every sync; placeholders only. -->
+    <key>Label</key>
+    <string>com.tortoise.ci-runner-gate</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/ci_runner_gate.sh</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+    </dict>
+    <!-- Every 5 minutes, plus once at load so a freshly converged machine has a
+         current verdict immediately. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.pi/agent/state/ci-runner-gate.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.pi/agent/state/ci-runner-gate.launchd.log</string>
+</dict>
+</plist>
