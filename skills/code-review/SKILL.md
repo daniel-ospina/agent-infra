@@ -890,20 +890,18 @@ Review the UI change through the UX lenses:
 ```
 
 **Measuring line-level layout** (whenever the change affects text wrapping, line boxes, widows/orphans or
-horizontal overflow). A verdict here rests on a number, and the obvious number can be the wrong one.
-`Range.getClientRects()` returns **one rect per line fragment**, so a word broken at its hyphen
-(`AI-forward` → head `AI-` on one line, tail `forward` on the next) yields **two** rects. A read that takes
-`getClientRects()[0]` therefore drops the tail fragment and attributes the word to its head's line only —
-silently, with a precise-looking number that can invert the verdict (a last line measured at 84px where it
-renders at 152px, `daniel-ospina/tortoise#8657`, 2026-10-14).
+horizontal overflow). `Range.getClientRects()` returns one rect per line fragment, so a word broken at its
+hyphen (`AI-forward` → head `AI-` on one line, tail `forward` on the next) yields **two** rects. A read that
+takes `getClientRects()[0]` keeps only the head and attributes the word to its head's line — silently, with a
+precise-looking number that can invert the verdict: on `daniel-ospina/tortoise#8657` a last line was reported
+at 84px where it renders at 152px.
 
-Measure **per fragment**: iterate **all** rects for each word or character, then group them into lines by
-top — with a tolerance, because rects on one visual line need not share an exact `top` (an inline box with
-its own font-size or vertical-align gets its own) — and take a line's extent as the union of the fragment
-groups in its band, never the last group alone. Then **corroborate with an independent read** — a single
-character's rect (`setStart(i)`, `setEnd(i + 1)`; a zero-width caret gives a position but no width), or a
-screenshot you inspect — before stating any line-level number in a finding, because a bad line-level number
-is not distinguishable from a good one by re-reading it. Report the method alongside the numbers.
+So read **all** rects, never `[0]` — and before any line-level number goes into a finding, confirm it against
+a **screenshot of the rendered block**, the artifact a reader can check. Grouping rects into lines by `top` is
+itself a source of error, and no fixed tolerance is safe: it must exceed the largest intra-line fragment
+offset (an inline box with its own font-size or vertical-align gets its own top) and stay below the leading —
+and those bounds cross once a box's offset reaches the leading, leaving no tolerance that works at all. That
+is why the screenshot, not the grouping, corroborates the number.
 
 *Section D2 — Config* (`CONFIG_TOUCHED`):
 ```
