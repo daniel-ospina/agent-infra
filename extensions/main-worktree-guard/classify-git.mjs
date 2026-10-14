@@ -3433,8 +3433,19 @@ export function classifyGitCommandDetailed(command) {
   // set, so the pure-query forms of mixed verbs (`worktree list`, `stash list`,
   // bare `tag`) no longer false-block the sanctioned `checkout main && …`
   // ceremony.
+  //
+  // #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation (the one
+  // decideM3 sanctioned — `stateInv`) is exempted BY IDENTITY, never by a verb
+  // allowlist. index.ts returns from the whole handler at the first
+  // `reBaseline`, so a sibling the read-only test wrongly admits is never seen
+  // by the M3 loop; a blanket `true` for the branch-state family therefore
+  // admitted an independent later mutation (`checkout main && switch -f
+  // feat/x`, `… && update-ref refs/heads/main HEAD`, `… && branch -M main
+  // stolen`). `stateInv` is the sanctioned return itself, so exempting it and
+  // requiring every OTHER invocation to be provably read-only is the whole
+  // guard.
   out.stateCarveOutClean = !hiddenStateSubst && invocations.every((v) =>
-    _isCarveOutReadOnlyInvocation(v));
+    v === stateInv || _isCarveOutReadOnlyInvocation(v));
 
   // #1144 (cycle-2 reviewer P0): per-invocation repo hints. The LEGACY_BLOCK
   // arm exempts worktree-isolated destructive ops from `eff.isWorktree`, but
@@ -4244,15 +4255,21 @@ const HUB_READONLY_VERBS = new Set([
  * fail-closed: anything not PROVEN to be a query returns false, so the mutating
  * cousins (`worktree add|prune|remove`, bare `stash` = push, `tag <name>`,
  * `stash push/drop`) stay gated.
+ *
+ * #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation is NOT judged
+ * here — `stateCarveOutClean` exempts it by identity (`v === stateInv`). A
+ * blanket `true` for the branch-state verb family (checkout/switch/
+ * symbolic-ref/update-ref/branch) admitted an INDEPENDENT later mutation of the
+ * same family, because index.ts returns from the whole handler on the first
+ * `reBaseline`: `checkout main && switch -f feat/x` / `… && update-ref
+ * refs/heads/main HEAD` / `… && branch -M main stolen` rode the return into the
+ * shared hub. Only the PROVABLE read-only forms of those verbs qualify now.
  * @param {{verb: string, args?: string[]}} v
  * @returns {boolean}
  */
 function _isCarveOutReadOnlyInvocation(v) {
   const verb = v.verb;
   const args = v.args || [];
-  // The carve-out's own branch-state verbs (pre-existing allowance — the
-  // sanctioned return itself, plus the state-verb family it already admitted).
-  if (["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(verb)) return true;
   if (HUB_READONLY_VERBS.has(verb)) return true;
   // A refspec-less fetch cannot write refs/heads/* (cycle-2 reviewer P3).
   if (verb === "fetch") return !args.some((x) => _stripQuotes(x).includes(":"));
@@ -4263,6 +4280,18 @@ function _isCarveOutReadOnlyInvocation(v) {
   if (verb === "tag") return pos.length === 0;
   // `stash list`/`stash show` are queries; bare `stash` = push, drop/pop apply.
   if (verb === "stash") return pos[0] === "list" || pos[0] === "show";
+  // #1144 (cycle-3 reviewer F1): the branch-state family — a mutating sibling
+  // is NOT read-only. Bare `branch` (list) and `symbolic-ref <name>` (query)
+  // stay read-only; a second checkout/switch, any `update-ref`, a ref-writing
+  // symbolic-ref, and every branch mutation fall through as non-read-only.
+  if (verb === "branch") return !_branchInvMutatesBranchState(args);
+  // A symbolic-ref QUERY is exactly `<name>` with only --quiet/--short; -d
+  // (and every abbreviation of --delete) writes, and any unenumerated flag
+  // fails closed rather than being read as a query.
+  if (verb === "symbolic-ref") {
+    return pos.length === 1 && args.every((a) =>
+      !a.startsWith("-") || a === "-q" || a === "--quiet" || a === "-s" || a === "--short");
+  }
   return false;
 }
 

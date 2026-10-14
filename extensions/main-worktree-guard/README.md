@@ -382,6 +382,17 @@ everything else needs a worktree or the human hatch, and the refusal message
 **names the permitted fast-forward forms** instead of pointing only at the
 hatch.
 
+**`onlyGitInvocation` and the sanctioned recovery one-liner (agent vs.
+terminal).** The documented recovery `cd <repo> && git checkout main && git pull
+--ff-only` is a COMPOUND, so it is admitted only where the compound is the
+sanctioned form: from a **human terminal** (the guard never intercepts a
+terminal) and in the **disordered hub**, where M4's recovery allowlist admits it
+before the sync arm is consulted. On a **clean hub** M4 is inactive and
+`onlyGitInvocation` refuses the compound — an agent there runs the sync on its
+own (`git pull --ff-only`), which is exactly what the refusal message says. This
+is a deliberate safe direction: the effect record describes the first sync op,
+so a compound needs per-invocation proof that the first cut did not carry.
+
 Two consequences of "effect, not verb" that the first cut missed (found by the
 second review cycle) are worth stating, because they are the same rule applied
 one level down:
@@ -401,6 +412,18 @@ one level down:
   bare `tag`/`stash list` are queries, `tag <name>`/bare `stash` are not), so
   the ordinary `git checkout main && git worktree list` ceremony is not
   false-blocked.
+- **The carve-out's OWN invocation is exempt by IDENTITY, never by verb.** A
+  blanket "the branch-state family is read-only" test admits an INDEPENDENT
+  later mutation of that family, because index.ts returns from the whole handler
+  at the first `reBaseline` and the sibling is never seen by the M3 loop:
+  `git checkout main && git switch -f feat/x` moved the shared hub off main, and
+  `… && update-ref refs/heads/main HEAD` / `… && branch -M main stolen` moved
+  the baseline ref, all with the sanctioned return's blessing. `stateCarveOutClean`
+  now exempts `stateInv` itself (the invocation decideM3 sanctioned) and judges
+  each other invocation on its own arguments; bare `branch` (list) and
+  `symbolic-ref <name>` (query) stay read-only, while every later
+  `checkout`/`switch`, any `update-ref`, a ref-writing `symbolic-ref`, and every
+  `branch` mutation are not.
 
 A second adversarial review cycle then found the same two rules **incompletely
 closed**, and they are enforced here rather than deferred:
@@ -449,7 +472,11 @@ sanctioned recovery ops above are allowed directly), but **cannot resume
 feature work in the hub**. Only `AGENT_ALLOW_MAIN_EDITS=1` (env, set at
 session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
-touched only by humans and is unaffected.
+touched only by humans and is unaffected — a human terminal is never
+intercepted, and inside the disordered hub M4's recovery allowlist admits the
+compound. (An AGENT on a CLEAN hub has no M4 active and must run the sync on its
+own: the #1144 effect arm refuses the compound because its effect evidence
+covers only the first sync op. See "The clean-hub sync allowance" above.)
 
 **Scope (#347/#618/#621):** M4 fires only when the session cwd IS the hub's main checkout
 and the hub is off-main/dirty. Worktree sessions are exempt from the M4 git-verb gates (they are isolated

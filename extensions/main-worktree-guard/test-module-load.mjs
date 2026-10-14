@@ -682,6 +682,52 @@ async function partB() {
     expectTrue("B9t-cont3: `checkout main && stash` (bare = push) stays BLOCKED (#1144 P2 control)",
       !!stashPush && stashPush.block === true, `handler returned ${JSON.stringify(stashPush)}`);
 
+    // ── B9u: #1144 cycle-3 reviewer F1 — the carve-out's SIBLINGS ─────────
+    // `_isCarveOutReadOnlyInvocation` returned true UNCONDITIONALLY for the
+    // whole branch-state verb family (checkout/switch/symbolic-ref/update-ref/
+    // branch), and index.ts returns from the whole handler at the first
+    // `reBaseline`. So a LATER member of that family rode the sanctioned return:
+    // `checkout main && switch -f feat/x` moved the SHARED hub off main and
+    // `… && update-ref refs/heads/main HEAD` / `… && branch -M main stolen`
+    // moved the BASELINE ref — with no hatch. The carve-out now exempts its OWN
+    // invocation by identity and requires every OTHER invocation to be
+    // provably read-only (each of these was ALLOWED at this head before the
+    // fix, and is ALLOWED at base).
+    const switchForce = await callBash("git checkout main && git switch -f feat/x");
+    expectTrue("B9u1: `checkout main && switch -f <foreign>` is BLOCKED (carve-out does not admit a later switch) (#1144 F1)",
+      !!switchForce && switchForce.block === true,
+      `handler returned ${JSON.stringify(switchForce)} — the shared hub was moved off main`);
+    const checkoutForce = await callBash("git checkout main && git checkout -f feat/x");
+    expectTrue("B9u2: `checkout main && checkout -f <foreign>` is BLOCKED (#1144 F1)",
+      !!checkoutForce && checkoutForce.block === true, `handler returned ${JSON.stringify(checkoutForce)}`);
+    const checkoutOther = await callBash("git checkout main && git checkout feat/x");
+    expectTrue("B9u3: a SECOND `checkout <foreign>` sibling is BLOCKED (#1144 F1)",
+      !!checkoutOther && checkoutOther.block === true, `handler returned ${JSON.stringify(checkoutOther)}`);
+    const updateRef = await callBash("git checkout main && git update-ref refs/heads/main HEAD");
+    expectTrue("B9u4: `checkout main && update-ref refs/heads/main HEAD` is BLOCKED (baseline ref move) (#1144 F1)",
+      !!updateRef && updateRef.block === true, `handler returned ${JSON.stringify(updateRef)}`);
+    const branchMove = await callBash("git checkout main && git branch -M main stolen");
+    expectTrue("B9u5: `checkout main && branch -M main stolen` is BLOCKED (baseline rename) (#1144 F1)",
+      !!branchMove && branchMove.block === true, `handler returned ${JSON.stringify(branchMove)}`);
+    const symrefWrite = await callBash("git checkout main && git symbolic-ref refs/heads/other HEAD");
+    expectTrue("B9u6: `checkout main && symbolic-ref refs/heads/other HEAD` (ref write) is BLOCKED (#1144 F1)",
+      !!symrefWrite && symrefWrite.block === true, `handler returned ${JSON.stringify(symrefWrite)}`);
+    // Positive controls: the sanctioned return ITSELF and its provably
+    // read-only siblings must keep passing (the exemption is identity-scoped,
+    // not a blanket refusal of the state-verb family).
+    const returnOnly = await callBash("git checkout main");
+    expectTrue("B9u-cont1: `checkout main` alone stays ALLOWED (the sanctioned return itself) (#1144 F1 control)",
+      returnOnly === undefined, `handler returned ${JSON.stringify(returnOnly)}`);
+    const returnStatus = await callBash("git checkout main && git status");
+    expectTrue("B9u-cont2: `checkout main && status` stays ALLOWED (read-only sibling) (#1144 F1 control)",
+      returnStatus === undefined, `handler returned ${JSON.stringify(returnStatus)}`);
+    const returnBranchList = await callBash("git checkout main && git branch");
+    expectTrue("B9u-cont3: `checkout main && branch` (list form) stays ALLOWED (#1144 F1 control)",
+      returnBranchList === undefined, `handler returned ${JSON.stringify(returnBranchList)}`);
+    const returnSymrefQuery = await callBash("git checkout main && git symbolic-ref HEAD");
+    expectTrue("B9u-cont4: `checkout main && symbolic-ref HEAD` (query) stays ALLOWED (#1144 F1 control)",
+      returnSymrefQuery === undefined, `handler returned ${JSON.stringify(returnSymrefQuery)}`);
+
     // ── B8: #967/#1484 script classifier — the EFFECT, not the text ──
     // Drive the REAL `_backdoorBlock` through the loaded extension: a git-FREE
     // script whose only path-shaped content is a markdown code span inside a
