@@ -454,15 +454,19 @@ comments nor docstrings, then take three measurements:
 
 1. **Code size** — code lines added, and what family it joins (an existing guard's code lines).
 2. **CI cost** — is the new test registered in the repo's own **test-shard/surface registry**, and
-   what is its *measured* duration? The registry is repo-specific, so name the one you read:
-   tortoise — `config/ci-surfaces.yml`; agent-infra — `scripts/run-bash-shards.sh` (its shard list
-   IS the CI surface; pinned by `scripts/check-ci-lane-parity.sh`). If the repo has none (eldato,
-   premise-labs), **say so and drop this measurement — never read "no output" as "not registered".**
+   what is its *measured* duration? The registry is repo-specific **and per test kind**, so name
+   the one you read: tortoise — `config/ci-surfaces.yml`; agent-infra — `scripts/run-bash-shards.sh`
+   for `.sh` shards (its list IS the shard surface; pinned by `scripts/check-ci-lane-parity.sh`),
+   and `.github/workflows/ci.yml` for the rest — the `test` job's concrete `.py` target list, the
+   `verify` job's `npx tsx <.test.ts>` registrations. A `.py`/`.test.ts` file is **not** in the
+   shard list, so a no-match there says nothing about whether it is registered. If the repo has
+   none (eldato, premise-labs), **say so and drop this measurement — never read "no output" as
+   "not registered".**
    `rg -n "<new_test_file>" <the repo's registry>`
 3. **Duplication** — does machinery ALREADY own this invariant? Search the repo's own
    guard/assertion trees and **name the trees you searched**: agent-infra — `scripts/`,
-   `extensions/`; tortoise — `tools/`, `.github/scripts/`. A path that does not exist makes `rg`
-   exit 2 and print nothing — that is an **unavailable search, not "no duplicate"**.
+   `extensions/`, `tests/`; tortoise — `tools/`, `.github/scripts/`. A path that does not exist
+   makes `rg` exit 2 and print nothing — that is an **unavailable search, not "no duplicate"**.
    `rg -l "<the invariant's key symbol>" <the repo's guard trees> | sort`
    Then check whether the new file even *names* what it overlaps. Zero mentions is a finding.
 
