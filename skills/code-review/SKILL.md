@@ -889,6 +889,19 @@ Review the UI change through the UX lenses:
 - ux-realism (UX_RATING=high only): does the change hold up against realistic content, data volumes and user flow?
 ```
 
+**Measuring line-level layout** (whenever the change affects text wrapping, line boxes, widows/orphans or
+horizontal overflow). A verdict here rests on a number, and the obvious number can be the wrong one.
+`Range.getClientRects()` returns **one rect per line fragment**, so a word broken at its hyphen
+(`AI-forward` → head `AI-` on one line, tail `forward` on the next) yields **two** rects. A read that takes
+`getClientRects()[0]` therefore drops the tail fragment and attributes the word to its head's line only —
+silently, with a precise-looking number that can invert the verdict (a last line measured at 84px where it
+renders at 152px, `daniel-ospina/tortoise#8657`, 2026-10-14).
+
+Measure **per fragment** — iterate **all** rects for each word or character and group them by line top —
+and **corroborate with an independent read** (per-character collapsed ranges, or a screenshot you inspect)
+before stating any line-level number in a finding, because a bad line-level number is not distinguishable
+from a good one by re-reading it. Report the method alongside the numbers.
+
 *Section D2 — Config* (`CONFIG_TOUCHED`):
 ```
 You are the config reviewer for this PR. Apply the config-validation skill discipline
