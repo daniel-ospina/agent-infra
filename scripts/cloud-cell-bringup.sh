@@ -32,6 +32,11 @@
 #
 # Also note: `cmux vm exec` does NOT forward stdin — `gh auth login --with-token`
 # piped in HANGS until timeout (measured: exit 124). Push a secret file instead.
+#
+#  (4) THE PUSHED TOKEN FILE MUST NOT OUTLIVE THE RUN.  The operator pushes the token as a FILE, so
+#      the file is a credential on the VM's disk until it is deleted — and deleting it on the
+#      success branch alone left a push-capable token behind on every failed/aborted bring-up
+#      (agent-infra#1718). Its lifetime is bounded by an EXIT trap; see SECRET LIFETIME below.
 
 set -uo pipefail
 
@@ -39,12 +44,134 @@ CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 REPO_SLUG="${REPO_SLUG:-daniel-ospina/tortoise}"
 WORKDIR="${WORKDIR:-/tmp/cell}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
+# The pushed gh token. Overridable for the same reason every other path here is (a hermetic test
+# must never touch the REAL /tmp/.gh-tok) — see the secret-lifetime block below.
+GH_TOKEN_FILE="${GH_TOKEN_FILE:-/tmp/.gh-tok}"
 MODE="${1:---check}"
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { say "FATAL: $*" >&2; exit 1; }
 ok()   { say "ok: $*"; }
 warn() { say "warn: $*"; }
+
+# ── SECRET LIFETIME — a secret file must not outlive the bring-up (agent-infra#1718) ────────────
+# The gh token is PUSHED to the cell as a FILE by the operator, and the pre-fix cleanup sat AFTER
+# the guard it was paired with:
+#
+#     gh auth login --with-token < "$tokfile" || die "gh auth failed from $tokfile"   # ← exits here
+#     rm -f "$tokfile" && ok "token file removed"                                     # ← success only
+#
+# So `die` exited first and left a PUSH-CAPABLE token on the VM whenever the login failed (a
+# stale/revoked token, a network fault) or the script aborted anywhere in between — measured: a
+# cell brought up with a rejected token still carried /tmp/.gh-tok on disk afterwards. The same
+# `rm -f … && ok …` also made a FAILED removal invisible: it printed nothing, and bring-up went on
+# to its CELL READY banner with the token still there. The cleanup is therefore bound to the
+# RESOURCE's lifetime, not to one branch of the auth result: every secret file is registered here
+# and removed by an EXIT trap that is re-asserted after $ENV_FILE is sourced, so no `exit` — a `die`,
+# the unknown-mode exit, or a signal — can skip it, and an accidental `trap - EXIT` line in keys.env
+# cannot disarm it. (A keys.env is arbitrary code with this shell's privileges, so it can defeat any
+# in-shell cleanup — this defends against the accident, not against a hostile file.)
+#
+# SECRET INVENTORY (the grep this fix owes: every secret the bring-up touches, and its disposition)
+#   * $GH_TOKEN_FILE (default /tmp/.gh-tok) — the pushed push-capable gh token. TRANSIENT: pushed
+#     only to seed `gh auth login`, so it is REGISTERED here and removed on every exit.
+#   * $ENV_FILE (keys.env) — operator-pushed, and NOT a bring-up byproduct: the cell's own session
+#     re-sources it (cloud-cell-supervisor.sh) for the provider keys and, for a merging cell,
+#     AI_REVIEW_GATE_KEY. Removing it would take the cell's keys away, so it is deliberately left
+#     in place — its lifetime is the CELL's, not this run's.
+#   * $HOME/.config/gh/hosts.yml — written by `gh auth login`, and the credential the cell is
+#     SUPPOSED to keep: cloud-cell-supervisor.sh's cmd_check refuses to run a controller without
+#     `gh auth status`. Not a leftover, so not removed.
+#   * $CELL_HOME/.pi/agent/.ai-review-gate-key — written by the operator/harness, never by this
+#     script; not touched.
+# Register below the moment this script starts handling another secret.
+SECRET_FILES=()
+
+# register_secret <path> — bound a file's lifetime to this process. Idempotent.
+register_secret() {
+  [ -n "${1:-}" ] || return 0
+  local f
+  for f in ${SECRET_FILES[@]+"${SECRET_FILES[@]}"}; do
+    [ "$f" = "$1" ] && return 0
+  done
+  SECRET_FILES+=("$1")
+}
+
+# remove_secret_now <path> — remove ONE registered secret right now. Non-zero if it SURVIVES, so a
+# caller can refuse to report success while a credential is still on disk.
+#
+# ⛔ The removal attempt is NEVER gated on a stat. `[ -e ]`/`[ -f ]` are FALSE both for an absent
+# file AND for one whose PARENT DIRECTORY denies traversal (measured: mode 400 on the parent →
+# `[-e]`/`[-f]` exit 1 while `ls` still lists the file), so a stat-gated cleanup reports "nothing to
+# do" for a credential that IS on disk — the exact silent leftover this fix exists to prevent. `rm
+# -f`'s own status is the only reliable signal: 0 iff the path is gone (an absent file is success by
+# design), non-zero for EACCES/EPERM — which is the direction that must fail closed. The stat is
+# kept for the LOG LINE only.
+remove_secret_now() {
+  local f="${1:-}" present=0
+  [ -n "$f" ] || return 0
+  [ -e "$f" ] && present=1
+  rm -f -- "$f" 2>/dev/null || return 1
+  [ "$present" = 1 ] && ok "secret file removed: $f"
+  return 0
+}
+
+# SECRET_REPORTED — paths whose failure has already been announced. Both the pre-banner refusal and
+# the EXIT trap run remove_secrets, and reporting the same credential twice leaves the operator
+# counting credentials that are not there.
+SECRET_REPORTED=()
+report_survivor() {
+  local f="$1" seen
+  for seen in ${SECRET_REPORTED[@]+"${SECRET_REPORTED[@]}"}; do
+    [ "$seen" = "$f" ] && return 0
+  done
+  SECRET_REPORTED+=("$f")
+  # "or even inspected": `rm -f` also fails when the PARENT denies traversal and the file was never
+  # there, so the honest claim is that we could neither remove nor verify — not that a credential is
+  # definitely on disk. The direction is deliberately fail-closed.
+  say "SECURITY: $f could not be removed (or even inspected — its directory denies access); delete it by hand before handing this VM on" >&2
+}
+
+# remove_secrets — remove every registered secret. Non-zero if ANY survived.
+remove_secrets() {
+  local f survived=0
+  for f in ${SECRET_FILES[@]+"${SECRET_FILES[@]}"}; do
+    [ -n "$f" ] || continue
+    remove_secret_now "$f" || { report_survivor "$f"; survived=1; }
+  done
+  return "$survived"
+}
+
+# install_secret_traps — (re)assert the secret-lifetime handlers. Called at start-up AND again once
+# $ENV_FILE has been sourced: that file is arbitrary shell, so a single `trap - EXIT` in it would
+# DISARM the cleanup for the rest of the run (measured: with `trap - EXIT` as a keys.env line, a
+# rejected login left the token on disk). The #1713 guard below cannot see this — it refuses a file
+# that cannot be parsed or that ends with a top-level exit/exec, not one that edits our traps.
+install_secret_traps() {
+  # ⚠️ NOT for the reason it is tempting to give. An UNTRAPPED fatal signal does run a bare EXIT
+  # trap (measured on bash 3.2.57: with only `trap … EXIT` set, an untrapped TERM/HUP printed its
+  # cleanup and exited 143/129 — while waiting on a child, in a builtin loop, and inside a `$( )`),
+  # so the EXIT trap alone already covers a Ctrl-C. The handlers earn their place on two narrower
+  # grounds: they pin the status at 128+signal deterministically, and they IGNORE further signals
+  # (`trap '' …`, NOT `trap - …`, which merely restores the fatal default) so a signal storm cannot
+  # kill the shell half-way through the cleanup and leave the rest of the list behind. And by
+  # agent-infra#1715 a handler that only cleans up RESUMES the shell — a non-interactive bash
+  # terminates on EXIT alone — so each handler `exit`s, which is what then runs the EXIT trap.
+  trap "trap '' INT TERM HUP; exit 130" INT
+  trap "trap '' INT TERM HUP; exit 143" TERM
+  trap "trap '' INT TERM HUP; exit 129" HUP
+  # The EXIT handler is fail-closed: a run that would have exited 0 must NOT do so while a secret is
+  # still on disk, or the operator reads success and hands the VM on. `trap - EXIT` first stops a
+  # re-entry from the `exit` below, and the signal dispositions are ignored (again) so the cleanup
+  # itself cannot be cut short.
+  trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP; remove_secrets || [ "$rc" -ne 0 ] || rc=1; exit "$rc"' EXIT
+}
+
+install_secret_traps
+# The operator pushes the token BEFORE this script starts, so the file can already exist on the
+# FIRST line: register the configured path here rather than only in check_gh, or an abort in
+# check_tools/check_network re-opens exactly the window the pre-fix code left open.
+register_secret "$GH_TOKEN_FILE"
 
 # ── $ENV_FILE is SOURCED, so a top-level `exit`/`exec` in it ENDS THIS SCRIPT (agent-infra#1713) ──
 # The same root measured in cloud-cell-supervisor.sh reproduces here: sourced directly with no
@@ -108,6 +235,9 @@ check_network() {
 check_provider() {
   if [ -f "$ENV_FILE" ]; then
     source_env_file
+    # $ENV_FILE is arbitrary shell: re-assert the secret-lifetime handlers now that it has run, so a
+    # `trap - EXIT` in it cannot leave the pushed credential on disk (agent-infra#1718).
+    install_secret_traps
     ok "sourced $ENV_FILE"
     # ⛔ keys.env may carry a HOME= line, and every check below (check_gh reads $HOME/.config/gh,
     # check_repo resolves paths) must run under the same home the cell will use — the session
@@ -134,15 +264,24 @@ check_provider() {
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────
+# The token file's lifetime is owned by the EXIT trap in the secret-lifetime block above; this
+# function only reads it and drops it as soon as it has been consumed (agent-infra#1718).
 check_gh() {
-  local tokfile="${1:-/tmp/.gh-tok}"
+  local tokfile="${1:-$GH_TOKEN_FILE}"
+  # Register BEFORE the read: from here on the token is bounded by the process, whatever happens
+  # to the login below — the failure branch included.
+  register_secret "$tokfile"
   if [ -f "$tokfile" ]; then
     gh auth login --with-token < "$tokfile" >/dev/null 2>&1 \
       && ok "gh authenticated from $tokfile" \
       || die "gh auth failed from $tokfile"
-    rm -f "$tokfile" && ok "token file removed"
+    # Consumed — drop it NOW so it does not sit on disk for the rest of the run, and do NOT let a
+    # failed removal pass silently: the pre-fix `rm -f … && ok …` printed nothing when rm failed,
+    # so a token that could not be removed still produced the CELL READY banner.
+    remove_secret_now "$tokfile" \
+      || die "could not remove the token file $tokfile — it is a push-capable credential; delete it by hand before using this VM"
   fi
-  gh auth status >/dev/null 2>&1 || die "gh is not authenticated (push /tmp/.gh-tok via --secret)"
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated (push $GH_TOKEN_FILE via --secret)"
   local login; login="$(gh api user --jq .login 2>/dev/null)"
   [ -n "$login" ] && ok "gh login: $login" || die "gh cannot read the API"
   gh api "repos/$REPO_SLUG" --jq '.permissions.push' 2>/dev/null | grep -q true \
@@ -173,6 +312,11 @@ main() {
       check_provider
       check_gh
       check_repo
+      # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
+      # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
+      # too, so the banner is never printed while a registered secret is still there.
+      remove_secrets \
+        || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
       say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone)"
       ;;
     *)

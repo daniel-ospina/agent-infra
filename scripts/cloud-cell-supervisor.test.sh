@@ -149,8 +149,11 @@ printf '#!/bin/sh\nprintf 200\n' > "$STUB/curl"   # check_network reads %{http_c
 chmod +x "$STUB/curl"
 mkdir -p "$T/bringup-home"
 BR_OUT=''; BR_RC=0
+# ⛔ GH_TOKEN_FILE is pinned into the temp dir: cloud-cell-bringup.sh now bounds the pushed token
+# file's lifetime with an EXIT trap (agent-infra#1718), so leaving it at its default would make THIS
+# suite delete the real /tmp/.gh-tok on the machine it runs on — hermetic means hermetic.
 bringup() {
-  BR_OUT="$(PATH="$STUB:$PATH" CELL_HOME="$T/bringup-home" ENV_FILE="$T/keys.env" \
+  BR_OUT="$(PATH="$STUB:$PATH" CELL_HOME="$T/bringup-home" ENV_FILE="$T/keys.env" GH_TOKEN_FILE="$T/gh-tok" \
             bash "$BRINGUP" --check 2>&1)"
   BR_RC=$?
 }
