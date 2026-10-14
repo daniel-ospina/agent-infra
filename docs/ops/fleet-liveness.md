@@ -163,6 +163,11 @@ The mirror failure is real too: a working child was once declared `wedged` with
 > classifier forks it. Adding a second identity probe anywhere is the "two contracts for one
 > safety rule" defect #1178 exists to remove.
 
+**Three consumers, still one rule.** `scripts/lane-watchdog.py` (the wedge reaper) forks the same
+CLI **at signal time**, immediately before each `os.kill`: it supplies the incarnation it recorded
+when it measured the subtree, and signals only on `holder`. It derives no identity of its own — an
+earlier version signalled by pid alone, which is the superseded form recorded in §6.
+
 The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 `scripts/pi-reap-idle.sh`):
 
@@ -320,6 +325,12 @@ A reader must not trust two contracts for one rule. Concretely:
   untracked state directory and was **not** rewired (unit 4 is blocked on its repo-home decision).
   It remains a second, weaker opinion on this host — treat its `PID DEAD` as a weaker form of
   `unknown`, not as this verdict.
+- **`lane-watchdog.py` signalling by pid alone — retired (#1696).** The wedge reaper derived
+  identity from its own `ps` table and never re-checked it between the measurement and the
+  `os.kill`, so a pid recycled inside that window received a SIGTERM meant for a corpse. It now
+  forks the rule above at signal time and withholds the signal on anything but `holder` — including
+  a victim it cannot fence at all, because an unrunnable rule is `unknown` and `unknown` never
+  authorises a kill.
 
 ---
 

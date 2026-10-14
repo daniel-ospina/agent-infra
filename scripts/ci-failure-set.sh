@@ -132,7 +132,14 @@
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
 #              (finished without running the suite) and NOT `startup_failure`
 #              (the workflow never started — nothing ran at all).
-#   pending    lane runs still queued/in-progress
+#   pending    lane runs still queued/in-progress — MINUS a run GitHub never
+#              EXPANDED into a job, i.e. one whose jobs API answers 0 (#1623; see
+#              `run_is_unexpanded` and the discriminator in `collect_union`). Such
+#              a run is un-startable AND un-cancellable and persists, so counting
+#              it would block a reviewed head forever. An UNREADABLE job count is
+#              NOT zero, so this exception fails CLOSED — and a run that has merely
+#              not expanded YET cannot enter `tested` either, so a listing holding
+#              ONLY such runs is refused by the `tested > 0` precondition regardless.
 #   `examined=0` is NOT a failure — a green lane legitimately has none. The
 #   vacuity signal is `tested=0`: it means nothing about this revision was ever
 #   exercised, so an empty failing set proves nothing. A failures-only
@@ -469,6 +476,54 @@ run_job_count() {
   printf '%s\n' "$count"
 }
 
+# run_is_unexpanded <run-id> — true (exit 0) ONLY when the Jobs API PROVES the run
+# has ZERO jobs, i.e. GitHub never expanded it runner-side (#1623).
+#
+# GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
+# it: measured on agent-infra PR #1615 at 194f1d83 — three runs reporting
+# `status=queued`, `conclusion=null`, `run_attempt=1` whose jobs API answered
+# `{"jobs":[]}`, while `POST /actions/runs/<id>/cancel` refused with "Cannot cancel
+# a workflow run that has not been queued yet". There is no delete-run API, so such
+# a run is un-startable AND un-cancellable AND persistent: counting it as `pending`
+# blocks a reviewed head permanently, and the printed remedy ("wait for CI, then
+# re-run the rail") can never clear it. A run that has exercised NO job is, by
+# GitHub's own admission, not in flight.
+#
+# FAIL CLOSED ON THE PROBE. A count that cannot be ESTABLISHED is not zero — the
+# same rule `fetch_failed_log` applies in its three-way branch — so a run whose
+# count is unreadable stays `pending`. No new API path: the count is
+# `run_job_count`'s, the Jobs API this file already reads for #1482 and for the
+# per-shard bound. It is spent ONE per run that is not `completed`, so a listing
+# whose runs have all finished (the ordinary merge path) costs NOTHING new.
+#
+# NO AGE BOUND, DECIDED DELIBERATELY. `jobs == 0` cannot by itself tell "not
+# expanded YET" from "never will be", and a clock could: only a run older than the
+# jobs-materialisation delay would be suppressed. It is not added, for two reasons.
+# (a) It would not buy safety. A run with no jobs is not TESTING the revision, so
+# it cannot enter `tested`; a listing whose only non-completed runs are unexpanded
+# therefore has `tested=0` and is REFUSED by the `tested > 0` precondition in
+# admin-merge.sh §1b and by `check-lane-tested.sh` at the detector — independently
+# of this counter. That holds for the LANE-FILTERED listing. It is qualified under
+# `--any-workflow`, where `tested` counts ANY workflow's completed run at the head:
+# there a suppressed test-lane run can be paired with an unrelated green workflow,
+# so suppression CAN be the thing that lets a merge proceed. The net is therefore
+# `tested > 0`, not this counter — see the qualification at the `any_workflow`
+# branch below.
+# (b) The only clock reachable here is a run-listing `createdAt`, which this file's
+# projection deliberately does not carry: the canonical three fields ARE the whole
+# of admin-merge.sh's mirrored `LANE_RUN_JQ`, and `drop_superseded_runs` fails
+# closed on any arity it does not recognise. Adding a field to serve one caller
+# would re-shape a shared, adversarially-hardened listing.
+# STATED RESIDUAL: a run created moments ago that has not yet materialised its jobs
+# is omitted from `pending` for that window. It is never credited to `tested`, and
+# when it is the listing's only run the head is refused as untested — which is the
+# over-block this defect is about, in the opposite (safe) direction.
+run_is_unexpanded() {
+  local id="$1" jobs
+  jobs="$(run_job_count "$id")" || return 1
+  [ "$jobs" = "0" ]
+}
+
 # run_failed_job_ids <run-id> → `job-unreadable::<slug>` for every failed job of
 # the run, one per line (#7131).
 #
@@ -674,7 +729,20 @@ collect_union() {
         success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
-      pending=$((pending + 1))
+      # #1623 — AN UNEXPANDED RUN IS NOT IN FLIGHT. GitHub can leave a run
+      # `queued` with no job EVER created; counting it as `pending` blocks a
+      # reviewed head permanently (see `run_is_unexpanded`). An unreadable probe
+      # or a count > 0 still counts as pending (fail closed). A RUN THAT HAS MERELY
+      # NOT EXPANDED YET IS STILL SAFE: while it is not being expanded it is not
+      # being tested either, so it cannot enter `tested`, and a listing that holds
+      # ONLY such runs leaves `tested=0` — refused by the independent `tested > 0`
+      # precondition here and by `check-lane-tested.sh` at the detector. This
+      # counter is not the gate that proves a revision was exercised.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in
       failure|timed_out|startup_failure) ;;
@@ -738,7 +806,12 @@ collect_union_rates() {
         success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in
       failure|timed_out|startup_failure) ;;
@@ -795,7 +868,12 @@ collect_union_signatures() {
       completed=$((completed + 1))
       case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
     examined=$((examined + 1))
@@ -875,7 +953,12 @@ collect_union_rows() {
       completed=$((completed + 1))
       case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
     examined=$((examined + 1))

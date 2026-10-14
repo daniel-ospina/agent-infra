@@ -296,6 +296,16 @@ case "$key" in
     if [ -f "$SCEN/head-$pr" ]; then cat "$SCEN/head-$pr"; exit 0; fi
     [ -f "$SCEN/head" ] && { cat "$SCEN/head"; exit 0; }
     exit 1 ;;
+  "repo view")
+    # ── #4764: THE REVIEW-RECORD GUARD'S IDENTITY RESOLUTION. The guard derives the
+    # record path from the CANONICAL `gh repo view --json nameWithOwner` slug
+    # (`pr_review_record_blocks_update`), so a scenario that exercises it must be able
+    # to answer this call — in the PROJECTED form the rail reads, which is the slug
+    # alone. NO FIXTURE means the identity is UNRESOLVABLE, which is both the guard's
+    # own fail-closed arm and the exact behaviour of every scenario written before this
+    # arm existed, so adding it moves no pre-existing scenario's verdict.
+    [ -f "$SCEN/repo-slug" ] || exit 1
+    cat "$SCEN/repo-slug"; exit 0 ;;
   "run list")
     [ -f "$SCEN/fail-run-list" ] && exit 1
     # A COUNTED failure seam, for the one place where NO flag can separate the
@@ -489,6 +499,22 @@ case "$key" in
     [ -f "$SCEN/merge-noop" ] || touch "$SCEN/merged"
     exit 0 ;;
   api*)
+    # ── #4764: THE BRANCH-UPDATE REQUEST. `refresh_pr_branch` writes with
+    # `gh api -X PUT <slug>/pulls/<N>/update-branch -f expected_head_sha=<sha>` — and
+    # the METHOD comes BEFORE the URL, so `$a2` is `-X` and NO arm below can see this
+    # endpoint. Matched against the whole argv for that reason: falling through to the
+    # `*/pulls/*` projection would answer a WRITE with a pull-request payload and would
+    # make "the rail asked for the update" indistinguishable from a GET. It is only
+    # reachable when the review-record guard PERMITS the update, so no pre-existing
+    # scenario reaches it.
+    case "$*" in
+      *update-branch*)
+        # Its OWN fixture: a REJECTED update must be expressible, because the rail
+        # certifies nothing on this call and must report the write as one that did not
+        # succeed rather than as an update it made.
+        [ -f "$SCEN/update-branch-fail" ] && { printf 'gh: update-branch rejected\n' >&2; exit 1; }
+        printf '{"message":"Updating pull request branch."}\n'; exit 0 ;;
+    esac
     # ── #1261: THE CHECK SURFACES. These URLs are answered from their OWN
     # fixtures and NEVER from the jobs fallback below — that fallback is a
     # catch-all for the #1167 API seam, and letting a health call fall into it
@@ -618,6 +644,44 @@ case "$key" in
         esac
         # ONE projected line, matching the rail's `gh api ... --jq` expression:
         # "<mergeable>\t<merge_commit_sha>".
+        #
+        # #7504 review round 1 (P1): the rail reads this SAME endpoint with TWO
+        # different projections — the mergeable/merge-ref PAIR above, and (since
+        # #7504) the landed commit ALONE. A fake that ignores `--jq` answers the
+        # second with the first projection's shape, so `landed_sha` came back as
+        # "true\t<sha>" and the success line printed a value that is visibly not a
+        # sha — while §62's `grep 'confirmed via the API'` passed for BOTH the fixed
+        # and the unfixed line, so the fix was certified by nothing. Project on
+        # request, exactly as real `gh api` does.
+        #
+        # THE ORDER OF THESE ARMS IS LOAD-BEARING, and getting it wrong is not a test
+        # nit: the PAIR expression at scripts/admin-merge.sh:955 is
+        # `'"\(.mergeable)" + "\t" + (.merge_commit_sha // "")'` — it CONTAINS
+        # `merge_commit_sha`, so a `*merge_commit_sha*` arm placed first swallows it,
+        # hands `resolve_merge_ref` a bare sha as its `state`, which the
+        # `[ "$state" = "$line" ]` guard clears as unrecognised, and the rail refuses
+        # every mergeable PR — measured: 334 of 1088 assertions failed, 56 of them
+        # the explicit `mergeable=<sha>` refusal block. So match the PAIR first and
+        # let it fall through to the pair projection below.
+        case "$(flag_val --jq "$@")" in
+          *mergeable*) ;;
+          *merge_commit_sha*)
+            # The landed (post-merge) commit is a DIFFERENT value from the PRE-merge
+            # `merge_commit_sha` — which holds the PREDICTED `refs/pull/N/merge` ref — so
+            # it gets its OWN fixture, served only once the merge has happened.
+            # Sharing one fixture was a real gap (review round 2, P2-1): with both reads
+            # fed the same value, an implementation that printed the ALREADY-READ merge
+            # ref passed §62 unchanged, so the assertion proved "not $head" rather than
+            # "the commit that landed".
+            [ -f "$SCEN/pr-landed-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
+            s=mergefeed00000000000000000000000000000000
+            [ -f "$SCEN/pr-merge-sha" ] && s="$(cat "$SCEN/pr-merge-sha")"
+            if [ -f "$SCEN/merged" ]; then
+              s=landedfeed000000000000000000000000000000
+              [ -f "$SCEN/pr-landed-sha" ] && s="$(cat "$SCEN/pr-landed-sha")"
+            fi
+            printf '%s\n' "$s"; exit 0 ;;
+        esac
         [ -f "$SCEN/pr-unreadable" ] && { echo "gh: API error" >&2; exit 1; }
         m=true; [ -f "$SCEN/pr-mergeable" ] && m="$(cat "$SCEN/pr-mergeable")"
         s=mergefeed00000000000000000000000000000000
@@ -736,7 +800,8 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
 
@@ -748,7 +813,8 @@ run_admin() {
 # assert on the rail's own output use this.
 run_admin_here() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -1659,7 +1725,7 @@ for mode in main-union commit; do
 echo "== 5l ($mode). an unreadable log still fails closed on collect_union =="
 new_scen "union-$mode"
 if [ "$mode" = "commit" ]; then
-  sha='aa5511000000000000000000000000000000000'
+  sha='aa55110000000000000000000000000000000000'
   lane_fail "$sha" 8802 > "$SCEN/runs-$sha"
   : > "$SCEN/fail-log-8802"          # log unreadable ...
   printf '3\n' > "$SCEN/jobs-count-8802"   # ... and the run DID have jobs
@@ -1715,7 +1781,7 @@ printf '3\n' > "$SCEN/jobs-count-8803"   # the run DID have jobs
 # `--commit-rows` -> collect_union_rows (the PR-side input). There is no
 # `--main-union-rows`; naming a mode the CLI does not have exits 2 on USAGE and
 # would have passed this test vacuously — asserted below.
-sha8803='aa5511000000000000000000000000000000000'
+sha8803='aa55110000000000000000000000000000000000'
 lane_fail "$sha8803" 8803 > "$SCEN/runs-$sha8803"
 cfs_run --main-union-signatures 10 --repo test-org/test-repo \
   --runs-report "$TMP/zl-sig-rep.txt" --provenance "$TMP/zl-sig-prov.txt"
@@ -1739,7 +1805,7 @@ rc=$?
 # merged, with a new message. This scenario is the one that catches it.
 echo "== #6798. a non-nodeid-only failing run must be EXTRACTED (both doors) =="
 new_scen nonnodeid
-sha_kill='aa6798000000000000000000000000000000000'
+sha_kill='aa67980000000000000000000000000000000000'
 printf '%s\n' "$sha_kill" > "$SCEN/head"
 lane_fail "$sha_kill" 6798 > "$SCEN/runs-$sha_kill"
 # The record's ONLY evidence is the watchdog banner: a genuine SIGKILL (rc=137)
@@ -1771,7 +1837,7 @@ fi
 # that was NOT killed must STILL refuse. If this scenario starts passing, the
 # change has opened the hole #6798 was mis-diagnosed against.
 new_scen nonnodeid-refuse
-sha_plain='aa6799000000000000000000000000000000000'
+sha_plain='aa67990000000000000000000000000000000000'
 printf '%s\n' "$sha_plain" > "$SCEN/head"
 lane_fail "$sha_plain" 6799 > "$SCEN/runs-$sha_plain"
 printf 'test (h)\tRun fast test suite\t2026-10-01T03:00:00.0000000Z ImportError: no module named y\n' > "$SCEN/log-6799"
@@ -1793,7 +1859,7 @@ fi
 # granularity from the jobs API instead of refusing.
 echo "== #7131. a PRUNED log falls back to the JOB-LEVEL failure set =="
 new_scen pruned
-sha_pr='aa7131000000000000000000000000000000000'
+sha_pr='aa71310000000000000000000000000000000000'
 printf '%s\n' "$sha_pr" > "$SCEN/head"
 lane_fail "$sha_pr" 7131 > "$SCEN/runs-$sha_pr"
 : > "$SCEN/pruned-log-7131"                  # the log is PROVEN absent
@@ -1827,7 +1893,7 @@ grep -q 'JOB-LEVEL' "$TMP/cfs-err" \
 # there is no fallback surface left and the run must refuse exactly as before.
 echo "== #7131. pruned log AND unreadable job list → still fail-closed =="
 new_scen pruned-nojobs
-sha_pn='aa7132000000000000000000000000000000000'
+sha_pn='aa71320000000000000000000000000000000000'
 printf '%s\n' "$sha_pn" > "$SCEN/head"
 lane_fail "$sha_pn" 7132 > "$SCEN/runs-$sha_pn"
 : > "$SCEN/pruned-log-7132"                  # log pruned
@@ -1874,7 +1940,7 @@ grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/pl-dec2.out" \
 # asserts the PRODUCER's OWN row shape AND feeds that row to the real decision.
 echo "== #7131. two jobs slugging alike in ONE run must not over-count =="
 new_scen pruned-collide
-sha_pc='aa7133000000000000000000000000000000000'
+sha_pc='aa71330000000000000000000000000000000000'
 printf '%s\n' "$sha_pc" > "$SCEN/head"
 lane_fail "$sha_pc" 7133 > "$SCEN/runs-$sha_pc"
 : > "$SCEN/pruned-log-7133"
@@ -1939,7 +2005,7 @@ if grep -q 'CLEAN' "$TMP/kk-dec.out"; then
 elif grep -q '^watchdog-kill::pytest$' "$TMP/kk-blocked.txt" 2>/dev/null; then
   pass "main GREEN on the kill => BLOCKED by name, not silently certified clean"
 else
-  fail "expected the kill to be BLOCKED with no main-side measurement; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
+  fail "expected the kill to be BLOCKED as absent from main's failure set; verdict='$(tr '\n' ' ' < "$TMP/kk-dec.out")'"
 fi
 # And the COMPARABLE direction: main red on the same identity at the same rate
 # must EXEMPT — otherwise the door is admitted but the comparison still fails.
@@ -1958,14 +2024,14 @@ fi
 
 # ── the RESIDUAL must group a non-nodeid id by its OWN unit (#6798) ──────
 # The verdict is only half the diagnosis: `attribute_residual` labels each
-# residual id "measured on this lane" or "not measurable". It derives the UNIT
+# residual id "measured on this lane" or "absent from main's failure set". It derives the UNIT
 # with the generic `s/::.*//`, which collapses `collect-error::tests/a.py` onto
 # the literal `collect-error` — so a main baseline for a DIFFERENT file reads as
 # the SAME unit and the operator is told the lane is re-measuring main's failure
 # when it is not. The file-keyed family must group by FILE; the environmental
 # kill, which has no file, must group by its own constant (like a guard step).
 new_scen nonnodeid-resid
-sha_ce='aa6798000000000000000000000000000000001'
+sha_ce='aa67980000000000000000000000000000000010'
 printf '%s\n' "$sha_ce" > "$SCEN/head"
 lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
 printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
@@ -1981,7 +2047,7 @@ grep -q "no failure in collect-error" "$TMP/err" && fail "(f) the bare 'collect-
   || pass "(f) …never the bare 'collect-error' prefix as a unit"
 grep -q "no failure in tests/a.py" "$TMP/err" && pass "(f) …the FILE is named as the unit" \
   || fail "(f) the residual did not name the file: $(grep 'no failure in' "$TMP/err" | head -1)"
-grep -q "not measurable on this lane" "$TMP/err" && pass "(f) …as not-measurable (a different file on main is not this failure)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(f) …as absent from main's failure set (a different file on main is not this failure)" \
   || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
   || pass "(f) no merge attempted"
@@ -2336,7 +2402,201 @@ run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head moved" || fail "expected a non-zero exit, got 0 — the clean path merged a moved head"
 grep -q "head moved before the evidence" "$TMP/err" && pass "the block names the head move" || fail "expected the head-move reason on stderr"
+# ⛔ THE TAG'S NEGATIVE (#1690 review round 2). The whole point of `[head_unreadable]` is that
+# it is the tag the MOVED-HEAD refusals do NOT carry — otherwise `grep -F '[head_unreadable]'`
+# is not a discriminator at all. Adding it to this refusal left every unit test green (measured),
+# so the discriminating property was unpinned until this line.
+grep -qF '[head_unreadable]' "$TMP/err" && fail "a MOVED head carried the [head_unreadable] tag — the two refusals are no longer distinguishable by machine" \
+  || pass "the moved-head refusal carries no [head_unreadable] tag"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a moved head" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# post_read_call_made — 0 when the rail made a `isDraft` probe, i.e. it CONTINUED past a
+# successful head read. The discriminator §13b/§13c/§13d/§13e rest on.
+#
+# A MISSING OR EMPTY LEDGER is a fail-open direction in a fail-closed guard, recorded here rather
+# than guarded. `post_read_call_made` returns 1 — the correct value — but at the `&& fail || pass`
+# sites (§13b/§13c/§13d) that is the PASS arm, so such a scenario reports green without ever
+# having shown the rail reached the head read. With the suite's fake `gh` in place it cannot
+# arise: the head read IS a `gh` call and `new_scen` creates the ledger, so any attempted read
+# leaves a line. It is recorded and not guarded because a third return status would put machinery
+# on the one state the harness cannot reach, and this file's standard is the LEAST machinery that
+# makes the behaviour trustworthy. (§13e inverts the arms, so it would go RED — the asymmetry is
+# right.) THE LIMIT: a rail that refused with zero `gh` invocations at all would satisfy §13b's
+# assertions on an empty ledger.
+#
+# ⛔ NO PIPE (#841) — AND THIS IS NOT A STYLE POINT. The first version of this anchor was
+# `grep 'isDraft' "$SCEN/calls" | grep -qv 'headRefOid'`, which is the `writer | grep` shape this
+# file explicitly forbids further down (see the note at the §~7000 belt: under `set -uo pipefail`
+# the upstream takes SIGPIPE and the pipeline returns 141, so at a `pipeline && fail || pass`
+# site the FAILURE ARM IS SKIPPED — a FAIL-OPEN enforcer that reports green on a regressed rail).
+# That is the precise failure these four scenarios exist to prevent, so shipping it inside them
+# would have been the joke telling itself. The repo's own `check-no-sigpipe-grep.sh` cannot see it
+# (it scans `scripts .husky pi-bootstrap` and its predicate is builtin-writer-into-quiet-grep, not
+# `grep | grep -q`). Capture-independent, per-line, pipe-free:
+post_read_call_made() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      *isDraft*) case "$l" in *headRefOid*) ;; *) return 0 ;; esac ;;
+    esac
+  done < "$SCEN/calls"
+  return 1
+}
+
+# ── 13b. a head READ THAT FAILS is UNREADABLE, never "moved" (#1690) ───────────
+# ⛔ THIS SCENARIO IS THE DURABLE HALF OF THE COMPOSITION PIN, AND IT EXISTS BECAUSE A
+# SOURCE SCAN IS NOT ONE. The unit suite (scripts/test_admin_merge_head.py) pins
+# `require_head` itself, and a companion test scans the rail's SOURCE for a `|| exit 1`
+# guard on each call site — but a source scan is a same-line substring match. Review
+# round 2 MEASURED four plausible shapes that all pass it with every unit test green:
+#   * the call reformatted across lines                → 12 passed
+#   * a process substitution  read -r h < <(require_head …)  → 12 passed
+#   * backticks               h=`require_head …`        → 12 passed
+#   * `|| true  # was || exit 1` (the guard in a COMMENT) → 12 passed
+# A guard that only holds for the formatting it was measured on is not a guard. Driving a REAL
+# `require_head` call site cannot be reformatted away, so that is what this does — it drives the
+# OPENING read. ⛔ IT DOES NOT REACH §4, and review round 5 MEASURED that (its ledger contains no
+# post-read call). §13e is the scenario that drives the §4 COMPARISON site; do not read this one
+# as covering it. (An earlier version of this comment claimed the §4 sites; it was false.)
+#
+# `run_admin_here` (not `run_admin`): the assertion is on the rail's OWN output, and the
+# shared `$TMP/err` can be satisfied by a STALE file from whichever scenario wrote it last.
+echo "== 13b. a head read that FAILS is UNREADABLE, never 'moved' (#1690) =="
+new_scen headunread
+# NO `head` fixture at all: the shim falls through to `exit 1`, so the read FAILS.
+# Everything AFTER the head read is made otherwise-clean, so a non-zero exit cannot be
+# earned by an unrelated refusal further down the rail.
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read FAILS" \
+  || fail "expected a non-zero exit, got 0 — an UNREADABLE head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ failed" \
+  || fail "expected the unreadable-head refusal on stderr, got: $(head -c 200 "$SCEN/err")"
+grep -qF '[head_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [head_unreadable] on the refusal line"
+# ⛔ THE DISCRIMINATOR — AND THE REASON THE ASSERTIONS ABOVE ARE NOT ENOUGH. Measured (review
+# round 3, by mutation): with `require_head` changed to print its correct refusal and then
+# `return 0`, this scenario reported the SAME exit code, the SAME "could not READ" line and the
+# SAME tag. Because `head` is then EMPTY, the rail CONTINUES, and a DOWNSTREAM guard exits 1 for
+# an unrelated reason — so a bare exit-code assertion is satisfied by a refusal the mutation did
+# not cause.
+#
+# ⛔ AND THE FIRST VERSION OF THIS LINE WAS STILL NOT A GUARD (review round 4). It grepped the
+# rail's PROGRESS LOG for `PR #42 head` — which is PROSE. Renaming that one `info` call, with no
+# behaviour change, left 13b/13c/13d all GREEN while the rail demonstrably still proceeded. A
+# guard that a reworded log line can delete is the same defect these scenarios exist to close.
+# So the assertion is anchored on the artifact the rail cannot reword: the fake-`gh` CALL LEDGER.
+# `isDraft` is probed only AFTER a successful head read, so its presence proves the rail continued.
+post_read_call_made \
+  && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
+  || pass "the rail never proceeded past the unread head (no post-read call was made)"
+# ⛔ THE ASSERTION 13b EXISTS FOR. #1690 was an operator reading THIS sentence on a PR that
+# had not moved. A source scan cannot catch a regression that reintroduces it; this can.
+grep -q "head moved" "$SCEN/err" && fail "a FAILED READ was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "a failed read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the head could not be read" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 13c. a head read that SUCCEEDS and returns NOTHING is unreadable too (#1690) ──
+# The OTHER half of the pair, and it reaches `require_head` differently: 13b models a read
+# that FAILS, this models a read that SUCCEEDS with no value. That is the shape that made
+# the original defect so quiet — the writer exited 0, so nothing looked like an error.
+echo "== 13c. a head read that SUCCEEDS with no value is unreadable too (#1690) =="
+new_scen headempty
+: > "$SCEN/head"                    # gh exits 0 with an EMPTY projection
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read returns nothing" \
+  || fail "expected a non-zero exit, got 0 — an EMPTY head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ was unusable" \
+  || fail "expected the unreadable-head refusal on stderr"
+post_read_call_made \
+  && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
+  || pass "the rail never proceeded past the empty head (no post-read call was made)"
+grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "an empty read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for an empty head" \
+  || pass "no evidence comment posted"
+
+# ── 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) ──
+# ⛔ WHY A THIRD SCENARIO, AND WHY ITS FIXTURE IS MULTI-LINE. A first attempt used a SINGLE short
+# value (`deadbeef`, 8 hex). Review round 4 MEASURED that this does NOT exercise the whole-value
+# property at all: the defect of the ORIGINAL fix — the per-line `grep -qE '^[0-9a-fA-F]{40}$'`
+# introduced by 09e1b15 and removed in review round 1 — also rejects `deadbeef`, so it left this
+# scenario GREEN. (Round 3/4 labelled that defect "round 2"; it was round 1. Corrected.) The
+# fixture was therefore not testing the fix it was named for. The whole-value property is only
+# exposed by a read containing a VALID 40-hex sha AND a second line: an any-line test accepts it
+# and the rail then emits BOTH lines as the head. Measured: the current rail rejects this (so the
+# clean case still passes), while the per-line version returned rc=0 with the two-line value.
+echo "== 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) =="
+new_scen headcorrupt
+# A VALID sha on line 1, plus a junk second line: accepted by a per-LINE check, rejected only by
+# a WHOLE-VALUE one.
+printf 'deadfeed00000000000000000000000000000000\nJUNK-SECOND-LINE\n' > "$SCEN/head"
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read is corrupt" \
+  || fail "expected a non-zero exit, got 0 — a CORRUPT head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the read was unusable" \
+  || fail "expected the unreadable-head refusal for a corrupt value"
+post_read_call_made \
+  && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
+  || pass "the rail never proceeded past the corrupt read"
+grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "a corrupt read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a corrupt head" \
+  || pass "no evidence comment posted"
+
+# ── 13e. the §4 COMPARISON SITE never renders a failed read as a moved head (#1690) ──
+# ⛔ 13b/13c/13d DO NOT REACH §4, AND THE FIRST VERSION OF THEM CLAIMED THEY DID (review round 4).
+# With an unreadable/empty/corrupt head fixture the rail aborts at the OPENING read — §13b's
+# stderr shows one refusal and its ledger shows no post-read call — so the comparison sites at
+# §4 (during re-run, before evidence) are never reached. But the sentence #1690's operator
+# actually SAW (`head moved before the evidence was posted (x -> )`) is emitted only at the §4
+# site, so the ORIGINAL SYMPTOM was still unreproduced by any scenario. This one reproduces it:
+# the OPENING read SUCCEEDS and a LATER read returns nothing. `head-seq` serves the Nth head read
+# from the Nth line, so a one-line fixture makes the 2nd and later reads return EMPTY — that is
+# the rc=0-EMPTY shape, not the rc!=0-FAILED one (§13b pins the failed shape at the opening site).
+echo "== 13e. an EMPTY §4 read is never reported as a moved head (#1690) =="
+new_scen headseqfail
+HEAD_SF="5555000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head-seq"   # line 2 is ABSENT → the 2nd read returns EMPTY
+printf '0' > "$SCEN/head-seq-count"
+lane_fail "$HEAD_SF" 7001 > "$SCEN/runs-$HEAD_SF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
+# The decision path must be CLEAN for this scenario to reach the §4 comparison (as in §13):
+# main fails the SAME id over 3 tested runs, so the PR's single-run failure is exempted.
+main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when a §4 head read returns nothing" \
+  || fail "expected a non-zero exit, got 0 — a §4 read returned NOTHING and the rail continued"
+# ⛔ PROVE IT GOT THERE (review round 5, MEASURED). This scenario is named for the §4 comparison
+# site, but every one of its assertions was ALSO satisfied by a refusal at the OPENING read: with
+# a `resolve_head` that refuses every value, §13e reported all five ✅ while §4 was never reached.
+# A scenario named for a site must show it reached that site. The `isDraft` probe is issued
+# BETWEEN the opening read and §4, so its presence proves the opening read succeeded and the §4
+# read is therefore the one that failed. (The `grep -v headRefOid` guard keeps this from being
+# satisfied by an argv that happens to name isDraft on the head read itself.)
+post_read_call_made \
+  && pass "§13e VERIFIABLY reached the §4 comparison (the opening read succeeded)" \
+  || fail "§13e never reached §4 — the opening read did not succeed, so this scenario proved NOTHING about the §4 site"
+# ⛔ THE ASSERTION 13e EXISTS FOR. This is the exact sentence #1690's operator read on a PR that
+# had NOT moved, and no other scenario can produce it.
+grep -q "head moved" "$SCEN/err" && fail "THE §4 COMPARISON SITE REPORTED A MOVED HEAD ON A FAILED READ — this is #1690 exactly as the operator saw it" \
+  || pass "the §4 site never renders a failed read as a moved head"
+grep -q "could not READ the head" "$SCEN/err" && pass "the §4 read is reported as UNREADABLE" \
+  || fail "expected the unreadable-head refusal from the §4 site"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the §4 read fails" \
+  || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
@@ -3509,7 +3769,7 @@ out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)
 # rail routes through it.
 echo '== 32b. the shell rail drops+reports at the FAILED-token position =='
 new_scen cfsmay
-HEAD_CM="aa5511000000000000000000000000000000000"
+HEAD_CM="aa55110000000000000000000000000000000000"
 lane_fail "$HEAD_CM" 8801 > "$SCEN/runs-$HEAD_CM"
 { log_failed 'tests/test_ok.py::test_ok'; log_failed 'may'; } > "$SCEN/log-8801"
 cfs_run --commit "$HEAD_CM"; rc=$?
@@ -3533,7 +3793,7 @@ grep -q 'UNATTRIBUTABLE.*may' "$TMP/cfs-err" && pass "the rail REPORTS the dropp
 # (The decision's UNATTRIBUTABLE VERDICT is the consumer side, #1147.)
 echo "== 33. a moved identity is REPORTED across the boundary and not attributed =="
 new_scen cfsrot
-HEAD_RR="bb6622000000000000000000000000000000000"
+HEAD_RR="bb66220000000000000000000000000000000000"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_status_surfaces_last_drill'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_manual_drill_records_measured_time'
 { lane_fail "$HEAD_RR" 8801; lane_fail "$HEAD_RR" 8802; } > "$SCEN/runs-$HEAD_RR"
@@ -3691,7 +3951,7 @@ grep -q "run list" "$SCEN/calls" \
 #   (d) the re-run ceiling is DERIVED (2 x the slowest OBSERVED shard) and the
 #       derivation is stated
 #   (e) a failure whose file main's lane has NOT measured reads
-#       "not measurable on this lane" — the refusal STAYS, and there is no
+#       "absent from main's failure set" — the refusal STAYS, and there is no
 #       waiver label (B1's docker/embedded redislite case)
 echo "== 37. the two waits, the derived ceiling, and non-narrowing attribution =="
 
@@ -3866,8 +4126,8 @@ run_admin 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(e) an unmeasured-file failure STILL BLOCKS (exit $rc) — the refusal is not narrowed" \
   || fail "(e) an unmeasured-file failure was allowed through"
-grep -q "not measurable on this lane" "$TMP/err" \
-  && pass "(e) it reports 'not measurable on this lane' instead of 'unique to this PR'" \
+grep -q "^ *-> absent from main" "$TMP/err" \
+  && pass "(e) it reports 'absent from main's failure set' instead of 'unique to this PR'" \
   || fail "(e) the output still asserts uniqueness with no measurement on main"
 grep -q "test_copy_race" "$TMP/err" && pass "(e) …naming the failure" || fail "(e) the failure is not named"
 grep -q "BOTH block" "$TMP/err" \
@@ -3892,7 +4152,13 @@ rc=$?
 grep -q "measured on this lane, not present on main" "$TMP/err" \
   && pass "(e2) it reads 'measured on this lane, not present on main'" \
   || fail "(e2) the measured-absent label is missing"
-grep -q "not measurable on this lane" "$TMP/err" && fail "(e2) a measured failure was called unmeasurable" \
+# SCOPE THE PATTERN TO THE SHELL'S OWN LABEL, never the bare string (#7734). The
+# id-level reason in ci_exemption.py and `attribute_residual`'s file-level label are
+# deliberately now the SAME wording, so a bare substring grep matches the DECISION's
+# line too — which in this scenario always fires, making the assertion fail whatever
+# the shell prints. Only `attribute_residual` emits a line beginning `-> `, so the
+# anchor restores the discrimination the label unification removed.
+grep -q "^ *-> absent from main" "$TMP/err" && fail "(e2) a measured failure was called absent from the failure set" \
   || pass "(e2) the two labels are distinct"
 
 # ── 38. THE PER-SHARD BOUND DERIVATION (#1167) ────────────────────────
@@ -4476,7 +4742,8 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 # still be read in two bases. `0700`/`03900` are ambiguous regardless; `010` is
 # the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
-            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010"; do
+            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
+            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
@@ -4626,7 +4893,7 @@ belt_wait progress 100 1
 # instead. Removing that union turns this test RED (the merge proceeds).
 echo "== 45. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
 new_scen rotation
-HEAD_ROT="ee5500000000000000000000000000000000000"
+HEAD_ROT="ee55000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
@@ -6717,6 +6984,68 @@ grep -q "did NOT EXECUTE 3 test shard" "$SCEN/err" \
   || fail "the raw gap was not the refusal: $(grep -o 'did NOT EXECUTE [0-9]* test shard' "$SCEN/err")"
 grep -q "pr merge" "$SCEN/calls" && fail "a merge ran on a whitespace-only changed-file list" || pass "no merge attempted"
 
+# (f2) #7702 — A LARGE CHANGED-FILE LIST MUST NOT HANG THE RAIL.
+# The emptiness test in `lane_applicable()` was `${WF_PR_CHANGED_PATHS//[[:space:]]/}`,
+# a bash-3.2 POSIX-character-class global substitution that is SUPER-LINEAR in the
+# length of the string. Measured under /bin/bash 3.2.57 (the interpreter the rail
+# actually runs): 50 paths 3.5 s, 100 paths 21.5 s, 200 paths > 25 s, and PR #7653's
+# 2,265 paths (173 KB) UNBOUNDED past 60 s. The rail printed its header and then hung
+# with NO verdict, NO refusal and NO timeout — so a large PR could not be landed at
+# all, and a watcher could not tell a hang from slow work. The failure mode is a HANG,
+# not a wrong answer, so this scenario BOUNDS the call: under the regression the rail
+# is killed and this leg FAILS instead of hanging the suite.
+new_scen lane7702-largechanged
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 7005 > "$SCEN/runs-$HEAD_VP"
+lane_pass main6946 7006 > "$SCEN/runs-main"
+lane_jobset 7006 success 'test (a)' 'test (b)' 'test-slow (a)' 'test-slow (b)' 'test-carve-out'
+lane_jobset 7005 success 'test (a)' 'test (b)'
+# ⛔ The workflow body fixture is LOAD-BEARING: without it the fake's contents arm
+# returns nothing, `lane_applicable()` returns at the EMPTY-BODY guard
+# (admin-merge.sh:2484-2487) and NEVER reaches the emptiness test — so the behavioural
+# leg below passed on BOTH the fixed and the regressed rail, i.e. it discriminated
+# nothing. Measured with this line: the fixed rail reaches the test with a 122 KB
+# list, and the regressed rail hangs and is killed at 90 s (verification round 1).
+wf_declares .github/workflows/python-ci.yml pull_request
+# 2,265 paths — the measured size of the PR #7653 list.
+: > "$SCEN/pr-changed-files"
+_w7702i=0
+while [ "$_w7702i" -lt 2265 ]; do
+  printf 'website/apps/dashboard/node_modules/pkg%s/file%s.js\n' "$((_w7702i/10))" "$_w7702i" >> "$SCEN/pr-changed-files"
+  _w7702i=$((_w7702i + 1))
+done
+selector_interp_312
+selector_stub False False
+# ⛔ A background killer + a plain `wait` (bash 3.2 has no `wait -n`, and a finished
+# but unreaped child still answers `kill -0`, so a poll loop cannot distinguish
+# "done" from "hung" here). `wait` returns the real exit status; 137 = SIGKILL.
+( SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+    bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err" ) &
+_w7702rail=$!
+( sleep 90; kill -9 "$_w7702rail" 2>/dev/null ) & _w7702killer=$!
+wait "$_w7702rail" 2>/dev/null; _w7702rc=$?
+kill -9 "$_w7702killer" 2>/dev/null; wait "$_w7702killer" 2>/dev/null
+if [ "$_w7702rc" -eq 137 ]; then
+  fail "#7702: the rail did NOT return within 90s on a 2,265-path changed-file list — the super-linear whitespace substitution at admin-merge.sh:2494 is back (this is the silent multi-hour stall)"
+else
+  pass "#7702: the rail returned on a 2,265-path changed-file list (exit $_w7702rc) instead of hanging"
+fi
+# ⛔ NOT `grep -v … | grep -q …` HERE. Under `set -o pipefail` (run.sh:195) the
+# upstream `grep -v` takes SIGPIPE (141) when the downstream `-q` exits at its first
+# match, so the pipeline status becomes 141 and the `&& fail` arm is SKIPPED: a
+# FAIL-OPEN enforcer that reports green on a regressed file (measured: fires 0.5% of
+# the time, green 99.5% — and the same race made the positive pin false-fail ~99.7%).
+# This is the repo's own #841 class; its guard (`scripts/check-no-sigpipe-grep.sh`)
+# scans only `scripts/`, so an instance in `tests/` is invisible to it. Capture first,
+# then grep a here-string — the repo's documented remedy.
+_w7702_nc="$(grep -v '^[[:space:]]*#' "$ADM")"
+grep -q 'WF_PR_CHANGED_PATHS//\[\[:space:\]\]' <<<"$_w7702_nc" \
+  && fail "#7702: admin-merge.sh again uses \${WF_PR_CHANGED_PATHS//[[:space:]]/} — super-linear in bash 3.2, unbounded on a large PR" \
+  || pass "#7702: the changed-paths emptiness test no longer uses a global whitespace substitution"
+grep -q 'case "\${WF_PR_CHANGED_PATHS:-}" in' <<<"$_w7702_nc" \
+  && pass "#7702: …it uses the linear case-glob form instead (same predicate, one pass)" \
+  || fail "#7702: admin-merge.sh does not test changed-path emptiness with the linear case-glob form"
+
 # (g) #6928 P1-1 — NO ≥3.12 INTERPRETER → FAIL CLOSED, NAMING THE REQUIREMENT.
 # This is the production defect: the rail's own python3 is 3.9.6 and tortoise's
 # selector refuses below 3.12, so the FIRST cut made the whole path refuse on the
@@ -7896,7 +8225,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(d) a merge was attempted on the mixed
 # second parser in the shell), and the bare `guard-step` prefix must never be
 # reported as a unit no real failure occupies, which would flip the diagnosis to
 # "measured on this lane, not present on main". Here main is red on a DIFFERENT
-# unit, so the guard failure is "not measurable on this lane" — and the STEP is
+# unit, so the guard failure is "absent from main's failure set" — and the STEP is
 # what is named.
 new_scen guardresid
 HEAD_GR="e4e4000000000000000000000000000000000000"
@@ -7912,7 +8241,7 @@ grep -q "Assert-no-redislite-orphans-issue" "$TMP/out" && pass "(e) …and the r
   || fail "(e) the guard step is not named in the residual: $(grep -c . "$TMP/out") line(s)"
 grep -q "no failure in guard-step" "$TMP/err" && fail "(e) the bare mechanism was reported as the unit" \
   || pass "(e) …never the bare 'guard-step' prefix as a unit"
-grep -q "not measurable on this lane" "$TMP/err" && pass "(e) …as not-measurable (absence is not novelty)" \
+grep -q "^ *-> absent from main" "$TMP/err" && pass "(e) …as absent from main's failure set (absence is not novelty)" \
   || fail "(e) the absence of a main-side guard unit was mis-described: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(e) a merge was attempted on a PR-unique guard failure" \
   || pass "(e) no merge attempted"
@@ -8347,7 +8676,93 @@ rc=$?
 grep -q 'confirmed via the API' "$SCEN/out" \
   && pass "the success line STATES the API-confirmed state" \
   || fail "the success line does not state the confirmation"
+# ── #7504: the line must name the LANDED commit, not the branch head ──
+# The grep above passes for the OLD line too (`… at $head (state=MERGED confirmed
+# via the API)`), so it certified nothing about this fix. Scope the HEAD-NAME checks
+# below to the SUCCESS LINE itself: the run output legitimately carries the pre-merge
+# `merge ref refs/pull/42/merge = mergefeed…` line earlier, so a whole-file grep for
+# that value would pass even when the success line is wrong. The FINAL check is the
+# deliberate exception — it scans the WHOLE run output, which is STRICTER (the head
+# must not appear as a landing anywhere), so its message says which it is.
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+case "$success_line" in
+  *landedfeed000000000000000000000000000000*)
+    pass "#7504: the success line names the LANDED (post-merge) commit" ;;
+  *)
+    fail "#7504: the success line does not name the landed commit: $success_line" ;;
+esac
+# The PRE-merge fixture is a DIFFERENT sha (`mergefeed…`) by construction, so this is
+# what fails if the rail echoes the merge ref it already read instead of re-reading
+# `merge_commit_sha` after the merge — the exact shape the shared fixture used to hide.
+case "$success_line" in
+  *mergefeed00000000000000000000000000000000*)
+    fail "#7504: the success line carries the PRE-merge merge ref — the post-merge read is not happening" ;;
+  *)
+    pass "#7504: the pre-merge merge ref is not presented as the landing" ;;
+esac
+# Deliberately a WHOLE-RUN scan rather than a success-line one, and the only check
+# here that is: a 40-hex head presented as a landing on ANY line is the #7504 shape.
+# Stricter than the checks above, so the message must not blame the success line when
+# it is in fact failing on some other line of the run.
+if grep -q "at $HEAD_MN" "$SCEN/out"; then
+  fail "#7504: the run output presents the branch head as the landing"
+else
+  pass "#7504: the branch head appears nowhere as a landing (whole-run scan)"
+fi
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 62b. #7504: an UNREADABLE landed commit must name NO sha — never the head ──
+# The `""` branch of the landed read was REACHABLE but UNTESTED (review round 3,
+# P2-1): the fake could serve `$SCEN/pr-landed-unreadable`, but no scenario set it —
+# so the branch, and the `${REPO:+--repo $REPO}` remedy that round 2 added to that
+# exact line, shipped unverified. This is not bureaucracy to delete: "print no sha
+# rather than a wrong one" IS the guard, and a wrong sha that LOOKS like the landed
+# artifact is the entire defect, so this is the only thing that tests it.
+echo "== 62b. #7504: an unreadable landed commit prints NO sha (never the head) =="
+new_scen merge-landed-unreadable
+printf '%s\n' "$HEAD_MN" > "$SCEN/head"
+lane_fail "$HEAD_MN" 931 > "$SCEN/runs-$HEAD_MN"
+log_failed "$MNX" > "$SCEN/log-931"
+{ lane_fail main1111 932; lane_fail main2222 933; lane_fail main3333 934; } > "$SCEN/runs-main"
+log_failed "$MNY" > "$SCEN/log-932"
+log_failed "$MNX" > "$SCEN/log-933"
+log_failed "$MNX" > "$SCEN/log-934"
+# The API call that reads the LANDED commit fails, while the merge itself is confirmed.
+touch "$SCEN/pr-landed-unreadable"
+run_admin_here 42 --repo acme/widgets --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "an unreadable landed sha does not fail a merge the API CONFIRMED" \
+  || fail "the merge was refused because the landed sha was unreadable (exit $rc): $(tr '\n' ' ' < "$SCEN/err" | head -c 200)"
+success_line="$(grep 'confirmed via the API' "$SCEN/out" | head -1)"
+[ -n "$success_line" ] \
+  && pass "the success line is still printed when the landed sha cannot be read" \
+  || fail "no success line at all when the landed read failed: $(tr '\n' ' ' < "$SCEN/out" | head -c 200)"
+case "$success_line" in
+  *"NOT readable"*)
+    pass "#7504: the fallback SAYS why no sha is printed" ;;
+  *)
+    fail "#7504: the fallback did not say the merge commit was unreadable: $success_line" ;;
+esac
+# A FULL 40-hex token on this line is machine-reachable as "the landed sha" — the
+# exact shape #7504 shipped. The branch head is printed TRUNCATED (12 chars) so that
+# cannot happen; a full head here is therefore the defect whatever the wording says.
+if printf '%s' "$success_line" | grep -Eq '[0-9a-f]{40}'; then
+  fail "#7504: the fallback line carries a full 40-hex sha, readable as the landed commit: $success_line"
+else
+  pass "#7504: the fallback line carries NO full 40-hex sha"
+fi
+if printf '%s' "$success_line" | grep -qF "$HEAD_MN"; then
+  fail "#7504: the fallback line presents the BRANCH HEAD as the landing"
+else
+  pass "#7504: the branch head is not presented as the landed commit"
+fi
+# …and it must stay ACTIONABLE. Round 2 added --repo to this very remedy because
+# without it the reader is pointed back at the wrong repository; scoped to the
+# SUCCESS LINE so a stray `--repo` elsewhere in the run cannot satisfy it.
+printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
+  && pass "#7504: the fallback remediation carries the --repo the run was given" \
+  || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
@@ -9268,6 +9683,116 @@ pe_case "dash-then-multiline flow"    yes $'on:\n  push:\n    branches:\n      -
 pe_case "anchored key fails closed"   unknown $'on:\n  push:\n  &a pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 pe_case "tagged key fails closed"     unknown $'on:\n  push:\n  !!str pull_request:\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
 
+# ── #1637: a NON-FILTER key's inline scalar must not abandon the attribution ─
+# `collect_filters()` bails out of the WHOLE document (`return None`) on an
+# inline, non-list scalar. That is right for a FILTER whose shape it cannot read
+# and WRONG for a key that is not a filter at all — and `workflow_dispatch.inputs`
+# is nothing but those (`description:`, `required:`, `default:`, `type:`). So
+# #1542's reader silently collapsed the answer to `unknown` for every workflow
+# with a normally-specified input, and `unknown` is consumed as PR-EVALUABLE.
+# The #6807 exemption therefore stopped firing for its own motivating file —
+# `deploy-hosted.yml` (`on: push` with `branches:` + `workflow_dispatch`, no
+# `pull_request` at all) — and a `push`-only base red entered §4.6, refusing
+# every PR with a remedy no rebase can satisfy. Measured on identical input:
+# the pre-#1542 predicate answers `no` for that file, the pre-fix one `unknown`.
+pe_case "workflow_dispatch input spec"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      d:\n        description: \x27x\x27\n        required: false\n        default: \x27false\x27\n        type: boolean\n'
+pe_case "input spec, no other trigger" no $'on:\n  workflow_dispatch:\n    inputs:\n      d:\n        default: x\n'
+pe_case "depth-3 scalar under inputs"  no $'on:\n  workflow_dispatch:\n    inputs:\n      d: x\n'
+# These three are NOT evidence that #1637 is fixed — they pass BEFORE and AFTER
+# it (measured against `git show bc0481b:scripts/ci-workflow-pr-evaluable.sh`).
+# They are guards against the OPPOSITE over-generalisation: the fix must not widen
+# the exemption in the other direction either. Only a `pull_request` whose filter
+# cannot be read still resolves through the trigger NAME and blocks (`yes`), and
+# an inline value on a TRIGGER key still refuses (`unknown`). Both fail-closed;
+# neither may become `no`.
+pe_case "unreadable paths flow-mapping" yes $'on:\n  pull_request:\n    paths: {a: b}\n'
+pe_case "pull_request w/ only types"    yes $'on:\n  pull_request:\n    types: [opened]\n'
+pe_case "inline value on trigger key"   unknown $'on:\n  push: main\n'
+# ── P1/P2 from the fresh-context review of PR #1639 (<- both were REAL) ───────
+# P1: the #1413 invariant is a property of the TRIGGER, so it must hold when the
+# unattributable key lives under a SIBLING trigger. Keying it on `cur_trig` let
+# `workflow_call` + `workflow_dispatch: inputs:` fall through to
+# `trigger_measurable`'s tail `return False` and answer `no` — the same fail-open
+# as the one the fix was written to close, one trigger over. Measured against the
+# pre-fix predicate these are `unknown`; the buggy intermediate was `no`.
+pe_case "reusable + sibling input spec"  unknown $'on:\n  workflow_call:\n  workflow_dispatch:\n    inputs:\n      reason:\n        description: why\n'
+pe_case "reusable + sibling push scalar" unknown $'on:\n  workflow_call:\n  push:\n    x: y\n'
+pe_case "reusable + sibling schedule"    unknown $'on:\n  workflow_call:\n  schedule:\n    x: y\n'
+# P2: a NON-FILTER key's SHAPE must still balance. Skipping the bail for such a
+# key also skipped the flow-balance arm, so a `paths:` nested inside another key's
+# UNTERMINATED flow sequence was read as a top-level PR filter and the verdict
+# moved `yes` -> `no` on input this reader cannot attribute.
+# ⛔ THE CHANGED SET IS NOT WHAT MAKES THIS PIN THE DEFECT (review round 3, P3 —
+# the earlier claim here was WRONG). Measured against the buggy commit, the
+# NO-changed-set run answers `unknown`, which also fails the pinned `yes`. The set
+# is carried because the fail-open is only REACHABLE with one, not because it is
+# what distinguishes the arms.
+pe_case_paths() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | PR_CHANGED_PATHS="$3" wf_eval)"
+  [ "$got" = "$2" ] && pass "predicate[#1637]: $1 -> $2" || fail "predicate[#1637]: $1 -> expected $2, got '$got'"
+}
+pe_case_paths "unterminated flow under non-filter key" yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened,\n            paths: [docs/**]]\n'
+# …and the type-matched closer: `[opened}` is not a balanced `[`. Taking either
+# closer was type-blind, and `scan_flow_state` decrements on either, so the outer
+# walk did not catch it either (review P3).
+pe_case_paths "mismatched closer under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types: [opened}\n    paths: [docs/**]\n'
+# A TRIGGER key's value is never readable. A bare block scalar used to be allowed
+# through and its BODY re-read as the trigger's mapping, so a filter-key line
+# inside it was attributed as a real filter and `workflow_call: |` fell to `no`
+# (review round 3, P2). The `|`/`>` allowance is needed only on the non-filter-key
+# branch below, for `description: |`.
+pe_case "trigger-key block scalar"        unknown $'on:\n  workflow_call: |\n    paths: [docs/**]\n'
+pe_case "sibling trigger block scalar"    unknown $'on:\n  workflow_call:\n  schedule: |\n    paths: [docs/**]\n'
+# Round 4. The reader still had two holes, and they are ONE statement: a value
+# already consumed is not a key. A block scalar's body is content, and a
+# NON-FILTER key's empty value opens a subtree whose children are not trigger-depth
+# keys. Each case below answered `no` on 45fc45b1 (fail-open) and `yes` now.
+pe_case_paths "filter-key block scalar"       yes 'src/app.ts' $'on:\n  pull_request:\n    paths: |\n      - docs/**\n'
+pe_case_paths "non-filter block scalar body"  yes 'src/app.ts' $'on:\n  pull_request:\n    types: |\n      paths: [docs/**]\n'
+pe_case_paths "filter under non-filter key"   yes 'src/app.ts' $'on:\n  pull_request:\n    types:\n      paths: [docs/**]\n'
+# ⛔ AND THE OVER-BLOCK THE SAME CHANGE NEARLY SHIPPED. Skipping the subtree is
+# what fixes the two above, but a subtree skip applied ONLY to block scalars left
+# `workflow_dispatch.inputs.<name>.<field>` — `deploy-hosted.yml`'s real shape,
+# the file #6807 exists for — answering `unknown`, because a body line that is not
+# a key bailed the whole attribution. This case is the regression net for that: it
+# must stay `no`.
+pe_case "legit nested inputs, no PR trigger"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      a:\n        description: |\n          paths: [not, ours]\n'
+# Round 5: the continuation of a MULTI-LINE QUOTED SCALAR is not a key. Unlike
+# #1649's nested flow element this is not ambiguous with anything — the quote is
+# OPEN, so the continuation is unambiguously scalar content — and it escaped BOTH
+# round-4 invariants: the block-scalar skip only skips DEEPER lines, and the depth
+# check matches exactly at the key's own indent. PyYAML reads this document as
+# types='opened paths: [docs/**] a: b', i.e. NO paths filter; the reader injected
+# one and answered `no` (fail-open) on 41ade4bc.
+pe_case_paths "continuation of a quoted scalar" yes 'src/app.ts' $'on:\n  pull_request:\n    types: "opened\n    paths: [docs/**]\n    a: b"\n'
+# …and the closed-on-one-line form must NOT be skipped: there the filter is real,
+# and `docs/**` does not match `src/app.ts`.
+pe_case_paths "closed quoted scalar keeps filter" no 'src/app.ts' $'on:\n  pull_request:\n    types: "opened"\n    paths: [docs/**]\n'
+# Round 6 (F1): the OUTER `on:` walk scanned a block scalar's body too, so a `"`
+# inside a `description: |` body opened a phantom quote that was never closed, the
+# EOF check refused the file, and a push-only workflow LOST the #6807 exemption it
+# is entitled to. The file below is GitHub-legal; `unknown` re-breaks the very
+# exemption this PR restores. Same invariant as `collect_filters`, one level up.
+pe_case "quote inside a block-scalar body"  no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          "quoted\n'
+# …and a body line the walk would otherwise read as an EXPLICIT KEY (`? k` / `: v`)
+# or as an unrecognised key must not refuse the file either — measured `unknown`
+# before the skip, `no` after.
+# ⛔ AN EARLIER VERSION OF THIS CASE PINNED NOTHING. It used a `paths:`-looking
+# body line, which review round 7 correctly measured as answering `no` on BOTH the
+# pre-fix and post-fix commits — it guarded `collect_filters`'s pre-existing skip,
+# not the walk change it was placed under. Replaced rather than kept as
+# decoration, since a test that cannot fail is not evidence.
+pe_case "explicit-key line in a | body"     no $'on:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      msg:\n        description: |\n          ? explicit\n'
+# P2 (round 2): the LIST-ITEM path is content too. `- cron: …` under a key this
+# reader does not interpret left the flag unset, so a reusable trigger still
+# reached `flt == {}` -> tail `return False` -> `no`. This is the ordinary way to
+# write a schedule.
+pe_case "reusable + sibling schedule list" unknown $'on:\n  workflow_call:\n  schedule:\n    - cron: \x270 0 * * *\x27\n'
+# A BARE `workflow_call` (no non-filter key anywhere) must stay `no`: the
+# document-level invariant only fires when the attribution is INCOMPLETE.
+pe_case "bare reusable stays exempt"     no  $'on:\n  workflow_call:\n'
+
 # ── #1542: the trigger's FILTERS decide measurability, not just its name ────
 # A `pull_request` that declares `paths:` can only attach a check to a PR whose
 # changed set matches. So the SAME workflow must answer `yes` for a matching PR
@@ -9294,6 +9819,18 @@ pe_paths "inline flow paths match"      yes 'src/a.c'             $'on:\n  pull_
 pe_paths "inline flow paths no match"   no  'README.md'           $'on:\n  pull_request:\n    paths: [src/**]\n'
 pe_paths "paths-ignore excludes"        no  'docs/a.md'           $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
 pe_paths "paths-ignore non-matching"    yes 'src/a.c'             $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P0. GitHub's `paths-ignore` rule is "run iff SOME changed path is
+# NOT ignored" — `not all`, never `not any`. The mixed set is the ONLY case that
+# separates them, and it is the case the pre-fix code got WRONG: it answered `no`
+# ("cannot attach") for a workflow GitHub runs, and `no` is consumed as an
+# affirmative exemption. Both endpoints (all-ignored / none-ignored) agree under
+# either reading, which is why the two vectors above stayed green.
+pe_paths "paths-ignore one of several ignored" yes $'docs/a.md\nsrc/b.c' $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P2. A whitespace-only value is UNREADABLE, not empty. It passes a
+# bare `[ -z ]` and, without the collapse, an empty path list reads as "matches
+# nothing" → `no` → an affirmative exemption from an input nobody could read.
+pe_paths "whitespace-only set fails closed" unknown '   '          $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+pe_paths "whitespace-only set, paths-ignore" unknown $'  \n\t '   $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
 pe_paths "both paths keys fails closed" unknown 'src/a.c'        $'on:\n  pull_request:\n    paths:\n      - src/**\n    paths-ignore:\n      - docs/**\n'
 # The push exemptions must be UNTOUCHED by this: a `push` is never PR-evaluable,
 # filtered or not. (This is the #6807 contract; a draft of #1542 briefly widened
@@ -9351,6 +9888,747 @@ _dbl="$(printf '%s\n' "$_code" | grep -c 'repos/\$slug' || true)"
 grep -q 'WF_PR_CHANGED_PATHS=.*\$slug/pulls/\$PR/files' <<<"$_code" \
   && pass "the changed-file fetch still assigns from a single-prefix pulls/ URL — #1569" \
   || fail "the #1569 changed-file fetch is gone or no longer assigns WF_PR_CHANGED_PATHS from a single-prefix \$slug/pulls/ URL — the #1542 filter input has no source"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# #1614 — THE WATCHED LANE IS INAPPLICABLE TO THIS DIFF: FALL BACK LOUDLY
+# ═══════════════════════════════════════════════════════════════════════════
+# `admin-merge.sh` defaults its lane to `python-ci.yml`, and precondition 1 needs
+# a TESTED run of it on the head. A diff that cannot trigger that lane can never
+# satisfy it, so the sanctioned merge path was a DEAD END for a whole class of
+# changes (`bin/`, `scripts/`, `extensions/`, `.github/workflows/`, `templates/`,
+# `docs/`) — measured live on PR #1596, whose only changed files are
+# `bin/agent-infra.js` and `tests/drift/run.sh`. `#1439` forbade a SILENT
+# widening (that re-opens #1261's vacuous green), so the fix MEASURES
+# applicability and falls back LOUDLY — and keeps the refusal for a lane that
+# SHOULD have run.
+echo "== #1614. lane applicability: measured fallback, loud, fail-closed =="
+
+# The predicate's LANE-SELECTOR question, distinct from its default #6807
+# check-attachment question. The SAME document must answer differently in the two
+# modes for a REUSABLE workflow — that difference IS this mode's reason to exist.
+lae() {  # <label> <expected> <changed-paths> <yaml>
+  local got
+  got="$(printf '%s' "$4" | CI_WF_PR_EVALUABLE_QUESTION=lane-applicable PR_CHANGED_PATHS="$3" bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+  [ "$got" = "$2" ] && pass "lane-applicable[$1]: -> $2" || fail "lane-applicable[$1]: expected $2, got '$got'"
+}
+REUSABLE_YAML=$'name: fixture\non:\n  workflow_call:\n    inputs:\n      v:\n        type: string\n'
+lae "workflow_call only"        no      'bin/x.js'   "$REUSABLE_YAML"
+lae "pr trigger unfiltered"     yes     'bin/x.js'   $'on:\n  pull_request:\n'
+lae "pr paths match"            yes     'src/a.c'    $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "pr paths exclude"          no      'bin/x.js'   $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "paths-ignore excludes all" no      'docs/a.md'  $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+lae "paths-ignore keeps a file" yes     'bin/x.js'   $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P0 — the MIXED set. GitHub runs the workflow iff SOME changed
+# path is not ignored, so this is `yes` (→ `applicable`). The pre-fix `not any`
+# reading answered `no`, i.e. the rail filed a lane GitHub WILL run as
+# inapplicable, dropped the lane filter, and stopped requiring its run.
+lae "paths-ignore one of several ignored" yes $'docs/a.md\nbin/x.js' $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+# #1614 review, P2 — a whitespace-only changed set is unreadable, so the mode must
+# fail closed rather than answer `no` from an empty path list.
+lae "whitespace-only set fails closed" unknown '   '        $'on:\n  pull_request:\n    paths-ignore:\n      - docs/**\n'
+lae "NO changed set fails closed" unknown ''          $'on:\n  pull_request:\n    paths:\n      - src/**\n'
+lae "push only"                 no      'bin/x.js'   $'on:\n  push:\n'
+lae "unparsable"                unknown 'bin/x.js'   $'name: fixture\njobs:\n  x:\n    runs-on: ubuntu-latest\n'
+# THE ANTI-REGRESSION FOR THE WHOLE MODE: the DEFAULT question must still answer
+# `unknown` for a reusable workflow. A reusable workflow's jobs DO attach to a PR
+# head (inside its CALLER's run, under the CALLER's name), so `no` there would be
+# consumed downstream as a false exemption (#1413). If a future edit makes the
+# mode the default, this reds.
+got="$(printf '%s' "$REUSABLE_YAML" | PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh")"
+[ "$got" = "unknown" ] \
+  && pass "the DEFAULT question still answers 'unknown' for a reusable workflow (#1413 preserved)" \
+  || fail "the default predicate now answers '$got' for a reusable workflow — a fail-open exemption was introduced"
+
+# #1614 review, P1 — `CI_WF_PR_EVALUABLE_QUESTION` MUST BE SCRUBBED at every call
+# site that is asking the DEFAULT question. It is an ordinary exported name, so an
+# operator's or an agent's shell that exports `lane-applicable` re-asks a different
+# question at the base-side call: a `workflow_call`-only lane flips `unknown` →
+# `no`, and `no` is consumed as an affirmative exemption (`no) pr_evaluable=0`) —
+# the ambient-env fail-open the A/B test names outright.
+#
+# MEASURED, both directions: with the var exported the predicate returns `no` for
+# `$REUSABLE_YAML`; with `env -u` it returns `unknown`. So this is behavioural, not a
+# comment. (The lane selector is the ONE site allowed to set it, and it does so
+# command-scoped, so it can never leak into a sibling call.)
+_amb="$(printf '%s' "$REUSABLE_YAML" | CI_WF_PR_EVALUABLE_QUESTION=lane-applicable PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+_scr="$(printf '%s' "$REUSABLE_YAML" | env -u CI_WF_PR_EVALUABLE_QUESTION PR_CHANGED_PATHS='bin/x.js' bash "$ROOT/scripts/ci-workflow-pr-evaluable.sh" 2>/dev/null)"
+[ "$_amb" = "no" ] && [ "$_scr" = "unknown" ] \
+  && pass "the ambient question selector is inert once scrubbed ($_amb → $_scr) — #1614" \
+  || fail "the scrub vector is no longer meaningful: ambient='$_amb' scrubbed='$_scr' (expected no/unknown)"
+_amb_sites="$(printf '%s\n' "$_code" | grep -c 'CI_WF_PR_EVALUABLE_QUESTION' || true)"
+_scr_sites="$(printf '%s\n' "$_code" | grep -c -- '-u CI_WF_PR_EVALUABLE_QUESTION' || true)"
+# `-ge 2`, not `-ge 1`: there are exactly TWO default-question call sites (the
+# base-side `workflow_pr_evaluable` fetch and the lane-diagnosis fetch), and a
+# scrub deleted from EITHER one is an ambient-env fail-open on the surface that
+# call feeds. `-ge 1` stayed green with one of them stripped — measured, which is
+# why this counts the per-site `-u` token rather than the `env -u` spelling (the
+# second site's `-u` is mid-chain, so the `env -u` literal appears only once).
+[ "$_scr_sites" -ge 2 ] \
+  && pass "the rail scrubs CI_WF_PR_EVALUABLE_QUESTION at both default-question call sites ($_scr_sites) — #1614" \
+  || fail "only $_scr_sites `-u CI_WF_PR_EVALUABLE_QUESTION` site(s) in the rail (found $_amb_sites reference(s)); a scrub is missing, so an ambient export can flip that call's answer — an exemption the gate should never grant"
+
+# The raw content fixture, for on:-block shapes `wf_declares` cannot express.
+wf_declares_body() {  # <path> <yaml>
+  mkdir -p "$SCEN/wf-contents/$(dirname "$1")"
+  printf '%s' "$2" > "$SCEN/wf-contents/$1"
+}
+
+# ── (a) THE #1596 SHAPE: the watched lane declares no PR trigger at all ─────
+# `workflow_call`-only cannot produce a run of ITSELF on a PR head, so with no
+# run for the head the precondition is unsatisfiable. Refusing would be a DEAD
+# END; the rail must fall back to the evaluated surface and SAY SO.
+new_scen laneinapp
+HEAD_LA="a4a4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LA" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml "$REUSABLE_YAML"
+pr_changed_files bin/agent-infra.js tests/drift/run.sh
+# The lane has NO run for this head — the dead end. The other workflows DID run.
+: > "$SCEN/runs-$HEAD_LA.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LA" 20001 > "$SCEN/runs-$HEAD_LA"
+lane_pass mainlane 20002 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(a) an INAPPLICABLE lane dead end is repaired: the rail falls back and proceeds (exit $rc)" \
+  || { fail "(a) the rail still refuses a diff its watched lane cannot trigger (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && pass "(a) …and the fallback is LOUD on stderr (#1614)" \
+  || fail "(a) the fallback happened SILENTLY — the exact failure mode #1439 refused"
+grep -q "watched lane: 'python-ci.yml'" "$SCEN/err" \
+  && pass "(a) …naming the lane it could not use" \
+  || fail "(a) the message does not name the watched lane"
+grep -q "no-pr-trigger" "$SCEN/err" \
+  && pass "(a) …and WHY — the consulted trigger evidence, not a bare assertion" \
+  || fail "(a) the message does not say which trigger evidence was consulted"
+grep -q "bin/agent-infra.js" "$SCEN/err" \
+  && pass "(a) …and which changed files were consulted" \
+  || fail "(a) the changed set is not shown"
+grep -q "FALLING BACK to the evaluated surface" "$SCEN/err" \
+  && pass "(a) …and which surface was evaluated instead" \
+  || fail "(a) the fallback surface is not named"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(a) …and the comparison really used the full surface (the certificate says so)" \
+  || fail "(a) the certificate still claims the inapplicable lane"
+grep -q "lane applicability fallback (#1614)" "$SCEN/out" \
+  && pass "(a) …disclosed on the evidence too, not only on stderr" \
+  || fail "(a) the evidence does not disclose the fallback"
+grep -q "pr merge" "$SCEN/calls" && fail "(a) --dry-run attempted a merge" || pass "(a) dry-run attempted no merge"
+
+# ── (b) THE #1261 ANTI-REGRESSION: a lane that SHOULD have run ──────────────
+# The lane declares `pull_request` with a `paths:` filter that MATCHES the diff,
+# so it SHOULD have run. With no run for the head the rail must REFUSE exactly as
+# before. If the fallback swallowed this, #1261's vacuous green would be back.
+new_scen laneapp_norun
+HEAD_LB="b4b4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LB" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  pull_request:\n    paths:\n      - src/**\n'
+pr_changed_files src/app.py
+: > "$SCEN/runs-$HEAD_LB"
+lane_fail mainfeed 20011 > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(b) a lane that SHOULD have run and did not still REFUSES (exit $rc)" \
+  || fail "(b) the applicability fallback swallowed the #1261 refusal — a real gap certified"
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(b) …for the not-tested reason, with the lane still the watched one" \
+  || fail "(b) the refusal is not the lane-not-tested one"
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(b) an APPLICABLE lane was declared inapplicable — the trigger match is wrong" \
+  || pass "(b) …and it was NOT declared inapplicable (the trigger filter matched)"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted" || pass "(b) no merge attempted"
+
+# ── (c) FAIL CLOSED: an applicability that cannot be MEASURED ───────────────
+# No workflow file is readable at the head, so the trigger map is UNMEASURED.
+# That is never an exemption: the rail keeps the lane filter and refuses.
+new_scen laneapp_unknown
+HEAD_LC="c4c4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LC" > "$SCEN/head"
+pr_changed_files bin/agent-infra.js
+: > "$SCEN/runs-$HEAD_LC"
+lane_fail mainfeed 20021 > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "(c) an UNREADABLE workflow file fails closed (exit $rc)" \
+  || fail "(c) an unmeasured applicability was read as an exemption — a fail-open"
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(c) the rail fell back on an UNMEASURED applicability — the map must be read reliably" \
+  || pass "(c) …and it did NOT fall back on an unmeasured map"
+grep -q "no run of the lane actually TESTED" "$SCEN/err" \
+  && pass "(c) …refusing with the original lane-not-tested reason" \
+  || fail "(c) the refusal reason changed on the fail-closed path"
+
+# ── (d) THE PATH-FILTER SHAPE: a PR trigger whose filter excludes the diff ──
+# Same fallback, different measured ground (the `paths:` filter), and the message
+# must name the patterns it consulted.
+new_scen lanepaths
+HEAD_LD="d4d4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LD" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  pull_request:\n    paths:\n      - src/**\n      - tools/x.py\n'
+pr_changed_files bin/agent-infra.js
+: > "$SCEN/runs-$HEAD_LD.by-workflow.python-ci.yml"
+lane_pass "$HEAD_LD" 20031 > "$SCEN/runs-$HEAD_LD"
+lane_pass mainlane 20032 > "$SCEN/runs-main"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(d) a 'paths:' filter that excludes the diff also falls back (exit $rc)" \
+  || { fail "(d) a path-excluded lane still dead-ends the rail (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "paths-excluded" "$SCEN/err" \
+  && pass "(d) …naming the path-filter ground" || fail "(d) the ground is not the path filter"
+grep -q "src/\*\*" "$SCEN/err" \
+  && pass "(d) …and the exact patterns it consulted" || fail "(d) the consulted patterns are not shown"
+grep -q "lane: any workflow" "$SCEN/out" \
+  && pass "(d) …falling back to the full evaluated surface" || fail "(d) the certificate still claims the lane"
+
+# ── (e) THE DEAD-END GATE: inapplicable BUT the lane DID run ────────────────
+# The fallback repairs a DEAD END, not a trigger shape. A lane that matched no
+# trigger path yet produced a run for the head is usable, so the rail must NOT
+# widen — otherwise every trigger-split repo silently becomes `--any-workflow`.
+new_scen lanehasrun
+HEAD_LE="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_LE" > "$SCEN/head"
+wf_declares_body .github/workflows/python-ci.yml $'name: fixture\non:\n  push:\n'
+pr_changed_files bin/agent-infra.js
+lane_pass "$HEAD_LE" 20041 > "$SCEN/runs-$HEAD_LE.by-workflow.python-ci.yml"
+lane_pass mainlane 20042 > "$SCEN/runs-main.by-workflow.python-ci.yml"
+main_green_surface
+pr_green_surface
+run_admin_here 42 --main-runs 1 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "(e) an inapplicable lane that DID run is left alone (exit $rc)" \
+  || { fail "(e) the rail widened instead of using the lane that ran (exit $rc)"; sed 's/^/      /' "$SCEN/err" | head -25; }
+grep -q "LANE INAPPLICABLE" "$SCEN/err" \
+  && fail "(e) the rail widened gratuitously — the lane had a run for this head" \
+  || pass "(e) …no gratuitous widening (the dead-end gate held)"
+grep -q "lane: python-ci.yml" "$SCEN/out" \
+  && pass "(e) …and the certificate still names the requested lane" \
+  || fail "(e) the certificate no longer names the lane that was actually used"
+
+# ── 68. #1623: an UNEXPANDED run is not in flight ──────────────────────────
+# GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
+# it (measured on PR #1615: three such runs, `status=queued`, `conclusion=null`,
+# jobs API EMPTY, `cancel` refusing with "has not been queued yet", no delete API).
+# Counting it as `pending` blocks a reviewed head PERMANENTLY — the printed remedy
+# ("wait for CI, then re-run the rail") can never clear it. The discriminator is
+# the jobs count (`run_job_count`, the same Jobs API #1482 already reads): ZERO jobs
+# means GitHub never expanded the run, so it cannot be in flight. An unreadable
+# count is NOT zero (fail closed), so the #3420 ratchet — a run that HAS jobs must
+# still count as pending — is not weakened; and a run that has merely not expanded
+# YET cannot enter `tested` either, so a listing holding only such runs is refused
+# by the `tested > 0` precondition (§1b / check-lane-tested.sh) regardless.
+echo "== 68. #1623: an unexpanded run does not hold the merge; a run WITH jobs still does =="
+
+# (a) THE MEASURED SHAPE: a tested sibling + three `queued` runs GitHub never
+# expanded (measured on PR #1615: 37642335832, 37642336639, 37642336755).
+new_scen unexpanded
+HEAD_UX="1623000000000000000000000000000000000000"
+lane_pass "$HEAD_UX" 31001 > "$SCEN/runs-$HEAD_UX"
+{ lane_line queued - "$HEAD_UX" 37642335832
+  lane_line queued - "$HEAD_UX" 37642336639
+  lane_line queued - "$HEAD_UX" 37642336755
+} >> "$SCEN/runs-$HEAD_UX"
+for id in 37642335832 37642336639 37642336755; do printf '0\n' > "$SCEN/jobs-count-$id"; done
+cfs_run --commit-rows "$HEAD_UX" --repo test-org/test-repo --runs-report "$TMP/ux-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) the commit-rows extraction succeeds" || { fail "(a) expected exit 0, got $rc"; sed 's/^/      /' "$TMP/cfs-err" | head -10; }
+v="$(sed -n 's/^pending=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "0" ] && pass "(a) three never-expanded runs yield pending=0 (does NOT block)" \
+  || fail "(a) expected pending=0, got '$v' — the permanent false block is back"
+v="$(sed -n 's/^tested=//p' "$TMP/ux-rep.txt")"
+[ "$v" = "1" ] && pass "(a) the tested run is still counted (tested=1)" \
+  || fail "(a) expected tested=1, got '$v'"
+c="$(grep -c "has ZERO jobs" "$TMP/cfs-err" || true)"
+[ "$c" = "3" ] && pass "(a) each suppressed run is NAMED on stderr (3 notes)" \
+  || fail "(a) expected 3 suppression notes, got '$c'"
+lane_tested "$TMP/ux-rep.txt" python-ci.yml "$HEAD_UX" >"$TMP/ux-guard.txt" 2>&1
+[ $? -eq 0 ] && pass "(a) the shipped gate (check-lane-tested.sh) now certifies the head" \
+  || { fail "(a) the shipped gate still refuses"; sed 's/^/      /' "$TMP/ux-guard.txt" | head -5; }
+
+# (b) NEGATIVE CONTROL — the ratchet. A queued/in-progress run that HAS jobs may
+# still be running, so it MUST keep counting as pending (#3420).
+new_scen unexpandedhasjobs
+HEAD_UY="2623000000000000000000000000000000000000"
+lane_pass "$HEAD_UY" 32001 > "$SCEN/runs-$HEAD_UY"
+lane_line in_progress - "$HEAD_UY" 32002 >> "$SCEN/runs-$HEAD_UY"
+printf '3\n' > "$SCEN/jobs-count-32002"
+cfs_run --commit-rows "$HEAD_UY" --repo test-org/test-repo --runs-report "$TMP/uy-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(b) the extraction succeeds" || fail "(b) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uy-rep.txt")"
+[ "$v" = "1" ] && pass "(b) an in-progress run WITH 3 jobs still yields pending=1 (still blocks)" \
+  || fail "(b) expected pending=1, got '$v' — the #3420 ratchet was WEAKENED"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(b) a run that has jobs was suppressed" \
+  || pass "(b) no suppression for a run that has jobs"
+lane_tested "$TMP/uy-rep.txt" python-ci.yml "$HEAD_UY" >"/dev/null" 2>&1 \
+  && fail "(b) the gate certified a head with a live run" \
+  || pass "(b) the shipped gate still refuses a head with a live run"
+
+# (c) FAIL CLOSED on an unreadable probe: no `jobs-count-<id>` fixture at all.
+new_scen unexpandedunknown
+HEAD_UZ="3623000000000000000000000000000000000000"
+lane_pass "$HEAD_UZ" 33001 > "$SCEN/runs-$HEAD_UZ"
+lane_line queued - "$HEAD_UZ" 33002 >> "$SCEN/runs-$HEAD_UZ"
+cfs_run --commit-rows "$HEAD_UZ" --repo test-org/test-repo --runs-report "$TMP/uz-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(c) the extraction succeeds" || fail "(c) expected exit 0, got $rc"
+v="$(sed -n 's/^pending=//p' "$TMP/uz-rep.txt")"
+[ "$v" = "1" ] && pass "(c) an UNESTABLISHABLE job count still yields pending=1 (fail closed)" \
+  || fail "(c) expected pending=1, got '$v' — an unreadable probe was read as zero jobs"
+grep -q "has ZERO jobs" "$TMP/cfs-err" && fail "(c) an unknown count was read as zero" \
+  || pass "(c) no suppression without a PROVEN zero count"
+
+# (d) THE RACE — a run created moments ago has no jobs YET. `jobs == 0` cannot by
+# itself tell "not expanded yet" from "never will be", and NO age bound is applied
+# (see the header note in `run_is_unexpanded`). The exposure is closed by the SAME
+# property the run has: a run whose jobs do not exist is not testing the revision,
+# so it cannot enter `tested` — and a listing holding ONLY such runs leaves
+# tested=0, which §1b and the shipped gate refuse on. The counter may read 0; the
+# MERGE is still refused.
+new_scen unexpandedalone
+HEAD_UW="4623000000000000000000000000000000000000"
+{ lane_line queued - "$HEAD_UW" 34001
+  lane_line in_progress - "$HEAD_UW" 34002
+} > "$SCEN/runs-$HEAD_UW"
+printf '0\n' > "$SCEN/jobs-count-34001"
+printf '0\n' > "$SCEN/jobs-count-34002"
+cfs_run --commit-rows "$HEAD_UW" --repo test-org/test-repo --runs-report "$TMP/uw-rep.txt"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(d) the extraction succeeds" || fail "(d) expected exit 0, got $rc"
+[ "$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) an all-unexpanded listing yields pending=0" \
+  || fail "(d) expected pending=0, got '$(sed -n 's/^pending=//p' "$TMP/uw-rep.txt")'"
+[ "$(sed -n 's/^tested=//p' "$TMP/uw-rep.txt")" = "0" ] \
+  && pass "(d) …and tested=0 — nothing was exercised" \
+  || fail "(d) an unexpanded run was credited as TESTED"
+lane_tested "$TMP/uw-rep.txt" python-ci.yml "$HEAD_UW" >"$TMP/uw-guard.txt" 2>&1
+[ $? -ne 0 ] && pass "(d) …so the shipped gate REFUSES the head (the race cannot merge)" \
+  || fail "(d) a head with NO tested run was certified"
+grep -q "NO tested run" "$TMP/uw-guard.txt" && pass "(d) …refusing on tested=0, not on the pending counter" \
+  || { fail "(d) the refusal reason is not 'NO tested run'"; sed 's/^/      /' "$TMP/uw-guard.txt" | head -5; }
+
+# ── 69. #4764: THE REVIEW-RECORD GUARD THAT GATES THE BRANCH UPDATE ─────────
+#
+# `refresh_pr_branch` PERFORMS the remedy the 4.6/4.7 refusals name: it asks GitHub
+# to bring the PR's head up to date with its base. That MOVES the head, and a review
+# record at `$HOME/.pi/agent/reviews/` is BOUND to a head — so
+# `pr_review_record_blocks_update` refuses the update whenever a record it can read
+# is bound to the head an update would move. The record's PATH IS NOT ONE FIXED NAME:
+# `record-review.sh` writes `<owner>-<repo>-<pr>.json` under whatever repo string it
+# was handed — VERBATIM when `--repo`/positional is given, the canonical
+# `gh repo view` slug when it is not — while the merge gate reads the record back
+# under the spelling the rail forwards. A guard that checks ONE spelling therefore
+# misses the other and moves a head out from under a record the gate still reads;
+# that is the fail-open these cases pin shut. The legacy `<pr>.json` name is shared
+# between repos, so its embedded `repo` is honoured only when it names no repo or
+# THIS one — case-INSENSITIVELY, because `gh` accepts any case for `--repo` and
+# writes it back verbatim.
+#
+# TWO FIXTURE SEAMS, both INERT without a fixture:
+#   * `$SCEN/repo-slug` answers `gh repo view --json nameWithOwner`. With no fixture
+#     the identity is unresolvable — the guard's own fail-closed arm, and the exact
+#     behaviour of every scenario written before this section.
+#   * the fake's `update-branch` arm answers the write itself, so a REJECTED update
+#     is expressible. What decides every case here is whether the write was ISSUED
+#     at all, and that is read from `$SCEN/calls` — never inferred from the exit
+#     status, which is non-zero for both "refused to update" and "updated, now
+#     re-measure".
+#
+# HOME IS ISOLATED PER SCENARIO. The record store is real filesystem state: a suite
+# that read the operator's real `~/.pi/agent/reviews` would let an unrelated record
+# decide its verdict (and would write into it).
+echo "== 69. #4764: a bound review record blocks the branch update; both record spellings are checked =="
+
+# review_record <filename> <head_sha> [repo] → one record in the scenario's OWN
+# review store. The qualified `<owner>-<repo>-<pr>.json` names carry the repo in the
+# FILENAME; only the legacy `<pr>.json` name carries it in the `repo` field.
+review_record() {
+  mkdir -p "$SCEN/home/.pi/agent/reviews"
+  if [ $# -ge 3 ]; then
+    printf '{"repo":"%s","head_sha":"%s"}\n' "$3" "$2" >"$SCEN/home/.pi/agent/reviews/$1"
+  else
+    printf '{"head_sha":"%s"}\n' "$2" >"$SCEN/home/.pi/agent/reviews/$1"
+  fi
+}
+
+# run_admin_guarded — `run_admin_here`'s invocation with the review store ISOLATED.
+# Every scenario below reaches the guard through the 4.6 STALE-GREEN refusal, the
+# first of the two call sites that perform the update.
+run_admin_guarded() {
+  HOME="$SCEN/home" SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  return $?
+}
+
+# stale_surface <head> — the fixture set of scenario (o) above, reduced to what the
+# guard needs: the PR's OWN tree is GREEN but was produced at 00:01, before a base
+# red that began at 00:02. Step 4.6 therefore refuses, names the re-measure remedy,
+# and calls `refresh_pr_branch` for the head it just read.
+stale_surface() {
+  local head="$1"
+  printf '%s\n' "$head" >"$SCEN/head"
+  lane_pass "$head" 4701 >"$SCEN/runs-$head"
+  lane_pass main4764 4702 >"$SCEN/runs-main"
+  write_pr_checks \
+    "$(check_run 5001 'ci / lint' completed success 7301 2026-01-01T00:00:00Z 2026-01-01T00:01:00Z)"
+  pr_run_map 7301 pull_request 'CI'
+  write_main_checks "$(check_run 6001 lint completed failure 7401 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  main_run_map 7401 push 'Post-merge validation'
+  pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+}
+
+# (a) A RECORD BOUND TO THE HEAD BLOCKS THE WRITE. This is the reason the guard
+# exists: the update would move the head and strand the attestation.
+new_scen record-bound-blocks
+HEAD_RB="e7e7000000000000000000000000000000000000"
+stale_surface "$HEAD_RB"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RB"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a) the 4.6 staleness refusal still refuses (exit $rc)" \
+  || fail "(a) the rail merged past a bound review record (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(a) the rail asked GitHub to UPDATE a branch whose review record is bound to the head" \
+  || pass "(a) …and NO update-branch write was issued"
+grep -q "bound to the head an update would move" "$SCEN/err" \
+  && pass "(a) …and the refusal STATES the condition, which is the line its own text points at" \
+  || fail "(a) the refusal says 'the ⛔ line above states the condition found' but prints no such line: $(grep -c '⛔' "$SCEN/err") ⛔ line(s) present"
+grep -q "NOT updating" "$SCEN/err" \
+  && pass "(a) …naming the decision (NOT updating) rather than only the reason" \
+  || fail "(a) the refusal does not say it declined to update"
+
+# (b) THE VERBATIM $REPO SPELLING IS CHECKED. `--repo Daniel-Ospina/Agent-Infra` is a
+# spelling `gh` accepts; the canonical slug the fake answers is lowercase. The record
+# exists ONLY under the spelling the writer was handed, so a guard that derives the
+# path from the slug alone reads nothing and writes.
+# NOTE: the two spellings differ only by CASE (record-review.sh is handed a repo
+# string, and `gh` accepts any case for the same repo — there is no non-case
+# difference that names the SAME repo), so on a case-INSENSITIVE filesystem — macOS
+# default — the canonical candidate resolves the same file and neither the write
+# assertion nor the path in the refusal can discriminate. This case, and (n), are
+# therefore VACUOUS on such a filesystem: they pin the bug where it is observable
+# (Linux, i.e. CI), and the case-sensitive proof for this defect was made
+# OUT-OF-BAND, against the pre-fix rail. (c) does NOT stand in for them — it compares
+# a string field and exercises a DIFFERENT code path (the legacy `<pr>.json` repo
+# field, not the derivation of the qualified name from the spelling the writer got).
+new_scen record-verbatim-spelling
+HEAD_RV="e8e8000000000000000000000000000000000000"
+stale_surface "$HEAD_RV"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "Daniel-Ospina-Agent-Infra-42.json" "$HEAD_RV"
+run_admin_guarded 42 --repo Daniel-Ospina/Agent-Infra
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) the refusal still stands (exit $rc)" \
+  || fail "(b) the rail merged with a record bound to the head (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(b) the verbatim --repo spelling was NOT checked: the update proceeded although a record under 'Daniel-Ospina-Agent-Infra-42.json' is bound to the head" \
+  || pass "(b) …and the record filed under the VERBATIM --repo spelling was found"
+grep -qi "agent-infra-42.json" "$SCEN/err" \
+  && pass "(b) …naming the record file it refused to strand" \
+  || fail "(b) the refusal does not name the record it found"
+
+# (c) THE LEGACY NAME'S `repo` IS COMPARED CASE-INSENSITIVELY. A pure-string compare,
+# so this half is filesystem-independent: `record-review.sh` writes the `repo` it was
+# handed, verbatim, and `gh` accepts a different case for the same repo.
+new_scen record-legacy-repo-case
+HEAD_RC="e9e9000000000000000000000000000000000000"
+stale_surface "$HEAD_RC"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "42.json" "$HEAD_RC" "Daniel-Ospina/Agent-Infra"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a legacy record whose repo differs only by CASE still refuses (exit $rc)" \
+  || fail "(c) the case-sensitive compare read the record as another repo's and updated the branch"
+grep -q "update-branch" "$SCEN/calls" && fail "(c) the update was issued over a case-different legacy record" \
+  || pass "(c) …and no update-branch write was issued"
+grep -q "/42.json" "$SCEN/err" \
+  && pass "(c) …naming the LEGACY file as the blocking artifact" \
+  || fail "(c) the refusal does not name the legacy record"
+
+# (d) …AND THE OTHER HALF, WHICH MATTERS AS MUCH: a same-number legacy record that
+# names ANOTHER repo is not this PR's record and must NOT block. An over-block is a
+# failure too — it would refuse every update in a repo whose review tooling writes
+# one shared legacy name per number.
+new_scen record-legacy-other-repo
+HEAD_RD="eaea000000000000000000000000000000000000"
+stale_surface "$HEAD_RD"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "42.json" "$HEAD_RD" "someone/other-repo"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) the refusal still stands (exit $rc)" \
+  || fail "(d) the rail merged past an unrelated record (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(d) …and another repo's same-number record does NOT block: the update was requested" \
+  || fail "(d) an unrelated repo's record blocked this PR's update"
+
+# (e) AN EXISTING-BUT-UNREADABLE RECORD BLOCKS. The guard cannot tell whether such a
+# file is bound to this head, and "I could not read it" is never a green.
+new_scen record-unreadable
+HEAD_RE="ebeb000000000000000000000000000000000000"
+stale_surface "$HEAD_RE"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RE"
+chmod 000 "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_admin_guarded 42
+rc=$?
+chmod 600 "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  pass "⚠️ SKIPPED (e) — root shell: mode 000 is still readable, so the refusal cannot be asserted here (it DOES run in CI, where the suite is non-root)"
+else
+  [ "$rc" -ne 0 ] && pass "(e) an existing-but-UNREADABLE record refuses (exit $rc)" \
+    || fail "(e) an unreadable record was read as 'no record' and the update proceeded"
+  grep -q "update-branch" "$SCEN/calls" && fail "(e) the update was issued despite an unreadable record" \
+    || pass "(e) …and no update-branch write was issued"
+  # The guard refuses an unreadable path BEFORE it tries to read a head out of it, so the
+  # reason it now prints is this more specific one. Pinning that exact text keeps the
+  # assertion meaningful: the refusal must say WHY it refused, not merely exit non-zero.
+  grep -q "not a readable regular file" "$SCEN/err" \
+    && pass "(e) …naming the unreadable head as the reason" \
+    || fail "(e) the refusal does not say the head could not be read"
+fi
+
+# (f) NO RECORD AT ALL PERMITS THE WRITE — the remedy the refusal names is performed,
+# and pinning it is what keeps the guard from degrading into an unconditional refusal.
+new_scen record-absent-updates
+HEAD_RF="ecec000000000000000000000000000000000000"
+stale_surface "$HEAD_RF"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(f) this invocation still refuses (the refreshed head has no completed check) (exit $rc)" \
+  || fail "(f) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(f) …but with no record to strand, the update WAS requested" \
+  || fail "(f) the rail refused to update with no record present"
+grep -q "expected_head_sha=$HEAD_RF" "$SCEN/calls" \
+  && pass "(f) …pinned to the head this refusal was computed against" \
+  || fail "(f) the write is not pinned to the head: $(grep 'update-branch' "$SCEN/calls")"
+grep -q "the rail asked GitHub to bring the branch up to date" "$SCEN/out" \
+  && pass "(f) …and the rail reports the write it made (never a sha it has not read)" \
+  || fail "(f) the rail did not report the update it made: $(grep -c 'update' "$SCEN/out") line(s) mentioning update on stdout"
+
+# (g) A RECORD BOUND TO A DIFFERENT HEAD PERMITS THE WRITE. The head has moved since the
+# record was written, so this update strands nothing — the anti-over-block twin of (a).
+new_scen record-other-head-updates
+HEAD_RG="eded000000000000000000000000000000000000"
+stale_surface "$HEAD_RG"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "deb0deb0deb0deb0deb0deb0deb0deb0deb0deb0"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) the refusal still stands (exit $rc)" \
+  || fail "(g) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(g) …and a record bound to ANOTHER head does not block: the update was requested" \
+  || fail "(g) a record bound to a different head blocked this head's update"
+
+# (h) THE DRY RUN WRITES NOTHING AND CLAIMS NOTHING. The guard runs BEFORE the dry-run
+# branch, so a dry run is refused by a bound record exactly as a real run is — and with
+# no record it must reach the dry-run notice, not the update path.
+new_scen record-absent-dry-run
+HEAD_RH="eeee000000000000000000000000000000000000"
+stale_surface "$HEAD_RH"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+run_admin_guarded 42 --dry-run
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) the dry run refuses (exit $rc)" || fail "(h) expected a refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(h) --dry-run ISSUED an update-branch write" \
+  || pass "(h) …and --dry-run issued NO write"
+grep -q "would bring the branch up to date" "$SCEN/out" \
+  && pass "(h) …saying it WOULD have brought the branch up to date" \
+  || fail "(h) the dry run does not say what it would have done"
+# The success path prints its claim on STDOUT, so this must read `out`: grepping `err`
+# made the assertion unfalsifiable, because only the API-failure arm writes that text to
+# stderr and this scenario has no failure fixture.
+grep -q "the rail asked GitHub" "$SCEN/out" \
+  && fail "(h) the dry run claims the rail asked GitHub to update (it did not)" \
+  || pass "(h) …and claims no update it did not make"
+grep -q "NOT updating" "$SCEN/err" \
+  && fail "(h) the dry run reports the guard's refusal TEXT although no record blocked it" \
+  || pass "(h) …and reports no record refusal it did not take"
+
+# (i) THE NUMBER IS KEPT AS GIVEN. `record-review.sh` names the record with `$PR`
+# VERBATIM (it validates only `^[0-9]+$`), so a run for `01631` writes
+# `…-01631.json` — while `gh` accepts a padded number and this rail is invoked with
+# the same spelling the operator typed. A guard that stripped the zeros read a path
+# the writer never writes, so a record bound to the head was invisible and the head
+# was moved out from under a record the merge gate still reads. Pinned shut here.
+new_scen record-leading-zero
+HEAD_RI="f1f1000000000000000000000000000000000000"
+stale_surface "$HEAD_RI"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-01631.json" "$HEAD_RI"
+run_admin_guarded 01631
+rc=$?
+[ "$rc" -ne 0 ] && pass "(i) a record filed under the VERBATIM padded number refuses the update (exit $rc)" \
+  || fail "(i) the guard stripped the zeros and read a path the writer never wrote: the update proceeded (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(i) the rail asked to update a branch whose padded-number record is bound to the head" \
+  || pass "(i) …and no update-branch write was issued"
+grep -q "daniel-ospina-agent-infra-01631.json" "$SCEN/err" \
+  && pass "(i) …naming the padded record it refused to strand" \
+  || fail "(i) the refusal does not name the padded record: $(ls "$SCEN/home/.pi/agent/reviews" 2>/dev/null | tr '\n' ' ')"
+
+# (j) "EXISTS BUT IS NOT A READABLE REGULAR FILE" IS NOT "NO RECORD". A directory at
+# a candidate path made the old `[ -f ] || continue` read as absent, so the update
+# went ahead against a record store the guard could not read — the fail-open pinned
+# shut here. A DIRECTORY is used rather than `chmod 000`, because the suite may run as
+# root, where a mode-000 file is still readable and the case would be vacuous.
+new_scen record-store-not-regular
+HEAD_RJ="f2f2000000000000000000000000000000000000"
+stale_surface "$HEAD_RJ"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+mkdir -p "$SCEN/home/.pi/agent/reviews/daniel-ospina-agent-infra-42.json"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(j) a DIRECTORY at the candidate path refuses the update (exit $rc)" \
+  || fail "(j) a non-regular path was read as 'no record' and the update proceeded (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(j) the rail asked to update a branch with a record store it could not read" \
+  || pass "(j) …and no update-branch write was issued"
+grep -q "not a readable regular file" "$SCEN/err" \
+  && pass "(j) …saying the path exists but is not a readable regular file" \
+  || fail "(j) the refusal does not state the not-a-regular-file condition"
+
+# (k) A REJECTED UPDATE IS NOT AN UPDATE. `refresh_pr_branch` returns 1 for BOTH a
+# refusal and a failed API call, so a caller that reported the write unconditionally
+# would tell the lane a re-measurement is under way on a path where no new head was
+# created and no check will ever run. The write IS issued (no record to strand) and the
+# rail must report that the call did not succeed — without claiming it updated anything.
+# THIS invocation still refuses either way: the refreshed head carries no completed check.
+new_scen record-absent-update-rejected
+HEAD_RK="f3f3000000000000000000000000000000000000"
+stale_surface "$HEAD_RK"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+: >"$SCEN/update-branch-fail"
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(k) the invocation still refuses (exit $rc)" \
+  || fail "(k) expected the 4.6 refusal, got exit $rc"
+grep -q "update-branch" "$SCEN/calls" \
+  && pass "(k) …with no record to strand, the update WAS requested" \
+  || fail "(k) the rail did not attempt the update its own refusal names as the remedy"
+grep -q "the call did not succeed" "$SCEN/err" \
+  && pass "(k) …and the rail reports the call did not succeed" \
+  || fail "(k) the rail does not report the rejected update"
+grep -q "the rail asked GitHub to bring the branch up to date with its base" "$SCEN/out" \
+  && fail "(k) the rail claims it brought the branch up to date although the call was rejected" \
+  || pass "(k) …and claims no update it did not make"
+
+# (l) AN UNRESOLVED REPO IDENTITY IS NOT A REASON TO SKIP THE CHECK. Both record paths
+# are named after the canonical slug, so with no slug the qualified file is unchecked
+# and the update can strand the record this guard exists to protect — the fail-open
+# pinned shut here. Refusing costs one re-run, and every other step of this rail needs
+# a working `gh` against this repo anyway.
+new_scen record-slug-unresolved
+HEAD_RL="f4f4000000000000000000000000000000000000"
+stale_surface "$HEAD_RL"
+rm -f "$SCEN/repo-slug"          # the identity seam's ABSENT state
+run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(l) an unresolvable repo identity refuses the update (exit $rc)" \
+  || fail "(l) the rail updated with the record identity unresolved (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(l) the update proceeded although the qualified record path could not be derived" \
+  || pass "(l) …and no update-branch write was issued"
+grep -q "repo identity could not be resolved" "$SCEN/err" \
+  && pass "(l) …naming the unresolvable identity as the reason" \
+  || fail "(l) the refusal does not name the unresolvable identity"
+
+# (m) A REVIEW STORE THAT CANNOT BE SEARCHED IS NOT AN ABSENT RECORD. `[ -e "$f" ]`
+# cannot tell ENOENT from EACCES, so a `~/.pi/agent/reviews` without its read/search
+# bits made every candidate look absent and let the update proceed — measured as a live
+# fail-open (store at mode 000: the guard returned ALLOW and printed "No review record
+# was left stale by this update"). The record is present and bound to the head, and the
+# store arm must refuse BEFORE any candidate path is read. The directory is restored
+# after the run so the suite's own tree walk can remove the scenario.
+new_scen record-store-unsearchable
+HEAD_RM="f5f5000000000000000000000000000000000000"
+stale_surface "$HEAD_RM"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "$HEAD_RM"
+chmod 000 "$SCEN/home/.pi/agent/reviews"
+run_admin_guarded 42
+rc=$?
+chmod 700 "$SCEN/home/.pi/agent/reviews" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  # A mode-000 directory is still searchable as root, so the case cannot distinguish the
+  # store arm from a permitted update — SKIP rather than assert a false pass.
+  pass "⚠️ SKIPPED (m) — root shell: a mode-000 directory is still searchable, so the refusal cannot be asserted here (it DOES run in CI, where the suite is non-root)"
+else
+  [ "$rc" -ne 0 ] && pass "(m) an UNSEARCHABLE review store refuses the update (exit $rc)" \
+    || fail "(m) an unsearchable store made every record look absent and the update proceeded"
+  grep -q "update-branch" "$SCEN/calls" \
+    && fail "(m) the update was issued although the review store could not be searched" \
+    || pass "(m) …and no update-branch write was issued"
+  grep -q "exists but cannot be searched" "$SCEN/err" \
+    && pass "(m) …naming the unsearchable store as the reason" \
+    || fail "(m) the refusal does not say the store could not be searched"
+fi
+
+# (n) `GH_REPO` IS A RECORD-KEY SPELLING. `record-review.sh` resolves the repo it was
+# handed through `GH_REPO` when no `--repo`/positional is given, and writes the
+# qualified name VERBATIM; the merge gate resolves the record through that same
+# spelling. A guard that checked only the canonical slug and `$REPO` therefore read a
+# path the writer never wrote and moved the head out from under the record — the
+# fail-open pinned shut here.
+# NOTE: the GH_REPO spelling and the canonical slug differ only by CASE (there is no
+# non-case spelling of the SAME repo), so on a case-INSENSITIVE filesystem — macOS
+# default — the canonical candidate resolves the same file and the write assertion
+# cannot discriminate. This case pins the bug where it is observable (Linux, i.e. CI),
+# exactly as (b) does for the `--repo` spelling.
+new_scen record-ghrepo-spelling
+HEAD_RN="f6f6000000000000000000000000000000000000"
+stale_surface "$HEAD_RN"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "Daniel-Ospina-Agent-Infra-42.json" "$HEAD_RN"
+# GH_REPO is exported into the rail for THIS case only: the prefix assignment is placed
+# in run_admin_guarded's own environment and is therefore inherited by the `bash "$ADM"`
+# it launches (verified: the child sees it, the parent does not).
+GH_REPO=Daniel-Ospina/Agent-Infra run_admin_guarded 42
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n) a record filed under the GH_REPO spelling refuses the update (exit $rc)" \
+  || fail "(n) the rail merged with a GH_REPO-spelled record bound to the head (exit $rc)"
+grep -q "update-branch" "$SCEN/calls" \
+  && fail "(n) the GH_REPO spelling was NOT checked: the update proceeded although 'Daniel-Ospina-Agent-Infra-42.json' is bound to the head" \
+  || pass "(n) …and no update-branch write was issued"
+
+# (o) A SEARCHABLE-BUT-UNLISTABLE STORE IS NOT "UNSEARCHABLE". The candidate records are read
+# BY NAME, so directory SEARCH (`-x`) is the only permission this guard uses; requiring
+# directory READ (`-r`) turned an unlistable store into a refusal for a condition that was
+# FALSE, blocking an update that stranded nothing. Mode 111 = searchable, not listable.
+# This is the anti-over-block twin of (m), and (g) already proves the update is permitted once
+# the guard can look: so mode 111 with a record bound to ANOTHER head must REQUEST the update.
+new_scen record-store-searchable-not-listable
+HEAD_RO="f7f7000000000000000000000000000000000000"
+stale_surface "$HEAD_RO"
+printf 'daniel-ospina/agent-infra\n' >"$SCEN/repo-slug"
+review_record "daniel-ospina-agent-infra-42.json" "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"
+chmod 111 "$SCEN/home/.pi/agent/reviews"
+run_admin_guarded 42
+rc=$?
+chmod 700 "$SCEN/home/.pi/agent/reviews" 2>/dev/null || true
+if [ "$(id -u)" = "0" ]; then
+  # Root bypasses the permission bits, so this case cannot distinguish the store arm here —
+  # SKIP rather than assert a false pass (it DOES run in CI, where the suite is non-root).
+  pass "⚠️ SKIPPED (o) — root shell: a mode-111 directory is still readable as root, so the store arm cannot be distinguished here"
+else
+  grep -q "cannot be searched" "$SCEN/err" \
+    && fail "(o) a SEARCHABLE store was refused as unsearchable: the guard required READ (-r) where it only uses SEARCH (-x) to read the candidate names it builds" \
+    || pass "(o) a searchable-but-unlistable store is not treated as unsearchable"
+  grep -q "update-branch" "$SCEN/calls" \
+    && pass "(o) …and with no record bound to THIS head, the update WAS requested" \
+    || fail "(o) …but no update-branch write was issued: the store blocked an update that stranded nothing"
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

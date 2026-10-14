@@ -83,6 +83,82 @@ Provide a code review for the given pull request.
 
 ## Process (Full Review)
 
+### Step 0.0 — Reviewer Test Scope: DERIVE, never accept a hand-picked list
+
+**On a full review, before the coverage check below.** It applies to the full review. The
+`--standard-tier` path starts at Step 1 and does **not** run it, and `--re-review` skips to Smart
+Re-Review (Step A) — so on a re-review, derive the scope on the fix-commit delta yourself before
+continuing; do not assume this step ran.
+
+**The controller must pass the reviewer the DIFF, never a hand-picked list of TEST files.** (Affected
+files as review context, per Step 4, are a different thing.) The reviewer derives its own scope and
+names every file it did not run.
+
+**Run the legs CI runs — not just `test_files`.** The selector subtracts the other legs out of
+`test_files`, so a reviewer who runs only that set has a *smaller* denominator than CI, which is the
+defect this step exists to prevent. These are the three **diff-gated** legs — they are not the whole
+of CI, which also runs always-on Python jobs (`test-track-b` selecting the `track_b` markers that
+every leg below marker-deselects, `test-concurrency-falkor`, `packs-compile`, and
+`test-d14-hosted-api` — a whole-tree `-m embedded_only` selection that no other job executes outside
+the carve-out file list); treat those as further files to run or to name as not-run — and enumerate
+the workflow's unconditional jobs yourself rather than trusting this list to be complete:
+
+| JSON field | Run it when |
+|---|---|
+| `test_files` | always — if the value is the sentinel `"ALL"`, expand it to the full suite |
+| `slow_selected` | `slow_run` is true (CI's `test-slow`, gated on `slow_run == 'true'`) |
+| the carve-out leg | `carve_out_run` is true (CI's `test-carve-out`); the JSON carries the flag but not the file list — read it from the repo's CI surface config |
+
+If you deliberately leave a leg to CI, say so and name it as not-run. Do not silently drop one.
+
+```bash
+# The repo's CI diff selector. Guard the INPUT, not the selector's output: an empty or
+# failed file fetch makes the selector answer with a plausible tier-1 smoke set (full=false,
+# slow_run=false, carve_out_run=false) — a silently stripped suite that still reports green.
+CHANGED="$(gh api "repos/{owner}/{repo}/pulls/<PR_NUMBER>/files?per_page=100" --paginate --jq '.[].filename')"
+if [ -z "${CHANGED//[[:space:]]/}" ]; then
+  echo "changed-file list EMPTY (or the fetch failed) — UNAVAILABLE, not 'no tests'"; exit 1
+fi
+printf '%s\n' "$CHANGED" | uv run python tools/ci_selection.py --changed-files - --event pull_request
+# Then the callers/importers of every changed symbol (unbounded — do not cap this):
+rg -ln '<changed_symbol>|<module_basename>' --glob '!*.md'
+```
+
+An empty **changed-file list** is UNAVAILABLE, never "no tests". Do not test the selector's output
+for emptiness — it never is. This mirrors what CI and the rail already do: CI refuses an empty
+`$BASE...HEAD` set before invoking the selector (`#3442`: *refusing to certify this head on the
+tier-1 smoke alone*), and the rail guards it whitespace-aware (`an unavailable answer, not a diff
+with no files`).
+
+**The selector is repo-specific.** `tools/ci_selection.py` is the **tortoise** tool; agent-infra,
+eldato and premise-labs do not have it, and this snippet will not run there. The portable rule is:
+*use the repo's CI diff selector; if the repo has none, derive the scope from its test-file→source
+mapping.* Substitute your repo's selector for the snippet above.
+
+**Why this is a gate and not advice — the observed failure.** On tortoise PR #7615 the head
+`8b7ac2d559` was CI-red on
+`tests/longmem_eval/test_ingest_stall_guard.py::test_ingest_haystack_v2_aborts_stalled_question`
+(`AssertionError: SDK touched during a stalled ingest: _graph_write_retry_count`, shard `test (g)`,
+run `37684958263`, completed `failure` at 20:51:52Z) — while a fresh-context review **on that same
+sha**, posted 21:21:26Z
+([comment](https://github.com/daniel-ospina/tortoise/pull/7615#issuecomment-6047099958)), returned
+`NO ISSUES FOUND`. The guard that fired is a `_BoomSDK.__getattr__` that raises on any attribute
+access; it lives in a file the reviewer was not told to run. **Do not cite a count of clean cycles
+you cannot point at an artifact for** — cite the sha, the failing test, and the permalink of the
+clean verdict at that sha.
+
+The mechanism is structural, not carelessness: scoping a reviewer by hand-picked files silently
+converts its question from *"is this change correct?"* into *"is this change correct within the
+files I thought of?"*, and the second question has a far smaller denominator.
+
+**Corollaries.**
+- **Intent, not an enforced gate:** record the derived scope in the review comment. A clean verdict
+  without it cannot be audited later — note that the merge gate does **not** read it (Step 10 is
+  explicit that the artifact is an auditability boundary, not proof of review).
+- **A P3 fixed in round N can introduce the red found in round N+1.** On #7615 a `finally` fold added
+  to satisfy a prior round's P3 was half of that regression; removing only it leaves the test red.
+  Re-derive and re-run the scope after every fix, not only at the end.
+
 ### Step 0 — Test Coverage Check (MANDATORY, always runs)
 
 Before reviewing code, check whether source changes are accompanied by test changes:
