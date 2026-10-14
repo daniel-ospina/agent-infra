@@ -16,6 +16,7 @@ else
   REPO="$1"; OR="$2"; PR="$3"; BR="$4"
 fi
 case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
+KIND=reviewer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -30,19 +31,38 @@ cd "$REPO" || exit 1
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
-  echo "[timeout] agent pid=$pid wall_limit=${t}s rc=$rc" >> "$log"
+  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
+  # reviewer wall-time — the load-bearing number for fleet capacity (it was unmeasured).
+  elapsed=$(( $(date +%s) - start ))
+  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
+  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
+  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
+  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
+  mkdir -p "$O/state"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
   return "$rc"
 }
 git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
 
-# ── single-owner claim ────────────────────────────────────────────────────────
+# HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha>, not <PR>
+# (agent-infra#1709 rec 1). It is also the key record-review/needsfix already use.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+
+# The log is TRUNCATED here, before any claim evidence is appended. It used to be truncated at
+# the end of the claim block, which silently deleted the "cross-box claim: acquired …" line on
+# every run — the feature worked and left no evidence that it had.
+echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
+
+# ── single-owner claim: local lock, then the cross-box git-ref claim ──────────
 # Three paths reach this script: chain-<N> (waits for a lane's PR), fix-<PR>, and the
 # controller's merge sweep. Only the last two are visible to the controller by session name,
 # so without a shared claim a freshly opened PR gets TWO concurrent reviewers racing the same
@@ -67,8 +87,42 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'rm -f "$CLAIM"' EXIT
 
-HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
-echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
+# ── cross-box claim (agent-infra#1709 recs 1-3) ───────────────────────────────
+# The noclobber lock above is atomic on ONE box only: three boxes driving this repo are three
+# independent filesystems, so it stops nothing between them. The boxes share exactly one
+# durable store — the repository — and creating a ref with `git push` is an atomic CAS.
+#
+# FAIL-OPEN, ON PURPOSE. If the claim store is unreachable (network blip, a rejected push for
+# an unrelated reason) we proceed and SAY SO in the log. #1709's headline finding is that
+# no mechanism guarantees two machines never run the same job, so the design must tolerate
+# duplicates: every side effect on this path is idempotent per head (one evidence comment, a
+# record-review marker keyed on $HEAD, and `gh pr merge` twice is a no-op). Failing CLOSED
+# would stall the whole fleet on one transient error — the strictly worse failure. The log
+# line makes the fallback visible rather than silent.
+CROSS_OWN=""
+CROSS_RC=0
+if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$O/claims.sh"
+  # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
+  # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the 30x30s gate
+  # wait below (900) + the merge itself. Derived, not a bare constant — and passed explicitly,
+  # because sourcing claims.sh above sets CLAIM_TTL=1800 and would silently win over a default.
+  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+  claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
+  CROSS_RC=$?
+  case "$CROSS_RC" in
+    0) CROSS_OWN="$CLAIM_COMMIT"
+       echo "[merge $PR] cross-box claim: $CLAIM_RESULT" >> "$L.log" ;;
+    1) echo "[merge $PR] cross-box claim REFUSED: $CLAIM_RESULT — another box owns head $HEAD; exiting" >> "$L.log"
+       rm -f "$CLAIM"; exit 0 ;;
+    *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log" ;;
+  esac
+fi
+# agent-infra's TERM/INT handlers above only TERMINATE (the #1715 fix); each `exit` runs this
+# EXIT trap, so the cross-box release folds in here rather than into a returning handler. The
+# local claim drop stays first so a release attempt can never leave the pid lock behind.
+trap 'rm -f "$CLAIM"; [ -n "${CROSS_OWN:-}" ] && claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1' EXIT
 
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF

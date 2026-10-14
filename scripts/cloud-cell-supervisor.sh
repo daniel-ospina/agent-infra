@@ -224,9 +224,11 @@ cmd_check() {
   # from $HARNESS. cmd_start seeds $O from $HARNESS; assert it, so a stale/empty $O is a loud
   # failure rather than a controller that runs the inline sweep but can never review, fix or
   # dispatch — a false "CELL CAN RUN A CONTROLLER".
+  # claims.sh is included because orch-loop.sh and merge-one.sh SOURCE it from $O: without it the
+  # cross-box claim silently degrades to the fail-open path (logged, but not the design).
   say "ok: HOME, harness, tmux, gh auth, repo, state dir"
   local missing="" w
-  for w in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  for w in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"

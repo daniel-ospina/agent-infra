@@ -193,12 +193,25 @@ esac
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
-claim_live() {
+claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box ref claim
   local f="$O/state/mergeclaim-$1.lock" p
-  [ -f "$f" ] || return 1
-  p="$(cat "$f" 2>/dev/null || echo 0)"
-  [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null && return 0
-  rm -f "$f"; return 1
+  if [ -f "$f" ]; then
+    p="$(cat "$f" 2>/dev/null || echo 0)"
+    if [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null; then return 0; fi
+    rm -f "$f"
+  fi
+  # Cross-box (agent-infra#1709 recs 1-3): a reviewer on ANOTHER box holds the claim as a git
+  # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
+  # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
+  # once at the top of this cycle, not from the network per PR.
+  local sha="${2:-}" ref until
+  [ -n "$sha" ] || return 1
+  [ -f "$O/state/claims-snapshot" ] || return 1
+  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
+  until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
+  [ -n "${until:-}" ] && [ "$until" != "0" ] || return 1
+  [ "$(date +%s)" -le "$until" ] && return 0
+  return 1
 }
 
 # single-instance lock (atomic: noclobber create fails if the file exists)
@@ -282,8 +295,14 @@ can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
 # regression cannot hide behind a comment):
 #   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
 #   review_slots -> reviewer concurrency, with headroom once a backlog exists
-mp_reason() { # <open_prs> <lanes>
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then
+mp_reason() { # <open_prs> <lanes> <workers>
+  # The condition is "the box has review/merge work IN FLIGHT", not "a lane happens to be
+  # running". Measured 2026-10-13 (agent-infra#1709 item 4): the lanes-only form let dispatch
+  # through on 4/4 sampled blocks — e.g. `lanes=0 workers=8` with 27 open PRs, i.e. eight
+  # reviewers mid-flight on a box already saturated. That ADDS WIP to fixed throughput and
+  # lengthens cycle time (Little's Law), which is the opposite of draining.
+  # Total in-flight agents = lanes + workers; `workers` is the merge/fix session count.
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ $(( ${2:-0} + ${3:-0} )) -ge 1 ]; then
     echo "merge-priority (${1} open PRs — draining before opening more)"
   fi
 }
@@ -438,6 +457,23 @@ while true; do
   if [ "$SWEEP_RC" -ne 0 ]; then
     echo "[sweep] PR listing FAILED rc=$SWEEP_RC (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
   fi
+  # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
+  # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
+  # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
+  if [ -f "$O/claims.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$O/claims.sh"
+    # REQUIRED: this loop runs from launchd with cwd=$HOME. Without CLAIM_REPO every git call
+    # inside claims.sh targets a non-repo, the fetch fails silently and the snapshot is empty
+    # even with live claims — measured: 3 claims on origin, 0 snapshot lines.
+    CLAIM_REPO="$REPO"
+    claim_snapshot "$O/state/claims-snapshot"
+    # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
+    if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
+      touch "$O/state/.claims-pruned"
+      ( claim_prune >> "$LOG" 2>&1 ) &
+    fi
+  fi
   printf '%s\n' "${SWEEP_LIST:-}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT; do
     [ -z "${PR:-}" ] && continue
@@ -534,7 +570,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -556,7 +592,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         if grep -q ai-review-gate <<<"$V"; then
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
@@ -602,7 +638,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -636,6 +672,11 @@ open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
   L="$(load1)"; LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
+  # live at this instant, so the dispatch block line below can distinguish "blocked while the box
+  # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
+  # not). Total in-flight agents = lanes + workers.
+  WORKERS="$(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-')"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on
@@ -665,7 +706,7 @@ PY
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
-  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES")"
+  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES" "$WORKERS")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
@@ -689,7 +730,7 @@ PY
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     else echo "[dispatch] backlog empty" >> "$LOG"; fi
   else
-    echo "[dispatch] skipped ($GATE_WHY)" >> "$LOG"
+    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
   heartbeat
 
@@ -706,9 +747,15 @@ PY
     fi
   fi
 
+  # agent-infra#1709 rec 4: JITTER. Three boxes on the same 240s cycle wake together — the
+  # classic thundering-herd trigger, and the sources name randomised expiry/backoff as the fix.
+  # Spread each box's wake-up by up to ±20% of the cycle. Cheap, and it matters more at 3 boxes
+  # than at 2: the claim CAS resolves the collision, but jitter means far fewer collisions to
+  # resolve at all.
+  JIT=$(( CYC / 5 ))
   # `& wait`, not a bare sleep: bash runs a trap only AFTER the current foreground command
   # completes, so `sleep 240` deferred the stop for up to a whole cycle — measured 5.07s of a 6s
   # sleep, vs 0.09s with the background form. The lock is held either way, but "kill -TERM ends
   # the process" (agent-infra#1715's indicator) is then true in ~0.1s, not in four minutes.
-  sleep "$CYC" & wait $!
+  sleep $(( CYC - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
 done

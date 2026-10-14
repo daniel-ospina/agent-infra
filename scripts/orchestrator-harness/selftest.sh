@@ -2130,8 +2130,16 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # command completes, so a bare `sleep "$CYC"` deferred the stop for up to the whole cycle
   # (measured 5.07s of a 6s sleep, vs 0.09s for `sleep … & wait $!`). Drive the SHIPPED line with
   # CYC=8 and require the stop inside 4s, so a revert to the bare sleep fails here.
-  grep -m1 '^  sleep "\$CYC" & wait \$!$' "$LOOP" > "$TMP/cycsleep.sh"
+  # ⛔ Extract from the JIT assignment THROUGH the backgrounded sleep, not just the sleep line
+  # (agent-infra#1709 rec 4): the shipped sleep is now `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))`,
+  # so JIT must be in the extracted driver or the arithmetic fails. A bare `grep 'sleep "$CYC"'`
+  # matched the pre-jitter form ONLY and silently extracted nothing once jitter landed.
+  awk '/^  JIT=/{f=1} f{print} f&&/& wait \$!$/{exit}' "$LOOP" > "$TMP/cycsleep.sh"
   if need "$TMP/cycsleep.sh" "the interruptible cycle sleep is extracted from the shipped orch-loop.sh"; then
+    # The extraction must still carry the JITTER, or a revert to a fixed interval would pass the
+    # interruptibility check below while re-introducing the thundering herd it exists to prevent.
+    grep -q 'RANDOM' "$TMP/cycsleep.sh" && rc=0 || rc=1
+    ck "the shipped cycle sleep is jittered (±20% of CYC), not a fixed interval" $rc
     { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
     bash -n "$LK/cyc.sh" && rc=0 || rc=1
     ck "the cycle-sleep driver parses" $rc

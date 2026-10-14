@@ -564,14 +564,23 @@ A CONFLICTING PR can never merge, but the sweep classified it GREEN/PENDING and 
 on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193, #8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict, and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
 fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
 
-### 7.2b Cross-box duplicate work — **OPEN**
+### 7.2b Cross-box duplicate work — **FIXED in this PR**
 
 The per-PR claim (§5.1b) is a **local file**, so it makes concurrency safe *within one box*. Two
-boxes sweeping the same repo will still both review and attempt to merge the same PR, and both may
-pick the same issue. This is inherent: the boxes share GitHub, not a coordinator. tortoise#5052
-proposes "an authoritative, expiring claim registry" — the cross-box version of §5.1b. `SCOPE=own`
-(§5, item 3) is the interim **partition**: it stops more than one box taking broad, but it does not
-make ownership knowable, so it is not the registry.
+boxes sweeping the same repo still both evaluate the same PR and the same issue, and the boxes
+share GitHub, not a coordinator. The registry is now `refs/claims/<PR>-<head-sha>` in the
+repository the boxes already share: `git push` to a ref is an **atomic create-or-fail** (a CAS), so
+it needs no broker and no service, and the namespace is **outside `refs/heads/*`**, so it triggers
+no workflow and never appears as a branch. `claims.sh` holds the primitive; `merge-one.sh` resolves
+HEAD **before** claiming and exits 0 when another box owns that head; `orch-loop.sh` refreshes
+**every** claim in **one** fetch per cycle into `state/claims-snapshot`, so `claim_live()` costs no
+per-PR network call. The lease is **data, not liveness** (a remote pid cannot be probed), derived as
+`REVIEW_TIMEOUT + 1200` and carried in the claim commit; every release/reclaim is
+`--force-with-lease`, so a box that lost ownership cannot release the winner's claim. It **fails
+open on purpose** — if the claim store is unreachable the harness proceeds and logs it — because
+agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
+must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
+`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
@@ -737,6 +746,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | Script | Role |
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
+| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
@@ -744,6 +754,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
+| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
+| `test-claims.sh` | the claim CAS against live origin from two throwaway clones. Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
