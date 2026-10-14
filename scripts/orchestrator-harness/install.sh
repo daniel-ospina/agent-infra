@@ -25,7 +25,7 @@ OR="${OR:-daniel-ospina/tortoise}"
 # sysctl -n hw.ncpu is a macOS-only key and sysctl is absent from a minimal Linux userland
 # (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"
@@ -278,6 +278,41 @@ mkdir -p "$(dirname "$PLIST")" || die "cannot create $(dirname "$PLIST") — is 
 xml_esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 sed_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
 esc() { sed_esc "$(xml_esc "$1")"; }
+# Every numeric limit below is substituted VERBATIM -- deliberately NOT routed through esc(), because
+# a whole number has nothing to escape. That contract was never checked, and breaking it fails two
+# different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
+# own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
+# VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+  _v="${!_n}"
+  case "${_v:-}" in ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;; esac
+  # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
+  # OPENS the gate the value configures. `MAX_LANES=99999999999999999999` passed the class test, and
+  # install.sh exited 0; the loop then compared, errored, and lost the lane cap. No limit here is near
+  # a billion, so bound the length.
+  [ "${#_v}" -le 9 ] || die "$_n='$_v' is out of range (at most 9 digits)"
+done
+# Each value is substituted by its OWN sed rule and the rules run IN ORDER, so a value carrying a
+# LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as `4` — exit 0, plutil OK,
+# and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
+# below can only fire on a genuinely unrendered TEMPLATE token, never on a value that merely looks
+# like one (a legal `O=/tmp/__DATA__host` used to be refused with a diagnostic naming the wrong cause).
+for _v in "$O" "$REPO" "$OR" "$SCOPE" "$HOME" "$DAEMON_PATH"; do
+  case "$_v" in *__[A-Z_]*__*) die "a substituted value contains a template token ('$_v') — sed applies its rules in order, so a later rule would rewrite it" ;; esac
+  case "$_v" in *$'\n'*) die "a substituted value contains a newline, which sed cannot put in a replacement" ;; esac
+done
+# Render ATOMICALLY: the redirect truncates its target BEFORE sed runs, so rendering straight into
+# $PLIST and then rejecting the result left the LIVE plist empty or poisoned -- and README §9's next
+# step (`launchctl unload && launchctl load`) then failed, so a rejected re-install destroyed a working
+# daemon config. Render to a temp file, validate THAT, and only then move it into place.
+#
+# The trap is not decoration: the render runs under `set -euo pipefail`, so a sed/template read
+# failure aborts BETWEEN creating $RENDER and the two explicit `rm -f`s below, orphaning a
+# `*.plist.new.<pid>` in LaunchAgents that nothing ever prunes (README §7.5 tracks exactly this
+# class of unbounded growth). It also covers any future early-exit between here and the `mv`. After
+# a successful `mv` the path no longer exists, so the trap is a no-op on the happy path.
+RENDER="$PLIST.new.$$"
+trap 'rm -f "$RENDER"' EXIT
 sed \
   -e "s|__O__|$(esc "$O")|g" \
   -e "s|__REPO__|$(esc "$REPO")|g" \
@@ -295,8 +330,16 @@ sed \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
   -e "s|__BATCH__|$BATCH|g" \
   -e "s|__CYC__|$CYC|g" \
-  "$TEMPLATE" > "$PLIST"
-plutil -lint "$PLIST" >/dev/null || die "rendered plist is invalid"
+  "$TEMPLATE" > "$RENDER"
+plutil -lint "$RENDER" >/dev/null || { rm -f "$RENDER"; die "rendered plist is invalid"; }
+# plutil -lint proves the XML is well-formed; it cannot tell that a substitution did not take. The
+# substituted VALUES are checked above, so a token surviving here means the TEMPLATE has a token with
+# no rule -- which this catches, and it catches it for any token added later too.
+if grep -q '__[A-Z_]*__' "$RENDER"; then
+  _toks="$(grep -o '__[A-Z_]*__' "$RENDER" | sort -u | tr '\n' ' ')— a template token has no substitution rule"
+  rm -f "$RENDER"; die "rendered plist still contains ${_toks}"
+fi
+mv -f "$RENDER" "$PLIST"
 ok "plist valid"
 
 # launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon

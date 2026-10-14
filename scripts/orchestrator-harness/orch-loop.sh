@@ -33,6 +33,13 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
 # so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# A digit string is not enough for a TUNABLE: `[` errors at or above 2**63, and an errored test is
+# FALSE, which OPENS the very gate the value configures (MAX_LANES=99999999999999999999 passed the
+# class test, then `[ "$LANES" -ge "$MAX_LANES" ]` errored and the lane cap was gone). So the limits
+# carry a bound too -- but ONLY the limits: `is_num` must stay generous because it also validates an
+# epoch mtime, which is already 10 digits, and a tighter bound silently rejected every file as
+# un-stat-able (the reaper stopped reaping).
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
 # Coerce HERE — immediately before the ONLY reads of _NCPU and MAX_LOAD, not in the input-validation
 # block 30 lines below. A guard placed THERE guarded nothing (#1702 review): MAX_LOAD is derived on
@@ -41,9 +48,14 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # MAX_LOAD gets the same coercion for the same reason every other threshold below does: it is
 # supplied by the launchd plist, and a typo there would open the load gate rather than close it
 # (`[ -ge ]` on a non-number is FALSE, and a false test in the gate chain ALLOWS dispatch).
-is_num "${_NCPU:-}"    || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"
-is_num "${MAX_LOAD:-}" || MAX_LOAD=$(( _NCPU * 10 ))
+#
+# It is `is_limit`, not `is_num`, because a non-number is only the FIRST way the gate opens: `[`
+# ERRORS at or above 2**63 ("integer expression expected"), so an absurd-but-numeric MAX_LOAD
+# slips past is_num and then aborts the gate chain — the same fail-open this block exists to
+# close. `_NCPU` keeps is_num: its source is `nproc` on this host, not the plist.
+is_num "${_NCPU:-}"      || _NCPU=4
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
@@ -72,8 +84,26 @@ safe_ref() {
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
-is_num "${MIN_SWAP_FREE:-600}"   || MIN_SWAP_FREE=600
-is_num "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
+is_limit "${MIN_SWAP_FREE:-600}"   || MIN_SWAP_FREE=600
+is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
+# The same rule applies to EVERY other plist-supplied limit, and these are the ones that fail in the
+# OPEN direction: MAX_LANES drops the lane cap (`[ "$LANES" -ge "$MAX_LANES" ]` errors to false, and
+# a false test ALLOWS dispatch), MERGE_PRIORITY_AT makes mp_reason() print nothing so the
+# drain-before-dispatch gate disappears entirely, BATCH never breaks the candidate loop
+# (`[ "$K" -ge "$BATCH" ]` errors to false) so ONE cycle dispatches and writes off the whole backlog,
+# and CYC makes `sleep` error so the controller spins with no delay. MAX_FIX_TRIES and MAX_REVIEW
+# fail OPEN too, which is worth spelling out because both LOOK like caps: `[ "$NFC" -ge "$MAX_FIX_TRIES" ]`
+# errors to false and control falls straight through to the SPAWN `elif`, so a cap of 3 let fixer
+# attempt 10 run; and `$((MAX_REVIEW + 2))` reads a leading-zero value as OCTAL (030 -> 26, not 30),
+# which is the same trap the scope decision already normalises with `10#` below. MAX_FIX is coerced
+# for the same reason. Each is first read below this point, so coercing here is still guard-before-use.
+is_limit "${MAX_LANES:-}"         || MAX_LANES=4
+is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
+is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=10
+is_limit "${MAX_FIX:-}"           || MAX_FIX=3
+is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
+is_limit "${BATCH:-}"             || BATCH=2
+is_limit "${CYC:-}"               || CYC=240
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -201,6 +231,11 @@ trap 'rm -f "$LOCKF"' EXIT
 # timeout and a runaway child it spawns (a reviewer's `find /` ran for 8 hours on 2026-10-12)
 # keeps the pane alive, so the concurrency caps — which count SESSIONS — silently halve.
 STALE_MIN="${STALE_MIN:-40}"
+# §4 documents STALE_MIN and README tells a cell to set it through $ENV_FILE, so it is env-supplied
+# like the rest -- but its only read is the arithmetic just below and it had NO coercion, so
+# `STALE_MIN=abc` aborted the controller mid-cycle under `set -u` ("abc: unbound variable") instead
+# of degrading. Guard-before-use, same rule as every other limit.
+is_limit "${STALE_MIN:-}" || STALE_MIN=40
 
 # ── stale-worker reaper ───────────────────────────────────────────────────────
 # Kill a worker that has gone silent. It only ever touches tmux sessions, so it can never reach
@@ -217,7 +252,7 @@ reap_stale_workers() {
     # (#1702): set -u turned the unassigned `age` into `File: unbound variable`.
     m="$(file_mtime_epoch "$f")" || continue
     age=$(( $(date +%s) - m ))
-    [ "$age" -gt $((STALE_MIN * 60)) ] || continue
+    [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
     pid="$(tmux list-panes -t "=$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
     echo "[reap-worker] $s silent ${age}s -> killing session (pane_pid=${pid:-?})" >> "$LOG"
     # `=name` forces an EXACT session match. Without it tmux prefix-matches, so if this session
@@ -284,7 +319,7 @@ res_line() {
   echo "[res] cpu(${cpu:-?}) | mem(${pmem:-?}) | swap(${swapfree:-?}/${swaptotal:-?}) | disk(${dline:-?}) | procs=$procs runnable=$runnable | svc(${svcs:-?}) | gh_gql=${rate:-?}" >> "$LOG"
 }
 review_slots() { # <open_prs>
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $((MAX_REVIEW + 2)); else echo "$MAX_REVIEW"; fi
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $(( 10#${MAX_REVIEW:-4} + 2 )); else echo "$MAX_REVIEW"; fi
 }
 
 # Count of open PRs. This one number drives THREE decisions — scope (BROAD drain vs OWN), the
@@ -421,22 +456,72 @@ while true; do
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | python3 -c "
+    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | python3 -c "
 import sys,json
 try: d=json.load(sys.stdin)
 except Exception: print('NOCHECKS'); raise SystemExit
-m={c['name']:c['state'] for c in d}
+# The source is either the check-runs API shape (an object carrying a check_runs list) or the flat
+# list \`gh pr checks --json\` prints. Both normalise to one row list; anything else is unreadable.
+rows=d.get('check_runs') if isinstance(d,dict) else d
+if not isinstance(rows,list): print('NOCHECKS'); raise SystemExit
 want='$REQ'.split()
-bad=lambda s: s in ('FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED')
-ok=lambda s: s in ('SUCCESS','FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED','SKIPPED','NEUTRAL')
-# ai-review-gate IS the merge authority, so it must be an explicit SUCCESS. SKIPPED/NEUTRAL
-# there means no signed review exists; reading that as satisfied would merge without evidence.
-gate=m.get('ai-review-gate','')
-if gate != 'SUCCESS' and not bad(gate):
-    print('FAILED:ai-review-gate'); raise SystemExit
-fail=[n for n in want if bad(m.get(n,''))]
-pend=[n for n in want if not ok(m.get(n,''))]
-print(('FAILED:'+','.join(fail)) if fail else (('PENDING:'+','.join(pend)) if pend else 'GREEN'))
+# ⛔ ALLOW-LISTS, NEVER A DENY-LIST (agent-infra#1714). A conclusion is NON-RED only if it is NAMED
+# here - the identical five spellings admin-merge.sh (NON_RED_CONC) and record-review.sh
+# (target_head_red) use, so the harness and the merge rail cannot disagree. 'not in the red set' is
+# not a synonym for non-red: a token this code has never seen (a vendor adds a conclusion, GitHub
+# returns a newer spelling, the value is null) must FAIL CLOSED, so it is RED. The deny-list this
+# replaced named the red tokens and filed EVERYTHING ELSE as PENDING, so an unrecognised or NULL
+# conclusion reached \`gh pr merge --auto\` instead of blocking - the fail-open the issue is about.
+NONRED=('success','neutral','skipped','cancelled','stale')
+# IN FLIGHT means a status the API NAMES as in flight - the same five the rail uses. Any OTHER
+# non-completed spelling is judged by its CONCLUSION under the allow-list, so an unrecognised status
+# with a null conclusion is RED, not pending (the rail's #1353 fail-open shape, closed the same
+# way). \`expected\` is deliberately NOT here: it is not a named in-flight spelling, so a check
+# GitHub has announced but not reported reads RED - the fail-closed direction, matching the rule.
+INFLIGHT=('queued','in_progress','waiting','requested','pending')
+# One entry per (app, name) - NOT per name: a same-named check under two apps must not let one
+# app's result mask the other's (agent-infra#1714). \`app.slug\` when the source supplies it (the
+# check-runs API), otherwise the workflow name (\`gh pr checks\` exposes no app field), and the
+# NEWEST attempt by id when the source supplies one. Ties, and sources with no id at all, take the
+# last row seen - all the information \`gh pr checks\` carries.
+groups={}
+for c in rows:
+    if not isinstance(c,dict): continue
+    name=str(c.get('name') or '')
+    app=c.get('app')
+    if isinstance(app,dict): app=app.get('slug') or ''
+    if not app: app=c.get('workflow') or ''
+    try: cid=int(c.get('id') or c.get('databaseId') or 0)
+    except Exception: cid=0
+    if 'status' in c or 'conclusion' in c:
+        status=str(c.get('status') or '').lower(); concl=str(c.get('conclusion') or '').lower()
+    else:
+        st=str(c.get('state') or '').lower()
+        status,concl=(st,'') if st in INFLIGHT else ('completed',st)
+    k=(str(app),name)
+    prev=groups.get(k)
+    if prev is None or cid>=prev[0]: groups[k]=(cid,status,concl)
+rank={'nonred':0,'pending':1,'red':2}
+named={}
+gate=[]
+for k in groups:
+    status=groups[k][1]; concl=groups[k][2]
+    v='pending' if status in INFLIGHT else ('nonred' if concl in NONRED else 'red')
+    if k[1]=='ai-review-gate': gate.append((v,concl))
+    if k[1] not in named or rank[v]>rank[named[k[1]]]: named[k[1]]=v
+# ai-review-gate IS the merge authority, so it must be an explicit SUCCESS. SKIPPED/NEUTRAL there
+# means no signed review exists; reading that as satisfied would merge without evidence. This is
+# also why GREEN always carries at least one MEASURING success: a surface of nothing but
+# cancelled/stale/skipped/neutral rows can never read green - those are non-red, never green.
+gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
+# Read it in this order: RED if any required check is red (a completed red is final - nothing in
+# flight can un-fail it); otherwise NOT YET KNOWN while any is in flight or never reported;
+# otherwise GREEN. An EMPTY surface is NOCHECKS, never GREEN - a missing check is not a green check,
+# and NOCHECKS reaches neither the merge nor the fixer arm below.
+fail=[n for n in want if named.get(n)=='red']
+pend=[n for n in want if named.get(n)=='pending' or n not in named]
+if 'ai-review-gate' in want and not gate_ok and 'ai-review-gate' not in fail: fail.insert(0,'ai-review-gate')
+print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PENDING:'+','.join(pend) if pend else ('GREEN' if want else 'NOCHECKS'))))
 " 2>/dev/null)"
     # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
     # while nothing changes. Route it to the fixer, which integrates origin/main and resolves the
