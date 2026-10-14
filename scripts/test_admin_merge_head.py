@@ -57,12 +57,14 @@ def _drive(tmp_path, gh_body: str, bash_body: str,
         {bash_body}
     """)
     env = dict(os.environ, ADMIN_MERGE_GH=_fake_gh(tmp_path, gh_body),
-               # ⛔ SCOPED PER INVOCATION, NOT PROCESS-GLOBAL. `resolve_head` retries with an
-               # exponential backoff (`sleep 1`, then `sleep 2`), so at the seam's default
-               # this suite spends ~13 s of its ~16 s ASLEEP and the `--timeout=60` budget in
-               # both CI lanes is mostly spent waiting rather than asserting. Setting it here
-               # rather than with a module-level `os.environ.setdefault` keeps it out of every
-               # OTHER test in the same pytest process (review round 2 measured that leak).
+               # ⛔ SCOPED PER INVOCATION, NOT PROCESS-GLOBAL. `resolve_head` sleeps
+               # `HEAD_READ_SLEEP * attempt` BETWEEN attempts, so a multi-attempt test would
+               # spend its assertion budget waiting rather than asserting. Pinning the sleep to
+               # 0 here is what keeps this suite fast however the seam's defaults are set — the
+               # reason does not depend on what those defaults ARE, so this comment states no
+               # numbers and cannot go stale when they change. It is set here rather than with a
+               # module-level `os.environ.setdefault` so it stays out of every OTHER test in
+               # the same pytest process (review round 2 measured that leak).
                ADMIN_MERGE_HEAD_READ_SLEEP="0")
     # ⛔ `update`, NOT `**extra_env` in the literal above: a caller overriding an already-named
     # key would otherwise raise `TypeError: dict() got multiple values for keyword argument`.
@@ -401,3 +403,72 @@ def test_the_SOURCED_path_accepts_a_valid_knob(tmp_path):
         f"a VALID knob was refused on the SOURCED path: {r.stderr!r}")
     assert "[head_unreadable]" in r.stderr, (
         "the positive control never reached the read, so it does not prove the knob was accepted")
+
+
+# ── THE REFUSAL MUST CARRY THE READ'S OWN WORDS (#1690 review) ────────────────────────────
+# `2>/dev/null` was the defect's own shape. It is why a transient blip and a permanent cause
+# (bad credentials, wrong `--repo`, PR not found) produced the SAME refusal, with a remedy
+# ("re-run the rail") that can never help the permanent ones. These tests pin both directions
+# of the diagnostic channel: it is QUOTED when it exists, and its ABSENCE is stated rather
+# than papered over.
+def test_the_refusal_quotes_the_reads_diagnostic(tmp_path):
+    """A permanent cause must be distinguishable from a transient one in the refusal."""
+    r = _drive(tmp_path,
+               'echo "HTTP 403: API rate limit exceeded for user ID 1" >&2\nexit 1',
+               'require_head 1; echo "rc=$?"')
+    assert "API rate limit exceeded" in r.stderr, (
+        "the refusal discarded the read's diagnostic, so a permanent cause is "
+        f"indistinguishable from a transient blip: {r.stderr!r}")
+    # The refusal must still be the UNREADABLE one, and still carry its tag: quoting a
+    # diagnostic must not turn it into a claim about reality.
+    assert "[head_unreadable]" in r.stderr, f"the tag was lost: {r.stderr!r}"
+    assert "head moved" not in r.stderr, (
+        f"an unreadable head was rendered as a moved head: {r.stderr!r}")
+
+
+def test_the_refusal_says_so_when_there_is_no_diagnostic(tmp_path):
+    """The other direction: silence must be REPORTED, not rendered as a generic 're-run the
+    rail' — that is the same defect one layer up (absence read as a benign fact)."""
+    r = _drive(tmp_path, "exit 1", 'require_head 1; echo "rc=$?"')
+    assert "produced no diagnostic" in r.stderr, (
+        "a silent failure was reported as if a diagnostic had been quoted, or not "
+        f"reported at all: {r.stderr!r}")
+    assert "[head_unreadable]" in r.stderr, f"the tag was lost: {r.stderr!r}"
+
+
+def test_a_successful_read_leaves_no_diagnostic_behind(tmp_path):
+    """The channel must not leak a stale or spurious diagnostic into a SUCCESS."""
+    r = _drive(tmp_path, f'printf "%s\\n" {VALID} >&2\nprintf "%s\\n" {VALID}',
+               'require_head 1; echo "rc=$?"')
+    assert "rc=0" in r.stdout, f"a valid head was not returned: {r.stdout!r}"
+    assert "the read reported" not in r.stderr, (
+        f"a stale or spurious diagnostic was printed on a SUCCESS: {r.stderr!r}")
+
+
+def test_the_diagnostic_is_captured_on_the_LAST_attempt_not_the_first(tmp_path):
+    """Retry semantics: the diagnostic quoted must be the one closest to the refusal. A fake
+    `gh` failing with a DISTINCT message per call proves which attempt's words survive.
+
+    ⛔ THE COUNTER MUST LIVE IN A FILE, NOT IN THE CHILD'S ENV. The first version of this test
+    did `export ADMIN_MERGE_HEAD_CALLS=$((n+1))` inside the fake `gh` — but each attempt is a
+    SEPARATE PROCESS, and a child's `export` cannot reach the parent shell, so every attempt
+    read an unset variable and wrote `attempt 1`. The test then failed (measured) while the
+    rail was quoting the last attempt correctly: a fixture defect that would have been easy to
+    misread as a rail defect. `$0` is the fake `gh`'s own path, which DOES persist across
+    invocations, so the counter rides on a file beside it.
+    """
+    body = (
+        'c="$0.calls"\n'
+        'n=0\n'
+        '[ -s "$c" ] && n="$(cat "$c")"\n'
+        'n=$((n + 1))\n'
+        'printf "%s" "$n" > "$c"\n'
+        'echo "attempt $n: distinct diagnostic" >&2\n'
+        'exit 1\n'
+    )
+    r = _drive(tmp_path, body, 'require_head 1; echo "rc=$?"',
+               extra_env={"ADMIN_MERGE_HEAD_ATTEMPTS": "3"})
+    assert "attempt 3: distinct diagnostic" in r.stderr, (
+        f"the diagnostic quoted is not the last attempt's: {r.stderr!r}")
+    assert "attempt 1:" not in r.stderr and "attempt 2:" not in r.stderr, (
+        f"an earlier attempt's diagnostic leaked into the refusal: {r.stderr!r}")

@@ -563,8 +563,24 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # `[head_unreadable]` — so the rail asserted "could not read the head" on a run where
 # ZERO reads were attempted. That is #1690's own symptom, machine-readably, on the
 # instrument whose job is not to make it.
-HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-3}"
-HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-1}"
+#
+# ⛔ THE WINDOW IS SIZED FOR A BLIP AND THE SIZE IS STATED (#1690 review). The loop sleeps
+# `HEAD_READ_SLEEP * attempt` BETWEEN attempts, so the old defaults gave 1s + 2s = 3s — and a
+# review measured exactly that, making the point sharply: the incident #1690 reports did not
+# clear inside 3s, so the retry as first written would NOT have recovered it. Now 5 attempts
+# over 2s + 4s + 6s + 8s = 20s.
+#
+# The number is deliberately TENS OF SECONDS, not minutes, and that is the judgement rather
+# than an oversight: a blip (a dropped connection, a DNS hiccup, a TLS retry) clears in
+# seconds, while a rate limit or a credential problem is NOT something to wait out — waiting
+# minutes would hang the rail on a condition it cannot fix. The diagnostic channel below is
+# what covers that case: the operator is told the actual cause and can act, instead of
+# watching a retry exhaust itself against a permanent failure. Both halves are needed;
+# neither replaces the other. A caller that does not want the wait sets
+# ADMIN_MERGE_HEAD_READ_SLEEP=0 — the rail's own test scenarios do exactly that, so the wider
+# default costs the suite no wall-clock time.
+HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-5}"
+HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-2}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -1253,7 +1269,17 @@ resolve_head() {
   # On persistent failure this prints NOTHING and returns NON-ZERO, so no caller can
   # mistake it for a value. ⛔ Callers must use `require_head` below, never this
   # directly: the whole defect was a caller that could not tell "empty" from "absent".
-  local attempt out rc
+  local attempt out rc errtmp err
+  # ⛔ THE READ'S DIAGNOSTIC IS NOT DISCARDED (#1690 review). `2>/dev/null` was the
+  # defect's own shape: it is why a transient blip and a permanent cause (bad
+  # credentials, wrong `--repo`, PR not found) produced the SAME refusal, with a
+  # remedy ("re-run") that can never help the permanent ones. The last attempt's
+  # stderr is kept here and quoted by `require_head`, so the operator can tell a
+  # re-runnable transient from a configuration error. It is a GLOBAL, not a local,
+  # because `resolve_head` must still print NOTHING on failure — the value channel
+  # stays empty and the diagnostic travels on its own channel.
+  HEAD_READ_DIAG=""
+  errtmp="${TMPDIR:-/tmp}/admin-merge-head.$$.err"
   # ⛔ THE RETRY BUDGET IS A VALIDATED STARTUP KNOB, NOT AN INLINE `case` (#1690 review).
   # `HEAD_ATTEMPTS` / `HEAD_READ_SLEEP` are checked by `validate_timing_knobs` before any
   # CI work, with the rail's own primitives (leading-zero, positive, range) — see their
@@ -1261,7 +1287,7 @@ resolve_head() {
   # redundant: it accepted `08`, which bash arithmetic then errors on.
   for ((attempt = 1; attempt <= HEAD_ATTEMPTS; attempt++)); do
     # shellcheck disable=SC2086
-    out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null)" && rc=0 || rc=$?
+    out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>"$errtmp")" && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
       # ⛔ VALIDATE THE WHOLE VALUE, NOT A LINE OF IT (#1690 review). The first version of
       # this check was `printf '%s' "$out" | grep -qE '^[0-9a-fA-F]{40}$'`, wrong twice:
@@ -1277,13 +1303,18 @@ resolve_head() {
       # rejects the multi-line case BY CONSTRUCTION, and needs no pipe at all.
       case "$out" in
         "" | *[!0-9a-fA-F]*) ;;   # empty, or anything that is not pure hex
-        *) [ "${#out}" -eq 40 ] && { printf '%s\n' "$out"; return 0; } ;;
+        *) [ "${#out}" -eq 40 ] && { rm -f "$errtmp"; printf '%s\n' "$out"; return 0; } ;;
       esac
     fi
+    # Keep the LAST attempt's diagnostic (one line, bounded): a later attempt's error
+    # is the one closest to the refusal the operator actually reads.
+    err="$(tail -n 1 "$errtmp" 2>/dev/null)"
+    [ -n "$err" ] && HEAD_READ_DIAG="${err:0:200}"
     if [ "$attempt" -lt "$HEAD_ATTEMPTS" ]; then
       sleep "$((HEAD_READ_SLEEP * attempt))"
     fi
   done
+  rm -f "$errtmp"
   return 1
 }
 
@@ -1306,7 +1337,8 @@ resolve_head() {
 # Rendering the first as the second is precisely #1690.
 require_head() {
   local pr="$1"; shift
-  local out
+  # ⛔ NO `local out` ANY MORE (#1690 review): the head is no longer captured and reprinted —
+  # `resolve_head`'s stdout IS the return value now (see the note at the call below).
   # ⛔ THE INVARIANT TRAVELS WITH THE FUNCTION, NOT THE ENTRY POINT (#1690 review round 4).
   # `validate_timing_knobs` runs only inside `main()`, so anything that SOURCES the rail — the
   # unit suite's `_drive`, the rail suite's `sed '$d'` loader — bypassed it entirely. (Round 5
@@ -1314,8 +1346,15 @@ require_head() {
   # `require_head` also FORMATS the attempt count into its refusal, so it must not build a
   # message from an unvalidated value either.) Rejecting, never defaulting.
   head_read_knobs_ok || { refuse_bad_head_knobs; return 1; }
-  if out="$(resolve_head "$pr" "$@")"; then
-    printf '%s\n' "$out"
+  # ⛔ NO COMMAND SUBSTITUTION AROUND THIS CALL (#1690 review). The first version read
+  # `out="$(resolve_head "$pr" "$@")"`, and a variable assigned inside `$( )` is assigned in a
+  # SUBSHELL and destroyed with it — so `HEAD_READ_DIAG` never reached this function, the
+  # refusal always took its "no diagnostic" branch, and the two tests asserting the diagnostic
+  # is QUOTED failed while the two asserting its ABSENCE passed VACUOUSLY (the channel was dead
+  # on every path, including success). Calling it directly keeps the diagnostic in THIS shell,
+  # and `resolve_head`'s stdout — the head, and nothing else — passes straight through to our
+  # caller, which is exactly what the old capture-then-reprint did.
+  if resolve_head "$pr" "$@"; then
     return 0
   fi
   # ⛔ A MACHINE-READABLE TOKEN, NOT JUST PROSE (#1690 review). The rail separated the two
@@ -1328,7 +1367,20 @@ require_head() {
   # "could the instrument read the head?" without depending on how the sentence is worded.
   say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${HEAD_ATTEMPTS} attempts)."
   say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
-  say_err "   something that is not a commit SHA. Nothing was merged. Re-run the rail."
+  say_err "   something that is not a commit SHA. Nothing was merged."
+  # ⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES (#1690 review).
+  # "Re-run the rail" is right for a transient blip and useless for a permanent
+  # cause; without the read's own words the two were indistinguishable here. So the
+  # diagnostic is QUOTED when there is one, and its absence is stated rather than
+  # papered over — the operator learns which case they are in, or that we cannot say.
+  if [ -n "${HEAD_READ_DIAG:-}" ]; then
+    say_err "   the read reported: ${HEAD_READ_DIAG}"
+    say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
+    say_err "   probably not transient — check credentials, --repo, and the PR number."
+  else
+    say_err "   the read produced no diagnostic (gh exited 0 with an unusable value, or wrote"
+    say_err "   nothing to stderr). Re-run the rail."
+  fi
   return 1
 }
 
@@ -4044,7 +4096,12 @@ main() {
   # ran (729 stale `admin-merge.*` directories, 21 MB, on the reviewing machine).
   # Assign the FILE-SCOPE `TMP` declared below and expand it at trap-set time.
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
-  trap 'rm -rf "${TMP:-}"' EXIT
+  # ⛔ THE READ'S OWN TEMP FILE IS IN THE EXIT TRAP (#1690 review). `resolve_head` removes it on
+  # both normal exits, but a process-group signal (what a terminal Ctrl-C actually delivers)
+  # kills the subshell before its `rm` runs, and the file leaks. SIGKILL can still leak it —
+  # nothing can trap that — so this narrows the window rather than closing it to zero, and the
+  # name is PID-scoped so a leak is one file per killed run, not a shared collision.
+  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err"' EXIT
 
   local head
   # shellcheck disable=SC2086
