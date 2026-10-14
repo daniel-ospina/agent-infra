@@ -353,6 +353,14 @@ jobs:
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
+      - name: Secret-redactor suite (#5109, zero-dep)
+        # #5109 — the tool_result redaction guard. Zero-dependency by construction
+        # (the pi import in index.ts is TYPE-only; the suite redirects HOME to a
+        # temp dir before the module is imported), so it MUST run in THIS job,
+        # which performs no `npm ci`. Pins the round-4 shape fixes: byte payloads
+        # keep their container type AND their non-UTF-8 bytes, a plain-object KEY
+        # holding a secret is redacted, and a traversal failure fails CLOSED.
+        run: npx tsx extensions/secret-redactor/index.test.ts
       - name: Kill-switch / session-escape suite (#1419)
         # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
         # MUST run in THIS job, which performs no `npm ci`; it is also invoked

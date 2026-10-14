@@ -28,9 +28,13 @@
  *       strings only): `#private` slots and non-enumerable/symbol props cannot be
  *       reproduced, so a rebuild would hand back a half-initialised object whose
  *       methods throw. Losing `instanceof` is the safer of the two failures;
- *     - symbol-keyed and non-enumerable properties are not traversed;
- *     - a secret in a Map KEY is redacted only when the key is a string; an object
- *       key that contains a secret is redacted by value but the key identity changes;
+ *     - symbol-keyed and non-enumerable properties are not traversed (so a secret in
+ *       one is not redacted);
+ *     - a secret used as a STRING key (Map or plain object) is redacted, which renames
+ *       the key — the entry remains, under `[REDACTED:…]`;
+ *     - a non-8-bit typed array (Uint16Array, Float64Array, …) cannot hold a redacted
+ *       byte sequence of a different length without changing its element count, so a
+ *       secret found in one FAILS CLOSED rather than being silently dropped;
  *     - only exact configured values and the five credential shapes are caught; an
  *       unknown-format secret in a store not under ~/.pi/agent is not.
  *   The durable fix for the class is to redact at the point of PERSISTENCE (one
@@ -46,7 +50,11 @@
  * Over-redaction is itself a harm: a false positive rewrites what the model is
  * reading and, on a read→write round trip, persists the marker into the file. So the
  * patterns are LEFT-ANCHORED, env REFERENCE templates ($VAR / ${VAR}) are never
- * secrets, and a failure with no detected secret leaves the result untouched.
+ * secrets, and a result in which NO secret is found is returned untouched. A
+ * TRAVERSAL FAILURE is treated separately and FAILS CLOSED: an incomplete scan is not
+ * evidence of absence, so "no hit recorded yet" is not the same statement as "no
+ * secret present" (the earlier code returned the original result on any throw, which
+ * re-emitted a secret sitting in a later, unvisited sibling).
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -185,6 +193,45 @@ function redactString(text: string, secrets: Secret[], hits: Set<string>): strin
 }
 
 /**
+ * Byte-precise redaction of a view's bytes. Returns a Buffer carrying the
+ * replacements, or null when nothing matched (so the caller returns the original).
+ *
+ * Both directions are byte-preserving: exact secrets are matched as BYTE SEQUENCES
+ * (a non-ASCII secret survives), and the credential PATTERNS are ASCII, so scanning
+ * through a latin1 view — one char per byte — cannot rewrite a byte it did not match.
+ * The previous version decoded the WHOLE buffer as UTF-8 and re-encoded it, which
+ * destroyed every non-UTF-8 byte in the same buffer (`ff fe` became `ef bf bd`), a
+ * correctness regression on any binary payload that merely embedded a credential.
+ */
+function scanBytes(view: Uint8Array, secrets: Secret[], hits: Set<string>): Buffer | null {
+  let buf = Buffer.from(view.buffer, view.byteOffset, view.byteLength);
+  let changed = false;
+  for (const s of secrets) {
+    if (!s.value) continue;
+    const needle = Buffer.from(s.value, "utf8");
+    if (needle.length === 0) continue;
+    let idx = buf.indexOf(needle);
+    while (idx !== -1) {
+      hits.add(s.label);
+      changed = true;
+      const marker = Buffer.from(`[REDACTED:${s.label}]`, "utf8");
+      buf = Buffer.concat([buf.subarray(0, idx), marker, buf.subarray(idx + needle.length)]);
+      idx = buf.indexOf(needle, idx + marker.length);
+    }
+  }
+  let text = buf.toString("latin1");
+  for (const [label, re] of PATTERNS) {
+    const fresh = new RegExp(re.source, re.flags);
+    if (!fresh.test(text)) continue;
+    hits.add(label);
+    changed = true;
+    text = text.replace(new RegExp(re.source, re.flags), `[REDACTED:${label}]`);
+  }
+  if (!changed) return null;
+  return Buffer.from(text, "latin1");
+}
+
+/**
  * Redact every string reachable from a value, with a memo so that an aliased or
  * cyclic value cannot re-emit the UNREDACTED original through a second path (it did:
  * `{a: leaf, b: leaf}` redacted only `a`). Each container is seeded into the memo
@@ -213,16 +260,32 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
     return out as unknown as T;
   }
 
-  // Byte containers: a secret encoded as UTF-8 bytes is data, not a string property.
+  // Byte containers: a secret encoded as bytes is data, not a string property.
   if (ArrayBuffer.isView(node) && !(node instanceof DataView)) {
-    const bytes = node as unknown as Uint8Array;
-    const text = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("utf8");
-    const redacted = redactString(text, secrets, hits);
-    if (redacted === text) {
+    const view = node as unknown as Uint8Array;
+    const redacted = scanBytes(view, secrets, hits);
+    if (redacted === null) {
       memo.set(obj, node);
       return node;
     }
-    return new Uint8Array(Buffer.from(redacted, "utf8")) as unknown as T;
+    if (view.BYTES_PER_ELEMENT !== 1) {
+      // Uint16Array/Float64Array cannot represent a redacted byte run of a different
+      // length without changing their element count; withhold rather than leak.
+      throw new Error("secret-redactor: cannot redact a non-8-bit typed array");
+    }
+    // Preserve the container type: a Buffer must come back a Buffer, a Uint8Array a
+    // Uint8Array (the old code returned a plain Uint8Array for both).
+    const bytes = new Uint8Array(redacted.buffer, redacted.byteOffset, redacted.byteLength);
+    if (Buffer.isBuffer(view)) return Buffer.from(bytes) as unknown as T;
+    const Ctor = view.constructor as new (src: Uint8Array) => Uint8Array;
+    let rebuilt: Uint8Array;
+    try {
+      rebuilt = new Ctor(bytes);
+    } catch {
+      rebuilt = new Uint8Array(bytes);
+    }
+    memo.set(obj, rebuilt);
+    return rebuilt as unknown as T;
   }
 
   if (node instanceof Map) {
@@ -271,9 +334,13 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
   memo.set(obj, rebuilt);
   let changed = false;
   for (const [k, v] of entries) {
+    // Keys are values too: a secret used as a plain-object key was copied through
+    // unredacted and the handler then saw no hit at all (review finding). Redacting
+    // the key renames it — the entry survives under `[REDACTED:…]`.
+    const rk = redactString(k, secrets, hits);
     const r = redactDeep(v, secrets, hits, memo);
-    if (r !== v) changed = true;
-    rebuilt[k] = r;
+    if (rk !== k || r !== v) changed = true;
+    rebuilt[rk] = r;
   }
   if (!changed) {
     memo.set(obj, node);
@@ -313,10 +380,11 @@ export default function (pi: ExtensionAPI): void {
       parts.push({ type: "text", text: warning });
       return { content: parts, details } as never;
     } catch {
-      if (hits.size === 0) return; // nothing was detected: a traversal error must not destroy the result
-      // A secret WAS detected, so fail closed rather than pass it through. `details` is
-      // cleared EXPLICITLY: an omitted field keeps its current value, and details is
-      // where tool payloads live.
+      // FAIL CLOSED. A thrown traversal means the scan was INCOMPLETE, so "hits is
+      // empty" does not mean "no secret" — the previous version returned the original
+      // result in that case, re-emitting a secret in any sibling that came after the
+      // throw (review finding). `details` is cleared EXPLICITLY: an omitted field keeps
+      // its current value, and details is where tool payloads live.
       return { content: [{ type: "text", text: WITHHELD }], details: {}, isError: true } as never;
     }
   });

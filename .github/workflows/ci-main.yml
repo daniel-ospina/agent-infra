@@ -160,6 +160,13 @@ jobs:
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
+        # #5109 — secret-redactor: the tool-boundary redaction guard. Zero-dep
+        # (the pi import is TYPE-only; HOME is redirected to a temp dir before the
+        # module is imported). Pins the round-4 shape fixes: byte payloads keep
+        # their container type AND their non-UTF-8 bytes, a plain-object KEY holding
+        # a secret is redacted, and a traversal failure fails CLOSED.
+        echo "== extensions/secret-redactor/index.test.ts =="
+        npx tsx extensions/secret-redactor/index.test.ts || failures=$((failures+1))
         # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in
         # loop-enforcer (5 uses, 0 definitions/imports), so every write threw
         # ReferenceError into a swallowed catch and the documented escape was inert
