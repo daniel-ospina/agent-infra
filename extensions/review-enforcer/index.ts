@@ -24,6 +24,7 @@ import * as os from "os";
 import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
+import { redactCommand } from "../shared/redact-command.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -665,6 +666,17 @@ export interface ReviewRecord {
    * REQUIRED for a clean-low merge: a post-record `gh pr edit --base` moves the
    * merge base and changes what merges while the head sha still matches. */
   merge_base_sha?: string;
+  /** #1351 — the sha256 of the NORMALIZED three-dot diff this review certified,
+   * as written by record-review.sh (#2982/#1362). It is the record's CONTENT
+   * identity, the local counterpart of the `diff=<sha256>` the GitHub
+   * ai-review-gate verifies in the signed marker: a merge-only
+   * `gh pr update-branch` moves the head without changing this value, so the
+   * two gates agree on what "reviewed" means.
+   *
+   * OPTIONAL. Records predating #2982 and records minted while the diff read was
+   * degraded carry none, and their ABSENCE must fall back to the HEAD binding —
+   * never to an accept (see evaluateMergeGate's carry arm). */
+  diff_sha256?: string;
 }
 
 /**
@@ -967,6 +979,106 @@ export function getPrMergeBaseSha(pr: number, head: string | null, ctx: RepoCont
   }
 }
 
+// ── #1351: the live diff digest (the carry arm's I/O half) ────
+//
+// The pure gate takes `currentDiffHash` as an argument; this is where that
+// argument comes from. The digest must be the SAME one the GitHub
+// ai-review-gate computes live AND the same one record-review.sh stores, or the
+// two gates disagree again. So it is not re-implemented here: the ONE
+// implementation is `scripts/record-review.sh --print-diff-hash`, which reuses
+// `diff_hash_for_pr`, the #1398 size-cap local fallback, and the shared
+// `scripts/lib/diff-normalize.py` normalizer. Delegating (like
+// resolveAdminMergeEvidenceVerifier delegates its predicate) is what keeps one
+// definition of "unchanged" instead of two that drift.
+
+/** TEST SEAM: replace the live-diff-digest read. Honored only under
+ * NODE_ENV=test, mirroring _setRunGhOverride, so production can never honor a
+ * stray override. */
+let prDiffHashOverride: ((pr: number, ctx: RepoContext) => string | null) | null = null;
+
+export function _setPrDiffHashOverride(
+  fn: ((pr: number, ctx: RepoContext) => string | null) | null
+): void {
+  if (process.env.NODE_ENV === "test" || fn === null) prDiffHashOverride = fn;
+}
+
+/**
+ * Resolve `scripts/record-review.sh` from THIS extension's own location (via
+ * realpath, because the extension is normally installed as a symlink whose load
+ * path is not the tree the script lives in). Returns null when it is absent —
+ * the caller then treats the live digest as uncomputable and the gate fails
+ * closed on the head binding, exactly as it did before #1351.
+ */
+export function resolveDiffHashHelper(): string | null {
+  const roots: string[] = [];
+  if (EXTENSION_DIR) {
+    try {
+      roots.push(fs.realpathSync(EXTENSION_DIR));
+    } catch {
+      /* an unresolvable extension dir is simply no candidate */
+    }
+    roots.push(EXTENSION_DIR);
+  }
+  for (const root of roots) {
+    const candidate = resolvePath(root, "..", "..", "scripts", "record-review.sh");
+    try {
+      if (fs.existsSync(candidate)) return candidate;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+/**
+ * Parse the helper's stdout — the LAST non-empty line, whose shape is
+ * `<status>\t<hash>`. ONLY `ok` carries an acceptable digest: every other
+ * status (`empty`, `too_large`, `nondiff`, `unavailable`) means the diff could
+ * not be READ, and a failed read must never be compared as if it were content.
+ * Any other line shape, a missing hash, or a hash that is not a full 64-hex
+ * digest (or is the empty-body constant) yields null.
+ */
+export function parseDiffHashHelperOutput(stdout: string): string | null {
+  const lines = stdout.split("\n").filter((l) => l.length > 0);
+  if (lines.length === 0) return null;
+  const line = lines[lines.length - 1];
+  const tab = line.indexOf("\t");
+  if (tab < 0) return null;
+  const status = line.slice(0, tab).trim();
+  const hash = line.slice(tab + 1).trim();
+  if (status !== "ok") return null;
+  return isDiffSha256(hash) ? hash : null;
+}
+
+/**
+ * The PR's live normalized three-dot diff digest, or null when it cannot be
+ * computed. The repo is taken from the SAME resolved context the gate verified
+ * the head through, and is RE-VALIDATED here (a `--repo` flag is user-controlled
+ * text) before it reaches an argv element. Every failure — no repo, no helper,
+ * no `gh`/`openssl`/`python3`, the 300-file cap, a network failure, a timeout —
+ * returns null, which the gate reads as "no identity" and blocks on the head.
+ */
+export function getPrLiveDiffHash(pr: number, ctx: RepoContext): string | null {
+  if (prDiffHashOverride !== null) return prDiffHashOverride(pr, ctx);
+  const helper = resolveDiffHashHelper();
+  if (helper === null) return null;
+  const repo = ctx.repo ?? (ctx.cwd ? repoFromGitRemote(ctx.cwd) : null);
+  if (!repo || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) return null;
+  try {
+    // execFileSync, NOT a shell string: every argument is passed as an argv
+    // element, so no value here can be re-parsed as shell syntax.
+    const out = execFileSync("bash", [helper, "--print-diff-hash", String(pr), repo], {
+      cwd: ctx.cwd,
+      timeout: 60000,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return parseDiffHashHelperOutput(out);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Current PR head via the gate's own gh call, using the resolved repo context
  * (cwd for `cd ... &&` prefixes, --repo flag for explicit owner/name). Returns
@@ -1054,10 +1166,33 @@ export function isAcceptedVerdict(verdict: string): boolean {
   return ACCEPTED_VERDICTS.includes(verdict);
 }
 
+/**
+ * #1351 — the sha256 of the EMPTY byte string, named so it can never be
+ * compared by accident.
+ *
+ * It is a CONSTANT shared by every "no content" input: hash an empty (or
+ * non-diff) body and every PR gets this digest, so every stale record
+ * "matches" it and an unreviewed revision merges. The producer already refuses
+ * to mint it (it hashes nothing unless the body carries a `diff --git` entry),
+ * and this predicate is the consumer's half of the same rule: a value equal to
+ * the empty-body digest is NEVER a diff identity, on EITHER side, so it can
+ * neither be claimed by a record nor supplied as the live hash. It makes the
+ * carry arm fail CLOSED on a caller that hands it sha256("") instead of null. */
+export const EMPTY_BYTE_SHA256 =
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/** A full, lowercase, 64-hex diff digest — and NOT the empty-body constant.
+ * Shape AND constant are both required: the carry comparison must be a full
+ * 64-hex equality (never a prefix or a substring), and the empty-body digest
+ * must never be able to satisfy it. */
+export function isDiffSha256(v: unknown): v is string {
+  return typeof v === "string" && /^[0-9a-f]{64}$/.test(v) && v !== EMPTY_BYTE_SHA256;
+}
+
 export type MergeGateResult =
   | { status: "block"; reason: string; reasonTag?: string }
   | { status: "failopen"; warning: string }
-  | { status: "allow"; message: string };
+  | { status: "allow"; message: string; carried?: boolean };
 
 // Pure gate decision — separated from I/O so it is unit-testable.
 export function evaluateMergeGate(
@@ -1067,6 +1202,12 @@ export function evaluateMergeGate(
   ctx: RepoContext,
   taskSubAgent: boolean = false,
   currentMergeBase: string | null = null,
+  // #1351 — the PR's LIVE normalized diff digest, computed by the caller (the
+  // pure function performs no I/O). null means "not computed" — a missing tool,
+  // an unreadable/empty/non-diff body, the 300-file API cap, or a network
+  // failure. Every one of those is a FAILED READ, and a failed read is not a
+  // matching read, so null blocks on the head binding like any other mismatch.
+  currentDiffHash: string | null = null,
 ): MergeGateResult {
   if (!record) {
     // #285 Fix C: the emergency-bypass line is FALSE for task sub-agents — the
@@ -1159,6 +1300,48 @@ export function evaluateMergeGate(
       warning:
         `⚠️  [review-enforcer] Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}). ` +
         `Allowing merge WITHOUT head verification. ${advice}`,
+    };
+  }
+  // #1351 — the DIFF binding: mirror the GitHub ai-review-gate's rule (b).
+  //
+  // A required GitHub check accepts a signed record when `diff=<sha256>` matches
+  // the PR's CURRENT diff even though its `@ <sha>` is stale (tortoise#2982): a
+  // merge-only `gh pr update-branch` moves the head without changing the
+  // three-dot diff. The local gate was HEAD-only, so the SAME PR showed a green
+  // required check AND a locally blocked merge — the two gates disagreed about
+  // what "reviewed" means, and the fleet paid for a re-record the content never
+  // required.
+  //
+  // ORDER IS THE SECURITY. This arm sits AFTER the head-unverifiable branch
+  // (whose fail-open/fail-closed semantics are untouched) and BEFORE the
+  // head-advanced block, so a match RETURNS allow instead of being overridden by
+  // it. It fires ONLY on a STALE head: when the head matches, the head binding is
+  // already satisfied and every later guard — the #1348 clean-low merge-base
+  // binding included — must run exactly as it did before. A carried record does
+  // not reach the merge-base branch at all, which is correct rather than a
+  // bypass: a matching diff digest proves the CONTENT is identical, and the
+  // clean-low claim is about the content's shape, so the binding's question is
+  // already answered (a repointed base changes the diff and fails this arm).
+  //
+  // FAIL CLOSED on everything else. A record with NO usable `diff_sha256` falls
+  // through to `head_advanced` — absence is not identity. So does an
+  // uncomputable live hash. And both sides must be a full 64-hex digest that is
+  // not the empty-body constant (isDiffSha256): equality is exact, never a
+  // prefix or a substring.
+  if (
+    record.head_sha !== currentHead &&
+    isDiffSha256(record.diff_sha256) &&
+    isDiffSha256(currentDiffHash) &&
+    record.diff_sha256 === currentDiffHash
+  ) {
+    return {
+      status: "allow",
+      carried: true,
+      message:
+        `[review-enforcer] ✅ Merge registry gate passed for PR #${pr} ` +
+        `(${record.verdict} review, head moved ${record.head_sha.slice(0, 12)} → ${currentHead.slice(0, 12)} ` +
+        `but the reviewed DIFF is unchanged — diff_sha256 ${currentDiffHash.slice(0, 12)} matches the PR's ` +
+        `current diff, so the verdict is CARRIED FORWARD on content identity) — allowing merge`,
     };
   }
   if (record.head_sha !== currentHead) {
@@ -1318,7 +1501,17 @@ export function logMergeGateDecision(
   } else {
     logGateEvent(
       "merge_gate_pass",
-      { pr, ...verdict, ...(result.status === "failopen" ? { reason: "failopen" } : {}) },
+      {
+        pr,
+        ...verdict,
+        ...(result.status === "failopen" ? { reason: "failopen" } : {}),
+        // #1351 — a merge allowed because the reviewed DIFF is unchanged at a
+        // moved head is a materially different event from one allowed at a
+        // matching head. Without this field the audit trail cannot tell them
+        // apart, so a carried merge is unreconstructible from gate-events.jsonl
+        // — the opposite of what a content-identity accept should be.
+        ...(result.status === "allow" && result.carried ? { carried: true } : {}),
+      },
       file
     );
   }
@@ -2126,11 +2319,43 @@ function _adminMergeOverride(): boolean {
 const BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation.",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
+
+/** Chars of the command's END retained past the bound, so a trailing operation survives. */
+export const TRUNCATION_TAIL = 200;
+
+/**
+ * The command a block REFUSED, redacted and bounded, for the durable audit trail (#1492).
+ *
+ * A `gate_block` entry records `reason` and `tier` — enough to COUNT blocks, not
+ * enough to tell WHICH command was refused. This field answers that, and the
+ * neighbouring hub-state gate carries a `command` field in the same stream, so the
+ * shape is established.
+ *
+ * BOUNDED at BOTH ends. A head-only bound can drop a trailing `&& git push`, which is
+ * the one thing this field exists to show, so the tail is kept as well (#1492).
+ *
+ * REDACTED before bounding: the audit files are world-readable, and the redactor is the
+ * shared one both gates import, so the redaction rule cannot drift between them.
+ */
+export function auditCommand(command: string, limit = 2000): string {
+  const redacted = redactCommand(command);
+  if (redacted.length <= limit) return redacted;
+  // The count is the REDACTED length and says so: redaction shortens the text, so an
+  // unlabelled count would not be the refused command's length (#1492).
+  return (
+    `${redacted.slice(0, limit)}` +
+    `… [truncated, ${redacted.length} chars after redaction] …` +
+    `${redacted.slice(-TRUNCATION_TAIL)}`
+  );
+}
 
 // #485: micro is no longer a 0-dispatch pass-through — the VGATE docs/CSS/static
 // shape skip (#472) removed the backstop that made that leniency safe (a
@@ -2142,6 +2367,9 @@ export { BLOCK_MESSAGE };
 export const MICRO_BLOCK_MESSAGE = [
   "✅ Review enforcement gate is working correctly.",
   "❌ No reviewers were dispatched in this session before the git operation (micro tier).",
+  "   → NOTHING IN THE BLOCKED COMMAND RAN. A blocked tool call is a no-op: if it bundled a",
+  "     sub-agent launch alongside the git op, the launch DID NOT HAPPEN (#1492). Verify the",
+  "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Micro skips the multi-agent code-review GATE (commit-workflow 03-code-review.md) — the review-enforcer ≥1-dispatch rule still applies (#485).",
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
@@ -2305,6 +2533,7 @@ export default function (pi: ExtensionAPI) {
           logGateEvent("merge_gate_block", {
             pr: adminPr,
             reason: "admin_merge_no_evidence",
+            command: auditCommand(command), // #1492: the refused command, not just the reason
           });
           return { block: true, reason: adminResult.reason };
         }
@@ -2379,10 +2608,24 @@ export default function (pi: ExtensionAPI) {
           record.head_sha === currentHead
             ? getPrMergeBaseSha(prNumber, currentHead, ctx)
             : null;
+        // #1351 — fetch the PR's LIVE diff digest only when it can change the
+        // verdict: a record that carries a usable `diff_sha256` AND a head that
+        // has actually moved. Nothing else reads it, so a matching head must not
+        // pay for the read (the head binding already allows), and a record
+        // without the field must not either (its absence falls through to the
+        // head block — never to an accept). The read is the SAME normalized
+        // digest the record stores and the GitHub gate computes, so the two
+        // gates cannot disagree about what "reviewed" means.
+        const currentDiffHash =
+          record && isDiffSha256(record.diff_sha256) &&
+          currentHead !== null &&
+          record.head_sha !== currentHead
+            ? getPrLiveDiffHash(prNumber, ctx)
+            : null;
         // #285 Fix C: the no-record block message is shape-aware (task
         // sub-agents get the "parent must record the review" variant).
         const result = evaluateMergeGate(
-          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase
+          prNumber, record, currentHead, ctx, isTaskSubAgent(), currentMergeBase, currentDiffHash
         );
         if (result.status === "block") {
           console.log("[review-enforcer] 🚫 Merge registry gate blocked merge");
@@ -2432,12 +2675,20 @@ export default function (pi: ExtensionAPI) {
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
-        logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: "micro" }); // #516: durable audit
+        logGateEvent("gate_block", {
+          reason: "no_reviewers_dispatch",
+          tier: "micro",
+          command: auditCommand(command), // #1492: the refused command, not just the reason
+        }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
-      logGateEvent("gate_block", { reason: "no_reviewers_dispatch", tier: tier === "" ? "unlabeled" : tier }); // #516: durable audit
+      logGateEvent("gate_block", {
+        reason: "no_reviewers_dispatch",
+        tier: tier === "" ? "unlabeled" : tier,
+        command: auditCommand(command), // #1492: the refused command, not just the reason
+      }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });
 
