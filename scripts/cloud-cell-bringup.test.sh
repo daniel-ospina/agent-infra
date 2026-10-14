@@ -29,6 +29,8 @@
 #   * a token whose parent directory denies traversal is still reported LOUDLY and never produces a
 #     readiness banner — `[ -e ]`/`[ -f ]` are false there, so a stat-gated removal would skip it
 #     silently, which is the pre-fix failure mode wearing a different hat;
+#   * a DEAD STDOUT during the cleanup (the removal LOG write raises SIGPIPE) does not truncate the
+#     loop: with two registered secrets BOTH are removed, not just the entry being logged;
 #   * NON-VACUITY: a clean run still exits 0 and still prints CELL READY, and a token that is
 #     present is genuinely deleted (a suite that never had the file would pass for the wrong reason).
 #
@@ -283,7 +285,7 @@ else
 fi
 
 # ── 9) a SECOND signal while the cleanup is running must not abort it ────────────────────────────
-# The EXIT trap IGNORES INT/TERM/HUP for the duration of the cleanup. Without that, a second signal
+# The EXIT trap IGNORES INT/TERM/HUP/PIPE for the duration of the cleanup. Without that, a second signal
 # kills the shell mid-loop and the remaining secrets stay on disk — silently, because a survivor
 # changes nothing the operator can see. The `rm` shim parks so the window is real, not theoretical.
 # The discriminator is the trap's own REMOVAL LOG: a shell killed mid-cleanup never reaches it (the
@@ -314,6 +316,39 @@ case "$(cat "$T/twice.out" 2>/dev/null)" in
   *) bad "the cleanup was ABORTED by the second signal — nothing logged a removal" ;;
 esac
 [ ! -e "$TOK" ] && ok "the token is gone after the second signal" || bad "the token SURVIVED the second signal"
+
+# ── 10) a DEAD STDOUT while the cleanup is running must not truncate it ──────────────────────────
+# The cleanup LOGS every removal to stdout, and a log write to a pipe whose reader is gone raises
+# SIGPIPE. If that signal is not ignored for the duration of the cleanup it kills the shell mid-loop
+# and every registered secret AFTER the current one stays on disk — silently, because a survivor the
+# operator is never told about changes nothing they can see. Reproduced on bash 3.2.57 with
+# INT/TERM/HUP ignored and two registered secrets: A removed, B LEFT.
+# ⚠️ This sources the SHIPPED definitions (only the final `main "$@"` line is stripped): the shipped
+# CLI path registers exactly ONE secret, so a second entry cannot be exercised through it — and the
+# file explicitly invites registering another. The cleanup code under test is the shipped cleanup.
+say_case "a dead stdout during the cleanup cannot truncate it (two registered secrets)"
+LIB="$T/bringup-defs.sh"
+if [ "$(tail -n 1 "$BRINGUP")" != 'main "$@"' ]; then
+  bad "the shipped entry point is no longer the last line — the definitions copy would run main"
+else
+  sed '$d' "$BRINGUP" > "$LIB"
+  SEC_A="$T/tok/.gh-tok"; SEC_B="$T/tok/.second-tok"
+  printf '%s\n' "$TOK_BODY" > "$SEC_A"
+  printf '%s\n' "$TOK_BODY" > "$SEC_B"
+  (
+    GH_TOKEN_FILE="$SEC_A"     # what the lib's top-level `register_secret` picks up (entry 1)
+    . "$LIB"
+    register_secret "$SEC_B"   # entry 2
+    exec 1> >(exec true)       # stdout becomes a pipe whose reader is about to be gone
+    sleep 1                    # ...provably gone before the trap logs its first removal
+    exit 0
+  ) 2>/dev/null
+  DEAD_RC=$?
+  [ ! -e "$SEC_A" ] && ok "the FIRST registered secret was removed" \
+                    || bad "the first registered secret SURVIVED the dead-stdout cleanup (rc=$DEAD_RC)"
+  [ ! -e "$SEC_B" ] && ok "the SECOND registered secret was removed (the loop reached the end)" \
+                    || bad "the second registered secret SURVIVED — a dead stdout truncated the cleanup (rc=$DEAD_RC)"
+fi
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
