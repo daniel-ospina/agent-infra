@@ -8151,16 +8151,20 @@ testAsync("#1662 E2E: background dispatch RETURNS EARLY, task_status sees it ali
   }
 });
 
-test("#1662: the retention sweep runs on dispatch — an age-expired run is pruned before the new one", () => {
+test("#1662: task-runs retention is DRY-RUN by default (recorded decision) and deletes only when ARMED", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-prune-"));
   const savedRunsRoot = process.env.TASK_RUNS_ROOT;
   const savedMaxAge = process.env.TASK_RUNS_MAX_AGE_DAYS;
+  const savedDryRun = process.env.TASK_RUNS_PRUNE_DRY_RUN;
+  const savedPrune = process.env.TASK_RUNS_PRUNE;
   try {
     process.env.TASK_RUNS_ROOT = dir;
     process.env.TASK_RUNS_MAX_AGE_DAYS = "7";
+    delete process.env.TASK_RUNS_PRUNE;
     // An old terminal run (record + capture log), nine days back.
     const oldId = mintRunId();
     const oldLog = runLogPath(dir, oldId);
+    const oldRec = runRecordPath(dir, oldId);
     writeFileSync(oldLog, "old", "utf-8");
     writeRunRecord(dir, {
       run_id: oldId, pid: 999_999_999, pgid: null, log_path: oldLog, started_at: 1,
@@ -8168,13 +8172,13 @@ test("#1662: the retention sweep runs on dispatch — an age-expired run is prun
     } as any);
     const back = new Date(Date.now() - 9 * 24 * 3600 * 1000);
     utimesSync(oldLog, back, back);
-    utimesSync(join(dir, `${oldId}.json`), back, back);
+    utimesSync(oldRec, back, back);
 
     // An unspawnable target refuses synchronously. The sweep runs BEFORE the new
     // record is written, so this proves the dispatch-path wiring without a child.
     const notADir = join(dir, "not-a-dir");
     writeFileSync(notADir, "x");
-    startBackgroundTask({
+    const dispatch = () => startBackgroundTask({
       model: "deepseek-v4-flash",
       provider: "deepseek",
       env: { ...process.env },
@@ -8184,11 +8188,104 @@ test("#1662: the retention sweep runs on dispatch — an age-expired run is prun
       runsRoot: dir,
       nonce: null,
     });
-    equal(existsSync(join(dir, `${oldId}.json`)), false, "the age-expired record was pruned on dispatch");
-    equal(existsSync(oldLog), false, "the age-expired capture log was pruned on dispatch");
+
+    // (1) UNARMED: the recorded retention decision is dry-run by default — an
+    // unarmed sweep must not delete a settled run's record (which carries the
+    // composed final message). Pre-fix this deleted, so this assertion is the
+    // non-vacuous pin (#1662 review).
+    delete process.env.TASK_RUNS_PRUNE_DRY_RUN;
+    dispatch();
+    equal(existsSync(oldRec), true, "UNARMED dispatch must NOT delete the age-expired record (dry-run by default)");
+    equal(existsSync(oldLog), true, "UNARMED dispatch must NOT delete the capture log");
+
+    // (2) ARMED: TASK_RUNS_PRUNE_DRY_RUN=0 is the explicit, owned arming step.
+    process.env.TASK_RUNS_PRUNE_DRY_RUN = "0";
+    dispatch();
+    equal(existsSync(oldRec), false, "the ARMED dispatch prunes the age-expired record");
+    equal(existsSync(oldLog), false, "the ARMED dispatch prunes the age-expired capture log");
   } finally {
     if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
     if (savedMaxAge === undefined) delete process.env.TASK_RUNS_MAX_AGE_DAYS; else process.env.TASK_RUNS_MAX_AGE_DAYS = savedMaxAge;
+    if (savedDryRun === undefined) delete process.env.TASK_RUNS_PRUNE_DRY_RUN; else process.env.TASK_RUNS_PRUNE_DRY_RUN = savedDryRun;
+    if (savedPrune === undefined) delete process.env.TASK_RUNS_PRUNE; else process.env.TASK_RUNS_PRUNE = savedPrune;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+testAsync("#1662: a SETTLE-time record persist failure is REPORTED loudly, never swallowed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-settlefail-"));
+  const shimDir = join(dir, "bin");
+  mkdirSync(shimDir, { recursive: true });
+  // A child that settles immediately, so the fire-and-forget `.then` runs soon.
+  writeFileSync(join(shimDir, "pi"), "#!/bin/sh\necho SETTLED-OK\nexit 0\n", { mode: 0o755 });
+  const savedPath = process.env.PATH ?? "";
+  const savedArgv1 = process.argv[1];
+  const savedRunsRoot = process.env.TASK_RUNS_ROOT;
+  const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+  const savedLedger = process.env.DISPATCH_LEDGER;
+  const savedPrune = process.env.TASK_RUNS_PRUNE;
+  const require2 = createRequire(import.meta.url);
+  const realFs = require2("node:fs") as any;
+  const origWriteFileSync = realFs.writeFileSync;
+  const origConsoleError = console.error;
+  const errs: string[] = [];
+  const runId = mintRunId();
+  try {
+    process.env.PATH = `${shimDir}:${savedPath}`;
+    process.env.TASK_RUNS_ROOT = dir;
+    process.env.TASK_RUNS_PRUNE = "0"; // keep the retention sweep out of this test
+    process.env.TASK_SESSION_ROOT = join(dir, "sessions");
+    process.env.DISPATCH_LEDGER = "0";
+    process.argv[1] = undefined as unknown as string;
+    console.error = (...a: any[]) => { errs.push(a.map(String).join(" ")); };
+
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "settle me"],
+      runId,
+      runsRoot: dir,
+      nonce: null,
+    });
+    equal(handle.record_persisted, true, "the dispatch-time record was persisted");
+
+    // Fail ONLY the terminal settle write (the record carrying status "done").
+    // `writeRunRecord` reports failure solely via its return value and logs
+    // nothing itself, so a handler that ignores it swallows the failure: the
+    // record stays `running` and a settled success is reaped as a permanent
+    // `failed`/`settle-lost` with `content: null` (#1662 review P1).
+    realFs.writeFileSync = (...a: any[]) => {
+      if (typeof a[1] === "string" && a[1].includes('"status": "done"')) {
+        throw new Error("ENOSPC: simulated settle persist failure");
+      }
+      return origWriteFileSync(...a);
+    };
+
+    const deadline = Date.now() + 20_000;
+    while (Date.now() < deadline && !errs.some((l) => /SETTLE record persist failed/.test(l))) {
+      await sleep(100);
+    }
+    realFs.writeFileSync = origWriteFileSync;
+
+    ok(
+      errs.some((l) => /SETTLE record persist failed/.test(l)),
+      `the settle persist failure must be REPORTED (captured: ${JSON.stringify(errs.slice(-3))})`,
+    );
+    equal(
+      readRunRecord(dir, runId)?.status,
+      "running",
+      "the record stays `running` — exactly why a silent swallow reaps a settled success as a failure",
+    );
+  } finally {
+    realFs.writeFileSync = origWriteFileSync;
+    console.error = origConsoleError;
+    process.env.PATH = savedPath;
+    process.argv[1] = savedArgv1;
+    if (savedRunsRoot === undefined) delete process.env.TASK_RUNS_ROOT; else process.env.TASK_RUNS_ROOT = savedRunsRoot;
+    if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT; else process.env.TASK_SESSION_ROOT = savedSessionRoot;
+    if (savedLedger === undefined) delete process.env.DISPATCH_LEDGER; else process.env.DISPATCH_LEDGER = savedLedger;
+    if (savedPrune === undefined) delete process.env.TASK_RUNS_PRUNE; else process.env.TASK_RUNS_PRUNE = savedPrune;
     rmSync(dir, { recursive: true, force: true });
   }
 });

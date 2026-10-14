@@ -4968,12 +4968,26 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
   // #1662 review: bound the durable run tree. Every dispatch leaves a record +
   // capture log, and nothing pruned them. Best-effort synchronous pass that
   // evicts the oldest NON-LIVE runs by age OR total bytes, run BEFORE this
-  // dispatch's record is written so the new run is never a candidate. Mirrors
-  // the sibling `pi-task-session-prune.sh` contract; disable with
-  // TASK_RUNS_PRUNE=0. It never throws into the returns-early path.
+  // dispatch's record is written so the new run is never a candidate.
+  // DRY-RUN BY DEFAULT, mirroring the recorded retention decision and the
+  // sibling `pi-task-session-prune.sh` contract (AGENTS.md: "Retention is
+  // owned, bounded, and dry-run by default … arming it is a separate manual
+  // step"). So an unarmed pass REPORTS what it would evict and deletes
+  // nothing; `TASK_RUNS_PRUNE_DRY_RUN=0` is the explicit arming step, and
+  // `TASK_RUNS_PRUNE=0` disables the sweep entirely. It never throws into the
+  // returns-early path.
   if (created.ok && process.env.TASK_RUNS_PRUNE !== "0") {
+    const dryRun = process.env.TASK_RUNS_PRUNE_DRY_RUN !== "0";
     try {
-      pruneTaskRuns(runsRoot, resolveTaskRunsPruneBounds());
+      const sweep = pruneTaskRuns(runsRoot, { ...resolveTaskRunsPruneBounds(), dryRun });
+      if (sweep.pruned > 0) {
+        console.error(
+          dryRun
+            ? `[task] task-runs retention DRY-RUN: would evict ${sweep.pruned} run(s) (${sweep.freedBytes} bytes) — not armed; set TASK_RUNS_PRUNE_DRY_RUN=0 to arm (TASK_RUNS_PRUNE=0 disables)`
+            : `[task] task-runs retention: evicted ${sweep.pruned} run(s) (${sweep.freedBytes} bytes)`,
+        );
+      }
+      for (const e of sweep.errors) console.error(`[task] task-runs retention error: ${e}`);
     } catch (err) {
       console.error(`[task] task-runs retention sweep failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -5030,11 +5044,29 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
   // Fire-and-forget settle persistence. The CALLER never awaits this — that is
   // the entire point. `void` is deliberate: the returned promise is handled
   // here, not by the caller.
+  //
+  // #1662 review (P1): `writeRunRecord` reports failure ONLY through its return
+  // value, and it logs nothing itself. Ignoring it here swallows the one
+  // failure that matters most: the record stays `running` while the child has
+  // already settled, so `task_collect` takes its settle-lost salvage and
+  // declares a lane that exited 0 a PERMANENT terminal failure (`content:
+  // null`), and the #208 resume contract re-dispatches work that succeeded.
+  // The handle has already been returned by the time the settle fires, so the
+  // durable signal is a loud `console.error`; never swallow it.
+  const persistSettle = (record: TaskRunRecord, phase: string): void => {
+    const w = writeRunRecord(runsRoot, record);
+    if (!w.ok) {
+      console.error(
+        `[task] background SETTLE record persist failed (${phase}) for ${runId} (${logPath}): ${w.error ?? "unknown"} — ` +
+          `the record stays status "running", so task_status/task_collect will finalize a settled lane as a settle-lost FAILURE; the result is NOT durable`,
+      );
+    }
+  };
   void pending
     .then((result) => {
       if (!created.ok) return;
       const terminal = classifyBackgroundOutcome(result);
-      writeRunRecord(runsRoot, {
+      persistSettle({
         ...baseRecord,
         pid: spawnInfo.pid,
         pgid: spawnInfo.pgid,
@@ -5044,18 +5076,18 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
         final_content: (result?.content ?? undefined) as TaskRunRecord["final_content"],
         final_details: result?.details as TaskRunRecord["final_details"],
         settled_at: Date.now(),
-      });
+      }, "settle");
     })
     .catch((err: unknown) => {
       if (!created.ok) return;
-      writeRunRecord(runsRoot, {
+      persistSettle({
         ...baseRecord,
         pid: spawnInfo.pid,
         pgid: spawnInfo.pgid,
         status: "failed",
         reason: `settle-handler-error: ${err instanceof Error ? err.message : String(err)}`,
         settled_at: Date.now(),
-      });
+      }, "settle-handler-error");
     });
 
   return {

@@ -315,6 +315,17 @@ export function createBoundedLogWriter(
 // gone (a parent that died mid-run) is evicted only after `SETTLE_GRACE_MS`, so
 // an in-flight settle write cannot lose its record. Fail-safe: this function
 // never throws into the dispatch path; a missing/unreadable root is a no-op.
+//
+// DRY-RUN BY DEFAULT at the dispatch path (#1662 review). The recorded
+// retention decision is that an unarmed sweep must not delete (AGENTS.md
+// "Retention is owned, bounded, and dry-run by default"; sibling
+// `scripts/pi-task-session-prune.sh` defaults `TASK_SESSION_PRUNE_DRY_RUN=1`).
+// `pruneTaskRuns` therefore takes an explicit `dryRun` option; the dispatch
+// path passes true unless the operator arms it with
+// `TASK_RUNS_PRUNE_DRY_RUN=0`. Env knobs (documented in
+// `docs/ops/task-runs-retention.md`): `TASK_RUNS_PRUNE` (0 disables),
+// `TASK_RUNS_PRUNE_DRY_RUN` (1 default), `TASK_RUNS_MAX_AGE_DAYS` (7),
+// `TASK_RUNS_MAX_BYTES` (2 GiB), `TASK_RUNS_ROOT`.
 
 export const DEFAULT_TASK_RUNS_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DEFAULT_TASK_RUNS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -337,6 +348,12 @@ export interface TaskRunsPruneOptions {
   maxAgeMs?: number;
   maxBytes?: number;
   now?: number;
+  /** Report what WOULD be evicted, delete nothing. Defaults to false here so
+   * the unit-level function stays directly testable; the DISPATCH path passes
+   * true unless explicitly armed (`TASK_RUNS_PRUNE_DRY_RUN=0`), mirroring the
+   * recorded dry-run-by-default retention decision (AGENTS.md; sibling
+   * `scripts/pi-task-session-prune.sh`). */
+  dryRun?: boolean;
 }
 
 export interface TaskRunsPruneResult {
@@ -382,6 +399,7 @@ export function pruneTaskRuns(
   const maxAgeMs = opts.maxAgeMs ?? DEFAULT_TASK_RUNS_MAX_AGE_MS;
   const maxBytes = opts.maxBytes ?? DEFAULT_TASK_RUNS_MAX_BYTES;
   const now = opts.now ?? Date.now();
+  const dryRun = opts.dryRun === true;
   const result: TaskRunsPruneResult = { examined: 0, pruned: 0, freedBytes: 0, keptLive: 0, errors: [] };
   let entries: string[];
   try {
@@ -429,6 +447,13 @@ export function pruneTaskRuns(
   for (const [, g] of evictable) {
     const evict = g.mtime < cutoff || total - freed > maxBytes;
     if (!evict) continue;
+    if (dryRun) {
+      // Report-only pass: the run is counted and its bytes as "would free",
+      // but nothing is unlinked. This is the DEFAULT at the dispatch path.
+      freed += g.bytes;
+      result.pruned++;
+      continue;
+    }
     let ok = true;
     for (const f of g.files) {
       try {

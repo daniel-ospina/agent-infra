@@ -270,6 +270,25 @@ test("pruneTaskRuns: age-expired non-live runs are evicted (record + log); young
   ok(r.freedBytes > 0, "freed bytes reported");
 });
 
+test("pruneTaskRuns: DRY-RUN reports what it would evict and deletes NOTHING (the dispatch-path default)", () => {
+  const dir = tmpDir("prune-dryrun");
+  const old = seedRun(dir, { ageMs: 9 * DAY });
+  const young = seedRun(dir, { ageMs: 1000 });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now(), dryRun: true });
+  equal(r.pruned, 1, "the age-expired run is reported as would-evict");
+  ok(r.freedBytes > 0, "would-free bytes reported");
+  equal(existsSync(old.recPath), true, "dry-run must NOT delete the record — the composed final message is still there");
+  equal(existsSync(old.logPath), true, "dry-run must NOT delete the capture log");
+  equal(readFileSync(old.recPath, "utf-8").includes("\"status\""), true, "the record content is intact");
+  equal(existsSync(young.recPath), true, "young run untouched either way");
+  // The negative twin: the SAME input with the sweep armed really does delete,
+  // so the assertion above is not vacuous.
+  const armed = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now(), dryRun: false });
+  equal(armed.pruned, 1, "armed pass evicts");
+  equal(existsSync(old.recPath), false, "armed pass deletes the record");
+  equal(existsSync(old.logPath), false, "armed pass deletes the log");
+});
+
 test("pruneTaskRuns: a LIVE running run is never evicted, even when ancient", () => {
   const dir = tmpDir("prune-live");
   const live = seedRun(dir, { status: "running", pid: process.pid, ageMs: 99 * DAY });
