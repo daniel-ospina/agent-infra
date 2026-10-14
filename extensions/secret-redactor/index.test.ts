@@ -30,6 +30,9 @@ import { ok, equal, strictEqual } from "node:assert/strict";
 const CONFIG_SECRET = "cfgsecretvalue0000000001";
 const ENV_SECRET = "envsecretvalue0000000002";
 const PATTERN_SECRET = "tt_" + "A".repeat(30);
+const KEY_LEAF_SECRET = "underscorekeyvalue00000004";
+const PUBLIC_KEY_MATERIAL = "not-a-secret-public-key-material";
+const SSH_PUBLIC_KEY_MATERIAL = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ public";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -46,6 +49,23 @@ writeFileSync(
 );
 // A camelCase leaf (`authToken`) must still be collected (review round 3).
 writeFileSync(join(AGENT, "camel-config.json"), JSON.stringify({ authToken: "camelcasevalue00000003" }));
+// A `*_KEY` leaf must be collected (review round 5) while public-key leaves must NOT —
+// the same shape that was missed before, plus the over-redaction trap its fix opens.
+// The nested env block is the reviewer's exact reproduction (`.mcp.json`).
+writeFileSync(
+  join(AGENT, ".mcp.json"),
+  JSON.stringify({ mcpServers: { s: { env: { OPENAI_KEY: KEY_LEAF_SECRET } } } }),
+);
+writeFileSync(
+  join(AGENT, "keys-config.json"),
+  JSON.stringify({
+    public_key: PUBLIC_KEY_MATERIAL,
+    ssh_public_key: SSH_PUBLIC_KEY_MATERIAL,
+    // Ordinary camelCase/key-suffix data that a naive `key$` would redact as a secret.
+    sortKey: "ordinary-sort-key-value00001",
+    monkey: "ordinary-data-not-secret0001",
+  }),
+);
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
 delete process.env.ZAI_API_KEY;
 
@@ -194,6 +214,43 @@ async function main(): Promise<void> {
     ];
     const out = await run({ toolName: "x", content });
     ok(out && out.isError === true && !JSON.stringify(out).includes(CONFIG_SECRET), "fail closed");
+  });
+
+  // ── review round 5: the `*_KEY` leaf gap + its over-redaction trap ──────────
+  await test("exact value under a `*_KEY` leaf is collected (used to emit verbatim)", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `OPENAI_KEY=${KEY_LEAF_SECRET}` }] });
+    ok(out, "a *_KEY literal in a config store must produce a patch");
+    ok(!JSON.stringify(out).includes(KEY_LEAF_SECRET), "the *_KEY secret must not survive");
+  });
+
+  await test("public-key leaves are NOT collected (the widened-`key$` trap)", async () => {
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `public_key=${PUBLIC_KEY_MATERIAL}` }] }),
+      undefined,
+    );
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `ssh_public_key=${SSH_PUBLIC_KEY_MATERIAL}` }] }),
+      undefined,
+    );
+  });
+
+  await test("ordinary camelCase `*Key` data is NOT collected (over-redaction guard)", async () => {
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "sortKey=ordinary-sort-key-value00001" }] }),
+      undefined,
+    );
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: "monkey=ordinary-data-not-secret0001" }] }),
+      undefined,
+    );
+  });
+
+  await test("the marker label does not double its store prefix", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `key=${CONFIG_SECRET}` }] });
+    ok(
+      out && JSON.stringify(out).includes("[REDACTED:tortoise-config:apiKey]"),
+      "the label is store:path, not store:store.path",
+    );
   });
 
   // ── negatives: no over-redaction, no touch when clean ──────────────────────

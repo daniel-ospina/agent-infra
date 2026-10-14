@@ -35,6 +35,10 @@
  *     - a non-8-bit typed array (Uint16Array, Float64Array, …) cannot hold a redacted
  *       byte sequence of a different length without changing its element count, so a
  *       secret found in one FAILS CLOSED rather than being silently dropped;
+ *     - a secret in a `DataView`, a raw `ArrayBuffer`, or a NON-STRING `Map` key is
+ *       not scanned: the byte branch excludes `DataView`, a raw `ArrayBuffer` has no
+ *       enumerable entries, and only string `Map` keys are redacted (they are passed
+ *       through untouched, not withheld);
  *     - only exact configured values and the five credential shapes are caught; an
  *       unknown-format secret in a store not under ~/.pi/agent is not.
  *   The durable fix for the class is to redact at the point of PERSISTENCE (one
@@ -69,12 +73,21 @@ const MIN_LEN = 12;
 /** Read regardless of readdir: the known fleet stores. */
 const FALLBACK_STORES = ["tortoise-config.json", "jev-config.json", ".mcp.json", "models.json"];
 
-/** Secret-ish on the LEAF key (`authToken`, `apiKey`, `clientSecret`…) or on the path. */
-const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|secret|password|passwd|credential)/i;
+/** Secret-ish on the LEAF key (`authToken`, `apiKey`, `clientSecret`, `OPENAI_KEY`…)
+ *  or on the path. The `(^|[_-])key$` alternative mirrors the env collector's `_KEY`
+ *  suffix so a SCREAMING_SNAKE literal in a config store (`OPENAI_KEY`, `MASTER_KEY`,
+ *  `PRIVATE_KEY`…) is collected too; without it the SAME value was redacted from the
+ *  environment and emitted verbatim from `.mcp.json` (review round 5). Camel-case
+ *  `*Key` is deliberately NOT included: a bare `key$` would also match `monkey`/
+ *  `sortKey`/`foreignKey` and redact ordinary data (over-redaction is a harm). */
+const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|secret|password|passwd|credential|(^|[_-])key$)/i;
 const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|passwd|token|api[_-]?key)/i;
 /** PUBLIC values are not secrets. Tested on the LEAF only — a `publicProfile.apiKey`
- *  must still be collected (testing the whole path excluded the subtree). */
-const PUBLIC_RE = /^(public|pub[_-]?key|gpg[_-]?key|signing[_-]?key)$/i;
+ *  must still be collected (testing the whole path excluded the subtree). The
+ *  `*_key` forms are widened here because `SECRET_LEAF_RE` now collects `_KEY`
+ *  leaves: without this, `public_key` / `ssh_public_key` would be redacted as if
+ *  they were credentials (review round 5). */
+const PUBLIC_RE = /(^public$|(public|pub|gpg|signing)[_-]?key$)/i;
 const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key|signing_?key/i;
 
 /** A value that is a REFERENCE to an env var, not a credential (tested trimmed). */
@@ -110,7 +123,10 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
       const leaf = leafOf(path);
       const secretKey = SECRET_LEAF_RE.test(leaf) || SECRET_PATH_RE.test(path);
       if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
-        into.push({ label: `${label}:${path.replace(/^\./, "")}`, value: node });
+        // The label is `store:path` — the traversal ROOT is the store label, so it must
+        // be stripped from the display path or it repeats (`store:store.apiKey`).
+        const p = path === label ? "" : path.slice(label.length + 1);
+        into.push({ label: `${label}:${p || "(root)"}`, value: node });
       }
       return;
     }
