@@ -91,6 +91,16 @@ TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
 TOK_BODY="$(cat "$TOK")"
 
+# check_dispatch (agent-infra#1736) runs the REAL `refresh-candidates.sh --check` whenever the
+# harness is resolvable, which it is from a full checkout — and this suite's fixture clone has no
+# tools/collision_preflight.py, so the real check dies before the banner and every case that expects
+# a clean run goes red. HARNESS is the documented override: pinning it at a non-existent directory
+# takes check_dispatch's `warn … return 0` path, keeping this suite about #1718's secret lifetime
+# and not about whether the fixture repo can be provisioned for dispatch. Exported so it reaches
+# `br()` and every inline invocation below (they add vars as a command prefix, which does not clear
+# the already-exported environment).
+export HARNESS="$T/no-harness"
+
 # br <gh-mode> <curl-mode> [extra args…] — run the REAL script with the stub toolchain. Capture rc
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
 BR_RC=0; BR_OUT=''

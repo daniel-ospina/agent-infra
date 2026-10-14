@@ -308,6 +308,29 @@ check_repo() {
   git -C "$WORKDIR" config user.name  "cmux cloud lane"
 }
 
+# ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ─────
+# A cell that cannot provision its dispatch scout merges forever with `lanes: 0`, and the
+# controller stays RUNNING while it does — the refresh runs in a BACKGROUNDED subshell, so its
+# abort cannot fail the loop. `--check` is the last gate before a cell is started; refuse here.
+# Best-effort: bring-up is normally pushed standalone, so the harness is only present when the
+# whole repo was cloned — cloud-cell-supervisor.sh `check` (which `start` calls) is the enforcing
+# gate; this one makes the failure visible earlier, on the bare VM.
+check_dispatch() {
+  local harness out
+  harness="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
+  if [ ! -f "$harness/refresh-candidates.sh" ]; then
+    warn "harness not found at $harness — cannot pre-verify dispatch provisioning here;"
+    warn "  cloud-cell-supervisor.sh check (which 'start' calls) enforces it before the controller runs"
+    return 0
+  fi
+  if ! out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)"; then
+    printf '%s\n' "$out" >&2
+    die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
+  fi
+  printf '%s\n' "$out" | sed 's/^/    /'
+  ok "dispatch provisioning pre-flight passed"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -319,12 +342,13 @@ main() {
       check_provider
       check_gh
       check_repo
+      check_dispatch
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

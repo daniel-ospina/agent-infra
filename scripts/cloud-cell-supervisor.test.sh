@@ -442,6 +442,95 @@ if [ -n "$REAL_TMUX" ]; then
   wk_case real amb cold
 fi
 
+# ── 8) the check gate refuses a repo that cannot provision DISPATCH (agent-infra#1736) ───────────
+# `refresh-candidates.sh` is the step that refills the dispatch backlog, and orch-loop.sh runs it in
+# a BACKGROUNDED subshell — so a refresh that aborts every cycle cannot fail the loop: the controller
+# reports RUNNING with `lanes: 0` forever and the cell is MERGE-ONLY (measured 2026-10-14 on the
+# first cmux cloud cell, pointed at agent-infra). `check` is the gate `start` runs before the
+# controller exists, so it must REFUSE such a repo — with the reason — rather than leave the failure
+# to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
+say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
+F="$T/cellcheck"; mkdir -p "$F/harness" "$F/repo/.git" "$F/home" "$F/o" "$F/bin"
+for f in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+  : > "$F/harness/$f"; : > "$F/o/$f"
+done
+printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
+# Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
+# against the wrong repo cannot pass silently) and exits with $PROBE_RC.
+cat > "$F/harness/refresh-candidates.sh" <<'SH'
+#!/bin/bash
+echo "[refresh] check: stub probe REPO=${REPO:-} O=${O:-}"
+exit "${PROBE_RC:-0}"
+SH
+cp "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
+chmod +x "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
+CC_OUT=''; CC_RC=0
+cellcheck() {
+  # $1 = PROBE_RC, $2 = TORTOISE_REPO to make AMBIENT in the supervisor's own shell ('' = none).
+  # `TORTOISE=` is cleared so the alias cannot make an unforeseen case look like the one under test.
+  CC_OUT="$(PROBE_RC="$1" TORTOISE_REPO="${2:-}" TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
+            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
+  CC_RC=$?
+}
+cellcheck 3
+[ "$CC_RC" -ne 0 ] && ok "check: NOT PROVISIONABLE (rc=3) refuses the cell (non-zero)" \
+                   || bad "check: returned 0 for a repo that cannot provision dispatch"
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check: still printed the CELL CAN RUN banner" ;;
+  *) ok "check: no CELL CAN RUN banner on a merge-only repo" ;;
+esac
+case "$CC_OUT" in
+  *"cannot be provisioned for dispatch"*) ok "check: names the reason (merge-only, agent-infra#1736)" ;;
+  *) bad "check: the refusal does not name dispatch provisioning — output: $CC_OUT" ;;
+esac
+[ "$CC_RC" -ne 0 ] && case "$CC_OUT" in *"REPO=$F/repo"*) ok "check: the probe was handed the TARGET repo (not a default)";; *) bad "check: probe saw the wrong repo — $CC_OUT";; esac
+cellcheck 1
+[ "$CC_RC" -ne 0 ] && ok "check: a TRANSIENT probe failure (rc=1) also refuses (it is not usable now)" \
+                   || bad "check: accepted a repo whose probe failed transiently"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: a provisionable repo still passes (no false block)" \
+                   || bad "check: FALSE BLOCK — rc=$CC_RC: $CC_OUT"
+case "$CC_OUT" in
+  *"dispatch provisioning"*) ok "check: reports the dispatch-provisioning verdict" ;;
+  *) bad "check: no dispatch-provisioning verdict — output: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner when the repo is fine" ;;
+  *) bad "check: did not reach the banner on a healthy repo — output: $CC_OUT" ;;
+esac
+
+# ⛔ Issue 3 (#1748 review): the provisioning probe runs in the OPERATOR's shell, but the controller
+# session gets a tmux-server environment plus a re-source of $ENV_FILE — so an ambient-only
+# TORTOISE_REPO makes `check` pass while the refresh it blesses would resolve no checkout, refuse
+# with rc=3, and leave the cell MERGE-ONLY. Pin the warning, and pin that a repo which VENDORS its
+# own tool (or a value $ENV_FILE carries) draws NO warning — a false warning is its own trap.
+say_case "check warns when the provisioning verdict rests on an ambient-only TORTOISE_REPO (#1748)"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) ok "check: an ambient-only TORTOISE_REPO is named as not delivered" ;;
+  *) bad "check: ambient-only TORTOISE_REPO drew no warning — output: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"put TORTOISE_REPO="*"$F/keys.env"*) ok "check: the remedy points at \$ENV_FILE (the delivered route)" ;;
+  *) bad "check: the warning does not prescribe \$ENV_FILE — output: $CC_OUT" ;;
+esac
+# The value $ENV_FILE carries IS delivered (the session sources it) → no warning.
+printf 'TORTOISE_REPO=%s\n' "$F/tort" > "$F/keys.env"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) bad "check: warned even though \$ENV_FILE carries TORTOISE_REPO" ;;
+  *) ok "check: a TORTOISE_REPO in \$ENV_FILE is NOT reported as ambient-only" ;;
+esac
+rm -f "$F/keys.env"
+# A repo that vendors its own pre-flight tool does not depend on the checkout at all → no warning.
+mkdir -p "$F/repo/tools"; : > "$F/repo/tools/collision_preflight.py"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) bad "check: warned although the repo vendors its own pre-flight tool" ;;
+  *) ok "check: no warning when the repo vendors its own pre-flight tool" ;;
+esac
+rm -f "$F/repo/tools/collision_preflight.py"
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
