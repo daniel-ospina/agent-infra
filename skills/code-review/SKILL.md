@@ -897,10 +897,13 @@ horizontal overflow). A verdict here rests on a number, and the obvious number c
 silently, with a precise-looking number that can invert the verdict (a last line measured at 84px where it
 renders at 152px, `daniel-ospina/tortoise#8657`, 2026-10-14).
 
-Measure **per fragment** — iterate **all** rects for each word or character and group them by line top —
-and **corroborate with an independent read** (per-character collapsed ranges, or a screenshot you inspect)
-before stating any line-level number in a finding, because a bad line-level number is not distinguishable
-from a good one by re-reading it. Report the method alongside the numbers.
+Measure **per fragment**: iterate **all** rects for each word or character, then group them into lines by
+top — with a tolerance, because rects on one visual line need not share an exact `top` (an inline box with
+its own font-size or vertical-align gets its own) — and take a line's extent as the union of the fragment
+groups in its band, never the last group alone. Then **corroborate with an independent read** — a single
+character's rect (`setStart(i)`, `setEnd(i + 1)`; a zero-width caret gives a position but no width), or a
+screenshot you inspect — before stating any line-level number in a finding, because a bad line-level number
+is not distinguishable from a good one by re-reading it. Report the method alongside the numbers.
 
 *Section D2 — Config* (`CONFIG_TOUCHED`):
 ```
