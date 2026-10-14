@@ -18,9 +18,12 @@
 #
 # WHY `refs/claims/*` AND NOT `refs/heads/claim/*`. As a branch it would fire
 # branch-triggered workflows and clutter the branch list. `refs/claims/*` is outside the branch
-# namespace and matches no `on: push:` trigger in any workflow.
+# namespace and matches no `on: push:` trigger in any workflow — VERIFIED EMPIRICALLY 2026-10-14 on
+# both daniel-ospina/agent-infra and daniel-ospina/tortoise: a probe push to refs/claims/* created
+# zero workflow runs and zero check-runs, and every `on: push` in both repos is filtered to
+# `branches: [main]` or `tags`.
 #
-# KEY = <PR>-<head-sha>, NOT <PR> (rec 1). Identity must be content-addressed, the same lesson
+# KEY = <PR>-<head-sha12>, NOT <PR> (rec 1). Identity must be content-addressed, the same lesson
 # as a Bazel/Nx cache key: two boxes reviewing the SAME head is duplicate work, a box reviewing
 # a NEWER head is new work. Keying on the SHA makes the claim idempotent per content version
 # and stops a pushed-update PR from being blocked by a stale claim for its predecessor head.
@@ -32,9 +35,14 @@
 # claim as free and reclaims it with a CAS, not with a blind force.
 #
 # FENCING (rec 6). Every mutation after acquisition is conditional on the observed SHA of the
-# claim ref (`--force-with-lease=<ref>:<sha>`). A box that lost ownership cannot release, and
-# cannot reclaim, another box's claim — its writes are rejected. That is what makes a stale
-# owner's write impossible rather than merely unlikely.
+# claim ref (`--force-with-lease=<ref>:<sha>`). A box holding a STALE commit — one that is no longer
+# the ref's tip, because it was superseded or reclaimed — cannot release, and cannot reclaim,
+# another box's claim: its write is rejected. That is what makes a stale owner's write impossible
+# rather than merely unlikely.
+# ⛔ The fence is on the ref's VALUE, not on ownership (P3.1, 2026-10-14 adversarial review): it
+# stops a STALE write; it does NOT stop a caller who happens to pass the ref's CURRENT sha. Every
+# shipped call site passes only the sha it pushed (`$CROSS_OWN` / `$CLAIM_COMMIT`), which is what
+# makes the property hold in practice.
 #
 # COST. Acquisition is ONE push. `claim_snapshot()` refreshes every claim in ONE fetch per
 # cycle, so the sweep never pays a network round trip per PR.
@@ -43,6 +51,16 @@ set -u
 
 CLAIM_NS="${CLAIM_NS:-refs/claims}"
 CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache}"
+# Worker-side lease-READ temp refs live in their OWN namespace, never in CLAIM_CACHE_NS.
+# ⛔ `claim_snapshot` fetches with `--prune` and an explicit destination refspec, and `--prune` with
+# an explicit destination prunes anything matching the DESTINATION pattern (`refs/claims-cache/*`)
+# — not just refs that came from the source. The controller and the workers share ONE repo
+# (CLAIM_REPO="$REPO"), so a snapshot fetch used to delete a concurrent worker's `read-…` /
+# `status-…` / `prune-…` temp ref mid-read; `_lease_of` then returned "?\t0", and an unparseable
+# lease is treated as LIVE, so the merge was refused while nobody owned it — every cycle
+# (P2, 2026-10-14 adversarial review). Keeping temp refs out of the pruned namespace removes the
+# race. If you add a temp ref anywhere below, put it under CLAIM_TMP_NS.
+CLAIM_TMP_NS="${CLAIM_TMP_NS:-refs/claims-tmp}"
 CLAIM_TTL="${CLAIM_TTL:-1800}"   # 30 min default lease
 # The repository every git call runs against. Defaults to the cwd (correct for merge-one.sh,
 # which cd's into $REPO first) but the CONTROLLER must set it: orch-loop.sh runs from launchd
@@ -103,7 +121,7 @@ _lease_of() {
 # Echoes CLAIM_RESULT as well, so a caller in a subshell still sees the reason.
 claim_acquire() {
   local repo="$1" pr="$2" sha="$3" ttl="${4:-$CLAIM_TTL}"
-  local now until commit back cur tmp
+  local now until commit back cur tmp perr after
 
   CLAIM_REF="$(claim_ref "$pr" "$sha")"
   CLAIM_OWNER="$(claim_owner)"
@@ -117,6 +135,11 @@ claim_acquire() {
     # rec 2: read the ref BACK rather than trusting the exit code alone.
     back="$(_git ls-remote origin "$CLAIM_REF" 2>/dev/null | awk '{print $1}')"
     if [ "$back" != "$commit" ]; then
+      # P2 (2026-10-14 adversarial review): the push may have CREATED the ref and only the read-back
+      # failed. Surface the commit we pushed so the caller can attempt a FENCED release — otherwise
+      # the claim is orphaned for the whole lease (up to REVIEW_TIMEOUT+1200 = 50 min) and every box
+      # refuses that head until it expires. merge-one.sh consumes CLAIM_COMMIT on rc=2.
+      CLAIM_COMMIT="$commit"
       CLAIM_RESULT="push reported success but read-back differs ($back != $commit)"
       echo "$CLAIM_RESULT"; return 2
     fi
@@ -128,7 +151,7 @@ claim_acquire() {
   # --- the ref exists. Read the lease (data, not liveness) and decide.
   cur="$(_git ls-remote origin "$CLAIM_REF" 2>/dev/null | awk '{print $1}')"
   if [ -z "$cur" ]; then CLAIM_RESULT="push failed and ref is unreadable (network?)"; echo "$CLAIM_RESULT"; return 2; fi
-  tmp="$CLAIM_CACHE_NS/read-$RANDOM$$"
+  tmp="$CLAIM_TMP_NS/read-$RANDOM$$"
   if ! _git fetch -q origin "+$CLAIM_REF:$tmp" 2>/dev/null; then
     _git update-ref -d "$tmp" 2>/dev/null
     CLAIM_RESULT="cannot fetch the existing claim to read its lease"; echo "$CLAIM_RESULT"; return 2
@@ -148,22 +171,45 @@ claim_acquire() {
 
   # --- expired: reclaim with a CAS on the observed value, never a blind force. If another box
   #     reclaimed it meanwhile our expected value no longer matches and we lose cleanly.
-  if _git push -q --force-with-lease="$CLAIM_REF:$cur" origin "$commit:$CLAIM_REF" 2>/dev/null; then
+  if perr="$(_git push -q --force-with-lease="$CLAIM_REF:$cur" origin "$commit:$CLAIM_REF" 2>&1)"; then
     back="$(_git ls-remote origin "$CLAIM_REF" 2>/dev/null | awk '{print $1}')"
     if [ "$back" = "$commit" ]; then
       CLAIM_COMMIT="$commit"
       CLAIM_RESULT="reclaimed expired claim from $held_owner (was until $held_until)"
       echo "$CLAIM_RESULT"; return 0
     fi
-    CLAIM_RESULT="reclaim read-back differs"; echo "$CLAIM_RESULT"; return 2
+    CLAIM_COMMIT="$commit"   # may have landed; the caller can attempt a fenced release
+    CLAIM_RESULT="reclaim read-back differs ($back != $commit)"
+    echo "$CLAIM_RESULT"; return 2
   fi
-  CLAIM_RESULT="lost the reclaim race for $CLAIM_REF (another box took it)"
+  # ⛔ The push failed. DISTINGUISH "I lost the race" from "the remote was unreachable" (P2,
+  # 2026-10-14 adversarial review). The CREATE path already does this; the reclaim path used to call
+  # EVERY non-zero exit a lost race (stderr discarded), so `merge-one.sh` logged "another box owns
+  # head" and exited 0 on a transient network failure — FAIL-CLOSED, the opposite of the stated
+  # policy. Re-read the ref: a DIFFERENT sha = genuine lost race (rc=1); unchanged at `$cur`, or
+  # unreadable, = infrastructure failure (rc=2 → fail-open).
+  after="$(_git ls-remote origin "$CLAIM_REF" 2>/dev/null | awk '{print $1}')"
+  perr="$(printf '%s' "${perr:-}" | tr '\n' ' ' | cut -c1-200)"
+  if [ "$after" = "$commit" ]; then
+    # the push landed despite its non-zero exit; the read-back is the authority.
+    CLAIM_COMMIT="$commit"
+    CLAIM_RESULT="reclaimed expired claim from $held_owner (was until $held_until; push exited non-zero but the ref is ours)"
+    echo "$CLAIM_RESULT"; return 0
+  fi
+  if [ -z "$after" ] || [ "$after" = "$cur" ]; then
+    CLAIM_RESULT="reclaim push failed and $CLAIM_REF is ${after:-unreadable} (still $cur) — infrastructure failure, not a lost race: ${perr:-no stderr}"
+    echo "$CLAIM_RESULT"; return 2
+  fi
+  CLAIM_RESULT="lost the reclaim race for $CLAIM_REF (another box took it: $cur -> $after)"
   echo "$CLAIM_RESULT"; return 1
 }
 
 # claim_release <repo> <pr> <head-sha> <own-commit>
-# Deletes ONLY if the ref still points at our own claim (fencing, rec 6): a box that lost
-# ownership cannot release the winner's claim.
+# Deletes ONLY if the ref still points at <own-commit> (fencing, rec 6). A box holding a STALE
+# commit — its claim was superseded or reclaimed — cannot release the winner's claim.
+# ⛔ The fence is on the ref's VALUE, not on ownership (P3.1, 2026-10-14 adversarial review): it
+# refuses a STALE commit; it does not refuse a caller who passes the ref's CURRENT sha. Shipped call
+# sites pass only the sha they pushed.
 claim_release() {
   local repo="$1" pr="$2" sha="$3" own="$4" ref
   ref="$(claim_ref "$pr" "$sha")"
@@ -184,7 +230,7 @@ claim_status() {
   ref="$(claim_ref "$2" "$3")"
   cur="$(_git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
   [ -n "$cur" ] || return 1
-  tmp="$CLAIM_CACHE_NS/status-$RANDOM$$"
+  tmp="$CLAIM_TMP_NS/status-$RANDOM$$"
   _git fetch -q origin "+$ref:$tmp" 2>/dev/null || { _git update-ref -d "$tmp" 2>/dev/null; return 1; }
   _lease_of "$tmp"; echo
   _git update-ref -d "$tmp" 2>/dev/null
@@ -205,6 +251,8 @@ claim_snapshot() {
   local tmp="$out.$$"
   : > "$tmp"
   # --prune so a claim DELETED on another box (released, or pruned) does not linger here.
+  # ⛔ It prunes by DESTINATION pattern, so worker-side temp refs must live in CLAIM_TMP_NS, never
+  # under CLAIM_CACHE_NS — a snapshot must not delete a concurrent lease read (P2).
   _git fetch -q --prune origin "+$CLAIM_NS/*:$CLAIM_CACHE_NS/*" 2>/dev/null || true
   _git for-each-ref --format='%(refname)' "$CLAIM_CACHE_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
@@ -226,7 +274,7 @@ claim_prune() {
     local cur tmp
     cur="$(_git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
     [ -n "$cur" ] || continue
-    tmp="$CLAIM_CACHE_NS/prune-$RANDOM$$"
+    tmp="$CLAIM_TMP_NS/prune-$RANDOM$$"
     _git fetch -q origin "+$ref:$tmp" 2>/dev/null || continue
     lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
     until="${lease##*$'\t'}"

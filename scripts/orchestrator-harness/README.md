@@ -568,16 +568,31 @@ fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
 
 The per-PR claim (§5.1b) is a **local file**, so it makes concurrency safe *within one box*. Two
 boxes sweeping the same repo still both evaluate the same PR and the same issue, and the boxes
-share GitHub, not a coordinator. The registry is now `refs/claims/<PR>-<head-sha>` in the
-repository the boxes already share: `git push` to a ref is an **atomic create-or-fail** (a CAS), so
-it needs no broker and no service, and the namespace is **outside `refs/heads/*`**, so it triggers
-no workflow and never appears as a branch. `claims.sh` holds the primitive; `merge-one.sh` resolves
-HEAD **before** claiming and exits 0 when another box owns that head; `orch-loop.sh` refreshes
-**every** claim in **one** fetch per cycle into `state/claims-snapshot`, so `claim_live()` costs no
-per-PR network call. The lease is **data, not liveness** (a remote pid cannot be probed), derived as
-`REVIEW_TIMEOUT + 1200` and carried in the claim commit; every release/reclaim is
-`--force-with-lease`, so a box that lost ownership cannot release the winner's claim. It **fails
-open on purpose** — if the claim store is unreachable the harness proceeds and logs it — because
+share GitHub, not a coordinator. The registry is now `refs/claims/<PR>-<head-sha12>` in the
+repository the boxes already share (`<head-sha12>` because the key is `claim_key()`, which truncates
+the head sha to its first 12 characters): `git push` to a ref is an **atomic create-or-fail** (a
+CAS), so it needs no broker and no service, and the namespace is **outside `refs/heads/*`**, so it
+triggers no workflow and never appears as a branch. **Verified empirically** on both
+`daniel-ospina/agent-infra` and `daniel-ospina/tortoise`: pushing a probe ref to `refs/claims/*`
+created **zero** workflow runs and **zero** check-runs, matching the static picture (every
+`on: push` in both repos is filtered to `branches: [main]` or `tags`). `claims.sh` holds the
+primitive; `merge-one.sh` resolves HEAD **before** claiming and exits 0 when another box owns that
+head; `fix-one.sh` takes the **same** claim on the current head for the fixer's duration and
+releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim left two boxes free
+to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
+cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
+**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit; every
+release/reclaim is `--force-with-lease`, so a box holding a **stale** commit (one that is no longer
+the ref's tip) cannot release the winner's claim. Three hardening points from the adversarial
+review of this PR: a **read-back failure on the create path still surfaces the commit we pushed**,
+so the caller can fenced-release a claim that did exist instead of orphaning it for the whole lease;
+a **failed reclaim push is classified by re-reading the ref** — unchanged or unreadable is an
+infrastructure failure (rc=2, fail-open), a moved ref is a genuine lost race (rc=1) — rather than
+reporting every transient error as a lost race and failing closed; and worker lease-read temp refs
+live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespace, so
+`claim_snapshot --prune` can no longer delete a concurrent read mid-flight. It **fails open on
+purpose** — if the claim store is unreachable the harness proceeds and logs it — because
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
@@ -746,7 +761,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | Script | Role |
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
-| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh` and `merge-one.sh` |
+| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `merge-one.sh` and `fix-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |

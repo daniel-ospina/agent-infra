@@ -16,6 +16,10 @@ else
   REPO="$1"; OR="$2"; PR="$3"; BR="$4"
 fi
 case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
+# Guard-before-use for env tunables. Every OTHER limit in this file is validated before it is
+# used; `REVIEW_TIMEOUT` was the lone exception and it fed ARITHMETIC (P1, 2026-10-14 adversarial
+# review — see the coercion note at the claim block).
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 KIND=reviewer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
@@ -53,7 +57,8 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
 }
 git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
 
-# HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha>, not <PR>
+# HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha12> (claim_key()
+# truncates the sha to 12), not <PR>
 # (agent-infra#1709 rec 1). It is also the key record-review/needsfix already use.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 
@@ -101,6 +106,36 @@ trap 'rm -f "$CLAIM"' EXIT
 # line makes the fallback visible rather than silent.
 CROSS_OWN=""
 CROSS_RC=0
+
+# Release the cross-box claim, BOUNDED to ~20s. `claim_release` is one network push and a
+# black-holed connection can hang for minutes; this runs on the EXIT path, so it must not hold the
+# process open (P3, 2026-10-14 adversarial review). Returns claim_release's status (1 = nothing to
+# release), so a caller can tell a fenced release from a refusal.
+release_claim_bounded() {
+  local p w rc
+  [ -n "${CROSS_OWN:-}" ] || return 1
+  claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1 &
+  p=$!
+  ( sleep 20; kill -TERM "$p" 2>/dev/null; sleep 5; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  return "$rc"
+}
+
+# ⛔ Coerce REVIEW_TIMEOUT BEFORE the arithmetic below (P1, 2026-10-14 adversarial review). On
+# /bin/bash 3.2.57 — what the launchd plist invokes — a FAILED arithmetic assignment aborts the
+# remainder of the enclosing `if` body and resumes after `fi` with status 0. Reproduced with the
+# real merge-one.sh and REVIEW_TIMEOUT=30m: `CLAIM_LEASE=$(( 30m + 1200 ))` aborted the claim block,
+# claim_acquire was NEVER called, the log carried NO "cross-box claim" line at all, and the worker
+# still reported success. The trigger is plausible because `30m`/`1800s` are VALID for `sleep`, so
+# the operator's intended timeout works while the claim silently vanishes. Coerce rather than
+# reject: a bad tunable must not cost the fleet its cross-box safety.
+if ! is_num "${REVIEW_TIMEOUT:-1800}"; then
+  echo "[merge $PR] REVIEW_TIMEOUT='${REVIEW_TIMEOUT:-}' is not an integer — using 1800 (the cross-box lease needs a number)" >> "$L.log"
+  REVIEW_TIMEOUT=1800
+fi
+
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
@@ -116,13 +151,30 @@ if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
        echo "[merge $PR] cross-box claim: $CLAIM_RESULT" >> "$L.log" ;;
     1) echo "[merge $PR] cross-box claim REFUSED: $CLAIM_RESULT — another box owns head $HEAD; exiting" >> "$L.log"
        rm -f "$CLAIM"; exit 0 ;;
-    *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log" ;;
+    *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log"
+       # P2 (2026-10-14 adversarial review): the CREATE path can SUCCEED on the remote and fail only
+       # the read-back. claims.sh surfaces the commit it pushed; release it, fenced, so the PR is not
+       # stalled fleet-wide until the lease expires (up to REVIEW_TIMEOUT+1200 = 50 min of every box
+       # refusing to review it). CROSS_OWN stays set only when this fenced release FAILS, so the EXIT
+       # trap retries it.
+       if [ -n "${CLAIM_COMMIT:-}" ]; then
+         CROSS_OWN="$CLAIM_COMMIT"
+         if release_claim_bounded; then
+           CROSS_OWN=""
+           echo "[merge $PR] cross-box claim: released the orphaned claim commit ${CLAIM_COMMIT:0:12} after the read-back failure" >> "$L.log"
+         else
+           echo "[merge $PR] cross-box claim: could not release the orphaned commit ${CLAIM_COMMIT:0:12} — the EXIT trap will retry" >> "$L.log"
+         fi
+       fi ;;
   esac
 fi
 # agent-infra's TERM/INT handlers above only TERMINATE (the #1715 fix); each `exit` runs this
-# EXIT trap, so the cross-box release folds in here rather than into a returning handler. The
-# local claim drop stays first so a release attempt can never leave the pid lock behind.
-trap 'rm -f "$CLAIM"; [ -n "${CROSS_OWN:-}" ] && claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1' EXIT
+# EXIT trap, so the cross-box release folds in here rather than into a returning handler.
+# ⛔ ORDER (P3, 2026-10-14 adversarial review): the release runs FIRST and is BOUNDED. The old trap
+# did `rm -f "$CLAIM"` first and then an UNTIMED `claim_release` push — a black-holed connection hung
+# the exit path for minutes with the local pid lock already gone, so the controller could spawn a
+# second worker for the same PR. Release first, drop the lock last.
+trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
 
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF
