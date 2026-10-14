@@ -134,13 +134,15 @@ export function unmergedEntries(repo: string): UnmergedEntry[] {
 /**
  * #1661 (review): what, if anything, is mid-flight in the checkout. The
  * abandoned conflict the issue is about has NO sequencer state ("index-only");
- * a live merge/rebase/cherry-pick/revert leaves MERGE_HEAD / CHERRY_PICK_HEAD /
+ * a live merge/rebase/am/cherry-pick/revert leaves MERGE_HEAD / CHERRY_PICK_HEAD /
  * REVERT_HEAD or a rebase-merge|rebase-apply directory. The distinction matters
  * because the banner must not assert "no MERGE_HEAD" for a live merge, and a
  * rebase INVERTS --ours/--theirs relative to a merge, so the old blanket
- * `checkout --theirs` remedy could silently discard the user's commit.
+ * `checkout --theirs` remedy could silently discard the user's commit. `git am`
+ * is separated from `rebase` because it shares `.git/rebase-apply` yet its
+ * remedy is `git am --continue`/`--abort`, not `git rebase ...` (git refuses).
  */
-export type UnmergedOp = "index-only" | "merge" | "rebase" | "cherry-pick" | "revert";
+export type UnmergedOp = "index-only" | "merge" | "rebase" | "am" | "cherry-pick" | "revert";
 
 export function unmergedOp(repo: string): UnmergedOp {
   let gitDir: string;
@@ -152,7 +154,15 @@ export function unmergedOp(repo: string): UnmergedOp {
     return "index-only";
   }
   const has = (name: string): boolean => gitDir.length > 0 && existsSync(join(gitDir, name));
-  if (has("rebase-merge") || has("rebase-apply")) return "rebase";
+  if (has("rebase-merge")) return "rebase";
+  if (has("rebase-apply")) {
+    // #1661 (review): `git am` shares .git/rebase-apply with `rebase --apply`.
+    // The mode file discriminates: `applying` = am, `rebasing` = rebase
+    // --apply. Labelling an am conflict "rebase" offered `git rebase
+    // --continue`, which git refuses ("It looks like 'git am' is in
+    // progress. Cannot rebase.").
+    return has("rebase-apply/applying") ? "am" : "rebase";
+  }
   if (has("CHERRY_PICK_HEAD")) return "cherry-pick";
   if (has("REVERT_HEAD")) return "revert";
   if (has("MERGE_HEAD")) return "merge";
@@ -206,12 +216,19 @@ export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: Unmer
   if (entries.length > 6) list.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
 
   if (op !== "index-only") {
+    // #1661 (review): ONLY a rebase inverts --ours/--theirs. cherry-pick,
+    // revert and am use the merge convention (--ours = HEAD), so the old
+    // blanket warning told those users the sides were swapped when they are
+    // not — on the one banner whose job is to hand them a correct command.
+    const sides = op === "rebase"
+      ? "rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command"
+      : `--ours is your current branch (HEAD); --theirs is ${op === "cherry-pick" ? "the picked commit" : op === "revert" ? "the reverted commit" : op === "am" ? "the patch being applied" : "the incoming commit"} (the merge convention)`;
     return [
       `[auto-sync] ⛔ ${op.toUpperCase()} IN PROGRESS with unmerged paths — sync must wait until it is concluded.`,
       ...list,
       `[auto-sync]    Finish: resolve each path, \`git -C "${repo}" add <path>\`, then \`git -C "${repo}" ${op} --continue\`.`,
       `[auto-sync]    Or abort: git -C "${repo}" ${op} --abort`,
-      `[auto-sync]    (${op} inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command.)`,
+      `[auto-sync]    (${sides}.)`,
       `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
     ];
   }
@@ -631,6 +648,30 @@ function tryLosslessRecoverUnderLock(repo: string, branch: string): { recovered:
   }
 }
 
+/**
+ * #195 L3: warn-only orphan sweep — aborted dispatches leave worktrees/branches
+ * recorded in the teardown manifest; surface them within a day without ever
+ * auto-deleting (scan-orphans.sh --apply is the manual gate). Never throws: a
+ * missing/offline scanner is silent (warn-only by design). Extracted so the
+ * #1661 stuck-index early return can still run it (see session_start).
+ */
+function sweepOrphanRecords(infraPath: string): void {
+  try {
+    const out = execSync(`bash "${infraPath}/scripts/scan-orphans.sh" --repo "${infraPath}" 2>&1`, {
+      timeout: 30_000,
+      encoding: "utf-8",
+    });
+    const lines = out.trim().split("\n").filter((l) => l.includes("⚠️") || l.includes("👻") || l.includes("🧹"));
+    if (lines.length > 0) {
+      console.log(`[auto-sync] 🧹 ${lines.length} orphaned worktree/branch record(s) — inspect:`);
+      console.log(lines.slice(0, 5).map((l) => `    ${l.trim()}`).join("\n"));
+      console.log(`    Cleanup: bash "${infraPath}/scripts/scan-orphans.sh" --apply`);
+    }
+  } catch {
+    // scanner missing/offline — silent (warn-only by design)
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     const infraPath = process.env.AGENT_INFRA_PATH;
@@ -648,6 +689,12 @@ export default function (pi: ExtensionAPI) {
     const unmerged = unmergedEntries(infraPath);
     if (unmerged.length > 0) {
       for (const line of unmergedBanner(infraPath, unmerged, unmergedOp(infraPath))) console.log(line);
+      // #1661 (review): the early return must NOT also silence the #195 orphan
+      // sweep for as long as the index stays stuck — a stuck index persists
+      // until a human resolves it, so orphan records would go unreported that
+      // whole time. Print mode is excluded because the pre-#1661 order returned
+      // before the sweep there (the sweep sits after the print-mode return).
+      if (!isPrintMode()) sweepOrphanRecords(infraPath);
       return;
     }
 
@@ -671,23 +718,8 @@ export default function (pi: ExtensionAPI) {
       return; // offline — silent
     }
 
-    // #195 L3: warn-only orphan sweep — aborted dispatches leave worktrees/
-    // branches recorded in the teardown manifest; surface them within a day
-    // without ever auto-deleting (scan-orphans.sh --apply is the manual gate).
-    try {
-      const out = execSync(`bash "${infraPath}/scripts/scan-orphans.sh" --repo "${infraPath}" 2>&1`, {
-        timeout: 30_000,
-        encoding: "utf-8",
-      });
-      const lines = out.trim().split("\n").filter((l) => l.includes("⚠️") || l.includes("👻") || l.includes("🧹"));
-      if (lines.length > 0) {
-        console.log(`[auto-sync] 🧹 ${lines.length} orphaned worktree/branch record(s) — inspect:`);
-        console.log(lines.slice(0, 5).map((l) => `    ${l.trim()}`).join("\n"));
-        console.log(`    Cleanup: bash "${infraPath}/scripts/scan-orphans.sh" --apply`);
-      }
-    } catch {
-      // scanner missing/offline — silent (warn-only by design)
-    }
+    // #195 L3: warn-only orphan sweep (never auto-deletes).
+    sweepOrphanRecords(infraPath);
 
     const state = syncState(infraPath);
     const syncHint = `cd "${infraPath}" && ./sync.sh`;

@@ -114,6 +114,31 @@ function makeBehindStuckConflict(): string {
   return repo;
 }
 
+/** #1661 (review): a real `git am -3` conflict — stage-1/2/3 entries with the
+ * `rebase-apply/applying` mode file `git am` writes (as opposed to
+ * `rebase-apply/rebasing` for `rebase --apply`). Pins `unmergedOp` to "am"
+ * rather than the old mislabel "rebase", whose `git rebase --continue` git
+ * refuses while an am is in progress. */
+function makeAmConflict(): string {
+  const origin = seededOrigin();
+  const patcher = makeClone(origin);
+  const repo = makeClone(origin);
+  git(patcher, "config user.email test@auto-sync.local");
+  git(patcher, "config user.name \"auto-sync test\"");
+  writeFileSync(join(patcher, "file.txt"), "change\npatch\n");
+  git(patcher, "add -A");
+  git(patcher, "commit -q -m patched");
+  const patch = git(patcher, "format-patch -1 --stdout");
+  git(repo, "config user.email test@auto-sync.local");
+  git(repo, "config user.name \"auto-sync test\"");
+  writeFileSync(join(repo, "0001-patch.patch"), patch);
+  writeFileSync(join(repo, "file.txt"), "change\nours\n");
+  git(repo, "add -A");
+  git(repo, "commit -q -m ours");
+  try { git(repo, "am -3 0001-patch.patch"); } catch { /* expected conflict */ }
+  return repo;
+}
+
 /** Write DIFFERENT content to file.txt on each side (identical additions merge
  * cleanly in git, which would not produce the conflict this fixture needs). */
 function writeConflictSide(repo: string, line: string): void {
@@ -483,6 +508,10 @@ async function main() {
     const repo = makeClone(origin);
     // "AU"THORS: the old naive parser read the rename's extra original-path
     // record as `XY PATH` and fabricated an unmerged entry "HORS".
+    // CI runners have no global git identity — set it locally before the raw
+    // commit (the commit() helper does this; this path bypasses it).
+    git(repo, "config user.email test@auto-sync.local");
+    git(repo, "config user.name \"auto-sync test\"");
     writeFileSync(join(repo, "AUTHORS"), "authors\n");
     git(repo, "add AUTHORS");
     git(repo, "commit -q -m authors");
@@ -513,6 +542,45 @@ async function main() {
     ok(!lines.some((l) => l.includes("checkout --theirs")), "rebase inverts --ours/--theirs — a blanket --theirs is unsafe");
     ok(lines.some((l) => l.includes("rebase --abort")), "must offer the abort");
     ok(lines.some((l) => l.includes("rebase --continue")), "must offer the finish");
+  });
+
+  await test("unmergedOp: a `git am -3` conflict is 'am', not 'rebase' (#1661 review)", () => {
+    const am = makeAmConflict();
+    ok(existsSync(join(am, ".git", "rebase-apply", "applying")), "fixture must leave the am mode file");
+    ok(unmergedEntries(am).length > 0, "fixture must have unmerged entries");
+    equal(unmergedOp(am), "am");
+    const lines = unmergedBanner(am, unmergedEntries(am), unmergedOp(am));
+    ok(lines.some((l) => l.includes("AM IN PROGRESS")), `expected am wording: ${lines.join("\n")}`);
+    ok(lines.some((l) => l.includes("am --continue")), `must offer \`git am --continue\`: ${lines.join("\n")}`);
+    ok(lines.some((l) => l.includes("am --abort")), `must offer \`git am --abort\`: ${lines.join("\n")}`);
+    ok(!lines.some((l) => l.includes("rebase")), `must not mislabel an am conflict as a rebase: ${lines.join("\n")}`);
+  });
+
+  await test("sync.sh in a git-am conflict → names am, not rebase, exits 1", () => {
+    const am = makeAmConflict();
+    writeFileSync(join(am, "sync.sh"), execSync("cat sync.sh", { encoding: "utf-8" }), { mode: 0o755 });
+    let code = 0;
+    let out = "";
+    try {
+      out = execSync(`bash "${join(am, "sync.sh")}" 2>&1`, { encoding: "utf-8" });
+    } catch (e: any) {
+      code = e.status ?? 0;
+      out = String(e.stdout ?? e.message);
+    }
+    equal(code, 1, `expected non-zero exit, got ${code}; output: ${out}`);
+    ok(out.includes("am IN PROGRESS"), `expected am wording, got: ${out}`);
+    ok(out.includes("am --abort"), `expected the am abort, got: ${out}`);
+    ok(!out.includes("rebase IN PROGRESS"), `must not mislabel an am conflict as a rebase: ${out}`);
+  });
+
+  await test("unmergedBanner: only a rebase claims the --ours/--theirs inversion (#1661 review)", () => {
+    const rebase = unmergedBanner("/r", [{ path: "f", detail: "UU" }], "rebase");
+    ok(rebase.some((l) => l.includes("inverts --ours/--theirs")), `rebase DOES invert: ${rebase.join("\n")}`);
+    for (const op of ["merge", "cherry-pick", "revert", "am"] as const) {
+      const lines = unmergedBanner("/r", [{ path: "f", detail: "UU" }], op);
+      ok(!lines.some((l) => l.includes("inverts --ours/--theirs")), `${op} does NOT invert — must not claim it does: ${lines.join("\n")}`);
+      ok(lines.some((l) => l.includes("--ours is your current branch")), `${op} must state the merge convention: ${lines.join("\n")}`);
+    }
   });
 
   await test("unmergedBanner: remedy matches the conflict code (no side that does not exist)", () => {
@@ -605,6 +673,13 @@ async function main() {
 
   await test("behindCount: current = 0, behind = 3", () => {
     equal(behindCount(repoCurrent), 0);
+    const o = seededOrigin();
+    const repo = makeClone(o);
+    const p = makeClone(o);
+    commit(p, "b1"); commit(p, "b2"); commit(p, "b3");
+    git(p, "push -q origin main");
+    git(repo, "fetch -q origin");
+    equal(behindCount(repo), 3, "three pushed commits must read as 3 behind");
   });
 
   // ── Summary ──────────────────────────────────────────────────────────────

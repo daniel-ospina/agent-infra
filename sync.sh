@@ -9,12 +9,16 @@ cd "$(dirname "$0")"   # agent-infra root
 # stuck commit. Surface the offending paths + a valid remedy BEFORE the branch
 # guard (this blocks sync on ANY branch) and exit non-zero so no caller mistakes
 # it for success. Distinguish the abandoned index-only state the issue measured
-# from a live merge/rebase/cherry-pick/revert: a rebase INVERTS --ours/--theirs,
-# so a blanket keep-theirs remedy is unsafe there.
+# from a live merge/rebase/am/cherry-pick/revert: a rebase INVERTS --ours/--theirs,
+# so a blanket keep-theirs remedy is unsafe there; `git am` shares
+# .git/rebase-apply with `rebase --apply` (mode file `applying` vs `rebasing`),
+# so it must not be handed `git rebase --continue`.
 if [ -n "$(git ls-files -u)" ]; then
   gitdir="$(git rev-parse --absolute-git-dir)"
   op=""
-  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then op=rebase
+  if [ -d "$gitdir/rebase-merge" ]; then op=rebase
+  elif [ -d "$gitdir/rebase-apply" ]; then
+    if [ -f "$gitdir/rebase-apply/applying" ]; then op=am; else op=rebase; fi
   elif [ -f "$gitdir/CHERRY_PICK_HEAD" ]; then op=cherry-pick
   elif [ -f "$gitdir/REVERT_HEAD" ]; then op=revert
   elif [ -f "$gitdir/MERGE_HEAD" ]; then op=merge
@@ -25,7 +29,11 @@ if [ -n "$(git ls-files -u)" ]; then
     git ls-files -u | cut -f2- | sort -u | sed 's/^/     /'
     echo "   Finish: resolve each path, then: git ${op} --continue"
     echo "   Or abort: git ${op} --abort"
-    echo "   (a rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command)"
+    if [ "$op" = "rebase" ]; then
+      echo "   (a rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command)"
+    else
+      echo "   (--ours is your current branch (HEAD); --theirs is the incoming side — the merge convention)"
+    fi
     echo "   Then re-run: ./sync.sh"
     exit 1
   fi
