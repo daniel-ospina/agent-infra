@@ -26,9 +26,10 @@
 #     clamp authority deleted = clamp gone while CI stays green)
 #   MISSING store / live-dir files                           → WARN (4h
 #     refresh / first-install path)
-#   the regime floor unreadable, AMBIGUOUS, or disagreed on by
-#     the two instruments; an empty/inverted watcher band; or a
-#     models.json with no deepseek-served entry to anchor   → REFUSE (exit 2)
+#   the regime floor unreadable BY EXECUTION, or disagreed on by
+#     the two instruments; an empty/inverted watcher band (the
+#     watcher refuses to print its floor); or a models.json with
+#     no deepseek-served entry to anchor                → REFUSE (exit 2)
 # The weekly report (fleet-cost-report.sh) + tripwire are the store alert path.
 #
 # Escape hatch: COST_CLAMP_OVERRIDE=1 silences the CLAMP BLOCK (models.json /
@@ -89,9 +90,9 @@ CLAMP=300000
 #      not a constraint.
 #
 #   2. DERIVED — the geometry must match the floor the instruments band on. The FLOOR is READ
-#      FROM the instruments (`fleet-cost-report.sh`'s `FLEET_REGIME_TB:-<n>` default and
-#      `watch-truncation.sh`'s labelled clamp-bucket boundary), never restated here, so a literal
-#      in this file cannot prove the shell agrees with itself. This leg catches a CLAMP drift and
+#      FROM the instruments BY EXECUTION (`fleet-cost-report.sh --print-regime-floor` and
+#      `watch-truncation.sh --print-regime-floor`), never restated here, so a literal in this
+#      file cannot prove the shell agrees with itself. This leg catches a CLAMP drift and
 #      an instrument drift (the #1213/#1304 withdrawal moved 50000→16384, the trigger
 #      250000→283616; moving ONE instrument alone must also fail).
 #
@@ -103,56 +104,46 @@ CLAMP=300000
 #      printed `guard geometry 300000−16384=283616 matches the instruments' 283616 floor` while
 #      the live trigger was 233616.
 #
-#      SCOPE, recorded (#1342): the FLOOR is still read by PARSING the instruments' assignment text
-#      rather than by executing them — the mechanism the #1088 review on this file forbade for
-#      `$CAP_MS`. The parse reads the COMMITTED default literal, so an ambient `FLEET_REGIME_TB`
-#      override is outside what this leg certifies. That divergence, and the watcher's
-#      label-anchored boundary, are tracked in #1342.
-REGIME_TB_REPORT_ALL="$(sed -n 's/.*FLEET_REGIME_TB:-\([0-9]\{1,15\}\)}.*/\1/p' "$ROOT/scripts/fleet-cost-report.sh" 2>/dev/null)"
-# Anchored on the BUCKET LABEL, not on the bare `if N <= tb <` shape: the watcher states
-# `<= tb <` in more than one bucket boundary (the retired 700K-era `if 650000 <= tb < 900000`
-# still sits beside the live one), so the shape alone is ambiguous. The uniqueness assertion
-# below is kept as the backstop: if the label moves or a second labelled statement appears,
-# the guard refuses rather than picking by source order.
+#      READ BY EXECUTION (#1342): both instruments expose `--print-regime-floor`
+#      and the FLOOR is the value they PRINT, never a parse of their assignment
+#      text — the mechanism the #1088 review on this file forbade for `$CAP_MS`.
+#      The documented ambient override (`FLEET_REGIME_TB`, a "tests + tuning"
+#      seam) is UNSET for the call, so this leg certifies the COMMITTED default:
+#      without the unset the report bands at the ambient value while the guard
+#      certifies the default — a false PASS with no file edited. The watcher
+#      side reports its own frozen band FLOOR, so its owner-facing bucket LABEL
+#      is no longer an anchor and a correct relabel no longer blocks the
+#      pre-committed rollback (it used to read as an unreadable floor, exit 2).
 #
-# BOTH bounds are captured. Only the lower one is the floor, but a boundary whose band is empty or
-# inverted can never place a record in the clamp regime while this guard still derives a floor from
-# it. Reproduced: moving only the lower bound to 983616 yields `if 983616 <= tb < 650000` — a dead
-# band — and the guard exited 0 on it.
-#
-# The capture is bounded to 15 digits on purpose: an unbounded `[0-9][0-9]*` lets a literal above
-# bash's int64 range through, and `[ N -ge M ]` on such a value ERRORS (rc=2) — which the `if`
-# reads as "not >=", i.e. as a COHERENT band, silently disarming the inverted-band refusal and
-# pointing the operator at "instrument disagreement" for a band they just wrote. A literal that
-# long cannot match, so it takes the unreadable-floor refusal below instead.
-REGIME_TB_WATCH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9]\{1,15\}\) <= tb < \([0-9]\{1,15\}\).*/\1/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
-REGIME_TB_WATCH_HIGH_ALL="$(sed -n 's/.*"300K-clamp[^"]*" if \([0-9]\{1,15\}\) <= tb < \([0-9]\{1,15\}\).*/\2/p' "$ROOT/scripts/watch-truncation.sh" 2>/dev/null)"
-REGIME_TB_REPORT="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | head -1)"
-REGIME_TB_WATCH="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | head -1)"
-if [ -z "$REGIME_TB_REPORT" ] || [ -z "$REGIME_TB_WATCH" ]; then
-  echo "error: cannot read the fleet regime floor — fleet-cost-report.sh gives '${REGIME_TB_REPORT}' and watch-truncation.sh gives '${REGIME_TB_WATCH}'. The report side is read from its FLEET_REGIME_TB default literal; the watcher side is read from a clamp-bucket boundary that must carry this guard's label anchor '300K-clamp' (the shape is '\"300K-clamp...\" if N <= tb < M'), so a renamed or re-labelled bucket reads as unreadable here. The reserve cannot be asserted as a derived relation, and an underivable floor must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)." >&2
-  exit 2
-fi
-# AMBIGUITY is a refusal, not a pick. A bare `head -1` would silently resolve the floor by SOURCE
-# ORDER. The hazard is a SECOND statement the label anchor also matches — a re-labelled band, a
-# duplicated boundary. An unlabelled `if N <= tb <` line cannot match this pattern at all, because
-# the anchor is the label. An ambiguous derivation is not a derivation.
-REGIME_TB_REPORT_N="$(printf '%s\n' "$REGIME_TB_REPORT_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
-REGIME_TB_WATCH_N="$(printf '%s\n' "$REGIME_TB_WATCH_ALL" | sed '/^$/d' | wc -l | tr -d ' ')"
-if [ "$REGIME_TB_REPORT_N" != "1" ] || [ "$REGIME_TB_WATCH_N" != "1" ]; then
-  echo "error: the fleet regime floor is AMBIGUOUS in the instruments (fleet-cost-report.sh: ${REGIME_TB_REPORT_N} match(es): $(printf '%s' "$REGIME_TB_REPORT_ALL" | tr '\n' ' '); watch-truncation.sh: ${REGIME_TB_WATCH_N} match(es): $(printf '%s' "$REGIME_TB_WATCH_ALL" | tr '\n' ' ')) — exactly one statement per instrument is required, so the floor cannot be derived by source order" >&2
+# read_regime_floor_by_execution <instrument> — ask the instrument for its floor.
+# Mirrors `patch-pi-retry.sh --cap`: the shell that owns the value is the one
+# that answers, so no later assignment, `declare`, or chained second assignment
+# can make the answer differ from the behaviour. `FLEET_REGIME_TB` is unset for
+# the call (see above). A non-zero exit or a non-integer answer is fail-closed:
+# this echoes the reason and returns 1, so a caller must not read it as a floor.
+read_regime_floor_by_execution() {
+  local instrument="$1" answer rc
+  answer="$(env -u FLEET_REGIME_TB bash "$instrument" --print-regime-floor 2>&1)"
+  rc=$?
+  case "$answer" in
+    ''|*[!0-9]*) printf 'did not print a plain integer (got %s, rc=%s)' "'$answer'" "$rc"; return 1 ;;
+  esac
+  # A non-zero exit is NOT tolerated even when a valid-looking integer came back:
+  # a script that reports one value and then fails is not one whose answer can be
+  # trusted.
+  if [ "$rc" -ne 0 ]; then
+    printf 'exited non-zero (rc=%s, printed %s)' "$rc" "'$answer'"; return 1
+  fi
+  printf '%s' "$answer"
+}
+REGIME_TB_REPORT="$(read_regime_floor_by_execution "$ROOT/scripts/fleet-cost-report.sh")"; REGIME_TB_REPORT_RC=$?
+REGIME_TB_WATCH="$(read_regime_floor_by_execution "$ROOT/scripts/watch-truncation.sh")"; REGIME_TB_WATCH_RC=$?
+if [ "$REGIME_TB_REPORT_RC" -ne 0 ] || [ "$REGIME_TB_WATCH_RC" -ne 0 ]; then
+  echo "error: cannot read the fleet regime floor by EXECUTION — fleet-cost-report.sh --print-regime-floor ${REGIME_TB_REPORT} (rc=$REGIME_TB_REPORT_RC); watch-truncation.sh --print-regime-floor ${REGIME_TB_WATCH} (rc=$REGIME_TB_WATCH_RC). Both instruments must expose --print-regime-floor and answer with a bare integer; a non-zero exit or a non-integer answer is fail-closed. The reserve cannot be asserted as a derived relation, and an underivable floor must not read green (fail-closed; not covered by COST_CLAMP_OVERRIDE=1)." >&2
   exit 2
 fi
 if [ "$REGIME_TB_REPORT" != "$REGIME_TB_WATCH" ]; then
   echo "error: the fleet regime floor disagrees between the instruments: fleet-cost-report.sh says $REGIME_TB_REPORT, watch-truncation.sh says $REGIME_TB_WATCH — the reserve cannot derive a floor the instruments disagree on" >&2
-  exit 2
-fi
-# A band the watcher can never place a record in is not a floor. `lower < upper` is the coherence
-# the capture above makes checkable; an empty or inverted band fails closed (exit 2) rather than
-# certifying a floor no record can reach.
-REGIME_TB_WATCH_HIGH="$(printf '%s\n' "$REGIME_TB_WATCH_HIGH_ALL" | sed '/^$/d' | head -1)"
-if [ -z "$REGIME_TB_WATCH_HIGH" ] || [ "$REGIME_TB_WATCH" -ge "$REGIME_TB_WATCH_HIGH" ]; then
-  echo "error: the watcher's clamp-bucket band is empty or inverted (floor $REGIME_TB_WATCH, ceiling ${REGIME_TB_WATCH_HIGH:-<unreadable>}) — the guard cannot derive a floor the watcher never bands on" >&2
   exit 2
 fi
 FLEET_REGIME_TB="$REGIME_TB_REPORT"
