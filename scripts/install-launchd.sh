@@ -118,14 +118,23 @@ resolve_env() {
 # tools they use. The LOGICAL path is kept so the version-independent pi symlink is not pinned.
 # An entry that does not resolve is dropped too — launchd cannot resolve a tool from it.
 launchd_path() {
-    local out="" p phys
+    local out="" p phys glob_was_off=0
     local IFS=:
+    # ⛔ A PATH entry is a path, never a glob pattern (review D3). `for p in $PATH` splits on IFS=:
+    # as intended, but it ALSO pathname-expands each entry, so an entry containing `*`/`?`/`[...]`
+    # was silently expanded into whatever it matched (`/a*` → `/aa:/ab`) or dropped when it matched
+    # nothing — a job PATH the installer's own shell never had. The base renderer substituted the
+    # QUOTED `$PATH`, so this expansion arrived with this helper; suppress it here rather than
+    # relying on the caller's `set -f`, and restore the caller's own setting on the way out.
+    case "$-" in *f*) glob_was_off=1 ;; esac
+    set -f
     for p in $PATH; do
         case "$p" in "") continue ;; esac
         phys="$(cd "$p" 2>/dev/null && pwd -P)" || continue
         case "$phys" in */shims | */shims/*) continue ;; esac
         out="${out:+$out:}$p"
     done
+    [ "$glob_was_off" = 1 ] || set +f
     printf '%s' "$out"
 }
 

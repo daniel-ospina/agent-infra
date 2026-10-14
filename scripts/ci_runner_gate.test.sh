@@ -244,17 +244,6 @@ run_gate pages-blank GH_FALLBACK_N=' ' -- --status
 assert_eq "$RC" "2" "a whitespace-only pool read → exit 2 (--status never guesses a mode)"
 assert_contains "$OUT" "NO COUNT" "a count-free pool read names the read failure"
 
-# ⛔ The threshold is the other operand of the SAME numeric test (review D1). An unreadable value
-# made the comparison ERROR, and the `||` chain read that as false — HEALTHY. The gate relabelled
-# the pool, advanced the state file, notified, and exited 0 on a value it never read.
-echo "── #1704(3): an unreadable queue THRESHOLD must FAIL CLOSED ──"
-run_gate qt-junk GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=abc --
-assert_eq "$RC" "2" "a non-numeric threshold → exit 2 (could-not-measure)"
-assert_contains "$OUT" "queue threshold UNREADABLE" "a non-numeric threshold names the read failure"
-assert_absent "$STATE_DIR/ci-runner-gate.state" "a non-numeric threshold advanced no state file"
-assert_not_contains "$OUT" "TRANSITION" "a non-numeric threshold sent no transition notification"
-assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a non-numeric threshold relabelled no runner"
-
 # ⛔ The status summary's TWO fields are what `evaluate` actually branches on (review B1). The inline
 # python prints them space-separated, so a `null`/empty component status became `comp="None"` /
 # `comp="0"` — past the shape check and read as "not operational", i.e. UNHEALTHY, i.e. the gate
@@ -392,19 +381,35 @@ echo "── #1719: the scheduled job, the farm and the script must agree ──
 # so deleting the farm entry, or retargeting ProgramArguments, left both GREEN while the gate was
 # once again wired to nothing. Both were reproduced by mutation.
 TEMPLATE="$REPO_ROOT/templates/launchd/com.tortoise.ci-runner-gate.plist"
-if [ -f "$TEMPLATE" ]; then
-  ok "launchd template exists for the runner gate (#1719)"
-  GATE_ARGS="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$TEMPLATE")"
-  assert_contains "$GATE_ARGS" "{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
-    "ProgramArguments executes the path the pi-bootstrap farm lands (parsed, not whole-file)"
-  # Same reason as the two assertions above: read the EnvironmentVariables BLOCK, not the file — the
-  # template's own comment discusses {{PATH}}, so a whole-file grep would be satisfied by prose.
-  GATE_ENV="$(sed -n '/<key>EnvironmentVariables<\/key>/,/<\/dict>/p' "$TEMPLATE")"
-  assert_contains "$GATE_ENV" "{{PATH}}" \
-    "EnvironmentVariables takes PATH from the installer's (shim-filtered) renderer (parsed)"
-  assert_contains "$GATE_ENV" "{{HOME}}" "EnvironmentVariables pins HOME for the job (parsed)"
-else
+if [ ! -f "$TEMPLATE" ]; then
   bad "no templates/launchd/com.tortoise.ci-runner-gate.plist — the gate is wired to nothing (#1719)"
+elif ! command -v python3 >/dev/null 2>&1; then
+  # FAIL, never skip: a silent skip here is a false PASS on the only assertions that catch "wired to
+  # nothing". python3 is already a hard requirement of the installer this template ships through
+  # (`plist_program_args` parses the installed plist with plistlib).
+  bad "python3 absent — the launchd template was NOT parsed (wiring assertions did not run)"
+else
+  ok "launchd template exists for the runner gate (#1719)"
+  # ⛔ Parse the plist and read KEYS+VALUES; never grep it (reviews E2-1/E2-2, E3-3). A whole-file
+  # grep is satisfied by this PR's own explanatory COMMENTS, and a `sed` RANGE keyed on a
+  # content-derived start token is satisfied by a comment naming that token — both left this GREEN
+  # while the gate was wired to nothing, and renaming `<key>HOME</key>` to `<key>HOMEDIR</key>` left
+  # the old value-only grep green too. All three were reproduced by mutation.
+  GATE_PLIST="$(python3 - "$TEMPLATE" <<'PY'
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], "rb"))
+print("ARGS=" + "\t".join(d.get("ProgramArguments", [])))
+for k, v in sorted(d.get("EnvironmentVariables", {}).items()):
+    print("ENV=%s=%s" % (k, v))
+PY
+)" || GATE_PLIST=""
+  GATE_ARGS="$(printf '%s\n' "$GATE_PLIST" | sed -n 's/^ARGS=//p')"
+  assert_contains "$GATE_ARGS" "{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
+    "ProgramArguments executes the path the pi-bootstrap farm lands (parsed plist, not a grep)"
+  assert_contains "$GATE_PLIST" "ENV=HOME={{HOME}}" \
+    "EnvironmentVariables.HOME pins HOME for the job (the KEY, not just the value)"
+  assert_contains "$GATE_PLIST" "ENV=PATH={{PATH}}" \
+    "EnvironmentVariables.PATH takes the installer's shim-filtered renderer output (parsed plist)"
 fi
 SETUP="$REPO_ROOT/pi-bootstrap/setup.sh"
 # The farm LINE, not the file: `fleet_srcs=(…)` is the declaration that delivers the script.

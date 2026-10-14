@@ -130,6 +130,12 @@ mkfakehome() { # $1 = home dir
     # Without escaping, `render` turns it into a corrupted entry with a literal {{PATH}} left in the
     # middle of it, and nothing downstream notices (verify_targets inspects ProgramArguments only).
     mkdir -p "$1/.pi/agent/r&d"
+    # #1719 (review D3) — a PATH entry carrying a GLOB character. `for p in $PATH` splits on IFS=: as
+    # intended, but it ALSO pathname-expands each entry, so `.../globs/a*` was silently rewritten as
+    # the entries it matched — a job PATH the installer's own shell never had, and no test noticed.
+    # Two real dirs exist so an expansion has something to match; the assertion below reads the
+    # RENDERED PATH and fails if either fabricated entry appears.
+    mkdir -p "$1/.pi/agent/globs/aa" "$1/.pi/agent/globs/ab"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -184,7 +190,7 @@ run_installer() { # <home> [extra env assignments...]
         # PATH assertion below would be vacuous). A SYMLINK to it and the real-binary dir
         # (~/.pi/agent/bin, holding fd/rg) are on PATH too: the first must be dropped by physical
         # path, the second must be KEPT (review E2).
-        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$PATH"
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$HOME/.pi/agent/r&d:$HOME/.pi/agent/globs/a*:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -294,17 +300,45 @@ assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a 
 assert_contains "$GATE_PATH_VAL" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
 assert_not_contains "$GATE_PATH_VAL" "{{PATH}}" "no placeholder survives into the rendered PATH value (review D2-3)"
 assert_contains "$GATE_PATH_VAL" "r&amp;d" "a PATH entry containing & is XML-escaped in the rendered value (sed replacement escaped, review D2-3)"
+# #1719 (review D3) — a PATH entry containing a GLOB character must reach the plist UNEXPANDED.
+assert_not_contains "$GATE_PATH_VAL" "globs/aa" "a glob-char PATH entry is not expanded into its matches (review D3)"
+assert_not_contains "$GATE_PATH_VAL" "globs/ab" "…nor into its second match (review D3)"
 
-# #1719 (review D3) — the guard that refuses a template whose rendered PATH came out EMPTY. It is
-# only reachable when `launchd_path` filters everything away, which cannot happen while the installer
-# itself needs a working PATH (sed/grep/mktemp must resolve) — so it is pinned STATICALLY rather than
-# by an installer run: deleting the guard is what this catches, and the honest bound is recorded
-# here instead of a test that would have to fake the installer's own PATH to fire.
-if grep -q "unresolved placeholder(s) {{PATH}}" "$INSTALLER"; then
-  ok "installer refuses to install a job whose rendered PATH is empty (review D3)"
-else
-  bad "the empty-rendered-PATH guard is gone — a filtered-away PATH would install an inert job (review D3)"
-fi
+# #1719 (review D3, run as a RUN not a grep — review E3-5 corrected the earlier claim) — the guard
+# that refuses a job whose rendered PATH came out EMPTY. It IS dynamically reachable: with PATH
+# pointing ONLY at a directory literally NAMED `shims`, every entry is filtered by PHYSICAL path while
+# the installer's own `sed`/`grep`/`mktemp` still resolve THROUGH that directory (they are symlinks
+# inside it) — so `launchd_path` is empty for every {{PATH}} template and the guard must fire. The
+# earlier version of this pin grepped the installer for the guard's MESSAGE, which a deleted guard
+# would satisfy for as long as the string remained anywhere in the file, and it justified the grep
+# with the false claim that the guard could never be reached.
+HOME_GUARD="$T/home-guard"; mkfakehome "$HOME_GUARD"
+SHIMONLY="$T/shimonly/shims"; mkdir -p "$SHIMONLY"
+for tool in bash sh sed grep mktemp cmp cat dirname basename mkdir rm mv chmod awk tr cut head sort stat id; do
+    src="$(command -v "$tool" 2>/dev/null)" || continue
+    ln -sfn "$src" "$SHIMONLY/$tool"
+done
+ln -sfn "$T/bin/launchctl" "$SHIMONLY/launchctl"
+LOG_GUARD="$T/launchctl-emptypath.log"; : > "$LOG_GUARD"
+set +e
+OUT="$(HOME="$HOME_GUARD" PATH="$SHIMONLY" FAKE_LAUNCHCTL_LOG="$LOG_GUARD" \
+    TEMPLATES_DIR="$TEMPLATES" AGENTS_DIR="$HOME_GUARD/Library/LaunchAgents" \
+    AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" TORTOISE_REPO="$HOME_GUARD/tortoise" \
+    SWARM_ROOT="$HOME_GUARD/swarm" PYTHON_BIN="$HOME_GUARD/swarm/.venv/bin/python" \
+    ELDATO_ALLOW_TEST_HOME=1 bash "$INSTALLER" 2>&1)"
+RC=$?
+set -e
+assert_eq "$RC" "0" "an all-shim PATH is a clean SKIP, not a failure (exit 0)"
+assert_contains "$OUT" "SKIP com.tortoise.ci-runner-gate: unresolved placeholder(s) {{PATH}} — every PATH entry is unreadable" \
+  "the empty-rendered-PATH guard FIRES (review D3) — a filtered-away PATH never installs an inert job"
+[ ! -f "$HOME_GUARD/Library/LaunchAgents/com.tortoise.ci-runner-gate.plist" ] \
+  && ok "no runner-gate plist installed while every rendered PATH was empty" \
+  || bad "the runner-gate plist WAS installed with an empty PATH (the guard did not fire)"
+# Positive control — the one template with no {{PATH}} must still install through the SAME run, or
+# the two assertions above could pass because the run did nothing at all.
+[ -f "$HOME_GUARD/Library/LaunchAgents/com.eldato.corruption-canary.plist" ] \
+  && ok "control: the {{PATH}}-free canary still installs in that run (the guard is scoped to {{PATH}})" \
+  || bad "control: the canary did not install — that run proved nothing about the PATH guard"
 assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from

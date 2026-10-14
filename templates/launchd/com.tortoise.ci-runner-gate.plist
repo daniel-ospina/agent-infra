@@ -36,8 +36,10 @@
          ~/.pi/agent/state/ci-runner-gate.log and tees the same lines to stderr,
          so a launchd capture would be a byte-identical SECOND, uncapped copy of
          the same lines (the script already mkdir -p's its state dir, so the log
-         always lands). The three sibling self-logging jobs omit the keys for the
-         same reason - an unbounded launchd capture is the twin of the
+         always lands). Three of the four sibling self-logging jobs omit the keys
+         for the same reason (com.eldato.lane-liveness, com.eldato.pi-session-reaper,
+         com.tortoise.worktree-reaper - the fourth, com.eldato.pi-task-session-prune,
+         omits them silently); an unbounded launchd capture is the twin of the
          symlink-truncation surface they guard. -->
     <key>Label</key>
     <string>com.tortoise.ci-runner-gate</string>
