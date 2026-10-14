@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
+import { redactCommand } from "../shared/redact-command.js";
 // #966: the command parsers are ONE copy shared with review-enforcer, in
 // extensions/shared/ — the two extensions carried private copies that silently
 // drifted (and asserted opposite answers for the same input). Kept in shared/
@@ -867,14 +868,10 @@ function isCrossRepo(cwdRepo: string | null, explicitRepo: string | null): boole
   return !!explicitRepoN && !!cwdRepoN && explicitRepoN !== cwdRepoN;
 }
 
-// Redact credentials from a command before it hits the audit log (the audit
-// files are world-readable — an inlined GH_TOKEN=… must never persist).
-function redactCommand(command: string): string {
-  return command
-    .replace(/\b(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
-    .replace(/ghp_[A-Za-z0-9]+/g, "ghp_***")
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
-}
+// Redaction moved to the shared seam when `review-enforcer` began writing the same
+// `command` field into the same JSONL stream (#1492) — one helper, so the two gates'
+// redaction cannot drift (#966). The rule it enforces: the audit files are
+// world-readable, so an inlined `GH_TOKEN=…` must never persist.
 
 // #472: shared gate_skip audit — field shape identical to the #204 merge-scope
 // skip (:1105) so all skip surfaces stay audit-synced (#60).
@@ -891,6 +888,9 @@ const MERGE_SCOPE_DECISION_REASONS = [
 const GATE_SKIP_REASONS = [
   "push_range_empty",
   "delete_push_no_content",
+  // #7526: every routed candidate is a `D` row (or a per-arm deletion
+  // exclusion emptied them) — nothing has post-commit content to hash.
+  "deletion_only_no_content",
   "content_shape_exempt",
   // #3716 — a push whose remote-tracking ref is no longer an ancestor of the
   // pushed tip rewrites history: the scope moves to the branch's own diff
@@ -2433,6 +2433,11 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
   // Multi-refspec union: files dedup, renameOldPaths dedup, clean = AND over
   // the refspec parses (mixed-union rule).
   const union: DiffScope = { files: [], renameOldPaths: [], clean: true };
+  // #7526: the union of per-refspec LIVE files (`files` minus that refspec's
+  // `deleted`). The rebuild below excludes a deletion from the result only when
+  // no refspec contributes the path live — see `combineScopes` for the rule and
+  // the P0/P1 it settles.
+  const unionLiveFiles: string[] = [];
   let sawTierA = false;
   // #3716 — op-level provenance for the empty-range audit below: a rewrite push
   // whose narrowed range is empty is NOT an up-to-date push, and must not be
@@ -2632,9 +2637,20 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
       srcRef: srcRef ?? undefined,
       trackingRef: tracking,
     });
+    // #7526: `files` unions the refspecs' files PLAINLY — the deletion exclusion
+    // must NOT be subtracted here, or `applyScopeGate` (fed the rebuilt `files`
+    // below) stops seeing a deleted non-exempt path and the content-shape
+    // exemption widens (#7526 P1). The exclusion rides on the rebuilt `deleted`
+    // instead, filtered to paths no refspec contributes live: origin/A..A
+    // deletes `f.ts` while origin/B..B modifies it ⇒ `f.ts` stays a candidate
+    // (the #7526 P0).
     union.files.push(...subbed.files);
     union.renameOldPaths.push(...subbed.renameOldPaths);
     union.clean = union.clean && subbed.clean;
+    if (subbed.deleted !== undefined) {
+      union.deleted = [...(union.deleted ?? []), ...subbed.deleted];
+    }
+    unionLiveFiles.push(...verificationCandidates(subbed.files, subbed.deleted));
     if (subbed.subtractions !== undefined) {
       union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
     }
@@ -2689,12 +2705,17 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
   // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
-  // is therefore carried explicitly and null-safely.
+  // and the #7526 `deleted` projection are therefore carried explicitly and
+  // null-safely. `deleted` is the union of the refspecs' deletions MINUS the
+  // paths any refspec contributes live (absent, never `[]`, when it is empty).
+  const unionLive = new Set(unionLiveFiles);
+  const deleted = Array.from(new Set(union.deleted ?? [])).filter((p) => !unionLive.has(p));
   emitPendingRewrites();
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
     clean: union.clean,
+    ...(deleted.length > 0 ? { deleted } : {}),
     ...(union.subtractions !== undefined && union.subtractions.length > 0
       ? { subtractions: union.subtractions }
       : {}),
@@ -2723,6 +2744,20 @@ export interface DiffScope {
    *  nothing was subtracted. `combineScopes` concatenates it and reads nothing
    *  else, so `DiffScope`-shaped literals without the key stay valid. */
   subtractions?: SubAudit[];
+  /** #7526: paths whose row letter is `D` — the verify path's DELETION
+   *  exclusion. A `D` row has no post-commit content, so "verify this path"
+   *  has no referent: the verify path subtracts this set from `files` before
+   *  hashing (a deletion-only change therefore verifies nothing and is
+   *  allowed). This is a SEPARATE projection, NOT a filter of the parser's
+   *  faithful output — `files` still carries every `D` path (the G1 pin
+   *  requires it). ABSENT (never `[]`) when nothing was deleted, so the
+   *  whole-object `deepEqual` pins on `parseDiffNameStatus...` are unchanged.
+   *  A COMBINED scope (`combineScopes`, the push union) keeps `files` as the
+   *  PLAIN union (so `applyScopeGate` still sees every `D` path) and carries
+   *  only the deletions NO arm/refspec contributes as a live file — subtracting
+   *  the union globally would let one arm's `D` erase another arm's live path
+   *  (the #7526 P0). */
+  deleted?: string[];
 }
 
 // Pure `--name-status -z` parser. Row grammar (byte-exact, verified against
@@ -2742,9 +2777,12 @@ export interface DiffScope {
 // semantics (documented residual, #559 plan §1); only a NUL-stream anomaly is
 // newly fail-closed.
 export function parseDiffNameStatus(output: string): DiffScope {
-  // Thin wrapper — the seven G1 full-object deepEqual pins compare `.scope`, so
-  // splitting the parser must not change the returned object's shape.
-  return parseDiffNameStatusDetailed(output).scope;
+  // Thin wrapper — the G1 full-object deepEqual pins compare the WHOLE returned
+  // object, so this wrapper keeps its exact pre-#7526 shape: the #7526 `deleted`
+  // projection is a DETAILED-parse extra and is dropped here. Splitting the
+  // parser must never change this object's shape.
+  const { deleted: _deleted, ...scope } = parseDiffNameStatusDetailed(output).scope;
+  return scope;
 }
 
 /** #755 — the same parse, plus the per-path STATUS map the eligibility rule
@@ -2809,7 +2847,18 @@ export function parseDiffNameStatusDetailed(output: string): {
       i++;
     }
   }
-  return { scope: { files, renameOldPaths, clean }, statuses };
+  // #7526: the deletion projection, derived from the SAME status map the
+  // subtraction rule reads (never re-derived from the raw stream — a second
+  // parse could drift). Keyed off the map, so a repeated path is reported once
+  // and an anomaly's partial map yields a partial (never fabricated) set; the
+  // parse-block runs first, so a partial set is never consulted.
+  const deleted = [...statuses.entries()].filter(([, letter]) => letter === "D").map(([path]) => path);
+  return {
+    scope: deleted.length > 0
+      ? { files, renameOldPaths, clean, deleted }
+      : { files, renameOldPaths, clean },
+    statuses,
+  };
 }
 
 function execDiffStatusZ(cwd: string, cmd: string): string | null {
@@ -2826,10 +2875,43 @@ function execDiffStatusZ(cwd: string, cmd: string): string | null {
 // clean AND over the members). Pure + exported (unit-pinned — the mixed arm's
 // combination rule is otherwise comment-only).
 export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
+  // #7526: `files` is the PLAIN union of the arms' `files` — deliberately NOT
+  // pre-filtered by each arm's `deleted`. `applyScopeGate` (the content-shape
+  // exemption and the rename-source conjunction) consumes this set and must see
+  // every path, including `D` rows, exactly as a single-arm scope does. Dropping
+  // a deleted path HERE widens the exemption: a `D src/app.ts` (non-exempt code)
+  // + `A docs/code.md` change would present only the exempt path and route
+  // `exempt-allow` instead of `verify` — code moved into a docs-shaped path ships
+  // unverified (#7526 P1, introduced by subtracting per arm in 532ee59).
+  //
+  // The deletion exclusion is instead carried on the result's `deleted`, and
+  // ONLY for paths that no arm contributes as a LIVE file:
+  //   deleted_combined = (a.deleted ∪ b.deleted) \\ (live(a) ∪ live(b))
+  // where live(x) = x.files \\ x.deleted. A path may be excluded from
+  // verification only if EVERY arm that lists it in `files` also lists it in
+  // `deleted`; if any arm contributes it live, it must stay a candidate (the
+  // #7526 P0: `D f.ts` on one arm + `A f.ts` on another must still verify).
+  // Subtraction is then safe at the consumer, because no arm contributes the
+  // path as live content.
+  //
+  // `renameOldPaths` is deliberately NOT treated this way: it is an auxiliary
+  // R/C-SOURCE set consumed by the shape-exemption CONJUNCTION, not a projection
+  // subtracted from `files`, and one path carries one row letter — a `D` path can
+  // never be an R/C source — so unioning it unchanged is the existing (and
+  // correct) semantics.
+  const live = new Set([
+    ...verificationCandidates(a.files, a.deleted),
+    ...verificationCandidates(b.files, b.deleted),
+  ]);
+  const deleted = Array.from(new Set([...(a.deleted ?? []), ...(b.deleted ?? [])]))
+    .filter((p) => !live.has(p));
   const core: DiffScope = {
     files: Array.from(new Set([...a.files, ...b.files])),
     renameOldPaths: Array.from(new Set([...a.renameOldPaths, ...b.renameOldPaths])),
     clean: a.clean && b.clean,
+    // Absence-preserving (never `[]`) — the G4 whole-object literals carry no
+    // `deleted`, mirroring the `subtractions` contract.
+    ...(deleted.length > 0 ? { deleted } : {}),
   };
   // #755: concatenate the per-arm subtraction audits, null-safely AND
   // absence-preservingly — `[...a.subtractions, ...]` would throw
@@ -3080,6 +3162,33 @@ export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeG
     case "verify":
       return { action: "verify", files };
   }
+}
+
+/** #7526 — the verify path's candidate set: the routed `files` MINUS the
+ *  scope's `deleted` projection. A `D` row has no post-commit content, so
+ *  there is nothing for a verifier to hash; asking for one would make the gate's
+ *  cost scale with the number of files a change REMOVES (the report: 2,259
+ *  untracked vendored files → 2,259 "unverified" entries). A deletion-only
+ *  change filters to EMPTY — nothing to verify, so the caller allows it via the
+ *  same empty-allow posture as a genuinely empty diff.
+ *
+ *  This is the DECISION point, deliberately downstream of `applyScopeGate`:
+ *  the parser and the gate's parse-block / empty / exemption / rename-source
+ *  routing still see every path, and `A`/`M`/`R`/`T`/`U`/`X`/`B` pass through
+ *  untouched. Pure + exported so the decision is unit-pinned — a regression
+ *  cannot silently re-add a deleted path to the candidate set. `combineScopes`
+ *  and the push union also call it to compute an arm's LIVE files (that arm's
+ *  `files` minus its `deleted`), which is what lets them keep `files` a plain
+ *  union while still excluding a path every arm deleted.
+ *
+ *  Note: for a plain staged deletion (`git rm`) the worktree path is already
+ *  absent, so the loop's #920 ENOENT skip reached the same outcome; this
+ *  exclusion is what also covers the UNTRACK case (`git rm --cached`), where
+ *  the file is still on disk but no longer committed. */
+export function verificationCandidates(files: string[], deleted: readonly string[] | undefined): string[] {
+  if (deleted === undefined || deleted.length === 0) return files;
+  const deletedSet = new Set(deleted);
+  return files.filter((f) => !deletedSet.has(f));
 }
 
 /**
@@ -3972,9 +4081,27 @@ export default function (pi: ExtensionAPI) {
 
     // verify path — renameOldPaths never reach verify/hash/naming (consumed
     // only by the gate); changedFiles stays the new-path projection.
-    const changedFiles = route.files;
+    //
+    // #7526: DELETED paths are subtracted HERE — the DECISION point — never in
+    // the parser (`files` must remain the faithful projection; the G1 pin
+    // requires a `D` path to stay in it) and never in the parse-block / empty /
+    // exemption routing above (all of which still see every path). A `D` row has
+    // no post-commit content: an untracked file is no longer committed, so
+    // requiring a verifier hash for it has no referent. A deletion-only change
+    // filters to empty and is allowed exactly like the empty-allow route —
+    // nothing to verify.
+    const changedFiles = verificationCandidates(route.files, scope.deleted);
     if (changedFiles.length === 0) {
-      // (unreachable — empty-allow handled above; defensive)
+      // #7526: reachable when EVERY candidate is deleted (deletion-only
+      // change) — nothing to verify, allow. (Also the defensive empty case for
+      // the verify route: empty-allow was handled above.)
+      // Audited like the sibling allow classes (`delete_push_no_content`,
+      // `content_shape_exempt`): a non-empty routed set that filters to empty
+      // was a deletion-only skip — never a silent allow. The defensive
+      // empty-route case (`route.files` already empty) emits nothing.
+      if (route.files.length > 0) {
+        logGateSkip("deletion_only_no_content", command, cwd, { files: route.files });
+      }
       return undefined;
     }
 

@@ -682,7 +682,12 @@ def decide(
 
     Rules, in order — each one closes a declared class:
 
-    * id unknown to main's measurement -> **BLOCK** (no evidence of pre-existence).
+    * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
+      The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
+      makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
+      Calling it "no main-side measurement" asserted main never ran the file, false
+      whenever main's shards cover it (tortoise #7734); claiming novelty asserts the
+      opposite of what the same baseline can know.
     * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
       main also failed; same id is not same failure).
     * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
@@ -762,9 +767,28 @@ def decide(
             continue
 
         if mr is None:
+            # ABSENT-FROM-MAIN, not UNMEASURED (tortoise #7734). This reason used to
+            # read "no main-side measurement", which asserts main never ran the file.
+            # That is FALSE whenever main runs it and the test PASSES: the baseline is
+            # FAILURE-ONLY, so a passing test leaves no row — and main's own shard
+            # artifacts (`expected-nodeids.txt`) show it running the very files the old
+            # wording called unmeasured (98/41/23/12 of the blocked nodeids across four
+            # shards, for the four PRs #7734 names).
+            #
+            # It must NOT over-correct into the OPPOSITE claim either. "New here" is
+            # equally unsupported: this branch also fires for `guard-step::` /
+            # `collect-error::` / `watchdog-kill::` / `job-unreadable::` ids, for which a
+            # pytest nodeid manifest is no evidence at all, and the B1 case (main's
+            # docker lane vs a PR's embedded lane) reaches `mr is None` precisely because
+            # the two lanes run different files. So the reason asserts only what the
+            # baseline actually knows: main is not red for this id, and a failure-only
+            # baseline cannot tell "green on main" from "never run on main". THAT is
+            # why it blocks — not because novelty, nor measurement, was established.
             decision.blocked.append(Verdict(
                 nodeid, True,
-                f"no main-side measurement (PR {pr.rate}) — NOT exempt"))
+                f"absent from main's failure set (PR {pr.rate}) — main is not red for "
+                "this id, and a FAILURE-ONLY baseline cannot tell 'green on main' from "
+                "'never run on main', so absence is NOT evidence of novelty — not exempt"))
             continue
 
         if not _signatures_overlap(pr.signatures, sig_main.get(nodeid, frozenset())):
@@ -1178,12 +1202,22 @@ _GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
 _GUARD_INT_RE = re.compile(r"\b\d+\b")
 
 
-#: A NON-NODEID failure key (#6798) — the third family the rate/row doors must
+#: A NON-NODEID failure key (#6798, #7131) — the families the rate/row doors must
 #: admit. ANCHORED and fully enumerated: this predicate is the gate on main's own
 #: rate table, so admitting a loose string here is a false-EXEMPTION vector, not
 #: a formatting nicety.
+#:
+#: `job-unreadable::<slug>` (#7131) is the JOB-LEVEL fallback the producer emits
+#: when GitHub has PRUNED a failing run's log — the test-level identity does not
+#: exist anywhere, so the run is attributed at job granularity instead of being
+#: refused as unknowable. It carries NO signature, which is what keeps it safe:
+#: the signature gate fails CLOSED on an empty overlap, so a job-level key can
+#: never buy an exemption — it converts an unreadable refusal into a named,
+#: attributable block. The slug charset is exactly `_slug`'s, so the key stays
+#: whitespace-free for the `uniq -c | awk` rate table.
 _NON_NODEID_KEY_RE = re.compile(
-    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py)$"
+    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+)$"
 )
 
 
