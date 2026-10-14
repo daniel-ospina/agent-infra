@@ -800,7 +800,8 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
 
@@ -812,7 +813,8 @@ run_admin() {
 # assert on the rail's own output use this.
 run_admin_here() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -1723,7 +1725,7 @@ for mode in main-union commit; do
 echo "== 5l ($mode). an unreadable log still fails closed on collect_union =="
 new_scen "union-$mode"
 if [ "$mode" = "commit" ]; then
-  sha='aa5511000000000000000000000000000000000'
+  sha='aa55110000000000000000000000000000000000'
   lane_fail "$sha" 8802 > "$SCEN/runs-$sha"
   : > "$SCEN/fail-log-8802"          # log unreadable ...
   printf '3\n' > "$SCEN/jobs-count-8802"   # ... and the run DID have jobs
@@ -1779,7 +1781,7 @@ printf '3\n' > "$SCEN/jobs-count-8803"   # the run DID have jobs
 # `--commit-rows` -> collect_union_rows (the PR-side input). There is no
 # `--main-union-rows`; naming a mode the CLI does not have exits 2 on USAGE and
 # would have passed this test vacuously — asserted below.
-sha8803='aa5511000000000000000000000000000000000'
+sha8803='aa55110000000000000000000000000000000000'
 lane_fail "$sha8803" 8803 > "$SCEN/runs-$sha8803"
 cfs_run --main-union-signatures 10 --repo test-org/test-repo \
   --runs-report "$TMP/zl-sig-rep.txt" --provenance "$TMP/zl-sig-prov.txt"
@@ -1803,7 +1805,7 @@ rc=$?
 # merged, with a new message. This scenario is the one that catches it.
 echo "== #6798. a non-nodeid-only failing run must be EXTRACTED (both doors) =="
 new_scen nonnodeid
-sha_kill='aa6798000000000000000000000000000000000'
+sha_kill='aa67980000000000000000000000000000000000'
 printf '%s\n' "$sha_kill" > "$SCEN/head"
 lane_fail "$sha_kill" 6798 > "$SCEN/runs-$sha_kill"
 # The record's ONLY evidence is the watchdog banner: a genuine SIGKILL (rc=137)
@@ -1835,7 +1837,7 @@ fi
 # that was NOT killed must STILL refuse. If this scenario starts passing, the
 # change has opened the hole #6798 was mis-diagnosed against.
 new_scen nonnodeid-refuse
-sha_plain='aa6799000000000000000000000000000000000'
+sha_plain='aa67990000000000000000000000000000000000'
 printf '%s\n' "$sha_plain" > "$SCEN/head"
 lane_fail "$sha_plain" 6799 > "$SCEN/runs-$sha_plain"
 printf 'test (h)\tRun fast test suite\t2026-10-01T03:00:00.0000000Z ImportError: no module named y\n' > "$SCEN/log-6799"
@@ -1857,7 +1859,7 @@ fi
 # granularity from the jobs API instead of refusing.
 echo "== #7131. a PRUNED log falls back to the JOB-LEVEL failure set =="
 new_scen pruned
-sha_pr='aa7131000000000000000000000000000000000'
+sha_pr='aa71310000000000000000000000000000000000'
 printf '%s\n' "$sha_pr" > "$SCEN/head"
 lane_fail "$sha_pr" 7131 > "$SCEN/runs-$sha_pr"
 : > "$SCEN/pruned-log-7131"                  # the log is PROVEN absent
@@ -1891,7 +1893,7 @@ grep -q 'JOB-LEVEL' "$TMP/cfs-err" \
 # there is no fallback surface left and the run must refuse exactly as before.
 echo "== #7131. pruned log AND unreadable job list → still fail-closed =="
 new_scen pruned-nojobs
-sha_pn='aa7132000000000000000000000000000000000'
+sha_pn='aa71320000000000000000000000000000000000'
 printf '%s\n' "$sha_pn" > "$SCEN/head"
 lane_fail "$sha_pn" 7132 > "$SCEN/runs-$sha_pn"
 : > "$SCEN/pruned-log-7132"                  # log pruned
@@ -1938,7 +1940,7 @@ grep -qE '^VERDICT[[:space:]]+CLEAN[[:space:]]+.*exempt=1' "$TMP/pl-dec2.out" \
 # asserts the PRODUCER's OWN row shape AND feeds that row to the real decision.
 echo "== #7131. two jobs slugging alike in ONE run must not over-count =="
 new_scen pruned-collide
-sha_pc='aa7133000000000000000000000000000000000'
+sha_pc='aa71330000000000000000000000000000000000'
 printf '%s\n' "$sha_pc" > "$SCEN/head"
 lane_fail "$sha_pc" 7133 > "$SCEN/runs-$sha_pc"
 : > "$SCEN/pruned-log-7133"
@@ -2029,7 +2031,7 @@ fi
 # when it is not. The file-keyed family must group by FILE; the environmental
 # kill, which has no file, must group by its own constant (like a guard step).
 new_scen nonnodeid-resid
-sha_ce='aa6798000000000000000000000000000000001'
+sha_ce='aa67980000000000000000000000000000000010'
 printf '%s\n' "$sha_ce" > "$SCEN/head"
 lane_fail "$sha_ce" 6798 > "$SCEN/runs-$sha_ce"
 printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/a.py - ImportError: no module named x\n' > "$SCEN/log-6798"
@@ -2400,7 +2402,201 @@ run_admin 42 --main-runs 3 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head moved" || fail "expected a non-zero exit, got 0 — the clean path merged a moved head"
 grep -q "head moved before the evidence" "$TMP/err" && pass "the block names the head move" || fail "expected the head-move reason on stderr"
+# ⛔ THE TAG'S NEGATIVE (#1690 review round 2). The whole point of `[head_unreadable]` is that
+# it is the tag the MOVED-HEAD refusals do NOT carry — otherwise `grep -F '[head_unreadable]'`
+# is not a discriminator at all. Adding it to this refusal left every unit test green (measured),
+# so the discriminating property was unpinned until this line.
+grep -qF '[head_unreadable]' "$TMP/err" && fail "a MOVED head carried the [head_unreadable] tag — the two refusals are no longer distinguishable by machine" \
+  || pass "the moved-head refusal carries no [head_unreadable] tag"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a moved head" || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# post_read_call_made — 0 when the rail made a `isDraft` probe, i.e. it CONTINUED past a
+# successful head read. The discriminator §13b/§13c/§13d/§13e rest on.
+#
+# A MISSING OR EMPTY LEDGER is a fail-open direction in a fail-closed guard, recorded here rather
+# than guarded. `post_read_call_made` returns 1 — the correct value — but at the `&& fail || pass`
+# sites (§13b/§13c/§13d) that is the PASS arm, so such a scenario reports green without ever
+# having shown the rail reached the head read. With the suite's fake `gh` in place it cannot
+# arise: the head read IS a `gh` call and `new_scen` creates the ledger, so any attempted read
+# leaves a line. It is recorded and not guarded because a third return status would put machinery
+# on the one state the harness cannot reach, and this file's standard is the LEAST machinery that
+# makes the behaviour trustworthy. (§13e inverts the arms, so it would go RED — the asymmetry is
+# right.) THE LIMIT: a rail that refused with zero `gh` invocations at all would satisfy §13b's
+# assertions on an empty ledger.
+#
+# ⛔ NO PIPE (#841) — AND THIS IS NOT A STYLE POINT. The first version of this anchor was
+# `grep 'isDraft' "$SCEN/calls" | grep -qv 'headRefOid'`, which is the `writer | grep` shape this
+# file explicitly forbids further down (see the note at the §~7000 belt: under `set -uo pipefail`
+# the upstream takes SIGPIPE and the pipeline returns 141, so at a `pipeline && fail || pass`
+# site the FAILURE ARM IS SKIPPED — a FAIL-OPEN enforcer that reports green on a regressed rail).
+# That is the precise failure these four scenarios exist to prevent, so shipping it inside them
+# would have been the joke telling itself. The repo's own `check-no-sigpipe-grep.sh` cannot see it
+# (it scans `scripts .husky pi-bootstrap` and its predicate is builtin-writer-into-quiet-grep, not
+# `grep | grep -q`). Capture-independent, per-line, pipe-free:
+post_read_call_made() {
+  local l
+  while IFS= read -r l; do
+    case "$l" in
+      *isDraft*) case "$l" in *headRefOid*) ;; *) return 0 ;; esac ;;
+    esac
+  done < "$SCEN/calls"
+  return 1
+}
+
+# ── 13b. a head READ THAT FAILS is UNREADABLE, never "moved" (#1690) ───────────
+# ⛔ THIS SCENARIO IS THE DURABLE HALF OF THE COMPOSITION PIN, AND IT EXISTS BECAUSE A
+# SOURCE SCAN IS NOT ONE. The unit suite (scripts/test_admin_merge_head.py) pins
+# `require_head` itself, and a companion test scans the rail's SOURCE for a `|| exit 1`
+# guard on each call site — but a source scan is a same-line substring match. Review
+# round 2 MEASURED four plausible shapes that all pass it with every unit test green:
+#   * the call reformatted across lines                → 12 passed
+#   * a process substitution  read -r h < <(require_head …)  → 12 passed
+#   * backticks               h=`require_head …`        → 12 passed
+#   * `|| true  # was || exit 1` (the guard in a COMMENT) → 12 passed
+# A guard that only holds for the formatting it was measured on is not a guard. Driving a REAL
+# `require_head` call site cannot be reformatted away, so that is what this does — it drives the
+# OPENING read. ⛔ IT DOES NOT REACH §4, and review round 5 MEASURED that (its ledger contains no
+# post-read call). §13e is the scenario that drives the §4 COMPARISON site; do not read this one
+# as covering it. (An earlier version of this comment claimed the §4 sites; it was false.)
+#
+# `run_admin_here` (not `run_admin`): the assertion is on the rail's OWN output, and the
+# shared `$TMP/err` can be satisfied by a STALE file from whichever scenario wrote it last.
+echo "== 13b. a head read that FAILS is UNREADABLE, never 'moved' (#1690) =="
+new_scen headunread
+# NO `head` fixture at all: the shim falls through to `exit 1`, so the read FAILS.
+# Everything AFTER the head read is made otherwise-clean, so a non-zero exit cannot be
+# earned by an unrelated refusal further down the rail.
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read FAILS" \
+  || fail "expected a non-zero exit, got 0 — an UNREADABLE head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ failed" \
+  || fail "expected the unreadable-head refusal on stderr, got: $(head -c 200 "$SCEN/err")"
+grep -qF '[head_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [head_unreadable] on the refusal line"
+# ⛔ THE DISCRIMINATOR — AND THE REASON THE ASSERTIONS ABOVE ARE NOT ENOUGH. Measured (review
+# round 3, by mutation): with `require_head` changed to print its correct refusal and then
+# `return 0`, this scenario reported the SAME exit code, the SAME "could not READ" line and the
+# SAME tag. Because `head` is then EMPTY, the rail CONTINUES, and a DOWNSTREAM guard exits 1 for
+# an unrelated reason — so a bare exit-code assertion is satisfied by a refusal the mutation did
+# not cause.
+#
+# ⛔ AND THE FIRST VERSION OF THIS LINE WAS STILL NOT A GUARD (review round 4). It grepped the
+# rail's PROGRESS LOG for `PR #42 head` — which is PROSE. Renaming that one `info` call, with no
+# behaviour change, left 13b/13c/13d all GREEN while the rail demonstrably still proceeded. A
+# guard that a reworded log line can delete is the same defect these scenarios exist to close.
+# So the assertion is anchored on the artifact the rail cannot reword: the fake-`gh` CALL LEDGER.
+# `isDraft` is probed only AFTER a successful head read, so its presence proves the rail continued.
+post_read_call_made \
+  && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
+  || pass "the rail never proceeded past the unread head (no post-read call was made)"
+# ⛔ THE ASSERTION 13b EXISTS FOR. #1690 was an operator reading THIS sentence on a PR that
+# had not moved. A source scan cannot catch a regression that reintroduces it; this can.
+grep -q "head moved" "$SCEN/err" && fail "a FAILED READ was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "a failed read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the head could not be read" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 13c. a head read that SUCCEEDS and returns NOTHING is unreadable too (#1690) ──
+# The OTHER half of the pair, and it reaches `require_head` differently: 13b models a read
+# that FAILS, this models a read that SUCCEEDS with no value. That is the shape that made
+# the original defect so quiet — the writer exited 0, so nothing looked like an error.
+echo "== 13c. a head read that SUCCEEDS with no value is unreadable too (#1690) =="
+new_scen headempty
+: > "$SCEN/head"                    # gh exits 0 with an EMPTY projection
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read returns nothing" \
+  || fail "expected a non-zero exit, got 0 — an EMPTY head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ was unusable" \
+  || fail "expected the unreadable-head refusal on stderr"
+post_read_call_made \
+  && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
+  || pass "the rail never proceeded past the empty head (no post-read call was made)"
+grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "an empty read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for an empty head" \
+  || pass "no evidence comment posted"
+
+# ── 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) ──
+# ⛔ WHY A THIRD SCENARIO, AND WHY ITS FIXTURE IS MULTI-LINE. A first attempt used a SINGLE short
+# value (`deadbeef`, 8 hex). Review round 4 MEASURED that this does NOT exercise the whole-value
+# property at all: the defect of the ORIGINAL fix — the per-line `grep -qE '^[0-9a-fA-F]{40}$'`
+# introduced by 09e1b15 and removed in review round 1 — also rejects `deadbeef`, so it left this
+# scenario GREEN. (Round 3/4 labelled that defect "round 2"; it was round 1. Corrected.) The
+# fixture was therefore not testing the fix it was named for. The whole-value property is only
+# exposed by a read containing a VALID 40-hex sha AND a second line: an any-line test accepts it
+# and the rail then emits BOTH lines as the head. Measured: the current rail rejects this (so the
+# clean case still passes), while the per-line version returned rc=0 with the two-line value.
+echo "== 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) =="
+new_scen headcorrupt
+# A VALID sha on line 1, plus a junk second line: accepted by a per-LINE check, rejected only by
+# a WHOLE-VALUE one.
+printf 'deadfeed00000000000000000000000000000000\nJUNK-SECOND-LINE\n' > "$SCEN/head"
+lane_fail main5555 7002 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read is corrupt" \
+  || fail "expected a non-zero exit, got 0 — a CORRUPT head reached the merge path"
+grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the read was unusable" \
+  || fail "expected the unreadable-head refusal for a corrupt value"
+post_read_call_made \
+  && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
+  || pass "the rail never proceeded past the corrupt read"
+grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED HEAD — this is #1690 itself" \
+  || pass "a corrupt read is never reported as a moved head"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a corrupt head" \
+  || pass "no evidence comment posted"
+
+# ── 13e. the §4 COMPARISON SITE never renders a failed read as a moved head (#1690) ──
+# ⛔ 13b/13c/13d DO NOT REACH §4, AND THE FIRST VERSION OF THEM CLAIMED THEY DID (review round 4).
+# With an unreadable/empty/corrupt head fixture the rail aborts at the OPENING read — §13b's
+# stderr shows one refusal and its ledger shows no post-read call — so the comparison sites at
+# §4 (during re-run, before evidence) are never reached. But the sentence #1690's operator
+# actually SAW (`head moved before the evidence was posted (x -> )`) is emitted only at the §4
+# site, so the ORIGINAL SYMPTOM was still unreproduced by any scenario. This one reproduces it:
+# the OPENING read SUCCEEDS and a LATER read returns nothing. `head-seq` serves the Nth head read
+# from the Nth line, so a one-line fixture makes the 2nd and later reads return EMPTY — that is
+# the rc=0-EMPTY shape, not the rc!=0-FAILED one (§13b pins the failed shape at the opening site).
+echo "== 13e. an EMPTY §4 read is never reported as a moved head (#1690) =="
+new_scen headseqfail
+HEAD_SF="5555000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head-seq"   # line 2 is ABSENT → the 2nd read returns EMPTY
+printf '0' > "$SCEN/head-seq-count"
+lane_fail "$HEAD_SF" 7001 > "$SCEN/runs-$HEAD_SF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
+# The decision path must be CLEAN for this scenario to reach the §4 comparison (as in §13):
+# main fails the SAME id over 3 tested runs, so the PR's single-run failure is exempted.
+main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when a §4 head read returns nothing" \
+  || fail "expected a non-zero exit, got 0 — a §4 read returned NOTHING and the rail continued"
+# ⛔ PROVE IT GOT THERE (review round 5, MEASURED). This scenario is named for the §4 comparison
+# site, but every one of its assertions was ALSO satisfied by a refusal at the OPENING read: with
+# a `resolve_head` that refuses every value, §13e reported all five ✅ while §4 was never reached.
+# A scenario named for a site must show it reached that site. The `isDraft` probe is issued
+# BETWEEN the opening read and §4, so its presence proves the opening read succeeded and the §4
+# read is therefore the one that failed. (The `grep -v headRefOid` guard keeps this from being
+# satisfied by an argv that happens to name isDraft on the head read itself.)
+post_read_call_made \
+  && pass "§13e VERIFIABLY reached the §4 comparison (the opening read succeeded)" \
+  || fail "§13e never reached §4 — the opening read did not succeed, so this scenario proved NOTHING about the §4 site"
+# ⛔ THE ASSERTION 13e EXISTS FOR. This is the exact sentence #1690's operator read on a PR that
+# had NOT moved, and no other scenario can produce it.
+grep -q "head moved" "$SCEN/err" && fail "THE §4 COMPARISON SITE REPORTED A MOVED HEAD ON A FAILED READ — this is #1690 exactly as the operator saw it" \
+  || pass "the §4 site never renders a failed read as a moved head"
+grep -q "could not READ the head" "$SCEN/err" && pass "the §4 read is reported as UNREADABLE" \
+  || fail "expected the unreadable-head refusal from the §4 site"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the §4 read fails" \
+  || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
@@ -3573,7 +3769,7 @@ out="$(python3 "$ROOT/scripts/ci_exemption.py" ids --log "$REALLOG" 2>/dev/null)
 # rail routes through it.
 echo '== 32b. the shell rail drops+reports at the FAILED-token position =='
 new_scen cfsmay
-HEAD_CM="aa5511000000000000000000000000000000000"
+HEAD_CM="aa55110000000000000000000000000000000000"
 lane_fail "$HEAD_CM" 8801 > "$SCEN/runs-$HEAD_CM"
 { log_failed 'tests/test_ok.py::test_ok'; log_failed 'may'; } > "$SCEN/log-8801"
 cfs_run --commit "$HEAD_CM"; rc=$?
@@ -3597,7 +3793,7 @@ grep -q 'UNATTRIBUTABLE.*may' "$TMP/cfs-err" && pass "the rail REPORTS the dropp
 # (The decision's UNATTRIBUTABLE VERDICT is the consumer side, #1147.)
 echo "== 33. a moved identity is REPORTED across the boundary and not attributed =="
 new_scen cfsrot
-HEAD_RR="bb6622000000000000000000000000000000000"
+HEAD_RR="bb66220000000000000000000000000000000000"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_status_surfaces_last_drill'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrillScheduled::test_manual_drill_records_measured_time'
 { lane_fail "$HEAD_RR" 8801; lane_fail "$HEAD_RR" 8802; } > "$SCEN/runs-$HEAD_RR"
@@ -4546,7 +4742,8 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 # still be read in two bases. `0700`/`03900` are ambiguous regardless; `010` is
 # the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
-            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010"; do
+            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
+            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
@@ -4696,7 +4893,7 @@ belt_wait progress 100 1
 # instead. Removing that union turns this test RED (the merge proceeds).
 echo "== 45. a rotated identity is UNATTRIBUTABLE, never exempt-and-silent =="
 new_scen rotation
-HEAD_ROT="ee5500000000000000000000000000000000000"
+HEAD_ROT="ee55000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_ROT" > "$SCEN/head"
 ROT_A1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
 ROT_A2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'

@@ -1,21 +1,201 @@
 #!/bin/bash
 # refresh-candidates.sh — pre-flight a pool of open P0/P1/P2 issues and append the CLEAN ones
 # to ~/orchestrator/candidates.txt (the dispatch backlog). Skips anything already checked.
+#
+#   refresh-candidates.sh [LIMIT]     # refill the backlog (called by orch-loop.sh, BACKGROUNDED)
+#   refresh-candidates.sh --check     # read-only: CAN this repo be provisioned for dispatch?
+#
+# ⛔ WHY `--check` EXISTS (agent-infra#1736). The scout provisioning below used to be a
+# TORTOISE-shaped spec: `uv sync --extra embeddings --extra parity` (tortoise extras, and a
+# `pyproject.toml` the target repo may not have) plus tortoise's `tools/collision_preflight.py`
+# (which agent-infra does not carry). A cell pointed at a repo that is neither aborted every
+# cycle, and orch-loop.sh runs this script in a BACKGROUNDED subshell — so the non-zero exit could
+# not fail the loop and the controller reported RUNNING with `lanes: 0` forever: a cell that looks
+# alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
+# so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 O="${O:-$HOME/orchestrator}"
-export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
-LIMIT="${1:-24}"
+# ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
+# harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
+# caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
+# operator with a fixed interpreter) got whatever `uv` sat in /usr/local/bin instead, with no way
+# to opt out from outside. Appending keeps the tools discoverable without overruling the caller.
+# (`SCOUT_UV` below pins the binary explicitly when PATH order is not enough.)
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+
+# The `uv` used to provision the scout venv. `SCOUT_UV` overrides PATH resolution outright — the
+# regression suite pins its stub with it, and an operator can point it at a specific interpreter.
+# Both the `--check` probe and the run resolve through this SAME variable, so a check can never
+# disagree with what the refresh would actually execute.
+UV="${SCOUT_UV:-uv}"
+
+# ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
+# `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
+# now reads the code: TRANSIENT is retried next cycle (a network/tool hiccup — retrying is
+# correct); NOT_PROVISIONABLE stops the retry loop and is surfaced loudly, because retrying cannot
+# help. Keep these in sync with orch-loop.sh's `-eq 3` handler.
+EXIT_TRANSIENT=1
+EXIT_NOT_PROVISIONABLE=3
+
+# ── the interpreter minimum, from the TOOL (agent-infra#1748 review) ──────────────────────────
+# The collision pre-flight is stdlib-only, which is why a repo with no `pyproject.toml` needs no venv
+# — but it is NOT interpreter-agnostic: tortoise's `tools/collision_preflight.py` refuses a <3.12
+# interpreter at module scope (#5128), prints an explanation and exits 3 with NO `VERDICT` line.
+# Nothing here used to check the version, so the bare-`python3` arm could select macOS's CLT 3.9 shim
+# or Ubuntu 22.04's 3.10: `--check` said CHECK OK (it tested existence only), the refresh exited 0
+# having queued nothing, and no `.refresh-blocked` marker was written — the merge-only cell #1736
+# exists to remove, certified by the gate this PR added. Both paths gate the SELECTED interpreter on
+# this minimum; it is the tool's own contract, named once here.
+MIN_PY_MAJOR=3
+MIN_PY_MINOR=12
+
+# 0 iff $1 runs and is at least the tool's minimum. Used for the venv interpreter too: `uv sync`
+# honours the project's `requires-python`, which may be lower, so "a venv exists" is not by itself
+# evidence that the tool will run in it.
+py_satisfies_min() {
+  local bin="$1"
+  [ -n "$bin" ] || return 1
+  "$bin" -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= ($MIN_PY_MAJOR, $MIN_PY_MINOR) else 1)" >/dev/null 2>&1
+}
+
+# Set PY to an interpreter meeting the tool's minimum, or return 1 with the reason in PY_WHY.
+# `SCOUT_PY` pins it outright (mirrors `SCOUT_UV`) and is authoritative: a pinned interpreter that
+# does not satisfy the minimum is a REFUSAL, never silently swapped for another. Otherwise the
+# versioned names are tried before the generic `python3`, because on macOS `python3` is the CLT 3.9
+# shim while a 3.12 sits in /opt/homebrew/bin — and the export above only APPENDS those dirs, so
+# `command -v python3` finds the too-old one first. The two macOS dirs are tried explicitly for the
+# same reason, so a 3.12 there is still found under launchd's minimal PATH.
+resolve_python() {
+  local cand resolved
+  if [ -n "${SCOUT_PY:-}" ]; then
+    if py_satisfies_min "$SCOUT_PY"; then PY="$SCOUT_PY"; return 0; fi
+    PY_WHY="SCOUT_PY='$SCOUT_PY' is not a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR"
+    return 1
+  fi
+  for cand in python3.13 python3.12 python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    resolved="$(command -v "$cand" 2>/dev/null || true)"
+    [ -n "$resolved" ] || continue
+    if py_satisfies_min "$resolved"; then PY="$resolved"; return 0; fi
+  done
+  PY_WHY="no Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR found (tried python3.13, python3.12, python3, /opt/homebrew/bin/python3, /usr/local/bin/python3)"
+  return 1
+}
+
+MODE=refresh
+LIMIT=24
+case "${1:-}" in
+  --check) MODE=check ;;
+  '')      ;;
+  *[!0-9]*) echo "[refresh] FATAL: unknown argument '$1' (usage: refresh-candidates.sh [LIMIT] | --check)" >&2; exit 2 ;;
+  *)       LIMIT="$1" ;;
+esac
+
+# ── the collision pre-flight tool, resolved PER REPO (agent-infra#1736) ────────────────────────
+# The gate is a TORTOISE product: tortoise is the only repo that ships tools/collision_preflight.py
+# and it applies to ANY issue's repo through --repo. A repo that carries its own copy wins (it pins
+# the version that repo reviewed against); otherwise a tortoise checkout is used; otherwise there
+# is NOTHING to run, and "nothing to run" must be a loud refusal, never an empty backlog. The old
+# code hardcoded `$SC/tools/collision_preflight.py`, so a cell on agent-infra (no such file) ran a
+# tool that did not exist, emitted no VERDICT, and queued nothing — forever, and silently.
+PREFLIGHT=""
+# The configured tortoise checkout. `TORTOISE_REPO` is the harness's established name for this
+# (check-port-drift.sh, install-launchd.sh, hub-state-check.sh); `TORTOISE` is accepted as an alias
+# so an operator's existing keys.env keeps working (agent-infra#1748 review).
+tortoise_var() { [ -n "${TORTOISE_REPO:-}" ] && printf '%s' "$TORTOISE_REPO" || printf '%s' "${TORTOISE:-}"; }
+find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
+  local cand common configured
+  configured="$(tortoise_var)"
+  if [ -n "$configured" ] && [ -f "$configured/tools/collision_preflight.py" ]; then
+    (cd "$configured" && pwd -P); return 0
+  fi
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  for cand in \
+    "$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null)" \
+    "$([ -n "$common" ] && dirname "${common%/.git}")/tortoise" \
+    "${HOME:-/nonexistent}/Documents/GitHub/tortoise" \
+    "${HOME:-/nonexistent}/eldato/tortoise" \
+  ; do
+    [ -n "$cand" ] || continue
+    [ -f "$cand/tools/collision_preflight.py" ] || continue
+    (cd "$cand" && pwd -P); return 0
+  done
+  return 1
+}
+
+resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if none
+  local repo_dir t
+  # The TARGET repo's own copy — the scout worktree when it exists, else the main checkout.
+  # `--check` must not create the worktree, so the main checkout is what it reads there.
+  repo_dir="$REPO"; [ -d "$SC" ] && repo_dir="$SC"
+  if [ -f "$repo_dir/tools/collision_preflight.py" ]; then
+    PREFLIGHT="$repo_dir/tools/collision_preflight.py"; return 0
+  fi
+  if t="$(find_tortoise)"; then
+    PREFLIGHT="$t/tools/collision_preflight.py"; return 0
+  fi
+  return 1
+}
+
+# ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
+cmd_check() {
+  local scout tool_dir
+  [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
+  tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
+  if ! resolve_preflight; then
+    echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+    echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
+    echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] check: repo=$REPO"
+  echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ⛔ JUDGE THE INTERPRETER THE REFRESH WILL ACTUALLY USE. `--check` must not create the scout
+  # worktree, but the venv it reads must be the one the run will find there. Reading
+  # `$REPO/.venv/bin/python` whenever `$SC` did not exist was a FALSE PASS: the run uses
+  # `$SC/.venv/bin/python`, so a repo with a main-checkout venv and a broken `uv` passed the probe,
+  # then ran `uv sync`, failed, and exited the TRANSIENT 1 — no marker, nothing in `status`, retried
+  # forever (#1748 review). A worktree of $REPO carries $REPO's pyproject.toml, so "no scout yet"
+  # plus a repo pyproject means `uv` must be runnable. Whichever interpreter is selected — the
+  # venv's or a bare python3 — is then version-gated, because the tool refuses <3.12.
+  if [ -x "$SC/.venv/bin/python" ]; then
+    scout="$SC/.venv/bin/python"
+    if ! py_satisfies_min "$scout"; then
+      echo "[refresh] check: FAIL the scout venv interpreter $scout is older than Python $MIN_PY_MAJOR.$MIN_PY_MINOR, which the pre-flight tool requires"
+      echo "[refresh] NOT PROVISIONABLE: the pre-flight tool would refuse this interpreter and emit no VERDICT, so a cell on this repo would MERGE ONLY (#1736)"
+      echo "[refresh]   fix: rebuild the scout venv with a newer interpreter (uv sync on a >= $MIN_PY_MAJOR.$MIN_PY_MINOR requires-python), or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    echo "[refresh] check: interpreter=$scout"
+  elif [ -f "$SC/pyproject.toml" ] || { [ ! -d "$SC" ] && [ -f "$REPO/pyproject.toml" ]; }; then
+    # Two ways to need a provisioned scout venv: the scout already exists and declares a uv/Python
+    # project, or it does not exist yet but the repo it will be a worktree of does.
+    command -v "$UV" >/dev/null 2>&1 \
+      || { echo "[refresh] check: FAIL a pyproject.toml is present but 'uv' is not runnable (SCOUT_UV='${SCOUT_UV:-unset}', resolved command='$UV') — the scout venv cannot be provisioned"; return "$EXIT_TRANSIENT"; }
+    echo "[refresh] check: interpreter=$SC/.venv/bin/python (to be provisioned with $UV sync)"
+  elif resolve_python; then
+    echo "[refresh] check: no pyproject.toml in $tool_dir — the scout venv step is NOT APPLICABLE; interpreter=$PY"
+  else
+    echo "[refresh] check: FAIL $PY_WHY"
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR and no usable interpreter is available, so a cell on this repo would MERGE ONLY (#1736)"
+    echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] CHECK OK: this repo can be provisioned for dispatch"
+  return 0
+}
+
+if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 mkdir -p "$O"
 
-# The scout is a dedicated throwaway worktree used only to run tools/collision_preflight.py.
+# The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
 if [ ! -d "$SC" ]; then
   echo "[refresh] provisioning scout worktree at $SC"
-  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit 1; }
+  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit "$EXIT_TRANSIENT"; }
   git fetch origin main --quiet 2>/dev/null || true
   if git rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
     git worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1
@@ -23,14 +203,77 @@ if [ ! -d "$SC" ]; then
     git worktree add "$SC" -b chore/dispatch-scout origin/main >/dev/null 2>&1
   fi
 fi
-cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit 1; }
+cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit "$EXIT_TRANSIENT"; }
 
-# collision_preflight.py needs the project's dev environment; without it every check errors and
-# the backlog stays empty. Provision once, fail loudly if that is impossible.
-if [ ! -x "$SC/.venv/bin/python" ]; then
-  echo "[refresh] provisioning scout venv (uv sync)"
-  ( uv sync --extra embeddings --extra parity ) >/dev/null 2>&1 \
-    || { echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"; exit 1; }
+# Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
+# its environment, and the reason must be the one an operator sees.
+if ! resolve_preflight; then
+  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
+  echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
+  echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
+  exit "$EXIT_NOT_PROVISIONABLE"
+fi
+
+# ── the scout venv: ONLY for a repo that declares a Python/uv environment ─────────────────────
+# `uv sync` is a UV-PYTHON step. A repo with no pyproject.toml at all (agent-infra: package.json,
+# bin/, scripts/, mcp-servers/) cannot run it — measured on the live cell: "No `pyproject.toml`
+# found in current directory or any parent".
+# ⛔ That is NOT a provisioning failure: there is NOTHING TO PROVISION. Reporting it as one
+# (`ABORT: uv sync failed`) was the silent-loop defect (#1736). Only the genuinely
+# not-applicable case is skipped; a `uv sync` that fails on a REAL pyproject is still fatal, still
+# loud, and its output is printed — nothing else is swallowed.
+PY="$SC/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  if [ ! -f "$SC/pyproject.toml" ]; then
+    echo "[refresh] no pyproject.toml in $SC — not a uv/Python project; skipping the scout venv step (the pre-flight tool is stdlib-only)"
+    # ⛔ Not "any python3": the tool REFUSES <3.12 with exit 3 and no VERDICT, which the loop below
+    # would absorb as a per-issue "no verdict" and exit 0 — merge-only and silent (#1748 review).
+    if ! resolve_python; then
+      echo "[refresh] NOT PROVISIONABLE: no Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR to run the pre-flight tool — $PY_WHY"
+      echo "[refresh]   the tool refuses an older interpreter (exit 3, NO VERDICT), so the backlog would"
+      echo "[refresh]   stay empty and the refresh would exit 0 — a cell that looks RUNNING and MERGE ONLY (#1736)"
+      echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or put one on PATH"
+      exit "$EXIT_NOT_PROVISIONABLE"
+    fi
+  else
+    # Read the extras from the PROJECT rather than hardcoding tortoise's: `uv sync --extra X`
+    # ERRORS on an extra the pyproject does not declare, so inheriting `embeddings`/`parity` into a
+    # non-tortoise Python repo would fail every cycle for a spec that does not apply to it.
+    # SCOUT_UV_EXTRAS overrides the detection entirely (set it empty for a bare `uv sync`).
+    EXTRAS=""
+    if [ -n "${SCOUT_UV_EXTRAS+x}" ]; then
+      EXTRAS="$SCOUT_UV_EXTRAS"
+    else
+      for e in embeddings parity; do
+        awk -v want="$e" '
+          /^\[/ { sec = ($0 ~ /^\[project\.optional-dependencies\]/) ; next }
+          sec { line = $0; sub(/[[:space:]]*=.*/, "", line); gsub(/[[:space:]\"]/, "", line)
+                if (line == want) { print "declared"; exit } }
+        ' "$SC/pyproject.toml" 2>/dev/null | grep -q declared && EXTRAS="$EXTRAS --extra $e"
+      done
+      EXTRAS="${EXTRAS# }"
+    fi
+    echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
+    # shellcheck disable=SC2086  # $EXTRAS is a deliberate, space-separated argv list
+    if ! UVOUT="$(cd "$SC" && "$UV" sync $EXTRAS 2>&1)"; then
+      echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"
+      printf '%s\n' "$UVOUT" | tail -5 | sed 's/^/[refresh]   /'
+      exit "$EXIT_TRANSIENT"
+    fi
+    [ -x "$PY" ] || { echo "[refresh] ABORT: uv sync reported success but $PY is missing"; exit "$EXIT_TRANSIENT"; }
+  fi
+fi
+if [ -z "$PY" ] || ! "$PY" -c '' >/dev/null 2>&1; then
+  echo "[refresh] NOT PROVISIONABLE: no usable python to run the pre-flight tool (no scout venv, no python3)"
+  exit "$EXIT_NOT_PROVISIONABLE"
+fi
+# ⛔ The VENV interpreter is version-gated too: `uv sync` honours the project's `requires-python`,
+# which may be lower than the tool needs, so an existing venv is not evidence the tool can run in it.
+if ! py_satisfies_min "$PY"; then
+  echo "[refresh] NOT PROVISIONABLE: the selected interpreter $PY is older than Python $MIN_PY_MAJOR.$MIN_PY_MINOR, which the pre-flight tool requires"
+  echo "[refresh]   it would refuse it (exit 3, NO VERDICT) and the refresh would exit 0 having queued nothing (#1748 review)"
+  echo "[refresh]   fix: set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>, or rebuild the scout venv on a newer requires-python"
+  exit "$EXIT_NOT_PROVISIONABLE"
 fi
 git fetch origin --quiet 2>/dev/null || true
 
@@ -139,7 +382,26 @@ while read -r N; do
   # work lands). checked.txt is therefore written ONLY on the verdict that terminates the issue —
   # CLEAN, which is queued. Everything else is left unchecked, so the next pass re-attempts it.
   # (agent-infra#1716)
-  PRE="$("$SC/.venv/bin/python" tools/collision_preflight.py "$N" --repo . 2>&1)"
+  PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
+  # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
+  # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
+  # Python >= 3.12 guard (#5128), which prints an explanation and NO `VERDICT` line. Absorbing that
+  # into the `*)` arm below left the backlog empty and the script exiting 0, so no `.refresh-blocked`
+  # marker was written and nothing appeared in `status`: the cell stayed RUNNING with `lanes: 0` —
+  # the exact merge-only defect this gate exists to catch, now certified by it (#1748 review). The
+  # exit code is read IMMEDIATELY after the command, with no `$(...)` in between (the retired
+  # do-merge.sh bug class). EXIT_INCOMPLETE (2) and the verdict-less open-PR / ambiguous-target
+  # refusals are per-issue and transient by nature; 3 is the tool's usage/environment code.
+  # A here-string, not `printf … | grep -q`: under `pipefail` the quiet grep exits at its first
+  # match while the writer is still pushing bytes, the writer takes SIGPIPE (141), and pipeline
+  # status becomes non-zero — so this fail-closed gate would report NOT-PROVISIONABLE on output
+  # that DID carry a verdict (#841; scripts/check-no-sigpipe-grep.sh is the guard).
+  if [ "$PRE_RC" -eq 3 ] && ! grep -qE '^VERDICT' <<<"$PRE"; then
+    echo "[refresh] NOT PROVISIONABLE: the pre-flight tool exited 3 (usage/environment) with no VERDICT — a cell on this repo could only MERGE (#1736)"
+    printf '%s\n' "$PRE" | tail -3 | sed 's/^/[refresh]   /'
+    echo "[refresh]   fix: make the interpreter runnable (the tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR) or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
+    exit "${EXIT_NOT_PROVISIONABLE:-3}"
+  fi
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
   case "$V" in
     CLEAN)
