@@ -103,8 +103,13 @@ server is cold on its first request after idle — measured against the hosted
 Tortoise MCP: first request after ~45s idle took **15.55s** (right at the 15s
 default budget), after ~100s idle it stalled **35.4s** then returned a zero-byte
 503, while warm latency was **0.30s**. The cold path therefore straddles the
-default budget by design, so a single timeout is not an outage. Attempt 1 wakes
-the server; attempt 2 (250ms later) lands on the warm path.
+default budget by design, so a single timeout is not an outage. The retry
+rescues a cold start that only slightly overshoots the budget — the 15.55s
+datum: attempt 1 wakes the server and attempt 2 (250ms later) lands on the
+warm path. A **30s+ cold start still needs a raised `timeoutMs`**: attempt 2
+begins ≈15.3–18.3s after attempt 1 (15s budget + up to 3s teardown + 250ms) and
+is bounded by another 15s, so it gives up at ≈30–33s — before the 35.4s answer
+arrives.
 
 The retry is bounded to **2 attempts** so startup can never exceed ~2× the
 per-server budget (15s default → ≤30s worst case, before transport teardown).

@@ -311,12 +311,16 @@ export const IDLE_SWEEP_INTERVAL_MS = 60 * 1000;
 // straddles the default budget BY DESIGN, so a single timeout is not evidence
 // the server is down — it is evidence the server was woken.
 //
-// Fix: retry a failed eager connect once. Attempt 1 warms the server; attempt
-// 2 (after a short pause) lands on the warm path. The retry is deliberately
-// bounded to one attempt so total startup can never exceed 2× the per-server
-// `timeoutMs` (15s default → ≤30s worst case, before transport teardown) —
-// startup must not hang. Operators raising `timeoutMs` raise BOTH attempt
-// budgets; it remains the cold-start budget knob.
+// Fix: retry a failed eager connect once. This rescues a cold start that only
+// slightly overshoots the budget — the 15.55s datum: attempt 1 wakes the
+// server and attempt 2 (after a short pause) lands on the warm path. A 30s+
+// cold start (the 35.4s datum) still needs a raised `timeoutMs` — attempt 2
+// begins ≈15.3–18.3s after attempt 1 and gives up at ≈30–33s, before a 35.4s
+// answer arrives. The retry is deliberately bounded to one attempt so total
+// startup can never exceed 2× the per-server `timeoutMs` (15s default → ≤30s
+// worst case, before transport teardown) — startup must not hang. Operators
+// raising `timeoutMs` raise BOTH attempt budgets; it remains the cold-start
+// budget knob.
 
 /** Max attempts per eager server connect (1 initial + 1 retry). */
 export const EAGER_CONNECT_MAX_ATTEMPTS = 2;
