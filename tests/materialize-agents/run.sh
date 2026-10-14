@@ -336,6 +336,22 @@ for f in "$ROOT/AGENTS.md" "$BASE"; do
   if [ "${n:-0}" -eq 1 ]; then pass "anchor ×1 in ${f#"$ROOT"/}"; else fail "anchor count ${n} in ${f#"$ROOT"/}"; fi
 done
 
+# ── Filing-prose cross-reference pin (#1461): the symptom check ("do NOT file
+# a peer") and `## File Pre-Existing Bugs` ("file a GitHub issue for it") govern
+# one input — a pre-existing bug that is a symptom — and would otherwise give
+# opposite instructions. The carve-out must live at the point of the mandate,
+# in every AGENTS surface. The base⊆AGENTS.md pin above checks line preservation
+# only; it cannot tell that this acknowledgement was dropped from both files at
+# once, so this pin is the non-vacuous half.
+FILING_CARVE_OUT='**Unless the symptom check above shows it is a symptom of an existing issue**'
+for f in "$ROOT/AGENTS.md" "$BASE"; do
+  if grep -qF "$FILING_CARVE_OUT" "$f"; then
+    pass "filing-prose carve-out present in ${f#"$ROOT"/}"
+  else
+    fail "filing-prose carve-out missing in ${f#"$ROOT"/} — File Pre-Existing Bugs no longer reconciles with the symptom check"
+  fi
+done
+
 # ── MD026 pin: no heading in the base template may end in punctuation ──────
 # A trailing period sat on the SESSION RECAP heading and rode into every repo
 # that materialized the base, where markdownlint reports it as MD026 and the
