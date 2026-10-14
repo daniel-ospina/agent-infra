@@ -150,7 +150,7 @@ case "$LAST" in
       # The reviewer said CLEAN but named no comment, so there is no artifact to sign — the gate can
       # NEVER go green at this head. Park it: the pre-fix bare `exit 2` left no marker, so the loop
       # re-paid for a fresh review every cycle (#1717).
-      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head"
+      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id>), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
       echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
     fi
     # ── 2) record the review (writes the signed marker into the PR body) ──

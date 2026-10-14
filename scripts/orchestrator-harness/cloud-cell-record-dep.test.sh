@@ -96,6 +96,12 @@ mkstubs "$CELL_STUBS"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
 mkdir -p "$(dirname "$RECORDER")"
 printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
+# The recorder's DECLARED SIBLING (#1362): record-review.sh resolves its diff normalizer from its own
+# directory, so cmd_check refuses a cell that has the recorder without it — and `start` provisions the
+# pair together, exactly as pi-bootstrap/setup.sh's lib farm does.
+RECORDER_LIB="$CELL_HOME/.pi/agent/scripts/lib/diff-normalize.py"
+mkdir -p "$(dirname "$RECORDER_LIB")"
+printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
 
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
   env -u SCOPE -u AI_REVIEW_GATE_KEY \
@@ -145,6 +151,21 @@ case "$out" in *'NOT EXECUTABLE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" |
 ck "the refusal names executability, not absence" $rc
 chmod +x "$RECORDER"
 
+# 3b) THE RECORDER'S OWN RUNTIME DEPENDENCY (#1362/#1717). record-review.sh resolves
+# lib/diff-normalize.py from its OWN directory; without it it silently takes the RAW pre-#1362 digest
+# arm, so every base-only `gh pr update-branch` refuses carry-forward and buys a fresh PAID review.
+# A cell certified in that state is the same false-PASS/paid-loop class this PR exists to close — one
+# step down the cost ladder — so cmd_check must refuse it and name the sibling it probed.
+mv "$RECORDER_LIB" "$CELL/normalizer.stash"
+out="$(cell_check)"; rc=$?
+[ "$rc" -ne 0 ] && ! certified "$out" && rc=0 || { rc=1; note "rc=$rc certified=$([ -n "$out" ] && certified "$out" && echo yes || echo no)"; }
+ck "RED→GREEN: a recorder WITHOUT its sibling diff-normalize.py is not certified" $rc
+case "$out" in *'diff-normalize.py MISSING'*"$RECORDER_LIB"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names the missing normalizer path" $rc
+case "$out" in *'provisions it from'*"$CELL_HARNESS/../lib/diff-normalize.py"*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
+ck "the refusal names where the normalizer can be provisioned from" $rc
+mv "$CELL/normalizer.stash" "$RECORDER_LIB"
+
 # 4) THE SIBLINGS THE ISSUE DID NOT NAME. Each of these, absent, turns a loop step into a silent
 # no-op (python3 → an empty check classification, so no case arm matches and every PR is skipped in
 # silence) or a dead worker (pi → 127 on every review and every fixer), so each is fatal.
@@ -159,17 +180,28 @@ for dep in git python3 pi; do
 done
 
 # 5) `start` PROVISIONS the dependency the issue says is "checked and provisioned": the canonical
-# copy ships one directory up from the harness, exactly where recorder_src() looks.
+# copy ships one directory up from the harness, exactly where recorder_src()/recorder_lib_src() look.
+# The normalizer is the recorder's DECLARED SIBLING, so both must be provisioned, preserving the
+# relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py).
 printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
-rm -f "$RECORDER" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
+rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
 [ "$rc" -eq 0 ] && [ -x "$RECORDER" ] && rc=0 || { rc=1; note "rc=$rc recorder=$([ -x "$RECORDER" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
 ck "start provisions record-review.sh from the checkout" $rc
+[ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: start provisions the recorder's SIBLING diff-normalize.py in lib/" $rc
 [ -f "$CELL/tmstate/cmd" ] && rc=0 || rc=1
 ck "start then reached the session launch (the provision did not abort it)" $rc
 out="$(cell_check)"; rc=$?
 [ "$rc" -eq 0 ] && certified "$out" && rc=0 || { rc=1; note "$(printf '%s' "$out" | tail -3)"; }
 ck "the provisioned cell is then certified" $rc
+# …and the SIBLING alone is provisioned when an operator's recorder copy already exists (the
+# "present but degraded" cell the lib check exists for): remove ONLY the normalizer and re-start.
+rm -f "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+out="$(cell_start)"; rc=$?
+[ "$rc" -eq 0 ] && [ -s "$RECORDER_LIB" ] && rc=0 || { rc=1; note "rc=$rc normalizer=$([ -s "$RECORDER_LIB" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
+ck "start provisions ONLY the missing normalizer when the recorder already exists" $rc
 
 # 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
 # can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
@@ -201,7 +233,7 @@ run_merge() {
     # NB: the function bodies must NOT read $HEAD/$PR — bash imports an exported function into the
     # driven script, so those names are the SCRIPT's globals, and an unset $HEAD would print an
     # empty head (which makes every park assertion vacuous). Dedicated names only.
-    pi() { [ -n "${PI_COUNT:-}" ] && echo x >> "$PI_COUNT"; printf 'CLEAN https://github.com/acme/widget/pull/%s#issuecomment-12345\n' "$FAKE_PR"; }
+    pi() { [ -n "${PI_COUNT:-}" ] && echo x >> "$PI_COUNT"; printf '%s\n' "${FAKE_VERDICT:-CLEAN https://github.com/acme/widget/pull/${FAKE_PR}#issuecomment-12345}"; }
     gh() {
       case "$*" in
         *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
@@ -212,7 +244,7 @@ run_merge() {
     git() { return 0; }
     export -f pi gh git
     env -u AI_REVIEW_GATE_KEY PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" \
-      PI_COUNT="$MRG/pi-count" FAKE_HEAD="$HEAD" FAKE_PR="$PR" \
+      PI_COUNT="$MRG/pi-count" FAKE_HEAD="$HEAD" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
       "$BASH_BIN" "$MERGE" "$MRG/repo" acme/widget "$PR" fix/x
   ) 2>&1
 }
@@ -261,6 +293,22 @@ ck "RED→GREEN: a missing recorder is caught BEFORE the paid review" $rc
 ck "a missing recorder still reaches the terminal state" $rc
 case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'MISSING at'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
 ck "the reason names the missing path" $rc
+
+# 8b) A CLEAN verdict with NO comment URL is the ONE terminal state a human reaches with no in-band
+# route out: the controller `continue`s past the PR at that head, and merge-one.sh's own `exit 5`
+# refusal (the log line that carries the remedy elsewhere) never runs on the controller path. So the
+# parkreason itself must name BOTH the manual re-record command (the reviewer usually posted the
+# comment; only the verdict line lacked the URL) and the unpark invocation — exactly like the
+# MISSING / NOT-EXECUTABLE / record-failed siblings do.
+mkmrg
+printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(FAKE_VERDICT='CLEAN (review posted above; URL unavailable)' run_merge)"
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *"record-review.sh $PR $HEAD clean"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-URL park names the manual re-record command" $rc
+case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-URL park names the unpark invocation (the way out)" $rc
 
 # 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
 # merge, so the terminal state is a response to the failure and not a blanket refusal to merge.

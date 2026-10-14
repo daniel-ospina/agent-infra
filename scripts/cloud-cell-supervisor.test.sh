@@ -221,6 +221,15 @@ say_case "the merge key reaches a WORKER across the second tmux boundary"
 W="$T/wk"; mkdir -p "$W/harness" "$W/repo/.git" "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
 for f in dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
+# #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
+# cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
+# normalizer as its OWN sibling). So the fixture must carry the PAIR one directory up from the
+# harness, exactly where recorder_src()/recorder_lib_src() look, or every §7 case dies before the
+# session launch. The `pi` stub is the new runtime-dependency probe: the CI runner installs none, so
+# a fixture that leans on the host PATH reddens on the runner only (agent-infra#1348/#1369 class).
+printf '#!/bin/bash\nexit 0\n' > "$W/record-review.sh"; chmod +x "$W/record-review.sh"
+mkdir -p "$W/lib"; printf '#!/usr/bin/env python3\n' > "$W/lib/diff-normalize.py"
+for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$W/bin/$c"; chmod +x "$W/bin/$c"; done
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
 cat > "$W/harness/orch-loop.sh" <<EOF

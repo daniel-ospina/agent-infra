@@ -48,6 +48,14 @@ HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2
 # step at another file is a way to defeat the gate, not a configuration.
 recorder_path() { printf '%s\n' "$CELL_HOME/.pi/agent/scripts/record-review.sh"; }
 recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
+# The recorder's DECLARED SIBLING (#1362/#1717). record-review.sh resolves its diff normalizer from
+# its OWN directory (`$(dirname "${BASH_SOURCE[0]}")/lib/diff-normalize.py`), so the two must be
+# provisioned together, preserving the relative position — exactly as pi-bootstrap/setup.sh's lib
+# farm pins it. Without it the recorder degrades to the RAW pre-#1362 digest (no false accept, but
+# every base-only `gh pr update-branch` refuses carry-forward and buys a FRESH PAID review), which is
+# the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
+recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
+recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
 # OR is interpolated into the session command string, so it is defaulted here — the guard below reads
 # it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
@@ -238,7 +246,9 @@ cmd_check() {
   #             a dead sweep that is indistinguishable from a quiet queue.
   #   pi      → the worker runtime (lane.sh, fix-one.sh, merge-one.sh). Absent, every review and
   #             every fixer fails 127 and the cell produces nothing.
-  # All three are fatal here, exactly as install.sh makes them fatal for the daemon.
+  # All three are fatal HERE because a cell invokes each directly (above). Parity with install.sh is
+  # true for `pi` only: install.sh's fatal gate is `for bin in tmux gh pi` (install.sh:84), and it
+  # never probes git or python3. The requirement is this script's own, not a mirrored one.
   local dep
   for dep in git python3 pi; do
     command -v "$dep" >/dev/null 2>&1 || die "$dep missing on PATH — the loop invokes it (harness README §3)"
@@ -274,7 +284,17 @@ cmd_check() {
   elif [ ! -x "$rec" ]; then
     die "record-review.sh at $rec is NOT EXECUTABLE — merge-one.sh runs it directly, so the record step would fail (126) AFTER a paid review. Fix: chmod +x '$rec'"
   fi
-  say "ok: record step present and executable ($rec)"
+  # The recorder's OWN runtime dependency (#1362/#1717): it resolves lib/diff-normalize.py from its
+  # sibling directory. Absent, the recorder still runs — but it takes the RAW pre-#1362 digest arm
+  # (`⚠️ #1362` warning in its output), the marker's diff_sha256 stops matching what the consumer
+  # computes live, and EVERY base-only head move (`gh pr update-branch`) refuses carry-forward and
+  # buys a fresh PAID review. Certifying a cell in that state is the same false PASS this block
+  # exists to remove, one step down the cost ladder. Judge it beside the recorder it belongs to.
+  local reclib; reclib="$(recorder_lib_path)"
+  if [ ! -s "$reclib" ]; then
+    die "diff-normalize.py MISSING (or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
+  fi
+  say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources
@@ -356,13 +376,24 @@ cmd_start() {
   # Provision the record step (#1717), mirroring the $O seed above: hard dependency of the only
   # merge path, absent on a fresh cell. Copied only when ABSENT, so an operator's newer copy is
   # never clobbered by the cell checkout — and NEVER overwritten by whatever a keys.env points at.
-  local rec rsrc
+  local rec rsrc rlib rlibsrc
   rec="$(recorder_path)"; rsrc="$(recorder_src)"
+  rlib="$(recorder_lib_path)"; rlibsrc="$(recorder_lib_src)"
   if [ ! -e "$rec" ]; then
     mkdir -p "$(dirname "$rec")" || die "cannot create $(dirname "$rec")"
     cp -p "$rsrc" "$rec" 2>/dev/null || die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"
     chmod +x "$rec" || die "cannot make $rec executable"
     say "provisioned record step: $rsrc -> $rec"
+  fi
+  # …and its declared sibling, ALWAYS (not only when the recorder was absent): an operator's older
+  # recorder copy can sit beside a missing lib, and cmd_check below refuses that cell. Preserve the
+  # relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py) and refresh only
+  # when ABSENT, so a newer operator copy is never clobbered — same rule as the recorder above.
+  if [ ! -s "$rlib" ]; then
+    mkdir -p "$(dirname "$rlib")" || die "cannot create $(dirname "$rlib")"
+    cp -p "$rlibsrc" "$rlib" 2>/dev/null || die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"
+    chmod +x "$rlib" || die "cannot make $rlib executable"
+    say "provisioned record-step library: $rlibsrc -> $rlib"
   fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
