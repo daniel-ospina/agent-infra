@@ -1661,6 +1661,10 @@ if [ "$code" -eq 2 ]; then pass "an empty/inverted watcher band -> exit 2 (fail-
 if grep -q "band is empty or inverted" "$OUT"; then pass "the inverted-band refusal is explicit"; else fail "expected an explicit inverted-band refusal"; sed -n '1,30p' "$OUT"; fi
 # The watcher is the owner of the band, so its own run must refuse too — not only the print path.
 if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor for an inverted band"; else pass "watch-truncation --print-regime-floor itself refuses an inverted band"; fi
+# Discriminating on the MESSAGE too: pre-fix the watcher has no --print-regime-floor flag at all,
+# so it exits non-zero through its unknown-argument/usage path — the exit-code assertion alone is
+# green pre-fix. Only the watcher's own band-coherence check names the inverted band.
+if grep -q "band is empty or inverted" "$OUT"; then pass "the watcher's own inverted-band refusal is explicit"; else fail "expected the watcher's own inverted-band refusal (not an unrelated non-zero exit)"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 # (h) an OUT-OF-RANGE floor literal (above bash's int64) must be refused AT VALIDATION. `[ N -ge M ]`
@@ -2192,6 +2196,10 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
 bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "a silent --print-regime-floor (exit 0, no value) → exit 2 (fail-closed)"; else fail "expected exit 2 on a silent answer, got $code"; sed -n '1,30p' "$OUT"; fi
+# Discriminating on the MESSAGE too: the pre-fix guard also exited 2 on a silent instrument
+# (`cannot read the fleet regime floor — … watch-truncation.sh gives ''`), so the exit-code
+# assertion alone is green pre-fix. Only the post-fix execution read names the silent answer.
+if grep -q "did not print a plain integer" "$OUT"; then pass "the silent-answer refusal is explicit"; else fail "expected an explicit silent-answer refusal"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP45"
 # (f) an instrument that answers with an integer ABOVE bash's int64 range is refused AT THE READ,
 #     with the right cause. The pre-fix digit case accepted the literal, so this arm only fell
