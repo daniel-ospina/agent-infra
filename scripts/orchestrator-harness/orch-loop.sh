@@ -32,7 +32,18 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
 # so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ LEADING ZEROS ARE NOT NUMBERS HERE (P2, second review round, 2026-10-14). `''|*[!0-9]*`
+# ACCEPTED `08`, and `$(( ))` parses base 0 (a leading 0 means OCTAL; `08`/`09` are not octal).
+# On /bin/bash 3.2.57 — what the launchd plist invokes — the failed arithmetic ASSIGNMENT aborts
+# the rest of the enclosing block and resumes after it with status 0, silently. Inside `while true`
+# it is worse: the whole loop is discarded and the script exits 0 after one cycle. Two shipped
+# consequences: `CYC=08` reached `JIT=$(( CYC / 5 ))` and turned the controller into a
+# relaunch-per-cycle loop under KeepAlive, and a leading-zero timeout reached the lease arithmetic in
+# the merge/fix workers. Accept only `0` or `[1-9][0-9]*`.
+# NOTE this also tightens `is_limit` below (it delegates here), which is how CYC=08 is coerced to
+# 240 before any arithmetic sees it. `is_num` must stay otherwise generous: it also validates a
+# 10-digit epoch mtime, and a tighter DIGIT bound silently rejected every file as un-stat-able.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # A digit string is not enough for a TUNABLE: `[` errors at or above 2**63, and an errored test is
 # FALSE, which OPENS the very gate the value configures (MAX_LANES=99999999999999999999 passed the
 # class test, then `[ "$LANES" -ge "$MAX_LANES" ]` errored and the lane cap was gone). So the limits
@@ -51,11 +62,31 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 #
 # It is `is_limit`, not `is_num`, because a non-number is only the FIRST way the gate opens: `[`
 # ERRORS at or above 2**63 ("integer expression expected"), so an absurd-but-numeric MAX_LOAD
-# slips past is_num and then aborts the gate chain — the same fail-open this block exists to
-# close. `_NCPU` keeps is_num: its source is `nproc` on this host, not the plist.
-is_num "${_NCPU:-}"      || _NCPU=4
+# slips past is_num and then aborts the gate chain — the same fail-open this block exists to close.
+# ⛔ `_NCPU` GETS THE SAME BOUND (P3, fourth review round, 2026-10-14), and the failure it prevents
+# is NOT the plist's: `_NCPU` is an OS probe (`sysctl`/`nproc`), so an absurd-but-numeric value
+# reaches `$(( 10#$_NCPU * 10 ))` and the magnitude WRAPS instead of erroring — and each wrapped
+# outcome is individually a VALID number, so no downstream guard can see it. Measured on
+# /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to 3875820019684212726, and -- CORRECTED, fifth
+# review round 2026-10-14: that is 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT error.
+# It just NEVER BINDS and the load gate OPENS SILENTLY (the same mechanism as the 9-digit product
+# two sentences below; the earlier comment wrongly said `[ -ge ]` ERRORS here). And
+# 9223372036854775808 (2**63) * 10 wraps to exactly **0**, which
+# `is_limit` ACCEPTS — and `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box
+# dispatches nothing, indefinitely. Bound the PROBE so neither wrap can be produced.
+# ⛔ AND MAX_LOAD NEEDS A TRUE DEFAULT, not a re-derivation (same round): the first fallback
+# recomputed from the SAME `_NCPU`, so it could not repair an out-of-range product — a 9-digit
+# _NCPU yields a 10-digit product (999999999 -> 9999999990), which is under 2**63 so `[ -ge ]` does
+# not error, it just never binds and the gate silently OPENS. The second guard falls back to the
+# documented default instead. (`MAX_LOAD` may still be set to 0 deliberately — install.sh allows 0
+# for every limit but CYC — so this bounds the DERIVATION, never a plist value that passes is_limit.)
+is_limit "${_NCPU:-}"    || _NCPU=4
+# A 0-valued probe is a FAILED probe, not "no cores": `10 * 0` is 0, `is_limit 0` is true, and
+# `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
+# install.sh carries the identical line (P3, fifth review round, 2026-10-14).
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
@@ -104,6 +135,12 @@ is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
 is_limit "${CYC:-}"               || CYC=240
+# ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
+# is TRUE and install.sh's range loop explicitly allowed `0`, so `CYC=0` survived all the way to
+# `sleep $(( 10#0 - 0 + RANDOM % 1 ))` = `sleep 0` — the controller revisited every cycle with no
+# delay, hammering the GitHub API. The floor is a small 5s (not 240, which would silently replace a
+# deliberate small value); install.sh refuses < 5 at render time, so the two ends agree.
+[ "$CYC" -ge 5 ] || CYC=240
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -193,12 +230,80 @@ esac
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
-claim_live() {
+claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box ref claim
   local f="$O/state/mergeclaim-$1.lock" p
-  [ -f "$f" ] || return 1
-  p="$(cat "$f" 2>/dev/null || echo 0)"
-  [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null && return 0
-  rm -f "$f"; return 1
+  if [ -f "$f" ]; then
+    p="$(cat "$f" 2>/dev/null || echo 0)"
+    if [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null; then return 0; fi
+    rm -f "$f"
+  fi
+  # Cross-box (agent-infra#1709 recs 1-3): a reviewer on ANOTHER box holds the claim as a git
+  # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
+  # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
+  # once at the top of this cycle, not from the network per PR.
+  local sha="${2:-}" ref until
+  [ -n "$sha" ] || return 1
+  [ -f "$O/state/claims-snapshot" ] || return 1
+  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
+  until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
+  # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
+  # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
+  # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
+  # SECOND — 10 digits today). Without it the two readers DISAGREED about the same datum: the bare
+  # `[ "$now" -le "$until" ]` below ERRORS at or above 2**63 (rc=2, and an errored test is FALSE),
+  # so claim_live() reported a foreign full-width claim as DEAD while claim_acquire() correctly
+  # refused that head as live. The controller therefore reached the spawn branch EVERY cycle, the
+  # refused fixer wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker and
+  # `parked-<pr>` on the next cycle — so the cap never tripped and the PR was never parked: one
+  # refused spawn plus 1 GitHub call and 3 remote round trips per cycle, indefinitely, on a PR no
+  # box could work. The conservative direction is the same one claims.sh takes: treat it as LIVE.
+  #
+  # ⛔ AND ABSENT IS STILL NOT THE SAME AS UNPARSEABLE (P2, fifth review round, 2026-10-14). An entry
+  # MISSING from the snapshot means "no visible claim" -> NOT live. An entry whose lease reads `0`
+  # means "a claim EXISTS whose lease is unreadable", and claims.sh treats exactly that as LIVE
+  # (claim_acquire's `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via
+  # `[ "$until" != "0" ]`). A negative lease collapses to the same `0` — `_lease_of`'s `[0-9]*`
+  # cannot match a minus sign — and so does any other non-digit. Collapsing the sentinel into the
+  # absent case made these two readers DISAGREE on the one input class claims.sh documents as a
+  # sentinel, with the very same consequence described above (the controller re-spawns a fixer
+  # claim_acquire refuses; refund_bailed_fixer un-parks the PR every cycle, so the cap never trips).
+  # `-n` is checked FIRST because absent (not live) and unreadable (live) must never be merged; the
+  # non-digit test then covers the literal negative, which claim_prune also reads as "keep".
+  [ -n "${until:-}" ] || return 1
+  [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
+  [ -z "${until//[0-9]/}" ] || return 0
+  [ "$(date +%s)" -le "$until" ] && return 0
+  return 1
+}
+
+# refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
+# already owns this head). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
+# used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
+# refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
+# 2026-10-14). This refunds the attempt and restores the marker. `restore-findings` is 1 only on the
+# ai-review-gate arm, because that is the only arm that deletes the marker at spawn — the CI-red and
+# CONFLICTING arms never touch it, so restoring there would invent a findings record.
+refund_bailed_fixer() {
+  local pr="$1" head="$2" restore="${3:-0}" b f n
+  [ -n "${head:-}" ] || return 0
+  b="$O/state/fixbail-$pr-$head"
+  [ -f "$b" ] || return 0
+  rm -f "$b"
+  f="$O/state/fixcount-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
+  is_num "$n" || n=0
+  [ "$n" -gt 0 ] && n=$(( n - 1 ))
+  echo "$n" > "$f"
+  if [ "$restore" = "1" ]; then
+    touch "$O/state/needsfix-$pr-$head"
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+  else
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
+  fi
+  # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
+  rm -f "$O/state/parked-$pr"
+  return 0
 }
 
 # single-instance lock (atomic: noclobber create fails if the file exists)
@@ -282,8 +387,14 @@ can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
 # regression cannot hide behind a comment):
 #   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
 #   review_slots -> reviewer concurrency, with headroom once a backlog exists
-mp_reason() { # <open_prs> <lanes>
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then
+mp_reason() { # <open_prs> <lanes> <workers>
+  # The condition is "the box has review/merge work IN FLIGHT", not "a lane happens to be
+  # running". Measured 2026-10-13 (agent-infra#1709 item 4): the lanes-only form let dispatch
+  # through on 4/4 sampled blocks — e.g. `lanes=0 workers=8` with 27 open PRs, i.e. eight
+  # reviewers mid-flight on a box already saturated. That ADDS WIP to fixed throughput and
+  # lengthens cycle time (Little's Law), which is the opposite of draining.
+  # Total in-flight agents = lanes + workers; `workers` is the merge/fix session count.
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ $(( ${2:-0} + ${3:-0} )) -ge 1 ]; then
     echo "merge-priority (${1} open PRs — draining before opening more)"
   fi
 }
@@ -438,6 +549,23 @@ while true; do
   if [ "$SWEEP_RC" -ne 0 ]; then
     echo "[sweep] PR listing FAILED rc=$SWEEP_RC (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
   fi
+  # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
+  # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
+  # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
+  if [ -f "$O/claims.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$O/claims.sh"
+    # REQUIRED: this loop runs from launchd with cwd=$HOME. Without CLAIM_REPO every git call
+    # inside claims.sh targets a non-repo, the fetch fails silently and the snapshot is empty
+    # even with live claims — measured: 3 claims on origin, 0 snapshot lines.
+    CLAIM_REPO="$REPO"
+    claim_snapshot "$O/state/claims-snapshot"
+    # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
+    if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
+      touch "$O/state/.claims-pruned"
+      ( claim_prune >> "$LOG" 2>&1 ) &
+    fi
+  fi
   printf '%s\n' "${SWEEP_LIST:-}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT; do
     [ -z "${PR:-}" ] && continue
@@ -530,11 +658,13 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
       GREEN|PENDING:*)
         MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
+          # A bailed fixer must not have consumed an attempt here (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
-          case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
+          is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -554,13 +684,16 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
         if grep -q ai-review-gate <<<"$V"; then
+          # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
+          # marker at spawn — so restore it too (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
-            case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
+            is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
@@ -598,11 +731,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # docs-lint findings — MD056, an unescaped '|' in a table row, and MD046, fence style;
           # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
           # which now also receives the failing CI log, capped like every other fix loop.
+          # ⛔ THE REFUND MUST PRECEDE THE READ (P2, third review round, 2026-10-14). The CONFLICTING
+          # arm above and the ai-review-gate arm below both read the count AFTER the refund; this arm
+          # read it BEFORE, so the decrement was immediately overwritten by `$NFC2 + 1` and the refund
+          # was a NO-OP here. fix-one.sh exits 0 — having done no work — when the cross-box CAS
+          # refuses it, so three no-op cross-box refusals still PARKED the PR as needs-a-human,
+          # exactly the defect the previous round claimed to close. Keep this ordering; selftest §15
+          # drives the shipped sequence and goes RED if the read moves back above the refund.
+          # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
+          # marker, so restore is 0 (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
-          case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
+          is_num "$NFC2" || NFC2=0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -636,6 +779,11 @@ open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
   L="$(load1)"; LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
+  # live at this instant, so the dispatch block line below can distinguish "blocked while the box
+  # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
+  # not). Total in-flight agents = lanes + workers.
+  WORKERS="$(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-')"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on
@@ -665,7 +813,7 @@ PY
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
-  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES")"
+  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES" "$WORKERS")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
@@ -689,26 +837,53 @@ PY
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     else echo "[dispatch] backlog empty" >> "$LOG"; fi
   else
-    echo "[dispatch] skipped ($GATE_WHY)" >> "$LOG"
+    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
   heartbeat
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
   BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
   if [ "$BL" -lt 6 ]; then
-    if [ ! -d "$O/.refresh.lock" ]; then
+    if [ -f "$O/.refresh-blocked" ]; then
+      # agent-infra#1736: a PERMANENT provisioning failure (exit 3) is recorded here so it is
+      # neither retried forever nor silent. `lanes: 0` alone also describes a healthy idle cell,
+      # so the reason is printed every cycle AND surfaced by `cloud-cell-supervisor.sh status`.
+      echo "[refresh] blocked (not retrying): $(head -1 "$O/.refresh-blocked")" >> "$LOG"
+    elif [ ! -d "$O/.refresh.lock" ]; then
       mkdir -p "$O/.refresh.lock"
       echo "[refresh] spawning (backlog=$BL)" >> "$LOG"
-      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rm -rf "$O/.refresh.lock" ) &
+      # ⛔ `&` discards the refresh's exit status, so a refresh that aborts EVERY cycle reads as a
+      # healthy cell with `lanes: 0` forever (#1736, measured on the first cmux cloud cell).
+      # Capture rc: 3 is refresh-candidates.sh's NOT_PROVISIONABLE code — permanent, so retrying
+      # cannot help; record it and stop re-spawning. Any OTHER non-zero is transient (network, a
+      # failed listing) and IS retried next cycle.
+      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
+        rm -rf "$O/.refresh.lock"
+        if [ "$rc" -eq 3 ]; then
+          echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
+          echo "MERGE-ONLY: this repo cannot be provisioned for dispatch (agent-infra#1736) — no implementation lane will be dispatched until this is fixed. Reason and evidence: $LOG (search 'NOT PROVISIONABLE'). Fix: put TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), or vendor tools/collision_preflight.py into the repo — then delete this file and re-run 'check'." > "$O/.refresh-blocked"
+        elif [ "$rc" -ne 0 ]; then
+          echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
+        fi ) &
     else
       # stale lock guard (>20 min)
       if [ -n "$(find "$O/.refresh.lock" -mmin +20 2>/dev/null)" ]; then rm -rf "$O/.refresh.lock"; echo "[refresh] cleared stale lock" >> "$LOG"; fi
     fi
   fi
 
+  # agent-infra#1709 rec 4: JITTER. Three boxes on the same 240s cycle wake together — the
+  # classic thundering-herd trigger, and the sources name randomised expiry/backoff as the fix.
+  # Spread each box's wake-up by up to ±20% of the cycle. Cheap, and it matters more at 3 boxes
+  # than at 2: the claim CAS resolves the collision, but jitter means far fewer collisions to
+  # resolve at all.
+  JIT=$(( 10#${CYC} / 5 ))
   # `& wait`, not a bare sleep: bash runs a trap only AFTER the current foreground command
   # completes, so `sleep 240` deferred the stop for up to a whole cycle — measured 5.07s of a 6s
   # sleep, vs 0.09s with the background form. The lock is held either way, but "kill -TERM ends
   # the process" (agent-infra#1715's indicator) is then true in ~0.1s, not in four minutes.
-  sleep "$CYC" & wait $!
+  # ⛔ `10#` on BOTH arithmetic sites (P1, second review round, 2026-10-14): the predicate above
+  # coerces CYC=08 to 240, but this is defence in depth — this line is where a leading zero used to
+  # DISCARD the entire `while true` loop and exit 0 after one cycle (relaunch-per-cycle under
+  # KeepAlive). `10#${CYC}` reads it base 10 whatever the predicate did.
+  sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
 done

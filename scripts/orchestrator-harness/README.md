@@ -87,7 +87,7 @@ doc_status: draft
 >
 > | divergence | why it is here |
 > |---|---|
-> | `orch-loop.sh` guards **every** limit with `is_limit` (digits **and** at most nine of them) before its first arithmetic read — `MAX_LANES`, `MAX_REVIEW`, `MERGE_PRIORITY_AT`, `MAX_FIX`, `MAX_FIX_TRIES`, `BATCH`, `CYC`, `STALE_MIN` (and `MAX_LOAD`/`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB`, which had `is_num`: the first two are plist-supplied gates that `[` would ERR on at or above 2**63, the last is plist-supplied too, so all three moved to `is_limit`) | two failure modes, both fail-**OPEN**: `[ -ge ]` on a non-number is FALSE and FALSE in the gate chain ALLOWS, so `MAX_LANES=4x` dropped the lane cap, `MERGE_PRIORITY_AT=notanum` removed the drain-before-dispatch gate, `BATCH=abc` dispatched the whole backlog in one cycle, and `MAX_FIX_TRIES=abc` let fixer attempt 10 run past a cap of 3. `[` also ERRORS at or above 2**63, so an absurd-but-numeric limit opened them the same way. `is_num` itself is deliberately left unbounded: it also validates an **epoch mtime**, which is already 10 digits, and `_NCPU`, whose source is `nproc` on this host rather than the plist |
+> | `orch-loop.sh` guards **every** limit with `is_limit` (digits **and** at most nine of them) before its first arithmetic read — `MAX_LANES`, `MAX_REVIEW`, `MERGE_PRIORITY_AT`, `MAX_FIX`, `MAX_FIX_TRIES`, `BATCH`, `CYC`, `STALE_MIN` (and `MAX_LOAD`/`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB`, which had `is_num`: the first two are plist-supplied gates that `[` would ERR on at or above 2**63, the last is plist-supplied too, so all three moved to `is_limit`) | two failure modes, both fail-**OPEN**: `[ -ge ]` on a non-number is FALSE and FALSE in the gate chain ALLOWS, so `MAX_LANES=4x` dropped the lane cap, `MERGE_PRIORITY_AT=notanum` removed the drain-before-dispatch gate, `BATCH=abc` dispatched the whole backlog in one cycle, and `MAX_FIX_TRIES=abc` let fixer attempt 10 run past a cap of 3. `[` also ERRORS at or above 2**63, so an absurd-but-numeric limit opened them the same way. `is_num` itself stays unbounded for an **epoch mtime** (already 10 digits), but `_NCPU` is now `is_limit` too: its source is the host (`sysctl`/`nproc`), not the plist, so an absurd-but-numeric probe reached `$(( 10#$_NCPU * 10 ))` and WRAPPED — 99999999999999999999 to 3875820019684212726, 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT ERROR: it simply never binds and the gate OPENS **silently** (the earlier wording said `[ -ge ]` ERRORS here — corrected, fifth review round 2026-10-14) — and 2**63 to exactly 0, which `is_limit` ACCEPTS because install.sh allows 0 for every limit but CYC (`[ "$L" -ge 0 ]` is always true, so the gate CLOSES and the box dispatches nothing). `install.sh` now mirrors the loop's guard (`is_limit` + the `_NCPU >= 1` probe guard + the two MAX_LOAD guards) because install.sh is what substitutes `__MAX_LOAD__` into the live plist — the wrap survived there on the real production path |
 > | `orch-loop.sh` reads base 10 where it read base 8 | `$((MAX_REVIEW + 2))` read `030` as **octal** (26, not 30) and `$((STALE_MIN * 60))` did the same. `MERGE_PRIORITY_AT` already normalised with `10#` |
 > | `install.sh` refuses a non-integer, an out-of-range value, or a value carrying a `__TOKEN__` | `MAX_LANES=4x` was written into the live launchd plist and `install.sh` exited 0, so the plist lied about the ceiling; and the sed rules run in order, so `OR=__MAX_LANES__` rendered as `4` — exit 0, valid XML, and the daemon then ran `gh --repo 4` |
 > | `install.sh` renders to a temp file and `mv`s it into place, and asserts no `__…__` survived | the redirect truncates `$PLIST` **before** `sed` runs, so rejecting after writing straight to it left the live plist empty or poisoned — and §9's next step (`launchctl unload && load`) then failed, so a rejected re-install destroyed a working daemon config. `plutil -lint` cannot see a substitution that did not take |
@@ -207,10 +207,10 @@ the fact: the PR body names the comment it was signed against.
 | `tmux` | every worker is a detached tmux session | `brew install tmux` |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
-| `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific |
+| `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra` |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge without it.** Treat as a secret; never commit it |
-| the target repo's `tools/collision_preflight.py` | `refresh-candidates.sh` refuses overlapping dispatches | tortoise-specific path |
+| a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
 **Single-host assumption.** Everything is local: tmux sessions, worktrees, logs, the key.
@@ -267,7 +267,9 @@ by `./selftest.sh` rather than quoted here.
                        # the reaper's keep/reap decisions, rejection of a hostile branch name,
                        # install.sh rendering with a hostile path, limit-default consistency,
                        # placeholder parity, the daemon PATH (shim exclusion + execute-probe) and
-                       # the failed-count fallback, README overclaim guards, credential scan
+                       # the failed-count fallback, README overclaim guards, credential scan,
+                       # repo-aware scout provisioning and the permanent/transient refresh split
+                       # (refresh-scout.test.sh, #1736)
 ```
 
 **The gate key only reaches the daemon if it is a FILE.** `install.sh` deliberately does not copy a
@@ -304,7 +306,7 @@ scripts.
 The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
-configures), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
+configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
 therefore rendered as `4` and still exited 0. It then renders to a **temp file**, lints that, asserts
 no placeholder survived, and only then moves it into place — the redirect truncates its target before
 `sed` runs, so rejecting after writing straight to `$PLIST` left the live plist empty and the next
@@ -312,9 +314,13 @@ no placeholder survived, and only then moves it into place — the redirect trun
 refused at both ends, and every limit is coerced *before* its first arithmetic read, because `[ -ge ]`
 on a non-number is FALSE and a false test in the gate chain OPENS the gate.
 
-⚠️ **`0` is a valid integer and passes every guard above.** It is not a typo they can catch: for
-`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the gate can never bind (disabled), and `CYC=0` makes the
-cycle delay zero, so the controller spins. Set one of those only when that is what you mean.
+⚠️ **`0` is a valid integer for most limits** — for `MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the
+gate can never bind (disabled). Set one of those only when that is what you mean.
+⛔ **`CYC` is the exception: it has a 5-second floor.** It is the one limit where `0` is not merely
+useless but harmful — `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))` becomes `sleep 0` or a negative
+argument, so the controller revisits every cycle with no delay and hammers the GitHub API.
+`install.sh` refuses `CYC<5` at render time and `orch-loop.sh` floors a zero/bad value to its 240s
+default, so the two ends cannot disagree. `CYC=5` (a deliberately fast cycle) is still accepted.
 
 **The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
@@ -564,14 +570,43 @@ A CONFLICTING PR can never merge, but the sweep classified it GREEN/PENDING and 
 on it every cycle, so the queue looked busy while nothing moved (observed: #8245, #8226, #8193, #8104). They are now routed to `fix-one.sh`, which integrates `origin/main`, resolves the conflict, and re-runs the review chain — capped by `MAX_FIX_TRIES` and parkable like any other fix loop. The
 fixer prompt states that when a PR is CONFLICTING the conflict *is* the task.
 
-### 7.2b Cross-box duplicate work — **OPEN**
+### 7.2b Cross-box duplicate work — **FIXED in this PR**
 
 The per-PR claim (§5.1b) is a **local file**, so it makes concurrency safe *within one box*. Two
-boxes sweeping the same repo will still both review and attempt to merge the same PR, and both may
-pick the same issue. This is inherent: the boxes share GitHub, not a coordinator. tortoise#5052
-proposes "an authoritative, expiring claim registry" — the cross-box version of §5.1b. `SCOPE=own`
-(§5, item 3) is the interim **partition**: it stops more than one box taking broad, but it does not
-make ownership knowable, so it is not the registry.
+boxes sweeping the same repo still both evaluate the same PR and the same issue, and the boxes
+share GitHub, not a coordinator. The registry is now `refs/claims/<PR>-<head-sha12>` in the
+repository the boxes already share (`<head-sha12>` because the key is `claim_key()`, which truncates
+the head sha to its first 12 characters): `git push` to a ref is an **atomic create-or-fail** (a
+CAS), so it needs no broker and no service, and the namespace is **outside `refs/heads/*`**, so it
+triggers no workflow and never appears as a branch. **Verified empirically** on both
+`daniel-ospina/agent-infra` and `daniel-ospina/tortoise`: pushing a probe ref to `refs/claims/*`
+created **zero** workflow runs and **zero** check-runs, matching the static picture (every
+`on: push` in both repos is filtered to `branches: [main]` or `tags`). `claims.sh` holds the
+primitive; `merge-one.sh` resolves HEAD **before** claiming and exits 0 when another box owns that
+head; `fix-one.sh` takes the **same** claim on the current head for the fixer's duration and
+releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim left two boxes free
+to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
+cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
+**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. Both tunables are
+validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
+`claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
+worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
+unparseable lease is read as **LIVE**, and `claim_prune` can never reap it, so that PR/head is frozen
+across every box with no automatic recovery. Every
+release/reclaim is `--force-with-lease`, so a box holding a **stale** commit (one that is no longer
+the ref's tip) cannot release the winner's claim. Three hardening points from the adversarial
+review of this PR: a **read-back failure on the create path still surfaces the commit we pushed**,
+so the caller can fenced-release a claim that did exist instead of orphaning it for the whole lease;
+a **failed reclaim push is classified by re-reading the ref** — unchanged or unreadable is an
+infrastructure failure (rc=2, fail-open), a moved ref is a genuine lost race (rc=1) — rather than
+reporting every transient error as a lost race and failing closed; and worker lease-read temp refs
+live under `refs/claims-tmp/*`, **not** the pruned `refs/claims-cache/*` namespace, so
+`claim_snapshot --prune` can no longer delete a concurrent read mid-flight. It **fails open on
+purpose** — if the claim store is unreachable the harness proceeds and logs it — because
+agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
+must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
+`SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
@@ -594,6 +629,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
+| **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |
 | Plist rendered with unescaped `sed` replacements | a `&` in a path expanded to the matched placeholder, producing a *valid* plist pointing at wrong paths (so `plutil -lint` cannot catch it) | escape `\`, `&` and `\|` in every substituted value |
 | `retired/do-merge.sh` logged `rc=$?` after an unquoted `$(date)` | every merge failure logged as `rc=0` | capture the status first |
@@ -744,6 +780,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | Script | Role |
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
+| `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `merge-one.sh` and `fix-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
@@ -751,6 +788,10 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
+| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
+| `test-claims.sh` | the claim CAS against live origin from two throwaway clones. Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
+| `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
+| `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
@@ -795,10 +836,13 @@ old limits: the operator believes a limits change took effect when it did not. C
 `pkill -f orch-loop.sh` (§6) rather than with `launchctl`.
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
-suffix (`tm`), `feat/<N>-tm` naming, `uv sync --extra embeddings --extra parity`, the
-`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, the
-`tools/collision_preflight.py` path, and the seven required check names
+suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the
+`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, and the seven required check names
 (`ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact`).
+Two things that were on this list are now repo-aware: the collision pre-flight tool is resolved per
+repo (the target repo's own copy, else a `TORTOISE_REPO` checkout) and the scout venv step is skipped for
+a repo with no `pyproject.toml` — and a repo that can be provisioned is verified at `check` time —
+agent-infra#1736.
 
 ---
 
