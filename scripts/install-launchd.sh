@@ -130,7 +130,11 @@ launchd_path() {
     set -f
     for p in $PATH; do
         case "$p" in "") continue ;; esac
-        phys="$(cd "$p" 2>/dev/null && pwd -P)" || continue
+        # ⛔ `CDPATH= cd` and not a bare `cd` (review B4-2): `cd` honours the CDPATH search path, so an
+        # entry that does NOT resolve could still be kept — contradicting this function's own contract
+        # ("an entry that does not resolve is dropped too"). Measured: with CDPATH exported and
+        # containing `phantom`, `PATH=phantom:/real` rendered `phantom` into the plist.
+        phys="$(CDPATH= cd -- "$p" 2>/dev/null && pwd -P)" || continue
         case "$phys" in */shims | */shims/*) continue ;; esac
         out="${out:+$out:}$p"
     done

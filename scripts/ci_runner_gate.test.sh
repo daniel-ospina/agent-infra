@@ -384,9 +384,12 @@ TEMPLATE="$REPO_ROOT/templates/launchd/com.tortoise.ci-runner-gate.plist"
 if [ ! -f "$TEMPLATE" ]; then
   bad "no templates/launchd/com.tortoise.ci-runner-gate.plist — the gate is wired to nothing (#1719)"
 elif ! command -v python3 >/dev/null 2>&1; then
-  # FAIL, never skip: a silent skip here is a false PASS on the only assertions that catch "wired to
-  # nothing". python3 is already a hard requirement of the installer this template ships through
-  # (`plist_program_args` parses the installed plist with plistlib).
+  # FAIL, never skip: the assertions below PARSE with python3, so without it they cannot run at all —
+  # a skip would be a false PASS on the only assertions that catch "wired to nothing".
+  # ⛔ Do NOT justify this with "python3 is a hard requirement of install-launchd.sh": it is not
+  # (that installer falls back to PlistBuddy, `plist_program_args`), and stating it as fact hid a real
+  # hole in that fallback (filed as its own issue). The gate SCRIPT does require python3 at runtime
+  # (`need gh; need curl; need python3`), which is the true and sufficient reason.
   bad "python3 absent — the launchd template was NOT parsed (wiring assertions did not run)"
 else
   ok "launchd template exists for the runner gate (#1719)"
@@ -398,24 +401,33 @@ else
   GATE_PLIST="$(python3 - "$TEMPLATE" <<'PY'
 import plistlib, sys
 d = plistlib.load(open(sys.argv[1], "rb"))
-print("ARGS=" + "\t".join(d.get("ProgramArguments", [])))
+print("ARGS=" + "|".join(d.get("ProgramArguments", [])))
 for k, v in sorted(d.get("EnvironmentVariables", {}).items()):
     print("ENV=%s=%s" % (k, v))
 PY
 )" || GATE_PLIST=""
   GATE_ARGS="$(printf '%s\n' "$GATE_PLIST" | sed -n 's/^ARGS=//p')"
-  assert_contains "$GATE_ARGS" "{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
-    "ProgramArguments executes the path the pi-bootstrap farm lands (parsed plist, not a grep)"
+  # ⛔ EQUALITY on the whole argument list, not containment (review B4-1/E4-2). `assert_contains`
+  # passed on a SUFFIX-renamed target (`ci_runner_gate.sh.old` contains the needle) and on a
+  # retargeted interpreter (`/bin/echo` leaves the path untouched) — both left the suite green while
+  # the job was once again wired to nothing, one of them executing nothing at all. Every element and
+  # the element COUNT are pinned here.
+  assert_eq "$GATE_ARGS" "/bin/bash|{{HOME}}/.pi/agent/scripts/$(basename "$GATE")" \
+    "ProgramArguments IS exactly [/bin/bash, the farmed path] — a retargeted interpreter or a suffix-renamed path cannot pass"
   assert_contains "$GATE_PLIST" "ENV=HOME={{HOME}}" \
     "EnvironmentVariables.HOME pins HOME for the job (the KEY, not just the value)"
   assert_contains "$GATE_PLIST" "ENV=PATH={{PATH}}" \
     "EnvironmentVariables.PATH takes the installer's shim-filtered renderer output (parsed plist)"
 fi
 SETUP="$REPO_ROOT/pi-bootstrap/setup.sh"
-# The farm LINE, not the file: `fleet_srcs=(…)` is the declaration that delivers the script.
+# The farm LINE, not the file: `fleet_srcs=(…)` is the declaration that delivers the script. Match the
+# entry as a WHOLE WORD (review B4-1): a plain `grep -F` for the basename is also satisfied by
+# `ci_runner_gate.sh.old`, i.e. by the exact rename that leaves the farm delivering a file the plist
+# does not execute. `tr` splits the array on whitespace, `grep -x` requires the whole entry.
 FARM_LINE="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP")"
-assert_contains "$FARM_LINE" "$(basename "$GATE")" \
-  "the fleet_srcs ARRAY carries the gate (parsed, not the file's own comment)"
+FARM_ENTRY="$(printf '%s\n' "$FARM_LINE" | tr -s ' ' '\n' | grep -x -- "$(basename "$GATE")" || true)"
+assert_eq "$FARM_ENTRY" "$(basename "$GATE")" \
+  "the fleet_srcs ARRAY carries the gate as a whole entry (exact membership, not a substring)"
 
 # ⛔ HERMETICITY: the whole suite must never reach the real cmux / the live orchestrator lane
 # (review E1). Every run above sets CI_GATE_ORCH_WS="", and the gate reads it with `${VAR-…}` so an

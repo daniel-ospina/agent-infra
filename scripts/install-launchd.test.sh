@@ -300,7 +300,10 @@ assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a 
 assert_contains "$GATE_PATH_VAL" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
 assert_not_contains "$GATE_PATH_VAL" "{{PATH}}" "no placeholder survives into the rendered PATH value (review D2-3)"
 assert_contains "$GATE_PATH_VAL" "r&amp;d" "a PATH entry containing & is XML-escaped in the rendered value (sed replacement escaped, review D2-3)"
-# #1719 (review D3) — a PATH entry containing a GLOB character must reach the plist UNEXPANDED.
+# #1719 (review D3) — a PATH entry containing a GLOB character must never be EXPANDED into its
+# matches (review E4-4 corrected this comment: it does not "reach the plist unexpanded" — with
+# globbing suppressed the literal `globs/a*` no longer resolves, so it is DROPPED, exactly like any
+# other unresolvable entry. What is asserted below is that the FABRICATED matches never appear).
 assert_not_contains "$GATE_PATH_VAL" "globs/aa" "a glob-char PATH entry is not expanded into its matches (review D3)"
 assert_not_contains "$GATE_PATH_VAL" "globs/ab" "…nor into its second match (review D3)"
 
