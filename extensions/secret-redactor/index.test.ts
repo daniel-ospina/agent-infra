@@ -5,7 +5,7 @@
  * found 23 defects (unanchored patterns, the memoised traversal, Map keys, byte
  * payloads, leaf-scoped key matching, the fail-open), and NOTHING enforced any of
  * them — a future edit could silently reintroduce every one. This suite pins the
- * redaction behaviours and, specifically, the three shape fixes of review round 4:
+ * redaction behaviours and, specifically, the shape fixes of review rounds 4–6:
  *
  *   - byte payloads are redacted at BYTE precision and keep their container type
  *     (the old path UTF-8-decoded the whole buffer, turning `ff fe` into `ef bf bd`,
@@ -13,7 +13,12 @@
  *   - a secret used as a PLAIN-OBJECT key is redacted (it used to be copied through
  *     and the handler then saw no hit at all — the result passed unredacted);
  *   - a TRAVERSAL FAILURE fails CLOSED (it used to return the original result when
- *     no hit had been recorded yet, re-emitting a secret in a later sibling).
+ *     no hit had been recorded yet, re-emitting a secret in a later sibling);
+ *   - a `*_KEY` leaf is collected while a `public_key`/`ssh_public_key` leaf is not;
+ *   - ordinary snake_case `*_key` data (`sort_key`, `foreign_key`, `primary_key`, …)
+ *     is NOT collected — the over-redaction the `_key$` widening introduced; and
+ *   - a `*_SIGNING_KEY` leaf/env var IS collected (it is a private signing secret,
+ *     not public key material — the unanchored `PUBLIC_RE` exempted every one).
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -31,6 +36,8 @@ const CONFIG_SECRET = "cfgsecretvalue0000000001";
 const ENV_SECRET = "envsecretvalue0000000002";
 const PATTERN_SECRET = "tt_" + "A".repeat(30);
 const KEY_LEAF_SECRET = "underscorekeyvalue00000004";
+const SIGNING_KEY_SECRET = "signingkeysecretvalue0005";
+const SIGNING_ENV_SECRET = "signingenvironmentsecret06";
 const PUBLIC_KEY_MATERIAL = "not-a-secret-public-key-material";
 const SSH_PUBLIC_KEY_MATERIAL = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ public";
 
@@ -52,9 +59,12 @@ writeFileSync(join(AGENT, "camel-config.json"), JSON.stringify({ authToken: "cam
 // A `*_KEY` leaf must be collected (review round 5) while public-key leaves must NOT —
 // the same shape that was missed before, plus the over-redaction trap its fix opens.
 // The nested env block is the reviewer's exact reproduction (`.mcp.json`).
+// A `*_SIGNING_KEY` leaf is a PRIVATE HMAC/JWT signing secret, not public key
+// material — the round-5 `PUBLIC_RE` widening dropped its leading anchor and
+// exempted every `*signing_key` leaf, so it was emitted verbatim (review round 6).
 writeFileSync(
   join(AGENT, ".mcp.json"),
-  JSON.stringify({ mcpServers: { s: { env: { OPENAI_KEY: KEY_LEAF_SECRET } } } }),
+  JSON.stringify({ mcpServers: { s: { env: { OPENAI_KEY: KEY_LEAF_SECRET, TOKEN_SIGNING_KEY: SIGNING_KEY_SECRET } } } }),
 );
 writeFileSync(
   join(AGENT, "keys-config.json"),
@@ -64,9 +74,23 @@ writeFileSync(
     // Ordinary camelCase/key-suffix data that a naive `key$` would redact as a secret.
     sortKey: "ordinary-sort-key-value00001",
     monkey: "ordinary-data-not-secret0001",
+    // ...and the SNAKE_CASE spelling of the same ordinary relational/identity data.
+    // The round-5 `_key$` widening collected every one of these as a secret; a
+    // narrow credential suffix would drop the round-5 `*_KEY` fix, so the exclusion
+    // is a vocabulary of non-secret key shapes (review round 6).
+    sort_key: "ordinary-snake-sort-key-001",
+    foreign_key: "ordinary-foreign-key-data02",
+    primary_key: "ordinary-primary-key-val03",
+    cache_key: "ordinary-cache-key-value04",
+    partition_key: "ordinary-partition-key-05",
+    dedup_key: "ordinary-dedup-key-value06",
+    key: "ordinary-bare-key-value-0007",
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
+// A signing secret in the ENVIRONMENT must be collected too — `PUBLIC_ANY_RE`
+// carried the same unanchored `signing_?key` exemption (review round 6).
+process.env.JWT_SIGNING_KEY = SIGNING_ENV_SECRET;
 delete process.env.ZAI_API_KEY;
 
 let passed = 0;
@@ -177,6 +201,14 @@ async function main(): Promise<void> {
     ok(!buf.includes(Buffer.from(CONFIG_SECRET, "utf8")), "the secret bytes must be gone");
   });
 
+  await test("an aliased Buffer resolves to ONE redacted copy", async () => {
+    const raw = Buffer.from(`x${CONFIG_SECRET}y`, "utf8");
+    const out = await run({ toolName: "x", content: [{ type: "text", text: "ok" }], details: { a: raw, b: raw } });
+    ok(out && Buffer.isBuffer(out.details.a), "a Buffer must come back a Buffer");
+    strictEqual(out.details.a, out.details.b, "an alias must resolve to the same redacted copy");
+    ok(!Buffer.from(out.details.a).includes(Buffer.from(CONFIG_SECRET)), "the secret must be gone");
+  });
+
   await test("Uint8Array payload stays a Uint8Array", async () => {
     const raw = new Uint8Array(Buffer.from(`xx${CONFIG_SECRET}yy`, "utf8"));
     const out = await run({ toolName: "x", content: [{ type: "text", text: "ok" }], details: { blob: raw } });
@@ -243,6 +275,33 @@ async function main(): Promise<void> {
       await run({ toolName: "x", content: [{ type: "text", text: "monkey=ordinary-data-not-secret0001" }] }),
       undefined,
     );
+  });
+
+  // ── review round 6: the `_key$` over-redaction + the `*_SIGNING_KEY` leak ───
+  await test("ordinary snake_case `*_key` data is NOT collected (over-redaction guard)", async () => {
+    for (const line of [
+      "sort_key=ordinary-snake-sort-key-001",
+      "foreign_key=ordinary-foreign-key-data02",
+      "primary_key=ordinary-primary-key-val03",
+      "cache_key=ordinary-cache-key-value04",
+      "partition_key=ordinary-partition-key-05",
+      "dedup_key=ordinary-dedup-key-value06",
+      "key=ordinary-bare-key-value-0007",
+    ]) {
+      strictEqual(await run({ toolName: "x", content: [{ type: "text", text: line }] }), undefined, line);
+    }
+  });
+
+  await test("a `*_SIGNING_KEY` store leaf IS collected (private signing secret, not public material)", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `TOKEN_SIGNING_KEY=${SIGNING_KEY_SECRET}` }] });
+    ok(out, "a *_SIGNING_KEY literal in a config store must produce a patch (used to leak)");
+    ok(!JSON.stringify(out).includes(SIGNING_KEY_SECRET), "the signing secret must not survive");
+  });
+
+  await test("a `*_SIGNING_KEY` ENV var IS collected (same exemption, env side)", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `JWT_SIGNING_KEY=${SIGNING_ENV_SECRET}` }] });
+    ok(out, "a *_SIGNING_KEY env value must produce a patch (used to leak)");
+    ok(!JSON.stringify(out).includes(SIGNING_ENV_SECRET), "the signing env secret must not survive");
   });
 
   await test("the marker label does not double its store prefix", async () => {

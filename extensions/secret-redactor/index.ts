@@ -79,16 +79,31 @@ const FALLBACK_STORES = ["tortoise-config.json", "jev-config.json", ".mcp.json",
  *  `PRIVATE_KEY`…) is collected too; without it the SAME value was redacted from the
  *  environment and emitted verbatim from `.mcp.json` (review round 5). Camel-case
  *  `*Key` is deliberately NOT included: a bare `key$` would also match `monkey`/
- *  `sortKey`/`foreignKey` and redact ordinary data (over-redaction is a harm). */
+ *  `sortKey`/`foreignKey` and redact ordinary data (over-redaction is a harm).
+ *  `NON_SECRET_KEY_RE` is the snake_case half of that same guard: `_key$` accepts
+ *  EVERY `*_key` leaf, so `sort_key`/`foreign_key`/`primary_key` — the snake_case
+ *  spelling of the very words above — were redacted too (review round 6). The env
+ *  collector's `_KEY` suffix names a CREDENTIAL shape; it is not a licence to treat
+ *  every `_key` field as one. */
 const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|secret|password|passwd|credential|(^|[_-])key$)/i;
+/** Leaves that END in `key` but hold ordinary relational/identity data, not a
+ *  credential (`sort_key`, `foreign_key`, `primary_key`, `cache_key`, `partition_key`,
+ *  `dedup_key`, …) plus the bare, ambiguous `key`. Vetoed from `SECRET_LEAF_RE`'s
+ *  `_key$` alternative (and from the env collector's `_KEY` suffix in
+ *  `loadSecrets`), so the widened rule cannot over-redact ordinary data. */
+const NON_SECRET_KEY_RE = /(^key$|^(foreign|primary|secondary|sort|cache|partition|dedup|shard|id)[_-]?key$)/i;
 const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|passwd|token|api[_-]?key)/i;
 /** PUBLIC values are not secrets. Tested on the LEAF only — a `publicProfile.apiKey`
  *  must still be collected (testing the whole path excluded the subtree). The
  *  `*_key` forms are widened here because `SECRET_LEAF_RE` now collects `_KEY`
  *  leaves: without this, `public_key` / `ssh_public_key` would be redacted as if
- *  they were credentials (review round 5). */
-const PUBLIC_RE = /(^public$|(public|pub|gpg|signing)[_-]?key$)/i;
-const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key|signing_?key/i;
+ *  they were credentials (review round 5). The widening is ANCHORED at both ends:
+ *  the round-5 form dropped the leading `^`, so ANY leaf *ending* in `signing_key`
+ *  was exempted — and `TOKEN_SIGNING_KEY` / `JWT_SIGNING_KEY` is a PRIVATE HMAC/JWT
+ *  signing secret, not public key material, so it was emitted verbatim (review
+ *  round 6). `signing` is therefore no longer treated as a public-key word. */
+const PUBLIC_RE = /(^public$|^(ssh[_-]?)?(public|pub|gpg)[_-]?key$)/i;
+const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key/i;
 
 /** A value that is a REFERENCE to an env var, not a credential (tested trimmed). */
 const REFERENCE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
@@ -121,7 +136,8 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
   const walk = (node: unknown, path: string): void => {
     if (typeof node === "string") {
       const leaf = leafOf(path);
-      const secretKey = SECRET_LEAF_RE.test(leaf) || SECRET_PATH_RE.test(path);
+      const secretKey =
+        (SECRET_LEAF_RE.test(leaf) || SECRET_PATH_RE.test(path)) && !NON_SECRET_KEY_RE.test(leaf);
       if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
         // The label is `store:path` — the traversal ROOT is the store label, so it must
         // be stripped from the display path or it repeats (`store:store.apiKey`).
@@ -171,7 +187,8 @@ function loadSecrets(): Secret[] {
       v.length >= MIN_LEN &&
       !isReference(v) &&
       /(API_KEY|_KEY|_TOKEN|_SECRET|_CREDENTIALS?|PASSWORD)$/i.test(k) &&
-      !PUBLIC_ANY_RE.test(k)
+      !PUBLIC_ANY_RE.test(k) &&
+      !NON_SECRET_KEY_RE.test(k)
     ) {
       out.push({ label: `env:${k}`, value: v });
     }
@@ -290,9 +307,15 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
       throw new Error("secret-redactor: cannot redact a non-8-bit typed array");
     }
     // Preserve the container type: a Buffer must come back a Buffer, a Uint8Array a
-    // Uint8Array (the old code returned a plain Uint8Array for both).
+    // Uint8Array (the old code returned a plain Uint8Array for both). Memoise the
+    // copy BEFORE returning so an aliased Buffer resolves to ONE redacted copy (the
+    // branch used to return ahead of `memo.set`, giving a distinct copy per alias).
     const bytes = new Uint8Array(redacted.buffer, redacted.byteOffset, redacted.byteLength);
-    if (Buffer.isBuffer(view)) return Buffer.from(bytes) as unknown as T;
+    if (Buffer.isBuffer(view)) {
+      const out = Buffer.from(bytes) as unknown as T;
+      memo.set(obj, out);
+      return out;
+    }
     const Ctor = view.constructor as new (src: Uint8Array) => Uint8Array;
     let rebuilt: Uint8Array;
     try {
