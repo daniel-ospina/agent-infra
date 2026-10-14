@@ -1663,6 +1663,20 @@ if grep -q "band is empty or inverted" "$OUT"; then pass "the inverted-band refu
 if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor for an inverted band"; else pass "watch-truncation --print-regime-floor itself refuses an inverted band"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (h) an OUT-OF-RANGE floor literal (above bash's int64) must be refused AT VALIDATION. `[ N -ge M ]`
+# ERRORS (rc=2) on such a value, and an `if` reads that as "not >=" — i.e. as a COHERENT band —
+# silently disarming the inverted-band refusal above, which is the exact hazard the pre-#1342 guard
+# bounded its capture against. Post-fix the watcher refuses and prints no floor; pre-fix it prints
+# the literal and exits 0 (the arm is red pre-fix).
+sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_FLOOR=99999999999999999999999999$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (h): the out-of-range floor mutation took effect"; else fail "37 fixture (h): the out-of-range floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed an out-of-range floor (the inverted-band refusal was silently disarmed)"; else pass "watch-truncation --print-regime-floor refuses an out-of-range floor"; fi
+if grep -q "outside the representable integer range" "$OUT"; then pass "the out-of-range refusal is explicit"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "an out-of-range watcher floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an out-of-range floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the guard's execution read refuses the out-of-range floor"; else fail "expected the guard's unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 rm -rf "$TMP37"
 
 echo ""
@@ -2076,22 +2090,28 @@ if grep -q 'Dep-free of npm' "$OUT"; then pass "the header's tail is present (no
 echo ""
 # ── 45. the fleet regime floor is read by EXECUTION (#1342). The pre-fix guard PARSED the
 #       instruments' assignment text with `sed` and anchored the watcher side on the owner-facing
-#       bucket LABEL. Two consequences, both executed below: (a) an ambient FLEET_REGIME_TB made
-#       the report band at one floor while the guard certified another (false PASS, no file
-#       edited); (b) a correct bucket RELABEL — required whenever the floor moves, per policy §7 —
-#       made the floor unreadable (exit 2), blocking the pre-committed rollback. The guard now
-#       runs `<instrument> --print-regime-floor` with FLEET_REGIME_TB unset, mirroring
-#       `patch-pi-retry.sh --cap`.
+#       bucket LABEL. Consequences exercised below: (a) the guard certifies the COMMITTED default
+#       and is deliberately blind to an ambient FLEET_REGIME_TB — these guard-side arms are
+#       REGRESSION PINS for that guarantee (they hold on the pre-fix code too; the instrument-side
+#       assertion is the arm that fails pre-fix). The report itself still bands at the override:
+#       FLEET_REGIME_TB is a documented "tests + tuning" seam, so that is by design, NOT a false
+#       PASS the guard claims to prevent (without the unset the guard would read the ambient
+#       value, disagree with the watcher, and false-BLOCK); (b) a correct bucket RELABEL — required
+#       whenever the floor moves, per policy §7 — made the floor unreadable (exit 2), blocking the
+#       pre-committed rollback. The guard now runs `<instrument> --print-regime-floor` with
+#       FLEET_REGIME_TB unset, mirroring `patch-pi-retry.sh --cap`.
 echo "45. the regime floor is read by EXECUTION, not by parsing assignment text (#1342)"
-# (a) ambient FLEET_REGIME_TB cannot diverge the guard from the instruments.
+# (a) the guard certifies the COMMITTED default and is blind to an ambient FLEET_REGIME_TB.
+#     Regression pin — see the header: this guard-side pair does not discriminate the fix; the
+#     instrument-side assertion just below it does (pre-fix the report has no --print-regime-floor).
 TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
 mkroot "$TMP45"
 reported="$(FLEET_REGIME_TB=900000 bash "$TMP45/scripts/fleet-cost-report.sh" --print-regime-floor 2>&1)"
 if [ "$reported" = "900000" ]; then pass "the override IS live in the instrument (it reports 900000) — the arm is not vacuous"; else fail "expected the report instrument to honour the ambient override, got '$reported'"; fi
 FLEET_REGIME_TB=900000 bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
-if [ "$code" -eq 0 ]; then pass "ambient FLEET_REGIME_TB=900000 does not move the guard off the committed floor (exit 0)"; else fail "expected exit 0 under an ambient override (the guard unsets it), got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "matches the instruments' 283616 floor" "$OUT"; then pass "the guard certifies the COMMITTED 283616 floor, not the ambient 900000"; else fail "expected the guard to name the committed 283616 floor"; sed -n '1,30p' "$OUT"; fi
+if [ "$code" -eq 0 ]; then pass "ambient FLEET_REGIME_TB=900000 does not move the guard off the committed floor (exit 0; regression pin — the guard certifies the committed default by design)"; else fail "expected exit 0 under an ambient override (the guard unsets it), got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "matches the instruments' 283616 floor" "$OUT"; then pass "the guard certifies the COMMITTED 283616 floor, not the ambient 900000 (regression pin)"; else fail "expected the guard to name the committed 283616 floor"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP45"
 # (b) the bucket LABEL is not an anchor: relabel it (as a correct regime move does) with the floor
 #     unchanged → the guard still reads the floor and stays green.
@@ -2130,6 +2150,20 @@ printf '#!/bin/bash\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
 bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "a silent --print-regime-floor (exit 0, no value) → exit 2 (fail-closed)"; else fail "expected exit 2 on a silent answer, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (f) an instrument that answers with an integer ABOVE bash's int64 range is refused AT THE READ,
+#     with the right cause. The pre-fix digit case accepted the literal, so this arm only fell
+#     through to the instrument-disagreement/geometry legs (exit 1) — and with both instruments at
+#     the overflow value it misreported a plain integer as unreadable. Discriminating on exit code
+#     AND message: post-fix exit 2 + 'outside the representable range'; pre-fix exit 1.
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+printf '#!/bin/bash\nprintf "99999999999999999999999999\\n"\nexit 0\n' > "$TMP45/scripts/fleet-cost-report.sh"
+printf '#!/bin/bash\nprintf "99999999999999999999999999\\n"\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "an out-of-range integer from --print-regime-floor → exit 2 (fail-closed, not a certified floor)"; else fail "expected exit 2 on an out-of-range answer, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "outside the representable range" "$OUT"; then pass "the out-of-range refusal is explicit (not misreported as a non-integer)"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP45"
 
 if [ "$failures" -eq 0 ]; then

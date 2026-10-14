@@ -317,14 +317,22 @@ property; this guard is the pattern to copy, not a substitute for it.
     (exit 2)** (#1342): the guard asks EACH instrument for its floor by
     executing `<instrument> --print-regime-floor` (with `FLEET_REGIME_TB`
     unset), mirroring `patch-pi-retry.sh --cap`; a non-zero exit, an empty
-    answer, or a non-integer answer is fail-closed, and the two floors must
-    agree. The report's ambient `FLEET_REGIME_TB` override therefore cannot
-    make the report band at one floor while the guard certifies another (a
-    false PASS with no file edited), and the watcher's owner-facing bucket
-    LABEL is not an anchor — a correct relabel no longer blocks the
-    pre-committed rollback. The watcher OWNS its band and refuses to print a
-    floor when the band is empty or inverted (`floor >= ceiling`), which would
-    certify a floor no record can reach. The **same exit-2 class** covers a
+    answer, a non-integer answer, or a digit literal too long for bash's int64
+    arithmetic (`-ge` on such a value errors, which an `if` reads as a coherent
+    band) is fail-closed, and the two floors must agree. The unset is what makes
+    this leg certify the **committed default**, deliberately blind to the
+    operator's ambient `FLEET_REGIME_TB`: the guard must not be moved off the
+    committed floor by the environment it runs in. It does **not** constrain a
+    report the weekly driver runs **with** the override — that run still bands at
+    the override while the guard certifies the committed default; because the
+    override is a documented "tests + tuning" seam, that divergence is by design
+    rather than a false PASS this leg prevents. (Without the unset the guard
+    would instead read the ambient value, disagree with the watcher, and
+    false-BLOCK.) The watcher's owner-facing bucket LABEL is not an anchor — a
+    correct relabel no longer blocks the pre-committed rollback. The watcher OWNS
+    its band and refuses to print a floor when the band is empty or inverted
+    (`floor >= ceiling`, or a literal outside the representable range), which
+    would certify a floor no record can reach. The **same exit-2 class** covers a
     `models.json` in which no deepseek-served entry is recognised — a geometry
     anchor with nothing to assert must not read green. This class is **not**
     covered by `COST_CLAMP_OVERRIDE=1`.

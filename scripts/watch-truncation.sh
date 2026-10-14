@@ -139,11 +139,19 @@ fi
 # place a record in the current regime, so certifying its floor would certify a
 # regime nothing can reach — fail closed, and do it here (not in a consumer, and
 # not only in the print path) so a normal run is caught the same way.
+# The length bound is REQUIRED, not decoration: `[ N -ge M ]` ERRORS (rc=2) on
+# a value above bash's int64 range, and because that test runs as an `if`
+# CONDITION `set -e` does not fire — the failed comparison is read as FALSE,
+# i.e. as a COHERENT band, silently disarming the inverted-band refusal below.
+# (The pre-#1342 guard bounded its capture at 15 digits for that exact reason;
+# the bound has to move here with the check.) 16 `?` = any literal of length >= 16.
 case "$REGIME_TB_FLOOR" in
     ''|*[!0-9]*) echo "ERROR: the clamp-regime band floor must be a plain integer (got '$REGIME_TB_FLOOR')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime band floor is outside the representable integer range (got '$REGIME_TB_FLOOR') — bash cannot compare it, so the inverted-band refusal would be silently disarmed" >&2; exit 2 ;;
 esac
 case "$REGIME_TB_ERA_CEIL" in
     ''|*[!0-9]*) echo "ERROR: the clamp-regime band ceiling must be a plain integer (got '$REGIME_TB_ERA_CEIL')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime band ceiling is outside the representable integer range (got '$REGIME_TB_ERA_CEIL') — bash cannot compare it, so the inverted-band refusal would be silently disarmed" >&2; exit 2 ;;
 esac
 if [ "$REGIME_TB_FLOOR" -ge "$REGIME_TB_ERA_CEIL" ]; then
     echo "ERROR: the clamp-regime band is empty or inverted (floor $REGIME_TB_FLOOR >= ceiling $REGIME_TB_ERA_CEIL) — the triage cannot band a record into the current regime" >&2

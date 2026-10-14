@@ -108,9 +108,16 @@ CLAMP=300000
 #      and the FLOOR is the value they PRINT, never a parse of their assignment
 #      text — the mechanism the #1088 review on this file forbade for `$CAP_MS`.
 #      The documented ambient override (`FLEET_REGIME_TB`, a "tests + tuning"
-#      seam) is UNSET for the call, so this leg certifies the COMMITTED default:
-#      without the unset the report bands at the ambient value while the guard
-#      certifies the default — a false PASS with no file edited. The watcher
+#      seam) is UNSET for the call, so this leg certifies the COMMITTED default
+#      and is deliberately blind to the operator's environment — the guard must
+#      not be moved off the committed floor by an ambient variable. It does NOT
+#      constrain a report the weekly driver runs WITH the override: that run
+#      still bands at the override while this leg certifies the committed
+#      default. Because the override is a documented seam that divergence is by
+#      design, not a false PASS this leg claims to prevent; without the unset the
+#      guard would instead read the ambient value, disagree with the watcher, and
+#      false-BLOCK — so the unset is what keeps a green meaning "the committed
+#      geometry is intact". The watcher
 #      side reports its own frozen band FLOOR, so its owner-facing bucket LABEL
 #      is no longer an anchor and a correct relabel no longer blocks the
 #      pre-committed rollback (it used to read as an unreadable floor, exit 2).
@@ -127,6 +134,11 @@ read_regime_floor_by_execution() {
   rc=$?
   case "$answer" in
     ''|*[!0-9]*) printf 'did not print a plain integer (got %s, rc=%s)' "'$answer'" "$rc"; return 1 ;;
+    # An unbounded digit string is NOT a usable floor: bash arithmetic on a value
+    # above int64 errors (rc=2), so this leg would certify a floor its own
+    # consumers cannot band on. The pre-#1342 parse bounded the literal at 15
+    # digits for exactly this reason; the bound moves here with the read.
+    ????????????????*) printf 'answered with an integer outside the representable range (got %s, rc=%s)' "'$answer'" "$rc"; return 1 ;;
   esac
   # A non-zero exit is NOT tolerated even when a valid-looking integer came back:
   # a script that reports one value and then fails is not one whose answer can be
