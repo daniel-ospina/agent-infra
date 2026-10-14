@@ -273,6 +273,18 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, 
   mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/repo" "$MRG/o/logs" "$MRG/o/state"
   mkstubs "$MRG/stubs"
   : > "$MRG/pi-count"
+  : > "$MRG/pr-body"
+}
+# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it posts the SIGNED marker
+# into the PR body — the artifact ai-review-gate reads. `rc=0` alone is not that artifact, which is
+# the fail-open §8f pins. The gh stub above serves this file back for `pr view --json body`.
+mkrecorder_posts() {
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "0000000000000000000000000000000000000000000000000000000000000000" >> '$MRG/pr-body'
+exit 0
+EOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
 }
 # Drive the SHIPPED merge-one.sh. `pi`, `gh` and `git` are EXPORTED SHELL FUNCTIONS, not file stubs:
 # merge-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH itself, so a file stub could be
@@ -288,6 +300,7 @@ run_merge() {
     gh() {
       case "$*" in
         *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
+        *"pr view"*body*) cat "$FAKE_BODY_FILE" 2>/dev/null; return 0 ;;
         *"pr checks"*) printf 'SUCCESS\n'; return 0 ;;
         *) return 0 ;;
       esac
@@ -296,6 +309,7 @@ run_merge() {
     export -f pi gh git
     env -u AI_REVIEW_GATE_KEY PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" \
       PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
+      FAKE_BODY_FILE="$MRG/pr-body" \
       "$BASH_BIN" "$MERGE" "$MRG/repo" acme/widget "$PR" fix/x
   ) 2>&1
 }
@@ -446,11 +460,35 @@ out="$(FAKE_HEAD_OVERRIDE='0123456789ABCDEF0123456789ABCDEF01234567' run_merge)"
 [ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
 ck "a non-lowercase head is refused before the paid review (record-review.sh's exact shape)" $rc
 
-# 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
-# merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
+# 8f) RED→GREEN — `rc=0` IS NOT PROOF THE SIGNED MARKER REACHED THE PR BODY. record-review.sh posts
+# the marker BEST-EFFORT and never fails the record, so it has reachable rc=0 paths with NO post
+# (the body GET/PATCH failed, or gh/repo is unavailable). The pre-fix worker trusted rc=0, saw
+# gate=SUCCESS (the stub), and MERGED — so this fails on the pre-fix tree. The signed marker is the
+# only artifact the gate reads, so its absence must be the same terminal failure as a non-zero rc.
 mkmrg
 printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
 chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls)"; }
+ck "a rc=0 record still pays for exactly one review" $rc
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "rc=0 with no marker fell through to the merge"; }
+ck "RED→GREEN: rc=0 with NO signed marker does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: rc=0 with NO signed marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NO signed marker'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the no-marker park names the missing signed marker" $rc
+out="$(run_merge)"; rc2=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a parked no-marker head was re-reviewed"; }
+ck "a parked no-marker head does not re-pay on the next run" $rc
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the no-marker park refuses re-review with exit 5" $rc
+
+# 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
+# merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
+# The recorder must POST the signed marker (not merely exit 0) — that is now the precondition the
+# worker checks before the gate, so a `: > /dev/null` stub would park and this would be vacuous.
+mkmrg
+mkrecorder_posts
 out="$(run_merge)"
 [ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
 ck "non-vacuity: a successful record reaches MERGED" $rc
@@ -458,6 +496,42 @@ ck "non-vacuity: a successful record reaches MERGED" $rc
 ck "non-vacuity: a successful record writes no park" $rc
 [ "$(pi_calls)" = "1" ] && rc=0 || rc=1
 ck "non-vacuity: exactly one review is run on the happy path" $rc
+
+# ══ the controller's own park: the reason must move with the marker ══════════════════════════
+# 10) `parkreason-<PR>` is the only in-band remedy a human sees (merge-one.sh's exit-5 refusal prints
+# it, and the chain-<N>/fix-one.sh paths read nothing else). The controller used to write
+# `parked-<PR>` at its three park sites and NEVER touch the reason, so a park at a NEW head (after a
+# push moved the old one) left the OLD head's reason beside it — the operator was told to
+# "re-provision the recorder" for a PR parked for an unrelated cause. Drive the shipped helper and
+# require the pair to move together, and require every controller site to use it.
+LOOP="$HERE/orch-loop.sh"
+[ -x "$LOOP" ] || { echo "❌ missing $LOOP"; exit 1; }
+sed -n '/^park_ctrl() {/,/^}/p' "$LOOP" > "$TMP/parkctrl.sh"
+[ -s "$TMP/parkctrl.sh" ] && rc=0 || { rc=1; note "park_ctrl() is not in the shipped orch-loop.sh"; }
+ck "RED→GREEN: the controller has a park helper that writes marker+reason together" $rc
+if [ -s "$TMP/parkctrl.sh" ]; then
+  (
+    set -u; PR=7; O="$TMP/ctrl"; mkdir -p "$O/state"
+    # a park from an EARLIER head, with its own (now stale) reason
+    printf '%s\n' "old-head" > "$O/state/parked-$PR"
+    printf '%s\n' "recorder MISSING at the old head" > "$O/state/parkreason-$PR"
+    # shellcheck disable=SC1090
+    . "$TMP/parkctrl.sh"
+    park_ctrl "$PR" "$HEAD" "still CONFLICTING after 3 fixes"
+  )
+  [ "$(cat "$TMP/ctrl/state/parked-7")" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$TMP/ctrl/state/parked-7" 2>/dev/null)"; }
+  ck "park_ctrl moves the marker to the new head" $rc
+  case "$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null)" in *'still CONFLICTING'*) rc=0 ;; *) rc=1; note "reason=$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null) — the stale reason survived";; esac
+  ck "RED→GREEN: park_ctrl REPLACES a stale reason from an earlier head" $rc
+  case "$(cat "$TMP/ctrl/state/parkreason-7" 2>/dev/null)" in *'recorder MISSING'*) rc=1 ;; *) rc=0 ;; esac
+  ck "the stale reason does not survive beside the new marker" $rc
+fi
+# …and every controller park site must go THROUGH that helper: a bare `> parked-$PR` write anywhere
+# would reintroduce the stale-reason defect at that site. (The guarded read at the top of the sweep
+# is a `cat`, not a write, so it does not match.)
+bare="$(grep -cE '>[[:space:]]*"\$O/state/parked-\$PR"' "$LOOP")"
+[ "$bare" = "0" ] && rc=0 || { rc=1; note "$bare controller site(s) still write parked-\$PR directly"; }
+ck "no controller park site writes parked-\$PR without its reason" $rc
 
 echo
 echo "==> $pass passed, $fail failed"
