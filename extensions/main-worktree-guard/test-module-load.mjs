@@ -670,6 +670,9 @@ async function partB() {
     const tagList = await callBash("git checkout main && git tag");
     expectTrue("B9t3: `checkout main && tag` (list form) stays ALLOWED — no false block (#1144 P2)",
       tagList === undefined, `handler returned ${JSON.stringify(tagList)}`);
+    const tagListFlag = await callBash("git checkout main && git tag -l");
+    expectTrue("B9t4: `checkout main && tag -l` (explicit list flag) stays ALLOWED — no false block (#1144 P2)",
+      tagListFlag === undefined, `handler returned ${JSON.stringify(tagListFlag)}`);
     // …while the MUTATING cousins of those same verbs stay gated (the
     // argument-scoped form is the discriminator, not the verb).
     const wtAdd = await callBash(`git checkout main && git worktree add ${join(tmp, "p2-wt")}`);
