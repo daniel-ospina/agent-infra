@@ -26,8 +26,9 @@
 # WORKERS, which orch-loop.sh spawns through a SECOND tmux boundary — so `cmd_check` could print ok
 # while every review was recorded UNSIGNED.
 #
-# Hermetic: temp HOME + temp state dir, no network, no tmux session is ever created (the refusal
-# happens before tmux is reached). Run:  bash scripts/cloud-cell-supervisor.test.sh
+# Hermetic: temp HOME + temp state dir, no network, and no session on the OPERATOR's tmux server —
+# §1–§6 refuse before tmux is reached, and §7's optional real-tmux half uses private `tmux -L`
+# servers that the EXIT trap kills. Run:  bash scripts/cloud-cell-supervisor.test.sh
 
 set -uo pipefail
 
@@ -257,11 +258,16 @@ case "$sub" in
     [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
   show-options)
     no_server && exit 1
-    [ -f "$S/update-env" ] && cat "$S/update-env"; exit 0 ;;
+    # Only `update-environment` is modelled, and the option NAME is matched — a typo'd option would
+    # otherwise be invisible on a tmux-less runner.
+    [ "${1:-}" = "-gqv" ] && shift
+    [ "${1:-}" = "update-environment" ] || exit 1
+    cat "$S/update-env" 2>/dev/null; exit 0 ;;
   set-option)
     no_server && exit 1
     [ "${1:-}" = "-g" ] && shift
-    [ "${1:-}" = "update-environment" ] && shift
+    [ "${1:-}" = "update-environment" ] || exit 1
+    shift
     printf '%s' "${1:-}" | tr ' ' '\n' | grep . > "$S/update-env" || true
     exit 0 ;;
   new-session)
@@ -269,6 +275,9 @@ case "$sub" in
       for v in PATH HOME O AI_REVIEW_GATE_KEY AI1711_STATE; do
         declare -p "$v" 2>/dev/null || printf 'unset %s\n' "$v"
       done > "$S/server-env"
+      # Seed a representative slice of tmux's own compiled-in default list, so the suite can tell an
+      # APPEND from a REPLACEMENT — without it, `set-option` overwriting the list is invisible.
+      printf 'DISPLAY\nSSH_AUTH_SOCK\n' > "$S/update-env"
     fi
     sess=""; cmd=""
     while [ $# -gt 0 ]; do case "$1" in
@@ -305,17 +314,23 @@ else
   echo "  ⏭ SKIP: no tmux on this host — §7 asserts against the double only"
 fi
 
-K_ENV="KEY-ENV-$$"; K_FILE="KEY-FILE-$$"
+K_ENV="KEY-ENV-$$"; K_FILE="KEY-FILE-$$"; K_AMB="KEY-AMBIENT-$$"
 printf 'AI_REVIEW_GATE_KEY=%s\n' "$K_ENV" > "$W/keys-env.env"
 printf '# deliberately carries no key\n' > "$W/keys-file.env"
 printf '%s\n' "$K_FILE" > "$W/cellhome/.pi/agent/.ai-review-gate-key"
 
-# wk_case <kind:stub|real> <route:env|file> <server:pre|cold>
+# wk_case <kind:stub|real> <route:env|file|amb> <server:pre|cold>
 #   pre  — an OPERATOR server already exists (the scenario the issue names: it supplies the session
 #          environment, so without publication the worker gets the operator's HOME and no key)
 #   cold — no server at all; `start` CREATES one, and it inherits the supervisor's own environment
+#   route=env  keys.env carries the key;              want $K_ENV
+#   route=file keys.env carries none, the key FILE does; want $K_FILE
+#   route=amb  as `file`, PLUS a stale AI_REVIEW_GATE_KEY exported into the supervisor's own shell.
+#              The worker must still resolve the FILE: `record-review.sh` is env-FIRST, so an ambient
+#              export that reaches the session SHADOWS the authoritative file and signs reviews with
+#              the wrong value while the preflight printed ok.
 wk_case() {
-  local kind="$1" route="$2" server="$3" bin st="" sock="" envf sess rc=0 i got want tag
+  local kind="$1" route="$2" server="$3" bin st="" sock="" envf sess rc=0 i got want tag amb=""
   tag="$kind/$route/$server"
   bin="$W/$([ "$kind" = real ] && echo realbin || echo stub)"
   rm -f "$W/worker-key" "$W/worker-env"
@@ -333,8 +348,16 @@ wk_case() {
       [ -s "$st/server-env" ] || bad "$tag: fixture broken — the pre-existing server was not created"
     fi
   fi
-  envf="$W/keys-$route.env"; sess="ai1711-$kind-$route-$server"
-  env PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
+  # `env` uses the same file for both file-backed routes; `amb` adds the stale export.
+  envf="$W/keys-$route.env"
+  if [ "$route" = env ]; then
+    want="$K_ENV"; envf="$W/keys-env.env"
+  else
+    want="$K_FILE"; envf="$W/keys-file.env"
+  fi
+  [ "$route" = amb ] && amb="$K_AMB"
+  sess="ai1711-$kind-$route-$server"
+  env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
       SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" SCOPE=own \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
@@ -344,46 +367,74 @@ wk_case() {
     return
   fi
   got="$(cat "$W/worker-key" 2>/dev/null || true)"
-  [ "$route" = env ] && want="$K_ENV" || want="$K_FILE"
   [ "$got" = "$want" ] \
     && ok "$tag: the WORKER resolved the merge key across the second tmux boundary" \
     || bad "$tag: the worker got '${got:-<none>}' (want $want) — the delivery did not cross; start said: $(grep -i 'key\|FATAL' "$W/start.$kind.$route.$server.out" | head -2 | tr '\n' ' ')"
+  [ "$route" = amb ] && { [ "$got" != "$K_AMB" ] \
+    && ok "$tag: a stale ambient export did NOT shadow the authoritative key FILE" \
+    || bad "$tag: the worker signed with the AMBIENT export ($K_AMB) instead of the key file"; }
   grep -q "^HOME=$W/cellhome$" "$W/worker-env" 2>/dev/null \
     && ok "$tag: the worker's \$HOME is \$CELL_HOME (so the key FILE resolves too)" \
     || bad "$tag: worker HOME was not \$CELL_HOME — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
+  # $O is the second half of the same root: a worker that defaults $HOME/orchestrator writes state
+  # the controller never reads. Asserted, or dropping it from WORKER_ENV_NAMES stays green.
+  grep -q "^O=$W/o$" "$W/worker-env" 2>/dev/null \
+    && ok "$tag: the worker's \$O is the controller's (no split state dir)" \
+    || bad "$tag: worker \$O was not $W/o — $(tr '\n' ' ' < "$W/worker-env" 2>/dev/null)"
   # The NAMES are published (the mechanism) — but ONLY when there was a server to publish into. A
   # cold start must not lose the option, and must not die trying: the server it creates inherits the
-  # same three names from this shell (the delivery assertion above is what proves that).
+  # same names from this shell (the delivery assertion above is what proves that).
   if [ "$kind" = stub ]; then
     if [ "$server" = pre ]; then
       grep -qx 'AI_REVIEW_GATE_KEY' "$st/update-env" 2>/dev/null \
         && ok "$tag: start published AI_REVIEW_GATE_KEY into tmux update-environment" \
         || bad "$tag: update-environment does not carry the key name"
+      # APPEND, not REPLACE: the double seeds DISPLAY + SSH_AUTH_SOCK when the server starts.
+      if grep -qx 'DISPLAY' "$st/update-env" 2>/dev/null && grep -qx 'SSH_AUTH_SOCK' "$st/update-env" 2>/dev/null; then
+        ok "$tag: the publish APPENDED (the server's own default names survived)"
+      else
+        bad "$tag: the publish REPLACED update-environment — the server's default names were dropped"
+      fi
     else
-      [ ! -f "$st/update-env" ] \
-        && ok "$tag: cold start did not try to publish into a server that does not exist" \
-        || bad "$tag: a cold start published into a server that was not there"
+      if grep -qx 'AI_REVIEW_GATE_KEY' "$st/update-env" 2>/dev/null; then
+        bad "$tag: a cold start published into a server that was not there"
+      else
+        ok "$tag: cold start did not publish (the server it creates carries the names already)"
+      fi
     fi
   fi
-  # The secret VALUE must never reach a tmux command line — over EVERY argv the double saw (the
-  # session command, `set-option`, `set-environment`, anything), plus the operator-visible output.
+  # The secret VALUE must never reach a tmux command line. Over EVERY argv the double saw (the
+  # session command, `set-option`, `set-environment`, anything) where the double exists, and over
+  # the operator-visible output everywhere — labelled separately, because the real half inspects no
+  # argv and must not print a claim about one.
+  if [ "$kind" = stub ]; then
+    if grep -qF "$K_ENV" "$st/argv" 2>/dev/null || grep -qF "$K_AMB" "$st/argv" 2>/dev/null; then
+      bad "$tag: the secret VALUE reached a tmux argv"
+    else
+      ok "$tag: the secret VALUE is on no tmux argv (every call the double saw)"
+    fi
+  fi
   if grep -qF "$K_ENV" "$W/start.$kind.$route.$server.out" 2>/dev/null \
-     || { [ "$kind" = stub ] && grep -qF "$K_ENV" "$st/argv" 2>/dev/null; }; then
-    bad "$tag: the secret VALUE reached a tmux argv / operator-visible output"
+     || grep -qF "$K_AMB" "$W/start.$kind.$route.$server.out" 2>/dev/null; then
+    bad "$tag: the secret VALUE reached operator-visible output"
   else
-    ok "$tag: the secret VALUE is not on any tmux argv"
+    ok "$tag: the secret VALUE is not in the operator-visible output"
   fi
 }
 
 wk_case stub env pre
 wk_case stub file pre
+wk_case stub amb pre
 wk_case stub env cold
 wk_case stub file cold
+wk_case stub amb cold
 if [ -n "$REAL_TMUX" ]; then
   wk_case real env pre
   wk_case real file pre
+  wk_case real amb pre
   wk_case real env cold
   wk_case real file cold
+  wk_case real amb cold
 fi
 
 echo

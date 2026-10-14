@@ -108,16 +108,25 @@ export HOME="$CELL_HOME"
 
 # Publish WORKER_ENV_NAMES into the tmux server's `update-environment`, APPENDING to whatever is
 # already there — tmux's default list carries SSH_AUTH_SOCK and friends, and replacing it would
-# silently drop them on this cell.
-# ⛔ Guarded by a server-existence probe, and that is MEASURED, not assumed: with no server running,
-# `show-options` AND `set-option` both fail ("error connecting … No such file or directory") rather
-# than starting one — so an unguarded `set-option` here would make `start` die on EVERY cold cell,
-# the common path, which this fix must not break. A cold start needs no publication: the
-# `new-session` below CREATES the server from THIS shell's environment, and that environment already
-# carries all three names (the "works only by accident" path the issue names, and the reason a cold
-# start was never the broken one). It also keeps the server's own compiled-in `update-environment`
-# default intact. A server that ALREADY exists is the case this function is for, and there the set
-# must fail CLOSED — a swallowed failure is exactly the keyless-cell false green this removes.
+# silently drop them on this cell. (The append is asserted: the §7 double seeds a default list and
+# requires it to survive.)
+# ⛔ The first read is guarded by a server-existence probe, and that is MEASURED, not assumed: with no
+# server running, `show-options` AND `set-option` both fail ("error connecting … No such file or
+# directory") rather than starting one — so an unguarded `set-option` here would make `start` die on
+# EVERY cold cell, the common path, which this fix must not break. A cold start needs no publication:
+# the `new-session` below CREATES the server from THIS shell's environment, and that already covers
+# the delivery — HOME is exported above, a keys.env key is exported by the `set -a` source, and `O`
+# arrives when it came from keys.env or the caller and otherwise coincides with the worker's own
+# `$HOME/orchestrator` fallback (the "works only by accident" path the issue names, and the reason a
+# cold start was never the broken one). Returning early also leaves the server's own compiled-in
+# `update-environment` default intact.
+# ⛔ A `show-options` failure is READ as "no server". That is the one case it is meant to catch (the
+# cold path, measured above), but the read is not selective: a `show-options` that failed for any
+# OTHER reason on a live server would also skip publication, and `start` would proceed. On tmux that
+# state is not reachable — the socket either answers or the server is gone — so the residual is
+# stated rather than papered over, and it is NOT closed by a read-back: the early return happens
+# before one. The alternatives that would remove the ambiguity (`set-environment -g`, `-e`) put the
+# secret on a tmux argv, which is the exposure this whole route exists to avoid.
 publish_worker_env() {
   local list n
   if ! list="$(tmux show-options -gqv update-environment 2>/dev/null)"; then
@@ -231,10 +240,10 @@ cmd_check() {
   # key file (the raw value is non-empty, so the fallback never runs, and the normalized value is
   # empty) — so that case must be checked BEFORE the file, and reported as a failure, not a "present".
   if [ -n "$KEY_IN_FILE" ]; then
-    say "ok: merge authority key present in $ENV_FILE — the controller re-sources it, and every"
-    say "    MERGE WORKER it spawns across the second tmux boundary gets it too: 'start' publishes"
-    say "    $WORKER_ENV_NAMES into tmux update-environment, and a server it CREATES inherits this"
-    say "    shell's environment outright."
+    say "ok: merge authority key present in $ENV_FILE — the controller re-sources it. On the"
+    say "    'start' path (the only supported launch) the MERGE WORKERS it spawns across the second"
+    say "    tmux boundary get it too: 'start' publishes $WORKER_ENV_NAMES into tmux update-environment"
+    say "    and dies rather than start a cell where that publication fails."
   elif [ "$KEY_IN_FILE_SET" = 1 ]; then
     say "warn: AI_REVIEW_GATE_KEY in $ENV_FILE is WHITESPACE-ONLY. The consumer strips whitespace,"
     say "      so it resolves to EMPTY — and because the env value wins, it will NOT fall back to"
@@ -248,7 +257,8 @@ cmd_check() {
     local kfpath="$CELL_HOME/.pi/agent/.ai-review-gate-key"
     if [ -n "${AI_REVIEW_GATE_KEY:-}" ]; then
       say "warn: AI_REVIEW_GATE_KEY is set in THIS shell but not in $ENV_FILE — the controller"
-      say "      session will NOT receive it (tmux serves a new session the SERVER's environment)."
+      say "      session will NOT receive it: tmux serves a new session the SERVER's environment, and"
+      say "      'start' drops this shell's export before creating the session, so it cannot be delivered."
       say "      Write it to $ENV_FILE, or to $kfpath."
     elif [ -e "$kfpath" ] && [ ! -r "$kfpath" ]; then
       # EXISTING but UNREADABLE is neither missing nor empty, and the remedy differs: prescribing
@@ -331,9 +341,25 @@ cmd_start() {
   # a keys.env that fails to parse, so the controller ran on a partially-set environment with no
   # signal in the log. A top-level `exit` here still ends the session, which the `sleep 3`
   # has-session check below already turns into a loud failure.
+  # ⛔ Drop an AMBIENT-ONLY key from THIS shell before anything is published or created. Publishing
+  # the NAME makes whatever this shell holds copyable into the session — the creating client here is
+  # this very shell — so an export `cmd_check` has just called a misconfiguration ("set in THIS shell
+  # but not in $ENV_FILE") would be delivered anyway, falsifying that verdict. Worse,
+  # `record-review.sh` resolves the key env-FIRST, so a stale ambient export would SHADOW an
+  # authoritative key FILE in every worker and sign reviews with the wrong value while the preflight
+  # printed ok — a false PASS of exactly the class this fix exists to remove. keys.env was ALREADY
+  # sourced above, so a key from there is present legitimately and is KEPT; only a key backed by
+  # NEITHER source is dropped. The `unset` also strips the name from a session whose SERVER still
+  # carries an older value: `update-environment` REMOVES a listed name the creating client lacks.
+  # A whitespace-only keys.env value is deliberately NOT dropped — it is a state `cmd_check` names
+  # explicitly, and leaving it is what makes that warning true.
+  if [ -z "$KEY_IN_FILE" ] && [ "$KEY_IN_FILE_SET" != 1 ]; then
+    unset AI_REVIEW_GATE_KEY
+  fi
   # BEFORE the controller exists, so every worker it later spawns reads the published names when
   # there is a server to publish into. The controller's own session inherits them too (harmless —
-  # the command string sets them again).
+  # the command string sets them again). This is the path that actually launches a cell, which is
+  # what the preflight's delivery claim is about; the publish itself dies on a failed `set-option`.
   publish_worker_env
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
