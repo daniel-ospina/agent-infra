@@ -56,14 +56,20 @@ steps:
 
 **AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
 CONTENT is clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved) AND pre-flight tests passed (per `01-preflight.md` risk tier —
-regression check for code PRs) AND the verification gate verified the staged files. The review
-is surface-dispatched from the PR diff (issue complexity ratings scale review depth, per
-`code-review` Step 0.8 infra detection + Step 3.6 surface matrix, and `test-routing` domain dispatch):
-always-on: bug scan (one checker, two ORDERED passes — the blind diff scan first, then the deep caller/callee), guidance compliance, history + prior-PR comments (one checker), and SECURITY
-(security-review skill discipline — HIGH-confidence findings only, research-before-report);
-plus domain reviewers as applicable: skills/extensions/.mcp.json/ontology → Skill Infrastructure /
-Ontology & Templates / Extension Safety; UX → ux-consistency/ux-coverage/ux-realism (code-review) + ux-verification (test-routing); config → Agent #12 config review;
-research/docs → proportional review. No human approval required for technical merges.
+regression check for code PRs) AND the verification gate verified the staged files. `code-review`
+Step 3.6 resolves the risk class (which caps the reviewer count per `proportional-gates`
+§Review Cycles) and the PR diff surface (which selects WHAT is examined, never how many
+reviewers run); `test-routing` dispatches the verification domain. The merged reviewers are:
+always-on **A** (Guidance & History) and **B** (Correctness & Security — bug scan as two ORDERED
+passes, blind diff scan first then deep caller/callee, plus the security-review discipline,
+HIGH-confidence findings only, research-before-report); surface-matched **C** (Architecture &
+Data) and **D** (Surface & Config — UX consistency/coverage/realism + config validation); and
+**E** (Infrastructure — Skill Infrastructure / Ontology & Templates / Extension Safety) only when
+`INFRA_RISK` is set. Low risk class → the panel is B alone (one reviewer round, both of B's
+bug-scan passes, no re-review loop); reviewer E still fires whenever `INFRA_RISK` is set, at
+every class. UX verification
+additionally routes through `ux-verification` (test-routing); research/docs → proportional review.
+No human approval required for technical merges.
 **Human escalation (only):** P0 findings requiring an architectural or security decision
 (irreversible ops, data loss, security breach) — and only after the code-review fixer loop
 escalation is exhausted (per the `code-review` skill, Step 6.5 Orchestrator Escalation).
