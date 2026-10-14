@@ -432,13 +432,23 @@ echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + fleet-health
 # by sibling path -- safe-send.sh calls lane-guard.py beside it, turn-classify.py shells
 # lane-status.py beside it. The farm therefore RENAMES the directory: source
 # scripts/lane/<f> -> dest scripts/<f>. Same idempotent real-copy refresh model as above.
-lane_srcs=(lane-status.py lane-guard.py lane-triage.py lane-wip.py safe-send.sh \
-           queue-dispatch.py turn-classify.py turn-end.py heartbeat-loop.sh \
+#
+# ⛔ TWO OF THEM ALREADY HOME AT THE REPO ROOT, and must NOT be re-versioned here.
+# lane-status.py and heartbeat-loop.sh were promoted to scripts/ by #1670 and evolved by
+# #1693/#1695 (their pytest suites are pinned in BOTH CI lanes). The Oct-1 snapshots that
+# used to sit under scripts/lane/ were therefore removed instead of kept as a second,
+# silently-divergent classifier, and the farm reads those two from scripts/ so a farmed box
+# gets the CANONICAL copy -- never a 1,013-line snapshot copied over the live one (the
+# fail-dangerous overwrite the #1553 review named). One home: scripts/<f>.
+lane_root_srcs=(lane-status.py heartbeat-loop.sh)
+lane_srcs=(lane-guard.py lane-triage.py lane-wip.py safe-send.sh \
+           queue-dispatch.py turn-classify.py turn-end.py \
            orchestrator-heartbeat.sh)
 mkdir -p "$DEST/scripts"
 lane_copied=0
-for base in "${lane_srcs[@]}"; do
+for base in "${lane_root_srcs[@]}" "${lane_srcs[@]}"; do
   f="$INFRA_ROOT/scripts/lane/$base"
+  case " ${lane_root_srcs[*]} " in *" $base "*) f="$INFRA_ROOT/scripts/$base" ;; esac
   [ -f "$f" ] || continue
   dest="$DEST/scripts/$base"
   if [ -L "$dest" ]; then

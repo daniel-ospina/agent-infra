@@ -247,11 +247,23 @@ def screened_stalled(label):
         return True                    # out of budget this tick: alert, do not hide
     SCREEN_CAP[0] -= 1
     try:
-        import subprocess
-        r=subprocess.run(["/usr/bin/python3",
-                          "$HOME/.pi/agent/state/lane-confirm.py", label],
+        import os, subprocess
+        # ⛔ `$HOME` IS NOT EXPANDED HERE. The whole block is the argument to a
+        # single-quoted `python3 -c '…'`, so bash never touches it and Python
+        # expands nothing inside a string: the argv path was the LITERAL
+        # `$HOME/.pi/agent/state/lane-confirm.py`. python3 exits 2 on the missing
+        # file, and the old `rc == 0` read that as "not stalled" — so every WEAK
+        # verdict (the whole stall/idle family) was diverted into
+        # `known…[screened-ok]` and NEVER alerted. Measured 2026-10-06. Expand it
+        # where expansion can actually happen.
+        p=os.path.expanduser("~/.pi/agent/state/lane-confirm.py")
+        if not os.path.exists(p):
+            return True                # screener absent: fail OPEN, never silence an alarm
+        r=subprocess.run(["/usr/bin/python3", p, label],
                          capture_output=True, text=True, timeout=900)
-        return r.returncode == 0       # 0 == STALLED (lettered); anything else == suppress
+        if r.returncode not in (0, 1):
+            return True                # could not run (crash/missing dep): fail OPEN
+        return r.returncode == 0       # 0 == STALLED (lettered); 1 == not stalled == suppress
     except Exception:
         return True                    # fail OPEN
 
@@ -340,7 +352,11 @@ if [ "$RL" = "1" ]; then N_ALERT=0; ALERTS=""; N_KNOWN=0; KNOWN=""; fi
 # DONE_READY re-tasks a lane that is mid-work.
 # FAIL-OPEN: any failure leaves the mechanical verdicts untouched.
 TRIAGE_READY=""; TRIAGE_CONTINUE=""; TRIAGE_HUMAN=""; TRIAGE_EXT=""; TRIAGE_STALL=""; TRIAGE_HELD=""; N_TRIAGE=0
-TRV=$(/usr/bin/python3 "$HOME/.pi/agent/state/lane-triage.py" 2>/dev/null) && eval "$TRV" || log "NOTE triage unavailable -- mechanical verdicts stand"
+# ⛔ $SCRIPTS, not $HOME/.pi/agent/state. The farm installs lane-triage.py to
+# $DEST/scripts/ (pi-bootstrap/setup.sh lane_srcs), and the old state/ path is a
+# location the farm never provisions (and never removes) — so this call kept
+# executing the un-versioned copy and a merged fix could never reach the fleet.
+TRV=$(/usr/bin/python3 "$SCRIPTS/lane-triage.py" 2>/dev/null) && eval "$TRV" || log "NOTE triage unavailable -- mechanical verdicts stand"
 if [ "${N_TRIAGE:-0}" -gt 0 ]; then
   # JEV's DONE_READY supersedes the stale-mtime CAPACITY list; the screened-out lanes keep theirs.
   CAP="$TRIAGE_READY"

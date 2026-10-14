@@ -41,7 +41,7 @@ set -uo pipefail
 # The syntax-sweep targets. A DATA list, not two literal `for f in …` lines: `--list-sweeps` prints
 # exactly what the loops below iterate, so the sweep half cannot be advertised and not performed
 # (or performed and not advertised) without editing this one line.
-SWEEP_GLOBS=("scripts/*.sh" "scripts/checkout-hygiene/*.sh")
+SWEEP_GLOBS=("scripts/*.sh" "scripts/checkout-hygiene/*.sh" "scripts/lane/*.sh")
 
 if [ "${1:-}" = "--list" ]; then
   # Only `.sh` targets: the sentinel self-check below also calls run_shard, and it must not

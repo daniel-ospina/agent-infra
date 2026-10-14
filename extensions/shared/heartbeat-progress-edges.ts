@@ -782,6 +782,23 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "floor the configured freshness interval is clamped up to (5 min)",
   },
+  // — orchestrator-heartbeat lane idle bounds (scripts/lane/orchestrator-heartbeat.sh, #1552) —
+  {
+    name: "IDLE_MIN",
+    owners: ["scripts/lane/orchestrator-heartbeat.sh"],
+    value: "=9",
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: "quiet-for-N-minutes with NO spinner ⇒ finished/idle — the boundary between a lane merely BETWEEN steps and an idle one. Feeds the WEAK stall set (so it is screened) and the CAPACITY field. Registered by the reverse scan when the lane-orchestration layer was versioned; the constant alone cannot be reviewed against the 9-minute false positive its own comment records.",
+  },
+  {
+    name: "CAP_IDLE_MIN",
+    owners: ["scripts/lane/orchestrator-heartbeat.sh"],
+    value: "=20",
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: ">= this many minutes idle with NO child in flight ⇒ FREE CAPACITY (an opportunity, never an alert). Deliberately above IDLE_MIN so a lane merely between steps is not reported as free.",
+  },
   // — subagent byte-freshness backstop (class 2: value+behaviour pinned) —
   {
     name: "getSubagentBackstopFreshMs",

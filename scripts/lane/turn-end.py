@@ -74,7 +74,6 @@ MARK_DIR = f"{STATE}/turn-end"
 KILL = f"{STATE}/HEARTBEAT-OFF"
 NUDGE_KILL = f"{STATE}/LANE-NUDGE-OFF"
 LOCK = f"{STATE}/turn-end.lock"
-CMUX_DISPATCH = (f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py")
 
 # A lane must have been quiet this long before we speak. Below it, a lane that has
 # simply paused between tool calls would be interrupted.
@@ -99,8 +98,6 @@ SKIP_IF_QUESTION = True
 # it; decoding the records does not save it either, because the lane's own text carries
 # the line as `` `RESEARCH: ...` `` (backtick-prefixed). The guard now reads the ISSUE'S
 # LABEL - the gate's own output - which is authoritative and needs no prose parsing.
-DECL_RE = re.compile(r"^\s*RESEARCH:\s*skill=", re.M)   # kept for reference only
-DECL_RE = re.compile(r"^\s*RESEARCH:\s*skill=", re.M)
 
 # ⛔ DELIVERY IS VERIFIED AGAINST THE ARTIFACT, NOT THE DISPATCHER'S EXIT CODE.
 # `cmux_dispatch.py send` returned rc=1 with

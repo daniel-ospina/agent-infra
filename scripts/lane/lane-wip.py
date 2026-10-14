@@ -33,6 +33,12 @@ from __future__ import annotations
 import glob, json, os, subprocess, sys, time
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+# The classifier's canonical home is the repo root (scripts/, promoted by #1670); the farm
+# copies it FLAT into $DEST/scripts beside this file, so the sibling resolves there. Running
+# lane-wip.py straight out of scripts/lane/ has no sibling in that directory — fall back to
+# the repo-root copy rather than shelling a path that does not exist.
+if not os.path.exists(os.path.join(SCRIPTS, "lane-status.py")):
+    SCRIPTS = os.path.dirname(SCRIPTS)
 SESS = os.path.expanduser("~/.pi/agent/sessions")
 
 

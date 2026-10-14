@@ -59,7 +59,6 @@ HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
 SCRIPTS = f"{HOME}/.pi/agent/scripts"
 REGISTRY = f"{STATE}/lane-registry.tsv"
-CMUX_DISPATCH = f"{HOME}/Documents/GitHub/tortoise/tools/cmux_dispatch.py"
 
 # SHARED with turn-end.py ON PURPOSE: one marker directory means one claim per
 # turn, so the two nudgers cannot both speak to the same end-of-turn.
