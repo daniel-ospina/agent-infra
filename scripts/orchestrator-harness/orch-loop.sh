@@ -713,7 +713,7 @@ PY
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
-          echo "MERGE-ONLY: this repo cannot be provisioned for dispatch (agent-infra#1736) — no implementation lane will be dispatched until this is fixed. Reason and evidence: $LOG (search 'NOT PROVISIONABLE'). Fix: set TORTOISE=<a tortoise checkout>, or vendor tools/collision_preflight.py into the repo — then delete this file and re-run 'check'." > "$O/.refresh-blocked"
+          echo "MERGE-ONLY: this repo cannot be provisioned for dispatch (agent-infra#1736) — no implementation lane will be dispatched until this is fixed. Reason and evidence: $LOG (search 'NOT PROVISIONABLE'). Fix: set TORTOISE_REPO=<a tortoise checkout>, or vendor tools/collision_preflight.py into the repo — then delete this file and re-run 'check'." > "$O/.refresh-blocked"
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
         fi ) &

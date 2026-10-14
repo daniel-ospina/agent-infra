@@ -13,8 +13,16 @@
 # HOW THESE CHECKS ARE WRITTEN. Every check drives the SHIPPED script (or the shipped orch-loop.sh
 # block, extracted verbatim) — never a re-implementation, which would pass on the broken copy too.
 # The scout worktree is pre-created as a plain directory, so no real `git worktree`, network, uv or
-# gh is touched: `gh` is a stub, `uv` is a stub, and `HOME` is a sandbox so the real tortoise
-# checkout is never discovered by the fallback resolver.
+# gh is touched: `gh` is a stub, `uv` is a stub pinned through SCOUT_UV, and `HOME` is a sandbox so
+# the real tortoise checkout is never discovered by the fallback resolver.
+#
+# ⛔ WHY SCOUT_UV, NOT JUST A PATH STUB (agent-infra#1748 review). The shipped script used to
+# hard-prepend /opt/homebrew/bin:/usr/local/bin, so a stub merely placed first in the CALLER's PATH
+# was outranked by a real `uv` in those dirs — on the cmux cell (`/usr/local/bin/uv`) and on any
+# Homebrew macOS box this suite silently ran the REAL `uv sync --extra …` (network, `.venv`
+# writes), failed 4 checks, and reported a false "33 PASS". The script now appends those dirs and
+# resolves `uv` through `${SCOUT_UV:-uv}`, so the stub below is authoritative regardless of what
+# the host has installed.
 #
 # Run:  bash scripts/orchestrator-harness/refresh-scout.test.sh
 
@@ -42,13 +50,16 @@ mk_case() {
   printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
 }
 # rf <dir> <refresh|check> [KEY=VAL ...] — runs the SHIPPED script hermetically; $OUT/$RC.
-# RF_PATH overrides the constructed PATH for the one case that must have no `uv` on it.
+# RF_PATH overrides the constructed PATH for the one case that must have no `uv` on it. The ambient
+# provisioning knobs are CLEARED every run, so a case's own values are the only ones in play and an
+# operator's exported TORTOISE_REPO/TORTOISE/SCOUT_UV cannot leak into the sandbox.
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
-  OUT="$(env HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
+  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV \
+          HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
 }
@@ -87,7 +98,7 @@ EOF
 mk_case no-pyproject
 mk_tool "$D/tort/tools/collision_preflight.py"
 printf '#!/bin/bash\necho "UV-WAS-CALLED $*" >> "%s/uv-args"\nexit 99\n' "$D" > "$D/bin/uv"; chmod +x "$D/bin/uv"
-rf "$D" refresh TORTOISE="$D/tort"
+rf "$D" refresh TORTOISE_REPO="$D/tort" SCOUT_UV="$D/bin/uv"
 [ "$RC" -eq 0 ] && ok "no pyproject.toml: the refresh PROCEEDS (rc=0, was an abort every cycle)" \
                 || bad "no pyproject.toml: rc=$RC (want 0) — output: $OUT"
 case "$OUT" in
@@ -112,7 +123,7 @@ case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
 exit 0
 SH
 chmod +x "$D/bin/gh"
-rf "$D" refresh TORTOISE="$D/tort" TOOL_LOG="$D/tool-log"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool-log"
 [ "$RC" -eq 0 ] && ok "own tool: the refresh proceeds (rc=0)" || bad "own tool: rc=$RC — $OUT"
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) ok "own tool: the pre-flighted CLEAN candidate reached the backlog" ;;
@@ -132,11 +143,30 @@ else
   bad "own tool: the resolved tool never ran (no tool-log) — output: $OUT"
 fi
 
+# ── 2b) TORTOISE_REPO is the CANONICAL knob; the legacy TORTOISE alias still resolves ───────────
+# `TORTOISE_REPO` is what the rest of the harness uses (check-port-drift.sh, install-launchd.sh,
+# hub-state-check.sh), so an operator who already exported it must not be told to set a variable
+# they believe is set (agent-infra#1748 review). When BOTH are set the canonical one wins; the alias
+# is exercised on its own so an existing keys.env keeps working.
+mk_case canonical-wins
+mk_tool "$D/tort-repo/tools/collision_preflight.py"
+mk_tool "$D/tort-legacy/tools/collision_preflight.py"
+rf "$D" check TORTOISE_REPO="$D/tort-repo" TORTOISE="$D/tort-legacy"
+case "$OUT" in
+  *"pre-flight tool=$(cd "$D/tort-repo" && pwd -P)/tools/collision_preflight.py"*) ok "TORTOISE_REPO: the canonical knob wins over the legacy alias" ;;
+  *) bad "TORTOISE_REPO: did not win over TORTOISE — output: $OUT" ;;
+esac
+mk_case legacy-alias
+mk_tool "$D/tort/tools/collision_preflight.py"
+rf "$D" check TORTOISE="$D/tort"
+[ "$RC" -eq 0 ] && ok "TORTOISE: the legacy alias still resolves a checkout (rc=0)" \
+               || bad "TORTOISE alias: rc=$RC — $OUT"
+
 # ── 3) NOTHING resolvable must be a LOUD refusal with the reason — never an empty backlog ───────
 # rc=3 is the PERMANENT code orch-loop.sh keys on; a transient failure would be 1. The reason must
 # be the missing tool, NOT the old, misleading "uv sync failed".
 mk_case no-tool
-rf "$D" refresh TORTOISE=
+rf "$D" refresh TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "no tool anywhere: rc=3 (PERMANENT — not the transient code)" \
                || bad "no tool anywhere: rc=$RC (want 3) — output: $OUT"
 case "$OUT" in
@@ -159,7 +189,7 @@ mk_case uv-fails
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '[project]\nname = "demo"\n' > "$D/repo/.worktrees/dispatch-scout/pyproject.toml"
 printf '#!/bin/bash\necho "error: cache is read-only" >&2\nexit 1\n' > "$D/bin/uv"; chmod +x "$D/bin/uv"
-rf "$D" refresh
+rf "$D" refresh SCOUT_UV="$D/bin/uv"
 [ "$RC" -eq 1 ] && ok "uv failure: rc=1 (TRANSIENT — distinct from the permanent 3)" \
                || bad "uv failure: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
@@ -186,7 +216,7 @@ parity = ["pyarrow>=17"]
 embeddings = true
 TOML
 mk_uv_ok "$D"
-rf "$D" refresh
+rf "$D" refresh SCOUT_UV="$D/bin/uv"
 case "$(cat "$D/uv-args" 2>/dev/null)" in
   *"--extra embeddings"*"--extra parity"*) ok "extras: declared extras ARE applied" ;;
   *) bad "extras: declared extras not applied — '$(cat "$D/uv-args" 2>/dev/null)'" ;;
@@ -195,17 +225,37 @@ mk_case extras-absent
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '[project]\nname = "demo"\n' > "$D/repo/.worktrees/dispatch-scout/pyproject.toml"
 mk_uv_ok "$D"
-rf "$D" refresh
+rf "$D" refresh SCOUT_UV="$D/bin/uv"
 case "$(cat "$D/uv-args" 2>/dev/null)" in
   *"--extra"*) bad "extras: an undeclared extra was passed — '$(cat "$D/uv-args" 2>/dev/null)'" ;;
   *) ok "extras: no extras are invented for a project that declares none" ;;
 esac
 
+# ── 5b) SCOUT_UV PINS THE BINARY: a decoy `uv` earlier in PATH must NOT be the one executed ─────
+# The shipped script used to hard-prepend the macOS dirs, so a caller's PATH could not pin `uv` and
+# a real one shadowed the suite's stub (agent-infra#1748). SCOUT_UV is that pin, so the decoy — the
+# FIRST `uv` on PATH — must be ignored. On the PRE-FIX code this fails: SCOUT_UV did not exist, the
+# decoy (or the system `uv`) ran, and no `--extra` argv was ever recorded.
+mk_case uv-override
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '[project]\nname = "demo"\n[project.optional-dependencies]\nembeddings = ["sentence-transformers>=3"]\n' > "$D/repo/.worktrees/dispatch-scout/pyproject.toml"
+mkdir -p "$D/decoybin"
+printf '#!/bin/bash\necho "DECOY $*" >> "%s/decoy-args"\nexit 7\n' "$D" > "$D/decoybin/uv"; chmod +x "$D/decoybin/uv"
+mk_uv_ok "$D"
+RF_PATH="$D/decoybin:$D/bin:$PATH" rf "$D" refresh SCOUT_UV="$D/bin/uv"
+case "$(cat "$D/uv-args" 2>/dev/null)" in
+  *"--extra embeddings"*) ok "SCOUT_UV: the pinned stub ran — PATH order did not override it" ;;
+  *) bad "SCOUT_UV: the pinned stub did not run — uv-args='$(cat "$D/uv-args" 2>/dev/null)'" ;;
+esac
+[ ! -e "$D/decoy-args" ] && ok "SCOUT_UV: the earlier-PATH decoy uv was never executed" \
+                        || bad "SCOUT_UV: the PATH decoy ran — $(cat "$D/decoy-args" 2>/dev/null)"
+RF_PATH=""
+
 # ── 6) `--check`: the READ-ONLY verdict the cell's `start` gate uses ────────────────────────────
 # (a) provisionable → rc 0, names the tool and the not-applicable venv, and writes NOTHING.
 mk_case check-ok
 mk_tool "$D/tort/tools/collision_preflight.py"
-rf "$D" check TORTOISE="$D/tort"
+rf "$D" check TORTOISE_REPO="$D/tort"
 [ "$RC" -eq 0 ] && ok "--check: a provisionable repo passes (rc=0)" || bad "--check: rc=$RC — $OUT"
 WANT_TOOL="$(cd "$D/tort" && pwd -P)/tools/collision_preflight.py"
 case "$OUT" in
@@ -222,24 +272,25 @@ esac
 
 # (b) not provisionable → rc 3, with the reason and the fix.
 mk_case check-bad
-rf "$D" check TORTOISE=
+rf "$D" check TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "--check: a non-provisionable repo is REFUSED (rc=3)" || bad "--check: rc=$RC — $OUT"
 case "$OUT" in
-  *"NOT PROVISIONABLE"*"set TORTOISE="*) ok "--check: the refusal carries the reason AND the fix" ;;
+  *"NOT PROVISIONABLE"*"set TORTOISE_REPO="*) ok "--check: the refusal carries the reason AND the fix" ;;
   *) bad "--check: refusal lacks reason/fix — output: $OUT" ;;
 esac
-# A repo whose pyproject is present but whose `uv` is missing must also refuse, and say so. The
-# PATH is stripped to the system dirs so no real `uv` can leak in (the shipped script prepends
-# /opt/homebrew/bin and /usr/local/bin, neither of which carries one here or on the CI runner).
+# A repo whose pyproject is present but whose `uv` is missing must also refuse, and say so. `uv`
+# is pinned through SCOUT_UV to a path that does not exist, so the case is deterministic on ANY
+# host: stripping PATH alone could not work because the shipped script re-added /usr/local/bin,
+# where a real `uv` lives on the cmux cell (`/usr/local/bin/uv`) — the case then read CHECK OK.
 mk_case check-no-uv
 mk_tool "$D/tort/tools/collision_preflight.py"
 printf '[project]\nname = "demo"\n' > "$D/repo/.worktrees/dispatch-scout/pyproject.toml"
-RF_PATH="$D/bin:/usr/bin:/bin:/usr/sbin:/sbin" rf "$D" check TORTOISE="$D/tort"
+RF_PATH="$D/bin:/usr/bin:/bin:/usr/sbin:/sbin" rf "$D" check TORTOISE_REPO="$D/tort" SCOUT_UV="$D/bin/no-such-uv"
 RF_PATH=""
 [ "$RC" -ne 0 ] && ok "--check: a pyproject with no uv on PATH is refused" \
                 || bad "--check: passed with no uv — output: $OUT"
 case "$OUT" in
-  *"'uv' is not on PATH"*) ok "--check: the refusal names uv" ;;
+  *"'uv' is not runnable"*"SCOUT_UV="*) ok "--check: the refusal names uv and the resolution that failed" ;;
   *) bad "--check: the refusal does not name uv — output: $OUT" ;;
 esac
 

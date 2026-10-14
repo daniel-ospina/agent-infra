@@ -18,7 +18,19 @@ OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 O="${O:-$HOME/orchestrator}"
-export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
+# harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
+# caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
+# operator with a fixed interpreter) got whatever `uv` sat in /usr/local/bin instead, with no way
+# to opt out from outside. Appending keeps the tools discoverable without overruling the caller.
+# (`SCOUT_UV` below pins the binary explicitly when PATH order is not enough.)
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"
+
+# The `uv` used to provision the scout venv. `SCOUT_UV` overrides PATH resolution outright — the
+# regression suite pins its stub with it, and an operator can point it at a specific interpreter.
+# Both the `--check` probe and the run resolve through this SAME variable, so a check can never
+# disagree with what the refresh would actually execute.
+UV="${SCOUT_UV:-uv}"
 
 # ── exit codes: TWO failure kinds, because the caller must act on them differently ────────────
 # `&` in orch-loop.sh discarded this script's status, so a bare non-zero was invisible. orch-loop
@@ -45,10 +57,15 @@ esac
 # code hardcoded `$SC/tools/collision_preflight.py`, so a cell on agent-infra (no such file) ran a
 # tool that did not exist, emitted no VERDICT, and queued nothing — forever, and silently.
 PREFLIGHT=""
+# The configured tortoise checkout. `TORTOISE_REPO` is the harness's established name for this
+# (check-port-drift.sh, install-launchd.sh, hub-state-check.sh); `TORTOISE` is accepted as an alias
+# so an operator's existing keys.env keeps working (agent-infra#1748 review).
+tortoise_var() { [ -n "${TORTOISE_REPO:-}" ] && printf '%s' "$TORTOISE_REPO" || printf '%s' "${TORTOISE:-}"; }
 find_tortoise() {   # print a tortoise checkout carrying the tool, or return 1
-  local cand common
-  if [ -n "${TORTOISE:-}" ] && [ -f "${TORTOISE}/tools/collision_preflight.py" ]; then
-    (cd "$TORTOISE" && pwd -P); return 0
+  local cand common configured
+  configured="$(tortoise_var)"
+  if [ -n "$configured" ] && [ -f "$configured/tools/collision_preflight.py" ]; then
+    (cd "$configured" && pwd -P); return 0
   fi
   common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
   for cand in \
@@ -84,9 +101,9 @@ cmd_check() {
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
-    echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE='${TORTOISE:-}')"
+    echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
     echo "[refresh] NOT PROVISIONABLE: this repo cannot be pre-flighted for dispatch, so a cell on it would MERGE ONLY (#1736)"
-    echo "[refresh]   fix: set TORTOISE=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
+    echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env), or vendor tools/collision_preflight.py into the repo"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   echo "[refresh] check: repo=$REPO"
@@ -97,9 +114,9 @@ cmd_check() {
   if [ -x "$scout/.venv/bin/python" ]; then
     echo "[refresh] check: interpreter=$scout/.venv/bin/python"
   elif [ -f "$scout/pyproject.toml" ]; then
-    command -v uv >/dev/null 2>&1 \
-      || { echo "[refresh] check: FAIL $scout/pyproject.toml is present but 'uv' is not on PATH — the scout venv cannot be provisioned"; return "$EXIT_TRANSIENT"; }
-    echo "[refresh] check: interpreter=$scout/.venv/bin/python (to be provisioned with uv sync)"
+    command -v "$UV" >/dev/null 2>&1 \
+      || { echo "[refresh] check: FAIL $scout/pyproject.toml is present but 'uv' is not runnable (SCOUT_UV='${SCOUT_UV:-unset}', resolved command='$UV') — the scout venv cannot be provisioned"; return "$EXIT_TRANSIENT"; }
+    echo "[refresh] check: interpreter=$scout/.venv/bin/python (to be provisioned with $UV sync)"
   elif command -v python3 >/dev/null 2>&1; then
     echo "[refresh] check: no pyproject.toml in $scout — the scout venv step is NOT APPLICABLE; interpreter=python3"
   else
@@ -131,9 +148,9 @@ cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-fli
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
 if ! resolve_preflight; then
-  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE='${TORTOISE:-}')"
+  echo "[refresh] NOT PROVISIONABLE: no tools/collision_preflight.py in $SC and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
   echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
-  echo "[refresh]   fix: set TORTOISE=<a tortoise checkout> or vendor tools/collision_preflight.py into the repo"
+  echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> or vendor tools/collision_preflight.py into the repo"
   exit "$EXIT_NOT_PROVISIONABLE"
 fi
 
@@ -170,7 +187,7 @@ if [ ! -x "$PY" ]; then
     fi
     echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
     # shellcheck disable=SC2086  # $EXTRAS is a deliberate, space-separated argv list
-    if ! UVOUT="$(cd "$SC" && uv sync $EXTRAS 2>&1)"; then
+    if ! UVOUT="$(cd "$SC" && "$UV" sync $EXTRAS 2>&1)"; then
       echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"
       printf '%s\n' "$UVOUT" | tail -5 | sed 's/^/[refresh]   /'
       exit "$EXIT_TRANSIENT"

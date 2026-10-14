@@ -263,7 +263,7 @@ else
   printf '%s\n' "$PV" >&2
   warn "this repo cannot be provisioned for dispatch — a cell on it could only MERGE;"
   warn "  refresh-candidates.sh would add nothing to the backlog (agent-infra#1736)."
-  warn "  Fix: set TORTOISE=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO."
+  warn "  Fix: set TORTOISE_REPO=<a tortoise checkout>, or vendor tools/collision_preflight.py into $REPO."
 fi
 # The scout VENV is a uv-Python step: warn about it only for a repo that declares one.
 if [ -f "$REPO/pyproject.toml" ] && [ ! -x "$REPO/.worktrees/dispatch-scout/.venv/bin/python" ]; then
