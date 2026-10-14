@@ -2421,9 +2421,11 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 #   * a process substitution  read -r h < <(require_head …)  → 12 passed
 #   * backticks               h=`require_head …`        → 12 passed
 #   * `|| true  # was || exit 1` (the guard in a COMMENT) → 12 passed
-# A guard that only holds for the formatting it was measured on is not a guard. Driving
-# the REAL §4 call sites cannot be reformatted away, so that is what this does; the unit
-# test stays as the fast half.
+# A guard that only holds for the formatting it was measured on is not a guard. Driving a REAL
+# `require_head` call site cannot be reformatted away, so that is what this does — it drives the
+# OPENING read. ⛔ IT DOES NOT REACH §4, and review round 5 MEASURED that (its ledger contains no
+# post-read call). §13e is the scenario that drives the §4 COMPARISON site; do not read this one
+# as covering it. (An earlier version of this comment claimed the §4 sites; it was false.)
 #
 # `run_admin_here` (not `run_admin`): the assertion is on the rail's OWN output, and the
 # shared `$TMP/err` can be satisfied by a STALE file from whichever scenario wrote it last.
@@ -2455,7 +2457,8 @@ grep -qF '[head_unreadable]' "$SCEN/err" && pass "the refusal carries the machin
 # guard that a reworded log line can delete is the same defect these scenarios exist to close.
 # So the assertion is anchored on the artifact the rail cannot reword: the fake-`gh` CALL LEDGER.
 # `isDraft` is probed only AFTER a successful head read, so its presence proves the rail continued.
-grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
+grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+  && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
   || pass "the rail never proceeded past the unread head (no post-read call was made)"
 # ⛔ THE ASSERTION 13b EXISTS FOR. #1690 was an operator reading THIS sentence on a PR that
 # had not moved. A source scan cannot catch a regression that reintroduces it; this can.
@@ -2480,7 +2483,8 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an EMPTY head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ was unusable" \
   || fail "expected the unreadable-head refusal on stderr"
-grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
+grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+  && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
   || pass "the rail never proceeded past the empty head (no post-read call was made)"
 grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED HEAD — this is #1690 itself" \
   || pass "an empty read is never reported as a moved head"
@@ -2490,12 +2494,13 @@ grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED 
 # ── 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) ──
 # ⛔ WHY A THIRD SCENARIO, AND WHY ITS FIXTURE IS MULTI-LINE. A first attempt used a SINGLE short
 # value (`deadbeef`, 8 hex). Review round 4 MEASURED that this does NOT exercise the whole-value
-# property at all: the ROUND-2 defect — the per-LINE `grep -qE '^[0-9a-fA-F]{40}$'` — also rejects
-# `deadbeef`, so it left this scenario GREEN. The fixture was therefore not testing the fix it was
-# named for. The whole-value property is only exposed by a read that contains a VALID 40-hex sha
-# AND a second line: an any-line test accepts it and the rail then emits BOTH lines as the head.
-# Measured: the current rail rejects this (so the clean case still passes), while the per-line
-# version returned rc=0 with the two-line value.
+# property at all: the defect of the ORIGINAL fix — the per-line `grep -qE '^[0-9a-fA-F]{40}$'`
+# introduced by 09e1b15 and removed in review round 1 — also rejects `deadbeef`, so it left this
+# scenario GREEN. (Round 3/4 labelled that defect "round 2"; it was round 1. Corrected.) The
+# fixture was therefore not testing the fix it was named for. The whole-value property is only
+# exposed by a read containing a VALID 40-hex sha AND a second line: an any-line test accepts it
+# and the rail then emits BOTH lines as the head. Measured: the current rail rejects this (so the
+# clean case still passes), while the per-line version returned rc=0 with the two-line value.
 echo "== 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) =="
 new_scen headcorrupt
 # A VALID sha on line 1, plus a junk second line: accepted by a per-LINE check, rejected only by
@@ -2509,7 +2514,8 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — a CORRUPT head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the read was unusable" \
   || fail "expected the unreadable-head refusal for a corrupt value"
-grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
+grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+  && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
   || pass "the rail never proceeded past the corrupt read"
 grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED HEAD — this is #1690 itself" \
   || pass "a corrupt read is never reported as a moved head"
@@ -2523,10 +2529,10 @@ grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED
 # §4 (during re-run, before evidence) are never reached. But the sentence #1690's operator
 # actually SAW (`head moved before the evidence was posted (x -> )`) is emitted only at the §4
 # site, so the ORIGINAL SYMPTOM was still unreproduced by any scenario. This one reproduces it:
-# the OPENING read SUCCEEDS and a LATER read returns nothing, which is what a flaky read looks
-# like in the wild. `head-seq` serves the Nth head read from the Nth line, so a one-line fixture
-# makes the 2nd and later reads return EMPTY.
-echo "== 13e. a failed §4 read is never reported as a moved head (#1690) =="
+# the OPENING read SUCCEEDS and a LATER read returns nothing. `head-seq` serves the Nth head read
+# from the Nth line, so a one-line fixture makes the 2nd and later reads return EMPTY — that is
+# the rc=0-EMPTY shape, not the rc!=0-FAILED one (§13b pins the failed shape at the opening site).
+echo "== 13e. an EMPTY §4 read is never reported as a moved head (#1690) =="
 new_scen headseqfail
 HEAD_SF="5555000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SF" > "$SCEN/head-seq"   # line 2 is ABSENT → the 2nd read returns EMPTY
@@ -2540,6 +2546,16 @@ run_admin_here 42 --main-runs 3
 rc=$?
 [ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when a §4 head read returns nothing" \
   || fail "expected a non-zero exit, got 0 — a §4 read returned NOTHING and the rail continued"
+# ⛔ PROVE IT GOT THERE (review round 5, MEASURED). This scenario is named for the §4 comparison
+# site, but every one of its assertions was ALSO satisfied by a refusal at the OPENING read: with
+# a `resolve_head` that refuses every value, §13e reported all five ✅ while §4 was never reached.
+# A scenario named for a site must show it reached that site. The `isDraft` probe is issued
+# BETWEEN the opening read and §4, so its presence proves the opening read succeeded and the §4
+# read is therefore the one that failed. (The `grep -v headRefOid` guard keeps this from being
+# satisfied by an argv that happens to name isDraft on the head read itself.)
+grep 'isDraft' "$SCEN/calls" 2>/dev/null | grep -qv 'headRefOid' \
+  && pass "§13e VERIFIABLY reached the §4 comparison (the opening read succeeded)" \
+  || fail "§13e never reached §4 — the opening read did not succeed, so this scenario proved NOTHING about the §4 site"
 # ⛔ THE ASSERTION 13e EXISTS FOR. This is the exact sentence #1690's operator read on a PR that
 # had NOT moved, and no other scenario can produce it.
 grep -q "head moved" "$SCEN/err" && fail "THE §4 COMPARISON SITE REPORTED A MOVED HEAD ON A FAILED READ — this is #1690 exactly as the operator saw it" \

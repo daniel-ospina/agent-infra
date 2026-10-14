@@ -44,10 +44,12 @@ def _fake_gh(tmp_path, body: str, name: str = "gh") -> str:
     return str(p)
 
 
-def _drive(tmp_path, gh_body: str, bash_body: str) -> subprocess.CompletedProcess:
+def _drive(tmp_path, gh_body: str, bash_body: str,
+           extra_env: dict | None = None) -> subprocess.CompletedProcess:
     """Source the rail with a fake `gh`, then run `bash_body` against it.
 
     `bash_body` runs INSIDE the sourced shell, so it can call the real functions.
+    `extra_env` overrides the per-invocation env (e.g. a deliberately bad knob).
     """
     script = textwrap.dedent(f"""
         set -uo pipefail
@@ -62,6 +64,11 @@ def _drive(tmp_path, gh_body: str, bash_body: str) -> subprocess.CompletedProces
                # rather than with a module-level `os.environ.setdefault` keeps it out of every
                # OTHER test in the same pytest process (review round 2 measured that leak).
                ADMIN_MERGE_HEAD_READ_SLEEP="0")
+    # ⛔ `update`, NOT `**extra_env` in the literal above: a caller overriding an already-named
+    # key would otherwise raise `TypeError: dict() got multiple values for keyword argument`.
+    # The first version of the sourced-path test hit exactly that and failed for that reason
+    # rather than for any property of the rail.
+    env.update(extra_env or {})
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                           env=env, cwd=REPO_ROOT, timeout=120, check=False)
 
@@ -334,3 +341,47 @@ def test_a_valid_retry_budget_is_accepted_and_reaches_the_head_read():
     assert "[head_unreadable]" in r.stderr, (
         "the positive control never reached the head read, so it does not prove the knob was "
         f"accepted — it only proves some later step failed: {r.stderr!r}")
+
+
+def test_the_SOURCED_path_refuses_a_bad_knob_instead_of_claiming_an_unread_head(tmp_path):
+    """⛔ THE GUARD'S OWN TEST — WHICH IT DID NOT HAVE (review round 5, MEASURED).
+
+    Deleting the `require_head`/`resolve_head` knob guard left **14/14 unit tests AND the whole
+    rail suite green**, while the SOURCED path reproduced #1690 exactly: with
+    `ADMIN_MERGE_HEAD_ATTEMPTS=0` the loop body never ran, so ZERO reads were attempted, and the
+    rail still printed `[head_unreadable] — could not READ the head … (0 attempts)`.
+
+    `validate_timing_knobs` cannot catch this: it runs only inside `main()`, and this is a sourced
+    call. That is why EVERY bad-knob test that drives `main` passes with or without the guard —
+    and why the guard, the round-4/5 delta's only production change, was unenforced. A fix that no
+    test exercises is not a fix, which is the same sentence this PR keeps rediscovering.
+    """
+    for bad, why in (("0", "permits no read at all"),
+                     ("08", "is invalid octal to the arithmetic"),
+                     ("abc", "is not a number")):
+        r = _drive(tmp_path, "exit 1", 'require_head 1; echo "rc=$?"',
+                   extra_env={"ADMIN_MERGE_HEAD_ATTEMPTS": bad})
+        assert "refusing a bad head-read knob" in r.stderr, (
+            f"ADMIN_MERGE_HEAD_ATTEMPTS={bad} ({why}) was NOT refused on the SOURCED path: "
+            f"{r.stderr!r}")
+        assert "[head_unreadable]" not in r.stderr, (
+            f"ADMIN_MERGE_HEAD_ATTEMPTS={bad} produced an UNREADABLE-HEAD claim on the sourced "
+            "path — #1690's symptom, emitted by the instrument on a run whose budget may permit "
+            "zero reads")
+        # ⛔ ASSERT ON THE FUNCTION'S OWN STATUS, NOT THE SCRIPT'S. A bash body that ends in
+        # `echo` exits 0 whatever happened, and the FIRST version of this test wrote
+        # `require_head 1 || true`, which FORCES 0 — so `assert r.returncode != 0` was
+        # unsatisfiable and the test was red on a CORRECT rail (review round 5 measured it).
+        assert "rc=0" not in r.stdout, (
+            f"a bad knob ({bad}, {why}) must make require_head return non-zero: {r.stdout!r}")
+
+
+def test_the_SOURCED_path_accepts_a_valid_knob(tmp_path):
+    """The positive control for the test above: without it, a guard that refused EVERYTHING on
+    the sourced path would pass, and the rail would be unusable for every real caller."""
+    r = _drive(tmp_path, "exit 1", 'require_head 1; echo "rc=$?"',
+               extra_env={"ADMIN_MERGE_HEAD_ATTEMPTS": "3"})
+    assert "refusing a bad head-read knob" not in r.stderr, (
+        f"a VALID knob was refused on the SOURCED path: {r.stderr!r}")
+    assert "[head_unreadable]" in r.stderr, (
+        "the positive control never reached the read, so it does not prove the knob was accepted")
