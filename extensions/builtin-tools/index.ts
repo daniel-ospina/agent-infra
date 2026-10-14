@@ -106,6 +106,7 @@ import {
   resolveTaskRunsRoot,
   runLogPath,
   safeRunId,
+  SETTLE_GRACE_MS,
   writeRunRecord,
   type BoundedLogWriter,
   type TaskRunRecord,
@@ -4623,6 +4624,9 @@ function parseRunHeartbeat(rec: TaskRunRecord): TaskRunStatusView["heartbeat"] {
     tool_age_max_ms: state.toolAgeMaxMs,
     stream_age_ms: state.streamAgeMs,
     session_ended: state.sessionEnded,
+    tool_updates: state.toolUpdates,
+    cpu_advanced: state.toolCpuAdvanced,
+    cpu_stall_ms: state.toolCpuStallMs,
   };
 }
 
@@ -4651,6 +4655,12 @@ export interface TaskRunStatusView {
     tool_age_max_ms: number;
     stream_age_ms: number;
     session_ended: boolean;
+    /** #783 §6.6 / #928 — the watchdog's progress-evidence inputs, surfaced so
+     * `task_status` can apply the SAME in-flight-tool predicate the idle
+     * detector does instead of an age-only comparison (#1662 review). */
+    tool_updates: boolean;
+    cpu_advanced: boolean;
+    cpu_stall_ms: number;
   } | null;
   exit_code?: number | null;
   reason?: string;
@@ -4711,7 +4721,7 @@ export function evaluateTaskRunStatus(
     // as successful before task_collect failed it closed. Return the distinct
     // non-terminal `gone`; task_collect salvages the record (fail-closed) into
     // a terminal `failed` (#1662 review).
-    return { ...base, status: "gone", terminal: false, alive, note: "process is gone; finalize pending — call task_collect" };
+    return { ...base, status: "gone", terminal: false, alive, note: "process is gone; terminal record may still be landing (settle grace) — call task_collect, which reaps it once the grace expires" };
   }
   // The bound the watchdog will ACTUALLY apply for this dispatch. A background
   // lane carries the resolved S in its record (per-dispatch `stream_stall_ms` →
@@ -4724,10 +4734,47 @@ export function evaluateTaskRunStatus(
     typeof rec.stream_stall_ms === "number" && Number.isFinite(rec.stream_stall_ms) && rec.stream_stall_ms > 0
       ? rec.stream_stall_ms
       : getStreamStallMs();
-  if (heartbeat && heartbeat.tools_in_flight > 0 && heartbeat.tool_age_max_ms > streamStallMs) {
-    return { ...base, status: "wedged", terminal: false, alive, note: `in-flight tool older than the stream-stall bound (${Math.round(streamStallMs / 60_000)} min)` };
-  }
+  // Watchdog parity (#1662 review). The idle detector's in-flight-tool bounds
+  // are NOT `tool_age > S`: each requires PROGRESS EVIDENCE (`inFlightProgress
+  // === "no-progress"`), and the AGE backstop is `getToolStallMs()` (2/3 of the
+  // hard cap, ~4 h), never the 20-min S. Comparing raw `tool_age_max_ms`
+  // against S reported a healthy, CPU-progressing long tool as `wedged` while
+  // the watchdog kept it alive — and `wedged` is the orchestrator-facing
+  // re-dispatch signal, so the false verdict duplicates work on a live lane.
+  // Ages are made EFFECTIVE with the time since the last write (the
+  // `markerAge` analogue the watchdog adds; the replay runs with `now = 0`, so
+  // the frozen sample alone is not the effective age).
+  const markerAge = base.log_write_age_ms ?? 0;
+  const effStreamAge = (heartbeat?.stream_age_ms ?? 0) + markerAge;
+  const effToolAge = (heartbeat?.tool_age_max_ms ?? 0) + markerAge;
   const staleLog = base.log_write_age_ms !== null && base.log_write_age_ms > getHeartbeatFreshWindowMs();
+  // `markers > 0` mirrors the watchdog's `stateFresh` precondition
+  // (`lastMarkerAt > 0`): with no valid marker the in-flight clauses are inert
+  // there and here. The marker-disabled (TASK_HEARTBEAT_DISABLE) shape is still
+  // covered below by the log-freshness clauses.
+  if (!staleLog && heartbeat && heartbeat.markers > 0) {
+    if (heartbeat.tools_in_flight > 0) {
+      const progress = inFlightProgress(
+        { toolCpuStallMs: heartbeat.cpu_stall_ms, toolCpuAdvanced: heartbeat.cpu_advanced },
+        getCpuStallMs(),
+      );
+      // clause 1 (tool-silence, tool_updates=1) / 1b (tool-dead, tool_updates=0)
+      const silenceBound = heartbeat.tool_updates ? effStreamAge : effToolAge;
+      if (progress === "no-progress" && silenceBound > streamStallMs) {
+        return { ...base, status: "wedged", terminal: false, alive, note: `in-flight tool over the stream-stall bound (${Math.round(streamStallMs / 60_000)} min) with no progress evidence` };
+      }
+      // clause 2 (tool-stall): the AGE backstop, not S.
+      const toolStallBound = heartbeat.turn_active
+        ? getToolStallMs()
+        : Math.min(getToolStallMs(), getHeartbeatTimeoutMs());
+      if (effToolAge > toolStallBound) {
+        return { ...base, status: "wedged", terminal: false, alive, note: `in-flight tool over the tool-stall age backstop (${Math.round(toolStallBound / 60_000)} min)` };
+      }
+    } else if (effStreamAge > streamStallMs) {
+      // clause 3 (stream-stall): no tools in flight, stream idle beyond S.
+      return { ...base, status: "wedged", terminal: false, alive, note: `stream idle over the stream-stall bound (${Math.round(streamStallMs / 60_000)} min)` };
+    }
+  }
   // A FRESH log is never `wedged` merely because no marker is in the read
   // window: `markers === 0` means "no marker in the last 512 KB", not "no
   // activity". This is a supported configuration (TASK_HEARTBEAT_DISABLE=1
@@ -4812,10 +4859,22 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
     // as settle-lost too. Finalize as a FAILED salvage (fail-closed: a settle we
     // cannot prove is never a success) and hand back the capture log so partials
     // remain reachable (#1662 review).
+    //
+    // #1662 review (blocking): `!view.alive` alone is WRONG on its own — the
+    // child can exit seconds before the parent's settle write lands (the
+    // exit-without-close shape holds the pipes up to the exit grace), so during
+    // that window the pid is already gone while a perfectly good terminal record
+    // is in flight. Finalizing there is a PERMANENT false `failed` with
+    // `content: null`, and because the verdict is terminal the documented reaping
+    // loop never re-polls — the #208 resume contract then re-dispatches work that
+    // succeeded. Apply the SAME settle grace `runIsLive` already uses: salvage a
+    // gone pid only once the pending-settle window has demonstrably expired.
     const staleSettle =
       view.log_write_age_ms !== null &&
       view.log_write_age_ms > getHeartbeatFreshWindowMs();
-    if (!view.alive || staleSettle) {
+    const settleGraceExpired =
+      view.log_write_age_ms === null || view.log_write_age_ms > SETTLE_GRACE_MS;
+    if ((!view.alive && settleGraceExpired) || staleSettle) {
       const why = view.alive
         ? "no heartbeat/log activity past the freshness window and no terminal record was persisted"
         : "process is gone and no terminal record was persisted (parent exited mid-run?)";
@@ -6093,12 +6152,12 @@ export default function (pi: ExtensionAPI) {
     name: "task_status",
     label: "Task Status (background run)",
     description:
-      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which salvages it fail-closed. Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal or `gone`, then RUN THE REVIEW GATE (a parent step, #825).",
+      "Check a background `task({ background: true })` run: alive | wedged | gone | done. `gone` means the process exited but no terminal record was persisted yet — call `task_collect`, which reaps it once the settle grace expires (or salvages it fail-closed). Derived from the child's `[task-heartbeat]` markers and a pid probe, never from %CPU. Non-blocking — polls state only, never waits. Poll this between other work, then `task_collect` once terminal or `gone`, then RUN THE REVIEW GATE (a parent step, #825).",
     promptSnippet: "Check the liveness of a background task run",
     promptGuidelines: [
-      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect, do NOT read it as success.",
+      "Use task_status({ run_id }) to observe a lane dispatched with task({ background: true }). It returns immediately: alive | wedged | gone | done. `gone` means the process is gone but the terminal record is not yet persisted — call task_collect; it reaps the run once the settle grace expires, never as a success.",
       "Liveness comes from the child's [task-heartbeat] markers and a pid probe — never from %CPU. A lane blocked in a long tool call reads 0 % CPU but is still alive.",
-      "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status OR `gone` (process gone, terminal record not persisted — collect it directly, fail-closed), then run the review ceremony (a PARENT step, #825).",
+      "Poll task_status between other work; call task_collect({ run_id }) once it reports a terminal status OR `gone` (process gone, terminal record not yet persisted — collect it directly; it is reaped once the settle grace expires or salvaged fail-closed), then run the review ceremony (a PARENT step, #825).",
     ],
     parameters: Type.Object({
       run_id: Type.String({ description: "The run_id returned by task({ background: true })." }),
@@ -6136,7 +6195,7 @@ export default function (pi: ExtensionAPI) {
       "Collect the final message + exit status of a finished background `task({ background: true })` run. Non-blocking: returns a not-finished notice while the lane is still running. After it returns a terminal result you MUST run the review ceremony for the lane — the review gate is a parent step (sub-agents run with AGENT_SKIP_REVIEW_GATE=1, #825).",
     promptSnippet: "Collect the result of a finished background task run",
     promptGuidelines: [
-      "Use task_collect({ run_id }) to reap a background lane once task_status reports a terminal status or `gone`. It returns the same final message + exit status a blocking task call would have; a lane wedged on a stale log is also salvaged fail-closed rather than polled forever.",
+      "Use task_collect({ run_id }) to reap a background lane once task_status reports a terminal status or `gone`. It returns the same final message + exit status a blocking task call would have; a lane wedged on a stale log is also salvaged fail-closed rather than polled forever. A `gone` lane whose settle may still be in flight (child exited before the parent's settle write) is reported not-finished until the settle grace expires, so it is never falsely failed.",
       "task_collect never blocks: while the lane is running it returns a not-finished notice — poll task_status instead of blocking.",
       "⚠️ THE REVIEW GATE IS A PARENT STEP (#825): after collecting a terminal result, run the review ceremony for the lane BEFORE treating it as complete. Sub-agents cannot self-review.",
     ],

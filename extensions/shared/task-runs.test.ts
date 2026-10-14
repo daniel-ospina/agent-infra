@@ -145,8 +145,27 @@ test("corrupt / malformed / missing records read as null", () => {
   equal(readRunRecord(dir, id), null, "missing run_id/status");
   writeFileSync(join(dir, `${id}.json`), JSON.stringify({ run_id: id }), "utf-8");
   equal(readRunRecord(dir, id), null, "missing status");
+  // An out-of-enum status VALUE is malformed too. Only checking
+  // `typeof status === "string"` accepted it, and since it carries no failure
+  // marker the consumers classified it as a confident terminal SUCCESS — a
+  // fail-open. Each out-of-enum shape must read as ABSENT (#1662 review).
+  for (const bad of ["banana", "RUNNING", "Done", "", "settled"]) {
+    writeFileSync(join(dir, `${id}.json`), JSON.stringify({ run_id: id, status: bad }), "utf-8");
+    equal(readRunRecord(dir, id), null, `out-of-enum status ${JSON.stringify(bad)} reads as absent`);
+  }
   equal(readRunRecord(dir, "does-not-exist"), null, "missing file");
   equal(readRunRecord(dir, "../escape"), null, "unsafe id is never read");
+});
+
+test("writeRunRecord refuses a path-escaping run_id (the writer is inside the traversal gate too)", () => {
+  const dir = tmpDir("write-unsafe-id");
+  for (const bad of ["../escape", "a/b", "/etc/passwd", "", "..hidden"]) {
+    const w = writeRunRecord(dir, record({ run_id: bad }));
+    equal(w.ok, false, `unsafe run_id ${JSON.stringify(bad)} is refused`);
+    ok(typeof w.error === "string" && w.error.length > 0, "error surfaced");
+  }
+  // Nothing was written outside (or inside) the root under a foreign name.
+  deepEqual(readdirSync(dir).filter((f) => f.endsWith(".json")), [], "no record written for an unsafe id");
 });
 
 test("writeRunRecord reports ok:false (never throws) for an unwritable root", () => {
@@ -261,13 +280,26 @@ test("pruneTaskRuns: age-expired non-live runs are evicted (record + log); young
   const dir = tmpDir("prune-age");
   const old = seedRun(dir, { ageMs: 9 * DAY });
   const young = seedRun(dir, { ageMs: 1000 });
-  const r = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now() });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now(), dryRun: false });
   equal(r.pruned, 1, "exactly the age-expired run");
   equal(existsSync(old.logPath), false, "old capture log removed");
   equal(existsSync(old.recPath), false, "old record removed");
   equal(existsSync(young.logPath), true, "young log survives");
   equal(existsSync(young.recPath), true, "young record survives");
   ok(r.freedBytes > 0, "freed bytes reported");
+});
+
+test("pruneTaskRuns: DRY-RUN is the DEFAULT — an omitted option deletes NOTHING (the recorded decision)", () => {
+  const dir = tmpDir("prune-default-dryrun");
+  const old = seedRun(dir, { ageMs: 9 * DAY });
+  // No `dryRun` at all: the recorded retention decision is that an UNARMED
+  // sweep must not delete. Deletion requires the explicit arming step
+  // (`dryRun: false`), so a future caller that forgets the option cannot lose a
+  // settled run's composed final message (#1662 review).
+  const r = pruneTaskRuns(dir, { maxAgeMs: 7 * DAY, maxBytes: 1_000_000_000, now: Date.now() });
+  equal(r.pruned, 1, "the age-expired run is reported as would-evict");
+  equal(existsSync(old.recPath), true, "default (omitted) dryRun must NOT delete the record");
+  equal(existsSync(old.logPath), true, "default (omitted) dryRun must NOT delete the capture log");
 });
 
 test("pruneTaskRuns: DRY-RUN reports what it would evict and deletes NOTHING (the dispatch-path default)", () => {
@@ -303,7 +335,7 @@ test("pruneTaskRuns: a dead-pid running run is kept only while its log is fresh 
   const dir = tmpDir("prune-settle");
   const fresh = seedRun(dir, { status: "running", pid: 999_999_999, ageMs: 0 });
   const stale = seedRun(dir, { status: "running", pid: 999_999_999, ageMs: 30 * 60_000 });
-  const r = pruneTaskRuns(dir, { maxAgeMs: 1, maxBytes: 1_000_000_000, now: Date.now() });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 1, maxBytes: 1_000_000_000, now: Date.now(), dryRun: false });
   equal(existsSync(fresh.recPath), true, "settle-pending (fresh log) run survives the grace");
   equal(existsSync(stale.recPath), false, "stale settle-lost run is evictable and pruned");
   equal(r.pruned, 1, "only the stale run");
@@ -314,7 +346,7 @@ test("pruneTaskRuns: the byte cap evicts oldest non-live first; live bytes count
   const a = seedRun(dir, { ageMs: 3000, logBytes: 600 });
   const b = seedRun(dir, { ageMs: 2000, logBytes: 600 });
   const live = seedRun(dir, { status: "running", pid: process.pid, ageMs: 10, logBytes: 600 });
-  const r = pruneTaskRuns(dir, { maxAgeMs: 365 * DAY, maxBytes: 1000, now: Date.now() });
+  const r = pruneTaskRuns(dir, { maxAgeMs: 365 * DAY, maxBytes: 1000, now: Date.now(), dryRun: false });
   equal(r.pruned, 2, "both non-live runs evicted to get under the cap");
   equal(existsSync(a.recPath), false, "oldest evicted first");
   equal(existsSync(b.recPath), false, "next-oldest evicted");

@@ -36,6 +36,7 @@ log is inside the 5-minute settle grace) is never evicted.
 | `TASK_RUNS_MAX_BYTES` | `2147483648` (2 GiB) | size bound |
 | `TASK_RUNS_PRUNE` | unset (sweep runs) | `0` disables the sweep entirely |
 | `TASK_RUNS_PRUNE_DRY_RUN` | `1` | `1` = report only; `0` = **armed** (deletes) |
+| `TASK_RUNS_LOG_MAX_BYTES` | `16777216` (16 MiB) | per-run capture-log cap (truncate-while-keeping-the-tail; the record is never capped) |
 
 ## ⛔ Dry-run by default — this is the recorded decision
 

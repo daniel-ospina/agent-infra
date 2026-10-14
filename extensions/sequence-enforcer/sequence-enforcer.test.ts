@@ -2860,6 +2860,36 @@ await test("task tool_call → reviewer counted; tool_result → advances to nex
   } finally { auditRelease(); }
 });
 
+await test("#1662: a background dispatch's returns-early result does NOT advance the verifier step; the terminal task_collect does", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/bg/SKILL.md", verifierSkillSteps(), 1);
+
+        await handlers.tool_call!({ toolName: "task", input: { background: true } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "background reviewer dispatch counted at the verifier step");
+
+        // The returns-early notice — the reviewer has NOT reported yet.
+        await handlers.tool_result!({ toolName: "task", details: { background: true, status: "running" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, "a background dispatch result must NOT advance the step");
+
+        // A poll that has not finished is still not a verdict.
+        await handlers.tool_result!({ toolName: "task_collect", details: { terminal: false, status: "running" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, "a not-finished collect must NOT advance the step");
+
+        // The terminal collect IS the reviewer's completion.
+        await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done" } });
+        equal(_stackForTest()[0]!.stepIndex, 2, "the terminal collect advances past the verifier gate");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
 await test("warn mode: sequence timer does NOT park a backdated checkpoint owner (park is gate/strict-only; re-arm persists)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();

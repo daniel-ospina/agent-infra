@@ -68,6 +68,12 @@ export function resolveTaskRunsRoot(
 /** `running` until the child settles; one of the terminal states after. */
 export type TaskRunStatus = "running" | "done" | "failed" | "cut";
 
+/** Runtime mirror of `TaskRunStatus` — a record whose `status` is outside this
+ * vocabulary is MALFORMED and must read as absent, never as a confident
+ * terminal state (an out-of-enum status has no failure marker to key on, so a
+ * consumer would reap it as success — fail-OPEN). */
+const TASK_RUN_STATUSES: readonly string[] = ["running", "done", "failed", "cut"];
+
 export interface TaskRunRecord {
   run_id: string;
   /** child pid (null only if the spawn never produced one). */
@@ -152,7 +158,19 @@ export function writeRunRecord(
   root: string,
   record: TaskRunRecord,
 ): { ok: boolean; path: string; error?: string } {
-  const path = runRecordPath(root, record.run_id);
+  // Route the writer through the SAME traversal gate every reader uses. The only
+  // caller mints a uuid today, but the module advertises `safeRunId` as the path
+  // contract — a writer outside it is a latent escape if a caller ever passes a
+  // caller-supplied id (#1662 review).
+  const safe = safeRunId(record.run_id);
+  if (!safe) {
+    return {
+      ok: false,
+      path: runRecordPath(root, typeof record.run_id === "string" ? record.run_id : ""),
+      error: `unsafe run_id: ${JSON.stringify(record.run_id)}`,
+    };
+  }
+  const path = runRecordPath(root, safe);
   const tmp = `${path}.${process.pid}.tmp`;
   try {
     mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -176,7 +194,12 @@ export function readRunRecord(root: string, runId: string): TaskRunRecord | null
   try {
     const parsed = JSON.parse(readFileSync(path, "utf-8")) as TaskRunRecord;
     if (!parsed || typeof parsed !== "object" || typeof parsed.run_id !== "string") return null;
-    if (typeof parsed.status !== "string") return null;
+    // The status must be IN the enum, not merely a string: an out-of-enum value
+    // ("banana", "RUNNING", a status written by a future/other version) has no
+    // failure marker, so `evaluateTaskRunStatus` would report it terminal and
+    // the #1508 hook would classify it as a SUCCESS — a malformed record read as
+    // a confident terminal success (#1662 review). Reads as absent instead.
+    if (typeof parsed.status !== "string" || !TASK_RUN_STATUSES.includes(parsed.status)) return null;
     return parsed;
   } catch {
     return null;
@@ -329,7 +352,12 @@ export function createBoundedLogWriter(
 
 export const DEFAULT_TASK_RUNS_MAX_BYTES = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DEFAULT_TASK_RUNS_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-const SETTLE_GRACE_MS = 5 * 60 * 1000;
+/** Grace during which a `running` record whose pid is gone may still be about
+ * to be settled by its (possibly alive) parent — the child can exit seconds
+ * before the parent's fire-and-forget settle write lands. Shared by
+ * `runIsLive` (never evict a pending settle) and `collectTaskRun` (never
+ * declare a pending settle a permanent failure). */
+export const SETTLE_GRACE_MS = 5 * 60 * 1000;
 const RUN_FILE_RE = /\.(json|log)$/;
 
 /** Operator bounds for the retention sweep (env-tunable). Mirrors the sibling
@@ -348,11 +376,13 @@ export interface TaskRunsPruneOptions {
   maxAgeMs?: number;
   maxBytes?: number;
   now?: number;
-  /** Report what WOULD be evicted, delete nothing. Defaults to false here so
-   * the unit-level function stays directly testable; the DISPATCH path passes
-   * true unless explicitly armed (`TASK_RUNS_PRUNE_DRY_RUN=0`), mirroring the
-   * recorded dry-run-by-default retention decision (AGENTS.md; sibling
-   * `scripts/pi-task-session-prune.sh`). */
+  /** Report what WOULD be evicted, delete nothing. Defaults to TRUE — the
+   * recorded retention decision is dry-run by default (AGENTS.md "Retention is
+   * owned, bounded, and dry-run by default"; sibling
+   * `scripts/pi-task-session-prune.sh`). Arming is an explicit, owned step:
+   * pass `dryRun: false` (the dispatch path does so only under
+   * `TASK_RUNS_PRUNE_DRY_RUN=0`). An omitted option must never delete, because
+   * the evicted `<run_id>.json` carries the composed final message. */
   dryRun?: boolean;
 }
 
@@ -399,7 +429,9 @@ export function pruneTaskRuns(
   const maxAgeMs = opts.maxAgeMs ?? DEFAULT_TASK_RUNS_MAX_AGE_MS;
   const maxBytes = opts.maxBytes ?? DEFAULT_TASK_RUNS_MAX_BYTES;
   const now = opts.now ?? Date.now();
-  const dryRun = opts.dryRun === true;
+  // DRY-RUN unless explicitly armed: an omitted option must never delete
+  // (the recorded decision). `dryRun: false` is the owned arming step.
+  const dryRun = opts.dryRun !== false;
   const result: TaskRunsPruneResult = { examined: 0, pruned: 0, freedBytes: 0, keptLive: 0, errors: [] };
   let entries: string[];
   try {

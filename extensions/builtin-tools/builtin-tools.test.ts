@@ -63,6 +63,7 @@ import {
   safeRunId,
   runLogPath,
   pidAlive,
+  SETTLE_GRACE_MS,
   DEFAULT_TASK_RUNS_ROOT,
 } from "../shared/task-runs.js";
 import type { ExhaustionMarker, LegRef } from "../shared/provider-failover.js";
@@ -7767,15 +7768,61 @@ test("#1662: without a persisted bound the env TASK_STREAM_STALL_MS is the fallb
   }
 });
 
-test("#1662: an in-flight tool past the persisted bound reads WEDGED (negative twin)", () => {
+test("#1662: a no-progress in-flight tool past the persisted bound reads WEDGED (watchdog parity, negative twin)", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-s-wedge-"));
   try {
-    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // Genuine no-progress evidence: the tool has never streamed an update
+      // (`tool_updates=0`) and its CPU has not advanced past the 30-min bound
+      // (`cpu_stall_ms` > DEFAULT_CPU_STALL_MS with `cpu_advanced=1`). That is
+      // precisely the shape the watchdog's `tool-dead` clause cuts at S, so
+      // `wedged` is correct here.
       const { id } = seedRunningRun(dir, {
         streamStallMs: 60_000,
-        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1\n`,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1 tool_updates=0 cpu_advanced=1 cpu_stall_ms=2000000\n`,
       });
-      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "over the persisted bound ⇒ wedged");
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "no-progress past the persisted bound ⇒ wedged");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool past the persisted bound but still PROGRESSING stays ALIVE (watchdog parity — the false-wedge bug)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-s-progress-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // Same age as the negative twin, but the tool HAS streamed an update and
+      // its CPU is advancing: the watchdog's in-flight clauses require
+      // `inFlightProgress === "no-progress"`, so it stays alive until the 4h
+      // tool-stall age backstop. Pre-fix `task_status` compared the raw tool
+      // AGE against S and declared this healthy lane `wedged` — a false
+      // re-dispatch signal on exactly the long-producing-tool shape this mode
+      // exists to serve.
+      const { id } = seedRunningRun(dir, {
+        streamStallMs: 60_000,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=120000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=0\n`,
+      });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "alive", `a progressing tool must not read wedged (got ${v.status}: ${v.note ?? ""})`);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: an in-flight tool over the tool-stall age backstop reads WEDGED even while progressing (clause 2)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-toolstall-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_TOOL_STALL_MS: undefined, TASK_HARD_CAP_MS: undefined }, () => {
+      // Clause 2 is the age backstop the watchdog applies REGARDLESS of progress
+      // evidence: a runaway tool that streams forever is still bounded. Seed an
+      // age past `getToolStallMs()` (2/3 of the 6h cap) with progressing CPU —
+      // `wedged` must fire on the age, not only on no-progress.
+      const { id } = seedRunningRun(dir, {
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=${Math.floor(getToolStallMs() + 60_000)} saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=0\n`,
+      });
+      equal(evaluateTaskRunStatus(id, dir).status, "wedged", "over the tool-stall age backstop ⇒ wedged");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -7894,12 +7941,12 @@ test("#1662: a running record whose process is gone reads GONE, never the termin
       // The parent died mid-run: the child pid is gone but the record is still
       // `running`. `done` is the terminal-SUCCESS vocabulary; a poller keyed on
       // `status === "done"` must not read this as success (#1662 review).
-      const { id } = seedRunningRun(dir, { pid: 999_999_999 });
+      const { id } = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
       const v = evaluateTaskRunStatus(id, dir);
       equal(v.alive, false, "the process is gone");
       equal(v.terminal, false, "not terminal until task_collect salvages it");
       equal(v.status, "gone", `a settle-lost lane must not read as done (got ${v.status}: ${v.note ?? ""})`);
-      // collect still finalizes it fail-closed.
+      // collect still finalizes it fail-closed once the settle grace has expired.
       equal(collectTaskRun(id, dir).status, "failed", "collect fails it closed");
     });
   } finally {
@@ -7945,13 +7992,14 @@ test("#1662: collect returns the final message + exit once terminal, and a not-f
   }
 });
 
-test("#1662: a running record whose process is gone is FINALIZED by collect (no infinite 'not finished')", () => {
+test("#1662: a running record whose process is gone is FINALIZED by collect once the settle grace has expired (no infinite 'not finished')", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-salvage-"));
   try {
     withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
       // The parent died mid-run: the child pid is gone but its terminal record
-      // was never written. The documented poll loop must still terminate.
-      const { id } = seedRunningRun(dir, { pid: 999_999_999 });
+      // was never written. The documented poll loop must still terminate — but
+      // only AFTER the settle grace (a gone pid alone may be a settle in flight).
+      const { id } = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
       const got = collectTaskRun(id, dir);
       equal(got.terminal, true, "collect terminates instead of looping forever");
       equal(got.status, "failed", "a settle that cannot be proven is fail-closed, never success");
@@ -7959,6 +8007,35 @@ test("#1662: a running record whose process is gone is FINALIZED by collect (no 
       ok(String(got.note).includes("process is gone"), `salvage note: ${got.note}`);
       equal((got.details as any)?.log_path, runLogPath(dir, id), "the capture log is handed back for partials");
       equal(got.review_gate, "parent-required", "review obligation still rides on the salvage");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a gone pid with a settle still possibly PENDING is not finalized — no permanent false failure in the exit→settle window", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-settle-pending-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // The child exits before its parent's fire-and-forget settle lands (the
+      // exit-without-close shape holds the pipes up to the exit grace). During
+      // that window the pid is gone but the terminal record is IN FLIGHT.
+      // Pre-fix `!view.alive` alone finalized this as a terminal `failed`/
+      // `settle-lost` with `content: null` — and a terminal verdict is never
+      // re-polled, so a successful lane was permanently reported failed and the
+      // #208 resume contract re-dispatched it.
+      const fresh = seedRunningRun(dir, { pid: 999_999_999 });
+      const pending = collectTaskRun(fresh.id, dir);
+      equal(pending.terminal, false, "a settle still inside its grace is NOT terminal");
+      equal(pending.status, "gone", "it reads the non-terminal `gone` so the loop re-polls");
+      ok(pending.reason === undefined, "no settle-lost reason while the settle may still land");
+      // Negative twin: once the grace has demonstrably expired the SAME shape is
+      // salvaged fail-closed, so the assertion above is not vacuous.
+      const stale = seedRunningRun(dir, { pid: 999_999_999, logAgeMs: SETTLE_GRACE_MS + 60_000 });
+      const salvaged = collectTaskRun(stale.id, dir);
+      equal(salvaged.terminal, true, "past the grace the salvage terminates the loop");
+      equal(salvaged.status, "failed", "and it is fail-closed");
+      equal(salvaged.reason, "settle-lost", "named");
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });

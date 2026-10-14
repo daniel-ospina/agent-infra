@@ -3154,7 +3154,16 @@ export default function (pi: ExtensionAPI) {
       // docs-only micro change reviewed via the `subagent` tool must not
       // false-block post-flip (micro relies on this counter as its only gate;
       // VGATE is shape-exempt and code review is skipped at micro).
-      if (event.toolName !== "task" && event.toolName !== "subagent") return undefined;
+      // #1662: a `task({ background: true })` dispatch returns at DISPATCH, not
+      // completion — counting it would satisfy the ≥1-dispatch gate while the
+      // reviewer is still running (a fail-open on the git-op gate). Count the
+      // reviewer when its verdict is actually reaped: the terminal
+      // `task_collect`. The returns-early notice and a not-finished collect are
+      // both ignored.
+      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean } }).details;
+      const isTerminalCollect =
+        event.toolName === "task_collect" && reviewDetails?.terminal === true;
+      if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach
@@ -3162,6 +3171,8 @@ export default function (pi: ExtensionAPI) {
       // this early return is what keeps the noise out.)
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
+      if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
+      if (reviewDetails?.background === true) return undefined;
 
       dispatchCount++;
       console.log(

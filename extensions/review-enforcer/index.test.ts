@@ -1541,6 +1541,41 @@ testAsync("task dispatches are audited per-event and the count survives across g
   });
 });
 
+testAsync("#1662: a background dispatch is not counted until its terminal task_collect", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A `task({ background: true })` result fires at DISPATCH — the reviewer
+        // is still running, so it must not satisfy the dispatch gate.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a background dispatch must NOT count as a completed reviewer");
+
+        // A not-finished collect is still not a verdict.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: false } });
+        const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b2 && b2.block === true, "a not-finished collect must NOT count");
+
+        // The terminal collect is the reviewer's completion — now it counts.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("gh pr merge with no review record → blocked AND merge_gate_block audited with PR", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;

@@ -2212,9 +2212,23 @@ function tokenStateLabel(reason: string): string {
     const targetSkill = gateOwner ?? top;
 
     // Count dispatched reviewers for verifier gate
+    //
+    // #1662: a `task({ background: true })` dispatch produces its tool_result at
+    // DISPATCH time (the returns-early notice), so decrementing here would
+    // advance the verifier step before ANY reviewer verdict exists — the parent
+    // is promoted while its reviewers are still running. Count the reviewer
+    // completion where it actually lands: the terminal `task_collect` result.
+    // A non-terminal collect (still running) and the background dispatch notice
+    // both leave the count untouched, so the step cannot advance until the
+    // verdict is reaped.
+    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean } }).details;
+    const isTerminalCollect =
+      event.toolName === "task_collect" && verifierDetails?.terminal === true;
+    const isBackgroundDispatch = verifierDetails?.background === true;
     if (
       step.gate === "verifier" &&
-      (event.toolName === "task" || event.toolName === "subagent")
+      (isTerminalCollect ||
+        ((event.toolName === "task" || event.toolName === "subagent") && !isBackgroundDispatch))
     ) {
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
       if (current > 0) {
