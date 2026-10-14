@@ -14,18 +14,31 @@ class that ships as SILENT fleet behaviour. These tests pin three of them:
     copies), not a second Oct-1 snapshot under ``scripts/lane/``.
 
 Each behavioural assertion is written to FAIL on the pre-fix source — the non-vacuity
-proof for the P1 findings. The screener block is extracted VERBATIM from the shell file
+proof for the P1/P2 findings. The screener block is extracted VERBATIM from the shell file
 and executed as a subprocess against synthetic lane rows under a throwaway HOME, which is
 how the finding was reproduced.
+
+The second review round (#1553 @ 4304fef) added four findings, pinned here as well:
+
+  * ``turn-classify.py``'s Jev door (``finished_the_work`` -> ``idle_next_work``) must
+    re-verify idleness at the SEND boundary, exactly like the structural idle door —
+    otherwise a lane that started a long tool call after the snapshot is sidetracked;
+  * ``scripts/heartbeat-loop.sh`` must DERIVE its HOME/PATH from the environment, not
+    hard-pin the author's home (which made the farmed loop a silent no-op);
+  * ``lane-guard.py``'s ``--budget`` must bound the probe it declares a bound for, and
+    each side must cost ONE pane read rather than read_screen + ui_working;
+  * the stall-term registry must not advertise an ``IDLE_MIN`` bound no code reads.
 """
 from __future__ import annotations
 
 import glob
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -33,6 +46,10 @@ REPO_ROOT = HERE.parent
 HEARTBEAT = HERE / "lane" / "orchestrator-heartbeat.sh"
 SHARDS = HERE / "run-bash-shards.sh"
 SETUP = REPO_ROOT / "pi-bootstrap" / "setup.sh"
+TURN_CLASSIFY = HERE / "lane" / "turn-classify.py"
+LANE_GUARD = HERE / "lane" / "lane-guard.py"
+LOOP = HERE / "heartbeat-loop.sh"
+REGISTRY_TS = REPO_ROOT / "extensions" / "shared" / "heartbeat-progress-edges.ts"
 
 # The stall-verdict Python is the single-quoted argument of the second `python3 -c '…'`.
 _BLOCK_RE = re.compile(r"\| /usr/bin/python3 -c '\n(.*?)\n' 2>/dev/null\)", re.S)
@@ -187,3 +204,271 @@ def test_the_lane_classifier_has_one_home():
     assert "lane_root_srcs=(lane-status.py heartbeat-loop.sh)" in setup, (
         "the farm must source the two promoted files from scripts/, not scripts/lane/"
     )
+
+
+# ── P1 (review @4304fef): turn-classify.py's Jev door re-verifies at the boundary ──
+#
+# `idle_next_work` is the ONE nudge that ASSERTS the lane has nothing in flight. It is
+# emitted from TWO doors: the structural DONE-IDLE/WIP-IDLE path (guarded) and the Jev
+# `finished_the_work` path (UNGUARDED before this fix). The second door is kept, so the
+# guard must be too — a lane that ended its previous turn and has since started a long
+# tool call reaches it and would be sidetracked. Driven in-process with every external
+# edge stubbed, so the assertion is about the SEND BOUNDARY, not about Jev or cmux.
+
+
+def _load_turn_classify(tmp_path, monkeypatch):
+    """Import turn-classify.py with HOME redirected to a throwaway dir.
+
+    HOME is read at import time, so it must be set before exec_module. The unique
+    synthetic module name keeps each test's import independent.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    spec = importlib.util.spec_from_file_location("turn_classify_under_test", TURN_CLASSIFY)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _drive_turn_classify(mod, tmp_path, monkeypatch, *, jev_choice, guard_ok):
+    """Run one dry-run pass over a single lane whose end-of-turn verdict is `jev_choice`."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        json.dumps({
+            "cwd": "/tmp/nowhere",                 # not under /.worktrees/ -> no nested census
+            "role": "assistant",
+            "message": {"content": [{"type": "text", "text": "I finished the work."}]},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    calls = {"send": [], "guard": []}
+
+    monkeypatch.setattr(mod, "lanes_with_open_question", lambda: (set(), True))
+    monkeypatch.setattr(mod, "registry", lambda: [
+        {"lane": "L1", "ws": "WS1", "issue_label": ""}])
+    monkeypatch.setattr(mod, "sh", lambda argv, timeout=120: (0, json.dumps([{
+        "lane": "L1", "ws": "WS1", "sid": "sid-1",
+        "size": transcript.stat().st_size, "file": str(transcript),
+        "verdict": "STOPPED", "child": None,
+    }])))
+    monkeypatch.setattr(mod, "jev_choice",
+                        lambda state: (jev_choice, {"confidence": 0.9, "cost_usd": 0}))
+
+    def _guard(ws, lane):
+        calls["guard"].append((ws, lane))
+        return guard_ok, "synthetic guard result"
+
+    def _send(lane, ws, msg, f, before_size, dry):
+        calls["send"].append((lane, ws))
+        return "WOULD-TEST"
+
+    monkeypatch.setattr(mod, "consumable_now", _guard)
+    monkeypatch.setattr(mod, "send", _send)
+    rc = mod.main(["--dry-run"])
+    return rc, calls
+
+
+def test_jev_door_withholds_idle_nudge_when_the_guard_refuses(tmp_path, monkeypatch):
+    """PRE-FIX this fails: the Jev door sent idle_next_work with no guard.
+
+    With the guard refusing, the fixed code must (a) HAVE CALLED the guard for this
+    lane and (b) NOT have sent. Pre-fix, `send` is reached and the guard is never
+    consulted — both assertions fail.
+    """
+    mod = _load_turn_classify(tmp_path, monkeypatch)
+    rc, calls = _drive_turn_classify(
+        mod, tmp_path, monkeypatch,
+        jev_choice="finished_the_work", guard_ok=False,
+    )
+    assert rc == 0
+    assert calls["guard"] == [("WS1", "L1")], (
+        "the `finished_the_work` door must re-verify idleness at the send boundary"
+    )
+    assert calls["send"] == [], (
+        "a lane the guard will not certify must NOT receive idle_next_work"
+    )
+
+
+def test_jev_door_sends_idle_nudge_when_the_guard_certifies(tmp_path, monkeypatch):
+    """The guard must not over-withhold: a CONSUMABLE lane still gets the nudge."""
+    mod = _load_turn_classify(tmp_path, monkeypatch)
+    rc, calls = _drive_turn_classify(
+        mod, tmp_path, monkeypatch,
+        jev_choice="finished_the_work", guard_ok=True,
+    )
+    assert rc == 0
+    assert calls["guard"] == [("WS1", "L1")]
+    assert calls["send"] == [("L1", "WS1")], "a consumable lane must still be nudged"
+
+
+def test_non_idle_kind_is_not_reverified_at_the_send_boundary(tmp_path, monkeypatch):
+    """Only `idle_next_work` asserts idleness — every other kind is an ordinary queue.
+
+    This is the over-fix guard: adding the boundary check to a non-idle nudge would
+    suppress legitimate continuations.
+    """
+    mod = _load_turn_classify(tmp_path, monkeypatch)
+    rc, calls = _drive_turn_classify(
+        mod, tmp_path, monkeypatch,
+        jev_choice="asked_the_owner", guard_ok=False,
+    )
+    assert rc == 0
+    assert calls["guard"] == [], "only idle_next_work is re-verified at the boundary"
+    assert calls["send"] == [("L1", "WS1")], "a question nudge must still be delivered"
+
+
+# ── P1 (review @4304fef): the farmed heartbeat-loop derives HOME/PATH ─────────
+
+
+def test_heartbeat_loop_has_no_hard_pinned_home():
+    """PRE-FIX this fails: HOME and both PATH pins named the author's home literally.
+
+    A farmed box then ran `cd "$HOME" || exit 0` against a home it does not have:
+    the loop printed nothing, logged nothing, and reported success.
+    """
+    src = LOOP.read_text(encoding="utf-8")
+    assert "/Users/" not in src, (
+        "a hard-pinned user home survives in the farmed heartbeat loop"
+    )
+    assert 'export PI_FLEET_HOME="${PI_FLEET_HOME:-$HOME}"' in src, (
+        "HOME must be derived from the environment, not hard-pinned"
+    )
+    assert 'export HOME="$PI_FLEET_HOME"' in src, "HOME must follow PI_FLEET_HOME"
+    assert '"$HOME/bin' in src, "the PATH pin must be derived from HOME"
+
+
+def test_heartbeat_loop_derivation_behaves(tmp_path):
+    """Behavioural proof: the actual assignment lines honour PI_FLEET_HOME.
+
+    The lines are extracted and run under a controlled environment, so the test proves
+    the derivation rather than the text. PRE-FIX the literal HOME wins and this fails.
+    """
+    src = LOOP.read_text(encoding="utf-8")
+    assigns = [ln for ln in src.splitlines()
+               if re.match(r'^export (HOME|PATH|PI_FLEET_HOME|PI_FLEET_PATH_PINNED)=', ln)]
+    assert assigns, "no HOME/PATH assignments found in heartbeat-loop.sh"
+    script = "\n".join(assigns) + '\nprintf "%s\\n" "$HOME"\nprintf "%s\\n" "$PATH"\n'
+    env = dict(os.environ, HOME="/original-home", PI_FLEET_HOME="/fleet-home",
+               PATH="/usr/bin:/bin")
+    proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    home, path = proc.stdout.splitlines()[:2]
+    assert home == "/fleet-home", f"PI_FLEET_HOME was ignored: HOME={home!r}"
+    assert path.startswith("/fleet-home/bin:"), path
+    assert "/fleet-home/.pi/agent/shims" in path, path
+    assert "/original-home" not in path, path
+
+
+# ── P2 (review @4304fef): lane-guard's --budget must bound the probe ──────────
+
+
+def _guard_fixture(tmp_path, monkeypatch):
+    """Load lane-guard.py with a fake lane-status module and a DETERMINISTIC clock.
+
+    `read_screen`/`ui_working` each advance the fake clock, so the budget's effect is
+    exact rather than a timing race.
+    """
+    spec = importlib.util.spec_from_file_location("lane_guard_under_test", LANE_GUARD)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    session = tmp_path / "sess.jsonl"
+    session.write_text("{}\n", encoding="utf-8")
+    old = time.time() - 1000
+    os.utime(session, (old, old))
+
+    class Clock:
+        def __init__(self):
+            self.t = time.time()
+
+        def time(self):
+            return self.t
+
+        def advance(self, s):
+            self.t += s
+
+        def sleep(self, s):
+            self.t += s
+
+    clock = Clock()
+
+    class FakeLS:
+        def __init__(self):
+            self.reads = 0
+
+        def resolve_session(self, ws):
+            return "sid-1"
+
+        def session_file(self, sid):
+            return str(session)
+
+        def read_screen(self, ws, lines=80):
+            self.reads += 1
+            clock.advance(0.25)
+            return "pane text, no spinner"
+
+        def ui_working(self, ws):          # kept so the PRE-FIX path (which calls it) runs
+            self.reads += 1
+            clock.advance(0.25)
+            return False
+
+        def declared_children(self, label):
+            return []
+
+        def parse_child_lines(self, screen):
+            return []
+
+        def pending_child(self, path):
+            return None
+
+    fake = FakeLS()
+    monkeypatch.setattr(mod, "_load_lane_status", lambda: fake)
+    monkeypatch.setattr(mod, "time", clock)
+    return mod, fake
+
+
+def test_lane_guard_budget_bounds_the_probe(tmp_path, monkeypatch):
+    """PRE-FIX this fails: `over()` was consulted once, before any cmux call.
+
+    Each pane read costs 0.25s of fake time against a 0.2s budget, so by the re-verify
+    read the budget is spent. The fixed probe must REFUSE (unknown is not idle); the
+    pre-fix probe ran the read anyway and returned CONSUMABLE.
+    """
+    mod, _fake = _guard_fixture(tmp_path, monkeypatch)
+    obs = mod.probe("WS1", "L1", 0.0, 0.0, 0.2)
+    assert obs["ok"] is False, f"the budget must bound the probe, not just pre-flight it: {obs}"
+    assert "budget" in obs["reason"], obs["reason"]
+
+
+def test_lane_guard_uses_one_pane_read_per_side(tmp_path, monkeypatch):
+    """PRE-FIX this fails: each side cost read_screen + ui_working = 2 cmux calls.
+
+    The spinner test reuses the text of the read it already has (14 lines is a superset
+    of the 12 `ui_working` reads), so the probe is two pane reads, not four.
+    """
+    mod, fake = _guard_fixture(tmp_path, monkeypatch)
+    obs = mod.probe("WS1", "L1", 0.0, 0.0, 100.0)
+    assert obs["ok"] is True, obs
+    assert fake.reads == 2, (
+        f"expected one pane read per side (2 total), got {fake.reads}"
+    )
+
+
+# ── P2 (review @4304fef): the registry must not advertise a dead bound ───────
+
+
+def test_registry_does_not_advertise_a_dead_idle_min():
+    """PRE-FIX this fails: `IDLE_MIN=9` existed and was registered.
+
+    No code path read it — the WEAK stall set is a hardcoded set of verdict NAMES and
+    the CAPACITY field is computed from CAP_IDLE_MIN — so the registry note asserted
+    enforcement that did not exist. It was deleted, not wired.
+    """
+    sh_src = HEARTBEAT.read_text(encoding="utf-8")
+    assert not re.search(r"^\s*IDLE_MIN\s*=", sh_src, re.M), (
+        "a dead IDLE_MIN constant is back in orchestrator-heartbeat.sh"
+    )
+    ts_src = REGISTRY_TS.read_text(encoding="utf-8")
+    assert 'name: "IDLE_MIN"' not in ts_src, (
+        "the stall registry advertises IDLE_MIN, which no code reads"
+    )
+    assert 'name: "CAP_IDLE_MIN"' in ts_src, "CAP_IDLE_MIN must stay registered"

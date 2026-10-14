@@ -58,7 +58,9 @@ ORCH_SURFACE="1510BE3B-AFFD-4BDB-80BC-A15BC599D698"
 ORCH_MARK="01a0cec8"
 
 STALE_MIN=12   # >= this, with a spinner  => WEDGE SUSPECT
-IDLE_MIN=9     # >= this, with no spinner => finished/idle
+# (There is deliberately no `IDLE_MIN` here: the 9m idle boundary is owned by
+# `lane-status.py`'s own verdict, and a local constant nothing read was a bound the
+# registry advertised as enforced while no code consulted it — #1553 review, P2.)
 MIN_GAP_MIN=4  # never nudge more often than this (was 8 — it throttled the 5-min pulse)
 PULSE_MIN=20          # send the short form anyway if nothing has been said for this long
 
@@ -313,7 +315,8 @@ except Exception:
 # own field (never counted in N_ALERT -- it is an opportunity, not a fault) and it
 # rides BOTH the alert message and the short pulse. The >=20m bound and the no-child
 # requirement keep it off a lane that is merely BETWEEN steps, which is the measured
-# false positive this classifier already records at 9m.
+# false positive this classifier already records at 9m (the `lane-status.py` DONE-IDLE
+# boundary -- there is no local IDLE_MIN constant; see the note at its old declaration).
 CAP_IDLE_MIN=20
 cap=[]
 for r in rows:

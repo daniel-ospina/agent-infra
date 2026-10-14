@@ -106,11 +106,20 @@ def probe(ws: str, label: str, window: float, min_idle: float, budget: float) ->
         return obs
 
     # ── 3. the pane must be READABLE and must not be mid-turn.
+    #
+    # ONE read feeds BOTH tests: the spinner check reuses this text rather than
+    # making a second `cmux read-screen` (that is what `ui_working` does internally
+    # — `"Working" in read_screen(ws, 12)` — and a second call is a second chance to
+    # blow the budget below). The 14-line window is a superset of the 12 the
+    # primitive reads, so detection is preserved.
+    if over():
+        obs["reason"] = f"probe budget {budget}s exhausted before reading the pane — refusing unanswered"
+        return obs
     screen = ls.read_screen(ws, lines=14) or ""
     if not screen.strip():
         obs["reason"] = "pane UNREADABLE — busy/idle UNKNOWN, not idle"
         return obs
-    if ls.ui_working(ws):
+    if "Working" in screen:
         obs["reason"] = "pane shows `Working` — mid-turn; a message would QUEUE unread"
         obs["spinner"] = True
         return obs
@@ -156,8 +165,11 @@ def probe(ws: str, label: str, window: float, min_idle: float, budget: float) ->
             f"session MOVED during the probe (size {s0}->{s1}, mtime {m0:.0f}->{m1:.0f}) "
             f"— work is in flight NOW")
         return obs
+    if over():
+        obs["reason"] = f"probe budget {budget}s exhausted before the re-verify read — refusing unanswered"
+        return obs
     screen2 = ls.read_screen(ws, lines=14) or ""
-    if ls.ui_working(ws) or "Working" in (screen2 or ""):
+    if "Working" in (screen2 or ""):
         obs["reason"] = "a `Working` spinner APPEARED during the probe — a turn started while we checked"
         return obs
     if (ls.parse_child_lines(screen2) or []):

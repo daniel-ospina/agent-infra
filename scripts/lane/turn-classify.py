@@ -1011,6 +1011,19 @@ def main(argv: list[str]) -> int:
                              verdict=choice, acted=True)
             continue
 
+        # RE-VERIFY AT THE SEND BOUNDARY — the SAME guard the structural idle path
+        # uses, and for the same reason (see consumable_now's comment above): this
+        # branch is reached from a `st` sample that is minutes old by now, and
+        # `finished_the_work` is judged from the PREVIOUS turn's last assistant
+        # message — so a lane that ended its last turn and has since started a long
+        # tool call still lands here and would be sidetracked. ONE implementation of
+        # "is this lane consumable right now", used by EVERY door that emits
+        # `idle_next_work`.
+        if kind == "idle_next_work":
+            ok, why = consumable_now(r["ws"], lane)
+            if not ok:
+                log(f"{lane}: {kind} -> WITHHELD at send boundary: {why}")
+                continue                   # no marker: re-considered next tick
         msg = build_message(kind, r["issue_label"])
         result = send(lane, r["ws"], msg, f, size, a.dry_run)
         after = os.path.getsize(f) if os.path.exists(f) else size

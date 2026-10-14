@@ -783,21 +783,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "floor the configured freshness interval is clamped up to (5 min)",
   },
   // — orchestrator-heartbeat lane idle bounds (scripts/lane/orchestrator-heartbeat.sh, #1552) —
-  {
-    name: "IDLE_MIN",
-    owners: ["scripts/lane/orchestrator-heartbeat.sh"],
-    value: "=9",
-    axis: "heartbeat",
-    guardedBy: NONE,
-    note: "quiet-for-N-minutes with NO spinner ⇒ finished/idle — the boundary between a lane merely BETWEEN steps and an idle one. Feeds the WEAK stall set (so it is screened) and the CAPACITY field. Registered by the reverse scan when the lane-orchestration layer was versioned; the constant alone cannot be reviewed against the 9-minute false positive its own comment records.",
-  },
+  // NO entry for the shell file's old `IDLE_MIN`: it matched the IDLE family so the reverse
+  // scan demanded an entry, but NO code path read it — the WEAK set is a hardcoded set of
+  // verdict NAMES and the CAPACITY field is computed from CAP_IDLE_MIN. It was deleted in the
+  // #1553 review rather than registered, because a note asserting enforcement that does not
+  // exist is worse than no entry (the point of this registry).
   {
     name: "CAP_IDLE_MIN",
     owners: ["scripts/lane/orchestrator-heartbeat.sh"],
     value: "=20",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: ">= this many minutes idle with NO child in flight ⇒ FREE CAPACITY (an opportunity, never an alert). Deliberately above IDLE_MIN so a lane merely between steps is not reported as free.",
+    note: ">= this many minutes idle with NO child in flight ⇒ FREE CAPACITY (an opportunity, never an alert). Set above the 9m DONE-IDLE false positive the shell comment records, so a lane merely between steps is not reported as free.",
   },
   // — subagent byte-freshness backstop (class 2: value+behaviour pinned) —
   {
