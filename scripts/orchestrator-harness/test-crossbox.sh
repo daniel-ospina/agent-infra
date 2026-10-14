@@ -158,6 +158,32 @@ done
 clear_ref "$REF2"
 
 echo
+echo "=== step 4c (P2): a LEADING-ZERO FIX_TIMEOUT must NOT disable the FIXER's claim ==="
+# The same predicate and the same failure on the FIXER: `FIX_LEASE=$(( 08 + 1200 ))` aborted the
+# claim block, so the fixer ran UNCLAIMED for its whole duration and a second box could spawn its own
+# fixer for the same head. Asserted separately from step 4b because the two scripts carry SEPARATE
+# copies of `is_num` — a one-file fix would leave this path silently open while 4b stayed green.
+O4F="/tmp/xb-crossbox-fixorch-lz.$$"
+rm -rf "$O4F"; mkdir -p "$O4F/logs" "$O4F/state"
+cp "$HERE/claims.sh" "$O4F/claims.sh"
+printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O4F/merge-one.sh"
+for ft in 08 09; do
+  c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
+  [ -n "$c" ] && git -C "$A" push -q --force-with-lease="$FIXREF:$c" origin ":$FIXREF"
+  rm -f "$O4F/logs/fix-666666.log"
+  ( cd "$A" && exec env O="$O4F" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+  if grep -qa 'cross-box fixer claim: acquired' "$O4F/logs/fix-666666.log"; then
+    ok "FIX_TIMEOUT=$ft acquired the FIXER's claim (leading zero rejected, coerced to 2400)"
+  else
+    bad "FIX_TIMEOUT=$ft did NOT acquire — the fixer ran UNCLAIMED"
+    grep -a 'cross-box\|FIX_TIMEOUT' "$O4F/logs/fix-666666.log" 2>/dev/null | sed 's/^/     /'
+  fi
+done
+c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
+[ -n "$c" ] && git -C "$A" push -q --force-with-lease="$FIXREF:$c" origin ":$FIXREF"
+rm -rf "$O4F"
+
+echo
 echo "=== step 5 (P3.4): a TERM'd worker releases the claim on the way out ==="
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
