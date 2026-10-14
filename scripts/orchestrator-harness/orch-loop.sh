@@ -62,11 +62,24 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 #
 # It is `is_limit`, not `is_num`, because a non-number is only the FIRST way the gate opens: `[`
 # ERRORS at or above 2**63 ("integer expression expected"), so an absurd-but-numeric MAX_LOAD
-# slips past is_num and then aborts the gate chain — the same fail-open this block exists to
-# close. `_NCPU` keeps is_num: its source is `nproc` on this host, not the plist.
-is_num "${_NCPU:-}"      || _NCPU=4
+# slips past is_num and then aborts the gate chain — the same fail-open this block exists to close.
+# ⛔ `_NCPU` GETS THE SAME BOUND (P3, fourth review round, 2026-10-14), and the failure it prevents
+# is NOT the plist's: `_NCPU` is an OS probe (`sysctl`/`nproc`), so an absurd-but-numeric value
+# reaches `$(( 10#$_NCPU * 10 ))` and the magnitude WRAPS instead of erroring — and each wrapped
+# outcome is individually a VALID number, so no downstream guard can see it. Measured on
+# /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to a 19-DIGIT MAX_LOAD (`[ -ge ]` then ERRORS,
+# which opens the load gate), and 9223372036854775808 (2**63) * 10 wraps to exactly **0**, which
+# `is_limit` ACCEPTS — and `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box
+# dispatches nothing, indefinitely. Bound the PROBE so neither wrap can be produced.
+# ⛔ AND MAX_LOAD NEEDS A TRUE DEFAULT, not a re-derivation (same round): the first fallback
+# recomputed from the SAME `_NCPU`, so it could not repair an out-of-range product — a 9-digit
+# _NCPU yields a 10-digit product (999999999 -> 9999999990), which is under 2**63 so `[ -ge ]` does
+# not error, it just never binds and the gate silently OPENS. The second guard falls back to the
+# documented default instead. (`MAX_LOAD` may still be set to 0 deliberately — install.sh allows 0
+# for every limit but CYC — so this bounds the DERIVATION, never a plist value that passes is_limit.)
+is_limit "${_NCPU:-}"    || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
@@ -227,6 +240,18 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
   until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
   [ -n "${until:-}" ] && [ "$until" != "0" ] || return 1
+  # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
+  # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
+  # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
+  # SECOND — 10 digits today). Without it the two readers DISAGREED about the same datum: the bare
+  # `[ "$now" -le "$until" ]` below ERRORS at or above 2**63 (rc=2, and an errored test is FALSE),
+  # so claim_live() reported a foreign full-width claim as DEAD while claim_acquire() correctly
+  # refused that head as live. The controller therefore reached the spawn branch EVERY cycle, the
+  # refused fixer wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker and
+  # `parked-<pr>` on the next cycle — so the cap never tripped and the PR was never parked: one
+  # refused spawn plus 1 GitHub call and 3 remote round trips per cycle, indefinitely, on a PR no
+  # box could work. The conservative direction is the same one claims.sh takes: treat it as LIVE.
+  [ "${#until}" -gt 18 ] && return 0
   [ "$(date +%s)" -le "$until" ] && return 0
   return 1
 }

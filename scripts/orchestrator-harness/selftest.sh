@@ -896,6 +896,26 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   ck "shipped claim_live(): a dead owner is not in flight" $rc
   [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
   ck "shipped claim_live(): the stale claim file is removed" $rc
+  # ⛔ A FOREIGN OVERSIZED (>= 2**63) LEASE (P2, fourth review round, 2026-10-14). claim_acquire()
+  # treats such a lease as unparseable => LIVE (claims.sh's 18-digit bound; test-claims.sh §P3e seeds
+  # the same value), but claim_live() read the SAME datum with a bare `[ "$now" -le "$until" ]`,
+  # which ERRORS at 2**63 and — read as false — reported it DEAD. The two readers then disagreed
+  # forever: the controller reached the spawn branch EVERY cycle, fix-one.sh was refused by
+  # claim_acquire, wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker AND
+  # `parked-<pr>` next cycle — so the cap never tripped and the PR was never parked. One refused
+  # spawn + 1 GitHub call + 3 remote round trips per cycle, indefinitely, on a PR no box could work.
+  # Drive the snapshot file the function actually reads, with a lease whose ONLY defect is magnitude.
+  CLSHA=deadbeefcafebabe0123456789abcdef01234567
+  printf 'refs/claims/3-%s\tforeignbox\t9223372036854775808\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  # The shipped CONFLICTING arm is `elif claim_live "$PR" "$HEAD" || sess "fix-$PR" || sess "merge-$PR"`;
+  # `false` stands in for a `sess` that finds no local worker session, so `spawn=yes` is exactly the
+  # fall-through that runs `tmux … fix-one.sh`.
+  spawn=no
+  if claim_live 3 "$CLSHA" || false; then :; else spawn=yes; fi
+  claim_live 3 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): an oversized (>=2**63) lease reports LIVE, not dead" $rc
+  [ "$spawn" = "no" ] && rc=0 || rc=1
+  ck "shipped claim_live(): no spawn is attempted for an oversized-lease claim" $rc
 fi
 
 # ── 15) a BAILED fixer refunds its attempt and restores the findings marker ─────
@@ -2041,7 +2061,7 @@ fi
 # AFTER `MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"` — its only read. A guard that runs after the
 # arithmetic cannot protect it ("dead-guard"), so the property to pin is that the coercion line
 # PRECEDES the MAX_LOAD line. Both are asserted line-ordered; the check fails on the pre-fix file.
-_ncpu_guard_line="$(grep -n 'is_num "${_NCPU:-}"' "$LOOP" | head -1 | cut -d: -f1)"
+_ncpu_guard_line="$(grep -n 'is_limit "${_NCPU:-}"' "$LOOP" | head -1 | cut -d: -f1)"
 _maxload_line="$(grep -n '^MAX_LOAD="' "$LOOP" | head -1 | cut -d: -f1)"
 [ -n "$_ncpu_guard_line" ] && [ -n "$_maxload_line" ] && [ "$_ncpu_guard_line" -lt "$_maxload_line" ] && rc=0 || rc=1
 ck "orch-loop.sh coerces _NCPU BEFORE MAX_LOAD reads it (guard is not guard-after-use)" $rc
@@ -2050,7 +2070,13 @@ ck "orch-loop.sh coerces a non-numeric MAX_LOAD instead of letting the load gate
 # ⛔ Behaviour, not source text. The grep above restates the implementation line, and every other
 # fixture in this file sets MAX_LOAD to a valid integer, so nothing ever DROVE the coercion. Extract
 # the shipped coercion lines and run them, the way the memory and swap gates are driven above.
-NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; grep -F '[ "$CYC" -ge 5 ] || CYC=240' "$LOOP"; } )"
+# ⛔ THE CYC FLOOR IS MATCHED ON AN ANCHORED CODE LINE, not by substring (P3, fourth review round,
+# 2026-10-14). `grep -F '[ "$CYC" -ge 5 ] || CYC=240'` also matched the COMMENTED-OUT line
+# (`# [ "$CYC" -ge 5 ] || CYC=240`), so commenting the floor out still satisfied the extraction —
+# the guard could not fail while the comment text survived. The `^` is an ANCHOR here, which `-F`
+# would have taken literally (verified: `grep -F '^x'` matches nothing), so this is an anchored
+# BRE. The behavioural assertion below is the real gate; this only makes the extraction honest.
+NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; grep '^\[ "\$CYC" -ge 5 \] || CYC=240' "$LOOP"; } )"
 # ⛔ Non-vacuity: NGRD ALWAYS contains the is_num() definition, so `[ -n "$NGRD" ]` passes with zero
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
@@ -2060,8 +2086,10 @@ ck "all 12 shipped limit coercions are extracted (a definition alone is not an e
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
-# make the fix look broken. Non-vacuity: require the floor line to be present in the extraction.
-printf '%s\n' "$NGRD" | grep -qF '[ "$CYC" -ge 5 ] || CYC=240' && rcf=0 || { rcf=1; echo "      the CYC floor line is missing from the extraction"; }
+# make the fix look broken. Non-vacuity: require the floor line to be present in the extraction, again
+# ANCHORED so a commented-out floor cannot satisfy it, and via a here-string (the `printf … | grep -q`
+# form is the #841 SIGPIPE false-negative idiom that scripts/check-no-sigpipe-grep.sh rejects).
+grep -q '^\[ "\$CYC" -ge 5 \] || CYC=240' <<<"$NGRD" && rcf=0 || { rcf=1; echo "      the CYC floor line is missing from the extraction"; }
 ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" $rcf
 # <MAX_LOAD> <MAX_LANES> <MERGE_PRIORITY_AT> <BATCH>, with MAX_REVIEW/MAX_FIX/MAX_FIX_TRIES/STALE_MIN
 # unset and CYC non-numeric -> the values the shipped coercion leaves behind
@@ -2081,6 +2109,34 @@ ck "numeric plist limits survive the coercion unchanged" $rc
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
 [ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
+# ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
+# passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
+# — which re-derived from the SAME unbounded `_NCPU` and could therefore leave an out-of-range value
+# in place. Extract the shipped `_NCPU` guard + derivation + coercion and DRIVE it with an absurd
+# probe, whose magnitude WRAPS (it does not abort), so the range guard cannot see it downstream.
+# The block always carries the two is_* DEFINITIONS, so a non-empty extraction proves nothing; the
+# `a sane _NCPU still derives MAX_LOAD=cores*10` assertion below IS the non-vacuity guard (it can
+# only pass if the derivation line was evaluated).
+{ grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; sed -n '/^is_limit "\${_NCPU:-}"/,/^[[:space:]]*is_limit "\${MAX_LOAD:-}"/p' "$LOOP"; } > "$TMP/maxb.sh"
+if need "$TMP/maxb.sh" "the shipped _NCPU guard + MAX_LOAD derivation are extracted"; then
+  MAXB="$(cat "$TMP/maxb.sh")"
+  maxload_probe() { ( _NCPU="$1"; MAX_LOAD="$2"; eval "$MAXB"; printf '%s' "$MAX_LOAD" ); }
+  [ "$(maxload_probe 12 '')" = "120" ] && rc=0 || { rc=1; echo "      _NCPU=12 -> '$(maxload_probe 12 '')', expected 120"; }
+  ck "a sane _NCPU still derives MAX_LOAD=cores*10 through the shipped block" $rc
+  [ "$(maxload_probe 99999999999999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=1e20 -> '$(maxload_probe 99999999999999999999 '')', expected 40"; }
+  ck "an absurd _NCPU (>= 2**63) falls back to 40, not a 19-digit load gate that ERRORS" $rc
+  # The other wrap, and the one a MAX_LOAD-only guard CANNOT catch: 2**63 * 10 wraps to 0, and
+  # `is_limit 0` is TRUE (install.sh allows 0 for every limit but CYC), so `[ "$L" -ge 0 ]` is always
+  # true and the controller dispatches nothing, forever. Only bounding the PROBE closes it.
+  [ "$(maxload_probe 9223372036854775808 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=2**63 -> '$(maxload_probe 9223372036854775808 '')', expected 40"; }
+  ck "an _NCPU that wraps the product to 0 (which passes is_limit) is bounded to 40" $rc
+  # A 9-digit _NCPU is in range, but its product is 10 digits and still under 2**63 — `[ -ge ]` does
+  # not error, it just never binds, so ONLY the true-default fallback catches it.
+  [ "$(maxload_probe 999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=999999999 -> '$(maxload_probe 999999999 '')', expected 40"; }
+  ck "a product that outgrows the 9-digit bound falls back to 40, not a gate that never binds" $rc
+  [ "$(maxload_probe 99999999999999999999 30)" = "30" ] && rc=0 || { rc=1; echo "      absurd _NCPU + MAX_LOAD=30 -> '$(maxload_probe 99999999999999999999 30)'"; }
+  ck "a valid plist MAX_LOAD survives even an absurd _NCPU (the derivation is bounded, not the value)" $rc
+fi
 # ⛔ LEADING ZEROS — the third failure mode, and the one the FIRST fix missed (P1/P2, second review
 # round, 2026-10-14). `is_num` used `''|*[!0-9]*`, which ACCEPTS `08`; that reached `$(( 08 + … ))`,
 # where bash parses base 0 (leading 0 = OCTAL) and `08` is not octal. On /bin/bash 3.2.57 the failed
