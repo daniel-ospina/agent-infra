@@ -357,6 +357,24 @@ park() { # park <reason…>
   echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
 }
 
+# ⛔ THE HEAD IS THE SAME CLASS OF PRE-REVIEW DEPENDENCY AS THE RECORDER (#1717). The `gh pr view`
+# above swallows its own failure (2>/dev/null), so one transient API/network/rate-limit blip leaves
+# HEAD empty — and the PRE-FIX flow still ran the WHOLE fresh-context review (up to REVIEW_TIMEOUT =
+# 1800 s, PAID), only for record-review.sh to refuse an empty sha ("head_sha must be a full 40-char
+# hex sha — refusing to record"). park() then could not write `parked-<PR>` AT ALL (there is no head
+# to key it to, and the controller's guard requires a non-empty head too), so the controller saw no
+# park at its HEAD_N, re-spawned a worker, and paid again every cycle — the exact unbounded paid
+# loop #1717 removes. Refuse BEFORE the paid step, against the same 40-char hex shape
+# record-review.sh enforces, and leave the actionable terminal reason.
+head_ok=0
+case "${HEAD:-}" in '' | *[!0-9a-f]*) head_ok=1 ;; esac
+[ "${#HEAD}" -eq 40 ] || head_ok=1
+if [ "$head_ok" -ne 0 ]; then
+  park "could not resolve PR #$PR head (gh pr view returned '${HEAD:-<empty>}') — the record step needs a full 40-char hex sha, so a review paid for here could never be recorded or merged. Re-run once gh is reachable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: unresolvable head '${HEAD:-<empty>}' — not paying for a review whose record step could never sign" >> "$L.log"
+  exit 3
+fi
+
 # Honour the park HERE, not only in the controller. chain-<N> and fix-one.sh invoke this script
 # directly, and the controller's parked guard is invisible to them; without this the park would
 # hold only the path that was already fixed. Exit 5 = "refused, already parked at this head".
