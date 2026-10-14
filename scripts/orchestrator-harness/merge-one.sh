@@ -76,11 +76,6 @@ git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) 
 # (agent-infra#1709 rec 1). It is also the key record-review/needsfix already use.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
 
-# The log is TRUNCATED here, before any claim evidence is appended. It used to be truncated at
-# the end of the claim block, which silently deleted the "cross-box claim: acquired …" line on
-# every run — the feature worked and left no evidence that it had.
-echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
-
 # ── single-owner claim: local lock, then the cross-box git-ref claim ──────────
 # Three paths reach this script: chain-<N> (waits for a lane's PR), fix-<PR>, and the
 # controller's merge sweep. Only the last two are visible to the controller by session name,
@@ -88,6 +83,10 @@ echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 # head: duplicate evidence comments, duplicate record-review writes, and an
 # ISSUES/CLEAN interleaving where one worker's needsfix marker lands after the other merged.
 # Atomic noclobber create is the lock; the controller also tests this file.
+# ⛔ THE LOCK MUST BE TAKEN BEFORE THE LOG IS TRUNCATED. The loser below appends its refusal to
+# the winner's log; if the truncation ran first, the loser would wipe the live worker's log (and
+# the "cross-box claim: acquired …" evidence this ordering exists to protect) on its way to
+# discovering it does not own the PR. (P2, 2026-10-14 review round.)
 CLAIM="$O/state/mergeclaim-$PR.lock"
 claim() { ( set -o noclobber; echo $$ > "$CLAIM" ) 2>/dev/null; }
 if ! claim; then
@@ -105,6 +104,11 @@ fi
 trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'rm -f "$CLAIM"' EXIT
+
+# The log is TRUNCATED here — AFTER the local lock, so a losing duplicate never touches it, and
+# BEFORE any cross-box claim evidence is appended, so the "cross-box claim: acquired …" line
+# survives. Truncating at the end of the claim block silently deleted that evidence on every run.
+echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 
 # ── cross-box claim (agent-infra#1709 recs 1-3) ───────────────────────────────
 # The noclobber lock above is atomic on ONE box only: three boxes driving this repo are three

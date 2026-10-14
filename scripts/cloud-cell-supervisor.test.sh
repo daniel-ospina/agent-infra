@@ -451,7 +451,11 @@ fi
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
 F="$T/cellcheck"; mkdir -p "$F/harness" "$F/repo/.git" "$F/home" "$F/o" "$F/bin"
-for f in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+# Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
+# required worker script now, so a fixture without it dies in cmd_check with "worker scripts
+# missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
+# (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
+for f in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"

@@ -272,6 +272,14 @@ out="$( O="$TMP/O" PR=901 L="$TMP/claimtest2" bash -c "set -u; . '$TMP/claim.sh'
 case "$out" in *ALIVE*) rc=0 ;; *) rc=1; echo "      got '$out'";; esac
 ck "shipped claim block: a dead owner's claim is reclaimed" $rc
 fi
+# (c) ORDERING PIN (P2, 2026-10-14 review): the local lock must be taken BEFORE the log is
+# truncated, or a losing duplicate wipes the live winner's log (and its "cross-box claim:
+# acquired …" evidence) on its way to discovering it does not own the PR. Structural on the
+# shipped file, so the pre-fix ordering (truncate before the lock) is RED.
+lock_ln="$(grep -nF 'CLAIM="$O/state/mergeclaim-$PR.lock"' "$MERGE" | head -1 | cut -d: -f1)"
+trunc_ln="$(grep -nF '[merge $PR] start' "$MERGE" | head -1 | cut -d: -f1)"
+if [ -n "$lock_ln" ] && [ -n "$trunc_ln" ] && [ "$lock_ln" -lt "$trunc_ln" ]; then rc=0; else rc=1; echo "      lock line=$lock_ln truncation line=$trunc_ln"; fi
+ck "shipped merge-one: the local lock is taken BEFORE the log is truncated" $rc
 
 # ── 5) the shipped reaper un-blacklists only undelivered dispatches ──────────────
 # Extracted from refresh-candidates.sh and run against fixtures:
