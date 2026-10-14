@@ -254,9 +254,9 @@ CLAUSE_FILTER='(contains("<!-- admin-merge-safety: '"$HEAD"' -->"))
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
        or ([ (. | split("\n"))[] | select(test("Attribution[^\\n]*tokens DROPPED")) ] | all(test("^[ \\t]*Attribution — FAILED tokens DROPPED by the parser \\(not test ids, so NEVER in a failing set\\): PR=0 \\| main=0\\.\\r?$"))))
   and ((test("PR failing:\\s*0+\\s*\\|\\s*main failing:\\s*0+\\s*\\|") | not)
-       or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
+       or (test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( EXCEPT the [0-9]+ shard\\(s\\) its diff selector DECLINED for this head, which are forgiven)?( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")
            and ([match("lane parity:[^\\n]*"; "g") | .string
-                 | test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")] | all)
+                 | test("(^|\\n)[ \\t]*lane parity: PR ⊇ main — the PR executed every test shard main'"'"'s lane executed( EXCEPT the [0-9]+ shard\\(s\\) its diff selector DECLINED for this head, which are forgiven)?( \\(parity family: [^;\\n[:cntrl:]\\x{2028}\\x{2029}]*; [0-9]+ shard\\(s\\) on the PR side, [0-9]+ on main\\))?[ \\t]*(\\n|$)")] | all)
            and ([match("lane parity:[^\\n]*"; "g") | .string
                  | [match("\\(parity family:"; "g")] | length] | all(. <= 1))
            and (test("(^|\\n)[ \\t]*lane parity:[^\\n]*(NOT ESTABLISHED|FAILED|MISMATCH|DID NOT|NEVER ESTABLISHED)"; "i") | not)))'

@@ -221,10 +221,14 @@ scripts/admin-merge.sh <PR> --squash
 #
 # A repo whose PR lane CANNOT run a shard main's push lane runs (a trigger-split
 # repo — this one: main's push calls the reusable `python-ci.yml` and no PR lane
-# does, #1349) has an AUDITED escape: `ADMIN_MERGE_LANE_PARITY=declared-off`. It
-# CERTIFIES the vacuous comparison but says so out loud — the posted evidence and
-# stderr both carry `lane parity: NOT ESTABLISHED — declared off`, and the parity
-# check still RUNS and still reports the divergent shards. Any other value is
+# does, #1349) is NOT excused by a flag. `ADMIN_MERGE_LANE_PARITY=declared-off` is
+# still accepted and still RUNS the comparison, but it no longer certifies: the
+# evidence gate refuses a vacuous certificate without the positive
+# `lane parity: PR ⊇ main` line (`verify-admin-merge-evidence.sh` clause 5), so
+# that escape posted evidence the merge shim then refused and retracted — a merge
+# path that reported certified and ended unmerged (#1439). Both values now REFUSE,
+# and the refusal names the route that does work: `AGENT_ADMIN_MERGE_OVERRIDE=1`,
+# which bypasses the certificate rather than faking one. Any other value is
 # refused at startup, so a typo cannot read as 'off'. Narrowing
 # `ADMIN_MERGE_LANE_JOB_PREFIX` is NOT the escape: it removes the excluded shard
 # family from the gate, which is the family the gate exists to protect.
