@@ -194,6 +194,17 @@ KEY_IN_FILE="$(printf '%s' "$KEY_IN_FILE_RAW" | tr -d '[:space:]')"
 # fallback is `[ -z "$GATE_KEY" ]` on the raw value). If that value normalizes to empty, the file
 # check is SHADOWED — so this state must be judged absent-and-dead, never present.
 
+# Does $ENV_FILE itself carry a tortoise checkout (the pre-flight tool's fallback source)? Same
+# delivery reasoning as the key probe above: the controller session re-sources $ENV_FILE (so a value
+# it carries reaches the session) while an ambient-only export does not — the session command line
+# carries only HOME REPO O OR SCOPE, and tmux serves a session the SERVER's environment, which on a
+# pre-existing server is the normal relaunch after `stop`. cmd_check uses this to warn about a
+# dispatch-provisioning verdict that holds only in THIS shell (agent-infra#1748 review).
+TORTOISE_IN_FILE=0
+if [ -f "$ENV_FILE" ]; then
+  [ "$(env -u TORTOISE_REPO -u TORTOISE bash -c 'set -a; . "$1" >/dev/null 2>&1; { [ -n "${TORTOISE_REPO:-}" ] || [ -n "${TORTOISE:-}" ]; } && printf x' _ "$ENV_FILE" 2>/dev/null)" = x ] && TORTOISE_IN_FILE=1
+fi
+
 # SCOPE (see orch-loop.sh): UNSET -> auto; anything SET, including a set-but-EMPTY value, is
 # validated by validate_scope() and forwarded verbatim. Presence, not emptiness — `${SCOPE:-auto}`
 # here would coerce a blank keys.env entry to auto and evaporate the pin this override exists for.
@@ -208,6 +219,15 @@ validate_scope() {
     auto|own|broad) ;;
     *) die "SCOPE must be auto|own|broad (got '$SCOPE')" ;;
   esac
+}
+
+# Does the TARGET repo carry its own pre-flight tool? When it does, the provisioning verdict does
+# not depend on a tortoise checkout at all, so an operator's TORTOISE_REPO is irrelevant and must not
+# draw the ambient-only warning below. Mirrors resolve_preflight() in refresh-candidates.sh (the
+# scout worktree wins when it exists, else the main checkout).
+repo_vendors_tool() {
+  [ -f "$REPO/tools/collision_preflight.py" ] \
+    || [ -f "$REPO/.worktrees/dispatch-scout/tools/collision_preflight.py" ]
 }
 
 # ── check: can this cell actually run a controller? ─────────────────────────────
@@ -247,6 +267,28 @@ cmd_check() {
   fi
   printf '%s\n' "$pv" | sed 's/^/    /'
   say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
+  # ⛔ The probe above runs in THIS shell, so an AMBIENT TORTOISE_REPO makes it pass — but the
+  # controller session will NOT receive it: the session re-sources $ENV_FILE and its command line
+  # carries only HOME REPO O OR SCOPE, and on a PRE-EXISTING tmux server a session is served the
+  # SERVER's environment (measured on tmux 3.4). The refresh would then resolve no checkout, exit
+  # rc=3, and the cell would be MERGE-ONLY — after `check` and `start` both blessed it. This is the
+  # same trap cmd_check already guards for the gate key (an ambient-only key is named as NOT
+  # delivered); the provisionability verdict had no equivalent guard. Warn while the operator can
+  # still fix it, and only when the verdict actually DEPENDED on that checkout: a repo that vendors
+  # its own tool does not care, and a value $ENV_FILE carries is delivered by the session's own
+  # source. (agent-infra#1748 review)
+  if ! repo_vendors_tool && [ "$TORTOISE_IN_FILE" != 1 ]; then
+    local ambient=""
+    [ -n "${TORTOISE_REPO:-}" ] && ambient="TORTOISE_REPO"
+    [ -n "${TORTOISE:-}" ] && ambient="${ambient:+$ambient and }TORTOISE"
+    if [ -n "$ambient" ]; then
+      say "warn: the dispatch-provisioning probe passed using this shell's ambient $ambient, which"
+      say "      $ENV_FILE does not carry. The controller session re-sources $ENV_FILE and does not"
+      say "      receive an ambient export on a pre-existing tmux server, so it would resolve no"
+      say "      tortoise checkout, refuse with rc=3, and leave the cell MERGE-ONLY."
+      say "      Fix: put TORTOISE_REPO=<a tortoise checkout> in $ENV_FILE, or vendor tools/collision_preflight.py into the repo."
+    fi
+  fi
 
   # Judge the key by what the SESSION will receive, not by what this shell happens to hold: the key
   # FILE is authoritative, and a key in $ENV_FILE reaches the session because the session re-sources

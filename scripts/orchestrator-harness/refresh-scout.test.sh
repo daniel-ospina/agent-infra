@@ -90,6 +90,22 @@ exit 0
 EOF
   chmod +x "$1/bin/uv"
 }
+# mk_old_python <path> — a python SHIM standing in for an interpreter OLDER than the pre-flight
+# tool's minimum (3.12). It answers the version probe with a <3.12 answer and reproduces the tool's
+# own guard (exit 3, NO `VERDICT`) for anything else — exactly what tortoise's
+# tools/collision_preflight.py does under a 3.9/3.10 interpreter (tortoise #5128). Pinned through
+# SCOUT_PY, so the case is deterministic even on a host whose /usr/local/bin/python3 is >=3.12.
+mk_old_python() {
+  cat > "$1" <<'SH'
+#!/bin/bash
+case "$1" in
+  -c) case "${2:-}" in *version_info*) exit 1 ;; *) exit 0 ;; esac ;;
+esac
+echo "collision-preflight: requires Python >= 3.12 (got 3.9) — run it as \`uv run python tools/collision_preflight.py\`" >&2
+exit 3
+SH
+  chmod +x "$1"
+}
 
 # ── 1) a repo with NO pyproject.toml must PROCEED, not abort (the measured defect) ──────────────
 # Tortoise's tool is resolved through the fallback, and the venv step is skipped because it is
@@ -111,6 +127,70 @@ case "$OUT" in
 esac
 [ ! -e "$D/uv-args" ] && ok "no pyproject.toml: the venv step was NOT RUN (uv never invoked)" \
                       || bad "no pyproject.toml: uv was invoked — $(cat "$D/uv-args")"
+
+# ── 1b) the bare-python3 fallback is VERSION-GATED (agent-infra#1748 review P1) ─────────────────
+# The pre-flight tool refuses a <3.12 interpreter with exit 3 and NO `VERDICT` (tortoise #5128).
+# Nothing here used to check the version, so a cell whose `python3` was the macOS CLT 3.9 shim (or
+# Ubuntu 22.04's 3.10) had `--check` print CHECK OK, the refresh queue nothing and exit 0, and no
+# `.refresh-blocked` marker written — merge-only and silent. On the PRE-FIX code SCOUT_PY did not
+# exist, so the assertions below fail there (the real interpreter ran and the tool "answered").
+mk_case old-python
+mk_tool "$D/tort/tools/collision_preflight.py"
+mk_old_python "$D/bin/oldpy"
+rf "$D" check TORTOISE_REPO="$D/tort" SCOUT_PY="$D/bin/oldpy"
+[ "$RC" -eq 3 ] && ok "--check: an interpreter older than the tool's minimum is REFUSED (rc=3)" \
+               || bad "--check: accepted an old interpreter — rc=$RC — $OUT"
+case "$OUT" in
+  *"CHECK OK"*) bad "--check: printed CHECK OK for an old interpreter" ;;
+  *) ok "--check: no CHECK OK for an old interpreter" ;;
+esac
+case "$OUT" in
+  *"Python >= 3.12"*) ok "--check: the refusal names the tool's minimum (Python >= 3.12)" ;;
+  *) bad "--check: the refusal does not name the minimum — output: $OUT" ;;
+esac
+# (run) the same interpreter on the refresh path must be PERMANENT (rc=3), so orch-loop.sh writes
+# the merge-only marker instead of the script exiting 0 with an empty backlog.
+mk_case old-python-run
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_old_python "$D/bin/oldpy"
+rf "$D" refresh SCOUT_PY="$D/bin/oldpy"
+[ "$RC" -eq 3 ] && ok "old interpreter (run): rc=3 (PERMANENT — a marker, not a silent 0)" \
+               || bad "old interpreter (run): rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "old interpreter (run): the refusal is LOUD and named" ;;
+  *) bad "old interpreter (run): no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+[ ! -s "$D/o/candidates.txt" ] && ok "old interpreter (run): nothing is queued" \
+                              || bad "old interpreter (run): queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+
+# ── 1c) a pre-flight that REFUSES TO RUN is PERMANENT, not a per-issue "no verdict" (#1748 P1) ──
+# The tool's EXIT_USAGE (3) reports an unusable environment with NO `VERDICT` line. Absorbing that
+# into the `*)` arm left the script exiting 0 and no marker written: RUNNING with `lanes: 0`. The
+# stub reproduces exit 3 exactly. On the PRE-FIX code the `*)` arm runs and rc is 0.
+mk_case preflight-usage
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import sys
+print("collision-preflight: simulated usage/environment failure", file=sys.stderr)
+raise SystemExit(3)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 3 ] && ok "pre-flight exits 3 (no VERDICT): the refresh is PERMANENT rc=3, not a silent 0" \
+               || bad "pre-flight exits 3: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "pre-flight exits 3: the refusal is LOUD and named" ;;
+  *) bad "pre-flight exits 3: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+[ ! -s "$D/o/candidates.txt" ] && ok "pre-flight exits 3: nothing is queued" \
+                              || bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
 # Structural, not textual: the stub tool records its cwd and argv, and the candidate it cleared must
@@ -292,6 +372,34 @@ RF_PATH=""
 case "$OUT" in
   *"'uv' is not runnable"*"SCOUT_UV="*) ok "--check: the refusal names uv and the resolution that failed" ;;
   *) bad "--check: the refusal does not name uv — output: $OUT" ;;
+esac
+
+# (c) a scout that does not exist yet: `--check` must judge the venv the REFRESH will use, not the
+# main checkout's (agent-infra#1748 review P2). `--check` must not create the worktree, but reading
+# `$REPO/.venv/bin/python` as evidence was a FALSE PASS: the refresh uses `$SC/.venv/bin/python`, so
+# a repo with a main-checkout venv and a broken `uv` passed the probe, then failed `uv sync` and
+# exited the TRANSIENT 1 — no marker, nothing in `status`, retried forever.
+mk_case check-no-scout
+mk_tool "$D/tort/tools/collision_preflight.py"
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mkdir -p "$D/repo/.venv/bin"
+printf '#!/bin/bash\nexit 0\n' > "$D/repo/.venv/bin/python"; chmod +x "$D/repo/.venv/bin/python"
+printf '[project]\nname = "demo"\n' > "$D/repo/pyproject.toml"
+rf "$D" check TORTOISE_REPO="$D/tort" SCOUT_UV="$D/bin/no-such-uv"
+[ "$RC" -ne 0 ] && ok "--check: no scout yet + a repo pyproject + no uv is REFUSED" \
+                || bad "--check: FALSE PASS — the main checkout's .venv read as the scout venv"
+case "$OUT" in
+  *"CHECK OK"*) bad "--check: printed CHECK OK without ever probing uv" ;;
+  *) ok "--check: no CHECK OK when the scout venv cannot be provisioned" ;;
+esac
+# The same shape with `uv` runnable must pass — a probe that only ever refuses is a false block.
+printf '#!/bin/bash\nprintf "ok\\n"; exit 0\n' > "$D/bin/uv"; chmod +x "$D/bin/uv"
+rf "$D" check TORTOISE_REPO="$D/tort" SCOUT_UV="$D/bin/uv"
+[ "$RC" -eq 0 ] && ok "--check: a no-scout repo with uv runnable still passes (no false block)" \
+               || bad "--check: false block — rc=$RC — $OUT"
+case "$OUT" in
+  *"to be provisioned"*) ok "--check: names the venv as to-be-provisioned (not the main checkout's)" ;;
+  *) bad "--check: does not name the venv provisioning — output: $OUT" ;;
 esac
 
 # ── 7) orch-loop.sh: a permanent failure STOPS the retry loop and is loud (was silent, forever) ─

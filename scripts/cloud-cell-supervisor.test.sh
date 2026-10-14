@@ -463,7 +463,9 @@ cp "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
 chmod +x "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
 CC_OUT=''; CC_RC=0
 cellcheck() {
-  CC_OUT="$(PROBE_RC="$1" CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
+  # $1 = PROBE_RC, $2 = TORTOISE_REPO to make AMBIENT in the supervisor's own shell ('' = none).
+  # `TORTOISE=` is cleared so the alias cannot make an unforeseen case look like the one under test.
+  CC_OUT="$(PROBE_RC="$1" TORTOISE_REPO="${2:-}" TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
             O="$F/o" REPO="$F/repo" HARNESS="$F/harness" PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
   CC_RC=$?
 }
@@ -493,6 +495,38 @@ case "$CC_OUT" in
   *"CELL CAN RUN A CONTROLLER"*) ok "check: reaches the CELL CAN RUN banner when the repo is fine" ;;
   *) bad "check: did not reach the banner on a healthy repo — output: $CC_OUT" ;;
 esac
+
+# ⛔ Issue 3 (#1748 review): the provisioning probe runs in the OPERATOR's shell, but the controller
+# session gets a tmux-server environment plus a re-source of $ENV_FILE — so an ambient-only
+# TORTOISE_REPO makes `check` pass while the refresh it blesses would resolve no checkout, refuse
+# with rc=3, and leave the cell MERGE-ONLY. Pin the warning, and pin that a repo which VENDORS its
+# own tool (or a value $ENV_FILE carries) draws NO warning — a false warning is its own trap.
+say_case "check warns when the provisioning verdict rests on an ambient-only TORTOISE_REPO (#1748)"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) ok "check: an ambient-only TORTOISE_REPO is named as not delivered" ;;
+  *) bad "check: ambient-only TORTOISE_REPO drew no warning — output: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"put TORTOISE_REPO="*"$F/keys.env"*) ok "check: the remedy points at \$ENV_FILE (the delivered route)" ;;
+  *) bad "check: the warning does not prescribe \$ENV_FILE — output: $CC_OUT" ;;
+esac
+# The value $ENV_FILE carries IS delivered (the session sources it) → no warning.
+printf 'TORTOISE_REPO=%s\n' "$F/tort" > "$F/keys.env"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) bad "check: warned even though \$ENV_FILE carries TORTOISE_REPO" ;;
+  *) ok "check: a TORTOISE_REPO in \$ENV_FILE is NOT reported as ambient-only" ;;
+esac
+rm -f "$F/keys.env"
+# A repo that vendors its own pre-flight tool does not depend on the checkout at all → no warning.
+mkdir -p "$F/repo/tools"; : > "$F/repo/tools/collision_preflight.py"
+cellcheck 0 "$F/tort"
+case "$CC_OUT" in
+  *"ambient TORTOISE_REPO"*) bad "check: warned although the repo vendors its own pre-flight tool" ;;
+  *) ok "check: no warning when the repo vendors its own pre-flight tool" ;;
+esac
+rm -f "$F/repo/tools/collision_preflight.py"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
