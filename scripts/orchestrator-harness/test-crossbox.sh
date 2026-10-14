@@ -184,6 +184,57 @@ c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"
 rm -rf "$O4F"
 
 echo
+echo "=== step 4d (P2): an ENORMOUS REVIEW_TIMEOUT must not mint an unprunable lease ==="
+# `is_num` is UNBOUNDED, so it accepted `9223372036854775807`: `CLAIM_LEASE=$(( REVIEW_TIMEOUT +
+# 1200 ))` then wrapped NEGATIVE, `claims.sh`'s `until=$(( now + ttl ))` was negative, `_lease_of`'s
+# `[0-9]*` cannot parse a minus sign, an unparseable lease is read as LIVE forever, and `claim_prune`
+# can never reap it — so that PR/head was frozen across ALL boxes with no automatic recovery
+# (FAIL-CLOSED, the opposite of the design's fail-open policy). `is_limit` bounds REVIEW_TIMEOUT to 9
+# digits, so the sum cannot overflow. The lease LENGTH distinguishes "the caller's guard ran" from
+# "claims.sh silently clamped": a coerced REVIEW_TIMEOUT=1800 must yield ~3000s, not ~1800s.
+for rt in 9999999999999999999 9223372036854775807; do
+  clear_ref "$REF2"
+  rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"
+  t0="$(date +%s)"
+  ( cd "$A" && O="$O" REVIEW_TIMEOUT=$rt FAKE_PI_INSTANT=1 bash "$MERGE_ONE" "$A" daniel-ospina/tortoise 888888 test/branch >/dev/null 2>&1 )
+  line="$(grep -a 'cross-box claim: acquired' "$O/logs/merge-888888.log" 2>/dev/null | head -1)"
+  lu="$(printf '%s' "$line" | sed -n 's/.*lease_until=\(.*\)$/\1/p')"
+  if [ -n "$lu" ] && [ "${#lu}" -le 10 ] && [ "$lu" -gt "$t0" ] 2>/dev/null && [ $(( lu - t0 )) -ge 2400 ]; then
+    ok "REVIEW_TIMEOUT=$rt -> a sane lease (${lu}, $(( lu - t0 ))s ahead)"
+  else
+    bad "REVIEW_TIMEOUT=$rt produced lease_until='$lu' — negative, oversized, or silently clamped"
+    grep -a 'REVIEW_TIMEOUT\|cross-box claim' "$O/logs/merge-888888.log" 2>/dev/null | sed 's/^/     /'
+  fi
+done
+clear_ref "$REF2"
+
+echo
+echo "=== step 4e (P2): an ENORMOUS FIX_TIMEOUT must not mint an unprunable lease ==="
+# The fixer carries its OWN is_num/is_limit copy — a one-file fix would leave this path open — so it
+# is asserted separately (the same reason step 4c is separate from 4b). FIX_TIMEOUT's default is
+# 2400, so a coerced lease is ~3600s.
+O4H="/tmp/xb-crossbox-fixorch-huge.$$"; rm -rf "$O4H"; mkdir -p "$O4H/logs" "$O4H/state"
+cp "$HERE/claims.sh" "$O4H/claims.sh"
+printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O4H/merge-one.sh"
+fixref_clear() { local c; c="$(git -C "$A" ls-remote origin "$FIXREF" | awk '{print $1}')"; [ -n "$c" ] && git -C "$A" push -q --force-with-lease="$FIXREF:$c" origin ":$FIXREF"; return 0; }
+for ft in 9999999999999999999 9223372036854775807; do
+  fixref_clear
+  rm -f "$O4H/logs/fix-666666.log"
+  t0="$(date +%s)"
+  ( cd "$A" && exec env O="$O4H" FIX_TIMEOUT=$ft FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
+  line="$(grep -a 'cross-box fixer claim: acquired' "$O4H/logs/fix-666666.log" 2>/dev/null | head -1)"
+  lu="$(printf '%s' "$line" | sed -n 's/.*lease_until=\(.*\)$/\1/p')"
+  if [ -n "$lu" ] && [ "${#lu}" -le 10 ] && [ "$lu" -gt "$t0" ] 2>/dev/null && [ $(( lu - t0 )) -ge 3000 ]; then
+    ok "FIX_TIMEOUT=$ft -> a sane FIXER lease (${lu}, $(( lu - t0 ))s ahead)"
+  else
+    bad "FIX_TIMEOUT=$ft produced lease_until='$lu' — negative, oversized, or silently clamped"
+    grep -a 'FIX_TIMEOUT\|cross-box fixer claim' "$O4H/logs/fix-666666.log" 2>/dev/null | sed 's/^/     /'
+  fi
+done
+fixref_clear
+rm -rf "$O4H"
+
+echo
 echo "=== step 5 (P3.4): a TERM'd worker releases the claim on the way out ==="
 clear_ref "$REF2"
 rm -f "$O/state/mergeclaim-888888.lock" "$O/logs/merge-888888.log"

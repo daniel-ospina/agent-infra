@@ -20,6 +20,13 @@ case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty
 # 0. `$(( ))` parses base 0 (leading 0 = octal) and `08`/`09` are not octal. Accept only `0` or
 # `[1-9][0-9]*`.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
+# accepted `9223372036854775807`; `FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))` then wrapped NEGATIVE, the
+# lease failed to parse (`_lease_of`'s `[0-9]*` cannot match a minus sign), and an unparseable lease
+# is read as LIVE — so the head was frozen across ALL boxes and `claim_prune` could never reap it.
+# FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
+# digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 KIND=fixer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
@@ -101,10 +108,12 @@ trap 'exit 130' INT
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
-  if ! is_num "${FIX_TIMEOUT:-2400}"; then
-    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer — using 2400" >> "$L.log"
+  if ! is_limit "${FIX_TIMEOUT:-2400}"; then
+    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 2400 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
     FIX_TIMEOUT=2400
   fi
+  # Overflow-safe by construction: the guard above leaves FIX_TIMEOUT <= 999999999, so this sum is
+  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site.
   FIX_LEASE=$(( ${FIX_TIMEOUT:-2400} + 1200 ))
   claim_acquire "$REPO" "$PR" "$HEAD" "$FIX_LEASE" >/dev/null
   CROSS_RC=$?

@@ -25,6 +25,15 @@ OR="${OR:-daniel-ospina/tortoise}"
 # sysctl -n hw.ncpu is a macOS-only key and sysctl is absent from a minimal Linux userland
 # (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+# ⛔ THE GUARD, NOT JUST THE LINE (P3, third review round, 2026-10-14). The comment above calls this
+# assignment "IDENTICAL to orch-loop.sh's line" — the LINE was, the PROTECTION was not: orch-loop.sh
+# coerces `_NCPU` with `is_num` on the line before its only read, and install.sh had NO is_num at all.
+# `sysctl` can SUCCEED while printing an empty or garbage value, and `$(( 10#$_NCPU * 10 ))` is then a
+# syntax error that ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back
+# to 4 exactly as the loop does. Same predicate as every shipped copy (leading zeros are read as
+# octal by `$(( ))`, so `08` must be rejected too).
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+is_num "${_NCPU:-}"      || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
@@ -319,6 +328,13 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES 
   # a billion, so bound the length.
   [ "${#_v}" -le 9 ] || die "$_n='$_v' is out of range (at most 9 digits)"
 done
+# ⛔ CYC NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). The loop above
+# deliberately allows `0` — it is a valid integer and every OTHER limit may legitimately be 0 — but
+# `CYC=0` reaches the loop's `sleep $(( 10#0 - 0 + RANDOM % 1 ))` = `sleep 0`, so the controller
+# revisits every cycle with no delay and hammers the GitHub API. The loop floors it to 240 as well;
+# refusing it here is the consistent half — a value this installer accepts must be the value the loop
+# uses. 5s, not 240, so a deliberately small cycle is not silently replaced.
+[ "$CYC" -ge 5 ] || die "CYC=$CYC is below the 5s floor — a zero (or near-zero) cycle re-hits the GitHub API with no delay"
 # Each value is substituted by its OWN sed rule and the rules run IN ORDER, so a value carrying a
 # LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as `4` — exit 0, plutil OK,
 # and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion

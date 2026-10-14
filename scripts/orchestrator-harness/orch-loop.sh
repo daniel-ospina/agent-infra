@@ -115,6 +115,12 @@ is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
 is_limit "${CYC:-}"               || CYC=240
+# ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
+# is TRUE and install.sh's range loop explicitly allowed `0`, so `CYC=0` survived all the way to
+# `sleep $(( 10#0 - 0 + RANDOM % 1 ))` = `sleep 0` — the controller revisited every cycle with no
+# delay, hammering the GitHub API. The floor is a small 5s (not 240, which would silently replace a
+# deliberate small value); install.sh refuses < 5 at render time, so the two ends agree.
+[ "$CYC" -ge 5 ] || CYC=240
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -680,11 +686,18 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # docs-lint findings — MD056, an unescaped '|' in a table row, and MD046, fence style;
           # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
           # which now also receives the failing CI log, capped like every other fix loop.
+          # ⛔ THE REFUND MUST PRECEDE THE READ (P2, third review round, 2026-10-14). The CONFLICTING
+          # arm above and the ai-review-gate arm below both read the count AFTER the refund; this arm
+          # read it BEFORE, so the decrement was immediately overwritten by `$NFC2 + 1` and the refund
+          # was a NO-OP here. fix-one.sh exits 0 — having done no work — when the cross-box CAS
+          # refuses it, so three no-op cross-box refusals still PARKED the PR as needs-a-human,
+          # exactly the defect the previous round claimed to close. Keep this ordering; selftest §15
+          # drives the shipped sequence and goes RED if the read moves back above the refund.
+          # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
+          # marker, so restore is 0 (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
-          # A bailed fixer must not have consumed an attempt here either. This arm never deleted a
-          # findings marker, so restore is 0 (P2, second review round).
-          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
             [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then

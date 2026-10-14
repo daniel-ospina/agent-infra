@@ -843,9 +843,33 @@ if need "$TMP/saferef.sh" "safe_ref() is extracted from the shipped orch-loop.sh
   safe_ref "feat/1234-tm" && rc=0 || rc=1
   ck "shipped safe_ref() accepts a generated branch name" $rc
 fi
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 grep -q '^is_num() {' "$LOOP" && rc=0 || rc=1
 ck "the shipped loop defines is_num() for PR ids" $rc
+# ⛔ ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH (P3, third review round, 2026-10-14).
+# selftest.sh carried its OWN lenient `is_num` (`''|*[!0-9]*`, which ACCEPTS `08`) beside the
+# tightened copies in orch-loop.sh / merge-one.sh / fix-one.sh / install.sh. It was unused — every
+# driver in this file extracts and sources the SHIPPED predicate it is testing, not this one — so it
+# was a documentation hazard rather than a live defect. But it contradicted "all copies agree", and
+# the next reader to copy the nearest definition would take the lax form. The lenient copy is DELETED
+# and this check requires the tight form in every copy that exists, including this file's. Restoring
+# the lenient definition anywhere is RED.
+_tight='0*) return 1'
+_lax=0; _ndefs=0
+for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
+  _found=0
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    _found=1
+    case "$_d" in *"$_tight"*) ;; *) _lax=1; echo "      $_f has a lenient is_num(): $_d";; esac
+  # DEFINITIONS only (`^is_num() {`) — a bare `is_num() {` also appears inside this file's own
+  # extraction greps, and matching those would flag every one of them as a lenient copy.
+  done < <(grep -E '^[[:space:]]*is_num\(\) \{' "$_f" 2>/dev/null)
+  [ "$_found" = "1" ] && _ndefs=$((_ndefs+1))
+done
+[ "$_lax" = "0" ] && rc=0 || rc=1
+ck "every is_num() copy in the tree (including selftest's) rejects leading zeros and accepts 0" $rc
+[ "$_ndefs" = "4" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 4 shipped files that need it"; }
+ck "the four SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
 grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc
 grep -qE "'\\\$OR' \\\$PR '\\\$BR'" "$LOOP" && rc=1 || rc=0
@@ -904,6 +928,29 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   echo 08 > "$O/state/fixcount-55"; : > "$O/state/fixbail-55-abc"; refund_bailed_fixer 55 abc 0
   [ "$(cat "$O/state/fixcount-55" 2>/dev/null)" = "0" ] && rc=0 || { rc=1; echo "      got '$(cat "$O/state/fixcount-55" 2>/dev/null)'"; }
   ck "a leading-zero fixcount is normalised by is_num (no arithmetic abort)" $rc
+  # (e) ⛔ THE ORDERING AT THE THIRD CALL SITE, DRIVEN (P2, third review round, 2026-10-14). The
+  # CONFLICTING arm and the ai-review-gate arm read the count AFTER the refund; the CI-red arm read
+  # it BEFORE, so the decrement was immediately overwritten by `NFC2 + 1` and a bailed fixer still
+  # consumed an attempt. Three no-op cross-box refusals PARKED the PR as needs-a-human. The block
+  # below extracts the THREE statements of the SHIPPED CI-red arm IN FILE ORDER and runs them on a
+  # fixture: start=3 with a bail marker must leave NFC2=2 (refunded, then read) — not 3. Moving the
+  # read back above the refund is RED, and the cap predicate on the shipped NFC2 is then false, so
+  # the arm spawns instead of parking.
+  awk 'index($0,"docs|test-isolation")>0{b=1}
+       b&&index($0,"if grep -q python-ci-gate")>0{b=0}
+       b' "$LOOP" \
+    | grep -E '^ *(NFC2=|is_num "\$NFC2"|refund_bailed_fixer "\$PR")' > "$TMP/ci-arm-seq.sh"
+  if need "$TMP/ci-arm-seq.sh" "the CI-red arm's refund+read sequence is extracted from the shipped loop"; then
+    rm -f "$O/state/fixcount-231" "$O/state/fixbail-231-abc" "$O/state/parked-231"
+    echo 3 > "$O/state/fixcount-231"; : > "$O/state/fixbail-231-abc"; : > "$O/state/parked-231"
+    PR=231; HEAD_N=abc; MAX_FIX_TRIES=3; NFC2=unset
+    # shellcheck disable=SC1090
+    eval "$(cat "$TMP/ci-arm-seq.sh")"
+    if [ "${NFC2:-x}" = "2" ] && [ "$(cat "$O/state/fixcount-231" 2>/dev/null)" = "2" ] \
+       && [ "${NFC2:-0}" -lt "${MAX_FIX_TRIES:-3}" ]; then rc=0
+    else rc=1; echo "      CI-red arm: NFC2='${NFC2:-}' fixcount='$(cat "$O/state/fixcount-231" 2>/dev/null)' parked=$([ -f "$O/state/parked-231" ] && echo yes || echo no)"; fi
+    ck "the CI-red arm refunds BEFORE reading the count (start=3 -> NFC2=2 < cap, respawn not PARK)" $rc
+  fi
 fi
 
 grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
@@ -1972,6 +2019,24 @@ ck "the reaper reads the log mtime through file_mtime_epoch() and skips on unkno
 # files' effective defaults — a divergence there would only surface ON a Linux host, so pin it here.
 grep -q 'nproc 2>/dev/null' "$INST" && rc=0 || rc=1
 ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on any host)" $rc
+# ⛔ AND install.sh MUST CARRY THE SAME GUARD (P3, third review round, 2026-10-14). orch-loop.sh
+# coerces `_NCPU` on the line above its only read; install.sh had NO is_num at all, so a `sysctl`
+# that SUCCEEDS while printing garbage (or empty) made `$(( 10#$_NCPU * 10 ))` a syntax error that
+# ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back to 4 as the loop
+# does. Extract the shipped lines and DRIVE them with a sysctl stub: a missing guard is a hard
+# failure, not a cosmetic difference from the loop. Red on the pre-fix install.sh.
+grep -E '^_NCPU=|^is_num\(\) |^is_num "\$\{_NCPU|^MAX_LOAD=' "$INST" > "$TMP/ncpu-inst.sh"
+if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
+  _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
+  [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
+  ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
+  # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
+  _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
+  [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
+  ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
+fi
 # ⛔ ORDER, not presence: the `_NCPU` coercion was added in the input-validation block, ~30 lines
 # AFTER `MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"` — its only read. A guard that runs after the
 # arithmetic cannot protect it ("dead-guard"), so the property to pin is that the coercion line
@@ -1985,20 +2050,26 @@ ck "orch-loop.sh coerces a non-numeric MAX_LOAD instead of letting the load gate
 # ⛔ Behaviour, not source text. The grep above restates the implementation line, and every other
 # fixture in this file sets MAX_LOAD to a valid integer, so nothing ever DROVE the coercion. Extract
 # the shipped coercion lines and run them, the way the memory and swap gates are driven above.
-NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; } )"
+NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; grep -F '[ "$CYC" -ge 5 ] || CYC=240' "$LOOP"; } )"
 # ⛔ Non-vacuity: NGRD ALWAYS contains the is_num() definition, so `[ -n "$NGRD" ]` passes with zero
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 [ "$_ngrd_n" = "12" ] && rcn=0 || { rcn=1; echo "      expected 12 shipped coercions in the extraction, got $_ngrd_n"; }
 ck "all 12 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
+# explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
+# CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
+# make the fix look broken. Non-vacuity: require the floor line to be present in the extraction.
+printf '%s\n' "$NGRD" | grep -qF '[ "$CYC" -ge 5 ] || CYC=240' && rcf=0 || { rcf=1; echo "      the CYC floor line is missing from the extraction"; }
+ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" $rcf
 # <MAX_LOAD> <MAX_LANES> <MERGE_PRIORITY_AT> <BATCH>, with MAX_REVIEW/MAX_FIX/MAX_FIX_TRIES/STALE_MIN
 # unset and CYC non-numeric -> the values the shipped coercion leaves behind
 # ⛔ HERMETIC: every variable the coercion block touches is set explicitly. Leaving them unset is not
 # enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
-nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"
-           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; CYC=abc; STALE_MIN=
+nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
 [ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
@@ -2021,6 +2092,16 @@ ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the 
 # single `0`-followed-by-digit forms.)
 [ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
+# ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
+# integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
+# cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
+# The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
+# drops the floor line leaves cyc=0 here — RED.
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
+# Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+ck "a deliberate small CYC=5 survives the floor unchanged" $rc
 # And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
 # `is_num 08` must be FALSE, while `0` and a real number stay true.
 { grep -m1 '^is_num() {' "$LOOP"; } > "$TMP/isnum.sh"
@@ -2088,6 +2169,16 @@ ck "install.sh refuses an out-of-range limit (>=2**63, where [ errors and the ga
 out="$(run_inst "$(mk_sb)" CYC=08)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=08 -> '$out'"; }
 ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched" $rc
+# ⛔ CYC=0 (P3, third review round, 2026-10-14): a VALID integer that passes the range loop and then
+# makes the loop `sleep 0` — a zero-delay cycle that re-hits the GitHub API. Refused here, floored in
+# the loop, so the two ends cannot disagree. Pre-fix this case exits 0 (RED).
+out="$(run_inst "$(mk_sb)" CYC=0)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=0 -> '$out'"; }
+ck "install.sh refuses CYC=0 (a zero-delay cycle) and leaves the live plist untouched" $rc
+# Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
+SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }
+ck "install.sh accepts a deliberate small CYC=5 (the floor is not a blanket refusal)" $rc
 out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc

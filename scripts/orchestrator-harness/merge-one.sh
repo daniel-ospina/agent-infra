@@ -26,6 +26,14 @@ case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<emp
 # with status 0, so claim_acquire never ran and the worker reported success. Accept only `0` or
 # `[1-9][0-9]*`.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
+# accepted `9223372036854775807`; `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))` then wrapped NEGATIVE,
+# `claims.sh`'s `until=$(( now + ttl ))` was negative, `_lease_of`'s `[0-9]*` could not parse the minus
+# sign, and an unparseable lease is read as LIVE — so that PR/head was frozen across ALL boxes with
+# no automatic recovery (`claim_prune` can never reap it). FAIL-CLOSED, the opposite of the design's
+# fail-open policy. `is_limit` (is_num AND at most 9 digits) is the predicate orch-loop.sh applies to
+# every other tunable for exactly this reason, and 9 digits cannot overflow the sum below.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
 KIND=reviewer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
@@ -145,8 +153,8 @@ release_claim_bounded() {
 # still reported success. The trigger is plausible because `30m`/`1800s` are VALID for `sleep`, so
 # the operator's intended timeout works while the claim silently vanishes. Coerce rather than
 # reject: a bad tunable must not cost the fleet its cross-box safety.
-if ! is_num "${REVIEW_TIMEOUT:-1800}"; then
-  echo "[merge $PR] REVIEW_TIMEOUT='${REVIEW_TIMEOUT:-}' is not an integer — using 1800 (the cross-box lease needs a number)" >> "$L.log"
+if ! is_limit "${REVIEW_TIMEOUT:-1800}"; then
+  echo "[merge $PR] REVIEW_TIMEOUT='${REVIEW_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 1800 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
   REVIEW_TIMEOUT=1800
 fi
 
@@ -157,6 +165,9 @@ if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the 30x30s gate
   # wait below (900) + the merge itself. Derived, not a bare constant — and passed explicitly,
   # because sourcing claims.sh above sets CLAIM_TTL=1800 and would silently win over a default.
+  # Overflow-safe by construction: the guard above leaves REVIEW_TIMEOUT <= 999999999, so this sum
+  # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
+  # that skips this guard still cannot mint a lease the reader is unable to parse.
   CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
   claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
   CROSS_RC=$?

@@ -306,7 +306,7 @@ scripts.
 The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
-configures), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
+configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
 therefore rendered as `4` and still exited 0. It then renders to a **temp file**, lints that, asserts
 no placeholder survived, and only then moves it into place — the redirect truncates its target before
 `sed` runs, so rejecting after writing straight to `$PLIST` left the live plist empty and the next
@@ -314,9 +314,13 @@ no placeholder survived, and only then moves it into place — the redirect trun
 refused at both ends, and every limit is coerced *before* its first arithmetic read, because `[ -ge ]`
 on a non-number is FALSE and a false test in the gate chain OPENS the gate.
 
-⚠️ **`0` is a valid integer and passes every guard above.** It is not a typo they can catch: for
-`MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the gate can never bind (disabled), and `CYC=0` makes the
-cycle delay zero, so the controller spins. Set one of those only when that is what you mean.
+⚠️ **`0` is a valid integer for most limits** — for `MIN_SWAP_FREE`/`MIN_MEM_FREE_MB` it means the
+gate can never bind (disabled). Set one of those only when that is what you mean.
+⛔ **`CYC` is the exception: it has a 5-second floor.** It is the one limit where `0` is not merely
+useless but harmful — `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))` becomes `sleep 0` or a negative
+argument, so the controller revisits every cycle with no delay and hammers the GitHub API.
+`install.sh` refuses `CYC<5` at render time and `orch-loop.sh` floors a zero/bad value to its 240s
+default, so the two ends cannot disagree. `CYC=5` (a deliberately fast cycle) is still accepted.
 
 **The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
@@ -584,7 +588,12 @@ releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit; every
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. Both tunables are
+validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
+`claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
+worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
+unparseable lease is read as **LIVE**, and `claim_prune` can never reap it, so that PR/head is frozen
+across every box with no automatic recovery. Every
 release/reclaim is `--force-with-lease`, so a box holding a **stale** commit (one that is no longer
 the ref's tip) cannot release the winner's claim. Three hardening points from the adversarial
 review of this PR: a **read-back failure on the create path still surfaces the commit we pushed**,

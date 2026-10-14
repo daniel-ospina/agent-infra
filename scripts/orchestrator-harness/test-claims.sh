@@ -438,6 +438,59 @@ for s in EXIT INT TERM; do
 done
 
 echo
+echo "=== P2d. an OVERFLOWING ttl is CLAMPED at the arithmetic site, not written as a lease ==="
+# `until=$(( now + ttl ))` wraps NEGATIVE at or above 2**63; `_lease_of`'s `[0-9]*` cannot parse the
+# minus sign, an unparseable lease is read as LIVE forever, and `claim_prune` can never reap it — so
+# the head is frozen across ALL boxes with no automatic recovery. The shipped callers now validate
+# their tunables with `is_limit`, and the PRIMITIVE clamps too (defence in depth: no caller can mint
+# a lease this module is unable to read back). Pre-fix the acquire echoes a negative lease_until.
+huge_lease() { # <box-dir>
+  ( cd "$1" && export CLAIM_OWNER_ID=huge \
+    && . "$CLAIMS_SH" \
+    && claim_acquire "$1" "$PR" "$SHA" 9223372036854775807 >/dev/null; rc=$?
+    printf 'rc=%s lease=%s\n' "$rc" "$(printf '%s' "$CLAIM_RESULT" | sed -n 's/.*lease_until=\(.*\)$/\1/p')" )
+}
+cleanup_ref
+hl="$(huge_lease "$A")"
+echo "  $hl"
+ck "an overflowing ttl still acquires (it is clamped, not refused)" "rc=0" "$hl"
+hlv="$(printf '%s' "$hl" | sed -n 's/.*lease=\(.*\)$/\1/p')"
+case "$hlv" in
+  ''|*[!0-9]*) hlb=0 ;;
+  *) if [ "${#hlv}" -le 10 ] && [ "$hlv" -gt 0 ]; then hlb=1; else hlb=0; fi ;;
+esac
+if [ "$hlb" = "1" ]; then echo "  ✅ the overflowing ttl was clamped — the lease parses ($hlv)"; PASS=$((PASS+1));
+else echo "  ❌ lease_until='$hlv' is absent/negative/oversized — unparseable, so read as LIVE forever"; FAIL=$((FAIL+1)); fi
+cleanup_ref
+
+echo
+echo "=== P3e. a FOREIGN oversized (>=2**63) lease is treated as LIVE, not STOLEN ==="
+# `[ "$now" -le "$held_until" ]` ERRORS (rc=2, and an errored test is FALSE) at or above 2**63, so
+# control fell through to the RECLAIM CAS and STOLE a claim this code means to treat as live; the
+# "unparseable = live" branch covered an ABSENT lease but not an oversized-but-numeric one. The seed
+# is a real claim commit with lease_until = 9223372036854775808 (exactly 2**63 — the smallest value
+# at which `[` errors; 2**63-1 is still an in-range integer). Not reachable from the shipped writers
+# (they clamp), so this is defence in depth against a foreign or older writer. RED pre-fix: the
+# acquire reclaims it (rc=0) instead of refusing (rc=1).
+seed_huge() { # -> prints the commit it pushed
+  local c
+  c="$( cd "$A" && . "$CLAIMS_SH" && _claim_commit foreignbox 9223372036854775808 )"
+  ( cd "$A" && . "$CLAIMS_SH" && _git push -q origin "$c:$REF" ) || return 1
+  echo "$c"
+}
+cleanup_ref
+EH="$(seed_huge)"; echo "  seeded an oversized-lease claim: $EH"
+outH=$(runA claim_acquire "$A" $PR "$SHA"); rcH=$?
+echo "  rc=$rcH :: $outH"
+ck "an oversized (>=2**63) lease reads as UNPARSEABLE => LIVE (rc=1)" "^1$" "$rcH"
+ck "the refusal says it cannot parse the lease" "no parseable lease" "$outH"
+stillH="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
+if [ -n "$EH" ] && [ "$stillH" = "$EH" ]; then
+  echo "  ✅ the oversized-lease claim was NOT stolen"; PASS=$((PASS+1))
+else echo "  ❌ the claim was STOLEN or the seed failed ($stillH vs seed '$EH')"; FAIL=$((FAIL+1)); fi
+cleanup_ref
+
+echo
 echo "=== cleanup ==="
 cleanup_ref
 left=$(git -C "$A" ls-remote origin "$REF" | wc -l | tr -d ' ')

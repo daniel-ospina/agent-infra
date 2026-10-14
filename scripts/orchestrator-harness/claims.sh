@@ -62,6 +62,19 @@ CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache}"
 # race. If you add a temp ref anywhere below, put it under CLAIM_TMP_NS.
 CLAIM_TMP_NS="${CLAIM_TMP_NS:-refs/claims-tmp}"
 CLAIM_TTL="${CLAIM_TTL:-1800}"   # 30 min default lease
+# ⛔ EVERY LEASE MUST BE A MAGNITUDE, NOT JUST A DIGIT STRING (P2, third review round, 2026-10-14).
+# `ttl` feeds `until=$(( now + ttl ))`, and a ttl at or above 2**63 WRAPS that NEGATIVE. `_lease_of`'s
+# `[0-9]*` pattern cannot parse a minus sign, so the lease reads as absent — and an absent lease is
+# treated as LIVE forever (below), while `claim_prune` can never reap it (`[ "$now" -gt "-" ]` is an
+# error, not a match). One bad tunable therefore froze a PR/head across ALL boxes with no automatic
+# recovery: FAIL-CLOSED, the opposite of this file's stated fail-open policy. The callers validate
+# their own tunables with `is_limit`; this clamps the primitive as well, so NO caller can mint an
+# unprunable lease. Accept only `0` or `[1-9][0-9]*` (leading zeros are read as octal by `$(( ))`),
+# at most 9 digits (9 digits + an epoch second cannot overflow).
+case "${CLAIM_TTL:-}" in
+  ''|*[!0-9]*|0*) CLAIM_TTL=1800 ;;
+  *) [ "${#CLAIM_TTL}" -le 9 ] || CLAIM_TTL=1800 ;;
+esac
 # The repository every git call runs against. Defaults to the cwd (correct for merge-one.sh,
 # which cd's into $REPO first) but the CONTROLLER must set it: orch-loop.sh runs from launchd
 # with cwd=$HOME, where `git fetch` fails and the claim snapshot silently comes back empty —
@@ -123,6 +136,15 @@ claim_acquire() {
   local repo="$1" pr="$2" sha="$3" ttl="${4:-$CLAIM_TTL}"
   local now until commit back cur tmp perr after
 
+  # Same bound as CLAIM_TTL above, at the ARITHMETIC SITE, because `ttl` may arrive from the caller:
+  # a leased value this function cannot parse back is worse than the default lease (see the note on
+  # CLAIM_TTL). Leading zeros are refused for the same reason there — `$(( 08 ))` is an octal error.
+  case "${ttl:-}" in
+    ''|*[!0-9]*|0?*) ttl="$CLAIM_TTL" ;;
+    0) ;;
+    *) [ "${#ttl}" -le 9 ] || ttl="$CLAIM_TTL" ;;
+  esac
+
   CLAIM_REF="$(claim_ref "$pr" "$sha")"
   CLAIM_OWNER="$(claim_owner)"
   now="$(date +%s)"; until=$(( now + ttl ))
@@ -160,7 +182,22 @@ claim_acquire() {
   lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
   held_owner="${lease%%$'\t'*}"; held_until="${lease##*$'\t'}"
 
-  if [ -z "$held_until" ] || [ "$held_until" = "0" ]; then
+  # ⛔ AN OVERSIZED BUT NUMERIC LEASE IS ALSO UNPARSEABLE (P3, third review round, 2026-10-14). A
+  # value at or above 2**63 makes `[ "$now" -le "$held_until" ]` ERROR (rc=2, test FALSE), so control
+  # fell through to the RECLAIM CAS and STOLE a claim this code means to treat as live. The "no
+  # parseable lease" branch below covers an absent value; it did not cover one a foreign or older
+  # writer minted at full width. Bound the digits BEFORE the comparison, exactly as the writer side
+  # now does. Not reachable from the shipped writers (they clamp), so this is defence in depth.
+  #
+  # ⛔ THE BOUND IS 18 DIGITS, NOT 9. The review finding asked for "longer than 9 digits", but
+  # `lease_until` is an EPOCH SECOND, which is 10 digits TODAY (`date +%s` = 1792001642) — a 9-digit
+  # bound would call every legitimate lease unparseable and treat it as LIVE forever, so no claim
+  # would ever expire or be reclaimed (a fleet-wide fail-closed, and test-claims.sh's expiry steps
+  # go RED). The overflow threshold is 2**63-1 = 9223372036854775807 (19 digits): 18 digits max is
+  # 999999999999999999 < 2**63, so the comparison cannot error. Rejecting 19+ digits is therefore the
+  # precise magnitude guard — and it is the CONSERVATIVE direction (a foreign full-width lease reads
+  # as live, never as stolen).
+  if [ -z "$held_until" ] || [ "$held_until" = "0" ] || [ "${#held_until}" -gt 18 ]; then
     CLAIM_RESULT="held by $held_owner (no parseable lease — treating as live)"
     echo "$CLAIM_RESULT"; return 1
   fi
@@ -287,7 +324,11 @@ claim_prune() {
     _git fetch -q origin "+$ref:$tmp" 2>/dev/null || continue
     lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
     until="${lease##*$'\t'}"
-    if [ -n "$until" ] && [ "$until" != "0" ] && [ "$now" -gt "$until" ]; then
+    # The same 18-digit bound as claim_acquire's live check: a 19+ digit lease can error `[` (2**63),
+    # and the safe reading of an unreadable lease is "still live, do not reap". The explicit bound
+    # also keeps an ignored `[` error from being relied on as control flow. (10 digits is a REAL
+    # epoch second — see the note in claim_acquire; do not tighten this to 9.)
+    if [ -n "$until" ] && [ "$until" != "0" ] && [ "${#until}" -le 18 ] && [ "$now" -gt "$until" ]; then
       _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && echo "pruned expired $ref"
     fi
   done
