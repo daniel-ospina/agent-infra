@@ -635,9 +635,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
   `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
   prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
   marker is written — one fresh review per cycle, forever, with no terminal state.
-- **`cloud-cell-bringup.sh` deletes the pushed gh token only on the success branch (agent-infra#1718).**
-  `die` on a failed `gh auth login` exits before `rm -f "$tokfile"`, leaving a push-capable token at
-  `/tmp/.gh-tok` on the VM.
 - **`ci_runner_gate.sh` is versioned here but wired to nothing (agent-infra#1719).** No
   `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
   still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy

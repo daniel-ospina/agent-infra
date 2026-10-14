@@ -142,29 +142,28 @@ remove_secrets() {
   return "$survived"
 }
 
-# install_secret_traps — (re)assert the secret-lifetime handlers. Called at start-up AND again once
+# install_secret_traps — (re)assert the secret-lifetime handler. Called at start-up AND again once
 # $ENV_FILE has been sourced: that file is arbitrary shell, so a single `trap - EXIT` in it would
 # DISARM the cleanup for the rest of the run (measured: with `trap - EXIT` as a keys.env line, a
 # rejected login left the token on disk). The #1713 guard below cannot see this — it refuses a file
 # that cannot be parsed or that ends with a top-level exit/exec, not one that edits our traps.
+#
+# ⚠️ There is deliberately NO INT/TERM/HUP handler, and adding one "so the EXIT trap runs" rests on a
+# FALSE premise: an UNTRAPPED fatal signal already runs an EXIT trap. Measured on bash 3.2.57 and
+# 5.3.15 — with only `trap … EXIT` set, an untrapped TERM/HUP ran the cleanup and the parent saw
+# 143/129, whether the shell was waiting on a child, spinning in a builtin loop, or inside a `$( )`;
+# bash re-raises the signal status after the trap, so 128+signo survives a trap that does not call
+# `exit`. A handler would add a second, untestable path to the same cleanup (deleting the three it
+# replaced left this suite green), so it is not carried.
 install_secret_traps() {
-  # ⚠️ NOT for the reason it is tempting to give. An UNTRAPPED fatal signal does run a bare EXIT
-  # trap (measured on bash 3.2.57: with only `trap … EXIT` set, an untrapped TERM/HUP printed its
-  # cleanup and exited 143/129 — while waiting on a child, in a builtin loop, and inside a `$( )`),
-  # so the EXIT trap alone already covers a Ctrl-C. The handlers earn their place on two narrower
-  # grounds: they pin the status at 128+signal deterministically, and they IGNORE further signals
-  # (`trap '' …`, NOT `trap - …`, which merely restores the fatal default) so a signal storm cannot
-  # kill the shell half-way through the cleanup and leave the rest of the list behind. And by
-  # agent-infra#1715 a handler that only cleans up RESUMES the shell — a non-interactive bash
-  # terminates on EXIT alone — so each handler `exit`s, which is what then runs the EXIT trap.
-  trap "trap '' INT TERM HUP; exit 130" INT
-  trap "trap '' INT TERM HUP; exit 143" TERM
-  trap "trap '' INT TERM HUP; exit 129" HUP
-  # The EXIT handler is fail-closed: a run that would have exited 0 must NOT do so while a secret is
-  # still on disk, or the operator reads success and hands the VM on. `trap - EXIT` first stops a
-  # re-entry from the `exit` below, and the signal dispositions are ignored (again) so the cleanup
-  # itself cannot be cut short.
-  trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP; remove_secrets || [ "$rc" -ne 0 ] || rc=1; exit "$rc"' EXIT
+  # `trap - EXIT` first stops a re-entry from the demotion below; signals are then IGNORED
+  # (`trap "" …`, NOT `trap - …`, which would merely restore the fatal default) so a SECOND signal
+  # cannot kill the shell half-way through the cleanup and leave the rest of the list behind.
+  # The handler is DEMOTE-ONLY: it never invents a status. A surviving secret turns a would-be 0 into
+  # 1 (so `CELL READY` can never accompany a leftover credential); anything else FALLS THROUGH,
+  # leaving bash's own status untouched. An explicit `exit "$?"` here would be wrong — `$?` inside
+  # an EXIT trap after a fatal signal is 0, not 128+signo.
+  trap 'rc=$?; trap - EXIT; trap "" INT TERM HUP; if ! remove_secrets && [ "$rc" -eq 0 ]; then exit 1; fi' EXIT
 }
 
 install_secret_traps

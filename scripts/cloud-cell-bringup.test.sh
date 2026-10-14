@@ -69,6 +69,10 @@ printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "0.85.1"; else echo "LAN
 # check_provider wraps the probe in `timeout 120 pi …`; GNU timeout is not on every dev box (macOS
 # has none), so it is stubbed here rather than assumed.
 printf '#!/bin/sh\nshift\nexec "$@"\n' > "$STUB/timeout"
+# rm shim — delegates to the real rm, but PARKS first when RM_STUB_SLOW is set, so a case can deliver
+# a second signal while the EXIT trap's cleanup is genuinely in flight. Leave RM_STUB_SLOW unset and
+# it is transparent.
+printf '#!/bin/sh\ncase "$*" in\n  *.gh-tok*) if [ -n "${RM_STUB_SLOW:-}" ]; then [ -n "${RM_STUB_MARK:-}" ] && : > "$RM_STUB_MARK"; sleep 2; fi ;;\nesac\nexec /bin/rm "$@"\n' > "$STUB/rm"
 # check_network reads the http_code from stdout. `slow` parks the script there so a SIGTERM can be
 # delivered while it is genuinely in flight (and writes a marker so the test does not race startup).
 printf '#!/bin/sh\ncase "${CURL_STUB_MODE:-normal}" in\n  fail) echo 000 ;;\n  slow) : > "$CURL_STUB_MARK"; sleep 2; echo 200 ;;\n  *) echo 200 ;;\n  esac\n' > "$STUB/curl"
@@ -150,7 +154,7 @@ br ok normal --bogus
 [ ! -e "$TOK" ] && ok "token REMOVED on the unknown-mode exit" \
                 || bad "token SURVIVED the unknown-mode exit"
 
-# ── 5) SIGTERM: an unhandled fatal signal kills bash WITHOUT running an EXIT trap ────────────────
+# ── 5) SIGTERM: the cleanup must RUN — the 143 alone is not the proof ──────────────────────────
 say_case "SIGTERM while the run is in flight"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 rm -f "$T/curl-started"
@@ -208,6 +212,9 @@ else
     *"could not remove the token file"*) ok "the failure names the file that could not be removed" ;;
     *) bad "the failed removal is not reported — output: $BR_OUT" ;;
   esac
+  [ "$(printf '%s\n' "$BR_OUT" | grep -c 'SECURITY:')" -eq 1 ] \
+    && ok "the failure is reported exactly once (the pre-banner refusal and the EXIT trap do not double-report)" \
+    || bad "the SECURITY report was duplicated or absent — output: $BR_OUT"
   case "$BR_OUT" in
     *"CELL READY"*) bad "CLAIMED readiness with the token still on disk (fail-open)" ;;
     *) ok "never claims CELL READY while the token is still on disk" ;;
@@ -262,6 +269,9 @@ else
     *"SECURITY:"*) ok "the unreachable credential is reported loudly" ;;
     *) bad "the unreachable credential was IGNORED silently — output: $BR_OUT" ;;
   esac
+  [ "$(printf '%s\n' "$BR_OUT" | grep -c 'SECURITY:')" -eq 1 ] \
+    && ok "reported exactly once (the refusal and the EXIT trap do not double-report)" \
+    || bad "the SECURITY report was duplicated or absent — output: $BR_OUT"
   case "$BR_OUT" in
     *"CELL READY — all links verified"*) bad "CLAIMED readiness while the credential was still on disk (fail-open)" ;;
     *) ok "never claims CELL READY while the credential is still on disk" ;;
@@ -272,6 +282,39 @@ else
   rmdir "$T/nox" 2>/dev/null
 fi
 
+# ── 9) a SECOND signal while the cleanup is running must not abort it ────────────────────────────
+# The EXIT trap IGNORES INT/TERM/HUP for the duration of the cleanup. Without that, a second signal
+# kills the shell mid-loop and the remaining secrets stay on disk — silently, because a survivor
+# changes nothing the operator can see. The `rm` shim parks so the window is real, not theoretical.
+# The discriminator is the trap's own REMOVAL LOG: a shell killed mid-cleanup never reaches it (the
+# shim's child may still unlink the file), so asserting only the token's absence would pass for the
+# wrong reason.
+say_case "a second signal during the cleanup cannot abort it"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+rm -f "$T/curl-started" "$T/rm-started"
+PATH="$STUB:$PATH" CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
+  GH_TOKEN_FILE="$TOK" CURL_STUB_MODE=slow CURL_STUB_MARK="$T/curl-started" \
+  RM_STUB_SLOW=1 RM_STUB_MARK="$T/rm-started" \
+  REPO_SLUG="daniel-ospina/tortoise" \
+  bash "$BRINGUP" --check > "$T/twice.out" 2>&1 &
+TWICE_PID=$!
+i=0
+while [ ! -e "$T/curl-started" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+kill -TERM "$TWICE_PID" 2>/dev/null   # signal 1 — kills the shell, which runs the EXIT trap
+i=0
+while [ ! -e "$T/rm-started" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if [ ! -e "$T/rm-started" ]; then
+  bad "the cleanup never started — the second-signal window could not be tested"
+else
+  kill -TERM "$TWICE_PID" 2>/dev/null # signal 2 — lands INSIDE the cleanup
+fi
+wait "$TWICE_PID" 2>/dev/null
+case "$(cat "$T/twice.out" 2>/dev/null)" in
+  *"secret file removed: $TOK"*) ok "the cleanup COMPLETED through the second signal (removal logged)" ;;
+  *) bad "the cleanup was ABORTED by the second signal — nothing logged a removal" ;;
+esac
+[ ! -e "$TOK" ] && ok "the token is gone after the second signal" || bad "the token SURVIVED the second signal"
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
@@ -280,6 +323,11 @@ if [ "$SKIP" -gt 0 ]; then
   echo "      host. A green run here is partial coverage, not a verified contract."
 fi
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
-[ "$SKIP" -gt 0 ] && { echo "  ⚠️  all EXECUTED checks passed"; exit 0; }
+if [ "$SKIP" -gt 0 ]; then
+  echo "  ⛔ $SKIP contract case(s) were SKIPPED: this host cannot exercise the fail-closed removal"
+  echo "     contract (root bypasses directory permissions). That is NOT a pass — run as a non-root"
+  echo "     user. Exiting non-zero so a green shard can never mean 'unverified'."
+  exit 1
+fi
 echo "  ✅ all checks passed"
 exit 0
