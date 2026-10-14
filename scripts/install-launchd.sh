@@ -12,7 +12,10 @@
 # Placeholders substituted from env (with machine defaults):
 #   {{HOME}}              $HOME (required)
 #   {{PATH}}              the installer's PATH (launchd's default PATH lacks
-#                         homebrew/bin — the alert jobs need `gh` on it)
+#                         homebrew/bin — the alert jobs need `gh` on it), with the
+#                         pi shim directory removed: launchd cannot exec into
+#                         ~/.pi/agent/shims (symlinks into ~/Documents, TCC EPERM,
+#                         #427/#1719)
 #   {{AGENT_INFRA_PATH}}  this repo's MAIN checkout (env overrides; worktree-safe)
 #   {{TORTOISE_REPO}}     env, else ~/Documents/GitHub/tortoise, else sibling ../tortoise
 #   {{SWARM_ROOT}}        env only ("if present" — no auto-detect; canary is
@@ -47,7 +50,9 @@ TEMPLATES_DIR="${TEMPLATES_DIR:-$INFRA_ROOT/templates/launchd}"
 AGENTS_DIR="${AGENTS_DIR:-${HOME:?HOME is required}/Library/LaunchAgents}"
 DOMAIN="gui/$(id -u)"
 
-usage() { sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# The range is literal and moves with the header: it ends on `set -uo pipefail`,
+# exactly as it did before the {{PATH}} note above was added.
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Resolve this repo's MAIN checkout (not a worktree) so installed jobs point
 # at a stable path that survives worktree teardown. `git worktree list
@@ -92,16 +97,80 @@ resolve_env() {
     fi
 }
 
+# launchd_path — the PATH a rendered plist receives: {{PATH}} minus the pi SHIM directory.
+#
+# agent-infra#1719. `~/.pi/agent/shims` holds symlinks INTO ~/Documents (e.g.
+# shims/gh -> <repo>/scripts/gh-shim/gh), a tree launchd cannot read: macOS TCC refuses the exec
+# with EPERM (#427). It is FIRST on an interactive session's PATH — and sync.sh runs this installer
+# FROM such a session — so every plist rendered from {{PATH}} began with a directory no launchd job
+# can execute from, and a job's `gh` resolved to an unrunnable symlink. A scheduled job must never
+# be handed a PATH element launchd cannot use, so the shim dir is dropped at render time; the real
+# binaries later in PATH are what the jobs are meant to find.
+#
+# ⛔ RESOLVE THE PHYSICAL PATH, do not match the NAME (review E2). It is the shim's TARGET that
+# launchd cannot read, so a PATH entry that is a SYMLINK to the shim directory matches no literal
+# pattern and would be rendered verbatim into every job — re-creating the EPERM the helper exists
+# to prevent. `scripts/orchestrator-harness/install.sh:add_dir()` resolves `pwd -P` for exactly
+# this reason and warns against a name test; this mirrors it.
+# ⛔ But only `*/shims`/`*/shims/*` are dropped, NOT all of `*/.pi/*`: `~/.pi/agent/bin` holds the
+# REAL `fd`/`rg` binaries and is outside the TCC-protected tree, so install.sh's blanket `.pi`
+# exclusion (harmless there — it adds resolved tool paths selectively) would cost these jobs
+# tools they use. The LOGICAL path is kept so the version-independent pi symlink is not pinned.
+# An entry that does not resolve is dropped too — launchd cannot resolve a tool from it.
+launchd_path() {
+    local out="" p phys glob_was_off=0
+    local IFS=:
+    # ⛔ A PATH entry is a path, never a glob pattern (review D3). `for p in $PATH` splits on IFS=:
+    # as intended, but it ALSO pathname-expands each entry, so an entry containing `*`/`?`/`[...]`
+    # was silently expanded into whatever it matched (`/a*` → `/aa:/ab`) or dropped when it matched
+    # nothing — a job PATH the installer's own shell never had. The base renderer substituted the
+    # QUOTED `$PATH`, so this expansion arrived with this helper; suppress it here rather than
+    # relying on the caller's `set -f`, and restore the caller's own setting on the way out.
+    case "$-" in *f*) glob_was_off=1 ;; esac
+    set -f
+    for p in $PATH; do
+        case "$p" in "") continue ;; esac
+        # ⛔ `CDPATH= cd` and not a bare `cd` (review B4-2): `cd` honours the CDPATH search path, so an
+        # entry that does NOT resolve could still be kept — contradicting this function's own contract
+        # ("an entry that does not resolve is dropped too"). Measured: with CDPATH exported and
+        # containing `phantom`, `PATH=phantom:/real` rendered `phantom` into the plist.
+        phys="$(CDPATH= cd -- "$p" 2>/dev/null && pwd -P)" || continue
+        case "$phys" in */shims | */shims/*) continue ;; esac
+        out="${out:+$out:}$p"
+    done
+    [ "$glob_was_off" = 1 ] || set +f
+    printf '%s' "$out"
+}
+
+# sed_repl — make a string safe as the REPLACEMENT half of `s|…|…|g` AND safe in the XML text node it
+# lands in.
+#
+# agent-infra#1719 (review D2-3). TWO escapes are needed, and the XML one is not optional:
+#   * `&` in a sed replacement expands to the WHOLE MATCH and `\` starts an escape, so a value
+#     carrying either is silently corrupted into the rendered plist (a PATH entry containing `&`
+#     rendered as `a{{PATH}}b`, with nothing to catch it — `verify_targets` inspects ProgramArguments
+#     only, and the pre-render placeholder guard greps the TEMPLATE, not the output).
+#   * the value lands inside `<string>`, so `&` is the XML entity introducer: an unescaped one makes
+#     the plist MALFORMED. Measured — a `&` in a PATH entry failed `plutil -lint`, i.e. the installer
+#     would have written a plist launchd cannot parse.
+# XML-escape FIRST (so the entity's own `&` is then sed-escaped, not re-expanded), then sed-escape.
+# The `|` delimiter must be escaped too, since that is the separator this file's sed uses.
+sed_repl() {
+    printf '%s' "$1" \
+        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        | sed -e 's/[&\\|]/\\&/g'
+}
+
 render() {
     # $1 = template path → stdout rendered plist
-    sed -e "s|{{HOME}}|$HOME|g" \
-        -e "s|{{PATH}}|$PATH|g" \
-        -e "s|{{AGENT_INFRA_PATH}}|$AGENT_INFRA_PATH|g" \
-        -e "s|{{TORTOISE_REPO}}|$TORTOISE_REPO|g" \
-        -e "s|{{SWARM_ROOT}}|$SWARM_ROOT|g" \
-        -e "s|{{SWARM_ENV_FILE}}|$SWARM_ENV_FILE|g" \
-        -e "s|{{PYTHON_BIN}}|$PYTHON_BIN|g" \
-        -e "s|{{PI_BIN_DIR}}|$PI_BIN_DIR|g" \
+    sed -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
+        -e "s|{{PATH}}|$(sed_repl "$(launchd_path)")|g" \
+        -e "s|{{AGENT_INFRA_PATH}}|$(sed_repl "$AGENT_INFRA_PATH")|g" \
+        -e "s|{{TORTOISE_REPO}}|$(sed_repl "$TORTOISE_REPO")|g" \
+        -e "s|{{SWARM_ROOT}}|$(sed_repl "$SWARM_ROOT")|g" \
+        -e "s|{{SWARM_ENV_FILE}}|$(sed_repl "$SWARM_ENV_FILE")|g" \
+        -e "s|{{PYTHON_BIN}}|$(sed_repl "$PYTHON_BIN")|g" \
+        -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
         "$1"
 }
 
@@ -170,6 +239,17 @@ install_job() {
     done
     if [ -n "$unset_ph" ]; then
         echo "  SKIP $label: unresolved placeholder(s)$unset_ph — is this a swarm host?" >&2
+        return 0
+    fi
+
+    # ⛔ {{PATH}} is RENDERED THROUGH A TRANSFORM, so test the value that will actually be written
+    # (review D3). The loop above tests `${!ph}` — the RAW `$PATH` — but `render` substitutes
+    # `launchd_path`. A PATH composed only of shim/resolvable-less entries is non-empty raw and
+    # EMPTY rendered, so the guard above passes and the job installs with
+    # `<key>PATH</key><string></string>`: an installed-but-inert job whose own log line cannot even
+    # run (`mkdir: command not found`). Refuse to install it, like any other unresolved placeholder.
+    if grep -q '{{PATH}}' "$template" && [ -z "$(launchd_path)" ]; then
+        echo "  SKIP $label: unresolved placeholder(s) {{PATH}} — every PATH entry is unreadable" >&2
         return 0
     fi
 
