@@ -554,6 +554,17 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
+# ── THE HEAD READ'S RETRY BUDGET (#1690) ────────────────────────────────
+# Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
+# exactly like POLL_INTERVAL — NOT inline in `resolve_head`, which is how the first
+# version did it and why `ADMIN_MERGE_HEAD_ATTEMPTS=08` reached the loop: `08` contains
+# no non-digit, so an inline `case '' | *[!0-9]*)` guard passes it, and bash ARITHMETIC
+# then reads it as an invalid OCTAL and errors. The refusal that followed still carried
+# `[head_unreadable]` — so the rail asserted "could not read the head" on a run where
+# ZERO reads were attempted. That is #1690's own symptom, machine-readably, on the
+# instrument whose job is not to make it.
+HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-3}"
+HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-1}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -1143,6 +1154,36 @@ validate_timing_knobs() {
     say_err "   on EVERY poll, so the wait becomes a tight BUSY SPIN of gh calls instead of a paced"
     say_err "   poll — and an interval beyond an hour paces nothing."
   fi
+  if counter_has_leading_zero "$HEAD_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL, so '08' is not 8 but an ERROR that"
+    say_err "   aborts the loop body. The rail would then refuse the PR while reporting that it"
+    say_err "   could not READ the head — a claim about the instrument on a run where the instrument"
+    say_err "   never ran. Write it without the leading zero (e.g. '3')."
+  elif ! counter_is_positive "$HEAD_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — the head-read retry"
+    say_err "   budget must be a POSITIVE integer. A non-numeric value errors the loop's arithmetic,"
+    say_err "   and a non-positive one attempts no read at all before refusing."
+  elif counter_exceeds_max "$HEAD_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — beyond the usable range"
+    say_err "   (max ${TIMING_KNOB_MAX})."
+  fi
+  if counter_has_leading_zero "$HEAD_READ_SLEEP"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — a LEADING ZERO is"
+    say_err "   ambiguous: arithmetic reads it as OCTAL while 'sleep' sleeps the decimal value."
+  elif ! counter_is_number "$HEAD_READ_SLEEP"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — the backoff base"
+    say_err "   must be a NON-NEGATIVE integer number of seconds (0 is legal: the test seam)."
+  elif counter_exceeds_max "$HEAD_READ_SLEEP" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX}s)."
+  fi
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
   # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
@@ -1179,16 +1220,12 @@ resolve_head() {
   # mistake it for a value. ⛔ Callers must use `require_head` below, never this
   # directly: the whole defect was a caller that could not tell "empty" from "absent".
   local attempt out rc
-  # ⛔ ENV SEAMS (#1690 review). Every other timing knob in this file is overridable (see
-  # `# Env seams` above), and without one the suite cannot exercise the BOUND itself —
-  # only a read that fails inside it. Validated fail-safe: a garbage value falls back to
-  # the default rather than turning into an arithmetic error inside the rail.
-  local attempts="${ADMIN_MERGE_HEAD_ATTEMPTS:-3}"
-  case "$attempts" in '' | *[!0-9]*) attempts=3 ;; esac
-  [ "$attempts" -ge 1 ] || attempts=3
-  local backoff="${ADMIN_MERGE_HEAD_READ_SLEEP:-1}"
-  case "$backoff" in '' | *[!0-9]*) backoff=1 ;; esac
-  for ((attempt = 1; attempt <= attempts; attempt++)); do
+  # ⛔ THE RETRY BUDGET IS A VALIDATED STARTUP KNOB, NOT AN INLINE `case` (#1690 review).
+  # `HEAD_ATTEMPTS` / `HEAD_READ_SLEEP` are checked by `validate_timing_knobs` before any
+  # CI work, with the rail's own primitives (leading-zero, positive, range) — see their
+  # declaration site and that function. Inline validation here was WRONG, not merely
+  # redundant: it accepted `08`, which bash arithmetic then errors on.
+  for ((attempt = 1; attempt <= HEAD_ATTEMPTS; attempt++)); do
     # shellcheck disable=SC2086
     out="$($GH pr view "$pr" "$@" --json headRefOid --jq .headRefOid 2>/dev/null)" && rc=0 || rc=$?
     if [ "$rc" -eq 0 ]; then
@@ -1209,8 +1246,8 @@ resolve_head() {
         *) [ "${#out}" -eq 40 ] && { printf '%s\n' "$out"; return 0; } ;;
       esac
     fi
-    if [ "$attempt" -lt "$attempts" ]; then
-      sleep "$((backoff * attempt))"
+    if [ "$attempt" -lt "$HEAD_ATTEMPTS" ]; then
+      sleep "$((HEAD_READ_SLEEP * attempt))"
     fi
   done
   return 1
@@ -1248,7 +1285,7 @@ require_head() {
   # `gate-events.jsonl` so block rates can be reconstructed BY REASON. `[head_unreadable]` is
   # the tag the moved-head refusals do NOT carry, so `grep -F '[head_unreadable]'` answers
   # "could the instrument read the head?" without depending on how the sentence is worded.
-  say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${ADMIN_MERGE_HEAD_ATTEMPTS:-3} attempts)."
+  say_err "admin-merge: ✗ BLOCK [head_unreadable] — could not READ the head of PR #$pr (${HEAD_ATTEMPTS} attempts)."
   say_err "   This is NOT a claim that the branch tip changed: the read failed, or returned"
   say_err "   something that is not a commit SHA. Nothing was merged. Re-run the rail."
   return 1
