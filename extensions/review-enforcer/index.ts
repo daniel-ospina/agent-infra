@@ -3168,6 +3168,14 @@ export default function (pi: ExtensionAPI) {
       // `task_collect`. The returns-early notice and a not-finished collect are
       // both ignored.
       const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+      // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
+      // results are built BEFORE the background branch, so they carry NO
+      // `details.background` — a refused `task({ background: true })` would then
+      // fall through and `dispatchCount++`, satisfying the ≥1-dispatch gate for a
+      // child that was never created. Read the tool INPUT too (the same dual
+      // signal `verification-gate` uses), so every background result —
+      // dispatched, refused, or halted — is recognised as background.
+      const reviewInput = (event as { input?: { background?: boolean } }).input;
       const isTerminalCollect =
         event.toolName === "task_collect" && reviewDetails?.terminal === true;
       if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
@@ -3179,7 +3187,7 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      if (reviewDetails?.background === true) return undefined;
+      if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
       // #1662 review: `task_collect` is idempotent — every result carries the
       // `run_id` it reaped (`details: view`). Count each run's verdict once, so
       // re-collecting a finished lane cannot inflate the dispatch total (and

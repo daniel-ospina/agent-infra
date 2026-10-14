@@ -2677,9 +2677,9 @@ await test("explicit env override beats argv print flag → gate/strict wins", (
 // ── getExpectedToolsForStep + gateGuidance ───────────
 section("getExpectedToolsForStep + gateGuidance");
 
-await test("verifier gate → allow [task, subagent, read, loop_enforcer], block everything else", () => {
+await test("verifier gate → allow [task, subagent, task_status, task_collect, read, loop_enforcer], block everything else", () => {
   const { allow, block } = getExpectedToolsForStep(makeStep({ gate: "verifier" }));
-  deepEqual(allow, ["task", "subagent", "read", "loop_enforcer"]);
+  deepEqual(allow, ["task", "subagent", "task_status", "task_collect", "read", "loop_enforcer"]);
   ok(block.length === 1 && block[0]!.test("bash"));
 });
 
@@ -2704,7 +2704,7 @@ await test("no gate → destructive git/mcp ops blocked", () => {
 
 await test("gateGuidance(verifier) → dispatch-a-task hint", () => {
   const g = gateGuidance(makeStep({ gate: "verifier" }));
-  ok(g.includes("Allowed tools: task, subagent, read, loop_enforcer"));
+  ok(g.includes("Allowed tools: task, subagent, task_status, task_collect, read, loop_enforcer"));
   ok(g.includes("dispatch a task sub-agent"));
 });
 
@@ -2760,7 +2760,7 @@ await test("warn mode + would-block call → EXACTLY ONE warn_blocked (no allowe
         ok(!res, "warn never blocks");
         const wb = auditEntries.filter((x) => x.event === "warn_blocked");
         equal(wb.length, 1, "EXACTLY ONE warn_blocked entry (would-block single-entry #357 Task 5)");
-        deepEqual(wb[0]!.allowed, ["task", "subagent", "read", "loop_enforcer"]);
+        deepEqual(wb[0]!.allowed, ["task", "subagent", "task_status", "task_collect", "read", "loop_enforcer"]);
         ok((wb[0]!.hint as string).includes("dispatch a task sub-agent"));
         equal(wb[0]!.step, "review");
         ok(!auditEntries.some((x) => x.event === "allowed"), "no allowed entry for a would-block call");
@@ -2919,6 +2919,67 @@ await test("#1662 review: re-collecting the SAME terminal task_collect does NOT 
         // the second, distinct verdict advances
         await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-B" } });
         equal(_stackForTest()[0]!.stepIndex, 2, "the second distinct verdict advances the step");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
+await test("#1662: gate mode — the reap tools are reachable at a verifier step (the background flow must not deadlock)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(GATE_ENV, async () => {
+      sequenceEnforcer(pi as any);
+      _pushSkillForTest("/repo/skills/bg-gate/SKILL.md", verifierSkillSteps(), 1);
+
+      // Dispatch is allowed at the verifier step (pre-existing contract).
+      const dispatched = await handlers.tool_call!({ toolName: "task", input: { prompt: "review", background: true } });
+      ok(!dispatched || !dispatched.block, "task dispatch allowed at the verifier step");
+      equal(_stackForTest()[0]!.reviewers.get(1), 1, "background reviewer counted at the verifier step");
+
+      // ...but the tools that observe/reap the lane are the ONLY way the step
+      // can advance, so blocking them here is a deadlock: the dispatch is
+      // allowed, the returns-early notice does not advance the step, and the
+      // reap calls are refused (#1662 review).
+      const status = await handlers.tool_call!({ toolName: "task_status", input: { run_id: "RUN-A" } });
+      ok(!status || !status.block, "task_status must be allowed at a verifier step");
+      const collect = await handlers.tool_call!({ toolName: "task_collect", input: { run_id: "RUN-A" } });
+      ok(!collect || !collect.block, "task_collect must be allowed at a verifier step");
+
+      // The reap flow completes in gate mode exactly as in warn mode.
+      await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+      equal(_stackForTest()[0]!.stepIndex, 2, "the terminal collect advances past the verifier gate in gate mode");
+    });
+  } finally { auditRelease(); }
+});
+
+await test("#1662 review: a refused background dispatch does NOT advance the verifier step (no child, no verdict)", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/bg-refused/SKILL.md", verifierSkillSteps(), 1);
+
+        await handlers.tool_call!({ toolName: "task", input: { background: true, cwd: "package.json" } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "the dispatch attempt was counted");
+
+        // A pre-spawn refusal (invalid cwd) is built BEFORE the background
+        // branch: its details carry `status: "invalid-cwd"` but NO
+        // `details.background`. Only the tool INPUT marks it as background —
+        // and a refusal is not a reviewer verdict, so it must not decrement the
+        // count or advance the step (#1662 review).
+        await handlers.tool_result!({
+          toolName: "task",
+          input: { background: true },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd", cwd: "/nope" },
+        });
+        equal(_stackForTest()[0]!.stepIndex, 1, "a refused background dispatch must NOT advance the step");
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "a refused background dispatch must NOT decrement the count");
       },
     );
   } finally { auditRelease(); }

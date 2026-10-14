@@ -7738,13 +7738,19 @@ test("#1662: ALIVE is not derived from %CPU — a quiet-but-live marker stream s
 test("#1662: an in-flight tool past the DEFAULT bound but under the dispatch's stream_stall_ms stays ALIVE", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-s-override-"));
   try {
-    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: undefined }, () => {
-      // 21.7 min of in-flight tool: > the 20-min DEFAULT (so a hardcoded
-      // comparison says wedged) but < the 60-min bound this lane was dispatched
-      // with. The watchdog would keep it alive; task_status must too.
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: undefined, TASK_CPU_STALL_MS: undefined }, () => {
+      // 21.7 min of IN-FLIGHT TOOL SILENCE — `stream_age_ms` is 21.7 min too, so
+      // the effective stream age really does exceed the 20-min DEFAULT (a
+      // hardcoded comparison says wedged) while staying under the 60-min bound
+      // this lane was dispatched with. `tool_updates=1 cpu_advanced=1
+      // cpu_stall_ms=2000000` is the no-progress evidence clause 1 requires, so
+      // this fixture reaches the `streamStallMs` comparison — without them
+      // `inFlightProgress` returns "unknown" and the lane stays `alive` under
+      // ANY bound, so the test could not fail for the reason it names (#1662
+      // review: the pre-fix fixture carried neither field).
       const { id } = seedRunningRun(dir, {
         streamStallMs: 3_600_000,
-        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1\n`,
+        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1300000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=2000000\n`,
       });
       const v = evaluateTaskRunStatus(id, dir);
       equal(v.status, "alive", `a raised dispatch bound must be honoured (got ${v.status}: ${v.note ?? ""})`);
@@ -7756,12 +7762,20 @@ test("#1662: an in-flight tool past the DEFAULT bound but under the dispatch's s
 
 test("#1662: without a persisted bound the env TASK_STREAM_STALL_MS is the fallback (not the constant)", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-s-env-"));
+  // The same 21.7-min no-progress-silence fixture as the raised-bound test:
+  // under the 20-min DEFAULT it is wedged, under a 60-min env bound it is alive,
+  // so running BOTH passes proves the fallback reads the env rather than a
+  // constant that would make both results identical (#1662 review).
+  const markers = `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1300000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1 tool_updates=1 cpu_advanced=1 cpu_stall_ms=2000000\n`;
   try {
-    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_STREAM_STALL_MS: "3600000" }, () => {
-      const { id } = seedRunningRun(dir, {
-        markers: `[task-heartbeat] tool_start nonce=testnonce t1 bash\n[task-heartbeat] tick nonce=testnonce tools=1 turn=1 stream_age_ms=1000 tool_age_max_ms=1300000 saw_msg=0 saw_tool=1\n`,
-      });
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_STREAM_STALL_MS: "3600000" }, () => {
+      const { id } = seedRunningRun(dir, { markers });
       equal(evaluateTaskRunStatus(id, dir).status, "alive", "env bound honoured when the record has none");
+    });
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined, TASK_CPU_STALL_MS: undefined, TASK_STREAM_STALL_MS: undefined }, () => {
+      const { id } = seedRunningRun(dir, { markers });
+      const v = evaluateTaskRunStatus(id, dir);
+      equal(v.status, "wedged", `without the env bound the 20-min default applies (got ${v.status}: ${v.note ?? ""})`);
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -8420,6 +8434,12 @@ test("#1662: a pre-spawn refusal is reported as a REFUSAL in background mode, ne
     const res = buildBackgroundDispatchResult(handle);
     equal((res.details as any).status, "invalid-cwd", "the result is the refusal status — in FAILED_TASK_STATUS, so the hook flips isError");
     equal((res.details as any).retryable, false, "a cwd refusal is not retryable");
+    // #1662 review: the refusal is built BEFORE the background branch and carried
+    // no `background` marker, so `review-enforcer` counted it as a completed
+    // reviewer and `sequence-enforcer` decremented the verifier count on it — a
+    // gate advanced by a child that never existed. The marker must ride the
+    // refusal payload.
+    equal((res.details as any).background, true, "a refused background dispatch still carries the background marker");
     ok(String(res.content[0].text).includes("refused"), `the refusal is stated: ${res.content[0].text}`);
     equal(String(res.content[0].text).includes("🚀"), false, "a refused dispatch must not render a success rocket");
     equal(String(res.content[0].text).includes("dispatched"), false, "a refused dispatch must not claim a dispatch");

@@ -4635,7 +4635,11 @@ function parseRunHeartbeat(rec: TaskRunRecord): TaskRunStatusView["heartbeat"] {
  * lane blocked in a long tool call is exactly 0 % CPU; docs/ops/fleet-liveness.md). */
 export interface TaskRunStatusView {
   run_id: string;
-  status: TaskRunStatus | "unknown" | "gone";
+  /** #1662: the view vocabulary is `alive | wedged | done | failed | cut | gone
+   * | unknown` — `alive`/`wedged` are the two most common non-terminal verdicts
+   * and MUST be in the declared union, or a consumer switching on it is told
+   * they are impossible. */
+  status: TaskRunStatus | "alive" | "wedged" | "unknown" | "gone";
   /** true only when the run has reached a terminal state and its outcome is
    * persisted — i.e. `task_collect` will return the final message. */
   terminal: boolean;
@@ -4798,7 +4802,8 @@ export function evaluateTaskRunStatus(
  * once terminal (the exact payload a blocking `task` call would have returned). */
 export interface TaskCollectView {
   run_id: string;
-  status: TaskRunStatus | "unknown" | "gone";
+  /** Same vocabulary as `TaskRunStatusView` — see the note there (#1662). */
+  status: TaskRunStatus | "alive" | "wedged" | "unknown" | "gone";
   terminal: boolean;
   exit_code?: number | null;
   reason?: string;
@@ -5182,9 +5187,18 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
   // (#1662 review). Accepting the guard here (not at the call site) keeps a
   // refused handle from ever rendering as "dispatched".
   if (handle.refusal) {
+    // #1662 review: a refusal created NO child, but it is still a BACKGROUND
+    // dispatch result. Carry the `background: true` marker every background
+    // consumer keys on (`review-enforcer`, `sequence-enforcer`,
+    // `verification-gate`) — without it a refused `task({ background: true })`
+    // is read as a *blocking* completion: it satisfies the ≥1-dispatch gate
+    // (review-enforcer) and decrements the verifier count, advancing the step
+    // with zero verdicts (sequence-enforcer). `details.status` stays
+    // `invalid-cwd` (in FAILED_TASK_STATUS), so the `tool_result` hook still
+    // flips the dispatch to `isError`.
     return {
       content: handle.refusal.content as Array<{ type: string; text: string }>,
-      details: handle.refusal.details,
+      details: { ...handle.refusal.details, background: true },
     };
   }
   return {

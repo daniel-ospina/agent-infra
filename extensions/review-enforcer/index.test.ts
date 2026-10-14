@@ -1606,6 +1606,42 @@ testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted
   });
 });
 
+testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A pre-spawn refusal (`cwd` names a file) is built BEFORE the
+        // background branch: its details carry `status: "invalid-cwd"` but no
+        // `details.background`. Only the tool INPUT is marked background, and a
+        // refusal spawned no child — it must not satisfy the ≥1-dispatch gate
+        // (#1662 review).
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a refused background dispatch must NOT satisfy the dispatch gate");
+
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 0, "a refused background dispatch must not enter the review_dispatch audit trail");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("gh pr merge with no review record → blocked AND merge_gate_block audited with PR", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;

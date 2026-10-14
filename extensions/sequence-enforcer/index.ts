@@ -1390,7 +1390,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
   const tools = allow.join(", ");
   if (gate === "verifier" || gate === "ai_review") {
     return `→ Allowed tools: ${tools}
-→ To proceed: dispatch a task sub-agent to review this stage, or read the sub-skill SKILL.md`;
+→ To proceed: dispatch a task sub-agent to review this stage, then observe/reap a background lane with task_status/task_collect, or read the sub-skill SKILL.md`;
   }
   if (gate === "human_approval" || gate === "human_review") {
     return `→ Allowed tools: ${tools}
@@ -1423,8 +1423,17 @@ export function getExpectedToolsForStep(step: Step): { allow: string[]; block: R
   }
   // verifier (also matches legacy "ai_review"): only task/subagent during review
   // loop_enforcer always allowed — the gate must never block its own escape hatch (#7470)
+  //
+  // #1662: `task_status` / `task_collect` are part of the SAME reviewer flow as
+  // `task`/`subagent` — a `task({ background: true })` dispatch returns at
+  // DISPATCH and its verdict lands on the terminal `task_collect` (the tool_result
+  // handler advances the step there). Blocking the reap tools at the very step
+  // that requires their verdict is a deadlock: the dispatch is allowed, the step
+  // cannot advance on the returns-early notice, and the only tools that could
+  // reap the lane are refused. Allow them here so the advertised
+  // dispatch → status → collect → REVIEW path is reachable in gate/strict mode.
   if (gate === "verifier" || gate === "ai_review") {
-    return { allow: ["task", "subagent", "read", "loop_enforcer"], block: [/.*/] };
+    return { allow: ["task", "subagent", "task_status", "task_collect", "read", "loop_enforcer"], block: [/.*/] };
   }
   // human_approval (also matches legacy "human_review"): only read/search/fetch during approval
   if (gate === "human_approval" || gate === "human_review") {
@@ -2230,9 +2239,18 @@ function tokenStateLabel(reason: string): string {
     // both leave the count untouched, so the step cannot advance until the
     // verdict is reaped.
     const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+    // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
+    // results are built BEFORE the background branch, so they carry NO
+    // `details.background` — a refused `task({ background: true })` would then
+    // read as a *blocking* completion and decrement the verifier count,
+    // advancing the step with zero verdicts. Read the tool INPUT too (the same
+    // dual signal `verification-gate` uses), so every background result —
+    // dispatched, refused, or halted — is recognised as background.
+    const verifierInput = (event as { input?: { background?: boolean } }).input;
     const isTerminalCollect =
       event.toolName === "task_collect" && verifierDetails?.terminal === true;
-    const isBackgroundDispatch = verifierDetails?.background === true;
+    const isBackgroundDispatch =
+      verifierDetails?.background === true || verifierInput?.background === true;
     // #1662 review: every `task_collect` result carries the `run_id` it reaped
     // (`details: view`). Dedupe terminal collects by that id so re-collecting
     // the same finished lane cannot decrement the reviewer count twice and
