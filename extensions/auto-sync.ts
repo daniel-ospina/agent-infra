@@ -69,7 +69,9 @@ export function stalenessThreshold(env: Record<string, string | undefined> = pro
  * #1661 (2): the "your tooling is old" banner. EMPTY below `threshold` — a
  * one-commit-behind checkout is normal and must stay quiet. Above it, the
  * magnitude of the pin (the thing that was invisible) is stated explicitly.
- * Pure (repo is only interpolated) so it is directly unit-testable.
+ * Deterministic for a given repo — it only SHELLS OUT to `git rev-parse
+ * --short HEAD` via `shortHead` (so it is not pure; pass a real repo in tests),
+ * which makes its output directly unit-testable.
  */
 export function stalenessBanner(repo: string, behind: number, threshold: number): string[] {
   if (behind < threshold) return [];
@@ -170,15 +172,31 @@ export function unmergedOp(repo: string): UnmergedOp {
 }
 
 /**
+ * #1661 (review): single-quote a value for safe interpolation into a PRINTED
+ * shell command. The banner's whole purpose is to hand the user (or a
+ * sub-agent) a command to run, and an unmerged path is attacker-influenceable:
+ * git permits `"`, backtick, `$`, `;` and `#` in filenames, so embedding one
+ * inside double quotes is not quoting at all. Same shape as
+ * `repo-freshness.ts:187` / `verification-gate/index.ts:3024`.
+ */
+export function shellQuoteSingle(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/**
  * #1661 (review): a remedy valid for the entry's conflict shape. `--theirs`
  * needs index stage 3 and `--ours` needs stage 2; DD has neither and AU/UD lack
  * stage 3, DU/UA lack stage 2 — so the old hard-coded `--theirs` errored
- * ("path ... does not have their version") for those codes. Pure.
+ * ("path ... does not have their version") for those codes. The repo/path are
+ * single-quote-escaped (see `shellQuoteSingle`) because these strings are
+ * printed as commands to run. Pure.
  */
 function remedyCommands(repo: string, e: UnmergedEntry): string[] {
-  const keepTheirs = `git -C "${repo}" checkout --theirs "${e.path}" && git -C "${repo}" add "${e.path}"`;
-  const keepOurs = `git -C "${repo}" checkout --ours "${e.path}" && git -C "${repo}" add "${e.path}"`;
-  const remove = `git -C "${repo}" rm "${e.path}"`;
+  const r = shellQuoteSingle(repo);
+  const p = shellQuoteSingle(e.path);
+  const keepTheirs = `git -C ${r} checkout --theirs ${p} && git -C ${r} add ${p}`;
+  const keepOurs = `git -C ${r} checkout --ours ${p} && git -C ${r} add ${p}`;
+  const remove = `git -C ${r} rm ${p}`;
   switch (e.detail) {
     case "DD": // deleted on both sides — no stage 2 or 3
       return [`both sides deleted this path: ${remove}`];
@@ -197,7 +215,7 @@ function remedyCommands(repo: string, e: UnmergedEntry): string[] {
       if (e.detail.includes("2")) return [`keep yours (stage 2): ${keepOurs}`];
       if (e.detail.includes("3")) return [`keep origin's version (stage 3): ${keepTheirs}`];
       if (e.detail.includes("1")) return [`base-only entry: ${remove}`];
-      return [`inspect: git -C "${repo}" status`, `then keep origin's version: ${keepTheirs}`];
+      return [`inspect: git -C ${r} status`, `then keep origin's version: ${keepTheirs}`];
   }
 }
 
@@ -222,7 +240,12 @@ export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: Unmer
     // not — on the one banner whose job is to hand them a correct command.
     const sides = op === "rebase"
       ? "rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command"
-      : `--ours is your current branch (HEAD); --theirs is ${op === "cherry-pick" ? "the picked commit" : op === "revert" ? "the reverted commit" : op === "am" ? "the patch being applied" : "the incoming commit"} (the merge convention)`;
+      // #1661 (review): for `revert`, `--theirs` is NOT the reverted commit —
+      // that commit is the three-way merge BASE, so `--theirs` is its parent
+      // (git's own conflict marker reads "parent of <sha>"). Saying "the
+      // reverted commit" would send a reader to the pre-revert state believing
+      // it was the commit they are undoing.
+      : `--ours is your current branch (HEAD); --theirs is ${op === "cherry-pick" ? "the picked commit" : op === "revert" ? "the state before the reverted commit (the reverted commit's parent)" : op === "am" ? "the patch being applied" : "the incoming commit"} (the merge convention)`;
     return [
       `[auto-sync] ⛔ ${op.toUpperCase()} IN PROGRESS with unmerged paths — sync must wait until it is concluded.`,
       ...list,

@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
@@ -581,6 +581,29 @@ async function main() {
       ok(!lines.some((l) => l.includes("inverts --ours/--theirs")), `${op} does NOT invert — must not claim it does: ${lines.join("\n")}`);
       ok(lines.some((l) => l.includes("--ours is your current branch")), `${op} must state the merge convention: ${lines.join("\n")}`);
     }
+    // #1661 (review): for `revert`, --theirs is the pre-revert state (the
+    // reverted commit is the merge BASE, so --theirs is its parent), NOT the
+    // reverted commit itself.
+    const rev = unmergedBanner("/r", [{ path: "f", detail: "UU" }], "revert");
+    ok(rev.some((l) => l.includes("the state before the reverted commit")), `revert --theirs is the pre-revert state: ${rev.join("\n")}`);
+    ok(!rev.some((l) => l.includes("--theirs is the reverted commit")), `must not call --theirs "the reverted commit" (it is its parent): ${rev.join("\n")}`);
+  });
+
+  await test("unmergedBanner: a shell-metacharacter path is single-quoted in the printed remedy (#1661 review)", () => {
+    // A legal git pathname may contain `"`, `;`, `$` and `#`. The banner prints
+    // an executable command, so the path must be quoted for the SHELL — double
+    // quotes are not quoting when the path can close them.
+    const marker = join(tempDir("auto-sync-inject-"), "PWNED");
+    const evil = `a"; touch "${marker}"; #`;
+    const line = unmergedBanner("/r", [{ path: evil, detail: "UU" }]).find((l) => l.includes("checkout --theirs"));
+    ok(line, "UU must carry a --theirs remedy");
+    const cmd = line!.slice(line!.indexOf("git -C"));
+    // Execute the emitted command with a no-op `git` shim first on PATH: the
+    // ONLY thing that can create the marker is injected shell.
+    const shim = tempDir("auto-sync-shim-");
+    writeFileSync(join(shim, "git"), "#!/bin/bash\nexit 0\n", { mode: 0o755 });
+    execFileSync("bash", ["-c", cmd], { env: { ...process.env, PATH: `${shim}:${process.env.PATH}` }, stdio: "pipe" });
+    ok(!existsSync(marker), `emitted remedy executed injected shell: ${cmd}`);
   });
 
   await test("unmergedBanner: remedy matches the conflict code (no side that does not exist)", () => {
@@ -588,7 +611,7 @@ async function main() {
     ok(ud.some((l) => l.includes("checkout --ours")), `UD has stage 2 only → --ours: ${ud.join("\n")}`);
     ok(!ud.some((l) => l.includes("checkout --theirs")), "UD has no stage 3 → --theirs would error");
     const dd = unmergedBanner("/r", [{ path: "f", detail: "DD" }]);
-    ok(dd.some((l) => l.includes(`git -C "/r" rm "f"`)), `DD has neither side → git rm: ${dd.join("\n")}`);
+    ok(dd.some((l) => l.includes(`git -C ${shellQuoteSingle("/r")} rm ${shellQuoteSingle("f")}`)), `DD has neither side → git rm: ${dd.join("\n")}`);
     ok(!dd.some((l) => l.includes("checkout")), "DD has no stage 2/3 → no checkout");
   });
 
