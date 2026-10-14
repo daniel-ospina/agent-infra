@@ -590,7 +590,7 @@ and terminal statuses too). The sanctioned promotion routes:
 - `promotion_policy="auto"` opts into #131 parity (source auto-promotion on
   first edge write) — the migration path from the old default.
 
-The response carries `warnings` (never fatal) — see the TWELVE-key table.
+The response carries `warnings` (never fatal) — see the ELEVEN-key table.
 
 ## Idempotent resubmission
 
@@ -614,24 +614,30 @@ by the retry (content+kind fallback scan), never duplicated.
 
 | Connection | Route | Result |
 |---|---|---|
-| Plain `operator: IMPL/NAND` — **any endpoint is a plain `:Point`** | Operator point | `{"operator_id", "deduped"}` |
-| Plain `operator: IMPL/NAND` — **both endpoints non-Point** (e.g. `Object↔Object`) | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
+| Plain `operator: IMPL/NAND` | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
 | `mitigation` / `reify: true` | Operator point | `{"operator_id", "deduped"}` |
 | `relation` | Structural edge | `{"relation", "from", "to", "deduped"}` |
 
-⛔ **Point↔Point relations are operator-mediated** (owner ruling 2026-10-13, tortoise #8499) — an
-operator-less edge carries no operator node, so it can be neither mitigated nor annotated, and it
-cannot carry the epistemic weighting a Point's relations claim. (Durability was the ruling's
-original third argument — plain direct edges were journaled but never replayed, so `rebuild_all`
-lost them — but #8499 landed the `DirectEdgeCreated` replay fold, so they survive a rebuild now
-too; the ruling does not rest on that argument any more.) The direct shape is reserved for
-`Object↔Object`, where no epistemic weighting is claimed. Write `reify: true` to say the operator
-route explicitly; a plain spelling that gets re-routed is reported as the `point_mediated_route`
-warning. Note `ingest`'s connection contract admits only plain `:Point` endpoints today (sole
-carve-out: an `Event` on the operator route), so in practice every plain `IMPL`/`NAND` in a bundle
-is operator-mediated and returns the bare operator-id string — the `{direct_edge, from, to}`
-descriptor is what `create_direct_edge` returns for an `Object↔Object` pair, while `create_edge`
-writes a *relation* edge (`{relation, from, to}`) instead.
+⚠️ **Target state — NOT yet in tortoise `origin/main`.** Point↔Point relations *should* be
+operator-mediated (owner ruling 2026-10-13, tortoise #8499 — an **open** issue whose code half is
+unmerged, so nothing below is shipped behaviour). An operator-less edge carries no operator node,
+so it can be neither mitigated nor annotated, and it cannot carry the epistemic weighting a
+Point's relations claim. Plain direct edges are likewise journaled but never replayed, so
+`rebuild_all` **still loses them** — `DirectEdgeCreated` remains in `_NO_PROJECTION_FOLD` (A10
+#1048; the replay fold has *not* landed).
+
+What `origin/main` does today: route selection is endpoint-kind blind — `_connection_route`
+returns `direct` for every plain `IMPL`/`NAND`, and `ingest`'s direct route requires plain `:Point`
+endpoints (sole carve-out: an `Event` on the operator route). So a plain `IMPL`/`NAND` bundle
+connection **whose endpoints pass Phase-1** (plain `Point`s, singular `to`) currently lands the
+operator-less direct edge above and returns `{"direct_edge", "from", "to"}` — a plain spelling is
+**not** re-routed and does **not** warn (`point_mediated_route` does not exist at `origin/main`;
+`docs/INGEST_CONTRACT.md` §3.2 is still eleven keys — the twelfth arrives with #8499). Connections
+that fail Phase-1 — a non-`Point` endpoint, or multi-item `to` on a plain `IMPL`/`NAND` — return
+`ERR_BUNDLE_INVALID` with zero mutations instead. This is exactly the shape #8499 reports. **Until
+#8499 lands, write `reify: true` yourself** to say the operator route explicitly. (`create_direct_edge`
+returns the `{direct_edge, from, to}` descriptor; `create_edge` writes a *relation* edge,
+`{relation, from, to}`.)
 
 Multi-item `to` on a plain IMPL/NAND connection: use `reify:true` /
 mitigation (the operator route) or split into singular connections.
@@ -646,7 +652,7 @@ mitigation (the operator route) or split into singular connections.
   rejections — migrate via `reify:true` ×2 (the operator route preserves
   both labels).
 
-## Warnings — the TWELVE keys (closed set)
+## Warnings — the ELEVEN keys (closed set)
 
 `warnings` entries are key-prefixed strings. A key outside this table is a
 divergence — report it:
@@ -655,8 +661,7 @@ divergence — report it:
 · `mitigation_drift_duplicate` · `nfc_straddle_duplicate` ·
 `mitigation_strength_change` · `partial_operator_residue` ·
 `operator_absorb_completed` · `label_dropped_resubmit` ·
-`direction_dropped_resubmit` · `direction_changed_resubmit` ·
-`point_mediated_route`
+`direction_dropped_resubmit` · `direction_changed_resubmit`
 
 ## Query-back verification (J8 exit state)
 
