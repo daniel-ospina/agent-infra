@@ -281,9 +281,13 @@ def test_every_head_read_that_is_assigned_is_guarded():
     guard = re.compile(r'\)"?\s*\|\|\s*exit 1\s*$')
     unguarded = [c for c in calls if not guard.search(c)]
     assert unguarded == [], (
-        "these call sites do not propagate require_head's failure AFTER the command "
-        "substitution, so a failed read flows on as an empty head and is rendered as a MOVED "
-        f"head (#1690): {unguarded}")
+        "these call sites do not carry `|| exit 1` on the CLOSING-PAREN LINE of the command "
+        "substitution, so a failed read could flow on as an empty head and be rendered as a "
+        "MOVED head (#1690). ⛔ IF ONE OF THE LINES BELOW IS A LEGITIMATE REFORMAT that puts "
+        "the guard on that line, this is an over-block (the safe direction) — the fix is to "
+        "move the guard onto the closing-paren line, NOT to relax this check, because the "
+        "outcome scenarios (§13b/§13c/§13d/§13e) are the ones that prove the behaviour and "
+        f"this scan only has to not lie. Offending: {unguarded}")
 
 
 # ── THE RETRY BUDGET IS A KNOB, AND A BAD KNOB MUST NOT LOOK LIKE THE BUG ─────

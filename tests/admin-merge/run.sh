@@ -800,7 +800,8 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
 
@@ -812,7 +813,8 @@ run_admin() {
 # assert on the rail's own output use this.
 run_admin_here() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -2440,16 +2442,21 @@ grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ
   || fail "expected the unreadable-head refusal on stderr, got: $(head -c 200 "$SCEN/err")"
 grep -qF '[head_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
   || fail "expected [head_unreadable] on the refusal line"
-# ⛔ THE DISCRIMINATOR — AND THE REASON THE FIVE ASSERTIONS ABOVE ARE NOT ENOUGH. Measured
-# (review round 3, by mutation): with `require_head` changed to print its correct refusal and
-# then `return 0`, this scenario reported the SAME exit code, the SAME "could not READ" line
-# and the SAME tag. Because `head` is then EMPTY, the rail CONTINUES, and a DOWNSTREAM guard
-# exits 1 for an unrelated reason — so a bare exit-code assertion is satisfied by a refusal
-# the mutation did not cause. What the fix actually guarantees is that the rail never
-# PROCEEDS past an unread head, and the rail's own log line says which of the two happened:
-# it is emitted only AFTER the read succeeded. This one line is what makes 13b a test.
-grep -q "PR #42 head" "$SCEN/out" && fail "the rail PROCEEDED past an unread head (its own log line appears) — the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
-  || pass "the rail never proceeded past the unread head"
+# ⛔ THE DISCRIMINATOR — AND THE REASON THE ASSERTIONS ABOVE ARE NOT ENOUGH. Measured (review
+# round 3, by mutation): with `require_head` changed to print its correct refusal and then
+# `return 0`, this scenario reported the SAME exit code, the SAME "could not READ" line and the
+# SAME tag. Because `head` is then EMPTY, the rail CONTINUES, and a DOWNSTREAM guard exits 1 for
+# an unrelated reason — so a bare exit-code assertion is satisfied by a refusal the mutation did
+# not cause.
+#
+# ⛔ AND THE FIRST VERSION OF THIS LINE WAS STILL NOT A GUARD (review round 4). It grepped the
+# rail's PROGRESS LOG for `PR #42 head` — which is PROSE. Renaming that one `info` call, with no
+# behaviour change, left 13b/13c/13d all GREEN while the rail demonstrably still proceeded. A
+# guard that a reworded log line can delete is the same defect these scenarios exist to close.
+# So the assertion is anchored on the artifact the rail cannot reword: the fake-`gh` CALL LEDGER.
+# `isDraft` is probed only AFTER a successful head read, so its presence proves the rail continued.
+grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED past an unread head — it reached the draft probe, which is reachable only after a successful read; the non-zero exit came from a refusal DOWNSTREAM, not from the read" \
+  || pass "the rail never proceeded past the unread head (no post-read call was made)"
 # ⛔ THE ASSERTION 13b EXISTS FOR. #1690 was an operator reading THIS sentence on a PR that
 # had not moved. A source scan cannot catch a regression that reintroduces it; this can.
 grep -q "head moved" "$SCEN/err" && fail "a FAILED READ was reported as a MOVED HEAD — this is #1690 itself" \
@@ -2473,24 +2480,27 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — an EMPTY head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the READ was unusable" \
   || fail "expected the unreadable-head refusal on stderr"
-grep -q "PR #42 head" "$SCEN/out" && fail "the rail PROCEEDED past an EMPTY head (its own log line appears)" \
-  || pass "the rail never proceeded past the empty head"
+grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED past an EMPTY head (it reached the draft probe)" \
+  || pass "the rail never proceeded past the empty head (no post-read call was made)"
 grep -q "head moved" "$SCEN/err" && fail "an EMPTY read was reported as a MOVED HEAD — this is #1690 itself" \
   || pass "an empty read is never reported as a moved head"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for an empty head" \
   || pass "no evidence comment posted"
 
 # ── 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) ──
-# ⛔ WHY A THIRD SCENARIO, MEASURED RATHER THAN ASSUMED. Reverting the whole-value shape
-# validation (so an unvalidated value is returned with rc=0) leaves 13b GREEN, because 13b's
-# shim FAILS the read — `rc` is non-zero, so the validation block is never reached (verified
-# by injecting a probe at the mutated line: reached 0 times). 13b models a read that FAILS;
-# this models a read that SUCCEEDS with a value that is not a SHA. That is the half-read case
-# the fix's own comment names, and WITHOUT this scenario the whole-value validation — the
-# round-2 fix itself — has no test at the rail level at all.
+# ⛔ WHY A THIRD SCENARIO, AND WHY ITS FIXTURE IS MULTI-LINE. A first attempt used a SINGLE short
+# value (`deadbeef`, 8 hex). Review round 4 MEASURED that this does NOT exercise the whole-value
+# property at all: the ROUND-2 defect — the per-LINE `grep -qE '^[0-9a-fA-F]{40}$'` — also rejects
+# `deadbeef`, so it left this scenario GREEN. The fixture was therefore not testing the fix it was
+# named for. The whole-value property is only exposed by a read that contains a VALID 40-hex sha
+# AND a second line: an any-line test accepts it and the rail then emits BOTH lines as the head.
+# Measured: the current rail rejects this (so the clean case still passes), while the per-line
+# version returned rc=0 with the two-line value.
 echo "== 13d. a head read that SUCCEEDS with a CORRUPT value is unreadable too (#1690) =="
 new_scen headcorrupt
-printf 'deadbeef\n' > "$SCEN/head"   # gh exits 0 and returns a value that is NOT a 40-hex sha
+# A VALID sha on line 1, plus a junk second line: accepted by a per-LINE check, rejected only by
+# a WHOLE-VALUE one.
+printf 'deadfeed00000000000000000000000000000000\nJUNK-SECOND-LINE\n' > "$SCEN/head"
 lane_fail main5555 7002 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7002"
 run_admin_here 42 --main-runs 3
@@ -2499,12 +2509,46 @@ rc=$?
   || fail "expected a non-zero exit, got 0 — a CORRUPT head reached the merge path"
 grep -q "could not READ the head" "$SCEN/err" && pass "the refusal says the read was unusable" \
   || fail "expected the unreadable-head refusal for a corrupt value"
-grep -q "PR #42 head" "$SCEN/out" && fail "the rail PROCEEDED with a CORRUPT head (its own log line appears) — the shape validation did not reject it" \
+grep -q 'isDraft' "$SCEN/calls" && fail "the rail PROCEEDED with a CORRUPT head (it reached the draft probe) — the whole-value check did not reject a two-line read" \
   || pass "the rail never proceeded past the corrupt read"
 grep -q "head moved" "$SCEN/err" && fail "a CORRUPT read was reported as a MOVED HEAD — this is #1690 itself" \
   || pass "a corrupt read is never reported as a moved head"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a corrupt head" \
   || pass "no evidence comment posted"
+
+# ── 13e. the §4 COMPARISON SITE never renders a failed read as a moved head (#1690) ──
+# ⛔ 13b/13c/13d DO NOT REACH §4, AND THE FIRST VERSION OF THEM CLAIMED THEY DID (review round 4).
+# With an unreadable/empty/corrupt head fixture the rail aborts at the OPENING read — §13b's
+# stderr shows one refusal and its ledger shows no post-read call — so the comparison sites at
+# §4 (during re-run, before evidence) are never reached. But the sentence #1690's operator
+# actually SAW (`head moved before the evidence was posted (x -> )`) is emitted only at the §4
+# site, so the ORIGINAL SYMPTOM was still unreproduced by any scenario. This one reproduces it:
+# the OPENING read SUCCEEDS and a LATER read returns nothing, which is what a flaky read looks
+# like in the wild. `head-seq` serves the Nth head read from the Nth line, so a one-line fixture
+# makes the 2nd and later reads return EMPTY.
+echo "== 13e. a failed §4 read is never reported as a moved head (#1690) =="
+new_scen headseqfail
+HEAD_SF="5555000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head-seq"   # line 2 is ABSENT → the 2nd read returns EMPTY
+printf '0' > "$SCEN/head-seq-count"
+lane_fail "$HEAD_SF" 7001 > "$SCEN/runs-$HEAD_SF"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7001"
+# The decision path must be CLEAN for this scenario to reach the §4 comparison (as in §13):
+# main fails the SAME id over 3 tested runs, so the PR's single-run failure is exempted.
+main_red_n main5555 7002 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when a §4 head read returns nothing" \
+  || fail "expected a non-zero exit, got 0 — a §4 read returned NOTHING and the rail continued"
+# ⛔ THE ASSERTION 13e EXISTS FOR. This is the exact sentence #1690's operator read on a PR that
+# had NOT moved, and no other scenario can produce it.
+grep -q "head moved" "$SCEN/err" && fail "THE §4 COMPARISON SITE REPORTED A MOVED HEAD ON A FAILED READ — this is #1690 exactly as the operator saw it" \
+  || pass "the §4 site never renders a failed read as a moved head"
+grep -q "could not READ the head" "$SCEN/err" && pass "the §4 read is reported as UNREADABLE" \
+  || fail "expected the unreadable-head refusal from the §4 site"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the §4 read fails" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
 # The decision's baseline is TWO files (rates + signatures). The signature table
@@ -4649,7 +4693,8 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 # still be read in two bases. `0700`/`03900` are ambiguous regardless; `010` is
 # the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
-            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010"; do
+            "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
+            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"

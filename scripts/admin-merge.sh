@@ -1273,6 +1273,29 @@ resolve_head() {
 require_head() {
   local pr="$1"; shift
   local out
+  # ⛔ THE INVARIANT TRAVELS WITH THE FUNCTION (#1690 review round 4). `validate_timing_knobs`
+  # runs only inside `main()`, so anything that SOURCES the rail — the unit suite's `_drive`,
+  # the rail suite's `sed '$d'` loader — bypassed it entirely, and `resolve_head` then ran its
+  # arithmetic on an UNVALIDATED global. Measured on the sourced path:
+  #   ADMIN_MERGE_HEAD_ATTEMPTS=0   → the loop body never executes, so ZERO reads are attempted,
+  #                                    yet the rail still printed
+  #                                    `[head_unreadable] — could not READ the head … (0 attempts)`;
+  #   ADMIN_MERGE_HEAD_ATTEMPTS=08  → `value too great for base`, then the same tag.
+  # That is #1690's symptom emitted by the instrument itself — and round 3 made this path WORSE
+  # than the inline guard it replaced: the old `case` DEFAULTED to 3 real attempts; this performed
+  # none and still claimed it had tried. The correct repair is a REJECTING guard at the point of
+  # use (the round-3 comment was right that the old guard's DEFAULTING was the error — it was never
+  # that defending here was wrong). Refusing means a bad knob can never produce a claim about a
+  # read, on any path, however the rail is entered.
+  if ! counter_is_positive "$HEAD_ATTEMPTS" || counter_has_leading_zero "$HEAD_ATTEMPTS" \
+     || counter_exceeds_max "$HEAD_ATTEMPTS" "$TIMING_KNOB_MAX" \
+     || ! counter_is_number "$HEAD_READ_SLEEP" || counter_has_leading_zero "$HEAD_READ_SLEEP" \
+     || counter_exceeds_max "$HEAD_READ_SLEEP" "$TIMING_KNOB_MAX"; then
+    say_err "admin-merge: ✗ refusing a bad head-read knob (ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}',"
+    say_err "   ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}') — refusing to report on a head read"
+    say_err "   whose retry budget is not a validated positive integer. Fix the value and re-run."
+    return 1
+  fi
   if out="$(resolve_head "$pr" "$@")"; then
     printf '%s\n' "$out"
     return 0
