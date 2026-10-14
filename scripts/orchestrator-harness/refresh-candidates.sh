@@ -1,5 +1,5 @@
 #!/bin/bash
-# refresh-candidates.sh — pre-flight a pool of open P1/P2 issues and append the CLEAN ones
+# refresh-candidates.sh — pre-flight a pool of open P0/P1/P2 issues and append the CLEAN ones
 # to ~/orchestrator/candidates.txt (the dispatch backlog). Skips anything already checked.
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
