@@ -244,7 +244,7 @@ run_merge() {
     git() { return 0; }
     export -f pi gh git
     env -u AI_REVIEW_GATE_KEY PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" \
-      PI_COUNT="$MRG/pi-count" FAKE_HEAD="$HEAD" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
+      PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
       "$BASH_BIN" "$MERGE" "$MRG/repo" acme/widget "$PR" fix/x
   ) 2>&1
 }
@@ -309,6 +309,37 @@ case "$reason" in *"record-review.sh $PR $HEAD clean"*) rc=0 ;; *) rc=1; note "r
 ck "the no-URL park names the manual re-record command" $rc
 case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
 ck "the no-URL park names the unpark invocation (the way out)" $rc
+
+# 8c) RED→GREEN — an UNRESOLVABLE HEAD is the same class of pre-review dependency as the recorder.
+# `gh pr view` swallows its failure, so a transient API/network blip leaves HEAD empty; the pre-fix
+# flow STILL paid for the whole review (and, with a recorder that exits 0, even reached the merge
+# with an empty head). record-review.sh refuses a non-40-hex sha, and park() cannot key a marker to
+# an empty head, so the controller re-paid every cycle — the paid loop #1717 removes. Refuse BEFORE
+# the review, and name the way out. Non-vacuity: the same fixture with a resolvable head runs one
+# review and merges (section 9).
+mkmrg
+printf '#!/bin/bash\nexit 0\n' > "$MRG/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(FAKE_HEAD_OVERRIDE='' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; note "rc=$rc out=$(printf '%s' "$out" | tail -3)"; }
+ck "RED→GREEN: an empty head is refused (non-zero exit)" $rc
+[ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a review was paid for with an unresolvable head"; }
+ck "RED→GREEN: an empty head is caught BEFORE the paid review" $rc
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "the empty-head run fell through to the merge"; }
+ck "an empty head does not fall through to the merge" $rc
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'could not resolve'*'head'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the refusal names the unresolvable head" $rc
+case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the unresolvable-head reason names the way out" $rc
+# …and a head that is present but NOT a 40-char lower-hex sha is the same refusal (the shape
+# record-review.sh:649 enforces), not a review that can never be recorded.
+out="$(FAKE_HEAD_OVERRIDE='deadbeef' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
+ck "a non-40-hex head is refused before the paid review" $rc
+out="$(FAKE_HEAD_OVERRIDE='0123456789ABCDEF0123456789ABCDEF01234567' run_merge)"; rc=$?
+[ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
+ck "a non-lowercase head is refused before the paid review (record-review.sh's exact shape)" $rc
 
 # 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
 # merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
