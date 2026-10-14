@@ -5191,7 +5191,15 @@ async function main() {
   // prompt for g.ts. Scoping ONLY against A's recorded set drops g.ts
   // (zero-merge) and the op re-blocks although the verifier just PASSed the file
   // that is staged. The merge scope must be the UNION of the recorded set and
-  // the root's CURRENT staged diff. Pre-fix (recorded-set-only) this test is RED.
+  // the root's CURRENT staged diff.
+  //
+  // HONEST SCOPE OF 1660b/1660c: these two are NOT red on the origin/main pre-fix
+  // code — pre-fix the `foreign` clear fell back to A's staged diff, which
+  // already contains the newly staged file. They guard against a REGRESSION TO A
+  // RECORDED-SET-ONLY implementation (the hypothetical partial revert that keeps
+  // the per-root registry but drops the union). The union-specific pre-fix pins
+  // are the #336 FALLBACK scenarios 1660d/1660e below, which only the union
+  // makes green.
   function setupTwoRootsWithStaleRecordedSet(hubName: string) {
     const hub = join(TEST_ROOT, hubName);
     mkdirSync(hub, { recursive: true });
@@ -5242,7 +5250,7 @@ async function main() {
     });
     const retryA = await fire("tool_call", opA);
     equal(retryA, undefined,
-      "1660b: the PASS for the newly staged file must be honored — pre-fix A's stale recorded set shadowed src/g.ts, zero-merged, and the retry re-blocked (convergence regression)");
+      "1660b: the PASS for the newly staged file must be honored — a recorded-set-only scope would shadow src/g.ts, zero-merge, and re-block (union-scope regression guard)");
   });
 
   test("scenario 1660c: a newly staged file in root A still merges after A's recorded set went stale (union scope, JSON verified_files PASS)", async () => {
@@ -5262,7 +5270,44 @@ async function main() {
     });
     const retryA = await fire("tool_call", opA);
     equal(retryA, undefined,
-      "1660c: the JSON PASS for the newly staged file must be honored — pre-fix `scopeFiles`/`mergeVerifiedFiles` scoped against A's stale recorded set only, skipped src/g2.ts, and the retry re-blocked");
+      "1660c: the JSON PASS for the newly staged file must be honored — a recorded-set-only `scopeFiles`/`mergeVerifiedFiles` would skip src/g2.ts and re-block (union-scope regression guard)");
+  });
+
+  // The two #336 FALLBACK merge sites also read the block context, so they must
+  // carry the SAME union scope. These two scenarios are RED on the pre-fix union
+  // implementation (which passed the raw recorded set at both sites) and RED on
+  // origin/main: only the union makes the named+staged file recordable.
+  test("scenario 1660d: a newly staged file in root A still merges after A's recorded set went stale (union scope, JSON PASS with empty verified_files)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660d-hub", "g3.ts", "g3\n");
+    // #336 shape: the verifier returns a schema-valid PASS with NO per-file
+    // hashes. The fallback must record the union (stale recorded src/f.ts ∪
+    // staged src/g3.ts) — recording only the stale recorded set drops the file
+    // the retry is about to commit and the op re-blocks.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g3.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g3.ts")) || bridge.includes("::src/g3.ts"),
+      "1660d: the empty-verified_files fallback must record the newly staged src/g3.ts (pre-fix: only the stale src/f.ts was recorded)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660d: the retry on root A must be ALLOWED — pre-fix the #336 fallback recorded A's stale set and the retry blocked on src/g3.ts");
+  });
+
+  test("scenario 1660e: a newly staged file in root A still merges after A's recorded set went stale (union scope, plain-text PASS with no 'verify files:' phrase)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660e-hub", "g4.ts", "g4\n");
+    // #336 shape: a bare PASS from a prompt with no parseable file list. The
+    // fallback must scope the union, not the stale recorded set alone.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660e: the retry on root A must be ALLOWED — pre-fix the #336 fallback recorded A's stale set and the retry blocked on src/g4.ts");
   });
 
 } // main: plugin loaded; tests run sequentially via runAll()

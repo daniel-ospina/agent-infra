@@ -4540,8 +4540,14 @@ export default function (pi: ExtensionAPI) {
         if (promptFiles.size > 0) {
           mergeFiles = [...promptFiles];
         } else if (blockFiles.length > 0) {
-          mergeFiles = [...blockFiles];
-          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${blockFiles.length} blocked files`);
+          // #1660 P2: the #336 fallback scopes the UNION (recorded ∪ current
+          // staged diff), not the recorded set alone — a STALE recorded entry
+          // must not drop a file this root has newly staged for the op being
+          // retried. The fallback still fires ONLY when a block context exists,
+          // so a root that never blocked cannot bless its staged diff on a
+          // no-files PASS (pre-fix zero-merge preserved).
+          mergeFiles = [...mergeScope];
+          console.error(`[verification-gate] ⚠️ Plain-text PASS with zero prompt files — falling back to ${mergeScope.length} file(s) in this root's scope (recorded ∪ staged)`);
         } else {
           mergeFiles = [];
         }
@@ -4689,6 +4695,12 @@ export default function (pi: ExtensionAPI) {
     // current staged diff, never a blind pass-through.
     const { root: projectRoot } = resolveMergeRoot(lastBlockedCwd, prompt);
     const blockFiles = blockedContextFor(projectRoot);
+    // #1660/#190: the union scope shared by ALL FIVE merge sites (this root's
+    // recorded blocked set ∪ its CURRENT staged diff) — see mergeScopeFor.
+    // Hoisted above the #336 fallback so that fallback uses it too: a STALE
+    // recorded entry must not shadow a file this root has newly staged (the
+    // file the retried op is about to commit).
+    const mergeScope = mergeScopeFor(projectRoot, blockFiles);
 
     // #336: a schema-valid PASS with EMPTY verified_files carries no
     // verifier-supplied hashes — the pre-#336 code zero-merged here (records
@@ -4696,9 +4708,12 @@ export default function (pi: ExtensionAPI) {
     // Fall back to the files the gate is CURRENTLY blocking: hash them at
     // merge time (current disk state) so a post-PASS edit still re-blocks
     // (fail-closed), and diff-scope them so a hash-less PASS can never mark
-    // arbitrary files verified. A root with no block context → zero-merge.
+    // arbitrary files verified. A root with no block context → zero-merge (the
+    // staged-diff component ALONE is never blessed here: a hash-less PASS names
+    // no files, so only the gate's own blocked set may stand in for its intent).
     if (result.verified_files.length === 0) {
-      const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, blockFiles, projectRoot);
+      const fallbackScope = blockFiles.length > 0 ? mergeScope : [];
+      const fallbackMerged = hashAndMergeFiles(verifiedSet, blockAttempts, fallbackScope, projectRoot);
       if (fallbackMerged > 0) {
         vgateFailures = 0;
         recordDispatchSuccess(); // #561
@@ -4713,7 +4728,7 @@ export default function (pi: ExtensionAPI) {
         // could not be read (deleted/unreadable) — that is a different remedy.
         const cause = blockFiles.length === 0
           ? "no blocked-file context for this root — a hash-less PASS has nothing to record"
-          : `the ${blockFiles.length} blocked file(s) for this root could not be hashed (unreadable or deleted from disk)`;
+          : `none of the ${fallbackScope.length} file(s) in this root's scope (recorded ∪ staged) could be hashed (unreadable or deleted from disk)`;
         console.error(`[verification-gate] ⚠️ PASS with empty verified_files — zero-merge (${cause}), failure streak NOT reset (#132)`);
         console.error(`[verification-gate] ⚠️ #1660 zero-merge: verifier root=${projectRoot}, blocked-op root=${lastBlockedCwd ?? "<none>"}, blocked files for root=${blockFiles.length}`);
         noteVerifierDisposition(projectRoot, 0, fallbackMerged, cause);
@@ -4722,10 +4737,10 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // #1660/#190: scope against the root's recorded blocked set UNION its
-    // current staged diff, so a newly staged file is not shadowed by a stale
-    // recorded entry while a committed branch still resolves via the recorded set.
-    const mergeScope = mergeScopeFor(projectRoot, blockFiles);
+    // #1660/#190: `mergeScope` (hoisted above for the #336 fallback) is the
+    // root's recorded blocked set UNION its current staged diff, so a newly
+    // staged file is not shadowed by a stale recorded entry while a committed
+    // branch still resolves via the recorded set.
     const { kept: scopedVerifiedFiles, skipped: scopeSkipped } = scopeFiles(
       result.verified_files.map(vf => vf.path),
       projectRoot,
