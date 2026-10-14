@@ -33,6 +33,7 @@ import { EventEmitter } from "node:events";
 import { spawn, execSync } from "node:child_process";
 import { treeKill } from "../shared/tree-kill.js";
 import { readFileSync, renameSync, existsSync, writeFileSync, rmSync, mkdirSync, chmodSync, mkdtempSync, realpathSync, utimesSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import {
@@ -58,6 +59,7 @@ import {
   resolveTaskRunsRoot,
   readRunRecord,
   writeRunRecord,
+  runRecordPath,
   safeRunId,
   runLogPath,
   pidAlive,
@@ -7991,6 +7993,56 @@ test("#1662: a recycled pid does not strand collect — a stale LIVE record is s
   }
 });
 
+test("#1662: a run that SETTLES between collect's snapshot and its fresh read is returned as terminal — never a permanent false failure", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t1662-collect-race-"));
+  // The two record reads inside `collectTaskRun` (the snapshot, then the fresh
+  // read inside `evaluateTaskRunStatus`) are adjacent but not atomic: the
+  // parent's fire-and-forget settle can land between them. Model it by letting
+  // the FIRST read see the on-disk `running` record and every later read see a
+  // settled `done` record. On the pre-fix code the fresh terminal view was
+  // ignored and the run was finalized `failed`/`settle-lost` with `content:
+  // null` — a terminal verdict, so the reaping loop never re-polled and the
+  // persisted success was lost (#1662 review).
+  const require2 = createRequire(import.meta.url);
+  const realFs = require2("node:fs") as any;
+  const origReadFileSync = realFs.readFileSync;
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      const { id, rec } = seedRunningRun(dir, { pid: 999_999_999 }); // process is gone
+      const recordPath = runRecordPath(dir, id);
+      const settled = {
+        ...rec,
+        status: "done",
+        exit_code: 0,
+        final_content: [{ type: "text", text: "SUCCESS-PAYLOAD-42" }],
+        final_details: { model: "deepseek-v4-flash", provider: "deepseek" },
+        settled_at: Date.now(),
+      };
+      let reads = 0;
+      realFs.readFileSync = (...a: any[]) => {
+        if (typeof a[0] === "string" && a[0] === recordPath) {
+          reads += 1;
+          if (reads >= 2) return JSON.stringify(settled);
+        }
+        return origReadFileSync(...a);
+      };
+      const got = collectTaskRun(id, dir);
+      realFs.readFileSync = origReadFileSync;
+      ok(reads >= 2, `the race was exercised (record reads: ${reads})`);
+      equal(got.terminal, true, "the settled run reaches a terminal verdict");
+      equal(got.status, "done", `a settled success must NOT be re-reported as failed (got ${got.status}: ${got.reason ?? ""})`);
+      equal(got.reason, undefined, "no settle-lost reason on a settled record");
+      equal(got.content?.[0]?.text, "SUCCESS-PAYLOAD-42", "the persisted final payload is handed back, not dropped");
+      // The #208 resume contract re-dispatches a failed lane; a false failure
+      // duplicates work for a lane that actually succeeded.
+      equal((got.details as any)?.provider, "deepseek", "the fresh final details are surfaced");
+    });
+  } finally {
+    realFs.readFileSync = origReadFileSync;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#1662: a done lane with no recorded exit code is NOT rendered as signal death", () => {
   const done: any = { run_id: "r1", status: "done", terminal: true, exit_code: null, review_gate: "parent-required" };
   const head = formatCollectedRunHead(done);
@@ -8160,6 +8212,43 @@ test("#1662: a failed record persist is SURFACED in the handle, never swallowed"
     });
     equal(handle.record_persisted, false, "persist failure is reported to the caller");
     equal(handle.log_path, "", "no capture log when the root could not be created");
+    // The pre-spawn refusal is carried, so the result is a refusal — not a
+    // success-shaped "dispatched" (#1662 review).
+    ok(handle.refusal, "the pre-spawn refusal is captured on the handle");
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("#1662: a pre-spawn refusal is reported as a REFUSAL in background mode, never a successful dispatch", () => {
+  const base = mkdtempSync(join(tmpdir(), "t1662-bg-refusal-"));
+  try {
+    // `spawnSubAgent` refuses an unspawnable cwd synchronously, BEFORE the
+    // `new Promise` executor — so `onSpawn` never fires and `pid` stays null.
+    // The background branch used to render that as "🚀 Background sub-agent
+    // dispatched" with `details.status: "running"`, which the `tool_result`
+    // hook does not treat as a failure: a deterministic refusal became an
+    // apparent live lane (#1662 review).
+    const notADir = join(base, "not-a-dir");
+    writeFileSync(notADir, "x");
+    const handle = startBackgroundTask({
+      model: "deepseek-v4-flash",
+      provider: "deepseek",
+      env: { ...process.env },
+      args: ["-p", "--no-session", "x"],
+      cwd: notADir,
+      runId: mintRunId(),
+      runsRoot: base,
+      nonce: null,
+    });
+    equal(handle.pid, null, "no child was spawned");
+    ok(handle.refusal, "the refusal rides on the handle");
+    const res = buildBackgroundDispatchResult(handle);
+    equal((res.details as any).status, "invalid-cwd", "the result is the refusal status — in FAILED_TASK_STATUS, so the hook flips isError");
+    equal((res.details as any).retryable, false, "a cwd refusal is not retryable");
+    ok(String(res.content[0].text).includes("refused"), `the refusal is stated: ${res.content[0].text}`);
+    equal(String(res.content[0].text).includes("🚀"), false, "a refused dispatch must not render a success rocket");
+    equal(String(res.content[0].text).includes("dispatched"), false, "a refused dispatch must not claim a dispatch");
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
@@ -8193,6 +8282,7 @@ section("#1662 — tool surface");
       started_at: 1,
       record_persisted: true,
       review_gate: "parent-required",
+      refusal: null,
     });
     equal((res.details as any).review_gate, "parent-required", "the consumer-facing field is review_gate");
     equal((res.details as any).reviewGate, undefined, "the camelCase spelling must not return");
@@ -8205,6 +8295,7 @@ section("#1662 — tool surface");
       started_at: 1,
       record_persisted: false,
       review_gate: "parent-required",
+      refusal: null,
     });
     ok(String(unpersisted.content[0].text).includes("NOT persisted"), "a failed persist is surfaced in the text");
     // The module must never reintroduce the camelCase field on the dispatch result.

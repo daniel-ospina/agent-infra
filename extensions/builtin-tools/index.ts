@@ -3488,6 +3488,15 @@ export function taskCwdRefusal(cwd?: string | null): string | null {
   }
 }
 
+/** #1662 review: the payload `spawnSubAgent` resolves with when it refuses
+ * BEFORE any spawn (an unspawnable cwd, `taskCwdRefusal`). The blocking path
+ * returns it to the caller directly; the background path must too, rather than
+ * reporting a successful dispatch for a child that was never created. */
+export interface PreSpawnRefusal {
+  content: any[];
+  details: Record<string, unknown>;
+}
+
 /**
  * #1662: optional observers for the concrete child a dispatch is about to
  * spawn. Used by the BACKGROUND path (`task({ background: true })`) to capture
@@ -3502,6 +3511,13 @@ export interface SpawnObservers {
    * caller that captures `{ pid, pgid, logPath }` here holds the child's
    * identity BEFORE the returned promise settles. */
   onSpawn?: (info: { pid: number | null; pgid: number | null; logPath: string | null }) => void;
+  /** Fired synchronously when `spawnSubAgent` REFUSES before any spawn (an
+   * unspawnable cwd). `onSpawn` never fires on that path — `pid` stays null —
+   * so the returns-early background path must treat the refusal as a refusal
+   * rather than report a dispatch for a child that was never created
+   * (#1662 review). The blocking path is unchanged: it surfaces the same
+   * `details.status: "invalid-cwd"` through `FAILED_TASK_STATUS`. */
+  onRefusal?: (refusal: PreSpawnRefusal) => void;
   /** When set, every raw stdout/stderr chunk is appended here (the background
    * run's capture log). The log carries the `[task-heartbeat]` markers verbatim,
    * so liveness is derived from markers — never from `%CPU` (#1662). */
@@ -3516,10 +3532,16 @@ export function spawnSubAgent(model: string, provider: string, subAgentEnv: Reco
   // row per attempt) — same shape as the `invalid-session-id` refusal.
   const cwdError = taskCwdRefusal(cwd);
   if (cwdError) {
-    return Promise.resolve({
+    const refusal: PreSpawnRefusal = {
       content: [{ type: "text", text: `❌ Sub-agent dispatch refused: ${cwdError}` }],
       details: { model, provider, status: "invalid-cwd", retryable: false, error: cwdError, cwd: resolveTaskCwd(cwd) },
-    });
+    };
+    // #1662 review: the background path returns before this promise is
+    // observed, so `pid === null` is its only synchronous signal that no child
+    // exists. Report the refusal through the observer so the handle is not
+    // rendered as a successful dispatch.
+    observers?.onRefusal?.(refusal);
+    return Promise.resolve(refusal);
   }
   return new Promise((resolve) => {
     // #176 code-review: per-dispatch marker nonce — the child echoes it in
@@ -4756,6 +4778,27 @@ export function collectTaskRun(runId: string, runsRoot: string): TaskCollectView
   }
   if (rec.status === "running") {
     const view = evaluateTaskRunStatus(rec.run_id, runsRoot);
+    // #1662 review: `view` is a FRESH read, so it may already be terminal — the
+    // parent's fire-and-forget settle (startBackgroundTask's `.then`) can land
+    // between the snapshot read above and this one. When it has, return the
+    // fresh terminal payload: falling through to the settle-lost salvage would
+    // report a settled success as a terminal `failed/settle-lost` with
+    // `content: null`, dropping the persisted result — and because the result
+    // is terminal, the documented reaping loop never re-polls, so the false
+    // failure is permanent (#1662 review).
+    if (view.terminal) {
+      const fresh = readRunRecord(runsRoot, rec.run_id) ?? rec;
+      return {
+        run_id: fresh.run_id,
+        status: fresh.status,
+        terminal: true,
+        exit_code: fresh.exit_code,
+        reason: fresh.reason,
+        content: fresh.final_content ?? null,
+        details: fresh.final_details ?? null,
+        review_gate: "parent-required",
+      };
+    }
     // Settle-lost: the terminal record was never persisted (the only writer is
     // the PARENT's fire-and-forget `.then` in startBackgroundTask, so a parent
     // that died mid-run leaves the record `running` forever). The original gate
@@ -4869,6 +4912,11 @@ export interface BackgroundDispatchHandle {
   pgid: number | null;
   log_path: string;
   started_at: number;
+  /** Non-null when `spawnSubAgent` REFUSED before any spawn (an unspawnable
+   * cwd). No child exists, so this handle must be rendered as the refusal —
+   * `details.status: "invalid-cwd"` — never as a dispatched lane
+   * (#1662 review). */
+  refusal: PreSpawnRefusal | null;
   /** Always "parent-required" — the child runs with AGENT_SKIP_REVIEW_GATE=1
    * and cannot review itself; the parent must run the review ceremony (#825).
    * Carried on the handle itself, not just the tool result, so every consumer
@@ -4942,6 +4990,11 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
   }
 
   const spawnInfo: { pid: number | null; pgid: number | null } = { pid: null, pgid: null };
+  // #1662 review: captured synchronously by the refusal observer below. A
+  // pre-spawn refusal means `onSpawn` never fires and `pid` stays null; the
+  // handle must carry the refusal so the tool result is an error, not a
+  // success-shaped "dispatched".
+  let refusal: PreSpawnRefusal | null = null;
   const pending = spawnSubAgent(
     input.model,
     input.provider,
@@ -4956,6 +5009,9 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
       onSpawn: (info) => {
         spawnInfo.pid = info.pid;
         spawnInfo.pgid = info.pgid;
+      },
+      onRefusal: (r) => {
+        refusal = r;
       },
     },
   );
@@ -5014,6 +5070,7 @@ export function startBackgroundTask(input: BackgroundDispatchInput): BackgroundD
     // forever and the lane's result is silently lost (#1662 review).
     record_persisted: recordPersisted,
     review_gate: "parent-required",
+    refusal,
   };
 }
 
@@ -5028,6 +5085,17 @@ export function buildBackgroundDispatchResult(handle: BackgroundDispatchHandle):
   content: Array<{ type: string; text: string }>;
   details: Record<string, unknown>;
 } {
+  // A pre-spawn refusal created no child: return the refusal payload itself —
+  // `details.status: "invalid-cwd"` — so the `tool_result` hook flips the
+  // dispatch to `isError`, exactly as the blocking path already does
+  // (#1662 review). Accepting the guard here (not at the call site) keeps a
+  // refused handle from ever rendering as "dispatched".
+  if (handle.refusal) {
+    return {
+      content: handle.refusal.content as Array<{ type: string; text: string }>,
+      details: handle.refusal.details,
+    };
+  }
   return {
     content: [{
       type: "text",
