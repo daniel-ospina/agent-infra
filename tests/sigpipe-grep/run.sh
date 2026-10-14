@@ -1146,6 +1146,862 @@ rc="$(PATH="$E/fakebin:$PATH" bash "$GUARD" --root "$E" --dirs '.husky' >"$OUT" 
 [ "$rc" -eq 2 ] && ! grep -q '✅' "$OUT" && pass "a partial .husky enumeration refuses (exit 2)" \
              || fail "a withheld .husky hook was reported clean (exit $rc)"
 
+# ============================================================================
+# 12. THE MATCHER ITSELF — the four shapes the guard used to report CLEAN (#1645)
+#
+#     Each of these is a FALSE CLEAN: the file is CLAIMED and counted inside
+#     "scanned N file(s)" while it contains the idiom, so the gate passes over a tree
+#     that has the bug. That is the one verdict a guard must never produce.
+#
+#     WHICH PINS DEPEND ON THIS CHANGE. Forty fail under the origin/main guard: 12a (`-qm1`),
+#     12b (`/bin/grep`), 12c (`command grep`), 12d (a literal pipe in the writer argument),
+#     12o (`-1q`), 12t (an invalid byte must not abort the awk scan), 12u (a long option list),
+#     12v (a `--quiet` abbreviation), 12w (a separated option argument), 12x (the deliberate
+#     narrowing of a `q` that an option consumed), 12y (a flag placed after the pattern, which grep
+#     permutes), 12z (an `-m0` that reads all its input), 12aa (a line longer than the scan budget),
+#     12ab (the command prefixes grep is reached by), 12ac (a quoted or escaped flag), 12ad (an
+#     unquoted separator as a command boundary, both directions), 12af (writers after an earlier
+#     writer), 12ag (a writer inside a quoted command substitution), 12ah (an option on a prefix
+#     command), 12aj (a metacharacter inside a quoted option token), 12ak (a brace group carrying
+#     the writer's stdout to the pipe), 12al (a subshell versus a command substitution), 12am (a
+#     backtick writer boundary), 12an (a separated long option on a prefix command), 12ao (`exec` as
+#     a prefix), 12ap (a consumer-side group), 12aq (a signed or zero-padded zero max-count),
+#     12ar (`--silent` and its abbreviations), 12as (a wrapper that takes a bare operand before the
+#     command) and 12at (a quoted shell-out body that inherits the wrapper's stdin), 12av (a body
+#     reached through a path, an assignment or a substitution), 12aw (a quiet flag immediately
+#     before a closer), 12ax (a clustered option on a wrapper), 12ay (a shell -c inside a cluster),
+#     12az (a body past the token cap, a quoted command word, a word split by a line continuation)
+#     and 12ba (a long quiet option immediately before a separator), 12bb (a body that quotes or
+#     escapes its command or flag the other way), 12bc (a shell's own option arguments) and 12bd
+#     (a command string attached to `env --split-string`/`-S`) and 12be (a shell option between
+#     `-c` and its command string). 12au is a
+#     CONTROL and passes on both guards: it pins that the ordinary adjacency match is unchanged. The
+#     rest already passed there, and are kept
+#     because an intermediate revision of this very change broke them: they pin PARITY with
+#     origin/main, and fail if a future refactor narrows the writer word, the bridge, or the
+#     recognised `grep` forms again. 12ae is one of those — a 200-option list was flagged by
+#     origin/main too, so it guards a cap introduced and removed inside THIS change, and would not
+#     have failed there. Measured: with GUARD pointed at origin/main's guard, exactly
+#     those forty fail and no other pin does.
+#
+#     No single matcher covers all four, and trying to make one do it is what produced the
+#     earlier false cleans. 12d needs a reader that skips quoted text; 12f/12g need a reader
+#     that sees THROUGH it. The guard runs both and flags if either matches.
+# ----------------------------------------------------------------------------
+
+# 12a. `-qm1` — a digit in the same token as `q`. has_quiet() matched /^-[A-Za-z]*q[A-Za-z]*$/,
+#      so the combined form was not recognised, and because the token still began with `-`
+#      the loop did not stop either: it walked on to the pattern and returned 0.
+E="$TMP/f12a"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -qm1 pat' > "$E/scripts/combined.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'combined\.sh' "$OUT" \
+  && pass "a quiet flag carrying a digit (-qm1) is caught" \
+  || fail "grep -qm1 was reported clean (exit $rc) — the false clean #1645 describes"
+
+# 12b. `/bin/grep` — the matcher required the bare word `grep`, so a fully qualified
+#      invocation was invisible to it.
+E="$TMP/f12b"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | /bin/grep -q pat' > "$E/scripts/bypath.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'bypath\.sh' "$OUT" \
+  && pass "a by-path invocation (/bin/grep) is caught" \
+  || fail "/bin/grep -q was reported clean (exit $rc)"
+
+# 12c. `command grep` — the form a shell function shadowing grep invites, which makes it the
+#      likeliest one inside a hook.
+E="$TMP/f12c"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | command grep -q pat' > "$E/scripts/shadowed.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'shadowed\.sh' "$OUT" \
+  && pass "command grep is caught (the shadowing form)" \
+  || fail "command grep -q was reported clean (exit $rc)"
+
+# 12d. a literal `|` INSIDE the writer argument. The `[^|]*` bridge cannot cross it, so the
+#      shape was missed even though that pipe is data rather than a pipeline break.
+E="$TMP/f12d"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "a|b" | grep -q pat' > "$E/scripts/pipearg.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'pipearg\.sh' "$OUT" \
+  && pass "a literal pipe inside the writer argument is caught" \
+  || fail "a quoted pipe defeated the bridge and the file was reported clean (exit $rc)"
+
+# 12e. THE COUNTERWEIGHT. A false CLEAN is the cardinal sin, but a false BLOCK is a real cost,
+#      and the widened matcher must not become an over-match machine. Three near-misses must
+#      stay clean — a grep with no writer, a writer whose consumer is not quiet, and a quoted
+#      pipe with no grep at all — while the ONE real idiom in the same tree is still flagged.
+#      This is what keeps the fix from being "match more" rather than "match correctly".
+E="$TMP/f12e"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q pat file' > "$E/scripts/nowriter.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep pat' > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "a | b"' > "$E/scripts/justdata.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q pat' > "$E/scripts/real.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real\.sh' "$OUT" \
+  && ! grep -q 'nowriter' "$OUT" && ! grep -q 'notquiet' "$OUT" && ! grep -q 'justdata' "$OUT" \
+  && pass "only the real idiom is flagged — 3 near-misses stay clean (no over-match)" \
+  || fail "over-match: a near-miss was reported as the idiom (exit $rc)"
+
+# 12f. AN ESCAPED QUOTE inside a double-quoted writer argument. Quote tracking that toggles on
+#      a bare `"` closes the string at the escaped quote, so the real pipeline lands inside the
+#      (apparent) string and the file is reported CLEAN — the same cardinal sin, reintroduced
+#      by the quote-stripping that fixed 12d. Escape-aware tracking is the fix.
+E="$TMP/f12f"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf '\''%s'\'' "a \"b" | grep -q pat' > "$E/scripts/escquote.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'escquote\.sh' "$OUT" \
+  && pass "an escaped quote inside the writer argument is caught" \
+  || fail "a \"-escaped quote defeated quote tracking and the file was reported clean (exit $rc)"
+
+# 12g. AN IDIOM NESTED IN A SHELL COMMAND STRING. An intermediate revision dropped the whole
+#      quoted body before matching, so `bash -c '… | grep -q …'` went invisible while the
+#      origin/main matcher, which reads the raw line, flagged it. Matching the raw line keeps
+#      this at parity with origin/main (this pin passes under the old matcher too).
+E="$TMP/f12g"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "bash -c 'printf \"%s\" \"\$V\" | grep -q pat'" > "$E/scripts/nested.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'nested\.sh' "$OUT" \
+  && pass "an idiom nested in a shell command string (bash -c '…') is caught" \
+  || fail "the nested shell-command idiom was reported clean (exit $rc) — a regression vs origin/main"
+
+# 12m. THE WRITER WORD IS NOT ALWAYS A BARE, UNQUOTED, SPACE-SEPARATED TOKEN. Bounding the
+#      writer to a command boundary regressed six of these to CLEAN — a quoted word, an
+#      escaped word, a backtick substitution, and a writer with no space before the pipe were
+#      all flagged by origin/main and went silent. The matcher is a superset of origin/main, so
+#      every one of them stays flagged.
+E="$TMP/f12m"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' '"printf" "%s" "$V" | grep -q pat'      > "$E/scripts/qword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '\printf "%s" "$V" | grep -q pat'        > "$E/scripts/escword.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=`printf "%s" "$V" | grep -q pat`'      > "$E/scripts/btick.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo|grep -q pat'                          > "$E/scripts/nospace.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+missed=""
+for f in qword escword btick nospace; do grep -q "$f\.sh" "$OUT" || missed="$missed $f"; done
+[ "$rc" -ne 0 ] && [ -z "$missed" ] \
+  && pass "a quoted, escaped, backticked or unspaced writer word is still caught" \
+  || fail "bounding the writer word to a command start lost:$missed (exit $rc)"
+
+# 12h. A QUOTED PIPE IS NOT A BRIDGE. Quote-stripping could let the bridge cross a `;` and
+#      charge an unrelated later pipeline to the `echo` — a false BLOCK, the opposite failure.
+#      Kept at parity with origin/main (this pin passes under the old matcher too).
+E="$TMP/f12h"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "a|b" ; ls | grep -q p' > "$E/scripts/stmtsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q pat' > "$E/scripts/real2.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real2\.sh' "$OUT" && ! grep -q 'stmtsep\.sh' "$OUT" \
+  && pass "a quoted pipe followed by an unrelated pipeline is not a false block" \
+  || fail "the bridge crossed a statement separator and reported stmtsep.sh (exit $rc)"
+
+# 12i. A REDIRECTION between the writer and the pipe. `2>&1` contains an `&`, and a bridge
+#      narrowed to exclude `&` (to stop it crossing `&&`) also stops here and reports the
+#      idiom clean — a regression vs origin/main, which crosses it.
+E="$TMP/f12i"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" 2>&1 | grep -q pat' > "$E/scripts/redir.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'redir\.sh' "$OUT" \
+  && pass "a 2>&1 redirection before the pipe does not hide the idiom" \
+  || fail "the idiom behind a 2>&1 redirect was reported clean (exit $rc)"
+
+# 12j. A GROUP as the writer. The `;` inside `{ ... }` does not break the pipeline, and a
+#      scanner that stops at the first `;` reports the idiom clean.
+E="$TMP/f12j"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' '{ printf "%s" "$V"; } | grep -q pat' > "$E/scripts/group.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'group\.sh' "$OUT" \
+  && pass "the idiom in a brace group is caught" \
+  || fail "a brace-grouped writer was reported clean (exit $rc)"
+
+# 12k. THE IDIOM IS NOT THE FIRST WRITER ON THE LINE. Stopping at the first `printf|echo`
+#      reported the second one clean when it was the only one in the idiom.
+E="$TMP/f12k"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "bash -c 'echo hi'; bash -c 'printf \"%s\" \"\$V\" | grep -q pat'" > "$E/scripts/second.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'second\.sh' "$OUT" \
+  && pass "a later writer on the line is still scanned" \
+  || fail "only the first writer on the line was examined (exit $rc)"
+
+# 12l. THE FALSE-BLOCK DIRECTION. `-e1q` is `-e` with pattern `1q`, NOT quiet. A widen that
+#      accepts a digit anywhere in the token flags a pipeline that cannot SIGPIPE.
+E="$TMP/f12l"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -e1q' > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q pat' > "$E/scripts/real3.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real3\.sh' "$OUT" && ! grep -q 'notquiet\.sh' "$OUT" \
+  && pass "grep -e1q is not mistaken for a quiet flag" \
+  || fail "a digit before the q in a grep flag was treated as quiet (exit $rc)"
+
+# 12n. A LATER SITE MUST NOT BE MASKED BY AN EARLIER NON-QUIET ONE. `match()` returns only the
+#      LEFTMOST hit, so `printf x | grep -v; echo|grep -q p` was reported clean — the first site
+#      (`grep -v`) matched, was found non-quiet, and the genuine idiom after it was never
+#      examined. The widenings made this reachable on lines the old matcher flagged, so it is a
+#      regression, not a latent quirk.
+E="$TMP/f12n"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | /bin/grep -v; echo|grep -q pat' > "$E/scripts/masked.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'masked\.sh' "$OUT" \
+  && pass "an earlier non-quiet grep does not mask a later idiom" \
+  || fail "the first match masked the real idiom and the file was reported clean (exit $rc)"
+
+# 12o. `-1q` IS QUIET; `-e1q` AND `-m1q` ARE NOT. A leading run of digits is grep's -NUM context
+#      option (`grep -1 -q`), but a digit that is an option's ARGUMENT is not: `-e1q` is `-e`
+#      with pattern `1q`, and `-m1q` is `-m` with junk. Both directions are pinned here.
+E="$TMP/f12o"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -1q pat' > "$E/scripts/numopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -e1q' > "$E/scripts/earg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -m1q' > "$E/scripts/marg.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'numopt\.sh' "$OUT" \
+  && ! grep -q 'earg\.sh' "$OUT" && ! grep -q 'marg\.sh' "$OUT" \
+  && pass "grep -1q is quiet but -e1q and -m1q are not" \
+  || fail "the leading-context digit was confused with an option argument (exit $rc)"
+
+# 12p. A WRITER THAT IS AN ARGUMENT IS NOT A WRITER. `grep -e echo ... | grep -q p` pipes the
+#      first grep's output; charging that pipe to `echo`, or to a path-like token after a `;`,
+#      flags lines the old matcher left clean — a new false block.
+E="$TMP/f12p"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -e echo -e "OK|FAIL" "$f" | grep -q FAIL' > "$E/scripts/argwriter.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | foo;/bin/grep -q p' > "$E/scripts/pathsep.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] \
+  && pass "a writer that is an argument, and a grep after a statement separator, stay clean" \
+  || fail "a new false block: $(grep -o '[a-z]*\.sh' "$OUT" | tr '\n' ' ')(exit $rc)"
+
+# 12q. THE SCANNER MUST NOT CHARGE A PIPE THE WRITER CANNOT REACH. Each fixture carries a quoted
+#      pipe, which is what defeats raw_idiom — so this pins scan_idiom alone. It does NOT claim the
+#      guard ignores these constructs in general: raw_idiom is blind to a redirect exactly as
+#      origin/main is, so a pipe-free payload such as `printf x >f | grep -q p` is flagged by BOTH
+#      guards (pre-existing, and recoverable through the exceptions file).
+E="$TMP/f12q"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "a|b" >f | grep -q p'            > "$E/scripts/redirout.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "a|b" > /dev/null | grep -q p'    > "$E/scripts/redirnull.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "a|b" & cat | grep -q p'           > "$E/scripts/background.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'wc <(echo "a|b") | grep -q p'          > "$E/scripts/procsub.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf -v x "a|b" | grep -q p'          > "$E/scripts/printfv.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] \
+  && pass "a redirect, background job, process substitution or printf -v is not charged to the scanner" \
+  || fail "the scanner charged a pipe the writer cannot reach: $(grep -o '[a-z]*\.sh' "$OUT" | tr '\n' ' ')(exit $rc)"
+
+# 12r. A `q` CONSUMED BY AN OPTION ARGUMENT IS NOT A QUIET FLAG. In `-eq1` and `-1eq` the `q` is
+#      part of the pattern `-e` takes, so grep reads all its input; a rule that accepted any digit
+#      after the `q` called these quiet — a new false block. `-1q`/`-q1` are the mirror case and
+#      must still be caught (a leading digit run is the -NUM context option).
+E="$TMP/f12r"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -eq1 p'  > "$E/scripts/eq1.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -1eq p'  > "$E/scripts/oneeq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -fq1 p'  > "$E/scripts/fq1.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -mq1 p'  > "$E/scripts/mq1.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] \
+  && pass "a q consumed as an option argument is not a quiet flag" \
+  || fail "a new false block: $(grep -o '[a-z0-9]*\.sh' "$OUT" | tr '\n' ' ')(exit $rc)"
+
+# 12s. THE SCAN IS BOUNDED. Scanning the remainder from every writer made the cost grow with the
+#      square of the line length (an 800-token line took 18s and a 2,000-token line 92s, against
+#      0.13s before). A line with no pipe at all is skipped outright. This pin fails loudly (by
+#      stalling the suite) if the per-writer scan is ever unbounded again.
+E="$TMP/f12s"; mkdir -p "$E/scripts"
+{ printf '#!/usr/bin/env bash\n'; i=0; while [ "$i" -lt 2000 ]; do printf 'echo '; i=$((i + 1)); done; printf '\n'; } > "$E/scripts/longline.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -eq 0 ] \
+  && pass "a 2,000-writer line is scanned without the quadratic blow-up" \
+  || fail "the scanner did not handle a long writer-dense line (exit $rc)"
+
+# 12t. AN INVALID UTF-8 BYTE MUST NOT ABORT THE AWK SCAN. Under a UTF-8 locale awk substr is
+#      multibyte-aware and a file with a bad byte fails with a towc multibyte conversion error,
+#      which the guard turns into exit 2 — refusing a verdict over a file it could have read.
+#      The awk now runs under LC_ALL=C, where substr is byte-oriented. (The guard may still
+#      refuse LATER, in its classification pass, whose sed also fails closed on an invalid byte;
+#      that is pre-existing and is a refusal, not a verdict, so only the awk abort is pinned.)
+E="$TMP/f12t"; mkdir -p "$E/scripts"
+printf '#!/usr/bin/env bash\nprintf "\377" | grep -q p\n' > "$E/scripts/badbyte.sh"
+bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1
+! grep -qi 'multibyte' "$OUT" \
+  && pass "an invalid UTF-8 byte does not abort the awk scan" \
+  || fail "awk aborted on an invalid byte: $(grep -i multibyte "$OUT" | head -1)"
+
+# 12u. A LONG OPTION LIST MUST NOT HIDE THE FLAG — on EITHER matcher. `has_quiet` walks grep's
+#      options from an offset and stops at the first non-option token, and the scanner takes the
+#      full remainder; both are unbounded in what they can read. Handing either a fixed-size window
+#      made a `-q` beyond it invisible and reported a genuine idiom clean, so this pins both paths
+#      at 9,000 bytes of options (the size at which the window was measured to break).
+E="$TMP/f12u"; mkdir -p "$E/scripts"
+LONG=""; _i=0; while [ "$_i" -lt 9000 ]; do LONG="${LONG}a"; _i=$((_i + 1)); done
+printf '%s\n' '#!/usr/bin/env bash' "printf x | grep --include=$LONG -q pat"       > "$E/scripts/longopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' "echo \"a|b\" | grep --include=$LONG -q pat" > "$E/scripts/longoptscan.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'longopt\.sh' "$OUT" && grep -q 'longoptscan\.sh' "$OUT" \
+  && pass "a quiet flag beyond a long option list is still found, on both matchers" \
+  || fail "a long option list hid the flag and an idiom was reported clean (exit $rc)"
+
+# 12v. `--quiet` ABBREVIATIONS ARE QUIET. getopt accepts any unambiguous prefix of a long option,
+#      and only `--quiet` begins with `q`, so `--q`, `--qu`, `--qui` and `--quie` are the same
+#      flag. Only the full spelling was recognised, so the rest were reported clean.
+E="$TMP/f12v"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --quie pat' > "$E/scripts/abbrev.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --q pat'    > "$E/scripts/shortabbrev.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'abbrev\.sh' "$OUT" && grep -q 'shortabbrev\.sh' "$OUT" \
+  && pass "an unambiguous abbreviation of --quiet is treated as quiet" \
+  || fail "a --quiet abbreviation was reported clean (exit $rc)"
+
+# 12w. A SEPARATED OPTION ARGUMENT. `-e`, `-f`, `-m`, `-A`, `-B`, `-C`, `-d`, `-D` consume the NEXT
+#      token, so `grep -e pat -q` IS quiet - and the walk used to stop at `pat` as though it were
+#      the pattern, reporting CLEAN. Measured against real grep on a large payload: rc 141.
+E="$TMP/f12w"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -e pat -q'     > "$E/scripts/shortarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -m 1 -q'       > "$E/scripts/numarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --include x -q' > "$E/scripts/longarg.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'shortarg\.sh' "$OUT" && grep -q 'numarg\.sh' "$OUT" && grep -q 'longarg\.sh' "$OUT" \
+  && pass "an option argument separated from its flag does not hide a later -q" \
+  || fail "a separated option argument stopped the walk and an idiom was reported clean (exit $rc)"
+
+# 12x. THE `q` AFTER A CONSUMING OPTION IS ITS ARGUMENT, NOT A FLAG. origin/main flagged `-eq`,
+#      `-fq`, `-Aq` and the rest; real grep treats `-eq` as `-e q` and reads all its input, so
+#      THIS change deliberately reports them clean. Pinned so the narrowing is not mistaken for a
+#      regression and re-broadened back into a false block.
+E="$TMP/f12x"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -eq pat' > "$E/scripts/eqbare.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -fq p'   > "$E/scripts/fqbare.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -Aq p'   > "$E/scripts/aqbare.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -q pat'   > "$E/scripts/real4.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real4\.sh' "$OUT" \
+  && ! grep -q 'eqbare\.sh' "$OUT" && ! grep -q 'fqbare\.sh' "$OUT" && ! grep -q 'aqbare\.sh' "$OUT" \
+  && pass "a q consumed as an option argument is not a flag (a deliberate narrowing)" \
+  || fail "the q-as-option-argument narrowing was lost (exit $rc)"
+
+# 12y. GREP PERMUTES OPTIONS. `grep PATTERN -q` IS quiet (measured rc 141 against GNU grep 3.8) —
+#      the walk used to stop at the first non-option token, treating the pattern as the end of the
+#      options, and reported the idiom clean.
+E="$TMP/f12y"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep pat -q'        > "$E/scripts/operandfirst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -F pat --quiet' > "$E/scripts/operandlong.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep pat -A 2 -q'  > "$E/scripts/operandctx.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'operandfirst\.sh' "$OUT" && grep -q 'operandlong\.sh' "$OUT" && grep -q 'operandctx\.sh' "$OUT" \
+  && pass "a quiet flag after the pattern is still found (grep permutes options)" \
+  || fail "the walk stopped at the pattern and an idiom was reported clean (exit $rc)"
+
+# 12z. `-m0` CANCELS QUIET. max-count 0 makes grep read ALL its input, so the writer cannot die
+#      (measured rc 1, not 141). Flagging the attached form was a NEW false block; the separated
+#      `-q -m0` was already a false block in origin/main.
+E="$TMP/f12z"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -qm0 pat'  > "$E/scripts/m0attached.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q -m0 pat' > "$E/scripts/m0separate.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "$V" | grep -q pat'     > "$E/scripts/real5.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'real5\.sh' "$OUT" \
+  && ! grep -q 'm0attached\.sh' "$OUT" && ! grep -q 'm0separate\.sh' "$OUT" \
+  && pass "a max-count of zero cancels quiet, attached or separated" \
+  || fail "an -m0 pipeline was flagged although grep reads all its input (exit $rc)"
+
+# 12aa. A LONG LINE IS STILL READ. The scan is bounded per LINE and never truncated per writer,
+#       and it is bounded per COMMAND rather than per token count: a byte window, a token cap or a
+#       per-line budget each ended the scan on a CLEAN verdict, which is the one verdict a guard
+#       must never reach without reading. This is the shape that made the old budget refuse or
+#       report clean.
+E="$TMP/f12aa"; mkdir -p "$E/scripts"
+PAD="$(head -c 1100000 /dev/zero | tr '\000' 'a')"
+printf '%s\n' '#!/usr/bin/env bash' "printf \"%s\" \"a|b\" \"\$V\" | grep -q pat # $PAD" > "$E/scripts/longline2.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'longline2\.sh' "$OUT" \
+  && pass "a data-pipe idiom on a line longer than the scan budget is still found" \
+  || fail "a line longer than the budget was reported clean without being scanned (exit $rc)"
+
+# 12ab. THE COMMAND PREFIXES grep IS REACHED THROUGH. `printf x | LC_ALL=C grep -q p` IS the idiom
+#       (measured rc 141), and a prefix run — an environment assignment, or env/nice/command/time/
+#       sudo bare or by path — was admitted by neither matcher, so each was reported clean.
+E="$TMP/f12ab"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | LC_ALL=C grep -q pat'        > "$E/scripts/envassign.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env grep -q pat'             > "$E/scripts/envcmd.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | nice grep -q pat'            > "$E/scripts/nicecmd.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sudo grep -q pat'            > "$E/scripts/sudocmd.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | time grep -q pat'            > "$E/scripts/timecmd.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | /usr/bin/env grep -q pat'    > "$E/scripts/envpath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | LC_ALL=C /bin/grep -q pat'   > "$E/scripts/envandpath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | LC_ALL=C grep pat'           > "$E/scripts/envnotquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'envassign\.sh' "$OUT" && grep -q 'envcmd\.sh' "$OUT" \
+  && grep -q 'nicecmd\.sh' "$OUT" && grep -q 'sudocmd\.sh' "$OUT" && grep -q 'timecmd\.sh' "$OUT" \
+  && grep -q 'envpath\.sh' "$OUT" && grep -q 'envandpath\.sh' "$OUT" \
+  && ! grep -q 'envnotquiet\.sh' "$OUT" \
+  && pass "grep is recognised through the command prefixes it is reached by" \
+  || fail "a prefixed grep was reported clean, or a prefix alone was flagged (exit $rc)"
+
+# 12ac. THE SHELL REMOVES THE QUOTING BEFORE GREP SEES IT. A flag written inside double quotes, inside
+#       single quotes, escaped with a backslash, or as an ANSI-C string all reach grep as `-q`
+#       (measured rc 141); the walk tokenised the raw text and read none of them as an option.
+E="$TMP/f12ac"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep "-q" pat'    > "$E/scripts/dqflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep '\''-q'\'' pat' > "$E/scripts/sqflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep \-q pat'     > "$E/scripts/escflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep $'\''-q'\'' pat' > "$E/scripts/ansiflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep "-v" pat'    > "$E/scripts/dqnotquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'dqflag\.sh' "$OUT" && grep -q 'sqflag\.sh' "$OUT" \
+  && grep -q 'escflag\.sh' "$OUT" && grep -q 'ansiflag\.sh' "$OUT" && ! grep -q 'dqnotquiet\.sh' "$OUT" \
+  && pass "a quoted or escaped -q is read as the flag the shell hands grep" \
+  || fail "a quoted flag was reported clean, or quoted non-flag text was flagged (exit $rc)"
+
+# 12ad. A SEPARATOR IS A COMMAND BOUNDARY ONLY WHEN IT IS UNQUOTED. A pattern operand that merely
+#       CONTAINS a pipe or a semicolon is still the operand (`grep -E 'a|b' -q` is quiet, measured
+#       rc 141), while an option carrying a real `;` ends the command (`grep -x;y -q pat` runs
+#       grep -x, so the -q belongs to another command and the writer cannot die). A raw separator
+#       test got both backwards: it reported the first clean and the second flagged.
+E="$TMP/f12ad"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -E '\''a|b'\'' -q'  > "$E/scripts/qpattern.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep '\''a;b'\'' -q'     > "$E/scripts/qsemi.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep '\''a|b'\'' pat'    > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -x;y -q pat'        > "$E/scripts/optsep.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'qpattern\.sh' "$OUT" && grep -q 'qsemi\.sh' "$OUT" \
+  && ! grep -q 'notquiet\.sh' "$OUT" && ! grep -q 'optsep\.sh' "$OUT" \
+  && pass "a quoted separator stays in its operand, an unquoted one ends the command" \
+  || fail "a quoted pattern hid the flag, or a separator-joined command borrowed one (exit $rc)"
+
+# 12ae. THERE IS NO TOKEN CAP ON THE OPTION WALK. A 200-token cap ended the walk on a CLEAN verdict,
+#       so a -q past it was invisible — 200 harmless options sufficed (a regression against
+#       origin/main, whose walk was unbounded). Both sides of the boundary are pinned.
+E="$TMP/f12ae"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | grep$(printf ' -i%.0s' $(seq 1 200)) -q pat" > "$E/scripts/tok200.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | grep$(printf ' -i%.0s' $(seq 1 199)) -q pat" > "$E/scripts/tok199.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'tok200\.sh' "$OUT" && grep -q 'tok199\.sh' "$OUT" \
+  && pass "a quiet flag is found however many options precede it" \
+  || fail "an option count ended the walk and hid a later flag (exit $rc)"
+
+# 12af. ONE PASS OVER THE LINE, NOT ONE SCAN PER WRITER. The scanner used to re-walk the remainder
+#       from every writer — quadratic in the writer count — and a per-line budget that could only
+#       be spent on scanning less (a false clean) or refusing a verdict. A genuine idiom that
+#       follows a long run of writers was reported clean once that budget ran out.
+E="$TMP/f12af"; mkdir -p "$E/scripts"
+MANY="$(printf 'echo x ; %.0s' $(seq 1 600))printf '%s' \"a|b\" | grep -q pat"
+printf '%s\n' '#!/usr/bin/env bash' "$MANY" > "$E/scripts/manywriters.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'manywriters\.sh' "$OUT" \
+  && pass "an idiom after hundreds of writers on one line is still found" \
+  || fail "the writer count on a line hid a later idiom (exit $rc)"
+
+# 12ag. A WRITER INSIDE A QUOTED REGION IS SCANNED IN ITS OWN CONTEXT. `out="$(printf ... | grep -q
+#       p)"` puts the writer inside the outer double quotes while its own argument holds a data pipe,
+#       so the streaming pass sees a quoted `printf` and raw_idiom's `[^|]*` bridge stops at the
+#       data pipe — both blind at once, and the file was reported clean. Quoting RESTARTS inside a
+#       command substitution, so the scan restarts at the writer.
+E="$TMP/f12ag"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'out="$(printf "%s" "a|b" | grep -q pat)"'    > "$E/scripts/subassign.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'echo "$(printf "%s" "a|b" | grep -q pat)"'    > "$E/scripts/subecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"$(printf "%s" "a|b" | /bin/grep -q pat)"'    > "$E/scripts/subpath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'out="$(printf "%s" "a|b" | grep pat)"'        > "$E/scripts/subnotquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'subassign\.sh' "$OUT" && grep -q 'subecho\.sh' "$OUT" \
+  && grep -q 'subpath\.sh' "$OUT" && ! grep -q 'subnotquiet\.sh' "$OUT" \
+  && pass "a writer inside a quoted command substitution is scanned in its own quoting context" \
+  || fail "a quoted command substitution hid an idiom with a data pipe (exit $rc)"
+
+# 12ah. PREFIXES ARE COMMANDS WITH THEIR OWN OPTIONS. `env -i grep -q p`, `nice -n 5 grep -q p` and
+#       `sudo -u root grep -q p` are all quiet (measured with the oracle), and the prefix walk used to
+#       stop at the option token. The argument forms are separated ON PURPOSE: treating `-i` as
+#       argument-taking would swallow the `grep` and report a false clean instead.
+E="$TMP/f12ah"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env -i grep -q pat'     > "$E/scripts/envopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | nice -n 5 grep -q pat'  > "$E/scripts/nicearg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sudo -u root grep -q pat' > "$E/scripts/sudoarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | command -p grep -q pat' > "$E/scripts/cmdopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env -u VAR grep -q pat' > "$E/scripts/envunset.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env cat grep -q pat'    > "$E/scripts/envcat.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | nice -n 5 cat'          > "$E/scripts/nicecat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'envopt\.sh' "$OUT" && grep -q 'nicearg\.sh' "$OUT" \
+  && grep -q 'sudoarg\.sh' "$OUT" && grep -q 'cmdopt\.sh' "$OUT" && grep -q 'envunset\.sh' "$OUT" \
+  && ! grep -q 'envcat\.sh' "$OUT" && ! grep -q 'nicecat\.sh' "$OUT" \
+  && pass "an option on a prefix command does not hide the grep it prefixes" \
+  || fail "a prefixed command with an option was reported clean, or another command was flagged (exit $rc)"
+
+# 12ai. THE OPTION ANALYSIS IS NOT CAPPED, ONLY THE TOKEN VALUE IS. The token string is capped
+#       because concatenating a huge token is quadratic in this awk, but a `q` PAST the cap was then
+#       invisible - a false clean introduced by this change and caught by review.
+E="$TMP/f12ai"; mkdir -p "$E/scripts"
+LONGOPT="$(printf 'i%.0s' $(seq 1 399))"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | grep -${LONGOPT}q pat" > "$E/scripts/longcluster.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'longcluster\.sh' "$OUT" \
+  && pass "a quiet flag in an option cluster longer than the token cap is still found" \
+  || fail "the token cap hid a trailing flag (exit $rc)"
+
+# 12aj. AN OPTION CLUSTER CANNOT CONTAIN A SHELL METACHARACTER. `grep "-q;x" pat` hands grep the
+#       single argument `-q;x`, which grep rejects (exit 2) - it never reads, so it is not a quiet
+#       grep, and the pipeline fails loudly rather than silently. Unquoting the token made it read
+#       as `-q` and flagged it.
+E="$TMP/f12aj"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep "-q;x" pat' > "$E/scripts/quotedmetachar.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep "-q" pat'    > "$E/scripts/stillquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'stillquiet\.sh' "$OUT" && ! grep -q 'quotedmetachar\.sh' "$OUT" \
+  && pass "a metacharacter inside an option token is not a quiet flag" \
+  || fail "an unquoted metacharacter was read as a flag, or a real flag was missed (exit $rc)"
+
+# 12ak. A BRACE GROUP SENDS ITS STDOUT TO THE PIPE. `{ printf "%s" "a|b"; } | grep -q pat` is the
+#       idiom (measured rc 141), but the `;` and the closing `}` cleared the writer, and raw_idiom is
+#       blocked by the data pipe. The `;` only ends the command when no group is open.
+E="$TMP/f12ak"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' '{ printf "%s" "a|b"; } | grep -q pat'  > "$E/scripts/bracegroup.sh"
+printf '%s\n' '#!/usr/bin/env bash' '{ printf "%s" "a|b"; } | grep pat'     > "$E/scripts/bracenotquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'bracegroup\.sh' "$OUT" && ! grep -q 'bracenotquiet\.sh' "$OUT" \
+  && pass "a brace group carrying the writer's stdout to the pipe is found" \
+  || fail "the group separator cleared a writer whose stdout reaches the pipe (exit $rc)"
+
+# 12al. A SUBSHELL PASSES STDOUT ON; A COMMAND SUBSTITUTION CAPTURES IT. `( printf ... ) | grep -q
+#       p` is the idiom (the subshell stdout is the pipe), while `$(echo p) | grep -q p` is not (the
+#       substitution output is captured, so nothing reaches the pipe). Clearing the writer on every
+#       `)` got both backwards, and also lost the pipe when the substitution was merely an ARGUMENT
+#       of the writer.
+E="$TMP/f12al"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "( printf '%s|%s' a b ) | grep -q pat"                > "$E/scripts/subshell.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" $(echo) "a|b" | grep -q pat'             > "$E/scripts/argcapture.sh"
+printf '%s\n' '#!/usr/bin/env bash' '$(echo "a|b") | grep -q pat'                         > "$E/scripts/captured.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'wc <(echo "a|b") | grep -q pat'                      > "$E/scripts/procsub.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'subshell\.sh' "$OUT" && grep -q 'argcapture\.sh' "$OUT" \
+  && ! grep -q 'captured\.sh' "$OUT" && ! grep -q 'procsub\.sh' "$OUT" \
+  && pass "a subshell keeps the pipe and a command substitution captures it" \
+  || fail "a captured or subshell-captured writer was mis-charged (exit $rc)"
+
+# 12am. A BACKTICK STARTS A COMMAND SUBSTITUTION. It is a command boundary like `$(`, so a writer
+#       right after one is a writer - and, like `$(`, its stdout is CAPTURED, so a pipe after the
+#       closer is not the writer's.
+E="$TMP/f12am"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'x=`printf "%s" "a|b" | grep -q pat`'  > "$E/scripts/backtick.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=`printf "%s" "a|b" | /bin/grep -q pat`' > "$E/scripts/backtickpath.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'backtick\.sh' "$OUT" && grep -q 'backtickpath\.sh' "$OUT" \
+  && pass "a writer inside a backtick substitution is found" \
+  || fail "the backtick writer boundary was not recognised (exit $rc)"
+
+# 12an. A PREFIX COMMAND'S LONG OPTIONS. `env --unset VAR grep -q p`, `nice --adjustment 5 grep -q p`
+#       and `stdbuf --output 0 grep -q p` are quiet (oracle), and the argument is SEPARATED - so the
+#       walk has to know which long options take one. The attached spelling needs no rule and is
+#       pinned as the control.
+E="$TMP/f12an"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env --unset VAR grep -q pat'    > "$E/scripts/envlong.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | nice --adjustment 5 grep -q pat' > "$E/scripts/nicelong.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | stdbuf --output 0 grep -q pat'   > "$E/scripts/stdfbuflong.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sudo --user root grep -q pat'    > "$E/scripts/sudolong.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env --unset=VAR grep -q pat'     > "$E/scripts/envlongattached.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'envlong\.sh' "$OUT" && grep -q 'nicelong\.sh' "$OUT" \
+  && grep -q 'stdfbuflong\.sh' "$OUT" && grep -q 'sudolong\.sh' "$OUT" && grep -q 'envlongattached\.sh' "$OUT" \
+  && pass "a separated long option on a prefix command does not hide the grep it prefixes" \
+  || fail "a prefix long option hid the grep (exit $rc)"
+
+# 12ao. `exec` IS A PREFIX. `printf x | exec grep -q pat` replaces the subshell with grep, which reads
+#       the pipe and exits at its first match - the writer can die. Add it to the prefix run.
+E="$TMP/f12ao"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | exec grep -q pat'  > "$E/scripts/execgrep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | exec cat'          > "$E/scripts/execcat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'execgrep\.sh' "$OUT" && ! grep -q 'execcat\.sh' "$OUT" \
+  && pass "grep reached through exec is recognised, other exec commands are not" \
+  || fail "exec grep was reported clean, or a non-grep exec was flagged (exit $rc)"
+
+# 12ap. A CONSUMER-SIDE GROUP IS TRANSPARENT. `| (grep -q pat)` and `| { grep -q pat; }` send the
+#       group stdout to the pipe, so grep inside reads the writer - the group char arrives attached
+#       to the command word.
+E="$TMP/f12ap"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | (grep -q pat)'        > "$E/scripts/parengroup.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | { grep -q pat; }'     > "$E/scripts/bracegroup2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s" "a|b" | (grep -q pat)' > "$E/scripts/parengroup2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | (cat)'                > "$E/scripts/parencat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'parengroup\.sh' "$OUT" && grep -q 'bracegroup2\.sh' "$OUT" \
+  && grep -q 'parengroup2\.sh' "$OUT" && ! grep -q 'parencat\.sh' "$OUT" \
+  && pass "a group on the consumer side of the pipe is transparent to the grep inside it" \
+  || fail "a grouped quiet grep was reported clean, or a grouped other command was flagged (exit $rc)"
+
+# 12aq. A ZERO max-count CARRIES A SIGN OR EXTRA ZEROS. `--max-count=0000`, `--max-count=+0` and
+#       `-m +0` all mean max-count ZERO, so grep reads all its input (oracle rc 1, not 141) and the
+#       writer cannot die. An exact `=0` spelling test flagged all three.
+E="$TMP/f12aq"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --max-count=0000 -q pat' > "$E/scripts/mczeros.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --max-count=+0 -q pat'   > "$E/scripts/mcplus.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -m +0 -q pat'            > "$E/scripts/mplus.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --max-count=1 -q pat'    > "$E/scripts/mcone.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'mcone\.sh' "$OUT" && ! grep -q 'mczeros\.sh' "$OUT" \
+  && ! grep -q 'mcplus\.sh' "$OUT" && ! grep -q 'mplus\.sh' "$OUT" \
+  && pass "a zero max-count is zero however it is spelled" \
+  || fail "a zero max-count was treated as quiet, or a non-zero one as quiet cancelling (exit $rc)"
+
+# 12ar. `--silent` IS `--quiet`. GNU grep documents `-q, --quiet, --silent` as ONE option, and it
+#       accepts any unambiguous abbreviation of a long option, so `--s`, `--si`, `--sil`, `--sile`
+#       and `--silen` are all quiet too. Only the `--quiet` ladder was recognised, so
+#       `printf x | grep --silent pat` reported CLEAN while grep exited at its first match and the
+#       writer died (measured rc 141 against GNU grep 3.8 under pipefail).
+E="$TMP/f12ar"; mkdir -p "$E/scripts"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | grep --silent pat'  > "$E/scripts/long.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | grep --sil pat'     > "$E/scripts/abbr3.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | grep --si pat'      > "$E/scripts/abbr2.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | grep --silent'      > "$E/scripts/nopat.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | grep --no-messages pat' > "$E/scripts/control.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'long\.sh' "$OUT" && grep -q 'abbr3\.sh' "$OUT" && grep -q 'abbr2\.sh' "$OUT" && grep -q 'nopat\.sh' "$OUT" \
+  && ! grep -q 'control\.sh' "$OUT" \
+  && pass "--silent and its abbreviations are quiet (and --no-messages is not)" \
+  || fail "a --silent spelling was reported clean, or --no-messages was called quiet (exit $rc)"
+
+# 12as. A WRAPPER THAT TAKES AN OPERAND. `timeout 5 grep -q pat` pipes the writer into a quiet grep
+#       (measured rc 141), and `timeout` puts its DURATION — a bare operand — before the command, so
+#       a walk that stops at the duration reports CLEAN. The same hold for `nohup`/`setsid`/`busybox`,
+#       and `timeout --kill-after 5 10` consumes its option value AND a duration before the command.
+E="$TMP/f12as"; mkdir -p "$E/scripts"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | timeout 5 grep -q pat'                    > "$E/scripts/tmo.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | timeout -k 5 10 grep -q pat'              > "$E/scripts/tmok.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | timeout --kill-after 5 10 grep -q pat'    > "$E/scripts/tmolong.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | nohup grep -q pat'                        > "$E/scripts/nohup.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | setsid grep -q pat'                       > "$E/scripts/setsid.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | busybox grep -q pat'                      > "$E/scripts/busybox.sh"
+printf '%s
+' '#!/usr/bin/env bash' 'printf x | timeout 5 cat'                            > "$E/scripts/tmocat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'tmo\.sh' "$OUT" && grep -q 'tmok\.sh' "$OUT" && grep -q 'tmolong\.sh' "$OUT" \
+  && grep -q 'nohup\.sh' "$OUT" && grep -q 'setsid\.sh' "$OUT" && grep -q 'busybox\.sh' "$OUT" \
+  && ! grep -q 'tmocat\.sh' "$OUT" \
+  && pass "a wrapper with a bare operand before the command is seen through" \
+  || fail "a wrapper's operand hid the grep, or a non-grep wrapper command was flagged (exit $rc)"
+
+# 12at. A QUOTED SHELL-OUT BODY IS A COMMAND. `printf x | sh -c 'grep -q pat'` and
+#       `printf x | eval "grep -q pat"` both pipe the writer into a quiet grep (measured rc 141):
+#       the body inherits the wrapper's stdin, so a separator INSIDE the body does not end the
+#       command the way an unquoted one does. The walk saw one opaque token and reported CLEAN.
+E="$TMP/f12at"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c 'grep -q pat'"                > "$E/scripts/shc.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -c "grep -q pat"'             > "$E/scripts/bashc.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | eval "grep -q pat"'                > "$E/scripts/evalq.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c 'set -e; grep -q pat'"       > "$E/scripts/shcsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c 'cat'"                       > "$E/scripts/shccat.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c 'grep pat'"                  > "$E/scripts/shcnq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | eval cat'                           > "$E/scripts/evalcat.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sed "s/grep -q//"'                > "$E/scripts/sedctl.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -x;y -q pat'                  > "$E/scripts/unqsep.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'shc\.sh' "$OUT" && grep -q 'bashc\.sh' "$OUT" && grep -q 'evalq\.sh' "$OUT" && grep -q 'shcsep\.sh' "$OUT" \
+  && ! grep -q 'shccat\.sh' "$OUT" && ! grep -q 'shcnq\.sh' "$OUT" && ! grep -q 'evalcat\.sh' "$OUT" \
+  && ! grep -q 'sedctl\.sh' "$OUT" && ! grep -q 'unqsep\.sh' "$OUT" \
+  && pass "a quoted shell-out body is read as the command it is, and only when it has a quiet grep" \
+  || fail "a shell-out body with a quiet grep was clean, or a body without one was flagged (exit $rc)"
+
+# 12au. CONTROL: the wrapper set did not disturb the ordinary match. `printf x | grep -q pat` is the
+#       adjacency the guard has always flagged and `--quiet` is still the long spelling of it, while
+#       `printf x | cat | grep -q pat` stays CLEAN: the writer is piped into `cat`, not into grep, and
+#       charging that later pipe to the writer is the two-stage false block the guard deliberately
+#       does not make.
+E="$TMP/f12au"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -q pat'            > "$E/scripts/plain.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | cat | grep -q pat'      > "$E/scripts/twostage.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --quiet pat'       > "$E/scripts/quietlong.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'quietlong\.sh' "$OUT" && ! grep -q 'twostage\.sh' "$OUT" \
+  && pass "the ordinary adjacency match is unchanged by the wrapper set" \
+  || fail "a plain quiet grep or --quiet was missed, or the two-stage form was flagged (exit $rc)"
+
+# 12av. A BODY REACHED THROUGH SOMETHING ELSE. The body is read before the token is classified, so
+#       an absolute path, an environment assignment or a command substitution at its start does not
+#       hide the grep: `/bin/grep -q pat`, `LC_ALL=C grep -q pat`, `FOO=1 grep -q pat`,
+#       `y=$(grep -q pat)` and a backtick form all inherit the wrapper's stdin. The path group in
+#       the body pattern was `+` while the non-body one was `*`, so a body that STARTED with `/`
+#       never matched at all; the assignment skip ran before the body was read; and a backtick was
+#       not in the boundary class.
+E="$TMP/f12av"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c '/bin/grep -q pat'"       > "$E/scripts/abspath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "LC_ALL=C grep -q pat"' > "$E/scripts/assign.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "FOO=1 grep -q pat"'    > "$E/scripts/assign2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "y=$(grep -q pat)"'     > "$E/scripts/subst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "echo `grep -q pat`"'   > "$E/scripts/backtick.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "cat"'                  > "$E/scripts/bodycat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'abspath\.sh' "$OUT" && grep -q 'assign\.sh' "$OUT" && grep -q 'assign2\.sh' "$OUT" \
+  && grep -q 'subst\.sh' "$OUT" && grep -q 'backtick\.sh' "$OUT" && ! grep -q 'bodycat\.sh' "$OUT" \
+  && pass "a body starting with a path, an assignment or a substitution is still read" \
+  || fail "a wrapper body was skipped because of how its first word looked (exit $rc)"
+
+# 12aw. A QUIET FLAG IMMEDIATELY BEFORE A CLOSER. `grep pat -q; echo done`, `{ grep pat -q; }`,
+#       `(grep pat -q)` and `grep pat -q)` ARE quiet: the separator ends the COMMAND, not the
+#       option, and discarding the whole token threw the `q` away with it. An EMBEDDED separator
+#       still ends the command (`grep -x;y -q pat`), and the control pins that the re-analysis
+#       keeps the max-count-zero cancellation: `grep -qm0; echo x` is NOT quiet.
+E="$TMP/f12aw"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep pat -q; echo done' > "$E/scripts/semi.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | { grep pat -q; }'       > "$E/scripts/brace.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | (grep pat -q)'          > "$E/scripts/paren.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep pat -q)'           > "$E/scripts/stray.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -x;y -q pat'       > "$E/scripts/embedded.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -qm0; echo x'      > "$E/scripts/m0semi.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'semi\.sh' "$OUT" && grep -q 'brace\.sh' "$OUT" && grep -q 'paren\.sh' "$OUT" && grep -q 'stray\.sh' "$OUT" \
+  && ! grep -q 'embedded\.sh' "$OUT" && ! grep -q 'm0semi\.sh' "$OUT" \
+  && pass "a quiet flag before a closer is quiet, an embedded separator still ends the command" \
+  || fail "a trailing closer swallowed the flag, or an embedded separator did not end the command (exit $rc)"
+
+# 12ax. A CLUSTERED OPTION ON A WRAPPER. getopt groups, so `timeout -vk 5 10 grep -q pat` is the
+#       same command as `timeout -v -k 5 10 grep -q pat` (already flagged): `-v` takes no argument
+#       and `-k` does. Reading only the letter after the dash made `-vk` look argument-less, so the
+#       duration was taken for the command and the idiom was reported clean. The control keeps a
+#       wrapper whose command is not a grep clean.
+E="$TMP/f12ax"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout -vk 5 10 grep -q pat' > "$E/scripts/vk.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout -vs 9 5 grep -q pat'  > "$E/scripts/vs.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout -v -k 5 10 grep -q pat' > "$E/scripts/sep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout -k5 10 grep -q pat'    > "$E/scripts/attached.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout -vk 5 10 cat'          > "$E/scripts/vkcat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'vk\.sh' "$OUT" && grep -q 'vs\.sh' "$OUT" && grep -q 'sep\.sh' "$OUT" && grep -q 'attached\.sh' "$OUT" \
+  && ! grep -q 'vkcat\.sh' "$OUT" \
+  && pass "a clustered wrapper option is read whole, attached or separated" \
+  || fail "a clustered option on a wrapper hid the grep, or a non-grep command was flagged (exit $rc)"
+
+# 12ay. A SHELL `-c` IN A CLUSTER. `sh -ce "grep -q pat"` is the grouped spelling of `sh -c -e ...`,
+#       and a shell command string is ALWAYS the next argv operand (an attached form is an error, not
+#       an attached argument). The generic attached-argument rule read `-ce` as argument-less, so the
+#       body was never offered to the reader and the idiom was reported clean - inside the wrapper
+#       allowlist the header claims to see through. The control keeps `sh -c` with a non-grep body
+#       clean and pins that a `-c`-less cluster is not treated as a body host.
+E="$TMP/f12ay"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -ce "grep -q pat"'      > "$E/scripts/ce.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -cx "grep -q pat"'    > "$E/scripts/cx.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | dash -cl "grep -q pat"'    > "$E/scripts/cl.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | timeout 5 sh -ce "grep -q pat"' > "$E/scripts/tmo.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -ce "cat"'              > "$E/scripts/cecat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'ce\.sh' "$OUT" && grep -q 'cx\.sh' "$OUT" && grep -q 'cl\.sh' "$OUT" && grep -q 'tmo\.sh' "$OUT" \
+  && ! grep -q 'cecat\.sh' "$OUT" \
+  && pass "a shell -c inside a cluster still hands over its body" \
+  || fail "a clustered shell -c hid its body, or a non-grep body was flagged (exit $rc)"
+
+# 12az. A WRAPPER BODY LONGER THAN THE TOKEN CAP, AND A WIDE BODY SHAPE. The body is read from the
+#       LINE, not from the 400-character stored token: a body whose `grep` sits past the cap used to
+#       be invisible. The extra files pin two more ways a body reaches its command - a quoted command
+#       word (quote characters are blanked before the test) and a word split by a backslash-newline,
+#       which the shell joins with NOTHING while the guard used to join with a space (`gr` + `ep`
+#       became two words and stopped being `grep`).
+E="$TMP/f12az"; mkdir -p "$E/scripts"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf 'printf x | sh -c "%s; grep -q pat"\n' "$(printf 'A%.0s' $(seq 1 500))"
+} > "$E/scripts/long.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c \"'grep' -q pat\"" > "$E/scripts/quoted.sh"
+printf '#!/usr/bin/env bash\nprintf x | sh -c "gr\\\nep -q pat"\n' > "$E/scripts/continuation.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "cat"'             > "$E/scripts/longcat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'long\.sh' "$OUT" && grep -q 'quoted\.sh' "$OUT" && grep -q 'continuation\.sh' "$OUT" \
+  && ! grep -q 'longcat\.sh' "$OUT" \
+  && pass "a body past the token cap, a quoted command word, and a split word are all read" \
+  || fail "a long body, a quoted command word or a split word hid the grep (exit $rc)"
+
+# 12ba. A LONG QUIET OPTION BEFORE A SEPARATOR. `grep -e pat --quiet;echo done` IS quiet: the
+#       separator ends the COMMAND, and the token is read up to the FIRST one, so the same rule now
+#       serves both directions - `-q;echo` has the flag BEFORE the separator and is quiet, while
+#       `-x;y -q pat` has it after and is not. The long-option ladder had no separator handling at
+#       all, so `--quiet;` matched neither it nor the invalid-option test. The control is the
+#       max-count-zero cancellation surviving the same strip.
+E="$TMP/f12ba"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -e pat --quiet;echo done'  > "$E/scripts/lq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -e pat --silent;echo done' > "$E/scripts/ls.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -e pat -q;echo done'      > "$E/scripts/sq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -f pfile -q;echo done'    > "$E/scripts/fq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep -x;y -q pat'              > "$E/scripts/embedded.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | grep --max-count=0 -q;echo x'  > "$E/scripts/m0long.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'lq\.sh' "$OUT" && grep -q 'ls\.sh' "$OUT" && grep -q 'sq\.sh' "$OUT" && grep -q 'fq\.sh' "$OUT" \
+  && ! grep -q 'embedded\.sh' "$OUT" && ! grep -q 'm0long\.sh' "$OUT" \
+  && pass "a flag before a separator is quiet, and a flag after it is not, for long and short options" \
+  || fail "a long quiet option before a separator was dropped, or an embedded separator borrowed a flag (exit $rc)"
+
+# 12bb. A BODY THAT SPELLS ITS COMMAND OR ITS FLAG WITH QUOTING OR BACKSLASHES. The INNER shell
+#       removes BOTH quote flavours and backslashes before it execs the body, so every one of these
+#       runs a quiet grep. Only the single quote was blanked, which fixed one direction of quoting
+#       and left the other, plus every escaped spelling, a false clean. The control is a body with
+#       no quiet grep in it.
+E="$TMP/f12bb"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "\"grep\" -q x"'   > "$E/scripts/dq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "\grep -q x"'       > "$E/scripts/esc.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "g\rep -q x"'       > "$E/scripts/midesc.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "grep -\q x"'       > "$E/scripts/flagesc.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "grep -\"q\" x"'  > "$E/scripts/flagdq.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c "grep -v x"'         > "$E/scripts/control.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'dq\.sh' "$OUT" && grep -q 'esc\.sh' "$OUT" && grep -q 'midesc\.sh' "$OUT" \
+  && grep -q 'flagesc\.sh' "$OUT" && grep -q 'flagdq\.sh' "$OUT" && ! grep -q 'control\.sh' "$OUT" \
+  && pass "a body that quotes or escapes its command or flag the other way is still read" \
+  || fail "a quoted or escaped body spelling was reported clean (exit $rc)"
+
+# 12bc. A SHELL OWN OPTIONS. A shell's `-c` does NOT take an attached argument - it takes the FIRST
+#       NON-OPTION operand - while `-o`/`-O` DO take a separated one, and the long forms
+#       `--init-file`/`--rcfile` take a value. Treating `-o` as argument-less made its VALUE the
+#       command and stopped the walk before the `-c` that carried the body; `+o`/`+O` were not even
+#       dispatched. The controls keep a shell whose body is not a grep CLEAN.
+E="$TMP/f12bc"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -o pipefail -c "grep -q p"'      > "$E/scripts/o.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -euo pipefail -c "grep -q p"'    > "$E/scripts/uo.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -O extglob -c "grep -q p"'      > "$E/scripts/bigO.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash +o pipefail -c "grep -q p"'     > "$E/scripts/pluso.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash +O extglob -c "grep -q p"'      > "$E/scripts/plusbigO.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash --init-file /dev/null -c "grep -q p"' > "$E/scripts/initf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -co pipefail "grep -q p"'       > "$E/scripts/co.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash -o pipefail -c "cat"'           > "$E/scripts/ocat.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | bash --rcfile /dev/null -c "cat"'    > "$E/scripts/rccat.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'o\.sh' "$OUT" && grep -q 'uo\.sh' "$OUT" && grep -q 'pluso\.sh' "$OUT" \
+  && grep -q 'plusbigO\.sh' "$OUT" && grep -q 'initf\.sh' "$OUT" && grep -q 'co\.sh' "$OUT" \
+  && ! grep -q 'ocat\.sh' "$OUT" && ! grep -q 'rccat\.sh' "$OUT" \
+  && pass "a shell option argument is not mistaken for the shell command string" \
+  || fail "a shell option argument was read as the command, or a non-grep body was flagged (exit $rc)"
+
+# 12bd. `env --split-string=CMD` AND ITS ATTACHED SHORT FORM. GNU coreutils adds an option whose
+#       ATTACHED value is a command string, the only one in the allowlist: the generic attached-value
+#       rule discards it, and the body must be read from the value with the option prefix removed
+#       (otherwise the command word has no boundary before it). The control keeps a non-grep value
+#       clean.
+E="$TMP/f12bd"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env --split-string="grep -q p"' > "$E/scripts/long.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | env -S'grep -q p'"            > "$E/scripts/short.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | env --split-string="cat"'    > "$E/scripts/control.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'long\.sh' "$OUT" && grep -q 'short\.sh' "$OUT" && ! grep -q 'control\.sh' "$OUT" \
+  && pass "a command string attached to env --split-string or -S is read" \
+  || fail "an env attached command string was reported clean (exit $rc)"
+
+# 12be. A SHELL OPTION BETWEEN `-c` AND ITS COMMAND STRING. A shell accepts further options after
+#       `-c` (`sh -c -e 'grep -q pat'`, `bash -c -x ...`, `sh -c -c ...`), so the option is not the
+#       command string. The pending-body slot consumed the OPTION, `body_quiet` saw `-e` for a body,
+#       and the real body was never read. The control keeps a shell option with a non-grep body
+#       CLEAN, and `sh -c` with nothing after it is clean too (nothing is executed).
+E="$TMP/f12be"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c -e 'grep -q pat'"     > "$E/scripts/e.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | bash -c -x 'grep -q pat'"   > "$E/scripts/x.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c -c 'grep -q pat'"     > "$E/scripts/cc.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c -- 'grep -q pat'"     > "$E/scripts/dd.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c -e -x 'grep -q pat'" > "$E/scripts/ex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf x | sh -c -e 'cat'"            > "$E/scripts/ecat.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'printf x | sh -c'                    > "$E/scripts/nobody.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+[ "$rc" -ne 0 ] && grep -q 'e\.sh' "$OUT" && grep -q 'x\.sh' "$OUT" && grep -q 'cc\.sh' "$OUT" && grep -q 'dd\.sh' "$OUT" \
+  && grep -q 'ex\.sh' "$OUT" && ! grep -q 'ecat\.sh' "$OUT" && ! grep -q 'nobody\.sh' "$OUT" \
+  && pass "a shell option between -c and its command string is not mistaken for the body" \
+  || fail "an option was consumed as the shell command string (exit $rc)"
+
 echo ""
 if [ "$failures" -eq 0 ]; then
   echo "✅ All SIGPIPE false-negative tests passed (${checks} assertions)"

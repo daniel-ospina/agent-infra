@@ -112,7 +112,7 @@ The marker belongs **on the artifact a lane actually reads: the ISSUE** (a comme
 
 When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge, **and it contradicts no recorded decision (run the contradiction test above FIRST)**, and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
 
-## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions.
+## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions
 
 If you're going to present a recap at the end of a turn or session, don't say things like "Cycle 3 found the worst bug of the whole lane" or "Two corrections I had to make about my own work" unless they're changing the scope, architecture or UX that was agreed. Instead present the state, key design principles/decisions made, and cleanly present any user decisions needed (see USER QUESTIONS PROTOCOL) or next steps. If the next steps are just to continue, do not stop and just continue (see NEVER PAUSE WITHOUT A REASON)
 
