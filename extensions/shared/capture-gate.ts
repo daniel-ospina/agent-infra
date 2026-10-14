@@ -56,6 +56,14 @@ export type CaptureGateReason =
 export interface CaptureGateResult {
   enabled: boolean;
   reason: CaptureGateReason;
+  /**
+   * For `repo-opt-out`: the directory whose `.pi/tortoise-capture.json` denied.
+   * Only set on a deny, because the reproducer the disclosure prints must name
+   * the file that ACTUALLY denied — the gate's `projectDir` is the session cwd
+   * (not the repo root), so the deny often lives at an ancestor of it. Undefined
+   * when no deny was read (or a deny surface could not be named).
+   */
+  projectDenyDir?: string;
 }
 
 export interface CaptureGateInput {
@@ -160,8 +168,11 @@ function hasGitBoundary(cwd: string): boolean {
 }
 
 /**
- * Is there a repo-scoped opt-out at `cwd` or ANY ancestor? DENY-ONLY, so it can
- * only ever narrow egress (#803 review cycle 3 P0). Two cases need it:
+ * The directory at `cwd` or ANY ancestor that carries a repo-scoped opt-out, or
+ * null when none does. DENY-ONLY, so it can only ever narrow egress (#803 review
+ * cycle 3 P0). Returns the directory rather than a boolean because the caller
+ * logs which file denied — and with the session cwd as the gate's `projectDir`,
+ * the deny usually sits at an ANCESTOR. Two cases need it:
  *
  *   - the cwd is NOT in a repository (`.git` absent, renamed away, or a broken
  *     symlink), so there is no resolved main root to read — but an ancestor
@@ -171,12 +182,12 @@ function hasGitBoundary(cwd: string): boolean {
  *     (`R/pkg/{src/deep}` with the deny at `R/pkg`), which the two-candidate-root
  *     check (cwd + main root) never reads.
  */
-function ancestorDenyExists(cwd: string): boolean {
+function ancestorDenyDir(cwd: string): string | null {
   let dir = resolve(cwd);
   for (;;) {
-    if (readOptOutFile(dir)) return true;
+    if (readOptOutFile(dir)) return dir;
     const parent = dirname(dir);
-    if (parent === dir) return false;
+    if (parent === dir) return null;
     dir = parent;
   }
 }
@@ -368,6 +379,12 @@ export interface ProjectCaptureScope {
   denied: boolean;
   /** The git roots resolved, so "no deny found" is trustworthy. */
   resolved: boolean;
+  /**
+   * The directory that carried the denying `.pi/tortoise-capture.json` — an
+   * ancestor of `projectDir` when the deny was found by the ancestor walk. Only
+   * set on a deny, so the disclosure can name the file that actually denied.
+   */
+  denyDir?: string;
 }
 
 /**
@@ -385,7 +402,7 @@ export interface ProjectCaptureScope {
  */
 export function resolveProjectCaptureScope(projectDir?: string): ProjectCaptureScope {
   if (!projectDir) return { denied: false, resolved: true };
-  if (readOptOutFile(projectDir)) return { denied: true, resolved: true };
+  if (readOptOutFile(projectDir)) return { denied: true, resolved: true, denyDir: projectDir };
   const { root: mainRoot, notARepo, boundaryRejected } = resolveMainRootDetailed(projectDir);
   if (mainRoot === null) {
     // Before trusting a definitive "not a repository" — or resolving a REJECTED
@@ -398,18 +415,20 @@ export function resolveProjectCaptureScope(projectDir?: string): ProjectCaptureS
     // it already fails closed below, and the reason must stay
     // `repo-root-unresolved`/`no-api-key` rather than claim a deny we did not
     // verify (review cycle 2 P2).
-    if ((notARepo || boundaryRejected) && ancestorDenyExists(projectDir)) {
-      return { denied: true, resolved: true };
+    const ancestorDeny = notARepo || boundaryRejected ? ancestorDenyDir(projectDir) : null;
+    if (ancestorDeny !== null) {
+      return { denied: true, resolved: true, denyDir: ancestorDeny };
     }
     return { denied: false, resolved: notARepo };
   }
   if (mainRoot !== projectDir && readOptOutFile(mainRoot)) {
-    return { denied: true, resolved: true };
+    return { denied: true, resolved: true, denyDir: mainRoot };
   }
   // Resolved path, same root cause: the opt-out may sit at an INTERMEDIATE
   // ancestor between the cwd and the main root (`R/pkg` for `R/pkg/src/deep`),
   // which the two candidate roots above never read.
-  if (ancestorDenyExists(projectDir)) return { denied: true, resolved: true };
+  const ancestorDeny = ancestorDenyDir(projectDir);
+  if (ancestorDeny !== null) return { denied: true, resolved: true, denyDir: ancestorDeny };
   return { denied: false, resolved: true };
 }
 
@@ -446,7 +465,7 @@ export function resolveCaptureGate(input: CaptureGateInput): CaptureGateResult {
   // for a scope that cannot be trusted WHILE the config is otherwise enable-capable.
   const scope = resolveProjectCaptureScope(input.projectDir);
   if (scope.denied) {
-    return { enabled: false, reason: "repo-opt-out" };
+    return { enabled: false, reason: "repo-opt-out", projectDenyDir: scope.denyDir };
   }
   if (!input.apiKey || input.apiKey.trim().length === 0) {
     return { enabled: false, reason: "no-api-key" };
@@ -477,8 +496,13 @@ export function captureStatusLine(args: {
   }
   const local = `sessions saved locally to ${fallbackDir} only`;
   switch (gate.reason) {
-    case "repo-opt-out":
-      return `[reflect-hook] capture OFF — repo opt-out${projectDir ? ` (${join(projectDir, PROJECT_CAPTURE_RELPATH)})` : ""}; ${local}`;
+    case "repo-opt-out": {
+      // Name the file that ACTUALLY denied. `projectDir` is the session cwd, so
+      // the deny usually lives at an ancestor of it; `join(projectDir, …)` would
+      // point at a file that does not exist.
+      const denyDir = gate.projectDenyDir ?? projectDir;
+      return `[reflect-hook] capture OFF — repo opt-out${denyDir ? ` (${join(denyDir, PROJECT_CAPTURE_RELPATH)})` : ""}; ${local}`;
+    }
     case "repo-root-unresolved":
       return `[reflect-hook] capture OFF — could not resolve the repo root to check for a per-repo opt-out${projectDir ? ` (${projectDir})` : ""}; failing closed; ${local}`;
     case "env-disabled":

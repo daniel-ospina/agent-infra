@@ -278,7 +278,13 @@ export function createReflectHook(
   opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
 ): (pi: ExtensionAPI) => void {
   const env = opts?.env ?? process.env;
-  const initProjectDir = opts?.projectDir ?? resolveProjectRoot(process.cwd());
+  // The gate's projectDir is the RAW session cwd, never `resolveProjectRoot(cwd)`:
+  // `resolveProjectCaptureScope` already resolves the repo root AND walks every
+  // ancestor itself, so passing the git TOPLEVEL would silently drop the
+  // intermediate directories a deny may live in (`R/pkg` for a session in
+  // `R/pkg/src`, with the deny at `R/pkg`) — a fail-open on a deny surface this
+  // gate documents (#803 review cycle 4 P1). `opts.projectDir` stays a test seam.
+  const initProjectDir = opts?.projectDir ?? process.cwd();
   const initGate = resolveCaptureGate({
     cloud: config.cloud,
     apiKey: config.apiKey,
@@ -323,10 +329,12 @@ function registerShutdownHandler(
         .join("\n\n");
       const prs = extractPrs(sessionText);
 
-      // projectRoot is metadata-only now (no script resolution); it is ALSO the
-      // repo scope for the #803 capture gate (a subdirectory cwd still resolves
-      // to the repo root that owns the opt-out file).
-      const projectRoot = resolveProjectRoot(ctx.cwd ?? process.cwd());
+      // projectRoot is metadata-only now (no script resolution); it is the repo
+      // root the session ran in. The #803 gate takes the RAW cwd instead — the
+      // gate's scope walk resolves the repo root and every intermediate ancestor
+      // itself, so the git TOPLEVEL would drop an intermediate opt-out.
+      const cwd = ctx.cwd ?? process.cwd();
+      const projectRoot = resolveProjectRoot(cwd);
 
       const sessionId = ctx.sessionManager.getSessionId?.() ?? `session_${Date.now()}`;
 
@@ -372,13 +380,13 @@ function registerShutdownHandler(
       const gate: CaptureGateResult = resolveCaptureGate({
         cloud: config.cloud,
         apiKey: config.apiKey,
-        projectDir: projectRoot,
+        projectDir: cwd,
         env,
       });
       if (
         gate.enabled !== initGate.enabled ||
         gate.reason !== initGate.reason ||
-        projectRoot !== initProjectDir
+        cwd !== initProjectDir
       ) {
         console.log(
           captureStatusLine({
@@ -386,7 +394,7 @@ function registerShutdownHandler(
             apiUrl: config.apiUrl,
             fallbackDir: FALLBACK_DIR,
             configPath: CONFIG_PATH,
-            projectDir: projectRoot,
+            projectDir: cwd,
           }),
         );
       }

@@ -608,10 +608,11 @@ describe("#803 capture egress gate (repo opt-out + env deny)", () => {
     ).toBe(false);
   });
 
-  test("gate scope is the GIT ROOT — a subdirectory cwd still honors the repo opt-out", () => {
-    // Regression for the reviewer-found P0: the production call site passes
-    // `{ projectDir: resolveProjectRoot(ctx.cwd) }`, so launching pi from
-    // `repo/packages/x` must not bypass `<repo>/.pi/tortoise-capture.json`.
+  test("gate scope walks ancestors of the RAW cwd — repo-root opt-out honored from a subdirectory", () => {
+    // The production handler passes the raw session cwd (cycle 4 P1): the shared
+    // gate resolves the repo root and walks intermediate ancestors itself, so
+    // launching pi from `repo/packages/x` must not bypass
+    // `<repo>/.pi/tortoise-capture.json`.
     const dir = tmpProject({ cloud: false });
     execSync("git init -q", { cwd: dir });
     const sub = join(dir, "packages", "x");
@@ -620,9 +621,92 @@ describe("#803 capture egress gate (repo opt-out + env deny)", () => {
     expect(
       isCloudEnabled(
         { autoCapture: true, cloud: true, apiKey: "tt_x" },
-        { projectDir: resolveProjectRoot(sub), env: {} },
+        { projectDir: sub, env: {} },
       ),
     ).toBe(false);
+  });
+
+  test("REAL agent_end handler: an INTERMEDIATE package deny blocks egress from a descendant cwd", async () => {
+    // #803 review cycle 4 P1 + P2: the handler used to pass
+    // `resolveProjectRoot(ctx.cwd)` and built its gate inline, so (a) a deny at
+    // `R/pkg` for a session in `R/pkg/src/deep` was never read, and (b) every
+    // `#803` test pinned `isCloudEnabled`, which the handler never called. This
+    // drives the real handler end-to-end, so deleting the deny check from it
+    // makes this test fail.
+    const root = mkdtempSync(join(tmpdir(), "capture-e2e-"));
+    dirs.push(root);
+    const home = join(root, "home");
+    const docsDir = join(home, "docs");
+    mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+    mkdirSync(join(root, "pkg", ".pi"), { recursive: true });
+    writeFileSync(
+      join(root, "pkg", ".pi", "tortoise-capture.json"),
+      JSON.stringify({ cloud: false }),
+      "utf-8",
+    );
+    execSync("git init -q", { cwd: root });
+    const deep = join(root, "pkg", "src", "deep");
+    mkdirSync(deep, { recursive: true });
+
+    const savedHome = process.env.HOME;
+    const savedSrc = process.env.TORTOISE_SRC_DIR;
+    const savedKey = process.env.TORTOISE_API_KEY;
+    const savedUrl = process.env.TORTOISE_API_URL;
+    const savedEnvFlag = process.env.TORTOISE_CAPTURE_CLOUD;
+    delete process.env.TORTOISE_API_KEY;
+    delete process.env.TORTOISE_API_URL;
+    delete process.env.TORTOISE_CAPTURE_CLOUD;
+    // getTortoiseDir() returns "" without this, so the local ingest + frontmatter
+    // python spawns are skipped and the test stays hermetic.
+    delete process.env.TORTOISE_SRC_DIR;
+    process.env.HOME = home;
+
+    const handlers: Record<string, (event: any, ctx: any) => Promise<void>> = {};
+    const pi = { on: (name: string, fn: any) => { handlers[name] = fn; } };
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn(async () =>
+      ({ ok: true, status: 200, json: async () => ({ ok: true }) }) as unknown as Response,
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      tortoiseCapture(pi as any, {
+        config: {
+          autoCapture: true,
+          cloud: true,
+          apiKey: "tt_x",
+          apiUrl: "https://api.premiselabs.co",
+          docsDir,
+        },
+      });
+      await handlers["agent_end"](
+        {
+          messages: [
+            { role: "user", content: "ship it" },
+            { role: "assistant", content: "shipped" },
+          ],
+        },
+        {
+          cwd: deep,
+          sessionManager: { getSessionId: () => "sess-e2e-deny", getEntries: () => [] },
+        },
+      );
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = originalFetch;
+      process.env.HOME = savedHome;
+      if (savedSrc === undefined) delete process.env.TORTOISE_SRC_DIR;
+      else process.env.TORTOISE_SRC_DIR = savedSrc;
+      if (savedKey === undefined) delete process.env.TORTOISE_API_KEY;
+      else process.env.TORTOISE_API_KEY = savedKey;
+      if (savedUrl === undefined) delete process.env.TORTOISE_API_URL;
+      else process.env.TORTOISE_API_URL = savedUrl;
+      if (savedEnvFlag === undefined) delete process.env.TORTOISE_CAPTURE_CLOUD;
+      else process.env.TORTOISE_CAPTURE_CLOUD = savedEnvFlag;
+      log.mockRestore();
+      warn.mockRestore();
+    }
   });
 });
 

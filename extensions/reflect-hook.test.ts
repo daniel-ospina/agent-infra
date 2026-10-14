@@ -509,6 +509,35 @@ async function testShutdownUploadGate() {
     const calls = await runShutdown(config, { projectDir: dir, env: {} }, makeCtx(sub));
     equal(calls.length, 0);
   });
+
+  await test("an INTERMEDIATE package deny blocks egress from a descendant cwd (production shape)", async () => {
+    // #803 review cycle 4 P1: production passed `resolveProjectRoot(ctx.cwd)` to
+    // the gate, so a deny BETWEEN the session cwd and the repo root
+    // (`R/pkg/.pi/tortoise-capture.json`, session in `R/pkg/src/deep`) was never
+    // read and the transcript plus the Bearer key went to the hosted endpoint.
+    // This drives the REAL `session_shutdown` handler with NO `projectDir`
+    // override — the input shape production supplies — so deleting the cwd-based
+    // gate would fail it.
+    const dir = tmpProject("reflect-upload-intermediate");
+    execSync("git init -q", { cwd: dir });
+    const pkg = join(dir, "pkg");
+    mkdirSync(join(pkg, ".pi"), { recursive: true });
+    writeFileSync(
+      join(pkg, ".pi", "tortoise-capture.json"),
+      JSON.stringify({ cloud: false }),
+      "utf-8",
+    );
+    const deep = join(pkg, "src", "deep");
+    mkdirSync(deep, { recursive: true });
+    const config = {
+      apiUrl: "https://api.premiselabs.co",
+      apiKey: "tt_x",
+      team: "organisation-design-team",
+      cloud: true,
+    };
+    const calls = await runShutdown(config, { env: {} }, makeCtx(deep));
+    equal(calls.length, 0, "an intermediate-ancestor deny must block the POST");
+  });
 }
 
 // ── Run all suites ──────────────────────────────────────────────────────────

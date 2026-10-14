@@ -153,7 +153,9 @@ try {
   // deny-only ancestor walk closes it; `lstat` keeps a rejected `.git` symlink a
   // boundary instead of an absence.
   for (const [label, mutate] of [
-    ["no .git", (_root: string) => {}],
+    // Actually remove the boundary — a no-op mutation ran against a VALID repo
+    // and its label was false (review cycle 4 observation 1).
+    ["no .git", (root: string) => rmSync(join(root, ".git"), { recursive: true, force: true })],
     ["renamed .git", (root: string) => renameSync(join(root, ".git"), join(root, ".git-bak"))],
     [
       "broken .git symlink",
@@ -200,10 +202,35 @@ try {
       true,
       "a deny at an INTERMEDIATE ancestor applies to its descendants (was enabled)",
     );
+    const intermediateGate = resolveCaptureGate({
+      cloud: true,
+      apiKey: "tt_x",
+      projectDir: deep,
+      env: {},
+    });
+    equal(intermediateGate.reason, "repo-opt-out", "intermediate-ancestor deny yields repo-opt-out");
+    // The disclosure must name the file that ACTUALLY denied (the ancestor), not
+    // `join(deep, …)` — the path a future reader would check and find absent.
     equal(
-      resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: deep, env: {} }).reason,
-      "repo-opt-out",
-      "intermediate-ancestor deny yields repo-opt-out",
+      intermediateGate.projectDenyDir,
+      pkg,
+      "the gate reports the directory that actually denied",
+    );
+    equal(
+      resolveProjectCaptureScope(deep).denyDir,
+      pkg,
+      "resolveProjectCaptureScope reports the denying ancestor",
+    );
+    const line = captureStatusLine({
+      gate: intermediateGate,
+      apiUrl: "https://api.premiselabs.co",
+      fallbackDir: "/tmp/fallback",
+      configPath: "/tmp/tortoise-config.json",
+      projectDir: deep,
+    });
+    ok(
+      line.includes(join(pkg, ".pi", "tortoise-capture.json")),
+      `opt-out line must name the denying ancestor file: ${line}`,
     );
   }
 

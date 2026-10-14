@@ -49,7 +49,6 @@ import {
 import {
   asConfigStringField,
   resolveCaptureGate,
-  resolveProjectRoot,
   type CaptureGateResult,
 } from "../shared/capture-gate.js";
 
@@ -58,7 +57,7 @@ import {
 /** Per-session model cache (per-process instance per extension). */
 const sessionModels = new SessionModelCache();
 
-interface TortoiseConfig {
+export interface TortoiseConfig {
   autoCapture: boolean;
   /** Path to tortoise.db. Default: ~/.tortoise/tortoise.db */
   dbPath?: string;
@@ -381,20 +380,35 @@ export function cloudConfig(config: TortoiseConfig): { apiUrl: string; apiKey: s
 }
 
 /**
+ * The one place this extension builds the shared #803 egress gate. Used by BOTH
+ * the startup disclosure and the `agent_end` handler, so a test that covers this
+ * function covers the decision production makes (an earlier revision left the
+ * extension with an exported gate helper the handler never called — #803 review
+ * cycle 4 P2). `projectDir` is the RAW session cwd; the shared gate resolves the
+ * repo root and walks intermediate ancestors itself.
+ */
+export function resolveCloudGate(
+  config: TortoiseConfig,
+  opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
+): CaptureGateResult {
+  return resolveCaptureGate({
+    cloud: config.cloud,
+    apiKey: cloudConfig(config).apiKey,
+    projectDir: opts?.projectDir ?? process.cwd(),
+    env: opts?.env,
+  });
+}
+
+/**
  * Cloud mode is active only when explicitly opted in AND a key exists AND no
- * repo/env deny (#803). Same shared gate as reflect-hook — see
- * extensions/shared/capture-gate.ts. `projectDir` defaults to process.cwd().
+ * repo/env deny (#803). Thin boolean accessor over {@link resolveCloudGate} —
+ * the same construction the `agent_end` handler uses.
  */
 export function isCloudEnabled(
   config: TortoiseConfig,
   opts?: { projectDir?: string; env?: NodeJS.ProcessEnv },
 ): boolean {
-  return resolveCaptureGate({
-    cloud: config.cloud,
-    apiKey: cloudConfig(config).apiKey,
-    projectDir: opts?.projectDir ?? resolveProjectRoot(process.cwd()),
-    env: opts?.env,
-  }).enabled;
+  return resolveCloudGate(config, opts).enabled;
 }
 
 /** Append a durable JSONL record (shaped like the /v1/sessions payload) BEFORE the network attempt. */
@@ -596,8 +610,14 @@ function runIngest(filePath: string, config: TortoiseConfig, extraArg?: string):
 
 // ── Extension entry point ─────────────────────────────────
 
-export default function tortoiseCapture(pi: ExtensionAPI): void {
-  const config = loadConfig();
+export default function tortoiseCapture(
+  pi: ExtensionAPI,
+  // Test seam mirroring reflect-hook's `createReflectHook(config)`: the loader
+  // calls this with `pi` alone (so `loadConfig()` still runs in production), and
+  // tests inject a hermetic config without touching the module-level cache.
+  opts?: { config?: TortoiseConfig },
+): void {
+  const config = opts?.config ?? loadConfig();
 
   if (!config.autoCapture) {
     console.log("[tortoise-capture] autoCapture disabled — set autoCapture: true in ~/.pi/agent/tortoise-config.json");
@@ -617,16 +637,14 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
   // Lazy evaluation: unless `cloud: true`, do NOT spawn git or resolve the key at
   // all — the default local-capture case must not pay a git subprocess on every
   // event (a non-git cwd would otherwise re-spawn on each agent_end, because a
-  // failed resolution is deliberately never cached).
-  const initProjectDir = config.cloud === true ? resolveProjectRoot(process.cwd()) : process.cwd();
+  // failed resolution is deliberately never cached). The gate's projectDir is the
+  // RAW cwd; the shared gate resolves the repo root and walks intermediate
+  // ancestors itself, so `resolveProjectRoot` here would drop an intermediate
+  // opt-out (#803 review cycle 4 P1).
+  const initProjectDir = process.cwd();
   const initialGate: CaptureGateResult =
     config.cloud === true
-      ? resolveCaptureGate({
-          cloud: config.cloud,
-          apiKey: cloudConfig(config).apiKey,
-          projectDir: initProjectDir,
-          env: process.env,
-        })
+      ? resolveCloudGate(config, { projectDir: initProjectDir, env: process.env })
       : { enabled: false, reason: "cloud-not-enabled" };
 
   // One honest gate line, reused by the egress restatement so the startup
@@ -719,16 +737,10 @@ export default function tortoiseCapture(pi: ExtensionAPI): void {
       // Update tracking state
       state.lastMessageCount = conversation.length;
 
-      const egressProjectDir =
-        config.cloud === true ? resolveProjectRoot(ctx.cwd ?? process.cwd()) : (ctx.cwd ?? process.cwd());
+      const egressProjectDir = ctx.cwd ?? process.cwd();
       const egressGate: CaptureGateResult =
         config.cloud === true
-          ? resolveCaptureGate({
-              cloud: config.cloud,
-              apiKey: cloudConfig(config).apiKey,
-              projectDir: egressProjectDir,
-              env: process.env,
-            })
+          ? resolveCloudGate(config, { projectDir: egressProjectDir, env: process.env })
           : { enabled: false, reason: "cloud-not-enabled" };
       // Restate when the egress decision differs from the startup line (the
       // session's cwd can differ from the launch cwd after a rebind/resume) so
