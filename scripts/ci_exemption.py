@@ -198,6 +198,28 @@ def _failed_candidate(line: str, *, recover_nodeid: bool = True) -> str | None:
     if fields[0] in _FAILED_FIELDS:
         if len(fields) == 1:
             return ""
+        # ⛔ A PROGRESS FRAGMENT IS NOT A FAILURE RECORD (#6917). A run log
+        # ECHOES pytest's progress output, and a leading `FAILED` can land in
+        # front of a bare percentage — `FAILED [  2%]`. That payload is not a
+        # malformed id: there is no id on the line AT ALL, it is progress output.
+        # Counting it as a DROP marks the whole set CLIPPED, and a CLIPPED set is
+        # NOT COMPARABLE to a measured zero (#1319) — so the PR cannot be
+        # certified however green it is, and every re-run RETRACTS the evidence
+        # and fails the same way. Measured on tortoise #6917: a PR with `PR=0`
+        # failing tests was refused, permanently, by `PR=2 | main=0` drops whose
+        # only named token was `[  2%]`.
+        #
+        # ⚠️ THIS TEST MUST RUN BEFORE `_SUMMARY_RE`. That pattern matches ANY
+        # `FAILED <payload>` (its nodeid group is `.+?`), so it accepts
+        # `[  2%]` as a nodeid and returns it — the check placed after it was
+        # unreachable, which is how the first attempt at this fix did nothing
+        # while looking correct.
+        #
+        # The test is deliberately NARROW — the ENTIRE payload must be a
+        # bracketed percentage, so a genuine malformed record still DROPS and
+        # still fails closed. This only stops a progress bar being read as one.
+        if _PROGRESS_FRAGMENT_RE.match(" ".join(fields[1:])):
+            return None
         match = _SUMMARY_RE.match(line.strip())
         if match:
             return match.group("nodeid").strip()
@@ -660,7 +682,12 @@ def decide(
 
     Rules, in order — each one closes a declared class:
 
-    * id unknown to main's measurement -> **BLOCK** (no evidence of pre-existence).
+    * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
+      The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
+      makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
+      Calling it "no main-side measurement" asserted main never ran the file, false
+      whenever main's shards cover it (tortoise #7734); claiming novelty asserts the
+      opposite of what the same baseline can know.
     * signature disjoint from main's -> **BLOCK** (a DIFFERENT failure inside an id
       main also failed; same id is not same failure).
     * THIS id's MAIN row measured over fewer than ``min_runs`` runs -> **BLOCK**
@@ -740,9 +767,28 @@ def decide(
             continue
 
         if mr is None:
+            # ABSENT-FROM-MAIN, not UNMEASURED (tortoise #7734). This reason used to
+            # read "no main-side measurement", which asserts main never ran the file.
+            # That is FALSE whenever main runs it and the test PASSES: the baseline is
+            # FAILURE-ONLY, so a passing test leaves no row — and main's own shard
+            # artifacts (`expected-nodeids.txt`) show it running the very files the old
+            # wording called unmeasured (98/41/23/12 of the blocked nodeids across four
+            # shards, for the four PRs #7734 names).
+            #
+            # It must NOT over-correct into the OPPOSITE claim either. "New here" is
+            # equally unsupported: this branch also fires for `guard-step::` /
+            # `collect-error::` / `watchdog-kill::` / `job-unreadable::` ids, for which a
+            # pytest nodeid manifest is no evidence at all, and the B1 case (main's
+            # docker lane vs a PR's embedded lane) reaches `mr is None` precisely because
+            # the two lanes run different files. So the reason asserts only what the
+            # baseline actually knows: main is not red for this id, and a failure-only
+            # baseline cannot tell "green on main" from "never run on main". THAT is
+            # why it blocks — not because novelty, nor measurement, was established.
             decision.blocked.append(Verdict(
                 nodeid, True,
-                f"no main-side measurement (PR {pr.rate}) — NOT exempt"))
+                f"absent from main's failure set (PR {pr.rate}) — main is not red for "
+                "this id, and a FAILURE-ONLY baseline cannot tell 'green on main' from "
+                "'never run on main', so absence is NOT evidence of novelty — not exempt"))
             continue
 
         if not _signatures_overlap(pr.signatures, sig_main.get(nodeid, frozenset())):
@@ -896,6 +942,11 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # no gain. Dropping a real id here would be fail-OPEN (an undecided id is an
 # unblocked id), which is why this path is deliberately the permissive one.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
+
+# A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
+# percentage pytest's progress line prints, and it is NOT an id of any kind.
+# Used to keep a progress bar from being read as a failure RECORD (#6917).
+_PROGRESS_FRAGMENT_RE = re.compile(r"^\[\s*\d{1,3}%\]$")
 
 # ── NON-NODEID failure identities (#6798) ────────────────────────────────
 # A failing run does not always name a `::nodeid`. Two measured shapes carry a
@@ -1151,12 +1202,22 @@ _GUARD_KEY_RE = re.compile(r"^guard-step::[A-Za-z0-9_.\-]+::[A-Za-z0-9_.\-]+$")
 _GUARD_INT_RE = re.compile(r"\b\d+\b")
 
 
-#: A NON-NODEID failure key (#6798) — the third family the rate/row doors must
+#: A NON-NODEID failure key (#6798, #7131) — the families the rate/row doors must
 #: admit. ANCHORED and fully enumerated: this predicate is the gate on main's own
 #: rate table, so admitting a loose string here is a false-EXEMPTION vector, not
 #: a formatting nicety.
+#:
+#: `job-unreadable::<slug>` (#7131) is the JOB-LEVEL fallback the producer emits
+#: when GitHub has PRUNED a failing run's log — the test-level identity does not
+#: exist anywhere, so the run is attributed at job granularity instead of being
+#: refused as unknowable. It carries NO signature, which is what keeps it safe:
+#: the signature gate fails CLOSED on an empty overlap, so a job-level key can
+#: never buy an exemption — it converts an unreadable refusal into a named,
+#: attributable block. The slug charset is exactly `_slug`'s, so the key stays
+#: whitespace-free for the `uniq -c | awk` rate table.
 _NON_NODEID_KEY_RE = re.compile(
-    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py)$"
+    r"^(?:watchdog-kill::pytest|collect-error::[A-Za-z0-9_./\-]+\.py"
+    r"|job-unreadable::[A-Za-z0-9_.\-]+)$"
 )
 
 
@@ -1519,6 +1580,15 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
             # `_collection_error_id` requires the `ERROR` keyword, which is the
             # only form pytest emits for a collection error.
             if _collection_error_id(stripped) is not None:
+                continue
+            # #6917: the SAME rule as `_failed_candidate`, in the SAME order — a
+            # pytest PROGRESS fragment is not a record, so it is not a drop here
+            # either. The module's header promises ONE candidate rule across both
+            # doors; `_SUMMARY_RE`'s nodeid group is `.+?` and accepts `[  2%]`,
+            # so without this the sibling door reported `rejected=1` for a line
+            # the `ids` door had already declined to count — the exact asymmetry
+            # the collection-error intercept above exists to avoid.
+            if _PROGRESS_FRAGMENT_RE.match(nodeid):
                 continue
             rejected.append(stripped)
             continue

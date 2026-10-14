@@ -1989,6 +1989,18 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   // deregister a worktree the caller does not control (code-review-cycle-9 P1),
   // so it cannot be pointed at the hub or another checkout.
   "scripts/scratch-worktree.sh",
+  // #1484/#1141 class, second instance — the review RECORDER. `record-review.sh` is mandated by the
+  // review/merge path and its git surface is READ-ONLY (`merge-tree` incl. `--write-tree`,
+  // `merge-base`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`, `diff`) — no `checkout`/`reset`/
+  // `clean`/`stash`/`commit`/`push`/`rebase`/`worktree remove`. It is therefore LESS privileged
+  // than the two entries above, which do `worktree add/remove/prune`, `sparse-checkout` and
+  // `read-tree`. Without this entry its content walk blocks exactly the hub-rooted lanes the merge
+  // path is written for, and the only remaining route is the improvisation this guard exists to
+  // stop: measured 2026-10-05, a lane that had completed a review (tortoise #7433, comment
+  // 6000279278) could review but never RECORD, which left a reviewed-but-unlandable PR — and the
+  // same step gates every `blocked` row of the drain, since the rail requires a record bound to the
+  // current head.
+  "scripts/record-review.sh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {

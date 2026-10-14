@@ -132,7 +132,14 @@
 #              `success`, `failure`, `timed_out`. NOT `cancelled`/`skipped`
 #              (finished without running the suite) and NOT `startup_failure`
 #              (the workflow never started — nothing ran at all).
-#   pending    lane runs still queued/in-progress
+#   pending    lane runs still queued/in-progress — MINUS a run GitHub never
+#              EXPANDED into a job, i.e. one whose jobs API answers 0 (#1623; see
+#              `run_is_unexpanded` and the discriminator in `collect_union`). Such
+#              a run is un-startable AND un-cancellable and persists, so counting
+#              it would block a reviewed head forever. An UNREADABLE job count is
+#              NOT zero, so this exception fails CLOSED — and a run that has merely
+#              not expanded YET cannot enter `tested` either, so a listing holding
+#              ONLY such runs is refused by the `tested > 0` precondition regardless.
 #   `examined=0` is NOT a failure — a green lane legitimately has none. The
 #   vacuity signal is `tested=0`: it means nothing about this revision was ever
 #   exercised, so an empty failing set proves nothing. A failures-only
@@ -435,6 +442,10 @@ extract_failed_tests() {
   case "$rc" in
     0) ;;
     2) rm -f "$log_file"; return 2 ;;
+    # #7131: the log is PRUNED (not merely unreadable). Degrade to the job-level
+    # identities the jobs API still serves. If even that fails, return 1 and the
+    # caller refuses exactly as before.
+    3) rm -f "$log_file"; run_failed_job_ids "$run_id"; return $? ;;
     *) rm -f "$log_file"; return 1 ;;
   esac
   failed_ids_from_log "$log_file"
@@ -465,6 +476,109 @@ run_job_count() {
   printf '%s\n' "$count"
 }
 
+# run_is_unexpanded <run-id> — true (exit 0) ONLY when the Jobs API PROVES the run
+# has ZERO jobs, i.e. GitHub never expanded it runner-side (#1623).
+#
+# GitHub can leave a workflow run `queued` FOREVER without ever creating a job for
+# it: measured on agent-infra PR #1615 at 194f1d83 — three runs reporting
+# `status=queued`, `conclusion=null`, `run_attempt=1` whose jobs API answered
+# `{"jobs":[]}`, while `POST /actions/runs/<id>/cancel` refused with "Cannot cancel
+# a workflow run that has not been queued yet". There is no delete-run API, so such
+# a run is un-startable AND un-cancellable AND persistent: counting it as `pending`
+# blocks a reviewed head permanently, and the printed remedy ("wait for CI, then
+# re-run the rail") can never clear it. A run that has exercised NO job is, by
+# GitHub's own admission, not in flight.
+#
+# FAIL CLOSED ON THE PROBE. A count that cannot be ESTABLISHED is not zero — the
+# same rule `fetch_failed_log` applies in its three-way branch — so a run whose
+# count is unreadable stays `pending`. No new API path: the count is
+# `run_job_count`'s, the Jobs API this file already reads for #1482 and for the
+# per-shard bound. It is spent ONE per run that is not `completed`, so a listing
+# whose runs have all finished (the ordinary merge path) costs NOTHING new.
+#
+# NO AGE BOUND, DECIDED DELIBERATELY. `jobs == 0` cannot by itself tell "not
+# expanded YET" from "never will be", and a clock could: only a run older than the
+# jobs-materialisation delay would be suppressed. It is not added, for two reasons.
+# (a) It would not buy safety. A run with no jobs is not TESTING the revision, so
+# it cannot enter `tested`; a listing whose only non-completed runs are unexpanded
+# therefore has `tested=0` and is REFUSED by the `tested > 0` precondition in
+# admin-merge.sh §1b and by `check-lane-tested.sh` at the detector — independently
+# of this counter. That holds for the LANE-FILTERED listing. It is qualified under
+# `--any-workflow`, where `tested` counts ANY workflow's completed run at the head:
+# there a suppressed test-lane run can be paired with an unrelated green workflow,
+# so suppression CAN be the thing that lets a merge proceed. The net is therefore
+# `tested > 0`, not this counter — see the qualification at the `any_workflow`
+# branch below.
+# (b) The only clock reachable here is a run-listing `createdAt`, which this file's
+# projection deliberately does not carry: the canonical three fields ARE the whole
+# of admin-merge.sh's mirrored `LANE_RUN_JQ`, and `drop_superseded_runs` fails
+# closed on any arity it does not recognise. Adding a field to serve one caller
+# would re-shape a shared, adversarially-hardened listing.
+# STATED RESIDUAL: a run created moments ago that has not yet materialised its jobs
+# is omitted from `pending` for that window. It is never credited to `tested`, and
+# when it is the listing's only run the head is refused as untested — which is the
+# over-block this defect is about, in the opposite (safe) direction.
+run_is_unexpanded() {
+  local id="$1" jobs
+  jobs="$(run_job_count "$id")" || return 1
+  [ "$jobs" = "0" ]
+}
+
+# run_failed_job_ids <run-id> → `job-unreadable::<slug>` for every failed job of
+# the run, one per line (#7131).
+#
+# THE FALLBACK SURFACE. When GitHub has pruned a failing run's log, the test-level
+# identity is not recoverable from ANY surface — the check-run annotations carry
+# only `Process completed with exit code N.`, which is explicitly never an
+# identity (`_RUNNER_GENERIC_ANNOTATIONS`). What the jobs API still serves is the
+# failed JOB NAMES, so the failure can be attributed at that granularity instead
+# of being refused as unknowable.
+#
+# WHY THIS IS SAFE AND NOT A FAIL-OPEN: the keys this emits carry no signature
+# anywhere, and the decision's signature gate fails CLOSED on an empty overlap.
+# A job-level key therefore BLOCKS rather than exempts — it can only convert an
+# unreadable refusal into a NAMED block, never buy a merge. Admission to the key
+# universe is what matters (a rejected PR row makes `decide` see an EMPTY set and
+# certify a red PR — the silent false PASS the #6798 pair of predicates exists to
+# prevent), which is why `job-unreadable::` is enumerated in
+# `ci_exemption.py`'s `_NON_NODEID_KEY_RE`, gating BOTH doors.
+#
+# Fail-closed: an API error, or a run whose failed-job list comes back empty, is
+# return 1 — the caller then refuses exactly as it did before this change.
+#
+# The slug is `[A-Za-z0-9_.-]` (whitespace-free, matching `_GUARD_KEY_RE`'s
+# charset) so the key survives the `uniq -c | awk` rate table, and it is a pure
+# function of the JOB NAME so a PR and main slug the same job to the same key.
+# Runs of punctuation collapse to ONE dash and the ends are trimmed, so the
+# matrix job `test (d)` reads as `job-unreadable::test-d` rather than `test--d-`.
+# Two distinct job names CAN collide after slugging (`test (d)` / `test-d`); that
+# is harmless here because the key asserts only "a job with this slug failed",
+# which is exactly the granularity the fallback claims.
+run_failed_job_ids() {
+  local run_id="$1" slug names out
+  # Same slug resolution as run_job_count (`gh api` has no `--repo`; it resolves
+  # from the CWD), so the fallback cannot silently read the wrong repository.
+  if [ -n "${repo:-}" ]; then slug="repos/$repo"; else slug="repos/{owner}/{repo}"; fi
+  names="$($GH api "$slug/actions/runs/${run_id}/jobs" --paginate \
+    --jq '.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out" or .conclusion=="startup_failure") | .name' 2>/dev/null)" || return 1
+  [ -n "$names" ] || return 1
+  # ⛔ DEDUPE PER RUN — THIS IS LOAD-BEARING, NOT TIDINESS (review cycle 1, P0).
+  # `collect_union_rows` counts LINES per id against `runs` = the run count, so a
+  # second emission of the same key in ONE run yields `failures > runs`. Two
+  # distinct job names CAN slug alike by design (the comment on the slug below
+  # says so), and `parse_failure_rows` REJECTS a row whose failures exceed its
+  # runs — a rejected row is not a block, it is an ABSENCE, so `decide` would see
+  # an EMPTY set and emit CLEAN for a red PR. One run contributes each key at
+  # most once, exactly as the log path's `sorted(set(ids))` does.
+  out="$(printf '%s\n' "$names" | while IFS= read -r one; do
+    local s
+    s="$(printf '%s' "$one" | sed 's/[^A-Za-z0-9_.-]/-/g; s/--*/-/g; s/^-//; s/-$//')"
+    [ -n "$s" ] && printf 'job-unreadable::%s\n' "$s"
+  done | sort -u)"
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
 # fetch_failed_log <run-id> <out-file> — the RAW `gh run view --log-failed`
 # capture, for the callers that need the failure TEXT and not only the ids.
 #
@@ -474,7 +588,15 @@ run_job_count() {
 #
 # Return: 0 = captured · 1 = FAIL CLOSED (unknowable) · 2 = ZERO-JOB run, which
 # contributes NOTHING and is not an error (the only non-zero status a caller may
-# treat as benign — see #1482).
+# treat as benign — see #1482) · 3 = the log is PROVEN ABSENT (GitHub pruned it),
+# which is #7131: absence is still not an empty set, but it is not UNKNOWABLE
+# either — the run can be attributed at JOB granularity, so the callers degrade
+# instead of refusing.
+#
+# ⚠ THE 1-vs-3 SPLIT IS LOAD-BEARING. Only the DEFINITIVE `log not found` earns 3.
+# A transport error (auth, network, rate limit) stays 1 and keeps its refusal,
+# because for those the log may well exist and a retry can recover it — treating
+# them as pruned would trade a recoverable refusal for a permanent one.
 #
 # ⚠ ONE MESSAGE PER RUN, EMITTED AFTER the discrimination. Printing the refusal
 # first and then the exemption made the rail say "the failure set is UNKNOWABLE,
@@ -508,7 +630,8 @@ fetch_failed_log() {
   esac
   case "$err" in
     *"log not found"*)
-      say_err "ci-failure-set: ✗ run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — the failure set is UNKNOWABLE, refusing to read this as an empty failing set" ;;
+      say_err "ci-failure-set: · run $run_id has NO LOG (GitHub pruned it); its job count $jobs_note — falling back to the JOB-LEVEL failure set (#7131): the test-level identity does not exist on any surface, so the run is attributed by failed JOB NAME and, carrying no signature, cannot be exempted"
+      return 3 ;;
     *)
       say_err "ci-failure-set: ✗ could not fetch the failed-step log for run $run_id (gh error); its job count $jobs_note — refusing to read this as an empty failing set" ;;
   esac
@@ -606,7 +729,20 @@ collect_union() {
         success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
-      pending=$((pending + 1))
+      # #1623 — AN UNEXPANDED RUN IS NOT IN FLIGHT. GitHub can leave a run
+      # `queued` with no job EVER created; counting it as `pending` blocks a
+      # reviewed head permanently (see `run_is_unexpanded`). An unreadable probe
+      # or a count > 0 still counts as pending (fail closed). A RUN THAT HAS MERELY
+      # NOT EXPANDED YET IS STILL SAFE: while it is not being expanded it is not
+      # being tested either, so it cannot enter `tested`, and a listing that holds
+      # ONLY such runs leaves `tested=0` — refused by the independent `tested > 0`
+      # precondition here and by `check-lane-tested.sh` at the detector. This
+      # counter is not the gate that proves a revision was exercised.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in
       failure|timed_out|startup_failure) ;;
@@ -670,7 +806,12 @@ collect_union_rates() {
         success|failure|timed_out) tested=$((tested + 1)); credited=1 ;;
       esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in
       failure|timed_out|startup_failure) ;;
@@ -727,7 +868,12 @@ collect_union_signatures() {
       completed=$((completed + 1))
       case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
     examined=$((examined + 1))
@@ -739,6 +885,14 @@ collect_union_signatures() {
       # Zero-job run: contributes no ids AND no signature, and must not be
       # credited as having exercised the suite (#1482).
       [ "$credited" = "1" ] && tested=$((tested - 1))
+      rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -eq 3 ]; then
+      # #7131: the log is PRUNED — there is no capture to sign. The job-level
+      # fallback deliberately emits NO signature (that is what keeps the key
+      # fail-closed at the decision), so this door contributes nothing and must
+      # not abort the collection.
       rm -f "$log_file"
       continue
     fi
@@ -799,7 +953,12 @@ collect_union_rows() {
       completed=$((completed + 1))
       case "$conclusion" in success|failure|timed_out) tested=$((tested + 1)); credited=1 ;; esac
     else
-      pending=$((pending + 1))
+      # #1623 — an unexpanded run is not in flight; see `collect_union`.
+      if run_is_unexpanded "$run_id"; then
+        say_err "ci-failure-set: · run $run_id is NOT completed but has ZERO jobs — GitHub never expanded it into a job, so it cannot still be running; NOT counted as pending (#1623)"
+      else
+        pending=$((pending + 1))
+      fi
     fi
     case "$conclusion" in failure|timed_out|startup_failure) ;; *) continue ;; esac
     examined=$((examined + 1))
@@ -814,6 +973,23 @@ collect_union_rows() {
       # stays fail-closed by construction, which is deliberate.
       [ "$credited" = "1" ] && tested=$((tested - 1))
       rm -f "$log_file"
+      continue
+    fi
+    if [ "$frc" -eq 3 ]; then
+      # #7131: the log is PRUNED. Attribute at JOB granularity instead of
+      # refusing as unknowable. `extracted` MUST advance when ids come back —
+      # otherwise the `examined > extracted` gate in admin-merge.sh refuses the
+      # run and the fallback buys nothing. NO signature is emitted, so the
+      # decision's signature gate fails CLOSED and the key can never be exempted.
+      rm -f "$log_file"
+      ids="$(run_failed_job_ids "$run_id")" || { rm -f "$tmp_ids" "$tmp_sigs"; return 1; }
+      if [ -n "$ids" ]; then
+        extracted=$((extracted + 1))
+        printf '%s\n' "$ids" >> "$tmp_ids"
+        if [ -n "$per_run" ]; then
+          printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
+        fi
+      fi
       continue
     fi
     if [ "$frc" -ne 0 ]; then

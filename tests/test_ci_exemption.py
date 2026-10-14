@@ -184,6 +184,38 @@ def test_pytest_progress_line_is_not_a_record_and_not_a_drop():
     assert parsed.rejected == []
 
 
+def test_a_leading_FAILED_before_a_PROGRESS_FRAGMENT_is_skipped_not_dropped():
+    """`FAILED [  2%]` is a progress bar in front of the record anchor, not a record.
+
+    ⛔ THIS IS NOT A LOOSENING. A run log echoes pytest's progress output, and a
+    leading `FAILED` can land in front of a bare percentage. That payload is not a
+    malformed id — there is NO id on the line at all — so counting it as a drop
+    marks the whole set CLIPPED, and a CLIPPED set is NOT COMPARABLE to a measured
+    zero (#1319). The PR then cannot be certified however green it is, and every
+    re-run RETRACTS the evidence (`<!-- admin-merge-retraction: … -->`) and fails
+    the same way.
+
+    Measured on tortoise #6917: `PR=0` failing tests, refused permanently by
+    `PR=2 | main=0` drops whose only named token was `[  2%]`.
+
+    ⚠️ `_SUMMARY_RE` must NOT be consulted first: its nodeid group is `.+?`, so it
+    accepts `[  2%]` AS a nodeid and returns it. The first attempt at this fix put
+    the check after the summary match, was unreachable, and silently did nothing.
+    """
+    parsed = parse_failed_ids("FAILED [  2%]\n", raw_log=True)
+
+    assert parsed.ids == []
+    assert parsed.rejected == [], "a progress bar is not a record, so not a drop"
+
+    # The NARROWNESS that keeps it fail-closed: only an ENTIRELY bracketed
+    # percentage qualifies. Anything else is still a malformed record -> DROPPED.
+    for malformed in ("FAILED [ 47%] something-extra\n", "FAILED garbage\n"):
+        p = parse_failed_ids(malformed, raw_log=True)
+        assert p.ids == [], malformed
+        assert p.rejected, f"{malformed!r} must still be a counted drop"
+        assert p.ok is False
+
+
 def test_a_leading_FAILED_with_a_non_nodeid_payload_is_still_counted():
     """The anchor narrows WHERE a record starts — it does not loosen what one
     needs. A malformed record at line start is still DROPPED and COUNTED, so the
@@ -528,8 +560,9 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
     intercept first (the missing main signature fails the overlap check), so the
     mutation does not surface as an exemption here — the reason assertion is what
     pins the membership gate. MUTATION: remove the `mr is None` membership block →
-    the blocked reason changes → this REDs on the `"no main-side measurement"`
-    assertion.
+    the blocked reason changes → this REDs on the `"absent from main's failure set"`
+    assertion. That wording is itself pinned (tortoise #7734): the reason must not
+    claim main never MEASURED the file, which the failure-only baseline cannot know.
     """
     other = "tests/test_other.py::TestT::test_other"
     decision = decide(
@@ -538,7 +571,13 @@ def test_5250_a_thin_pr_sample_does_not_exempt_an_id_main_never_failed():
     )
 
     assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert "absent from main's failure set" in decision.blocked[0].reason
+    assert "no main-side measurement" not in decision.blocked[0].reason
+    # #7734: the reason must claim NEITHER un-measurability NOR novelty. The old text
+    # asserted the first; asserting the second would be equally unsupported for the
+    # non-nodeid families this branch also covers. Pin the honest clause positively.
+    assert "NOT evidence of novelty" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
     assert decision.visible_exemptions() == []
 
 
@@ -737,7 +776,8 @@ def test_an_id_main_never_failed_is_always_pr_unique():
     )
 
     assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
 
 
 # ── verdict-stability · the ACCEPTANCE test ───────────────────────────────
@@ -1649,8 +1689,8 @@ def test_guard_step_absent_from_main_still_blocks():
         k_pr=8,
     )
 
-    assert decision.any_blocked
-    assert "no main-side measurement" in decision.blocked[0].reason
+    assert decision.blocked[0].blocked is True
+    assert "absent from main's failure set" in decision.blocked[0].reason
 
 
 def test_a_pytest_nodeid_is_never_re_keyed_as_a_guard_step():
