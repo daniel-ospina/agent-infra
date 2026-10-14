@@ -38,13 +38,19 @@ steps:
 > |---|---|---|
 > | **A — Correctness & Discriminating Power** | #1 Correctness & Quality + #4 Test Quality | is each assertion *correct*, and does it actually discriminate? Runs **two ordered passes** — mechanical correctness, then semantic strength |
 > | **B — Coverage, Surface & Journey Alignment** | #2 Coverage & Surface Alignment + #3 Journey Alignment | does the suite cover the required surfaces and journey steps, at the right layer? |
-> | **C — E2E & Reproducibility** (conditional) | new — dispatches `skills/reviewers/e2e-coverage`, `skills/reviewers/e2e-reproducibility` | fires only when the change touches e2e surfaces |
+> | **C — E2E & Reproducibility** (conditional) | new — covers the e2e-coverage and reproducibility concerns; consults `skills/reviewers/e2e-coverage`, `skills/reviewers/e2e-reproducibility` as supplementary references | fires only when the change touches e2e surfaces |
 >
-> **Why the two passes stay ordered.** `skills/reviewers/test-quality/SKILL.md` records the boundary: a test can pass mechanical correctness and still be a weak test that proves nothing. Merging the *dispatch* must not merge the *judgement* — so pass 2 is a separate pass with its own `ISSUE:` output and its own `check:` field (TQ1–TQ7), and it runs **after** pass 1, never instead of it.
+> **Why the two passes stay ordered.** `skills/reviewers/test-quality/SKILL.md` records the boundary: a test can pass mechanical correctness and still be a weak test that proves nothing. Merging the *dispatch* must not merge the *lens* — so pass 2 keeps its own `ISSUE:` output and its own `check:` field (TQ1–TQ7), and it runs **after** pass 1, never instead of it.
+>
+> **What the merge does cost — independence, stated rather than claimed away.** Both passes run in **one `task` dispatch, one context**. Before the merge, reviewer #4 was a separate fresh sub-agent that had never seen reviewer #1's conclusions; pass 2 now runs in the agent that produced pass 1, so it is **not** independent of pass 1's findings the way a fresh dispatch is. The independence guarantee this skill relies on (`CRITICAL: Every review cycle dispatches FRESH task sub-agents`) holds **across cycles**, not within a dispatch. The ordered passes preserve the *lens distinction*, not cross-pass blindness — a deliberate trade for the dispatch reduction, recorded on #1538.
+>
+> **A's combined verdict — the clean exit is a verdict, not a token match.** A emits per-pass verdicts **and exactly one overall verdict line**: `REVIEWER A VERDICT: CLEAN` only when **both** passes returned `NO ISSUES FOUND`; otherwise `REVIEWER A VERDICT: ISSUES`. A response that prints `NO ISSUES FOUND` for pass 1 and `ISSUE:` blocks for pass 2 is `REVIEWER A VERDICT: ISSUES` and is **not** clean — see Phase 4's exit conditions.
 >
 > **The count.** `proportional-gates` §Review Cycles **owns** the reviewer-count table and is unchanged. `test-review`'s merged panel is **2** (3 when C fires), so a High-risk test review fields at most 3; the table's "4" is an upper bound this panel cannot reach, and depth is scaled *inside* A and B instead (A's two passes always run). Deliberate — see the `OVERRIDES:` line on #1538.
 >
-> Supersedes `test-review`'s reviewer-count clause only (not the HOW/WHAT boundary), extending #1538/#1539 from `code-review` to this skill. Measured basis: a live review of DMeer PR #1112 made **45 `task` dispatches, 16 of them (36%) test-review reviewers** — the largest single block — and host load reached 115.
+> **Precedence change (intentional).** With the grouping, Phase 2's tie-break sort becomes pass 1 > pass 2 > coverage/surface > journey; it was correctness > coverage > journey > test-quality. `test-quality` moves from last to second and `journey` to last, so the semantic-strength pass is never filed below the coverage or journey lenses at equal severity.
+>
+> Supersedes `test-review`'s reviewer-count clause only (not the HOW/WHAT boundary), extending #1538/#1539 from `code-review` to this skill. Load rationale and metrics: #1538.
 
 
 # Test Review
@@ -152,7 +158,7 @@ This creates a searchable memory that future Tortoise lookups (Phase 0a) will fi
 
 #### Phase 0d — Output
 
-Produce a `### Testing Knowledge` block with ALL findings (from knowledge base + Tortoise + fresh research). Inject as context for every merged reviewer and the fixer:
+Produce a `### Testing Knowledge` block with ALL findings (from knowledge base + Tortoise + fresh research). Inject it as context for the reviewers whose prompts carry a `TESTING KNOWLEDGE` field — **Reviewer A's pass 1** and **Reviewer B's part 1** — and for the fixer. The semantic-strength pass (A pass 2), the journey pass (B part 2), and Reviewer C do not take the field:
 
 ```markdown
 ### Testing Knowledge (research intake)
@@ -293,6 +299,11 @@ P2=test-data quality or excessive mocking
 If no issues: NO ISSUES FOUND
 ```
 
+**A's required output — both passes, then one verdict.** Print pass 1's `ISSUE:` blocks (or `NO ISSUES FOUND`) first, then pass 2's, then exactly one line:
+`REVIEWER A VERDICT: CLEAN` — only when **both** passes returned `NO ISSUES FOUND`
+`REVIEWER A VERDICT: ISSUES` — otherwise, with both passes' issues listed above
+A response carrying `NO ISSUES FOUND` from pass 1 and `ISSUE:` blocks from pass 2 is `REVIEWER A VERDICT: ISSUES`, never clean.
+
 ---
 
 **Reviewer B — Coverage, Surface & Journey Alignment.**
@@ -401,9 +412,7 @@ If no issues: NO ISSUES FOUND
 
 ---
 
----
-
-**Reviewer C — E2E & Reproducibility** (conditional — dispatch ONLY when the change touches e2e surfaces: an E2E scenario, a Playwright/browser surface, or a change to how a failure is reproduced):
+**Reviewer C — E2E & Reproducibility** (conditional — dispatch ONLY when the change touches e2e surfaces: an E2E scenario, a Playwright/browser surface, or the failure-reproduction path of an e2e/browser test. A unit-test pin that is not part of an e2e surface does NOT fire C):
 
 ```
 You are reviewing tests for end-to-end coverage and reproducibility. Your job is to find gaps — NOT to fix them.
@@ -441,7 +450,7 @@ P2=weaker assertion than the scenario requires
 If no issues: NO ISSUES FOUND
 ```
 
-Catalog checklists for this reviewer: `skills/reviewers/e2e-coverage/SKILL.md` and `skills/reviewers/e2e-reproducibility/SKILL.md`.
+**C's specification is the inline prompt above — not a catalog.** `skills/reviewers/e2e-coverage/SKILL.md` and `skills/reviewers/e2e-reproducibility/SKILL.md` are **supplementary references** for the e2e-coverage and reproducibility concerns; both are plan-pipeline catalogs whose required inputs are epic-doc sections (Detailed E2E, User Journeys, Data Model, Architecture) and whose output shape is `ISSUE #N / Dimension: …`, so neither can be run against a test file as-is. Read them for their concern list and check IDs (`E2E1–E2E7`, `E2R1–E2R7`); emit findings in C's `ISSUE:` shape above.
 
 ---
 
@@ -449,7 +458,7 @@ Catalog checklists for this reviewer: `skills/reviewers/e2e-coverage/SKILL.md` a
 
 1. Parse all `ISSUE:` blocks from reviewer outputs
 2. Dedup: same location + similar description → keep higher severity
-3. Sort: P0 > P1 > P2, then pass 1 (mechanical correctness) > pass 2 (semantic strength) > coverage/surface > journey
+3. Sort: P0 > P1 > P2, then pass 1 (mechanical correctness) > pass 2 (semantic strength) > coverage/surface > journey (pre-merge this was correctness > coverage > journey > test-quality — the change is intentional, see the v1.1.0 note)
 4. If zero issues → tests are clean, exit with `NO ISSUES FOUND`
 
 ### Phase 3 — Fix (Research-Backed)
@@ -477,12 +486,15 @@ Each review cycle dispatches FRESH `task` sub-agents. Reviewers have no memory o
 
 For each cycle:
 1. Dispatch all applicable reviewers in parallel via `task` tool (fresh `pi -p` sessions)
-2. Parse responses: all return "NO ISSUES FOUND" → exit clean. Issues found → Phase 2-3.
+2. Parse responses: every dispatched reviewer must return its clean verdict → exit clean. Issues found → Phase 2-3.
 3. After fixes applied, go to step 1 (repeat cycle)
+
+**The clean verdict is per-reviewer and unambiguous — a bare `NO ISSUES FOUND` is NOT enough.** Reviewer A returns **one overall verdict**, `REVIEWER A VERDICT: CLEAN`, which requires *both* of its ordered passes to be clean. A response that prints `NO ISSUES FOUND` for pass 1 and `ISSUE:` blocks for pass 2 is `REVIEWER A VERDICT: ISSUES` and does **not** exit the loop — this is the fail-open the per-pass combination rule closes. Reviewer B returns `NO ISSUES FOUND`; Reviewer C, when dispatched, returns `NO ISSUES FOUND`.
 
 **Exit conditions — ALL must be true:**
 
-- [ ] Last cycle's all reviewers returned "NO ISSUES FOUND" (verbatim, not paraphrased)
+- [ ] Last cycle's every dispatched reviewer returned its clean verdict **verbatim** (not paraphrased): Reviewer A → `REVIEWER A VERDICT: CLEAN` (both passes clean), Reviewer B → `NO ISSUES FOUND`, and Reviewer C → `NO ISSUES FOUND` if it was dispatched
+- [ ] The cycle log records whether C was dispatched: `C: dispatched` or `C: skipped (<reason>)` — an unrecorded skip counts as C not having run
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
@@ -513,6 +525,8 @@ After all reviewers return clean, output:
 ✅ Test review complete:
   - Review cycles: N
   - Reviewers per cycle: 2 (A, B) — or 3 when C fires (e2e)
+  - Reviewer A: pass 1 <CLEAN | N issues>, pass 2 <CLEAN | N issues> — combined verdict CLEAN
+  - Reviewer C: dispatched | skipped (<reason>)
   - Issues found and fixed: N
   - Final status: CLEAN
 

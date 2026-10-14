@@ -277,9 +277,9 @@ test-review <test-file> --surface-map "<extract from plan doc>" [--journey-map "
 
 `test-review` handles the full cycle:
 - **Phase 0 — Research Intake:** Researches testing patterns for the surfaces under test
-- **Phase 1 — Review:** 4 parallel fresh sub-agents (correctness, coverage+surface, journey-alignment, test-quality)
+- **Phase 1 — Review:** 2 merged fresh sub-agents (A correctness + discriminating power; B coverage/surface/journey), plus C (e2e + reproducibility) when e2e surfaces are touched
 - **Phase 2-4 — Fix + Re-review Loop:** Surgical fixes, fresh re-review, to test-review's own convergence rule (fingerprint-stall; 10-cycle safety cap — see test-review §Phase 4)
-- **Exit:** Clean (all reviewers return NO ISSUES FOUND) or capped with documented remaining issues
+- **Exit:** Clean (Reviewer A's combined verdict is `REVIEWER A VERDICT: CLEAN` — both its ordered passes clean — and every other dispatched reviewer returns `NO ISSUES FOUND`) or capped with documented remaining issues
 
 **If `test-review` returns capped:** flag the remaining issues as P1 with `check_type: test-quality-gap`. Include them in the review output.
 

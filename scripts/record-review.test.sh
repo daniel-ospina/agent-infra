@@ -2593,8 +2593,8 @@ done
 # `issues? remain` alone), so each must be pinned by a vector or a later edit can
 # drop its alternative with no red test — the false-pin failure 13g2's backslash
 # arm just suffered. Both forms of the test-review marker are pinned: the literal
-# un-substituted `N` template (skills/test-review/SKILL.md:433) and the
-# digit-substituted one.
+# un-substituted `N` template (`⚠️ Test review capped at 10 cycles — N issues remain:`
+# in skills/test-review/SKILL.md) and the digit-substituted one.
 rm -f "$(Q2 424766)"
 EV_REF="comment:42476601" run_record_ev 424766 \
     STUB_EVIDENCE_BODY="⚠️ Test review capped at 10 cycles — N issues remain:
