@@ -2890,6 +2890,40 @@ await test("#1662: a background dispatch's returns-early result does NOT advance
   } finally { auditRelease(); }
 });
 
+await test("#1662 review: re-collecting the SAME terminal task_collect does NOT advance the verifier step twice", async () => {
+  _resetStateForTest();
+  const { pi, handlers } = fakePi();
+  auditCapture();
+  try {
+    await withEnv(
+      { PI_MODE: "print", AGENT_SEQUENCE_MODE: "warn", AGENT_STATE_MACHINE: undefined, ELDATO_STATE_MACHINE: undefined },
+      async () => {
+        sequenceEnforcer(pi as any);
+        _pushSkillForTest("/repo/skills/bg-dedupe/SKILL.md", verifierSkillSteps(), 1);
+
+        // two background reviewers dispatched at the verifier step
+        await handlers.tool_call!({ toolName: "task", input: { background: true } });
+        await handlers.tool_call!({ toolName: "task", input: { background: true } });
+        equal(_stackForTest()[0]!.reviewers.get(1), 2, "two background reviewers counted");
+
+        // the first verdict lands
+        await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, "one verdict of two must NOT advance the step");
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "one reviewer still pending");
+
+        // the SAME run re-collected (`task_collect` is idempotent) — must not count again
+        await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        equal(_stackForTest()[0]!.stepIndex, 1, "a repeated collect of the same run must NOT advance the step");
+        equal(_stackForTest()[0]!.reviewers.get(1), 1, "a repeated collect must not decrement again");
+
+        // the second, distinct verdict advances
+        await handlers.tool_result!({ toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-B" } });
+        equal(_stackForTest()[0]!.stepIndex, 2, "the second distinct verdict advances the step");
+      },
+    );
+  } finally { auditRelease(); }
+});
+
 await test("warn mode: sequence timer does NOT park a backdated checkpoint owner (park is gate/strict-only; re-arm persists)", async () => {
   _resetStateForTest();
   const { pi, handlers } = fakePi();

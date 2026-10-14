@@ -149,6 +149,14 @@ interface SkillState {
   stepIndex: number;
   stepStartedAt: number;
   reviewers: Map<number, number>; // dispatched reviewer count per step
+  // #1662 review: run_ids whose terminal `task_collect` has already been
+  // counted as a reviewer completion. `task_collect` is idempotent — the same
+  // terminal run can be reaped repeatedly — so without this a repeated collect
+  // decrements the count a second time and advances the verifier step with
+  // fewer real verdicts than were dispatched. Per-skill (not per-step): a run
+  // belongs to exactly one dispatch, and a duplicate must stay ignored even
+  // after the step advances.
+  countedCollects: Set<string>;
 }
 
 const stepCache = new Map<string, Step[] | null>();
@@ -1638,7 +1646,7 @@ function parkCheckpoint(skill: SkillState, reason: string): void {
 
 export function _pushSkillForTest(path: string, steps: Step[], stepIndex = 0): void {
   if (process.env.NODE_ENV !== "test") return;
-  skillStack.push({ path, steps, stepIndex, stepStartedAt: Date.now(), reviewers: new Map() });
+  skillStack.push({ path, steps, stepIndex, stepStartedAt: Date.now(), reviewers: new Map(), countedCollects: new Set() });
 }
 
 export function _stackForTest(): SkillState[] {
@@ -1874,7 +1882,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     // Push new skill onto stack (replace if top was completed & popped above)
-    skillStack.push({ path, steps, stepIndex: 0, stepStartedAt: Date.now(), reviewers: new Map() });
+    skillStack.push({ path, steps, stepIndex: 0, stepStartedAt: Date.now(), reviewers: new Map(), countedCollects: new Set() });
     // #357 (Task 3) F2: lazily warn when a skill activates with checkpoint
     // steps that will fail-closed (missing token_phase) — diagnose, don't let
     // the hard-block be the only signal. Fires at activation (stack/stepCache
@@ -2221,15 +2229,25 @@ function tokenStateLabel(reason: string): string {
     // A non-terminal collect (still running) and the background dispatch notice
     // both leave the count untouched, so the step cannot advance until the
     // verdict is reaped.
-    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean } }).details;
+    const verifierDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
     const isTerminalCollect =
       event.toolName === "task_collect" && verifierDetails?.terminal === true;
     const isBackgroundDispatch = verifierDetails?.background === true;
+    // #1662 review: every `task_collect` result carries the `run_id` it reaped
+    // (`details: view`). Dedupe terminal collects by that id so re-collecting
+    // the same finished lane cannot decrement the reviewer count twice and
+    // advance the verifier step with fewer verdicts than were dispatched.
+    const collectRunId =
+      typeof verifierDetails?.run_id === "string" ? verifierDetails.run_id : "";
     if (
       step.gate === "verifier" &&
       (isTerminalCollect ||
         ((event.toolName === "task" || event.toolName === "subagent") && !isBackgroundDispatch))
     ) {
+      if (isTerminalCollect && collectRunId) {
+        if (targetSkill.countedCollects.has(collectRunId)) return undefined; // already counted — never advance twice
+        targetSkill.countedCollects.add(collectRunId);
+      }
       const current = targetSkill.reviewers.get(targetSkill.stepIndex) || 0;
       if (current > 0) {
         const count = current - 1;

@@ -1576,6 +1576,36 @@ testAsync("#1662: a background dispatch is not counted until its terminal task_c
   });
 });
 
+testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted once", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A background dispatch returns at DISPATCH — not counted.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+
+        // The verdict is reaped — counted once.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The SAME finished lane is re-collected (`task_collect` is idempotent).
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The durable per-event audit count must not be inflated by the repeat.
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 1, "the same run is counted exactly once");
+        equal(dispatchLines[0].dispatch_count, 1, "the running total reflects one real dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("gh pr merge with no review record → blocked AND merge_gate_block audited with PR", async () => {
   await withTempHome(async () => {
     const prevMode = process.env.PI_MODE;

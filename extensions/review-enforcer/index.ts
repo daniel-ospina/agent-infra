@@ -2825,10 +2825,16 @@ export default function (pi: ExtensionAPI) {
     // ── State ──────────────────────────────────────
     let extensionEnabled = true;
     let dispatchCount = 0;
+    // #1662 review: run_ids whose terminal `task_collect` already counted as a
+    // reviewer dispatch. `task_collect` is idempotent (the same terminal run
+    // can be reaped repeatedly), so without this a repeated collect inflates
+    // the ≥1-dispatch count and the durable `review_dispatch` audit total.
+    const countedCollectRuns = new Set<string>();
 
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -2885,6 +2891,7 @@ export default function (pi: ExtensionAPI) {
     // ── session_shutdown ───────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
+      countedCollectRuns.clear();
       // Clear marker file to prevent persistent state leakage across sessions
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -3160,7 +3167,7 @@ export default function (pi: ExtensionAPI) {
       // reviewer when its verdict is actually reaped: the terminal
       // `task_collect`. The returns-early notice and a not-finished collect are
       // both ignored.
-      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean } }).details;
+      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
       const isTerminalCollect =
         event.toolName === "task_collect" && reviewDetails?.terminal === true;
       if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
@@ -3173,6 +3180,18 @@ export default function (pi: ExtensionAPI) {
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
       if (reviewDetails?.background === true) return undefined;
+      // #1662 review: `task_collect` is idempotent — every result carries the
+      // `run_id` it reaped (`details: view`). Count each run's verdict once, so
+      // re-collecting a finished lane cannot inflate the dispatch total (and
+      // the durable review_dispatch audit count) past the real dispatches.
+      if (isTerminalCollect) {
+        const collectRunId =
+          typeof reviewDetails?.run_id === "string" ? reviewDetails.run_id : "";
+        if (collectRunId) {
+          if (countedCollectRuns.has(collectRunId)) return undefined;
+          countedCollectRuns.add(collectRunId);
+        }
+      }
 
       dispatchCount++;
       console.log(
