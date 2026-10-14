@@ -395,10 +395,14 @@ done
 # approved and note it afterwards; a one-line confirmation can follow later.`
 # inserted after the branch left both shipped surfaces reporting clean, while the
 # text again authorized a write on self-asserted uncertainty. R1 now scans the
-# whole owner-approval subsection (heading → next `---`; falling back to the
-# marker→EOF region when the heading is absent, never a skip): the ask and the
-# write negation must appear in the branch, and NO un-negated apply directive may
-# survive anywhere in the subsection.
+# WHOLE ENCLOSING `## HARD RULE: Process Problems…` SECTION — H2 heading → next
+# H2 heading (or EOF), never a `---`, so a `---` inserted inside cannot truncate
+# it — falling back to the H3 subsection, then to the marker→EOF region, never a
+# skip: the ask and the write negation must appear in the branch, and NO
+# un-negated write directive may survive anywhere in the section. #1681's fifth
+# review proved the H3 scope still let a directive in the paragraph ABOVE the H3
+# escape (the `What this does NOT cover` paragraph of the same rule), so the H2
+# is the scope.
 #
 # THE SWEEP IS AN EXACT-CLAUSE ALLOW-LIST, NOT A WORDING STRIP-LIST. The first
 # section-scoped version deleted BROAD SUBSTRINGS before looking — `s/to apply//g`
@@ -414,13 +418,40 @@ done
 # `apply`-family token is therefore a finding: a reworded directive that matches
 # no allow-listed clause trips the pin — the cheap false-flag direction below.
 #
+# THE HEADING IS SWEPT, NOT DROPPED. The first section-scoped version removed the
+# heading line with `grep -v '^### .*owner-APPROVED diff is yours to APPLY'`, so a
+# write-on-uncertainty directive APPENDED TO THE HEADING was never scanned; the
+# predicate calls that a regression against its predecessor, which swept the
+# heading because it swept the whole subsection. Only the frozen heading clause is
+# removed now, line-anchored and applied after lower-casing, so anything appended
+# to the heading still reaches the sweep.
+#
+# A NON-apply VERB IS STILL A WRITE. The sweep reports only apply-family tokens, so
+# `go ahead and make the change anyway` re-instated the unauthorized-write path and
+# passed clean — #1681's fifth review reproduced it inside the branch the ask and
+# negation arms scan. A second, SECTION-WIDE arm therefore reports any
+# write-imperative verb family (`proceed|go ahead|land|make|edit|write|commit|
+# adopt|carry out|implement|push|merge`) anywhere in the section, after removing
+# the shipped NON-directive uses first (the two `write` nouns, `edit this file`,
+# `make the gate re-verify`). This is deliberately over-blocking: an unrecognised
+# reword is a finding, the cheap direction, not a silent pass.
+#
 # These are word pins, so a legitimate REWORD still trips them. That is the cheap
 # direction here (a false flag is caught by whoever edits the text) — widen the
 # predicate rather than delete the arm, exactly as with the MD026 pin. Each RED
 # fixture is the PRE-FIX text (or the reworded false-PASS the review reproduced),
 # so the pin is non-vacuous; the GREEN fixtures are post-fix controls.
+#
+# DECLARED RESIDUALS, both in the widening direction when falsified:
+#   * the write-imperative verb family is a fixed list, so a directive phrased
+#     with a verb OUTSIDE it (`enact the change`) is not reported — widen the
+#     family in `nonapply` when one is found, do not narrow it to the verbs
+#     already listed;
+#   * the sweep removes only the allow-listed clauses that SHIP, so any new
+#     legitimate non-directive use of an apply verb must be added as an exact
+#     clause removal (it will first appear as a false flag, the cheap direction).
 rule_scan() {  # <file> → one finding per line on stdout
-  local f="$1" findings="" br ref sec plain sweep residual
+  local f="$1" findings="" br ref sec plain sweep residual nonapply
 
   # R2: the sentence carrying the reopen cross-reference. Heading-agnostic and
   # fail-closed — an unlocatable sentence is a finding, not a skip.
@@ -431,13 +462,21 @@ rule_scan() {  # <file> → one finding per line on stdout
     findings+="R2: the reopen cross-reference does not point at the contradiction test 'below' (got: $(grep -oE 'contradiction test (above|below|in USER QUESTIONS PROTOCOL)' <<<"$ref" || true))"$'\n'
   fi
 
-  # R1: the owner-approval SUBSECTION, failed closed on the positive shape. The
-  # scope is the subsection (heading → next `---`), so a write-on-uncertainty
-  # reworded into a NEIGHBOURING paragraph cannot escape the branch anchored at
-  # the `Unsure` marker. Without the heading the scope falls back to the region
-  # from that marker to EOF — still fail-closed, never a skip — and when neither
-  # is present R1 reports rather than passes.
-  sec="$(awk '/^### .*owner-APPROVED diff is yours to APPLY/{f=1} f{print} f && /^---$/ {exit}' "$f")"
+  # R1: the owner-approval SUBSECTION, failed closed on the positive shape.
+  #
+  # SCOPE IS THE ENCLOSING `## HARD RULE: Process Problems…` SECTION, not the H3.
+  # The H3 scope let a write-on-uncertainty directive in the paragraph ABOVE the
+  # H3 (the `What this does NOT cover` paragraph of the same rule) escape the
+  # sweep entirely — #1681's fifth review reproduced it on the shipped surface.
+  # The section runs from that H2 heading to the NEXT H2 heading (or EOF), never
+  # to a `---`, so a `---` inserted inside the section cannot truncate it. Without
+  # the H2 heading the scope falls back to the H3 subsection, then to the
+  # marker→EOF region — still fail-closed, never a skip — and when none is present
+  # R1 reports rather than passes.
+  sec="$(awk '/^## .*HARD RULE: Process Problems/{f=1; print; next} f && /^## /{exit} f{print}' "$f")"
+  if [ -z "$sec" ]; then
+    sec="$(awk '/^### .*owner-APPROVED diff is yours to APPLY/{f=1} f{print} f && /^---$/ {exit}' "$f")"
+  fi
   if [ -z "$sec" ]; then
     sec="$(awk '/\*\*Unsure which diff was approved\*\*/{f=1} f{print}' "$f")"
   fi
@@ -451,19 +490,24 @@ rule_scan() {  # <file> → one finding per line on stdout
       br="$(sed -E 's/^.*[*][*]Unsure which diff was approved[*][*]//' <<<"$plain")"
       grep -q 'ask for the one-line confirmation' <<<"$br" \
         || findings+="R1: the uncertainty branch does not ask for the one-line confirmation before writing"$'\n'
-      grep -Eq 'never apply|not apply|do not apply|never to a write|not to a write|not a write' <<<"$br" \
+      grep -q 'never apply' <<<"$br" \
         || findings+="R1: the uncertainty branch carries no negation of the write — a bare 'confirm' does not gate it"$'\n'
     fi
-    # Section-scoped write-directive sweep. Remove ONLY the exact allow-listed
+    # Section-scoped apply-family sweep. Remove ONLY the exact allow-listed
     # clauses (never a bare `to apply` / `applying` substring, which is what let
     # `may proceed to apply` and `may APPLY` pass), lower-case first so a
     # capitalised directive cannot hide, and report any surviving apply-family
-    # token. Fail-closed: an unrecognised reword of an allow-listed clause trips
-    # this, which the comment above declares the cheap direction.
+    # token. The heading line is NOT dropped — a whole-line
+    # `grep -v '^### .*APPLY'` let a directive APPENDED TO THE HEADING escape the
+    # sweep (#1681's fifth review, a regression against the previous predicate);
+    # only its frozen clause is removed, line-anchored, so anything appended is
+    # still swept. Fail-closed: an unrecognised reword of an allow-listed clause
+    # trips this, which the comment above declares the cheap direction.
     sweep="$(
       printf '%s' "$sec" \
-        | grep -v '^### .*owner-APPROVED diff is yours to APPLY' \
-        | tr 'A-Z' 'a-z' | tr '\n' ' '
+        | tr 'A-Z' 'a-z' \
+        | sed -E 's/^### .*owner-approved diff is yours to apply//' \
+        | tr '\n' ' '
     )"
     residual="$(
       printf '%s' "$sweep" \
@@ -478,7 +522,26 @@ rule_scan() {  # <file> → one finding per line on stdout
         | grep -m1 -oE 'appl(y|ying|ies|ied|ication)' || true
     )"
     if [ -n "$residual" ]; then
-      findings+="R1: the owner-approval subsection carries an un-negated write directive outside the affirmative 'Yes' branch — a write-on-uncertainty reworded into a neighbouring paragraph is not gated by a confirmation"$'\n'
+      findings+="R1: the owner-approval section carries an un-negated write directive outside the affirmative 'Yes' branch — a write-on-uncertainty reworded into a neighbouring paragraph is not gated by a confirmation"$'\n'
+    fi
+    # NON-apply WRITE VERBS ARE STILL WRITES. A write-on-uncertainty directive
+    # need not use the word `apply` — `go ahead and make the change anyway`
+    # re-instates the same path and escaped the apply-family sweep (#1681's fifth
+    # review reproduced it). The section is swept for a write-imperative verb
+    # family too; only the shipped NON-directive uses are removed first (the two
+    # `write` nouns, `edit this file`, `make the gate re-verify`). Fail-closed: an
+    # unrecognised reword is a finding — the cheap direction above.
+    nonapply="$(
+      printf '%s' "$sweep" \
+        | sed -E \
+            -e 's/make the gate re-verify[^.]*//g' \
+            -e 's/edit this file//g' \
+            -e 's/is what authorizes the write//g' \
+            -e 's/never to a write//g' \
+        | grep -oE '\b(proceed|go ahead|land|make|edit|write|commit|adopt|carry out|implement|push|merge)\b' | head -1 || true
+    )"
+    if [ -n "$nonapply" ]; then
+      findings+="R1: the owner-approval section carries a write directive that uses no apply-family verb — the non-apply verb '$nonapply' is not gated by a confirmation"$'\n'
     fi
   fi
   printf '%s' "$findings"
@@ -540,7 +603,7 @@ else
 r1_ask_red="$(rule_fixture red-unsure-no-ask <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
-**Unsure which diff was approved** → do not apply on your own reading; wait for the owner.
+**Unsure which diff was approved** → never apply on your own reading; wait for the owner.
 EOF
 )"
 r1_ask_hits="$(rule_scan "$r1_ask_red")"
@@ -565,6 +628,28 @@ if grep -q 'carries no negation of the write' <<<"$r1_neg_hits" \
   pass "rule pin: branch that asks but still applies → negation arm alone flags it"
 else
   fail "rule pin: R1 negation arm not isolated (got: $(head -1 <<<"$r1_neg_hits"))"; fi
+
+# RED, isolated to R1's WRITE-VERB arm (agent-infra#1681 fifth review). The
+# shipped branch is intact — it asks and negates, so the ask and negation arms
+# and the apply-family sweep all stay silent — and a write directive using a
+# NON-apply verb is appended to it. #1681's fifth review reproduced exactly this
+# shape: the sweep reported only apply-family tokens, so `go ahead and make the
+# change anyway` re-instated the unauthorized-write path and passed clean.
+r1_verb_red="$(rule_fixture red-foreign-verb <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+**Unsure which diff was approved** → **state that exact diff and ask for the one-line confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of your own reading of what was approved — but if the owner is slow, go ahead and make the change anyway, then note it.
+EOF
+)"
+r1_verb_hits="$(rule_scan "$r1_verb_red")"
+if grep -q 'non-apply verb' <<<"$r1_verb_hits" \
+   && ! grep -q 'does not ask' <<<"$r1_verb_hits" \
+   && ! grep -q 'no negation of the write' <<<"$r1_verb_hits" \
+   && ! grep -q 'un-negated write directive' <<<"$r1_verb_hits" \
+   && ! grep -q '^R2' <<<"$r1_verb_hits"; then
+  pass "rule pin: write-on-uncertainty with a non-apply verb → write-verb arm alone flags it"
+else
+  fail "rule pin: non-apply-verb write escaped the branch (got: $(head -1 <<<"$r1_verb_hits"))"; fi
 
 # RED, isolated to the SECTION-SCOPED sweep: the uncertainty branch is the
 # shipped (clean) one — it asks and negates, so the ask and negation arms stay
@@ -642,6 +727,75 @@ EOF
   else
     fail "rule pin: ${r1_sweep_labels[$i]} escaped the section sweep (got: $(head -1 <<<"$r1_sweep_hits"))"; fi
 done
+
+# RED for the sweep's SCOPE (agent-infra#1681 fifth review). The first
+# section-scoped predicate began at the owner-approval H3, so a write directive in
+# the paragraph ABOVE it — the `What this does NOT cover` paragraph of the same
+# `## HARD RULE: Process Problems` section — was never scanned. The review
+# reproduced it end to end: a directive inserted immediately above the H3 left
+# both shipped surfaces reporting clean. The branch is the shipped (clean) one and
+# the cross-reference is clean, so only the sweep has anything to say.
+r1_above_red="$(rule_fixture red-paragraph-above-apply <<'EOF'
+## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
+
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+**What this does NOT cover, and what still goes to the owner:** a P0-consequence decision, and any recorded decision the fix would reverse. An `OVERRIDES:` marker makes such a departure *findable* — it does **not** authorize it. If you are unsure, apply the change and note it afterwards.
+
+### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
+
+**When the owner approves the CONTENT of an exact change, apply it.**
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
+approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+
+---
+EOF
+)"
+r1_above_hits="$(rule_scan "$r1_above_red")"
+if grep -q 'un-negated write directive' <<<"$r1_above_hits" \
+   && ! grep -q 'does not ask' <<<"$r1_above_hits" \
+   && ! grep -q 'no negation of the write' <<<"$r1_above_hits" \
+   && ! grep -q 'non-apply verb' <<<"$r1_above_hits" \
+   && ! grep -q '^R2' <<<"$r1_above_hits"; then
+  pass "rule pin: write-on-uncertainty reworded ABOVE the H3 → section sweep flags it"
+else
+  fail "rule pin: paragraph-above-the-H3 write escaped the section sweep (got: $(head -1 <<<"$r1_above_hits"))"; fi
+
+# RED for the sweep's HEADING handling (agent-infra#1681 fifth review). The first
+# section-scoped predicate removed the whole heading line
+# (`grep -v '^### .*owner-APPROVED diff is yours to APPLY'`), so a directive
+# APPENDED TO THE HEADING was never scanned — a regression against the predicate
+# it replaced, which swept the heading. Only the frozen heading clause may be
+# removed; anything appended to it is swept. The branch and cross-reference are
+# clean so only the sweep has anything to say.
+r1_heading_red="$(rule_fixture red-heading-apply <<'EOF'
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+### ⛔ An owner-APPROVED diff is yours to APPLY — if you are unsure, apply the diff you believe was approved
+
+**When the owner approves the CONTENT of an exact change, apply it.**
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+
+---
+EOF
+)"
+r1_heading_hits="$(rule_scan "$r1_heading_red")"
+if grep -q 'un-negated write directive' <<<"$r1_heading_hits" \
+   && ! grep -q 'does not ask' <<<"$r1_heading_hits" \
+   && ! grep -q 'no negation of the write' <<<"$r1_heading_hits" \
+   && ! grep -q 'non-apply verb' <<<"$r1_heading_hits" \
+   && ! grep -q '^R2' <<<"$r1_heading_hits"; then
+  pass "rule pin: write directive appended to the H3 heading → section sweep flags it"
+else
+  fail "rule pin: heading-appended write escaped the section sweep (got: $(head -1 <<<"$r1_heading_hits"))"; fi
 
 # GREEN control for the sweep: the shipped subsection shape, clear of any
 # neighbouring write, must stay clean — a legitimate reword of the two
