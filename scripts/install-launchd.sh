@@ -106,13 +106,24 @@ resolve_env() {
 # can execute from, and a job's `gh` resolved to an unrunnable symlink. A scheduled job must never
 # be handed a PATH element launchd cannot use, so the shim dir is dropped at render time; the real
 # binaries later in PATH are what the jobs are meant to find.
+#
+# ⛔ RESOLVE THE PHYSICAL PATH, do not match the NAME (review E2). It is the shim's TARGET that
+# launchd cannot read, so a PATH entry that is a SYMLINK to the shim directory matches no literal
+# pattern and would be rendered verbatim into every job — re-creating the EPERM the helper exists
+# to prevent. `scripts/orchestrator-harness/install.sh:add_dir()` resolves `pwd -P` for exactly
+# this reason and warns against a name test; this mirrors it.
+# ⛔ But only `*/shims`/`*/shims/*` are dropped, NOT all of `*/.pi/*`: `~/.pi/agent/bin` holds the
+# REAL `fd`/`rg` binaries and is outside the TCC-protected tree, so install.sh's blanket `.pi`
+# exclusion (harmless there — it adds resolved tool paths selectively) would cost these jobs
+# tools they use. The LOGICAL path is kept so the version-independent pi symlink is not pinned.
+# An entry that does not resolve is dropped too — launchd cannot resolve a tool from it.
 launchd_path() {
-    local out="" p
+    local out="" p phys
     local IFS=:
     for p in $PATH; do
-        case "$p" in
-            "" | */.pi/agent/shims) continue ;;
-        esac
+        case "$p" in "") continue ;; esac
+        phys="$(cd "$p" 2>/dev/null && pwd -P)" || continue
+        case "$phys" in */shims | */shims/*) continue ;; esac
         out="${out:+$out:}$p"
     done
     printf '%s' "$out"
@@ -182,7 +193,7 @@ job_loaded() {
 }
 
 install_job() {
-    local template="$1" label installed rendered tmp left ph unset_ph=""
+    local template="$1" label installed rendered tmp left ph unset_ph="" logkey logdir
     label="$(job_label "$template")"
     installed="$AGENTS_DIR/$label.plist"
 
@@ -196,6 +207,17 @@ install_job() {
     done
     if [ -n "$unset_ph" ]; then
         echo "  SKIP $label: unresolved placeholder(s)$unset_ph — is this a swarm host?" >&2
+        return 0
+    fi
+
+    # ⛔ {{PATH}} is RENDERED THROUGH A TRANSFORM, so test the value that will actually be written
+    # (review D3). The loop above tests `${!ph}` — the RAW `$PATH` — but `render` substitutes
+    # `launchd_path`. A PATH composed only of shim/resolvable-less entries is non-empty raw and
+    # EMPTY rendered, so the guard above passes and the job installs with
+    # `<key>PATH</key><string></string>`: an installed-but-inert job whose own log line cannot even
+    # run (`mkdir: command not found`). Refuse to install it, like any other unresolved placeholder.
+    if grep -q '{{PATH}}' "$template" && [ -z "$(launchd_path)" ]; then
+        echo "  SKIP $label: unresolved placeholder(s) {{PATH}} — every PATH entry is unreadable" >&2
         return 0
     fi
 
@@ -218,6 +240,25 @@ install_job() {
 
     mkdir -p "$AGENTS_DIR"
     mv "$tmp" "$installed"
+    # ⛔ launchd creates the log FILE but NOT its parent directory, so a job rendered with a
+    # StandardOutPath under a directory this box has not created yet can load without running — the
+    # #1719 failure mode (a launcher wired to nothing) on the fresh second box that fix exists to
+    # equip. `~/.pi/agent/state` is created by pi ACTIVITY, not by this installer or the farm.
+    # Create every rendered log directory before bootstrap; a no-op for templates without the keys.
+    for logkey in StandardOutPath StandardErrorPath; do
+        # Portable by design: /usr/libexec/PlistBuddy does not exist on the ubuntu lane, so a
+        # PlistBuddy read would make this a silent no-op there — the same read that the
+        # broken-target guard above already depends on. The rendered plist puts the value on the
+        # line after its key, which is what the templates emit.
+        logdir="$(sed -n "/<key>$logkey<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}" "$installed")"
+        if [ -n "$logdir" ] && ! mkdir -p "$(dirname "$logdir")" 2>/dev/null; then
+            # NAMED, never swallowed: an unopenable StandardOutPath is the "loaded but never ran"
+            # shape this whole section exists to prevent, so a failure here must not read as success.
+            # It is not fatal — the job's own log (the script's `mkdir -p "$STATE_DIR"`) may still
+            # work — but it must be visible.
+            echo "    WARNING: $label cannot create $logkey dir $(dirname "$logdir") — the job may load inert" >&2
+        fi
+    done
     # Clear any disabled override, then reload. bootout is tolerated (a job
     # that was never loaded exits nonzero — fine). bootstrap must succeed.
     launchctl enable "$DOMAIN/$label" 2>/dev/null || true

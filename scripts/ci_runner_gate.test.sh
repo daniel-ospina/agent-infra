@@ -52,6 +52,7 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-gate-test.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 BIN="$T/bin"; mkdir -p "$BIN"
 GH_LOG="$T/gh.log"
+CMUX_LOG="$T/cmux.log"
 
 # ── `gh` test double ────────────────────────────────────────────────────────
 # Behavior is driven by env only, so the suite never touches the real gh. Three call shapes reach
@@ -92,13 +93,29 @@ exit 0
 STUB
 chmod +x "$BIN/gh"
 
+printf '%s' '{"components":[{"name":"Actions","status":"operational"}],"incidents":[]}' > "$T/status-default.json"
 cat > "$BIN/curl" <<'STUB'
 #!/usr/bin/env bash
-# The githubstatus summary: Actions operational, no incidents — so the queue threshold is the only
-# unhealthy lever this suite pulls.
-printf '%s' '{"components":[{"name":"Actions","status":"operational"}],"incidents":[]}'
+# The githubstatus summary, read from a FILE: the default is Actions operational with no incidents,
+# so the queue threshold is the only unhealthy lever this suite pulls. CURL_BODY (handled in
+# run_gate) points CURL_STATUS_FILE at a different body — a null or empty component status, a
+# newline in the status, a live incident — without any nested quoting in the stub.
+cat "${CURL_STATUS_FILE:?}"
 STUB
 chmod +x "$BIN/curl"
+
+# ⛔ The cmux leg MUST be stubbed (review E1). `notify()` calls `cmux agent message <ORCH_WS>` when
+# `cmux` is on PATH, and `CI_GATE_ORCH_WS=""` only disables it because the gate reads
+# `${CI_GATE_ORCH_WS-…}` (dash, not `:-`). Before that fix — and for ANY box that reverts it to
+# `:-` — this suite invoked the REAL cmux against the live ORCHESTRATOR lane ("never dispatch
+# here"), waking that agent and writing production state from a test. The stub makes it impossible
+# to reach the real binary, and CMUX_LOG is asserted empty so the disable path is pinned too.
+cat > "$BIN/cmux" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${CMUX_LOG:?}"
+exit 0
+STUB
+chmod +x "$BIN/cmux"
 
 RC=0
 OUT=""
@@ -107,17 +124,25 @@ GH_THRESHOLD_DEFAULT=60
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
 # CI_GATE_ORCH_WS="" keeps the cmux leg out of the picture: the durable inbox file is the
-# deterministic notification sink, so "did it notify?" has one readable answer.
+# deterministic notification sink, so "did it notify?" has one readable answer. That claim is only
+# true because the gate reads `${CI_GATE_ORCH_WS-…}`; CMUX_LOG (asserted empty at the end) is what
+# catches a regression to `:-`, and the cmux stub is what stops such a regression reaching the
+# live orchestrator lane at all.
 run_gate() {
   local name="$1"; shift
   local home="$T/home-$name"
   STATE_DIR="$T/state-$name"
   mkdir -p "$STATE_DIR" "$home"
   : > "$GH_LOG"
+  # ⛔ CMUX_LOG is NOT truncated per run (review: the truncation made the suite's closing
+  # "no run invoked cmux" assertion VACUOUS — every invocation wiped the previous run's line, and
+  # the last four runs exit before `notify()`, so the count was always 0 even with the leg enabled).
+  # It is truncated ONCE, before the first run, so the closing count spans the whole suite.
   (
     export HOME="$home"
     export PATH="$BIN:$PATH"
     export GH_LOG
+    export CMUX_LOG
     export CI_GATE_STATE_DIR="$STATE_DIR"
     export CI_GATE_REPO="test-org/test-repo"
     export CI_GATE_QUEUE_THRESHOLD="$GH_THRESHOLD_DEFAULT"
@@ -127,6 +152,12 @@ run_gate() {
       shift
     done
     if [ "${1:-}" = "--" ]; then shift; fi
+    if [ -n "${CURL_BODY:-}" ]; then
+      printf '%s' "$CURL_BODY" > "$T/status-$name.json"
+      export CURL_STATUS_FILE="$T/status-$name.json"
+    else
+      export CURL_STATUS_FILE="$T/status-default.json"
+    fi
     bash "$GATE" "$@"
   ) > "$T/out-$name" 2>&1
   RC=$?
@@ -134,6 +165,7 @@ run_gate() {
 }
 
 echo "── control: a numeric queue + a readable pool takes the normal path ──"
+: > "$CMUX_LOG"   # ONE truncation for the whole suite — see run_gate
 run_gate healthy GH_QUEUED=5 GH_FALLBACK_N=0 GH_MODE=ok --
 assert_eq "$RC" "0" "healthy run exits 0 (numeric queue stays a real measurement)"
 assert_contains "$OUT" "queued=5" "healthy run logs the value it read"
@@ -171,6 +203,67 @@ assert_contains "$OUT" "UNREADABLE" "empty queue count names the read failure"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "empty queue count advanced no state file"
 assert_not_contains "$OUT" "TRANSITION" "empty queue count sent no transition notification"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "empty queue count relabelled no runner"
+
+# ⛔ The threshold is the other operand of the SAME numeric test (review D1). An unreadable value
+# made the comparison ERROR, and the `||` chain read that as false — HEALTHY. The gate relabelled
+# the pool, advanced the state file, notified, and exited 0 on a value it never read.
+echo "── #1704(3): an unreadable queue THRESHOLD must FAIL CLOSED ──"
+run_gate qt-junk GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=abc --
+assert_eq "$RC" "2" "a non-numeric threshold → exit 2 (could-not-measure)"
+assert_contains "$OUT" "queue threshold UNREADABLE" "a non-numeric threshold names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a non-numeric threshold advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "a non-numeric threshold sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a non-numeric threshold relabelled no runner"
+
+# ⛔ The status summary's TWO fields are what `evaluate` actually branches on (review B1). The inline
+# python prints them space-separated, so a `null`/empty component status became `comp="None"` /
+# `comp="0"` — past the shape check and read as "not operational", i.e. UNHEALTHY, i.e. the gate
+# RELABELLED the pool on a status it never read. And `incident` was never shape-checked at all:
+# `${incident:-0}` read an EMPTY count as "0 incidents" — a fail-open to HEALTHY while an Actions
+# incident was live.
+echo "── #1704(4): an unreadable status-summary field must FAIL CLOSED ──"
+run_gate comp-null CURL_BODY='{"components":[{"name":"Actions","status":null}],"incidents":[]}' \
+  GH_QUEUED=5 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "an Actions status of null → exit 2 (never 'not operational')"
+assert_contains "$OUT" "actions component UNREADABLE" "a null Actions status names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a null Actions status advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "a null Actions status sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a null Actions status relabelled no runner"
+
+run_gate comp-empty CURL_BODY='{"components":[{"name":"Actions","status":""}],"incidents":[]}' \
+  GH_QUEUED=5 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "an EMPTY Actions status → exit 2 (the leading-space case the old check missed)"
+assert_contains "$OUT" "actions component UNREADABLE" "an empty Actions status names the read failure"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an empty Actions status relabelled no runner"
+
+# The summary's SECOND field must reduce to a bare count. `${incident:-0}` read an empty or
+# unreadable count as "0 incidents" — a fail-open to HEALTHY with an Actions incident live — and
+# then took the pool OFF `ubuntu-latest` exactly when GitHub-hosted was degraded. Here the status
+# itself is allow-listed, so the incident guard is the one that has to catch it.
+run_gate incident-junk CURL_BODY='{"components":[{"name":"Actions","status":"operational x"}],"incidents":[{"name":"Actions incident"}]}' \
+  GH_QUEUED=5 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "an unreadable incident count → exit 2 (never '0 incidents')"
+assert_contains "$OUT" "incident count UNREADABLE" "an unreadable incident count names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an unreadable incident count advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "an unreadable incident count sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unreadable incident count relabelled no runner"
+
+# A status the summary cannot be consumed from at all (a newline truncates the line) is refused by
+# the summary SHAPE check, before either field is trusted — the stricter counterpart of the guard
+# above, and the case the pre-fix `[:space:]` admitted.
+run_gate status-newline CURL_BODY='{"components":[{"name":"Actions","status":"operational\n"}],"incidents":[{"name":"Actions incident"}]}' \
+  GH_QUEUED=5 GH_FALLBACK_N=0 --
+assert_eq "$RC" "2" "a status carrying a newline → exit 2 (the summary is not consumable)"
+assert_contains "$OUT" "status summary unreadable" "an unconsumable summary names the read failure"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an unconsumable summary advanced no state file"
+assert_not_contains "$OUT" "TRANSITION" "an unconsumable summary sent no transition notification"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "an unconsumable summary relabelled no runner"
+
+# The negative control: a real Actions incident still routes to the local pool.
+run_gate incident-real CURL_BODY='{"components":[{"name":"Actions","status":"operational"}],"incidents":[{"name":"Actions incident"}]}' \
+  GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "a live Actions incident still exits 0 (the fix is not 'always fail')"
+assert_contains "$OUT" "TRANSITION unknown -> local" "a live Actions incident routes CI to the local pool"
 
 echo "── #1704(2): a failed runner enumeration must FAIL CLOSED ──"
 # threshold 1 + queued 5 + a readable pool reading `github` ⇒ want=local, so the gate DOES attempt a
@@ -244,6 +337,23 @@ fi
 SETUP="$REPO_ROOT/pi-bootstrap/setup.sh"
 assert_contains "$(cat "$SETUP")" "$(basename "$GATE")" \
   "pi-bootstrap farm list carries the gate (#1719)"
+
+# ⛔ HERMETICITY: the whole suite must never reach the real cmux / the live orchestrator lane
+# (review E1). Every run above sets CI_GATE_ORCH_WS="", and the gate reads it with `${VAR-…}` so an
+# empty value disables the leg. CMUX_LOG was truncated ONCE (before the first run) and never since,
+# so this count covers every notifying run in the suite — a revert to `${VAR:-…}` re-enables the
+# default lane for each of them and this assertion goes red. The stub is the belt to this braces:
+# even on a revert, the real binary is unreachable.
+echo "── hermeticity: the suite never touched the cmux / orchestrator lane ──"
+assert_eq "$(wc -l < "$CMUX_LOG" | tr -d ' ')" "0" "no run invoked cmux (CI_GATE_ORCH_WS='' disables the leg)"
+
+# Positive control — without it the assertion above could pass because the stub is broken or the
+# leg never fires at all. With a lane configured the message MUST go out exactly once.
+echo "── control: the cmux leg DOES fire when it is not disabled (the stub is live) ──"
+run_gate cmux-enabled GH_QUEUED=5 GH_FALLBACK_N=0 CI_GATE_ORCH_WS="TEST-LANE-UUID" --
+assert_eq "$RC" "0" "a run with a configured lane exits 0"
+assert_eq "$(wc -l < "$CMUX_LOG" | tr -d ' ')" "1" "exactly one cmux message is sent when the leg is enabled"
+assert_contains "$(cat "$CMUX_LOG")" "TEST-LANE-UUID" "the cmux message names the configured lane"
 
 echo "───────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -gt 0 ]; then

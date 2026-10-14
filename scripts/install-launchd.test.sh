@@ -116,6 +116,16 @@ mkfakehome() { # $1 = home dir
     # (symlinks into ~/Documents → EPERM under TCC, #427), and run_installer puts it on PATH.
     mkdir -p "$1/.pi/agent/shims"
     touch "$1/.pi/agent/shims/gh"
+    # #1719 (review E2) — a PATH entry that is a SYMLINK to the shim dir matches no literal name
+    # pattern, so the helper must resolve the PHYSICAL path to drop it. Created here so run_installer
+    # can put it on PATH; its presence in a rendered plist is a failure.
+    ln -sfn "$1/.pi/agent/shims" "$1/.pi/agent/shimlink"
+    # #1719 (review E2) — the REVERSE control: ~/.pi/agent/bin holds REAL fd/rg binaries and is
+    # outside the TCC-protected tree, so it must SURVIVE the filter. Mirrors install.sh:add_dir(),
+    # whose blanket `*/.pi/*` exclusion would wrongly drop it here.
+    mkdir -p "$1/.pi/agent/bin"
+    touch "$1/.pi/agent/bin/rg"
+    chmod +x "$1/.pi/agent/bin/rg"
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
@@ -167,8 +177,10 @@ run_installer() { # <home> [extra env assignments...]
         export HOME="$1"
         # #1719: the shim dir is FIRST on an interactive session's PATH, exactly as it is on a real
         # box — the renderer must strip it, so the suite puts it there deliberately (otherwise the
-        # PATH assertion below would be vacuous).
-        export PATH="$T/bin:$HOME/.pi/agent/shims:$PATH"
+        # PATH assertion below would be vacuous). A SYMLINK to it and the real-binary dir
+        # (~/.pi/agent/bin, holding fd/rg) are on PATH too: the first must be dropped by physical
+        # path, the second must be KEPT (review E2).
+        export PATH="$T/bin:$HOME/.pi/agent/shims:$HOME/.pi/agent/shimlink:$HOME/.pi/agent/bin:$PATH"
         export FAKE_LAUNCHCTL_LOG="$LOG"
         export TEMPLATES_DIR="$TEMPLATES"
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -265,6 +277,28 @@ assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "<integer>300</integer>" 
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "RunAtLoad" "runner-gate runs once at load (a freshness kick)"
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-version: 0.1.0" "runner-gate template carries version marker"
 assert_not_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
+assert_not_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
+assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "/.pi/agent/bin" "runner-gate plist PATH KEEPS ~/.pi/agent/bin (real fd/rg — not a shim, review E2)"
+# #1719 (review D2) — launchd creates the log FILE, not its parent directory, and nothing in the
+# install path created ~/.pi/agent/state (pi ACTIVITY does). A job rendered with StandardOutPath
+# under a non-existent dir can load without running — the very "wired to nothing" failure #1719 is
+# about — so the installer must create every rendered log directory before bootstrap.
+if [ -d "$HOME1/.pi/agent/state" ]; then
+  ok "installer created the rendered log directory before bootstrap (review D2)"
+else
+  bad "installer did NOT create ~/.pi/agent/state — a fresh box's gate job may load inert (review D2)"
+fi
+
+# #1719 (review D3) — the guard that refuses a template whose rendered PATH came out EMPTY. It is
+# only reachable when `launchd_path` filters everything away, which cannot happen while the installer
+# itself needs a working PATH (sed/grep/mktemp must resolve) — so it is pinned STATICALLY rather than
+# by an installer run: deleting the guard is what this catches, and the honest bound is recorded
+# here instead of a test that would have to fake the installer's own PATH to fire.
+if grep -q "unresolved placeholder(s) {{PATH}}" "$INSTALLER"; then
+  ok "installer refuses to install a job whose rendered PATH is empty (review D3)"
+else
+  bad "the empty-rendered-PATH guard is gone — a filtered-away PATH would install an inert job (review D3)"
+fi
 assert_not_contains "$(cat "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from

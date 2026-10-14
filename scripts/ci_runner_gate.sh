@@ -23,7 +23,7 @@
 # USAGE
 #   ci_runner_gate.sh            # evaluate + act + notify
 #   ci_runner_gate.sh --dry-run  # evaluate and report, change nothing
-#   ci_runner_gate.sh --status   # print current mode, exit 0
+#   ci_runner_gate.sh --status   # print current mode, exit 0 (2 when the pool read fails)
 #
 # EXIT: 0 ok · 1 usage · 2 could-not-measure / could-not-act (fail-closed: changes nothing)
 set -uo pipefail
@@ -82,8 +82,28 @@ print(comp, len(inc))
   # and routing CI onto this box. That is the opposite of what the header promises (`2
   # could-not-measure (fail-closed: changing nothing)`). It also catches python's `comp="?"`
   # fallback, so a githubstatus schema change is unreadable rather than "not operational".
-  case "$parsed" in ''|*[!A-Za-z0-9_[:space:]]*) log "status summary unreadable: ${parsed:0:120}"; return 2 ;; esac
+  #
+  # ⛔ `[:blank:]`, NOT `[:space:]` (review B1). The inline python prints `comp` and the incident
+  # count SPACE-separated, so a status that is `null`/`""` yields `" 0"` — and `read`, which strips
+  # leading IFS whitespace, turns that into `comp="0"`, not `""`. Admitting a newline let a status
+  # containing one truncate the line so the incident field vanished. Neither is a readable summary.
+  case "$parsed" in ''|*[!A-Za-z0-9_[:blank:]]*) log "status summary unreadable: ${parsed:0:120}"; return 2 ;; esac
   read -r comp incident <<<"$parsed"
+
+  # ⛔ BOTH FIELDS MUST BE STRICTLY READABLE (review B1). `comp` was compared verbatim and
+  # `incident` was never checked at all — `${incident:-0}` read an EMPTY count as "0 incidents", so
+  # a summary whose second field did not parse reported HEALTHY while an Actions incident was live
+  # (`fallback_off` would then relabel the pool off `ubuntu-latest` exactly when GitHub-hosted is
+  # degraded). A component status outside GitHub's documented set — `None`, `""`, `"?"`, or any
+  # future value — is a schema change, i.e. could-not-measure (2), never "unhealthy" (1): acting on
+  # an unread status relabels the pool. Only the four non-operational statuses fall through to 1.
+  # `comp` is checked FIRST: when the status is unreadable the space-separated print leaves the
+  # incident field empty too, and naming the status is the more useful of the two reasons.
+  case "$comp" in
+    operational|degraded_performance|partial_outage|major_outage|under_maintenance) ;;
+    *) log "actions component UNREADABLE ('${comp}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  case "$incident" in '' | *[!0-9]*) log "incident count UNREADABLE ('${incident}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
 
   queued="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=1" --jq '.total_count' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
@@ -100,7 +120,17 @@ print(comp, len(inc))
     '' | *[!0-9]*) log "queued count UNREADABLE ('${queued}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
-  if [ "$comp" != "operational" ] || [ "${incident:-0}" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
+  # ⛔ THE THRESHOLD IS THE OTHER OPERAND OF THE SAME NUMERIC TEST (review D1), so an unreadable
+  # value makes `[ "$queued" -ge "$QUEUE_THRESHOLD" ]` ERROR — and the `||` chain reads that as
+  # false, i.e. HEALTHY — relabelling the pool, advancing the state file and notifying on a value
+  # that was never read. The launchd job never sets CI_GATE_QUEUE_THRESHOLD (the plist carries only
+  # PATH/HOME), so this is reachable from an env-overriding caller rather than from the schedule;
+  # the read is refused either way.
+  case "$QUEUE_THRESHOLD" in
+    '' | *[!0-9]*) log "queue threshold UNREADABLE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+
+  if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
     return 1   # unhealthy -> prefer local
   fi
   return 0     # healthy   -> prefer GitHub
@@ -168,7 +198,11 @@ current_mode() {  # github | local | unknown
 # transports, both already in the fleet, neither needs a credential we do not have:
 #   1. the orchestrator inbox  — durable, append-only, read by the fleet (always works)
 #   2. the cmux orchestrator lane — immediate, where the owner actually is (best-effort)
-ORCH_WS="${CI_GATE_ORCH_WS:-C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD}"   # ORCHESTRATOR (never dispatch here)
+ORCH_WS="${CI_GATE_ORCH_WS-C2C97E96-0CBC-4DFE-BC91-FEF44F09B5BD}"   # ORCHESTRATOR (never dispatch here)
+# ⛔ `${VAR-…}`, NOT `${VAR:-…}` (review E1): with `:-` an explicitly EMPTY value is replaced by the
+# default, so `CI_GATE_ORCH_WS=""` — the obvious way to switch the cmux leg off, and what the test
+# suite sets to keep the leg out of the picture — actually SENT messages to the live orchestrator
+# lane. Empty now means disabled.
 
 notify() { # $1 = text
   local text="$1"
