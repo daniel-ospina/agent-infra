@@ -679,6 +679,9 @@ These are kept as a record because each one is a *failure mode of the design*, n
   errors and the `||` chain reads that as false) and `set_labels()` reports success when the runner
   enumeration fails (the loop runs zero times and `[ "$fail" -eq 0 ]` succeeds). Both are false
   PASSes on a gate that changes runner labels.
+  **✔ FIXED in agent-infra** — both now return 2 (could-not-measure), name the failure, and leave the
+  state file and the notification untouched; pinned by `scripts/ci_runner_gate.test.sh` (a bash shard
+  in both CI lanes), which is red on the pre-fix tree.
 - **The reaper fails open when the PR listing fails (agent-infra#1705).** `refresh-candidates.sh`
   writes an empty `.pr_brs` on a failed listing, so `has_pr` is false for every issue and PR-bearing
   issues are un-blacklisted and re-dispatched. Same class as the `open_pr_count()` fail-closed fix
@@ -715,6 +718,10 @@ These are kept as a record because each one is a *failure mode of the design*, n
   `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
   still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy
   that runs — and a second box has no fallback gate at all.
+  **✔ FIXED in agent-infra** — `templates/launchd/com.tortoise.ci-runner-gate.plist` renders the job
+  under the label the hand-made duplicate already used (so the installer converges that machine
+  rather than stranding a duplicate), and `pi-bootstrap/setup.sh` (fleet_srcs) farms the script to
+  the path the plist executes.
 - **Three worker launch paths spawn ungated (agent-infra#1720).** `chain-<N>` → `merge-one.sh` (the
   first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh` and `adopt-fix.sh` →
   `fix-one.sh` read no `MAX_LOAD`; only the controller's four spawn *decisions* are gated, and §4
