@@ -491,6 +491,34 @@ else echo "  ❌ the claim was STOLEN or the seed failed ($stillH vs seed '$EH')
 cleanup_ref
 
 echo
+echo "=== P3f. a foreign UNREADABLE lease (0, and the -5 that collapses to it) is LIVE, not STOLEN ==="
+# claim_acquire's unparseable branch is `[ -z "$held_until" ] || [ "$held_until" = "0" ]`: a claim
+# whose commit message carries `lease_until=0` (or a negative, which _lease_of's `[0-9]*` cannot match
+# and therefore collapses to `0`) means "a claim EXISTS whose lease is unreadable". Reading it as dead
+# would let a box STEAL it. This is the datum claim_live() must AGREE with (selftest §14's `0` case),
+# and the class the fifth review round closed on the reader side. RED pre-fix is on the READER; this
+# pins the WRITER-side semantics it must match.
+seed_lease() { # <lease-string> -> prints the commit it pushed
+  local c
+  c="$( cd "$A" && . "$CLAIMS_SH" && _claim_commit foreignbox "$1" )"
+  ( cd "$A" && . "$CLAIMS_SH" && _git push -q origin "$c:$REF" ) || return 1
+  echo "$c"
+}
+for L in 0 -5; do
+  cleanup_ref
+  EL="$(seed_lease "$L")"; echo "  seeded lease_until=$L: $EL"
+  outL=$(runA claim_acquire "$A" $PR "$SHA"); rcL=$?
+  echo "  rc=$rcL :: $outL"
+  ck "lease_until=$L reads as UNPARSEABLE => LIVE (rc=1)" "^1$" "$rcL"
+  ck "the refusal for lease_until=$L says it cannot parse the lease" "no parseable lease" "$outL"
+  stillL="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
+  if [ -n "$EL" ] && [ "$stillL" = "$EL" ]; then
+    echo "  ✅ the lease_until=$L claim was NOT stolen"; PASS=$((PASS+1))
+  else echo "  ❌ the lease_until=$L claim was STOLEN or the seed failed ($stillL vs seed '$EL')"; FAIL=$((FAIL+1)); fi
+done
+cleanup_ref
+
+echo
 echo "=== cleanup ==="
 cleanup_ref
 left=$(git -C "$A" ls-remote origin "$REF" | wc -l | tr -d ' ')

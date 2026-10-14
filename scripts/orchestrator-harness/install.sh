@@ -33,8 +33,24 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # to 4 exactly as the loop does. Same predicate as every shipped copy (leading zeros are read as
 # octal by `$(( ))`, so `08` must be rejected too).
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
-is_num "${_NCPU:-}"      || _NCPU=4
+# ⛔ A DIGIT STRING IS NOT ENOUGH FOR `_NCPU` — IT MUST BE A MAGNITUDE (P3, fifth review round,
+# 2026-10-14). `is_num` accepts a 19-digit probe, and `$(( 10#$_NCPU * 10 ))` then WRAPS instead of
+# erroring: 9223372036854775808 (2**63) * 10 is exactly 0, which every downstream guard accepts
+# (`0` is a legal plist limit), so the rendered plist carries `MAX_LOAD=0` and the loop's
+# `[ "$L" -ge 0 ]` is always true — the box dispatches NOTHING, silently and indefinitely. This was
+# already closed in orch-loop.sh; install.sh runs the IDENTICAL derivation but had only `is_num`, so
+# the wrap survived on the real production path (install.sh is what substitutes __MAX_LOAD__ into the
+# live plist). Mirror the loop exactly.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+is_limit "${_NCPU:-}"   || _NCPU=4
+# A 0-valued probe is a FAILED probe, not "no cores": the identical line is in orch-loop.sh.
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+# The same two guards the loop applies, for the same reason: the first fallback re-derives from the
+# SAME `_NCPU`, so it cannot repair an out-of-range PRODUCT (a 9-digit probe yields a 10-digit value
+# that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
+# validates plist limits where 0 is legal (see the `0) : ;;` arm below).
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"

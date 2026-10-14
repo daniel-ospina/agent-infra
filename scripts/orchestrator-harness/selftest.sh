@@ -924,6 +924,31 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   ck "shipped claim_live(): an oversized (>=2**63) lease reports LIVE, not dead" $rc
   [ "$spawn" = "no" ] && rc=0 || rc=1
   ck "shipped claim_live(): no spawn is attempted for an oversized-lease claim" $rc
+  # ⛔ THE `0` SENTINEL IS NOT THE SAME AS ABSENT (P2, fifth review round, 2026-10-14). claims.sh
+  # documents `0` as "a claim exists whose lease is UNREADABLE" and treats it as LIVE (claim_acquire's
+  # `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via `[ "$until" != "0" ]`).
+  # `_lease_of` collapses a negative lease to the same `0` (its `[0-9]*` cannot match the minus sign),
+  # so `lease_until=-5` ARRIVES HERE AS `0`. claim_live used to read that `0` as DEAD while
+  # claim_acquire read the same datum as LIVE — the SAME disagreement as the oversized class above,
+  # with the same consequence (refund_bailed_fixer un-parks the PR every cycle, so the cap never
+  # trips). Drive the snapshot entry the function actually reads.
+  printf 'refs/claims/5-%s\tforeignbox\t0\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  spawn=no
+  if claim_live 5 "$CLSHA" || false; then :; else spawn=yes; fi
+  claim_live 5 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): an unreadable lease (0) reports LIVE, not dead" $rc
+  [ "$spawn" = "no" ] && rc=0 || rc=1
+  ck "shipped claim_live(): no spawn is attempted for an unreadable-lease claim" $rc
+  # The literal negative too — the form _lease_of collapses, and the one claim_prune reads as "keep"
+  # (never as reaped). The reader must AGREE on this row as well.
+  printf 'refs/claims/6-%s\tforeignbox\t-5\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  claim_live 6 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): a negative lease reports LIVE, matching claim_acquire/claim_prune" $rc
+  # Non-vacuity: an entry ABSENT from the snapshot is still NOT live. Without this the fix could be
+  # "return 0 always" and every assertion above would still pass.
+  printf 'refs/claims/999-%s\tforeignbox\t1799999999\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  claim_live 6 "$CLSHA" && rc=1 || rc=0
+  ck "shipped claim_live(): a PR absent from the snapshot is NOT live (the sentinel fix is not vacuous)" $rc
 fi
 
 # ── 15) a BAILED fixer refunds its attempt and restores the findings marker ─────
@@ -2053,7 +2078,12 @@ ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on
 # ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back to 4 as the loop
 # does. Extract the shipped lines and DRIVE them with a sysctl stub: a missing guard is a hard
 # failure, not a cosmetic difference from the loop. Red on the pre-fix install.sh.
-grep -E '^_NCPU=|^is_num\(\) |^is_num "\$\{_NCPU|^MAX_LOAD=' "$INST" > "$TMP/ncpu-inst.sh"
+# ⛔ AND THE EXTRACTION MUST TAKE THE WHOLE GUARD (P3, fifth review round, 2026-10-14). The pattern
+# used to name `is_num("${_NCPU` explicitly; install.sh now uses `is_limit` (the magnitude bound)
+# plus the `_NCPU >= 1` probe guard, so an extraction that still named the old lines would miss the
+# newly added ones and drive an incomplete block. It is a RANGE: from the predicate definitions
+# through the last MAX_LOAD guard, so any guard added inside it is picked up automatically.
+sed -n '/^_NCPU=/,/^is_limit "${MAX_LOAD:-}"/p' "$INST" > "$TMP/ncpu-inst.sh"
 if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
   { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
   _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
@@ -2064,6 +2094,31 @@ if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted";
   _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
   [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
   ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
+  # ⛔ THE PRODUCTION PATH'S OWN WRAP (P3, fifth review round, 2026-10-14). install.sh substitutes
+  # __MAX_LOAD__ into the LIVE plist, so an absurd-but-numeric `_NCPU` here — not in the loop — was
+  # the one that actually wrote `MAX_LOAD=0` into a running box. 2**63 * 10 wraps to exactly 0 and
+  # every guard accepts 0, so this is RED on the pre-fix install.sh (which had is_num only).
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
+  _nout3="$(bash "$TMP/ncpu-drive3.sh" 2>&1)"
+  [ "$_nout3" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 40 (not 0)"; }
+  ck "install.sh bounds an absurd _NCPU so the plist cannot get MAX_LOAD=0 (would dispatch nothing)" $rc
+  # A 0-valued probe is a failed probe: the same guard as the loop's.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
+  _nout4="$(bash "$TMP/ncpu-drive4.sh" 2>&1)"
+  [ "$_nout4" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 40 (not 0)"; }
+  ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=40, not 0)" $rc
+  # The other wrap a MAX_LOAD-only guard cannot see: a 9-digit probe is IN range, but its product is
+  # 10 digits and never binds. Only the true-default fallback catches it.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
+  _nout5="$(bash "$TMP/ncpu-drive5.sh" 2>&1)"
+  [ "$_nout5" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 40"; }
+  ck "install.sh falls back to 40 for a product that outgrows the 9-digit bound" $rc
+  # ⛔ A DELIBERATE plist MAX_LOAD=0 MUST STILL BE ACCEPTED (keep the `0) : ;;` arm): the loop's
+  # second guard bounds the DERIVATION, never a value that passes is_limit. Non-vacuity for the fix.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive6.sh"
+  _nout6="$(MAX_LOAD=0 bash "$TMP/ncpu-drive6.sh" 2>&1)"
+  [ "$_nout6" = "0" ] && rc=0 || { rc=1; echo "      a deliberate MAX_LOAD=0 became '$_nout6', expected 0"; }
+  ck "install.sh still accepts a deliberate plist MAX_LOAD=0 (only the derivation is bounded)" $rc
 fi
 # ⛔ ORDER, not presence: the `_NCPU` coercion was added in the input-validation block, ~30 lines
 # AFTER `MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"` — its only read. A guard that runs after the
@@ -2131,8 +2186,12 @@ if need "$TMP/maxb.sh" "the shipped _NCPU guard + MAX_LOAD derivation are extrac
   maxload_probe() { ( _NCPU="$1"; MAX_LOAD="$2"; eval "$MAXB"; printf '%s' "$MAX_LOAD" ); }
   [ "$(maxload_probe 12 '')" = "120" ] && rc=0 || { rc=1; echo "      _NCPU=12 -> '$(maxload_probe 12 '')', expected 120"; }
   ck "a sane _NCPU still derives MAX_LOAD=cores*10 through the shipped block" $rc
+  # A 0-valued probe is a FAILED probe: `10 * 0` = 0 passes is_limit and `[ "$L" -ge 0 ]` is always
+  # true, so the load gate closes forever. The `_NCPU >= 1` guard converts it to the default.
+  [ "$(maxload_probe 0 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=0 -> '$(maxload_probe 0 '')', expected 40 (not 0)"; }
+  ck "a 0-valued _NCPU probe is treated as failed (MAX_LOAD=40, not a gate that never opens)" $rc
   [ "$(maxload_probe 99999999999999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=1e20 -> '$(maxload_probe 99999999999999999999 '')', expected 40"; }
-  ck "an absurd _NCPU (>= 2**63) falls back to 40, not a 19-digit load gate that ERRORS" $rc
+  ck "an absurd _NCPU (>= 2**63) falls back to 40, not a 19-digit load gate that never binds" $rc
   # The other wrap, and the one a MAX_LOAD-only guard CANNOT catch: 2**63 * 10 wraps to 0, and
   # `is_limit 0` is TRUE (install.sh allows 0 for every limit but CYC), so `[ "$L" -ge 0 ]` is always
   # true and the controller dispatches nothing, forever. Only bounding the PROBE closes it.

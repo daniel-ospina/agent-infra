@@ -67,8 +67,11 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # is NOT the plist's: `_NCPU` is an OS probe (`sysctl`/`nproc`), so an absurd-but-numeric value
 # reaches `$(( 10#$_NCPU * 10 ))` and the magnitude WRAPS instead of erroring — and each wrapped
 # outcome is individually a VALID number, so no downstream guard can see it. Measured on
-# /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to a 19-DIGIT MAX_LOAD (`[ -ge ]` then ERRORS,
-# which opens the load gate), and 9223372036854775808 (2**63) * 10 wraps to exactly **0**, which
+# /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to 3875820019684212726, and -- CORRECTED, fifth
+# review round 2026-10-14: that is 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT error.
+# It just NEVER BINDS and the load gate OPENS SILENTLY (the same mechanism as the 9-digit product
+# two sentences below; the earlier comment wrongly said `[ -ge ]` ERRORS here). And
+# 9223372036854775808 (2**63) * 10 wraps to exactly **0**, which
 # `is_limit` ACCEPTS — and `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box
 # dispatches nothing, indefinitely. Bound the PROBE so neither wrap can be produced.
 # ⛔ AND MAX_LOAD NEEDS A TRUE DEFAULT, not a re-derivation (same round): the first fallback
@@ -78,6 +81,10 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 # documented default instead. (`MAX_LOAD` may still be set to 0 deliberately — install.sh allows 0
 # for every limit but CYC — so this bounds the DERIVATION, never a plist value that passes is_limit.)
 is_limit "${_NCPU:-}"    || _NCPU=4
+# A 0-valued probe is a FAILED probe, not "no cores": `10 * 0` is 0, `is_limit 0` is true, and
+# `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
+# install.sh carries the identical line (P3, fifth review round, 2026-10-14).
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
@@ -239,7 +246,6 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   [ -f "$O/state/claims-snapshot" ] || return 1
   if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
   until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
-  [ -n "${until:-}" ] && [ "$until" != "0" ] || return 1
   # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
   # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
   # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
@@ -251,7 +257,21 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   # `parked-<pr>` on the next cycle — so the cap never tripped and the PR was never parked: one
   # refused spawn plus 1 GitHub call and 3 remote round trips per cycle, indefinitely, on a PR no
   # box could work. The conservative direction is the same one claims.sh takes: treat it as LIVE.
-  [ "${#until}" -gt 18 ] && return 0
+  #
+  # ⛔ AND ABSENT IS STILL NOT THE SAME AS UNPARSEABLE (P2, fifth review round, 2026-10-14). An entry
+  # MISSING from the snapshot means "no visible claim" -> NOT live. An entry whose lease reads `0`
+  # means "a claim EXISTS whose lease is unreadable", and claims.sh treats exactly that as LIVE
+  # (claim_acquire's `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via
+  # `[ "$until" != "0" ]`). A negative lease collapses to the same `0` — `_lease_of`'s `[0-9]*`
+  # cannot match a minus sign — and so does any other non-digit. Collapsing the sentinel into the
+  # absent case made these two readers DISAGREE on the one input class claims.sh documents as a
+  # sentinel, with the very same consequence described above (the controller re-spawns a fixer
+  # claim_acquire refuses; refund_bailed_fixer un-parks the PR every cycle, so the cap never trips).
+  # `-n` is checked FIRST because absent (not live) and unreadable (live) must never be merged; the
+  # non-digit test then covers the literal negative, which claim_prune also reads as "keep".
+  [ -n "${until:-}" ] || return 1
+  [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
+  [ -z "${until//[0-9]/}" ] || return 0
   [ "$(date +%s)" -le "$until" ] && return 0
   return 1
 }
