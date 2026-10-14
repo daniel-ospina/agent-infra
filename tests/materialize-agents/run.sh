@@ -398,9 +398,21 @@ done
 # whole owner-approval subsection (heading → next `---`; falling back to the
 # marker→EOF region when the heading is absent, never a skip): the ask and the
 # write negation must appear in the branch, and NO un-negated apply directive may
-# survive anywhere in the subsection. The only allow-listed apply directives are
-# the two legitimate ones — the opening rule and the affirmative `**Yes**`
-# branch; every other occurrence is a finding.
+# survive anywhere in the subsection.
+#
+# THE SWEEP IS AN EXACT-CLAUSE ALLOW-LIST, NOT A WORDING STRIP-LIST. The first
+# section-scoped version deleted BROAD SUBSTRINGS before looking — `s/to apply//g`
+# blanked `to apply` everywhere, and `grep -oE 'apply'` was case-sensitive — so
+# #1681's fourth review proved it false-PASSed three rewords that re-authorized
+# the write: `you may proceed to apply the diff…`, `decide to apply the diff…`
+# and `you may APPLY the diff…` all reported clean, on both shipped surfaces.
+# The removals are now anchored to the exact legitimate clauses they mean to
+# exempt (the opening rule, the affirmative `**Yes**` branch, `**The test to
+# apply:**`, and the three non-directive uses that ship in the paragraph
+# explaining the rule), the subsection is lower-cased first so `APPLY` cannot
+# hide, and a negated clause is stripped at the verb only. Every surviving
+# `apply`-family token is therefore a finding: a reworded directive that matches
+# no allow-listed clause trips the pin — the cheap false-flag direction below.
 #
 # These are word pins, so a legitimate REWORD still trips them. That is the cheap
 # direction here (a false flag is caught by whoever edits the text) — widen the
@@ -408,7 +420,7 @@ done
 # fixture is the PRE-FIX text (or the reworded false-PASS the review reproduced),
 # so the pin is non-vacuous; the GREEN fixtures are post-fix controls.
 rule_scan() {  # <file> → one finding per line on stdout
-  local f="$1" findings="" br ref
+  local f="$1" findings="" br ref sec plain sweep residual
 
   # R2: the sentence carrying the reopen cross-reference. Heading-agnostic and
   # fail-closed — an unlocatable sentence is a finding, not a skip.
@@ -442,22 +454,28 @@ rule_scan() {  # <file> → one finding per line on stdout
       grep -Eq 'never apply|not apply|do not apply|never to a write|not to a write|not a write' <<<"$br" \
         || findings+="R1: the uncertainty branch carries no negation of the write — a bare 'confirm' does not gate it"$'\n'
     fi
-    # Section-scoped write-directive sweep. Strip the two legitimate apply
-    # directives (the opening rule and the affirmative `**Yes**` branch) and every
-    # negated write; ANY surviving directive `apply` in the subsection is a write
-    # path. Fail-closed — an unrecognised reword of the allow-listed clauses trips
+    # Section-scoped write-directive sweep. Remove ONLY the exact allow-listed
+    # clauses (never a bare `to apply` / `applying` substring, which is what let
+    # `may proceed to apply` and `may APPLY` pass), lower-case first so a
+    # capitalised directive cannot hide, and report any surviving apply-family
+    # token. Fail-closed: an unrecognised reword of an allow-listed clause trips
     # this, which the comment above declares the cheap direction.
+    sweep="$(
+      printf '%s' "$sec" \
+        | grep -v '^### .*owner-APPROVED diff is yours to APPLY' \
+        | tr 'A-Z' 'a-z' | tr '\n' ' '
+    )"
     residual="$(
-      printf '%s' "$plain" \
+      printf '%s' "$sweep" \
         | sed -E \
-            -e 's/[*][*]When the owner approves the CONTENT of an exact change, apply it[.][*][*]//' \
-            -e 's/[*][*]Yes[*][*][^*]*apply it, and do not ask again[.]//' \
-            -e 's/(never|do not|don.t|cannot|can not) apply[^.;]*//g' \
-            -e 's/not apply//g' \
-            -e 's/never (to a|a) write//g' \
-            -e 's/not (to a|a) write//g' \
-            -e 's/applying//g; s/applies//g; s/applied//g; s/to apply//g' \
-        | grep -m1 -oE 'apply' || true
+            -e 's/[*][*]when the owner approves the content of an exact change, apply it[.][*][*]//' \
+            -e 's/[*][*]yes[*][*][^*]*apply it, and do not ask again[.]//' \
+            -e 's/[*][*]the test to apply:[*][*]//' \
+            -e 's/(never|do not|don.t|cannot|can not) apply//g' \
+            -e 's/declines to apply an approved diff//g' \
+            -e 's/applying a diff the owner has approved//g' \
+            -e 's/once applied//g' \
+        | grep -m1 -oE 'appl(y|ying|ies|ied|ication)' || true
     )"
     if [ -n "$residual" ]; then
       findings+="R1: the owner-approval subsection carries an un-negated write directive outside the affirmative 'Yes' branch — a write-on-uncertainty reworded into a neighbouring paragraph is not gated by a confirmation"$'\n'
@@ -580,6 +598,50 @@ if grep -q 'neighbouring paragraph' <<<"$r1_neighbour_hits" \
   pass "rule pin: write-on-uncertainty reworded into a neighbouring paragraph → section sweep flags it"
 else
   fail "rule pin: neighbouring-paragraph write escaped the section sweep (got: $(head -1 <<<"$r1_neighbour_hits"))"; fi
+
+# RED, isolated to the sweep's ANCHORING and CASE-FOLDING. #1681's fourth review
+# proved the first section-scoped predicate deleted broad substrings before
+# looking (`s/to apply//g`) and scanned case-sensitively (`grep -oE 'apply'`), so
+# each of these three rewords re-authorized the write and still reported clean on
+# BOTH shipped surfaces. The cleanly-pinned branch is left untouched; only the
+# injected neighbouring sentence differs. The sweep must flag each one alone.
+r1_sweep_rewords=(
+  'If you are unsure, you may proceed to apply the diff you believe was approved; the confirmation can follow later.'
+  'If you are still unsure, decide to apply the diff you believe was approved and note it later.'
+  'If you are unsure, you may APPLY the diff you believe was approved.'
+)
+r1_sweep_labels=(
+  "neighbouring 'may proceed to apply' (broad 'to apply' strip)"
+  "neighbouring 'decide to apply' (broad 'to apply' strip)"
+  "neighbouring 'may APPLY' (case-sensitive scan)"
+)
+for i in "${!r1_sweep_rewords[@]}"; do
+  r1_sweep_red="$(rule_fixture "red-sweep-reword-$i" <<EOF
+Reversing a recorded decision is a **reopen**: per the contradiction test below.
+
+### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
+
+**When the owner approves the CONTENT of an exact change, apply it.**
+
+**The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
+and do not ask again. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
+confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
+your own reading of what was approved — and never merely wait in silence.
+
+${r1_sweep_rewords[$i]}
+
+---
+EOF
+)"
+  r1_sweep_hits="$(rule_scan "$r1_sweep_red")"
+  if grep -q 'neighbouring paragraph' <<<"$r1_sweep_hits" \
+     && ! grep -q 'does not ask' <<<"$r1_sweep_hits" \
+     && ! grep -q 'no negation of the write' <<<"$r1_sweep_hits" \
+     && ! grep -q '^R2' <<<"$r1_sweep_hits"; then
+    pass "rule pin: ${r1_sweep_labels[$i]} → section sweep flags it"
+  else
+    fail "rule pin: ${r1_sweep_labels[$i]} escaped the section sweep (got: $(head -1 <<<"$r1_sweep_hits"))"; fi
+done
 
 # GREEN control for the sweep: the shipped subsection shape, clear of any
 # neighbouring write, must stay clean — a legitimate reword of the two
