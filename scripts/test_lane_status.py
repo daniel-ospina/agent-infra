@@ -473,7 +473,7 @@ def test_main_refuses_an_empty_roster_instead_of_publishing_it(L, monkeypatch, c
     that removing the refusal fails HERE and not merely somewhere in the prose.
     """
     monkeypatch.setattr(L, "registry", lambda: [])
-    monkeypatch.setattr(L.sys, "argv", ["lane-status.py", "--json"])
+    monkeypatch.setattr(L.sys, "argv", ["lane-status.py", "--json", "--no-cache"])
     with pytest.raises(SystemExit) as exc:
         L.main()
     assert exc.value.code == 3, "an empty roster must exit non-zero, got %r" % (exc.value.code,)

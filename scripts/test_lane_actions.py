@@ -10,8 +10,16 @@ produces those directions has to be pinned by a test rather than by a comment. T
 Run: /usr/bin/python3 scripts/test_lane_actions.py
 """
 import importlib.util
+import atexit
 import json
 import os
+import shutil
+import tempfile
+
+# The scratch directory the module this file loads persists into (#1734). Module-level because it
+# must outlive any single class: `_objective_mod()` mints a fresh module object per call.
+_STATE_SCRATCH = tempfile.mkdtemp(prefix="lane-actions-state-")
+atexit.register(shutil.rmtree, _STATE_SCRATCH, ignore_errors=True)
 import sys
 import tempfile
 import time
@@ -637,6 +645,21 @@ def _objective_mod():
     spec = importlib.util.spec_from_file_location("objective_uv", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)          # the __main__ guard keeps this side-effect free
+    # ⛔ "SIDE-EFFECT FREE" WAS TRUE OF LOADING AND FALSE OF THE CALLS THAT PERSIST STATE (#1734).
+    # `objective.py` persists state
+    # BETWEEN HEARTBEAT BEATS, and `STUCK_FILE` resolves to
+    # `~/.pi/agent/state/call-rail-stuck.json` -- the file the live loop maintains to escalate a
+    # call-rail PR that has gone quiet. Measured: a run of this file wrote it three times and then
+    # REMOVED it -- so the suite could delete the operator's live state.
+    #
+    # Redirected HERE, where the module is loaded, rather than in a single test: `_objective_mod()`
+    # mints a FRESH module object per call (`module_from_spec`), so a redirect applied to one caller
+    # leaves every other caller -- and every class added later -- writing the real file. One seam,
+    # every consumer. `test_the_suite_never_points_at_the_production_state_dir` pins the redirect, so
+    # deleting it fails instead of silently resuming the writes.
+    mod.STATE = _STATE_SCRATCH
+    mod.CACHE = os.path.join(_STATE_SCRATCH, "objective.last")
+    mod.STUCK_FILE = os.path.join(_STATE_SCRATCH, "call-rail-stuck.json")
     return mod
 
 
@@ -646,6 +669,18 @@ class TestActionVocabulary:
         cls.o = _objective_mod()
         cls.REQ = list(cls.o.REQUIRED)
         cls.DU = "https://github.com/o/r/actions/runs/1/job/2"
+
+    def test_the_suite_never_points_at_the_production_state_dir(self):
+        """⛔ THE REDIRECT MUST BE IN FORCE, NOT MERELY PRESENT (#1734). Deleting the `STUCK_FILE`
+        line in `_objective_mod()` must fail HERE, or the next edit that removes it silently resumes
+        writing -- and deleting -- a file the heartbeat loop owns.
+
+        Asserted on the module `_objective_mod()` returns, which is the seam every class in this file
+        loads through, so this pins the redirect rather than one class's copy of it."""
+        state = os.path.expanduser("~/.pi/agent/state")
+        for name in ("STATE", "CACHE", "STUCK_FILE"):
+            value = getattr(self.o, name)
+            assert not value.startswith(state), f"{name} points at production: {value}"
 
     def _cr(self, red=(), absent=(), extra_red=()):
         """A check-run list for the 7 required contexts, plus optional never-required reds."""
