@@ -85,8 +85,18 @@ echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 # reason is a state nobody can act on.
 park() { # park <reason…>
   local why="$*"
+  # ⛔ THE REASON BELONGS TO THE HEAD THIS PARK IS KEYED TO. An EMPTY HEAD means the
+  # unresolvable-head branch below (a transient `gh` blip) reached park() while an earlier park at a
+  # real head is still in place: it writes no marker, and re-writing the reason there would replace
+  # the real, actionable cause with the transient one — so when gh recovers the worker matches the
+  # park, exits 5, and the exit-5 log (the only in-band remedy on the chain-<N>/fix-one.sh paths)
+  # would name the wrong cause. With no head there is no new park to describe, so the first reason
+  # wins. A NON-EMPTY HEAD is a fresh park — a moved head re-arms the PR and the already-parked
+  # guard cannot have fired for it — so its reason must REPLACE a stale one from an earlier head.
+  if [ -n "${HEAD:-}" ] || [ ! -s "$O/state/parked-$PR" ]; then
+    printf '%s\n' "$why" > "$O/state/parkreason-$PR"
+  fi
   [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
-  printf '%s\n' "$why" > "$O/state/parkreason-$PR"
   echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
 }
 

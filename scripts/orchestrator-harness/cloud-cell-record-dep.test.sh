@@ -89,6 +89,12 @@ CELL="$TMP/cell"
 CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"; CELL_HARNESS="$CELL/harness"
 CELL_STUBS="$CELL/stubs"
 mkdir -p "$CELL_HOME" "$CELL_REPO/.git" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
+# cmd_check also judges DISPATCH PROVISIONING (agent-infra#1736): the target repo must carry its
+# own tools/collision_preflight.py (or resolve a tortoise checkout), else the whole cell is refused
+# as MERGE-ONLY before the recorder assertions below are ever reached — which would make them pass
+# for the wrong reason. Give the fixture its own tool so every recorder assertion is decided by the
+# recorder probe it names, not by an earlier refusal.
+mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/tools/collision_preflight.py"
 cp "$HERE"/*.sh "$CELL_HARNESS/"
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
 cp "$HERE"/*.sh "$CELL_O/"
@@ -172,7 +178,8 @@ out="$(cell_check)"; rc=$?
 ck "a DIRECTORY at the recorder path is not certified" $rc
 case "$out" in *'NOT A REGULAR FILE'*) rc=0 ;; *) rc=1; note "$(printf '%s' "$out" | tail -3)";; esac
 ck "the refusal names the non-regular-file shape" $rc
-rmdir "$RECORDER"; printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER" record-review.sh resolves
+rmdir "$RECORDER"; printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
+# A recorder WITHOUT its declared sibling: record-review.sh resolves
 # lib/diff-normalize.py from its OWN directory; without it it silently takes the RAW pre-#1362 digest
 # arm, so every base-only `gh pr update-branch` refuses carry-forward and buys a fresh PAID review.
 # A cell certified in that state is the same false-PASS/paid-loop class this PR exists to close — one
@@ -326,6 +333,36 @@ ck "a second run at the parked head does not re-pay for a review" $rc
 ck "the refusal to re-review exits with its own code (5), not a generic failure" $rc
 grep -q 'refusing to re-review' "$MRG/o/logs/merge-$PR.log" && rc=0 || rc=1
 ck "the refusal says it is refusing, and names the way out" $rc
+
+# 7b) A transient `gh` blip after a park must NOT overwrite the park's reason. The unresolvable-head
+# branch also calls park(), and it runs BEFORE the already-parked guard; with HEAD empty it writes no
+# `parked-<PR>` marker, but an unconditional `parkreason` write would replace the real cause with
+# "could not resolve head". When gh recovers the worker matches the park, exits 5, and the exit-5 log
+# — the only remedy surfaced on the chain-<N>/fix-one.sh paths — would name the wrong cause.
+out="$(FAKE_HEAD_OVERRIDE='' run_merge)"; rc=$?
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) head=$HEAD"; }
+ck "a gh blip after a park does not move the park marker" $rc
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a blip paid for a review"; }
+ck "a gh blip after a park does not re-pay for a review" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'rc=127'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null) — the transient blip clobbered it";; esac
+ck "RED→GREEN: a gh blip does not clobber the original park reason" $rc
+# …and once gh recovers, the refusal still reports the ORIGINAL cause, not the transient blip.
+out="$(run_merge)"; rc2=$?
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the refusal after a recovered blip still exits 5" $rc
+grep -q 'reason: .*rc=127' "$MRG/o/logs/merge-$PR.log" && rc=0 || { rc=1; note "$(tail -1 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "the exit-5 refusal names the original reason, not the transient blip" $rc
+
+# 7c) A push MOVES the head, so the PR re-arms (the controller's guard compares only the head) and
+# the worker must park at the NEW head with a reason that describes THAT head's failure. Keeping the
+# previous head's reason beside a new head would tell the operator the wrong cause — the same
+# wrong-cause defect 7b closes on the blip path, reached the other way.
+HEAD2="89abcdef0123456789abcdef0123456789abcdef"
+out="$(FAKE_HEAD_OVERRIDE="$HEAD2" run_merge)"; rc=$?
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD2" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null) head2=$HEAD2"; }
+ck "a moved head re-parks at the NEW head" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *"head=$HEAD2"*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null) — stale reason from the previous head";; esac
+ck "RED→GREEN: the re-park's reason names the NEW head, not the stale one" $rc
 
 # 8) RED→GREEN — the recorder is MISSING entirely. This must be caught BEFORE the paid review, not
 # after it: that is what turns an unbounded paid loop into one cheap refusal per PR.
