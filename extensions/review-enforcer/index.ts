@@ -234,13 +234,17 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  *   - `gh alias` expansion: the argv is `gh <alias> …`, so an alias defined as
  *     `pr merge --admin` is invisible to BOTH layers.
  *
- * Neither is chased with a spelling list, and neither is reachable for a real merge
- * only: the CALLER hands over the unresolvable FLAG, never the MERGE — a command the
- * text layer reads as a merge keeps this layer's fail-closed decision
- * (`mergeVerbInText`), so a command that discards PATH cannot also get its admin merge
- * deferred. What is deferred is the over-read that #1776 is about (a construct plus the
- * word `admin` with no merge in it), which cannot merge anything at all. The post-merge
- * detector, not this gate, is the authority of record for the two classes above.
+ * Neither is chased with a spelling list, and the boundary is the MERGE: the CALLER
+ * defers only the unresolvable FLAG, and keeps this layer's fail-closed decision for any
+ * command the text layer reads as a merge (`mergeVerbInText` — a `pr`/`merge` token pair,
+ * or a CONSTRUCT IN A VERB POSITION, where the construct class is `$`, a backtick and
+ * `{`/`}`: a substitution, or brace expansion, or the substituted repo-flag value the
+ * token scan consumed with it). That is what makes the first class mostly moot — a
+ * command that discards the PATH entry cannot get a merge deferred, because the shape
+ * that discards it is the shape the text layer reads. A spelling that gets a merge past
+ * the text layer anyway lands in the second class (an alias is expanded inside gh, after
+ * this process has run), and the post-merge detector, not this gate, is the authority of
+ * record for both.
  */
 export function ghShimWillEnforce(shimDir: string | null): boolean {
   // Both halves are OURS and both must hold: the layer is switched on, AND the
@@ -638,10 +642,19 @@ export function mergeVerbInText(command: string): boolean {
   // Requiring only "construct + the words gh and pr" was too broad (it made
   // `gh pr view $X` an admin merge), and requiring `pr` to be a word missed
   // ``gh p`printf r` …``, where `printf` hides it.
+  //
+  // The construct class here is `$`, a backtick, and `{`/`}`: BRACE EXPANSION splices a
+  // verb just as effectively as a substitution does — `gh {pr,merge} 999 $V` hands the
+  // real gh the argv `pr merge 999 --admin` — and a brace carries no `$`, so a test that
+  // stopped at substitutions and backticks read no merge and deferred a command that had
+  // already discarded the PATH entry the argv layer lives on. Measured: without `{}` in
+  // this class that command was ALLOWED while the OLD code (which gated every admin
+  // candidate) had refused it — a fail-open the deferral introduced.
+  const CONSTRUCT = /[$`{}]/;
   const afterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < scan.tokens.length - 1; i++) {
       if (at(i) !== word) continue;
-      if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
+      if (CONSTRUCT.test(scan.tokens[i + 1] ?? "")) return true;
     }
     return false;
   };
@@ -649,13 +662,13 @@ export function mergeVerbInText(command: string): boolean {
   // stripper consumes together with its value: `gh pr --repo=$(cat x) merge 999 $V`
   // leaves `gh pr x) merge …`, so both arms above miss it and the merge went to the
   // argv layer — which the command itself can then disable by resetting PATH. The RAW
-  // text still shows a `$`-bearing token right after `gh`/`pr`. Erring here costs a
+  // text still shows a construct-bearing token right after `gh`/`pr`. Erring here costs a
   // refusal; erring the other way costs the gate.
   const raw = command.trim().split(/\s+/);
   const rawAfterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < raw.length - 1; i++) {
       if (dequote(raw[i]) !== word) continue;
-      if (/[$`]/.test(raw[i + 1] ?? "")) return true;
+      if (CONSTRUCT.test(raw[i + 1] ?? "")) return true;
     }
     return false;
   };

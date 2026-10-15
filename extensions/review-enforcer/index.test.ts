@@ -5317,6 +5317,10 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // repo-flag stripper consumed `--repo=$(…)` together with its `$`, so the token
         // scan saw no verb at all until the raw-text arm was added.
         "PATH=\"/usr/bin\"; export PATH; gh pr --repo=$(cat .gh-repo) merge 999 $'--admin'",
+        // …and with the VERB SPLICED BY BRACE EXPANSION, which carries no `$` and no
+        // backtick: `gh {pr,merge} 999 $V` hands the real gh the argv
+        // `pr merge 999 --admin`, and the pre-deferral code refused it.
+        "PATH=\"${PATH#*:}\"; export PATH; V=--admin; gh {pr,merge} 999 $V",
       ];
       for (const cmd of cmds) {
         ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);
