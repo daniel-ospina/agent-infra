@@ -181,6 +181,46 @@ check_ci_runner_gate_farmed() {
   fi
 }
 
+# #1552 — the `fleet_srcs` farm is the ONLY delivery path for the lane-orchestration layer the
+# fleet's own dispatch decisions rest on (lane-guard, safe-send, turn-classify, the heartbeat…).
+# 27 of its entries existed on exactly ONE disk and in no repo file until #1552. Pin the WHOLE
+# declared list, not just the new entries, because the two claims are different: "the array says
+# it" and "the box has it". The loop that consumes the array SKIPS an entry whose repo file is
+# absent (`[ -f "$f" ] || continue`), so a declared-but-unlanded entry fails SILENT — and the
+# measured cost of that silence is #1738 (a committed, reviewed, merged, farmed fix that sat
+# inert for 27 hours because nothing could answer "is the code on this machine the code in the
+# repo?"). Byte-identity is the other half: the farm's whole purpose is that the REPO copy is
+# the copy that RUNS, and a stale destination is exactly what #1552 measured (28 deployed files
+# byte-identical, 4 stale, before this change).
+check_fleet_srcs_farmed() {
+  local label="$1"
+  local line entry dest checked=0 declared=0
+  line="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$ROOT/pi-bootstrap/setup.sh")"
+  [ -n "$line" ] \
+    || { fail "$label: could not read the fleet_srcs array from setup.sh (wrapped across lines? — ci_runner_gate.test.sh reads it the same way)"; return; }
+  for entry in $line; do
+    declared=$((declared+1))
+    [ -f "$ROOT/scripts/$entry" ] \
+      || { fail "$label: fleet_srcs declares '$entry' but scripts/$entry does not exist — the farm skips it SILENTLY"; continue; }
+    dest="$DEST/scripts/$entry"
+    [ -f "$dest" ] \
+      || { fail "$label: fleet_srcs entry '$entry' was NOT farmed into scripts/ (silent skip)"; continue; }
+    if diff -q "$ROOT/scripts/$entry" "$dest" >/dev/null 2>&1; then
+      checked=$((checked+1))
+    else
+      fail "$label: farmed $entry differs from scripts/$entry (stale copy!)"
+    fi
+  done
+  # The summary must never print `ok:` on a run that failed entries (review: an `ok:` beside a
+  # FAIL is the same false-clean read this whole function exists to close), so the prefix is
+  # decided by the count, not printed unconditionally.
+  if [ "$checked" -eq "$declared" ]; then
+    echo "ok: $label fleet_srcs farm byte-identical for $checked/$declared declared entries (#1552)"
+  else
+    echo "PARTIAL: $label fleet_srcs farm verified only $checked/$declared declared entries (#1552)"
+  fi
+}
+
 # #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
 # $DEST/scripts/lib/pid-identity.sh, byte-identical to the repo copy, and the
 # farmed reaper (which resolves the library from its OWN sibling directory) must
@@ -565,6 +605,7 @@ check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
 check_ci_runner_gate_farmed "run1"
+check_fleet_srcs_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"

@@ -249,7 +249,13 @@ jobs:
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py -x --timeout=60 -q
+        # #1552 — `scripts/test_objective.py` and `scripts/test_turn_classify_state.py`
+        # are named here for the SAME reason: both lived ONLY on the laptop
+        # (~/.pi/agent/scripts) and in no repo file, so the guard on objective.py's
+        # blindness flag and on the objective cache's freshness were pinned by suites
+        # CI could not execute. A suite the repo does not RUN is a suite it does not
+        # HAVE — naming them is the half of the landing that makes the other half count.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
