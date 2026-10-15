@@ -9280,10 +9280,17 @@ expect_poll diag-blank-line unreadable '<unreadable>' "a stderr whose message en
   && pass "(shape) …and its message survives the blank line, rather than being reported as none" \
   || fail "(shape) a stderr ending in a blank line lost its message (diag=[$POLL_DIAG])"
 
-# ⛔ THE VALUE IS BOUNDED, because the shape `case` is a GLOB removal that is O(n²) in the
-# value's length: a producer emitting a large body made the rail HANG instead of answering
-# it (measured: 80 KB ≈ 6 s, 160 KB ≈ 28 s, 200 KB never returned). The ceiling is asserted
-# by its own byte count, so the case cannot pass vacuously on a fixture that never got big.
+# ⛔ THE VALUE IS BOUNDED BEFORE THE EXPANSIONS. The two parameter expansions that follow
+# (`${observed%%$'\t'*}` / `${observed#*$'\t'}`) are O(n²) in the value's length, so a large
+# body made the rail HANG instead of answering it (measured: 80 KB ≈ 7 s and ≈ 18 s for those
+# two expansions, 160 KB ≈ 25 s and ≈ 58 s). The ceiling is asserted by its own byte count,
+# so the case cannot pass vacuously on a fixture that never got big.
+#
+# ⛔ WHAT THIS DOES NOT PIN, stated rather than implied: the ORDERING (ceiling before the
+# expansions) is not observable through a VERDICT. This fixture is the shape that is read
+# WRONGLY when unbounded (one tab, a huge mergedAt ⇒ `merged`), which pins the ceiling's
+# presence and its effect; a HANG-shaped fixture would answer `unreadable` either way, only
+# slowly, so pinning the ordering would take a wall-clock bound — flaky, and not asserted.
 { printf 'MERGED\t'; head -c 8000 /dev/zero | tr '\0' 'x'; } > "$TMP/huge-answer"
 [ "$(wc -c < "$TMP/huge-answer" | tr -d ' ')" -gt 4096 ] \
   && pass "(shape) the oversized fixture really exceeds the 4 KiB ceiling ($(wc -c < "$TMP/huge-answer" | tr -d ' ') bytes)" \

@@ -1696,11 +1696,14 @@ poll_merge_artifact() {
     # the file IFF it held no NUL. A missing or unreadable file makes `cmp` exit 2, which is
     # not "equal", so this test fails CLOSED (unreadable) rather than open.
     #
-    # ⛔ AND THE VALUE IS BOUNDED, because the `case` below is a GLOB removal that is O(n²)
-    # in the value's length (measured on this box: 80 KB ≈ 6 s, 160 KB ≈ 28 s, 200 KB never
-    # returned) — a producer emitting a large body would HANG the rail instead of answering
-    # it. The projection is a fixed, tiny shape (`MERGED\t2026-09-23T00:00:00Z` is 30 bytes),
-    # so a generous 4 KiB ceiling costs nothing real and makes the glob's input bounded.
+    # ⛔ AND THE VALUE IS BOUNDED, because the two parameter EXPANSIONS below
+    # (`${observed%%$'\t'*}` and `${observed#*$'\t'}`) are what is O(n²) in the value's
+    # length — measured on this box: 80 KB ≈ 7 s and ≈ 18 s for the two expansions, 160 KB
+    # ≈ 25 s and ≈ 58 s — so a producer emitting a large body HANGED the rail instead of
+    # answering it. (The `case` tests themselves are linear; the cost is in the removals.)
+    # The projection is a fixed, tiny shape (real `gh` output for these two fields is 28
+    # bytes), so a generous 4 KiB ceiling costs nothing real and keeps those expansions from
+    # ever seeing an oversized value.
     state_part=""; rest=""
     if [ "$rc" -eq 0 ] && [ "$(wc -c < "$outtmp")" -le 4096 ] \
        && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
@@ -5829,8 +5832,8 @@ ${parity_forgiven_note}"
       if [ -n "${MERGE_ART_DIAG:-}" ]; then
         say_err "   the state read reported: ${MERGE_ART_DIAG}"
       else
-        say_err "   the state read wrote NOTHING to stderr (a producer that answers with"
-        say_err "   something other than the projection and says nothing about it)."
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
       fi
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
@@ -5902,8 +5905,8 @@ ${parity_forgiven_note}"
       if [ -n "${MERGE_ART_DIAG:-}" ]; then
         say_err "   the state read reported: ${MERGE_ART_DIAG}"
       else
-        say_err "   the state read wrote NOTHING to stderr (a producer that answers with"
-        say_err "   something other than the projection and says nothing about it)."
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
       fi
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
