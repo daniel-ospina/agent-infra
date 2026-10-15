@@ -23,11 +23,16 @@
 #   (e) `--verify` refuses a cell missing a guard, a stray entry under ~/.pi/agent/tools/
 #       (pi blocks every interactive boot on one, #1277), or an unlocatable checkout — and
 #       the tools/ migration removes a legacy tools/fleet/ farm;
-#   (f) an npm-less cell is refused rather than certified with a partial layer.
+#   (f) an npm-less cell is refused rather than certified with a partial layer;
+#   (g) the npm child runs with an EMPTY environment (the cell's keys.env is exported into
+#       reach of this installer, so an inherited merge key would be readable by any
+#       dependency's lifecycle script) and with --ignore-scripts;
+#   (h) `--verify` refuses a hand-edited guard EXTENSION and a missing config artifact
+#       (agents/) — existence alone was certified before.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
-# same shape as test-setup-no-nesting.sh). The extension runtime DEPS are therefore not
-# exercised here; that step is `npm install --omit=dev`, and its failure path IS pinned (f).
+# same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
+# RECORDS what it can see (see (g)); the failure paths of the real npm call are pinned by (f).
 #
 # Usage:  bash pi-bootstrap/tests/test-cell-install.sh
 # Exit:   0 = all assertions passed, 1 = at least one failure.
@@ -53,13 +58,20 @@ hdr()  { echo "== $*"; }
 
 # --- hermetic environment -------------------------------------------------
 mkdir -p "$FAKEBIN" "$CELL_HOME"
-cat > "$FAKEBIN/npm" <<'EOF'
+SPY="$TMP/npm-spy.log"
+cat > "$FAKEBIN/npm" <<EOF
 #!/bin/bash
-# Stub: cell-install.sh runs `npm install` per extension; keep this suite offline — but DO
+# Stub: cell-install.sh runs npm install per extension; keep this suite offline — but DO
 # create node_modules, because the artifact the installer's own --verify reads back is the
-# dependency tree npm would have produced. A stub that only exits 0 would make --verify's
-# dependency check unfalsifiable (it would fail for the wrong reason and prove nothing).
+# dependency tree npm would have produced.
+#
+# It also records one line per invocation: first the merge key it can SEE in its
+# environment, then its argv. The installer must call it with an EMPTY environment (a
+# package's lifecycle script inherits it otherwise) and with --ignore-scripts, so a
+# compromised dependency cannot execute at install time. The path is baked in because the
+# child deliberately gets no environment to pass one through.
 mkdir -p node_modules
+{ printf '%s\n' "\${AI_REVIEW_GATE_KEY-CELL_INSTALL_TEST_UNSET}"; printf '%s\n' "\$*"; } >> "$SPY"
 exit 0
 EOF
 chmod +x "$FAKEBIN/npm"
@@ -81,14 +93,24 @@ run_verify() {
 # simplest thing that can be right, so agreeing with the installer's python parser means
 # something. Emits `path-under-$DEST/scripts<TAB>path-under-$INFRA_ROOT`.
 expected_farm_rows() {
-  local name dest src rest rel base line
-  for spec in "fleet_srcs||scripts" \
-              "merge_gate_srcs||scripts" \
-              "lib_srcs|lib|scripts/lib" \
-              "fleet_tools|fleet|tools/fleet"; do
-    name="${spec%%|*}"; rest="${spec#*|}"; dest="${rest%%|*}"; src="${rest##*|}"
+  local name dest src rest rel base line req
+  for spec in "fleet_srcs||scripts|required" \
+              "merge_gate_srcs||scripts|required" \
+              "lib_srcs|lib|scripts/lib|required" \
+              "fleet_tools|fleet|tools/fleet|required" \
+              "lane_root_srcs||scripts|optional" \
+              "lane_srcs||scripts|optional"; do
+    name="${spec%%|*}"; rest="${spec#*|}"; req="${rest##*|}"; rest="${rest%|*}"
+    dest="${rest%%|*}"; src="${rest##*|}"
     line="$(sed -n "s/^${name}=(\(.*\))$/\1/p" "$SETUP")"
-    [ -n "$line" ] || { fail "independent reader found no $name=(...) in setup.sh"; continue; }
+    if [ -z "$line" ]; then
+      # `optional` = an array that does not exist YET (#1552/#1553's lane farm): the reader is
+      # deliberately a SUPERSET of today's declaration, so this suite is not born red on the
+      # tree where #1553 lands. The installer's own parser has no such escape (an unknown
+      # array is a FATAL), so the two readers still agree on what is installed.
+      [ "$req" = "optional" ] || fail "independent reader found no $name=(...) in setup.sh"
+      continue
+    fi
     for base in $line; do
       if [ -n "$dest" ]; then rel="$dest/$base"; else rel="$base"; fi
       printf '%s\t%s/%s\n' "$rel" "$src" "$base"
@@ -114,8 +136,25 @@ for e in ((m.get("files") or {}).get("extensions/") or {}).get("entries") or []:
 PY
 }
 
+# The extensions whose package.json declares real dependencies — the ONLY ones the installer
+# may spend an npm run on, and the same predicate --verify uses. Read from the checkout, never
+# from the installer.
+expected_dep_count() {
+  local d n=0
+  for d in "$ROOT"/extensions/*/; do
+    [ -f "$d/package.json" ] || continue
+    if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("dependencies") else 1)' \
+         "$d/package.json" 2>/dev/null; then n=$((n + 1)); fi
+  done
+  printf '%s' "$n"
+}
+
 # -------------------------------------------------------------------------
 hdr "run 1: install into an empty cell home"
+# The cell's bring-up sources keys.env with `set -a` BEFORE calling the installer, so the
+# merge authority is in this process's environment for real. Export a sentinel so the
+# assertion below is falsifiable: without the installer's `env -i`, the spy would see it.
+export AI_REVIEW_GATE_KEY="CELL-INSTALL-TEST-MERGE-KEY"
 run_install
 rc=$?
 [ "$rc" -eq 0 ] || fail "install exited $rc (expected 0); log: $LOG"
@@ -185,6 +224,27 @@ if [ -d "$DEST/tools" ] && [ -n "$(ls -A "$DEST/tools" 2>/dev/null)" ]; then
   fail "installer left entries in \$DEST/tools/ — pi blocks every interactive boot on a non-fd/rg one (#1277)"
 else
   ok "\$DEST/tools/ is absent or empty (pi's startup scan stays quiet)"
+fi
+
+# (g) The npm child must see NO inherited secret and must not be allowed to run package
+# scripts. Proven by what the stub SAW, not by reading the installer's source.
+if [ ! -s "$SPY" ]; then
+  fail "npm was never invoked — the dependency step is not running, so these assertions would be vacuous"
+else
+  if grep -q "CELL-INSTALL-TEST-MERGE-KEY" "$SPY"; then
+    fail "the npm child INHERITED AI_REVIEW_GATE_KEY — a dependency lifecycle script can read the merge authority"
+  else
+    ok "npm runs with an EMPTY environment — the exported merge key never reaches a dependency"
+  fi
+  noscripts="$(awk 'NR % 2 == 0 && $0 !~ /--ignore-scripts/' "$SPY" | wc -l | tr -d ' ')"
+  [ "$noscripts" = "0" ] \
+    && ok "every npm invocation carries --ignore-scripts (no dependency script executes at install time)" \
+    || fail "$noscripts npm invocation(s) ran WITHOUT --ignore-scripts"
+  deps="$(expected_dep_count)"
+  n="$(awk 'NR % 2 == 1' "$SPY" | wc -l | tr -d ' ')"
+  [ "$n" = "$deps" ] \
+    && ok "npm ran for exactly the $deps extension(s) that declare dependencies (install and verify agree)" \
+    || fail "npm ran $n time(s) but $deps extension(s) declare dependencies — the two halves of the contract disagree"
 fi
 
 # -------------------------------------------------------------------------
@@ -287,6 +347,27 @@ run_verify
 [ $? -eq 0 ] && ok "fd/rg alone keep \$DEST/tools/ legal (pi's own binaries survive)" \
   || fail "fd/rg in \$DEST/tools/ tripped the guard"
 rm -rf "$DEST/tools"
+
+# A hand-edited guard is worse than a missing one: the missing one is loud, the edited one
+# reports LAYER VERIFIED. Existence alone used to be the whole check here.
+echo "# drift injected by the test" >> "$DEST/extensions/review-enforcer/index.ts"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "extension DIR DIFFERS from the checkout: extensions/review-enforcer" "$LOG" \
+  && ok "--verify refuses a hand-edited guard extension (existence is not certification)" \
+  || fail "--verify CERTIFIED a hand-edited guard extension — a stale guard would load on the cell"
+# The config set used to be installed blind and never read back: a checkout missing
+# pi-config/agents produced a certified cell whose lane could dispatch no sub-agent.
+rm -rf "$DEST/agents"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "config artifact MISSING: agents" "$LOG" \
+  && ok "--verify refuses a cell with no agents/ (pi resolves user-scope sub-agents from it)" \
+  || fail "--verify CERTIFIED a cell with no agents/ — a lane could not dispatch a reviewer"
+run_install >/dev/null 2>&1
+cmp -s "$ROOT/extensions/review-enforcer/index.ts" "$DEST/extensions/review-enforcer/index.ts" \
+  && ok "re-install restored the drifted guard and the config set" \
+  || fail "re-install did not restore the drifted guard"
 
 # A dependency tree that has VANISHED is a partial layer, and verify cannot see that npm ever
 # ran — the install path is gated on npm's exit code, verify has only the artifact.

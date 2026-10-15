@@ -205,23 +205,29 @@ check_dispatch() {
 # merge-one.sh:240 executes. See the header's (4).
 #
 # FATAL, not best-effort, and deliberately unlike check_dispatch above: the supervisor's
-# cmd_check covers only record-review.sh + diff-normalize.py (2 of the 24 declared farm
-# files), so if this step is skipped nothing else ever installs the guards. A "CELL READY"
-# over an unguarded cell is exactly the false PASS this repo keeps removing, and the remedy
-# is one env var (`INFRA_ROOT=<checkout>`) — so refuse.
+# cmd_check tests NEITHER record-review.sh NOR lib/diff-normalize.py (agent-infra#1717;
+# orchestrator-harness/README.md §7.5 "Still open"), and nothing else installs any of the
+# other 22 declared farm files — so if this step is skipped, nothing else ever installs the
+# guards. (A
+# "CELL CAN RUN A CONTROLLER" from cloud-cell-supervisor.sh start is therefore NOT evidence
+# that the layer is present: it reads a cell that never received it.) A "CELL READY" over an
+# unguarded cell is exactly the false PASS this repo keeps removing, and the remedy is one
+# env var (`INFRA_ROOT=<checkout>`) — so refuse.
 check_operational_layer() {
   local cand root="" installer os_release
   # A cell keeps its agent-infra checkout in any of a few places (this script is normally
-  # pushed STANDALONE, so its own directory proves nothing). Identical candidate list to
-  # cell-install.sh's own resolver, plus ${BASH_SOURCE[0]}/.. for a run from the checkout.
+  # pushed STANDALONE, so its own directory proves nothing). Same candidates as
+  # cell-install.sh's own resolver — with NO world-writable one: a fixed /tmp path would let
+  # any local user put a checkout-shaped tree there, and everything under it is installed
+  # and then EXECUTED by pi. Pass INFRA_ROOT explicitly if the checkout is elsewhere.
   for cand in "${INFRA_ROOT:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" \
               "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" \
-              "$CELL_HOME/agent-infra" /tmp/cell-ai; do
+              "$CELL_HOME/agent-infra"; do
     [ -n "$cand" ] || continue
     if [ -f "$cand/pi-bootstrap/cell-install.sh" ]; then root="$cand"; break; fi
   done
   if [ -z "$root" ]; then
-    die "no agent-infra checkout on this cell (looked at \$INFRA_ROOT, $(dirname "${BASH_SOURCE[0]}")/.., \$AGENT_INFRA_PATH, \${HARNESS}/.., $CELL_HOME/agent-infra, /tmp/cell-ai).
+    die "no agent-infra checkout on this cell (looked at \$INFRA_ROOT, $(dirname "${BASH_SOURCE[0]}")/.., \$AGENT_INFRA_PATH, \${HARNESS}/.., $CELL_HOME/agent-infra).
        The operational layer (guards, skills, the merge-path record-review.sh) cannot be installed,
        so this cell would run unguarded with a rc=127 merge path. Clone agent-infra onto the cell
        and re-run:  INFRA_ROOT=<checkout> bash $0 --check"

@@ -224,14 +224,20 @@ work unless they coordinate (see §5, "broad mode").
 
 ## 4. Install
 
-**On a cmux cloud cell**, the whole prerequisite list above is provisioned by
-`scripts/cloud-cell-bringup.sh --check`, which installs the operational layer from the
-agent-infra checkout already on the cell via `pi-bootstrap/cell-install.sh` and REFUSES to
-print `CELL READY` if the layer cannot be installed. `cell-install.sh` copies the farm set
-that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), every extension in
+**On a cmux cloud cell**, `scripts/cloud-cell-bringup.sh --check` provisions the toolchain,
+the network, the provider, `gh` auth/push, the target-repo clone, the dispatch pre-flight and
+**the operational layer** — that last one from the agent-infra checkout already on the cell via
+`pi-bootstrap/cell-install.sh`, and it REFUSES to print `CELL READY` if the layer cannot be
+installed. Two things a `CELL READY` does NOT speak for, and which the operator still owns:
+**`AI_REVIEW_GATE_KEY`** (push it in `keys.env`; the gate that enforces it is
+`cloud-cell-supervisor.sh check`) and **`AGENT_INFRA_PATH`**, which the `AGENTS.md` this step
+installs declares as a prerequisite — nothing on the cell sets it (`session-checks` and
+`auto-sync` silently skip without it, and `sequence-enforcer` in gate mode reports an
+unpassable checkpoint), so export it in the cell session's environment. `cell-install.sh` copies
+the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), every extension in
 `manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
-the skill tree, `templates/AGENTS.base.md` and a merged `settings.json`; run it with
-`--verify` to check an existing cell with no writes.
+the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
+`settings.json`; run it with `--verify` to check an existing cell with no writes.
 
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:

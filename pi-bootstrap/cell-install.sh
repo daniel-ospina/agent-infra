@@ -121,10 +121,13 @@
 #
 #   ENV  CELL_HOME    the cell home (default /tmp/cell-home; the cell's real HOME)
 #        INFRA_ROOT  the agent-infra checkout to install FROM. When unset it is resolved
-#                    from this script's own checkout, then AGENT_INFRA_PATH, $HARNESS/..,
-#                    $CELL_HOME/agent-infra and /tmp/cell-ai, and the script FAILS if none
-#                    of them is a checkout — a cell that cannot receive the layer must not
-#                    be certified.
+#                    from this script's own checkout, then AGENT_INFRA_PATH, $HARNESS/..
+#                    and $CELL_HOME/agent-infra, and the script FAILS if none of them is a
+#                    checkout — a cell that cannot receive the layer must not be certified.
+#                    There is deliberately NO world-writable candidate (a fixed /tmp path
+#                    would let any local user put a checkout-shaped tree there and have
+#                    this script copy its extensions onto the cell and pi EXECUTE them);
+#                    pass INFRA_ROOT explicitly if the checkout is somewhere unusual.
 #
 #   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
@@ -195,7 +198,7 @@ resolve_infra_root() {
   # shipped in (the strongest signal — it IS the checkout the installer came from), then the
   # ambient/derived locations an operator or the supervisor may have exported.
   for cand in "${INFRA_ROOT:-}" "$SELF_DIR/.." "${AGENT_INFRA_PATH:-}" \
-              "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra" /tmp/cell-ai; do
+              "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra"; do
     [ -n "$cand" ] || continue
     if is_infra_checkout "$cand"; then
       (cd "$cand" && pwd)
@@ -379,19 +382,37 @@ install_extensions() {
 # loop-enforcer/@sinclair/typebox, custom-provider-qwen/undici) resolved from THEIR OWN
 # node_modules — pi's loader does not provide them. Without this step the cell gets the
 # files and none of the tools: `builtin-tools` IS the `task` dispatcher a lane uses.
+#
+# The npm child runs with an EMPTY environment and package scripts disabled, and the loop
+# uses the SAME predicate as verify_layer (a non-empty `dependencies`). Both are load-bearing:
+#   * bring-up sources the cell's keys.env (`set -a; . keys.env; set +a`) BEFORE calling this
+#     installer, so every secret in it — the provider keys AND AI_REVIEW_GATE_KEY, the merge
+#     authority `ai-review-gate` verifies — is in this process's environment. `npm install`
+#     runs each dependency's lifecycle scripts with that environment inherited, and these
+#     extensions resolve floating ranges, so a compromised published version or any
+#     transitive dep could read the merge key and mint review markers for arbitrary code.
+#     `env -i` + `--ignore-scripts` removes the secret from the child and removes the
+#     execution path; the shipped deps are pure JS, so nothing needs a build step.
+#   * the predicate mismatch made install announce `deps installed: X` for extensions npm
+#     installed nothing for, and sent 5 needless network round-trips.
 install_extension_deps() {
-  local d base
+  local d base npm_home
   command -v npm >/dev/null 2>&1 \
     || die "npm is missing: the shipped extensions that declare runtime deps cannot load without it (builtin-tools alone is the 'task' dispatcher)"
+  npm_home="$(mktemp -d "${TMPDIR:-/tmp}/cell-install-npm-home.XXXXXX")" || die "cannot create an npm HOME"
   for d in "$DEST"/extensions/*/; do
     [ -f "$d/package.json" ] || continue
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("dependencies") else 1)' \
+      "$d/package.json" 2>/dev/null || continue
     base="$(basename "$d")"
-    if (cd "$d" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1); then
+    if (cd "$d" && env -i PATH="$PATH" HOME="$npm_home" TMPDIR="${TMPDIR:-/tmp}" \
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
       say "deps installed: $base"
     else
       fail "npm install failed for $base — that extension will not load (re-run with network, or: cd '$d' && npm install --omit=dev)"
     fi
   done
+  rm -rf "$npm_home"
 }
 
 # ── 3. skills + config ───────────────────────────────────────────────────────
@@ -405,7 +426,7 @@ install_skills() {
 # copy_repo_path <rel> — install a repo file or directory at its basename under $DEST.
 copy_repo_path() {
   local rel="$1" src="$INFRA_ROOT/$1" dst="$DEST/$(basename "$1")"
-  [ -e "$src" ] || return 0
+  [ -e "$src" ] || return 1
   if [ -L "$dst" ]; then rm -f "$dst"; fi
   if [ -f "$src" ]; then
     install_file "$src" "$dst"
@@ -421,6 +442,12 @@ install_config() {
              pi-bootstrap/pi-config/coding-rules.md \
              pi-bootstrap/pi-config/response-rules-reminder.md \
              pi-bootstrap/pi-config/skills-repos.yaml; do
+    # An absent source is a FAILURE, not a skip. `copy_repo_path` used to return 0 here, so
+    # a checkout missing (say) pi-config/agents installed nothing, printed success, and then
+    # verified clean — a cell with no sub-agent definitions at all, which is the exact
+    # partial-layer-reports-success case this script exists to remove.
+    [ -e "$INFRA_ROOT/$rel" ] \
+      || { fail "declared config path $rel is MISSING from $INFRA_ROOT — the cell would get no agents/behavior-control (pi resolves user-scope sub-agents from ~/.pi/agent/agents)"; continue; }
     copy_repo_path "$rel" || fail "could not install $rel"
   done
   say "agents + behavior-control + small config files installed"
@@ -553,7 +580,25 @@ verify_layer() {
       [ -e "$DEST/extensions/$base" ] && fail "denied extension is PRESENT on the cell: extensions/$base"
       continue
     fi
-    [ -e "$DEST/extensions/$base" ] || fail "extension MISSING: extensions/$base"
+    # EXISTENCE IS NOT ENOUGH. The farm loop above byte-compares every file, but this loop
+    # used to accept a bare `[ -e ]` — so a stale, truncated or hand-edited guard extension
+    # verified clean, and a guard that is not the reviewed one is worse than a missing one
+    # (the missing one is loud; this one reports LAYER VERIFIED). Compare the content.
+    local esrc="$INFRA_ROOT/extensions/$base" edst="$DEST/extensions/$base"
+    if [ ! -e "$edst" ]; then
+      fail "extension MISSING: extensions/$base"
+    elif [ ! -e "$esrc" ]; then
+      fail "extension $base is in manifest.json's ship-list but absent from the checkout ($esrc) — verify cannot vouch for what it did not read"
+    elif [ -f "$esrc" ]; then
+      cmp -s "$esrc" "$edst" \
+        || fail "extension DIFFERS from the checkout: extensions/$base (a stale or hand-edited copy)"
+    elif [ ! -d "$edst" ]; then
+      fail "extension SHAPE CHANGED: extensions/$base is a directory in the checkout and not one on the cell"
+    elif ! diff -rq -x node_modules "$esrc" "$edst" >/dev/null 2>&1; then
+      # A directory extension: compare the whole tree, excluding the node_modules npm
+      # created on the cell (a cell-local artifact, not shipped content).
+      fail "extension DIR DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)"
+    fi
   done <<<"$entries"
 
   local g
@@ -584,6 +629,18 @@ verify_layer() {
 
   [ -d "$DEST/skills" ] && [ -n "$(ls -A "$DEST/skills" 2>/dev/null)" ] \
     || fail "skills/ is missing or empty"
+  # The config set. These five were installed blind and never read back, so a checkout
+  # missing one produced a cell that verified clean with no sub-agent definitions at all —
+  # pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch
+  # a reviewer, and extensions/subagent reports `Agents: none` without an error.
+  local cfg
+  for cfg in agents behavior-control coding-rules.md response-rules-reminder.md skills-repos.yaml; do
+    [ -e "$DEST/$cfg" ] \
+      || fail "config artifact MISSING: $cfg (installed from $INFRA_ROOT/pi-bootstrap/pi-config/$cfg)"
+  done
+  if [ -d "$DEST/agents" ] && [ -z "$(ls -A "$DEST/agents" 2>/dev/null)" ]; then
+    fail "agents/ is EMPTY — pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch a reviewer"
+  fi
   [ -f "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing (a cell lane gets no global rules)"
   [ -f "$DEST/settings.json" ] || fail "settings.json is missing"
   if command -v python3 >/dev/null 2>&1 && [ -f "$DEST/settings.json" ]; then
@@ -607,7 +664,7 @@ main() {
   esac
 
   if ! INFRA_ROOT="$(resolve_infra_root)"; then
-    die "no agent-infra checkout found (looked at: \$INFRA_ROOT, \$AGENT_INFRA_PATH, $SELF_DIR/.., \${HARNESS}/.., $CELL_HOME/agent-infra, /tmp/cell-ai).
+    die "no agent-infra checkout found (looked at: \$INFRA_ROOT, \$AGENT_INFRA_PATH, $SELF_DIR/.., \${HARNESS}/.., $CELL_HOME/agent-infra).
        Without one a cell runs UNGUARDED (no review-enforcer, verification-gate, main-worktree-guard,
        search-guard, audit-logger, and no skills) and its merge path dies rc=127 on the missing
        scripts/record-review.sh. Clone agent-infra onto the cell and re-run with INFRA_ROOT=<path>."
