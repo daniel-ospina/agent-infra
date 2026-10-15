@@ -47,6 +47,13 @@ jobs:
         # is NOT installed in CI, #672).
         echo "== scripts/commit-msg-check.test.sh =="
         bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
+        # #1760 — the version-stamp drift check's suite (the keystone of tracker #1759). Named
+        # explicitly like its neighbours above: this leg has no `scripts/*.test.mjs` glob, so an
+        # unwired suite is never collected post-merge (the #1719 shape — versioned but wired to
+        # nothing). The suite, not the checker: it builds its own git fixtures, so it does not read
+        # the runner's surface set.
+        echo "== scripts/check-version-stamp.test.mjs =="
+        node --test scripts/check-version-stamp.test.mjs || failures=$((failures+1))
         # Glob-collected: every extensions/*/test*.mjs suite, including #744's
         # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
         # regression pin) — no explicit line for it, that would double-run it.
