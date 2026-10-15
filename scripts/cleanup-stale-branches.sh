@@ -100,14 +100,41 @@
 # `-d` is required to succeed on the branch's own evidence, or the branch stays
 # put and is reported as failed.
 #
+# Deletion mechanics (remote): the classification reads
+# refs/remotes/origin/<br>, but the destructive action targets origin's REAL
+# refs/heads/<br>, so before each delete the two are compared
+# (`git ls-remote <origin's resolved push url> refs/heads/<br>` vs the OID
+# captured from the tracking ref) and the delete is REFUSED — loudly, and with a
+# non-zero exit — on any mismatch or when ls-remote yields nothing. ALL of
+# origin's push urls are resolved first (`git remote get-url --push --all`);
+# zero is a refusal, and MORE THAN ONE is a refusal as well, because
+# `git push origin` reaches every one of them and no single URL can pin the
+# proof to the delete. The delete itself is `git push origin --delete`, never a
+# push to the resolved URL: the resolution applies `pushInsteadOf`/`pushurl`
+# ONCE, and pushing to its result would apply the rewrite a SECOND time, landing
+# the delete on a repository the verification never proved. The remote sweep's
+# classification
+# IS its delete list, so freshness of the tracking ref is a safety property, not
+# a nicety. Two mechanisms make it stale while the fetch exits 0: a NEGATIVE
+# refspec (`^…`, caught early by a config guard) and a NARROWED POSITIVE refspec
+# (`+refs/heads/main:refs/remotes/origin/main`, what `git remote set-branches`
+# and `clone --single-branch` leave behind), plus the plain fetch→push race. The
+# fetch itself is status-checked explicitly, because the opt-in report log runs
+# the pass under `set +e` (see the dispatch tail) where errexit does not apply.
+# The comparison is the mechanism that closes the class; the config guards are
+# early, loud, and strictly additional.
+#
 # ── PR-state injection (the test seam) ────────────────────────────
 # The branch→PR-state map is read ONCE, from the first source that resolves:
 #   1. --pr-map-file <path>            a file holding the RAW `gh pr list --json
 #                                      headRefName,state,headRefOid,baseRefName`
 #                                      payload (a JSON array of objects)
 #   2. CLEANUP_BRANCH_PR_MAP_JSON      the same payload inline (env)
-#   3. `gh pr list --state all --limit N --json
+#   3. `gh pr list --repo github.com/<owner/repo> --state all --limit N --json
 #      headRefName,state,headRefOid,baseRefName`   (N = --pr-limit, default 10000)
+#      --repo is passed EXPLICITLY, WITH the host pinned, so neither an exported
+#      GH_REPO nor an ambient GH_HOST can redirect the map to another repository
+#      or host (see load_pr_map).
 #
 # 1 and 2 are the injection seam: scripts/cleanup-stale-branches.test.sh uses a
 # fixture file, so the suite needs no `gh`, no network and no real PRs. They are
@@ -154,7 +181,7 @@
 # sibling that does, and it does so symlink-safely.)
 #
 # ── why the lookup is not per-branch ──────────────────────────────
-# The map is parsed once with a single `jq` pass into two TAB-delimited
+# The map is parsed once with a single `jq` pass into four TAB-delimited
 # membership strings. Bash 3.2 (macOS) has no associative arrays, so membership
 # is `case` on those strings; git ref names cannot contain a TAB, so the
 # sentinel cannot collide with a real branch. Calling jq (or gh) once per branch
@@ -192,7 +219,8 @@ PR_LIMIT="${CLEANUP_PR_LIMIT:-10000}"
 MAIN_BRANCH="main"
 # Opt-in capped report log (unset = stdout only). See the header.
 CLEANUP_BRANCH_LOG="${CLEANUP_BRANCH_LOG:-}"
-CLEANUP_BRANCH_LOG_MAX_BYTES="${CLEANUP_BRANCH_LOG_MAX_BYTES:-1048576}"
+DEFAULT_LOG_MAX_BYTES=1048576
+CLEANUP_BRANCH_LOG_MAX_BYTES="${CLEANUP_BRANCH_LOG_MAX_BYTES:-$DEFAULT_LOG_MAX_BYTES}"
 
 help() {
     cat <<'EOF'
@@ -230,27 +258,52 @@ Defaults: --scope remote, dry-run, 14-day cutoff.
 EOF
 }
 
+# require_value <flag> <remaining-arg-count> — a two-token flag with its value
+# missing must fail LOUDLY. `shift 2` on a single remaining argument returns
+# non-zero, and under `set -e` the shell exits BEFORE any usage text: the
+# operator sees only "shift: shift count out of range", never which flag was
+# malformed or that a value was owed.
+require_value() {
+    if [ "$2" -lt 2 ]; then
+        echo "ERROR: $1 requires a value, but none was given" >&2
+        exit 1
+    fi
+}
+
 # ── Parse args ────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cutoff)
-            CUTOFF_DAYS="${2:-}"
+            require_value "$1" "$#"
+            CUTOFF_DAYS="$2"
             shift 2
             ;;
         --scope)
-            SCOPE="${2:-}"
+            require_value "$1" "$#"
+            SCOPE="$2"
             shift 2
             ;;
         --pr-map-file)
-            PR_MAP_FILE="${2:-}"
+            require_value "$1" "$#"
+            PR_MAP_FILE="$2"
+            # Absolutize AT PARSE TIME, BEFORE the `cd "$REPO_ROOT"` below: args
+            # are parsed before the cd but the file is read after it, so a
+            # relative path would be resolved against the SWEPT checkout instead
+            # of the caller's cwd and the supplied map would silently "not exist".
+            case "$PR_MAP_FILE" in
+                ""|/*) ;;
+                *) PR_MAP_FILE="$(pwd)/$PR_MAP_FILE" ;;
+            esac
             shift 2
             ;;
         --pr-limit)
-            PR_LIMIT="${2:-}"
+            require_value "$1" "$#"
+            PR_LIMIT="$2"
             shift 2
             ;;
         --repo)
-            REPO_ROOT="${2:-}"
+            require_value "$1" "$#"
+            REPO_ROOT="$2"
             shift 2
             ;;
         --execute)
@@ -268,16 +321,34 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ⛔ A value that matches ^[0-9]+$ can still OVERFLOW bash's integer range:
+# `[ 99999999999999999999 -lt 1 ]` returns status 2 ("integer expression
+# expected"), the `if` reads FALSE, and a validation meant to refuse the value
+# silently passes it. Every later comparison errors the same way, so e.g. the log
+# cap NEVER fires — the exact silent no-op the validation exists to close. Bound
+# the DIGIT count too, and put that test BEFORE any arithmetic: 15 digits
+# (< 2^53) is far above any legitimate cutoff, limit or cap, and short-circuits
+# before the overflow can be reached.
+
 # Validate cutoff is a positive integer
-if ! [[ "$CUTOFF_DAYS" =~ ^[0-9]+$ ]] || [ "$CUTOFF_DAYS" -lt 1 ]; then
+if ! [[ "$CUTOFF_DAYS" =~ ^[0-9]+$ ]] || [ "${#CUTOFF_DAYS}" -gt 15 ] || [ "$CUTOFF_DAYS" -lt 1 ]; then
     echo "ERROR: --cutoff must be a positive integer, got '$CUTOFF_DAYS'" >&2
     exit 1
 fi
 
 # Validate the PR-map limit is a positive integer
-if ! [[ "$PR_LIMIT" =~ ^[0-9]+$ ]] || [ "$PR_LIMIT" -lt 1 ]; then
+if ! [[ "$PR_LIMIT" =~ ^[0-9]+$ ]] || [ "${#PR_LIMIT}" -gt 15 ] || [ "$PR_LIMIT" -lt 1 ]; then
     echo "ERROR: --pr-limit must be a positive integer, got '$PR_LIMIT'" >&2
     exit 1
+fi
+
+# Validate the report-log cap is a positive integer. A non-numeric value makes
+# `[ "$size" -ge "$max" ]` return status 2, the `if` read false, and the cap
+# silently NEVER fire — no error, no warning — defeating the header's "cannot
+# grow without bound" claim. Warn and fall back to the default instead.
+if ! [[ "$CLEANUP_BRANCH_LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || [ "${#CLEANUP_BRANCH_LOG_MAX_BYTES}" -gt 15 ] || [ "$CLEANUP_BRANCH_LOG_MAX_BYTES" -lt 1 ]; then
+    echo "WARNING: CLEANUP_BRANCH_LOG_MAX_BYTES must be a positive integer, got '$CLEANUP_BRANCH_LOG_MAX_BYTES' — falling back to $DEFAULT_LOG_MAX_BYTES" >&2
+    CLEANUP_BRANCH_LOG_MAX_BYTES="$DEFAULT_LOG_MAX_BYTES"
 fi
 
 case "$SCOPE" in
@@ -302,13 +373,88 @@ cutoff_epoch() {
 
 # ── Shared: the PR-state seam ─────────────────────────────────────
 # github_slug <url> — owner/repo for a github.com origin, else empty.
+# ⛔ The HOST is parsed EXPLICITLY and compared for EXACT equality. A substring
+# test (`*github.com[:/]*`) accepts `https://notgithub.com/owner/repo.git` and
+# `git@mygithub.com:owner/repo.git`, stripping the embedded `github.com/` and
+# yielding a FOREIGN but syntactically valid `owner/repo`. `gh` reads a 2-segment
+# value as `github.com/<owner>/<repo>`, so a foreign repository's map silently
+# displaces this one's and the OPEN-PR keep rule protects the wrong branches. Any
+# host that is not exactly `github.com` returns EMPTY, which the caller treats as
+# "cannot read PR state" and fails closed on.
 github_slug() {
-    case "${1:-}" in
-        *github.com[:/]*)
-            printf '%s\n' "$1" | sed -E 's#^[^/]*//##; s#^git@##; s#github\.com[:/]##; s#\.git$##'
+    local url="${1:-}" rest="" host="" path=""
+    [ -n "$url" ] || return 0
+    case "$url" in
+        # scheme://[user@]host[:port]/path — https, http, ssh, git, ...
+        *://*)
+            rest="${url#*://}"
+            rest="${rest#*@}"
+            host="${rest%%/*}"
+            path="${rest#*/}"
             ;;
-        *) printf '' ;;
+        # scp-like: [user@]host:path
+        *@*:*)
+            rest="${url#*@}"
+            host="${rest%%:*}"
+            path="${rest#*:}"
+            ;;
+        # scp-like with NO user: host:path. git hands this form to ssh, so
+        # `github.com:owner/repo.git` is a GENUINE github.com origin. Without
+        # this arm the URL fell through to the bare-path branch below, where
+        # `${url%%/*}` split on the FIRST `/` INSIDE the path — yielding
+        # host=`github.com:owner` (a host that is not `github.com`) and a
+        # single-segment path, so a legitimate origin was REFUSED and the whole
+        # PR-state seam (and hence the local scope) stood down.
+        *:*)
+            host="${url%%:*}"
+            path="${url#*:}"
+            ;;
+        # bare host/owner/repo, or a filesystem path (no scheme, no user@host:)
+        */*)
+            host="${url%%/*}"
+            path="${url#*/}"
+            ;;
+        *) printf ''; return 0 ;;
     esac
+    # the host may carry a port; the path a leading slash, a trailing slash, .git
+    host="${host%%:*}"
+    # ⛔ The host comparison below is EXACT, so it must be CASE-NORMALISED first:
+    # git accepts `https://GitHub.com/owner/repo.git` (URL host names are
+    # case-insensitive), but `[ "$host" != "github.com" ]` would refuse that
+    # valid origin — a false negative that fails closed and disables the whole
+    # PR-state seam for a legitimate remote. Bash 3.2-safe (no `${var,,}`).
+    # ⛔ `LC_ALL=C` PINS the fold. `tr '[:upper:]' '[:lower:]'` is LOCALE-DEPENDENT:
+    # under a Turkish locale it folds `İ` (U+0130) to `i`, so the foreign host
+    # `GİTHUB.COM` became exactly `github.com` and PASSED the exact-host guard
+    # below — a foreign repository's PR map silently displacing this one's, which
+    # is the very defect the exact comparison exists to stop. C makes the fold
+    # ASCII-only, and ASCII case-insensitivity is all a host name needs.
+    host="$(printf '%s' "$host" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+    path="${path#/}"
+    path="${path%/}"
+    path="${path%.git}"
+    if [ "$host" != "github.com" ] || [ -z "$path" ]; then
+        printf ''
+        return 0
+    fi
+    # ⛔ EXACTLY two non-empty path segments. A 1-segment path
+    # (`https://github.com/onlyowner`) previously yielded the slug `onlyowner`,
+    # so the pinned `--repo github.com/$slug` was the 2-segment
+    # `github.com/onlyowner`, which `gh` resolves as OWNER/REPO against the
+    # ambient `$GH_HOST` — the host pin did not hold for an input the parser
+    # accepted. Requiring owner AND repo makes `github.com/$slug` always 3
+    # segments, which `gh` reads as host/owner/repo. More than two segments (a
+    # deep URL such as `.../owner/repo/tree/main`) is refused for the same reason.
+    case "$path" in
+        */*) ;;
+        *) printf ''; return 0 ;;
+    esac
+    local owner="${path%%/*}" repo_part="${path#*/}"
+    if [ -z "$owner" ] || [ -z "$repo_part" ] || [ "${repo_part#*/}" != "$repo_part" ]; then
+        printf ''
+        return 0
+    fi
+    printf '%s\n' "$path"
 }
 
 # load_pr_map <file> — prints "STATE<TAB>branch<TAB>headRefOid<TAB>base" lines,
@@ -344,13 +490,24 @@ load_pr_map() {
         # diagnosis of WHY the fetch failed. $? is read immediately after the
         # command — inside a `then` branch of `if ! cmd` it is the status of
         # `!`, which is always 0.
+        #
+        # ⛔ --repo is passed EXPLICITLY to BOTH invocations, and WITH the host
+        # pinned (`github.com/$slug`), never as a bare `owner/repo`. `gh` reads a
+        # 2-segment --repo as resolved against $GH_HOST, so an ambient GH_HOST
+        # would redirect the whole map to another host — the same class as the
+        # GH_REPO defect below. `gh` parses the 3-segment form as host/owner/repo.
+        # Without any --repo at all, `gh pr list` honours an exported GH_REPO, so
+        # the whole PR map would be fetched for a DIFFERENT repository: the
+        # OPEN-PR keep rule would silently protect that repository's branches and
+        # this one's OPEN PRs would vanish from the map (in the merged path `-D`
+        # could then remove local-only commits).
         local errf="" gh_rc=0
         errf="$(mktemp "${TMPDIR:-/tmp}/cleanup-branch-gh.XXXXXX" 2>/dev/null)" || errf=""
         if [ -n "$errf" ]; then
-            src="$(gh pr list --state all --limit "$PR_LIMIT" \
+            src="$(gh pr list --repo "github.com/$slug" --state all --limit "$PR_LIMIT" \
                     --json headRefName,state,headRefOid,baseRefName 2>"$errf")" || gh_rc=$?
         else
-            src="$(gh pr list --state all --limit "$PR_LIMIT" \
+            src="$(gh pr list --repo "github.com/$slug" --state all --limit "$PR_LIMIT" \
                     --json headRefName,state,headRefOid,baseRefName)" || gh_rc=$?
         fi
         if [ "$gh_rc" -ne 0 ]; then
@@ -444,6 +601,69 @@ is_member() {
     return 1
 }
 
+# ── delete-time target verification (R3-1) ────────────────────────
+# verify_remote_target <push_url> <local_branch> <classified_oid>
+#
+# Returns 0 (printing nothing) only when origin's REAL push target serves a ref
+# named EXACTLY refs/heads/<br> at exactly the OID this sweep classified from
+# refs/remotes/origin/<br>. On anything else it prints a one-line reason and
+# returns 1 — the caller REFUSES that delete.
+#
+# ⛔ The target is the PUSH url, not the fetch url. `git ls-remote origin` reads
+# remote.origin.url, but `git push origin` honours remote.origin.pushurl AND
+# `url.<base>.pushInsteadOf` — so when they diverge a fetch-side verification
+# proves repository A while the delete lands on repository B and reports success.
+# The caller resolves origin's push urls ONCE with
+# `git remote get-url --push --all origin`, refuses unless there is EXACTLY one,
+# and passes that single URL here. The delete then goes through git's own remote
+# resolution (`git push origin --delete`) so the rewrite is applied the SAME
+# number of times — once — as it was to produce this URL.
+#
+# Why this is not redundant with the `^` refspec guard: that guard greps the
+# CONFIG for a negative refspec, which is only ONE way refs/remotes/origin/<br>
+# goes stale. A NARROWED positive refspec (what `git remote set-branches` and
+# `clone --single-branch` leave behind: `+refs/heads/main:refs/remotes/origin/main`)
+# omits `refs/heads/*`, so the fetch exits 0 and the guard finds nothing, yet the
+# tracking ref is never refreshed and never pruned. Comparing against origin's
+# real ref is what actually closes the class — including the fetch→push race,
+# which no config inspection can see.
+verify_remote_target() {
+    local push_url="$1" local_branch="$2" tracking_oid="$3" ls_out="" real_oid="" n=""
+    if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$local_branch" 2>/dev/null)"; then
+        printf '%s' "git ls-remote $push_url refs/heads/$local_branch FAILED, so origin's real ref cannot be verified"
+        return 1
+    fi
+    if [ -z "$ls_out" ]; then
+        printf '%s' "origin has NO refs/heads/$local_branch — the classified refs/remotes/origin/$local_branch is stale"
+        return 1
+    fi
+    # ⛔ `ls-remote <pattern>` matches path-component SUFFIXES, NOT the exact
+    # ref: with only refs/heads/refs/heads/foo present, `ls-remote refs/heads/foo`
+    # RETURNS it. Counting lines and taking the first OID is therefore not a name
+    # check — it can pass for the wrong ref, and it FALSELY REFUSES a legitimate
+    # branch whenever a same-suffix ref exists alongside it. Select the line whose
+    # post-TAB ref name is EXACTLY refs/heads/<br>; refuse on zero (no exact ref,
+    # however many suffix matches there were) or more than one (impossible for a
+    # single remote, but a guess here is exactly what this guard exists to stop).
+    n=0
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "${line#*$'\t'}" = "refs/heads/$local_branch" ] || continue
+        n=$((n + 1))
+        real_oid="${line%%$'\t'*}"
+    done <<<"$ls_out"
+    if [ "$n" != "1" ]; then
+        printf '%s' "git ls-remote $push_url matched $n ref(s) named exactly refs/heads/$local_branch — refusing to guess which one was classified"
+        return 1
+    fi
+    if [ "$real_oid" != "$tracking_oid" ]; then
+        printf '%s' "origin's real refs/heads/$local_branch is $real_oid but this sweep classified $tracking_oid from refs/remotes/origin/$local_branch"
+        return 1
+    fi
+    return 0
+}
+
 # ── remote scope (unchanged behaviour, #74) ───────────────────────
 run_remote_scope() {
     # ── Sanity check: on main, up to date ─────────────────────────
@@ -461,7 +681,106 @@ run_remote_scope() {
 
     # ── Fetch and prune remote tracking refs ──────────────────────
     echo "[$(date '+%H:%M:%S')] Fetching and pruning remote refs..."
-    git fetch origin --prune --quiet
+    # ⛔ THIS STATUS IS CHECKED EXPLICITLY, never via errexit. The opt-in report
+    # log runs the whole pass inside `set +e` (see the dispatch tail: it must read
+    # PIPESTATUS through the tee), and under `set +e` a bare `git fetch` that
+    # FAILS falls through: the stale tracking refs are classified, and
+    # `git push origin --delete` then destroys the real branch. `CLEANUP_BRANCH_LOG`
+    # is set by templates/launchd/com.tortoise.branch-reaper.plist, i.e. by the
+    # normal operator invocation, so this is the DEFAULT path, not an edge case.
+    if ! git fetch origin --prune --quiet; then
+        echo "ERROR: git fetch origin --prune --quiet FAILED — remote-tracking refs may be STALE." >&2
+        echo "ERROR: refs/remotes/origin/<br> can hold an OLD merged tip while origin's real" >&2
+        echo "ERROR: refs/heads/<br> has advanced to an UNMERGED commit, so deleting on that" >&2
+        echo "ERROR: stale tip would destroy commits that exist nowhere else." >&2
+        echo "ERROR: Refusing the remote sweep because the fetch failed. Re-run once origin is" >&2
+        echo "ERROR: reachable (or point origin at a reachable URL) — this pass will not delete" >&2
+        echo "ERROR: anything on refs it could not refresh." >&2
+        return 1
+    fi
+
+    # ⛔ Even a fetch that EXITS 0 does not prove the refs were refreshed. A
+    # NEGATIVE refspec in remote.origin.fetch (an entry beginning with `^`) makes
+    # the fetch succeed while `--prune` SKIPS the excluded ref: refs/remotes/
+    # origin/<br> keeps an OLD merged tip while origin's real refs/heads/<br> has
+    # advanced to an UNMERGED commit. `git branch -r --merged origin/main` then
+    # classifies the STALE tip, and `git push origin --delete` destroys commits
+    # that exist nowhere else. Unlike the local scope (which only stands its
+    # remotecopy gate down), here the classification IS the delete list, so the
+    # sweep is REFUSED. The refspec belongs to the OPERATOR — this pass will not
+    # rewrite it. A here-string, not `printf ... | grep -q` (#841).
+    # ⛔ The `^` guard alone covers ONE staleness mechanism: a NARROWED POSITIVE
+    # refspec (`+refs/heads/main:refs/remotes/origin/main`, what
+    # `git remote set-branches` / `clone --single-branch` leaves behind) omits
+    # `refs/heads/*`, so the fetch exits 0 and the grep finds nothing while
+    # refs/remotes/origin/<br> is never refreshed and never pruned. The
+    # DELETE-TIME VERIFICATION in the execute loop closes the whole class (and the
+    # fetch→push race) independently of the config.
+    local remote_scope_refspecs=""
+    remote_scope_refspecs="$(git config --get-all remote.origin.fetch 2>/dev/null || true)"
+    if grep -q '^\^' <<<"$remote_scope_refspecs"; then
+        echo "ERROR: remote.origin.fetch carries a NEGATIVE refspec (an entry beginning with '^')." >&2
+        echo "ERROR: 'git fetch origin --prune' exits 0 but SKIPS the excluded ref, so" >&2
+        echo "ERROR: refs/remotes/origin/<br> can hold an OLD merged tip while origin's real" >&2
+        echo "ERROR: refs/heads/<br> has advanced to an UNMERGED commit. Deleting on that" >&2
+        echo "ERROR: stale tip would destroy commits that exist nowhere else." >&2
+        echo "ERROR: Refusing the remote sweep. Remove the negative refspec and re-run;" >&2
+        echo "ERROR: this pass will not rewrite remote.origin.fetch." >&2
+        return 1
+    fi
+
+    # ⛔ RESOLVE EVERY PUSH TARGET, and refuse unless there is EXACTLY ONE.
+    # `git ls-remote origin` reads the FETCH url (remote.origin.url), but
+    # `git push origin` honours remote.origin.pushurl (ALL of them) AND
+    # `url.<base>.pushInsteadOf`, which can point at a DIFFERENT repository. When
+    # they diverge, a fetch-side verification proves repository A while the
+    # destructive delete lands on repository B -- and the sweep reports success.
+    # `git remote get-url --push --all origin` is git's own resolution and
+    # applies BOTH rewrite channels, so it is the only URL the verification may
+    # use.
+    #
+    # ⛔ MULTIPLE PUSH URLS ARE A REFUSAL. `--all` names every one, and
+    # `git push origin` reaches ALL of them (it is one push per pushurl). No
+    # single URL covers the set, so a verification against the first tells us
+    # nothing about the others: with two mirrors both holding the branch, the
+    # sweep would prove M1, delete M1, report `Deleted: 1`, and leave M2's copy
+    # in place -- and if M2's copy were the unmerged one, an unverified delete.
+    # There is no single target the proof and the delete can both be pinned to,
+    # so the sweep stands down and names each URL.
+    #
+    # ⛔ THE DELETE IS `git push origin --delete`, NEVER a push to the resolved
+    # URL. `git remote get-url --push origin` applies the rewrite ONCE; a delete
+    # that pushed to that RESOLVED url would apply it a SECOND time, so a CHAINED
+    # rewrite (`url.B.pushInsteadOf=A` + `url.C.pushInsteadOf=B`) proves repo B
+    # while the delete lands on repo C -- an unverified repository whose unique
+    # UNMERGED branch is destroyed, reported as success. `git push origin`
+    # resolves the remote and applies the rewrite exactly once, which is the same
+    # single application that produced the verified URL. An empty resolution is a
+    # refusal: there is nothing to verify and nothing safe to push to.
+    local push_urls="" push_url="" push_url_count=0 _push_u
+    push_urls="$(git remote get-url --push --all origin 2>/dev/null || true)"
+    while IFS= read -r _push_u; do
+        [ -n "$_push_u" ] || continue
+        push_url_count=$((push_url_count + 1))
+        push_url="$_push_u"
+    done <<<"$push_urls"
+    if [ "$push_url_count" -eq 0 ]; then
+        echo "ERROR: could not resolve origin's PUSH url (git remote get-url --push --all origin)." >&2
+        echo "ERROR: 'git ls-remote origin' reads the FETCH url, which is NOT necessarily the" >&2
+        echo "ERROR: delete target — 'pushurl'/'pushInsteadOf' can redirect it. Refusing the sweep." >&2
+        return 1
+    fi
+    if [ "$push_url_count" -gt 1 ]; then
+        echo "ERROR: origin has $push_url_count PUSH urls, so there is no single delete target:" >&2
+        while IFS= read -r _push_u; do
+            [ -n "$_push_u" ] || continue
+            echo "ERROR:   $_push_u" >&2
+        done <<<"$push_urls"
+        echo "ERROR: 'git push origin' reaches ALL of them, so verifying one proves nothing about the" >&2
+        echo "ERROR: others — the delete would report success while leaving the rest in place (and an" >&2
+        echo "ERROR: unverified copy could be the one holding unmerged commits). Refusing the sweep." >&2
+        return 1
+    fi
     echo ""
 
     # ── Find stale merged branches ────────────────────────────────
@@ -472,6 +791,12 @@ run_remote_scope() {
     #   4. Collect stale candidates
 
     local STALE_BRANCHES=()
+    # Refs belonging to a remote OTHER than origin. They are never deletion
+    # candidates: deletion is always `git push origin --delete`, and
+    # `${branch#origin/}` strips nothing from `upstream/foo`, so the pass would
+    # tell ORIGIN to delete `refs/heads/upstream/foo` — a branch nothing has shown
+    # to be merged into anything. They are reported, never silently skipped.
+    local NON_ORIGIN_REMOTE=()
     local CUTOFF_EPOCH
     CUTOFF_EPOCH="$(cutoff_epoch)"
 
@@ -501,9 +826,62 @@ run_remote_scope() {
         if [ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]; then
             local COMMIT_DATE_HR
             COMMIT_DATE_HR="$(date -r "$COMMIT_DATE" '+%Y-%m-%d' 2>/dev/null || date -d "@$COMMIT_DATE" '+%Y-%m-%d')"
-            STALE_BRANCHES+=("$branch"$'\t'"$COMMIT_DATE_HR")
+            # ⛔ `git branch -r --merged` lists EVERY remote's tracking refs, but
+            # deletion is ALWAYS `git push origin --delete ${branch#origin/}`. For
+            # a non-origin ref that prefix-strip removes nothing, so the premise
+            # would be evaluated on `upstream/foo` while the destructive action
+            # landed on origin's `refs/heads/upstream/foo` — a branch never shown
+            # to be merged anywhere. Confine the scope to `origin/*`.
+            # ⛔ TAB is the separator, NOT `|`: `|` is a legal ref-name
+            # character (`git check-ref-format 'refs/heads/foo|bar'` is OK), so a
+            # `|`-delimited entry decoded with `${entry%%|*}` truncated
+            # `origin/foo|bar` to `origin/foo` — the premise was evaluated on one
+            # ref and the delete landed on ANOTHER. `check-ref-format` REJECTS a
+            # TAB in a ref name, so the sentinel cannot collide.
+            if [[ "$branch" != origin/* ]]; then
+                NON_ORIGIN_REMOTE+=("$branch"$'\t'"$COMMIT_DATE_HR")
+                continue
+            fi
+            # The tip THIS pass classified, captured now so the delete-time
+            # verification compares origin's real ref against what was actually
+            # classified (not against a re-read taken later).
+            local TRACKING_OID
+            TRACKING_OID="$(git rev-parse --verify -q "refs/remotes/$branch" 2>/dev/null || true)"
+            STALE_BRANCHES+=("$branch"$'\t'"$COMMIT_DATE_HR"$'\t'"$TRACKING_OID")
         fi
     done < <(git branch -r --merged "origin/$MAIN_BRANCH" 2>/dev/null || true)
+
+    # ⛔ DELETE ORDER: longest local branch first. `git push --delete --
+    # refs/heads/foo` fails with "dst refspec refs/heads/foo matches more than
+    # one" while refs/heads/refs/heads/foo exists, because refspec matching is
+    # SUFFIX based (the same mechanism the delete-time verifier now checks by
+    # NAME). Deleting the longer (nested) ref FIRST removes the ambiguity, so the
+    # shorter one becomes deletable. Length-descending, not reversal: the nesting
+    # holds for ANY `X` / `refs/heads/X` pair, whatever X's first character is.
+    # (`sort`/`awk`/`cut` are POSIX; no Bash 3.2 arrays tricks.)
+    if [ "${#STALE_BRANCHES[@]}" -gt 1 ]; then
+        local _stale_sorted=""
+        _stale_sorted="$(printf '%s\n' "${STALE_BRANCHES[@]}" \
+            | awk -F'\t' '{ print length($1) "\t" $0 }' \
+            | sort -rn -k1,1 \
+            | cut -f2-)"
+        STALE_BRANCHES=()
+        local _stale_entry
+        while IFS= read -r _stale_entry; do
+            [ -n "$_stale_entry" ] || continue
+            STALE_BRANCHES+=("$_stale_entry")
+        done <<<"$_stale_sorted"
+    fi
+
+    # ── non-origin remotes are reported, never deleted ────────────
+    if [ ${#NON_ORIGIN_REMOTE[@]} -gt 0 ]; then
+        echo "Kept ${#NON_ORIGIN_REMOTE[@]} stale merged ref(s) on a NON-origin remote (origin is the only remote this pass can delete through):"
+        local nonorigin_entry
+        for nonorigin_entry in "${NON_ORIGIN_REMOTE[@]}"; do
+            printf '  keep   %-18s %s\n' "non-origin-remote" "${nonorigin_entry%%$'\t'*}"
+        done
+        echo ""
+    fi
 
     # ── Output ────────────────────────────────────────────────────
     if [ ${#STALE_BRANCHES[@]} -eq 0 ]; then
@@ -513,9 +891,11 @@ run_remote_scope() {
 
     echo "Found ${#STALE_BRANCHES[@]} stale merged branch(es):"
     echo ""
-    local entry branch commit_date_hr
+    local entry branch commit_date_hr rest
     for entry in "${STALE_BRANCHES[@]}"; do
-        IFS=$'\t' read -r branch commit_date_hr <<<"$entry"
+        branch="${entry%%$'\t'*}"
+        rest="${entry#*$'\t'}"
+        commit_date_hr="${rest%%$'\t'*}"
         printf "  %-55s last commit: %s\n" "$branch" "$commit_date_hr"
     done
     echo ""
@@ -526,9 +906,9 @@ run_remote_scope() {
         echo ""
         echo "Deletion commands that would run:"
         for entry in "${STALE_BRANCHES[@]}"; do
-            IFS=$'\t' read -r branch _ <<<"$entry"
+            branch="${entry%%$'\t'*}"
             local local_branch="${branch#origin/}"
-            echo "  git push origin --delete \"$local_branch\""
+            echo "  git push origin --delete -- \"refs/heads/$local_branch\""
         done
         return 0
     fi
@@ -538,13 +918,51 @@ run_remote_scope() {
     echo ""
     local DELETED=0
     local FAILED=0
+    local REFUSED=0
 
     for entry in "${STALE_BRANCHES[@]}"; do
-        IFS=$'\t' read -r branch _ <<<"$entry"
+        branch="${entry%%$'\t'*}"
+        local tracking_oid="${entry##*$'\t'}"
         local local_branch="${branch#origin/}"
 
+        # ⛔ DELETE-TIME VERIFICATION. The classification above reads
+        # refs/remotes/origin/<br>, but the destructive action targets origin's
+        # real refs/heads/<br>. Nothing has proved they are the SAME ref: a
+        # NARROWED positive refspec (or a negative one) leaves the tracking ref
+        # stale while the fetch exits 0, and origin can change between the fetch
+        # and this push. So compare them immediately before the delete and REFUSE
+        # this one on any mismatch — or when ls-remote yields nothing, which is
+        # not evidence the classification was right.
+        local refusal=""
+        if ! refusal="$(verify_remote_target "$push_url" "$local_branch" "$tracking_oid")"; then
+            echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
+            echo "     $refusal" >&2
+            echo "     origin's real ref is not provably the ref this sweep classified. A narrowed" >&2
+            echo "     or negative fetch refspec leaves refs/remotes/$branch STALE while the fetch" >&2
+            echo "     exits 0, or origin changed between the fetch and this delete. Deleting on" >&2
+            echo "     the stale tip would destroy commits that exist nowhere else." >&2
+            REFUSED=$((REFUSED + 1))
+            continue
+        fi
+
         echo "  Deleting origin/$local_branch..."
-        if git push origin --delete "$local_branch" 2>&1; then
+        # ⛔ `--` before the refspec: without it a remote branch named `-x` or
+        # `--version` is parsed by `git push` as an OPTION, the delete always
+        # fails, and such a ref could never be reaped. The same `--` is mirrored
+        # in the dry-run command echo above.
+        # ⛔ The ref must be FULLY QUALIFIED (`refs/heads/<br>`). A bare name is
+        # NOT always a legal refspec: `@` is a legal ref name but also a revision
+        # shorthand, so `git push origin --delete @` fails with `fatal: invalid
+        # refspec ':@'` and the branch could never be reaped. A bare `foo` is
+        # also ambiguous when origin carries both `foo` and `refs/heads/foo`
+        # ('matches more than one'), while the qualified form targets exactly one
+        # ref. The delete goes through GIT'S OWN REMOTE RESOLUTION
+        # (`git push origin`), which applies pushInsteadOf/pushurl EXACTLY ONCE —
+        # the same single application that produced the resolved URL the
+        # verification above proved. Pushing to the RESOLVED URL instead would
+        # apply the rewrite a SECOND time and land the delete on an unverified
+        # repository (R5-1).
+        if git push origin --delete -- "refs/heads/$local_branch" 2>&1; then
             echo "    ✅ deleted"
             DELETED=$((DELETED + 1))
         else
@@ -557,7 +975,14 @@ run_remote_scope() {
     echo "── Summary ──"
     echo "  Deleted: $DELETED"
     echo "  Failed:  $FAILED"
+    echo "  Refused: $REFUSED"
     echo "  Total:   ${#STALE_BRANCHES[@]}"
+
+    if [ "$REFUSED" -gt 0 ]; then
+        echo "ERROR: $REFUSED remote delete(s) were REFUSED: origin's real ref could not be shown to" >&2
+        echo "ERROR: be the ref this sweep classified. The sweep does NOT report success." >&2
+        return 1
+    fi
 
     return 0
 }
@@ -596,7 +1021,7 @@ run_local_scope() {
         return 1
     fi
 
-    # The map is folded into three `case`-matchable membership strings (Bash 3.2
+    # The map is folded into four `case`-matchable membership strings (Bash 3.2
     # has no associative arrays, and one jq/gh call per branch is quadratic):
     #   open_lookup          \tbr\t            an OPEN PR — always kept
     #   merged_main_lookup   \tbr\t            a MERGED PR based on main
@@ -755,6 +1180,7 @@ run_local_scope() {
         # 5. the three gates — first match wins (merged first: it is the only
         #    class that authorizes `-D`, and it is the strongest evidence).
         cls=""
+        local offbase=0
         if is_member "$merged_main_lookup" "$br"; then
             # A MERGED PR whose base is main proves the PR's CONTENT landed; it
             # does NOT prove the local TIP is the revision that landed. Only a
@@ -768,11 +1194,15 @@ run_local_scope() {
                 keep_tipmoved=$((keep_tipmoved + 1)); keep_total=$((keep_total + 1)); continue
             fi
         elif is_member "$merged_offbase_lookup" "$br"; then
-            # Merged into a base that is not main (a stacked PR): the content is
-            # in that base, not in main, so the redundant/remotecopy evidence
-            # would have to carry it — and neither gate matches here.
-            keep_list="${keep_list}merged-base-not-main"$'\t'"$br"$'\n'
-            keep_offbase=$((keep_offbase + 1)); keep_total=$((keep_total + 1)); continue
+            # Merged into a base that is not main (a stacked PR): that proves the
+            # content is in THAT base, not in main — so it is NOT by itself
+            # authority to delete. But it is also NOT a verdict: an off-base
+            # merged PR whose local tip is already contained in origin/main is
+            # provably redundant, and the old unconditional `continue` gave such a
+            # branch a permanent false negative — no pass ever selected it. Record
+            # the off-base reason and FALL THROUGH to the redundant/remotecopy
+            # gates; only if neither carries the branch is it kept.
+            offbase=1
         fi
         if [ -z "$cls" ] && [ "$main_ref_ok" = 1 ]; then
             cnt="$(git rev-list --count "origin/$MAIN_BRANCH..refs/heads/$br" 2>/dev/null || echo -1)"
@@ -806,6 +1236,14 @@ run_local_scope() {
                     keep_list="${keep_list}non-origin-upstream"$'\t'"$br"$'\n'
                     keep_nonorigin=$((keep_nonorigin + 1)); keep_total=$((keep_total + 1)); continue ;;
             esac
+        fi
+
+        if [ -z "$cls" ] && [ "$offbase" = 1 ]; then
+            # Off-base MERGED PR and no other gate carries the branch: keep it,
+            # named. This is the fall-through destination for the off-base reason
+            # above — it must NOT pre-empt the redundant/remotecopy gates.
+            keep_list="${keep_list}merged-base-not-main"$'\t'"$br"$'\n'
+            keep_offbase=$((keep_offbase + 1)); keep_total=$((keep_total + 1)); continue
         fi
 
         if [ -z "$cls" ]; then
@@ -844,10 +1282,14 @@ run_local_scope() {
         echo ""
         while IFS=$'\t' read -r cls br; do
             [ -n "$cls" ] || continue
-            if git branch -d "$br" >/dev/null 2>&1; then
+            # ⛔ `--` before the ref: without it a branch whose name begins with
+            # `-` (`-x`, `--version`) is parsed by git as an OPTION, the delete
+            # always fails, and such a ref could never be reaped. The same `--`
+            # must be mirrored in the dry-run command echo below.
+            if git branch -d -- "$br" >/dev/null 2>&1; then
                 printf '  deleted %-10s %s\n' "$cls" "$br"
                 deleted=$((deleted + 1))
-            elif [ "$cls" = "merged" ] && git branch -D "$br" >/dev/null 2>&1; then
+            elif [ "$cls" = "merged" ] && git branch -D -- "$br" >/dev/null 2>&1; then
                 # Squash-merged AND unmoved: the classification already proved
                 # the local tip IS the revision the PR merged (it equalled
                 # headRefOid), so `-d` refuses only because the squash commit is
@@ -867,7 +1309,7 @@ run_local_scope() {
         echo "Deletion commands that would run (-D fallback only for the merged class):"
         while IFS=$'\t' read -r cls br; do
             [ -n "$cls" ] || continue
-            printf '  git branch -d "%s"   # class=%s\n' "$br" "$cls"
+            printf '  git branch -d -- "%s"   # class=%s\n' "$br" "$cls"
         done <<<"$delete_list"
         echo ""
     else
@@ -910,7 +1352,12 @@ run_scopes() {
         remote) run_remote_scope ;;
         local)  run_local_scope ;;
         both)
-            run_remote_scope
+            # ⛔ The status MUST be propagated explicitly. Under the opt-in log
+            # path the whole pass runs inside `set +e` (so PIPESTATUS can be
+            # read), and a bare `run_remote_scope` returning 1 would be followed
+            # by `run_local_scope`, whose 0 then becomes PIPESTATUS[0] — a REFUSED
+            # remote sweep reported as success (exit 0).
+            run_remote_scope || return 1
             run_local_scope
             ;;
     esac

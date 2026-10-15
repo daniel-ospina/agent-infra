@@ -571,6 +571,27 @@ case "${FAKE_GH_MODE:-ok}" in
         # gh's real answer for a repository with ZERO pull requests
         printf '%s' '[]'
         ;;
+    repo)
+        # Finding 2 (round 1): the map must be pinned to the SWEPT repo. F2
+        # (round 2): a 2-segment `--repo` is resolved against an ambient GH_HOST,
+        # so the HOST must be pinned too. This fake returns the swept repo's map
+        # ONLY for `--repo github.com/example/example`; a bare `example/example`
+        # (or any other value) is treated as a redirected lookup and returns [] —
+        # which knows nothing of `old-redundant`, so the branch is deleted as
+        # redundant instead of kept by its OPEN PR.
+        repo=""
+        prev=""
+        for a in "$@"; do
+            if [ "$prev" = "--repo" ]; then repo="$a"; fi
+            prev="$a"
+        done
+        if [ -n "${FAKE_GH_ARGV_LOG:-}" ]; then printf '%s\n' "$repo" > "$FAKE_GH_ARGV_LOG"; fi
+        if [ "$repo" = "github.com/example/example" ]; then
+            printf '%s' '[{"headRefName":"old-redundant","state":"OPEN","headRefOid":"1111111111111111111111111111111111111111","baseRefName":"main"}]'
+        else
+            printf '%s' '[]'
+        fi
+        ;;
     *)
         echo "unexpected FAKE_GH_MODE" >&2
         exit 9
@@ -601,6 +622,67 @@ run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=empty bash "$GH_SCRIPT" --scop
 assert_eq "$RC" "0" "gh returning [] is authoritative: local scope RUNS (exit 0)"
 assert_match "$OUT" '^  delete +redundant +old-redundant$' 'gh [] → keep rule vacuous, classification proceeds'
 assert_not_contains "$OUT" "an empty array" 'gh [] is NOT refused as an injected empty map'
+
+echo ""
+echo "== 7b. the gh map is PINNED to the swept repo AND host (F2) =="
+# Finding 2 (round 1): `gh pr list` honours an exported GH_REPO when no --repo
+# is given. F2 (round 2): a 2-segment --repo is resolved against an ambient
+# GH_HOST, so an exported host still redirects the whole map to another host.
+# The fake `gh` returns the swept repo's map ONLY for the host-pinned 3-segment
+# value, and section 7c records the argv it received.
+FAKE_GH_ARGV="$FIX/fake-gh-repo-argv"
+run_script env PATH="$FAKEBIN:$PATH" GH_REPO="other/other" GH_HOST="gh-host-should-not-be-used.invalid" FAKE_GH_MODE=repo FAKE_GH_ARGV_LOG="$FAKE_GH_ARGV" bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "a foreign GH_REPO/GH_HOST does not fail the pass (F2)"
+assert_contains "$(cat "$FAKE_GH_ARGV" 2>/dev/null || true)" "github.com/example/example" "gh is asked for the HOST-PINNED repo (F2)"
+assert_match "$OUT" '^  keep +open-pr +old-redundant$' 'the swept repo OPEN PR is still kept when GH_REPO/GH_HOST point elsewhere (F2)'
+assert_no_match "$OUT" '^  delete +[a-z-]+ +old-redundant$' 'the OPEN-PR branch is NOT deleted when GH_REPO/GH_HOST point elsewhere (F2)'
+
+echo ""
+echo "== 7c. github_slug accepts ONLY an exact github.com host (F3) =="
+# A SUBSTRING host test (`*github.com[:/]*`) accepts `https://notgithub.com/...`
+# and `git@mygithub.com:...`, strips the embedded `github.com/`, and yields a
+# FOREIGN but syntactically valid `owner/repo`. `gh` reads that as
+# `github.com/<owner>/<repo>`, so a foreign repository's map silently displaces
+# this one's. The script must find NO github.com origin and fail closed.
+git -C "$REPO3" remote set-url origin 'https://notgithub.com/example/example.git'
+run_script bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "1" "a notgithub.com origin fails closed (F3)"
+assert_contains "$OUT" "no github.com origin" "a notgithub.com origin is named as such (F3)"
+assert_not_contains "$OUT" "── SELECTED" "a notgithub.com origin classifies nothing (F3)"
+
+git -C "$REPO3" remote set-url origin 'git@mygithub.com:example/example.git'
+run_script bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "1" "a mygithub.com SSH origin fails closed (F3)"
+assert_contains "$OUT" "no github.com origin" "a mygithub.com origin is named as such (F3)"
+assert_not_contains "$OUT" "── SELECTED" "a mygithub.com origin classifies nothing (F3)"
+
+# Restore the real github.com URL for any later use of REPO3.
+git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+
+echo ""
+echo "== 7d. github_slug requires EXACTLY owner/repo — a 1-segment path does not pin a host (R3-5) =="
+# `https://github.com/onlyowner` used to yield the slug `onlyowner`, so the
+# pinned `--repo github.com/$slug` was the 2-segment `github.com/onlyowner`, which
+# `gh` resolves as OWNER/REPO against the ambient $GH_HOST — the declared host pin
+# did not hold for an input the parser accepted. Requiring two non-empty segments
+# makes `github.com/$slug` always 3 segments (host/owner/repo).
+git -C "$REPO3" remote set-url origin 'https://github.com/onlyowner'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "1" "a 1-segment origin fails closed (R3-5)"
+assert_contains "$OUT" "no github.com origin" "a 1-segment origin yields NO slug (R3-5)"
+assert_not_contains "$OUT" "── SELECTED" "a 1-segment origin classifies nothing (R3-5)"
+
+git -C "$REPO3" remote set-url origin 'https://github.com/owner/repo/tree/main'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "1" "a >2-segment URL path fails closed (R3-5)"
+assert_contains "$OUT" "no github.com origin" "a >2-segment URL path yields NO slug (R3-5)"
+assert_not_contains "$OUT" "── SELECTED" "a >2-segment URL path classifies nothing (R3-5)"
+
+# A normal owner/repo origin still resolves (the fake gh returns a valid map).
+git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "a normal owner/repo origin still resolves the slug (R3-5)"
+assert_match "$OUT" '^  delete +redundant +old-redundant$' 'the normal origin still classifies (R3-5)'
 
 echo ""
 echo "== 8. a FAILED fetch disables the remotecopy gate (Defect 2, fail-closed) =="
@@ -867,6 +949,1033 @@ run_script bash "$LOCAL_SCRIPT" --pr-limit 0 --scope local
 assert_eq "$RC" "1" "an invalid --pr-limit exits 1"
 assert_contains "$OUT" "--pr-limit must be a positive integer" "an invalid --pr-limit is named"
 
+echo ""
+echo "== 12. an off-base MERGED PR does not pre-empt the redundant gate (Finding 3) =="
+# `merged-base-not-main` used to `continue` unconditionally, so a branch whose
+# content is provably already in main was kept forever. It must now fall through
+# to the redundant/remotecopy gates, while a genuinely off-base branch is still
+# kept. `merged-tip-moved` keeps its behaviour.
+
+F3_ORIGIN="$FIX/f3-origin.git"
+F3_REPO="$FIX/f3-repo"
+new_repo "$F3_REPO" "$F3_ORIGIN"
+cd "$F3_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F3_SCRIPT="$F3_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f3.txt; git add f3.txt; old_commit "init"; git push -q origin main
+F3_MAIN_SHA="$(git rev-parse main)"
+# offbase-redundant: tip == origin/main, MERGED into a non-main base → redundant
+git branch offbase-redundant main
+# offbase-local: a commit not on main, MERGED into a non-main base → kept
+git checkout -q -b offbase-local main
+echo local > local.txt; git add local.txt; old_commit "local"
+F3_OFFBASE_LOCAL_SHA="$(git rev-parse HEAD)"
+# Back to main, with a `git` command on the NEXT line: a bare `git checkout main`
+# immediately followed by a non-command line is mis-scanned as a path-restore by
+# extensions/main-worktree-guard, and the `git` word bounds its argument list.
+git checkout -q main
+git rev-parse --verify -q refs/heads/offbase-local >/dev/null
+F3_MAP="$FIX/f3-map.json"
+cat > "$F3_MAP" <<JSON
+[
+  {"headRefName":"offbase-redundant","state":"MERGED","headRefOid":"$F3_MAIN_SHA","baseRefName":"feat/base"},
+  {"headRefName":"offbase-local","state":"MERGED","headRefOid":"$F3_OFFBASE_LOCAL_SHA","baseRefName":"feat/base"}
+]
+JSON
+run_script bash "$F3_SCRIPT" --scope local --pr-map-file "$F3_MAP"
+assert_eq "$RC" "0" "off-base fixture: dry-run exits 0"
+assert_match "$OUT" '^  delete +redundant +offbase-redundant$' 'an off-base MERGED PR at origin/main tip is selected as redundant (Finding 3)'
+assert_match "$OUT" '^  keep +merged-base-not-main +offbase-local$' 'a genuinely off-base MERGED PR is still KEPT (Finding 3)'
+assert_no_match "$OUT" '^  delete +[a-z-]+ +offbase-local$' 'the off-base local-commit branch is NOT selected'
+
+echo ""
+echo "== 13. a non-numeric CLEANUP_BRANCH_LOG_MAX_BYTES warns and still caps (Finding 4) =="
+# `[ "$size" -ge "$max" ]` with a non-numeric $max returns status 2; the `if`
+# then reads false and the cap silently NEVER fires — no error, no warning — so
+# the log grows without bound exactly as the header promises it cannot.
+LOG3="$FIX/report-cap.log"
+{ printf 'STALE-MARKER-STALE-MARKER\n'; printf '%*s' 1100000 '' | tr ' ' X; } > "$LOG3"
+run_script env CLEANUP_BRANCH_LOG="$LOG3" CLEANUP_BRANCH_LOG_MAX_BYTES=abc \
+    bash "$F3_SCRIPT" --scope local --pr-map-file "$F3_MAP"
+assert_eq "$RC" "0" "a non-numeric log cap does not abort the pass (Finding 4)"
+assert_contains "$OUT" "CLEANUP_BRANCH_LOG_MAX_BYTES must be a positive integer" "a non-numeric log cap is WARNED about (Finding 4)"
+assert_not_contains "$(cat "$LOG3")" "STALE-MARKER" "the cap still FIRES after falling back to the default (Finding 4)"
+assert_contains "$(cat "$LOG3")" "Stale Local Branch Cleanup" "the newest pass is logged after the fallback truncation (Finding 4)"
+
+echo ""
+echo "== 13b. a NUMERIC value that overflows bash's integer range is refused (F4) =="
+# `[[ "99999999999999999999" =~ ^[0-9]+$ ]]` is TRUE, so a digit-only check
+# passes it; `[ "$v" -lt 1 ]` — and every later `[ "$size" -ge "$max" ]` — then
+# returns status 2 (integer overflow), the `if` reads false, and the cap silently
+# NEVER fires — exactly the silent no-op Finding 4 exists to close. The digit
+# count must be bounded too.
+LOG4="$FIX/report-overflow.log"
+{ printf 'STALE-MARKER-STALE-MARKER\n'; printf '%*s' 1100000 '' | tr ' ' X; } > "$LOG4"
+run_script env CLEANUP_BRANCH_LOG="$LOG4" CLEANUP_BRANCH_LOG_MAX_BYTES=99999999999999999999 \
+    bash "$F3_SCRIPT" --scope local --pr-map-file "$F3_MAP"
+assert_eq "$RC" "0" "an overflowing log cap does not abort the pass (F4)"
+assert_contains "$OUT" "CLEANUP_BRANCH_LOG_MAX_BYTES must be a positive integer" "an overflowing log cap is WARNED about (F4)"
+assert_not_contains "$(cat "$LOG4")" "STALE-MARKER" "the cap FIRES after the fallback (F4)"
+assert_contains "$(cat "$LOG4")" "Stale Local Branch Cleanup" "the pass is logged after the fallback truncation (F4)"
+
+for _nflag in --cutoff --pr-limit; do
+    run_script bash "$SCRIPT" "$_nflag" 99999999999999999999 --repo "$FIX"
+    assert_eq "$RC" "1" "$_nflag with an overflowing value exits 1 (F4)"
+    assert_contains "$OUT" "$_nflag must be a positive integer" "$_nflag overflow is refused and named (F4)"
+done
+unset _nflag
+
+echo ""
+echo "== 14. a relative --pr-map-file resolves against the CALLER's cwd (Finding 5) =="
+# Args are parsed before `cd "$REPO_ROOT"`, but the file is read after, so a
+# relative path used to be looked up INSIDE the swept checkout — the supplied map
+# silently "not found".
+F5_ORIGIN="$FIX/f5-origin.git"
+F5_REPO="$FIX/f5-repo"
+new_repo "$F5_REPO" "$F5_ORIGIN"
+mkdir -p "$F5_REPO/scripts"
+cp "$SCRIPT" "$F5_REPO/scripts/"
+F5_SCRIPT="$F5_REPO/scripts/cleanup-stale-branches.sh"
+F5_CWD="$FIX/f5-cwd"
+mkdir -p "$F5_CWD"
+cp "$PR_MAP_OTHER" "$F5_CWD/map5.json"
+cd "$F5_REPO"
+echo base > f5.txt; git add f5.txt; old_commit "init"; git push -q origin main
+git branch f5-redundant main
+cd "$F5_CWD"
+run_script bash "$F5_SCRIPT" --scope local --repo "$F5_REPO" --pr-map-file ./map5.json
+assert_eq "$RC" "0" "a relative --pr-map-file is read from the caller's cwd (Finding 5)"
+assert_contains "$OUT" "Loading PR state (file:" "the supplied map was opened (Finding 5)"
+assert_match "$OUT" '^  delete +redundant +f5-redundant$' 'classification ran with the relative map (Finding 5)'
+
+echo ""
+echo "== 15. a two-token flag with no value names the flag (Finding 7) =="
+# `shift 2` on a single remaining argument fails under `set -e` and the shell
+# exits with only shell noise; the operator never learns which flag was
+# malformed. The value is parsed BEFORE any repo validation, so no fixture is
+# needed.
+for _flag in --cutoff --scope --pr-map-file --pr-limit --repo; do
+    run_script bash "$SCRIPT" "$_flag"
+    assert_eq "$RC" "1" "$_flag with no value exits 1 (Finding 7)"
+    assert_contains "$OUT" "$_flag requires a value" "$_flag with no value names the flag (Finding 7)"
+done
+unset _flag
+
+echo ""
+echo "== 16. a branch whose name begins with '-' can be reaped (Finding 8) =="
+# `git branch -d "$br"` passes the name as the first non-option token, so git
+# parses `-x` as an OPTION, the delete always fails, and such a ref could never
+# be removed. `--` ends option parsing.
+F8_ORIGIN="$FIX/f8-origin.git"
+F8_REPO="$FIX/f8-repo"
+new_repo "$F8_REPO" "$F8_ORIGIN"
+cd "$F8_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F8_SCRIPT="$F8_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f8.txt; git add f8.txt; old_commit "init"; git push -q origin main
+F8_MAIN_SHA="$(git rev-parse main)"
+git update-ref refs/heads/-x "$F8_MAIN_SHA"
+git update-ref refs/heads/--version "$F8_MAIN_SHA"
+run_script bash "$F8_SCRIPT" --scope local --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "dash-named fixture: dry-run exits 0 (Finding 8)"
+assert_match "$OUT" '^  delete +redundant +-x$' 'a branch named -x is SELECTED as redundant (Finding 8)'
+assert_match "$OUT" '^  delete +redundant +--version$' 'a branch named --version is SELECTED as redundant (Finding 8)'
+assert_contains "$OUT" 'git branch -d -- "-x"' 'the dry-run echo mirrors the -- guard (Finding 8)'
+run_script bash "$F8_SCRIPT" --scope local --execute --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "dash-named fixture: --execute exits 0 (Finding 8)"
+assert_match "$OUT" '^  deleted +redundant +-x' 'a branch named -x is actually DELETED (Finding 8)'
+assert_match "$OUT" '^  deleted +redundant +--version' 'a branch named --version is actually DELETED (Finding 8)'
+assert_branch_absent "-x" "-x was removed (Finding 8)"
+assert_branch_absent "--version" "--version was removed (Finding 8)"
+
+echo ""
+echo "== 16b. remote scope reaps a branch whose name begins with '-' (F5) =="
+# `git push origin --delete "$local_branch"` passes the name as the first
+# non-option token, so `-x`/`--version` are parsed as OPTIONS, the delete always
+# fails, and such a ref could never be reaped. `--` ends option parsing, and the
+# dry-run echo must mirror it.
+F10_ORIGIN="$FIX/f10-origin.git"
+F10_REPO="$FIX/f10-repo"
+new_repo "$F10_REPO" "$F10_ORIGIN"
+cd "$F10_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F10_SCRIPT="$F10_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f10.txt; git add f10.txt; old_commit "init"; git push -q origin main
+F10_MAIN_SHA="$(git rev-parse main)"
+git update-ref refs/heads/-x "$F10_MAIN_SHA"
+git update-ref refs/heads/--version "$F10_MAIN_SHA"
+git push -q origin refs/heads/-x:refs/heads/-x
+git push -q origin refs/heads/--version:refs/heads/--version
+run_script bash "$F10_SCRIPT" --scope remote
+assert_eq "$RC" "0" "dash-named remote fixture: dry-run exits 0 (F5)"
+assert_contains "$OUT" '--delete -- "refs/heads/-x"' 'the dry-run echo mirrors the -- guard for -x (F5)'
+assert_contains "$OUT" '--delete -- "refs/heads/--version"' 'the dry-run echo mirrors the -- guard for --version (F5)'
+run_script bash "$F10_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "dash-named remote fixture: --execute exits 0 (F5)"
+if [ -z "$(git ls-remote origin 'refs/heads/-x' 2>/dev/null)" ]; then
+    ok "remote branch -x was actually reaped (F5)"
+else
+    bad "remote branch -x was NOT reaped (F5)"
+fi
+if [ -z "$(git ls-remote origin 'refs/heads/--version' 2>/dev/null)" ]; then
+    ok "remote branch --version was actually reaped (F5)"
+else
+    bad "remote branch --version was NOT reaped (F5)"
+fi
+
+echo ""
+echo "== 17. remote scope never deletes a NON-origin remote's ref through origin (Finding 1) =="
+# `git branch -r --merged` enumerates EVERY remote's tracking refs, but deletion
+# is always `git push origin --delete ${branch#origin/}`. For `upstream/foo` the
+# prefix-strip removes nothing, so the pass tells ORIGIN to delete
+# `refs/heads/upstream/foo` — a branch never shown to be merged. The premise was
+# evaluated on ref A and the destructive action landed on ref B.
+F1_ORIGIN="$FIX/f1-origin.git"
+F1_UPSTREAM="$FIX/f1-upstream.git"
+F1_REPO="$FIX/f1-repo"
+new_repo "$F1_REPO" "$F1_ORIGIN"
+cd "$F1_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F1_SCRIPT="$F1_REPO/scripts/cleanup-stale-branches.sh"
+git init -q --bare "$F1_UPSTREAM"
+git remote add upstream "$F1_UPSTREAM"
+echo base > f1.txt; git add f1.txt; old_commit "init"; git push -q origin main
+# `upstream/foo` — merged into main on the SECOND remote.
+git checkout -q -b foo main
+echo up > up.txt; git add up.txt; old_commit "up"
+git push -q -u upstream foo
+git checkout -q main
+git merge -q --ff-only upstream/foo
+git push -q origin main
+# origin carries a branch LITERALLY named `upstream/foo`, with an UNMERGED
+# commit — this is the ref the pre-fix push would destroy.
+git checkout -q -b upstream/foo main
+echo danger > danger.txt; git add danger.txt; old_commit "danger"
+git push -q origin refs/heads/upstream/foo:refs/heads/upstream/foo
+git checkout -q main
+# origin's plain `foo`, also unmerged and distinct.
+git checkout -q -b origin-foo main
+echo of > of.txt; git add of.txt; old_commit "of"
+git push -q origin refs/heads/origin-foo:refs/heads/foo
+# NOTE: deliberately left on origin-foo — a trailing bare `git checkout main`
+# here is mis-scanned as a path-restore (see the section-12 note); the remote
+# scope only warns when HEAD is not main, which no assertion depends on.
+
+run_script bash "$F1_SCRIPT" --scope remote
+assert_eq "$RC" "0" "non-origin fixture: remote dry-run exits 0 (Finding 1)"
+assert_contains "$OUT" "non-origin-remote" "a non-origin merged ref is REPORTED, never silently skipped (Finding 1)"
+assert_match "$OUT" '^  keep +non-origin-remote +upstream/foo$' 'the non-origin ref is a KEEP line, not just any mention (Finding 1)'
+# ⛔ F6: the previous assertion here (`assert_contains "$OUT" "upstream/foo"`) was
+# NOT falsifying — the PRE-fix dry-run also prints `upstream/foo`, inside
+# `git push origin --delete "upstream/foo"`. Assert on the deletion PLAN instead:
+# origin must never be told to delete a ref whose `--merged` premise was
+# evaluated on another remote. RED whenever the origin confinement is reverted.
+assert_no_match "$OUT" '--delete -- "refs/heads/upstream/foo"' 'the deletion plan never targets the non-origin ref through origin (Finding 1)'
+
+run_script bash "$F1_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "non-origin fixture: remote --execute exits 0 (Finding 1)"
+if [ -n "$(git ls-remote origin refs/heads/upstream/foo 2>/dev/null)" ]; then
+    ok "origin refs/heads/upstream/foo SURVIVES --execute (Finding 1)"
+else
+    bad "origin refs/heads/upstream/foo was DELETED through origin (Finding 1)"
+fi
+# ⛔ F6: the pre-F6 `origin refs/heads/foo SURVIVES` check that stood here was
+# INERT in both directions — origin's `foo` is unmerged, so it was never a
+# candidate and the assertion could not fail either way. It is dropped; the
+# deletion-plan assertion above replaces it and IS inversion-sensitive.
+
+echo ""
+echo "== 18. remote scope REFUSES to sweep behind a NEGATIVE refspec (F1 round 2) =="
+# `git fetch origin --prune` exits 0 while a NEGATIVE refspec (`^refs/heads/foo`)
+# makes `--prune` SKIP that ref, so refs/remotes/origin/foo survives at an OLD
+# MERGED tip while origin's REAL refs/heads/foo has advanced to an UNMERGED
+# commit. The remote scope's classification IS its delete list, so pre-fix the
+# sweep would `git push origin --delete foo` and destroy the only copy of the
+# unmerged commit. The sweep must fail closed, and must not rewrite the refspec.
+NEG_ORIGIN="$FIX/neg-origin.git"
+NEG_REPO="$FIX/neg-repo"
+NEG_CLONE="$FIX/neg-clone"
+new_repo "$NEG_REPO" "$NEG_ORIGIN"
+cd "$NEG_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+NEG_SCRIPT="$NEG_REPO/scripts/cleanup-stale-branches.sh"
+echo base > neg.txt; git add neg.txt; old_commit "init"; git push -q origin main
+# foo — merged into main at an OLD tip, so origin/foo is a `--merged` candidate.
+git checkout -q -b foo main
+echo old > old.txt; git add old.txt; old_commit "old"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+NEG_STALE_SHA="$(git rev-parse origin/foo)"
+# Advance origin's REAL foo to an UNMERGED commit, from a SEPARATE clone so this
+# repo's remote-tracking ref stays at the old merged tip.
+git clone -q -b main "$NEG_ORIGIN" "$NEG_CLONE"
+git -C "$NEG_CLONE" config user.email test@test.test
+git -C "$NEG_CLONE" config user.name "Test Runner"
+git -C "$NEG_CLONE" config commit.gpgsign false
+git -C "$NEG_CLONE" checkout -q -b adv main
+echo danger > "$NEG_CLONE/danger.txt"
+git -C "$NEG_CLONE" add danger.txt
+GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git -C "$NEG_CLONE" commit -q -m danger
+git -C "$NEG_CLONE" push -q origin adv:refs/heads/foo
+NEG_REAL_SHA="$(git -C "$NEG_ORIGIN" rev-parse refs/heads/foo)"
+# The negative refspec makes every subsequent `--prune` SKIP refs/heads/foo while
+# the fetch still exits 0.
+git config --add remote.origin.fetch '^refs/heads/foo'
+git fetch origin --prune --quiet
+if [ "$(git rev-parse origin/foo)" = "$NEG_STALE_SHA" ]; then
+    ok "negative-refspec fixture: origin/foo is STALE (old merged tip) after a 0-exit prune"
+else
+    bad "negative-refspec fixture: origin/foo was refreshed — the fixture no longer exercises the defect"
+fi
+if [ "$NEG_REAL_SHA" != "$NEG_STALE_SHA" ]; then
+    ok "negative-refspec fixture: origin's real foo has ADVANCED to an unmerged commit"
+else
+    bad "negative-refspec fixture: origin's real foo did not advance"
+fi
+run_script bash "$NEG_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "a negative refspec REFUSES the remote --execute (F1)"
+assert_contains "$OUT" "remote.origin.fetch carries a NEGATIVE refspec" "the negative refspec is named (F1)"
+assert_contains "$OUT" "Refusing the remote sweep" "the refusal says the sweep is refused (F1)"
+assert_not_contains "$OUT" "Deleting origin/" "no branch was even attempted (F1)"
+if [ "$(git -C "$NEG_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$NEG_REAL_SHA" ]; then
+    ok "origin's real UNMERGED foo SURVIVES --execute behind a negative refspec (F1)"
+else
+    bad "origin's real foo was deleted or moved — data loss (F1)"
+fi
+# The refspec is the operator's to own: the refusal must not have rewritten it.
+if grep -q '^\^' <<<"$(git config --get-all remote.origin.fetch 2>/dev/null || true)"; then
+    ok "the negative refspec is left in place (the pass does not rewrite config) (F1)"
+else
+    bad "the pass rewrote remote.origin.fetch (F1)"
+fi
+run_script bash "$NEG_SCRIPT" --scope remote
+assert_eq "$RC" "1" "a negative refspec refuses the remote dry-run too (F1)"
+# ⛔ R3-6: the assertion that stood here (`assert_not_contains "$OUT" "Deleting origin/"`)
+# was VACUOUS — `Deleting origin/` is emitted only inside the execute block, which
+# the dry-run returns before ever reaching, so it could not fail in either
+# direction. Assert on the dry-run's DELETE PLAN instead, which the pre-fix
+# dry-run DOES print and which is therefore inversion-sensitive.
+assert_no_match "$OUT" '--delete -- "refs/heads/foo"' 'the dry-run plans no deletion behind the refspec (F1)'
+
+echo ""
+echo "== 19. remote scope VERIFIES the target before deleting — a NARROWED POSITIVE refspec (R3-1) =="
+# The config guard greps remote.origin.fetch for a NEGATIVE refspec (an entry
+# beginning with `^`). A NARROWED POSITIVE refspec —
+# `+refs/heads/main:refs/remotes/origin/main`, what `git remote set-branches` and
+# `clone --single-branch` leave behind — omits `refs/heads/*`, so the fetch exits
+# 0, `--prune` never refreshes and never prunes the ref, and the grep finds
+# nothing. The stale refs/remotes/origin/doomed holds an OLD merged tip while
+# origin's real refs/heads/doomed has advanced to an UNMERGED commit: the sweep
+# classifies the stale tip, and pre-fix `git push origin --delete` destroyed the
+# real branch. The DELETE-TIME comparison against `git ls-remote` must refuse it.
+R31_ORIGIN="$FIX/r31-origin.git"
+R31_REPO="$FIX/r31-repo"
+R31_CLONE="$FIX/r31-clone"
+new_repo "$R31_REPO" "$R31_ORIGIN"
+cd "$R31_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R31_SCRIPT="$R31_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r31.txt; git add r31.txt; old_commit "init"; git push -q origin main
+# doomed — merged into main at an OLD tip, so origin/doomed is a `--merged` candidate.
+git checkout -q -b doomed main
+echo old > old.txt; git add old.txt; old_commit "old"
+git push -q -u origin doomed
+git checkout -q main
+git merge -q --ff-only doomed
+git push -q origin main
+R31_STALE_OID="$(git rev-parse origin/doomed)"
+# Advance origin's REAL doomed to an UNMERGED commit, from a SEPARATE clone, so
+# this repo's remote-tracking ref stays at the old merged tip.
+git clone -q -b main "$R31_ORIGIN" "$R31_CLONE"
+git -C "$R31_CLONE" config user.email test@test.test
+git -C "$R31_CLONE" config user.name "Test Runner"
+git -C "$R31_CLONE" config commit.gpgsign false
+git -C "$R31_CLONE" checkout -q -b adv main
+echo danger > "$R31_CLONE/danger.txt"
+git -C "$R31_CLONE" add danger.txt
+GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git -C "$R31_CLONE" commit -q -m danger
+git -C "$R31_CLONE" push -q origin adv:refs/heads/doomed
+R31_REAL_OID="$(git -C "$R31_ORIGIN" rev-parse refs/heads/doomed)"
+# The NARROWED refspec: only main is refreshed, so `--prune` never sees doomed.
+git config --replace-all remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+git fetch origin --prune --quiet
+if [ "$(git rev-parse origin/doomed)" = "$R31_STALE_OID" ]; then
+    ok "narrowed-refspec fixture: origin/doomed is STALE (old merged tip) after a 0-exit prune (R3-1)"
+else
+    bad "narrowed-refspec fixture: origin/doomed was refreshed — the fixture no longer exercises the defect (R3-1)"
+fi
+if [ "$R31_REAL_OID" != "$R31_STALE_OID" ]; then
+    ok "narrowed-refspec fixture: origin's real doomed has ADVANCED to an unmerged commit (R3-1)"
+else
+    bad "narrowed-refspec fixture: origin's real doomed did not advance (R3-1)"
+fi
+# The early config guard must NOT fire — this is precisely the class it misses.
+if grep -q '^\^' <<<"$(git config --get-all remote.origin.fetch 2>/dev/null || true)"; then
+    bad "narrowed-refspec fixture: the config carries a '^' entry, so the WRONG guard fires (R3-1)"
+else
+    ok "narrowed-refspec fixture: the config has NO negative refspec (the '^' guard cannot catch it) (R3-1)"
+fi
+run_script bash "$R31_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "a narrowed refspec REFUSES the remote --execute (R3-1)"
+assert_contains "$OUT" "REFUSING to delete origin/doomed" "the refused delete is named (R3-1)"
+assert_contains "$OUT" "origin's real refs/heads/doomed is $R31_REAL_OID" "the refusal names origin's REAL oid (R3-1)"
+assert_contains "$OUT" "classified $R31_STALE_OID" "the refusal names the CLASSIFIED oid (R3-1)"
+assert_contains "$OUT" "Refused: 1" "the summary reports the refusal (R3-1)"
+# R5-5: a REFUSED delete is a refusal, not a failure. It used to increment BOTH
+# counters, so one branch was reported as `Failed: 1` AND `Refused: 1` — the
+# summary double-counted a branch that was never attempted.
+assert_contains "$OUT" "Failed:  0" "the refused branch is NOT also counted as a failure (R5-5)"
+assert_contains "$OUT" "Total:   1" "the one candidate is counted exactly once (R5-5)"
+assert_not_contains "$OUT" "✅ deleted" "no branch was actually deleted (R3-1)"
+if [ "$(git -C "$R31_ORIGIN" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$R31_REAL_OID" ]; then
+    ok "origin's real UNMERGED doomed SURVIVES --execute (R3-1)"
+else
+    bad "origin's real doomed was deleted or moved — data loss (R3-1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 20. a FAILED fetch REFUSES the remote sweep even under CLEANUP_BRANCH_LOG (R3-2) =="
+# `git fetch origin --prune --quiet` in the remote scope was bare and relied on
+# `set -e`. The opt-in report log wraps the whole pass in `set +e` (so PIPESTATUS
+# can be read through the tee), which DISABLES that abort: a failed fetch fell
+# through, the STALE tracking ref was classified, and `git push origin --delete`
+# destroyed origin's real branch. CLEANUP_BRANCH_LOG is set by
+# templates/launchd/com.tortoise.branch-reaper.plist — the normal operator
+# invocation — so the check must be EXPLICIT, never errexit-dependent.
+R32_ORIGIN="$FIX/r32-origin.git"
+R32_REPO="$FIX/r32-repo"
+new_repo "$R32_REPO" "$R32_ORIGIN"
+cd "$R32_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R32_SCRIPT="$R32_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r32.txt; git add r32.txt; old_commit "init"; git push -q origin main
+git checkout -q -b doomed32 main
+echo old > old32.txt; git add old32.txt; old_commit "old32"
+git push -q -u origin doomed32
+git checkout -q main
+git merge -q --ff-only doomed32
+git push -q origin main
+R32_ORIGIN_OID="$(git rev-parse origin/doomed32)"
+# A broken fetch refspec that makes `git fetch` FAIL while `git push --delete`
+# still SUCCEEDS: fetching into `refs/heads/*` refuses to update the CHECKED-OUT
+# main branch, but push parses no fetch refspec.
+git config --replace-all remote.origin.fetch '+refs/heads/*:refs/heads/*'
+if git fetch origin --prune --quiet >/dev/null 2>&1; then
+    bad "fetch-failure fixture: the broken refspec did NOT make fetch fail (R3-2)"
+else
+    ok "fetch-failure fixture: the broken refspec makes fetch FAIL (R3-2)"
+fi
+# Prove push still works on this config, so the survival below is attributable to
+# the FETCH check and not to a push that simply cannot run.
+git push -q origin refs/heads/main:refs/heads/r32-push-probe
+if git push -q origin --delete -- r32-push-probe; then
+    ok "fetch-failure fixture: 'git push --delete' still SUCCEEDS under the broken fetch config (R3-2)"
+else
+    bad "fetch-failure fixture: push also fails, so the fixture does not isolate the fetch check (R3-2)"
+fi
+R32_LOG="$FIX/r32-report.log"
+run_script env CLEANUP_BRANCH_LOG="$R32_LOG" bash "$R32_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "with the log set, a FAILED fetch refuses the remote sweep (R3-2)"
+assert_contains "$OUT" "git fetch origin --prune --quiet FAILED" "the failed fetch is named (R3-2)"
+assert_contains "$OUT" "Refusing the remote sweep because the fetch failed" "the refusal is explicit, not deferred to delete-time verification (R3-2)"
+assert_not_contains "$OUT" "REFUSING to delete origin/" "the sweep never reached the delete loop (R3-2)"
+assert_contains "$(cat "$R32_LOG")" "Refusing the remote sweep because the fetch failed" "the refusal reaches the log through the tee (R3-2)"
+if [ "$(git -C "$R32_ORIGIN" rev-parse -q --verify refs/heads/doomed32 || echo GONE)" = "$R32_ORIGIN_OID" ]; then
+    ok "origin's real doomed32 SURVIVES the failed-fetch --execute (R3-2)"
+else
+    bad "origin's real doomed32 was deleted on a failed fetch — data loss (R3-2)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 21. --scope both propagates a remote REFUSAL through the log pipe (R3-4) =="
+# Under `set +e` (the log path) the `both` case ran `run_remote_scope` bare and
+# then `run_local_scope`, whose status 0 became PIPESTATUS[0] — a REFUSED remote
+# sweep was reported as success. The refusal must be independent of errexit.
+R34_ORIGIN="$FIX/r34-origin.git"
+R34_REPO="$FIX/r34-repo"
+new_repo "$R34_REPO" "$R34_ORIGIN"
+cd "$R34_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R34_SCRIPT="$R34_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r34.txt; git add r34.txt; old_commit "init"; git push -q origin main
+git checkout -q -b doomed34 main
+echo old > old34.txt; git add old34.txt; old_commit "old34"
+git push -q -u origin doomed34
+git checkout -q main
+git merge -q --ff-only doomed34
+git push -q origin main
+git config --add remote.origin.fetch '^refs/heads/doomed34'
+git fetch origin --prune --quiet
+R34_LOG="$FIX/r34-report.log"
+# --pr-map-file supplies a VALID map, so the LOCAL leg returns 0 — otherwise the
+# reverted code would exit non-zero for an unrelated reason and the test would not
+# be falsifying.
+run_script env CLEANUP_BRANCH_LOG="$R34_LOG" \
+    bash "$R34_SCRIPT" --scope both --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "1" "--scope both with the log set exits NON-ZERO when the remote sweep refuses (R3-4)"
+assert_contains "$OUT" "Refusing the remote sweep" "the remote refusal is the cause (R3-4)"
+# Prove the local leg WOULD have returned 0 — the pre-fix status that masked it.
+run_script bash "$R34_SCRIPT" --scope local --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "the local leg alone exits 0 under the same fixture (so only the remote leg is non-zero) (R3-4)"
+
+cd "$REPO"
+echo ""
+echo "== 22. remote scope handles a '|' in a ref name without truncating it (R3-3) =="
+# `|` is a LEGAL ref-name character (`git check-ref-format 'refs/heads/foo|bar'`
+# is OK), and the sweep encoded `"$branch|$DATE"` then decoded with
+# `${entry%%|*}` — a LONGEST-suffix strip — so `origin/foo|bar` decoded to
+# `origin/foo`: the premise was evaluated on one ref and the delete landed on
+# ANOTHER. Same truncation in the non-origin decode. The separator is now TAB,
+# which check-ref-format REJECTS in a ref name (so the sentinel cannot collide).
+R33_ORIGIN="$FIX/r33-origin.git"
+R33_REPO="$FIX/r33-repo"
+new_repo "$R33_REPO" "$R33_ORIGIN"
+cd "$R33_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R33_SCRIPT="$R33_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r33.txt; git add r33.txt; old_commit "init"; git push -q origin main
+# `foo|bar` — an old MERGED tip, so it IS a stale `--merged` candidate.
+git checkout -q -b 'foo|bar' main
+echo fb > fb.txt; git add fb.txt; old_commit "foo-bar"
+git push -q origin 'refs/heads/foo|bar:refs/heads/foo|bar'
+git checkout -q main
+git merge -q --ff-only 'foo|bar'
+git push -q origin main
+# `foo` — a DIFFERENT origin branch with an UNMERGED commit: the ref the pre-fix
+# truncation would have destroyed.
+git checkout -q -b foo main
+echo f > f.txt; git add f.txt; old_commit "foo-unmerged"
+git push -q origin refs/heads/foo:refs/heads/foo
+git checkout -q main
+git rev-parse --verify -q refs/heads/foo >/dev/null
+R33_FOO_OID="$(git -C "$R33_ORIGIN" rev-parse refs/heads/foo)"
+run_script bash "$R33_SCRIPT" --scope remote
+assert_eq "$RC" "0" "pipe-named fixture: dry-run exits 0 (R3-3)"
+assert_contains "$OUT" '--delete -- "refs/heads/foo|bar"' 'the dry-run plan targets foo|bar, not a truncated foo (R3-3)'
+assert_no_match "$OUT" '--delete -- "refs/heads/foo"$' 'the dry-run plan does NOT target plain foo (R3-3)'
+run_script bash "$R33_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "pipe-named fixture: --execute exits 0 (R3-3)"
+if [ -z "$(git ls-remote origin 'refs/heads/foo|bar' 2>/dev/null)" ]; then
+    ok "origin refs/heads/foo|bar was actually reaped (R3-3)"
+else
+    bad "origin refs/heads/foo|bar was NOT reaped (R3-3)"
+fi
+if [ "$(git -C "$R33_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$R33_FOO_OID" ]; then
+    ok "origin's UNMERGED foo SURVIVES (the truncated target was never deleted) (R3-3)"
+else
+    bad "origin's foo was deleted by the truncated target — data loss (R3-3)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 23. the remote HAPPY PATH still deletes a stale merged branch when the refs AGREE (R3-1) =="
+# The delete-time verification must not become a blanket refusal: a genuinely
+# stale, merged remote branch whose tracking ref EQUALS origin's real ref is
+# still deletable.
+R35_ORIGIN="$FIX/r35-origin.git"
+R35_REPO="$FIX/r35-repo"
+new_repo "$R35_REPO" "$R35_ORIGIN"
+cd "$R35_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R35_SCRIPT="$R35_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r35.txt; git add r35.txt; old_commit "init"; git push -q origin main
+git checkout -q -b happily-stale main
+echo hs > hs.txt; git add hs.txt; old_commit "hs"
+git push -q -u origin happily-stale
+git checkout -q main
+git merge -q --ff-only happily-stale
+git push -q origin main
+run_script bash "$R35_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "the happy path exits 0 (R3-1)"
+assert_contains "$OUT" "Refused: 0" "nothing was refused when the refs agree (R3-1)"
+if [ -z "$(git ls-remote origin refs/heads/happily-stale 2>/dev/null)" ]; then
+    ok "a genuinely stale merged remote branch IS still deleted (R3-1)"
+else
+    bad "the happy path no longer deletes a stale merged remote branch (R3-1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 24. the verifier proves the PUSH url, not the FETCH url — remote.origin.pushurl (F1) =="
+# `git ls-remote origin` reads the FETCH url (remote.origin.url) while
+# `git push origin` honours remote.origin.pushurl, which may name a DIFFERENT
+# repository. Pre-fix the fetch-side check proved repo A while the delete landed
+# on repo B — and reported success. The target must be resolved with
+# `git remote get-url --push origin` and used for BOTH the proof and the delete.
+P1_A="$FIX/p1-a.git"
+P1_B="$FIX/p1-b.git"
+P1_REPO="$FIX/p1-repo"
+new_repo "$P1_REPO" "$P1_A"
+cd "$P1_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+P1_SCRIPT="$P1_REPO/scripts/cleanup-stale-branches.sh"
+echo base > p1.txt; git add p1.txt; old_commit "init"; git push -q origin main
+# Repo A: `doomed` is merged into main and stale → a genuine candidate.
+git checkout -q -b doomed main
+echo da > da.txt; git add da.txt; old_commit "doomed-on-A"
+git push -q -u origin doomed
+git checkout -q main
+git merge -q --ff-only doomed
+git push -q origin main
+P1_A_OID="$(git -C "$P1_A" rev-parse refs/heads/doomed)"
+# Repo B: its own `doomed` holds a UNIQUE, UNMERGED commit that exists nowhere else.
+git init -q --bare "$P1_B"
+git checkout -q -b b-doomed main
+echo dangerB > dangerB.txt; git add dangerB.txt; old_commit "doomed-on-B"
+P1_B_OID="$(git rev-parse HEAD)"
+git push -q "$P1_B" refs/heads/b-doomed:refs/heads/doomed
+git checkout -q main
+git rev-parse --verify -q refs/heads/b-doomed >/dev/null
+if [ "$P1_A_OID" != "$P1_B_OID" ]; then
+    ok "pushurl fixture: repo A's and repo B's doomed differ (the divergence is real) (F1)"
+else
+    bad "pushurl fixture: A and B share one oid — the fixture does not exercise the divergence (F1)"
+fi
+# The divergence itself: fetch from A, push to B.
+git config remote.origin.pushurl "$P1_B"
+if [ "$(git remote get-url --push origin)" = "$P1_B" ]; then
+    ok "pushurl fixture: git resolves origin's PUSH url to repo B (F1)"
+else
+    bad "pushurl fixture: git did not resolve the pushurl — the fixture is wrong (F1)"
+fi
+run_script bash "$P1_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "a pushurl divergence REFUSES the delete (F1)"
+assert_contains "$OUT" "REFUSING to delete origin/doomed" "the pushurl divergence is refused (F1)"
+assert_contains "$OUT" "Refused: 1" "the pushurl refusal is counted (F1)"
+if [ "$(git -C "$P1_B" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$P1_B_OID" ]; then
+    ok "repo B's unique UNMERGED doomed SURVIVES (F1)"
+else
+    bad "repo B's doomed was DELETED — data loss (F1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 25. the verifier proves the PUSH url — pushInsteadOf with no pushurl (F1) =="
+# The same divergence with NO pushurl: `url.<base>.pushInsteadOf` rewrites every
+# push to origin into a push to a DIFFERENT repository. `git remote get-url
+# --push` applies that rewrite, so it must be the URL the verifier and the
+# delete both use.
+P2_A="$FIX/p2-a.git"
+P2_C="$FIX/p2-c.git"
+P2_REPO="$FIX/p2-repo"
+new_repo "$P2_REPO" "$P2_A"
+cd "$P2_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+P2_SCRIPT="$P2_REPO/scripts/cleanup-stale-branches.sh"
+echo base > p2.txt; git add p2.txt; old_commit "init"; git push -q origin main
+git checkout -q -b doomed main
+echo da > da.txt; git add da.txt; old_commit "doomed-on-A2"
+git push -q -u origin doomed
+git checkout -q main
+git merge -q --ff-only doomed
+git push -q origin main
+P2_A_OID="$(git -C "$P2_A" rev-parse refs/heads/doomed)"
+git init -q --bare "$P2_C"
+git checkout -q -b c-doomed main
+echo dangerC > dangerC.txt; git add dangerC.txt; old_commit "doomed-on-C"
+P2_C_OID="$(git rev-parse HEAD)"
+git push -q "$P2_C" refs/heads/c-doomed:refs/heads/doomed
+git checkout -q main
+git rev-parse --verify -q refs/heads/c-doomed >/dev/null
+if [ "$P2_A_OID" != "$P2_C_OID" ]; then
+    ok "pushInsteadOf fixture: repo A's and repo C's doomed differ (F1)"
+else
+    bad "pushInsteadOf fixture: A and C share one oid — the fixture does not exercise the divergence (F1)"
+fi
+# No pushurl: the rewrite alone must redirect the push.
+git config "url.$P2_C.pushInsteadOf" "$P2_A"
+if [ "$(git remote get-url --push origin)" = "$P2_C" ]; then
+    ok "pushInsteadOf fixture: git resolves origin's PUSH url to repo C (F1)"
+else
+    bad "pushInsteadOf fixture: git did not apply pushInsteadOf — the fixture is wrong (F1)"
+fi
+run_script bash "$P2_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "a pushInsteadOf divergence REFUSES the delete (F1)"
+assert_contains "$OUT" "REFUSING to delete origin/doomed" "the pushInsteadOf divergence is refused (F1)"
+if [ "$(git -C "$P2_C" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$P2_C_OID" ]; then
+    ok "repo C's unique UNMERGED doomed SURVIVES (F1)"
+else
+    bad "repo C's doomed was DELETED — data loss (F1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 26. remote scope reaps '@' and a foo vs refs/heads/foo collision (F2) =="
+# `@` is a legal ref name but also a revision shorthand: `git push --delete @`
+# fails with `fatal: invalid refspec ':@'` and the sweep still exits 0, so the
+# branch is never reaped. A bare `foo` is likewise ambiguous beside
+# `refs/heads/foo`. Pushing the FULLY-QUALIFIED ref fixes both.
+P3_ORIGIN="$FIX/p3-origin.git"
+P3_REPO="$FIX/p3-repo"
+new_repo "$P3_REPO" "$P3_ORIGIN"
+cd "$P3_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+P3_SCRIPT="$P3_REPO/scripts/cleanup-stale-branches.sh"
+echo base > p3.txt; git add p3.txt; old_commit "init"; git push -q origin main
+git checkout -q -b merged-tip main
+echo m > m.txt; git add m.txt; old_commit "merged-tip"
+git checkout -q main
+git merge -q --ff-only merged-tip
+git push -q origin main
+P3_SHA="$(git rev-parse main)"
+git update-ref refs/heads/@ "$P3_SHA"
+git update-ref refs/heads/collide "$P3_SHA"
+# push the three remote refs one at a time (a bare `refs/heads/foo` SRC is itself
+# ambiguous beside refs/heads/refs/heads/foo)
+git push -q origin refs/heads/@:refs/heads/@
+git push -q origin refs/heads/collide:refs/heads/foo
+git push -q origin refs/heads/collide:refs/heads/refs/heads/foo
+for _r in 'refs/heads/@' 'refs/heads/foo' 'refs/heads/refs/heads/foo'; do
+    if [ -n "$(git ls-remote origin "$_r" 2>/dev/null)" ]; then
+        ok "qualified-ref fixture: origin has $_r (F2)"
+    else
+        bad "qualified-ref fixture: origin is missing $_r (F2)"
+    fi
+done
+unset _r
+run_script bash "$P3_SCRIPT" --scope remote
+assert_eq "$RC" "0" "qualified-ref fixture: dry-run exits 0 (F2)"
+assert_contains "$OUT" '--delete -- "refs/heads/@"' 'the plan targets the QUALIFIED ref for @ (F2)'
+assert_contains "$OUT" '--delete -- "refs/heads/refs/heads/foo"' 'the plan targets the QUALIFIED nested ref (F2)'
+run_script bash "$P3_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "qualified-ref fixture: --execute exits 0 (F2)"
+for _r in 'refs/heads/@' 'refs/heads/foo' 'refs/heads/refs/heads/foo'; do
+    if [ "$(git -C "$P3_ORIGIN" rev-parse -q --verify "$_r" 2>/dev/null || echo GONE)" = "GONE" ]; then
+        ok "origin $_r was actually reaped (F2)"
+    else
+        bad "origin $_r was NOT reaped (F2)"
+    fi
+done
+unset _r
+
+cd "$REPO"
+echo ""
+echo "== 27. the delete-time verifier checks the returned ref NAME, not just the OID (F3) =="
+# `ls-remote <pattern>` matches path-component SUFFIXES: with only
+# `refs/heads/refs/heads/foo` present, `ls-remote refs/heads/foo` RETURNS it, so a
+# count==1 + OID comparison PASSES for `foo` while the matched ref has a
+# different name. The verifier must require an exact ref-name match.
+P4_ORIGIN="$FIX/p4-origin.git"
+P4_REPO="$FIX/p4-repo"
+new_repo "$P4_REPO" "$P4_ORIGIN"
+cd "$P4_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+P4_SCRIPT="$P4_REPO/scripts/cleanup-stale-branches.sh"
+echo base > p4.txt; git add p4.txt; old_commit "init"; git push -q origin main
+P4_SHA="$(git rev-parse main)"
+# origin gets ONLY the nested-suffix ref, at the merged OID...
+git -C "$P4_ORIGIN" update-ref refs/heads/refs/heads/foo "$P4_SHA"
+# ...and the local repo holds a STALE tracking ref `origin/foo` at that OID.
+git update-ref refs/remotes/origin/foo "$P4_SHA"
+# A narrowed fetch refspec keeps `--prune` from removing origin/foo (it tracks
+# only main) — the same staleness mechanism section 19 exercises.
+git config --replace-all remote.origin.fetch '+refs/heads/main:refs/remotes/origin/main'
+if [ "$(git rev-parse origin/foo)" = "$P4_SHA" ]; then
+    ok "suffix-only fixture: origin/foo is a stale tracking ref at the merged oid (F3)"
+else
+    bad "suffix-only fixture: origin/foo is not as set up (F3)"
+fi
+run_script bash "$P4_SCRIPT" --scope remote --execute
+assert_eq "$RC" "1" "a suffix-only match is REFUSED, not passed (F3)"
+assert_contains "$OUT" "REFUSING to delete origin/foo" "the suffix-only match is refused (F3)"
+assert_contains "$OUT" "named exactly refs/heads/foo" "the refusal names the missing EXACT ref (F3)"
+if [ "$(git -C "$P4_ORIGIN" rev-parse -q --verify refs/heads/refs/heads/foo || echo GONE)" = "$P4_SHA" ]; then
+    ok "the nested ref SURVIVES the refused suffix-only match (F3)"
+else
+    bad "the nested ref was deleted by a suffix-only match — wrong target (F3)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 27b. a same-suffix ref does NOT falsely refuse the legitimate branch (F3) =="
+P5_ORIGIN="$FIX/p5-origin.git"
+P5_REPO="$FIX/p5-repo"
+new_repo "$P5_REPO" "$P5_ORIGIN"
+cd "$P5_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+P5_SCRIPT="$P5_REPO/scripts/cleanup-stale-branches.sh"
+echo base > p5.txt; git add p5.txt; old_commit "init"; git push -q origin main
+# `foo` — merged into main, stale → a genuine candidate.
+git checkout -q -b foo main
+echo f > f.txt; git add f.txt; old_commit "foo-merged"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+# `refs/heads/refs/heads/foo` — a legitimate stale merged ref whose name is a
+# SUFFIX match for `foo` (so `ls-remote refs/heads/foo` returns TWO refs).
+git push -q origin refs/heads/foo:refs/heads/refs/heads/foo
+run_script bash "$P5_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "a same-suffix ref does NOT cause a false refusal (F3)"
+assert_contains "$OUT" "Refused: 0" "nothing was refused when foo is the exact match (F3)"
+assert_contains "$OUT" "Deleting origin/foo..." "the legitimate foo is not refused by the verifier (F3)"
+if [ "$(git -C "$P5_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "the legitimate foo IS still deleted beside a suffix-matching ref (F3)"
+else
+    bad "the legitimate foo was FALSELY REFUSED (F3)"
+fi
+if [ "$(git -C "$P5_ORIGIN" rev-parse -q --verify refs/heads/refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "the same-named suffix ref is reaped on its own evidence (F3)"
+else
+    bad "the suffix ref was left behind (F3)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 28. github_slug normalises the HOST case (F4) =="
+# URL host names are case-insensitive and git accepts `https://GitHub.com/o/r.git`,
+# but the exact `[ "$host" != "github.com" ]` comparison refused it — a false
+# negative that disables the PR-state seam for a legitimate origin.
+git -C "$REPO3" remote set-url origin 'https://GitHub.com/example/example.git'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "a mixed-case GitHub.com origin resolves the slug (F4)"
+assert_match "$OUT" '^  delete +redundant +old-redundant$' 'a mixed-case host still classifies normally (F4)'
+# Restore the canonical github.com URL for any later use.
+git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+
+cd "$REPO"
+echo ""
+echo "== 29. a CHAINED pushInsteadOf is applied ONCE by the delete (R5-1) =="
+# `git remote get-url --push origin` applies pushInsteadOf ONCE, so with
+# `url.B.pushInsteadOf=A` and `url.C.pushInsteadOf=B` it resolves to repo B. The
+# pre-fix delete then ran `git push "$push_url"`, i.e. `git push B`, which applies
+# the rewrite a SECOND time and lands on repo C — an unverified repository whose
+# unique UNMERGED branch is destroyed, reported as `Deleted: 1 / Refused: 0`,
+# rc=0. The delete must go through git's own remote resolution
+# (`git push origin --delete`), which applies the rewrite exactly once — the same
+# single application that produced the verified URL.
+R51_A="$FIX/r51-a.git"
+R51_B="$FIX/r51-b.git"
+R51_C="$FIX/r51-c.git"
+R51_REPO="$FIX/r51-repo"
+new_repo "$R51_REPO" "$R51_A"
+cd "$R51_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R51_SCRIPT="$R51_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r51.txt; git add r51.txt; old_commit "init"; git push -q origin main
+git checkout -q -b chain-doomed main
+echo cd > cd.txt; git add cd.txt; old_commit "chain-doomed-on-A"
+git push -q -u origin chain-doomed
+git checkout -q main
+git merge -q --ff-only chain-doomed
+git push -q origin main
+R51_A_OID="$(git -C "$R51_A" rev-parse refs/heads/chain-doomed)"
+# Repo B is a MIRROR of A's merged branch — the same OID — so a verification
+# against B passes. B is what `get-url --push` resolves to.
+git init -q --bare "$R51_B"
+git push -q "$R51_B" refs/heads/chain-doomed:refs/heads/chain-doomed
+# Repo C holds a UNIQUE, UNMERGED chain-doomed that exists nowhere else.
+git init -q --bare "$R51_C"
+git checkout -q -b c-chain main
+echo dangerChain > dangerChain.txt; git add dangerChain.txt; old_commit "chain-doomed-on-C"
+R51_C_OID="$(git rev-parse HEAD)"
+git push -q "$R51_C" refs/heads/c-chain:refs/heads/chain-doomed
+git checkout -q main
+git rev-parse --verify -q refs/heads/c-chain >/dev/null
+if [ "$R51_A_OID" != "$R51_C_OID" ]; then
+    ok "chained-rewrite fixture: A's and C's chain-doomed differ (R5-1)"
+else
+    bad "chained-rewrite fixture: A and C share one oid — no divergence to exercise (R5-1)"
+fi
+# Prove the premise: get-url applies ONCE (→B), so the fix's single-target
+# resolution holds and the ambiguity refusal does NOT fire.
+git config "url.$R51_B.pushInsteadOf" "$R51_A"
+git config "url.$R51_C.pushInsteadOf" "$R51_B"
+if [ "$(git remote get-url --push origin)" = "$R51_B" ]; then
+    ok "chained-rewrite fixture: get-url --push applies the rewrite ONCE (→ repo B) (R5-1)"
+else
+    bad "chained-rewrite fixture: get-url --push did not resolve to B — the fixture is wrong (R5-1)"
+fi
+if [ "$(git remote get-url --push --all origin | wc -l | tr -d ' ')" = "1" ]; then
+    ok "chained-rewrite fixture: --all resolves ONE push url (the fix does not refuse) (R5-1)"
+else
+    bad "chained-rewrite fixture: --all did not resolve exactly one push url (R5-1)"
+fi
+# The DRY-RUN plan must name git's own resolution, never the resolved URL (which
+# would be re-rewritten at push time).
+run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote
+assert_eq "$RC" "0" "chained-rewrite fixture: dry-run exits 0 (R5-1)"
+assert_contains "$OUT" 'git push origin --delete -- "refs/heads/chain-doomed"' 'the dry-run plan deletes through origin, not the resolved URL (R5-1)'
+assert_not_contains "$OUT" "$R51_B" 'the dry-run plan does NOT echo the resolved URL as the push target (R5-1)'
+run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote --execute
+assert_eq "$RC" "0" "chained-rewrite fixture: --execute exits 0 (R5-1)"
+assert_contains "$OUT" "Deleted: 1" "exactly one branch is deleted (R5-1)"
+if [ "$(git -C "$R51_B" rev-parse -q --verify refs/heads/chain-doomed || echo GONE)" = "GONE" ]; then
+    ok "the VERIFIED target (repo B) is the one reaped (R5-1)"
+else
+    bad "repo B's chain-doomed was NOT deleted (R5-1)"
+fi
+if [ "$(git -C "$R51_C" rev-parse -q --verify refs/heads/chain-doomed || echo GONE)" = "$R51_C_OID" ]; then
+    ok "repo C's unique UNMERGED chain-doomed SURVIVES (the rewrite is NOT applied twice) (R5-1)"
+else
+    bad "repo C's chain-doomed was DELETED — the delete re-rewrote the resolved URL (R5-1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 30. TWO pushurls REFUSE the sweep — git push origin reaches BOTH (R5-2) =="
+# `git remote get-url --push origin` returns only the FIRST pushurl while
+# `git push origin` pushes to EVERY one. Pre-fix the sweep verified the first
+# mirror, deleted there, and reported `Deleted: 1` — leaving the second mirror's
+# copy in place, and that copy is unverified (a delete authorised by the other
+# mirror's evidence). With more than one push target there is no single URL the
+# proof and the delete can both be pinned to, so the sweep must REFUSE and name
+# each URL.
+R52_A="$FIX/r52-a.git"
+R52_M1="$FIX/r52-m1.git"
+R52_M2="$FIX/r52-m2.git"
+R52_REPO="$FIX/r52-repo"
+new_repo "$R52_REPO" "$R52_A"
+cd "$R52_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+R52_SCRIPT="$R52_REPO/scripts/cleanup-stale-branches.sh"
+echo base > r52.txt; git add r52.txt; old_commit "init"; git push -q origin main
+git checkout -q -b multi-doomed main
+echo md > md.txt; git add md.txt; old_commit "multi-doomed"
+git push -q -u origin multi-doomed
+git checkout -q main
+git merge -q --ff-only multi-doomed
+git push -q origin main
+R52_OID="$(git -C "$R52_A" rev-parse refs/heads/multi-doomed)"
+# Two mirrors, BOTH holding the merged branch at the same OID.
+git init -q --bare "$R52_M1"
+git init -q --bare "$R52_M2"
+git push -q "$R52_M1" refs/heads/multi-doomed:refs/heads/multi-doomed
+git push -q "$R52_M2" refs/heads/multi-doomed:refs/heads/multi-doomed
+git config --add remote.origin.pushurl "$R52_M1"
+git config --add remote.origin.pushurl "$R52_M2"
+if [ "$(git remote get-url --push --all origin | wc -l | tr -d ' ')" = "2" ]; then
+    ok "two-pushurl fixture: origin resolves TWO push urls (R5-2)"
+else
+    bad "two-pushurl fixture: origin does not resolve two push urls — the fixture is wrong (R5-2)"
+fi
+if [ "$(git remote get-url --push origin)" = "$R52_M1" ]; then
+    ok "two-pushurl fixture: the single-URL resolution returns only the FIRST mirror (R5-2)"
+else
+    bad "two-pushurl fixture: get-url --push did not return the first mirror (R5-2)"
+fi
+run_script bash "$R52_SCRIPT" --repo "$R52_REPO" --scope remote --execute
+assert_eq "$RC" "1" "more than one push url REFUSES the sweep (R5-2)"
+assert_contains "$OUT" "origin has 2 PUSH urls" "the refusal names the count of push urls (R5-2)"
+assert_contains "$OUT" "$R52_M1" "the refusal names the first mirror (R5-2)"
+assert_contains "$OUT" "$R52_M2" "the refusal names the second mirror (R5-2)"
+assert_not_contains "$OUT" "Deleting origin/" "nothing is deleted when the push target is ambiguous (R5-2)"
+for _m in "$R52_M1" "$R52_M2"; do
+    if [ "$(git -C "$_m" rev-parse -q --verify refs/heads/multi-doomed || echo GONE)" = "$R52_OID" ]; then
+        ok "mirror $(basename "$_m")'s multi-doomed SURVIVES the ambiguity refusal (R5-2)"
+    else
+        bad "mirror $(basename "$_m")'s multi-doomed was deleted — one mirror was never verified (R5-2)"
+    fi
+done
+unset _m
+
+cd "$REPO"
+echo ""
+echo "== 31. the host fold is LOCALE-PINNED — a Turkish fold cannot forge github.com (R5-3) =="
+# `tr '[:upper:]' '[:lower:]'` is LOCALE-DEPENDENT. Under a Turkish locale it
+# folds `İ` (U+0130) to `i`, so the foreign host `GİTHUB.COM` folded to exactly
+# `github.com` and PASSED the exact-host guard — a foreign repository's PR map
+# silently displacing this one's, the very defect the exact comparison exists to
+# stop. The fold must be pinned `LC_ALL=C` (ASCII-only), which is all a host name
+# needs.
+#
+# The triggering locale is not guaranteed to be installed on every machine, so
+# the suite does not depend on it: a FAKE `tr` on PATH models the
+# locale-dependent fold deterministically — it applies the Turkish `İ`→`i`
+# mapping UNLESS its LC_ALL is exactly `C`, which is precisely the property the
+# fix asserts. Every other locale is treated as hostile.
+TRBIN="$FIX/fake-tr-bin"
+mkdir -p "$TRBIN"
+cat > "$TRBIN/tr" <<'FAKETR'
+#!/usr/bin/env bash
+# Models the locale-dependent case fold of the REAL tr. `LC_ALL=C` ⇒ ASCII-only
+# fold (İ is untouched); ANY other value ⇒ the Turkish fold (İ→i). Every other
+# invocation delegates to the real tr.
+if [ "${1:-}" = "[:upper:]" ] && [ "${2:-}" = "[:lower:]" ] && [ "$#" -eq 2 ]; then
+    if [ "${LC_ALL:-}" = "C" ]; then
+        exec /usr/bin/tr '[:upper:]' '[:lower:]'
+    fi
+    /usr/bin/tr '[:upper:]' '[:lower:]' | /usr/bin/sed 's/İ/i/g'
+    exit 0
+fi
+exec /usr/bin/tr "$@"
+FAKETR
+chmod +x "$TRBIN/tr"
+# Prove the fake models the defect: under a non-C locale it forges github.com...
+if [ "$(printf 'GİTHUB.COM' | env LC_ALL=tr_TR.UTF-8 PATH="$TRBIN:$PATH" tr '[:upper:]' '[:lower:]')" = "github.com" ]; then
+    ok "fake-tr fixture: a non-C locale folds GİTHUB.COM to github.com (the defect is modelled) (R5-3)"
+else
+    bad "fake-tr fixture: the fake tr does not model the Turkish fold — the test cannot falsify (R5-3)"
+fi
+# ...and under LC_ALL=C it folds ASCII only.
+if [ "$(printf 'GİTHUB.COM' | env LC_ALL=C PATH="$TRBIN:$PATH" tr '[:upper:]' '[:lower:]')" = "gİthub.com" ]; then
+    ok "fake-tr fixture: LC_ALL=C folds ASCII only, leaving İ untouched (R5-3)"
+else
+    bad "fake-tr fixture: LC_ALL=C did not produce the ASCII-only fold (R5-3)"
+fi
+# A foreign host that folds to github.com ONLY under a hostile locale must be
+# REFUSED: the pass must not read a foreign repository's PR map.
+git -C "$REPO3" remote set-url origin 'https://GİTHUB.COM/example/example.git'
+run_script env LC_ALL=tr_TR.UTF-8 PATH="$TRBIN:$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "1" "a host that folds to github.com only under a hostile locale is REFUSED (R5-3)"
+assert_contains "$OUT" "no github.com origin" "the locale-folded host yields NO slug (R5-3)"
+assert_not_contains "$OUT" "── SELECTED" "the locale-folded host classifies nothing (R5-3)"
+# The intended ASCII case-insensitivity still works: an ALL-ASCII mixed-case
+# host folds to github.com under the pin (and under any locale).
+git -C "$REPO3" remote set-url origin 'https://GITHUB.COM/example/example.git'
+run_script env LC_ALL=tr_TR.UTF-8 PATH="$TRBIN:$FAKEBIN:$PATH" FAKE_GH_MODE=ok bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "an ALL-ASCII mixed-case host still resolves under a hostile locale (R5-3)"
+assert_match "$OUT" '^  delete +redundant +old-redundant$' 'the ASCII mixed-case host still classifies (R5-3)'
+# Restore the canonical github.com URL for §32.
+git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+
+cd "$REPO"
+echo ""
+echo "== 32. an scp-like origin with NO user still resolves github.com (R5-4) =="
+# `[user@]host:path` was only recognised WITH a user, so `github.com:o/r.git`
+# and `github.com:o/r` — both GENUINE github.com origins, which git hands to ssh —
+# fell through to the bare-path branch. `${url%%/*}` then split on the `/` INSIDE
+# the path, yielding host `github.com:o` (≠ github.com) and a single-segment
+# path, so the origin was REFUSED and the whole local scope stood down.
+# GIT_SSH_COMMAND=false keeps the fetch from attempting ssh (no network, fails
+# fast); the origin URL string — all the parser reads — is unchanged.
+git -C "$REPO3" remote set-url origin 'github.com:example/example.git'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok GIT_SSH_COMMAND=false bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "an scp-like origin with no user resolves the slug (R5-4)"
+assert_match "$OUT" '^  delete +redundant +old-redundant$' 'the no-user scp-like origin classifies normally (R5-4)'
+git -C "$REPO3" remote set-url origin 'github.com:example/example'
+run_script env PATH="$FAKEBIN:$PATH" FAKE_GH_MODE=ok GIT_SSH_COMMAND=false bash "$GH_SCRIPT" --scope local
+assert_eq "$RC" "0" "an scp-like origin with no user and no .git resolves (R5-4)"
+assert_match "$OUT" '^  delete +redundant +old-redundant$' 'the no-user, no-.git scp-like origin classifies (R5-4)'
+# Restore the canonical github.com URL for any later use.
+git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+
+cd "$REPO"
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
