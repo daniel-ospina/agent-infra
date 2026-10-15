@@ -693,7 +693,7 @@ const SUBCOMMAND_WORD = /^[a-z][a-z-]*$/;
  */
 const PR_NON_MERGE_SUBCOMMANDS = new Set([
   "create", "view", "list", "comment", "close", "reopen", "edit", "diff", "checkout",
-  "ready", "review", "status", "lock", "unlock", "checks", "update-branch",
+  "ready", "review", "status", "lock", "unlock", "checks", "update-branch", "revert",
 ]);
 
 /**
@@ -718,6 +718,21 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
  */
 export function readsNonMergeGhCall(command: string): boolean {
   const scan = scanTokens(command);
+  // A POSITIVE READ MUST NOT COEXIST WITH A HIDDEN EXECUTION. A decoy readable `gh …`
+  // elsewhere in the command satisfied the read while the real merge spelled its own words
+  // away (`echo gh issue comment 5; V=--admin; C=gh; $C pr merge 999 $V`) — measured as a
+  // live bypass of BOTH layers, with the argv layer discarded by the command itself. So a
+  // construct-bearing token where an executable or a verb belongs, or a path to a `gh`,
+  // fails the read: this is the fail-closed direction, and it is why the polarity cannot be
+  // satisfied by a decoy.
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const tok = scan.tokens[i];
+    const w = shellWord(tok);
+    if (w !== "gh" && /(^|\/)gh$/.test(w)) return false; // `/tmp/x/gh`, `$P/g''h`
+    if (!CONSTRUCT.test(tok)) continue;
+    const next = shellWord(scan.tokens[i + 1]);
+    if (next === "pr" || next === "merge") return false; // `$C pr merge`, `$P$'r' merge`
+  }
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {
     if (shellWord(scan.tokens[i]) !== "gh") continue;
@@ -740,9 +755,10 @@ export function readsNonMergeGhCall(command: string): boolean {
  * Does the TEXT name a merge? True for a resolvable `pr merge`, and for a verb hidden
  * behind a construct in a verb position (`gh pr m`printf erge``, `gh p`printf r` merge`).
  *
- * This is the DEFERRAL's boundary (#1776). The text layer hands the argv layer the
- * unresolvable FLAG — never the MERGE. A command it reads as a merge keeps the
- * text-layer decision, for two reasons that meet here: that is the only shape in which a
+ * This is the CANDIDATE rule's shared read (`isAdminMergeCommand` calls it on its
+ * spliced-verb branch); the DEFERRAL's own boundary is `readsNonMergeGhCall`. The text
+ * layer hands the argv layer the unresolvable FLAG — never the MERGE: a command read as a
+ * merge is never a positive non-merge read (pinned), for two reasons that meet here — that is the only shape in which a
  * hidden `--admin` can reach gh AS AN ADMIN MERGE, and it is exactly the shape where the
  * argv layer can be told not to run for that command —
  * `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'` discards the injected
@@ -2861,14 +2877,19 @@ export default function (pi: ExtensionAPI) {
       // cannot, and it decides; when it is absent or switched off, this gate
       // refuses exactly as before. See `ghShimWillEnforce`.
       //
-      // #1776: the deferral is the unresolvable FLAG, never the MERGE, and it is bounded by
-      // POLARITY (`readsNonMergeGhCall`), not by a list of spells. This layer stands down only
-      // for a command whose text POSITIVELY reads a non-merge gh call, so a merge spelled past
-      // the tokenizer — a spliced or ANSI-C-quoted word, a brace expansion, a redirection, a
-      // construct-supplied verb behind a global flag, an empty-quoted repo value, a spelling
-      // this lane has not seen — keeps this gate's fail-closed decision instead of being
-      // handed to an argv layer the command itself can discard
-      // (`PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`).
+      // #1776: the deferral is the unresolvable FLAG, never the MERGE. Two halts bound it:
+      // a LITERAL `--admin` keeps the decision in the layer that can make it, and
+      // `readsNonMergeGhCall`'s POLARITY stands this layer down only for a command it can
+      // POSITIVELY read as a non-merge gh call — a read that also fails when a
+      // construct-bearing token sits where an executable or a verb belongs (a decoy readable
+      // `gh …` cannot buy the deference for a merge that spelled its own words away) or when
+      // a path to a `gh` appears. So a spliced or ANSI-C-quoted word, a brace expansion, a
+      // redirection, a construct-supplied verb behind a global flag, an empty-quoted repo
+      // value, a tokenizer residue, or a spelling this lane has not seen keeps the gate
+      // instead of being handed to an argv layer the command itself can discard
+      // (`PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`). A shape the text
+      // READS as a merge cannot be a positive non-merge read, which is pinned in the
+      // predicate test rather than asserted here.
       if (isAdminMergeCommand(command) &&
           (hasLiteralAdminFlag(command) || !readsNonMergeGhCall(command) ||
            !ghShimWillEnforce(shimDir))) {

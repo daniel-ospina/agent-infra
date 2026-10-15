@@ -5360,6 +5360,12 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // — is what keeps this one (measured as a live bypass before it did).
         "X='pr merge'; PATH=\"${PATH#*:}\"; export PATH; gh --hostname github.com $X 999 $'--admin'",
         "P=pr; PATH=\"${PATH#*:}\"; export PATH; gh --hostname github.com $P merge 999 $'--admin'",
+        // …and the DECOY family: a readable `gh …` elsewhere in the command satisfies a
+        // naive positive read while the real merge spells its own words away. Measured as a
+        // live bypass of both layers before `readsNonMergeGhCall` required that no hidden
+        // execution coexist with the read.
+        "echo gh issue comment 5; V=--admin; C=gh; PATH=/usr/bin; export PATH; $C pr merge 999 $V",
+        "gh issue comment 5 --body x; V=--admin; C=gh; P=p; PATH=/usr/bin; export PATH; $C $P$'r' merge 999 $V",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5433,6 +5439,7 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh api /repos/o/r --method POST $(mktemp)",
     "gh run view 123 --log",
     "gh pr view 4 --json body $(mktemp)",
+    "gh pr revert 1234 --title 'Revert admin RBAC' --body $(cat msg.md)",
   ]) {
     ok(readsNonMergeGhCall(cmd), `a readable non-merge gh call defers: ${cmd}`);
   }
@@ -5443,6 +5450,10 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh $G create --title 'admin $(x)'", // a construct hides the group
     "gh pr $SUB 999 $V", // a construct hides the subcommand
     "gh pr --repo=$(cat f) merge 999 $'--admin'", // a tokenizer RESIDUE is not a subcommand
+    "gh issue comment 5; C=gh; $C pr merge 999 $V", // a decoy read must not buy a hidden execution
+    "echo gh issue comment 5; C=gh; P=p; $C $P$'r' merge 999 $V",
+    "/tmp/x/gh pr merge 999 $V", // a path to gh is not a readable gh invocation
+    "gh pr frobnicate 999 $V", // an UNKNOWN subcommand is not a positive read (fail closed)
     "gh pr view 4 && gh pr merge 999 $V", // ONE unreadable call is enough
     "echo 'the admin says merge $(date)'", // no gh command word at all
   ]) {
@@ -5461,6 +5472,9 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "pr merge 999 $V",
   ]) {
     ok(mergeVerbInText(cmd), `the text names a merge: ${cmd}`);
+    // …and therefore NEVER a positive non-merge read — the property the caller's boundary
+    // rests on, pinned here so the docstring's claim is not merely asserted in prose.
+    ok(!readsNonMergeGhCall(cmd), `…and is not a positive non-merge read: ${cmd}`);
   }
   for (const cmd of [
     "gh pr view $X",
