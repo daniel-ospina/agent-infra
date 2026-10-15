@@ -939,7 +939,12 @@ async function main() {
     git(repoP, "config user.email e2e@test");
     git(repoP, "config user.name e2e");
     writeFileSync(join(repoP, "keep.txt"), "k1\n");
-    git(repoP, "add keep.txt");
+    // A second LIVE file in the same root that the writer below does NOT
+    // re-verify. Its seeded entry is the discriminator between a real MERGE
+    // (preserves foreign/untouched keys) and the old whole-file SNAPSHOT
+    // (rewrites the bridge down to the writer's own keys, dropping this one).
+    writeFileSync(join(repoP, "other.txt"), "other\n");
+    git(repoP, "add keep.txt other.txt");
     git(repoP, "commit -m baseline");
     // Stage a fresh edit so the proactive PASS is diff-scoped and actually
     // merges (a PASS that matches nothing in the diff writes no bridge at all).
@@ -955,6 +960,7 @@ async function main() {
     seeded.verified_files = [
       ...(Array.isArray(seeded.verified_files) ? seeded.verified_files : []),
       { path: `${realP}::keep.txt`, hash: sha("k1\n") },
+      { path: `${realP}::other.txt`, hash: sha("other\n") },
       { path: `${realP}::deleted-long-ago.txt`, hash: sha("gone\n") },
     ];
     mkdirSync(dirname(bridgePath), { recursive: true });
@@ -971,6 +977,12 @@ async function main() {
     ok(!paths.some((p: string) => p.endsWith("deleted-long-ago.txt")),
       `a deleted file's entry under a live root must be pruned, got: ${JSON.stringify(paths)}`);
     ok(paths.some((p: string) => p.endsWith("::keep.txt")), "the live file's entry must survive the prune");
+    // #1783 review Finding 1 (P2): the writer re-verified only keep.txt. An
+    // untouched LIVE file's entry must therefore survive this write — the old
+    // whole-file snapshot dropped it, so this assertion is what makes 21c
+    // discriminate the fix rather than merely the prune.
+    ok(paths.some((p: string) => p.endsWith("::other.txt")),
+      `an untouched live-root entry must survive another file's write (merge, not snapshot), got: ${JSON.stringify(paths)}`);
   });
 
   test("scenario 21d (#1225/#1573): an unremovable lock path must not WEDGE writeBridge — the lock degrades promptly", () => {
