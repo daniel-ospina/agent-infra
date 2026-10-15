@@ -439,7 +439,11 @@ run_script env PATH="$FAKEBIN:$PATH" bash "$LOCAL_SCRIPT" --scope local --pr-map
 assert_eq "$RC" "1" "a failed worktree enumeration exits 1 (fail-closed)"
 assert_contains "$OUT" "could not enumerate worktrees" "a failed worktree enumeration names the cause"
 assert_not_contains "$OUT" "── SELECTED" "a failed worktree enumeration classifies NOTHING"
-assert_not_contains "$OUT" '^  delete ' "a failed worktree enumeration selects no branch"
+# ⛔ REGEX, not a fixed string: the pattern is anchored (`^  delete `), and
+# `assert_not_contains` is `grep -qF`. A fixed-string search for a literal `^`
+# can never match this output, so the assertion was DEAD — it reported ok even
+# when the reverted guard selected branches. `assert_no_match` is `grep -qE`.
+assert_no_match "$OUT" '^  delete ' "a failed worktree enumeration selects no branch"
 rm -rf "$FAKEBIN"
 
 echo ""
