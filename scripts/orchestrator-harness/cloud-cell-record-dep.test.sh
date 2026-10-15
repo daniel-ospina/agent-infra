@@ -287,6 +287,12 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, 
   rm -rf "$MRG"
   mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/repo" "$MRG/o/logs" "$MRG/o/state"
   mkstubs "$MRG/stubs"
+  # python3 must be the REAL interpreter here, overriding mkstubs' exit-0 stub. merge-one.sh's step 3
+  # parses `gh pr checks --json name,state` THROUGH python3 (agent-infra#1764: the gate name became an
+  # input selected in python rather than a literal spliced into a jq program). With the exit-0 stub,
+  # json.load never runs, the gate reads EMPTY, and the worker waits the full 30 x 30s loop before
+  # exiting 4 — a fixture defect that reads as a worker hang, not as a failure.
+  p="$(command -v python3 2>/dev/null)" && ln -sf "$p" "$MRG/stubs/python3"
   : > "$MRG/pi-count"
   : > "$MRG/pr-body"
 }
@@ -335,7 +341,22 @@ run_merge() {
       case "$*" in
         *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
         *"pr view"*body*) cat "$FAKE_BODY_FILE" 2>/dev/null; return 0 ;;
-        *"pr checks"*) printf 'SUCCESS\n'; return 0 ;;
+        # Step 3 reads the gate as `gh pr checks --json name,state | python3`, and compares the
+        # STATE of the row whose name is the repo's gate (agent-infra#1764: the name is an input,
+        # not a literal). Plain text makes json.load fail, the gate reads EMPTY, and the worker then
+        # waits 30 x 30s before exiting 4 — so the mock must emit the row it parses.
+        *"pr checks"*) printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'; return 0 ;;
+        # The repo's merge contract (agent-infra#1764): merge-one.sh now resolves the required checks
+        # from branch protection at runtime, and an UNREADABLE read is refused (exit 5) BEFORE the
+        # record step this suite drives — so the mock must ANSWER it or every check below passes for
+        # the wrong reason. This is the POST-jq shape (one bare context per line, as
+        # `--jq '.contexts[]'` prints) and it carries the gate, so the suite keeps exercising GATE
+        # mode; the same stub shape main's own test-crossbox.sh uses for the same reason.
+        *required_status_checks*)
+          case "$*" in
+            *'.contexts[]'*) printf 'ai-review-gate\n' ;;
+            *)               printf '{"contexts":["ai-review-gate"]}' ;;
+          esac; return 0 ;;
         *) return 0 ;;
       esac
     }
