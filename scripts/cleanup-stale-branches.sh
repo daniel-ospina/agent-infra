@@ -633,7 +633,12 @@ run_local_scope() {
     if git fetch origin --prune --quiet; then
         local fetch_refspecs=""
         fetch_refspecs="$(git config --get-all remote.origin.fetch 2>/dev/null || true)"
-        if printf '%s\n' "$fetch_refspecs" | grep -q '^\^'; then
+        # A here-string, NOT `printf ... | grep -q`: under `pipefail` the producer
+        # can die of SIGPIPE before grep reads a short payload, and the whole test
+        # then reports 'no match' for input that DOES match. That false negative
+        # here would read as "no negative refspec" and re-enable the very gate
+        # this check exists to disable (#841).
+        if grep -q '^\^' <<<"$fetch_refspecs"; then
             echo "WARNING: remote.origin.fetch carries a NEGATIVE refspec (an entry beginning with '^')." >&2
             echo "WARNING: 'git fetch origin --prune' exited 0 but SKIPS the excluded ref, so the" >&2
             echo "WARNING: remote-tracking refs are NOT provably fresh." >&2
