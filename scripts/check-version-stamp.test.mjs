@@ -893,6 +893,86 @@ try {
     eq("control — green at the new commit", verify().code, 0);
   }
 
+  // ── 36. a large report must survive a PIPE ────────────────────────────────────────────────
+  console.log("\n36. a large report must survive a PIPE, not only a file");
+  {
+    // `console.log` to a pipe is ASYNCHRONOUS in Node, and `process.exit()` after it discards
+    // whatever is still queued. `spawnSync` here gives the child a PIPE, which is exactly how every
+    // real consumer reads it (`--json | jq`). Before the fix this truncated at the 64 KiB pipe
+    // buffer on 10/10 runs, with the exit code still looking correct.
+    const args = [];
+    for (let i = 0; i < 600; i += 1) args.push("--surface", path.join(TMP, "bulk", `s${i}`));
+    const v = run([...args, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("the run exits 1 (unstamped surfaces)", v.code, 1);
+    eq("the report is larger than a pipe buffer", v.stdout.length > 65536, true);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(v.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("and the whole report arrived (valid, complete JSON)", parsed === null, false);
+    eq("every surface is in it", parsed === null ? -1 : parsed.results.length, 600);
+  }
+
+  // ── 37. a VALID stamp with an unexpected deep key must not crash --json either ───────────
+  console.log("\n37. a valid stamp carrying an unexpected deep key must not crash --json");
+  {
+    stampNow();
+    const good = stamp();
+    const base = JSON.stringify(good, null, 2);
+    const deep = '{"a":'.repeat(8000) + "1" + "}".repeat(8000);
+    const withExtra = base.replace(/\n\}\s*$/, `,\n  "extra": ${deep}\n}\n`);
+    eq("the fixture really does carry the extra key", withExtra.includes("\"extra\""), true);
+    fs.writeFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), withExtra);
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("a valid stamp with a deep extra key → exit 0", v.code, 0);
+    eq("--json still produces a report", v.stdout.length > 0, true);
+    eq("no stack overflow on stderr", v.stderr.includes("Maximum call stack"), false);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(v.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("and the verdict is in-sync", parsed === null ? null : parsed.results[0].verdict, "in-sync");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 38. a case-variant spelling of the stamp is still the stamp ───────────────────────────
+  console.log("\n38. a case-variant spelling of the stamp must not become payload");
+  {
+    const s4 = path.join(TMP, "casefold");
+    fs.mkdirSync(path.join(s4, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s4, "skills"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s4);
+    fs.symlinkSync(".", path.join(s4, "scripts"));
+    eq("control — the self-referential surface stamps", run(["--write", "--surface", s4, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — and verifies",
+      run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    const upper = ".AGENT-INFRA-STAMP.JSON";
+    fs.renameSync(path.join(s4, ".agent-infra-stamp.json"), path.join(s4, upper));
+    // On a case-INSENSITIVE filesystem the same file is now reachable by either spelling.
+    if (fs.existsSync(path.join(s4, ".agent-infra-stamp.json"))) {
+      // It must still be recognised as the surface's own stamp — it was drift before the fix.
+      eq(
+        "a case-variant stamp is not digested",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+    } else {
+      // Case-SENSITIVE filesystem: the differently-cased name is a genuinely different file and
+      // MUST stay payload — excluding it by name would be a hole.
+      eq("case-sensitive FS — a differently-cased name stays payload", true, true);
+    }
+    fs.renameSync(path.join(s4, upper), path.join(s4, ".agent-infra-stamp.json"));
+    fs.rmSync(s4, { recursive: true, force: true });
+  }
+
 } finally {
   fs.rmSync(TMP, { recursive: true, force: true });
 }

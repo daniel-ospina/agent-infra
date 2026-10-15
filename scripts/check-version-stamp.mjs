@@ -206,7 +206,35 @@ export function payloadEntries(rootDir, relRoot) {
       // Match the RESOLVED PATH, never the basename: matching the name at every depth made a
       // legitimately installed file that happens to carry that name invisible to the digest — a
       // fail-open in a tool whose whole job is to notice that an install changed.
-      if (abs === ownStamp || abs.startsWith(`${ownStamp}.tmp-`)) continue;
+      const lowerName = name.toLowerCase();
+      const lowerBase = STAMP_BASENAME.toLowerCase();
+      if (lowerName.startsWith(lowerBase)) {
+        // Same FILE, whatever the spelling. A case-INSENSITIVE filesystem lets the same stamp be
+        // reached as `.AGENT-INFRA-STAMP.JSON`, and `realpathSync` echoes the case it was ASKED
+        // about rather than canonicalising to the on-disk one (measured on APFS) — so a path-string
+        // comparison cannot recognise it, and the stamp got digested, making write/verify diverge
+        // forever. Compare IDENTITY (dev+ino), which is right on both filesystem kinds: on a
+        // case-SENSITIVE one a differently-cased name really is a different file and stays payload.
+        let same = lowerName.slice(lowerBase.length).startsWith(".tmp-"); // this tool's own temp sibling
+        if (!same) {
+          try {
+            const a = fs.statSync(abs);
+            const b = fs.statSync(ownStamp);
+            same = a.dev === b.dev && a.ino === b.ino;
+          } catch {
+            // The stamp may not exist yet (`--write` hashes BEFORE writing it) — fall back to the
+            // string form.
+            let resolved = abs;
+            try {
+              resolved = fs.realpathSync(abs);
+            } catch {
+              resolved = abs;
+            }
+            same = resolved === ownStamp;
+          }
+        }
+        if (same) continue;
+      }
       const rel = relDir === "" ? name : `${relDir}/${name}`;
       let st;
       try {
@@ -240,8 +268,16 @@ export function payloadEntries(rootDir, relRoot) {
       }
     }
   };
-  // The surface's OWN stamp, resolved — the one path the digest must never include.
-  const ownStamp = path.join(real, STAMP_BASENAME);
+  // The surface's OWN stamp, resolved — the one path the digest must never include. Anchored to the
+  // SURFACE, not to the payload root: a root that resolves to an ANCESTOR (`extensions -> ..`) walks
+  // the stamp in when the anchor is `path.join(real, …)`, and write/verify then never converge.
+  let surfaceReal = rootDir;
+  try {
+    surfaceReal = fs.realpathSync(rootDir);
+  } catch {
+    surfaceReal = path.resolve(rootDir);
+  }
+  const ownStamp = path.join(surfaceReal, STAMP_BASENAME);
   walk(real, "");
   return out;
 }
@@ -457,8 +493,10 @@ export function validateStamp(raw) {
   // form makes the reader's universe unable to differ from the writer's.
   if (JSON.stringify(pl.roots) !== JSON.stringify(PAYLOAD_ROOTS)) {
     return {
+      // The roots are echoed into a message, so clip them: an unbounded array here is a second
+      // channel by which a hostile stamp inflates the report.
       ok: false,
-      reason: `payload.roots ${JSON.stringify(pl.roots)} != the fixed payload roots ${JSON.stringify(PAYLOAD_ROOTS)}`,
+      reason: `payload.roots ${clip(JSON.stringify(pl.roots))} != the fixed payload roots ${JSON.stringify(PAYLOAD_ROOTS)}`,
     };
   }
   return { ok: true, stamp: raw };
@@ -486,14 +524,26 @@ export function readStamp(surfaceDir) {
   // input: a deeply nested stamp crashed the run with `RangeError: Maximum call stack size
   // exceeded` and an EMPTY report (measured: 48 KB in at depth 8000), and a non-string commit made
   // the human line throw. Only these fields are ever read, and each is type-guarded here.
-  return verdict.ok ? verdict : { ...verdict, stamp: stampProjection(raw) };
+  // Project in BOTH branches. A VALID stamp carrying one unexpected deep key still reached
+  // `JSON.stringify` through this path and crashed `--json` with an empty report, so "project only
+  // on refusal" closed half the hole. The projection carries every field any consumer reads.
+  return { ...verdict, stamp: stampProjection(raw) };
 }
 
 /**
- * A bounded, type-guarded view of a REJECTED stamp, for the report. Every field is optional in
- * unvalidated input, so each is narrowed explicitly — this object is what `--json` prints and what
- * the human line reads a commit from.
+ * A bounded, type-guarded view of a stamp, for the report. Every field is optional in unvalidated
+ * input, so each is narrowed explicitly — this object is what `--json` prints and what the human
+ * line reads a commit from. Bounded in SIZE as well as type: the whole object is serialized, so an
+ * unbounded `roots` array or string measured a 48 KB stamp into a 10 MB report.
  */
+const PROJECTION_MAX_STRING = 64;
+const PROJECTION_MAX_ROOTS = 16;
+
+/** Truncate any string the report echoes back, so a hostile stamp cannot inflate the output. */
+function clip(v) {
+  return typeof v === "string" && v.length > PROJECTION_MAX_STRING ? `${v.slice(0, PROJECTION_MAX_STRING)}…` : v;
+}
+
 function stampProjection(raw) {
   const obj = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const ai =
@@ -507,15 +557,17 @@ function stampProjection(raw) {
   return {
     version: typeof obj.version === "number" ? obj.version : null,
     agentInfra: {
-      version: typeof ai.version === "string" ? ai.version : null,
-      commit: typeof ai.commit === "string" ? ai.commit : null,
+      version: clip(typeof ai.version === "string" ? ai.version : null),
+      commit: clip(typeof ai.commit === "string" ? ai.commit : null),
       dirty: typeof ai.dirty === "boolean" ? ai.dirty : null,
     },
     payload: {
-      algo: typeof pl.algo === "string" ? pl.algo : null,
-      roots: Array.isArray(pl.roots) ? pl.roots.filter((r) => typeof r === "string") : null,
+      algo: clip(typeof pl.algo === "string" ? pl.algo : null),
+      roots: Array.isArray(pl.roots)
+        ? pl.roots.slice(0, PROJECTION_MAX_ROOTS).filter((r) => typeof r === "string").map(clip)
+        : null,
       files: typeof pl.files === "number" ? pl.files : null,
-      hash: typeof pl.hash === "string" ? pl.hash : null,
+      hash: clip(typeof pl.hash === "string" ? pl.hash : null),
     },
   };
 }
@@ -826,13 +878,19 @@ function defaultSurfaces(opts) {
   const pi = piSurface();
   const namedPi = Boolean(process.env.AGENT_INFRA_PI_HOME && process.env.AGENT_INFRA_PI_HOME !== "");
   let piIsDir = false;
+  let piErr = null;
   try {
     piIsDir = fs.statSync(pi).isDirectory();
-  } catch {
-    piIsDir = false;
+  } catch (err) {
+    piErr = err;
   }
   if (piIsDir) out.push(pi);
-  else if (namedPi) throw new PayloadReadError(pi, { code: "ENOENT" });
+  else if (namedPi) {
+    // Keep the REAL errno. Hard-coding ENOENT told an operator that a permission-denied path "did
+    // not exist", and the exists-but-is-a-file case has no ENOENT at all — a false statement about
+    // a named path, which is the class this refusal exists to make honest.
+    throw new PayloadReadError(pi, piErr ?? { code: "ENOTDIR", message: "not a directory" });
+  }
   if (!opts.noRepos) {
     for (const dir of linkedSurfaces(opts.reposRoot)) {
       try {
@@ -869,7 +927,13 @@ function main(argv) {
     return 2;
   }
   if (git(repo, ["rev-parse", "--git-dir"]) === null) {
-    console.error(`❌ check-version-stamp: ${repo} is not a git checkout — ancestry cannot be established`);
+    // Worded to what the probe actually supports. `git --version` can succeed while real commands
+    // fail (a broken wrapper on PATH) and a stale worktree `.git` can point nowhere, so asserting
+    // "not a git checkout" about a healthy repo sends an operator to inspect the wrong thing —
+    // exactly the class `gitAvailable()` exists to close.
+    console.error(
+      `❌ check-version-stamp: ${repo} cannot be read as a git checkout (\`git rev-parse --git-dir\` failed) — ancestry cannot be established`
+    );
     return 2;
   }
 
@@ -950,13 +1014,16 @@ function main(argv) {
               "payload, so verification will read this surface as drift until it is re-stamped from a clean checkout"
           );
         }
-        // A stamp that can NEVER certify is worth saying out loud: no commit identity, or nothing
-        // installed under the payload roots, both make every future verify fail.
-        if (stamp.agentInfra.commit === null || stamp.payload.files === 0) {
+        // A stamp that can NEVER certify is worth saying out loud: `validateStamp` refuses a null
+        // commit, so every future verify of this surface fails. An EMPTY payload is a DIFFERENT
+        // case — its digest is stable (sha256 of nothing) and it does certify — so it gets a
+        // factual note, not a claim of impossibility that the next verify would contradict.
+        if (stamp.agentInfra.commit === null) {
           console.error(
-            `⚠️  ${dir} was stamped with ${stamp.agentInfra.commit === null ? "NO COMMIT IDENTITY" : "an EMPTY payload"} — ` +
-              "verification will never report this surface in-sync"
+            `⚠️  ${dir} was stamped with NO COMMIT IDENTITY — verification will never report this surface in-sync`
           );
+        } else if (stamp.payload.files === 0) {
+          console.error(`ℹ️  ${dir} was stamped with an EMPTY payload — no files under ${PAYLOAD_ROOTS.join(", ")}`);
         }
         console.log(
           `✅ stamped ${dir} — commit ${(stamp.agentInfra.commit ?? "none").slice(0, 9)}, ` +
@@ -1040,4 +1107,10 @@ function sameRealPath(a, b) {
 
 const IS_MAIN =
   process.argv[1] !== undefined && sameRealPath(process.argv[1], fileURLToPath(import.meta.url));
-if (IS_MAIN) process.exit(main(process.argv.slice(2)));
+if (IS_MAIN) {
+  // ⛔ exitCode, never `process.exit()`: writing to a PIPE is asynchronous in Node, and exiting
+  // discards whatever is still queued. Measured: `--json | jq` truncated the report at the 64 KiB
+  // pipe buffer on 10/10 runs — a silent loss, with the exit code still looking correct. Setting
+  // `exitCode` lets the event loop drain the writes before the process ends.
+  process.exitCode = main(process.argv.slice(2));
+}
