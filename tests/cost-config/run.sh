@@ -1720,10 +1720,19 @@ mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
 # …and the documented 1M revert (ceiling >= drift) is NOT straddled, so the new rule does not
 # false-block it: floor 983616 > drift 900000 is outside the `floor < drift < ceiling` shape.
 cp "$TMP37/scripts/watch-truncation.sh" "$TMP37/scripts/watch-truncation.sh.orig"
-sed -i 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
-sed -i 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=1000000/' "$TMP37/scripts/watch-truncation.sh"
+# In-place edits MUST be portable: bare `sed -i` is GNU-only — BSD/macOS sed consumes the script
+# text as the backup suffix, leaves the tree UNMUTATED, and this arm would then take the `then pass`
+# branch against the shipped 283616/650000 band (the #329 `sed -i ''` class the plan doc records).
+# `-i.bak` works on both; the `.bak` is discarded because the `.orig` snapshot is what is restored
+# below. Gate on the mutation having taken effect so a no-op substitution is a loud FAIL rather
+# than an earned-looking pass.
+sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=1000000/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_FLOOR=983616$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the floor mutation took effect"; else fail "37 fixture (k) 1M-revert control: the floor mutation did not take effect"; fi
+if grep -q '^REGIME_TB_ERA_CEIL=1000000$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the ceiling mutation took effect"; else fail "37 fixture (k) 1M-revert control: the ceiling mutation did not take effect"; fi
 if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then pass "the documented 1M revert band (floor 983616 > drift 900000) is not refused as straddling"; else fail "the straddle rule false-blocked the documented 1M revert band"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/watch-truncation.sh.orig" "$TMP37/scripts/watch-truncation.sh"
+rm -f "$TMP37/scripts/watch-truncation.sh.bak"
 rm -rf "$TMP37"
 
 echo ""
