@@ -94,6 +94,8 @@ def protected(lane: str) -> bool:
 #
 # DONE-IDLE is a SAMPLE, not a state. The classifier's row already carries its own POSITIVE
 # signals, so refuse unless they ALL agree that nothing is in flight:
+#   * the roster read was NOT degraded              (`degraded`)
+#   * the session id was CONFIRMED written          (`session_verified`)
 #   * no session growth during the sample window   (`grew`)
 #   * no `Working` spinner                          (`spinner`)
 #   * no pending / declared / pane child            (`child`, `declared`)
@@ -105,7 +107,30 @@ MIN_IDLE_S = 120
 
 
 def no_wip(row: dict) -> tuple[bool, str]:
-    """Positive evidence that nothing is in flight, from the classifier's own signals."""
+    """Positive evidence that nothing is in flight, from the classifier's own signals.
+
+    THE TWO READ-QUALITY FLAGS COME FIRST, because they invalidate everything below them and
+    they are NOT verdicts (lane-status.py:1900-1907 states the contract in the row itself):
+
+      * `degraded` — the FLEET ROSTER could not be read, so this row set is the hand-written
+        TSV and every live-only lane is MISSING. A consumer must REFUSE, not act on a partial
+        fleet: an absent lane is not an idle lane.
+      * `session_verified is False` — the id under this row was NOT confirmed as the one being
+        written, so `stale_s`, `grew` and `spinner` may all describe a DIFFERENT, dead session.
+        The classifier still renders `DONE-IDLE` (it keys on the spinner alone), so a row can
+        read idle while the lane is running work. MEASURED (2026-10-12): two lanes were bound
+        to sessions last written 64h18m and 12h30m earlier and both rendered `DONE-IDLE`.
+
+    This mirrors the sibling consumer `lane-actions.py:459-467`, which abstains on the same
+    flag (`UNVERIFIED-SESSION` -> `action="report"`). Omitting them here let the AUTOMATIC
+    dispatcher (atomic claim + unattended `safe-send.sh --apply`) act on exactly the rows the
+    classifier says must abstain — and `lane-guard.py`'s send-boundary probe cannot catch it,
+    because it re-derives the SAME unverified id (resolve_session == resolve_session_ex()[0]).
+    """
+    if row.get("degraded"):
+        return False, "degraded fleet read (partial roster) — REFUSE, do not act"
+    if row.get("session_verified") is False:
+        return False, "session id unverified — abstain (the row may describe another session)"
     if row.get("verdict") != "DONE-IDLE":
         return False, f"verdict={row.get('verdict')}"
     if row.get("grew"):
@@ -139,7 +164,14 @@ def norm(lane: str) -> str:
 
 
 def lanes():
-    """Per-lane verdicts from the existing multi-signal classifier (do not reinvent)."""
+    """Per-lane verdicts from the existing multi-signal classifier (do not reinvent).
+
+    `sh` returns stdout+stderr concatenated, and a DEGRADED run writes its diagnostic to
+    stderr (lane-status.py:531/538), so a degraded read fails `json.loads` and lands here as
+    `[]` -- a fail-closed accident, not a check. `no_wip`'s `degraded`/`session_verified`
+    refusal below is the EXPLICIT guard, so the fleet is no longer protected only by string
+    concatenation (a diagnostic moving to stdout, or any other stderr line, is now covered).
+    """
     rc, out = sh(["python3", LANE_STATUS, "--json"], timeout=300)
     if rc != 0 or not out.strip().startswith("["):
         return []

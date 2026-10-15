@@ -28,6 +28,14 @@ The second review round (#1553 @ 4304fef) added four findings, pinned here as we
   * ``lane-guard.py``'s ``--budget`` must bound the probe it declares a bound for, and
     each side must cost ONE pane read rather than read_screen + ui_working;
   * the stall-term registry must not advertise an ``IDLE_MIN`` bound no code reads.
+
+The third review round (#1553 @ 2b89ae21) found the automatic dispatcher acts on rows the
+classifier marks abstain, pinned here as well:
+
+  * ``queue-dispatch.py``'s ``no_wip()`` must honour the row's two read-quality flags —
+    ``degraded`` (partial fleet roster: live-only lanes are missing) and
+    ``session_verified is False`` (the id may describe a different, dead session) — because a
+    claim + unattended ``safe-send.sh`` acts on the row with no human in the loop.
 """
 from __future__ import annotations
 
@@ -50,6 +58,7 @@ TURN_CLASSIFY = HERE / "lane" / "turn-classify.py"
 LANE_GUARD = HERE / "lane" / "lane-guard.py"
 LANE_TRIAGE = HERE / "lane" / "lane-triage.py"
 LOOP = HERE / "heartbeat-loop.sh"
+QUEUE_DISPATCH = HERE / "lane" / "queue-dispatch.py"
 REGISTRY_TS = REPO_ROOT / "extensions" / "shared" / "heartbeat-progress-edges.ts"
 
 # The stall-verdict Python is the single-quoted argument of the second `python3 -c '…'`.
@@ -575,3 +584,70 @@ def test_lane_guard_refuses_when_the_reverify_read_is_unreadable(tmp_path, monke
     assert calls["n"] == 2, f"expected the re-verify read to run: {calls}"
     assert obs["ok"] is False, f"an unreadable re-verify read must not certify CONSUMABLE: {obs}"
     assert "UNREADABLE" in obs["reason"], obs["reason"]
+
+
+# ── P1 (review @2b89ae21): the automatic dispatcher must honour the read-quality flags ──
+#
+# Every row carries `degraded` (the fleet roster could not be read, so live-only lanes are
+# MISSING from this row set) and `session_verified` (the id under the row was not confirmed as
+# the one being written). lane-status.py:1900-1907 says a consumer must REFUSE/ABSTAIN on each;
+# lane-actions.py:459-467 implements exactly that. `no_wip` read five signals and neither flag,
+# so `queue-dispatch.py --apply` (atomic claim + unattended safe-send, armed detached from
+# heartbeat-loop.sh) acted on rows the classifier says must abstain — and lane-guard.py cannot
+# catch it, because the guard re-derives the SAME unverified id. Driven in-process against the
+# module's own predicate, which is the sole gate on the dispatch path.
+
+
+def _load_queue_dispatch():
+    spec = importlib.util.spec_from_file_location("queue_dispatch_under_test", QUEUE_DISPATCH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _idle_row(**over):
+    """A production-shaped DONE-IDLE row, fully verified unless a flag is overridden."""
+    row = {"verdict": "DONE-IDLE", "grew": False, "spinner": False, "child": None,
+           "declared": [], "stale_s": 900, "degraded": False, "session_verified": True}
+    row.update(over)
+    return row
+
+
+def test_queue_dispatch_refuses_a_degraded_fleet_read():
+    """PRE-FIX this fails: a partially-read fleet passed through as "nothing in flight".
+
+    Degraded means the row set is the hand-written TSV only — every live-only lane is
+    INVISIBLE. An absent lane is not an idle lane, so the dispatcher must REFUSE the snapshot.
+    """
+    mod = _load_queue_dispatch()
+    ok, why = mod.no_wip(_idle_row(degraded=True))
+    assert ok is False, "a degraded fleet read must not certify a lane as dispatchable"
+    assert "degraded" in why.lower(), why
+
+
+def test_queue_dispatch_refuses_an_unverified_session():
+    """PRE-FIX this fails: an unverified session id passed through as positive evidence.
+
+    MEASURED (2026-10-12): two lanes were bound to sessions last written 64h18m and 12h30m
+    earlier and both rendered `DONE-IDLE`. `stale_s`/`grew`/`spinner` may describe that dead
+    session, so a row the classifier refuses to attribute must ABSTAIN, mirroring
+    lane-actions.py's `UNVERIFIED-SESSION`.
+    """
+    mod = _load_queue_dispatch()
+    ok, why = mod.no_wip(_idle_row(session_verified=False))
+    assert ok is False, "an unverified session id must abstain, not dispatch"
+    assert "unverified" in why.lower() or "abstain" in why.lower(), why
+
+
+def test_queue_dispatch_still_dispatches_a_fully_verified_idle_row():
+    """The over-fix guard: the flags must not withhold a genuinely verified quiet lane.
+
+    And an OLDER row with no flag field at all must still dispatch (the ledger's tolerance
+    rule) — only a DEFINITE `False`/`True` value withholds.
+    """
+    mod = _load_queue_dispatch()
+    assert mod.no_wip(_idle_row()) == (True, "")
+    legacy = _idle_row()
+    legacy.pop("degraded")
+    legacy.pop("session_verified")
+    assert mod.no_wip(legacy) == (True, "")
