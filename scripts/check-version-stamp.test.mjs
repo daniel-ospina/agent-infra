@@ -25,6 +25,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+// Unit-level import: the file-identity guard cannot be exercised end-to-end from a CLI run, because
+// a filesystem reporting `dev`/`ino` of 0 cannot be constructed here.
+import { identUsable } from "./check-version-stamp.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(REPO_ROOT, "scripts", "check-version-stamp.mjs");
@@ -1246,6 +1249,51 @@ try {
       1
     );
     fs.rmSync(s9, { recursive: true, force: true });
+  }
+
+  // ── 47. every --json refusal still puts JSON on stdout ────────────────────────────
+  console.log("\n47. every --json refusal still puts JSON on stdout");
+  {
+    // A refusal that exits 2 with EMPTY stdout is unparseable: a caller iterating ~20 repos cannot
+    // tell a clean refusal from a crash, nor which entry failed.
+    const named = run(["--json", "--repos-root", path.join(TMP, "no-such-root-xyz"), "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
+    eq("an unreadable named repos root exits 2", named.code, 2);
+    let p1 = null;
+    try {
+      p1 = JSON.parse(named.stdout);
+    } catch {
+      p1 = null;
+    }
+    eq("and still prints parseable JSON", p1 === null, false);
+    eq("naming the failure", typeof p1?.error === "string", true);
+
+    // The empty-surface-set refusal (reached through the UNNAMED default, an absent $HOME/.pi/agent).
+    const emptyHome = path.join(TMP, "arm47-home");
+    fs.mkdirSync(emptyHome, { recursive: true });
+    const empty = run(["--no-repos", "--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
+      env: { HOME: emptyHome, AGENT_INFRA_PI_HOME: "", AGENT_INFRA_REPOS_ROOT: "" },
+    });
+    eq("an empty surface set exits 2", empty.code, 2);
+    let p2 = null;
+    try {
+      p2 = JSON.parse(empty.stdout);
+    } catch {
+      p2 = null;
+    }
+    eq("and still prints parseable JSON", p2 === null, false);
+    contains("naming the failure", (p2?.error ?? "") + named.stderr, "verified");
+  }
+
+  // ── 48. file identity is unavailable when dev/ino are 0 ───────────────────────────
+  console.log("\n48. file identity is unavailable when dev/ino are 0");
+  {
+    // Some SMB/FUSE mounts report 0/0 for everything, so `0 === 0` would match every pair and the
+    // exclusion would claim "this is the surface's own directory" EVERYWHERE — excluding every
+    // stamp-named file at any depth, a fail-open wider than the path compare it replaced.
+    eq("a real identity is usable", identUsable({ dev: 16777220, ino: 12345 }), true);
+    eq("dev 0 alone is not enough to declare it unusable", identUsable({ dev: 0, ino: 7 }), true);
+    eq("ino 0 alone is not enough either", identUsable({ dev: 7, ino: 0 }), true);
+    eq("0/0 means unusable", identUsable({ dev: 0, ino: 0 }), false);
   }
 
 } finally {

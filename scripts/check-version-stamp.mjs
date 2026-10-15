@@ -222,7 +222,14 @@ export function payloadEntries(rootDir, relRoot) {
         let inSurfaceRoot = false;
         try {
           const parent = fs.statSync(path.dirname(abs));
-          inSurfaceRoot = parent.dev === surfaceStat.dev && parent.ino === surfaceStat.ino;
+          // Identity is UNAVAILABLE when the filesystem cannot identify files: `0 === 0` would then
+          // be true for every pair, so the test would claim "this is the surface's own directory"
+          // everywhere and exclude every stamp-named file at any depth — a fail-open WIDER than the
+          // path comparison it replaced. Fall back to the path comparison in that case.
+          inSurfaceRoot =
+            identUsable(parent) && identUsable(surfaceStat)
+              ? parent.dev === surfaceStat.dev && parent.ino === surfaceStat.ino
+              : path.dirname(abs) === surfaceReal;
         } catch {
           inSurfaceRoot = false;
         }
@@ -247,7 +254,8 @@ export function payloadEntries(rootDir, relRoot) {
             try {
               const a = fs.statSync(abs);
               const b = fs.statSync(ownStamp);
-              same = a.dev === b.dev && a.ino === b.ino;
+              same =
+                identUsable(a) && identUsable(b) ? a.dev === b.dev && a.ino === b.ino : abs === ownStamp;
             } catch {
               // The stamp may not exist yet (`--write` hashes BEFORE writing it).
               same = abs === ownStamp;
@@ -572,6 +580,12 @@ function clip(v) {
   return typeof v === "string" && v.length > PROJECTION_MAX_STRING ? `${v.slice(0, PROJECTION_MAX_STRING)}…` : v;
 }
 
+/** A `dev`/`ino` of 0 means this filesystem cannot identify files (some SMB/FUSE mounts) — see the
+ * exclusion in `payloadEntries`, where `0 === 0` would otherwise match everything. */
+export function identUsable(st) {
+  return !(st.dev === 0 && st.ino === 0);
+}
+
 function stampProjection(raw) {
   const obj = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const ai =
@@ -813,6 +827,14 @@ export function linkedSurfaces(reposRoot) {
 
 // ───────────────────────────────────────────────────────────────────────── CLI ──
 
+/** A refusal under `--json` must still put JSON on stdout: an empty stdout with exit 2 is
+ * unparseable, so a caller iterating ~20 repos cannot tell a clean refusal from a crash, nor which
+ * entry failed. Returns 2, so call sites read `return refuseJson(opts, why)`. */
+function refuseJson(opts, message) {
+  if (opts.json) console.log(JSON.stringify({ error: message }, null, 2));
+  return 2;
+}
+
 function usage() {
   return [
     "Usage: node scripts/check-version-stamp.mjs [options]",
@@ -983,7 +1005,7 @@ function main(argv) {
     // repos": the latter reports a green over a scope nobody read (see linkedSurfaces).
     if (err instanceof PayloadReadError) {
       console.error(`❌ check-version-stamp: ${err.message}`);
-      return 2;
+      return refuseJson(opts, err.message);
     }
     throw err;
   }
@@ -992,8 +1014,9 @@ function main(argv) {
   // pass this whole check exists to refuse, so it is exit 2 ("cannot verify"), matching
   // check-port-drift.sh's own 0/1/2 split.
   if (surfaces.length === 0) {
-    console.error("❌ check-version-stamp: no surfaces found — nothing was verified (an empty set is not a pass)");
-    return 2;
+    const why = "no surfaces found — nothing was verified (an empty set is not a pass)";
+    console.error(`❌ check-version-stamp: ${why}`);
+    return refuseJson(opts, why);
   }
 
   // ── --write: stamp, then stop. Mirrors `check-workflow-lock.mjs --update-lock`. ──
@@ -1099,14 +1122,14 @@ function main(argv) {
     const r = refreshRef(repo, ref);
     if (r.error !== undefined) {
       console.error(`❌ check-version-stamp: ${r.error}`);
-      return 2;
+      return refuseJson(opts, r.error);
     }
     warning = r.warning;
   }
   const target = resolveRef(repo, ref);
   if (target.error !== undefined) {
     console.error(`❌ check-version-stamp: ${target.error}`);
-    return 2;
+    return refuseJson(opts, target.error);
   }
 
   const results = surfaces.map((dir) => classifySurface(dir, repo, target));
