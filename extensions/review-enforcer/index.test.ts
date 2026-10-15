@@ -3950,12 +3950,10 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
 });
 
 test("ghShimWillEnforce: decided from our own state, never from the command text (#1776)", () => {
-  // Reading this decision out of the command text is the abandonned approach: a
-  // whitespace-anchored `PATH=` pattern missed `(PATH=/usr/bin gh …)`; unbounded it
-  // still missed `export "PATH"="$HOME/bin:…"` (which reaches the
-  // real gh); a `/gh` test missed `$P/g''h`. The predicate now asks only what the
-  // extension knows, so the ONLY inputs are the kill switch and the resolved dir —
-  // and the residual it does not claim is declared in its doc comment.
+  // The property under test: the predicate's only inputs are the kill switch and the
+  // resolved directory. It has no command-text parameter at all, which is what makes the
+  // decision unspellable-around — the end-to-end form of the claim lives in the `#1776`
+  // handler tests below.
   const prev = process.env.AGENT_GH_SHIM;
   const DIR = resolveGhShimDir();
   const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-noexec."));
@@ -5315,6 +5313,10 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         "V=--admin; gh pr merge 999 $V", // a `$VAR`-supplied flag
         "PATH=\"${PATH#*:}\"; export PATH; gh pr merge 999 $'--admin'", // …plus a discarded PATH entry
         "PATH=\"${PATH#*:}\"; export PATH; gh pr merge 999 --{admin,squash}", // brace expansion
+        // …and the same discard with the MERGE VERB behind a substituted repo value: the
+        // repo-flag stripper consumed `--repo=$(…)` together with its `$`, so the token
+        // scan saw no verb at all until the raw-text arm was added.
+        "PATH=\"/usr/bin\"; export PATH; gh pr --repo=$(cat .gh-repo) merge 999 $'--admin'",
       ];
       for (const cmd of cmds) {
         ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);

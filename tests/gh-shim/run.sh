@@ -593,9 +593,11 @@ bash "$SHIM" pr --repo owner/other "$M" 123 --admin >/dev/null 2>"$TMP/err"; rc=
   && pass "a \$VAR-supplied verb BEHIND a repo flag → REFUSED (exit $rc)" \
   || fail "a spliced verb behind a repo flag slipped past"
 
-# The verb SPLICED, so the resolved argv is the only place the word `merge` exists, and
-# the FLAG supplied by a variable so the flag is not a literal token either — the one shape
-# here the text layer hands over completely (a literal `--admin` would keep its decision).
+# The verb SPLICED and the FLAG supplied by a variable — neither is a literal token, but
+# this is NOT a deferred shape at the extension layer: the repo-flag stripper leaves `$M`
+# in the verb position, so the extension reads the text as a merge (`mergeVerbInText`) and
+# keeps its own fail-closed decision. This arm pins that the SHIM refuses it too, which is
+# what a command of this family faces if the extension's decision is ever overridden.
 new_scen defer-spliced-noflag
 M=merge
 V=--admin

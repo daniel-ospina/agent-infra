@@ -645,7 +645,26 @@ export function mergeVerbInText(command: string): boolean {
     }
     return false;
   };
-  return afterIsConstruct("gh") || afterIsConstruct("pr");
+  // A construct in a verb position can ALSO be hidden inside a token the repo-flag
+  // stripper consumes together with its value: `gh pr --repo=$(cat x) merge 999 $V`
+  // leaves `gh pr x) merge …`, so both arms above miss it and the merge went to the
+  // argv layer — which the command itself can then disable by resetting PATH. The RAW
+  // text still shows a `$`-bearing token right after `gh`/`pr`. Erring here costs a
+  // refusal; erring the other way costs the gate.
+  const raw = command.trim().split(/\s+/);
+  const rawAfterIsConstruct = (word: string): boolean => {
+    for (let i = 0; i < raw.length - 1; i++) {
+      if (dequote(raw[i]) !== word) continue;
+      if (/[$`]/.test(raw[i + 1] ?? "")) return true;
+    }
+    return false;
+  };
+  return (
+    afterIsConstruct("gh") ||
+    afterIsConstruct("pr") ||
+    rawAfterIsConstruct("gh") ||
+    rawAfterIsConstruct("pr")
+  );
 }
 
 export function isAdminMergeCommand(command: string): boolean {
@@ -742,10 +761,12 @@ export function isAdminMergeCommand(command: string): boolean {
     // another arm here: #984's finding is that the class is not closable in a scanner —
     // every framing of "is this text an admin merge" that tried to be precise admitted a
     // bypass on the splice × repo-flag cross-product. The caller's condition is
-    // `hasLiteralAdminFlag(command) || !ghShimWillEnforce(shimDir)`, and this guessing
-    // half is exactly what gets handed over. NOTE the false block the LITERAL arm still
-    // produces (a quoted `--admin` that is not an argument of any merge); it is
-    // deliberate, and `hasLiteralAdminFlag` documents why the caller accepts it.
+    // `hasLiteralAdminFlag(command) || mergeVerbInText(command) ||
+    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets handed
+    // over — only for a command that does NOT name a merge (`mergeVerbInText`). NOTE the
+    // false block the LITERAL arm still produces (a quoted `--admin`, once this guess has
+    // already made the command a candidate); it is deliberate, and
+    // `hasLiteralAdminFlag` documents why the caller accepts it.
     return (
       /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
@@ -1752,15 +1773,17 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     `--admin=true` while the earlier dash-anchored rule missed them;
  *   - a spliced VERB is refused rather than read (`isGhPrMergeCommand`).
  * It does NOT claim exhaustive coverage, and it does not:
- *   - OVER-BLOCKS, acceptably and visibly, WHEN THIS LAYER IS THE ONE DECIDING (that is:
- *     no argv-level shim installed, or `AGENT_GH_SHIM=0`): a `gh pr merge` carrying a
- *     construct (a `$`, backtick or brace) AND the word `admin` is refused unless it has
- *     head-bound evidence — including a harmless `echo "gh pr merge 1
- *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. With the shim
- *     present the guessed class is DEFERRED to it, not refused (`ghShimWillEnforce`): a
- *     literal `--admin` token still keeps this layer's decision either way. The remedy
- *     for the block is the mandated `scripts/admin-merge.sh`; the alternative was a
- *     bypass.
+ *   - OVER-BLOCKS, acceptably and visibly, WHENEVER THIS LAYER IS THE ONE DECIDING —
+ *     which is the complement of the deferral: no usable argv-level shim, OR the
+ *     command carries a literal `--admin`, OR the text names a merge. Under that
+ *     condition a `gh pr merge` carrying a construct (a `$`, backtick or brace) AND the
+ *     word `admin` is refused unless it has head-bound evidence — including a harmless
+ *     `echo "gh pr merge 1
+ *     --admin=true"` (a literal flag), and a `--body "ask the admin"` beside a `$VAR`
+ *     (the text names a merge). What is DEFERRED is only the over-read that mentions
+ *     `admin` under a construct with NO merge in it (`ghShimWillEnforce` +
+ *     `mergeVerbInText`). The remedy for the block is the mandated
+ *     `scripts/admin-merge.sh`; the alternative was a bypass.
  *
  * #984 — WHAT LAYERING THE SHIM ON TOP OF THIS CHANGES. The gaps ABOVE are limits
  * of THIS layer, and the CONSTRUCT-SPLICE class among them is now covered by
@@ -1817,9 +1840,11 @@ export function hasAdminMergeFlag(command: string): boolean {
  * so they count as literal; `$VAR`/backtick/ANSI-C spellings do not.
  *
  * ACCEPTED RESIDUAL — this read is position-blind, so a quoted `--admin` that is not
- * an argument of any merge (`gh pr create --title "--admin is dangerous" …`) keeps
- * the text-layer decision and is refused by the evidence gate for having no resolvable
- * PR number. That is a false block, it is deliberate, and it is the price of the
+ * an argument of any merge, in a command the guess arm has ALREADY made a candidate
+ * (`gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"`), keeps the
+ * text-layer decision and is refused by the evidence gate for having no resolvable
+ * PR number. Without a construct, the guess arm does not fire and the command is not
+ * gated at all. That is a false block, it is deliberate, and it is the price of the
  * decisive half: the alternative is a spelling rule about where a token may sit, which
  * is the scanner trap this design abandons. The escape is SESSION-level, not per
  * command: the override is read from this extension's own environment, so a lane
@@ -2687,13 +2712,12 @@ export default function (pi: ExtensionAPI) {
       // cannot, and it decides; when it is absent or switched off, this gate
       // refuses exactly as before. See `ghShimWillEnforce`.
       //
-      // #1776 review P1: the deferral is the unresolvable FLAG, never the MERGE. A
-      // command the text layer reads as a merge keeps this gate's fail-closed decision
+      // #1776: the deferral is the unresolvable FLAG, never the MERGE. A command the
+      // text layer reads as a merge keeps this gate's fail-closed decision
       // (`mergeVerbInText`), because the argv layer's presence is the one thing a
       // command can undo for itself — `PATH="${PATH#*:}"; export PATH; gh pr merge 999
       // $'--admin'` strips the injected entry, so a deferral there would decide nothing
-      // and the merge would proceed with neither layer looking. That was a live bypass
-      // of the whole deferral, in exactly the family the gate exists for.
+      // and the merge would proceed with neither layer looking.
       if (isAdminMergeCommand(command) &&
           (hasLiteralAdminFlag(command) || mergeVerbInText(command) || !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
