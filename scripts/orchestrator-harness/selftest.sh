@@ -1754,6 +1754,16 @@ printf '#!/bin/bash\necho 200\n' > "$BG/stub/curl"
 printf '#!/bin/bash\necho LANE_READY\n' > "$BG/stub/pi"
 printf '#!/bin/bash\nshift; exec "$@"\n' > "$BG/stub/timeout"
 printf '#!/bin/bash\nexit 0\n' > "$BG/stub/docker"
+# ⛔ `uv` and `tmux` are REQUIRED BY cloud-cell-bringup.sh's own toolchain check
+# (`check_tools`: `for c in git gh node python3 uv tmux`), so they must be stubbed here exactly
+# like the tools above. Without them this check passes ONLY on a box that happens to have both,
+# and the shard is RED on the Linux CI runner — the ubuntu-24.04 image ships neither (verified
+# against actions/runner-images Ubuntu2404-Readme.md, which lists no `uv` and no `tmux`). That is
+# the measured difference between a dev container (selftest.sh 330/0) and `bash-suites` on
+# agent-infra#1769 (`==> 328 passed, 2 failed`, both bringup checks): a platform-dependent
+# dependency smuggled into the shard list BOTH lanes run, which is the #1369 class itself.
+printf '#!/bin/bash\nprintf "uv 0.0.0-stub\\n"\n' > "$BG/stub/uv"
+printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
