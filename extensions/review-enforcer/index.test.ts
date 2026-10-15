@@ -5366,14 +5366,10 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // execution coexist with the read.
         "echo gh issue comment 5; V=--admin; C=gh; PATH=/usr/bin; export PATH; $C pr merge 999 $V",
         "gh issue comment 5 --body x; V=--admin; C=gh; P=p; PATH=/usr/bin; export PATH; $C $P$'r' merge 999 $V",
-        // …and the decoy with BOTH the executable and the verb supplied by variables. The
-        // readable merge here lives inside a quoted ASSIGNMENT, so the guard's third test
-        // does not catch it — the caller's `mergeVerbInText` conjunct does (the text reads
-        // `gh pr merge`), which is why that conjunct is not redundant.
-        "V=--admin; export V; PATH=\"${PATH#*:}\"; export PATH; gh pr view 1 >/dev/null; S='gh pr merge 9 $V'; sh -c \"$S\"",
-        // …and the same trick with NO construct at an executable position: every word comes
-        // from an assignment whose value is readable (`P=pr`), so only the conjunct and the
-        // value-position guard together keep it.
+        // …and the decoy with BOTH the executable and the verb supplied by variables: the
+        // guard keeps this one (the gap before `$C` holds a `;`, so it sits in COMMAND
+        // position) — dropping that guard is what makes THIS arm fail, and it is the
+        // conjunct that stays out of it.
         "gh pr view 1 >/dev/null; V=--admin; C=gh; P=pr; M=merge; PATH=/usr/bin; export PATH; $C $P $M 999 $V",
         // …and the same decoy with a CONSTRUCT-FREE PATH discard (`export PATH=/usr/bin`),
         // where every token the guard can see is in an ARGUMENT position and the merge lives
@@ -5386,7 +5382,7 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
       for (const cmd of cmds) {
         ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);
         ok(mergeVerbInText(cmd) || !readsNonMergeGhCall(cmd),
-          "…the text reads a merge, or cannot read a non-merge gh call — either way this layer keeps it");
+          `…the text reads a merge, or cannot read a non-merge gh call — either way this layer keeps it: ${cmd}`);
         const ev = { toolName: "bash", input: { command: cmd } };
         const evidenceBlocks = () =>
           tempAuditLines().filter(
@@ -5470,6 +5466,13 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh pr frobnicate 999 $V", // an UNKNOWN subcommand is not a positive read (fail closed)
     "gh pr view 4 && gh pr merge 999 $V", // ONE unreadable call is enough
     "echo 'the admin says merge $(date)'", // no gh command word at all
+    // The guard's two remaining halves, each pinned on its own because a clause with no
+    // test is a clause the next lane can delete: a construct in the FIRST token position,
+    // and one whose predecessor is a shell keyword rather than a separator (in both, a
+    // readable decoy would otherwise supply the positive read for a hidden execution).
+    "X=$(date) gh issue comment 5", // i === 0 — an assignment prefix may BE the command
+    "V=--admin; if true; then $C $P $M 999 $V; fi; gh issue comment 5", // `then`
+    "V=--admin; env $C $P $M 999 $V; gh issue comment 5", // `env`
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }
