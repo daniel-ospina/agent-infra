@@ -3949,16 +3949,11 @@ test("ghShimWillEnforce: decided from our own state, never from the command text
     fs.chmodSync(resolvePath(noExec, "gh"), 0o755);
     ok(isExecutableShim(noExec), "the same file WITH the execute bit is a shim");
     ok(ghShimWillEnforce(noExec), "…and the deferral fires");
-    // Command text is NOT an input: none of these change the answer, which is the
-    // point — a spelling cannot create or destroy the argv layer.
-    for (const c of [
-      "gh pr merge 999 --admin",
-      "(PATH=/usr/bin gh pr merge 999 --admin)",
-      'export "PATH"="$HOME/bin:/usr/bin:/bin"; gh pr merge 999 --admin',
-      "$P/g''h pr merge 999 --admin",
-    ]) {
-      ok(ghShimWillEnforce(DIR), `command text is not consulted: ${c}`);
-    }
+    // Command text is not an input — structurally: this predicate has no such
+    // parameter, so no spelling can create or destroy the argv layer. The end-to-end
+    // form of that claim is pinned by the `#1776` handler tests below, which observe a
+    // `$VAR`-supplied flag being handed over while a LITERAL one is still refused. A
+    // loop over spellings here would assert the same constant four times.
     process.env.AGENT_GH_SHIM = "0";
     ok(!ghShimWillEnforce(DIR), "the operator's kill switch disables the deferral even with a dir");
   } finally {
@@ -3968,17 +3963,35 @@ test("ghShimWillEnforce: decided from our own state, never from the command text
 });
 
 test("materializeGhShim: a non-executable source is refused, and never displaces a working link (#1776)", () => {
+  // The neutral path is the OPERATOR'S real one — `NEUTRAL_GH_SHIM_DIR` is fixed at
+  // import from the real home, which `withTempHome` does not move — so this test moves
+  // it aside and restores it exactly. A run against a broken revision must not be able
+  // to leave a real session holding a dangling shim.
   const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
-  const before = existsSync(neutral) ? fs.realpathSync(neutral) : null;
+  const backup = `${neutral}.test-backup-${process.pid}`;
+  const hadNeutral = existsSync(neutral);
+  const source = resolveGhShimDir();
+  ok(source !== null, "this checkout's shim resolves");
+  if (hadNeutral) fs.renameSync(neutral, backup);
   const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-src."));
   try {
+    // ARRANGE a WORKING link, so "never displaces a working link" is literally what is
+    // asserted rather than a comparison against whatever this machine happened to have.
+    fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
     fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
     fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
+    fs.symlinkSync(fs.realpathSync(resolvePath(source as string, "gh")), neutral);
+    const before = fs.realpathSync(neutral);
     equal(materializeGhShim(noExec), null, "a shim that cannot execute is not installed");
-    const after = existsSync(neutral) ? fs.realpathSync(neutral) : null;
-    equal(after, before, "…and the existing link is left alone, not replaced by the broken one");
+    equal(fs.realpathSync(neutral), before, "…and the working link is left exactly as it was");
   } finally {
     fs.rmSync(noExec, { recursive: true, force: true });
+    try {
+      fs.rmSync(neutral, { force: true });
+    } catch {
+      /* already gone */
+    }
+    if (hadNeutral) fs.renameSync(backup, neutral);
   }
 });
 
@@ -5093,6 +5106,12 @@ testAsync("#1776: with the argv layer OFF the text gate still refuses an unresol
     const prevMode = process.env.PI_MODE;
     process.env.AGENT_GH_SHIM = "0"; // the operator turned the argv layer off
     process.env.PI_MODE = "print";
+    // A deterministic gh failure, not the real one: without this the gate's head
+    // lookup would run the operator's actual `gh` (network, auth, and a rate-limit
+    // sleep inside a unit test).
+    _setRunGhOverride(() => {
+      throw ghError("gh: could not resolve host github.com");
+    });
     try {
       const { pi, fire } = mockPi();
       (reviewEnforcerFactory as any)(pi);
@@ -5167,8 +5186,14 @@ testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installe
       await fire("session_start");
       const cmd = "V=--admin; gh pr merge 999 $V";
       ok(!hasLiteralAdminFlag(cmd), "the flag is a guess");
-      ok(ghShimWillEnforce(resolveGhShimDir()), "…and the argv layer is installed");
-      await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      const ev = { toolName: "bash", input: { command: cmd } };
+      await fire("tool_call", ev);
+      // The premise is OBSERVED, not assumed: the handler patched this very command,
+      // so the argv layer is what runs when it executes (the decision reads the same
+      // value `withGhShim` was given — the cached `activeGhShimDir()`, not a fresh
+      // resolution, so the injection and the decision cannot drift).
+      ok(String(ev.input.command).startsWith("export PATH="),
+        "the argv layer's PATH prefix WAS injected for this command");
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
         "the evidence gate did not run on a guessed flag");
     } finally {
