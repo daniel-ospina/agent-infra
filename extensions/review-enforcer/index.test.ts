@@ -5358,6 +5358,23 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
       ok(!isAdminMergeCommand(declaredResidual), "…and is not a text-layer candidate at all");
       equal(await fire("tool_call", { toolName: "bash", input: { command: declaredResidual } }),
         undefined, "…so the text layer does not gate it (the argv layer does, unless discarded)");
+      // The SECOND declared residual, pinned so the obvious "fix" is not applied again: a
+      // flag whose VALUE is not in the command text, with no explicit PR number. There is
+      // no readable `admin` word, so this layer is not a candidate — and if the command
+      // also discards the argv layer, a real merge proceeds. That is the shim's
+      // PATH-discard limit (STATED LIMITS), not a scanner gap: the deciding layer is the
+      // argv one, and the value is simply not in the text. The same shape WITH a PR number
+      // IS a candidate (measured), so the residual needs both properties.
+      const valueHidden = "export PATH=/usr/bin; V=$(cat .flag); gh pr merge $V";
+      ok(!isAdminMergeCommand(valueHidden), "no readable `admin` word → not a text-layer candidate");
+      ok(mergeVerbInText(valueHidden), "…even though the text names a merge (the verb is readable)");
+      ok(isAdminMergeCommand(valueHidden.replace("merge $V", "merge $V 999")),
+        "…and the residual needs BOTH properties: with a LATER bare number the position is unambiguous and it IS a candidate");
+      // THIS is why the carve-out is not tightened: the caller keeps its decision for any
+      // `pr`/`merge` pair, so failing closed on the first slot would refuse these.
+      ok(!isAdminMergeCommand('gh pr merge "$PR" --squash'), "the ordinary spelling stays clean");
+      ok(mergeVerbInText('gh pr merge "$PR" --squash'),
+        "…because the caller WOULD keep a decision for it (the pair arm) — the false block the carve-out prevents");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;

@@ -758,6 +758,18 @@ export function isAdminMergeCommand(command: string): boolean {
       if (i === 0) {
         if (/\$\(|`/.test(arg)) return true; // a CONSTRUCTED value in the position slot
         if (laterBareNumber) return true; // the position was actually later
+        // `continue` — a GENUINE `$PR` position argument, in either quoting form (pinned by
+        // the carve-out test). Do NOT "fix" this by failing closed on every `$`-bearing
+        // first slot: the caller's condition keeps its own decision for any `pr`/`merge`
+        // PAIR (`mergeVerbInText`), so that would refuse every ordinary
+        // `gh pr merge "$PR" --squash` — the #1776 false-positive class, at a far larger
+        // volume. The residual it leaves is DECLARED, not chased and not closable here: a
+        // flag whose VALUE is not in the command text (`V=$(cat f); gh pr merge $V`) with
+        // no explicit PR number gives a text scanner no `admin` word to read, so this layer
+        // is not a candidate at all and the deciding layer is the argv one — whose discard
+        // (`export PATH=…`) is the shim's own STATED LIMITS entry, not a gap this predicate
+        // can close. The same residual WITH a PR number does not exist (`laterBareNumber`
+        // makes it a candidate: measured).
         continue; // a genuine `$PR` position argument
       }
       return true;
