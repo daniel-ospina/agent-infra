@@ -69,12 +69,22 @@ used to build a population (#1178). Nothing here kills, signals, or escalates.
 Exit codes: ``0`` a claim IS VISIBLE for the queried head (do not treat it as free —
 this is the fail-closed direction) · ``3`` nothing was established (unreadable, or no
 claim visible for this head — never read it as freedom) · ``2`` usage/env.
+
+ONE TARGET, NEVER THE CWD
+-------------------------
+The remote is always caller-stated (``--repo``'s ``origin`` or ``--remote-url``), and
+it is made ABSOLUTE before use: a relative ref would otherwise be resolved against the
+caller's cwd by ``ls-remote`` and against the temp bare repo by ``fetch`` — one
+argument, two reads (measured with ``origin=../origin.git``). Durations
+(``--max-age-s``, ``--timeout``) are validated finite and positive at the door, because
+a non-finite bound compares False forever and would silently accept a stale snapshot.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -155,6 +165,16 @@ READER_LIMITS = (
 _OWNER_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]{1,128}):(?P<pid>[0-9]{1,18})$")
 _LEASE_RE = re.compile(r"^[0-9]{1,%d}$" % LEASE_MAX_DIGITS)
 _URL_USERINFO_RE = re.compile(r"://[^/@\s]*@")
+# A remote reference that is already ONE target, mirrored on git's own rule: a scheme URL
+# (`https://`, `file://`, `ssh://`), an absolute path, or an scp-like `host:path` — with or
+# WITHOUT a `user@` — where the colon comes before any slash. Anything else (no colon, so
+# `../origin.git` / `relative.git`) is a filesystem path and must be resolved against a repo.
+_ABSOLUTE_REMOTE_RE = re.compile(
+    r"^(?:[A-Za-z][A-Za-z0-9+.\-]*:/"       # `file:/path` — a scheme with one slash
+    r"|[A-Za-z][A-Za-z0-9+.\-]*://"         # `https://…`, `ssh://…`
+    r"|[^/@\s]+@[^/@\s:]+:"                 # `user@host:path`
+    r"|[^/@\s]+:"                           # `host:path` — git's own scp test (colon before any `/`)
+    r"|/)")                                  # an absolute filesystem path
 
 
 class UsageError(Exception):
@@ -196,6 +216,63 @@ def short_host(name: Optional[str] = None) -> str:
 def _redact_url(url: str) -> str:
     """Never echo credentials: a remote URL may carry ``user:token@``."""
     return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))
+
+
+def _bounded_seconds(value, flag: str) -> float:
+    """A duration at the DOOR: finite, and positive.
+
+    ⛔ Fail-closed, because the value IS the guard. ``argparse``'s ``type=float``
+    accepts ``nan``/``inf``, and every comparison against a non-finite bound is
+    False — so an unvalidated ``--max-age-s nan`` silently accepted a 10-day-old
+    snapshot as FRESH (measured: rc=0 where the honest answer is the staleness
+    abstention), and ``--timeout nan`` escaped ``_git`` as a ``ValueError``
+    traceback instead of the declared exit 2. Validating the number once, here,
+    covers every caller that can reach the guard.
+    """
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        raise UsageError("%s must be a number (got %r)" % (flag, value))
+    if not math.isfinite(num):
+        raise UsageError("%s must be a finite number (got %r)" % (flag, value))
+    if num <= 0:
+        raise UsageError("%s must be positive (got %r)" % (flag, value))
+    return num
+
+
+def _one_target(url: str, repo: Optional[str]) -> str:
+    """Make a remote reference ABSOLUTE, so every later git call names ONE target.
+
+    ⛔ A relative ref is not a label, it is a lookup two processes can resolve
+    differently. Measured with ``origin=../origin.git`` (an ordinary sibling
+    clone): the SAME ``--repo`` read ``claims-unreadable`` from one cwd and
+    ``fetch rc=128`` — the URL resolved inside the temp bare repo — from another,
+    i.e. the reader answered a different question per directory, which is exactly
+    what the cwd ban exists to prevent. Resolving once against the repo the ref
+    came from removes the difference; with no repo to resolve against there is no
+    honest answer to give, so a relative ref is refused rather than guessed.
+
+    A scheme URL (``https://``, ``file://``), an absolute path, and an scp-like
+    ``host:path`` (with or without a ``user@``) are already one target and pass
+    through untouched — the scp form matters because a bare ``host:path`` has no
+    scheme AND no leading slash, and git resolves that form verbatim.
+    """
+    s = (url or "").strip()
+    if not s:
+        raise UsageError("empty remote reference")
+    if s.startswith("~"):
+        # git expands `~/x.git` against HOME, so it is already one target — but it is
+        # NOT self-evident to a reader of the regex, and treating it as a path would
+        # rewrite it under the repo. (Measured by the verify gate: pre-fix this form
+        # errored where git resolved it.)
+        return os.path.expanduser(s)
+    if _ABSOLUTE_REMOTE_RE.match(s):
+        return s
+    if not repo:
+        raise UsageError(
+            "a relative remote (%r) needs a --repo to resolve against — the current "
+            "directory is never used implicitly" % sanitize(s, 120))
+    return os.path.abspath(os.path.join(repo, s))
 
 
 # ── grammar (one place, cited to the shipped call sites) ────────────────
@@ -277,21 +354,23 @@ def _remote_arg(repo: Optional[str], remote_url: Optional[str]) -> str:
 
 
 def _resolve_remote(remote: str, repo: Optional[str], timeout: float) -> str:
-    """Resolve ``origin`` to a URL, so every later git call names ONE target.
+    """Resolve ``origin`` to an ABSOLUTE url, so every later git call names ONE target.
 
-    ⛔ Load-bearing: the temp bare repo has no remotes, so a literal ``origin``
-    would be resolved inside it and fail (measured: `fetch rc=128 ... and the
-    repository exists`). Resolving once, here, also removes any chance that a
-    later call silently reads the CWD's repo instead of the caller's target.
+    ⛔ Load-bearing twice over. (1) The temp bare repo has no remotes, so a literal
+    ``origin`` would be resolved inside it and fail (measured: `fetch rc=128 ... and
+    the repository exists`). (2) Resolving here also removes any chance that a later
+    call silently reads the CWD's repo — and ``_one_target`` extends that to a
+    RELATIVE url, which two git processes resolve against two different directories.
     """
-    if remote != "origin":
-        return remote
-    rc, out, _err, failure = _git(["-C", repo, "remote", "get-url", "origin"], timeout)
-    url = out.strip().splitlines()[0].strip() if out.strip() else ""
-    if failure or rc != 0 or not url:
-        raise UsageError("cannot resolve `origin` in %s (%s) — pass --remote-url URL"
-                         % (repo, failure or ("rc=%d" % rc)))
-    return url
+    resolved = remote
+    if remote == "origin":
+        rc, out, _err, failure = _git(["-C", repo, "remote", "get-url", "origin"], timeout)
+        url = out.strip().splitlines()[0].strip() if out.strip() else ""
+        if failure or rc != 0 or not url:
+            raise UsageError("cannot resolve `origin` in %s (%s) — pass --remote-url URL"
+                             % (repo, failure or ("rc=%d" % rc)))
+        resolved = url
+    return _one_target(resolved, repo)
 
 
 def _git_error(err: str) -> str:
@@ -494,8 +573,9 @@ def read_snapshot(path: str, *, max_age_s: float, ns: str = DEFAULT_NS,
     host = short_host() if host is None else host
     now = int(time.time()) if now is None else int(now)
     source = "snapshot %s" % sanitize(path)
-    if max_age_s is None or float(max_age_s) <= 0:
+    if max_age_s is None:
         raise UsageError("--snapshot requires a positive --max-age-s (no invented bound)")
+    max_age_s = _bounded_seconds(max_age_s, "--max-age-s")
     try:
         st = os.stat(path)
     except OSError as exc:
@@ -542,6 +622,10 @@ def read_registry(*, repo: Optional[str] = None, remote_url: Optional[str] = Non
                   host: Optional[str] = None, now: Optional[int] = None) -> liveness.ClaimRead:
     """Dispatch to the driver the caller asked for (FILE if snapshot, else PULL)."""
     ns = ns or os.environ.get("CLAIM_NS") or DEFAULT_NS
+    # Validate the duration ONCE, before any git call or guard consumes it: a
+    # non-finite or non-positive value must be a named usage error (exit 2), not a
+    # traceback out of subprocess and not a guard that compares False forever.
+    timeout = _bounded_seconds(timeout, "--timeout")
     if snapshot:
         return read_snapshot(snapshot, max_age_s=max_age_s, ns=ns, pr=pr, sha=sha,
                              host=host, now=now)
