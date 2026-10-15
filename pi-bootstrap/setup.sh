@@ -309,13 +309,18 @@ fi
 # `heartbeat-loop.sh`, `cadence-nudge.sh`, `publish-live-workspaces.py`) is present in scripts/ but
 # is in NO farm list, so a box rebuilt from this file gets the farmed CONSUMERS (the 27 below plus
 # the 9 pre-existing) WITHOUT those seven PRODUCERS.
-# Adding them is not a list-only edit and is deliberately out of #1552's scope, because the two
-# copies have drifted in OPPOSITE directions and each direction is its own hazard:
+# Adding them is not a list-only edit and is deliberately out of #1552's scope, because the copies
+# have drifted — measured AT THIS COMMIT, one-directionally:
 #   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005; the live copy
 #     carries the #1777 abstention text, in flight). Farming the repo copy would OVERWRITE the
 #     running classifier with an older one — the fail-dangerous overwrite #1553's review named.
-#   * `cadence-nudge.sh` — the REPO is ahead (repo 422 lines / live 409). Farming it would change
-#     the running cadence as a side effect of a versioning PR, which is not this PR's to make.
+#   * the other six (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `heartbeat-loop.sh`,
+#     `cadence-nudge.sh`, `publish-live-workspaces.py`) are byte-identical repo↔live at this commit,
+#     so none carries a hazard of its own today. They are listed as a SET because the seven must be
+#     farmed together, once `lane-status.py`'s live bytes land. (`cadence-nudge.sh` was repo-ahead
+#     422 / live 409 when this comment was first drafted and has since been synced — the numbers
+#     above are true as of THIS commit, and a stale number in a comment is the exact failure this
+#     PR exists to make reviewable.)
 # So the closure is a declared residual of #1552 (see its residual comment), and the repo↔deployed
 # identity instrument that would report it continuously is #1760/#1759's — not this list's.
 # The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
