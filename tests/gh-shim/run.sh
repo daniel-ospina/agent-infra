@@ -536,15 +536,16 @@ for badnum in 0 01006 0001 9007199254740993 9999999999999999; do
   fi
 done
 
-# ── 12. the deferral target: what the TEXT layer hands to this one (#1776) ───
-# The extension STANDS DOWN on the admin-merge question whenever this shim will run
-# (`ghShimWillEnforce`), because a verb spliced behind a repo flag is exactly what a
-# text scanner cannot read — three attempts to read it precisely each produced a
-# fresh fail-open (agent-infra#1776). That makes THIS suite the coverage for those
-# shapes, so they are pinned here in BOTH polarities: refused with no evidence, and
-# ALLOWED with evidence (the decisive half — a mis-parse can refuse for the wrong
-# reason, but it cannot let the merge through with the caller's argv intact).
-echo "== 12. the splice × repo-flag shapes the text layer hands over (#1776) =="
+# ── 12. the argv shapes the TEXT layer hands over, pinned at BOTH layers (#1776) ─
+# The extension declines its GUESS on the admin-merge question whenever this shim is
+# installed (`ghShimWillEnforce`), so the shapes whose flag is not a literal token are
+# decided HERE and nowhere else. They are pinned in BOTH polarities — refused with no
+# evidence, and ALLOWED with evidence — because a mis-parse can refuse for the wrong
+# reason, but it cannot let the merge through with the caller's argv intact.
+# (a)-(d) put the repo flag in each position the scanner cannot read through; (e) is the
+# non-literal FLAG behind that repo flag — the shape the text layer really does hand over,
+# since a literal `--admin` would keep its decision and never reach the deferral at all.
+echo "== 12. the shapes the text layer hands over (#1776) =="
 for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
              '--repo owner/other pr merge 123' '--repo=owner/other pr merge 123'; do
   tag="defer$(echo "$shape" | tr -dc 'a-z0-9')"
@@ -574,6 +575,33 @@ bash "$SHIM" pr --repo owner/other "$M" 123 --admin >/dev/null 2>"$TMP/err"; rc=
 [ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls" \
   && pass "a \$VAR-supplied verb BEHIND a repo flag → REFUSED (exit $rc)" \
   || fail "a spliced verb behind a repo flag slipped past"
+
+# The verb SPLICED, so the resolved argv is the only place the word `merge` exists, and
+# the FLAG supplied by a variable so the flag is not a literal token either — the one shape
+# here the text layer hands over completely (a literal `--admin` would keep its decision).
+new_scen defer-spliced-noflag
+M=merge
+V=--admin
+bash "$SHIM" pr --repo owner/other "$M" 123 "$V" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls" \
+  && pass "a \$VAR verb AND a \$VAR flag behind a repo flag → REFUSED (exit $rc)" \
+  || fail "a spliced verb + variable flag slipped past"
+new_scen defer-spliced-noflag-yes
+jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr --repo owner/other "$M" 123 "$V" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q -- "--repo owner/other" "$SCEN/calls" \
+  && pass "  …with head-bound evidence → allowed (the decisive half of the pair)" \
+  || fail "  …valid evidence did not open the variable-flag shape (rc=$rc)"
+
+# STATED LIMIT, pinned so it cannot be mistaken for coverage: `gh alias`. gh expands an
+# alias AFTER this process has run, so an alias whose body is `pr merge --admin` is
+# invisible to BOTH layers (the shim's own header declares it). This asserts the
+# pass-through, which is the honest statement of the hole — NOT a claim that it is closed.
+new_scen alias-limit
+bash "$SHIM" ship-it 123 >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q "^ship-it 123$" "$SCEN/calls" \
+  && pass "STATED LIMIT (declared, not closed): an alias-shaped argv passes through to gh" \
+  || fail "the alias pass-through changed shape — revisit the declared limit"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"

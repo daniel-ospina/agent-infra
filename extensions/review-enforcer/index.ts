@@ -81,12 +81,34 @@ export function resolveGhShimDir(): string | null {
   if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", "..", "scripts", "gh-shim"));
   for (const dir of candidates) {
     try {
-      if (fs.existsSync(resolvePath(dir, "gh"))) return dir;
+      if (isExecutableShim(dir)) return dir;
     } catch {
       /* an unreadable candidate is not a match */
     }
   }
   return null;
+}
+
+/**
+ * Is `<dir>/gh` present AND EXECUTABLE — i.e. is this directory a shim at all?
+ *
+ * A PATH entry whose `gh` lacks the execute bit is SKIPPED by the shell, so the real
+ * `gh` runs and nothing enforces. `existsSync` answers "is there a file there", which
+ * is not the question any caller here is asking: a non-executable shim — an
+ * `AGENT_GH_SHIM_DIR` misconfigured, an archive that dropped the mode, a `noexec`
+ * mount, or a mid-session `chmod -x` — makes the argv layer silently absent while
+ * every `existsSync` check reports it present. The pre-PR code read the datum the same
+ * way, but the text gate was still unconditional then, so it was a backstop rather
+ * than a fail-open; with the text gate deferring by design, the datum has to mean
+ * "will actually run".
+ */
+export function isExecutableShim(dir: string): boolean {
+  try {
+    fs.accessSync(resolvePath(dir, "gh"), fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -103,6 +125,13 @@ export const NEUTRAL_GH_SHIM_DIR = resolvePath(os.homedir(), ".pi", "agent", "sh
 
 export function materializeGhShim(sourceDir: string | null): string | null {
   if (!sourceDir) return null;
+  // A non-executable SOURCE is not a shim (see `isExecutableShim`): bash skips such a
+  // PATH entry, so installing it would leave the real gh running while every caller
+  // believes the argv layer is present. Refuse BEFORE touching the neutral path, so a
+  // broken source can never displace a working link. The same check after the link is
+  // made covers the other direction: a target that lost its execute bit after being
+  // linked here.
+  if (!isExecutableShim(sourceDir)) return null;
   try {
     fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
     const target = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
@@ -121,7 +150,7 @@ export function materializeGhShim(sourceDir: string | null): string | null {
         fs.chmodSync(target, 0o755);
       }
     }
-    return fs.existsSync(target) ? NEUTRAL_GH_SHIM_DIR : null;
+    return isExecutableShim(NEUTRAL_GH_SHIM_DIR) ? NEUTRAL_GH_SHIM_DIR : null;
   } catch {
     return null;
   }
@@ -135,8 +164,11 @@ function activeGhShimDir(): string | null {
     // or its target is deleted (removing a worktree dangles every link into it), the
     // cached directory would still be prepended to PATH while containing no `gh` — so
     // PATH lookup falls through to the REAL gh and the argv layer is silently absent
-    // for the rest of the session (VGATE #984). One existsSync per bash call.
-    if (ghShimDirCache !== null && fs.existsSync(resolvePath(ghShimDirCache, "gh"))) {
+    // for the rest of the session (VGATE #984). One executable-check per bash call —
+    // and it must be the EXECUTABLE test, not `existsSync`: a shim that loses its
+    // execute bit mid-session is exactly the silent absence this revalidation exists
+    // to catch, and `existsSync` reports it present forever.
+    if (ghShimDirCache !== null && isExecutableShim(ghShimDirCache)) {
       return ghShimDirCache;
     }
   }
@@ -174,29 +206,41 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  *
  * DECIDED FROM THE EXTENSION'S OWN STATE, NEVER FROM THE COMMAND TEXT.
  *
- * Three attempts to decide it from the text, and two review cycles on the result,
- * each produced a fresh hole: a whitespace-anchored `PATH=` pattern missed
- * `(PATH=/usr/bin gh …)`; unbounded, it still missed `export "PATH"="$HOME/bin:…"`
- * (which DOES reach the real gh — measured); a `/gh` path test missed `$P/g''h`.
- * That is #984's conclusion one layer up: a scanner cannot read shell text, and a
- * partial blacklist is worse than none, because it claims a coverage it does not
- * have. So this asks only what the extension itself knows: is there an argv layer
- * (`AGENT_GH_SHIM`), and did we put it on PATH for this call (`shimDir`, the SAME
- * value `withGhShim` was given, so the injection and this decision cannot drift).
+ * Reading it from the text was tried and abandoned: a whitespace-anchored `PATH=`
+ * pattern missed `(PATH=/usr/bin gh …)`; matching it unbounded still missed
+ * `export "PATH"="$HOME/bin:…"` (which does reach the real gh); and a `/gh` path
+ * test missed `$P/g''h`. That is #984's conclusion one layer up — a scanner cannot
+ * read shell text, and a partial blacklist is worse than none, because it claims a
+ * coverage it does not have. So this asks only two things, both of them ours: is
+ * there an argv layer (`AGENT_GH_SHIM`), and is the directory we injected for this
+ * call actually a shim (`shimDir`, the SAME value `withGhShim` was given, so the
+ * injection and this decision cannot drift; "a shim" means an EXECUTABLE `gh` — a
+ * PATH entry the shell skips enforces nothing, see `isExecutableShim`).
  *
- * WHAT IS THEREFORE OUT OF SCOPE, stated rather than implied. A command whose flag
- * is NOT a literal token AND that also discards the injected PATH entry
- * (`export "PATH"=…`, `env -i`, `sudo`, an absolute path to the real gh) is decided
- * by neither layer. That intersection is the shim's own STATED LIMIT — "a command
- * that discards this PATH entry … deliberate acts to remove the guard" — and the
- * post-merge detector, not this gate, is the authority of record for it. It is
- * DELIBERATELY not chased with another spelling list: that is exactly how this
- * predicate grew two P0s across two review cycles. Note the literal half matters —
- * `export "PATH"=…; gh pr merge 999 --admin` still carries a literal flag, so the
- * text layer keeps that decision (`hasLiteralAdminFlag`, asserted end-to-end).
+ * WHAT IS OUT OF SCOPE, declared rather than implied — both classes are the shim's
+ * own STATED LIMITS (`scripts/gh-shim/gh`), and both need the command to hide its
+ * flag from the text layer first:
+ *
+ *   - a discarded PATH entry: `export "PATH"=…`, `env -i`, `sudo`, an absolute path
+ *     to the real gh;
+ *   - `gh alias` expansion: the argv is `gh <alias> …`, so an alias defined as
+ *     `pr merge --admin` is invisible to BOTH layers.
+ *
+ * Neither is chased with a spelling list. The post-merge detector, not this gate, is
+ * the authority of record for them. The literal half still bounds the damage: any
+ * command that writes `--admin` as a token keeps the text-layer decision regardless
+ * of what it does to PATH (`hasLiteralAdminFlag`, asserted end-to-end).
  */
 export function ghShimWillEnforce(shimDir: string | null): boolean {
-  return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null;
+  // Both halves are OURS and both must hold: the layer is switched on, AND the
+  // directory we injected contains an EXECUTABLE `gh`. A PATH entry the shell skips
+  // — missing, unreadable, or without the execute bit — enforces nothing, so
+  // deferring to it would be a silent fail-open. Checking it HERE as well as in
+  // `resolveGhShimDir`/`materializeGhShim` is deliberate: this is the decision point,
+  // and a guard whose certainty rests on a caller's invariant is one refactor away
+  // from certainty it no longer has. Cheap — the caller short-circuits on
+  // `isAdminMergeCommand` first, so this runs only for admin-merge-class commands.
+  return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null && isExecutableShim(shimDir);
 }
 
 // ── gh invocation seam (testable) ─────────────────────
@@ -655,15 +699,17 @@ export function isAdminMergeCommand(command: string): boolean {
     // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
     //
     // It is a GUESS, so the CALLER does not act on it while the argv layer is
-    // present: it resolves what this cannot, and its false positives — an ordinary
-    // `gh` call whose TEXT contains a construct and the word `admin` (a PR title is
-    // enough) — are the reason agent-infra#1776 exists. Three separate attempts to
-    // make this guess PRECISE instead produced a fresh fail-open on the splice ×
-    // repo-flag cross-product each time, which is the empirical form of #984's
-    // conclusion: the class is not closable in a scanner. Do not add another arm
-    // here — the caller's condition is `hasLiteralAdminFlag(command) ||
-    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets
-    // handed over.
+    // present: it resolves what this cannot, and its false positives are the reason
+    // agent-infra#1776 exists — an ordinary `gh` call whose TEXT contains a construct
+    // and the word `admin` (a PR TITLE supplies it) was read as a merge. Making this
+    // guess PRECISE was tried and abandoned (each attempt opened a new hole on the
+    // splice × repo-flag cross-product), which is the empirical form of #984's
+    // conclusion: the class is not closable in a scanner. Do not add another arm here
+    // — the caller's condition is `hasLiteralAdminFlag(command) ||
+    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets handed
+    // over. NOTE the false blocks the LITERAL arm still produces (a quoted `--admin`
+    // that is not an argument of any merge); they are deliberate, and `hasLiteralAdminFlag`
+    // documents why the caller accepts them.
     return (
       /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
@@ -1729,6 +1775,14 @@ export function hasAdminMergeFlag(command: string): boolean {
  *
  * Quote-splices are resolved by `normalizeForFlagScan` (`--ad""min` → `--admin`),
  * so they count as literal; `$VAR`/backtick/ANSI-C spellings do not.
+ *
+ * ACCEPTED RESIDUAL — this read is position-blind, so a quoted `--admin` that is not
+ * an argument of any merge (`gh pr create --title "--admin is dangerous" …`) keeps
+ * the text-layer decision and is refused by the evidence gate for having no resolvable
+ * PR number. That is a false block, it is deliberate, and it is the price of the
+ * decisive half: the alternative is a spelling rule about where a token may sit, which
+ * is the scanner trap this design abandons. It is recoverable per command
+ * (`AGENT_ADMIN_MERGE_OVERRIDE=1`), and it is narrower than the guess it replaced.
  */
 export function hasLiteralAdminFlag(command: string): boolean {
   return literalAdminFlagIn(normalizeForFlagScan(command));

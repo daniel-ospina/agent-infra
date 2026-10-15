@@ -49,6 +49,7 @@ import {
   isGhPrMergeCommand,
   isAdminMergeCommand,
   ghShimWillEnforce,
+  isExecutableShim,
   hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
@@ -3892,12 +3893,11 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
   // 2026-10-15). `hasAdminMergeFlag` fires on a construct PLUS the word `admin`
   // ANYWHERE — which a PR TITLE supplies — so these ordinary calls ARE read as
   // admin merges here. That is asserted as TRUE, not fixed in place, because the
-  // predicate is the fail-closed TEXT layer: making it precise was attempted
-  // three times and each attempt produced a fresh fail-open on the splice ×
-  // repo-flag cross-product (#984's conclusion, re-measured). The fix is in the
-  // CALLER, which stands down whenever the argv layer will enforce the command —
-  // `ghShimWillEnforce`, and the `tool_call` tests below. The first command here
-  // is literally how agent-infra PR #1775 was blocked at zero dispatches.
+  // predicate is the fail-closed TEXT layer, and making it precise is the scanner
+  // trap (#984): each attempt opened a fresh fail-open on the splice × repo-flag
+  // cross-product. The fix is in the CALLER, which declines the GUESS whenever the
+  // argv layer is present — `ghShimWillEnforce`, and the `tool_call` tests below.
+  // The first command here is literally how agent-infra PR #1775 was blocked.
   ok(isAdminMergeCommand('gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"'),
      "the text layer DOES mis-read a PR title mentioning admin — over-broad BY DESIGN");
   ok(isAdminMergeCommand('gh issue comment 1 --body "the admin gate ran $(date)"'),
@@ -3923,18 +3923,32 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
 });
 
 test("ghShimWillEnforce: decided from our own state, never from the command text (#1776)", () => {
-  // Two review cycles falsified every attempt to decide this from the command
-  // text: a whitespace-anchored `PATH=` pattern missed `(PATH=/usr/bin gh …)`;
-  // unbounded it still missed `export "PATH"="$HOME/bin:…"` (which reaches the
+  // Reading this decision out of the command text is the abandonned approach: a
+  // whitespace-anchored `PATH=` pattern missed `(PATH=/usr/bin gh …)`; unbounded it
+  // still missed `export "PATH"="$HOME/bin:…"` (which reaches the
   // real gh); a `/gh` test missed `$P/g''h`. The predicate now asks only what the
   // extension knows, so the ONLY inputs are the kill switch and the resolved dir —
   // and the residual it does not claim is declared in its doc comment.
   const prev = process.env.AGENT_GH_SHIM;
-  const DIR = "/repo/scripts/gh-shim";
+  const DIR = resolveGhShimDir();
+  const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-noexec."));
   try {
     delete process.env.AGENT_GH_SHIM;
+    ok(DIR !== null, "this checkout's shim resolves");
     ok(ghShimWillEnforce(DIR), "a resolved dir and no kill switch → the argv layer decides");
     ok(!ghShimWillEnforce(null), "nothing injected → nothing will enforce, so the TEXT gate decides");
+    ok(!ghShimWillEnforce("/repo/scripts/gh-shim"),
+      "a dir that is not there enforces nothing — the guess must stay ours");
+    // A PATH entry whose `gh` lacks the execute bit is SKIPPED by the shell, so it is
+    // not a shim. Deferring to it would be a fail-open: the real gh runs and neither
+    // layer decides (#1776).
+    fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
+    ok(!isExecutableShim(noExec), "a `gh` without the execute bit is not a shim");
+    ok(!ghShimWillEnforce(noExec), "…so the deferral does not fire on it (fail-closed)");
+    fs.chmodSync(resolvePath(noExec, "gh"), 0o755);
+    ok(isExecutableShim(noExec), "the same file WITH the execute bit is a shim");
+    ok(ghShimWillEnforce(noExec), "…and the deferral fires");
     // Command text is NOT an input: none of these change the answer, which is the
     // point — a spelling cannot create or destroy the argv layer.
     for (const c of [
@@ -3948,7 +3962,23 @@ test("ghShimWillEnforce: decided from our own state, never from the command text
     process.env.AGENT_GH_SHIM = "0";
     ok(!ghShimWillEnforce(DIR), "the operator's kill switch disables the deferral even with a dir");
   } finally {
+    fs.rmSync(noExec, { recursive: true, force: true });
     if (prev === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prev;
+  }
+});
+
+test("materializeGhShim: a non-executable source is refused, and never displaces a working link (#1776)", () => {
+  const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
+  const before = existsSync(neutral) ? fs.realpathSync(neutral) : null;
+  const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-src."));
+  try {
+    fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
+    equal(materializeGhShim(noExec), null, "a shim that cannot execute is not installed");
+    const after = existsSync(neutral) ? fs.realpathSync(neutral) : null;
+    equal(after, before, "…and the existing link is left alone, not replaced by the broken one");
+  } finally {
+    fs.rmSync(noExec, { recursive: true, force: true });
   }
 });
 
@@ -4364,8 +4394,8 @@ test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash ca
   equal(withGhShim(ORIG, null), null, "no shim installed → nothing injected (never a broken PATH)");
   // The kill switch: this touches EVERY bash call, so it must be switchable.
   // SAVE/RESTORE, never a bare assignment — an un-restored mutation becomes the
-  // posture of every LATER test in this file (it did, and made the declared posture
-  // at the top inert; review cycle 3, P2), which turns the suite order-dependent.
+  // posture of every LATER test in this file and silently makes the declared
+  // posture at the top inert, which turns the suite order-dependent.
   const prevShim = process.env.AGENT_GH_SHIM;
   process.env.AGENT_GH_SHIM = "0";
   equal(withGhShim(ORIG, "/repo/scripts/gh-shim"), null, "AGENT_GH_SHIM=0 disables the layer");
@@ -5069,7 +5099,7 @@ testAsync("#1776: with the argv layer OFF the text gate still refuses an unresol
       await fire("session_start");
       const cmd = "V=--admin; gh pr merge 999 $V";
       ok(!hasLiteralAdminFlag(cmd), "the flag is a guess, not a literal token");
-      ok(!ghShimWillEnforce("/repo/scripts/gh-shim"),
+      ok(!ghShimWillEnforce(resolveGhShimDir()),
         "the env kill switch disables the deferral even with a shim dir");
       const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
       ok(res && res.block === true, "…so the fail-closed text gate still refuses it");
@@ -5082,10 +5112,10 @@ testAsync("#1776: with the argv layer OFF the text gate still refuses an unresol
 });
 
 testAsync("#1776: a LITERAL admin merge is refused even with the argv layer installed", async () => {
-  // The review-cycle-1 P0, end-to-end. Every attempt to detect a PATH discard from
-  // the command TEXT was defeated (cycle 1: `(PATH=…`; cycle 2: `export "PATH"=…`),
-  // so the fix is not another spelling — it is that a LITERAL `--admin` keeps the
-  // decision in the layer that CAN make it, whatever the command does to PATH.
+  // End-to-end. Detecting a PATH discard from the command TEXT was defeated by one
+  // spelling after another, so the fix is not another spelling — it is that a
+  // LITERAL `--admin` keeps the decision in the layer that CAN make it, whatever
+  // the command does to PATH.
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
     const prevMode = process.env.PI_MODE;
@@ -5099,8 +5129,8 @@ testAsync("#1776: a LITERAL admin merge is refused even with the argv layer inst
       const cmds = [
         "PATH=/usr/bin gh pr merge 999 --admin",
         "(PATH=/usr/bin gh pr merge 999 --admin)",
-        'export "PATH"="$HOME/bin:/usr/bin:/bin"; gh pr merge 999 --admin', // cycle-2 P0
-        "$P/g''h pr merge 999 --admin", // cycle-2 P1: a path-qualified gh, spliced basename
+        'export "PATH"="$HOME/bin:/usr/bin:/bin"; gh pr merge 999 --admin',
+        "$P/g''h pr merge 999 --admin",
       ];
       for (const cmd of cmds) {
         const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
@@ -5137,7 +5167,7 @@ testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installe
       await fire("session_start");
       const cmd = "V=--admin; gh pr merge 999 $V";
       ok(!hasLiteralAdminFlag(cmd), "the flag is a guess");
-      ok(ghShimWillEnforce("/repo/scripts/gh-shim"), "…and the argv layer is installed");
+      ok(ghShimWillEnforce(resolveGhShimDir()), "…and the argv layer is installed");
       await fire("tool_call", { toolName: "bash", input: { command: cmd } });
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
         "the evidence gate did not run on a guessed flag");
