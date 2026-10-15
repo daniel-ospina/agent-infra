@@ -1608,8 +1608,9 @@ require_draft() {
 #   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
 #   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
 #                        `0` on the one path that reads nothing: a refused knob
-#   MERGE_ART_DIAG       the DECIDING (last) attempt's stderr (one bounded line), empty
-#                        when that attempt wrote none — never an earlier attempt's text
+#   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
+#                        bounded line), empty when that attempt wrote none — never an
+#                        earlier attempt's text
 poll_merge_artifact() {
   local pr="$1"
   MERGE_ART_VERDICT="unreadable"
@@ -1676,18 +1677,33 @@ poll_merge_artifact() {
     # version this replaces took `head -1` and `${x%%$'\t'*}`, which are an ANY-FIRST-LINE
     # test and an ANY-SEPARATOR test: a read that answered the projection AND a trailing
     # junk line passed the first, and the mergedAt half could itself carry a tab. `@tsv`
-    # emits exactly ONE line with exactly ONE separator, so anything else is not the
-    # projection and is UNREADABLE by construction. A `case` on the whole value needs no
-    # pipe, so the `writer | grep -q` idiom banned repo-wide (#841) is not reintroduced
-    # either — and that matters here: under `set -uo pipefail` a SIGPIPE-killed writer
-    # makes the pipeline non-zero, which would classify a VALID read as unreadable.
+    # emits exactly ONE line with exactly ONE separator, so anything else — an INTERNAL
+    # newline, a second separator, a value that is not the projection — is UNREADABLE by
+    # construction. A `case` on the whole value needs no pipe, so the `writer | grep -q`
+    # idiom banned repo-wide (#841) is not reintroduced either — and that matters here:
+    # under `set -uo pipefail` a SIGPIPE-killed writer makes the pipeline non-zero, which
+    # would classify a VALID read as unreadable.
+    #
+    # ⛔ WHAT THIS DOES *NOT* RE-DERIVE, stated rather than implied: `$(...)` strips ALL
+    # trailing newlines, so a value whose extra lines are all BLANK past the first (and
+    # gh's own output ends in one newline, which is why the raw byte count cannot simply
+    # be `lines == 1`) is read as the single line it reduces to. That cannot change a
+    # verdict — a token still has to be exactly `MERGED`/`OPEN`/`CLOSED` — so it is a
+    # narrower guard, not a fail-open, and it is left deliberately (see the PR's limits).
     #
     # ⛔ AND A NUL IS TESTED AT THE BYTE LEVEL, because no bash string can carry one. The
     # read above is a FILE, so the test is exact: `tr -d '\000'` applied to the file equals
     # the file IFF it held no NUL. A missing or unreadable file makes `cmp` exit 2, which is
     # not "equal", so this test fails CLOSED (unreadable) rather than open.
+    #
+    # ⛔ AND THE VALUE IS BOUNDED, because the `case` below is a GLOB removal that is O(n²)
+    # in the value's length (measured on this box: 80 KB ≈ 6 s, 160 KB ≈ 28 s, 200 KB never
+    # returned) — a producer emitting a large body would HANG the rail instead of answering
+    # it. The projection is a fixed, tiny shape (`MERGED\t2026-09-23T00:00:00Z` is 30 bytes),
+    # so a generous 4 KiB ceiling costs nothing real and makes the glob's input bounded.
     state_part=""; rest=""
-    if [ "$rc" -eq 0 ] && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
+    if [ "$rc" -eq 0 ] && [ "$(wc -c < "$outtmp")" -le 4096 ] \
+       && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
       observed="$(cat "$outtmp")"
       case "$observed" in
         *$'\n'*)       : ;;                  # more than one line: not the projection
@@ -1718,7 +1734,12 @@ poll_merge_artifact() {
     # (a timeout, remedy: re-run) for a different one (the producer's shape changed), and it
     # is the one thing that separates a blip from a config error. Assigning unconditionally
     # lets the callers' `if [ -n … ]` / else-arm tell the truth about the deciding read.
-    err="$(tail -n 1 "$errtmp" 2>/dev/null)"
+    #
+    # ⛔ THE LAST *NON-BLANK* LINE, not the last line (#1298 delta review): a multiline error
+    # ending in a blank line — `boom\n\n` — made `tail -n 1` return the EMPTY string, so a
+    # real message was reported as "produced no diagnostic". `awk` keeps the last line that
+    # has content and ignores the padding, with no pipe to SIGPIPE.
+    err="$(awk 'NF { last = $0 } END { print last }' "$errtmp" 2>/dev/null)"
     MERGE_ART_DIAG="${err:0:200}"
     if [ "$MERGE_ART_STATE" = "MERGED" ]; then
       break
@@ -5808,8 +5829,8 @@ ${parity_forgiven_note}"
       if [ -n "${MERGE_ART_DIAG:-}" ]; then
         say_err "   the state read reported: ${MERGE_ART_DIAG}"
       else
-        say_err "   the state read produced no diagnostic (gh exited 0 with an unusable value, or"
-        say_err "   wrote nothing to stderr)."
+        say_err "   the state read wrote NOTHING to stderr (a producer that answers with"
+        say_err "   something other than the projection and says nothing about it)."
       fi
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
@@ -5881,8 +5902,8 @@ ${parity_forgiven_note}"
       if [ -n "${MERGE_ART_DIAG:-}" ]; then
         say_err "   the state read reported: ${MERGE_ART_DIAG}"
       else
-        say_err "   the state read produced no diagnostic (gh exited 0 with an unusable value, or"
-        say_err "   wrote nothing to stderr)."
+        say_err "   the state read wrote NOTHING to stderr (a producer that answers with"
+        say_err "   something other than the projection and says nothing about it)."
       fi
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1

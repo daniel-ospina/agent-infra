@@ -9101,22 +9101,24 @@ unset ADMIN_MERGE_VERIFY_ATTEMPTS
 # §70-§74 drive the WHOLE rail, so they can only express what the hermetic `gh` can
 # serve: a non-zero exit, or a well-formed `<state>\t<mergedAt>`. That leaves the
 # SHAPE guards — the multi-line test, the double-separator test, the missing-separator
-# test, the exit-status test and the byte-level NUL test — UNEXERCISED: deleting them
-# leaves §70-§74 green (measured: the `shape` mutation reddens exactly 5 assertions, and
-# all 5 are here). This section loads the rail's FUNCTION DEFINITIONS and calls the read
-# directly, so every declared shape has an assertion that goes RED when its guard is
-# removed or answered wrongly.
+# test, the exit-status test, the byte-level NUL test and the size ceiling — UNEXERCISED:
+# deleting them leaves §70-§74 green (measured: the `shape`, `nul-blind` and `size-unbound`
+# mutations redden only assertions that live here). This section loads the rail's FUNCTION
+# DEFINITIONS and calls the read directly, so every declared shape has an assertion that
+# goes RED when its guard is removed or answered wrongly.
 #
 # MUTATION EVIDENCE — each row is a one-line change applied to a COPY of the rail
-# (never the working tree; driver kept beside the logs), run against all 44 assertions
+# (never the working tree; driver kept beside the logs), run against every assertion
 # of §70-§75:
 #   nonzero    the non-zero arm's re-read removed    15 fail: §70×6 §72×6 §74×3
 #   noretrat   the non-zero arm's not_merged gate shut 3 fail: §71×3
 #   zeroexit   the zero-exit retraction gate reverted  3 fail: §73×3
-#   shape      the whole-value/exit-status/NUL tests reverted 5 fail: §75×5
-#   allowlist  the final verdict reverted to a DENY-LIST 21 fail: §72×6 §73×3 §74×3 §75×9
+#   shape      the whole-value/exit-status/NUL/size tests reverted 6 fail: §75×6
+#   allowlist  the final verdict reverted to a DENY-LIST 23 fail: §72×6 §73×3 §74×3 §75×11
 #   nul-blind  the byte-level NUL test removed         1 fail: §75×1
 #   diag-stale the deciding attempt's EMPTY stderr overwritten by an earlier one 1 fail: §75×1
+#   size-unbound the 4 KiB ceiling removed             1 fail: §75×1
+#   diag-last  the last-non-blank line reverted to `tail -n 1`  1 fail: §75×1
 # EVERY section is reddened by at least one row, and NO row reddens all of them: the
 # assertions are load-bearing and targeted rather than a blanket count.
 echo "== 75. #1298: the merge-artifact read validates the whole value (allow-list, not deny-list) =="
@@ -9202,13 +9204,13 @@ poll_shape ok-closed "$(printf 'CLOSED\t-')" 0
 expect_poll ok-closed not_merged CLOSED "a well-formed CLOSED read"
 
 # ⛔ EACH MALFORMED SHAPE IS ITS OWN ASSERTION, and each depends on a NAMED guard:
-# the four PROJECTION guards are deletion-sensitive (the `shape` mutation below reddens
-# exactly the four: missing separator, two separators, multi-line, and a non-zero exit
-# carrying plausible stdout), while the three STATE-TOKEN assertions are sensitive to the
-# guard's ANSWER rather than to its presence — removing the inner `*)` arm is unobservable
-# because the function's pre-initialised sentinels, and the final verdict case, already
-# answer `unreadable`; the `allowlist` mutation (which flips that answer to `not_merged`)
-# is what reddens them. Both directions are load-bearing; neither is claimed beyond that.
+# the four PROJECTION guards and the NUL test are deletion-sensitive (the `shape` mutation
+# below reddens exactly those five), while the three STATE-TOKEN assertions are sensitive to
+# the guard's ANSWER rather than to its presence — removing the inner `*)` arm is
+# unobservable because the function's pre-initialised sentinels, and the final verdict case,
+# already answer `unreadable`; the `allowlist` mutation (which flips that answer to
+# `not_merged`) is what reddens them. Both directions are load-bearing; neither is claimed
+# beyond that.
 poll_shape no-separator "MERGED" 0
 expect_poll no-separator unreadable '<unreadable>' "a bare MERGED with NO separator (the ANY-SEPARATOR trap)"
 poll_shape two-separators "$(printf 'MERGED\tx\ty')" 0
@@ -9267,6 +9269,27 @@ if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 2 ] && [ -z "$POLL_DIAG
 else
   fail "(shape) diag-decides → verdict=$POLL_VERDICT calls=$POLL_CALLS diag=[$POLL_DIAG]"
 fi
+
+# ⛔ THE LAST *NON-BLANK* LINE IS THE DIAGNOSTIC. A multiline error that ENDS IN A BLANK LINE
+# makes a bare `tail -n 1` return the EMPTY string, so a real message is reported as "no
+# diagnostic" — the absence of a captured message read as the absence of the message.
+# The argument deliberately carries real newlines, so the trailing blank line reaches fd 2.
+poll_shape diag-blank-line "$(printf 'PENDING\t-')" 0 1 $'boom: read timed out\n\n'
+expect_poll diag-blank-line unreadable '<unreadable>' "a stderr whose message ends in a blank line"
+[ "$POLL_DIAG" = 'boom: read timed out' ] \
+  && pass "(shape) …and its message survives the blank line, rather than being reported as none" \
+  || fail "(shape) a stderr ending in a blank line lost its message (diag=[$POLL_DIAG])"
+
+# ⛔ THE VALUE IS BOUNDED, because the shape `case` is a GLOB removal that is O(n²) in the
+# value's length: a producer emitting a large body made the rail HANG instead of answering
+# it (measured: 80 KB ≈ 6 s, 160 KB ≈ 28 s, 200 KB never returned). The ceiling is asserted
+# by its own byte count, so the case cannot pass vacuously on a fixture that never got big.
+{ printf 'MERGED\t'; head -c 8000 /dev/zero | tr '\0' 'x'; } > "$TMP/huge-answer"
+[ "$(wc -c < "$TMP/huge-answer" | tr -d ' ')" -gt 4096 ] \
+  && pass "(shape) the oversized fixture really exceeds the 4 KiB ceiling ($(wc -c < "$TMP/huge-answer" | tr -d ' ') bytes)" \
+  || fail "(shape) the oversized fixture is only $(wc -c < "$TMP/huge-answer") bytes"
+poll_file_shape huge-value "$TMP/huge-answer" 0
+expect_poll huge-value unreadable '<unreadable>' "a read past the 4 KiB ceiling (bounded, not hung)"
 
 # ⛔ A LEADING-ZERO BOUND MUST NOT REPORT AN ARTIFACT NOBODY READ (#1690's symptom,
 # one arithmetic site over). The refusal is asserted by NAME and by CALLS=0: the
