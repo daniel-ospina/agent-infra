@@ -333,7 +333,7 @@ jobs:
         # established (including "no claim visible").
         run: python3.12 tools/fleet/claim_lanes.test.py
       - name: Ref-claim reader mutation evidence (#1777, zero-dep)
-        # 23 mutations, each reintroducing the defect its test exists to catch:
+        # 24 mutations, each reintroducing the defect its test exists to catch:
         # a failed read read as an absence, an empty registry read as a failed
         # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
         # when metadata fails, the LOCAL ref space read instead of the registry,
@@ -346,7 +346,9 @@ jobs:
         # from the ls-remote ORDER instead of the match (so a lower-sorting claim
         # key hides a live holder), an un-normalised sha, a short sha consumed by
         # a coincidental decoy prefix, a multi-PR head reduced to one match by ref
-        # order, and the cascade order inverted. Its own step so neither verdict
+        # order, and the cascade order inverted. One hygiene mutation leaves the
+        # JSON verdict `detail` raw while the text renderer sanitizes the same
+        # attacker-influencable owner string. Its own step so neither verdict
         # suppresses the other.
         run: python3.12 tools/fleet/claim_lanes.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)

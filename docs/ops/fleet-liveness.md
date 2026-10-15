@@ -525,7 +525,7 @@ python3 tools/fleet/liveness.test.py               # 27 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (30)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 23 reader tests
-python3 tools/fleet/claim_lanes.test.py --mutations  # 23 mutations, each must go RED
+python3 tools/fleet/claim_lanes.test.py --mutations  # 24 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```
 
