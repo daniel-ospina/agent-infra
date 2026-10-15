@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Tests for the rail's HEAD READ — `resolve_head` / `require_head` in scripts/admin-merge.sh.
+"""Tests for the rail's two PROBES-that-must-abstain: `resolve_head`/`require_head` (#1690)
+and `resolve_draft`/`require_draft` (#1750) in scripts/admin-merge.sh.
 
 WHY THIS FILE EXISTS (#1690). The rail blocked a fully-attested PR with:
 
@@ -21,6 +22,13 @@ THE DISTINCTION UNDER TEST IS BETWEEN TWO SPEECH ACTS, not two strings:
   * an UNREADABLE head is NOT a claim about reality ("the instrument could not answer");
   * a MOVED head IS a claim about reality ("the evidence is SHA-bound and void").
 Rendering the first as the second is the defect.
+
+#1750 IS THE SAME ROOT ON THE OPPOSITE SIDE OF THE FALSIFIER, and the draft tests below pin it.
+`resolve_draft` had the identical bare-read shape, but failing OPEN: a failed read returned the
+EMPTY STRING, and its caller's `[ "$is_draft" = "true" ]` read that as "not a draft", so the
+rail PROCEEDED past the early refusal the probe exists to make. #1690 was a false refusal and
+#1750 is a false permission — the worse direction, because the CI window is spent and the
+head-bound evidence marker is posted before anything downstream can re-check it.
 """
 from __future__ import annotations
 
@@ -472,3 +480,178 @@ def test_the_diagnostic_is_captured_on_the_LAST_attempt_not_the_first(tmp_path):
         f"the diagnostic quoted is not the last attempt's: {r.stderr!r}")
     assert "attempt 1:" not in r.stderr and "attempt 2:" not in r.stderr, (
         f"an earlier attempt's diagnostic leaked into the refusal: {r.stderr!r}")
+
+
+# ── THE DRAFT PROBE (#1750) ───────────────────────────────────────────────────────────────
+# ⛔ THE SAME ROOT AS THE HEAD READ, FAILING THE OTHER WAY. `resolve_draft` was a bare
+# `$GH pr view … --jq .isDraft 2>/dev/null` whose only caller ASSIGNED the output and discarded
+# the status. A failed read returned the EMPTY STRING, `[ "$is_draft" = "true" ]` read that as
+# "not a draft", and the rail PROCEEDED — past the early refusal this probe exists to make, to
+# spend the whole CI window and post a head-bound evidence marker on a PR that could not merge.
+# #1690 was a false REFUSAL; this is a false PERMISSION.
+#
+# The reading contract differs from the head's in one way that matters: `isDraft` is a BOOLEAN,
+# so it has exactly two readings. A value that is not exactly `true` or `false` is UNREADABLE,
+# never `false`.
+
+def test_resolve_draft_returns_exactly_true_or_false(tmp_path):
+    """The positive control: the fix must not turn every draft read into a refusal."""
+    for val in ("true", "false"):
+        r = _drive(tmp_path, f"echo {val}; exit 0", 'resolve_draft 1; echo "rc=$?"')
+        assert r.stdout.strip() == f"{val}\nrc=0", (
+            f"a valid isDraft read ({val}) was not returned: {r.stdout!r} / {r.stderr!r}")
+
+
+def test_a_FAILED_draft_read_returns_nonzero_and_prints_nothing(tmp_path):
+    """The core of #1750: a read that FAILS must not look like a value — not even the empty
+    string, because the caller's boolean test reads `""` as `false`, which is a PERMISSION."""
+    r = _drive(tmp_path, "exit 1", 'resolve_draft 1; echo "rc=$?"')
+    assert r.stdout.strip() == "rc=1", (
+        "a failed isDraft read returned success or a value — the exact shape that made the "
+        f"caller proceed past the draft refusal: {r.stdout!r}")
+
+
+def test_a_draft_read_that_is_not_a_boolean_is_unreadable(tmp_path):
+    """⛔ NOT JUST NON-ZERO EXITS — the VALUE must be validated, because a SUCCESSFUL read with
+    a non-boolean value is exactly as unusable as a failed one, and `[ "$x" = "true" ]` quietly
+    reads every such value as `false`. A multi-line read is included deliberately: it exposes an
+    any-line check, which a whole-value `case` rejects by construction."""
+    for body, why in (
+        ("exit 0", "an EMPTY success (gh exited 0 with no value)"),
+        ("echo yes; exit 0", "a value that is not a boolean"),
+        ("echo TRUE; exit 0", "the wrong CASE (gh prints lowercase)"),
+        ("echo 0; exit 0", "a non-boolean that looks falsy"),
+        ("printf 'true\\nfalse\\n'; exit 0", "a MULTI-LINE read"),
+    ):
+        r = _drive(tmp_path, body, 'resolve_draft 1; echo "rc=$?"')
+        assert r.stdout.strip() == "rc=1", (
+            f"resolve_draft accepted {why} as a value; anything that is not exactly `true` or "
+            f"`false` is UNREADABLE, never `false`: {r.stdout!r}")
+
+
+def test_require_draft_refuses_by_name_when_the_read_fails(tmp_path):
+    """⛔ THE SPEECH-ACT TEST. The refusal must say the READ failed, must carry the
+    machine-readable tag, and must NOT reuse the genuine-draft wording — the two mean different
+    things ("the instrument could not answer" vs "this PR is a draft"), and the remedies differ
+    (retry the rail vs `gh pr ready`)."""
+    r = _drive(tmp_path, "exit 1", 'require_draft 1 || true')
+    assert "could not READ the isDraft flag" in r.stderr, (
+        f"no unreadable-draft refusal on stderr: {r.stderr!r}")
+    assert "[draft_unreadable]" in r.stderr, (
+        f"the refusal carries no machine-readable tag: {r.stderr!r}")
+    assert "Nothing was merged" in r.stderr, "the refusal must state that no merge happened"
+    # The GENUINE-draft speech act must not appear — neither its claim nor its remedy. A scraper
+    # (or an operator) matching the draft refusal must not match this one by phrasing.
+    assert "gh pr ready" not in r.stderr, (
+        f"an UNREADABLE read was refused with the draft's remedy: {r.stderr!r}")
+    assert "is a DRAFT" not in r.stderr, (
+        f"an UNREADABLE read was rendered as the claim that the PR is a draft: {r.stderr!r}")
+
+
+def test_a_valid_draft_read_is_returned_and_NOT_refused(tmp_path):
+    """The other half of the positive control, through the door itself: a readable boolean must
+    pass through untouched, with no refusal text on stderr."""
+    r = _drive(tmp_path, "echo false; exit 0", 'require_draft 1; echo "rc=$?"')
+    assert r.stdout.strip() == "false\nrc=0", (
+        f"require_draft did not pass a valid boolean through: {r.stdout!r} / {r.stderr!r}")
+    assert "draft_unreadable" not in r.stderr, (
+        f"a VALID read was refused: {r.stderr!r}")
+
+
+def test_the_draft_refusal_carries_the_reads_own_words_or_says_it_cannot(tmp_path):
+    """⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES — #1690's finding, which
+    applies verbatim here. `2>/dev/null` is the defect's own shape: it makes a transient blip
+    and a permanent cause produce the SAME refusal. Both directions are pinned: the diagnostic is
+    QUOTED when it exists, and its ABSENCE is stated rather than papered over."""
+    with_diag = _drive(tmp_path, 'echo "HTTP 403: API rate limit exceeded" >&2\nexit 1',
+                       'require_draft 1 || true')
+    assert "API rate limit exceeded" in with_diag.stderr, (
+        f"the refusal discarded the read's diagnostic: {with_diag.stderr!r}")
+    assert "[draft_unreadable]" in with_diag.stderr, f"the tag was lost: {with_diag.stderr!r}"
+    silent = _drive(tmp_path, "exit 1", 'require_draft 1 || true')
+    assert "produced no diagnostic" in silent.stderr, (
+        f"a silent failure was not reported as silent: {silent.stderr!r}")
+
+
+def test_a_failed_draft_read_that_is_not_propagated_CAN_be_read_as_not_a_draft(tmp_path):
+    """⛔ THE REGRESSION TEST FOR #1750 ITSELF, run as the caller actually runs it.
+
+    This drives the same two-line shape the rail's §0 uses — assign from the door, propagate on
+    the same line, then test for `true` — against a fake `gh` whose read ALWAYS fails. The
+    assertion is on the OUTCOME: the process must abort and must never report that it got past
+    the probe. With `resolve_draft` reverted to the bare read, this prints `PROCEEDED …` with
+    `is_draft=[]` — measured — which is the defect the issue reports verbatim.
+    """
+    r = _drive(
+        tmp_path,
+        "exit 1",
+        'is_draft="$(require_draft 1)" || exit 1; '
+        'if [ "$is_draft" = "true" ]; then echo "BLOCKED as a draft"; '
+        'else echo "PROCEEDED past the draft probe with is_draft=[$is_draft]"; fi',
+    )
+    assert "PROCEEDED" not in r.stdout, (
+        "a FAILED DRAFT READ was read as 'not a draft' and the rail proceeded — this is #1750 "
+        f"exactly, and it means the `|| exit 1` was not honoured: {r.stdout!r}")
+    assert r.returncode != 0, (
+        "the process exited 0 after a failed draft read, so the failure was swallowed")
+    assert "could not READ the isDraft flag" in r.stderr, (
+        f"no unreadable-draft refusal reached stderr: {r.stderr!r}")
+
+
+def test_every_draft_probe_goes_through_require_draft():
+    """⛔ THE DUPLICATION PIN, the draft twin of `test_every_head_comparison_goes_through_require_head`.
+
+    `resolve_draft` may be called only from `require_draft` (and never otherwise): a second
+    direct call site would have no way to tell an unreadable flag from a readable one, which is
+    the partial-fix shape that is hardest to notice."""
+    with open(RAIL) as fh:
+        src = fh.read()
+    # Look only OUTSIDE `require_draft`'s own body: its single internal call is the legitimate
+    # one, and a detector that cannot tell the two apart would pass vacuously or fail on the
+    # function it is meant to protect.
+    after = src.split("require_draft() {", 1)[1]
+    body_end = after.index("\n}\n")
+    inside, rest = after[:body_end], after[body_end + 3:]
+    calls = [ln.strip() for ln in rest.splitlines()
+             if "resolve_draft " in ln and "()" not in ln and "require_draft" not in ln]
+    assert calls == [], (
+        "these call sites still call resolve_draft directly and cannot distinguish an "
+        f"UNREADABLE draft flag from a readable one: {calls}")
+    # ...and the detector is not vacuous: require_draft must actually do the read.
+    assert 'resolve_draft "$pr"' in inside, (
+        "require_draft no longer performs the read — the guard above would pass for the wrong "
+        "reason")
+
+
+def test_every_draft_read_that_is_assigned_is_guarded():
+    """The structural half of the composition pin, the draft twin of the head one above.
+
+    The assignment succeeds whatever the read's status was, so a non-zero return that nothing
+    checks is invisible: `$is_draft` is empty, `[ "" = "true" ]` is false, and the rail proceeds.
+    ⛔ THE GUARD MUST FOLLOW THE SUBSTITUTION'S CLOSING PAREN — a `|| exit 1` written INSIDE
+    `$( … )` exits only the SUBSHELL, so the parent continues with an empty value.
+
+    ⛔ WHAT THIS TEST CANNOT DO, stated rather than implied: it is a source scan, so it sees only
+    the shapes it knows to look for. The OUTCOME is covered by `tests/admin-merge/run.sh` §13f
+    and §13g, which drive the real §0 call site through the fake-`gh` seam. This is the fast
+    half; that is the durable half.
+    """
+    with open(RAIL) as fh:
+        src = fh.read()
+
+    def without_trailing_comment(line: str) -> str:
+        i = line.find(" #")
+        return line[:i] if i != -1 else line
+
+    calls = [without_trailing_comment(ln).strip() for ln in src.splitlines()
+             if "require_draft " in ln and not ln.lstrip().startswith("#")]
+    assert calls, "detector is vacuous: no assigning require_draft call site was found"
+    guard = re.compile(r'\)"?\s*\|\|\s*exit 1\s*$')
+    unguarded = [c for c in calls if not guard.search(c)]
+    assert unguarded == [], (
+        "these call sites do not carry `|| exit 1` on the CLOSING-PAREN LINE of the command "
+        "substitution, so a failed read could flow on as an empty value and be read as 'not a "
+        "draft' (#1750). ⛔ IF ONE OF THE LINES BELOW IS A LEGITIMATE REFORMAT that puts the "
+        "guard on that line, this is an over-block (the safe direction) — the fix is to move "
+        "the guard onto the closing-paren line, NOT to relax this check, because the outcome "
+        f"scenarios (§13f/§13g) are what prove the behaviour. Offending: {unguarded}")

@@ -255,6 +255,11 @@ case "$key" in
       jprev="$x"
     done
     if [ "$want_draft" = 1 ] && [ "$want_head" = 0 ]; then
+      # #1750: a DRAFT READ THAT FAILS needs its own seam, because the defect is exactly a
+      # failed read rendered as a value — with no way to fail this probe, no scenario could
+      # drive the fail-open it produced. The diagnostic goes to stderr so the refusal's
+      # diagnostic-quoting arm is exercised on a REAL rail run, not only in the unit suite.
+      [ -f "$SCEN/draft-fail" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
       [ -f "$SCEN/draft" ] && { cat "$SCEN/draft"; exit 0; }
       printf 'false\n'; exit 0
     fi
@@ -2599,6 +2604,89 @@ grep -q "could not READ the head" "$SCEN/err" && pass "the §4 read is reported 
   || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
+# ── 13f/13g. the DRAFT PROBE fails OPEN, and the fix is on the other side (#1750) ──
+# ⛔ THE SAME ROOT AS §13b-§13e, FAILING THE OTHER WAY. `resolve_draft` had the identical bare-read
+# shape, and #1690's fix was fail-CLOSED (a failed head read produced a false REFUSAL). #1750 is
+# fail-OPEN: a failed `isDraft` read returned "" and `[ "" = "true" ]` read that as "not a
+# draft", so the rail PROCEEDED past the early refusal this probe exists to make — spending the
+# whole CI window and posting the head-bound evidence marker on a PR that could not merge.
+#
+# ⛔ THE DISCRIMINATOR IS THE GH CALL LEDGER, NOT PROSE (§13b's round-4 lesson, MEASURED there:
+# renaming one log line left §13b/§13c/§13d green while the rail demonstrably still proceeded).
+# The draft probe is the LAST `gh` call a correct rail makes: everything after §0 issues another
+# call (the lane listing), so a rail that PROCEEDED leaves a DIFFERENT last line. A missing or
+# empty ledger returns 1, which at the inverted `&& pass || fail` site below is the FAIL arm —
+# the safe direction — unlike the `&& fail || pass` sites §13b/§13c/§13d use.
+draft_probe_was_last_call() {
+  local last
+  last="$(tail -n 1 "$SCEN/calls" 2>/dev/null)"
+  case "$last" in *isDraft*) return 0 ;; esac
+  return 1
+}
+
+# ── 13f. a DRAFT PROBE that FAILS is UNREADABLE, never "not a draft" (#1750) ──
+# The fixture is otherwise-CLEAN past the probe, so a reverted rail has a path all the way to the
+# merge: a bare exit-code assertion would then be satisfied by a refusal the mutation did not
+# cause (§13b's round-3 finding), which is why the ledger and comment/merge assertions carry the
+# weight here.
+echo "== 13f. a draft probe that FAILS is UNREADABLE, never 'not a draft' (#1750) =="
+new_scen draftprobeunread
+HEAD_DF2="6666000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DF2" > "$SCEN/head"
+printf 'x\n' > "$SCEN/draft-fail"          # the isDraft read FAILS (its own seam)
+lane_fail "$HEAD_DF2" 7011 > "$SCEN/runs-$HEAD_DF2"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7011"
+main_red_n main6666 7012 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the draft probe fails" \
+  || fail "expected a non-zero exit, got 0 — an UNREADABLE draft probe reached the merge path"
+grep -qF '[draft_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [draft_unreadable] on the refusal line, got: $(head -c 200 "$SCEN/err")"
+grep -q "could not READ the isDraft flag" "$SCEN/err" && pass "the refusal says the READ failed" \
+  || fail "expected the unreadable-draft refusal on stderr"
+# ⛔ THE SPEECH-ACT NEGATIVE: this refusal must NOT be the genuine-draft one. It is not a claim
+# about the PR, and its remedy (retry the rail) is not the draft's.
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$SCEN/err" \
+  && fail "the rail claimed the PR IS A DRAFT on a run where it could not READ the flag — the two speech acts are conflated" \
+  || pass "an unreadable probe never claims the PR is a draft"
+draft_probe_was_last_call \
+  && pass "the draft probe was the rail's LAST call — it did not proceed" \
+  || fail "the rail PROCEEDED past the unreadable draft probe (another gh call follows it) — this is #1750's fail-open"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the draft probe could not answer" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 13g. a DRAFT PROBE that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) ──
+# ⛔ THE HALF A FIX THAT ONLY CHECKS THE EXIT STATUS MISSES. A read that exits 0 with `yes` is
+# exactly as unusable as one that fails, because `[ "$x" = "true" ]` reads EVERY non-boolean as
+# "not a draft". §13f's fixture makes `rc` non-zero, so it can never reach the whole-value check —
+# the same gap §13d closed for the head read (MEASURED there: reverting the shape fix left §13b
+# green). This scenario is what pins the value contract at the rail level.
+echo "== 13g. a draft probe that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) =="
+new_scen draftprobenonbool
+HEAD_DG="7777000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DG" > "$SCEN/head"
+printf 'yes\n' > "$SCEN/draft"             # gh exits 0 with a value that is NOT a boolean
+lane_fail "$HEAD_DG" 7021 > "$SCEN/runs-$HEAD_DG"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7021"
+main_red_n main7777 7022 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the draft probe returns a non-boolean" \
+  || fail "expected a non-zero exit, got 0 — a NON-BOOLEAN draft value was read as 'not a draft'"
+grep -qF '[draft_unreadable]' "$SCEN/err" && pass "the refusal carries the machine-readable tag" \
+  || fail "expected [draft_unreadable] for a non-boolean value"
+grep -q "is a DRAFT, and gh refuses to merge a draft" "$SCEN/err" \
+  && fail "a non-boolean value was rendered as the claim that the PR IS A DRAFT" \
+  || pass "a non-boolean value never becomes a draft claim"
+draft_probe_was_last_call \
+  && pass "the draft probe was the rail's LAST call — the non-boolean value did not become a permission" \
+  || fail "the rail PROCEEDED on a NON-BOOLEAN draft value — the whole-value check is missing"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted for a non-boolean draft value" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
 # The decision's baseline is TWO files (rates + signatures). The signature table
 # was added by the swap, and a failure to extract it must BLOCK — reading it as
@@ -3940,6 +4028,14 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted on a draft" 
 grep -q "run list" "$SCEN/calls" \
   && fail "the draft check must run BEFORE any CI work" \
   || pass "the refusal is EARLY (no CI run was even listed)"
+# ⛔ THE TAG'S NEGATIVE (#1750, the twin of §13's). `[draft_unreadable]` is only a discriminator
+# if the GENUINE draft refusal does NOT carry it — otherwise `grep -F '[draft_unreadable]'`
+# cannot tell "the instrument could not answer" from "this PR is a draft". Adding it to the
+# genuine-draft refusal leaves every unit test green (the head-read twin was MEASURED to behave
+# this way in #1690), so the discriminating property needs its own assertion.
+grep -qF '[draft_unreadable]' "$TMP/err" \
+  && fail "a GENUINE DRAFT carried the [draft_unreadable] tag — the two refusals are no longer distinguishable by machine" \
+  || pass "the genuine-draft refusal carries no [draft_unreadable] tag"
 
 # ── 37. THE TWO WAITS, the DERIVED ceiling, and attribution that does not
 #        narrow the refusal (B4 / B5 / B7 / B1) ───────────────────────────

@@ -487,7 +487,12 @@
 #   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
 #   systematic collision. The rail reads `isDraft` BEFORE any CI work and
 #   refuses with that specific reason (tell the caller to `gh pr ready`) — never
-#   a generic merge failure after the evidence marker.
+#   a generic merge failure after the evidence marker. ⛔ AN UNREADABLE `isDraft`
+#   READ IS A THIRD OUTCOME, NOT `false` (#1750): a failed read used to return
+#   the empty string and be read as "not a draft", so the rail PROCEEDED past
+#   this refusal. It now refuses by name via `require_draft` with its own
+#   machine-readable tag (`[draft_unreadable]`), which the genuine-draft refusal
+#   does NOT carry.
 #
 # Env seams (tests only):
 #   ADMIN_MERGE_GH                       the gh command (default: `gh`)
@@ -1384,15 +1389,94 @@ require_head() {
   return 1
 }
 
-# resolve_draft <pr> → the PR's `isDraft` flag (`true`/`false`). `commit-workflow`
-# opens drafts on purpose, and `gh pr merge` refuses a draft with "Pull Request is
-# still a draft" — so the rail probes this BEFORE any CI work and refuses early
-# with THAT reason, rather than surfacing it late as a generic merge failure once
-# the head-bound evidence marker has already been posted.
+# resolve_draft <pr> → the PR's `isDraft` flag on stdout: EXACTLY `true` or `false`.
+# `commit-workflow` opens drafts on purpose, and `gh pr merge` refuses a draft with
+# "Pull Request is still a draft" — so the rail probes this BEFORE any CI work and
+# refuses early with THAT reason, rather than surfacing it late as a generic merge
+# failure once the head-bound evidence marker has already been posted.
+#
+# ⛔ A FAILED READ MUST BE ABLE TO FAIL (#1750). This was a bare
+# `$GH pr view … --jq .isDraft 2>/dev/null`, and its only caller ASSIGNED the output
+# and discarded the status. A failed read then returned the EMPTY STRING, and the
+# caller's `[ "$is_draft" = "true" ]` read that as "not a draft" and PROCEEDED — past
+# the early refusal this probe exists to make. Same root as #1690 ("a read that failed
+# is rendered as a value"), opposite side of the falsifier: #1690 was a false REFUSAL,
+# this was a false PERMISSION. Fail-open is the worse direction, so this one is the
+# strict shape.
+#
+# The shape follows #1690's landed answer, and each clause is load-bearing:
+#   * VALIDATE THE WHOLE VALUE. `isDraft` is a BOOLEAN, so it has exactly two readings.
+#     Anything that is not `true` or `false` — empty, `yes`, a multi-line read — is
+#     UNREADABLE, never `false`. A `case` on the whole value rejects an embedded newline
+#     by construction, so no pipe is needed (the `writer | grep` shape is banned
+#     repo-wide, #841: under `set -uo pipefail` a writer killed by SIGPIPE makes the
+#     pipeline non-zero, which would classify a VALID value as unreadable).
+#   * ON ANY UNUSABLE READ, PRINT NOTHING AND RETURN NON-ZERO, so no caller can mistake
+#     the absence for a value.
+#   * THE READ'S OWN WORDS TRAVEL ON A SEPARATE CHANNEL (a global, not the value
+#     channel), so the refusal can tell a transient blip from a permanent cause instead
+#     of prescribing a remedy that cannot help. `resolve_draft` is called DIRECTLY by
+#     `require_draft`, never through a command substitution, so the global is not lost to
+#     a subshell — the same trap #1690's review found with `HEAD_READ_DIAG`.
+# ⛔ Callers must use `require_draft` below, never this directly: the whole defect was a
+# caller that could not tell "empty" from "the PR is not a draft".
 resolve_draft() {
   local pr="$1"; shift
+  local out rc errtmp err
+  DRAFT_READ_DIAG=""
+  errtmp="${TMPDIR:-/tmp}/admin-merge-draft.$$.err"
   # shellcheck disable=SC2086
-  $GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>/dev/null
+  out="$($GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>"$errtmp")" && rc=0 || rc=$?
+  err="$(tail -n 1 "$errtmp" 2>/dev/null)"
+  [ -n "$err" ] && DRAFT_READ_DIAG="${err:0:200}"
+  rm -f "$errtmp"
+  [ "$rc" -eq 0 ] || return 1
+  case "$out" in
+    true | false) printf '%s\n' "$out"; return 0 ;;
+  esac
+  return 1
+}
+
+# ── THE ONE DOOR FOR THE DRAFT PROBE (#1750) ───────────────────────────────────
+# ⛔ THERE IS EXACTLY ONE REASON TO READ `isDraft`, SO THERE IS EXACTLY ONE PLACE THAT
+# FAILS TO. The discrimination between "the instrument could not answer" and "this PR is
+# a draft" lives HERE, once — a caller that gets a value has a KNOWN-GOOD boolean.
+#
+# ⛔ THE TWO REFUSALS ARE DIFFERENT SPEECH ACTS AND MUST NOT SHARE A MESSAGE.
+#   * an UNREADABLE draft flag is NOT a claim about the PR — it says the instrument could
+#     not answer, and the remedy is to retry the rail;
+#   * "the PR IS A DRAFT" IS a claim about the PR — it voids the merge, and the remedy is
+#     `gh pr ready`.
+# Rendering the first as the second is bad; rendering it as NOTHING AT ALL — which is what
+# the bare read did — is #1750, and it is the failure this door exists to make impossible.
+require_draft() {
+  local pr="$1"; shift
+  if resolve_draft "$pr" "$@"; then
+    return 0
+  fi
+  # ⛔ A MACHINE-READABLE TOKEN, NOT JUST PROSE — the answer #1690 reached for the head
+  # read. `[draft_unreadable]` is the tag the genuine draft refusal does NOT carry, so
+  # `grep -F '[draft_unreadable]'` answers "could the instrument read the draft flag?"
+  # without depending on how the sentence is worded. The refusal deliberately does NOT
+  # contain the phrase "is a DRAFT" or the remedy `gh pr ready`, so a log scraper matching
+  # the GENUINE draft refusal cannot match this one by phrasing either.
+  say_err "admin-merge: ✗ BLOCK [draft_unreadable] — could not READ the isDraft flag of PR #$pr."
+  say_err "   This is NOT a claim about the PR, and NOT a CI-failure verdict: the read"
+  say_err "   failed, or returned something other than exactly 'true' or 'false'."
+  say_err "   Nothing was merged and no evidence was posted."
+  # ⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES (#1690 review, whose
+  # finding applies verbatim here). "Re-run the rail" is right for a transient blip and
+  # useless for a permanent cause; without the read's own words the two are the same
+  # refusal. Quoted when there is one; the absence is STATED rather than papered over.
+  if [ -n "${DRAFT_READ_DIAG:-}" ]; then
+    say_err "   the read reported: ${DRAFT_READ_DIAG}"
+    say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
+    say_err "   probably not transient — check credentials, --repo, and the PR number."
+  else
+    say_err "   the read produced no diagnostic (gh exited 0 with an unusable value, or wrote"
+    say_err "   nothing to stderr). Re-run the rail."
+  fi
+  return 1
 }
 
 # resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). The base branch's
@@ -4101,7 +4185,7 @@ main() {
   # kills the subshell before its `rm` runs, and the file leaks. SIGKILL can still leak it —
   # nothing can trap that — so this narrows the window rather than closing it to zero, and the
   # name is PID-scoped so a leak is one file per killed run, not a shared collision.
-  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err"' EXIT
+  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err" "${TMPDIR:-/tmp}/admin-merge-draft.$$.err"' EXIT
 
   local head
   # shellcheck disable=SC2086
@@ -4121,8 +4205,15 @@ main() {
   # posted. The rail does NOT silently ready the PR: a draft is a deliberate
   # review checkpoint, and clearing it is the author's act, not the rail's.
   local is_draft
+  # ⛔ READ THROUGH THE DOOR, AND PROPAGATE ITS FAILURE (#1750). The bare read here was
+  # the defect: a failed read yielded "", and the comparison below read that as "not a
+  # draft" and let the rail proceed. `require_draft` prints the value ONLY when it is
+  # exactly `true`/`false`, so `|| exit 1` is what makes an unreadable probe refuse
+  # instead of becoming a permission. It is deliberately NOT defended by a second
+  # emptiness check here: the guarantee lives in the door, once, and a defence at the
+  # one site that already refuses is how the @1690 fix inverted its own invariant.
   # shellcheck disable=SC2086
-  is_draft="$(resolve_draft "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  is_draft="$(require_draft "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
   if [ "$is_draft" = "true" ]; then
     say_err "admin-merge: ✗ BLOCK — PR #$PR is a DRAFT, and gh refuses to merge a draft"
     say_err "   (\"Pull Request is still a draft\"). This is NOT a CI-failure verdict and NOT"
