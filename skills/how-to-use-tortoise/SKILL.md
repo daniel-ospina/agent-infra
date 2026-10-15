@@ -618,6 +618,27 @@ by the retry (content+kind fallback scan), never duplicated.
 | `mitigation` / `reify: true` | Operator point | `{"operator_id", "deduped"}` |
 | `relation` | Structural edge | `{"relation", "from", "to", "deduped"}` |
 
+⚠️ **Target state — NOT yet in tortoise `origin/main`.** Point↔Point relations *should* be
+operator-mediated (owner ruling 2026-10-13, tortoise #8499 — an **open** issue whose code half is
+unmerged, so nothing below is shipped behaviour). An operator-less edge carries no operator node,
+so it can be neither mitigated nor annotated, and it cannot carry the epistemic weighting a
+Point's relations claim. Plain direct edges are likewise journaled but never replayed, so
+`rebuild_all` **still loses them** — `DirectEdgeCreated` remains in `_NO_PROJECTION_FOLD` (A10
+#1048; the replay fold has *not* landed).
+
+What `origin/main` does today: route selection is endpoint-kind blind — `_connection_route`
+returns `direct` for every plain `IMPL`/`NAND`, and `ingest`'s direct route requires plain `:Point`
+endpoints (sole carve-out: an `Event` on the operator route). So a plain `IMPL`/`NAND` bundle
+connection **whose endpoints pass Phase-1** (plain `Point`s, singular `to`) currently lands the
+operator-less direct edge above and returns `{"direct_edge", "from", "to"}` — a plain spelling is
+**not** re-routed and does **not** warn (`point_mediated_route` does not exist at `origin/main`;
+`docs/INGEST_CONTRACT.md` §3.2 is still eleven keys — the twelfth arrives with #8499). Connections
+that fail Phase-1 — a non-`Point` endpoint, or multi-item `to` on a plain `IMPL`/`NAND` — return
+`ERR_BUNDLE_INVALID` with zero mutations instead. This is exactly the shape #8499 reports. **Until
+#8499 lands, write `reify: true` yourself** to say the operator route explicitly. (`create_direct_edge`
+returns the `{direct_edge, from, to}` descriptor; `create_edge` writes a *relation* edge,
+`{relation, from, to}`.)
+
 Multi-item `to` on a plain IMPL/NAND connection: use `reify:true` /
 mitigation (the operator route) or split into singular connections.
 
