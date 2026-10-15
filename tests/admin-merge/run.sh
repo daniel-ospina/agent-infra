@@ -117,21 +117,23 @@
 #      a failed `gh run list` is a LISTING failure and not a thinner lane, and the
 #      parity key is the VERBATIM shard name (the matrix axis is NOT normalised
 #      away — `test (a, docker)` and `test (a, embedded)` are different lanes).
-#      The reference is drawn from at least `--main-runs` runs: the window counts
-#      MEASUREMENTS, so a run that measured nothing does not spend it, and the
-#      listing widens past such runs while no executed shard has been found. The
-#      widened window is DISCLOSED, so a shard main ran only inside the operator's
-#      window still cannot be sampled away (#4844). A listing that is only PARTLY readable is
-#      UNREADABLE, not a thinner lane (cycle-2 P1: an unparsable run line used to
-#      be skipped, silently shrinking the reference; an unterminated final line
-#      was dropped outright). A family whose every member is a workflow LIFECYCLE
+#      The reference is drawn from at least `--main-runs` runs: the listing WIDENS
+#      while no executed family shard has been found, so a window holding none does
+#      not end the search. The widened window is DISCLOSED, so a shard main ran only
+#      inside the operator's window still cannot be sampled away (#4844). A listing
+#      that is only PARTLY readable is UNREADABLE, not a thinner lane (cycle-2 P1:
+#      an unparsable run line used to be skipped, silently shrinking the reference;
+#      an unterminated final line was dropped outright). A family whose every member is a workflow LIFECYCLE
 #      job measured nothing and is refused (cycle-2 P1: `=changes` certified on
 #      bookkeeping while main's real shard went uncompared), which is why the
 #      evidence and the refusal both NAME the parity family. `--main-runs` is
-#      validated (positive, ≤ 200) before any CI work, and the widening stops once
-#      that many MEASURING runs are consulted: the window is the Jobs-API call
-#      budget for the ordinary path, and a wider one reads more job lists only
-#      where the requested window found no shard at all.
+#      validated (positive, ≤ 200) before any CI work, and the widening stops on a
+#      family match, on the history being exhausted, or at the 200-run bound — NOT
+#      once that many MEASURING runs are consulted (#7734: under --any-workflow
+#      the measuring runs can be non-code ones carrying no shard, and the widened
+#      window is exactly where the code lane is found). `--main-runs` is the
+#      STARTING width, and a wider window reads more job lists only where the
+#      requested window found no shard at all.
 #      `ADMIN_MERGE_LANE_PARITY=declared-off` is accepted for the trigger-split
 #      case (#1349) but NO LONGER CERTIFIES (#1439): the evidence gate refuses a
 #      vacuous certificate that lacks the positive `lane parity: PR ⊇ main` line,
@@ -5781,8 +5783,8 @@ new_scen vacuousnoprefix
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9851 > "$SCEN/runs-$HEAD_VP"
 lane_pass main9999 9852 > "$SCEN/runs-main"
-lane_jobset 9851 success 'unit-test' 'lint'
-lane_jobset 9852 success 'unit-test' 'lint'
+lane_jobset 9851 success 'unit-test' 'lint' 'probe (a, docker)'
+lane_jobset 9852 success 'unit-test' 'lint' 'probe (a, docker)'
 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "no job matches the shard prefix on either side → BLOCK (exit $rc)" \
@@ -5795,6 +5797,22 @@ grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$SCEN/err" && pass "…naming the knob fo
 # conflated them.
 grep -q "NONE is named 'test\*'" "$SCEN/err" && pass "…and names the FAMILY that selected nothing (not a stale reference)" \
   || fail "the refusal does not distinguish a prefix mismatch from an empty reference"
+# #7734: THE COUNT IS NOT ACTIONABLE ON ITS OWN. "This lane's shards are named
+# differently" and "no run of a code lane was in this window at all" have
+# OPPOSITE remedies (set the prefix vs. name the lane), and the numbers above
+# cannot separate them — so the refusal must NAME the executed job names it saw,
+# and say whether the search even finished. Both are asserted here because both
+# are load-bearing: an unactionable refusal is the defect, not the counts.
+# `probe (a, docker)` is here ON PURPOSE: the sample is ` | `-separated, not
+# comma-separated, precisely because a job NAME may contain a comma — and this
+# fixture is what makes a regression to a comma join RED instead of silently
+# rendering one name as two.
+grep -qF "window DID carry were: lint | probe (a, docker) | unit-test." "$SCEN/err" \
+  && pass "…and NAMES the executed job names it saw (the only way to tell the two remedies apart), pipe-separated so a comma-bearing name stays ONE element" \
+  || fail "the refusal does not render the job names it saw as pipe-separated elements: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
+grep -q "read IN FULL" "$SCEN/err" \
+  && pass "…and says the run history was read IN FULL, so a re-run cannot help" \
+  || fail "the refusal does not say the widening exhausted the history"
 
 # (h) A LISTING FAILURE IS NOT "FEWER SHARDS". `lane_run_ids` swallowed gh's exit
 # status, so an auth/network failure produced an EMPTY listing — which read as
@@ -6393,18 +6411,19 @@ rc=$?
   || fail "expected the startup refusal (exit 2), got $rc — an unbounded window is an unbounded call budget"
 grep -q "beyond the usable window" "$SCEN/err" && pass "…naming the bound" || fail "the window bound is not named"
 
-# ── (r) THE WINDOW IS SPENT ON MEASUREMENTS, NOT ON RAW RUNS (#4844) ────────
+# ── (r) WIDENING PAST RUNS THAT MEASURE NOTHING (#4844, #7734) ──────────────
 # The lane-coverage gate read `--main-runs` RAW runs and consulted only the
 # completed ones, so a push burst (each push CANCELLING its predecessor) filled
 # the window with cancelled/queued runs and pushed the last usable reference OUT
 # of it. The gate then reported "no EXECUTED test shard matching 'test*'" — which
 # reads as a coverage gap in the PR and sends the reader after
 # ADMIN_MERGE_LANE_JOB_PREFIX — and refused every merge until main's lane settled.
-# A run that MEASURED NOTHING must not spend the operator's window: when a window
-# yields no executed shard at all, the listing widens (bounded) until one is
-# found. The scenarios below pin the widening, its bound, its fail-CLOSED
-# direction, and the polarity of the id guard that used to refuse a whole side
-# when a listing line carried no run id.
+# #4844 stopped the raw-window charge by charging only for runs that FINISHED a
+# measurement; #7734 removed that measurement charge too, so nothing now stops the
+# widening but a family match, the end of the history, or the policy bound. The
+# scenarios below pin the widening, its bound, its fail-CLOSED direction, and the
+# polarity of the id guard that used to refuse a whole side when a listing line
+# carried no run id.
 
 # (r1) THE REPRODUCTION. Main's requested 3-run window is [completed-but-no-test-
 # shard, in flight, in flight]; the run that carries `test (a)` sits at position
@@ -6430,7 +6449,7 @@ grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the widen
 grep -q -- "--limit 3" "$SCEN/calls" && grep -q -- "--limit 6" "$SCEN/calls" \
   && pass "…because the listing WIDENED (--limit 3 → --limit 6), not because the window was ignored" \
   || fail "the reference was not reached by widening the listing: $(grep -c 'run list --branch main' "$SCEN/calls") main listing(s), none at --limit 6"
-grep -q "widened past non-measuring runs" "$SCEN/comment" \
+grep -q "carried no shard in the parity family" "$SCEN/comment" \
   && pass "…and the POSTED evidence DISCLOSES the widened window, so --main-runs describes what was READ" \
   || fail "the evidence does not disclose that the reference came from a wider window than requested"
 # …and the disclosure must not cost the CERTIFICATE. The evidence gate
@@ -6558,9 +6577,11 @@ grep -q "NOT a coverage gap in this PR" "$SCEN/err" \
 # fills with terminal runs whose conclusion is `cancelled`, not with `in_progress`
 # ones. Budgeting on run STATUS therefore still refused every merge: this 2-run
 # window holds one measured-but-shardless run (`changes`) and one CANCELLED run,
-# and charging the window for the cancelled one stops the search before the run
-# that actually carries a test shard. The budget counts runs that FINISHED a
-# measurement.
+# and charging the window for the cancelled one stopped the search before the run
+# that actually carried a test shard. #4844 charged the window only for runs that
+# FINISHED a measurement; #7734 removed the charge altogether, so the widening is
+# stopped by nothing but a family match, the end of the history, or the policy
+# bound — which is what this fixture still exercises.
 new_scen vacuouscancelled
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9201 > "$SCEN/runs-$HEAD_VP"
@@ -6576,8 +6597,8 @@ lane_jobs 9204
 lane_jobset 9205 success 'test (a)'
 run_admin_here 42 --main-runs 2 >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && pass "a run that measured nothing does not SPEND the window — the search reaches the measured one (exit 0)" \
-  || fail "expected exit 0, got $rc — a cancelled run still spends the window, so a push burst still blocks every merge (#4844)"
+[ "$rc" -eq 0 ] && pass "a run that measured nothing does not STOP the search — it reaches the measured one (exit 0)" \
+  || fail "expected exit 0, got $rc — the search still stops at the cancelled runs, so a push burst still blocks every merge (#4844)"
 grep -q -- "--limit 4" "$SCEN/calls" && pass "…by widening past the cancelled runs to the last MEASURED one" \
   || fail "the window was not widened past the completed/cancelled runs"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on that reference" \
@@ -6612,6 +6633,101 @@ grep -q "executed 2 distinct job name(s)" "$SCEN/err" \
   || fail "the executed-job count is not a distinct union over all passes: got '$(grep -o 'executed [0-9]* distinct' "$SCEN/err" | head -1)'"
 grep -q "yielded NO EXECUTED job" "$SCEN/err" \
   && fail "the reference diagnosis must not claim no job executed when one did" || pass "…and never claims the window had no executable job list"
+
+# (r8) THE REFERENCE CAN BE STARVED BY RUNS THAT MEASURE NOTHING OF THIS LANE
+# (#7734). The widening's stop condition counted runs that FINISHED A
+# MEASUREMENT, and under `--any-workflow` that is not a statement about the lane:
+# an `issue_comment` reporting run is `completed/success`, so it SPENT the
+# budget while carrying no test shard. The family therefore stayed EMPTY, the
+# widening stopped on the spent budget, and the gate refused naming
+# `ADMIN_MERGE_LANE_JOB_PREFIX` — a remedy that cannot reach a window holding no
+# code-lane run at all. MEASURED on tortoise main (`--any-workflow`, the rail's
+# default `--main-runs 10`): 2 distinct executed job names in the 10-run window
+# and 3 in the widened 20, NONE `test*`; the SAME listing 40 runs wide carried 36
+# distinct names, 17 of them `test*`. So the code lane was one doubling away and
+# the instrument stopped short of it. Here the `test` shards sit at LISTING
+# POSITION 5 (the fixture's 5th `runs-main` line), one doubling past a window whose
+# every run already finished measuring.
+new_scen vacuousfamilyspend
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9221 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainfs00 9222
+  lane_pass mainfs00 9223
+  lane_pass mainfs00 9224
+  lane_pass mainfs00 9225
+  lane_pass mainfs00 9226
+} > "$SCEN/runs-main"
+lane_jobset 9222 success 'changes' 'lint'
+lane_jobset 9223 success 'changes' 'lint'
+lane_jobset 9224 success 'changes' 'lint'
+lane_jobset 9225 success 'changes' 'lint'
+lane_jobset 9226 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a window of measured NON-FAMILY runs no longer starves the reference — it widens to the family (exit 0)" \
+  || fail "expected exit 0, got $rc — the widening still failed to reach the family, so the reference stayed empty (#7734)"
+grep -q -- "--limit 4" "$SCEN/calls" \
+  && pass "…because the listing WIDENED past the requested window (--limit 2 → --limit 4)" \
+  || fail "the reference was not reached by widening: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
+grep -q "NONE is named 'test\*'" "$SCEN/err" \
+  && fail "the family mismatch was refused although the widened window carries the shards" \
+  || pass "…and the family mismatch is not reported"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the widened reference" \
+  || fail "no merge issued although the widened window carries a real reference"
+
+# (r9) THE BOUND STOP IS NAMED (#7734). When the family matches nothing across
+# the whole policy window, the refusal must say the window was read TO THE BOUND
+# — so the operator is not left re-running in search of a result the window
+# cannot produce — and it must still NAME the executed names, because that list
+# is what tells "a differently-named family" (set the prefix) from "no code-lane
+# run here" (name the lane).
+new_scen vacuousfamilybound
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9231 > "$SCEN/runs-$HEAD_VP"
+lane_jobset 9232 success 'changes' 'lint'
+{
+  i=1
+  while [ "$i" -le 205 ]; do
+    lane_line completed success mainfb00 $((9232 + i))
+    cp "$SCEN/jobs-9232.json" "$SCEN/jobs-$((9232 + i)).json"
+    i=$((i + 1))
+  done
+} > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a family that matches nothing in the whole policy window still REFUSES (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty reference certified"
+grep -q -- "--limit 200" "$SCEN/calls" && pass "…after widening to the policy bound" \
+  || fail "the widening did not reach the policy bound: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
+grep -q "widened to the policy bound of 200 runs and STILL selected nothing" "$SCEN/err" \
+  && pass "…and the refusal SAYS the window was read to the bound (a re-run cannot help)" \
+  || fail "the refusal does not name the bound stop: $(grep -o 'WHY:.*' "$SCEN/err" | head -c 400)"
+grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
+  && pass "…and NAMES the executed job names it actually saw (the only way to tell the two remedies apart)" \
+  || fail "the refusal does not name the job names it saw: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
+grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$SCEN/err" && pass "…and still names the prefix knob" \
+  || fail "the refusal dropped the prefix remedy"
+# …INCLUDING WHEN `--main-runs` WAS ITSELF THE BOUND. A `bound` stop note is a claim
+# about the widening, so the width the operator REQUESTED and the width the policy
+# ALLOWS must be told apart: with `--main-runs 200` no widening was possible, and a
+# note saying the listing "was widened to the policy bound" would be a fabrication in
+# a refusal the operator reads to decide what to do next. `$SCEN/err` is rewritten by
+# each invocation, so this reads the SECOND run's own refusal.
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+run_admin_here 42 --main-runs 200 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a family that matches nothing still refuses when the requested width IS the policy bound (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty reference certified"
+grep -q "the requested width WAS the bound, so nothing was widened" "$SCEN/err" \
+  && pass "…and the stop note says NO widening happened, because with --main-runs 200 none could" \
+  || fail "the stop note mis-states the stop: $(grep -o 'and the listing was read.*selected nothing' "$SCEN/err" | head -c 200)"
+grep -q "widened to the policy bound" "$SCEN/err" \
+  && fail "the refusal claims a WIDENING on a run where --main-runs 200 made one impossible" \
+  || pass "…and it does NOT claim the listing was widened"
+grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
+  && pass "…while still naming the executed job names it saw" \
+  || fail "the at-the-bound refusal dropped the job names: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
 
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test

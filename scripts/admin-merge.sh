@@ -339,20 +339,28 @@
 #                        Jobs API call, and an unbounded window turns a
 #                        correctness knob into a cost one. A non-numeric or
 #                        non-positive N is refused before any CI work.
-#                        For the LANE-COVERAGE gate the window counts MEASUREMENTS,
-#                        never raw positions (#4844): a push burst that cancels its
-#                        own predecessors leaves terminal-but-unmeasured
-#                        (`completed/cancelled`) runs, which used to fill the window
-#                        and push the last measured run out of it — refusing every
-#                        merge on a condition unrelated to the PR. The gate widens
-#                        the raw listing past those runs (doubling, bounded by 200)
-#                        while a window has yielded no executed shard at all, and
-#                        stops once N runs that FINISHED a measurement are consulted.
-#                        So N is the widening's STOPPING RULE, not a bound on
-#                        what one pass reads or on the call budget: a widened pass
-#                        reads its whole listing (at most 200 lane runs per side,
-#                        one Jobs-API call each), and the posted evidence says when
-#                        the reference came from a wider window than N.
+#                        For the LANE-COVERAGE gate the raw listing WIDENS while the
+#                        window has yielded no shard in the parity FAMILY at all
+#                        (doubling, bounded by 200). That is what makes a push burst
+#                        harmless (#4844): each push CANCELS its predecessor, leaving
+#                        terminal-but-unmeasured (`completed/cancelled`) runs that
+#                        used to fill the window and push the last measured run out
+#                        of it, refusing every merge on a condition unrelated to the
+#                        PR. Such a run is still CONSULTED — it may have executed
+#                        shards before it was cancelled, and skipping it would SHRINK
+#                        the reference — but it cannot end the search. N is the
+#                        STARTING WIDTH, not a stopping rule (#7734): the widening
+#                        stops on a family match, on the history being exhausted, or
+#                        at the 200-run bound — never merely because N runs finished
+#                        a measurement, since under --any-workflow those runs can be
+#                        non-code ones that carry no shard (measured: tortoise main
+#                        carried 2 distinct executed job names in a 10-run window and
+#                        3 in a 20-run one, none named `test*`, where 40 runs wide
+#                        carried 17). So N is not a bound on what one pass reads or on
+#                        the call budget: a widened pass reads its whole listing (at
+#                        most 200 lane runs per side, one Jobs-API call each), and the
+#                        posted evidence says when the reference came from a wider
+#                        window than N.
 #   --workflow <f>       the TEST lane both sides are read from (default
 #                        `python-ci.yml`). NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
@@ -1594,16 +1602,15 @@ GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
 #     fail-open (a shard present only in an older run vanished from the
 #     reference), so there is no independent sampling cap any more — instead the
 #     window itself is BOUNDED and validated (--main-runs, $MAIN_RUNS_MAX).
-#     The window counts MEASUREMENTS, not raw positions (#4844): a run that did not
-#     finish a measurement does not SPEND the window. A push burst cancels its own
-#     predecessors, and a cancelled run is `completed` — terminal, but measured
-#     nothing; charging the window for it pushed the last usable reference out of
-#     a window the operator asked for. It is still CONSULTED (a cancelled run may
-#     have executed shards before it was cancelled, and dropping those would SHRINK
-#     the reference — the #1319 fail-open). When a window yields no executed shard
-#     at all the listing widens past those runs (bounded by $MAIN_RUNS_MAX), and the
-#     evidence SAYS SO — a reference drawn from a wider window than requested is
-#     disclosed, never implied. DECLARED RESIDUAL: a run still IN FLIGHT is not
+#     A run that did not finish a measurement must not END the search (#4844). A
+#     push burst cancels its own predecessors, and a cancelled run is `completed` —
+#     terminal, but measured nothing; charging the operator's window for it pushed
+#     the last usable reference out of a window they asked for. It is still
+#     CONSULTED (a cancelled run may have executed shards before it was cancelled,
+#     and dropping those would SHRINK the reference — the #1319 fail-open), and the
+#     listing widens while the window holds no shard in the parity FAMILY
+#     (bounded by $MAIN_RUNS_MAX). The evidence SAYS SO — a reference drawn from a
+#     wider window than requested is disclosed, never implied. DECLARED RESIDUAL: a run still IN FLIGHT is not
 #     consulted, so a shard such a run has ALREADY executed is unobserved until it
 #     concludes. Consulting a still-changing job list instead would make main's
 #     mid-flight lane block every merge — the failure this change removes.
@@ -1688,6 +1695,32 @@ lane_count() {
   local n
   n="$(grep -c '[^[:space:]]' "$1" 2>/dev/null)"
   printf '%s' "${n:-0}"
+}
+
+# lane_job_sample <all-names-file> [<max>] — a bounded, ` | `-separated rendering
+# of the executed job names a lane window carried. This is what lets a family
+# refusal NAME the names it saw (#7734): the COUNT alone cannot distinguish "the
+# shards are named differently" (remedy: ADMIN_MERGE_LANE_JOB_PREFIX) from "the
+# window held no run of a code lane at all" (remedy: name the lane with
+# --workflow), and a refusal that cannot be acted on is the defect this exists to
+# remove. The separator is ` | ` and NOT a comma because a GitHub job NAME may
+# contain one — this repo's own vocabulary includes `test (a, docker)`, which a
+# comma-joined sample would render as two names. Bounded because a wide window
+# can carry dozens of names and the refusal is read by a human; the overflow is
+# COUNTED rather than dropped silently. Prints nothing for an empty set, never a
+# blank line (the empty-stream rule that `lane_count` and `lane_shards` obey).
+lane_job_sample() {
+  local f="$1" max="${2:-12}" total="" sample=""
+  [ -f "$f" ] || return 0
+  total="$(sort -u "$f" 2>/dev/null | grep -c '[^[:space:]]' || true)"; total="${total:-0}"
+  [ "$total" -gt 0 ] || return 0
+  sample="$(sort -u "$f" | grep '[^[:space:]]' | head -n "$max" \
+    | awk 'BEGIN{ORS=""} {if (n++) printf " | "; printf "%s", $0}')"
+  if [ "$total" -gt "$max" ]; then
+    printf '%s (+%s more)' "$sample" "$((total - max))"
+  else
+    printf '%s' "$sample"
+  fi
 }
 
 # lane_shards <run-id> <all-names-out> — the TEST shards this run EXECUTED, one
@@ -1776,21 +1809,23 @@ for n in sorted(names):
 # questions and the gate needs both (#4844):
 #
 #   lane_run_in_flight — is this run still RUNNING? Only a NAMED in-flight
-#     spelling counts (see the allow-list note below). An in-flight run cannot
-#     spend the window and is not consulted — its job list is still changing, so
-#     the lane's shard set is not settled (the declared residual above).
+#     spelling counts (see the allow-list note below). An in-flight run is NOT
+#     CONSULTED — its job list is still changing, so the lane's shard set is not
+#     settled (the declared residual above) — and it is counted, so a refusal can
+#     say how much of the window was mid-run.
 #
 #   lane_run_measured — did this run FINISH a measurement? A `completed` run may
 #     still be `cancelled`, `skipped`, `stale`, `neutral` or `startup_failure`;
 #     those measured nothing, and a push burst leaves a window FULL of them (each
-#     push cancels its predecessor, and a cancelled run is `completed`). This is
-#     what spends the operator's `--main-runs` window. It is the parser's own
-#     vocabulary (`success|failure|timed_out` credit `tested`), not a new one.
+#     push cancels its predecessor, and a cancelled run is `completed`). It is
+#     the parser's own vocabulary (`success|failure|timed_out` credit `tested`),
+#     not a new one — and since #7734 it is a DIAGNOSTIC only: it is reported in
+#     the refusal, and it no longer stops the widening.
 #
-# CONSULTING and SPENDING are therefore separate: a cancelled run is still
-# consulted (it may have executed shards before it was cancelled, and dropping
-# those would SHRINK the reference — the #1319 fail-open), but it does not spend
-# the window.
+# CONSULTING is therefore governed by the in-flight allow-list ALONE: a cancelled
+# or otherwise unmeasured run is still consulted (it may have executed shards
+# before it was cancelled, and dropping those would SHRINK the reference — the
+# #1319 fail-open).
 #
 # A NON-FINISHED RUN IS TRUSTED TO BE IN FLIGHT ONLY FOR A NAMED SPELLING. The
 # polarity is an ALLOW-list, the same one the check-run surface uses (#1353: as a
@@ -1818,7 +1853,7 @@ lane_run_measured() {
 # full is the fail-open this gate prevents. No name is written for an empty
 # shard set.
 #
-# #4844 — the window is spent on MEASUREMENTS, not on raw positions.
+# #4844 — a terminal run that MEASURED NOTHING must not end the search.
 #
 #   * The id guard failed the WHOLE side for a line whose run could not be
 #     addressed — including a run that had not finished. Refusing on a
@@ -1832,22 +1867,54 @@ lane_run_measured() {
 #     predecessor, leaving `completed/cancelled` runs that are terminal but
 #     MEASURED NOTHING — filled it and pushed the last usable reference OUT of
 #     it. The gate then refused every PR, naming a shard family when the missing
-#     thing was the reference. Now a run spends the window only if it FINISHED a
-#     measurement; when a window yields no executed shard at all the listing
-#     WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until one appears, the history
-#     is exhausted, or the bound is reached. The ordinary path is unchanged —
-#     widening happens only where the old code refused.
+#     thing was the reference. Now the listing WIDENS (doubling, bounded by
+#     $MAIN_RUNS_MAX) while the window has yielded no FAMILY shard, so such a run
+#     cannot end the search, and the loop stops on a family match, on the history
+#     being exhausted, or at the bound. CONSULTATION is a SEPARATE question and
+#     `lane_run_in_flight` is its ONLY filter: a terminal-but-unmeasured run is
+#     still fully consulted (it may have executed shards before it was cancelled,
+#     and skipping it would SHRINK the reference). The ordinary path is unchanged
+#     — widening happens only where the old code refused.
+#
+#   * ⛔ `--main-runs` IS THE STARTING WIDTH, NOT THE STOPPING RULE, AND ONLY THREE
+#     CONDITIONS STOP THE WIDENING (#7734). `--main-runs` USED to stop it too:
+#     the loop broke as soon as `$limit` runs that had FINISHED A MEASUREMENT
+#     were counted. Under `--any-workflow` that counter is not a statement about
+#     the LANE at all — an `issue_comment` run of a reporting workflow is
+#     `completed/success`, so it SPENT the budget while contributing no test
+#     shard. Measured on the target repo (tortoise main, `--any-workflow`, the
+#     rail's default `--main-runs 10`): the 10-run window carried 2 distinct
+#     executed job names and the widened 20-run window 3, NONE of them `test*`,
+#     so the widening stopped on the spent budget with the family still EMPTY and
+#     refused with "the shard FAMILY selects nothing on main"; the SAME listing
+#     read 40 runs wide carried 36 distinct names, 17 of them `test*`. The code
+#     lane was one doubling away the whole time, and the refusal's remedy
+#     (`ADMIN_MERGE_LANE_JOB_PREFIX`) could never have reached it. The loop now
+#     stops ONLY on a family match, on the history being exhausted, or at
+#     $MAIN_RUNS_MAX. The direction is fail-safe, and NOT because a wider window
+#     is unconditionally stricter — the two sides differ, so say which. MAIN's
+#     reference can only GROW, so the demanded set grows: strictly stricter. The
+#     PR side's set grows too, which SHRINKS the reported gap (the looser
+#     direction) — sound only because every run consulted on that side carries
+#     THIS head's sha, so every name added was genuinely executed by the head in
+#     question; the certificate's claim ("PR ⊆ main" is not the claim — "main's
+#     shards ⊆ the PR's executed set" is) becomes more true, never less.
 #
 # The Jobs-API cost does NOT track the operator's window on the widening path,
-# and that is a deliberate trade. `--main-runs` is the widening's STOPPING RULE
-# (it widens while fewer than $limit runs that FINISHED a measurement have been
-# counted), not a bound on what one pass reads: a widened pass consults its whole
-# listing, so both the runs read and the measured runs counted can exceed $limit —
-# bounded by $MAIN_RUNS_MAX per side, which is the call budget, because every
-# CONSULTED run costs one job-list read. Reading each one is the only way to learn
-# that a terminal run measured nothing — refusing instead is the bug this fixes
-# (#4844). The LANE_SET_* globals report what the window actually held, so a
-# refusal can name the condition it found rather than a neighbouring one.
+# and that is a deliberate trade. A widened pass consults its whole listing, so
+# the runs read CAN exceed $limit — and so can the measured runs counted — bounded
+# by $MAIN_RUNS_MAX per side, which is the call budget, because every CONSULTED run
+# costs one job-list read. Dropping the budget break means the widening is no
+# longer stopped by the measurement count, so a window FULL of measuring,
+# non-family runs continues to the bound — or to the end of the history, whichever
+# comes first. That is not a new ceiling: an operator who passed `--main-runs 200`
+# already pays it, and the all-non-measuring path already reached it under the old
+# code (#4844's `vacuouswidenbound` pinned `--limit 200` before this change). It is
+# paid only where the REQUESTED window carried no family shard — the same path on
+# which the old code could refuse with a remedy the operator could not act on. The
+# LANE_SET_* globals report what the window actually held — including a bounded
+# SAMPLE of the executed job names, so a refusal can NAME what it saw instead of
+# only what it did not (#7734).
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
   local listing="$TMP/lane-runs.tmp" shards="$TMP/lane-shards.tmp"
@@ -1859,6 +1926,7 @@ lane_shard_set() {
   : > "$allnames"
   LANE_SET_LISTED=0; LANE_SET_WINDOW="$limit"; LANE_SET_CONSULTED=0
   LANE_SET_MEASURED=0; LANE_SET_NONMEASURING=0; LANE_SET_JOBS=0
+  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""
   while :; do
     if ! lane_run_ids "$flag" "$value" "$raw" > "$listing"; then
       say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
@@ -1892,9 +1960,9 @@ lane_shard_set() {
         return 1
       fi
       if lane_run_in_flight "$status"; then
-        # In flight: not read at all (the declared residual above), and it cannot
-        # spend the window. Counted so the refusal can say how much of the window
-        # was mid-run rather than implying the lane was empty.
+        # In flight: not read at all (the declared residual above). Counted so the
+        # refusal can say how much of the window was mid-run rather than implying
+        # the lane was empty.
         nonmeas=$((nonmeas + 1))
         continue
       fi
@@ -1923,14 +1991,14 @@ lane_shard_set() {
     [ "$listed" -lt "$raw" ] && LANE_SET_WINDOW="$listed"
     LANE_SET_CONSULTED="$consulted_n"; LANE_SET_MEASURED="$measured"
     LANE_SET_NONMEASURING="$nonmeas"
-    # Widen ONLY while the window has produced no executed shard AT ALL: an empty
-    # reference is the one condition more runs can repair. Stop once the
-    # operator's window is spent on runs that FINISHED a measurement, once the
-    # history is exhausted, or at the policy bound.
+    # Widen while the window has produced no FAMILY shard: an empty reference is
+    # the one condition more runs can repair. The three stops below are the ONLY
+    # ones — see the `--main-runs` bullet above `lane_shard_set` for why the
+    # `measured >= limit` budget break that used to sit among them is gone, and
+    # for why dropping it is fail-safe rather than permissive (#7734).
     [ -s "$out" ] && break
-    [ "$measured" -ge "$limit" ] && break
-    [ "$listed" -lt "$raw" ] && break
-    [ "$raw" -ge "$MAIN_RUNS_MAX" ] && break
+    [ "$listed" -lt "$raw" ] && { LANE_SET_EMPTY_STOP="history"; break; }
+    [ "$raw" -ge "$MAIN_RUNS_MAX" ] && { LANE_SET_EMPTY_STOP="bound"; break; }
     raw=$((raw * 2))
     [ "$raw" -gt "$MAIN_RUNS_MAX" ] && raw="$MAIN_RUNS_MAX"
   done
@@ -1939,6 +2007,11 @@ lane_shard_set() {
   # double-counted and not dropped).
   LANE_SET_JOBS="$(sort -u "$allnames" 2>/dev/null | grep -c '[^[:space:]]' || true)"
   LANE_SET_JOBS="${LANE_SET_JOBS:-0}"
+  # A bounded SAMPLE of those names, rendered for the refusal (#7734). The count
+  # alone cannot tell "this lane's shards are named differently" from "no run of a
+  # code lane was in the window at all", and those two have opposite remedies —
+  # so the refusal NAMES what it saw. Read BEFORE the accumulator is removed.
+  LANE_SET_JOB_SAMPLE="$(lane_job_sample "$allnames")"
   rm -f "$allnames"
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
@@ -2280,6 +2353,24 @@ lane_parity_check() {
   local main_consulted="$LANE_SET_CONSULTED" main_nonmeas="$LANE_SET_NONMEASURING"
   local main_measured="$LANE_SET_MEASURED"
   local main_jobs="$LANE_SET_JOBS"
+  # #7734: WHY the widening stopped, and WHAT the window actually carried. Both
+  # belong in the refusal — the count alone cannot be acted on, and "the family
+  # is named differently" versus "no code-lane run was in this window" have
+  # opposite remedies.
+  local main_job_sample="$LANE_SET_JOB_SAMPLE" main_empty_stop="$LANE_SET_EMPTY_STOP"
+  local main_stop_note=""
+  case "$main_empty_stop" in
+    history) main_stop_note="and the LANE's run history was read IN FULL (the listing returned fewer runs than were asked for) without finding one" ;;
+    bound)
+      # `--main-runs` may BE the bound, in which case no widening happened and a
+      # note claiming one would be false — so the two cases are stated apart.
+      if [ "$main_window" -gt "$MAIN_RUNS" ]; then
+        main_stop_note="and the listing was widened to the policy bound of ${MAIN_RUNS_MAX} runs and STILL selected nothing"
+      else
+        main_stop_note="and the listing was read at the policy bound of ${MAIN_RUNS_MAX} runs — the requested width WAS the bound, so nothing was widened — and STILL selected nothing"
+      fi ;;
+    *)       main_stop_note="and no run in that window executed a job in the family" ;;
+  esac
   LANE_PARITY_MAIN_WINDOW="$main_window"
   # Decide on NAMES, never on file size (see lane_count).
   if [ "$(lane_count "$TMP/lane-main.txt")" -eq 0 ]; then
@@ -2299,9 +2390,9 @@ lane_parity_check() {
     # read is STATED either way, because "widened past --main-runs" is a fact the
     # operator must be able to audit.
     if [ "$main_jobs" -eq 0 ]; then
-      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
-      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX"
+      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
     fi
     return 2
   fi
@@ -5227,7 +5318,7 @@ $attribution_line"
       # a WIDENED body (tests/admin-merge) — the source-line check alone cannot
       # catch a suffix added to the line's VALUE.
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
-        parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
+        parity_window_note="   reference window: main's lane reference was widened to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested ${MAIN_RUNS}-run window carried no shard in the parity family '${LANE_JOB_PREFIX}*'"
       fi
     fi
     # ── THE #6928 FORGIVENESS LINE, ON THE CERTIFICATE ──────────────────────
