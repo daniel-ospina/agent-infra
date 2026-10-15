@@ -654,10 +654,12 @@ while true; do
   echo "[scope] open=$OPEN_N -> $SCOPE_MODE ($SCOPE_WHY)" >> "$LOG"
   # END scope-select
   # ── repo authority for THIS cycle (agent-infra#1764) ────────────────────────
-  # Resolved per cycle: branch protection can change while the controller runs, and when REQ is
-  # already set in the environment this costs NO gh call at all (the resolver short-circuits on
-  # REQ_OVERRIDE). The required set is the repo's declaration of what must gate a merge; the
-  # merge authority follows from it, so both are read from ONE home.
+  # Resolved per cycle: branch protection can change while the controller runs. With REQ already set
+  # in the environment the RESOLVER costs no gh call (it short-circuits on REQ_OVERRIDE), but the
+  # authority-flip DETECTOR below does re-read branch protection on the cycles where an override is
+  # active (review round 7 — the earlier comment claimed zero gh calls and was wrong). The required
+  # set is the repo's declaration of what must gate a merge; the merge authority follows from it,
+  # so both are read from ONE home.
   # ⛔ resolve_required_checks, NEVER `REQ="$(resolve_required_checks …)"`: the command substitution
   # subshells the resolver, REQ_SOURCE cannot survive the assignment, and the ⚠️ fallback warning
   # in the case below would never fire.

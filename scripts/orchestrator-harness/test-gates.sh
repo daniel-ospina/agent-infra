@@ -348,6 +348,47 @@ done
   && { echo "  ✅ an EMPTY head REFUSES (exit 7) instead of running an un-keyed, never-parking retry loop"; PASS=$((PASS+1)); } \
   || { echo "  ❌ an empty head exited $ehrc (want 7, log-hit=$_hits) — the cap is unreachable without a head, so the rail is re-run every cycle"; FAIL=$((FAIL+1)); }
 
+# (g3) the count is HEAD-KEYED, so a count file from a DIFFERENT head must NOT block the new head
+# (review round 7, P2): without the reset the worker sees the old head's count at the cap and PARKS
+# the new head without ever running the rail — the stale-park deadlock of round 1, one layer down.
+cat > "$TMP/railrepo/scripts/admin-merge.sh" <<RAILSTUB
+#!/bin/bash
+printf '%s\n' "\$PWD" "\$*" > "$TMP/railO/rail-argv.txt"
+exit 0
+RAILSTUB
+chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+rm -f "$TMP/railO/state/merged-1764.done" "$TMP/railO/rail-argv.txt"
+printf '%s %s\n' aaaa1111 3 > "$TMP/railO/state/railcount-1764"    # an OLDER head, already AT the cap
+printf '%s\n' aaaa1111 > "$TMP/railO/state/parked-1764"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=eeee5555; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; nhrc=$?
+[ "$nhrc" = "0" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
+  && { echo "  ✅ a NEW head RE-ARMS the head-keyed budget (a stale count cannot park a head the rail never saw)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a new head hit the OLD head's cap (rc=$nhrc, merged=$([ -f "$TMP/railO/state/merged-1764.done" ] && echo yes || echo no), parked=[$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)]) — the rail never ran"; FAIL=$((FAIL+1)); }
+
+# (g4) the COERCIONS are load-bearing (review round 7, P2). A typo'd RAIL_TRIES must not disable the
+# cap: `[ 3 -ge 99999999999999999999 ]` errors FALSE on bash 3.2 (the shipped /bin/bash), so
+# without the coercion the park never lands and the rail is re-run every cycle — the API burn the
+# cap exists to close.
+printf '%s %s\n' aaaa1111 3 > "$TMP/railO/state/railcount-1764"
+printf '%s\n' zzzz9999 > "$TMP/railO/state/parked-1764"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; RAIL_TRIES=99999999999999999999; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=aaaa1111; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1
+[ "$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)" = "aaaa1111" ] \
+  && { echo "  ✅ a 20-digit RAIL_TRIES is coerced back into range (the cap still trips — bash 3.2 errors that compare FALSE)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a 20-digit RAIL_TRIES disabled the cap: parked=[$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)] (want aaaa1111) — the rail is re-run every cycle"; FAIL=$((FAIL+1)); }
+# …and a CORRUPT count is re-sanitised rather than propagated into the arithmetic.
+printf '%s %s\n' aaaa1111 99999999999999999999 > "$TMP/railO/state/railcount-1764"
+rm -f "$TMP/railO/state/parked-1764"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=aaaa1111; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1
+_cnt2="$(awk '{print $2}' "$TMP/railO/state/railcount-1764" 2>/dev/null)"
+case "${_cnt2:-}" in ''|*[!0-9]*|??????????*) echo "  ❌ a corrupt count was propagated into the arithmetic (railcount now [$_cnt2])"; FAIL=$((FAIL+1)) ;;
+  *) echo "  ✅ a corrupt count is reset to a sane value (railcount now [$_cnt2]) — it cannot overflow the cap into wrapping"; PASS=$((PASS+1)) ;; esac
+
 # (h) the controller's GREEN arm dispatches the rail — BEHAVIOURAL (review P2, round 1): the
 # 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
 # (`= "rail" ] && false`) still satisfies while every PR falls through to a raw merge on a rail
@@ -356,12 +397,12 @@ done
 # must do the reverse.
 sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
 if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.sh" && bash -n "$TMP/greenarm.sh" 2>/dev/null; then
-  drive_green() { # drive_green <authority> <req> -> writes $TMP/g.spy / $TMP/g.tspy / LOG
+  drive_green() { # drive_green <authority> <req> [<gate-name>] -> writes $TMP/g.spy / g.tspy / LOG
     # `: >`, never `rm -f` (review P2, round 2): an ABSENT file made `! grep -q new-session`
     # pass vacuously in the gate drive — the tmux mock never ran, so there was no file to read.
     : > "$TMP/g.spy"; : > "$TMP/g.tspy"; : > "$TMP/g.log"
     ( PR=1765; OR=daniel-ospina/agent-infra; REPO="$TMP/grepo"; BR=fix/x; HEAD_N=deadbeef
-      MR=3; MERGE_AUTHORITY="$1"; REQ="$2"; REVIEW_GATE='ai-review-gate'
+      MR=3; MERGE_AUTHORITY="$1"; REQ="$2"; REVIEW_GATE="${3:-ai-review-gate}"
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
@@ -394,6 +435,13 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   else
     echo "  ❌ GREEN+rail: the 7-name set did not survive the spawn line (expected [$_EXP7]; tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
   fi
+  drive_green rail "$_REQ7" my-gate
+  _EXPG="REVIEW_GATE=$(printf '%q' 'my-gate')"
+  if grep -qF -- "$_EXPG" "$TMP/g.tspy"; then
+    echo "  ✅ GREEN+rail: a NON-DEFAULT REVIEW_GATE is carried to the worker too (one resolution, one authority)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+rail: the spawn line dropped REVIEW_GATE=[$_EXPG] (tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — the worker re-resolves with the DEFAULT gate name and can disagree with the controller about the authority"; FAIL=$((FAIL+1))
+  fi
   drive_green gate 'pipeline-compliance'
   if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'new-session' "$TMP/g.tspy"; then
     echo "  ✅ GREEN+gate: the squash merge path is UNCHANGED (no worker detour)"; PASS=$((PASS+1))
@@ -411,6 +459,14 @@ _NQ="$(grep -cF -- "$_QPAT" "$ORCH")"
 [ "${_NQ:-0}" = "2" ] \
   && { echo "  ✅ every merge spawn line (${_NQ} of 2) %q-quotes the carried REQ"; PASS=$((PASS+1)); } \
   || { echo "  ❌ expected 2 %q-quoted spawn lines, found ${_NQ:-0} — one spawn's worker dies at sh -c on a multi-name REQ"; FAIL=$((FAIL+1)); }
+# …and the GATE NAME must travel with it (review round 7, P2): §h's old guard counted only REQ, so
+# dropping REVIEW_GATE from the spawn line stayed green — and a worker that re-resolves under the
+# DEFAULT gate name can land on a different authority than the controller classified under.
+_GPAT='REVIEW_GATE=$(printf '\''%q'\'' "$REVIEW_GATE")'
+_NG="$(grep -cF -- "$_GPAT" "$ORCH")"
+[ "${_NG:-0}" = "2" ] \
+  && { echo "  ✅ every merge spawn line (${_NG} of 2) %q-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ expected 2 %q-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
 
 # (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
 # without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE
@@ -690,6 +746,18 @@ if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
   case "$_o3" in
     *"RAW gh pr merge"*) echo "  ✅ …and the warning names the consequence (a raw merge, not merely a different label)"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ the authority-change warning does not name the consequence — log=[$_o3]"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⚠️ review round 7, P2: an override active while the read FAILS must NOT warn — the baseline is
+  # `unknown`, which is not a disagreement. Dropping that clause emitted a false "CHANGES the merge
+  # authority ('unknown' -> 'rail')" line, and the README tells operators to treat that line as an
+  # error, so a false one costs real attention.
+  _o4="$(REVIEW_GATE_SOURCE=env; OR=daniel-ospina/agent-infra; LOG="$TMP/ovr4.log"; : > "$LOG"; REQ_SOURCE=protection; REQ='pipeline-compliance'; \
+    MERGE_AUTHORITY='rail'; required_checks() { return 1; }; \
+    # shellcheck disable=SC1090
+    . "$TMP/ovr.sh" >/dev/null 2>&1; cat "$LOG")"
+  case "$_o4" in
+    *"CHANGES the merge authority"*) echo "  ❌ an UNREADABLE baseline drew a false authority-change warning — log=[$_o4]"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ✅ an unreadable baseline (unknown) draws NO change warning — only a real disagreement does"; PASS=$((PASS+1)) ;;
   esac
   # (t) a MALFORMED override is discarded, loudly, and never travels the contract (review round 5).
   # The screen lived only in required_checks, so an override skipped it: `REQ='ci,lint'` reached the
