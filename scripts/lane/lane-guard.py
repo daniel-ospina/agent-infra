@@ -64,7 +64,14 @@ if not os.path.exists(os.path.join(SCRIPTS, "lane-status.py")):
 # ceiling for its own calls (60s); the GUARD deliberately keeps a tighter one, because its
 # job is to answer "may I send?" promptly — an answer of UNKNOWN at 20s is more useful to a
 # caller than a real answer at 90s, and the caller's remedy (retry next tick) is the same.
-os.environ.setdefault("CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC", "20")
+#
+# ⛔ ASSIGNED, NOT `setdefault`. Both production callers export this to 60 BEFORE running the
+# guard (`safe-send.sh:7`, `heartbeat-loop.sh:26`), so a `setdefault` could never lower it and
+# the tighter ceiling documented right here was an INERT ENFORCER: it applied on no path the
+# fleet uses, and a single inherited cmux call could run the whole 60s. The guard is a SEPARATE
+# PROCESS, so overriding it here narrows only the guard's own cmux calls (the lane-status
+# primitives it imports) — the caller's process and its other cmux calls are untouched.
+os.environ["CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC"] = "20"
 
 
 def _load_lane_status():

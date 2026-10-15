@@ -325,14 +325,44 @@ for r in rows:
     a=(r.get("stale_s") or 0)//60
     if a>=CAP_IDLE_MIN: cap.append("%s(%dm)" % (r["lane"], a))
 cap.sort()
-print("ALERTS=\"" + " | ".join(alert).replace("\"", "") + "\";KNOWN=\"" + " | ".join(known).replace("\"", "") + "\";N_ACT=%d;N_WAIT=%d;N_TOTAL=%d;N_ALERT=%d;N_KNOWN=%d;CAP=\"%s\";N_CAP=%d" % (act, wait, len(rows), len(alert), len(known), " | ".join(cap), len(cap)))
+# ⛔ ONE FIELD PER LINE — DATA, NEVER SHELL SYNTAX. This contract used to be emitted as
+# `ALERTS="…";KNOWN="…";…` and consumed with `eval "$EV"`, so a lane label — taken
+# VERBATIM from the live pane title (`lane-status.py` `_live_label`) and joined into these
+# fields — containing backticks or `$( )` was EXECUTED as shell inside the orchestrator
+# heartbeat, once per tick, silently. Reproduced 2026-10-06 with a production-shaped row:
+# a label whose backtick span touched a file created it. The caller now reads these values
+# POSITIONALLY (one `read` per field) and never re-parses them, so no character in a label
+# can become code. A newline would forge a field boundary, so CR/LF are flattened.
+def _clean(v):
+    return str(v).replace("\r", " ").replace("\n", " ")
+for _v in (" | ".join(alert), " | ".join(known), act, wait, len(rows),
+           len(alert), len(known), " | ".join(cap), len(cap)):
+    print(_clean(_v))
 ' 2>/dev/null)
 
 if [ -z "$EV" ]; then
   log "NOTE lane-status produced no output"
   N_ACT=0; N_WAIT=0; N_TOTAL=0; N_ALERT=0; N_KNOWN=0; ALERTS=""; KNOWN=""; CAP=""; N_CAP=0
 else
-  eval "$EV"
+  # ⛔ NO `eval`. The block above prints ONE FIELD PER LINE (ALERTS, KNOWN, N_ACT, N_WAIT,
+  # N_TOTAL, N_ALERT, N_KNOWN, CAP, N_CAP) and these values EMBED A LANE LABEL taken from
+  # the live pane title. `eval "$EV"` executed whatever the label contained — a title with
+  # backticks or `$( )` became arbitrary code in the orchestrator heartbeat, once a tick
+  # (reproduced 2026-10-06: a backticked label created a file). Read positionally instead:
+  # the values are assigned as DATA and never re-parsed. Initialised first so `set -u`
+  # cannot trip on a short read.
+  ALERTS=""; KNOWN=""; N_ACT=0; N_WAIT=0; N_TOTAL=0; N_ALERT=0; N_KNOWN=0; CAP=""; N_CAP=0
+  {
+    IFS= read -r ALERTS
+    IFS= read -r KNOWN
+    IFS= read -r N_ACT
+    IFS= read -r N_WAIT
+    IFS= read -r N_TOTAL
+    IFS= read -r N_ALERT
+    IFS= read -r N_KNOWN
+    IFS= read -r CAP
+    IFS= read -r N_CAP
+  } <<< "$EV"
   log "VERDICTS known=$N_KNOWN: $KNOWN"
 fi
 if [ "$RL" = "1" ]; then N_ALERT=0; ALERTS=""; N_KNOWN=0; KNOWN=""; fi
@@ -359,7 +389,23 @@ TRIAGE_READY=""; TRIAGE_CONTINUE=""; TRIAGE_HUMAN=""; TRIAGE_EXT=""; TRIAGE_STAL
 # $DEST/scripts/ (pi-bootstrap/setup.sh lane_srcs), and the old state/ path is a
 # location the farm never provisions (and never removes) — so this call kept
 # executing the un-versioned copy and a merged fix could never reach the fleet.
-TRV=$(/usr/bin/python3 "$SCRIPTS/lane-triage.py" 2>/dev/null) && eval "$TRV" || log "NOTE triage unavailable -- mechanical verdicts stand"
+if TRV=$(/usr/bin/python3 "$SCRIPTS/lane-triage.py" 2>/dev/null) && [ -n "$TRV" ]; then
+  # ⛔ NO `eval`. lane-triage.py prints ONE FIELD PER LINE (READY, CONTINUE, HUMAN, EXT,
+  # STALL, HELD, N_TRIAGE) and those values embed lane labels taken from the live pane
+  # title — `eval "$TRV"` executed whatever a label contained. Read positionally; the
+  # values are DATA and are never re-parsed.
+  {
+    IFS= read -r TRIAGE_READY
+    IFS= read -r TRIAGE_CONTINUE
+    IFS= read -r TRIAGE_HUMAN
+    IFS= read -r TRIAGE_EXT
+    IFS= read -r TRIAGE_STALL
+    IFS= read -r TRIAGE_HELD
+    IFS= read -r N_TRIAGE
+  } <<< "$TRV"
+else
+  log "NOTE triage unavailable -- mechanical verdicts stand"
+fi
 if [ "${N_TRIAGE:-0}" -gt 0 ]; then
   # JEV's DONE_READY supersedes the stale-mtime CAPACITY list; the screened-out lanes keep theirs.
   CAP="$TRIAGE_READY"

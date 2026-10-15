@@ -24,7 +24,9 @@ are sent to Jev, so the cost stays at one call for the whole idle set (~$0.006 m
 FAIL-OPEN: if the snapshot or Jev fails, it prints nothing and exits non-zero, and the caller MUST
 fall back to the mechanical verdicts. A classifier outage must never hide capacity.
 
-Usage:  lane-triage.py            -> prints shell assignments:  TRIAGE_READY=... TRIAGE_CONTINUE=...
+Usage:  lane-triage.py            -> prints ONE FIELD PER LINE (READY, CONTINUE, HUMAN,
+                                       EXT, STALL, HELD, N_TRIAGE) -- positional DATA for
+                                       the caller's `read`s, never `eval`'d
         lane-triage.py --json     -> prints the raw dict
 """
 import json
@@ -35,6 +37,18 @@ import sys
 STATE = os.path.expanduser("~/.pi/agent/state")
 PY = "/usr/bin/python3"
 IDLE_ISH = {"DONE-IDLE", "WIP-IDLE", "UNBOUND", "WEDGED", "LONG-TOOL", "CHILD-OVERDUE", "CHILD-STUCK"}
+
+
+def _line(v):
+    """One field of the caller's contract, as DATA.
+
+    The caller reads these POSITIONALLY and never `eval`s them. The contract used to be
+    ``TRIAGE_READY="…";TRIAGE_CONTINUE="…";…`` consumed with ``eval "$TRV"``, so a lane
+    label -- taken verbatim from the live pane title -- containing backticks or ``$( )``
+    was EXECUTED as shell in the orchestrator heartbeat (reproduced 2026-10-06). A newline
+    in a value would forge a field boundary, so CR/LF are flattened.
+    """
+    return str(v).replace("\r", " ").replace("\n", " ")
 
 
 def pane_spinning(ws):
@@ -81,9 +95,12 @@ def main():
         out = {"buckets": {k: [] for k in
                ("CONTINUE", "BLOCKED_HUMAN", "BLOCKED_EXTERNAL", "DONE_READY", "STALLED")},
                "screen": 0, "source": "none"}
-        print(json.dumps(out, indent=1) if as_json else "") 
+        print(json.dumps(out, indent=1) if as_json else "")
         if not as_json:
-            print("TRIAGE_READY=\"\";TRIAGE_CONTINUE=\"\";TRIAGE_HUMAN=\"\";TRIAGE_EXT=\"\";TRIAGE_STALL=\"\";N_TRIAGE=0")
+            # Seven positional fields, matching the caller's reads exactly.
+            for _ in range(6):
+                print("")
+            print(0)
         return 0
 
     # 2. one Jev call for the whole idle set (snapshot -> typed verdicts)
@@ -132,10 +149,12 @@ def main():
     if as_json:
         print(json.dumps(out, indent=1))
     else:
-        esc = lambda xs: " | ".join(xs).replace('"', "")
-        print('TRIAGE_READY="%s";TRIAGE_CONTINUE="%s";TRIAGE_HUMAN="%s";TRIAGE_EXT="%s";TRIAGE_STALL="%s";TRIAGE_HELD="%s";N_TRIAGE=%d'
-              % (esc(buckets["DONE_READY"]), esc(buckets["CONTINUE"]), esc(buckets["BLOCKED_HUMAN"]),
-                 esc(buckets["BLOCKED_EXTERNAL"]), esc(buckets["STALLED"]), esc(held), screened))
+        # One field per line, in the caller's read order. No shell syntax, so no label can
+        # be interpreted as code (see `_line`).
+        for field in (buckets["DONE_READY"], buckets["CONTINUE"], buckets["BLOCKED_HUMAN"],
+                      buckets["BLOCKED_EXTERNAL"], buckets["STALLED"], held):
+            print(_line(" | ".join(field)))
+        print(screened)
     return 0
 
 

@@ -79,12 +79,12 @@ def _screener_python() -> str:
     return m.group(1)
 
 
-def _run_block(home: Path) -> str:
-    """Execute the extracted block against ROWS under a throwaway HOME."""
+def _run_block(home: Path, rows=None) -> str:
+    """Execute the extracted block against `rows` (default ROWS) under a throwaway HOME."""
     env = dict(os.environ, HOME=str(home))
     proc = subprocess.run(
         [sys.executable, "-c", _screener_python()],
-        input=json.dumps(ROWS),
+        input=json.dumps(ROWS if rows is None else rows),
         capture_output=True,
         text=True,
         env=env,
@@ -94,11 +94,42 @@ def _run_block(home: Path) -> str:
     return proc.stdout.strip()
 
 
+# The block's contract, in read order. The current wire format is ONE FIELD PER LINE (data,
+# never shell syntax); the pre-fix format was a single `NAME="…";…` line. Accepting both is
+# what keeps the screener tests testing the screener rather than the wire format.
+_FIELDS = ["ALERTS", "KNOWN", "N_ACT", "N_WAIT", "N_TOTAL", "N_ALERT", "N_KNOWN", "CAP", "N_CAP"]
+
+
 def _field(out: str, name: str) -> str:
-    """`NAME="…"` from the `KEY="value";KEY="value";…` line the block prints."""
+    """`NAME`'s value from either wire format: `NAME="…"` (pre-fix) or positional (now)."""
     m = re.search(rf'(?:^|;){name}="([^"]*)"', out)
-    assert m, f"{name} not in screener output: {out!r}"
-    return m.group(1)
+    if m:
+        return m.group(1)
+    assert name in _FIELDS, name
+    return out.split("\n")[_FIELDS.index(name)]
+
+
+def _ev_consumer_region() -> str:
+    """The `$EV` consumer block, verbatim, so the real code is what runs in the pin."""
+    lines = HEARTBEAT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == 'if [ -z "$EV" ]; then')
+    for j in range(start + 1, len(lines)):
+        if lines[j] == "fi":
+            return "\n".join(lines[start:j + 1])
+    raise AssertionError("could not locate the $EV consumer block")
+
+
+def _trv_consumer_region() -> str:
+    """The `$TRV` consumer, verbatim (one line pre-fix, an if/else/fi now)."""
+    lines = HEARTBEAT.read_text(encoding="utf-8").splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if ln.startswith('TRV=$(') or ln.startswith('if TRV=$('))
+    if 'eval "$TRV"' in lines[start]:
+        return lines[start]
+    for j in range(start + 1, len(lines)):
+        if lines[j] == "fi":
+            return "\n".join(lines[start:j + 1])
+    raise AssertionError("could not locate the $TRV consumer block")
 
 
 def _write_screener(home: Path, rc: int) -> Path:
@@ -651,3 +682,135 @@ def test_queue_dispatch_still_dispatches_a_fully_verified_idle_row():
     legacy.pop("degraded")
     legacy.pop("session_verified")
     assert mod.no_wip(legacy) == (True, "")
+
+
+# ── P1 (review @9f5bed49): the label-derived contracts must never be eval'd ────
+#
+# The stall contract ($EV) and the triage contract ($TRV) both embed a LANE LABEL taken
+# VERBATIM from the live pane title. Both were consumed with `eval`, so a title containing
+# backticks or `$( )` was EXECUTED as shell inside the orchestrator heartbeat — once per tick,
+# silently. Fixed by emitting ONE FIELD PER LINE and reading positionally: the values are DATA
+# and are never re-parsed. These pins drive the REAL producer and the REAL consumer.
+
+
+def test_the_heartbeat_never_evals_a_label_derived_contract():
+    """PRE-FIX this fails: `eval "$EV"` and `eval "$TRV"` both executed pane-title labels."""
+    src = HEARTBEAT.read_text(encoding="utf-8")
+    assert not re.search(r'^\s*eval\s+"\$(?:EV|TRV)"', src, re.M), (
+        "a label-derived contract is still eval'd — a pane title becomes code"
+    )
+
+
+def test_the_stall_contract_is_positional_data_not_shell_syntax(tmp_path):
+    """PRE-FIX this fails: the block printed `ALERTS="…";…` for `eval "$EV"` to consume."""
+    out = _run_block(tmp_path)
+    assert not re.search(r'^[A-Z_]+="', out, re.M), (
+        f"the stall contract is still emitted as shell syntax: {out!r}"
+    )
+    assert len(out.splitlines()) == len(_FIELDS), out
+
+
+def test_a_lane_label_in_the_stall_contract_is_never_executed(tmp_path):
+    """Command injection (P1): a pane-title label with backticks must be inert.
+
+    The payload is produced by the code under test and consumed by the code under test, so
+    the pin is about the shipped pair rather than a hand-written format guess. PRE-FIX the
+    real consumer `eval "$EV"` runs the label and creates the file.
+    """
+    pwn = tmp_path / "PWNED_EV"
+    evil = f"EVIL`touch '{pwn}'`"
+    out = _run_block(tmp_path, rows=[
+        {"lane": evil, "verdict": "WEDGED", "child": None, "stale_s": 900},
+        {"lane": "LANE-EMPTY", "verdict": "EMPTY", "child": None, "stale_s": 900},
+    ])
+    script = ("log() { :; }\n" + _ev_consumer_region() +
+              '\nprintf "ALERTS=[%s]\\n" "$ALERTS"\n')
+    proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                          env=dict(os.environ, EV=out))
+    assert proc.returncode == 0, proc.stderr
+    assert not pwn.exists(), f"a lane label was executed as shell: {proc.stdout!r}"
+    assert "EVIL" in proc.stdout, proc.stdout
+
+
+def _lane_triage_contract(monkeypatch, capsys, evil_label):
+    """Run lane-triage.py's real output path with the classifier/Jev edges stubbed."""
+    mod = _load_lane_triage()
+    mech = [{"lane": evil_label, "ws": "WS1", "verdict": "DONE-IDLE", "child": None}]
+
+    class _Proc:
+        def __init__(self, out):
+            self.stdout = out
+            self.returncode = 0
+
+    def fake_run(cmd, timeout=300):
+        joined = " ".join(str(c) for c in cmd)
+        if "lane-status.py" in joined:
+            return _Proc(json.dumps(mech))
+        if "lane-snapshot.py" in joined:
+            return _Proc("{}")
+        if "lane-verdict.py" in joined:
+            return _Proc(json.dumps({"verdicts": [
+                {"lane": evil_label, "verdict": "CONTINUE", "confidence": 0.9}]}))
+        return _Proc("")
+
+    monkeypatch.setattr(mod, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["lane-triage.py"])
+    assert mod.main() == 0
+    return capsys.readouterr().out
+
+
+def test_a_lane_label_in_the_triage_contract_is_never_executed(tmp_path, monkeypatch, capsys):
+    """Same injection class as the stall contract, through the triage door.
+
+    PRE-FIX the producer emitted `TRIAGE_CONTINUE="A`touch …`(0.90)"` and the consumer ran
+    `eval "$TRV"`, so the label executed. The payload here is the REAL producer output.
+    """
+    pwn = tmp_path / "PWNED_TRV"
+    evil = f"A`touch '{pwn}'`"
+    trv = _lane_triage_contract(monkeypatch, capsys, evil)
+    payload = tmp_path / "trv.out"
+    payload.write_text(trv, encoding="utf-8")
+    region = _trv_consumer_region().replace(
+        '$(/usr/bin/python3 "$SCRIPTS/lane-triage.py" 2>/dev/null)',
+        '$(cat "$TRV_PAYLOAD")')
+    script = ("log() { :; }\n" + region +
+              '\nprintf "CONT=[%s]\\n" "$TRIAGE_CONTINUE"\n')
+    proc = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                          env=dict(os.environ, TRV_PAYLOAD=str(payload), SCRIPTS=str(tmp_path)))
+    assert proc.returncode == 0, proc.stderr
+    assert not pwn.exists(), f"a lane label was executed as shell: {proc.stdout!r}"
+    assert "A" in proc.stdout, proc.stdout
+    # The producer half: without this, feeding a positional reader a positional payload would
+    # pass even if the producer still emitted shell syntax (the consumer never eval'd it).
+    assert not re.search(r'^[A-Z_]+="', trv, re.M), (
+        f"the triage contract is still emitted as shell syntax: {trv!r}"
+    )
+
+
+# ── P2 (review @9f5bed49): the guard's tighter cmux ceiling must be ENFORCED ───
+
+
+def test_lane_guard_enforces_its_tighter_cmux_ceiling():
+    """PRE-FIX this fails: `setdefault` could not lower the 60 the callers export.
+
+    `safe-send.sh:7` and `heartbeat-loop.sh:26` both export 60 BEFORE the guard runs, so the
+    tighter ceiling the guard documents ("UNKNOWN at 20s rather than a real answer at 90s")
+    applied on no path the fleet uses — an inert enforcer, and one inherited cmux call could
+    run the whole 60s. The value must also reach the imported classifier's cmux subprocess env
+    (`lane-status.py` snapshots `os.environ` into its module-level `CMUX`).
+    """
+    code = (
+        "import importlib.util, os\n"
+        f"spec = importlib.util.spec_from_file_location('lg_ceiling', {str(LANE_GUARD)!r})\n"
+        "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+        "ls = m._load_lane_status()\n"
+        "print(os.environ['CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC'])\n"
+        "print(ls.CMUX.get('CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC'))\n"
+    )
+    env = dict(os.environ, CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="60")
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
+    assert proc.returncode == 0, proc.stderr
+    got = proc.stdout.split()
+    assert got == ["20", "20"], (
+        f"the guard must ENFORCE its tighter ceiling, and it must reach cmux: got {got}"
+    )
