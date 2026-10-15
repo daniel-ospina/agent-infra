@@ -310,7 +310,15 @@ export function bridgeRoots(): string[] {
   const bridge = readBridge();
   if (!bridge || bridge.status !== "PASS") return [];
   const roots = new Set<string>();
-  for (const vf of bridge.verified_files) {
+  // readBridge() guarantees `verified_files` is an ARRAY; this guards the
+  // per-entry SHAPE. An entry that is not an object with a string path (a
+  // hand-edited/corrupt bridge) used to throw here, rejecting the
+  // session_start handler — so bridge recovery AND the init reset block were
+  // skipped and the gate wedged on spurious blocks until the file was cleared
+  // (the same "a verified change cannot be committed" symptom this PR fixes).
+  // The merge path already guards this exact shape; mirror it here.
+  for (const vf of (Array.isArray(bridge.verified_files) ? bridge.verified_files : [])) {
+    if (!vf || typeof vf.path !== "string") continue;
     const parsed = parseCompoundKey(vf.path);
     if (parsed) roots.add(parsed.root);
   }
@@ -526,7 +534,18 @@ function readBridge(): { status: string; verified_files: VerifiedFile[] } | null
   try {
     if (!existsSync(bridgePath())) return null;
     const raw = readFileSync(bridgePath(), "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    // Normalise the SHAPE at the one read boundary, so NO consumer has to
+    // defend against a hand-edited/corrupt bridge. A non-array
+    // `verified_files` used to make `for (const vf of ...)` throw inside the
+    // session_start handler, skipping bridge recovery AND the init reset block
+    // and wedging the gate on spurious blocks until the file was cleared —
+    // the same "a verified change cannot be committed" symptom this PR fixes.
+    // Entries that are not objects with a string path are skipped by each
+    // consumer; this only guarantees the CONTAINER is iterable.
+    if (!Array.isArray(parsed.verified_files)) parsed.verified_files = [];
+    return parsed;
   } catch {
     return null;
   }

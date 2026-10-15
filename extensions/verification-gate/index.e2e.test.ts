@@ -1057,6 +1057,57 @@ async function main() {
       `a verified dangling symlink must survive a foreign write (presence via lstat, never existsSync), got: ${JSON.stringify(paths)}`);
   });
 
+  test("scenario 21f (#1225/#1573): a malformed bridge entry must not abort session_start recovery", async () => {
+    // bridgeRoots() dereferenced vf.path with no shape guard, so a bridge
+    // holding a non-object entry (null / number) threw inside session_start —
+    // rejecting the handler, skipping recovery AND the init reset block, and
+    // wedging the gate on spurious blocks until the bridge was cleared. Same
+    // symptom class as the P0 this PR fixes.
+    const repoM = join(TEST_ROOT, "repo-malformed");
+    mkdirSync(repoM, { recursive: true });
+    git(repoM, "init -b main");
+    git(repoM, "config user.email e2e@test");
+    git(repoM, "config user.name e2e");
+    writeFileSync(join(repoM, "fileM.txt"), "m1\n");
+    git(repoM, "add fileM.txt");
+    git(repoM, "commit -m baseline");
+    const realM = realpathSync(repoM);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    // Every malformed SHAPE must be survivable: a non-array container (which
+    // made `for (const vf of ...)` throw "is not iterable") and an array whose
+    // entries are not objects with a string path (which threw reading `.path`).
+    const shapes: unknown[] = [
+      [null, 42, { path: 123 }, { path: `${realM}::fileM.txt`, hash: sha("m1\n") }],
+      {},
+      null,
+      5,
+    ];
+    for (const vf of shapes) {
+      writeFileSync(
+        bridgePath,
+        JSON.stringify({ status: "PASS", verified_files: vf, timestamp: new Date().toISOString() }),
+      );
+      // Must not throw, for ANY shape.
+      await fire("session_start", {});
+    }
+    // And a well-formed bridge must still enumerate its valid root.
+    writeFileSync(
+      bridgePath,
+      JSON.stringify({
+        status: "PASS",
+        verified_files: [{ path: `${realM}::fileM.txt`, hash: sha("m1\n") }],
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    await fire("session_start", {});
+    const m = await import("./index.js");
+    ok(
+      (m as any).bridgeRoots().includes(realM),
+      `malformed shapes must not abort recovery or hide valid roots; got ${JSON.stringify((m as any).bridgeRoots())}`,
+    );
+  });
+
   test("scenario 22 (#825/#264): sub-agent commit on UNVERIFIED files is blocked with a self-verify instruction", async () => {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
