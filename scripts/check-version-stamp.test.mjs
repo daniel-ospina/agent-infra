@@ -615,20 +615,16 @@ try {
   // disable the linked scan, so `[piSurface()]` filters to [] — the state the guard exists for.
   console.log("\n21. fail-closed — an empty surface set is 'nothing was verified' (exit 2)");
   {
-    const savedPi = process.env.AGENT_INFRA_PI_HOME;
-    const savedRoot = process.env.AGENT_INFRA_REPOS_ROOT;
-    process.env.AGENT_INFRA_PI_HOME = path.join(TMP, "no-such-pi-home");
-    process.env.AGENT_INFRA_REPOS_ROOT = path.join(TMP, "no-such-repos-root");
-    try {
-      const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
-      eq("an empty surface set exits 2, never 0", v.code, 2);
-      contains("the refusal says nothing was verified", v.stderr + v.stdout, "nothing was verified");
-    } finally {
-      if (savedPi === undefined) delete process.env.AGENT_INFRA_PI_HOME;
-      else process.env.AGENT_INFRA_PI_HOME = savedPi;
-      if (savedRoot === undefined) delete process.env.AGENT_INFRA_REPOS_ROOT;
-      else process.env.AGENT_INFRA_REPOS_ROOT = savedRoot;
-    }
+    // Reach the empty set through the UNNAMED default: an absent `$HOME/.pi/agent` is legitimate,
+    // so the set is genuinely empty. (A surface the operator NAMED that cannot be read is a
+    // different, earlier refusal — arm 30.)
+    const emptyHome = path.join(TMP, "empty-home");
+    fs.mkdirSync(emptyHome, { recursive: true });
+    const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { HOME: emptyHome, AGENT_INFRA_PI_HOME: "", AGENT_INFRA_REPOS_ROOT: "" },
+    });
+    eq("an empty surface set exits 2, never 0", v.code, 2);
+    contains("the refusal says nothing was verified", v.stderr + v.stdout, "nothing was verified");
   }
 
   // ── 22. an empty --repo names nothing and must not fall through to a default ─────────────
@@ -791,6 +787,110 @@ try {
     contains("the human line does not claim (no commit)", v.stdout, "(no commit)", false);
     writeStampRaw(SURFACE, { ...good });
     eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 30. a NAMED pi surface that cannot be read is cannot-verify, not a silent omission ────
+  console.log("\n30. a named pi surface that cannot be read must not be silently dropped");
+  {
+    const realPi = path.join(TMP, "real-pi");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", realPi);
+    const repoRoot = path.join(TMP, "one-repo");
+    const linked = path.join(repoRoot, "linked");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", linked);
+    fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
+    const env = { AGENT_INFRA_REPOS_ROOT: repoRoot };
+    run(["--write", "--surface", realPi, "--repo", ORIGIN], { env });
+    run(["--write", "--surface", linked, "--repo", ORIGIN], { env });
+    const withReal = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { ...env, AGENT_INFRA_PI_HOME: realPi },
+    });
+    eq("control — a real pi surface is reported", withReal.code, 0);
+    // SUBJECT: same run, pi surface NAMED but dangling. Before the fix it was dropped and the
+    // linked repo alone carried a green — a pass over a scope nobody read.
+    const dangling = path.join(TMP, "dangling-pi");
+    fs.symlinkSync("/nonexistent-pi-target", dangling);
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
+      env: { ...env, AGENT_INFRA_PI_HOME: dangling },
+    });
+    eq("a named dangling pi surface → exit 2", v.code, 2);
+    contains("the refusal names the pi surface", v.stderr + v.stdout, "dangling-pi");
+  }
+
+  // ── 31. --repos-root '' must not fall through to another scope ─────────────────────────────
+  console.log("\n31. --repos-root '' must not fall through to the env var or the default");
+  {
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--repos-root", ""]);
+    eq("--repos-root '' → exit 2", v.code, 2);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 32. a hostile stamp must not crash the report ────────────────────────────────────────
+  console.log("\n32. a hostile stamp must not crash the report (bounded projection)");
+  {
+    stampNow();
+    const deep = '{"a":'.repeat(8000) + "1" + "}".repeat(8000);
+    fs.writeFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), deep);
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]);
+    eq("a deeply nested stamp exits 1, not a crash", v.code, 1);
+    eq("--json still produces a report", v.stdout.length > 0, true);
+    eq("no stack overflow on stderr", v.stderr.includes("Maximum call stack"), false);
+
+    stampNow();
+    const good = stamp();
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: 12345 } });
+    const h = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
+    eq("a non-string commit does not throw the human line", h.code, 1);
+    contains("the human report still prints", h.stdout, "unstamped");
+    contains("and it does not claim a commit", h.stdout, "no commit");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
+  }
+
+  // ── 33. a payload file named like the stamp is still digested ───────────────────────────
+  console.log("\n33. a legitimately installed file named like the stamp must not be invisible");
+  {
+    stampNow();
+    const decoy = path.join(SURFACE, "skills", "s", ".agent-infra-stamp.json");
+    fs.mkdirSync(path.dirname(decoy), { recursive: true });
+    fs.writeFileSync(decoy, '{"legit":"payload"}\n');
+    eq("adding it is drift", verify().code, 1);
+    contains("the drift names the payload", verify().stdout, "payload hash");
+    stampNow();
+    eq("control — re-stamped is green", verify().code, 0);
+    fs.writeFileSync(decoy, '{"legit":"CHANGED"}\n');
+    eq("editing it is drift", verify().code, 1);
+    fs.rmSync(decoy);
+    stampNow();
+  }
+
+  // ── 34. --write must not conjure a surface ──────────────────────────────────────────────
+  console.log("\n34. --write must not create a surface that does not exist");
+  {
+    const ghost = path.join(TMP, "ghost", "deep", "surface");
+    const v = run(["--write", "--surface", ghost, "--repo", ORIGIN]);
+    eq("--write on a nonexistent surface → exit 2", v.code, 2);
+    eq("the path was NOT created", fs.existsSync(ghost), false);
+    contains("the refusal says it will not create one", v.stderr + v.stdout, "refusing to create");
+  }
+
+  // ── 35. --write announces COMMIT drift too, not only payload drift ─────────────────────
+  console.log("\n35. --write announces a re-baseline for commit drift as well");
+  {
+    stampNow();
+    const good = stamp();
+    const commitA = good.agentInfra.commit;
+    write("extensions/beta.ts", "export const beta = 2;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "second");
+    const commitB = git(ORIGIN, "rev-parse", "HEAD");
+    // a stamp naming the OLD commit, as an install made before the new commit would carry
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: commitA } });
+    const w = stampNow();
+    eq("--write exits 0", w.code, 0);
+    eq("the surface really did move to the new commit", stamp().agentInfra.commit, commitB);
+    contains("the commit move is announced", w.stdout, "RE-BASELINED");
+    contains("the note names the commit move", w.stdout, "commit ");
+    eq("control — green at the new commit", verify().code, 0);
   }
 
 } finally {

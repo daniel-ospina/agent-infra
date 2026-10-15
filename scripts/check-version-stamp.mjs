@@ -198,12 +198,15 @@ export function payloadEntries(rootDir, relRoot) {
       throw new PayloadReadError(absDir, err);
     }
     for (const name of names.sort()) {
+      const abs = path.join(absDir, name);
       // The stamp is this tool's OWN artifact, never installed payload. A payload root that
       // resolves to a directory CONTAINING it (e.g. `scripts -> .`) would otherwise fold the stamp
       // into the digest — and since `buildStamp` hashes before that file is written, every write
       // would be stale the moment it landed and write/verify could never agree.
-      if (name === STAMP_BASENAME || name.startsWith(`${STAMP_BASENAME}.tmp-`)) continue;
-      const abs = path.join(absDir, name);
+      // Match the RESOLVED PATH, never the basename: matching the name at every depth made a
+      // legitimately installed file that happens to carry that name invisible to the digest — a
+      // fail-open in a tool whose whole job is to notice that an install changed.
+      if (abs === ownStamp || abs.startsWith(`${ownStamp}.tmp-`)) continue;
       const rel = relDir === "" ? name : `${relDir}/${name}`;
       let st;
       try {
@@ -237,6 +240,8 @@ export function payloadEntries(rootDir, relRoot) {
       }
     }
   };
+  // The surface's OWN stamp, resolved — the one path the digest must never include.
+  const ownStamp = path.join(real, STAMP_BASENAME);
   walk(real, "");
   return out;
 }
@@ -283,6 +288,20 @@ function git(repo, args) {
     }).trim();
   } catch {
     return null;
+  }
+}
+
+/**
+ * Is the `git` BINARY runnable at all? `git()` collapses every failure to null, so without this a
+ * container with no git installed is told its perfectly healthy checkout "is not a git checkout" —
+ * a false statement about the named repo that sends an operator to inspect the wrong thing.
+ */
+function gitAvailable() {
+  try {
+    execFileSync("git", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -460,10 +479,45 @@ export function readStamp(surfaceDir) {
     return { ok: false, reason: `stamp is not valid JSON: ${err.message}` };
   }
   const verdict = validateStamp(raw);
-  // Carry the parsed object even on refusal: a stamp can be structurally sound and rejected on one
-  // field (e.g. a narrowed `payload.roots`), and reporting "(no commit)" for a stamp that plainly
-  // names one is a false statement about the artifact the reader is looking at.
-  return verdict.ok ? verdict : { ...verdict, stamp: raw };
+  // Carry a BOUNDED projection even on refusal: a stamp can be structurally sound and rejected on
+  // one field (a narrowed `payload.roots`), and reporting "(no commit)" for a stamp that plainly
+  // names one is a false statement about the reader's own artifact.
+  // ⛔ A PROJECTION, never the raw object. Passing `raw` through made `--json` stringify arbitrary
+  // input: a deeply nested stamp crashed the run with `RangeError: Maximum call stack size
+  // exceeded` and an EMPTY report (measured: 48 KB in at depth 8000), and a non-string commit made
+  // the human line throw. Only these fields are ever read, and each is type-guarded here.
+  return verdict.ok ? verdict : { ...verdict, stamp: stampProjection(raw) };
+}
+
+/**
+ * A bounded, type-guarded view of a REJECTED stamp, for the report. Every field is optional in
+ * unvalidated input, so each is narrowed explicitly — this object is what `--json` prints and what
+ * the human line reads a commit from.
+ */
+function stampProjection(raw) {
+  const obj = raw !== null && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const ai =
+    obj.agentInfra !== null && typeof obj.agentInfra === "object" && !Array.isArray(obj.agentInfra)
+      ? obj.agentInfra
+      : {};
+  const pl =
+    obj.payload !== null && typeof obj.payload === "object" && !Array.isArray(obj.payload)
+      ? obj.payload
+      : {};
+  return {
+    version: typeof obj.version === "number" ? obj.version : null,
+    agentInfra: {
+      version: typeof ai.version === "string" ? ai.version : null,
+      commit: typeof ai.commit === "string" ? ai.commit : null,
+      dirty: typeof ai.dirty === "boolean" ? ai.dirty : null,
+    },
+    payload: {
+      algo: typeof pl.algo === "string" ? pl.algo : null,
+      roots: Array.isArray(pl.roots) ? pl.roots.filter((r) => typeof r === "string") : null,
+      files: typeof pl.files === "number" ? pl.files : null,
+      hash: typeof pl.hash === "string" ? pl.hash : null,
+    },
+  };
 }
 
 // ──────────────────────────────────────────────────────────── ancestry / verdicts ──
@@ -741,13 +795,54 @@ function parseArgs(argv) {
         opts.repo = value;
         break;
       }
-      case "--repos-root": opts.reposRoot = need(a); break;
+      case "--repos-root": {
+        const value = need(a);
+        // Same class as --surface/--repo: an empty value is treated as UNNAMED by linkedSurfaces
+        // and silently falls through to the env var, then to the built-in default — a scan of a
+        // scope the operator did not name.
+        if (value === "") throw new Error("--repos-root needs a non-empty value");
+        opts.reposRoot = value;
+        break;
+      }
       case "-h":
       case "--help": opts.help = true; break;
       default: throw new Error(`unknown argument: ${a}`);
     }
   }
   return opts;
+}
+
+/**
+ * The DEFAULT surface set: the pi surface (always) plus the linked repos unless `--no-repos`.
+ *
+ * A surface that is not a readable directory is dropped — but ONLY when it is the built-in default
+ * (an absent `~/.pi/agent` is legitimate). A surface the operator NAMED via $AGENT_INFRA_PI_HOME
+ * that cannot be read is a cannot-verify: dropping it and reporting the remaining surfaces green
+ * is a pass computed over a scope nobody read — the vacuous pass this file refuses for the EMPTY
+ * set, reached through the PARTIAL one.
+ */
+function defaultSurfaces(opts) {
+  const out = [];
+  const pi = piSurface();
+  const namedPi = Boolean(process.env.AGENT_INFRA_PI_HOME && process.env.AGENT_INFRA_PI_HOME !== "");
+  let piIsDir = false;
+  try {
+    piIsDir = fs.statSync(pi).isDirectory();
+  } catch {
+    piIsDir = false;
+  }
+  if (piIsDir) out.push(pi);
+  else if (namedPi) throw new PayloadReadError(pi, { code: "ENOENT" });
+  if (!opts.noRepos) {
+    for (const dir of linkedSurfaces(opts.reposRoot)) {
+      try {
+        if (fs.statSync(dir).isDirectory()) out.push(dir);
+      } catch {
+        // Vanished between discovery and the check — simply gone.
+      }
+    }
+  }
+  return out;
 }
 
 function main(argv) {
@@ -769,6 +864,10 @@ function main(argv) {
     console.error("❌ check-version-stamp: no agent-infra checkout (no manifest.json) — pass --repo or set AGENT_INFRA_PATH");
     return 2;
   }
+  if (!gitAvailable()) {
+    console.error("❌ check-version-stamp: git is not available on PATH — ancestry cannot be established");
+    return 2;
+  }
   if (git(repo, ["rev-parse", "--git-dir"]) === null) {
     console.error(`❌ check-version-stamp: ${repo} is not a git checkout — ancestry cannot be established`);
     return 2;
@@ -783,13 +882,7 @@ function main(argv) {
         // only the linked-repo scan. Testing `opts.noRepos` on the pi branch too made the flag whose
         // documented meaning is "only the pi surface" hand back an EMPTY set — the tool then refused
         // to check anything, the exact opposite of the documented behaviour.
-        : [piSurface(), ...(opts.noRepos ? [] : linkedSurfaces(opts.reposRoot))].filter((dir) => {
-            try {
-              return fs.statSync(dir).isDirectory();
-            } catch {
-              return false;
-            }
-          });
+        : defaultSurfaces(opts);
   } catch (err) {
     // A repos root the operator NAMED that cannot be read is a cannot-verify, never "no linked
     // repos": the latter reports a green over a scope nobody read (see linkedSurfaces).
@@ -812,15 +905,41 @@ function main(argv) {
   if (opts.write) {
     for (const dir of surfaces) {
       try {
+        // Never CONJURE a surface. `--write` on a mistyped path created the tree and reported a
+        // 0-file stamp as success, on a tool whose whole doctrine is "an empty set is not a pass".
+        let st = null;
+        try {
+          st = fs.statSync(dir);
+        } catch {
+          st = null;
+        }
+        if (st === null || !st.isDirectory()) {
+          console.error(
+            `❌ check-version-stamp: ${dir} does not exist as a directory — refusing to create a surface in order to stamp it`
+          );
+          return 2;
+        }
         const prior = readStamp(dir);
         const stamp = writeStamp(dir, repo);
         // A write ACCEPTS whatever is on disk now, so say it when one erased a difference:
-        // otherwise an operator cannot tell a first stamp from a drift being laundered into a
-        // green baseline, on the one command that can hide drift.
+        // otherwise an operator cannot tell a first stamp from a drift being laundered into a green
+        // baseline, on the one command that can hide drift. PAYLOAD is not the only way to drift —
+        // a re-stamp from a different commit, or from a dirty checkout, erases an ancestry drift
+        // just as silently.
         let note = "";
-        if (prior.ok && prior.stamp.payload.hash !== stamp.payload.hash) {
-          note = ` — RE-BASELINED (was drift: payload ${prior.stamp.payload.hash.slice(0, 12)}… → ${stamp.payload.hash.slice(0, 12)}…)`;
-        } else if (!prior.ok && prior.reason !== "no stamp file") {
+        if (prior.ok) {
+          const was = [];
+          if (prior.stamp.payload.hash !== stamp.payload.hash) {
+            was.push(`payload ${prior.stamp.payload.hash.slice(0, 12)}… → ${stamp.payload.hash.slice(0, 12)}…`);
+          }
+          if (prior.stamp.agentInfra.commit !== stamp.agentInfra.commit) {
+            was.push(
+              `commit ${String(prior.stamp.agentInfra.commit).slice(0, 9)} → ${String(stamp.agentInfra.commit).slice(0, 9)}`
+            );
+          }
+          if (prior.stamp.agentInfra.dirty === true) was.push("the previous stamp came from a dirty checkout");
+          if (was.length > 0) note = ` — RE-BASELINED (was drift: ${was.join("; ")})`;
+        } else if (prior.reason !== "no stamp file") {
           note = ` — WARNING: replaced a stamp that was not valid (${prior.reason})`;
         }
         // The stamp is written either way — the state is recorded — but a dirty source is said
@@ -829,6 +948,14 @@ function main(argv) {
           console.error(
             `⚠️  ${dir} was stamped from a DIRTY source checkout — its commit does not describe the ` +
               "payload, so verification will read this surface as drift until it is re-stamped from a clean checkout"
+          );
+        }
+        // A stamp that can NEVER certify is worth saying out loud: no commit identity, or nothing
+        // installed under the payload roots, both make every future verify fail.
+        if (stamp.agentInfra.commit === null || stamp.payload.files === 0) {
+          console.error(
+            `⚠️  ${dir} was stamped with ${stamp.agentInfra.commit === null ? "NO COMMIT IDENTITY" : "an EMPTY payload"} — ` +
+              "verification will never report this surface in-sync"
           );
         }
         console.log(
@@ -873,7 +1000,10 @@ function main(argv) {
     if (warning !== null) console.error(`⚠️  ${warning}`);
     for (const r of results) {
       const icon = r.verdict === "in-sync" ? "✅" : r.verdict === "drift" ? "❌" : "⚠️ ";
-      const who = r.stamp?.agentInfra?.commit ? `commit ${r.stamp.agentInfra.commit.slice(0, 9)}` : "no commit";
+      // Type-guarded: `stamp` on a refused surface is a projection of UNVALIDATED input, so
+      // `commit` is not guaranteed to be a string even now.
+      const sha = r.stamp?.agentInfra?.commit;
+      const who = typeof sha === "string" ? `commit ${sha.slice(0, 9)}` : "no commit";
       console.log(`${icon} ${r.verdict.padEnd(9)} ${r.surface}  (${who})`);
       if (r.verdict !== "in-sync") console.log(`     ${r.reason}`);
     }
