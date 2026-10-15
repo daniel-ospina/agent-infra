@@ -237,14 +237,16 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  * Neither is chased with a spelling list, and the boundary is the MERGE: the CALLER
  * defers only the unresolvable FLAG, and keeps this layer's fail-closed decision for any
  * command the text layer reads as a merge (`mergeVerbInText` — a `pr`/`merge` token pair,
- * or a CONSTRUCT IN A VERB POSITION, where the construct class is `$`, a backtick and
- * `{`/`}`: a substitution, or brace expansion, or the substituted repo-flag value the
- * token scan consumed with it). That is what makes the first class mostly moot — a
- * command that discards the PATH entry cannot get a merge deferred, because the shape
- * that discards it is the shape the text layer reads. A spelling that gets a merge past
- * the text layer anyway lands in the second class (an alias is expanded inside gh, after
- * this process has run), and the post-merge detector, not this gate, is the authority of
- * record for both.
+ * or a token that blinds the read and sits IN A VERB POSITION: a substitution, brace
+ * expansion, a redirection, or the substituted repo-flag value the token scan consumed
+ * with it). The first class is therefore bounded by MEASUREMENT rather than by a claim: a
+ * command that discards the PATH entry cannot get a merge deferred FOR ANY OF THE SHAPES
+ * PINNED IN THE BOUNDARY TEST — a `$VAR`/`$'…'`/`${…}` flag, a brace-expanded verb, a verb
+ * behind a substituted repo value, a verb behind a redirection the shell consumes — each
+ * measured as a fail-open when found, each now a test arm. A spelling that still gets a
+ * merge past the text layer lands in the second class (an alias is expanded inside gh,
+ * after this process has run), and the post-merge detector, not this gate, is the
+ * authority of record for both.
  */
 export function ghShimWillEnforce(shimDir: string | null): boolean {
   // Both halves are OURS and both must hold: the layer is switched on, AND the
@@ -643,14 +645,16 @@ export function mergeVerbInText(command: string): boolean {
   // `gh pr view $X` an admin merge), and requiring `pr` to be a word missed
   // ``gh p`printf r` …``, where `printf` hides it.
   //
-  // The construct class here is `$`, a backtick, and `{`/`}`: BRACE EXPANSION splices a
-  // verb just as effectively as a substitution does — `gh {pr,merge} 999 $V` hands the
-  // real gh the argv `pr merge 999 --admin` — and a brace carries no `$`, so a test that
-  // stopped at substitutions and backticks read no merge and deferred a command that had
-  // already discarded the PATH entry the argv layer lives on. Measured: without `{}` in
-  // this class that command was ALLOWED while the OLD code (which gated every admin
-  // candidate) had refused it — a fail-open the deferral introduced.
-  const CONSTRUCT = /[$`{}]/;
+  // The construct class here is `$`, a backtick, `{`/`}` and a redirection (`<`/`>`): each
+  // BLINDS the verb read in its own way, and each is removed by bash before gh sees it.
+  // BRACE EXPANSION splices a verb (`gh {pr,merge} 999 $V` reaches gh as
+  // `pr merge 999 --admin`); a REDIRECTION is consumed by the shell, so
+  // `gh pr >/dev/null merge 999 $V` reaches gh as `pr merge 999 --admin` too, while the
+  // raw tokenizer still splits `pr` from `merge`. A class that stopped at substitutions
+  // and backticks read no merge in either shape, deferred a command that had already
+  // discarded the PATH entry the argv layer lives on, and let the merge through with
+  // neither layer looking — measured, and pre-deferral code had refused both.
+  const CONSTRUCT = /[$`{}<>]/;
   const afterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < scan.tokens.length - 1; i++) {
       if (at(i) !== word) continue;

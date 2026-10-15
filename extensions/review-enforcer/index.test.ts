@@ -5299,6 +5299,13 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
   // for any command it reads as a MERGE, and hands over only the commands it merely
   // OVER-reads (a construct plus the word `admin` with no merge in it — the #1775
   // false positive, whose ALLOWED outcome is pinned by the test below).
+  //
+  // ABOVE `cmds` IS THE DECLARED THREAT LIST for that boundary: a flag supplied by a
+  // variable, by an ANSI-C quote, or by brace expansion; a verb behind a substituted repo
+  // value, behind brace expansion, or behind a redirection the shell consumes. Each arm
+  // was a measured fail-open when it was found (each is a shape bash rewrites into
+  // `pr merge … --admin` while the raw tokenizer does not read the pair), and each now
+  // fails the run if the class that covers it narrows again.
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
     const prevMode = process.env.PI_MODE;
@@ -5321,7 +5328,14 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // backtick: `gh {pr,merge} 999 $V` hands the real gh the argv
         // `pr merge 999 --admin`, and the pre-deferral code refused it.
         "PATH=\"${PATH#*:}\"; export PATH; V=--admin; gh {pr,merge} 999 $V",
+        // …and with a REDIRECTION between the verb words. The shell consumes
+        // `>/dev/null` before gh runs, so gh still receives `pr merge 999 --admin`, while
+        // the raw tokenizer saw `pr` and `merge` in different positions — the verb read
+        // was blinded by a token bash removes.
+        "export PATH=/usr/bin; V=--admin; gh pr >/dev/null merge 999 $V",
       ];
+      const declaredResidual =
+        "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
       for (const cmd of cmds) {
         ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);
         ok(mergeVerbInText(cmd), "…but the text DOES name a merge, so this layer keeps it");
@@ -5335,6 +5349,15 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"
       );
       equal(blocked.length, cmds.length, "…each by the EVIDENCE gate — it ran, it did not defer");
+      // The DECLARED residual, pinned so it cannot be read as an oversight: with the flag
+      // LITERAL (`--admin` as its own argv token) and no construct anywhere, this layer was
+      // never the decider — that token is the argv layer's job (`scripts/gh-shim/gh`, #984),
+      // and a command that discards the PATH entry removes it. Unchanged by this PR (it was
+      // not gated before either); the post-merge detector is the authority for it.
+      ok(hasLiteralAdminFlag(declaredResidual), "the residual carries the literal token");
+      ok(!isAdminMergeCommand(declaredResidual), "…and is not a text-layer candidate at all");
+      equal(await fire("tool_call", { toolName: "bash", input: { command: declaredResidual } }),
+        undefined, "…so the text layer does not gate it (the argv layer does, unless discarded)");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
