@@ -48,6 +48,7 @@ import {
   hasAdminMergeFlag,
   isGhPrMergeCommand,
   isAdminMergeCommand,
+  mergeVerbInText,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -5292,40 +5293,42 @@ testAsync("#1776: a LITERAL admin merge is refused even with the argv layer inst
   });
 });
 
-testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installed", async () => {
-  // The other direction of the same split: a `$VAR`-supplied flag is not decidable
-  // from the text, so with the argv layer installed the evidence gate does NOT run on
-  // it — no evidence check is performed against a PR number read from a guess. The
-  // enforcement for this shape is the shim (tests/gh-shim/run.sh §2 and §12 pin that
-  // it refuses the splice, repo flag and all); the text layer takes it back the moment
-  // the argv layer is absent, which the test above pins.
+testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the deferral is the FLAG, never the MERGE", async () => {
+  // The boundary of the deferral. The argv layer can be told not to RUN for a given
+  // command: `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'` strips the
+  // injected entry, so deferring here would decide nothing and let the merge through
+  // while neither layer looked. The text layer therefore keeps its fail-closed decision
+  // for any command it reads as a MERGE, and hands over only the commands it merely
+  // OVER-reads (a construct plus the word `admin` with no merge in it — the #1775
+  // false positive, whose ALLOWED outcome is pinned by the test below).
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
     const prevMode = process.env.PI_MODE;
-    delete process.env.AGENT_GH_SHIM;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
     process.env.PI_MODE = "print";
-    _setRunGhOverride(adminGh("4".repeat(40), []));
+    _setRunGhOverride(adminGh("4".repeat(40), [])); // a real head, NO evidence comment
     try {
       const { pi, fire } = mockPi();
       (reviewEnforcerFactory as any)(pi);
       await fire("session_start");
-      const cmd = "V=--admin; gh pr merge 999 $V";
-      ok(!hasLiteralAdminFlag(cmd), "the flag is a guess");
-      const ev = { toolName: "bash", input: { command: cmd } };
-      const res = await fire("tool_call", ev);
-      // The premise is OBSERVED, not assumed: the handler patched this very command,
-      // so the argv layer is what runs when it executes (the decision reads the same
-      // value `withGhShim` was given — the cached `activeGhShimDir()`, not a fresh
-      // resolution, so the injection and the decision cannot drift).
-      ok(String(ev.input.command).startsWith("export PATH="),
-        "the argv layer's PATH prefix WAS injected for this command");
-      // The POSITIVE companion: what refused it is pinned too, so an early return that
-      // skipped the later gates cannot pass this test.
-      ok(res && res.block === true, "the registry gate still refuses it");
-      ok(tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "no_review_record"),
-        "…by its durable audit tag");
-      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
-        "the evidence gate did not run on a guessed flag");
+      const cmds = [
+        "V=--admin; gh pr merge 999 $V", // a `$VAR`-supplied flag
+        "PATH=\"${PATH#*:}\"; export PATH; gh pr merge 999 $'--admin'", // …plus a discarded PATH entry
+        "PATH=\"${PATH#*:}\"; export PATH; gh pr merge 999 --{admin,squash}", // brace expansion
+      ];
+      for (const cmd of cmds) {
+        ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);
+        ok(mergeVerbInText(cmd), "…but the text DOES name a merge, so this layer keeps it");
+        const ev = { toolName: "bash", input: { command: cmd } };
+        const res = await fire("tool_call", ev);
+        ok(res && res.block === true, `\`${cmd}\` → BLOCKED`);
+        ok(String(ev.input.command).startsWith("export PATH="),
+          "…the shim is still injected for the command (it is absent for OTHER commands, not for this one)");
+      }
+      const blocked = tempAuditLines().filter(
+        (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"
+      );
+      equal(blocked.length, cmds.length, "…each by the EVIDENCE gate — it ran, it did not defer");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;

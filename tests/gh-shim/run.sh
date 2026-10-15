@@ -144,6 +144,17 @@ bash "$SHIM" pr merge 123 --admin=false >/dev/null 2>&1; r4=$?
 [ "$r3" -eq 0 ] && pass "a NON-admin merge passes through" || fail "a plain \`--squash\` merge was blocked"
 [ "$r4" -eq 0 ] && pass "\`--admin=false\` is not a bypass (existing semantics preserved)" || fail "\`--admin=false\` was blocked"
 
+# The declared NEGATIVE class, at the layer that now decides it (#1776): a `gh` command
+# that merely MENTIONS `admin` — here with a construct in an unrelated argument — must
+# pass through with its argv intact. This is the argv of the command whose false block
+# opened #1776; the extension's own stand-down is pinned in its suite, and THIS is the
+# layer that then has to deliver an ordinary `gh pr create`.
+new_scen mention-negative
+bash "$SHIM" pr create --title "fix(admin-merge): x" --body "ask the admin" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q '^pr create --title fix(admin-merge): x --body ask the admin$' "$SCEN/calls" \
+  && pass "a mention of \`admin\` under a construct passes through, argv intact" \
+  || fail "the negative class was gated by the argv layer (rc=$rc): $(head -1 "$TMP/err")"
+
 # ── 5. the audited hatch still works ────────────────────────────────────────
 echo "== 5. the operator hatch is preserved, loudly =="
 new_scen override

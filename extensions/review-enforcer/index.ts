@@ -226,18 +226,21 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  * `isExecutableShim`).
  *
  * WHAT IS OUT OF SCOPE, declared rather than implied — both classes are the shim's
- * own STATED LIMITS (`scripts/gh-shim/gh`), and both need the command to hide its
- * flag from the text layer first:
+ * own STATED LIMITS (`scripts/gh-shim/gh`), and both need the command to hide its flag
+ * from the text layer first:
  *
  *   - a discarded PATH entry: `export "PATH"=…`, `env -i`, `sudo`, an absolute path
  *     to the real gh;
  *   - `gh alias` expansion: the argv is `gh <alias> …`, so an alias defined as
  *     `pr merge --admin` is invisible to BOTH layers.
  *
- * Neither is chased with a spelling list. The post-merge detector, not this gate, is
- * the authority of record for them. The literal half still bounds the damage: any
- * command that writes `--admin` as a token keeps the text-layer decision regardless
- * of what it does to PATH (`hasLiteralAdminFlag`, asserted end-to-end).
+ * Neither is chased with a spelling list, and neither is reachable for a real merge
+ * only: the CALLER hands over the unresolvable FLAG, never the MERGE — a command the
+ * text layer reads as a merge keeps this layer's fail-closed decision
+ * (`mergeVerbInText`), so a command that discards PATH cannot also get its admin merge
+ * deferred. What is deferred is the over-read that #1776 is about (a construct plus the
+ * word `admin` with no merge in it), which cannot merge anything at all. The post-merge
+ * detector, not this gate, is the authority of record for the two classes above.
  */
 export function ghShimWillEnforce(shimDir: string | null): boolean {
   // Both halves are OURS and both must hold: the layer is switched on, AND the
@@ -608,6 +611,43 @@ function hasBareGhWord(command: string): boolean {
  * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
  * be conjoined with a shape test.
  */
+/**
+ * Does the TEXT name a merge? True for a resolvable `pr merge`, and for a verb hidden
+ * behind a construct in a verb position (`gh pr m`printf erge``, `gh p`printf r` merge`).
+ *
+ * This is the DEFERRAL's boundary (#1776). The text layer hands the argv layer the
+ * unresolvable FLAG — never the MERGE. A command it reads as a merge keeps the
+ * text-layer decision, for two reasons that meet here: that is the only shape in which a
+ * hidden `--admin` can reach gh AS AN ADMIN MERGE, and it is exactly the shape where the
+ * argv layer can be told not to run for that command —
+ * `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'` discards the injected
+ * entry, so deferring to it would decide nothing and let the merge through. A command
+ * the layer merely OVER-reads — a construct plus the word `admin` with no merge in it —
+ * cannot merge anything, so deferring THAT is what removes the false block #1776 is
+ * about.
+ */
+export function mergeVerbInText(command: string): boolean {
+  const scan = scanTokens(command);
+  const at = (i: number) => dequote(scan.tokens[i] ?? "");
+  for (let i = 1; i < scan.tokens.length; i++) {
+    if (at(i) === "merge" && at(i - 1) === "pr") return true;
+  }
+  // The verb word may itself be spliced, and then no `pr`/`merge` token pair exists to
+  // find (``gh pr m`printf erge` …``, ``gh p`printf r` merge …``): the signal is a
+  // CONSTRUCT IN A VERB POSITION — the token right after `gh` or right after `pr`.
+  // Requiring only "construct + the words gh and pr" was too broad (it made
+  // `gh pr view $X` an admin merge), and requiring `pr` to be a word missed
+  // ``gh p`printf r` …``, where `printf` hides it.
+  const afterIsConstruct = (word: string): boolean => {
+    for (let i = 0; i < scan.tokens.length - 1; i++) {
+      if (at(i) !== word) continue;
+      if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
+    }
+    return false;
+  };
+  return afterIsConstruct("gh") || afterIsConstruct("pr");
+}
+
 export function isAdminMergeCommand(command: string): boolean {
   if (!hasAdminMergeFlag(command)) {
     // A `$VAR` can SUPPLY the flag: `V=--admin; gh pr merge 999 $V` reaches gh as
@@ -643,21 +683,10 @@ export function isAdminMergeCommand(command: string): boolean {
       // The VERB WORD may itself be construct-spliced, so the exact token match
       // finds no `merge` and everything below is skipped: ``gh pr m`printf erge`
       // 999 $V`` and ``gh p`printf r` merge 999 $V`` are both real admin merges
-      // (cycle-5 review P0, third seam).
-      //
-      // The signal is a CONSTRUCT IN A VERB POSITION — the token right after `gh`
-      // or right after `pr`. Requiring only "construct + the words gh and pr" was
-      // too broad (it made `gh pr view $X` an admin merge), and requiring `pr` to
-      // be a word missed ``gh p`printf r` …``, where `printf` hides it.
-      const hasConstructTokenAfter = (word: string): boolean => {
-        for (let i = 0; i < scan.tokens.length - 1; i++) {
-          if (dequote(scan.tokens[i]) !== word) continue;
-          if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
-        }
-        return false;
-      };
+      // (cycle-5 review P0, third seam). `mergeVerbInText` is the shared form of that
+      // signal — the same one the deferral uses to decide what it may hand over.
       if (!hasUnresolvableConstruct(command)) return false;
-      return hasConstructTokenAfter("gh") || hasConstructTokenAfter("pr");
+      return mergeVerbInText(command);
     }
     // The literal word `merge` gates the rest, but it must come AFTER the
     // spliced-verb fallback above: ``gh pr m`printf erge` …`` has no literal
@@ -2657,7 +2686,16 @@ export default function (pi: ExtensionAPI) {
       // zero dispatches. When the argv layer is installed it resolves what a guess
       // cannot, and it decides; when it is absent or switched off, this gate
       // refuses exactly as before. See `ghShimWillEnforce`.
-      if (isAdminMergeCommand(command) && (hasLiteralAdminFlag(command) || !ghShimWillEnforce(shimDir))) {
+      //
+      // #1776 review P1: the deferral is the unresolvable FLAG, never the MERGE. A
+      // command the text layer reads as a merge keeps this gate's fail-closed decision
+      // (`mergeVerbInText`), because the argv layer's presence is the one thing a
+      // command can undo for itself — `PATH="${PATH#*:}"; export PATH; gh pr merge 999
+      // $'--admin'` strips the injected entry, so a deferral there would decide nothing
+      // and the merge would proceed with neither layer looking. That was a live bypass
+      // of the whole deferral, in exactly the family the gate exists for.
+      if (isAdminMergeCommand(command) &&
+          (hasLiteralAdminFlag(command) || mergeVerbInText(command) || !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
