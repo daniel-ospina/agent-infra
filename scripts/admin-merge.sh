@@ -603,6 +603,17 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # default costs the suite no wall-clock time.
 HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-5}"
 HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-2}"
+# ── THE MERGE-ARTIFACT READ'S RETRY BUDGET (#1298) ──────────────────────
+# Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
+# exactly like HEAD_ATTEMPTS — and NOT inline in the reader, which is how
+# `ADMIN_MERGE_HEAD_ATTEMPTS=08` reached a loop and printed
+# `[head_unreadable] — could not READ the head (0 attempts)` on a run where ZERO
+# reads were attempted (#1690 review round 4). `poll_merge_artifact` is the SAME
+# shape: a `for ((attempt = 1; attempt <= attempts; attempt++))` whose bound is
+# supplied by an operator env var, so `08` is invalid OCTAL there and the loop body
+# never executes. Validation therefore has to happen BEFORE any arithmetic consumes
+# it, on the startup path AND on a sourced path (see `merge_art_knobs_ok`).
+VERIFY_ATTEMPTS="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -926,6 +937,17 @@ refresh_pr_branch() {
 # while the artifact (state=MERGED) was never observed. Two copies of a retraction
 # body would drift, and the drift would be invisible in exactly the situation it
 # exists for.
+#
+# ⛔ A RETRACTION IS A CLAIM, SO IT MAY ONLY BE POSTED ON EVIDENCE THAT SUPPORTS ONE
+# (#1298). "the merge did NOT happen" is a statement about the REPOSITORY, and the
+# ONLY thing that licenses it is a read of the repository that says so — a state of
+# `OPEN`/`CLOSED` from `poll_merge_artifact`. A non-zero `gh pr merge` exit does NOT
+# license it (that is a lost read, ambiguous about the mutation by definition), and
+# neither does an unreadable artifact read: this comment is durable and cannot be
+# un-posted, so a retraction posted over an UNKNOWN state annotates a possibly-MERGED
+# PR forever. Callers must branch on `MERGE_ART_VERDICT` and call this function ONLY
+# on `not_merged`. There is no third caller to write here — the undeterminable case
+# posts NOTHING and says exactly that on stderr.
 write_merge_retraction() {
   local pr="$1" head="$2" reason="$3" detail="$4" label="$5"
   {
@@ -1222,6 +1244,28 @@ validate_timing_knobs() {
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — beyond the usable"
     say_err "   range (max ${TIMING_KNOB_MAX}s)."
   fi
+  # The merge-artifact read's bound is the SAME class as the head read's (#1298), and
+  # it was the last knob still carrying a bare `case … attempts=6` default: an
+  # all-digit value with a LEADING ZERO passes that guard and is invalid octal to bash
+  # ARITHMETIC, so the loop body never ran and the rail printed
+  # `[merge_unreadable] — could NOT be READ (08 attempt(s))` — a claim about the
+  # instrument on a run where the instrument never ran. Refuse it BY NAME instead.
+  if counter_has_leading_zero "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL, so '08' is not 8 but an ERROR that aborts"
+    say_err "   the merge-artifact read's loop body. The rail would then report that it could not read"
+    say_err "   whether PR merged while attempting ZERO reads. Write it without the leading zero."
+  elif ! counter_is_positive "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — the merge-artifact"
+    say_err "   read's retry budget must be a POSITIVE integer: a non-numeric value errors the loop's"
+    say_err "   arithmetic, and a non-positive one attempts no read at all."
+  elif counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX})."
+  fi
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
   # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
@@ -1267,6 +1311,28 @@ refuse_bad_head_knobs() {
   say_err "admin-merge: ✗ refusing a bad head-read knob (ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}',"
   say_err "   ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}') — refusing to report on a head read"
   say_err "   whose retry budget is not a validated positive integer. Fix the value and re-run."
+  return 1
+}
+
+# ── THE MERGE-ARTIFACT READ'S KNOB INVARIANT BELONGS TO THE READ (#1298) ─
+# Same reason as `head_read_knobs_ok` (#1690 review rounds 4-5): `validate_timing_knobs`
+# runs only inside `main()`, so ANY path that SOURCES the rail bypasses it — and this
+# read OWNS the arithmetic that consumes the knob, so it is where the invariant has to
+# hold. It REJECTS rather than defaulting: the pre-refactor inline `case …) attempts=6`
+# silently turned a typo into a different budget, and (measured, #1690 review round 4)
+# a leading-zero value left the loop body never running while the refusal still printed
+# an attempt count.
+merge_art_knobs_ok() {
+  counter_is_positive "$VERIFY_ATTEMPTS" \
+    && ! counter_has_leading_zero "$VERIFY_ATTEMPTS" \
+    && ! counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"
+}
+
+# refuse_bad_merge_art_knobs -> 1 (having said why) when the bound is unusable.
+refuse_bad_merge_art_knobs() {
+  say_err "admin-merge: ✗ refusing a bad merge-artifact knob (ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}')"
+  say_err "   — refusing to report on whether the PR merged with a retry budget that is not a validated"
+  say_err "   positive integer without a leading zero (max ${TIMING_KNOB_MAX}). Fix the value and re-run."
   return 1
 }
 
@@ -1517,6 +1583,195 @@ require_draft() {
     say_err "   nothing to stderr). Re-run the rail."
   fi
   return 1
+}
+
+# ── THE ONE DOOR FOR READING THE MERGE ARTIFACT (#1298) ────────────────────────
+#
+# `gh pr merge`'s EXIT STATUS is a statement about the SEND. The PR's STATE is the
+# statement about the ARTIFACT. The two disagree in BOTH directions, and each
+# direction costs something real:
+#
+#   * exit 0 while the PR is still OPEN — a queued `--auto`, or a merge not yet
+#     reflected. The success marker then stands over an unmerged PR (#1359).
+#   * exit NON-ZERO while the PR is MERGED — GitHub PROCESSED the merge and the
+#     RESPONSE READ failed (a network timeout; tortoise #4413 shows the exact
+#     `Post "https://api.github.com/graphql": read tcp …: operation timed out`).
+#     A lost answer to a MUTATION is ambiguous BY DEFINITION about whether the
+#     mutation ran, so the exit status CANNOT tell a refused merge from an
+#     answered-and-lost one. The rail rendered the second as "the merge did NOT
+#     happen" and posted a durable retraction over a MERGED PR (#1298).
+#
+# BOTH arms therefore ask THE REPOSITORY, through THIS function, and neither infers
+# the artifact from the exit status. One door, for the same reason `require_head`
+# and `require_draft` are one door: two copies of "did it happen?" drift, and the
+# drift is invisible in exactly the situation the guard exists for.
+#
+# ⛔ THE OUTCOMES ARE THREE, NOT TWO. A read that FAILED is not a claim about the
+#    PR, so it is rendered as neither "merged" nor "not merged". Rendering a failed
+#    read as the second is #1298; #1690 fixed the same shape one arm over, and the
+#    rule it established applies verbatim to the highest-consequence instance.
+#
+# Nothing travels on stdout — the verdict and the observation travel in the globals
+# below, so no caller can read the empty stream as a value (the #1690/#1750 shape):
+#   MERGE_ART_VERDICT    merged | not_merged | unreadable
+#   MERGE_ART_STATE      the observed state, or `<unreadable>`
+#   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
+#   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
+#                        `0` on the one path that reads nothing: a refused knob
+#   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
+#                        bounded line), empty when that attempt wrote none — never an
+#                        earlier attempt's text
+poll_merge_artifact() {
+  local pr="$1"
+  MERGE_ART_VERDICT="unreadable"
+  MERGE_ART_STATE="<unreadable>"
+  MERGE_ART_MERGED_AT="<unreadable>"
+  # ⛔ EVERY EXIT PATH SETS EVERY GLOBAL (#1298 review). The knob refusal below returns
+  # BEFORE the loop, so leaving this unset made the callers' `(${MERGE_ART_ATTEMPTS}
+  # attempt(s))` an unbound-variable ABORT under `set -u` — the rail would die with a
+  # shell error instead of printing the refusal it had just composed. `0` is also the
+  # TRUE count on that path (zero reads ran), which is the distinction #1690 was about.
+  MERGE_ART_ATTEMPTS="0"
+  MERGE_ART_DIAG=""
+  local attempts="$VERIFY_ATTEMPTS"
+  # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
+  # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
+  # different budget for a typo) and — measured — a leading-zero value reached this
+  # arithmetic site, where `attempt <= 08` errors and the loop body NEVER RUNS: the rail
+  # then prints `[merge_unreadable] … (08 attempt(s))` on a run where ZERO reads were
+  # attempted, which is #1690's symptom one arm over. The STARTUP path refuses the same
+  # three classes BY NAME before any CI work, through `validate_timing_knobs`' own inline
+  # checks (which can name WHICH class was bad, as its per-cause messages do); this helper
+  # exists for the paths that never reach it, because ANY path that SOURCES the rail
+  # bypasses `main` — and that is where the arithmetic lives.
+  merge_art_knobs_ok || { refuse_bad_merge_art_knobs; return 1; }
+  MERGE_ART_ATTEMPTS="$attempts"
+  local attempt=0 rc=0 observed="" state_part="" rest="" err=""
+  local errtmp outtmp
+  # The same O_EXCL creation and the same parent-owns-the-file rule as the head and
+  # draft reads (#1690/#1750 review): the file is `mktemp`-generated, read from the
+  # file-scope `READ_ERRTMP` so the EXIT trap can remove it, and created here only on
+  # a path with no `main` (the suites that source the rail).
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art.XXXXXX" 2>/dev/null)"
+  # ⛔ THE READ IS CAPTURED TO A FILE, NOT STRAIGHT INTO A VARIABLE (#1298 review). A bash
+  # string CANNOT hold a NUL byte: `$(...)` deletes NULs silently, with no error and no
+  # warning, so a producer emitting `MER<NUL>GED` would be read as `MERGED` — a value
+  # GitHub did not say, rendered as a MERGE, which is the one direction that cannot be
+  # walked back (the evidence marker is standing and no retraction is posted). GitHub's
+  # `state` is an enum and cannot carry a NUL, so this was LATENT — but this guard must not
+  # rest on the producer's output shape, which is the same reason the `sed`-over-JSON
+  # projection above was rejected. The file is inside the per-run `$TMP` when there is one
+  # (so the EXIT trap removes it wholesale) and `mktemp`-generated otherwise, exactly like
+  # `errtmp` — never a FIXED name, which two concurrent runs would share.
+  outtmp="${TMP:+$TMP/merge-art.out}"
+  [ -n "$outtmp" ] || outtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art-out.XXXXXX" 2>/dev/null)"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over the
+    # whole JSON takes the LAST `"state"` anywhere in the output, so a nested or
+    # repeated object could be read as the merge state while the TOP-LEVEL state said
+    # OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json state,mergedAt` emits
+    # only those two keys, so it was not reachable today, but this guard's correctness
+    # must not rest on the producer's output shape). `--jq` reads the TOP-LEVEL fields:
+    # one tab-separated `<state>\t<mergedAt>`, mergedAt sentineled because it is null
+    # for an unmerged PR.
+    # shellcheck disable=SC2086
+    if $GH pr view "$pr" ${repo_args[@]+"${repo_args[@]}"} \
+        --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' \
+        >"$outtmp" 2>"$errtmp"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    # ⛔ THE WHOLE VALUE, NOT A LINE OF IT (#1690's review, applied to this read). The
+    # version this replaces took `head -1` and `${x%%$'\t'*}`, which are an ANY-FIRST-LINE
+    # test and an ANY-SEPARATOR test: a read that answered the projection AND a trailing
+    # junk line passed the first, and the mergedAt half could itself carry a tab. `@tsv`
+    # emits exactly ONE line with exactly ONE separator, so anything else — an INTERNAL
+    # newline, a second separator, a value that is not the projection — is UNREADABLE by
+    # construction. A `case` on the whole value needs no pipe, so the `writer | grep -q`
+    # idiom banned repo-wide (#841) is not reintroduced either — and that matters here:
+    # under `set -uo pipefail` a SIGPIPE-killed writer makes the pipeline non-zero, which
+    # would classify a VALID read as unreadable.
+    #
+    # ⛔ WHAT THIS DOES *NOT* RE-DERIVE, stated rather than implied: `$(...)` strips ALL
+    # trailing newlines, so a value whose extra lines are all BLANK past the first (and
+    # gh's own output ends in one newline, which is why the raw byte count cannot simply
+    # be `lines == 1`) is read as the single line it reduces to. That cannot change a
+    # verdict — a token still has to be exactly `MERGED`/`OPEN`/`CLOSED` — so it is a
+    # narrower guard, not a fail-open, and it is left deliberately (see the PR's limits).
+    #
+    # ⛔ AND A NUL IS TESTED AT THE BYTE LEVEL, because no bash string can carry one. The
+    # read above is a FILE, so the test is exact: `tr -d '\000'` applied to the file equals
+    # the file IFF it held no NUL. A missing or unreadable file makes `cmp` exit 2, which is
+    # not "equal", so this test fails CLOSED (unreadable) rather than open.
+    #
+    # ⛔ AND THE VALUE IS BOUNDED, because the two parameter EXPANSIONS below
+    # (`${observed%%$'\t'*}` and `${observed#*$'\t'}`) are what is O(n²) in the value's
+    # length — measured on this box: 80 KB ≈ 7 s and ≈ 18 s for the two expansions, 160 KB
+    # ≈ 25 s and ≈ 58 s — so a producer emitting a large body HANGED the rail instead of
+    # answering it. (The `case` tests themselves are linear; the cost is in the removals.)
+    # The projection is a fixed, tiny shape (real `gh` output for these two fields is 28
+    # bytes), so a generous 4 KiB ceiling costs nothing real and keeps those expansions from
+    # ever seeing an oversized value.
+    state_part=""; rest=""
+    if [ "$rc" -eq 0 ] && [ "$(wc -c < "$outtmp")" -le 4096 ] \
+       && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
+      observed="$(cat "$outtmp")"
+      case "$observed" in
+        *$'\n'*)       : ;;                  # more than one line: not the projection
+        *$'\t'*$'\t'*) : ;;                  # more than one separator: not the projection
+        *$'\t'*)       state_part="${observed%%$'\t'*}"
+                       rest="${observed#*$'\t'}" ;;
+      esac
+    fi
+    # ⛔ THE ANSWER IS AN ALLOW-LIST, NOT "ANYTHING THAT IS NOT MERGED". GitHub reports a
+    # PR state as exactly one of MERGED / OPEN / CLOSED, and only MERGED means the merge
+    # happened. ANY other value — empty, a state GitHub has not documented, a mis-shaped
+    # read — is UNREADABLE, never `not_merged`, so a garbage read cannot manufacture a
+    # retraction. This is the polarity the merge rail's own check-run reader adopted
+    # ("EVERY OTHER CONCLUSION IS RED — including one GitHub has not documented yet, and
+    # a null one"): an unnamed value must never fall through a gap.
+    case "$state_part" in
+      MERGED)      MERGE_ART_STATE="MERGED"
+                   MERGE_ART_MERGED_AT="${rest:-<unreadable>}" ;;
+      OPEN|CLOSED) MERGE_ART_STATE="$state_part"
+                   MERGE_ART_MERGED_AT="${rest:-<unreadable>}" ;;
+      *)           MERGE_ART_STATE="<unreadable>"
+                   MERGE_ART_MERGED_AT="<unreadable>" ;;
+    esac
+    # ⛔ THE DIAGNOSTIC BELONGS TO THE ATTEMPT THAT DECIDED (#1298 review). This kept the
+    # last NON-EMPTY stderr, so when the deciding attempt wrote none — a real `gh` shape:
+    # exit 0 with a non-projected answer and empty stderr — the callers printed an EARLIER
+    # attempt's transient error as "the state read reported: …". That names the wrong cause
+    # (a timeout, remedy: re-run) for a different one (the producer's shape changed), and it
+    # is the one thing that separates a blip from a config error. Assigning unconditionally
+    # lets the callers' `if [ -n … ]` / else-arm tell the truth about the deciding read.
+    #
+    # ⛔ THE LAST *NON-BLANK* LINE, not the last line (#1298 delta review): a multiline error
+    # ending in a blank line — `boom\n\n` — made `tail -n 1` return the EMPTY string, so a
+    # real message was reported as "produced no diagnostic". `awk` keeps the last line that
+    # has content and ignores the padding, with no pipe to SIGPIPE.
+    err="$(awk 'NF { last = $0 } END { print last }' "$errtmp" 2>/dev/null)"
+    MERGE_ART_DIAG="${err:0:200}"
+    if [ "$MERGE_ART_STATE" = "MERGED" ]; then
+      break
+    fi
+    # A well-formed read that is NOT merged keeps polling: the merge may still be
+    # landing (#1359). Only the LAST attempt's observation decides the verdict, so a
+    # readable OPEN followed by an unreadable final attempt is UNREADABLE — the state at
+    # the END is unknown, and an earlier observation cannot stand in for it.
+    [ "$attempt" -ge "$attempts" ] && break
+    sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
+  done
+  rm -f "$errtmp" "$outtmp"
+  case "$MERGE_ART_STATE" in
+    MERGED)      MERGE_ART_VERDICT="merged" ;;
+    OPEN|CLOSED) MERGE_ART_VERDICT="not_merged" ;;
+    *)           MERGE_ART_VERDICT="unreadable"
+                 MERGE_ART_STATE="<unreadable>"
+                 MERGE_ART_MERGED_AT="<unreadable>" ;;
+  esac
 }
 
 # resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). The base branch's
@@ -6092,79 +6347,138 @@ ${parity_forgiven_note}"
   # local inference, because a wrong "merged" is the one error that cannot be
   # walked back (the evidence comment is already standing).
   local merge_state="" merge_merged_at=""
+  # ⛔ `gh pr merge` EXITING NON-ZERO IS NOT EVIDENCE THAT IT DID NOT MERGE (#1298).
+  # A mutation whose RESPONSE READ failed is ambiguous by definition about whether the
+  # mutation ran, and the exit status cannot resolve it. Both arms below therefore ask
+  # the REPOSITORY through `poll_merge_artifact`, which answers with THREE outcomes —
+  # merged / not_merged / unreadable — and NEITHER arm infers the artifact from the send.
+  local merge_response_lost=0
   if [ "$merge_status" -eq 0 ]; then
-    local attempt=0 attempts="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
-    # A non-numeric bound would make `[ "$attempt" -ge "$attempts" ]` exit 2 on
-    # every pass, so the poll would never terminate — a HANG, not a refusal. So
-    # would a bound at or above the integer ceiling (all digits, so the guard below
-    # cannot see it: `-ge` can never be satisfied and `[` starts erroring past
-    # int64 — adversarial cycle 2, reproduced). Ten digits is already far beyond any
-    # sane bound, so anything longer falls back to the default.
-    case "$attempts" in ''|*[!0-9]*|??????????*) attempts=6 ;; esac
-    while : ; do
-      local observed state_tab
-      # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over
-      # the whole JSON takes the LAST `"state"` anywhere in the output, so a nested
-      # or repeated object could be read as the merge state while the TOP-LEVEL
-      # state said OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json
-      # state,mergedAt` emits only those two keys, so it was not reachable today, but
-      # this guard's correctness must not rest on the producer's output shape).
-      # `--jq` reads the TOP-LEVEL fields: one tab-separated `<state>\t<mergedAt>`,
-      # with mergedAt sentineled because it is null for an unmerged PR.
-      observed="$($GH pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' 2>/dev/null || true)"
-      state_tab="$(printf '%s' "$observed" | head -1)"
-      # THE SEPARATOR IS REQUIRED. `${x%%$'\t'*}` returns the WHOLE STRING when
-      # there is no TAB, so a producer that ignores `--jq` and answers a bare
-      # `MERGED` would set merge_state=MERGED with mergedAt never observed, and the
-      # break below would fire on the first pass — an assertion of MERGED with no
-      # observation of the artifact, which is the one thing this guard exists to
-      # prevent (adversarial cycle 2, reproduced). The absence of the separator is
-      # the absence of the response: unreadable, and therefore a REFUSAL.
-      case "$state_tab" in
-        *$'\t'*) merge_state="${state_tab%%$'\t'*}"
-                  merge_merged_at="${state_tab#*$'\t'}"
-                  [ -n "$merge_merged_at" ] || merge_merged_at="<unreadable>" ;;
-        *)        merge_state="<unreadable>"
-                  merge_merged_at="<unreadable>" ;;
-      esac
-      [ "$merge_state" = "MERGED" ] && break
-      attempt=$((attempt + 1))
-      [ "$attempt" -ge "$attempts" ] && break
-      sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
-    done
-    if [ "$merge_state" != "MERGED" ]; then
+    # ── THE ARTIFACT, NOT THE SEND (#1359) ───────────────────────────────────
+    # `gh pr merge` exiting 0 is a SEND. It is not the artifact. `--auto` enqueues a
+    # merge and exits 0 while the PR is still OPEN (and MERGE_ARGS is CALLER-supplied,
+    # so `-- --auto` reaches this line); an enqueued or asynchronously-completed merge
+    # can also lag the command's return. Either way the next line asserts a fact about
+    # the REPOSITORY, so the repository is what gets read — through the ONE read door,
+    # bounded, because a genuine merge can take a moment to be reflected and a wrong
+    # "merged" is the one error that cannot be walked back (the evidence comment is
+    # already standing).
+    poll_merge_artifact "$PR"
+    merge_state="$MERGE_ART_STATE"
+    merge_merged_at="$MERGE_ART_MERGED_AT"
+    if [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
       say_err "⛔ admin-merge: FAILED — gh pr merge reported SUCCESS (exit 0), but PR #$PR is NOT merged."
-      say_err "   The API reports state=${merge_state:-<unreadable>} mergedAt=${merge_merged_at:-<unreadable>} after $attempts attempt(s)."
+      say_err "   The API reports state=$merge_state mergedAt=$merge_merged_at after ${MERGE_ART_ATTEMPTS} attempt(s)."
       say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
       say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
       say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. A QUEUED merge is"
       say_err "   not a merge: the rail certifies the ARTIFACT, not the command's exit code. If you"
       say_err "   passed '--auto' through MERGE_ARGS, that is the cause."
       write_merge_retraction "$PR" "$head" \
-        "gh pr merge exited 0, but the API does not report this PR as MERGED (state=${merge_state:-<unreadable>}, mergedAt=${merge_merged_at:-<unreadable>}) after $attempts attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
+        "gh pr merge exited 0, but the API reports this PR as state=$merge_state (mergedAt=$merge_merged_at) after ${MERGE_ART_ATTEMPTS} attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
         "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    fi
+    # ⛔ THE RETRACTION GATE IS AN ALLOW-LIST, MATCHING ITS SIBLING ARM (#1298 review).
+    # This arm used to retract on `verdict != merged` — a DENY-LIST, so ANY verdict that
+    # was neither `merged` nor the explicitly-caught `unreadable` would fall through to a
+    # DURABLE retraction asserting "the merge did NOT happen" on a state nobody read as
+    # refused. `not_merged` is now the only licensed retraction, and everything else —
+    # today only `unreadable`, tomorrow any verdict this read grows — lands here and
+    # claims NEITHER outcome. The polarity is the rule `poll_merge_artifact` states: an
+    # unnamed value must never fall through a gap into a claim about the repository.
+    if [ "$MERGE_ART_VERDICT" != "merged" ]; then
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge reported SUCCESS (exit 0), but the"
+      say_err "   state of PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does"
+      say_err "   NOT know whether it merged."
+      say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did."
+      say_err "   Nothing is retracted and no claim about the PR is made — a retraction posted over"
+      say_err "   an UNKNOWN state is the worst of the three outcomes (#1298)."
+      say_err "   THE SUCCESS MARKER MAY BE STANDING OVER AN UNKNOWN STATE. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'."
+      if [ -n "${MERGE_ART_DIAG:-}" ]; then
+        say_err "   the state read reported: ${MERGE_ART_DIAG}"
+      else
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
+      fi
+      say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
     fi
   fi
 
   if [ "$merge_status" -ne 0 ]; then
-    say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
-    say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
-    say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
-    say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. The merge it was"
-    say_err "   posted to authorize FAILED, so PR #$PR is NOT merged."
-    if [ -s "$TMP/merge.err" ]; then
-      say_err "   gh pr merge said:"
-      sed 's/^/      /' "$TMP/merge.err" >&2
+    # ── A READ THAT FAILED IS NOT A VALUE (#1298, the #1690 rule, one arm over) ──
+    # `gh pr merge` exited non-zero. That may be a REFUSAL (a draft, a moved head, a
+    # permissions error) — or it may be a merge GitHub PERFORMED whose RESPONSE the
+    # client never read (a timeout; tortoise #4413 is the measured case). Both produce
+    # the SAME non-zero status, so the status decides NOTHING about the repository, and
+    # the rail asks the repository before it says anything about reality.
+    poll_merge_artifact "$PR"
+    merge_state="$MERGE_ART_STATE"
+    merge_merged_at="$MERGE_ART_MERGED_AT"
+    if [ "$MERGE_ART_VERDICT" = "merged" ]; then
+      # ⛔ THE MERGE HAPPENED. `gh pr merge` exited non-zero and the PR is MERGED — the
+      # two facts are INDEPENDENT, and the artifact decides. Reporting this as "did NOT
+      # happen" is #1298: the rail's loudest statement would be false, and a DURABLE
+      # retraction would annotate a MERGED PR forever. NO RETRACTION IS POSTED — there
+      # is nothing to correct: the marker's own claim ("the evidence comment was
+      # posted") is true and stays true.
+      #
+      # ⛔ THE MARKER ASSERTS ONLY WHAT WAS OBSERVED (#1298 review, io-contract).
+      # `[merge_response_lost]` names the CLASS this fix exists for, but a non-zero exit
+      # plus MERGED is also consistent with a refusal that coincided with a merged PR
+      # (gh answering "already merged", or another actor landing it). So the emitted
+      # lines state the OBSERVATIONS and point at the only evidence of the CAUSE — the
+      # command's own output — rather than asserting a networking incident.
+      merge_response_lost="$merge_status"
+      merge_status=0    # fall through to the landed-commit read and the success line
+    elif [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
+      say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
+      say_err "   This is the ARTIFACT, not the exit status: the API reports state=$merge_state after"
+      say_err "   ${MERGE_ART_ATTEMPTS} attempt(s), so the PR really is unmerged."
+      say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. The merge it was"
+      say_err "   posted to authorize FAILED, so PR #$PR is NOT merged."
+      if [ -s "$TMP/merge.err" ]; then
+        say_err "   gh pr merge said:"
+        sed 's/^/      /' "$TMP/merge.err" >&2
+      fi
+      if [ -s "$TMP/merge.out" ]; then
+        say_err "   gh pr merge stdout:"
+        sed 's/^/      /' "$TMP/merge.out" >&2
+      fi
+      write_merge_retraction "$PR" "$head" \
+        "\`gh pr merge\` exited $merge_status after that marker was posted, and the API reports state=$merge_state — so this retraction rests on the ARTIFACT read after the failure, not on the exit status alone." \
+        "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    else
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge exited $merge_status and the state of"
+      say_err "   PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does NOT know"
+      say_err "   whether the merge happened."
+      say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did. A"
+      say_err "   non-zero exit means the RESPONSE could not be read, and a lost answer to a mutation"
+      say_err "   is ambiguous BY DEFINITION about whether the mutation ran — so NOTHING is retracted"
+      say_err "   and no claim about the PR is made (#1298; a retraction posted over an UNKNOWN state"
+      say_err "   is the worst of the three outcomes)."
+      say_err "   THE SUCCESS MARKER MAY BE STANDING OVER AN UNKNOWN STATE. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'."
+      if [ -s "$TMP/merge.err" ]; then
+        say_err "   gh pr merge said:"
+        sed 's/^/      /' "$TMP/merge.err" >&2
+      fi
+      if [ -n "${MERGE_ART_DIAG:-}" ]; then
+        say_err "   the state read reported: ${MERGE_ART_DIAG}"
+      else
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
+      fi
+      say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
+      exit 1
     fi
-    if [ -s "$TMP/merge.out" ]; then
-      say_err "   gh pr merge stdout:"
-      sed 's/^/      /' "$TMP/merge.out" >&2
-    fi
-    write_merge_retraction "$PR" "$head" \
-      "\`gh pr merge\` exited $merge_status after that marker was posted." \
-      "$TMP/merge.err" "gh pr merge said:"
-    exit 1
   fi
   # THE SHA THAT LANDED, NOT THE SHA WE SENT (#7504). `$head` is the BRANCH head, and
   # under the DEFAULT `--squash` (see the MERGE_ARGS note above) the commit that lands
@@ -6208,6 +6522,28 @@ ${parity_forgiven_note}"
       info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was ${head:0:12}…)"
       ;;
   esac
+  # ── THE LOST RESPONSE IS DISCLOSED, NOT ERASED (#1298) ────────────────────
+  # When the merge happened DESPITE a non-zero exit, the success above is the truth
+  # and this line is the rest of it: the exit status was unreadable, and the merge was
+  # established by re-reading the ARTIFACT. It is machine-distinguishable from the
+  # ordinary success (a consumer must not have to parse the prose), and it is stated on
+  # the SAME run as the success line rather than in a comment somebody has to find.
+  if [ "$merge_response_lost" -ne 0 ]; then
+    info "admin-merge: ⚠️  [merge_response_lost] gh pr merge exited ${merge_response_lost} while the API reports"
+    info "   state=$merge_state — the merge DID happen, decided by the ARTIFACT and not by the exit status."
+    info "   The non-zero exit is NOT read as a refused merge: no retraction was posted, and the evidence"
+    info "   marker still stands over a MERGED PR. This marker asserts only what was OBSERVED (a non-zero"
+    info "   exit and a MERGED state); the command's own output below is the only evidence of WHY it was"
+    info "   non-zero — a lost response is the case this fix exists for, not the only one it admits."
+    # ⛔ THE READ'S OWN WORDS, ON THE DIAGNOSTIC CHANNEL (#1690 review, round 4: a refusal
+    # that cannot say WHAT it measured can only prescribe "re-run it"). Discarding this is
+    # how a transient timeout and a permanent cause became the same sentence — and it is the
+    # one thing that tells an operator whether the lost response was a blip or a config error.
+    if [ -s "$TMP/merge.err" ]; then
+      say_err "   gh pr merge said:"
+      sed 's/^/      /' "$TMP/merge.err" >&2
+    fi
+  fi
 }
 
 # ⛔ ENTRY-POINT GUARD (#1690): the read path must be REACHABLE FROM A TEST.
