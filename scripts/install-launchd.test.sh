@@ -106,7 +106,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -624,6 +624,48 @@ if [ -f "$WT_INSTALLED" ]; then
     esac
 else
     bad "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
+fi
+
+echo ""
+echo "── 14. branch-reaper installs UNARMED via the shared launcher (#1787) ──"
+# Same {{TORTOISE_REPO}}-gated shape as §13 (so it is skipped on a box with no
+# tortoise checkout). The pins that matter: the SHARED launcher is the entry
+# point, the FARMED reaper is its target, the checkout is passed explicitly,
+# and NO execute flag is present — the shipped state must dry-run.
+BR_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.branch-reaper.plist"
+if [ -f "$BR_INSTALLED" ]; then
+    ok "branch-reaper installs when {{TORTOISE_REPO}} resolves"
+    grep -q "$HOME3/tortoise/.venv/bin/python" "$BR_INSTALLED" \
+        && ok "branch-reaper entry point is the TCC-holding checkout interpreter" \
+        || bad "branch-reaper entry point is the TCC-holding checkout interpreter"
+    grep -q "$HOME3/.pi/agent/scripts/pi-reap-worktrees-launchd.py" "$BR_INSTALLED" \
+        && ok "branch-reaper uses the SHARED launcher (no branch-specific one)" \
+        || bad "branch-reaper uses the SHARED launcher"
+    grep -q "$HOME3/.pi/agent/scripts/cleanup-stale-branches.sh" "$BR_INSTALLED" \
+        && ok "branch-reaper launcher targets the FARMED reaper script" \
+        || bad "branch-reaper launcher targets the FARMED reaper script"
+    grep -q "<string>--repo</string>" "$BR_INSTALLED" \
+        && grep -q "<string>$HOME3/tortoise</string>" "$BR_INSTALLED" \
+        && ok "branch-reaper passes the checkout explicitly (bash -s empties BASH_SOURCE)" \
+        || bad "branch-reaper passes the checkout explicitly"
+    grep -q "<string>--scope</string>" "$BR_INSTALLED" \
+        && ok "branch-reaper selects the local scope" \
+        || bad "branch-reaper selects the local scope"
+    grep -q "<string>--execute</string>" "$BR_INSTALLED" \
+        && bad "branch-reaper SHIPS UNARMED (no execute flag)" \
+        || ok "branch-reaper SHIPS UNARMED (no execute flag)"
+    # The report must be RETRIEVABLE: the reaper writes no file on its own, so a
+    # plist without this key sends every pass to the unified log. The script
+    # caps the file (CLEANUP_BRANCH_LOG_MAX_BYTES), so no StandardOutPath.
+    grep -q "<key>CLEANUP_BRANCH_LOG</key>" "$BR_INSTALLED" \
+        && grep -q "$HOME3/.pi/agent/state/cleanup-stale-branches.log" "$BR_INSTALLED" \
+        && ok "branch-reaper points its pass report at a retrievable capped log" \
+        || bad "branch-reaper points its pass report at a retrievable capped log"
+    grep -q '{{' "$BR_INSTALLED" \
+        && bad "no unresolved placeholders remain in the branch-reaper plist" \
+        || ok "no unresolved placeholders remain in the branch-reaper plist"
+else
+    bad "branch-reaper installs when {{TORTOISE_REPO}} resolves"
 fi
 
 echo ""

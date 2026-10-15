@@ -295,7 +295,11 @@ fi
 # executes $DEST/scripts/ci_runner_gate.sh, so farming it is what makes the REPO
 # copy the copy that runs — without it a box keeps executing a hand-copied
 # duplicate (a merged fix never reaches it) and a second box has no fallback gate.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh)
+# #1787 adds cleanup-stale-branches.sh: the daily com.tortoise.branch-reaper job
+# runs the FARMED copy through the shared launcher with an explicit --repo, and
+# install-launchd.sh's broken-target guard refuses the whole install when the
+# farmed script is absent.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
