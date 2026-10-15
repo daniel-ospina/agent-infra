@@ -48,6 +48,8 @@ import {
   hasAdminMergeFlag,
   isGhPrMergeCommand,
   isAdminMergeCommand,
+  ghShimWillEnforce,
+  hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
   extractMergePrNumber,
@@ -90,6 +92,33 @@ import * as os from "node:os";
 
 let passed = 0;
 let failed = 0;
+
+// ── POSTURE OF THIS SUITE (#1776) ────────────────────────────────────────────
+// Two layers answer "is this an unevidenced admin merge?": this extension's TEXT
+// scanner and the argv-level gh shim (#984) the extension puts on PATH. Only the
+// argv layer can resolve `$VAR`/`$(…)`, so a read that NEEDS resolving does not
+// decide here while the argv layer is present (`ghShimWillEnforce`); a LITERAL
+// `--admin` always does (`hasLiteralAdminFlag`). Every pre-existing gate test below
+// therefore runs in the posture where the scanner owns the guessing half (the argv
+// layer absent or switched off) — the only posture in which those expectations are
+// this gate's behaviour rather than a duplicate of the shim's. The DEFAULT
+// (shim installed) posture is pinned by the `#1776` handler tests at the end; do not
+// "fix" a block expectation here by flipping this line — assert the posture you
+// mean, per test.
+process.env.AGENT_GH_SHIM = "0";
+
+/** Run `fn` in the OTHER posture — the argv shim INSTALLED (#1776) — for the few
+ *  sync assertions that are ABOUT the shim. See POSTURE OF THIS SUITE above. */
+function withShimInstalled<T>(fn: () => T): T {
+  const prev = process.env.AGENT_GH_SHIM;
+  delete process.env.AGENT_GH_SHIM;
+  try {
+    return fn();
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prev;
+  }
+}
 
 function test(name: string, fn: () => void) {
   try {
@@ -3859,6 +3888,85 @@ test("isAdminMergeCommand: the flag-shape fail-closed rules and their carve-outs
   ok(!isAdminMergeCommand('gh pr merge 999 -F "$tmpfile"'), "a dynamic --body-file is NOT the flag");
   ok(!isAdminMergeCommand('cd "$HOME/wt" && gh pr merge 7'), "a `$` BEFORE the merge word is not the flag");
   ok(!isAdminMergeCommand("gh pr view $X"), "a non-merge gh call with a `$VAR` is NOT gated");
+  // ⛔ THE FALSE POSITIVE THIS BRANCH STILL HAS (agent-infra#1776, measured
+  // 2026-10-15). `hasAdminMergeFlag` fires on a construct PLUS the word `admin`
+  // ANYWHERE — which a PR TITLE supplies — so these ordinary calls ARE read as
+  // admin merges here. That is asserted as TRUE, not fixed in place, because the
+  // predicate is the fail-closed TEXT layer: making it precise was attempted
+  // three times and each attempt produced a fresh fail-open on the splice ×
+  // repo-flag cross-product (#984's conclusion, re-measured). The fix is in the
+  // CALLER, which stands down whenever the argv layer will enforce the command —
+  // `ghShimWillEnforce`, and the `tool_call` tests below. The first command here
+  // is literally how agent-infra PR #1775 was blocked at zero dispatches.
+  ok(isAdminMergeCommand('gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"'),
+     "the text layer DOES mis-read a PR title mentioning admin — over-broad BY DESIGN");
+  ok(isAdminMergeCommand('gh issue comment 1 --body "the admin gate ran $(date)"'),
+     "…and likewise for any other gh call that mentions admin under a construct");
+  // The merge VERB is found in every spelling, including where a repo flag (whose
+  // value may be a substitution or a quoted multi-word) sits exactly between the
+  // verb words — these are the shapes the caller must NOT stand down for when the
+  // argv layer is absent, so they are pinned against the fallback.
+  ok(isAdminMergeCommand("V=--admin; gh p$'r' merge 999 $V"),
+     "a construct AFTER the `gh` word is still a merge verb");
+  ok(isAdminMergeCommand('V=--admin; gh pr m`printf erge` 999 $V'),
+     "a construct AFTER the `pr` word is still a merge verb");
+  ok(isAdminMergeCommand("V=--admin; $'gh' pr merge 999 $V"),
+     "a quoted `gh` with literal pr+merge is still a merge verb");
+  ok(isAdminMergeCommand("V=--admin; g$'h' pr merge 999 $V"),
+     "…and a spliced `gh` with literal pr+merge is too");
+  ok(isAdminMergeCommand("V=--admin; gh pr --repo o/r merge 999 $V"),
+     "a repo flag BETWEEN the verb words does not hide the merge");
+  ok(isAdminMergeCommand("V=--admin; gh pr --repo=$(cat x) merge 999 $V"),
+     "…nor does a substituted repo value");
+  ok(isAdminMergeCommand('V=--admin; gh pr --repo "$(cat .gh-repo)" merge 999 $V'),
+     "…nor a QUOTED multi-word repo value");
+});
+
+test("ghShimWillEnforce: decided from our own state, never from the command text (#1776)", () => {
+  // Two review cycles falsified every attempt to decide this from the command
+  // text: a whitespace-anchored `PATH=` pattern missed `(PATH=/usr/bin gh …)`;
+  // unbounded it still missed `export "PATH"="$HOME/bin:…"` (which reaches the
+  // real gh); a `/gh` test missed `$P/g''h`. The predicate now asks only what the
+  // extension knows, so the ONLY inputs are the kill switch and the resolved dir —
+  // and the residual it does not claim is declared in its doc comment.
+  const prev = process.env.AGENT_GH_SHIM;
+  const DIR = "/repo/scripts/gh-shim";
+  try {
+    delete process.env.AGENT_GH_SHIM;
+    ok(ghShimWillEnforce(DIR), "a resolved dir and no kill switch → the argv layer decides");
+    ok(!ghShimWillEnforce(null), "nothing injected → nothing will enforce, so the TEXT gate decides");
+    // Command text is NOT an input: none of these change the answer, which is the
+    // point — a spelling cannot create or destroy the argv layer.
+    for (const c of [
+      "gh pr merge 999 --admin",
+      "(PATH=/usr/bin gh pr merge 999 --admin)",
+      'export "PATH"="$HOME/bin:/usr/bin:/bin"; gh pr merge 999 --admin',
+      "$P/g''h pr merge 999 --admin",
+    ]) {
+      ok(ghShimWillEnforce(DIR), `command text is not consulted: ${c}`);
+    }
+    process.env.AGENT_GH_SHIM = "0";
+    ok(!ghShimWillEnforce(DIR), "the operator's kill switch disables the deferral even with a dir");
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prev;
+  }
+});
+
+test("hasLiteralAdminFlag: the DECISIVE read, split from the fail-closed guess (#1776)", () => {
+  // The caller's split: a literal flag keeps the text layer's decision; anything
+  // that needs a shell resolved is handed to the argv layer instead.
+  ok(hasLiteralAdminFlag("gh pr merge 999 --admin"), "the literal flag is decisive");
+  ok(hasLiteralAdminFlag("export PATH=$HOME/bin; gh pr merge 999 --admin"),
+     "…wherever it sits in the command");
+  ok(hasLiteralAdminFlag("gh pr merge 999 --admin=true"), "a Go-true value is decisive");
+  ok(hasLiteralAdminFlag('gh pr merge 999 --ad""min'),
+     "…and a QUOTE-splice is normalized into the literal read");
+  ok(!hasLiteralAdminFlag("gh pr merge 999 --admin=false"),
+     "a Go-false value is an ordinary merge, exactly as in hasAdminMergeFlag");
+  ok(!hasLiteralAdminFlag('gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"'),
+     "the word `admin` in a TITLE is NOT the flag — this is the false positive");
+  ok(!hasLiteralAdminFlag("V=--admin; gh pr merge 999 $V"), "a $VAR-supplied flag is a guess");
+  ok(!hasLiteralAdminFlag("gh pr merge 999 $'--admin'"), "…as is an ANSI-C-quoted one");
 });
 
 test("countMergeVerbs: a compound command must fail closed", () => {
@@ -4246,7 +4354,7 @@ test("resolveRepoContext: a QUOTED verb in an assignment does not hide the real 
 
 test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash call", () => {
   const ORIG = "gh pr merge 123 --admin";
-  const shimmed = withGhShim(ORIG, "/repo/scripts/gh-shim");
+  const shimmed = withShimInstalled(() => withGhShim(ORIG, "/repo/scripts/gh-shim"));
   ok(shimmed !== null, "a resolved shim dir yields a patched command");
   // Its OWN LINE: a `&&` prefix would change the command's exit status, which the
   // harness reports back to the agent.
@@ -4255,12 +4363,16 @@ test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash ca
   ok((shimmed as string).startsWith('export PATH="/repo/scripts/gh-shim":"$PATH"'), "PATH is prepended, quoted");
   equal(withGhShim(ORIG, null), null, "no shim installed → nothing injected (never a broken PATH)");
   // The kill switch: this touches EVERY bash call, so it must be switchable.
-  const prev = process.env.AGENT_GH_SHIM;
+  // SAVE/RESTORE, never a bare assignment — an un-restored mutation becomes the
+  // posture of every LATER test in this file (it did, and made the declared posture
+  // at the top inert; review cycle 3, P2), which turns the suite order-dependent.
+  const prevShim = process.env.AGENT_GH_SHIM;
   process.env.AGENT_GH_SHIM = "0";
   equal(withGhShim(ORIG, "/repo/scripts/gh-shim"), null, "AGENT_GH_SHIM=0 disables the layer");
-  if (prev === undefined) delete process.env.AGENT_GH_SHIM;
-  else process.env.AGENT_GH_SHIM = prev;
-  equal(withGhShim("true", "/a b/gh-shim"), 'export PATH="/a b/gh-shim":"$PATH"\ntrue',
+  if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+  else process.env.AGENT_GH_SHIM = prevShim;
+  equal(withShimInstalled(() => withGhShim("true", "/a b/gh-shim")),
+    'export PATH="/a b/gh-shim":"$PATH"\ntrue',
     "a shim path containing a space survives quoting");
 });
 
@@ -4271,7 +4383,7 @@ test("withGhShim: the injected prefix must NOT make a benign command look like a
   // that starts scanning the patched string has a failing test to hit.
   const benign = "echo hello";
   equal(isAdminMergeCommand(benign), false, "the benign command is not an admin merge");
-  const patched = withGhShim(benign, "/repo/scripts/gh-shim") as string;
+  const patched = withShimInstalled(() => withGhShim(benign, "/repo/scripts/gh-shim")) as string;
   equal(isAdminMergeCommand(patched), false, "the prefix alone is not an admin merge");
   equal(isGitOp(patched), isGitOp(benign), "and the prefix does not fabricate a git op");
   // WHAT IS ACTUALLY INJECTED must be free of gate-relevant words. Other extensions
@@ -4282,7 +4394,7 @@ test("withGhShim: the injected prefix must NOT make a benign command look like a
   // synthetic path above cannot catch that, so assert against the real one.
   ok(!/admin/i.test(NEUTRAL_GH_SHIM_DIR),
     `the neutral shim dir carries no gate word (got ${NEUTRAL_GH_SHIM_DIR})`);
-  const realPatch = withGhShim(benign, NEUTRAL_GH_SHIM_DIR) as string;
+  const realPatch = withShimInstalled(() => withGhShim(benign, NEUTRAL_GH_SHIM_DIR)) as string;
   equal(isGitOp(realPatch), isGitOp(benign), "the REAL injected prefix does not fabricate a git op");
   equal(isAdminMergeCommand(realPatch), isAdminMergeCommand(benign), "…nor an admin merge");
 });
@@ -4898,6 +5010,140 @@ testAsync("#930 --admin=false is not a bypass — the admin gate does not fire (
       equal(blocked[0].reason, "no_review_record", "the ADMIN gate must not fire for --admin=false");
     } finally {
       _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// #1776 — THE ROOT OF THE FALSE BLOCK: the text layer mis-reads an ordinary
+// `gh pr create` whose TITLE mentions `admin` (see the `isAdminMergeCommand` test
+// above, which pins the mis-read as TRUE), and the CALLER now stands down when the
+// argv layer will enforce the command. Both polarities are pinned here, because a
+// stand-down that fired unconditionally would be a fail-open.
+testAsync("#1776: the text gate stands down when the argv layer will enforce (the false block)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // default posture: the shim IS installed
+    process.env.PI_MODE = "print";
+    // A gh failure is the sharpest available probe: if the evidence gate RAN, the
+    // head lookup would throw and it would fail closed with ITS message. This
+    // session has dispatched no reviewer, so the ordinary dispatch gate still
+    // refuses the command — that is a DIFFERENT gate, and the assertions below
+    // separate the two.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = 'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"';
+      ok(isAdminMergeCommand(cmd), "the TEXT layer still mis-reads it (over-broad by design)");
+      const ev = { toolName: "bash", input: { command: cmd } };
+      const res = await fire("tool_call", ev);
+      // The premise of the stand-down, observed rather than assumed: the handler
+      // patched the command, so the shim IS on PATH when it executes.
+      ok(String(ev.input.command).startsWith("export PATH="),
+        "the argv layer's PATH prefix WAS injected for this command");
+      const reason = String((res && res.reason) ?? "");
+      ok(!/admin-merge|admin merge|resolvable PR number/i.test(reason),
+        `the ADMIN-MERGE gate is not what refused it (reason: ${reason || "<none>"})`);
+      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "…and no admin-merge block is audited for it");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1776: with the argv layer OFF the text gate still refuses an unresolvable admin merge", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    process.env.AGENT_GH_SHIM = "0"; // the operator turned the argv layer off
+    process.env.PI_MODE = "print";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = "V=--admin; gh pr merge 999 $V";
+      ok(!hasLiteralAdminFlag(cmd), "the flag is a guess, not a literal token");
+      ok(!ghShimWillEnforce("/repo/scripts/gh-shim"),
+        "the env kill switch disables the deferral even with a shim dir");
+      const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      ok(res && res.block === true, "…so the fail-closed text gate still refuses it");
+      ok(/admin-merge/.test(String(res && res.reason)), "…and says which gate refused");
+    } finally {
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1776: a LITERAL admin merge is refused even with the argv layer installed", async () => {
+  // The review-cycle-1 P0, end-to-end. Every attempt to detect a PATH discard from
+  // the command TEXT was defeated (cycle 1: `(PATH=…`; cycle 2: `export "PATH"=…`),
+  // so the fix is not another spelling — it is that a LITERAL `--admin` keeps the
+  // decision in the layer that CAN make it, whatever the command does to PATH.
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed …
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), [])); // a real head, NO evidence comment
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmds = [
+        "PATH=/usr/bin gh pr merge 999 --admin",
+        "(PATH=/usr/bin gh pr merge 999 --admin)",
+        'export "PATH"="$HOME/bin:/usr/bin:/bin"; gh pr merge 999 --admin', // cycle-2 P0
+        "$P/g''h pr merge 999 --admin", // cycle-2 P1: a path-qualified gh, spliced basename
+      ];
+      for (const cmd of cmds) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+        ok(res && res.block === true, `\`${cmd}\` → still BLOCKED`);
+      }
+      const blocked = tempAuditLines().filter(
+        (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"
+      );
+      equal(blocked.length, cmds.length, "…each by the EVIDENCE gate — it ran, it did not defer");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installed", async () => {
+  // The other direction of the same split: a `$VAR`-supplied flag is not decidable
+  // from the text, so with the argv layer installed the evidence gate does NOT run on
+  // it — no evidence check is performed against a PR number read from a guess. The
+  // enforcement for this shape is the shim (tests/gh-shim/run.sh §2 and §12 pin that
+  // it refuses the splice, repo flag and all); the text layer takes it back the moment
+  // the argv layer is absent, which the test above pins.
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), []));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = "V=--admin; gh pr merge 999 $V";
+      ok(!hasLiteralAdminFlag(cmd), "the flag is a guess");
+      ok(ghShimWillEnforce("/repo/scripts/gh-shim"), "…and the argv layer is installed");
+      await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "the evidence gate did not run on a guessed flag");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });

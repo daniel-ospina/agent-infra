@@ -160,6 +160,45 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
   return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
 }
 
+/**
+ * Will the ARGV-LEVEL layer enforce this command — i.e. may the text gate hand
+ * over a read it could only GUESS? (#1776)
+ *
+ * The scanner and the shim answer the same question from two layers, and #984
+ * settled that only the argv layer can answer it: resolving `$VAR`/`$(…)` means
+ * EVALUATING a shell, which a gate cannot do without running the command it exists
+ * to refuse. `hasAdminMergeFlag` therefore fails CLOSED on anything unresolvable —
+ * and that same guess refused an ordinary `gh pr create` whose TITLE contained the
+ * word `admin` (`gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"`),
+ * blocking agent-infra PR #1775 at zero dispatches.
+ *
+ * DECIDED FROM THE EXTENSION'S OWN STATE, NEVER FROM THE COMMAND TEXT.
+ *
+ * Three attempts to decide it from the text, and two review cycles on the result,
+ * each produced a fresh hole: a whitespace-anchored `PATH=` pattern missed
+ * `(PATH=/usr/bin gh …)`; unbounded, it still missed `export "PATH"="$HOME/bin:…"`
+ * (which DOES reach the real gh — measured); a `/gh` path test missed `$P/g''h`.
+ * That is #984's conclusion one layer up: a scanner cannot read shell text, and a
+ * partial blacklist is worse than none, because it claims a coverage it does not
+ * have. So this asks only what the extension itself knows: is there an argv layer
+ * (`AGENT_GH_SHIM`), and did we put it on PATH for this call (`shimDir`, the SAME
+ * value `withGhShim` was given, so the injection and this decision cannot drift).
+ *
+ * WHAT IS THEREFORE OUT OF SCOPE, stated rather than implied. A command whose flag
+ * is NOT a literal token AND that also discards the injected PATH entry
+ * (`export "PATH"=…`, `env -i`, `sudo`, an absolute path to the real gh) is decided
+ * by neither layer. That intersection is the shim's own STATED LIMIT — "a command
+ * that discards this PATH entry … deliberate acts to remove the guard" — and the
+ * post-merge detector, not this gate, is the authority of record for it. It is
+ * DELIBERATELY not chased with another spelling list: that is exactly how this
+ * predicate grew two P0s across two review cycles. Note the literal half matters —
+ * `export "PATH"=…; gh pr merge 999 --admin` still carries a literal flag, so the
+ * text layer keeps that decision (`hasLiteralAdminFlag`, asserted end-to-end).
+ */
+export function ghShimWillEnforce(shimDir: string | null): boolean {
+  return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null;
+}
+
 // ── gh invocation seam (testable) ─────────────────────
 // ESM named imports of builtin CJS modules (child_process) are not patchable
 // from tests, so gh calls route through runGh(). Tests inject a fake via
@@ -614,6 +653,17 @@ export function isAdminMergeCommand(command: string): boolean {
     // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
     // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
     // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
+    //
+    // It is a GUESS, so the CALLER does not act on it while the argv layer is
+    // present: it resolves what this cannot, and its false positives — an ordinary
+    // `gh` call whose TEXT contains a construct and the word `admin` (a PR title is
+    // enough) — are the reason agent-infra#1776 exists. Three separate attempts to
+    // make this guess PRECISE instead produced a fresh fail-open on the splice ×
+    // repo-flag cross-product each time, which is the empirical form of #984's
+    // conclusion: the class is not closable in a scanner. Do not add another arm
+    // here — the caller's condition is `hasLiteralAdminFlag(command) ||
+    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets
+    // handed over.
     return (
       /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
@@ -1661,10 +1711,35 @@ export function hasAdminMergeFlag(command: string): boolean {
   //    WITHOUT the word `admin` — e.g. the common `gh pr merge "$PR" --squash` —
   //    is untouched.
   if (hasUnresolvableConstruct(command) && /admin/i.test(command)) return true;
-  // 3. The literal flag. Token-anchored: `--admin` must be a WHOLE flag. A
-  //    `--adminx` typo is not a bypass (gh rejects it as an unknown flag), and
-  //    refusing it would be exactly the false block this rail must not produce.
-  //    `=` may carry a Go-false value; anything else is a bypass (see GO_FALSE).
+  // 3. The literal flag — the DECISIVE read (see `hasLiteralAdminFlag`).
+  return literalAdminFlagIn(probe);
+}
+
+/**
+ * Does the command carry `--admin` as a LITERAL token — i.e. is the admin flag
+ * readable from the text WITHOUT resolving a shell? (#1776)
+ *
+ * This is the polarity split the CALLER needs: `hasAdminMergeFlag` answers "is
+ * this an admin merge?" as `unresolvable ⇒ YES` (parts 1-2, fail-closed guesses),
+ * and a guess is not something the text layer can hand to a PR number, a head
+ * lookup, or an evidence check — a guess is what refused an ordinary `gh pr
+ * create` whose TITLE contained the word `admin` (agent-infra#1775). So the caller
+ * asks this instead: a LITERAL `--admin` is a read that needs no resolution, and
+ * the text layer keeps the decision for it even when the argv layer exists.
+ *
+ * Quote-splices are resolved by `normalizeForFlagScan` (`--ad""min` → `--admin`),
+ * so they count as literal; `$VAR`/backtick/ANSI-C spellings do not.
+ */
+export function hasLiteralAdminFlag(command: string): boolean {
+  return literalAdminFlagIn(normalizeForFlagScan(command));
+}
+
+/** The literal flag inside an already-normalized probe (see `hasAdminMergeFlag`). */
+function literalAdminFlagIn(probe: string): boolean {
+  // Token-anchored: `--admin` must be a WHOLE flag. A `--adminx` typo is not a
+  // bypass (gh rejects it as an unknown flag), and refusing it would be exactly the
+  // false block this rail must not produce. `=` may carry a Go-false value;
+  // anything else is a bypass (see GO_FALSE).
   const re = /(?:^|[\s])--admin(?:=([^\s;&|()`$<>]*))?(?=$|[\s;&|()`$<>])/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(probe)) !== null) {
@@ -2503,7 +2578,18 @@ export default function (pi: ExtensionAPI) {
       // the PR carries evidence bound to the CURRENT head SHA. On a pass it
       // FALLS THROUGH to the merge-registry gate — the two gates are
       // independent and both must pass.
-      if (isAdminMergeCommand(command)) {
+      //
+      // #1776: but only for a read the TEXT layer can actually make. A literal
+      // `--admin` needs no shell resolution, so it keeps the decision here even
+      // with the argv layer installed — which is why
+      // `export "PATH"=…; gh pr merge 999 --admin` is still refused. The rest of
+      // `isAdminMergeCommand` is a fail-closed GUESS (a construct plus the word
+      // `admin`, which a PR TITLE supplies), and a guess is not something an
+      // evidence check should be run on: it refused an ordinary `gh pr create` at
+      // zero dispatches. When the argv layer is installed it resolves what a guess
+      // cannot, and it decides; when it is absent or switched off, this gate
+      // refuses exactly as before. See `ghShimWillEnforce`.
+      if (isAdminMergeCommand(command) && (hasLiteralAdminFlag(command) || !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
