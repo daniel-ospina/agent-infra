@@ -35,7 +35,10 @@
  *              answer (unparseable, wrong `version`, missing/ill-formed commit or hash,
  *              `commit: null` because the surface was installed from a tarball with no git
  *              identity, a stamped commit that is not present in this checkout, a payload
- *              root that cannot be read, or a `payload.roots` that is not the fixed root set).
+ *              root that cannot be read, a `payload.roots` that is not the fixed root set, or
+ *              an `agentInfra.dirty` that is neither `true` nor `false` — a stamp that does
+ *              not say whether its source checkout was clean cannot answer whether the
+ *              recorded commit describes the payload).
  *              A hand-installed surface lands here BY CONSTRUCTION — absence is never read as
  *              "current". Fail-closed, never fail-open.
  *   in-sync    BOTH hold: the surface's recomputed payload hash equals the hash recorded in
@@ -45,6 +48,9 @@
  *   drift      a stamp exists and one of those fails:
  *                reason `payload`  — the installed files changed after stamping
  *                                    (hand-edit, partial copy, a file added or removed)
+ *                reason `dirty`    — the stamp was written from a checkout whose PAYLOAD ROOTS
+ *                                    had uncommitted changes, so its recorded commit does not
+ *                                    describe the installed bytes
  *                reason `diverged` — the stamped commit is NOT an ancestor of the target ref:
  *                                    a tree off main's line (the `e8d5ce29` case)
  *
@@ -61,7 +67,11 @@
  *     which files a given installer version happened to ship.
  *   - It is not a content lock. A stamp records what was installed — it does not assert the
  *     install is correct, and a PR that edits a payload AND re-runs `--write` still passes.
- *     That same-commit bound is the accepted one for this guard.
+ *     That same-commit bound is the accepted one for this guard. The ONE exception is the source
+ *     checkout being dirty AT STAMP TIME: the stamp's own `agentInfra.dirty` is consulted (scoped
+ *     to the payload roots), and such a stamp reads `drift` — its recorded commit does not
+ *     describe the installed bytes. The stamp is still written (so the state is recorded and
+ *     loud), but it can never certify `in-sync`.
  *   - `node_modules/` is excluded from the payload digest. It is machine-specific, huge and
  *     churns independently of the install; including it would make every surface drift on
  *     every dependency resolution (see #1069 for what that class costs). Named here so the
@@ -287,7 +297,13 @@ function manifestVersion(repo) {
 /** `{ commit, dirty }` for the checkout the install came from. `commit` may be null. */
 export function installIdentity(repo) {
   const commit = git(repo, ["rev-parse", "HEAD"]);
-  const porcelain = git(repo, ["status", "--porcelain"]);
+  // `dirty` is scoped to the PAYLOAD ROOTS, not the whole checkout. The question the stamp has to
+  // answer is "does the recorded commit describe the installed payload?" — a change to `docs/`, or
+  // to the stamp file itself, does not touch that payload. A whole-repo `git status` answered a
+  // different question and flagged every surface stamped while an unrelated file was being edited
+  // (and, for a surface that IS the checkout, the stamp file it had just written). A path that does
+  // not exist is not an error for `git status --porcelain -- <path>`.
+  const porcelain = git(repo, ["status", "--porcelain", "--", ...PAYLOAD_ROOTS]);
   return {
     commit: commit !== null && /^[0-9a-f]{40}$/.test(commit) ? commit : null,
     dirty: porcelain === null ? null : porcelain !== "",
@@ -499,6 +515,38 @@ export function classifySurface(surfaceDir, repo, target) {
       payload,
     };
   }
+  // A stamp written from a DIRTY source checkout cannot certify `in-sync`: the recorded commit does
+  // not describe the installed bytes, so "a version that really is on main's line" is false about
+  // this payload. The stamp records the fact (`agentInfra.dirty`) precisely so it can be consulted
+  // here instead of being dead metadata — measured: origin's `extensions/alpha.ts` edited and
+  // uncommitted, the surface holding those bytes, and the surface reading `in-sync`.
+  if (stamp.agentInfra.dirty === true) {
+    return {
+      surface: abs,
+      verdict: "drift",
+      reason:
+        `stamped from a DIRTY source checkout — commit ${stamp.agentInfra.commit.slice(0, 9)} does not ` +
+        "describe the installed payload (uncommitted changes were present under the payload roots when " +
+        "it was stamped); re-stamp from a clean checkout",
+      stamp,
+      payload,
+    };
+  }
+  // `dirty` must be a definite `false` to certify. `null` (the status probe failed) and an absent
+  // field are the same class of unanswerable as `commit: null`: the stamp does not say whether its
+  // commit describes the payload, so it is `unstamped`, never a pass.
+  if (stamp.agentInfra.dirty !== false) {
+    return {
+      surface: abs,
+      verdict: "unstamped",
+      reason:
+        `agentInfra.dirty is ${JSON.stringify(stamp.agentInfra.dirty ?? null)} — the stamp does not say ` +
+        "whether its source checkout was clean, so whether the recorded commit describes the installed " +
+        "payload is unanswerable",
+      stamp,
+      payload,
+    };
+  }
   if (stamp.agentInfra.commit === target.sha) {
     return { surface: abs, verdict: "in-sync", reason: "payload matches its stamp; commit == target", stamp, payload };
   }
@@ -648,7 +696,16 @@ function parseArgs(argv) {
       case "--no-fetch": opts.fetch = false; break;
       case "--no-repos": opts.noRepos = true; break;
       case "--ref": opts.ref = need(a); break;
-      case "--repo": opts.repo = need(a); break;
+      case "--repo": {
+        const value = need(a);
+        // An explicit `--repo` names a checkout. An EMPTY value names nothing, and `resolveRepo`
+        // treats `""` as unnamed — so it would silently fall through to $AGENT_INFRA_PATH or this
+        // script's own module root and answer about a repo nobody named. Same class as the
+        // `--surface ""` refusal above; refused here as bad usage (exit 2).
+        if (value === "") throw new Error("--repo needs a non-empty value");
+        opts.repo = value;
+        break;
+      }
       case "--repos-root": opts.reposRoot = need(a); break;
       case "-h":
       case "--help": opts.help = true; break;
@@ -685,14 +742,17 @@ function main(argv) {
   const surfaces =
     opts.surfaces.length > 0
       ? opts.surfaces.map((s) => path.resolve(s))
-      : [...(opts.noRepos ? [] : [piSurface()]), ...(opts.noRepos ? [] : linkedSurfaces(opts.reposRoot))]
-          .filter((dir) => {
-            try {
-              return fs.statSync(dir).isDirectory();
-            } catch {
-              return false;
-            }
-          });
+      // The pi surface is a DEFAULT surface and is checked UNCONDITIONALLY; `--no-repos` disables
+      // only the linked-repo scan. Testing `opts.noRepos` on the pi branch too made the flag whose
+      // documented meaning is "only the pi surface" hand back an EMPTY set — the tool then refused
+      // to check anything, the exact opposite of the documented behaviour.
+      : [piSurface(), ...(opts.noRepos ? [] : linkedSurfaces(opts.reposRoot))].filter((dir) => {
+          try {
+            return fs.statSync(dir).isDirectory();
+          } catch {
+            return false;
+          }
+        });
 
   // AN EMPTY SURFACE SET IS NOT A GREEN ONE. Reporting "✅ in-sync" over nothing is the vacuous
   // pass this whole check exists to refuse, so it is exit 2 ("cannot verify"), matching
@@ -707,6 +767,14 @@ function main(argv) {
     for (const dir of surfaces) {
       try {
         const stamp = writeStamp(dir, repo);
+        // The stamp is written either way — the state is recorded — but a dirty source is said
+        // LOUDLY, because this stamp can never certify `in-sync` (verification reads it as drift).
+        if (stamp.agentInfra.dirty === true) {
+          console.error(
+            `⚠️  ${dir} was stamped from a DIRTY source checkout — its commit does not describe the ` +
+              "payload, so verification will read this surface as drift until it is re-stamped from a clean checkout"
+          );
+        }
         console.log(
           `✅ stamped ${dir} — commit ${(stamp.agentInfra.commit ?? "none").slice(0, 9)}, ` +
             `${stamp.payload.files} files, ${stamp.payload.hash.slice(0, 12)}…`

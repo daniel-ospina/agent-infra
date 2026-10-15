@@ -297,7 +297,7 @@ try {
     eq("a named-but-absent surface is unstamped (exit 1)", empty.code, 1);
     contains("named-but-absent surface is reported unstamped", empty.stdout, "unstamped");
 
-    const noSurfaces = run(["--surface", ""], {});
+    const noSurfaces = run(["--surface", "", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { cwd: TMP });
     if (noSurfaces.code !== 0) ok("a blank surface argument never exits 0");
     else bad("a blank surface argument never exits 0", noSurfaces.stdout);
 
@@ -583,6 +583,98 @@ try {
     fs.rmSync(a, { force: true });
     fs.rmSync(b, { force: true });
     stampNow();
+  }
+
+  // ── 20. --no-repos disables ONLY the linked-repo scan; the pi surface remains ────────────
+  // The flag is documented in two places as "only the pi surface" (header CLI list + --help).
+  // Both ternaries used to test `opts.noRepos`, so the list came back EMPTY and the tool
+  // refused to check anything (exit 2) — the exact opposite of its documented meaning.
+  console.log("\n20. --no-repos still checks the pi surface");
+  {
+    const savedPi = process.env.AGENT_INFRA_PI_HOME;
+    stampNow();
+    process.env.AGENT_INFRA_PI_HOME = SURFACE;
+    try {
+      const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+      if (v.code === 2) bad("--no-repos does not hand back an empty set", v.stderr + v.stdout);
+      else ok("--no-repos does not hand back an empty set");
+      contains("the pi surface is still classified", v.stdout, SURFACE);
+      contains("and it is reported in-sync", v.stdout, "in-sync");
+    } finally {
+      if (savedPi === undefined) delete process.env.AGENT_INFRA_PI_HOME;
+      else process.env.AGENT_INFRA_PI_HOME = savedPi;
+    }
+  }
+
+  // ── 21. an EMPTY surface set is "nothing was verified" (exit 2) ─────────────────────────
+  // Deleting the `surfaces.length === 0` guard used to leave this whole suite GREEN (measured),
+  // because no arm ever built an empty set. Point the pi home at a path that does not exist and
+  // disable the linked scan, so `[piSurface()]` filters to [] — the state the guard exists for.
+  console.log("\n21. fail-closed — an empty surface set is 'nothing was verified' (exit 2)");
+  {
+    const savedPi = process.env.AGENT_INFRA_PI_HOME;
+    const savedRoot = process.env.AGENT_INFRA_REPOS_ROOT;
+    process.env.AGENT_INFRA_PI_HOME = path.join(TMP, "no-such-pi-home");
+    process.env.AGENT_INFRA_REPOS_ROOT = path.join(TMP, "no-such-repos-root");
+    try {
+      const v = run(["--no-repos", "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+      eq("an empty surface set exits 2, never 0", v.code, 2);
+      contains("the refusal says nothing was verified", v.stderr + v.stdout, "nothing was verified");
+    } finally {
+      if (savedPi === undefined) delete process.env.AGENT_INFRA_PI_HOME;
+      else process.env.AGENT_INFRA_PI_HOME = savedPi;
+      if (savedRoot === undefined) delete process.env.AGENT_INFRA_REPOS_ROOT;
+      else process.env.AGENT_INFRA_REPOS_ROOT = savedRoot;
+    }
+  }
+
+  // ── 22. an empty --repo names nothing and must not fall through to a default ─────────────
+  // `resolveRepo` reads `""` as UNNAMED and falls through to $AGENT_INFRA_PATH / this module's
+  // root — the substitution the explicit-`--repo` fix removed for a named value, left open for a
+  // blank one. `--surface ""` is refused; `--repo ""` must be too.
+  console.log("\n22. safety — an empty --repo must not resolve to some other checkout");
+  {
+    const v = run(["--surface", SURFACE, "--repo", "", "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("empty --repo → exit 2 (bad usage)", v.code, 2);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 23. a stamp from a DIRTY source checkout cannot certify in-sync ──────────────────────
+  // The stamp records `agentInfra.dirty`; nothing read it, so an install copied from a checkout
+  // with an uncommitted payload edit verified `in-sync` — the false green this check exists for.
+  console.log("\n23. fail-closed — a dirty source checkout is drift, never in-sync");
+  {
+    stampNow();
+    eq("control — a clean source stamps green", verify().code, 0);
+    const alphaPath = path.join(ORIGIN, "extensions", "alpha.ts");
+    const original = fs.readFileSync(alphaPath, "utf8");
+    fs.writeFileSync(alphaPath, original + "export const uncommitted = 1;\n");
+    try {
+      const w = stampNow();
+      eq("--write still exits 0 (the state is recorded, not hidden)", w.code, 0);
+      contains("--write warns that the source is dirty", w.stderr, "DIRTY");
+      eq("the stamp records dirty=true", stamp().agentInfra.dirty, true);
+      const v = verify();
+      eq("a dirty-source stamp exits 1", v.code, 1);
+      contains("the verdict is drift", v.stdout, "drift");
+      contains("the reason names the dirty source", v.stdout, "DIRTY source checkout");
+      contains("the reason never reads in-sync", v.stdout, "in-sync", false);
+
+      // `dirty: null` (the status probe failed) or an ABSENT field is the same class of
+      // unanswerable as `commit: null` — it must be unstamped, never a pass.
+      const dirtyStamp = stamp();
+      for (const unknown of [null, undefined]) {
+        writeStampRaw(SURFACE, { ...dirtyStamp, agentInfra: { ...dirtyStamp.agentInfra, dirty: unknown } });
+        const vn = verify();
+        eq(`dirty=${String(unknown)} → exit 1`, vn.code, 1);
+        contains(`dirty=${String(unknown)} is unstamped, never in-sync`, vn.stdout, "unstamped");
+        contains(`dirty=${String(unknown)} reason names agentInfra.dirty`, vn.stdout, "agentInfra.dirty");
+      }
+    } finally {
+      fs.writeFileSync(alphaPath, original);
+    }
+    stampNow();
+    eq("control — re-stamped from a clean checkout is green", verify().code, 0);
   }
 
 } finally {
