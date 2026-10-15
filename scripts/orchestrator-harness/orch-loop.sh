@@ -141,6 +141,13 @@ is_limit "${CYC:-}"               || CYC=240
 # delay, hammering the GitHub API. The floor is a small 5s (not 240, which would silently replace a
 # deliberate small value); install.sh refuses < 5 at render time, so the two ends agree.
 [ "$CYC" -ge 5 ] || CYC=240
+# agent-infra#1762. SWEEP_MAX_AGE bounds how long a 304 may serve a cached "unchanged" listing (see
+# the sweep listing block for the measured reason the bound is required). SWEEP_MIN_REMAIN is the
+# x-ratelimit-remaining floor below which the NEXT sweep is deferred to the reset.
+SWEEP_MAX_AGE="${SWEEP_MAX_AGE:-600}"
+is_limit "${SWEEP_MAX_AGE:-}"      || SWEEP_MAX_AGE=600
+SWEEP_MIN_REMAIN="${SWEEP_MIN_REMAIN:-20}"
+is_limit "${SWEEP_MIN_REMAIN:-}"   || SWEEP_MIN_REMAIN=20
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -433,6 +440,98 @@ review_slots() { # <open_prs>
   if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $(( 10#${MAX_REVIEW:-4} + 2 )); else echo "$MAX_REVIEW"; fi
 }
 
+# ── rate-limit-aware conditional listing (agent-infra#1762) ─────────────────────
+# The sweep re-listed every open PR every cycle and then read each one twice more, all over
+# GraphQL. That budget is 5,000 POINTS/hr per USER and is shared by every cell, lane and box acting
+# as the account, so two cells cross it; when it goes, EVERY `gh pr` call fails while
+# `gh api rate_limit` still reports `graphql 4933/5000`, and the sweep logs one
+# `nothing swept this cycle` line next to a healthy `[scope] open=N`. A cell that cannot list PRs
+# cannot merge, and it read as idle-but-fine.
+#
+# Two mechanisms from GitHub's own REST best-practice page replace that:
+#   * a CONDITIONAL listing — `If-None-Match: <etag>`; a 304 means the list is unchanged and GitHub
+#     does not charge a 304 to the primary rate limit, so the sweep's listing is free;
+#   * the RESPONSE HEADERS as the health signal — `x-ratelimit-remaining` / `-reset` / `Retry-After`
+#     — instead of polling `/rate_limit`, which the docs explicitly say not to trust and which was
+#     measured reporting 4933 remaining while every call failed (#1762). This governs the DEFERRAL
+#     DECISION only. The `[res]` line still prints a `/rate_limit` counter (`res_line`, advisory and
+#     deliberately not read for this decision) — do not read a healthy `gh_gql=` there as "the sweep
+#     can list PRs".
+# The listing moves to REST (`gh api`) because conditional requests are a REST feature — GraphQL has
+# no ETag — and `resources.core` is a SEPARATE 5,000/hr bucket from the GraphQL one the per-PR reads
+# below still spend. Those per-PR reads stay on GraphQL — moving them to REST is the issue's own
+# direction 1 / research item 4 and is NOT this PR — but a 304 SKIPS them for that cycle (an
+# identical list means an identical PR set). "Unchanged" therefore means "not moved to REST", never
+# "run every cycle": the skip is bounded by SWEEP_MAX_AGE, which drops `If-None-Match` once the
+# cached listing ages out.
+#
+# BEGIN sweep-quota (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
+# rl_header <name>: the value of one HTTP header in a raw `gh api --include` response, or empty.
+# Header NAMES are case-insensitive (HTTP/1.1) and the CRLF terminator is stripped. `--paginate -i`
+# repeats the header block once per page; the FIRST match (page 1) is returned, which is the page the
+# conditional header was sent on and therefore the one the deferral decision is about.
+rl_header() {
+  local want; want="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')"
+  tr -d '\r' | awk -v want="$want" '
+    {
+      c = index($0, ":")
+      if (c == 0) next
+      if (tolower(substr($0, 1, c - 1)) != want) next
+      v = substr($0, c + 1)
+      # Trim HTTP optional whitespace by character test, not a regex class: one-true-awk (the macOS
+      # default) does not reliably honour `\t` inside a bracket expression.
+      while (substr(v,1,1) == " " || substr(v,1,1) == "\t") v = substr(v, 2)
+      print v; exit
+    }'
+}
+# rl_status: the HTTP status of a raw `gh api --include` response ("HTTP/2.0 200 OK" on line 1).
+rl_status() {
+  awk 'NR == 1 { if (match($0, / [0-9][0-9][0-9]/)) { print substr($0, RSTART + 1, 3); exit } }'
+}
+# sweep_fail_kind <raw-response> <stderr> -> rate-limit | network | other.
+# A rate-limit failure and a network failure are NOT the same event: the first means the shared
+# budget is spent (wait for the reset, then retry), the second means the link (retry at once).
+# Reading them as one is what made a cell that cannot merge indistinguishable from an idle one.
+# A `304` never reaches here — the caller tests the status first.
+sweep_fail_kind() {
+  local raw="${1:-}" err="${2:-}"
+  # ⛔ NOT `HTTP 4(29|03)`. A bare 403 is how a PERMISSION/SCOPE failure arrives — an expired or
+  # under-scoped token, SSO, admin rights ("gh: Resource not accessible by integration (HTTP 403)")
+  # — and it carries no rate-limit header, because there was no rate limit. Matching 403 here
+  # classified such a failure as `rate-limit`, deferred the sweep for up to an hour, and logged
+  # `RATE-LIMITED ... CANNOT MERGE` over a stderr line that says otherwise: the same "instrument
+  # reports the opposite of the truth" defect this block exists to remove. A 429 is unambiguous; a 403
+  # must CORROBORATE the limit via a header or one of the named phrases, and otherwise falls through
+  # to `other`, where the real stderr reaches the operator.
+  if [ "$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-remaining')" = "0" ] \
+     || [ -n "$(printf '%s\n' "$raw" | rl_header 'retry-after')" ] \
+     || grep -qiE 'rate limit|abuse detection|secondary rate|HTTP 429' <<<"$err" ; then
+    echo rate-limit
+  elif grep -qiE 'timeout|timed out|TLS|tls:|dial|connection|no such host|network|EOF|reset by peer|refused' <<<"$err" ; then
+    echo network
+  else
+    echo other
+  fi
+}
+# sweep_defer_until <raw-response> -> epoch seconds to defer the sweep until.
+# Honours `Retry-After` (seconds) and `x-ratelimit-reset` (epoch), takes the LATER, and floors/ceils
+# it to [now+60, now+3600]: a missing or absurd reset must not become either a hot retry loop or a
+# multi-day stall.
+sweep_defer_until() {
+  local raw="${1:-}" now ra reset cand=0
+  now="$(date +%s)"
+  ra="$(printf '%s\n' "$raw" | rl_header 'retry-after')"
+  is_num "${ra:-}" || ra=""
+  reset="$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-reset')"
+  is_num "${reset:-}" || reset=""
+  [ -n "$ra" ] && cand=$(( now + ra ))
+  if [ -n "$reset" ] && [ "$reset" -gt "$cand" ]; then cand="$reset"; fi
+  [ "$cand" -lt $(( now + 60 )) ]   && cand=$(( now + 60 ))
+  [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
+  printf '%s\n' "$cand"
+}
+# END sweep-quota
+
 # Count of open PRs. This one number drives THREE decisions — scope (BROAD drain vs OWN), the
 # reviewer budget (review_slots), and the merge-priority gate (mp_reason) — so a FAILED count must
 # never be readable as "the queue is empty". The pre-fix line was
@@ -539,16 +638,97 @@ while true; do
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED
   # listing yields ZERO iterations and prints NOTHING — the sweep silently does nothing for the
   # whole cycle. Capture it, check rc, log the failure, and feed the loop from the captured text.
-  if SWEEP_LIST="$(gh pr list --repo "$OR" --state open --limit 300 --json number,headRefName,isDraft \
-    --jq ".[]|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" 2>"$O/state/.sweep-err.$$")"; then
-    SWEEP_RC=0
+  # `gh pr list` cannot be made conditional — GraphQL has no ETag — so it is a REST `gh api` call
+  # whose `--jq` reshapes each REST row into the SAME `.number/.headRefName/.isDraft` triple the
+  # pre-fix jq consumed, leaving $SEL and every decision below it untouched. `--paginate` follows the
+  # `Link` header, so a repo with more than 100 open PRs is listed in full (the old `--limit 300`
+  # silently dropped anything past 300). See the sweep-quota block above for why the listing moved,
+  # and for the header helpers used here.
+  # BEGIN sweep-listing (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
+  NOW="$(date +%s)"
+  SWEEP_LIST=""
+  # Bound the DIGITS before any `[ … -gt … ]`. `[` ERRORS at or above 2**63 (the is_limit hazard this
+  # file documents at the top), and an ERRORING `[` short-circuits a `&&` clamp into NOT firing — so a
+  # 19-digit value would sail past the clamp. `is_num` is deliberately unbounded (it must accept a
+  # 10-digit epoch), so the length test is what supplies the bound. Doing this FIRST means every
+  # comparison below is on a value that cannot error.
+  DEFER_UNTIL="$(cat "$O/state/sweep-defer-until" 2>/dev/null || true)"; is_num "${DEFER_UNTIL:-}" || DEFER_UNTIL=0
+  [ "${#DEFER_UNTIL}" -le 10 ] || DEFER_UNTIL=0
+  LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
+  [ "${#LAST_FULL}" -le 10 ] || LAST_FULL=0
+  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
+  # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
+  # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
+  # degrades to a FULL sweep rather than a permanent stall.
+  [ "$DEFER_UNTIL" -gt $(( NOW + 3600 )) ] && DEFER_UNTIL=0
+  # A FUTURE stamp is worse than a stale one. The floor below reads `NOW - LAST_FULL`, so a stamp
+  # ahead of NOW yields a NEGATIVE age, which is always `< SWEEP_MAX_AGE`: `If-None-Match` is then
+  # sent forever, every cycle is a 304, the per-PR reads are skipped forever, and a green PR sits
+  # unmerged behind a cached "unchanged" PERMANENTLY — the exact failure this floor exists to
+  # prevent, and silent, because the log reports a future full sweep. Reachable from a corrupt or
+  # hand-edited state file, or a BACKWARD clock step (NTP correction, VM snapshot restore). A stamp
+  # is written as `$NOW`, so any value ahead of NOW is invalid by construction: degrade to a sweep.
+  [ "$LAST_FULL" -gt "$NOW" ] && LAST_FULL=0
+  ETAG="$(cat "$O/state/sweep-etag" 2>/dev/null || true)"
+  # `If-None-Match` is sent only while the cached listing is younger than SWEEP_MAX_AGE. The floor is
+  # REQUIRED, not belt-and-braces: a completed check run does NOT reliably change the listing's ETag
+  # (measured 2026-10-15 — PR #1335's checks completed 00:23:32 while its listing `updated_at` stayed
+  # 00:17:07), so a 304 means "no PUSH", never "nothing to merge". Without the floor a green PR
+  # could sit unmerged behind a cached "unchanged" forever — the same cell-cannot-merge-reads-as-idle
+  # failure this fix removes. Once the stamp ages out the header is dropped, forcing a 200 and a full
+  # sweep.
+  COND=()
+  if [ -n "$ETAG" ] && [ $(( NOW - LAST_FULL )) -lt "$SWEEP_MAX_AGE" ]; then
+    COND=(-H "If-None-Match: $ETAG")
+  fi
+  if [ "$DEFER_UNTIL" -gt "$NOW" ]; then
+    # A previous listing was refused for rate limiting. Calling again before the reset is exactly the
+    # hammering the docs warn about — and every call would fail until then. The reset (or
+    # Retry-After) is already recorded, so the sweep waits it out rather than burning attempts.
+    echo "[sweep] ⛔ RATE-LIMITED — sweep DEFERRED for another $(( (DEFER_UNTIL - NOW + 59) / 60 ))m (until $(date -d "@$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || date -r "$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "epoch $DEFER_UNTIL")). THIS CELL CANNOT MERGE, NOT IDLE." >> "$LOG"
   else
-    SWEEP_RC=$?
+    if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
+        ".[]|{number,headRefName:.head.ref,isDraft:.draft}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" \
+        "repos/$OR/pulls?state=open&per_page=100" 2>"$O/state/.sweep-err.$$")"; then
+      SWEEP_RC=0
+    else
+      SWEEP_RC=$?
+    fi
+    SWEEP_ERR="$(tr '\n' ' ' < "$O/state/.sweep-err.$$" 2>/dev/null || true)"; rm -f "$O/state/.sweep-err.$$"
+    SWEEP_STATUS="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_status)"
+    RL_REMAIN="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'x-ratelimit-remaining')"
+    RL_RESET="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'x-ratelimit-reset')"
+    RL_AFTER="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'retry-after')"
+    if [ "$SWEEP_STATUS" = "304" ]; then
+      # Unchanged: GitHub does not charge a 304 to the primary rate limit, and the per-PR reads are
+      # skipped this cycle — an identical listing means an identical PR set. Bounded by SWEEP_MAX_AGE.
+      echo "[sweep] listing unchanged (304, etag sent) — no per-PR reads this cycle; next full sweep in <=$(( SWEEP_MAX_AGE - (NOW - LAST_FULL) ))s" >> "$LOG"
+    elif [ "$SWEEP_RC" -ne 0 ]; then
+      SWEEP_KIND="$(sweep_fail_kind "${SWEEP_RAW:-}" "$SWEEP_ERR")"
+      if [ "$SWEEP_KIND" = "rate-limit" ]; then
+        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
+        echo "[sweep] ⛔ RATE-LIMITED (HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC; remaining=${RL_REMAIN:-?} reset=${RL_RESET:-?} retry-after=${RL_AFTER:-?}) — sweep DEFERRED $(( (DEFER_UNTIL - NOW + 59) / 60 ))m. THIS CELL CANNOT MERGE, NOT IDLE. (${SWEEP_ERR:-no stderr})" >> "$LOG"
+      else
+        echo "[sweep] PR listing FAILED ($SWEEP_KIND, HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC) (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
+      fi
+    else
+      # 200: refresh the validator and the age stamp, and surface a nearly-spent bucket. The low
+      # deferral is set HERE, before the NEXT call — gating after the listing would only stop
+      # requests the listing has already paid for.
+      SWEEP_ETAG_NEW="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'etag')"
+      [ -n "$SWEEP_ETAG_NEW" ] && printf '%s\n' "$SWEEP_ETAG_NEW" > "$O/state/sweep-etag"
+      printf '%s\n' "$NOW" > "$O/state/sweep-stamp"
+      rm -f "$O/state/sweep-defer-until"
+      SWEEP_LIST="$(printf '%s\n' "${SWEEP_RAW:-}" | awk -F"$(printf '\t')" 'NF==3 && $1 ~ /^[0-9]+$/')"
+      if is_num "${RL_REMAIN:-}" && [ "$RL_REMAIN" -le "$SWEEP_MIN_REMAIN" ]; then
+        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
+        echo "[sweep] ⚠️ rate limit low: x-ratelimit-remaining=$RL_REMAIN (<= $SWEEP_MIN_REMAIN) reset=${RL_RESET:-?} — next sweep deferred $(( (DEFER_UNTIL - NOW + 59) / 60 ))m" >> "$LOG"
+      fi
+    fi
   fi
-  SWEEP_ERR="$(tr '\n' ' ' < "$O/state/.sweep-err.$$" 2>/dev/null || true)"; rm -f "$O/state/.sweep-err.$$"
-  if [ "$SWEEP_RC" -ne 0 ]; then
-    echo "[sweep] PR listing FAILED rc=$SWEEP_RC (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
-  fi
+  # END sweep-listing
   # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
   # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
   # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
