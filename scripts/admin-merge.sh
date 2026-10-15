@@ -548,6 +548,13 @@ set -uo pipefail
 
 # File-scope so the EXIT trap can read it after `main` returns (P1-2).
 TMP=""
+# The stderr-capture file for the two READ PROBES (`resolve_head` / `resolve_draft`).
+# File-scope for the same reason as `TMP`: a process-group signal (a terminal Ctrl-C) can
+# kill the subshell between create and `rm`, and only the EXIT trap can then clean it. ONE
+# global for both, because the two readers never run concurrently — the head read completes
+# before the draft probe starts. Empty until a read creates it, so the trap's `rm -f` is a
+# no-op on the paths that never read (#1750 review).
+READ_ERRTMP=""
 
 GH="${ADMIN_MERGE_GH:-gh}"
 # The jobs-JSON parse and the ISO-8601 age both need a real JSON/timestamp
@@ -1284,7 +1291,27 @@ resolve_head() {
   # because `resolve_head` must still print NOTHING on failure — the value channel
   # stays empty and the diagnostic travels on its own channel.
   HEAD_READ_DIAG=""
-  errtmp="${TMPDIR:-/tmp}/admin-merge-head.$$.err"
+  # ⛔ THE ERR FILE IS CREATED WITH `mktemp`, NOT A PREDICTABLE PATH (#1750 review). The name
+  # used to be `${TMPDIR:-/tmp}/admin-merge-head.$$.err`, and `2>"$path"` FOLLOWS a symlink
+  # — so with `TMPDIR` unset (cron/launchd/`env -i`) the `${TMPDIR:-/tmp}` fallback is a
+  # world-writable /tmp, and a same-box attacker who can predict the PID could have the rail
+  # truncate any file the operator can write (CWE-377/CWE-59). MEASURED: on this box `TMPDIR`
+  # is a mode-0700 per-user directory, and the abuse cases were fail-CLOSED (the redirect
+  # failed and the read refused) — so this is a truncation primitive under an unset `TMPDIR`,
+  # never a fail-open. `mktemp` uses O_EXCL, so the name cannot pre-exist as anyone else's
+  # symlink. A total `mktemp` failure (no writable temp dir) leaves the path empty, the
+  # redirect then fails, and the read refuses — fail-closed, the direction this change is
+  # about.
+  #
+  # ⛔ AND THE FILE MUST BE THE PARENT'S (#1750 review). These resolvers run inside command
+  # substitutions at the real call sites, so a `mktemp` performed here would put the path in
+  # a SUBSHELL that the EXIT trap — which runs in `main`, the parent — can never see; a
+  # Ctrl-C between create and `rm` would then leak an unpredictably-named file, a small
+  # regression against the #1690 trap. `main` creates ONE such file up front, in the parent,
+  # and the sourced path (the unit suite, the rail suite's `sed '$d'` loader, which have no
+  # `main`) falls back to creating its own here.
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-head.XXXXXX" 2>/dev/null)"
   # ⛔ THE RETRY BUDGET IS A VALIDATED STARTUP KNOB, NOT AN INLINE `case` (#1690 review).
   # `HEAD_ATTEMPTS` / `HEAD_READ_SLEEP` are checked by `validate_timing_knobs` before any
   # CI work, with the rail's own primitives (leading-zero, positive, range) — see their
@@ -1424,7 +1451,10 @@ resolve_draft() {
   local pr="$1"; shift
   local out rc errtmp err
   DRAFT_READ_DIAG=""
-  errtmp="${TMPDIR:-/tmp}/admin-merge-draft.$$.err"
+  # The same O_EXCL creation, and the same parent-owns-the-file rule, as the head read above
+  # (#1750 review); the two probes never run concurrently and share the one file.
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-draft.XXXXXX" 2>/dev/null)"
   # shellcheck disable=SC2086
   out="$($GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>"$errtmp")" && rc=0 || rc=$?
   err="$(tail -n 1 "$errtmp" 2>/dev/null)"
@@ -4180,12 +4210,20 @@ main() {
   # ran (729 stale `admin-merge.*` directories, 21 MB, on the reviewing machine).
   # Assign the FILE-SCOPE `TMP` declared below and expand it at trap-set time.
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
+  # ⛔ THE READ PROBES' STDERR FILE IS CREATED HERE, IN THE PARENT (#1750 review). The reads
+  # run inside command substitutions, so a `mktemp` performed THERE would put the path in a
+  # subshell that this trap cannot see — and the trap is the only thing that removes the file
+  # after a process-group signal. `mktemp` (O_EXCL) is still what makes the name
+  # unpredictable, so the truncation primitive the predictable name allowed is gone; this line
+  # is what keeps the trap able to clean up after it.
+  READ_ERRTMP="$(mktemp "${TMPDIR:-/tmp}/admin-merge-read.XXXXXX" 2>/dev/null)"
   # ⛔ THE READ'S OWN TEMP FILE IS IN THE EXIT TRAP (#1690 review). `resolve_head` removes it on
   # both normal exits, but a process-group signal (what a terminal Ctrl-C actually delivers)
   # kills the subshell before its `rm` runs, and the file leaks. SIGKILL can still leak it —
-  # nothing can trap that — so this narrows the window rather than closing it to zero, and the
-  # name is PID-scoped so a leak is one file per killed run, not a shared collision.
-  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err" "${TMPDIR:-/tmp}/admin-merge-draft.$$.err"' EXIT
+  # nothing can trap that — so this narrows the window rather than closing it to zero. The path
+  # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
+  # the file the reads actually created instead of naming a predictable path (#1750 review).
+  trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
 
   local head
   # shellcheck disable=SC2086

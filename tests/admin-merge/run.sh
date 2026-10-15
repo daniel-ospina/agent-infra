@@ -2658,16 +2658,27 @@ draft_probe_was_last_call \
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
 
 # ── 13g. a DRAFT PROBE that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) ──
-# ⛔ THE HALF A FIX THAT ONLY CHECKS THE EXIT STATUS MISSES. A read that exits 0 with `yes` is
-# exactly as unusable as one that fails, because `[ "$x" = "true" ]` reads EVERY non-boolean as
-# "not a draft". §13f's fixture makes `rc` non-zero, so it can never reach the whole-value check —
-# the same gap §13d closed for the head read (MEASURED there: reverting the shape fix left §13b
-# green). This scenario is what pins the value contract at the rail level.
+# ⛔ THE HALF A FIX THAT ONLY CHECKS THE EXIT STATUS MISSES. A read that exits 0 with a value
+# that is not exactly `true`/`false` is exactly as unusable as one that fails, because
+# `[ "$x" = "true" ]` reads EVERY such value as "not a draft". §13f's fixture makes `rc`
+# non-zero, so it can never reach the value check at all — the same gap §13d closed for the
+# head read (MEASURED there: reverting the shape fix left §13b green).
+#
+# ⛔ THE FIXTURE IS MULTI-LINE ON PURPOSE, AND THE FIRST VERSION WAS NOT (#1750 review,
+# MEASURED). It used a single non-boolean (`yes`), which a PER-LINE boolean check ALSO rejects
+# — so the scenario would have stayed green against a regression to a per-line test, the exact
+# property §13d exists to pin for the head. A first line that IS a valid boolean plus a junk
+# second line is only rejected by a WHOLE-VALUE check: `printf 'yes\n' | grep -qxE 'true|false'`
+# rejects, while `printf 'true\nJUNK\n'` is ACCEPTED by a per-line check and rejected by the
+# `case`. The plain non-boolean shapes (`yes`, `TRUE`, empty) are pinned in the unit suite; this
+# scenario pins the whole-value property at the rail level.
 echo "== 13g. a draft probe that SUCCEEDS with a NON-BOOLEAN is unreadable too (#1750) =="
 new_scen draftprobenonbool
 HEAD_DG="7777000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_DG" > "$SCEN/head"
-printf 'yes\n' > "$SCEN/draft"             # gh exits 0 with a value that is NOT a boolean
+# gh exits 0 with a valid boolean AND a junk line: accepted by a per-LINE check, rejected only
+# by a whole-value one.
+printf 'true\nJUNK\n' > "$SCEN/draft"
 lane_fail "$HEAD_DG" 7021 > "$SCEN/runs-$HEAD_DG"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7021"
 main_red_n main7777 7022 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"

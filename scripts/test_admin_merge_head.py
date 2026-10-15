@@ -503,12 +503,23 @@ def test_resolve_draft_returns_exactly_true_or_false(tmp_path):
 
 
 def test_a_FAILED_draft_read_returns_nonzero_and_prints_nothing(tmp_path):
-    """The core of #1750: a read that FAILS must not look like a value — not even the empty
-    string, because the caller's boolean test reads `""` as `false`, which is a PERMISSION."""
+    """A read that FAILS must not hand its caller a value — the property `require_draft`
+    relies on when it renders the unreadable refusal.
+
+    ⛔ WHAT THIS TEST DOES *NOT* PIN, stated rather than implied, because a #1690 reviewer
+    measured exactly this against the head twin and the note was never applied: it does NOT
+    fail on the pre-fix rail. The bare `$GH pr view … 2>/dev/null` was the function's LAST
+    command, so it ALREADY returned gh's non-zero status and printed nothing — the defect was
+    the CALLER discarding that status, which a test that surfaces `rc` through `echo` cannot
+    express. The #1750 regression pin is the composition test below, plus
+    `tests/admin-merge/run.sh` §13f at the rail level. This test's job is the narrower property
+    it does establish: the read yields NOTHING — not even the empty string that a boolean test
+    reads as `false`.
+    """
     r = _drive(tmp_path, "exit 1", 'resolve_draft 1; echo "rc=$?"')
     assert r.stdout.strip() == "rc=1", (
-        "a failed isDraft read returned success or a value — the exact shape that made the "
-        f"caller proceed past the draft refusal: {r.stdout!r}")
+        "a failed isDraft read printed a value or returned success — it must yield nothing, so "
+        f"the door has a failure to refuse on: {r.stdout!r}")
 
 
 def test_a_draft_read_that_is_not_a_boolean_is_unreadable(tmp_path):
@@ -574,13 +585,21 @@ def test_the_draft_refusal_carries_the_reads_own_words_or_says_it_cannot(tmp_pat
 
 
 def test_a_failed_draft_read_that_is_not_propagated_CAN_be_read_as_not_a_draft(tmp_path):
-    """⛔ THE REGRESSION TEST FOR #1750 ITSELF, run as the caller actually runs it.
+    """⛔ THE COMPOSITION TEST, run as the caller actually runs it.
 
     This drives the same two-line shape the rail's §0 uses — assign from the door, propagate on
     the same line, then test for `true` — against a fake `gh` whose read ALWAYS fails. The
     assertion is on the OUTCOME: the process must abort and must never report that it got past
-    the probe. With `resolve_draft` reverted to the bare read, this prints `PROCEEDED …` with
-    `is_draft=[]` — measured — which is the defect the issue reports verbatim.
+    the probe.
+
+    ⛔ WHICH MUTATION PRODUCES THE SYMPTOM, MEASURED. `PROCEEDED past the draft probe with
+    is_draft=[]` is what this test prints under a door that renders its refusal and then returns
+    0 (the #1690 `require_head` shape) — NOT under a reverted `resolve_draft`, because the read
+    is reached THROUGH the door and the door still refuses on its non-zero return. (On the
+    literal pre-fix rail there is no `require_draft` at all, so this snippet fails at `command
+    not found` — loudly, but for a different reason.) Which mutation each new test kills is
+    recorded in the PR body, not asserted here, so this docstring claims only the outcome it
+    checks.
     """
     r = _drive(
         tmp_path,
