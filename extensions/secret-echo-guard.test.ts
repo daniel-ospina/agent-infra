@@ -31,6 +31,7 @@ import secretEchoGuard, {
 	CONTENT_PART_LIMITS,
 	LABEL_VALUE_REPLACEMENT,
 	MAX_DETAILS_DEPTH,
+	MAX_HARVESTED_VALUES,
 	MAX_SOURCE_FILE_BYTES,
 	MIN_SECRET_LENGTH,
 	REDACTION_MARKER_BASE,
@@ -49,6 +50,7 @@ import secretEchoGuard, {
 	hitsTotal,
 	identifierTokens,
 	envSourceFromInput,
+	isEnvLikePath,
 	isSecretValueKey,
 	isUsableSecretValue,
 	loadStaticRegistry,
@@ -58,6 +60,7 @@ import secretEchoGuard, {
 	redactDetails,
 	redactString,
 	redactionMarker,
+	retainHarvested,
 	secretEchoGuardActive,
 } from "./secret-echo-guard.ts";
 
@@ -104,6 +107,10 @@ const JEV_KEY = "JEV-KEY-0123456789ABCDEF";
 const ENVFILE_KEY = "ENVFILE-JEV-KEY-0123456789";
 const PROCESS_ENV_KEY = "PROCESS-ENV-DEEPSEEK-0123456789";
 const MODELS_STORE_KEY = "MODELS-STORE-KEY-MUST-NOT-REGISTER";
+// #5109 review: array-valued secrets. A string element of a secret-named array was dropped by both
+// registry walkers, so these values were never registered, redacted or recorded.
+const ARRAY_SECRET_ONE = "ARRAY-SECRET-ONE-0123456789";
+const ARRAY_SECRET_TWO = "ARRAY-SECRET-TWO-0123456789";
 const SHORT_SECRET = "zzq"; // deliberately under MIN_SECRET_LENGTH
 const POINTER_VALUE = "/tmp/not/a/secret/pointer/path/abcdefgh";
 
@@ -217,6 +224,19 @@ test("POSITIVE: secret-bearing names are recognised (env and field)", () => {
 		strictEqual(isSecretValueKey(name, "env"), true, `${name} must be an env secret`);
 	}
 });
+test("POSITIVE (field): the PLURAL `keys` is a key list too — `apiKeys` was missed by every rule", () => {
+	// `apiKeys` splits to ["api","keys"]: the loose tail rule is env-only and `tokens.includes("key")`
+	// is false for the plural, so an array-valued `apiKeys` config was missed TWICE over (field rule +
+	// the array branch dropping string elements). The qualifier is still required, so `cacheKeys`/
+	// `sortKeys` stay out.
+	strictEqual(isSecretValueKey("apiKeys", "field"), true);
+	strictEqual(isSecretValueKey("api_keys", "field"), true);
+	strictEqual(isSecretValueKey("API_KEYS", "field"), true);
+	strictEqual(isSecretValueKey("sessionKeys", "field"), true);
+	strictEqual(isSecretValueKey("cacheKeys", "field"), false);
+	strictEqual(isSecretValueKey("sortKeys", "field"), false);
+	strictEqual(isSecretValueKey("keys", "field"), false);
+});
 test("POSITIVE (env only): a trailing _KEY with no qualifier — BLOG_AGENT_KEY is a real secret", () => {
 	strictEqual(isSecretValueKey("BLOG_AGENT_KEY", "env"), true);
 	// but the STRICT field rule refuses the same shape, so camelCase JSON `sortKey` stays safe
@@ -311,6 +331,40 @@ test("envSourceFromInput gates the harvest on an env-like SOURCE (read path and 
 	strictEqual(envSourceFromInput({ command: "ls -la" }), undefined);
 	strictEqual(envSourceFromInput(undefined), undefined);
 });
+test("R13: a dotted code identifier is NOT an env file — the harvest gate stays closed", () => {
+	// The old rule accepted any basename CONTAINING `.env.` (and any ending in `.env`), so a benign code
+	// expression opened the source-5 harvest: `grep -h process.env src/config.ts` registered the literal
+	// `process.env.MY_REAL_SECRET_KEY` as a secret and rewrote ordinary output with a
+	// `[REDACTED-SECRET:read:process.env#API_KEY]` marker, a durable record and a pane notice.
+	strictEqual(isEnvLikePath("process.env"), false);
+	strictEqual(isEnvLikePath("process.env.X"), false);
+	strictEqual(isEnvLikePath("import.meta.env.X"), false);
+	strictEqual(isEnvLikePath("config.env.ts"), false);
+	strictEqual(isEnvLikePath("/repo/src/config.env.ts"), false);
+	strictEqual(isEnvLikePath("/repo/a.env.md"), false);
+	strictEqual(envSourceFromInput({ command: "grep -h process.env src/config.ts" }), undefined);
+	strictEqual(envSourceFromInput({ path: "process.env.X" }), undefined);
+	// PRESERVED: every real env-file form still opens it, including the round-3 arbitrary-prefix
+	// basename `/repo/<secret>.env.local` — a legitimate hit the fix must not break.
+	strictEqual(isEnvLikePath("/repo/.env"), true);
+	strictEqual(isEnvLikePath(".env.local"), true);
+	strictEqual(isEnvLikePath("/repo/app.env"), true);
+	strictEqual(isEnvLikePath("/repo/app.env.local"), true);
+	strictEqual(isEnvLikePath(`/repo/${JEV_KEY}.env.local`), true);
+	strictEqual(envSourceFromInput({ path: `/repo/${JEV_KEY}.env.local` }), `${JEV_KEY}.env.local`);
+	// End-to-end: the handler must NOT harvest ordinary output for a `process.env`-shaped command.
+	resetEverything();
+	const { returned } = runHandler(
+		toolResultEvent({
+			toolName: "bash",
+			input: { command: "grep -h process.env src/config.ts" },
+			content: [{ type: "text", text: "API_KEY=process.env.MY_REAL_SECRET_KEY\nconst a = 1\n" }],
+		}),
+	);
+	strictEqual(returned, undefined, "ordinary output must be returned BY REFERENCE (no patch)");
+	strictEqual(appendEntryCalls.length, 0, "no durable record for a non-file token");
+	strictEqual(notifications.length, 0, "no pane notice for a non-file token");
+});
 
 // ── The registry from the fixture sources ───────────────────────────────────────────────────
 console.log("\nthe registry (fixture home + controlled env)");
@@ -364,6 +418,51 @@ test("collectAllStringValues takes every string (auth.json rule)", () => {
 	const out: Array<{ value: string; label: string }> = [];
 	collectAllStringValues({ p: { key: AUTH_KEY, refresh: AUTH_REFRESH } }, "auth.json", out);
 	strictEqual(out.length, 2);
+});
+test("R13: a string element of a secret-named ARRAY is registered (was dropped by both walkers)", () => {
+	// The walkers recursed per array element but their first line returned for non-objects, so a STRING
+	// element vanished — an array-valued `apiKey`/`credentials` was never registered, never redacted
+	// and never recorded. The enclosing secret-named field's secret-ness is now carried into the array.
+	const out: Array<{ value: string; label: string }> = [];
+	collectJsonSecrets({ providers: { x: { apiKey: [ARRAY_SECRET_ONE, ARRAY_SECRET_TWO] } } }, "models.json", out);
+	deepEqual(out, [
+		{ value: ARRAY_SECRET_ONE, label: "models.json#providers.x.apiKey[0]" },
+		{ value: ARRAY_SECRET_TWO, label: "models.json#providers.x.apiKey[1]" },
+	]);
+	// The PLURAL field name reaches the same values.
+	const plural: Array<{ value: string; label: string }> = [];
+	collectJsonSecrets({ x: { apiKeys: [ARRAY_SECRET_ONE] } }, "models.json", plural);
+	deepEqual(plural, [{ value: ARRAY_SECRET_ONE, label: "models.json#x.apiKeys[0]" }]);
+	// NEGATIVE: an array under a NON-secret-named key is still untouched — the rule stays field-driven.
+	const ordinary: Array<{ value: string; label: string }> = [];
+	collectJsonSecrets({ x: { models: [ARRAY_SECRET_ONE] } }, "models.json", ordinary);
+	deepEqual(ordinary, []);
+	// `auth.json` is ALL-values-secret, so its array elements are taken with no field name at all.
+	const whole: Array<{ value: string; label: string }> = [];
+	collectAllStringValues({ p: { keys: [AUTH_KEY, AUTH_REFRESH] } }, "auth.json", whole);
+	deepEqual(whole, [
+		{ value: AUTH_KEY, label: "auth.json#p.keys[0]" },
+		{ value: AUTH_REFRESH, label: "auth.json#p.keys[1]" },
+	]);
+});
+test("R13: loadStaticRegistry over on-disk array-valued secrets registers every element", () => {
+	const home = mkdtempSync(join(tmpdir(), "secret-echo-guard-arrays-"));
+	const agent = join(home, ".pi", "agent");
+	mkdirSync(agent, { recursive: true });
+	writeFileSync(
+		join(agent, "models.json"),
+		JSON.stringify({ providers: { x: { apiKey: [ARRAY_SECRET_ONE, ARRAY_SECRET_TWO] } } }),
+	);
+	writeFileSync(join(agent, "auth.json"), JSON.stringify({ p: { type: "api_key", keys: [AUTH_KEY, AUTH_REFRESH] } }));
+	try {
+		const byValue = new Map(loadStaticRegistry(optionsFor(home, {})).map((v) => [v.value, v.label]));
+		strictEqual(byValue.get(ARRAY_SECRET_ONE), "models.json#providers.x.apiKey[0]");
+		strictEqual(byValue.get(ARRAY_SECRET_TWO), "models.json#providers.x.apiKey[1]");
+		strictEqual(byValue.get(AUTH_KEY), "auth.json#p.keys[0]");
+		strictEqual(byValue.get(AUTH_REFRESH), "auth.json#p.keys[1]");
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
 });
 test("collectEnvSecrets takes secret-named vars only", () => {
 	const out: Array<{ value: string; label: string }> = [];
@@ -917,9 +1016,13 @@ test("M9: a source file larger than MAX_SOURCE_FILE_BYTES is SKIPPED without bei
 test("M10: the harvest cap stops after maxHarvested values", () => {
 	const into: Array<{ value: string; label: string }> = [];
 	const text = Array.from({ length: 5 }, (_, i) => `API_KEY_${i}=HARVEST-CAP-SECRET-${i}-0123456789`).join("\n");
+	const before = _secretEchoGuardCounters.harvestCapStops;
 	const added = harvestDotenvSecrets(text, into, "app.env", MIN_SECRET_LENGTH, 2);
 	strictEqual(added, 2, "the cap must stop the harvest");
 	strictEqual(into.length, 2);
+	// ⛔ NOT SILENT: hitting the cap is counted, so the handler can put `harvestCapped` in the durable
+	// record and emit a warning. Before this the caller ignored the return value and the loss was silent.
+	strictEqual(_secretEchoGuardCounters.harvestCapStops, before + 1, "the cap stop must be observable");
 });
 test("M11: the dotenv pre-check short-circuits ordinary text (observed, not inferred)", () => {
 	_secretEchoGuardCounters.dotenvPrecheckSkips = 0;
@@ -1509,6 +1612,72 @@ test("SECRET_ECHO_GUARD_MIN_LENGTH is honored end-to-end (the override is not si
 		strictEqual(returned, undefined, "the 100-char floor must exclude a 30-char value");
 	} finally {
 		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("R13: SECRET_ECHO_GUARD_MIN_LENGTH governs the source-5 HARVEST too (both directions)", () => {
+	// The override was read only by `getRegistryValues`, so the harvest always used the module default:
+	// a RAISED floor still redacted a value the operator asked to leave alone, and a LOWERED floor — the
+	// fail-open direction — never reached an unsourced `.env` value, the one vector the harvest exists to
+	// close. The test above drives the STATIC path only (input `/repo/notes.txt` is not env-like, so the
+	// harvest never runs) and could not catch either direction.
+	resetEverything();
+	try {
+		// RAISED floor: a harvested value under 100 chars must NOT be registered, redacted or recorded.
+		const long = "OPENROUTER-API-KEY-VALUE-0123456789"; // over default 12, under the 100 override
+		_setSecretEchoGuardHooksForTest({ env: () => ({ ...controlledEnv, SECRET_ECHO_GUARD_MIN_LENGTH: "100" }) });
+		_resetSecretEchoGuardCacheForTest();
+		const raised = runHandler(
+			toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: `OPENROUTER_API_KEY=${long}\n` }] }),
+		);
+		strictEqual(raised.returned, undefined, "the raised floor must exclude the harvested value");
+		strictEqual(appendEntryCalls.length, 0, "and record nothing");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+	try {
+		// LOWERED floor: a SHORT value (below the default 12) must now be harvested and redacted.
+		const short = "SHORT-KEY-1"; // 11 chars, under MIN_SECRET_LENGTH
+		ok(short.length < MIN_SECRET_LENGTH, "precondition: the value is under the default floor");
+		_setSecretEchoGuardHooksForTest({ env: () => ({ ...controlledEnv, SECRET_ECHO_GUARD_MIN_LENGTH: "5" }) });
+		_resetSecretEchoGuardCacheForTest();
+		const lowered = runHandler(
+			toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: `MY_API_KEY=${short}\n` }] }),
+		);
+		ok(lowered.returned, "the lowered floor must register and redact the short harvested value");
+		ok(!JSON.stringify(lowered.returned).includes(short), "the short value must be gone");
+	} finally {
+		_setSecretEchoGuardHooksForTest(baseHooks);
+		resetEverything();
+	}
+});
+test("R13: harvested-value eviction past the cap is RECORDED and announced, never silent", () => {
+	resetEverything();
+	const filler = Array.from({ length: MAX_HARVESTED_VALUES }, (_, i) => ({
+		value: `EVICTION-FILLER-${String(i).padStart(4, "0")}-0123456789`,
+		label: `read:pre.env#FILL_${i}_API_KEY`,
+	}));
+	try {
+		// `retainHarvested` returns whether retaining narrowed coverage. Fill exactly to the cap, then
+		// drive one more through the real handler so the OLDEST is evicted during the harvest.
+		strictEqual(retainHarvested(filler), false, "filling exactly to the cap must not evict");
+		const fresh = "EVICTION-TRIGGER-SECRET-0123456789";
+		const { returned } = runHandler(
+			toolResultEvent({ input: { path: "/repo/app.env" }, content: [{ type: "text", text: `NEW_API_KEY=${fresh}\n` }] }),
+		);
+		ok(returned, "the new harvested value must be redacted");
+		const entry = appendEntryCalls.find((call) => call.type === SECRET_ECHO_GUARD_ENTRY_TYPE);
+		ok(entry, "the durable record is written");
+		const data = entry.data as { harvestEvicted: boolean; harvestCapped: boolean };
+		strictEqual(data.harvestEvicted, true, "the record must attest the eviction");
+		strictEqual(data.harvestCapped, false, "this path is eviction, not the per-call cap");
+		ok(appendFileLines.some((line) => line.includes('"harvestEvicted":true')), "the fleet log carries it too");
+		const warned = [...consoleErrors, ...notifications.map((n) => n.msg)].find((line) =>
+			line.includes("harvested-value registry hit its cap"),
+		);
+		ok(warned, "the pane/stderr warning must announce the narrowed coverage");
+	} finally {
 		resetEverything();
 	}
 });
@@ -2338,6 +2507,14 @@ test("R9-NO-STARVE-SHARED: a shared budget must NOT starve pass 2 into losing a 
 		// came back BY REFERENCE — the secret the parent commit redacted was persisted. Sharing only the
 		// clock (round 10) keeps this redaction. Losing a redaction is worse than being slow.
 		CONTENT_PART_LIMITS.maxNodes = 1000;
+		// ⛔ SCRIPTED CLOCK for the WHOLE test (#5109 review). The property here is PASS-2 STARVATION —
+		// sharing the NODE counter makes pass 2 return dirty nodes by reference — which is node-count
+		// driven and load-independent. Asserting it on the real 500ms clock made this block a WALL-CLOCK
+		// LOAD DETECTOR (the file itself measured 18/200 = 9% failures on a loaded host: the walk stopped
+		// mid-way, `incomplete` was set, and parts 7-9 were copied verbatim). The deadline is now scripted
+		// 1e6 ms away, so the assertion cannot depend on the host's speed.
+		let ticks = 0;
+		Object.assign(CONTENT_PART_LIMITS, { maxNodes: 1000, now: () => ticks++, maxMs: 1_000_000 });
 		const tree: Record<string, unknown> = { first: `k=${S}` };
 		for (let i = 0; i < 5000; i++) tree[`k${i}`] = "v";
 		const out = redactContent([{ type: "image", payload: tree }], values, new Map());
@@ -2354,23 +2531,12 @@ test("R9-NO-STARVE-SHARED: a shared budget must NOT starve pass 2 into losing a 
 		const bytes = JSON.stringify(multi.value);
 		ok(!bytes.includes(S), "NO part may be left unredacted — a shared budget starves pass 2 per part");
 		strictEqual((bytes.match(/REDACTED/g) ?? []).length, 10, "every one of the ten parts is redacted");
-		// ⛔ These ten parts are asserted WITHOUT a scripted clock, so the shared 500ms deadline is real and
-		// this block is a WALL-CLOCK LOAD DETECTOR (measured 18/200 = 9% failures on a loaded host: the walk
-		// stopped mid-way, `incomplete` was set, and parts 7-9 were copied verbatim). The property that
-		// matters here is PASS-2 STARVATION — sharing the node counter makes pass 2 return dirty nodes by
-		// reference — which is node-count driven and load-independent. The scripted-clock case below pins the
-		// deadline behaviour instead, so this block must not depend on the host's speed.
-		let ticks = 0;
-		Object.assign(CONTENT_PART_LIMITS, { maxNodes: 1000, now: () => ticks++, maxMs: 1_000_000 });
-		const deterministic = redactContent(parts, values, new Map());
+		delete (CONTENT_PART_LIMITS as { now?: unknown }).now;
+		delete (CONTENT_PART_LIMITS as { maxMs?: unknown }).maxMs;
+	} finally {
 		CONTENT_PART_LIMITS.maxNodes = savedNodes;
 		delete (CONTENT_PART_LIMITS as { now?: unknown }).now;
 		delete (CONTENT_PART_LIMITS as { maxMs?: unknown }).maxMs;
-		const fixed = JSON.stringify(deterministic.value);
-		ok(!fixed.includes(S), "with the deadline out of reach, pass 2 must still redact every part");
-		strictEqual((fixed.match(/REDACTED/g) ?? []).length, 10, "all ten parts, load-independently");
-	} finally {
-		CONTENT_PART_LIMITS.maxNodes = savedNodes;
 	}
 });
 
@@ -2458,13 +2624,15 @@ test("R12-WIDE-ACCESSOR: a getter's value is redacted even when a WIDE part spen
 		let calls = 0;
 		CONTENT_PART_LIMITS.now = () => calls++;
 		CONTENT_PART_LIMITS.maxMs = 3;
-		// The accessor is LAST, after enough keys that the deadline is gone before it is reached. Round 12's
-		// [P1]: the forced rebuild's string redactions were budget-gated, so the getter's value was written
-		// through as a DATA property — neutralizing the getter and persisting the secret. `R8-UNSTABLE-FORCED-REBUILD`
-		// only exercises the NARROW shape (`{type, payload, caption}`), where the accessor is reached before
-		// the budget is consumed, so it could not fail on this residual.
+		// The accessor is LAST, after MORE THAN ONE 256-key pre-scan sample, so the deadline is spent both
+		// before the rebuild reaches it AND before `hasOwnEnumerableAccessor`'s own budget check lets it
+		// collect the key. The old 60-key shape never reached a 256 multiple, so the pre-scan always
+		// completed and `trapKeys` was always populated — the pin exercised only the NARROW shape while its
+		// name and the round-12 commit claimed the wide one (#5109 review round 13 [P1]). At 600 keys the
+		// pre-scan bails with `trapKeys` EMPTY, and only the descriptor-based unconditional redaction in
+		// `rebuildContentPart` keeps the getter's value out of the rebuilt part.
 		const part: Record<string, unknown> = { type: "image" };
-		for (let i = 0; i < 60; i++) part[`pad${i}`] = `filler-${i}`;
+		for (let i = 0; i < 600; i++) part[`pad${i}`] = `filler-${i}`;
 		Object.defineProperty(part, "zzz_trap", { enumerable: true, configurable: true, get: () => `k=${S}` });
 		const out = redactContent([part], values, new Map());
 		const first = (out.value as Record<string, unknown>[])[0] as Record<string, unknown>;

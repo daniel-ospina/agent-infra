@@ -199,6 +199,15 @@
 //   • a secret that is itself a SUBSTRING of a registered value (only the exact configured value
 //     is matched — a comma-separated multi-key env var is registered whole);
 //   • non-string secrets (a numeric PIN in a JSON config is skipped);
+//   • a registered value used as an object KEY reached AFTER the shared deadline: key redaction is
+//     budget-gated, so the key is left unredacted — ANNOUNCED (`bounded` -> `incomplete` -> record +
+//     stderr + pane), never silent, the same fail-open-on-the-turn posture as any post-deadline string.
+//     An ACCESSOR key's NAME is the exception: it is redacted unconditionally (see `rebuildContentPart`),
+//     because a live getter's value is exactly what the round-13 fix must not budget-gate;
+//   • a dotted code expression that ALSO carries a path separator and a non-environment suffix
+//     (`/repo/process.env.X`): `isEnvLikePath` rejects the bare form (`process.env.X`) but a pathed one
+//     with an unknown suffix is still accepted, because the alternative rejects real `<name>.env.<suffix>`
+//     files. The reported handler-level reproduction (`grep -h process.env src/config.ts`) is closed;
 //   • JSON-escaped forms of a value containing characters that escape differently in the output;
 //     real provider keys are `[A-Za-z0-9._-]`, so this is theoretical in practice;
 //   • the assistant's own prose, the model request payload, and non-pi logs;
@@ -299,6 +308,7 @@ export const DOTENV_PRECHECK_RE = /^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_]*(?:key|t
  */
 export const SECRET_WORDS: ReadonlySet<string> = new Set([
 	"apikey",
+	"apikeys",
 	"secret",
 	"clientsecret",
 	"privatekey",
@@ -435,7 +445,12 @@ export function isSecretValueKey(name: string, kind: "env" | "field"): boolean {
 	if (NON_SECRET_TAIL_TOKENS.has(last)) return false;
 	if (tokens.some((token) => SECRET_WORDS.has(token))) return true;
 	if (kind === "env" && ENV_SECRET_TAIL_TOKENS.has(last)) return true;
-	return tokens.includes("key") && tokens.some((token) => token !== "key" && SECRET_KEY_QUALIFIERS.has(token));
+	// The FIELD rule accepts a `key` token and its PLURAL (`apiKeys`), because an array-valued key list
+	// is exactly the shape the walkers below now collect; a qualifier is still required, so
+	// `sortKeys`/`cacheKeys` stay out. `apiKeys` matched NO rule before this: the loose env tail rule is
+	// env-only, and `tokens.includes("key")` is false for the plural (#5109 review).
+	const hasKeyToken = tokens.includes("key") || tokens.includes("keys");
+	return hasKeyToken && tokens.some((token) => token !== "key" && token !== "keys" && SECRET_KEY_QUALIFIERS.has(token));
 }
 
 // ── Registry values ─────────────────────────────────────────────────────────────────────────────
@@ -465,23 +480,34 @@ export function collectJsonSecrets(
 	path = "",
 	depth = 0,
 	minLength = MIN_SECRET_LENGTH,
+	underSecretField = false,
 ): void {
-	if (depth > MAX_DETAILS_DEPTH || node === null || typeof node !== "object") return;
+	if (depth > MAX_DETAILS_DEPTH) return;
+	// ⛔ ARRAY ELEMENTS (#5109 review). A string element is `typeof "string"`, so the OLD guard
+	// returned before the per-element recursion could collect it: EVERY string inside ANY array was
+	// dropped, so an array-valued `apiKey`/`credentials` was never registered, never redacted and
+	// never recorded — a silent fail-open with no marker, no record and no notice. The enclosing
+	// secret-named field's secret-ness is carried into the array branch and the usable string leaf is
+	// collected HERE. An array under a NON-secret key is still not collected (the rule stays
+	// field-driven); a scalar under a secret key is collected in the loop below, as before.
+	if (node === null || typeof node !== "object") {
+		if (underSecretField && isUsableSecretValue(node, minLength)) {
+			out.push({ value: node.trim(), label: `${labelPrefix}#${path}` });
+		}
+		return;
+	}
 	if (Array.isArray(node)) {
 		for (let index = 0; index < node.length; index++) {
-			collectJsonSecrets(node[index], labelPrefix, out, `${path}[${index}]`, depth + 1, minLength);
+			collectJsonSecrets(node[index], labelPrefix, out, `${path}[${index}]`, depth + 1, minLength, underSecretField);
 		}
 		return;
 	}
 	for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
 		const childPath = path ? `${path}.${key}` : key;
-		if (isSecretValueKey(key, "field")) {
-			if (isUsableSecretValue(value, minLength)) out.push({ value: value.trim(), label: `${labelPrefix}#${childPath}` });
-			// A secret-named key whose value is an object (unusual) is still walked below so a nested
-			// `{ apiKey: "..." }` cannot be missed.
-		}
+		const secretKey = isSecretValueKey(key, "field");
+		if (secretKey && isUsableSecretValue(value, minLength)) out.push({ value: value.trim(), label: `${labelPrefix}#${childPath}` });
 		if (value !== null && typeof value === "object") {
-			collectJsonSecrets(value, labelPrefix, out, childPath, depth + 1, minLength);
+			collectJsonSecrets(value, labelPrefix, out, childPath, depth + 1, minLength, secretKey);
 		}
 	}
 }
@@ -495,7 +521,15 @@ export function collectAllStringValues(
 	depth = 0,
 	minLength = MIN_SECRET_LENGTH,
 ): void {
-	if (depth > MAX_DETAILS_DEPTH || node === null || typeof node !== "object") return;
+	if (depth > MAX_DETAILS_DEPTH) return;
+	// ⛔ ARRAY ELEMENTS (#5109 review). This is the "ALL string values are secret" walker, but a string
+	// array element returned immediately from the recursive call, so `{"p":{"keys":[S1,S2]}}` in
+	// `auth.json` registered NOTHING — the file's one documented promise ("ALL string values,
+	// regardless of key name") was false for every array. Collect the string leaf here as well.
+	if (node === null || typeof node !== "object") {
+		if (isUsableSecretValue(node, minLength)) out.push({ value: node.trim(), label: `${labelPrefix}#${path}` });
+		return;
+	}
 	if (Array.isArray(node)) {
 		for (let index = 0; index < node.length; index++) {
 			collectAllStringValues(node[index], labelPrefix, out, `${path}[${index}]`, depth + 1, minLength);
@@ -950,19 +984,35 @@ function rebuildContentPart(
 	// early-stopped and wrote the SECRET through as a data property. Round 11 split the phases (cheap
 	// string work first, object recursion deferred) but the getter's own value was STILL budget-gated, so
 	// a part wide enough to spend the deadline on PRECEDING keys leaked it anyway (round 12's [P1],
-	// reproduced deterministically). An accessor key's value is therefore redacted with NO budget at all
-	// (`unconditionalKeys`), and that is what the ordering alone could not deliver.
+	// reproduced deterministically). An accessor key's value is therefore redacted with NO budget at all —
+	// decided from the key's DESCRIPTOR below, not from the pre-scan's `trapKeys` list, which is what the
+	// round-12 fix relied on and which the pre-scan's own budget can leave incomplete (round 13's [P1]).
 	//
 	// ⛔ WHAT IS STILL BUDGETED, stated so the claim is not read as total: a NON-accessor string value
 	// reached after the deadline is left unredacted (announced via `bounded` -> `incomplete`, never
 	// silently) — it is ordinary part content, not a live read, so it is the same fail-open-on-the-turn
 	// posture as every other scan. Only the RECURSION is deferred to phase 2.
 	const deferred: Array<[string, object]> = [];
-	for (const key of Object.keys(part)) {
+	// ⛔ ONE DESCRIPTOR PASS (#5109 review round 13 [P1]). `Object.getOwnPropertyDescriptors` returns
+	// every own key's descriptor WITHOUT invoking a getter, so it yields both the key list (the old
+	// `Object.keys`) and, for free, which keys are LIVE ACCESSORS. That accessor set is what the round-12
+	// fix took from the pre-scan's `trapKeys` — and the pre-scan samples its clock only every 256 keys, so
+	// it can be cut short BEFORE reaching a late accessor, leaving `trapKeys` empty. The getter's value was
+	// then handed to the budget-gated `redactString`, which early-stopped and wrote the SECRET through as
+	// a DATA property — neutralizing the getter and persisting the value. Deciding from the descriptor
+	// makes the unconditional redaction independent of how far the pre-scan got; it is ONE enumeration,
+	// the same order as the `Object.keys` it replaces.
+	const descriptors = Object.getOwnPropertyDescriptors(part) as Record<string, PropertyDescriptor>;
+	for (const key of Object.keys(descriptors)) {
+		const descriptor = descriptors[key];
+		// Only own ENUMERABLE keys were copied by the old rebuild (and are serialized by the transcript).
+		if (descriptor === undefined || descriptor.enumerable !== true) continue;
+		const keyIsAccessor = descriptor.get !== undefined || descriptor.set !== undefined;
+		const unconditional = keyIsAccessor || (unconditionalKeys !== undefined && unconditionalKeys.includes(key));
 		// A KEY is as outbound as a value — it lands in the transcript and would be re-read by the
 		// serializer — so it is redacted too, exactly as `markDirtyDetails` treats a registered value
 		// found in a key (#5109 review round 6: the header claimed this, the code did not do it).
-		const outKey = redactString(key, values, hits, budget);
+		const outKey = unconditional ? redactString(key, values, hits) : redactString(key, values, hits, budget);
 		const raw = key === "text" && text !== undefined ? text : part[key];
 		// Every string read out of a rebuilt part is redacted. The `unstable` path reaches here for a
 		// NON-text part — where the value read out of a live accessor would otherwise be copied into the
@@ -978,9 +1028,7 @@ function rebuildContentPart(
 			// unredacted because a PRECEDING key ate the deadline is the leak this whole path exists to
 			// close. An accessor key's value is bounded by one string, so skipping the budget here cannot
 			// unbounded the walk; the potentially huge work is the object recursion, deferred below.
-			value = unconditionalKeys !== undefined && unconditionalKeys.includes(key)
-				? redactString(raw, values, hits)
-				: redactString(raw, values, hits, budget);
+			value = unconditional ? redactString(raw, values, hits) : redactString(raw, values, hits, budget);
 		else if (raw !== null && typeof raw === "object") {
 			// Deferred to phase 2: recursion is the only part that can be arbitrarily large, so it is the
 			// only part the budget should be able to cut short.
@@ -1148,9 +1196,13 @@ function hasOwnEnumerableAccessor(source: object, budget?: DetailsWalkBudget, tr
 			seen++;
 			if (budget !== undefined && (seen & 255) === 0 && budget.now() >= budget.deadline) {
 				budget.bounded = true;
-				// Could not finish the scan. Return before an accessor was found is the fail-SAFE
-				// direction: the caller rebuilds the container from a single read rather than passing it
-				// through with a possibly-live getter.
+				// Could not finish the scan. Returning `true` makes the caller REBUILD the container, so a
+				// possibly-live getter is not persisted by reference; the rebuild then decides
+				// UNCONDITIONAL redaction from each key's DESCRIPTOR (see `rebuildContentPart`), not from the
+				// `trapOut` list this cut short — so a getter past the cut is still redacted without a budget
+				// and its value is never materialized unredacted (#5109 review round 13 [P1]). The earlier
+				// claim that returning here was "the fail-SAFE direction" was true only after that descriptor
+				// check existed; on its own, forcing the rebuild is what invoked the getter.
 				return true;
 			}
 			if (isOwnAccessorProperty(source, key)) {
@@ -1392,6 +1444,19 @@ export function collectDetailsStrings(
 /**
  * Is this a path pi's `read` tool would expose the contents of an ENV file through?
  * `.env`, `.env.local`, `.env.production`, `app.env` — yes; `environment.md` — no.
+ *
+ * ⛔ A DOTTED IDENTIFIER IS NOT AN ENV FILE (#5109 review). The old rule accepted any basename that
+ * merely CONTAINED `".env."` (plus any basename ENDING in `.env`), so a benign code expression read as
+ * an env file — `process.env`, `process.env.X`, `import.meta.env.X`, `config.env.ts`, `a.env.md` — and
+ * the source-5 harvest then registered the code reference as a "secret" and mangled ordinary output
+ * (measured: `grep -h process.env src/config.ts` harvested `process.env.MY_REAL_SECRET_KEY` and rewrote
+ * a benign line into `[REDACTED-SECRET:read:process.env#API_KEY]`, with a durable record and a pane
+ * notice claiming a redaction). The explicit dotenv names stay bare-safe; the ambiguous
+ * `<name>.env` / `<name>.env.<suffix>` forms now require a real PATH shape (a separator), and the
+ * mid form is accepted only when the suffix names an environment or the prefix before `.env` is
+ * filename-ish — so `process.env.X`, `config.env.ts` and `a.env.md` are code, not files. The round-3
+ * case `/repo/<secret>.env.local` — an arbitrary-prefix env-file basename, a legitimate hit — is
+ * preserved.
  */
 export function isEnvLikePath(path: string): boolean {
 	let base: string;
@@ -1400,8 +1465,53 @@ export function isEnvLikePath(path: string): boolean {
 	} catch {
 		return false;
 	}
-	return base === ".env" || base.startsWith(".env.") || base.endsWith(".env") || base.includes(".env.");
+	// The unambiguous dotenv names, bare or pathed: `.env`, `.env.local`, `.env.production`.
+	if (base === ".env" || base.startsWith(".env.")) return true;
+	// The ambiguous forms below are ALSO how a dotted code expression reads, so a bare token is not a
+	// file (`process.env` is a code namespace, not a path).
+	if (!path.includes("/")) return false;
+	if (base.endsWith(".env")) return true;
+	if (!base.includes(".env.")) return false;
+	// `<something>.env.<suffix>` — this is the shape a DOTTED IDENTIFIER also has (`process.env.X`,
+	// `config.env.ts`, `a.env.md`), so accept it only when it reads as an env FILE: the suffix names an
+	// environment, OR the prefix before `.env` is filename-ish (a hyphen/underscore/digit). A pure-alpha
+	// prefix with an unknown suffix is a dotted code expression, not a file. The bare `.env.<anything>`
+	// form is accepted above, so this narrowing only removes the code-identifier class; an UNKNOWN
+	// suffix on a filename-ish prefix is still accepted (the fail-closed direction).
+	const prefix = base.slice(0, base.indexOf(".env."));
+	const suffix = base.slice(base.lastIndexOf(".") + 1);
+	return ENV_FILE_SUFFIXES.has(suffix) || /[-_0-9]/.test(prefix);
 }
+
+/** Environment suffixes that name an env file, for the ambiguous `<name>.env.<suffix>` form. */
+const ENV_FILE_SUFFIXES: ReadonlySet<string> = new Set([
+	"local",
+	"development",
+	"dev",
+	"production",
+	"prod",
+	"test",
+	"testing",
+	"staging",
+	"stage",
+	"ci",
+	"qa",
+	"uat",
+	"sandbox",
+	"demo",
+	"example",
+	"sample",
+	"template",
+	"review",
+	"preview",
+	"integration",
+	"docker",
+	"live",
+	"beta",
+	"alpha",
+	"default",
+	"localhost",
+]);
 
 /**
  * The env-like source of a tool call, or `undefined` when the tool was not aimed at one. This is the
@@ -1430,7 +1540,7 @@ export function envSourceFromInput(input: unknown): string | undefined {
  * it changes no output, only cost — so its regression pin has to observe that it fired rather than
  * infer it from behaviour. See the `DOTENV_PRECHECK_RE` mutation test.
  */
-export const _secretEchoGuardCounters = { dotenvPrecheckSkips: 0 };
+export const _secretEchoGuardCounters = { dotenvPrecheckSkips: 0, harvestCapStops: 0 };
 
 /**
  * Strip a unified-diff line marker from each line before the dotenv parse. An `edit` result's
@@ -1465,7 +1575,13 @@ export function harvestDotenvSecrets(
 	for (const { key, value } of parseEnvFile(candidate)) {
 		if (!isSecretValueKey(key, "env")) continue;
 		if (!isUsableSecretValue(value, minLength)) continue;
-		if (into.length >= maxHarvested) break;
+		if (into.length >= maxHarvested) {
+			// ⛔ NOT SILENT (#5109 review). Before this the caller ignored the return value, so assignments
+			// past the per-call cap were dropped with no record and no notice. Counted so the handler can
+			// surface `harvestCapped` in the durable record and the pane warning.
+			_secretEchoGuardCounters.harvestCapStops++;
+			break;
+		}
 		into.push({ value: value.trim(), label: `read:${sourceName}#${key}` });
 		added++;
 	}
@@ -1590,14 +1706,25 @@ export function getRegistryValues(hooks: SecretEchoGuardHooks = secretEchoGuardH
 	return normalizeSecretValues([...cache.staticValues, ...cache.harvested]);
 }
 
-/** Append content-harvested values to the process-lifetime registry. Never logs the values. */
-export function retainHarvested(values: SecretValue[], hooks: SecretEchoGuardHooks = secretEchoGuardHooks): void {
-	if (values.length === 0) return;
+/** Append content-harvested values to the process-lifetime registry. Never logs the values. Returns
+ * `true` when retaining them EVICTED an older value (the cap was crossed), so the caller can record
+ * and announce the loss instead of leaving it silent. */
+export function retainHarvested(values: SecretValue[], hooks: SecretEchoGuardHooks = secretEchoGuardHooks): boolean {
+	if (values.length === 0) return false;
 	// Force a cache slot when the first call is a harvest (no source has been stat'ed yet).
 	getRegistryValues(hooks);
-	if (!cache) return;
+	if (!cache) return false;
 	cache.harvested.push(...values);
-	if (cache.harvested.length > MAX_HARVESTED_VALUES) cache.harvested.splice(0, cache.harvested.length - MAX_HARVESTED_VALUES);
+	if (cache.harvested.length > MAX_HARVESTED_VALUES) {
+		// ⛔ EVICTION IS NOT SILENT. The header promises harvested values "persist for the rest of the
+		// process so the SAME value is redacted from every later result"; past the cap the OLDEST are
+		// evicted, and before this the loss set no flag, wrote no record and emitted no notice — a later
+		// result carrying an evicted value produced NO patch and NO record at all. Every other coverage
+		// shortfall in this guard is recorded and announced; this one was not.
+		cache.harvested.splice(0, cache.harvested.length - MAX_HARVESTED_VALUES);
+		return true;
+	}
+	return false;
 }
 
 // ── Gate ────────────────────────────────────────────────────────────────────────────────────────
@@ -1729,6 +1856,12 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 		let eventReadFailed = false;
 		try {
 			values = getRegistryValues(hooks);
+			// ⛔ The configured floor must govern the source-5 HARVEST too, not only the static sources
+			// (#5109 review). It was read only inside `getRegistryValues`, so `SECRET_ECHO_GUARD_MIN_LENGTH`
+			// was silently ignored for harvested `.env` values: a RAISED floor still redacted a value the
+			// operator asked to leave alone, and a LOWERED floor — the fail-open direction — never reached
+			// the one vector the harvest exists to close (an unsourced repo `.env`).
+			const harvestMinLength = cache?.minLength ?? MIN_SECRET_LENGTH;
 
 			const e = event as {
 				toolName?: unknown;
@@ -1787,6 +1920,8 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 			// even when the static registry is empty, because an unsourced `.env` is exactly the case
 			// the config/env sources cannot see.
 			const harvested: SecretValue[] = [];
+			const harvestCapStopsBefore = _secretEchoGuardCounters.harvestCapStops;
+			let harvestEvicted = false;
 			const harvestBudget = newDetailsBudget(hooks.detailsHarvestLimits?.() ?? {});
 			const inputField = readEventField(e, "input");
 			if (!inputField.ok) {
@@ -1803,10 +1938,10 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					for (const part of asArray(rawContent)) {
 						if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
 							const text = (part as { text?: unknown }).text;
-							if (typeof text === "string") harvestDotenvSecrets(text, harvested, sourceName);
+							if (typeof text === "string") harvestDotenvSecrets(text, harvested, sourceName, harvestMinLength);
 						}
 					}
-					if (typeof rawContent === "string") harvestDotenvSecrets(rawContent, harvested, sourceName);
+					if (typeof rawContent === "string") harvestDotenvSecrets(rawContent, harvested, sourceName, harvestMinLength);
 				} catch (error) {
 					contentHarvestFailed = true;
 					globalThis.console?.error?.(
@@ -1821,7 +1956,7 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				try {
 					const detailStrings: string[] = [];
 					collectDetailsStrings(rawDetails, detailStrings, harvestBudget, new WeakSet<object>(), 0);
-					for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName);
+					for (const text of detailStrings) harvestDotenvSecrets(text, harvested, sourceName, harvestMinLength);
 				} catch (error) {
 					detailsHarvestFailed = true;
 					// ⛔ INVARIANT (review round 5, mutant M11): these two lines are set TOGETHER and neither is
@@ -1837,12 +1972,20 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					);
 				}
 				if (harvested.length > 0) {
-					retainHarvested(harvested, hooks);
+					harvestEvicted = retainHarvested(harvested, hooks);
 					// Static-first concatenation: a value already known from a config/env source keeps its
 					// more precise label (normalize does a first-wins dedupe by value).
 					values = normalizeSecretValues([...values, ...harvested]);
 				}
 			}
+			// ⛔ A harvest that hit either cap NARROWED coverage and must be recorded/announced, never silent
+			// (#5109 review). `harvestCapped`: assignments past MAX_HARVESTED_VALUES in a single call were
+			// dropped; `harvestEvicted`: retaining them evicted the OLDEST retained value, breaking the
+			// header's "persist for the rest of the process" promise. Both used to set no flag, write no
+			// record and emit no notice — a later result carrying the lost value produced no patch and no
+			// record at all.
+			const harvestCapped = _secretEchoGuardCounters.harvestCapStops > harvestCapStopsBefore;
+			const harvestLossy = harvestCapped || harvestEvicted;
 			// Nothing registered and no harvest/event/read failure and no bounded harvest → the remainder
 			// would be pure cost on every result. ALL of these proceed: a FAILED harvest, a FAILED redaction
 			// (or a redaction that could not inspect every part), an unreadable event field, and a BOUNDED
@@ -1958,6 +2101,9 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 				harvestFailed: contentHarvestFailed || detailsHarvestFailed,
 				eventReadFailed,
 				detailsWalkBounded,
+				// Coverage-narrowing facts for the harvested-value registry (see `harvestLossy`).
+				harvestCapped,
+				harvestEvicted,
 			};
 
 			// (a) durable session entry
@@ -1988,6 +2134,8 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 					" WARNING: the result's `details` exceeded the redaction walk bound — part of it was NOT inspected, so it was NOT fully redacted.";
 				const failureWarning =
 					" WARNING: the guard FAILED on part of this result — that part is left UNREDACTED.";
+				const harvestWarning =
+					" WARNING: the harvested-value registry hit its cap — an older harvested value may no longer be redacted from later results.";
 				const isFirst = !announced.has(key);
 				if (isFirst) announced.add(key);
 				if (isFirst) {
@@ -1997,15 +2145,16 @@ export default function secretEchoGuard(pi: ExtensionAPI): void {
 						record.total > 0
 							? `redacted ${record.total} secret value(s) from a ${String(record.toolName)} result (${labels}). The value(s) are NOT in this session transcript.`
 							: "no secret value was redacted from this result.";
-					const text = `[secret-echo-guard] ${summary}${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}`;
+					const text = `[secret-echo-guard] ${summary}${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}${harvestLossy ? harvestWarning : ""}`;
 					globalThis.console?.error?.(text);
 					(ctx as { ui?: { notify?: (message: string, type?: string) => void } } | null | undefined)?.ui?.notify?.(
 						text,
 						"warning",
 					);
-				} else if (detailsWalkBounded || anyFailure) {
-					// Per-result: a bounded OR failed walk never rides on the once-per-session summary.
-					const text = `[secret-echo-guard]${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}`;
+				} else if (detailsWalkBounded || anyFailure || harvestLossy) {
+					// Per-result: a bounded OR failed walk OR a cap-narrowed harvest never rides on the
+					// once-per-session summary.
+					const text = `[secret-echo-guard]${detailsWalkBounded ? boundedWarning : ""}${anyFailure ? failureWarning : ""}${harvestLossy ? harvestWarning : ""}`;
 					globalThis.console?.error?.(text);
 					(ctx as { ui?: { notify?: (message: string, type?: string) => void } } | null | undefined)?.ui?.notify?.(
 						text,
