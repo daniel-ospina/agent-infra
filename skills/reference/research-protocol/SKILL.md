@@ -202,7 +202,7 @@ Snowden's core insight: *"We don't see things we don't expect to see."* A single
 
 For Complex × Standard+ tasks:
 
-1. **Dispatch 2–3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking).
+1. **Dispatch 2–3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking). **Each obeys the `research` skill's Step 3 concurrency bound** — the group shares ONE aggregate budget of **at most 2 concurrent external search calls** (stagger them, or run sequentially), never 2 per agent, or the fan-out re-creates the measured 429 partial batch at the group level. Carry `attempted / returned` counts so a truncated batch cannot read as a complete evidence set (agent-infra#1779).
 2. **Each researches independently** — no cross-talk. Each produces its own findings.
 3. **Map agreements and disagreements.** Where all agree → high-confidence. Where they diverge → that's where the interesting information lives.
 4. **Treat outliers as signal.** The agent that sees something the others don't is not wrong — it has a perspective the others lack.
