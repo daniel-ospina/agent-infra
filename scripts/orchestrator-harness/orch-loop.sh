@@ -587,6 +587,18 @@ while true; do
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
   echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $([ "$MERGE_AUTHORITY" = gate ] && printf 'IS required' || printf 'is NOT required'))" >>"$LOG"
+  # ⚠️ review round 4: REQ_OVERRIDE is a deliberate operator escape hatch (documented in README),
+  # and REQ/REVIEW_GATE are read from the environment — which a cloud cell sources with `set -a`,
+  # so a stray export could set REQ. An override that CHANGES the authority away from the repo's
+  # own declaration would silently re-enable the raw merge this whole change exists to prevent on
+  # a rail repo. The override still wins (it is how a contract is pinned during an outage), but
+  # the flip is never silent: re-read the repo's own declaration and shout when they disagree.
+  if [ "${REQ_SOURCE:-}" = "env" ]; then
+    _own_auth="$(merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
+    if [ "$_own_auth" != "unknown" ] && [ "$_own_auth" != "$MERGE_AUTHORITY" ]; then
+      echo "[authority] ⚠️ $OR: the REQ override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; override REQ='$REQ') — the override wins, but verify it is intended" >>"$LOG"
+    fi
+  fi
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED
   # listing yields ZERO iterations and prints NOTHING — the sweep silently does nothing for the
   # whole cycle. Capture it, check rc, log the failure, and feed the loop from the captured text.
@@ -819,11 +831,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # REVIEW_GATE that is a substring of another red required check (compliance vs
         # pipeline-compliance) misrouted that check into the review arm instead of the CI fixer
         # that fetches its failing log — while merge_authority and CI_RED test whole names.
-        _gate_hit=0; _gifs="$IFS"; IFS=','
+        _gate_hit=0; _gifs="$IFS"; IFS=','; set -f
         for _vn in ${V#FAILED:}; do
           [ "$_vn" = "$REVIEW_GATE" ] && _gate_hit=1
         done
-        IFS="$_gifs"
+        set +f; IFS="$_gifs"
         if [ "$_gate_hit" = "1" ]; then
           # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
           # marker at spawn — so restore it too (P2, second review round).

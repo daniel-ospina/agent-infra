@@ -55,16 +55,18 @@ required_checks() {
   raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || return 1
   # De-duplicate and join on one line: the classifier splits on whitespace, and a newline would
   # otherwise reach it as part of the value rather than as a separator.
-  # ⚠️ A context whose NAME contains whitespace (GitHub allows it: `ci / lint`) cannot travel the
-  # space-joined contract — the classifier would read it as three names and the PR would sit
-  # PENDING forever (review round 3). The JOIN itself uses spaces, so the test is PER NAME, on
-  # the raw newline-delimited lines — a line with INTERNAL whitespace is an unrepresentable
-  # name. Supporting multiword names through the whole pipeline (bash splits, python split,
-  # case matching) is a redesign; REFUSING loudly is the fail-closed answer: this counts as a
-  # FAILED read, so the fallback applies and the sweep — and every merge worker — refuses to act
-  # on a contract it cannot represent.
-  if grep -Eq '[^[:space:]]+[[:space:]]+[^[:space:]]+' <<<"$raw"; then
-    printf 'repo-authority: %s: a required context name contains whitespace [%s] — the space-joined contract cannot represent it; treating the read as FAILED (fail-closed)\n' "$or" "$(grep -E '[^[:space:]]+[[:space:]]+[^[:space:]]+' <<<"$raw" | tr '\n' ' ')" >&2
+  # ⚠️ A context whose NAME contains whitespace or a comma (GitHub allows both: `ci / lint`,
+  # `a,b`) cannot travel this contract. The set is SPACE-joined (the classifier splits on
+  # whitespace) and the RED set the controller derives is COMMA-joined (the FAILED arm splits on
+  # commas), so either character inside a name silently becomes two names — the PR sits PENDING
+  # forever or misroutes to the wrong arm, with nothing logged (review rounds 3-4). The test is
+  # PER NAME, on the raw newline-delimited lines — a line containing whitespace or a comma is an
+  # unrepresentable name. Supporting such names end-to-end (bash splits, the python split, case
+  # matching) is a redesign; REFUSING loudly is the fail-closed answer: this counts as a FAILED
+  # read, so the fallback applies and the sweep — and every merge worker — refuses to act on a
+  # contract it cannot represent.
+  if grep -Eq '[[:space:],]' <<<"$raw"; then
+    printf 'repo-authority: %s: a required context name contains whitespace or a comma [%s] — the space-joined contract (and the comma-joined RED list) cannot represent it; treating the read as FAILED (fail-closed)\n' "$or" "$(grep -E '[[:space:],]' <<<"$raw" | tr '\n' ' ')" >&2
     return 1
   fi
   joined="$(printf '%s\n' "$raw" | awk 'NF && !seen[$0]++' | tr '\n' ' ')"

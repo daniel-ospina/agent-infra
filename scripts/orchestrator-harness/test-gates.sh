@@ -344,6 +344,14 @@ if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; 
     L="$TMP/wg2"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg2rc=$?
   [ "$wg2rc" != "5" ] && { echo "  ✅ an explicit REQ override still proceeds (the refusal is about NOT KNOWING, not about overriding)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the worker guard refused a valid operator override"; FAIL=$((FAIL+1)); }
+  # ⚠️ review round 4: the sandbox above sets REQ='' AND MERGE_AUTHORITY=unknown, so the first two
+  # disjuncts already fire and the THIRD — a non-empty FALLBACK_REQ read as `fallback` (gate
+  # authority) with no override — was never exercised; deleting it stayed green in every suite.
+  # That is the case that used to burn a full fresh-context reviewer first on an unreadable read.
+  ( REQ_SOURCE=fallback; REQ_OVERRIDE=''; REQ="$FALLBACK_REQ"; MERGE_AUTHORITY="$(merge_authority "$FALLBACK_REQ")"; PR=1766; OR=daniel-ospina/tortoise; \
+    L="$TMP/wg3"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg3rc=$?
+  [ "$wg3rc" = "5" ] && { echo "  ✅ a NON-EMPTY fallback contract ($FALLBACK_REQ, authority=gate) with no override still refuses (exit 5)" ; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the fallback disjunct is dead: a gate-authority fallback with no override exited $wg3rc, not 5"; FAIL=$((FAIL+1)); }
   # ⚠️ review round 3: §j sourced the fragment standalone, so the guard's POSITION was unpinned
   # — moved after run_agent it would refuse only AFTER the reviewer ran and was paid for.
   _wg_ln="$(grep -n 'REFUSED: branch protection' "$MERGE" | head -1 | cut -d: -f1)"
@@ -358,7 +366,7 @@ fi
 # (k) the FAILED arm's gate test is WHOLE-NAME (review P2, round 2): `grep -qF` matched a
 # substring, so REVIEW_GATE=compliance misrouted a red pipeline-compliance into the review arm
 # while merge_authority correctly said rail. Extract the shipped derivation and drive both.
-sed -n '/^        _gate_hit=0; _gifs=/,/^        IFS="\$_gifs"$/p' "$ORCH" > "$TMP/gatehit.sh"
+sed -n '/^        _gate_hit=0; _gifs=/,/^        .*IFS="\$_gifs"$/p' "$ORCH" > "$TMP/gatehit.sh"
 if [ -s "$TMP/gatehit.sh" ] && bash -n "$TMP/gatehit.sh" 2>/dev/null; then
   REVIEW_GATE=compliance; V='FAILED:pipeline-compliance'; _gate_hit=1
   # shellcheck disable=SC1090
@@ -370,6 +378,16 @@ if [ -s "$TMP/gatehit.sh" ] && bash -n "$TMP/gatehit.sh" 2>/dev/null; then
   . "$TMP/gatehit.sh"
   [ "${_gate_hit:-}" = "1" ] && { echo "  ✅ …and the exact gate name DOES match"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the exact gate name did not match"; FAIL=$((FAIL+1)); }
+  # ⚠️ review round 4: the loop needs `set -f` too — an unquoted ${V#FAILED:} GLOB-EXPANDS against
+  # the controller's cwd (the target repo), so a red check name containing a metacharacter is
+  # rewritten by whatever files happen to be there. Drive it from a dir holding a file named
+  # exactly like the gate: without `set -f` the glob expands to that filename and fakes a hit.
+  _gdir="$TMP/globdir"; mkdir -p "$_gdir"; : > "$_gdir/ai-review-gate"
+  _gh_hit="$( cd "$_gdir" && REVIEW_GATE=ai-review-gate; V='FAILED:*'; _gate_hit=0
+    # shellcheck disable=SC1090
+    . "$TMP/gatehit.sh"; printf '%s' "${_gate_hit:-}" )"
+  [ "$_gh_hit" = "0" ] && { echo "  ✅ a metacharacter in a red name is a LITERAL token (no glob against the cwd)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the FAILED-list split glob-expanded: a file named ai-review-gate in the cwd faked a gate hit (${_gh_hit})"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract the gate-hit derivation from orch-loop.sh"; FAIL=$((FAIL+1))
 fi
@@ -436,6 +454,101 @@ fi
 REQ_SOURCE=''; resolve_required_checks daniel-ospina/spaced "$_spg" 2>/dev/null
 [ "${REQ_SOURCE:-}" = "fallback" ] && { echo "  ✅ …and the resolver answers fallback (authority-unknown: the sweep and every worker refuse)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ the resolver did not treat the spaced read as fallback (source=${REQ_SOURCE:-?})"; FAIL=$((FAIL+1)); }
+
+# (n2) …and the SAME for a COMMA (review round 4). The required set is SPACE-joined but the RED set
+# the controller derives is COMMA-joined, so `a,b` passes the whitespace screen and then splits
+# into two names in the FAILED arm — the same silent misroute, one layer down.
+_cmg="$TMP/comma-gh"
+printf '#!/bin/bash\ncase "$*" in *required_status_checks*) printf "ci,lint\\n" ;; *) exit 1 ;; esac\n' > "$_cmg"; chmod +x "$_cmg"
+_cm_out="$(required_checks daniel-ospina/comma "$_cmg" 2>"$TMP/comma.err")"; _cm_rc=$?
+if [ "$_cm_rc" != "0" ] && grep -q 'contains whitespace or a comma' "$TMP/comma.err" 2>/dev/null; then
+  echo "  ✅ a comma in a required name is a FAILED read, loudly — it would split in the comma-joined RED list"; PASS=$((PASS+1))
+else
+  echo "  ❌ a comma-bearing required name was not rejected (rc=$_cm_rc out=[$_cm_out] err=[$(cat "$TMP/comma.err" 2>/dev/null)])"; FAIL=$((FAIL+1))
+fi
+
+# (n3) …and an rc-0 read with NO contexts is a FAILED read, not "this repo requires nothing"
+# (review round 4: the guard was unpinned — deleting it stayed green everywhere). This is
+# defence in depth: the consumers refuse an empty REQ anyway, but the header's promise ("an
+# unreadable protection endpoint NEVER becomes an EMPTY required set") must be pinned here.
+_emg="$TMP/empty-gh"
+printf '#!/bin/bash\nexit 0\n' > "$_emg"; chmod +x "$_emg"
+_em_out="$(required_checks daniel-ospina/empty "$_emg" 2>/dev/null)"; _em_rc=$?
+if [ "$_em_rc" != "0" ] && [ -z "$_em_out" ]; then
+  echo "  ✅ an rc-0 read with no contexts is a FAILED read (never \"requires nothing\")"; PASS=$((PASS+1))
+else
+  echo "  ❌ an empty rc-0 read returned rc=$_em_rc out=[$_em_out] — it must be a failed read"; FAIL=$((FAIL+1))
+fi
+REQ='x'; REQ_SOURCE='x'; resolve_required_checks daniel-ospina/empty "$_emg" 2>/dev/null
+[ "${REQ_SOURCE:-}" = "fallback" ] && { echo "  ✅ …so the resolver falls back (authority-unknown: nothing merges on an empty read)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ an empty read resolved as source=${REQ_SOURCE:-?} REQ=[$REQ]"; FAIL=$((FAIL+1)); }
+
+# (q) `merge_authority` honours the CONFIGURED review-gate name, not a hardcoded literal (review
+# round 4: hardcoding `ai-review-gate` stayed green while diverging the classifier from the
+# authority decision — a custom-gate repo would be routed to the rail while the classifier still
+# enforced the gate).
+[ "$(REVIEW_GATE=my-gate merge_authority 'my-gate other')" = "gate" ] \
+  && { echo "  ✅ a custom REVIEW_GATE name still reads gate (the gate name is repo-dependent)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ merge_authority ignored a non-default REVIEW_GATE: got [$(REVIEW_GATE=my-gate merge_authority 'my-gate other')]"; FAIL=$((FAIL+1)); }
+[ "$(REVIEW_GATE=my-gate merge_authority 'other only')" = "rail" ] \
+  && { echo "  ✅ …and a set without the configured gate reads rail"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a set without the configured gate did not read rail"; FAIL=$((FAIL+1)); }
+
+# (p) the CONTROLLER's AUTHORITY_UNKNOWN DERIVATION is driven from the shipped lines (review
+# round 4: §i sets the flag directly, so the derivation could be forced to 0 — the sweep would
+# then act on an unknown contract, the exact burn loop the fallback exists to prevent).
+sed -n '/^  resolve_required_checks "\$OR"$/,/^  fi$/p' "$ORCH" > "$TMP/deriv.sh"
+if [ -s "$TMP/deriv.sh" ] && bash -n "$TMP/deriv.sh" 2>/dev/null; then
+  # A separate script, not an inline subshell: the fragment must source AFTER the stubs exist, and
+  # a function-definition inside `( … )` inside a function does not parse.
+  cat > "$TMP/deriv-drive.sh" <<'DRV'
+#!/usr/bin/env bash
+OR=x; LOG=/dev/null; D_REQ="$1"; D_SRC="$2"
+resolve_required_checks() { REQ="$D_REQ"; REQ_SOURCE="$D_SRC"; return 0; }
+merge_authority() { printf '%s\n' "$D_AUTH"; }
+. "$DERIV" >/dev/null 2>&1
+printf '%s' "${AUTHORITY_UNKNOWN:-}"
+DRV
+  _au_derive() { DERIV="$TMP/deriv.sh" bash "$TMP/deriv-drive.sh" "$1" "$2"; }
+  for _case in "fallback:1" "protection:0"; do
+    _src="${_case%%:*}"; _want="${_case##*:}"
+    _got="$(_au_derive 'pipeline-compliance' "$_src")"
+    [ "$_got" = "$_want" ] && { echo "  ✅ derivation: REQ non-empty + source=$_src -> AUTHORITY_UNKNOWN=$_want"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ derivation: source=$_src gave AUTHORITY_UNKNOWN=$_got (want $_want)"; FAIL=$((FAIL+1)); }
+  done
+  _got="$(_au_derive '' protection)"
+  [ "$_got" = "1" ] && { echo "  ✅ derivation: an EMPTY contract is unknown even when the source says protection"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ derivation: an empty contract gave AUTHORITY_UNKNOWN=$_got (want 1)"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the AUTHORITY_UNKNOWN derivation from orch-loop.sh"; FAIL=$((FAIL+1))
+fi
+
+# (s) an override that CHANGES the merge authority away from the repo's own declaration is LOUD
+# (review round 4). The override still wins — it is the documented way to pin a contract during
+# an outage — but a silent flip from `rail` to `gate` re-enables the raw merge this branch exists
+# to prevent, and REQ/REVIEW_GATE are read from the environment (a cloud cell sources keys.env
+# with `set -a`). Drive the shipped block: a disagreeing override warns, an agreeing one does not.
+sed -n '/^  if \[ "\${REQ_SOURCE:-}" = "env" \]; then$/,/^  fi$/p' "$ORCH" > "$TMP/ovr.sh"
+if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
+  _ovr() { # <own-set> <authority> <override-set> -> prints the log
+    ( OR=daniel-ospina/agent-infra; LOG="$TMP/ovr.log"; : > "$LOG"; REQ_SOURCE=env; REQ="$3"
+      MERGE_AUTHORITY="$2"; required_checks() { printf '%s\n' "$1"; }
+      # shellcheck disable=SC1090
+      . "$TMP/ovr.sh" >/dev/null 2>&1; cat "$LOG" )
+  }
+  _o1="$(_ovr 'pipeline-compliance' 'gate' 'pipeline-compliance ai-review-gate')"
+  case "$_o1" in
+    *"CHANGES the merge authority"*) echo "  ✅ an override that flips rail->gate is logged as an authority CHANGE (never silent)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an authority-changing override was silent — log=[$_o1]"; FAIL=$((FAIL+1)) ;;
+  esac
+  _o2="$(_ovr 'pipeline-compliance' 'rail' 'pipeline-compliance')"
+  case "$_o2" in
+    *"CHANGES the merge authority"*) echo "  ❌ an override that AGREES with the repo's declaration drew a false change warning"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ✅ an override that agrees with the repo's own declaration warns about nothing"; PASS=$((PASS+1)) ;;
+  esac
+else
+  echo "  ❌ could not extract the override-authority warning from orch-loop.sh"; FAIL=$((FAIL+1))
+fi
 
 # (o) a PRESENT but STALE repo-authority.sh is a FATAL, not a silent rail (review round 3: it
 # sourced cleanly, yielded REQ="", read as `rail`, and rerouted a gate repo). Extract the
