@@ -883,7 +883,14 @@ function parseArgs(argv) {
         break;
       }
       case "--write": opts.write = true; break;
-      case "--json": opts.json = true; break;
+      case "--json":
+        opts.json = true;
+        // Remembered the moment the flag is CONSUMED, so the bad-usage refusal can still answer in
+        // JSON. Scanning `argv` instead over-reports: `--repo --json --bogus` consumes the literal
+        // token `--json` as a VALUE and then throws, so `argv.includes("--json")` would print JSON
+        // to a caller who never asked for it.
+        sawJsonFlag = true;
+        break;
       case "--quiet": opts.quiet = true; break;
       case "--no-fetch": opts.fetch = false; break;
       case "--no-repos": opts.noRepos = true; break;
@@ -954,6 +961,9 @@ function defaultSurfaces(opts) {
   return out;
 }
 
+/** Set by `parseArgs` the moment it consumes `--json` — see the comment there. */
+let sawJsonFlag = false;
+
 function main(argv) {
   let opts;
   try {
@@ -962,7 +972,7 @@ function main(argv) {
     console.error(`❌ check-version-stamp: ${err.message}`);
     console.error(usage());
     // `opts` does not exist on this path by construction, so the flag is read straight off argv.
-    return refuseJson({ json: argv.includes("--json") }, err.message);
+    return refuseJson({ json: sawJsonFlag }, err.message);
   }
   if (opts.help) {
     // `--json` promises stdout is machine-readable, and a usage text is not JSON. A consumer that

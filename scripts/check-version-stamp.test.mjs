@@ -1277,6 +1277,10 @@ try {
     fs.writeFileSync(path.join(manifestOnly, "manifest.json"), "{}\n");
 
     checkJson("bad usage", ["--json", "--ref"]);
+    // The bad-ref refusal inside the fetch path — the eighth site, which a previous version of this
+    // arm claimed to cover while testing seven. Without `--no-fetch`: the guard refuses BEFORE any
+    // network call, so this stays offline.
+    checkJson("bad ref", ["--json", "--repo", ORIGIN, "--ref", "origin/--upload-pack=x"]);
     checkJson("no manifest.json", ["--json", "--repo", noManifest, "--ref", "main", "--no-fetch"]);
     checkJson("git unavailable", ["--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { PATH: "/nonexistent" });
     checkJson("not a git checkout", ["--json", "--repo", manifestOnly, "--ref", "main", "--no-fetch"]);
@@ -1297,10 +1301,16 @@ try {
       AGENT_INFRA_REPOS_ROOT: "",
     });
 
-    // CONTROL — the human path is unchanged: text on stdout, still exit 2, and NOT JSON.
+    // CONTROL — the human path is unchanged: text on stderr, still exit 2, and its STDOUT is not
+    // JSON. The stdout half matters: asserting only stderr let a change that drops the `if
+    // (opts.json)` from `refuseJson` leak a JSON object into the human path and still pass.
     const human = run(["--repo", noManifest, "--ref", "main", "--no-fetch"]);
     eq("control — the human path exits 2", human.code, 2);
-    eq("control — and prints text, not JSON", human.stderr.includes("no agent-infra checkout"), true);
+    eq("control — and prints text on stderr", human.stderr.includes("no agent-infra checkout"), true);
+    eq("control — and its stdout is NOT JSON", human.stdout.trim() === "", true);
+    // And the argv-scan bug this replaced: `--json` consumed as a VALUE must not switch the format on.
+    const eaten = run(["--repo", "--json", "--bogus"]);
+    eq("control — a `--json` eaten as a value does not enable JSON", eaten.stdout.includes("{"), false);
 
     for (const d of [noManifest, manifestOnly, emptyHome]) fs.rmSync(d, { recursive: true, force: true });
   }
