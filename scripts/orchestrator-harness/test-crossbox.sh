@@ -296,12 +296,14 @@ for s in EXIT INT TERM; do
   # here-string, not a pipe — `printf … | grep -q` takes SIGPIPE under pipefail (#841).
   if grep -q "$s" <<<"$t"; then
     ok "trap registered for $s"
-  elif [ "$s" = INT ] && [ -z "$(trap -p INT)" ] && grep -qF "trap 'exit 130' INT" "$0"; then
+  elif [ "$s" = INT ] && [ -z "$(trap -p INT)" ] && grep -qE "^trap 'exit 130' INT$" "$0"; then
     # ⚠️ NOT a defect in this script (review round 7, diagnosed live; round 8, P3). POSIX puts SIGINT
     # (and SIGQUIT) at IGNORE in a `&` background job, and bash REFUSES to trap a signal inherited as
     # ignored — so `trap 'exit 130' INT` above is a no-op for a backgrounded run and this assertion
     # can never be met there. Foreground (CI, selftest.sh) it holds.
-    # ⛔ The skip is CONFIRMED STATICALLY, because the dynamic read cannot tell the two cases apart:
+    # ⛔ LINE-ANCHORED, and that is load-bearing: an UNANCHORED `grep -F` matched this very
+    # condition line and the comment above it, so deleting the registration left the pin GREEN —
+    # the exact regression it names (round-9 review, P3: the first fix was itself vacuous).
     # with SIGINT refused, `trap -p INT` prints EMPTY — byte-for-byte the same as "the trap line was
     # deleted", which is precisely the regression this pin names (measured round 8: backgrounded
     # refusal `[]`, no-trap `[]`, foreground `trap -- 'exit 130' SIGINT`). Skipping on the empty read

@@ -237,9 +237,12 @@ echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} author
 # authority, because the fallback carries the gate name) and could reach the raw merge below on a
 # rail repo whose gate row happened to read green — and always burned a full fresh-context
 # reviewer first. The guard therefore lives HERE, at the point of consequence: EVERY ingress is
-# covered, whatever spawned it. A worker is deliberately NOT handed a frozen contract by its
-# spawner — chain workers wait up to 90 minutes, and a fresh read that refuses beats a stale one
-# that merges.
+# covered, whatever spawned it. A controller-spawned `merge-<PR>` worker IS handed a frozen
+# contract: its spawn carries REQ/REVIEW_GATE, which arrive here as REQ_OVERRIDE and short-circuit
+# the read below — one resolution, one authority, so the worker cannot disagree with the controller
+# that classified the PR. The `chain-<N>` and `fix-one.sh` ingresses are the ones that are NOT
+# handed one and re-read branch protection themselves, and a chain worker can wait up to 90 minutes
+# after that read; a fresh read that refuses beats a stale one that merges.
 if [ -z "${REQ:-}" ] || [ "$MERGE_AUTHORITY" = "unknown" ] || { [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; }; then
   echo "[merge $PR] REFUSED: branch protection for $OR is unreadable (REQ_SOURCE=fallback, no REQ override) — the merge contract is UNKNOWN, so this worker merges nothing (agent-infra#1764)" >> "$L.log"
   exit 5

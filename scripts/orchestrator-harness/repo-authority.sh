@@ -75,14 +75,31 @@ _unrepresentable() {
 }
 
 # _normalise_set <string> — collapse every whitespace RUN to one space and trim both ends, so the
-# bash matchers (which delimit a name on a literal SPACE) and the classifier's `str.split()` (which
-# splits on ANY whitespace) can never disagree about the SAME string. A whitespace-only value
-# normalises to EMPTY, which every caller here reads as "absent" — never as a non-empty contract.
+# bash matchers (which delimit a name on a literal SPACE) and the classifier's `str.split()` can
+# never disagree about the SAME string. A whitespace-only value normalises to EMPTY, which every
+# caller here reads as "absent" — never as a non-empty contract.
 # ⛔ review round 8, classes B2/B3. `_override_usable` screened only a comma, so a tab-separated
 # override made `merge_authority` answer `rail` while the classifier enforced the gate: on a gate
 # repo `merge-one.sh` then took its RAIL branch, skipping the fresh-context reviewer and the signed
 # record — a §5.1 bypass — and a whitespace-only override routed to `rail` instead of refusing.
-_normalise_set() { printf '%s' "${1:-}" | tr '\n\t\r\v\f' '     ' | awk 'NF { $1 = $1; print }'; }
+# ⛔⛔ THE DEFINITION MUST BE SHARED, NOT COPIED (round-9 review, P2). The first fix ENUMERATED the
+# bytes to fold (`tr '\n\t\r\v\f'`), and an enumeration cannot be right: the classifier splits on
+# Python's `str.isspace()`, a SUPERSET of POSIX `[:space:]`. Measured at 10c56ed5, a set joined by
+# \x1c, \x1d or NBSP still made the classifier report GATE-ENFORCED while `merge_authority`
+# answered `rail` — the identical bypass, still open. python3 is ALREADY the classifier's own
+# dependency, so this normalises with the classifier's own rule and the two readers now agree BY
+# CONSTRUCTION. rc 1 = the normaliser is unavailable; every caller must then treat the contract as
+# ABSENT (fail-closed) rather than let an un-normalised value reach both readers differently.
+_normalise_set() {
+  local py
+  py="$(command -v python3 2>/dev/null || true)"
+  [ -n "$py" ] || return 1
+  printf '%s' "${1:-}" | "$py" -c '
+import sys
+d = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
+sys.stdout.buffer.write(" ".join(d.split()).encode("utf-8", "surrogateescape"))
+' 2>/dev/null || return 1
+}
 
 # _override_usable <owner/repo> <space-joined REQ_OVERRIDE> — rc 1 (loud) if the override carries
 # a comma (review round 5). The override is itself SPACE-separated, so a name containing a space
@@ -127,8 +144,11 @@ required_checks() {
 resolve_required_checks() {
   local _ov
   if [ -n "${REQ_OVERRIDE:-}" ]; then
-    _ov="$(_normalise_set "${REQ_OVERRIDE:-}")"
-    if [ -z "$_ov" ]; then
+    if ! _ov="$(_normalise_set "${REQ_OVERRIDE:-}")"; then
+      # The normaliser itself is unavailable (no python3). Discard the override rather than let an
+      # un-normalised value reach the classifier and the matcher unalike — fail-closed.
+      printf 'repo-authority: %s: the REQ override CANNOT be normalised (python3 is required) — the override is IGNORED (fail-closed: the repo declaration is used instead)\n' "${1:-}" >&2
+    elif [ -z "$_ov" ]; then
       # ⛔ A whitespace-only override is NOT an override: `' '.split()` is `[]` for the classifier,
       # so a non-empty-but-NAMELESS contract would ROUTE (`rail`) instead of refusing — the round-8
       # B3 bypass. Discard it and fall through to the repo's own declaration (fail-closed).
@@ -157,7 +177,10 @@ merge_authority() {
   # whitespace-only set is `[]` to the classifier while a bare `-z` test called it non-empty and
   # routed it to `rail`; both are "an empty contract must refuse, never route".
   local _set
-  _set="$(_normalise_set "${1:-}")"
+  if ! _set="$(_normalise_set "${1:-}")"; then
+    printf 'repo-authority: the required-check set CANNOT be normalised (python3 is required) — refusing (fail-closed)\n' >&2
+    printf 'unknown\n'; return 0
+  fi
   if [ -z "$_set" ]; then printf 'unknown\n'; return 0; fi
   case " $_set " in
     *" $REVIEW_GATE "*) printf 'gate\n' ;;

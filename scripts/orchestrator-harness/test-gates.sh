@@ -147,6 +147,16 @@ eqv "an empty set -> unknown (a stale contract refuses; never rail, never a raw 
 eqv "a whitespace-only set -> unknown (an empty contract must refuse, never route)" "unknown" "$(merge_authority " ")"
 eqv "a TAB-separated set is normalised, so the gate is still recognised" "gate" "$(merge_authority "$(printf 'ai-review-gate\tdocs')")"
 eqv "a NEWLINE-separated set is normalised too" "gate" "$(merge_authority "$(printf 'ai-review-gate\ndocs')")"
+# ⛔⛔ round-9 review, P2 — THE FIRST FIX ENUMERATED THE BYTES TO FOLD, AND AN ENUMERATION CANNOT BE
+# RIGHT. The classifier splits on Python's `str.isspace()`, a SUPERSET of the POSIX `[:space:]` class
+# `tr` folds; \x1c-\x1f, \x85, NBSP and U+2028 all split for Python and not for `tr`. Measured at
+# the previous head: each of the three below made the classifier report the gate ENFORCED while
+# `merge_authority` answered `rail` — the identical §5.1 bypass (rail ⇒ no fresh-context reviewer, no
+# signed record), still open. The normaliser now uses the classifier's own rule, so all three read
+# `gate`, and adding a fourth exotic separator cannot reopen the class.
+eqv "a \\x1c-joined set agrees with the classifier (Python whitespace, not POSIX)" "gate" "$(merge_authority "$(printf 'ai-review-gate\034docs')")"
+eqv "a \\x1d-joined set agrees with the classifier" "gate" "$(merge_authority "$(printf 'ai-review-gate\035docs')")"
+eqv "an NBSP-joined set agrees with the classifier (the case no `tr` set can express)" "gate" "$(merge_authority "$(printf 'ai-review-gate\302\240docs')")"
 eqv "a whitespace-only OVERRIDE is ABSENT, not a nameless env contract (fail-closed)" "fallback" \
   "$( REQ_OVERRIDE=' '; REQ=''; REQ_SOURCE=''; resolve_required_checks daniel-ospina/readfail "$G"; printf '%s' "${REQ_SOURCE:-<EMPTY>}" )"
 eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b" \
@@ -490,12 +500,10 @@ _NG="$(grep -cF -- "$_GPAT" "$ORCH")"
 [ "${_NG:-0}" = "2" ] \
   && { echo "  ✅ every merge spawn line (${_NG} of 2) POSIX-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
   || { echo "  ❌ expected 2 POSIX-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
-# ⛔ (h3) `printf %q` MUST NOT come back (round-8 adversarial review, class B6). `%q` emits `$'…'`
-# for any byte outside [[:print:]], and `$'…'` is NOT a quoting form in POSIX sh — `/bin/sh` is dash
-# on a Debian/Ubuntu cell, so the quoting is LOST and the remainder is re-parsed as COMMANDS
-# (measured: a required-check name carrying ESC executed an injected command on the merge host;
-# it does NOT reproduce on macOS, where `/bin/sh` is bash — which is why it went unnoticed).
-# The value must arrive WHOLE and execute NOTHING.
+# ⛔ ANY spelling of `printf %q`, not just `printf '%q'` (round-9 review, P3: the single-quoted
+# spelling alone let `printf %q "$1"` through). Comments are excluded (`^[^#]*`) because this file
+# DOCUMENTS the rule in prose — an unanchored match counted its own documentation as a violation.
+# The assertion runs after the drive below, so the drive's own evidence is printed first.
 if [ -s "$TMP/shq.sh" ]; then
   # shellcheck disable=SC1090
   . "$TMP/shq.sh"
@@ -506,20 +514,33 @@ if [ -s "$TMP/shq.sh" ]; then
   # `printf %q` emit `$'…'` and lets dash re-parse the remainder as commands.
   _PAY="a'$(printf '\033');touch\${IFS}$TMP/PWNED;#"
   rm -f "$TMP/PWNED" "$TMP/shq-got"
-  /bin/sh -c "REQ=$(shq "$_PAY"); printf '%s' \"\$REQ\" > '$TMP/shq-got'" 2>/dev/null
+  # The property being pinned is POSIX-sh SAFETY, so exercise a REAL POSIX sh where one exists.
+  # On macOS /bin/sh is bash, which ACCEPTS `$'…'` and therefore hides the very defect class this
+  # drive exists to catch (round-9 review, P3: a `printf %q` quoter passes this suite on macOS and
+  # executes the payload under dash). Prefer dash; naming the shell keeps a macOS green from
+  # reading as dash-safety.
+  _DSH="$(command -v dash 2>/dev/null || printf '/bin/sh')"
+  case "${_DSH##*/}" in
+    dash) _DKIND=dash ;;
+    *)    _DKIND="$("$_DSH" -c '[ -n "${BASH_VERSION:-}" ] && printf bash || printf posix-sh' 2>/dev/null)" ;;
+  esac
+  "$_DSH" -c "REQ=$(shq "$_PAY"); printf '%s' \"\$REQ\" > '$TMP/shq-got'" 2>/dev/null
   if [ -f "$TMP/PWNED" ]; then
     echo "  ❌ a control byte in a required-check name EXECUTED through the spawn shape — the carried contract is injectable under /bin/sh"; FAIL=$((FAIL+1))
   elif [ "$(cat "$TMP/shq-got" 2>/dev/null)" = "$_PAY" ]; then
-    echo "  ✅ a quote + control-byte name survives a POSIX sh -c WHOLE and executes nothing (the shq contract)"; PASS=$((PASS+1))
+    echo "  ✅ a quote + control-byte name survives a POSIX sh -c WHOLE and executes nothing (shell=${_DKIND:-?} at ${_DSH})"; PASS=$((PASS+1))
+    # A bash sh does NOT prove the POSIX property — it accepts what dash rejects. Say so; the
+    # always-on guarantee is the broadened `printf %q`-absence pin below, which needs no shell.
+    [ "${_DKIND:-}" = "bash" ] && echo "  ⊘ note: POSIX-sh safety itself was NOT exercised here — this box's sh is bash (it accepts \$'…'), so a \$'…'-based quoter would still pass. CI's ubuntu runner is dash."
   else
     echo "  ❌ the payload was mangled by the shipped shq (got [$(cat "$TMP/shq-got" 2>/dev/null | od -c | head -2 | tr '\n' ' ')])"; FAIL=$((FAIL+1))
   fi
 else
   echo "  ❌ shq() could not be extracted from orch-loop.sh — the injection drive did NOT run (a skipped check is not a pass)"; FAIL=$((FAIL+1))
 fi
-_QPCT="$(grep -cF "printf '%q'" "$ORCH")"
+_QPCT="$(grep -cE '^[^#]*printf[[:space:]]+.?%q' "$ORCH")"
 [ "${_QPCT:-0}" = "0" ] \
-  && { echo "  ✅ no \`printf %q\` site remains in orch-loop.sh (its \`\$'…'\` output is not POSIX quoting)"; PASS=$((PASS+1)); } \
+  && { echo "  ✅ no \`printf %q\` site remains in orch-loop.sh (any spelling; its \`\$'…'\` output is not POSIX quoting)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ ${_QPCT} \`printf %q\` site(s) remain in orch-loop.sh — dash re-parses that value as commands"; FAIL=$((FAIL+1)); }
 
 # (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
