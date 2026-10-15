@@ -402,7 +402,15 @@ fi
 # farmed destination is scripts/fleet/). fleet-health.py must sit BESIDE
 # liveness.py: it imports that sibling classifier for the identity probe, and
 # that classifier resolves the rule from the sibling scripts/lib/ above.
-fleet_tools=(liveness.py lane_liveness.py fleet-health.py map-sessions.py)
+# claim_lanes.py joined in #1777: the ref-claim registry READER. An orchestrator lane
+# (`pi -p --no-session`) writes no transcript and no cmux record, so it is in no
+# population lane_liveness.py can build; this reader reads the holder-authored
+# `refs/claims/<pr>-<sha12>` refs and feeds the SAME verdict function
+# (liveness.py, farmed just above). It must sit BESIDE liveness.py for the same
+# reason fleet-health.py does: it imports that sibling classifier. It is NOT
+# invoked by the launchd job (no network read behind the TCC wall) — the farm is
+# for the operator/agent CLI.
+fleet_tools=(liveness.py lane_liveness.py claim_lanes.py fleet-health.py map-sessions.py)
 mkdir -p "$DEST/scripts/fleet"
 tools_copied=0
 for base in "${fleet_tools[@]}"; do
@@ -417,7 +425,7 @@ for base in "${fleet_tools[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   tools_copied=$((tools_copied+1))
 done
-echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + fleet-health + map-sessions, #1178)"
+echo "    scripts/fleet farm: $tools_copied copied (lane-liveness + claim-lanes + fleet-health + map-sessions, #1178/#1777)"
 
 # Migration off the deprecated location (#1277). The farm used to write
 # $DEST/tools/fleet/, one of the very paths pi's startup scan rejects — so a

@@ -2,8 +2,15 @@
 """lane-status — multi-signal lane health. No single signal is definitive.
 
 Signals combined (owner, 2026-09-25):
-  1. SESSION file  — mtime/size DELTA over a sample window. The only reliable
-                     liveness signal: the spinner animates while wedged.
+  1. SESSION file  — mtime/size DELTA over a sample window. The strongest signal
+                     for a lane that HAS a session file: the spinner animates
+                     while wedged. It is a signal about a TRANSCRIPT, so it cannot
+                     see a lane that has none — an orchestrator lane runs
+                     `pi -p --no-session`, so it writes no session file and is
+                     absent from every population built from this store (#1777).
+                     Never read its absence as "nobody is on it"; for which
+                     orchestrator lanes exist, read the ref-claim registry
+                     (`tools/fleet/claim_lanes.py`).
   2. TRANSCRIPT    — the last 1-3 messages: tells WIP from DONE, which a
                      spinner cannot.
   3. UI            — the 'Working' indicator from cmux.
@@ -103,7 +110,11 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 #      submitted 0.03h earlier, and acting on that would have interrupted live work.
 #
 # ⛔ WHAT ACTUAL LIVENESS USES: the lane's SESSION JSONL mtime/size (`stale`/`grew`, above). That is
-# OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal.
+# OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal
+# FOR A LANE THAT HAS A SESSION FILE. It is not the only record of a lane: an orchestrator lane
+# (`pi -p --no-session`) has no session file at all, so a `grep` for its branch over the session store
+# comes back empty while it is live and committing (#1777, 2026-10-15). Absence here is not freedom —
+# read `tools/fleet/claim_lanes.py` for the population question.
 # Inbound-recency is reported BESIDE it, never in place of it.
 #
 # ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts

@@ -274,6 +274,30 @@ Read the RUNS, on the EXACT sha, newest attempt per check:
 
 A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
 
+## ⛔ Reading lane liveness — an ABSENCE is not a verdict
+
+**A lane can be live and absent from every population the fleet can enumerate.** An orchestrator
+lane runs `pi -p --no-session` (`lane.sh` / `fix-one.sh` / `merge-one.sh`), so it writes **no
+transcript and no cmux store record**: no session id to enumerate, no JSONL to grow, and no place in
+any population built from the cmux hook store or `~/.pi/agent/sessions/`. Measured 2026-10-15: the
+scheduled report listed `lanes=22` with the live `fix-<pr>` lane absent, and a controller read
+`grep -l <branch> ~/.pi/agent/sessions/*/*.jsonl` returning nothing as CLEAN — over a fixer that was
+committing to that branch.
+
+So **grepping the sessions directory for a branch is not a liveness test**, and "the report does not
+list it" is not "nobody is on it". For *which lanes exist*, read the durable, holder-authored
+**ref-claim registry** — `refs/claims/<pr>-<sha12>`, written by
+`scripts/orchestrator-harness/claims.sh` and read by `tools/fleet/claim_lanes.py`. **Every claim
+verdict is an abstention**: `claim-held` asserts a declared **ownership** window, never that a process
+is alive, and `claims-unreadable` / `no-claim-visible` / `claim-owner-unparseable` /
+`holder-on-foreign-box` / `claim-holder-unverifiable` are **not** freedom — an absent key is a
+HEAD-scoped, transient fact (refs are deleted on release and pruned on expiry, and a live lane has a
+*designed* no-claim window between `fix-one.sh`'s release and `merge-one.sh`'s re-claim).
+
+**One verdict function** (`tools/fleet/liveness.py`), never a second: a reader acquires evidence, it
+does not decide a state. The five states, the ordering, the abstention doctrine, and the four inputs:
+`docs/ops/fleet-liveness.md`.
+
 ## Sub-agent Dispatch
 
 Use Pi's `task` tool for all sub-agent work. Sub-agents have isolated context → construct their prompts with exactly what they need.

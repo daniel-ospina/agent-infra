@@ -29,6 +29,7 @@ The artifacts, one authority:
 |---|---|
 | `tools/fleet/liveness.py` | the verdict function (pure over evidence) and the evidence acquisition (`gather`) |
 | `tools/fleet/lane_liveness.py` | the **scheduled** driver: enumerates lanes, calls `gather`+`evaluate`, escalates a `dead` lane to a deduped issue. A driver, never a second opinion |
+| `tools/fleet/claim_lanes.py` | the **ref-claim registry reader** (#1777): reads `refs/claims/<pr>-<sha12>` from a remote (or a `claim_snapshot` file) into `liveness.ClaimRead`, and renders `liveness.evaluate` at its CLI. Acquisition only — it emits **no state** of its own |
 | `scripts/lib/pid-identity.sh` | the one **process-identity rule** — sourced by the kill-path reaper (Bash), forked as a CLI by the classifier (Python) |
 
 The kill path (`scripts/pi-reap-idle.sh`) is a *consumer of the same identity rule*, not a second
@@ -44,6 +45,22 @@ Every state is read from the same three inputs — the **cmux hook store**
 **fresh `ps` read** (through the probe CLI). The whole point of #1178 is that a frozen
 session-file `mtime` alone renders *dead*, *running-quiet* and *wedged* identical, so the doc
 states per state what is actually being read.
+
+**#1777 added a FOURTH input, and it is a different KIND of input.** The three above answer
+*"what is the state of this session's process?"* and all three require a **transcript** to
+exist: an orchestrator lane runs `pi -p --no-session` (`lane.sh` / `fix-one.sh` /
+`merge-one.sh`), so it has no session id, no JSONL, and no cmux record. It is in **no**
+population built from those three, however wide the escalation policy — measured 2026-10-15:
+the scheduled report listed `lanes=22` and the live `fix-<pr>` lane was not among them, while
+a controller read the empty session grep as CLEAN over a live writer.
+
+The fourth input is the **ref-claim registry** (§7): `refs/claims/<pr>-<sha12>`, a durable
+root commit whose message carries `owner=<host>:<pid>` and `lease_until=<digits>`, written by
+`scripts/orchestrator-harness/claims.sh`. It answers *"which lanes exist at all?"* — the
+population question — where the other three answer the *state* question. It is consulted
+**only** where the session ladder had nothing to go on (§4), so it can never override session
+evidence, and **every claim verdict is `unknown`**: a claim asserts **ownership** (a declared
+lease window), never **incarnation**.
 
 | state | what is read | evidence required |
 |---|---|---|
@@ -216,7 +233,8 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T20 with 24 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (**T1–T20 with 24 paired mutations**, plus
+> **T21–T26 with 6 more** for the #1777 claim evidence) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -238,6 +256,28 @@ not a stall.
 | `turn-state-unknown` | the transcript tail could not be read as a turn boundary |
 | `turn-unknown:<stopReason>` | on a message carrying **no** tool calls, the last assistant message's `stopReason` is outside `TERMINAL_STOP_REASONS` — unrecognized is not terminal (#1272) |
 | `tail-after-compaction` | a compaction entry is the last entry (see below) |
+
+**The six claim reasons (#1777)** — emitted only by `liveness.claim_verdict`, from
+`tools/fleet/claim_lanes.py`'s read. Every one of them is `unknown`, so a claim can neither
+escalate nor be rendered as a green light by an exit-code consumer:
+
+| reason | asserts | does **not** assert |
+|---|---|---|
+| `claims-unreadable` | the namespace could not be consulted at all (git failed / timed out / git absent; or a snapshot that is missing, stale, or shape-drifted) | anything at all about any holder — **never** "no claims" |
+| `no-claim-visible` | this HEAD's key is absent from a **successfully read** registry | that the head is free: the key is HEAD-scoped and the registry is transient (refs are deleted on release and pruned on expiry, and `fix-one.sh` releases before `merge-one.sh` re-claims a new head — a designed no-claim window *inside* a live lane) |
+| `claim-owner-unparseable` | a claim exists and its owner string is unusable (`?`) | who owns it; any liveness — presence alone refutes freedom |
+| `claim-held` | **ownership** liveness: the declared lease window is open, read exactly as `claims.sh`'s `claim_acquire` and `orch-loop.sh`'s `claim_live` read it | that any process is alive |
+| `holder-on-foreign-box` | a claim exists whose owner host is not this host (provenance) | the foreign holder's process liveness — it is **never** probed (a local pid collision could read `absent`, and `absent` is a death witness) |
+| `claim-holder-unverifiable` | no open lease and no probeable incarnation | that the holder is gone or dead |
+
+The cascade is **ordered and total**: `claims-unreadable` → `no-claim-visible` →
+`claim-owner-unparseable` → `claim-held` → `holder-on-foreign-box` →
+`claim-holder-unverifiable`. The first matching rung wins and the last is a catch-all, so the
+six partition the input space, and L15 pins that with a fixture table over
+{readable}×{present}×{scope}×{lease} whose completeness is **asserted** (the test fails unless
+every rung is exercised — a partition, not a sample) plus an order-independence check over every
+permutation of the holders. An unusable owner therefore outranks an open lease, and an unreadable
+read outranks everything.
 
 **A trailing compaction tail abstains rather than asserting `wedged`.** pi writes a
 `compaction` entry **between** turns and immediately starts the next call — measured by the #1254
@@ -295,11 +335,30 @@ verdict.
    but withheld from escalation (retirement, not a stuck lane).
 
 6. **No liveness input is read from a PR or issue body.** The verdict's inputs are the store, the
-   session JSONL, and a fresh `ps` read. Other tooling on the merge rail does read PR bodies — the
+   session JSONL, a fresh `ps` read, and — since #1777 — the ref-claim registry (§7). Other
+   tooling on the merge rail does read PR bodies — the
    compliance gate (`scripts/check-pipeline-compliance.sh`) and `scripts/record-review.sh` — but
    none of that output is an input to a liveness verdict. Where this doc cites an
    issue or PR number, the citation is a **pointer**; the substantive claim is cited to code, a
    test, or a stated measurement.
+
+7. **The population is the cmux population, and orchestrator lanes are absent from it BY
+   CONSTRUCTION (#1777).** This boundary is the defect the section above closes, and it is stated
+   here so a reader does not over-read the report's silence: a lane missing from
+   `lane_liveness.py`'s report is **not** a lane that is not running. `lane_liveness.py` renders
+   this gap as a paragraph in every report and carries it in `--json` (`coverage_gaps`), so the
+   declaration travels with the verdict instead of living in a doc the reader may not have open.
+   Widening *this* population is deliberately not the remedy (adding the process table is the
+   defect #1178 removes, and the scheduled job sits behind launchd's `~/Documents` wall where a
+   network read is not available every pass). Two further gaps travel in the same paragraph:
+   the harness's own local durable state (`~/orchestrator/state/mergeclaim-<PR>.lock`,
+   `fixbail-<PR>-<sha40>`, the tmux `lane-*` / `fix-<PR>` sessions) is unversioned (#1552) and
+   not read; and a claim names an **owner box**, not a branch (a `sha12`→branch resolution is
+   deliberately not derived).
+
+   Corollary: `claim_lanes.py` and `lane_liveness.py` are **two read sets, one verdict
+   function**. Neither may grow its own state vocabulary — `claim_lanes.py` is pinned by test to
+   export no state name and to construct no `Verdict`, and its CLI *renders* `liveness.evaluate`.
 
 ---
 
@@ -331,10 +390,102 @@ A reader must not trust two contracts for one rule. Concretely:
   forks the rule above at signal time and withholds the signal on anything but `holder` — including
   a victim it cannot fence at all, because an unrunnable rule is `unknown` and `unknown` never
   authorises a kill.
+- **"Grep the sessions directory for the branch" is not a liveness test (#1777).** Searching
+  `~/.pi/agent/sessions/*/*.jsonl` for a branch name finds only lanes that have a transcript —
+  and an orchestrator lane runs `pi -p --no-session`, so it has none. The emptiness is the
+  blind spot, not the answer: on 2026-10-15 it read as CLEAN over a live `fix-<pr>` lane that was
+  committing to the branch. The session store answers *what a session's process is doing*; it
+  cannot answer *which lanes exist*. For the population question, read the ref-claim registry
+  (§7) — and treat any of its six abstentions as "not known to be free", never as freedom.
 
 ---
 
-## 7. Where it runs, and how to run it
+## 7. The ref-claim registry (#1777)
+
+**What it is.** `scripts/orchestrator-harness/claims.sh` pushes an atomic git ref per PR head —
+`refs/claims/<pr>-<sha12>` — whose root commit's message is the payload:
+`claim owner=<host>:<pid> lease_until=<unix-seconds> nonce=…`. The ref is the **compare-and-swap**:
+creating it is one atomic push, so two boxes racing the same PR head cannot both win, and the
+record survives the process that made it.
+
+**⛔ `ref-claim` is not "claim".** The fleet carries a second, unrelated sense: the
+**comment-claim** — a GitHub issue comment a lane takes ownership with, read by the product
+repo's pre-flight (`collision_preflight.py`'s JEV `claim-ownership-v1` surface). This section,
+and `claim_lanes.py`, are about the **ref** sense only. Do not unify them.
+
+**How to read it, ad hoc:**
+
+```bash
+# who holds PR 1525? (exit 0 = a claim IS visible for this head · 3 = nothing established,
+# which includes "no claim visible" — never read 3 as freedom · 2 = usage)
+python3 tools/fleet/claim_lanes.py --repo . --pr 1525
+python3 tools/fleet/claim_lanes.py --repo . --pr 1525 --json
+
+# a caller-stated staleness bound is REQUIRED for a snapshot — there is no invented default
+python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapshot \
+    --max-age-s 600 --pr 1525
+```
+
+**The two drivers, one contract.** The normalized record is exactly the three fields
+`claim_snapshot` already writes — `<ref>\t<owner>\t<lease_until>`:
+
+- **PULL** — `git ls-remote <remote> "<ns>/*"` is the authority on **presence**. A non-zero rc is
+  `claims-unreadable` and is **never** "no claims"; rc 0 with zero refs is a *readable* empty
+  read (`no-claim-visible`). Claim commits are fetched into an **isolated temp bare repo** and
+  read with `cat-file`, so a hostile registry can neither write nor delete a local ref. A
+  per-claim metadata failure keeps `present=True` with `owner="?"` — presence alone refutes
+  freedom.
+- **FILE** — `--snapshot PATH` with a caller-stated `--max-age-s`. Missing, stale, or
+  shape-drifted is `claims-unreadable`; a 0-byte file is a *readable* empty read.
+
+The read is bound to the target: `--repo PATH` (its `origin`) or `--remote-url URL`, never the
+current directory (the controller runs from launchd with cwd `$HOME`, which is how `claim_snapshot`
+once came back empty while the origin held three live claims). `GIT_TERMINAL_PROMPT=0` and a
+timeout on every `git` call. **Local refs are never read** — a stale `refs/claims/*` in the
+caller's own repo cannot become a verdict.
+
+**The head key is matched, not assumed.** Given `--sha`, the reader finds the matching head across
+the whole registry and binds the PR from **what matched** — never from the order `git ls-remote`
+emitted, which is lexicographic and therefore attacker-influencable (a box that pushed
+`refs/claims/0-…` would otherwise make every `--sha`-only read look in the wrong PR, report the
+live holder as absent, and name the wrong PR's heads as the disclosure). The sha is compared
+case-insensitively, since the key is hex. Two consequences are load-bearing and tested:
+
+- A sha **shorter than 12 characters is a PREFIX UNION**, not a fallback: a decoy whose whole
+  `sha12` happens to equal the short query would otherwise consume it and hide the real head.
+- When several PRs carry the same head sha, **every match is returned and the ambiguity is
+  declared** (`detail` names the PRs); no match is dropped (that would be a false absence) and no
+  sibling list is invented, because "this PR's other heads" is undefined across PRs. Naming the PR
+  resolves it.
+
+**Exit codes are fail-closed:** `0` = a claim **IS VISIBLE** for the queried head (the positive
+answer to "is anyone on this?" — the opposite of freedom) · `3` = **nothing was established** —
+unreadable, **or no claim visible for this head** — and must never be read as freedom · `2` =
+usage/env. A flat "0 = the read worked" would make the incident's exact input (`no-claim-visible`)
+a machine-visible success.
+
+**The polarity is `claims.sh`'s own, and that is not an accident.** `lease_state ∈ {live, expired,
+unknown}` where **absent / `0` / non-digit / more than 18 digits ⇒ `unknown`, and `unknown` is NOT
+expired**. `claim_acquire`, `claim_prune` and `claim_live` all treat that class as LIVE; a tighter
+reading here would re-create the two-readers-disagree defect those call sites document (a
+controller re-spawning a fixer that `claim_acquire` refuses, and un-parking the PR every cycle so
+the attempt cap never trips). The 18-digit bound is the precise magnitude guard: `lease_until` is
+an epoch second (10 digits today), and 2<sup>63</sup>-1 is 19 digits, so 18 is the largest value
+that cannot overflow the shell comparison. **Leases are read, never renewed** — adopting renewal
+would turn the lease into a process signal and contradict the recorded decision #1709 rec 3
+(`claims.sh`: *"LEASE = DATA, NOT LIVENESS"*); that is a reopen, not a change to make here.
+
+**Why a claim is never probed.** A claim records no process **start**, so `probe <pid> ""` returns
+rc 2 `unusable-start-seconds` and `probe-argv` returns `holder` for *any* live pid (presence
+only, no identity). A presence-only probe mode would be a **second identity rule** — the defect
+#1178 exists to remove (§3). So a claim never sets `Verdict.holder_pid`; the owner identity,
+lease and scope ride in the **detail** string instead, which answers "who holds this?" without any
+consumer reading it as a verified incarnation. `holder-on-foreign-box` is the same rule from the
+other side: a foreign pid is not probeable here, and probing one is actively wrong.
+
+---
+
+## 8. Where it runs, and how to run it
 
 **Scheduled.** `templates/launchd/com.eldato.lane-liveness.plist` installs the job
 `com.eldato.lane-liveness` (`StartInterval` **1800 s**). It runs with no orchestrator alive —
@@ -363,25 +514,36 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 20 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
+python3 tools/fleet/liveness.test.py               # 26 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (30)
+python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
+python3 tools/fleet/claim_lanes.test.py            # 18 reader tests
+python3 tools/fleet/claim_lanes.test.py --mutations  # 19 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```
 
 ---
 
-## 8. Claim provenance
+## 9. Claim provenance
 
 This doc's value is being **true**. Claims are labelled by how they were established:
 
 - **Code-verified** — file/symbol references above (`tools/fleet/liveness.py`,
-  `tools/fleet/lane_liveness.py`, `scripts/lib/pid-identity.sh`, `scripts/pi-reap-idle.sh`,
-  `extensions/task-heartbeat.ts`). Line numbers were current at `origin/main` `7b8335e`; cite
-  symbols on drift.
+  `tools/fleet/lane_liveness.py`, `tools/fleet/claim_lanes.py`,
+  `scripts/orchestrator-harness/claims.sh`, `scripts/lib/pid-identity.sh`,
+  `scripts/pi-reap-idle.sh`, `extensions/task-heartbeat.ts`). Line numbers were current at
+  `origin/main` `7b8335e`; cite symbols on drift.
 - **Measured, and where** — the stop-reason table and the compaction-tail statistic (426 live
   session files, recorded in `liveness.py` by the #1254 unit); the store field count (**0 of 1409**
   records carry any heartbeat/tool field, this host, 2026-09-20); closed-pane count (8 of 34);
   every session file having a message entry within 256 KiB.
+  **#1777, this host, 2026-10-15:** `refs/claims/*` held **2** refs in `agent-infra` (both
+  `owner=cmux:<pid>`, i.e. a **foreign** host, both leases expired) and **1** in `tortoise`
+  (`owner=<this-host>:<pid>`, lease live — the live analogue the incident read as free); the
+  incident's own ref `8697-f5282009634e` was already **gone** (released/pruned), which is why the
+  incident's read came back empty rather than wrong. The scheduled report listed **`lanes=22`**
+  with the live `fix-<pr>` lane absent. Reproduce the read with
+  `python3 tools/fleet/claim_lanes.py --repo <repo> --pr <n>`.
 - **pi behaviour (third-party)** — the meaning of `stopReason` (`length` **fails** the truncated
   calls and continues the turn; `error` / `aborted` discard them), where pi writes a compaction entry, the session JSONL layout,
   and the `--session <id>` resume form. These are established by the measurements named above and
