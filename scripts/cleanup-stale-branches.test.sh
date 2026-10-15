@@ -505,6 +505,22 @@ run_script env CLEANUP_BRANCH_LOG="$LOG1" bash "$LOCAL_SCRIPT" --scope local
 assert_eq "$RC" "1" "a fail-closed refusal keeps its exit status through the log pipe"
 assert_contains "$(cat "$LOG1")" "refusing to classify local branches" "the refusal reaches the log too"
 
+# ⛔ A SYMLINKED log must not be truncated THROUGH. `: >"$f"` FOLLOWS the link
+# and destroys its TARGET, and CLEANUP_BRANCH_LOG is a fixed, predictable path
+# in the shipped plist — the symlink surface scripts/pi-reap-idle.sh guards. The
+# cap must replace the link (mktemp + mv) or skip; never write through it.
+LOG_LINK="$FIX/report-link.log"
+LOG_TARGET="$FIX/report-link-target.log"
+printf 'ORIGINAL-TARGET-CONTENT-MUST-SURVIVE\n' > "$LOG_TARGET"
+ln -s "$LOG_TARGET" "$LOG_LINK"
+run_script env CLEANUP_BRANCH_LOG="$LOG_LINK" CLEANUP_BRANCH_LOG_MAX_BYTES=1 \
+    bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$PR_MAP"
+assert_eq "$RC" "0" "a symlinked over-cap log does not change the exit status"
+assert_contains "$(cat "$LOG_TARGET")" "ORIGINAL-TARGET-CONTENT-MUST-SURVIVE" \
+    "an over-cap SYMLINKED log does NOT truncate its target"
+assert_contains "$(cat "$LOG_LINK")" "Stale Local Branch Cleanup" \
+    "the pass report still reaches the symlinked log path"
+
 echo ""
 echo "== 7. the gh seam: rc reporting (Defect 3) and truncation (Defect 4) =="
 
@@ -785,6 +801,53 @@ assert_contains "$OUT" "=== Stale Branch Cleanup ===" "both runs the remote scop
 assert_contains "$OUT" "Stale Local Branch Cleanup" "both runs the local scope too"
 assert_contains "$OUT" "origin/remote-old" "both: the remote leg sees the stale remote branch"
 assert_match "$OUT" '^  delete +redundant +remote-old$' 'both: the local leg selects the redundant local branch'
+
+echo ""
+echo "== 10c. a remote branch whose name contains '|' is deleted by its FULL name =="
+# `|` is a LEGAL git branch-name character. The remote scope used to build each
+# record as "<branch>|<date>" and split it with ${entry%%|*}, so a remote branch
+# named `release|2020-01-01` yielded `origin/release` and --execute deleted
+# `release` — a branch matching neither the staleness nor the merged premise and
+# never selected. The delimiter is now TAB, which a git ref name cannot contain.
+ORIGIN7="$FIX/origin7.git"
+REPO7="$FIX/repo7"
+new_repo "$REPO7" "$ORIGIN7"
+cd "$REPO7"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+PIPE_SCRIPT="$REPO7/scripts/cleanup-stale-branches.sh"
+
+echo base > file.txt; git add file.txt; old_commit "init"
+git push -q origin main
+
+# the colliding name: OLD and MERGED (its tip is an ancestor of origin/main)
+git checkout -q -b 'release|2020-01-01' main
+echo pipe > pipe.txt; git add pipe.txt; old_commit "pipe"
+git push -q origin 'release|2020-01-01'
+git checkout -q main
+git merge -q --ff-only 'release|2020-01-01'
+git push -q origin main
+
+# the decoy: a FRESH, UNMERGED `release` — matched by no premise, must survive
+git checkout -q -b release main
+echo rel > rel.txt; git add rel.txt
+git commit -q -m "release"          # current date: fresh
+git push -q origin release
+git checkout -q main
+
+run_script bash "$PIPE_SCRIPT" --scope remote --execute
+assert_eq "$RC" "0" "remote --execute with a '|' branch exits 0"
+assert_contains "$OUT" 'Deleting origin/release|2020-01-01' "the '|' branch is deleted by its FULL name"
+if git -C "$ORIGIN7" show-ref --verify --quiet 'refs/heads/release|2020-01-01'; then
+    bad "the '|' branch was NOT removed from origin"
+else
+    ok "the '|' branch was removed from origin"
+fi
+if git -C "$ORIGIN7" show-ref --verify --quiet refs/heads/release; then
+    ok "the fresh 'release' branch SURVIVES (a '|' name must not delete it)"
+else
+    bad "the fresh 'release' branch was WRONGLY deleted"
+fi
 
 echo ""
 echo "== 11. usage/help documents the surface =="

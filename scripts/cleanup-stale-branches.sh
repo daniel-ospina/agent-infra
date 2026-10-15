@@ -143,10 +143,15 @@
 # The report is printed. Under launchd that output lands in the unified log and
 # is not retrievable, so CLEANUP_BRANCH_LOG (set by
 # templates/launchd/com.tortoise.branch-reaper.plist) also APPENDS it to that
-# file, which is capped by TRUNCATING it before a pass once it exceeds
-# CLEANUP_BRANCH_LOG_MAX_BYTES (default 1048576) — the same shape as
-# pi-reap-worktrees.sh's REAP_WT_LOG. Unset (the terminal default, and the
-# suite's) means print only.
+# file, which is capped by recreating it before a pass once it exceeds
+# CLEANUP_BRANCH_LOG_MAX_BYTES (default 1048576). The recreation is `mktemp` in
+# the log's own directory + `mv` over the path (the pattern pi-reap-idle.sh uses
+# for its log cap), NOT `: >"$f"`: the redirect FOLLOWS a symlink and truncates
+# its TARGET, so a benign `ln -s` of the log into a shared log directory would
+# have that target silently destroyed. Unset (the terminal default, and the
+# suite's) means print only. (pi-reap-worktrees.sh, whose REAP_WT_LOG was cited
+# here as precedent, never truncates its log at all; pi-reap-idle.sh is the
+# sibling that does, and it does so symlink-safely.)
 #
 # ── why the lookup is not per-branch ──────────────────────────────
 # The map is parsed once with a single `jq` pass into two TAB-delimited
@@ -485,10 +490,18 @@ run_remote_scope() {
             continue
         fi
 
+        # ⛔ DELIMITER IS TAB, NOT `|`: `|` is a LEGAL git branch-name character
+        # (`git check-ref-format --branch 'a|b'` accepts it), so a remote branch
+        # named `release|2020-01-01` parsed with `${entry%%|*}` yielded
+        # `origin/release` and `--execute` deleted a branch that was never
+        # selected (`release` need not be stale or merged). TAB is a control
+        # character git ref names cannot contain (same sentinel the local
+        # scope's `delete_list` uses), so it cannot collide. Each record is read
+        # back with `IFS=$'\t' read`, as the local scope already does.
         if [ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]; then
             local COMMIT_DATE_HR
             COMMIT_DATE_HR="$(date -r "$COMMIT_DATE" '+%Y-%m-%d' 2>/dev/null || date -d "@$COMMIT_DATE" '+%Y-%m-%d')"
-            STALE_BRANCHES+=("$branch|$COMMIT_DATE_HR")
+            STALE_BRANCHES+=("$branch"$'\t'"$COMMIT_DATE_HR")
         fi
     done < <(git branch -r --merged "origin/$MAIN_BRANCH" 2>/dev/null || true)
 
@@ -502,8 +515,7 @@ run_remote_scope() {
     echo ""
     local entry branch commit_date_hr
     for entry in "${STALE_BRANCHES[@]}"; do
-        branch="${entry%%|*}"
-        commit_date_hr="${entry##*|}"
+        IFS=$'\t' read -r branch commit_date_hr <<<"$entry"
         printf "  %-55s last commit: %s\n" "$branch" "$commit_date_hr"
     done
     echo ""
@@ -514,7 +526,7 @@ run_remote_scope() {
         echo ""
         echo "Deletion commands that would run:"
         for entry in "${STALE_BRANCHES[@]}"; do
-            branch="${entry%%|*}"
+            IFS=$'\t' read -r branch _ <<<"$entry"
             local local_branch="${branch#origin/}"
             echo "  git push origin --delete \"$local_branch\""
         done
@@ -528,7 +540,7 @@ run_remote_scope() {
     local FAILED=0
 
     for entry in "${STALE_BRANCHES[@]}"; do
-        branch="${entry%%|*}"
+        IFS=$'\t' read -r branch _ <<<"$entry"
         local local_branch="${branch#origin/}"
 
         echo "  Deleting origin/$local_branch..."
@@ -905,16 +917,30 @@ run_scopes() {
 }
 
 # ── opt-in capped report log (see the header) ─────────────────────
-# Truncate BEFORE a pass once the file has outgrown the cap, so the log holds
-# the most recent passes and cannot grow without bound. `wc -c` (not `stat -f`)
+# Reset BEFORE a pass once the file has outgrown the cap, so the log holds the
+# most recent passes and cannot grow without bound. `wc -c` (not `stat -f`)
 # keeps this cross-platform.
+#
+# ⛔ RESET VIA `mktemp` + `mv`, NOT `: >"$f"` (symlink safety). Every one of
+# `[ -e ]`, `wc -c <` and `: >` FOLLOWS a symlink, and CLEANUP_BRANCH_LOG is a
+# fixed, predictable path (`~/.pi/agent/state/cleanup-stale-branches.log` in the
+# shipped plist), so `: >"$f"` on an over-cap symlink would silently destroy the
+# link's target (a shared log file, or one a local attacker pre-seeded). `mv`
+# REPLACES the symlink with the fresh file instead of writing through it — the
+# same defence pi-reap-idle.sh uses. A mktemp that cannot be created (read-only
+# directory) skips the reset: the log grows rather than a file being destroyed.
 cap_report_log() {
-    local f="$1" max="$2" size
+    local f="$1" max="$2" size dir tmp
     [ -e "$f" ] || return 0
     size="$(wc -c <"$f" 2>/dev/null | tr -d '[:space:]')" || return 0
     case "$size" in ''|*[!0-9]*) return 0 ;; esac
     if [ "$size" -ge "$max" ]; then
-        : >"$f" 2>/dev/null || true
+        dir="$(dirname -- "$f")"
+        if tmp="$(mktemp "$dir/pi-cleanup-log-trunc.XXXXXX" 2>/dev/null)"; then
+            if ! mv -f -- "$tmp" "$f" 2>/dev/null; then
+                rm -f -- "$tmp" 2>/dev/null || true
+            fi
+        fi
     fi
 }
 
