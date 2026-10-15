@@ -104,12 +104,16 @@ LIST=""; ERROUT=""; DRVC=""
 drive() {
   local d="$1"
   : > "$d/calls"
+  # `-uc`, NOT a bare `set -u` in this subshell: a `bash -c` child does NOT inherit shell options, so
+  # an outer `set -u` left the driven block running WITHOUT it — an unset reference added to the sweep
+  # would have passed here while aborting the real controller (orch-loop.sh runs `set -u`). The option
+  # has to be on the shell that SOURCES the block.
   DRVC="$( cd "$d" && \
-    set -u; PATH="$d/bin:/usr/bin:/bin" O="$d/o" LOG="$d/log" OR="acme/widget" \
+    PATH="$d/bin:/usr/bin:/bin" O="$d/o" LOG="$d/log" OR="acme/widget" \
     SEL='select(.headRefName|test("."))' SWEEP_MAX_AGE=600 SWEEP_MIN_REMAIN=20 \
     GH_CALLS="$d/calls" GHMODE="$GHMODE" GHETAG="$GHETAG" GHROWS="$GHROWS" \
     GHREMAIN="$GHREMAIN" GHRESET="$GHRESET" GHAFTER="$GHAFTER" \
-    bash -c '. "$1" || exit 90; . "$2" || exit 91; printf "LISTBEGIN\n%s\nLISTEND\n" "${SWEEP_LIST:-}"' \
+    bash -uc '. "$1" || exit 90; . "$2" || exit 91; printf "LISTBEGIN\n%s\nLISTEND\n" "${SWEEP_LIST:-}"' \
       _ "$(cd "$T" && pwd)/deps.sh" "$(cd "$T" && pwd)/block.sh" 2>&1 )"
   # Delimited, not `LIST<<%s>>`: SWEEP_LIST is MULTI-LINE, so an inline sentinel captures only the
   # first row and the second is silently dropped — a capture bug that would read as "no listing".
@@ -327,6 +331,23 @@ if need "$T/block.sh" "the sweep-listing block" && need "$T/deps.sh" "the shippe
   esac
   [ -s "$D/calls" ] && ok "huge deferral: the sweep still runs" \
                     || bad "huge deferral: the sweep was suppressed"
+
+  # ── 13) a >10-digit sweep-stamp is dropped by the DIGIT bound, not the clamp ─
+  # ⛔ THIS FIXTURE IS LOAD-BEARING. The `-gt "$NOW"` clamp cannot catch a value at/above 2**63 —
+  # `[` returns status 2 on it, so the `&&` clamp does not fire and the value SURVIVES; a surviving
+  # huge stamp disables the age floor and pins the conditional request forever (green PRs never
+  # merged). The digit bound is the only guard that catches it. Measured: neutralising that one bound
+  # left the suite fully green until this case existed.
+  reset_mode; GHMODE=200; GHREMAIN=4990; GHRESET=0; GHAFTER=""
+  rm -f "$D/o/state/sweep-defer-until"
+  printf '9223372036854775808\n' > "$D/o/state/sweep-stamp"
+  printf 'W/"t1"\n' > "$D/o/state/sweep-etag"
+  drive "$D"
+  grep -q 'If-None-Match' "$D/calls" \
+    && bad "huge stamp: an If-None-Match was sent — a >10-digit stamp disables the age floor" \
+    || ok "huge stamp: dropped, so the anti-starvation floor cannot be disabled"
+  [ -n "$LIST" ] && ok "huge stamp: the forced 200 still yields the listing" \
+                 || bad "huge stamp: no listing (the sweep would be blind)"
 fi
 
 echo
