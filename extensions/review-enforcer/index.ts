@@ -215,16 +215,15 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  *
  * DECIDED FROM THE EXTENSION'S OWN STATE, NEVER FROM THE COMMAND TEXT.
  *
- * Reading it from the text was tried and abandoned: a whitespace-anchored `PATH=`
- * pattern missed `(PATH=/usr/bin gh …)`; matching it unbounded still missed
- * `export "PATH"="$HOME/bin:…"` (which does reach the real gh); and a `/gh` path
- * test missed `$P/g''h`. That is #984's conclusion one layer up — a scanner cannot
- * read shell text, and a partial blacklist is worse than none, because it claims a
- * coverage it does not have. So this asks only two things, both of them ours: is
- * there an argv layer (`AGENT_GH_SHIM`), and is the directory we injected for this
- * call actually a shim (`shimDir`, the SAME value `withGhShim` was given, so the
- * injection and this decision cannot drift; "a shim" means an EXECUTABLE `gh` — a
- * PATH entry the shell skips enforces nothing, see `isExecutableShim`).
+ * Reading the answer out of the command text is not a rule this predicate declines to
+ * follow — it is not implementable (#984): no spelling test can tell whether the shell
+ * will put the shim on PATH for a given command, and a partial blacklist is worse than
+ * none because it claims a coverage it does not have. So this asks only two things,
+ * both of them ours: is there an argv layer (`AGENT_GH_SHIM`), and is the directory we
+ * injected for this call actually a shim (`shimDir`, the SAME value `withGhShim` was
+ * given, so the injection and this decision cannot drift; "a shim" means a regular,
+ * executable `gh` — a PATH entry the shell skips enforces nothing, see
+ * `isExecutableShim`).
  *
  * WHAT IS OUT OF SCOPE, declared rather than implied — both classes are the shim's
  * own STATED LIMITS (`scripts/gh-shim/gh`), and both need the command to hide its
@@ -710,15 +709,14 @@ export function isAdminMergeCommand(command: string): boolean {
     // It is a GUESS, so the CALLER does not act on it while the argv layer is
     // present: it resolves what this cannot, and its false positives are the reason
     // agent-infra#1776 exists — an ordinary `gh` call whose TEXT contains a construct
-    // and the word `admin` (a PR TITLE supplies it) was read as a merge. Making this
-    // guess PRECISE was tried and abandoned (each attempt opened a new hole on the
-    // splice × repo-flag cross-product), which is the empirical form of #984's
-    // conclusion: the class is not closable in a scanner. Do not add another arm here
-    // — the caller's condition is `hasLiteralAdminFlag(command) ||
-    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets handed
-    // over. NOTE the false blocks the LITERAL arm still produces (a quoted `--admin`
-    // that is not an argument of any merge); they are deliberate, and `hasLiteralAdminFlag`
-    // documents why the caller accepts them.
+    // and the word `admin` (a PR TITLE supplies it) was read as a merge. Do NOT add
+    // another arm here: #984's finding is that the class is not closable in a scanner —
+    // every framing of "is this text an admin merge" that tried to be precise admitted a
+    // bypass on the splice × repo-flag cross-product. The caller's condition is
+    // `hasLiteralAdminFlag(command) || !ghShimWillEnforce(shimDir)`, and this guessing
+    // half is exactly what gets handed over. NOTE the false block the LITERAL arm still
+    // produces (a quoted `--admin` that is not an argument of any merge); it is
+    // deliberate, and `hasLiteralAdminFlag` documents why the caller accepts it.
     return (
       /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
@@ -1725,11 +1723,15 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     `--admin=true` while the earlier dash-anchored rule missed them;
  *   - a spliced VERB is refused rather than read (`isGhPrMergeCommand`).
  * It does NOT claim exhaustive coverage, and it does not:
- *   - OVER-BLOCKS, acceptably and visibly: any `gh pr merge` carrying a construct
- *     (a `$`, backtick or brace) AND the word `admin` is refused unless it has
+ *   - OVER-BLOCKS, acceptably and visibly, WHEN THIS LAYER IS THE ONE DECIDING (that is:
+ *     no argv-level shim installed, or `AGENT_GH_SHIM=0`): a `gh pr merge` carrying a
+ *     construct (a `$`, backtick or brace) AND the word `admin` is refused unless it has
  *     head-bound evidence — including a harmless `echo "gh pr merge 1
- *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. The remedy
- *     is the mandated `scripts/admin-merge.sh`; the alternative was a bypass.
+ *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. With the shim
+ *     present the guessed class is DEFERRED to it, not refused (`ghShimWillEnforce`): a
+ *     literal `--admin` token still keeps this layer's decision either way. The remedy
+ *     for the block is the mandated `scripts/admin-merge.sh`; the alternative was a
+ *     bypass.
  *
  * #984 — WHAT LAYERING THE SHIM ON TOP OF THIS CHANGES. The gaps ABOVE are limits
  * of THIS layer, and the CONSTRUCT-SPLICE class among them is now covered by
@@ -1790,8 +1792,11 @@ export function hasAdminMergeFlag(command: string): boolean {
  * the text-layer decision and is refused by the evidence gate for having no resolvable
  * PR number. That is a false block, it is deliberate, and it is the price of the
  * decisive half: the alternative is a spelling rule about where a token may sit, which
- * is the scanner trap this design abandons. It is recoverable per command
- * (`AGENT_ADMIN_MERGE_OVERRIDE=1`), and it is narrower than the guess it replaced.
+ * is the scanner trap this design abandons. The escape is SESSION-level, not per
+ * command: the override is read from this extension's own environment, so a lane
+ * recovering from this false block must start the session with
+ * `AGENT_ADMIN_MERGE_OVERRIDE=1` (or the `ELDATO_` alias) — it is audited as
+ * `admin_merge_override`. It is narrower than the guess it replaced.
  */
 export function hasLiteralAdminFlag(command: string): boolean {
   return literalAdminFlagIn(normalizeForFlagScan(command));
