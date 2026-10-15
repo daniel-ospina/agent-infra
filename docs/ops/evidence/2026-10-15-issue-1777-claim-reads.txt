@@ -132,7 +132,7 @@ MUTATIONS=30 CAUGHT=30 MISSED=0
 $ python3 tools/fleet/claim_lanes.test.py
 PASS=23 FAIL=0
 $ python3 tools/fleet/claim_lanes.test.py --mutations
-MUTATIONS=23 CAUGHT=23 MISSED=0
+MUTATIONS=24 CAUGHT=24 MISSED=0
 $ python3 tools/fleet/lane_liveness.test.py
 
 PASS=109 FAIL=0
