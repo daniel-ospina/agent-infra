@@ -280,6 +280,13 @@ printf '%s' "\$k" | tr -d '[:space:]' > '$W/worker-key'
 printf 'HOME=%s\\nO=%s\\n' "\${HOME:-}" "\${O:-}" > '$W/worker-env'
 EOF
 chmod +x "$W/harness/orch-loop.sh" "$W/harness/merge-one.sh"
+# ⛔ COMMIT the fixture harness. The provenance gate now REFUSES a dirty harness tree (§9's dirty
+# arm), and this fixture writes its worker scripts into the worktree AFTER `worktree add` — left
+# untracked, every §7 `start` would refuse for the DIRTY reason instead of exercising key delivery.
+# HARNESS_REF is pinned to this commit so the relation the gate sees is still `current`.
+git -C "$W/harness" add -A
+git -C "$W/harness" commit -q -m "section 7 fixture harness"
+W_REF="$(git -C "$W/harness" rev-parse HEAD)"
 
 # A tmux double for the rules under test. The first `new-session` starts the SERVER, which inherits
 # ITS client's environment — including the operator's HOME and whatever key it did or did not have;
@@ -405,6 +412,7 @@ wk_case() {
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
       SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own \
+      HARNESS_REF="$W_REF" \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
   for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
   if [ "$rc" -ne 0 ]; then
@@ -510,12 +518,17 @@ exit "${PROBE_RC:-0}"
 SH
 cp "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
 chmod +x "$F/harness/refresh-candidates.sh" "$F/o/refresh-candidates.sh"
+# Commit the fixture harness (see §7): the gate refuses a dirty tree, and leaving these untracked
+# would make every §8 `check` refuse for the DIRTY reason rather than exercise provisioning.
+git -C "$F/harness" add -A
+git -C "$F/harness" commit -q -m "section 8 fixture harness"
+CC_REF="$(git -C "$F/harness" rev-parse HEAD)"
 CC_OUT=''; CC_RC=0
 cellcheck() {
   # $1 = PROBE_RC, $2 = TORTOISE_REPO to make AMBIENT in the supervisor's own shell ('' = none).
   # `TORTOISE=` is cleared so the alias cannot make an unforeseen case look like the one under test.
   CC_OUT="$(PROBE_RC="$1" TORTOISE_REPO="${2:-}" TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
-            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
+            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
   CC_RC=$?
 }
 cellcheck 3
@@ -601,17 +614,30 @@ cat > "$P/bin/tmux" <<'SH'
 case "${1:-}" in
   has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
   new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
+  ls) [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$P/bin/tmux"
-# A `df` reporting a nearly-full disk — the non-vacuity arm for the free-space floor.
-cat > "$P/lowbin/df" <<'SH'
+# A `df` stub emitting a realistic `df -Pk` line whose 4th column is 1KiB blocks. Parameterized so
+# the free-space-floor arms can straddle the REAL floor: a single "nearly full" stub cannot see the
+# KiB/MiB unit error, because 1 KiB is below any plausible threshold under either reading.
+mkdf() { # $1 = bin dir, $2 = Available in 1KiB blocks
+  mkdir -p "$1"
+  cat > "$1/df" <<SH
 #!/bin/bash
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-printf '/dev/root 1000000 999999 1 100%% /\n'
+printf '/dev/root 1000000 999999 $2 100%% /\n'
 SH
-chmod +x "$P/lowbin/df"
+  chmod +x "$1/df"
+}
+mkdf "$P/lowbin" 1           # ~0 MB
+mkdf "$P/unitmid" 113664     # 111 MiB  — the PR's own measured cell
+mkdf "$P/unitlow" 511999     # 499 MiB  — one MiB below the floor
+mkdf "$P/unithigh" 512000    # 500 MiB  — exactly at the floor
+mkdf "$P/prunebin" 921600    # 900 MiB  — above the floor, below the auto-prune trigger (1000)
+mkdir -p "$P/nodfbin"
+printf '#!/bin/bash\nexit 1\n' > "$P/nodfbin/df"; chmod +x "$P/nodfbin/df"   # df that CANNOT answer
 
 PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
 prov() {
@@ -741,10 +767,37 @@ PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 PPATH="$P/lowbin"
 prov check
 [ "$PROV_RC" -ne 0 ] && ok "check REFUSES a cell below the free-space floor (the full-disk false pass)" \
-                     || bad "check: accepted a cell with 1MB free — $PROV_OUT"
+                     || bad "check: accepted a cell with ~0MB free — $PROV_OUT"
+# ⛔ Match the DIE text, not the far weaker `*"free on"*` the warning line also satisfies (the old
+# pattern was green under the `if false` mutation, so it did not pin the refusal at all).
 case "$PROV_OUT" in
-  *"free on"*) ok "check: names the free-space floor and why it is fatal" ;;
-  *) bad "check: the disk refusal is not explained — $PROV_OUT" ;;
+  *"below the "*"MB floor"*) ok "check: the refusal is the free-space FLOOR die, not a coincidental refusal" ;;
+  *) bad "check: the disk refusal is not the floor message — $PROV_OUT" ;;
+esac
+# ⛔ THE UNIT, PINNED. `free_mb` reads `df -Pk`, whose 4th column is 1KiB blocks; treating it as MiB
+# made the 500 "MB" floor 500 KiB, so the PR's own measured 111 MiB cell read HEALTHY. These
+# fixtures straddle the real floor and are the only arms that can see the unit.
+PPATH="$P/unitmid"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES the measured 111MiB cell (the floor is no longer 1000x too low)" \
+                     || bad "check: accepted 111MiB free — the KiB/MiB unit bug is back — $PROV_OUT"
+PPATH="$P/unitlow"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES just BELOW the 500MiB floor" \
+                     || bad "check: accepted 499MiB free — $PROV_OUT"
+PPATH="$P/unithigh"
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES exactly AT the 500MiB floor (no false block)" \
+                     || bad "check: FALSE BLOCK at 500MiB free — $PROV_OUT"
+# ⛔ An unreadable df is cannot-verify, never a pass: a cell whose floor cannot be measured must not
+# be blessed as able to run a controller.
+PPATH="$P/nodfbin"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES when df cannot answer (cannot-verify is not a pass)" \
+                     || bad "check: accepted a cell whose free space could not be read — $PROV_OUT"
+case "$PROV_OUT" in
+  *"cannot read the free space"*) ok "check: names the unreadable-df state" ;;
+  *) bad "check: the unreadable-df refusal is not explained — $PROV_OUT" ;;
 esac
 PPATH=""
 
@@ -771,6 +824,180 @@ case "$PROV_OUT" in
   *"no git repo at"*|*"is not a git checkout"*) bad "check FALSE-BLOCKED a linked-worktree REPO" ;;
   *) ok "check accepts a linked-worktree REPO (.git is a file, not a directory)" ;;
 esac
+
+# ── (k) A DIRTY HARNESS TREE IS NOT `current` ────────────────────────────────────────────────────
+# `stamp_write` recorded `agentInfraDirty` and NOTHING read it, so a tree whose HEAD equalled the ref
+# but whose working tree carried hand edits was seeded and blessed: `check` answered "which commit
+# will run?" with the ref while the running bytes were something else. Both directions are pinned — a
+# dirty SOURCE tree, and a source edited AFTER the record (which the $O-only payload hash cannot
+# see) — plus the RECORDED field, which must be consulted rather than be decorative.
+say_case "harness provenance: a dirty tree is refused, never read as current (#1745)"
+ai_worktree "$P/dirty"
+PH="$P/dirty/scripts/orchestrator-harness"
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "fixture: a CLEAN worktree at the ref passes before the dirty arm" \
+                     || bad "fixture broken: a clean worktree was refused — $PROV_OUT"
+printf '\n# operator hand-edit, uncommitted\n' >> "$P/dirty/scripts/orchestrator-harness/orch-loop.sh"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a harness tree with UNCOMMITTED changes at the ref" \
+                     || bad "check: accepted a dirty harness (agentInfraDirty not consulted) — $PROV_OUT"
+case "$PROV_OUT" in
+  *"UNCOMMITTED"*) ok "check: names the dirty working tree" ;;
+  *) bad "check: the dirty refusal is not explained — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"CELL CAN RUN"*) bad "check: printed the CELL CAN RUN banner for a dirty harness" ;;
+  *) ok "check: no CELL CAN RUN banner for a dirty harness" ;;
+esac
+# apply MENDS a dirty tree (it must not read it as `unchanged`), without touching it in place.
+prov apply
+[ "$PROV_RC" -eq 0 ] && ok "apply MENDS a dirty-at-the-ref tree (pins a clean worktree)" \
+                     || bad "apply refused a dirty tree instead of mending it: $PROV_OUT"
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "after the mend, check is green — a dirty tree is repairable" \
+                     || bad "check still refuses after the mend: $PROV_OUT"
+# Direction (b): edit the SOURCE after a clean record. Only $O is re-hashed, so this used to pass.
+printf '\n# hand-edit to the SOURCE, after the record\n' >> "$P/pin/scripts/orchestrator-harness/merge-one.sh"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a SOURCE edited after the record (the \$O-only hash misses it)" \
+                     || bad "check: accepted a post-record SOURCE edit — $PROV_OUT"
+prov apply >/dev/null 2>&1
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "the mend also clears a post-record source edit" \
+                     || bad "re-apply did not clear the source edit: $PROV_OUT"
+# The RECORDED bit is consulted too: a dirty SEED whose source was since cleaned still has a record
+# whose commit does not describe the seeded bytes.
+sed 's/"agentInfraDirty": false/"agentInfraDirty": true/' "$P/o/.agent-infra-stamp.json" > "$P/o/stamp.tmp" \
+  && mv "$P/o/stamp.tmp" "$P/o/.agent-infra-stamp.json"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a record stamped DIRTY (the field is read, not decorative)" \
+                     || bad "check: accepted a record with agentInfraDirty=true — $PROV_OUT"
+case "$PROV_OUT" in
+  *"CLEAN"*) ok "check: names the dirty RECORD" ;;
+  *) bad "check: the dirty-record refusal is not explained — $PROV_OUT" ;;
+esac
+# A missing field is cannot-verify, never clean (mirrors check-version-stamp.mjs).
+grep -v 'agentInfraDirty' "$P/o/.agent-infra-stamp.json" > "$P/o/stamp.tmp" && mv "$P/o/stamp.tmp" "$P/o/.agent-infra-stamp.json"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a record with NO dirty field (cannot-verify is not clean)" \
+                     || bad "check: treated an absent agentInfraDirty as clean — $PROV_OUT"
+prov apply >/dev/null 2>&1
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "the mend rewrites a usable record (cleanup for the arms below)" \
+                     || bad "cleanup apply failed: $PROV_OUT"
+
+# ── (l) HARNESS_PIN_DIR IS `rm -rf`'d: a POSITIVE allow, not three deny-listed strings ────────────
+say_case "harness apply refuses an unsafe HARNESS_PIN_DIR (#1745)"
+mkdir -p "$P/pinguard/home" "$P/pinguard/scripts"
+printf 'SECRET\n' > "$P/pinguard/home/keys.env"
+printf 'hand copy\n' > "$P/pinguard/scripts/orch-loop.sh"
+PH="$P/div/scripts/orchestrator-harness"   # stale, so the REPLACE branch (the `rm -rf`) runs
+PING_OUT=''; PING_RC=0
+ping() { # $1 = HARNESS_PIN_DIR
+  PING_OUT="$(PATH="$P/bin:$PATH" CELL_HOME="$P/pinguard/home" ENV_FILE="$P/pinguard/home/keys.env" \
+              SESSION="ai1745-pin-$$" O="$P/pinguard/home/orchestrator" REPO="$P/repo" \
+              HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_PIN_DIR="$1" \
+              HARNESS_PIN_FILE="$P/pinguard/home/.harness-path" HARNESS="$PH" bash "$SUP" apply 2>&1)"
+  PING_RC=$?
+}
+ping "$P/pinguard/home"
+[ "$PING_RC" -ne 0 ] && ok "apply REFUSES a HARNESS_PIN_DIR that CONTAINS the cell home" \
+                     || bad "apply accepted a pin dir over the cell home — $PING_OUT"
+[ -f "$P/pinguard/home/keys.env" ] && ok "the cell home survived the refused apply (no rm -rf)" \
+                                   || bad "apply DELETED the cell home (keys.env gone) — SILENT DESTRUCTION"
+ping "$P/pinguard/scripts"
+[ "$PING_RC" -ne 0 ] && ok "apply REFUSES a non-empty dir that is not a linked worktree" \
+                     || bad "apply accepted an unowned non-empty dir — $PING_OUT"
+[ -f "$P/pinguard/scripts/orch-loop.sh" ] && ok "the operator's hand copy survived the refused apply" \
+                                          || bad "apply DELETED an operator's hand copy"
+
+# ── (m) A FAILED `git fetch` MUST NOT SPLIT `check` FROM `start`/`apply` ─────────────────────────
+# Measured divergence: with the origin unreachable and $HARNESS already AT the ref, `check` printed
+# CELL CAN RUN while `start`/`apply` died — a false PASS on the exact question `check` answers. Once
+# the ref resolves locally, a failed fetch cannot change what would be pinned, so the verbs agree.
+say_case "a failed git fetch does not make check green while start dies (#1745)"
+git clone -q "$AI_ORIGIN" "$P/fetchrepo"
+git -C "$P/fetchrepo" remote set-url origin "$P/gone.git"
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+FETCH_OUT=''; FETCH_RC=0
+fetch_prov() { # $1 = subcommand
+  rm -f "$P/tmuxup.fetch"
+  FETCH_OUT="$(PATH="$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup.fetch" CELL_HOME="$P/home" \
+              ENV_FILE="$P/keys.env" SESSION="ai1745-fetch-$$" O="$P/o" REPO="$P/repo" \
+              HARNESS_REPO="$P/fetchrepo" HARNESS_FETCH=1 HARNESS_REF=origin/main \
+              HARNESS_PIN_DIR="$P/fetchpin" HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
+              bash "$SUP" "$1" 2>&1)"
+  FETCH_RC=$?
+}
+fetch_prov check
+[ "$FETCH_RC" -eq 0 ] && ok "check passes when a fetch fails but the ref resolves locally" \
+                     || bad "check refused a resolvable local ref after a failed fetch — $FETCH_OUT"
+fetch_prov start
+[ "$FETCH_RC" -eq 0 ] && ok "start AGREES with check on the failed-fetch config (no false pass)" \
+                     || bad "start refused while check passed — the divergence is back: $FETCH_OUT"
+fetch_prov apply
+[ "$FETCH_RC" -eq 0 ] && ok "apply AGREES with check on the failed-fetch config" \
+                     || bad "apply refused while check passed: $FETCH_OUT"
+
+# ── (n) START's unattended cache prune must not delete a live worker's venv ──────────────────────
+# The guard only checked the CONTROLLER session, while orch-loop.sh spawns workers into their own
+# detached sessions and `stop` kills only the controller — so a `merge-*` worker can still be running
+# when `start` runs, and `cmd_prune --caches` would delete the `.venv` under it.
+say_case "start does not auto-prune caches while worker sessions run (#1745)"
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+PROV_TMUX_SESSIONS='merge-42: 1 windows (created Thu Oct 15 21:00:00 2026) (group merge-42)' \
+  PPATH="$P/prunebin" prov start
+[ -d "$P/repo/.venv" ] && ok "start did NOT prune caches while a worker session is live" \
+                       || bad "start pruned a LIVE worker's .venv (the unattended path)"
+unset PROV_TMUX_SESSIONS
+rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+PPATH="$P/prunebin" prov start
+[ -d "$P/repo/.venv" ] && bad "start did not prune even with no worker running (the arm is vacuous)" \
+                       || ok "start still auto-prunes caches when no worker session is live (non-vacuous)"
+PPATH=""
+
+# ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────
+# `prune` owns every `rm -rf` in this file and had NO test at all. Two guards had none either: (i) the
+# cache sweep must reach LINKED worktrees — the incident's single largest consumer was a 5.6G `.venv`
+# in ONE linked worktree, and a quoted command substitution collapsed the list into one word so only
+# the main checkout was ever swept; (ii) `--scratch` must never delete a REGISTERED worktree (source
+# that may hold unmerged work).
+say_case "prune reclaims caches in LINKED worktrees and protects registered worktrees (#1745)"
+R="$T/prune"; mkdir -p "$R/home" "$R/scratch"
+ai_init_repo "$R/repo"
+git -C "$R/repo" worktree add -q --detach "$R/repo-wt" HEAD
+PR_OUT=''; PR_RC=0
+prunesup() {
+  PR_OUT="$(CELL_HOME="$R/home" ENV_FILE="$R/keys.env" SESSION="ai1745-prune-$$" \
+            O="$R/o" REPO="$R/repo" HARNESS_REPO="$R/repo" HARNESS_FETCH=0 HARNESS="$R/repo" \
+            SCRATCH_ROOT="$R/scratch" HARNESS_PIN_DIR="$R/pin" HARNESS_PIN_FILE="$R/home/.harness-path" \
+            bash "$SUP" prune "$@" 2>&1)"
+  PR_RC=$?
+}
+mkdir -p "$R/repo/.venv" "$R/repo-wt/.venv" "$R/repo-wt/node_modules" "$R/repo-wt/.pytest_cache" "$R/repo-wt/sub/__pycache__"
+printf 'x\n' > "$R/repo/.venv/marker"; printf 'x\n' > "$R/repo-wt/.venv/marker"
+printf 'x\n' > "$R/repo-wt/sub/__pycache__/x.pyc"
+prunesup --caches
+[ -e "$R/repo-wt/.venv" ] && bad "prune --caches did NOT reach the LINKED worktree's .venv (the incident's case)" \
+                          || ok "prune --caches reclaimed the LINKED worktree's .venv"
+[ -e "$R/repo-wt/node_modules" ] && bad "linked-worktree node_modules survived" || ok "linked-worktree node_modules reclaimed"
+[ -e "$R/repo-wt/.pytest_cache" ] && bad "linked-worktree .pytest_cache survived" || ok "linked-worktree .pytest_cache reclaimed"
+[ -e "$R/repo-wt/sub/__pycache__" ] && bad "linked-worktree __pycache__ survived" || ok "linked-worktree __pycache__ reclaimed"
+[ -e "$R/repo/.venv" ] && bad "the main checkout's .venv survived" || ok "the main checkout is still swept too"
+# (ii) --scratch: a registered worktree is unmerged work and must survive; an unregistered old
+# checkout is what the flag exists to reclaim.
+git -C "$R/repo" worktree add -q --detach "$R/scratch/registered" HEAD
+printf 'unmerged WIP\n' > "$R/scratch/registered/WIP.txt"
+git init -q "$R/scratch/stale"
+touch -t 202001010000 "$R/scratch/registered" "$R/scratch/stale"
+prunesup --scratch=0
+[ -e "$R/scratch/registered/WIP.txt" ] && ok "prune --scratch did NOT delete a REGISTERED worktree (unmerged work protected)" \
+                                       || bad "prune --scratch DELETED a registered worktree — unmerged work lost"
+[ -e "$R/scratch/stale" ] && bad "prune --scratch did not delete an old, unregistered scratch checkout" \
+                          || ok "prune --scratch deleted an old, unregistered scratch checkout"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

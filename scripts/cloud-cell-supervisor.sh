@@ -289,6 +289,9 @@ HARNESS_FETCH="${HARNESS_FETCH:-1}"
 HARNESS_APPLIED=""
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
+# Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
+# driven hermetically by the test suite; a cell uses the default.
+SCRATCH_ROOT="${SCRATCH_ROOT:-/tmp}"
 STAMP="$O/.agent-infra-stamp.json"
 
 # Resolution order, most explicit first: an operator's $HARNESS (applied above, and never
@@ -317,8 +320,12 @@ fi
 SHA_CMD="sha256sum"
 command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
 
-# Available 1K blocks. Empty when df cannot answer — read as "cannot judge", never as "enough".
-free_mb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
+# Available MEBIBYTES. `df -Pk` reports 1KiB blocks, so its raw 4th column is KiB while every
+# consumer here (`MIN_FREE_MB`, the `*2` auto-prune trigger, the `free …MB` reports) means MiB — and
+# that mismatch made the 500 "MB" floor 500 KiB, so the measured 111 MiB cell read HEALTHY (the exact
+# false pass this floor exists to remove). Convert once, here. Empty when df cannot answer — read as
+# "cannot judge", never as "enough".
+free_mb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print int($4 / 1024)}'; }
 
 # ⛔ `--verify --quiet` is load-bearing, not tidiness: a bare `git rev-parse <unknown>` ECHOES its
 # argument to stdout (`git rev-parse origin/nope` prints `origin/nope`) while exiting non-zero — so a
@@ -350,10 +357,15 @@ classify_harness() {
 # compare it against a recorded non-empty hash, and `[ "$recorded" != "$live" ]` is true for it.
 o_payload_hash() {
   local f
-  { [ -d "$O" ] || return 0
-    cd "$O" || return 0
+  # ⛔ The `[ -d ]` guard is OUTSIDE the pipeline now. It used to sit inside a `{ …; } |` group, so its
+  # `return` ended a SUBSHELL and `sha256sum` still hashed empty input — an absent $O returned the
+  # well-known e3b0c442… digest instead of the empty string the comment (and the `-z "$live"`
+  # cannot-verify guard in cmd_check_provenance) assume.
+  [ -d "$O" ] || return 0
+  (
+    cd "$O" || exit 0
     for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f"; done
-  } | $SHA_CMD | awk '{print $1}'
+  ) | $SHA_CMD | awk '{print $1}'
 }
 
 # One field out of the stamp. Anchored on the quoted KEY, so `commit` cannot match `refCommit`
@@ -361,6 +373,14 @@ o_payload_hash() {
 stamp_field() {
   [ -f "$STAMP" ] || return 0
   sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$STAMP" | head -1
+}
+
+# The same, for an UNQUOTED JSON value (a boolean). `stamp_field` is anchored on a quoted value, so
+# it returns '' for a bare `true` — which would read a DIRTY record as "field absent" and, either
+# way, be read as clean.
+stamp_field_raw() {
+  [ -f "$STAMP" ] || return 0
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p" "$STAMP" | tr -d ' "' | head -1
 }
 
 stamp_write() {
@@ -384,6 +404,41 @@ stamp_write() {
 STAMPEOF
 }
 
+# Is the harness's WORKING TREE dirty? HEAD can equal the ref while the tree carries hand edits, and
+# `harness_apply` deliberately leaves such a tree where it is — so the recorded commit describes
+# bytes that are not the ones seeded. Read live, from $HARNESS.
+harness_dirty() { [ -n "$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" ]; }
+
+# Is <path> a LINKED worktree of <repo> — i.e. may this script `rm -rf` it? The MAIN working tree is
+# deliberately excluded: `git worktree list` names it too, and it is the checkout that must never be
+# deleted.
+linked_worktree_of() {
+  local repo="$1" p="$2" main
+  [ -n "$repo" ] && [ -n "$p" ] || return 1
+  main="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ "$(cd "$p" 2>/dev/null && pwd -P)" != "$(cd "$main" 2>/dev/null && pwd -P)" ] || return 1
+  git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}' | grep -qxF "$p"
+}
+
+# `harness_apply` is about to `rm -rf` this path, and it is operator-settable — the silent-destruction
+# class this file refuses everywhere else. The old guard refused only `""`, `/` and `.`: the three
+# values an operator cannot plausibly set, while `HARNESS_PIN_DIR=$CELL_HOME` (or $HOME, or $O) drove
+# `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
+# allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
+# worktree of $HARNESS_REPO or an empty directory.
+assert_pin_dir_safe() {
+  local dir="$1" p
+  case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
+  for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
+    [ -n "$p" ] || continue
+    case "$p" in "$dir"|"$dir"/*) die "refusing HARNESS_PIN_DIR='$dir': it CONTAINS $p, which this cell needs. Point it at a dedicated worktree path (default $CELL_HOME/harness).";; esac
+  done
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0
+  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0
+  if [ -d "$dir" ] && [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then return 0; fi
+  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it exists and is neither an empty directory nor a linked worktree of ${HARNESS_REPO:-<unresolved>}. Remove it by hand if you are sure it holds nothing."
+}
+
 # Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:
 # a $HARNESS already AT the ref is left exactly where it is (so an operator's `/tmp/harness-main` is
 # never disturbed), and only a stale/hand-copied tree is replaced. This is the whole of "apply the
@@ -391,19 +446,27 @@ STAMPEOF
 harness_apply() {
   [ -n "$HARNESS_REPO" ] || die "cannot apply a harness: no git checkout resolved (set HARNESS_REPO=<agent-infra checkout>)"
   git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 || die "HARNESS_REPO=$HARNESS_REPO is not a git checkout — nothing to apply from"
+  # ⛔ A failed fetch is NOT fatal while $HARNESS_REF still resolves locally, and that is what keeps
+  # `check` and `start` from disagreeing on the same config (the measured divergence: `check` rc=0
+  # while `apply`/`start` died during a transient outage, with nothing stale and nothing to fetch).
+  # The fetch is about how FRESH the local ref is; `want` is what gets pinned, and pinning a local
+  # commit needs no network. Only an unresolvable ref is fatal.
+  local want dir cur fetch_failed=0
   if [ "$HARNESS_FETCH" = 1 ]; then
-    git -C "$HARNESS_REPO" fetch --quiet origin main >/dev/null 2>&1 \
-      || die "git fetch failed in $HARNESS_REPO — check the network, and the disk ($0 prune)"
+    git -C "$HARNESS_REPO" fetch --quiet origin main >/dev/null 2>&1 || fetch_failed=1
   fi
-  local want dir cur
   want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
-  [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO — cannot pin a harness to verify against"
+  [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO$( [ "$fetch_failed" = 1 ] && printf ' after a failed git fetch — check the network' ) — cannot pin a harness to verify against"
+  [ "$fetch_failed" = 1 ] && say "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
   cur="$(harness_commit)"
-  if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ]; then
+  # A DIRTY tree at the ref is NOT `unchanged`: its commit does not describe its bytes, and seeding it
+  # records the ref over hand-edited worker code. Pin a clean detached worktree instead — which also
+  # repairs the operator's hand-maintained tree without disturbing it in place.
+  if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ] && ! harness_dirty; then
     HARNESS_APPLIED=unchanged
   else
     dir="$HARNESS_PIN_DIR"
-    case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
+    assert_pin_dir_safe "$dir"
     git -C "$HARNESS_REPO" worktree remove --force "$dir" >/dev/null 2>&1 || true
     rm -rf "$dir"
     git -C "$HARNESS_REPO" worktree prune >/dev/null 2>&1 || true
@@ -448,7 +511,13 @@ seed_and_stamp() {
 # with the added cost that `git` writes fail too (so nothing can be reviewed, recorded or merged).
 cmd_check_disk() {
   local mb; mb="$(free_mb "$CELL_HOME")"
-  case "${mb:-}" in ''|*[!0-9]*) return 0 ;; esac
+  # ⛔ An unreadable df is NOT a pass. `free_mb` prints nothing when df is missing/unreadable, and
+  # returning 0 here read that as "enough" — the opposite of what its own comment claims and of this
+  # file's rule that cannot-verify is never a pass. A cell whose floor cannot be measured must not be
+  # blessed as able to run a controller.
+  case "${mb:-}" in
+    ''|*[!0-9]*) die "cannot read the free space on $(dirname "$CELL_HOME") — df gave no usable answer, so the ${MIN_FREE_MB}MB floor cannot be enforced. Fix df/PATH before starting a cell." ;;
+  esac
   if [ "$mb" -lt "$MIN_FREE_MB" ]; then
     die "only ${mb}MB free on $(dirname "$CELL_HOME") — below the ${MIN_FREE_MB}MB floor. At this level git writes and the controller's own state writes fail with I/O errors and the loop keeps reporting lanes. Free space first: $0 prune"
   fi
@@ -461,7 +530,7 @@ cmd_check_disk() {
 # diverged, unknown) and one that can (behind) — see the header block for why.
 cmd_check_provenance() {
   classify_harness
-  local sc sp sr live
+  local sc sp sr live sd
   case "$HARNESS_REL" in
     current)
       say "ok: harness commit ${HARNESS_COMMIT:0:12} == $HARNESS_REF (${REF_COMMIT:0:12}) — $(harness_subject)" ;;
@@ -486,6 +555,12 @@ cmd_check_provenance() {
     current|behind) ;;
     *) die "harness provenance: DRIFT ($HARNESS_REL) — nothing was started; see the lines above";;
   esac
+  # ⛔ A DIRTY working tree at the ref is NOT `current`. HEAD can equal the ref while the tree carries
+  # hand edits, and `harness_apply` deliberately leaves such a tree where it is — so the commit is
+  # recorded over bytes it does not describe, and `start` seeds exactly those bytes. This is read LIVE
+  # (catches an edit made AFTER the record; the payload hash only covers $O). Before this,
+  # `agentInfraDirty` was written by stamp_write and never read by anything.
+  harness_dirty && die "DRIFT — the harness working tree at ${HARNESS:-<unresolved>} has UNCOMMITTED changes, so commit ${HARNESS_COMMIT:0:12} does not describe the bytes that will run. Commit or discard them, then $0 apply"
   if [ -f "$STAMP" ]; then
     sc="$(stamp_field commit)"; sp="$(stamp_field payloadSha256)"; sr="$(stamp_field relation)"
     live="$(o_payload_hash)"
@@ -495,6 +570,13 @@ cmd_check_provenance() {
     if [ -n "$HARNESS_COMMIT" ] && [ -n "$sc" ] && [ "$sc" != "$HARNESS_COMMIT" ]; then
       die "DRIFT — $O was recorded from ${sc:0:12} but the harness now at $HARNESS is ${HARNESS_COMMIT:0:12}: the tree moved under the record. Remedy: $0 apply"
     fi
+    # The RECORDED dirty bit, consulted at last — a dirty SEED whose source was cleaned afterwards is
+    # still a seeded copy whose commit does not describe its bytes. A field that is absent or blank is
+    # CANNOT-VERIFY and never clean: a record that does not say whether its source was clean cannot
+    # answer whether its commit describes its payload (the same rule check-version-stamp.mjs applies
+    # to the sibling stamp).
+    sd="$(stamp_field_raw agentInfraDirty)"
+    [ "$sd" = false ] || die "DRIFT — the record at $STAMP does not say its source was CLEAN (agentInfraDirty=${sd:-<absent>}); a dirty record's commit does not describe the seeded bytes. Remedy: $0 apply"
     say "ok: recorded install — commit ${sc:0:12}, relation '${sr}', payload ${sp:0:12}"
   elif tmux has-session -t "$SESSION" 2>/dev/null; then
     die "a controller is RUNNING (tmux '$SESSION') with NO harness provenance recorded at $STAMP — 'which commit is this cell running?' has no answer for a live merge actor. Remedy: stop, then $0 apply"
@@ -658,7 +740,19 @@ cmd_start() {
   local mb; mb="$(free_mb "$CELL_HOME")"
   case "${mb:-}" in
     ''|*[!0-9]*) ;;
-    *) [ "$mb" -lt "$((MIN_FREE_MB * 2))" ] && cmd_prune --caches ;;
+    *) if [ "$mb" -lt "$((MIN_FREE_MB * 2))" ]; then
+         # ⛔ The controller session is NOT the only thing running: orch-loop.sh spawns its workers
+         # into their OWN detached sessions (`fix-<PR>`, `merge-<PR>`), and `stop` kills only the
+         # controller — so after a `stop` a worker can still be mid-review. `cmd_prune --caches`
+         # deletes `.venv` at every worktree root, which makes the lane using it re-resolve its deps
+         # (the manual `prune` path warns about exactly this). Skip the unattended delete while any
+         # worker session is alive, and report the low-space state instead of acting.
+         if tmux ls 2>/dev/null | grep -qE '^(lane|fix|merge)-'; then
+           say "warn: only ${mb}MB free, but worker sessions are still running — NOT auto-pruning caches (a pruned venv breaks the lane using it). Run '$0 prune' once they finish."
+         else
+           cmd_prune --caches
+         fi
+       fi ;;
   esac
   harness_apply
   seed_and_stamp
@@ -783,7 +877,10 @@ cmd_apply() {
       *) die "usage: $0 apply [--force]" ;;
     esac
   done
-  safe_argv "${HARNESS_REPO:-}" || die "\$HARNESS_REPO must not contain a quote or shell metacharacter"
+  # Only a NON-EMPTY value is a metacharacter question; `safe_argv` returns non-zero for '' too, so
+  # the old unconditional call replaced harness_apply()'s accurate "no git checkout resolved" with a
+  # misleading "must not contain a quote or shell metacharacter: " (message-only, but a wrong remedy).
+  [ -n "$HARNESS_REPO" ] && { safe_argv "$HARNESS_REPO" || die "\$HARNESS_REPO must not contain a quote or shell metacharacter: $HARNESS_REPO"; }
   safe_argv "${HARNESS_PIN_DIR:-}" || die "\$HARNESS_PIN_DIR must not contain a quote or shell metacharacter"
   safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
   local before_c; before_c="$(harness_commit)"
@@ -807,6 +904,14 @@ rm_cache() {
   [ -e "$1" ] || return 0
   local mb; mb="$(du -sm "$1" 2>/dev/null | awk '{print $1}')"
   if rm -rf "$1" 2>/dev/null; then say "prune: -${mb:-?}MB $1"; else say "warn: could not remove $1"; fi
+}
+
+# Regenerable caches at ONE worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
+sweep_root_caches() {
+  local root="$1"
+  [ -d "$root" ] || return 0
+  rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
+  find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
 }
 
 # Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
@@ -843,22 +948,23 @@ cmd_prune() {
     # (1) worktree registrations whose directory is already gone — admin records, no bytes, but they
     # make `worktree list` lie about what is on the cell.
     git -C "$r" worktree prune >/dev/null 2>&1 || true
-    # (2) regenerable caches at each worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
-    for root in "$(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')" "$r"; do
-      [ -d "$root" ] || continue
-      rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
-      find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
-    done
+    # (2) regenerable caches at each worktree root. ⛔ The list is read LINE BY LINE — the old
+    # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
+    # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
+    # largest consumer was a 5.6G `.venv` in ONE LINKED worktree, which this loop could never reach.
+    while IFS= read -r root; do sweep_root_caches "$root"; done \
+      < <(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+    sweep_root_caches "$r"
   done
   [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
   # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
   # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git
   # checkout, (b) NOT a registered worktree, and (c) older than DAYS.
   local kept="" freed_scratch=0
-  for d in /tmp/*/; do
+  for d in "$SCRATCH_ROOT"/*/; do
     d="${d%/}"
     [ -d "$d" ] || continue
-    case "$d" in /tmp/cell|/tmp/cell-*|/tmp/harness*|/tmp/cell-home) continue ;; esac
+    case "$d" in "$SCRATCH_ROOT/cell"|"$SCRATCH_ROOT/cell-"*|"$SCRATCH_ROOT/harness"*|"$SCRATCH_ROOT/cell-home") continue ;; esac
     [ -e "$d/.git" ] || continue
     registered_worktree "$d" && continue
     if [ "$do_scratch" = 1 ] && [ -n "$(find "$d" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ]; then
