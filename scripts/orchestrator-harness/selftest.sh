@@ -2144,8 +2144,10 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-[ "$_ngrd_n" = "12" ] && rcn=0 || { rcn=1; echo "      expected 12 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 12 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# a coercion added without its pin must redden this check, not pass as "more is better".
+[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2584,6 +2586,23 @@ if [ -f "$HERE/refresh-scout.test.sh" ]; then
   fi
 else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
+fi
+
+# ── O) the sweep listing is CONDITIONAL and rate-limit-aware (#1762) ─────────────
+# The full contract — the listing is a REST `gh api` call carrying the stored ETag, a 304 reuses the
+# listing and skips the per-PR reads, response headers (not `/rate_limit`) drive the health decision,
+# a rate-limit failure is distinct from a network one and records the reset — lives in its own
+# hermetic suite, driven against the shipped block with a stub `gh`. Run it here so `./selftest.sh`
+# stays the one command that pins the harness.
+if [ -f "$HERE/sweep-quota.test.sh" ]; then
+  if bash "$HERE/sweep-quota.test.sh" > "$TMP/sweep-quota.out" 2>&1; then
+    ck "sweep-quota.test.sh: conditional listing + rate-limit headers (#1762)" 0
+  else
+    ck "sweep-quota.test.sh: conditional listing + rate-limit headers (#1762)" 1
+    grep -E '❌|Summary|PASS=' "$TMP/sweep-quota.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
 echo
