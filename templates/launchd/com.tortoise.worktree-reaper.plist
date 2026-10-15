@@ -40,6 +40,21 @@
          effect is a report, not a removal, and that budget (agent-infra #1095)
          is the lever deciding how much one pass can classify.
 
+         BUDGET, RAISED 2026-10-11 — 300s was measured TOO SMALL for the live
+         estate: a pass over 454 worktrees spent the whole budget and reported
+         DEFERRED=432 (only 22 classified), and 294 worktrees still deferred 65.
+         The budget bounds classification AND removal per worktree, so at 300s
+         the job could never reach the rows it exists to reap. Raised to 1800s
+         via REAP_WT_BUDGET_SECONDS below.
+
+         GH TIMEOUT, 2026-10-11 — the job fail-closed with
+         `GH pr-list failed (rc=124) ... exit 3` on two passes (WORKTREES=388
+         and 259, PRESERVE=0), i.e. `gh pr list` was KILLED BY THE 20s DEFAULT
+         `REAP_WT_GH_TIMEOUT` on a loaded box (rc=124 is the watchdog's timeout
+         code; it is NOT a missing or unresolvable binary). PATH below already
+         resolves `gh` to the real Mach-O at {{HOME}}/bin/gh — verified — so the
+         fix is time, not location. Raised to 120s below.
+
          The repo argument is {{TORTOISE_REPO}}. A machine without a tortoise
          checkout leaves that placeholder unresolved, and install-launchd.sh
          then SKIPS this template by design (unresolved placeholder) instead of
@@ -70,8 +85,20 @@
     <dict>
         <key>PATH</key>
         <string>{{PATH}}</string>
+        <!-- Both bounds are IN THE PLIST, not inherited from the operator's
+             shell: a launchd job gets neither the shell's env nor its rc files,
+             so an unset variable here silently keeps the script's 300s/20s
+             defaults — which are exactly the two values measured to make this
+             job a no-op (DEFERRED=432, and the rc=124 fail-closed abort). -->
+        <key>REAP_WT_BUDGET_SECONDS</key>
+        <string>1800</string>
+        <key>REAP_WT_GH_TIMEOUT</key>
+        <string>120</string>
     </dict>
     <key>StartInterval</key>
-    <integer>86400</integer>
+    <!-- 21600s = 6h. Measured growth: 194 -> 259 -> 294 worktrees across a few
+         passes, i.e. DAILY was too rare for the estate to stop growing, and it
+         is why the count reached 294 before the removal path was ever usable. -->
+    <integer>21600</integer>
 </dict>
 </plist>

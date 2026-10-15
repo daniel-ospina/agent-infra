@@ -165,6 +165,22 @@ check_record_review_farmed() {
   fi
 }
 
+# #1719 — the runner-label gate is the FALLBACK when GitHub-hosted CI is unhealthy: the launchd
+# job com.tortoise.ci-runner-gate executes $DEST/scripts/ci_runner_gate.sh. Farming is what makes
+# the REPO copy the copy that runs — without it the box keeps executing a hand-made duplicate (a
+# merged fix never reaches it) and a second box has no fallback gate at all.
+check_ci_runner_gate_farmed() {
+  local label="$1"
+  local dest="$DEST/scripts/ci_runner_gate.sh"
+  [ -f "$dest" ] \
+    || { fail "$label: ci_runner_gate.sh not farmed into scripts/ — the launchd job would execute a hand-made duplicate (#1719)"; return; }
+  if diff -q "$ROOT/scripts/ci_runner_gate.sh" "$dest" >/dev/null 2>&1; then
+    echo "ok: $label farmed ci_runner_gate.sh == repo copy (#1719)"
+  else
+    fail "$label: farmed ci_runner_gate.sh differs from scripts/ci_runner_gate.sh (stale copy!)"
+  fi
+}
+
 # #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
 # $DEST/scripts/lib/pid-identity.sh, byte-identical to the repo copy, and the
 # farmed reaper (which resolves the library from its OWN sibling directory) must
@@ -548,6 +564,7 @@ grep -q "farm symlinks kept" "$RUNS_LOG" \
 check_content_matches "$DEST/extensions" "run1" mcp-client shared
 check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
+check_ci_runner_gate_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
@@ -586,6 +603,7 @@ else
   echo "ok: empty \$DEST/tools/ removed once the legacy farm was migrated out (#1277)"
 fi
 check_fleet_tools_farmed "run1b"
+check_ci_runner_gate_farmed "run1b"
 
 # The guard must FAIL, not warn, when a non-fd/rg entry reappears — the exact
 # re-introduction path the farm itself took. fd/rg stay permitted (pi extracts
@@ -626,6 +644,9 @@ rm -rf "$DEST/tools"
 echo "== run 2: re-run refresh"
 echo "# machine-local mutation" >> "$DEST/agents/verifier.md"
 echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm refresh
+if [ -f "$DEST/scripts/ci_runner_gate.sh" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/ci_runner_gate.sh"  # #1719 farm refresh
+fi
 if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
 fi
@@ -660,6 +681,14 @@ else
   echo "ok: dest mutation reverted by source on re-run"
 fi
 check_record_review_farmed "run2"
+check_ci_runner_gate_farmed "run2"
+if [ ! -f "$DEST/scripts/ci_runner_gate.sh" ]; then
+  : # already reported by check_ci_runner_gate_farmed "run2" (a missing file is not "refreshed")
+elif grep -q "stale farm mutation" "$DEST/scripts/ci_runner_gate.sh"; then
+  fail "stale farm mutation survived re-run (farmed ci_runner_gate.sh was not refreshed)"
+else
+  echo "ok: farmed ci_runner_gate.sh refreshed on re-run (#1719)"
+fi
 check_identity_lib_farmed "run2"
 check_fleet_tools_farmed "run2"
 if grep -q "stale farm mutation" "$DEST/scripts/fleet/lane_liveness.py" 2>/dev/null; then

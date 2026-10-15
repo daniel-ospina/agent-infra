@@ -47,6 +47,13 @@ jobs:
         # is NOT installed in CI, #672).
         echo "== scripts/commit-msg-check.test.sh =="
         bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
+        # #1760 — the version-stamp drift check's suite (the keystone of tracker #1759). Named
+        # explicitly like its neighbours above: this leg has no `scripts/*.test.mjs` glob, so an
+        # unwired suite is never collected post-merge (the #1719 shape — versioned but wired to
+        # nothing). The suite, not the checker: it builds its own git fixtures, so it does not read
+        # the runner's surface set.
+        echo "== scripts/check-version-stamp.test.mjs =="
+        node --test scripts/check-version-stamp.test.mjs || failures=$((failures+1))
         # Glob-collected: every extensions/*/test*.mjs suite, including #744's
         # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
         # regression pin) — no explicit line for it, that would double-run it.
@@ -112,6 +119,16 @@ jobs:
         # left BYTE-IDENTICAL — the guard must never rewrite a good request.
         echo "== extensions/clamp-output-floor.test.ts =="
         npx tsx extensions/clamp-output-floor.test.ts || failures=$((failures+1))
+        # #1138 — cmux-session: the repo copy is a bootstrap SNAPSHOT of a file
+        # cmux upgrades IN PLACE on the farm, so it can silently fall behind
+        # (measured: main carried v2 at 55,408 B while the farm ran v4 at
+        # 74,220 B, and that delta existed in no ref). The marker pin fails on any
+        # snapshot that is not the version EXPECTED_MARKER names; without this
+        # line the suite runs nowhere and the drift is silent again — the inert-
+        # gate shape its sibling version-stamp step in ci.yml's `verify` job names.
+        # Zero-dep (pi import is TYPE-only, erased by tsx); mirrors the ci.yml step.
+        echo "== extensions/cmux-session.test.ts =="
+        npx tsx extensions/cmux-session.test.ts || failures=$((failures+1))
         # #5109 — secret-echo-guard: the transcript-leak control. Post-merge
         # backstop for the per-PR step in ci.yml, same split as clamp above.
         # Zero-dep (pi import is TYPE-only, node stdlib otherwise); negative pins
@@ -373,7 +390,7 @@ jobs:
       # finding). Post-merge, a RED here reaches auto-file-on-failure through
       # this job's `needs:` entry, same as the vendored suite above it. Test
       # half of tortoise#3761; the canonical module never leaves this repo.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
