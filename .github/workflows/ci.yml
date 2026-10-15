@@ -524,6 +524,15 @@ jobs:
         # RED on the defect, GREEN under a behaviour-identical reformat. Zero-dep
         # (`node:*` only), no `npm ci`, ~4s.
         run: node --test scripts/tortoise-memory.test.mjs
+      - name: version-stamp drift check — scripts/check-version-stamp.test.mjs (#1760)
+        # A check nothing runs is the inert gate #1760 exists to remove, so its suite is wired here.
+        # The SUITE is wired rather than the checker: the suite builds its own git fixtures (a real
+        # repo, a stamped surface, an off-main-line branch), so it is independent of whether the
+        # runner's surface set is stamped — while the checker itself, with no surfaces present,
+        # deliberately refuses (exit 2, "an empty set is not a pass") rather than reporting green.
+        # That refusal is the behaviour, so wiring the checker here would be red for the wrong reason.
+        # Zero-dep (`node:*` only), no `npm ci`.
+        run: node --test scripts/check-version-stamp.test.mjs
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
