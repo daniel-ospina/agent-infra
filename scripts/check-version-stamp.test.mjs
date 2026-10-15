@@ -1277,14 +1277,17 @@ try {
     fs.writeFileSync(path.join(manifestOnly, "manifest.json"), "{}\n");
 
     checkJson("bad usage", ["--json", "--ref"]);
-    // The bad-ref refusal inside the fetch path — the eighth site, which a previous version of this
-    // arm claimed to cover while testing seven. Without `--no-fetch`: the guard refuses BEFORE any
-    // network call, so this stays offline.
-    checkJson("bad ref", ["--json", "--repo", ORIGIN, "--ref", "origin/--upload-pack=x"]);
+    // The bad-ref refusal inside the fetch path — the eighth site. ⛔ `--surface` is REQUIRED here:
+    // without it `defaultSurfaces` runs first, and on a CI runner with no `~/.pi/agent` and no
+    // linked repos the run refuses at the "no surfaces found" site instead. `checkJson` asserts only
+    // exit 2 + a JSON error, so the case would PASS while never reaching the site it was added for —
+    // a gate that cannot fire, on exactly the platform that gates the PR. Without `--no-fetch`: the
+    // ref-name guard refuses before any network call, so this stays offline.
+    checkJson("bad ref", ["--json", "--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/--upload-pack=x"]);
     checkJson("no manifest.json", ["--json", "--repo", noManifest, "--ref", "main", "--no-fetch"]);
     checkJson("git unavailable", ["--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { PATH: "/nonexistent" });
     checkJson("not a git checkout", ["--json", "--repo", manifestOnly, "--ref", "main", "--no-fetch"]);
-    checkJson("unresolvable ref", ["--json", "--repo", ORIGIN, "--ref", "no-such-ref-xyz", "--no-fetch"]);
+    checkJson("unresolvable ref", ["--json", "--surface", SURFACE, "--repo", ORIGIN, "--ref", "no-such-ref-xyz", "--no-fetch"]);
     checkJson("unreadable named repos root", [
       "--json",
       "--repos-root",
@@ -1325,6 +1328,54 @@ try {
     eq("dev 0 alone is not enough to declare it unusable", identUsable({ dev: 0, ino: 7 }), true);
     eq("ino 0 alone is not enough either", identUsable({ dev: 7, ino: 0 }), true);
     eq("0/0 means unusable", identUsable({ dev: 0, ino: 0 }), false);
+  }
+
+  // ── 49. a file named __proto__ is payload, not a hole in the digest ────────────────
+  console.log("\n49. a file named __proto__ is payload, not a hole in the digest");
+  {
+    // The entry map was `{}`, and assigning to `out["__proto__"]` goes through the prototype
+    // SETTER: a string value is silently ignored, no own key is created, `Object.keys()` omits the
+    // file, and the digest never covers it. A file named `__proto__` at the top of a payload root
+    // could then be added, edited or re-pointed on ANY surface with the check still reporting
+    // in-sync — a fail-open in the one thing this tool promises to notice.
+    const s10 = path.join(TMP, "proto");
+    fs.mkdirSync(path.join(s10, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s10, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s10, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s10);
+    const evil = path.join(s10, "scripts", "__proto__");
+    fs.writeFileSync(evil, "payload-v1\n");
+    eq("control — stamps with the oddly-named file present", run(["--write", "--surface", s10, "--repo", ORIGIN]).code, 0);
+    const stamped = JSON.parse(fs.readFileSync(path.join(s10, ".agent-infra-stamp.json"), "utf8"));
+    eq("it is COUNTED in the stamp (extensions/e.ts + scripts/__proto__)", stamped.payload.files, 2);
+    eq("control — green", run(["--surface", s10, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(evil, "TAMPERED\n");
+    eq(
+      "tampering with a file named __proto__ is DRIFT",
+      run(["--surface", s10, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s10, { recursive: true, force: true });
+  }
+
+  // ── 50. --json AFTER the offending token still answers in JSON ─────────────────────
+  console.log("\n50. --json AFTER the offending token still answers in JSON");
+  {
+    // The flag was recorded only when `parseArgs` reached its case, so it threw before getting
+    // there and a caller who DID pass `--json` got exit 2 with EMPTY stdout — the exact unparseable
+    // state the helper exists to prevent. The scan must be value-aware in BOTH directions.
+    const late = run(["--repo", "", "--json"]);
+    eq("an empty --repo exits 2", late.code, 2);
+    let p = null;
+    try {
+      p = JSON.parse(late.stdout);
+    } catch {
+      p = null;
+    }
+    eq("and still prints parseable JSON", p === null, false);
+    // The other direction, again: `--json` eaten as a VALUE must not switch the format on.
+    const eaten = run(["--repo", "--json", "--bogus"]);
+    eq("control — a value that looks like --json does not enable JSON", eaten.stdout.includes("{"), false);
   }
 
 } finally {

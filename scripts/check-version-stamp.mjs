@@ -168,7 +168,12 @@ function absent(err) {
 }
 
 export function payloadEntries(rootDir, relRoot) {
-  const out = {};
+  // ⛔ A NULL-PROTOTYPE map, never `{}`. With a normal object, a payload file named `__proto__` at
+  // the top of a root hits the prototype SETTER, and assigning a STRING to it is silently ignored —
+  // so the own key is never created, `Object.keys()` omits the file, and the digest never covers it.
+  // It could then be added, edited or re-pointed on any surface without the check noticing: a
+  // fail-open in the one thing this tool promises to notice.
+  const out = Object.create(null);
   const start = path.join(rootDir, relRoot);
   let real;
   try {
@@ -885,11 +890,6 @@ function parseArgs(argv) {
       case "--write": opts.write = true; break;
       case "--json":
         opts.json = true;
-        // Remembered the moment the flag is CONSUMED, so the bad-usage refusal can still answer in
-        // JSON. Scanning `argv` instead over-reports: `--repo --json --bogus` consumes the literal
-        // token `--json` as a VALUE and then throws, so `argv.includes("--json")` would print JSON
-        // to a caller who never asked for it.
-        sawJsonFlag = true;
         break;
       case "--quiet": opts.quiet = true; break;
       case "--no-fetch": opts.fetch = false; break;
@@ -961,8 +961,21 @@ function defaultSurfaces(opts) {
   return out;
 }
 
-/** Set by `parseArgs` the moment it consumes `--json` — see the comment there. */
-let sawJsonFlag = false;
+/** The value-taking options, so a scan can tell a flag from a VALUE that merely looks like one. */
+const VALUE_OPTS = Object.freeze(["--surface", "--ref", "--repo", "--repos-root"]);
+
+/** Did the caller ask for JSON? Scans the WHOLE argv, value-aware: `--repo --json --bogus` consumed
+ * the literal token `--json` as a value and must not count (over-report), while `--repo "" --json`
+ * —which throws at the first token— still must (under-report). Reading the flag only when `parseArgs`
+ * reaches its `case` got the first right and the second wrong; a bare `argv.includes` got them the
+ * other way round. */
+function jsonRequested(argv) {
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--json") return true;
+    if (VALUE_OPTS.includes(argv[i])) i += 1;
+  }
+  return false;
+}
 
 function main(argv) {
   let opts;
@@ -972,7 +985,7 @@ function main(argv) {
     console.error(`❌ check-version-stamp: ${err.message}`);
     console.error(usage());
     // `opts` does not exist on this path by construction, so the flag is read straight off argv.
-    return refuseJson({ json: sawJsonFlag }, err.message);
+    return refuseJson({ json: jsonRequested(argv) }, err.message);
   }
   if (opts.help) {
     // `--json` promises stdout is machine-readable, and a usage text is not JSON. A consumer that
