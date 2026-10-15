@@ -5,7 +5,7 @@
  * found 23 defects (unanchored patterns, the memoised traversal, Map keys, byte
  * payloads, leaf-scoped key matching, the fail-open), and NOTHING enforced any of
  * them — a future edit could silently reintroduce every one. This suite pins the
- * redaction behaviours and, specifically, the shape fixes of review rounds 4–7:
+ * redaction behaviours and, specifically, the shape fixes of review rounds 4–9:
  *
  *   - byte payloads are redacted at BYTE precision and keep their container type
  *     (the old path UTF-8-decoded the whole buffer, turning `ff fe` into `ef bf bd`,
@@ -29,9 +29,11 @@
  *     (it was dropped by the prototype setter and its value became the prototype);
  *   - a config KEY that is itself a secret is scrubbed out of the redaction LABEL, so
  *     the marker and the warning cannot re-emit it (the label embedded the raw path);
- *   - a credential WORD in a leaf name must be a WHOLE segment or a camelCase SUFFIX:
- *     `secretary`/`credentialsFile`/`passwordPolicy`/`secretariatOffice` are NOT
- *     collected, while `clientSecret`/`secret_key`/`dbPassword`/`credentials` still are.
+ *   - a credential WORD in a leaf name must be a WHOLE segment, a camelCase SUFFIX, or a
+ *     camelCase PREFIX compound whose following words are also credential vocabulary:
+ *     `clientSecret`/`secret_key`/`dbPassword`/`credentials` AND
+ *     `secretKey`/`secretAccessKey`/`passwordHash` are collected, while
+ *     `secretary`/`credentialsFile`/`passwordPolicy`/`secretariatOffice` are NOT.
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -79,6 +81,20 @@ const CREDENTIALS_FILE_VALUE = "/home/user/credentials-store.json";
 const PASSWORD_POLICY_VALUE = "min-length-12-chars";
 const SECRETARIAT_VALUE = "room-204-floor-3";
 const TOKENIZER_PATH_VALUE = "/models/tokenizer-llama3";
+// Review round 9: the round-8 anchoring dropped the camelCase-PREFIX compound leaves
+// (credential word first, credential vocabulary after). Every one of these was collected
+// before round 8 and emitted verbatim after it — a configured secret under an ordinary
+// credential field name, which the pattern detector cannot catch.
+const SECRET_KEY_LEAF_CAMEL_VALUE = "camelsecretkeyvalue000013";
+const SECRET_ACCESS_KEY_VALUE = "camelsecretaccesskey0014";
+const AWS_SECRET_ACCESS_KEY_VALUE = "awssecretaccesskeyvalue15";
+const MY_SECRET_KEY_VALUE = "mysecretkeyvalue00000016";
+const CLIENT_SECRET_KEY_VALUE = "clientsecretkeyvalue0017";
+const CREDENTIALS_KEY_VALUE = "credentialskeyvalue00018";
+const SECRET_VALUE_VALUE = "secretvaluevalue00000019";
+const PASSWORD_HASH_VALUE = "passwordhashvalue0000020";
+const PASSWORD_VALUE_VALUE = "passwordvaluevalue00021";
+const CREDENTIAL_ID_VALUE = "credentialidvalue0000022";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -170,6 +186,19 @@ writeFileSync(
     secret_key: SECRET_KEY_LEAF_VALUE,
     dbPassword: DB_PASSWORD_VALUE,
     credentials: CREDENTIALS_LEAF_VALUE,
+    // Review round 9: a camelCase-PREFIX compound leaf must be collected too. The
+    // round-8 anchoring kept the negatives below green while dropping every one of
+    // these, so the fix is pinned in BOTH directions.
+    secretKey: SECRET_KEY_LEAF_CAMEL_VALUE,
+    secretAccessKey: SECRET_ACCESS_KEY_VALUE,
+    awsSecretAccessKey: AWS_SECRET_ACCESS_KEY_VALUE,
+    mySecretKey: MY_SECRET_KEY_VALUE,
+    clientSecretKey: CLIENT_SECRET_KEY_VALUE,
+    credentialsKey: CREDENTIALS_KEY_VALUE,
+    secretValue: SECRET_VALUE_VALUE,
+    passwordHash: PASSWORD_HASH_VALUE,
+    passwordValue: PASSWORD_VALUE_VALUE,
+    credentialId: CREDENTIAL_ID_VALUE,
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
@@ -485,6 +514,25 @@ async function main(): Promise<void> {
     ] as const) {
       const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
       ok(out && !JSON.stringify(out).includes(value), `${leaf} must still be collected`);
+    }
+  });
+
+  // ── review round 9: camelCase-PREFIX compound credential leaves ─────────────
+  await test("camelCase-PREFIX credential leaves are still collected (round-8 narrowing guard)", async () => {
+    for (const [leaf, value] of [
+      ["secretKey", SECRET_KEY_LEAF_CAMEL_VALUE],
+      ["secretAccessKey", SECRET_ACCESS_KEY_VALUE],
+      ["awsSecretAccessKey", AWS_SECRET_ACCESS_KEY_VALUE],
+      ["mySecretKey", MY_SECRET_KEY_VALUE],
+      ["clientSecretKey", CLIENT_SECRET_KEY_VALUE],
+      ["credentialsKey", CREDENTIALS_KEY_VALUE],
+      ["secretValue", SECRET_VALUE_VALUE],
+      ["passwordHash", PASSWORD_HASH_VALUE],
+      ["passwordValue", PASSWORD_VALUE_VALUE],
+      ["credentialId", CREDENTIAL_ID_VALUE],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
+      ok(out && !JSON.stringify(out).includes(value), `${leaf} must be collected (was emitted verbatim)`);
     }
   });
 
