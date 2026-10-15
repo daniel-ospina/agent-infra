@@ -961,7 +961,8 @@ function main(argv) {
   } catch (err) {
     console.error(`❌ check-version-stamp: ${err.message}`);
     console.error(usage());
-    return 2;
+    // `opts` does not exist on this path by construction, so the flag is read straight off argv.
+    return refuseJson({ json: argv.includes("--json") }, err.message);
   }
   if (opts.help) {
     // `--json` promises stdout is machine-readable, and a usage text is not JSON. A consumer that
@@ -972,22 +973,24 @@ function main(argv) {
 
   const repo = resolveRepo(opts.repo);
   if (repo === null) {
-    console.error("❌ check-version-stamp: no agent-infra checkout (no manifest.json) — pass --repo or set AGENT_INFRA_PATH");
-    return 2;
+    const why =
+      "no agent-infra checkout (no manifest.json) — pass --repo or set AGENT_INFRA_PATH";
+    console.error(`❌ check-version-stamp: ${why}`);
+    return refuseJson(opts, why);
   }
   if (!gitAvailable()) {
-    console.error("❌ check-version-stamp: git is not available on PATH — ancestry cannot be established");
-    return 2;
+    const why = "git is not available on PATH — ancestry cannot be established";
+    console.error(`❌ check-version-stamp: ${why}`);
+    return refuseJson(opts, why);
   }
   if (git(repo, ["rev-parse", "--git-dir"]) === null) {
     // Worded to what the probe actually supports. `git --version` can succeed while real commands
     // fail (a broken wrapper on PATH) and a stale worktree `.git` can point nowhere, so asserting
     // "not a git checkout" about a healthy repo sends an operator to inspect the wrong thing —
     // exactly the class `gitAvailable()` exists to close.
-    console.error(
-      `❌ check-version-stamp: ${repo} cannot be read as a git checkout (\`git rev-parse --git-dir\` failed) — ancestry cannot be established`
-    );
-    return 2;
+    const why = `${repo} cannot be read as a git checkout (\`git rev-parse --git-dir\` failed) — ancestry cannot be established`;
+    console.error(`❌ check-version-stamp: ${why}`);
+    return refuseJson(opts, why);
   }
 
   let surfaces;

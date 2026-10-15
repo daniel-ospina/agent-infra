@@ -1251,37 +1251,58 @@ try {
     fs.rmSync(s9, { recursive: true, force: true });
   }
 
-  // ── 47. every --json refusal still puts JSON on stdout ────────────────────────────
-  console.log("\n47. every --json refusal still puts JSON on stdout");
+  // ── 47. EVERY --json refusal puts JSON on stdout ─────────────────────────────────
+  console.log("\n47. EVERY --json refusal puts JSON on stdout");
   {
     // A refusal that exits 2 with EMPTY stdout is unparseable: a caller iterating ~20 repos cannot
-    // tell a clean refusal from a crash, nor which entry failed.
-    const named = run(["--json", "--repos-root", path.join(TMP, "no-such-root-xyz"), "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
-    eq("an unreadable named repos root exits 2", named.code, 2);
-    let p1 = null;
-    try {
-      p1 = JSON.parse(named.stdout);
-    } catch {
-      p1 = null;
-    }
-    eq("and still prints parseable JSON", p1 === null, false);
-    eq("naming the failure", typeof p1?.error === "string", true);
+    // tell a clean refusal from a crash, nor which entry failed. An earlier version of this arm was
+    // NAMED for every refusal but exercised only two of them — so three sites stayed bare and the
+    // name asserted a coverage that did not exist. Hence one case per site below.
+    const checkJson = (label, args, env) => {
+      const v = run(args, env === undefined ? undefined : { env });
+      eq(`${label} → exit 2`, v.code, 2);
+      let parsed = null;
+      try {
+        parsed = JSON.parse(v.stdout);
+      } catch {
+        parsed = null;
+      }
+      eq(`${label} → parseable JSON naming the failure`, parsed !== null && typeof parsed.error === "string", true);
+    };
 
-    // The empty-surface-set refusal (reached through the UNNAMED default, an absent $HOME/.pi/agent).
+    const noManifest = path.join(TMP, "arm47-norepo");
+    const manifestOnly = path.join(TMP, "arm47-nogit");
     const emptyHome = path.join(TMP, "arm47-home");
-    fs.mkdirSync(emptyHome, { recursive: true });
-    const empty = run(["--no-repos", "--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
-      env: { HOME: emptyHome, AGENT_INFRA_PI_HOME: "", AGENT_INFRA_REPOS_ROOT: "" },
+    for (const d of [noManifest, manifestOnly, emptyHome]) fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(manifestOnly, "manifest.json"), "{}\n");
+
+    checkJson("bad usage", ["--json", "--ref"]);
+    checkJson("no manifest.json", ["--json", "--repo", noManifest, "--ref", "main", "--no-fetch"]);
+    checkJson("git unavailable", ["--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], { PATH: "/nonexistent" });
+    checkJson("not a git checkout", ["--json", "--repo", manifestOnly, "--ref", "main", "--no-fetch"]);
+    checkJson("unresolvable ref", ["--json", "--repo", ORIGIN, "--ref", "no-such-ref-xyz", "--no-fetch"]);
+    checkJson("unreadable named repos root", [
+      "--json",
+      "--repos-root",
+      path.join(TMP, "arm47-absent"),
+      "--repo",
+      ORIGIN,
+      "--ref",
+      "main",
+      "--no-fetch",
+    ]);
+    checkJson("empty surface set", ["--no-repos", "--json", "--repo", ORIGIN, "--ref", "main", "--no-fetch"], {
+      HOME: emptyHome,
+      AGENT_INFRA_PI_HOME: "",
+      AGENT_INFRA_REPOS_ROOT: "",
     });
-    eq("an empty surface set exits 2", empty.code, 2);
-    let p2 = null;
-    try {
-      p2 = JSON.parse(empty.stdout);
-    } catch {
-      p2 = null;
-    }
-    eq("and still prints parseable JSON", p2 === null, false);
-    contains("naming the failure", (p2?.error ?? "") + named.stderr, "verified");
+
+    // CONTROL — the human path is unchanged: text on stdout, still exit 2, and NOT JSON.
+    const human = run(["--repo", noManifest, "--ref", "main", "--no-fetch"]);
+    eq("control — the human path exits 2", human.code, 2);
+    eq("control — and prints text, not JSON", human.stderr.includes("no agent-infra checkout"), true);
+
+    for (const d of [noManifest, manifestOnly, emptyHome]) fs.rmSync(d, { recursive: true, force: true });
   }
 
   // ── 48. file identity is unavailable when dev/ino are 0 ───────────────────────────
