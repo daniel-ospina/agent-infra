@@ -983,7 +983,10 @@ try {
         run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
         1
       );
-      fs.rmSync(path.join(s4, upper));
+      // ⛔ Do NOT delete it here: the stamp currently IS this file (it was renamed to this spelling
+      // above), and the shared cleanup renames it back — removing it crashed the whole suite with
+      // ENOENT on a case-SENSITIVE filesystem, i.e. on every CI runner. The temp dir is destroyed in
+      // `finally`, so leaving the content behind is harmless.
     }
     fs.renameSync(path.join(s4, upper), path.join(s4, ".agent-infra-stamp.json"));
     fs.rmSync(s4, { recursive: true, force: true });
@@ -1099,7 +1102,10 @@ try {
     // mutant that collapses EACCES to [] still exits 2 ("no surfaces found") and the arm cannot
     // tell the two apart — a check that cannot fail, which is the defect this arm exists to guard.
     fs.mkdirSync(path.join(h, ".pi", "agent", "scripts"), { recursive: true });
-    const env = { HOME: h };
+    // Hermetic: `run()` merges `process.env`, so an AMBIENT $AGENT_INFRA_REPOS_ROOT or
+    // $AGENT_INFRA_PI_HOME (which BOTH take precedence over $HOME) would silently redirect the arm —
+    // and on a box that sets these documented variables the suite would go red on a healthy change.
+    const env = { HOME: h, AGENT_INFRA_REPOS_ROOT: "", AGENT_INFRA_PI_HOME: "" };
     const c = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], { env });
     eq("control — the default root IS scanned", c.stdout.includes("repoX"), true);
     eq("control — and the pi surface is there too", c.stdout.includes(path.join(h, ".pi", "agent")), true);
@@ -1124,6 +1130,122 @@ try {
     const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
     eq("control — in-sync", v.code, 0);
     eq("the reason line is printed for in-sync too", v.stdout.includes("payload matches its stamp"), true);
+  }
+
+  // ── 44. a payload root spelled in a different CASE is still the surface root ─────────────
+  console.log("\n44. a payload root spelled in a different CASE is still the surface root");
+  {
+    // `realpathSync` echoes the case it was ASKED about, so a symlink target reading `CASEANCHOR` for
+    // an on-disk `caseanchor` made a path-STRING anchor miss: the real stamp was digested as payload
+    // and write/verify diverged forever, reporting a false drift that no --write could clear. The
+    // parent is compared by IDENTITY now. Only meaningful where the filesystem lets one directory be
+    // reached by another spelling, so the whole arm is skipped where it cannot be exercised.
+    const s8 = path.join(TMP, "caseanchor");
+    fs.mkdirSync(path.join(s8, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s8, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s8, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s8);
+    const spelledUpper = path.join(path.dirname(s8), "CASEANCHOR");
+    if (fs.existsSync(spelledUpper)) {
+      fs.rmSync(path.join(s8, "scripts"), { recursive: true });
+      fs.symlinkSync(spelledUpper, path.join(s8, "scripts"));
+      const ra = fs.statSync(fs.realpathSync(path.join(s8, "scripts")));
+      const rb = fs.statSync(s8);
+      eq(
+        "the case-variant root link really is the same directory",
+        `${ra.dev}:${ra.ino}`,
+        `${rb.dev}:${rb.ino}`
+      );
+      // ...and prove the SPELLING really differs, or the anchor is untested (the realpath above
+      // presents the case it was asked about, so this is the string a path comparison would see).
+      eq(
+        "...and it is spelled differently from the surface path",
+        fs.realpathSync(path.join(s8, "scripts")) === fs.realpathSync(s8),
+        false
+      );
+      eq("control — stamps through the case-variant root", run(["--write", "--surface", s8, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and converges (the stamp is not digested)",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      eq("control — a second write still converges", run(["--write", "--surface", s8, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and still agrees",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+    } else {
+      // Case-SENSITIVE filesystem: `<T>/CASEANCHOR` is a genuinely DIFFERENT directory, so the
+      // odd-spelling case cannot arise here — but an inert `eq(label, true, true)` would mean the
+      // anchoring rule is untested on the platform that gates the PR (every CI runner is Linux).
+      // Assert the OTHER direction instead: a stamp-named file inside that OTHER directory is
+      // payload, not ours, so tampering with it must go red.
+      fs.rmSync(path.join(s8, "scripts"), { recursive: true });
+      fs.mkdirSync(spelledUpper, { recursive: true });
+      fs.writeFileSync(path.join(spelledUpper, ".agent-infra-stamp.json"), "not our stamp\n");
+      fs.symlinkSync(spelledUpper, path.join(s8, "scripts"));
+      eq(
+        "control — stamps with the other directory's stamp-named file present",
+        run(["--write", "--surface", s8, "--repo", ORIGIN]).code,
+        0
+      );
+      eq(
+        "control — and is green",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      fs.writeFileSync(path.join(spelledUpper, ".agent-infra-stamp.json"), "tampered\n");
+      eq(
+        "a stamp-named file in ANOTHER directory is payload — tampering goes red",
+        run(["--surface", s8, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        1
+      );
+      fs.rmSync(spelledUpper, { recursive: true, force: true });
+    }
+    fs.rmSync(s8, { recursive: true, force: true });
+  }
+
+  // ── 45. --write --json on a bad surface still prints JSON ────────────────────────────────
+  console.log("\n45. --write --json refuses with JSON, never empty stdout");
+  {
+    // The "never CONJURE a surface" refusal returned 2 with EMPTY stdout, so a consumer scanning a
+    // repo list could not tell which entries had already been written.
+    const bad = path.join(TMP, "nope-nope-not-here");
+    const w = run(["--write", "--json", "--surface", bad, "--repo", ORIGIN]);
+    eq("exit 2", w.code, 2);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(w.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("parseable JSON on stdout, not empty", parsed === null, false);
+    eq("the refusal is named", typeof parsed?.error === "string", true);
+    eq("and nothing was created", fs.existsSync(bad), false);
+  }
+
+  // ── 46. a DIRECTORY named like our temp is somebody else's data ──────────────────────────
+  console.log("\n46. a DIRECTORY named like our temp is somebody else's data");
+  {
+    // The temp this tool creates is a FILE. Excluding `.tmp-*` by name alone hid a DIRECTORY of that
+    // name — and its entire subtree — when a payload root resolves to the surface root.
+    const s9 = path.join(TMP, "tmpdir");
+    fs.mkdirSync(path.join(s9, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s9, "skills"), { recursive: true });
+    fs.symlinkSync(".", path.join(s9, "scripts"));
+    const d = path.join(s9, ".agent-infra-stamp.json.tmp-d");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "x.ts"), "v1\n");
+    eq("control — stamps with the directory present", run(["--write", "--surface", s9, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s9, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(path.join(d, "x.ts"), "v2\n");
+    eq(
+      "tampering inside it is DRIFT",
+      run(["--surface", s9, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s9, { recursive: true, force: true });
   }
 
 } finally {

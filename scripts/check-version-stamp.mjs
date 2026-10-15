@@ -214,26 +214,47 @@ export function payloadEntries(rootDir, relRoot) {
       // digest, so a tampered payload reported in-sync. Anchoring the parent also settles a
       // hardlink: a link to the stamp under a payload root has a different path, so it stays
       // payload and `--write` converges instead of invalidating the equality it just hashed.
-      if (lowerName.startsWith(lowerBase) && path.dirname(abs) === surfaceReal) {
-        const suffix = lowerName.slice(lowerBase.length);
-        let same = suffix.startsWith(".tmp-"); // this tool's own temp sibling
-        if (!same && suffix === "") {
-          // Same FILE, whatever the spelling. A case-INSENSITIVE filesystem lets the same stamp be
-          // reached as `.AGENT-INFRA-STAMP.JSON`, and `realpathSync` echoes the case it was ASKED
-          // about rather than canonicalising to the on-disk one (measured on APFS) — so a path-string
-          // comparison cannot recognise it, and the stamp got digested, making write/verify diverge
-          // forever. Compare IDENTITY (dev+ino), which is right on both filesystem kinds: on a
-          // case-SENSITIVE one a differently-cased name really is a different file and stays payload.
-          try {
-            const a = fs.statSync(abs);
-            const b = fs.statSync(ownStamp);
-            same = a.dev === b.dev && a.ino === b.ino;
-          } catch {
-            // The stamp may not exist yet (`--write` hashes BEFORE writing it) — fall back to strings.
-            same = abs === ownStamp;
-          }
+      if (lowerName.startsWith(lowerBase)) {
+        // Is this entry in the SURFACE's own directory? Compared by the parent's IDENTITY, not as a
+        // path STRING: `realpathSync` echoes the case it was asked about, and a symlink target (or a
+        // bind mount) that SPELLS the surface differently is still the same directory. A string
+        // compare then digests the real stamp — permanent false drift that no `--write` can clear.
+        let inSurfaceRoot = false;
+        try {
+          const parent = fs.statSync(path.dirname(abs));
+          inSurfaceRoot = parent.dev === surfaceStat.dev && parent.ino === surfaceStat.ino;
+        } catch {
+          inSurfaceRoot = false;
         }
-        if (same) continue;
+        if (inSurfaceRoot) {
+          const suffix = lowerName.slice(lowerBase.length);
+          let same = false;
+          let entryIsDir = false;
+          try {
+            entryIsDir = fs.statSync(abs).isDirectory();
+          } catch {
+            entryIsDir = false;
+          }
+          // This tool's temp is a FILE created next to the stamp. A DIRECTORY of that name is
+          // somebody else's data and must stay payload — excluding it hid its whole subtree.
+          if (suffix.startsWith(".tmp-") && !entryIsDir) same = true;
+          if (!same && suffix === "") {
+            // Same FILE, whatever the spelling. A case-INSENSITIVE filesystem lets the same stamp be
+            // reached as `.AGENT-INFRA-STAMP.JSON`, and a path-string comparison cannot recognise it
+            // — so the stamp got digested and write/verify diverged forever. Compare IDENTITY
+            // (dev+ino), right on both filesystem kinds: on a case-SENSITIVE one a differently-cased
+            // name really is a different file and stays payload.
+            try {
+              const a = fs.statSync(abs);
+              const b = fs.statSync(ownStamp);
+              same = a.dev === b.dev && a.ino === b.ino;
+            } catch {
+              // The stamp may not exist yet (`--write` hashes BEFORE writing it).
+              same = abs === ownStamp;
+            }
+          }
+          if (same) continue;
+        }
       }
       const rel = relDir === "" ? name : `${relDir}/${name}`;
       let st;
@@ -278,6 +299,13 @@ export function payloadEntries(rootDir, relRoot) {
     surfaceReal = path.resolve(rootDir);
   }
   const ownStamp = path.join(surfaceReal, STAMP_BASENAME);
+  // The surface directory's identity, for the parent comparison below.
+  let surfaceStat = { dev: 0, ino: 0 };
+  try {
+    surfaceStat = fs.statSync(surfaceReal);
+  } catch {
+    surfaceStat = { dev: 0, ino: 0 };
+  }
   walk(real, "");
   return out;
 }
@@ -988,6 +1016,10 @@ function main(argv) {
           console.error(
             `❌ check-version-stamp: ${dir} does not exist as a directory — refusing to create a surface in order to stamp it`
           );
+          // ...and `--json` promises stdout is machine-readable on EVERY path, including this
+          // refusal: it returned 2 with an EMPTY stdout, so a consumer scanning a repo list could
+          // not tell which entries were written before the bad one.
+          if (opts.json) console.log(JSON.stringify({ written, error: `${dir} is not a directory` }, null, 2));
           return 2;
         }
         const prior = readStamp(dir);
