@@ -686,7 +686,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: '"${SWEEP_MAX_AGE:-600}"',
     axis: "hygiene",
     guardedBy:
-      "scripts/orchestrator-harness/sweep-quota.test.sh value + non-vacuity pin (fixtures 5, 11 and 13 drive the staleness floor: a stale stamp forces the fetch, a future stamp and a >10-digit stamp are both dropped)",
+      "scripts/orchestrator-harness/sweep-quota.test.sh behaviour + non-vacuity pin (fixtures 5, 11 and 13 drive the staleness floor: a stale stamp forces the fetch, a future stamp and a >10-digit stamp are both dropped); the VALUE is asserted by THIS registry's forward check, not by the suite — the suite sets its own SWEEP_MAX_AGE in the environment it drives",
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
