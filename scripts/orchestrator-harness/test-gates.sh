@@ -157,7 +157,11 @@ eqv "a NEWLINE-separated set is normalised too" "gate" "$(merge_authority "$(pri
 # ⛔ round-10 review, P3: the assertions below originally drove ONLY `merge_authority`, so a
 # normaliser/classifier MISMATCH — the exact bug they exist to catch — passed them (and did). They
 # now assert BOTH readers on the same string, in both directions, and the classifier's RULE itself
-# is pinned to the shipped line so a change to either side turns one of these red.
+# is pinned to the shipped line, and the normaliser's decode source is pinned separately, so a change
+# to EITHER side turns a pin red — the rule pin for the classifier, the encoding pin for the
+# normaliser. (Round-11 review, P3: the original claim was that a change to either side would turn
+# one of the _agree assertions red, which was false — on a UTF-8 host both readers coincide, and
+# reverting the normaliser to a hard-coded "utf-8" left the suite green.)
 _CLS_RULE="want=(os.environ.get('REQ') or '').split()"
 grep -vE '^[[:space:]]*#' "$ORCH" | grep -qF -- "$_CLS_RULE" \
   && { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } \
@@ -494,6 +498,21 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   else
     echo "  ❌ GREEN+gate: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — gate authority must merge directly as before"; FAIL=$((FAIL+1))
   fi
+  # ⛔ round-10 review, P2 (and round-11 P2): the arm's final `else` issued a RAW merge for ANY
+  # authority that was not `rail` — INCLUDING `unknown`. Drive the shipped arm with an UNKNOWN
+  # authority; it must merge nothing. ⚠️ This lives INSIDE this `if` on purpose: outside it,
+  # `drive_green` and `$_REQ7` are undefined, so an extraction failure aborted the WHOLE suite
+  # under `set -u` (measured: rc 1, no RESULT line, ~40 later assertions never ran) instead of
+  # failing this one check.
+  drive_green unknown "$_REQ7"
+  if ! grep -q -- '--squash' "$TMP/g.spy"; then
+    echo "  ✅ GREEN+unknown: NO raw merge is issued (an authority that names neither gate nor rail merges nothing)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+unknown: a RAW merge was issued for an unknown authority — spy=[$(tr '\n' ';' < "$TMP/g.spy")]"; FAIL=$((FAIL+1))
+  fi
+  grep -q 'merge authority is' "$TMP/g.log" \
+    && { echo "  ✅ GREEN+unknown: the refusal is LOGGED, naming the authority (a silent no-op is indistinguishable from a hang)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+unknown: no refusal log line — the arm refuses silently"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract a SYNTACTICALLY VALID GREEN arm from orch-loop.sh (extraction or the arm itself is broken)"; FAIL=$((FAIL+1))
 fi
@@ -513,23 +532,6 @@ _NG="$(grep -cF -- "$_GPAT" "$ORCH")"
 [ "${_NG:-0}" = "2" ] \
   && { echo "  ✅ every merge spawn line (${_NG} of 2) POSIX-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
   || { echo "  ❌ expected 2 POSIX-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
-  # ⛔ round-10 review, P2. The arm's final `else` issued a RAW `gh pr merge` for ANY authority that
-  # was not `rail` — INCLUDING `unknown`, which `_normalise_set` now returns when it cannot run. So a
-  # normaliser failure could raw-merge: the exact bypass this change exists to prevent. Drive the
-  # shipped arm with an UNKNOWN authority; it must merge nothing.
-  drive_green unknown "$_REQ7"
-  if ! grep -q -- '--squash' "$TMP/g.spy"; then
-    echo "  ✅ GREEN+unknown: NO raw merge is issued (an authority that names neither gate nor rail merges nothing)"; PASS=$((PASS+1))
-  else
-    echo "  ❌ GREEN+unknown: a RAW merge was issued for an unknown authority — spy=[$(tr '\n' ';' < "$TMP/g.spy")]"; FAIL=$((FAIL+1))
-  fi
-  grep -q 'merge authority is' "$TMP/g.log" \
-    && { echo "  ✅ GREEN+unknown: the refusal is LOGGED, naming the authority (a silent no-op is indistinguishable from a hang)"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ GREEN+unknown: no refusal log line — the arm refuses silently"; FAIL=$((FAIL+1)); }
-# ⛔ ANY spelling of `printf %q`, not just `printf '%q'` (round-9 review, P3: the single-quoted
-# spelling alone let `printf %q "$1"` through). Comments are excluded (`^[^#]*`) because this file
-# DOCUMENTS the rule in prose — an unanchored match counted its own documentation as a violation.
-# The assertion runs after the drive below, so the drive's own evidence is printed first.
 if [ -s "$TMP/shq.sh" ]; then
   # shellcheck disable=SC1090
   . "$TMP/shq.sh"
@@ -568,12 +570,14 @@ if [ -s "$TMP/shq.sh" ]; then
 else
   echo "  ❌ shq() could not be extracted from orch-loop.sh — the injection drive did NOT run (a skipped check is not a pass)"; FAIL=$((FAIL+1))
 fi
-# ⛔ ANY spelling of `printf %q` ANYWHERE after `printf` on a non-comment line. The previous form
-# required `%q` to sit one character after `printf`'s whitespace, so `printf -- '%q'`, `printf "%q"`
-# and `printf 'REQ=%q'` all passed it (round-10 review, P3 — "any spelling" was false).
-# Full-line comments are stripped first because this file DOCUMENTS the rule in prose — an
-# unanchored match counted its own documentation as a violation.
-_QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -cE 'printf.*%q')"
+# ⛔ ANY spelling of `printf %q` on a non-comment line, with LINE CONTINUATIONS JOINED FIRST.
+# The round-10 form (`printf.*%q`, line-local) missed a continuation — `printf \` + newline +
+# `'%q'` scored 0 (round-11 review, P3). Full-line comments are stripped because this file
+# DOCUMENTS the rule in prose.
+# ⚠️ CORRECTED (round-11 review, P3): the earlier note claimed the round-9 pattern
+# `printf[[:space:]]+.?%q` also missed `printf "%q"`. It did NOT — the `.` matched the double
+# quote. It missed only `-- '%q'` and `'REQ=%q'`. The claim was overstated and is restated here.
+_QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | awk '{ if (sub(/\\$/, "")) printf "%s", $0; else print }' | grep -cE 'printf.*%q')"
 [ "${_QPCT:-0}" = "0" ] \
   && { echo "  ✅ no \`printf %q\` site remains in orch-loop.sh (any spelling; its \`\$'…'\` output is not POSIX quoting)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ ${_QPCT} \`printf %q\` site(s) remain in orch-loop.sh — dash re-parses that value as commands"; FAIL=$((FAIL+1)); }
@@ -581,14 +585,16 @@ _QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -cE 'printf.*%q')"
 # (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
 # without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE
 # the classifier (a guard moved after the arms guards nothing).
+# ⛔ round-11 review, P3: the AUTHORITY_UNKNOWN derivation is driven BEHAVIOURALLY at (p) below,
+# which extracts and runs the shipped fragment. A text pin here was redundant and could be satisfied
+# by a comment, so it was removed rather than kept as a weaker twin of the drive.
 _au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
-# ⛔ round-10 review, P2: the DERIVATION ignored MERGE_AUTHORITY, so an authority of `unknown`
-# (which `_normalise_set` now returns when it cannot run) left AUTHORITY_UNKNOWN=0 and fell through
-# to the merge arms — where the GREEN arm's old bare `else` issued a RAW merge. Pin the clause in
-# non-comment code only, so a comment mention cannot satisfy it.
-grep -vE '^[[:space:]]*#' "$ORCH" | grep -qF -- '[ "${MERGE_AUTHORITY:-}" = "unknown" ]' \
-  && { echo "  ✅ the AUTHORITY_UNKNOWN derivation ALSO trips on an unknown MERGE_AUTHORITY (not only on REQ/fallback)"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ the derivation ignores MERGE_AUTHORITY — an unreadable authority is not treated as unknown, so the merge arms run on it"; FAIL=$((FAIL+1)); }
+# ⛔ round-11 review, P3: `_agree` below runs on a UTF-8 host, where THIS commit's encoding defect is
+# INVISIBLE — reverting the normaliser to a hard-coded "utf-8" left the suite green. So the shipped
+# decode/encode source is pinned directly, and the revert goes red.
+grep -vE '^[[:space:]]*#' "$RA" | grep -qF 'sys.getfilesystemencoding()' \
+  && { echo "  ✅ _normalise_set decodes with the FILESYSTEM encoding — the same source os.environ uses"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ _normalise_set no longer uses sys.getfilesystemencoding() — under a single-byte locale the classifier and the authority can disagree again (the §5.1 bypass) "; FAIL=$((FAIL+1)); }
 _au_ln="$(grep -nF -- "$_au_expr" "$ORCH" | head -1 | cut -d: -f1)"
 _cls_ln="$(grep -nF 'V="$(gh pr checks' "$ORCH" | head -1 | cut -d: -f1)"
 if [ -n "$_au_ln" ] && [ -n "$_cls_ln" ] && [ "$_au_ln" -lt "$_cls_ln" ]; then
@@ -630,7 +636,7 @@ AUTHORITY_UNKNOWN=0; _au_hits=0
 # guard covers only the sweep; chain-merge.sh and fix-one.sh invoke merge-one.sh directly. Drive
 # the shipped guard: fallback + no override must exit 5 BEFORE any reviewer; fallback + override
 # must proceed (and then hit the missing-rail refusal, exit 6 — proving the override path).
-sed -n '/^if \[ -z "${REQ:-}" \] || \[ "$MERGE_AUTHORITY" = "unknown" \]/,/^fi$/p' "$MERGE" > "$TMP/worker-guard.sh"
+sed -n '/^if \[ -z "${REQ:-}" \]/,/^fi$/p' "$MERGE" > "$TMP/worker-guard.sh"
 if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; then
   ( REQ_SOURCE=fallback; REQ_OVERRIDE=''; REQ=''; MERGE_AUTHORITY='unknown'; PR=1766; OR=daniel-ospina/agent-infra; \
     L="$TMP/wg"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wgrc=$?
@@ -648,6 +654,15 @@ if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; 
     L="$TMP/wg3"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg3rc=$?
   [ "$wg3rc" = "5" ] && { echo "  ✅ a NON-EMPTY fallback contract ($FALLBACK_REQ, authority=gate) with no override still refuses (exit 5)" ; PASS=$((PASS+1)); } \
     || { echo "  ❌ the fallback disjunct is dead: a gate-authority fallback with no override exited $wg3rc, not 5"; FAIL=$((FAIL+1)); }
+  # ⛔ round-11 review, P2: the guard was a DENY list, so an authority that was neither `rail` nor
+  # `unknown` fell through to the review path and its raw merge. Drive an UNRECOGNISED authority
+  # (non-empty REQ, protection read, valid override — so ONLY the authority can refuse it).
+  for _ba in garbage "" "rail "; do
+    ( REQ_SOURCE=protection; REQ_OVERRIDE='pipeline-compliance'; REQ='pipeline-compliance'; MERGE_AUTHORITY="$_ba"; PR=1766; OR=daniel-ospina/agent-infra; \
+      L="$TMP/wg4"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg4rc=$?
+    [ "$wg4rc" = "5" ] && { echo "  ✅ a worker with an UNRECOGNISED authority ('$_ba') refuses (exit 5) instead of falling into the review path's raw merge"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ an unrecognised authority ('$_ba') exited $wg4rc, not 5 — it fell through to a raw merge"; FAIL=$((FAIL+1)); }
+  done
   # ⚠️ review round 3: §j sourced the fragment standalone, so the guard's POSITION was unpinned
   # — moved after run_agent it would refuse only AFTER the reviewer ran and was paid for.
   _wg_ln="$(grep -n 'REFUSED: branch protection' "$MERGE" | head -1 | cut -d: -f1)"
@@ -799,13 +814,23 @@ if [ -s "$TMP/deriv.sh" ] && bash -n "$TMP/deriv.sh" 2>/dev/null; then
   # a function-definition inside `( … )` inside a function does not parse.
   cat > "$TMP/deriv-drive.sh" <<'DRV'
 #!/usr/bin/env bash
-OR=x; LOG=/dev/null; D_REQ="$1"; D_SRC="$2"
+OR=x; LOG=/dev/null; D_REQ="$1"; D_SRC="$2"; D_AUTH="${3:-gate}"
 resolve_required_checks() { REQ="$D_REQ"; REQ_SOURCE="$D_SRC"; return 0; }
-merge_authority() { printf '%s\n' "$D_AUTH"; }
+merge_authority() { printf '%s\n' "${D_AUTH:-gate}"; }
 . "$DERIV" >/dev/null 2>&1
 printf '%s' "${AUTHORITY_UNKNOWN:-}"
 DRV
-  _au_derive() { DERIV="$TMP/deriv.sh" bash "$TMP/deriv-drive.sh" "$1" "$2"; }
+  _au_derive() { DERIV="$TMP/deriv.sh" bash "$TMP/deriv-drive.sh" "$1" "$2" "${3:-gate}"; }
+  # ⛔ round-11 review, P3: D_AUTH was NEVER ASSIGNED, so merge_authority always answered EMPTY and
+  # the MERGE_AUTHORITY clause was never exercised — a mutant that kept the clause's text but made
+  # it inert stayed green. Drive every authority the shipped merge_authority can return, plus an
+  # unrecognised one (which the allow-list polarity added in this commit must treat as unknown).
+  for _case in "gate:0" "rail:0" "unknown:1" "garbage:1"; do
+    _auth="${_case%%:*}"; _want="${_case##*:}"
+    _got="$(_au_derive 'pipeline-compliance' protection "$_auth")"
+    [ "$_got" = "$_want" ] && { echo "  ✅ derivation: authority=$_auth -> AUTHORITY_UNKNOWN=$_want"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ derivation: authority=$_auth gave AUTHORITY_UNKNOWN=$_got (want $_want) — an unrecognised authority would reach the merge arms"; FAIL=$((FAIL+1)); }
+  done
   for _case in "fallback:1" "protection:0"; do
     _src="${_case%%:*}"; _want="${_case##*:}"
     _got="$(_au_derive 'pipeline-compliance' "$_src")"

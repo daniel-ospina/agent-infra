@@ -678,7 +678,15 @@ while true; do
   MERGE_AUTHORITY="$(merge_authority "$REQ")"
   # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
   # to read as `rail` and silently reroute a gate repo — unknown refuses, exactly like fallback.
-  if [ -z "${REQ:-}" ] || [ "${REQ_SOURCE:-}" = "fallback" ] || [ "${MERGE_AUTHORITY:-}" = "unknown" ]; then
+  # ⛔ ALLOW-LIST POLARITY (round-11 review, P2). This was a DENY list — an empty REQ, `fallback`,
+  # or the literal `unknown` — so any OTHER value was treated as a KNOWN authority and the sweep
+  # acted on it. An authority the controller does not recognise is exactly as unknown as an
+  # unreadable one, so the test now names the two values it TRUSTS and treats everything else as
+  # unknown. (`merge_authority` prints only gate|rail|unknown today, so this is latent — but it was
+  # one new value away from the raw merge this whole change exists to prevent.)
+  if [ -z "${REQ:-}" ] \
+     || { [ "${MERGE_AUTHORITY:-}" != "gate" ] && [ "${MERGE_AUTHORITY:-}" != "rail" ]; } \
+     || [ "${REQ_SOURCE:-}" = "fallback" ]; then
     AUTHORITY_UNKNOWN=1
   else
     AUTHORITY_UNKNOWN=0
@@ -698,7 +706,15 @@ while true; do
       AUTHORITY_UNKNOWN=1 ;;
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
-  echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $([ "$MERGE_AUTHORITY" = gate ] && printf 'IS required' || printf 'is NOT required'))" >>"$LOG"
+  # ⛔ round-11 review, P3: for an authority of `unknown` this line asserted the gate "is NOT
+  # required" — a determination the controller cannot make (unknown means it does not know). A
+  # three-way suffix, so the log never states a conclusion it did not reach.
+  case "$MERGE_AUTHORITY" in
+    gate) _gate_rel="IS required" ;;
+    rail) _gate_rel="is NOT required" ;;
+    *)    _gate_rel="is UNKNOWN (the contract could not be read — the sweep merges nothing this cycle)" ;;
+  esac
+  echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $_gate_rel)" >>"$LOG"
   # ⚠️ review rounds 4-6: REQ_OVERRIDE is a documented operator pin (README: "`REQ=…` in the cell
   # env / keys.env overrides the read"), and REQ/REVIEW_GATE are read from the environment — which
   # a cloud cell sources with `set -a`, so a stray export reaches here. An override that CHANGES

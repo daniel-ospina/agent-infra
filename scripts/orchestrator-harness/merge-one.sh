@@ -243,7 +243,14 @@ echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} author
 # that classified the PR. The `chain-<N>` and `fix-one.sh` ingresses are the ones that are NOT
 # handed one and re-read branch protection themselves, and a chain worker can wait up to 90 minutes
 # after that read; a fresh read that refuses beats a stale one that merges.
-if [ -z "${REQ:-}" ] || [ "$MERGE_AUTHORITY" = "unknown" ] || { [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; }; then
+# ⛔ ALLOW-LIST POLARITY (round-11 review, P2). This guard used to be a DENY list — `-z REQ`,
+# `= unknown`, `fallback`-with-no-override — so ANY value that was not one of those fell through to
+# the rail-only test below and then into the review path, which ends in a raw `gh pr merge`. An
+# authority the worker does not recognise must refuse exactly like `unknown` (the same polarity the
+# controller's GREEN arm now uses).
+if [ -z "${REQ:-}" ] \
+   || { [ "$MERGE_AUTHORITY" != "gate" ] && [ "$MERGE_AUTHORITY" != "rail" ]; } \
+   || { [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; }; then
   echo "[merge $PR] REFUSED: branch protection for $OR is unreadable (REQ_SOURCE=fallback, no REQ override) — the merge contract is UNKNOWN, so this worker merges nothing (agent-infra#1764)" >> "$L.log"
   exit 5
 fi
