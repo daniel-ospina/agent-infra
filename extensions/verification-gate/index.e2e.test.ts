@@ -973,17 +973,19 @@ async function main() {
     ok(paths.some((p: string) => p.endsWith("::keep.txt")), "the live file's entry must survive the prune");
   });
 
-  test("scenario 21d (#1225/#1573): an unremovable lock path must not WEDGE writeBridge — the lock degrades promptly", () => {
-    // A directory at `<bridge>.lock` makes openSync throw EEXIST while the
-    // stale-read throws every iteration. Pre-fix the loop `continue`d past its
-    // ONLY deadline check and busy-looped forever at ~100% CPU inside the
-    // tool_call hook that called writeBridge. A synchronous unbounded loop
-    // cannot be asserted on in-process (it would hang the suite), so drive the
-    // exported lock seam in a CHILD with a timeout: a regression fails as
-    // ETIMEDOUT instead of hanging the whole run.
+  test("scenario 21d (#1225/#1573): a non-regular lock path must not WEDGE writeBridge — no hang, no spin", () => {
+    // Two shapes used to wedge the tool_call hook that calls writeBridge:
+    //   directory — openSync throws EEXIST and the stale-read throws each
+    //               iteration; a bare `continue` skipped the only deadline
+    //               check -> ~100% CPU busy-loop.
+    //   FIFO      — the stale-read BLOCKS inside open(2) forever, which no
+    //               top-of-loop deadline can bound.
+    // A synchronous unbounded loop/block cannot be asserted on in-process (it
+    // would hang the suite), so drive the exported lock seam in a CHILD with a
+    // timeout: a regression fails as ETIMEDOUT instead of hanging the run.
     const home = join(TEST_ROOT, "lock-home");
     const verDir = join(home, ".pi", "agent", "verification");
-    mkdirSync(join(verDir, "latest.json.lock"), { recursive: true }); // a DIRECTORY, not a lock file
+    mkdirSync(verDir, { recursive: true });
     const modUrl = new URL("./index.js", import.meta.url).href;
     const script = join(home, "probe.mjs");
     writeFileSync(
@@ -995,24 +997,32 @@ async function main() {
         `console.log(JSON.stringify({ degraded: release === null, ms: Date.now() - t }));\n` +
         `if (release) release();\n`,
     );
-    let stdout = "";
-    try {
-      stdout = execFileSync("npx", ["tsx", script], {
-        encoding: "utf-8",
-        // Generous: the child re-resolves tsx through npx (as the CI job's own
-        // `npx tsx` steps do). `res.ms` below is what actually bounds the
-        // degrade, and it excludes this startup.
-        timeout: 60000,
-        cwd: fileURLToPath(new URL(".", import.meta.url)),
-      });
-    } catch (err: any) {
-      throw new Error(
-        `acquireBridgeLock must degrade within its bound; the child did not return — the unbounded lock loop is back: ${err?.message ?? err}`,
-      );
+    for (const kind of ["directory", "fifo"] as const) {
+      const lockPath = join(verDir, "latest.json.lock");
+      rmSync(lockPath, { recursive: true, force: true });
+      if (kind === "directory") mkdirSync(lockPath, { recursive: true });
+      else execFileSync("mkfifo", [lockPath]);
+      let stdout = "";
+      try {
+        stdout = execFileSync("npx", ["tsx", script], {
+          encoding: "utf-8",
+          // Generous: the child re-resolves tsx through npx (as the CI job's own
+          // `npx tsx` steps do). `res.ms` below is what actually bounds the
+          // handling, and it excludes this startup.
+          timeout: 60000,
+          cwd: fileURLToPath(new URL(".", import.meta.url)),
+        });
+      } catch (err: any) {
+        throw new Error(
+          `acquireBridgeLock must not wedge on a ${kind} at the lock path; the child did not return — the unbounded lock path is back: ${err?.message ?? err}`,
+        );
+      }
+      const res = JSON.parse(stdout.trim().split("\n").pop()!);
+      // Either outcome is acceptable — a directory is unremovable so it
+      // DEGRADES, a FIFO is reclaimable so it is unlinked and ACQUIRED. What
+      // must never happen is a hang or a spin.
+      ok(res.ms < 10000, `the ${kind} lock path must be handled promptly, took ${res.ms}ms`);
     }
-    const res = JSON.parse(stdout.trim().split("\n").pop()!);
-    ok(res.degraded === true, "an unremovable lock path must degrade unlocked (return null), never spin");
-    ok(res.ms < 10000, `the degrade must be promptly bounded, took ${res.ms}ms`);
     rmSync(join(verDir, "latest.json.lock"), { recursive: true, force: true });
   });
 

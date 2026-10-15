@@ -399,34 +399,45 @@ export function acquireBridgeLock(): (() => void) | null {
       return () => {
         try {
           // ownership check before unlink — a stale-reclaim cycle must not
-          // delete a lock a THIRD process now holds.
-          if (readFileSync(lockFile, "utf-8").trim() === String(process.pid)) unlinkSync(lockFile);
+          // delete a lock a THIRD process now holds. `isFile()` first: reading
+          // a non-regular path (a FIFO/socket) would block forever.
+          if (lstatSync(lockFile).isFile() && readFileSync(lockFile, "utf-8").trim() === String(process.pid)) {
+            unlinkSync(lockFile);
+          }
         } catch { /* already released */ }
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return null; // read-only dir — degrade unlocked
-      // Stale-lock self-heal: dead holder PID, or age past the threshold.
-      let stale = false;
+      // Stale-lock self-heal: dead holder PID, or age past the threshold. The
+      // lock is read ONLY after an `isFile()` check: a FIFO/socket/device at
+      // this path BLOCKS inside open(2) on read, and a synchronous block cannot
+      // be bounded by the deadline at the top of the loop — it would wedge the
+      // tool_call hook that called writeBridge, forever. `lstatSync` does not
+      // block, so every non-regular shape is handled as "not a lock we can
+      // take" rather than read.
+      let holderText: string | null = null;
       try {
-        const holder = Number(readFileSync(lockFile, "utf-8").trim());
-        if (Number.isInteger(holder) && holder > 0) {
-          try { process.kill(holder, 0); } catch { stale = true; } // ESRCH — holder is dead
-        } else {
-          stale = true; // empty/unreadable lock (e.g. the legacy 0-byte file)
-        }
-        if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
-      } catch {
-        // The path EXISTS (openSync said EEXIST) but is not a readable lock
-        // file — a directory, a dangling symlink, or it vanished between the
-        // two calls. Reclaim it and retry; if it exists and cannot be removed
-        // it is not a lock we can ever take, so degrade unlocked NOW rather
-        // than spinning (a synchronous spin here wedges the tool_call hook
-        // that called writeBridge, at ~100% CPU). The deadline at the top of
-        // the loop bounds every remaining path.
+        holderText = lstatSync(lockFile).isFile() ? readFileSync(lockFile, "utf-8").trim() : null;
+      } catch { holderText = null; }
+      if (holderText === null) {
+        // Not a regular lock file (directory / FIFO / socket / dangling
+        // symlink) or it vanished between the two calls. Reclaim it and retry;
+        // if it exists and cannot be removed it is not a lock we can ever
+        // take, so degrade unlocked NOW rather than spinning (a synchronous
+        // spin here wedges the hook too). The deadline at the top of the loop
+        // bounds every remaining path.
         try { unlinkSync(lockFile); continue; } catch { /* not removable / already gone */ }
         if (!existsSync(lockFile)) continue; // vanished between open and read — retry
-        return null; // exists but is not a removable lock — degrade unlocked
+        return null; // exists but is not a removable regular lock — degrade unlocked
       }
+      let stale = false;
+      const holder = Number(holderText);
+      if (Number.isInteger(holder) && holder > 0) {
+        try { process.kill(holder, 0); } catch { stale = true; } // ESRCH — holder is dead
+      } else {
+        stale = true; // empty/garbage lock (e.g. the legacy 0-byte file)
+      }
+      if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
       if (stale) { try { unlinkSync(lockFile); } catch { /* raced */ } continue; }
       const spinUntil = Date.now() + 10;
       while (Date.now() < spinUntil) { /* brief spin — holders are sub-ms */ }
