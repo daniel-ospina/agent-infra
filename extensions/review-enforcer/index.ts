@@ -654,6 +654,89 @@ function hasBareGhWord(command: string): boolean {
  * be conjoined with a shape test.
  */
 /**
+ * The CONSTRUCT class shared by the verb-read arms below: `$`, a backtick, `{`/`}` and a
+ * redirection (`<`/`>`). Each BLINDS a read of the text, and each is removed or rewritten by
+ * bash before gh sees it — measured: `gh {pr,merge} 999 $V` and `gh pr >/dev/null merge 999
+ * $V` both reach gh as `pr merge 999 --admin`. An arm that stops at substitutions and
+ * backticks reads no merge in those shapes, and a merge that reaches gh unread is a merge
+ * this gate never saw.
+ */
+const CONSTRUCT = /[$`{}<>]/;
+
+/**
+ * A word as bash would resolve it: quotes stripped (`dequote`) and an ANSI-C LEADING `$`
+ * dropped, so `$'pr'` reads as `pr` (bash resolves those before gh runs). A `$` INSIDE a
+ * word is a splice rather than a quote, and the construct-in-a-verb-position arm reads it.
+ */
+function shellWord(tok: string | undefined): string {
+  return dequote(tok ?? "").replace(/^\$/, "");
+}
+
+/**
+ * A word that could actually BE a gh subcommand (`pr`, `issue`, `create`, `update-branch`,
+ * …): lowercase letters and hyphens. The shape matters, not the vocabulary — the point is
+ * that a residue of the tokenizer's own text-level splitting (`.gh-repo)` out of
+ * `--repo=$(cat .gh-repo)`, which bash parses as ONE word) must NOT be read as a
+ * subcommand, because reading it as one turns a merge into a "non-merge gh call" and hands
+ * the merge to the argv layer. Anything that does not fit fails the positive read, so the
+ * admin-merge gate keeps its decision — the fail-CLOSED direction.
+ */
+const SUBCOMMAND_WORD = /^[a-z][a-z-]*$/;
+
+/**
+ * The `pr` subcommands that are NOT a merge. `merge` is deliberately absent, and so is
+ * every spelling nobody has written yet: the POSITIVE read is what lets this layer stand
+ * down, so a subcommand this list does not know — including the residue of a tokenizer
+ * split, which can look exactly like a word — is read as NO positive read and the gate keeps
+ * its decision. The list's failure direction is a REFUSAL, which is the direction this file
+ * is allowed to be wrong in.
+ */
+const PR_NON_MERGE_SUBCOMMANDS = new Set([
+  "create", "view", "list", "comment", "close", "reopen", "edit", "diff", "checkout",
+  "ready", "review", "status", "lock", "unlock", "checks", "update-branch",
+]);
+
+/**
+ * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
+ * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
+ * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
+ * way of blinding that read (a spliced word, brace expansion, a redirection, an empty quote
+ * pair, a verb behind a construct or a global flag, a spelling nobody has thought of yet)
+ * fails CLOSED — this layer keeps the gate — instead of open. ENUMERATING the spells does
+ * not work: four review cycles each found one more blinding shape, every one of them a
+ * measured bypass of a real merge, and each fix only moved the boundary to the next
+ * spelling. Polarity moves it out of reach: an unreadable command is not a permission.
+ *
+ * `gh` must be a readable word; the next word must be a readable non-flag (a global flag
+ * such as `--hostname` puts the subcommand where this cannot see it); a group other than
+ * `pr` is a positive read (`issue`, `api`, `repo`, `run`, `auth`, …); under `pr`, the next
+ * word must be readable and not `merge`. EVERY gh invocation in the text must satisfy
+ * that, and the text must contain at least one — otherwise the answer is "no positive
+ * read" and the admin-merge gate keeps its fail-closed decision. That is why the #1775
+ * false positive (an ordinary `gh pr create` whose TITLE carries a construct and the word
+ * `admin`) still stands down, while a merge spelled past the tokenizer does not.
+ */
+export function readsNonMergeGhCall(command: string): boolean {
+  const scan = scanTokens(command);
+  let seen = false;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (shellWord(scan.tokens[i]) !== "gh") continue;
+    seen = true;
+    const group = scan.tokens[i + 1];
+    if (group === undefined || CONSTRUCT.test(group)) return false;
+    const g = shellWord(group);
+    if (!SUBCOMMAND_WORD.test(g)) return false; // a global flag, or a tokenizer residue
+    if (g !== "pr") continue; // `issue`, `api`, `repo`, … — read, and not a merge
+    const sub = scan.tokens[i + 2];
+    if (sub === undefined || CONSTRUCT.test(sub)) return false;
+    const s = shellWord(sub);
+    if (!SUBCOMMAND_WORD.test(s) || !PR_NON_MERGE_SUBCOMMANDS.has(s)) return false;
+    continue; // `create`, `view`, `list`, … — read, and not a merge
+  }
+  return seen;
+}
+
+/**
  * Does the TEXT name a merge? True for a resolvable `pr merge`, and for a verb hidden
  * behind a construct in a verb position (`gh pr m`printf erge``, `gh p`printf r` merge`).
  *
@@ -670,36 +753,18 @@ function hasBareGhWord(command: string): boolean {
  */
 export function mergeVerbInText(command: string): boolean {
   const scan = scanTokens(command);
-  // An ANSI-C quote is resolved AWAY by bash before gh runs: `$'gh' $'pr' merge 999 $V`
-  // reaches gh as `gh pr merge 999 --admin`-equivalent argv, but dequoting leaves the
-  // sigil (`$gh`, `$pr`) so neither the pair nor the two anchors below matched it — while
-  // `hasAdminMergeFlag` still saw the `$` and made the command a candidate. The caller then
-  // deferred a MERGE, which is the one thing the deferral must never hand over (measured:
-  // with the PATH entry discarded, it went through). The LEADING `$` is what quoting
-  // produces; a `$` inside a word is a splice, which the construct-in-a-verb-position arm
-  // below already reads (`gh p$'r' merge …`).
-  const verbWord = (t: string | undefined) => dequote(t ?? "").replace(/^\$/, "");
-  const at = (i: number) => verbWord(scan.tokens[i]);
+  const at = (i: number) => shellWord(scan.tokens[i]);
   for (let i = 1; i < scan.tokens.length; i++) {
     if (at(i) === "merge" && at(i - 1) === "pr") return true;
   }
-  // The verb word may itself be spliced, and then no `pr`/`merge` token pair exists to
-  // find (``gh pr m`printf erge` …``, ``gh p`printf r` merge …``): the signal is a
-  // CONSTRUCT IN A VERB POSITION — the token right after `gh` or right after `pr`.
-  // Requiring only "construct + the words gh and pr" was too broad (it made
-  // `gh pr view $X` an admin merge), and requiring `pr` to be a word missed
-  // ``gh p`printf r` …``, where `printf` hides it.
-  //
-  // The construct class here is `$`, a backtick, `{`/`}` and a redirection (`<`/`>`): each
-  // BLINDS the verb read in its own way, and each is removed by bash before gh sees it.
-  // BRACE EXPANSION splices a verb (`gh {pr,merge} 999 $V` reaches gh as
-  // `pr merge 999 --admin`); a REDIRECTION is consumed by the shell, so
-  // `gh pr >/dev/null merge 999 $V` reaches gh as `pr merge 999 --admin` too, while the
-  // raw tokenizer still splits `pr` from `merge`. A class that stopped at substitutions
-  // and backticks read no merge in either shape, deferred a command that had already
-  // discarded the PATH entry the argv layer lives on, and let the merge through with
-  // neither layer looking — measured, and pre-deferral code had refused both.
-  const CONSTRUCT = /[$`{}<>]/;
+  // The construct class is `CONSTRUCT` above; the verb word may itself be spliced, and then
+  // no `pr`/`merge` token pair exists to find, so the signal is a CONSTRUCT IN A VERB
+  // POSITION — the token right after `gh` or right after `pr`. Requiring only "construct +
+  // the words gh and pr" was too broad (it made `gh pr view $X` an admin merge), and
+  // requiring `pr` to be a word missed ``gh p`printf r` …``, where `printf` hides it. NOTE
+  // this arm is the CANDIDATE rule's shared form (`isAdminMergeCommand`); the deferral's
+  // boundary is `readsNonMergeGhCall`, whose polarity does not depend on reading every
+  // spell.
   const afterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < scan.tokens.length - 1; i++) {
       if (at(i) !== word) continue;
@@ -2796,14 +2861,17 @@ export default function (pi: ExtensionAPI) {
       // cannot, and it decides; when it is absent or switched off, this gate
       // refuses exactly as before. See `ghShimWillEnforce`.
       //
-      // #1776: the deferral is the unresolvable FLAG, never the MERGE. A command the
-      // text layer reads as a merge keeps this gate's fail-closed decision
-      // (`mergeVerbInText`), because the argv layer's presence is the one thing a
-      // command can undo for itself — `PATH="${PATH#*:}"; export PATH; gh pr merge 999
-      // $'--admin'` strips the injected entry, so a deferral there would decide nothing
-      // and the merge would proceed with neither layer looking.
+      // #1776: the deferral is the unresolvable FLAG, never the MERGE, and it is bounded by
+      // POLARITY (`readsNonMergeGhCall`), not by a list of spells. This layer stands down only
+      // for a command whose text POSITIVELY reads a non-merge gh call, so a merge spelled past
+      // the tokenizer — a spliced or ANSI-C-quoted word, a brace expansion, a redirection, a
+      // construct-supplied verb behind a global flag, an empty-quoted repo value, a spelling
+      // this lane has not seen — keeps this gate's fail-closed decision instead of being
+      // handed to an argv layer the command itself can discard
+      // (`PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`).
       if (isAdminMergeCommand(command) &&
-          (hasLiteralAdminFlag(command) || mergeVerbInText(command) || !ghShimWillEnforce(shimDir))) {
+          (hasLiteralAdminFlag(command) || !readsNonMergeGhCall(command) ||
+           !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.

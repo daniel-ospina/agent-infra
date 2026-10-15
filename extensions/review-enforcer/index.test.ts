@@ -49,6 +49,7 @@ import {
   isGhPrMergeCommand,
   isAdminMergeCommand,
   mergeVerbInText,
+  readsNonMergeGhCall,
   ghShimWillEnforce,
   isExecutableShim,
   hasLiteralAdminFlag,
@@ -5354,22 +5355,38 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // `--repo` and `merge`, neither of which is a construct — so this shape needs the
         // pair arm to resolve `$'pr'`.
         "export PATH=/usr/bin; $'gh' --repo owner/other $'pr' merge 999 $'--admin'",
+        // …and with the verb hidden behind ONE construct-free gh GLOBAL FLAG, so no
+        // construct sits in a verb position at all: the POLARITY — not a longer spell list
+        // — is what keeps this one (measured as a live bypass before it did).
+        "X='pr merge'; PATH=\"${PATH#*:}\"; export PATH; gh --hostname github.com $X 999 $'--admin'",
+        "P=pr; PATH=\"${PATH#*:}\"; export PATH; gh --hostname github.com $P merge 999 $'--admin'",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
       for (const cmd of cmds) {
         ok(!hasLiteralAdminFlag(cmd), `the flag is not a literal token: ${cmd}`);
-        ok(mergeVerbInText(cmd), "…but the text DOES name a merge, so this layer keeps it");
+        ok(mergeVerbInText(cmd) || !readsNonMergeGhCall(cmd),
+          "…the text reads a merge, or cannot read a non-merge gh call — either way this layer keeps it");
         const ev = { toolName: "bash", input: { command: cmd } };
+        const evidenceBlocks = () =>
+          tempAuditLines().filter(
+            (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"
+          ).length;
+        const before = evidenceBlocks();
         const res = await fire("tool_call", ev);
         ok(res && res.block === true, `\`${cmd}\` → BLOCKED`);
+        // Per-arm attribution: the aggregate count could hide one arm refused by a
+        // DIFFERENT gate while another counted twice, and it does not say WHICH arm moved.
+        ok(evidenceBlocks() === before + 1,
+          `…by the EVIDENCE gate — it ran, it did not defer (reason: ${String((res && res.reason) ?? "")})`);
         ok(String(ev.input.command).startsWith("export PATH="),
           "…the shim is still injected for the command (it is absent for OTHER commands, not for this one)");
       }
       const blocked = tempAuditLines().filter(
         (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"
       );
-      equal(blocked.length, cmds.length, "…each by the EVIDENCE gate — it ran, it did not defer");
+      equal(blocked.length, cmds.length,
+        "…and no arm is unaccounted for (saw " + blocked.length + " of " + cmds.length + ")");
       // The DECLARED residual, pinned so it cannot be read as an oversight: with the flag
       // LITERAL (`--admin` as its own argv token) and no construct anywhere, this layer was
       // never the decider — that token is the argv layer's job (`scripts/gh-shim/gh`, #984),
@@ -5402,6 +5419,56 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+// The two predicates the deferral's boundary is made of, pinned directly. The CALLER sees
+// only their COMPOSITION, and a composition is satisfied by either half — so a narrowing of
+// one half could hide behind the other. These are the halves.
+test("#1776: the boundary's two predicates, each pinned on its own (polarity + merge read)", () => {
+  // `readsNonMergeGhCall` — the POLARITY. A positive read is REQUIRED to defer, so every
+  // shape it cannot read fails CLOSED (the caller keeps the gate) instead of open.
+  for (const cmd of [
+    'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"', // the #1775 false positive
+    'gh issue comment 1 --body "the admin gate ran $(date)"',
+    "gh api /repos/o/r --method POST $(mktemp)",
+    "gh run view 123 --log",
+    "gh pr view 4 --json body $(mktemp)",
+  ]) {
+    ok(readsNonMergeGhCall(cmd), `a readable non-merge gh call defers: ${cmd}`);
+  }
+  for (const cmd of [
+    "gh pr merge 999 $V", // a merge is not a positive read
+    "gh --hostname github.com $X 999 $'--admin'", // a global flag hides the subcommand
+    "gh {pr,merge} 999 $V", // a brace hides the group
+    "gh $G create --title 'admin $(x)'", // a construct hides the group
+    "gh pr $SUB 999 $V", // a construct hides the subcommand
+    "gh pr --repo=$(cat f) merge 999 $'--admin'", // a tokenizer RESIDUE is not a subcommand
+    "gh pr view 4 && gh pr merge 999 $V", // ONE unreadable call is enough
+    "echo 'the admin says merge $(date)'", // no gh command word at all
+  ]) {
+    ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
+  }
+  // `mergeVerbInText` — the candidate rule's shared read (`isAdminMergeCommand` calls it
+  // on its spliced-verb branch), which is why it is pinned here rather than only through
+  // the caller.
+  for (const cmd of [
+    "gh pr merge 999 $V",
+    "gh pr m$'erge' 999 $V",
+    "$'gh' $'pr' merge 999 $'--admin'",
+    "gh {pr,merge} 999 $V",
+    "gh pr >/dev/null merge 999 $V",
+    "gh pr --repo=$(cat f) merge 999 $V",
+    "pr merge 999 $V",
+  ]) {
+    ok(mergeVerbInText(cmd), `the text names a merge: ${cmd}`);
+  }
+  for (const cmd of [
+    "gh pr view $X",
+    'gh issue comment 1 --body "admin $(date)"',
+    "gh pr create --title x --body $(y)",
+  ]) {
+    ok(!mergeVerbInText(cmd), `the text does not name a merge: ${cmd}`);
+  }
 });
 
 // The OUTCOME the change exists to deliver, pinned directly: with the argv layer
