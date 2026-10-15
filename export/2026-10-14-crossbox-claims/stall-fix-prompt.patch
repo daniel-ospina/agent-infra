@@ -1,0 +1,37 @@
+--- a/scripts/orchestrator-harness/merge-one.sh
++++ b/scripts/orchestrator-harness/merge-one.sh
+@@ -121,7 +121,11 @@
+     gh pr diff $PR --repo $OR
+ Read the changed files IN FULL at the PR head (\`git show origin/$BR:<path>\`), not just the diff hunks. Read skills/code-review/SKILL.md for the discipline.
+ Report ONLY HIGH-confidence real issues: correctness bugs; security (injection/auth bypass/secrets); VACUOUS tests (would pass on the pre-fix code — prove it); scope/claim mismatch; regressions; fail-open paths; repo-rule violations — especially a NEW test file missing from config/ci-surfaces.yml (the manifest-integrity leg fails and the file is never selected).
+-If you need to run tests, use your own throwaway checkout: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`. Bound every command; never run the whole suite.
++TEST EXECUTION IS NOT AVAILABLE TO YOU. Your cwd is the main checkout and it has NO \`.venv\`. Do NOT go looking for an interpreter:
++  ⛔ NEVER run \`find\`, \`rg\`, \`du\`, \`mdfind\` or a recursive \`ls\` outside the repository root — above all never under \`$HOME\`, \`/Users\`, \`/private/tmp\`. A \`find\` over the home directory BLOCKS for many minutes (measured: >120s cold, ~25 min under load) and has burned entire 30-minute review budgets, returning NO verdict at all.
++  ⛔ Do not run \`uv sync\`, and do not create a virtualenv.
++If a point can only be settled by EXECUTING code, report it as \`UNVERIFIED\` and name the exact command that would settle it — the fixer runs tests, not you. Reasoning from the source is expected and is sufficient for everything else.
++Bound every command: explicit paths, \`-maxdepth\`, and never run the whole suite.
+ 
+ ## REQUIRED: post your review as a PR comment (this is the merge-gate audit artifact)
+ Write your review to a file, then:
+--- a/scripts/orchestrator-harness/fix-one.sh
++++ b/scripts/orchestrator-harness/fix-one.sh
+@@ -97,7 +97,7 @@
+ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirements:
+ - Make the fix at the stated location, and add/adjust tests so they genuinely FAIL on the pre-fix code (prove non-vacuity where you can).
+ - Register any new test file in \`config/ci-surfaces.yml\` (correct surface) — verify with \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python tools/ci_selection.py --integrity\`.
+-- Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite.
++- Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite. Your worktree has its own \`.venv\` — use THAT one. ⛔ Never search the filesystem for an interpreter: no \`find\`/\`rg\`/\`du\` outside this worktree (a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result). If \`.venv\` is genuinely missing here, run \`uv sync --extra embeddings --extra parity\` once.
+ - Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git push origin $BR\`.
+ - Do NOT merge. Do NOT amend already-pushed commits — add a new commit.
+ 
+--- a/scripts/orchestrator-harness/lane.sh
++++ b/scripts/orchestrator-harness/lane.sh
+@@ -47,7 +47,7 @@
+ 
+ ## Setup (you are already in the worktree)
+     uv sync --extra embeddings --extra parity        # tortoise: installs the canonical dev env
+-Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras).
++Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras). If \`.venv\` is missing in YOUR worktree, run \`uv sync --extra embeddings --extra parity\` once — ⛔ never search the filesystem for an interpreter (no \`find\`/\`rg\`/\`du\` outside this worktree: a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result).
+ 
+ ## Rules
+ - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.

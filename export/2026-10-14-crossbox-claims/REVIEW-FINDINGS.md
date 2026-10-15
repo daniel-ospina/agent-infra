@@ -1,61 +1,84 @@
-# Independent review of this export — findings (2026-10-14)
+# Independent review — findings and what was fixed (2026-10-14)
 
-Reviewed by a fresh-context sub-agent. Hash/integrity check on all 12 files passed; the patch was
-confirmed to round-trip against `files/`. **Verdict: no defect violates the safety invariants
-(atomic create, read-back, lease-as-data, fencing) — passing, with the fixes below recommended.**
+Two fresh-context reviews were run. The **first one caught a serious defect in this export's own
+first version**; that is recorded here rather than quietly corrected, because the same trap will
+catch the next person who edits these prompts.
 
-## P1 — owner identity is not unique, so the CAS token is not guaranteed distinct
+## 🔴 CAUGHT IN REVIEW #1 — the stall fix used unescaped backticks inside unquoted heredocs
+
+**Severity: would have shipped a prompt that executes commands at build time.**
+
+The agent prompts are built with `cat > "$L-reviewer.txt" <<EOF` — an **unquoted** heredoc, so
+command substitution runs. The first version of the stall fix added `\``-free backticks, so:
+
+- `` `uv sync` `` → **executed `uv sync`** every time `merge-one.sh` ran (in the main checkout)
+- `` `ls` `` → spliced a directory listing **into the reviewer prompt**
+- `` `UNVERIFIED` `` → executed and erased — i.e. the one token the change depended on was deleted
+- `` `find` ``, `` `rg` ``, `` `du` ``, `` `mdfind` `` → executed, words lost from the prompt
+
+`bash -n` passes throughout, because it does not expand heredocs — which is exactly why this looks
+safe and is not. **Reproduced with command shims**: expansion produced `[SHIM EXECUTED: uv]`,
+`[SHIM EXECUTED: UNVERIFIED]`.
+
+**Fixed** by escaping only *unescaped* backticks (regex lookbehind `(?<!\\)\``, so pre-existing
+`\`` sequences were not double-escaped), in all three files — `merge-one.sh` 24, `fix-one.sh` 18,
+`lane.sh` 18. **Re-verified by real expansion**: 0 shim executions, with `UNVERIFIED`, `uv sync` and
+`find` surviving literally in the generated prompt.
+
+> Rule for these files: inside the prompt heredocs, **every backtick must be written `` \` ``.**
+
+## Review #2 — integrity and protocol
+
+All 12 files hash-verified and non-empty. The primitive was exercised against a **local bare repo**
+(no shared state touched):
+
+- content-addressed key ✅ · atomic create rejects an existing different ref ✅ · read-back compares
+  the remote SHA ✅
+- live lease blocks (`rc=1`); expired lease reclaims (`rc=0`); an **unparseable lease is treated as
+  LIVE** (fail-closed) ✅
+- fencing: stale-owner release **refused**, correct-owner release accepted ✅
+- `claim_status`/`claim_snapshot` lookups **match** `claim_ref()` (the `refs/claims/.-<sha>`
+  regression is fixed) ✅
+- no command injection: refspecs are single argv elements; `merge-one.sh` enforces a numeric PR;
+  `orch-loop.sh` gates with `is_num`/`safe_ref` ✅
+
+`merge-one.sh` integration verified: head resolved **before** claiming; a refused claim exits without
+spawning a reviewer; the claim is released on every exit path; and the log-truncating redirect runs
+**before** the claim evidence is appended (the ordering bug that used to delete the "acquired" line).
+
+## 🟠 P1 — owner identity is not unique, so the CAS token is not guaranteed distinct
 
 `claim_owner()` is `hostname -s` + `$$`. Two acquisitions with the same owner **and the same
-`lease_until` second** produce **byte-identical** `commit-tree` objects. Pushing an identical commit
-to a ref that already holds it exits 0 ("up-to-date"), and the read-back then confirms it — so the
-second acquirer reports `acquired`.
+`lease_until` second** produce **byte-identical** commits; pushing an identical commit to a ref that
+already holds it exits 0 ("up-to-date"), and the read-back then confirms it — so the second acquirer
+reports `acquired`.
 
-- Breaks **`test-claims.sh`'s headline assertion** ("B lost the race"): both clones share `$$` and
-  hostname, so the test cannot prove cross-box atomicity on one machine. **It is flaky, not
-  wrong-by-design** — that is why it passed here and must not be trusted as the cross-box proof.
-- Two boxes sharing a hostname (cloned VMs/containers, or the `|| echo box` fallback) would both
-  believe they own the key.
-- **Does not corrupt state** in the documented 3-distinct-box fleet: it degenerates to the
-  explicitly tolerated duplicate execution, and fencing is unaffected (both hold the same SHA, so
-  one delete wins and the other is fenced).
-- **Fix:** add a random nonce to the claim commit message so every object is unique, and give the
-  test a per-box owner override.
+- **`test-claims.sh`'s headline assertion ("B lost the race") is flaky** for the same reason: both
+  clones share `$$` and hostname, so it cannot prove cross-box atomicity on one machine. It passed
+  here and **must not be treated as the cross-box proof**.
+- Two boxes sharing a hostname (cloned VMs, or the `|| echo box` fallback) would both claim.
+- **Not unsafe**: it degenerates to the duplicate execution the design already tolerates, and
+  fencing is unaffected (both hold the same SHA — one delete wins, the other is fenced).
+- **Fix:** add a random nonce to the claim commit message; give the test a per-box owner override.
 
-## P2 — `claim_snapshot` is not `set -u`-safe with its optional argument omitted
+## 🟡 P2 / P3
 
-`local out="${1:-…}" tmp="$1.$$"` dereferences unset `$1` → `unbound variable` / exit 127.
-Production is unaffected (`orch-loop.sh` always passes a path), but it is a latent footgun.
-
-## P2 — the numbers in this export disagree with each other
-
-`README.md` says the "my edits" split is 66 / ~30 / 14 / 27; `divergence.txt` says 12 / 7 / 7 / 7;
-the patch itself adds 60 / 54 / 13 / 13. **`divergence.txt`'s "my-edits" column is stale** (it was
-generated with a wrong baseline glob) — trust the patch and the "total delta" column.
-
-## P2 — `test-crossbox.sh` is not self-contained
-
-It runs `bash /tmp/merge-one.new`, a file **not in this export**, and hard-codes
-`/Users/home/eldato/tortoise`. The README's "end-to-end through the real merge-one.sh" is therefore
-not literally what the shipped script does. Point it at `files/merge-one.sh` when re-running.
-
-## P3
-
-- `README.md` is self-contradictory on idempotency: the fail-open rationale relies on side effects
-  being idempotent per head, while the open follow-ups admit that verifying `record-review.sh`'s
-  marker idempotency is unfinished. The safety argument rests on an unverified assumption.
-- `claim_status`'s comment says "every git call uses the cwd" but it uses `CLAIM_REPO`; the ignored
-  `repo` positional in `claim_acquire`/`claim_release` is documented only for `claim_status`.
-- A stale `ls-remote` advertisement right after push makes `claim_acquire` return 2; the caller then
-  fail-opens **without** `CROSS_OWN`, so it never releases its own (actually-held) ref — the lease
-  expires it. Fail-open, but it can orphan a claim until expiry.
-- `divergence.txt` "FEATURE PRESENCE" scans only the five edited scripts (excluding `claims.sh`,
-  where all `force-with-lease` uses live), so `force-with-lease my-box=0` is an artifact.
+- `claim_snapshot` is not `set -u`-safe when its optional argument is omitted
+  (`local out="${1:-…}" tmp="$1.$$"` dereferences unset `$1`). Production unaffected (`orch-loop.sh`
+  always passes a path).
+- **`divergence.txt`'s earlier "my-edits" column was stale** (bad baseline glob) — superseded; trust
+  the patch and the "total delta" column.
+- `test-crossbox.sh` is not self-contained: it references a scratch copy of `merge-one.sh` and
+  hard-codes this box's clone paths. Point it at `files/merge-one.sh` to re-run.
+- `README.md` relies on side-effect idempotency as its fail-open rationale while listing the
+  `record-review.sh` idempotency check as *open*. The risk is accepted, not proven — #1709 rec 7.
+- A stale `ls-remote` right after push makes `claim_acquire` return 2; the caller then fail-opens
+  without holding the claim ref, so its own ref is not released and expires by lease.
 
 ## Suites: what actually ran
 
-- `test-gates.sh` — **ran, 10 passed / 0 failed** (offline, extraction of the live `mp_reason` matched).
-- `test-claims.sh` — **not run here**; writes `refs/claims/*` to live origin, and (per the P1 above)
-  cannot prove cross-box atomicity on a single machine.
-- `test-crossbox.sh` — **cannot run as exported** (missing `/tmp/merge-one.new`).
-- There are **three** test scripts in this export, not four.
+- `test-gates.sh` — **ran: 10 passed / 0 failed** (offline; extraction of the live `mp_reason` matched).
+- `test-claims.sh` — **not run in review** (writes `refs/claims/*` to live origin); additionally
+  cannot prove cross-box atomicity on one machine, per the P1 above.
+- `test-crossbox.sh` — cannot run as shipped without path adjustment (see above).
+- There are **three** test scripts, not four.
