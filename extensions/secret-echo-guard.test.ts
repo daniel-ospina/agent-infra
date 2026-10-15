@@ -365,6 +365,31 @@ test("R13: a dotted code identifier is NOT an env file — the harvest gate stay
 	strictEqual(appendEntryCalls.length, 0, "no durable record for a non-file token");
 	strictEqual(notifications.length, 0, "no pane notice for a non-file token");
 });
+test("R14: a bare relative `*.env` READ is gated (a read path is a file), a bare command token is not", () => {
+	// Round 13 applied the path-separator rule uniformly, so `read({path: "app.env"})` — the ordinary
+	// cwd-relative invocation — stopped opening the source-5 harvest: the value was never registered,
+	// redacted or recorded (a SILENT fail-open). A `read` `input.path` is a file reference by
+	// construction, so a bare `app.env` must be gated there; the `process.env` false positive lives in a
+	// split bash command, so the separator rule stays there.
+	strictEqual(isEnvLikePath("app.env"), false, "the default (command) context stays strict");
+	strictEqual(isEnvLikePath("app.env", "read-path"), true);
+	strictEqual(isEnvLikePath("prod.env", "read-path"), true);
+	strictEqual(isEnvLikePath("secrets.env", "read-path"), true);
+	strictEqual(isEnvLikePath("process.env.X", "read-path"), false, "a dotted expression is still not a file on either path");
+	strictEqual(isEnvLikePath("/repo/process.env.X"), false, "the NOT COVERED bullet claims this is accepted — it is rejected");
+	strictEqual(envSourceFromInput({ path: "app.env" }), "app.env");
+	strictEqual(envSourceFromInput({ path: "./app.env" }), "app.env");
+	strictEqual(envSourceFromInput({ command: "cat app.env" }), undefined, "the documented command-branch tradeoff");
+	// End-to-end (this is the leak): the bare read must harvest and redact in the SAME result, and the
+	// redaction must be recorded — before the fix the handler returned no patch and wrote no record.
+	resetEverything();
+	const fresh = "BARE-RELATIVE-ENV-KEY-0123456789";
+	const { returned } = runHandler(toolResultEvent({ input: { path: "app.env" }, content: [{ type: "text", text: `OPENROUTER_API_KEY=${fresh}\n` }] }));
+	ok(returned, "the bare relative .env read must produce a patch");
+	ok(!JSON.stringify(returned).includes(fresh), "the freshly-harvested value must be gone from the transcript entry");
+	ok((returned as { content: Array<{ text: string }> }).content[0].text.includes("[REDACTED-SECRET:read:app.env#OPENROUTER_API_KEY]"), "the label names the source key");
+	strictEqual(appendEntryCalls.length, 1, "the redaction is recorded, not silently skipped");
+});
 
 // ── The registry from the fixture sources ───────────────────────────────────────────────────
 console.log("\nthe registry (fixture home + controlled env)");

@@ -146,9 +146,11 @@
 //      `firstLineExceedsLimit`). `read`/`bash` are therefore covered entirely by the `content`
 //      harvest; harvesting `details` is purely additive for tools whose text is details-only.
 //   5. Anything that LOOKS like a dotenv assignment in the tool result being inspected
-//      (`harvestDotenvSecrets`) — but ONLY when the tool was aimed at an env-like FILE (a `read`
-//      whose `input.path` basenames to `.env`/`*.env`/`.env.*`, or a `bash` command that names such a
-//      path). A `KEY=value` line whose key is secret-bearing. This exists because the most likely
+//      (`harvestDotenvSecrets`) — but ONLY when the tool was aimed at an env-like FILE: a `read`
+//      whose `input.path` basenames to `.env`/`*.env`/`.env.*` (bare or pathed — a read path is
+//      always a file reference), or a `bash` command that names such a path. A bare `<name>.env`
+//      token in a COMMAND is deliberately not gated (`process.env` is the same string); a `read` of
+//      `app.env` IS. A `KEY=value` line whose key is secret-bearing. This exists because the most likely
 //      remaining leak is an agent reading a repo `.env` that pi's own process never sourced
 //      (`tortoise/.env` holds `JEV_API_KEY`, `OPENROUTER_API_KEY`,
 //      `SUPABASE_AUTH_EXTERNAL_GOOGLE_SECRET` — none of which are in pi's process env). Harvesting
@@ -204,10 +206,16 @@
 //     stderr + pane), never silent, the same fail-open-on-the-turn posture as any post-deadline string.
 //     An ACCESSOR key's NAME is the exception: it is redacted unconditionally (see `rebuildContentPart`),
 //     because a live getter's value is exactly what the round-13 fix must not budget-gate;
-//   • a dotted code expression that ALSO carries a path separator and a non-environment suffix
-//     (`/repo/process.env.X`): `isEnvLikePath` rejects the bare form (`process.env.X`) but a pathed one
-//     with an unknown suffix is still accepted, because the alternative rejects real `<name>.env.<suffix>`
-//     files. The reported handler-level reproduction (`grep -h process.env src/config.ts`) is closed;
+//   • a bare relative `<name>.env` named by a `bash` COMMAND (`cat app.env`, `grep x app.env`): the
+//     ambiguous `<name>.env` form is gated in a command only when it carries a path separator, because
+//     `process.env` is indistinguishable from `app.env` once the command is split into tokens. The same
+//     name IS gated for a `read` tool's `input.path`, which is always a file reference
+//     (`read({path:"app.env"})` harvests; `bash({command:"cat app.env"})` does not). A dotted code
+//     expression is rejected in BOTH contexts — `process.env`, `process.env.X`, `config.env.ts`,
+//     `a.env.md` and `/repo/process.env.X` (the last by the suffix/prefix rule, not the separator) — so
+//     the reported `grep -h process.env src/config.ts` reproduction is closed. If an env file whose
+//     basename defies this rule must be covered, name it in `SECRET_ECHO_GUARD_ENV_FILES` (registry
+//     source 4 registers its values up front, so a read of it is redacted without the harvest gate);
 //   • JSON-escaped forms of a value containing characters that escape differently in the output;
 //     real provider keys are `[A-Za-z0-9._-]`, so this is theoretical in practice;
 //   • the assistant's own prose, the model request payload, and non-pi logs;
@@ -1452,13 +1460,24 @@ export function collectDetailsStrings(
  * (measured: `grep -h process.env src/config.ts` harvested `process.env.MY_REAL_SECRET_KEY` and rewrote
  * a benign line into `[REDACTED-SECRET:read:process.env#API_KEY]`, with a durable record and a pane
  * notice claiming a redaction). The explicit dotenv names stay bare-safe; the ambiguous
- * `<name>.env` / `<name>.env.<suffix>` forms now require a real PATH shape (a separator), and the
- * mid form is accepted only when the suffix names an environment or the prefix before `.env` is
- * filename-ish — so `process.env.X`, `config.env.ts` and `a.env.md` are code, not files. The round-3
- * case `/repo/<secret>.env.local` — an arbitrary-prefix env-file basename, a legitimate hit — is
- * preserved.
+ * `<name>.env` / `<name>.env.<suffix>` forms require a real PATH shape (a separator) **in a bash
+ * command**, and the mid form is accepted only when the suffix names an environment or the prefix
+ * before `.env` is filename-ish — so `process.env.X`, `config.env.ts` and `a.env.md` are code, not
+ * files. The round-3 case `/repo/<secret>.env.local` — an arbitrary-prefix env-file basename, a
+ * legitimate hit — is preserved.
+ *
+ * ⛔ THE SEPARATOR RULE IS COMMAND-ONLY (#5109 review round 14). Applying it to the `read`
+ * `input.path` too was a silent FAIL-OPEN: `read({path:"app.env"})` — the ordinary cwd-relative
+ * invocation — stopped opening the harvest, so the value was never registered, redacted or
+ * recorded. A `read` path is a FILE reference by construction, so a bare `app.env` is a hit there;
+ * the `process.env` false positive exists only in a split bash command, where `process.env` and
+ * `app.env` are literally the same string.
+ *
+ * @param context `"read-path"` for a `read` tool's `input.path`; `"command"` (the DEFAULT, the
+ *   stricter rule) for a whitespace-split token of a `bash` command. Defaulting to the strict rule
+ *   means no caller can widen the gate by omitting the argument.
  */
-export function isEnvLikePath(path: string): boolean {
+export function isEnvLikePath(path: string, context: "read-path" | "command" = "command"): boolean {
 	let base: string;
 	try {
 		base = basename(path).toLowerCase();
@@ -1467,9 +1486,10 @@ export function isEnvLikePath(path: string): boolean {
 	}
 	// The unambiguous dotenv names, bare or pathed: `.env`, `.env.local`, `.env.production`.
 	if (base === ".env" || base.startsWith(".env.")) return true;
-	// The ambiguous forms below are ALSO how a dotted code expression reads, so a bare token is not a
-	// file (`process.env` is a code namespace, not a path).
-	if (!path.includes("/")) return false;
+	// The ambiguous forms below are ALSO how a dotted code expression reads (`process.env`,
+	// `import.meta.env`), so they need a real PATH shape — but only in a COMMAND, where a bare token
+	// and a code expression are the same string. A `read` path is a file by construction.
+	if (context === "command" && !path.includes("/")) return false;
 	if (base.endsWith(".env")) return true;
 	if (!base.includes(".env.")) return false;
 	// `<something>.env.<suffix>` — this is the shape a DOTTED IDENTIFIER also has (`process.env.X`,
@@ -1522,11 +1542,11 @@ export function envSourceFromInput(input: unknown): string | undefined {
 	try {
 		if (!input || typeof input !== "object") return undefined;
 		const path = (input as { path?: unknown }).path;
-		if (typeof path === "string" && isEnvLikePath(path)) return basename(path);
+		if (typeof path === "string" && isEnvLikePath(path, "read-path")) return basename(path);
 		const command = (input as { command?: unknown }).command;
 		if (typeof command === "string") {
 			for (const token of command.split(/[\s'"();|&<>]+/)) {
-				if (token && isEnvLikePath(token)) return basename(token);
+				if (token && isEnvLikePath(token, "command")) return basename(token);
 			}
 		}
 	} catch {
