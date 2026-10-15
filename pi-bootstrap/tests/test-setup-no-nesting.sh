@@ -198,7 +198,8 @@ check_ci_runner_gate_farmed() {
 #   * It cannot see a stale DEPLOYED copy or an un-restarted long-lived process: it diffs repo bytes
 #     against a $DEST that THIS run just populated. #1738 is the NEAR-MISS that prompted looking for
 #     this gap, NOT an instance of it: #1738's own evidence records the deployed file as
-#     BYTE-IDENTICAL to origin/main, so the farm HAD delivered it — what failed there was the
+#     BYTE-IDENTICAL to origin/main, so the DEPLOYED COPY WAS CURRENT (delivered by some path other
+#     than this farm — `lane-watchdog.py` is in no farm array) — what failed there was the
 #     INVOCATION, and #1738 states it deliberately did not establish the mechanism. So #1738 must not
 #     be cited as a repo↔live identity failure; that instrument is #1760/#1759's, not this one.
 check_fleet_srcs_farmed() {

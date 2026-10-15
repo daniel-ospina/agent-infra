@@ -3,32 +3,50 @@
 # live ~/orchestrator runtime, and bring the cross-box claim registry up for the first time.
 #
 # Why it is staged (two phases) rather than one atomic swap:
-#   bash reads a script incrementally, so overwriting orch-loop.sh while pid N is executing
-#   it can run mixed content (half old, half new). And killing the controller kills the
-#   lane-* sessions under it, which hold UNCOMMITTED work. So:
-#     Phase A (immediate, safe) — copy everything EXCEPT orch-loop.sh. Every worker script is
-#       re-read from disk at spawn time, so new merge/fix workers pick up claims.sh at once.
-#       This is what activates cross-box claiming, and it activates it WITHOUT a restart.
-#     Phase B (when quiet)      — copy orch-loop.sh, restart the controller, verify.
-#   Waiting costs nothing and loses no work; skipping the wait can.
+#   bash reads a script incrementally, so an IN-PLACE overwrite (`cp over` truncates the same inode)
+#   while pid N is executing it can run mixed content (half old, half new). The fix is ATOMIC:
+#   write a temp file in the same directory and `mv` it over the target, which gives the target a
+#   NEW inode — a running bash keeps reading its old inode through its open fd, so nothing is ever
+#   half-read. Every file is installed that way, in BOTH phases.
+#   NOT a reason to wait, and this file previously said so wrongly: "killing the controller kills
+#   the lane-* sessions under it, which hold UNCOMMITTED work" is FALSE. The controller's only trap
+#   is `rm -f "$LOCKF"` (orch-loop.sh:340), and workers are spawned as `tmux new-session -d -s
+#   "merge-$PR" "bash '$O/merge-one.sh' …"` — children of the TMUX SERVER, not of the controller.
+#   Killing the controller therefore leaves every in-flight worker running; that false premise made
+#   phase B wait for a zero-in-flight moment on a Mac that merges ~39 PRs/12h and so deferred it
+#   three times (~2.5h of waiting) without protecting anything. `WAIT=1` is now OPT-IN.
 #
-# Usage:  bash deploy-mac-orchestrator.sh            # A now, B when quiet
+# Usage:  bash deploy-mac-orchestrator.sh            # A now, B now (atomic swap + restart)
 #         PHASE=A bash deploy-mac-orchestrator.sh    # A only
-#         WAIT=0  bash deploy-mac-orchestrator.sh    # don't wait for quiet (still restarts)
+#         WAIT=1  bash deploy-mac-orchestrator.sh    # ALSO wait for a zero-in-flight moment first
+#                                                    # (preference, never a safety requirement)
 set -uo pipefail
 
 AI_MAIN="${AI_MAIN:-$HOME/Documents/GitHub/agent-infra}"
 SRC_REF="${SRC_REF:-origin/main}"
 O="${O:-$HOME/orchestrator}"
 PHASE="${PHASE:-AB}"
-WAIT="${WAIT:-1}"
+WAIT="${WAIT:-0}"
 PATIENCE="${PATIENCE:-2400}"     # seconds to wait for a quiet moment before giving up on B
 STAGE="${STAGE:-/tmp/harness-main.$$}"
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
 inflight() { tmux ls 2>/dev/null | grep -cE '^(merge|fix)-'; }
-controller_pids() { pgrep -f '[o]rch-loop\.sh' 2>/dev/null; }
+# ⛔ SCOPED to THIS runtime's controller. An unscoped `pgrep -f '[o]rch-loop\.sh'` matches every
+# controller-shaped process on the box — measured 2026-10-15 it matched FOUR: this Mac's real
+# controller, a leaked 2h-old test fixture running `bash ./orch-loop.sh` in a temp dir, and two
+# fixtures of a PEER LANE's test that was running at that moment. An unscoped kill would have taken
+# out a peer lane's test. A destructive verb must be scoped to its own target.
+controller_pids() { pgrep -f "[b]ash $O/orch-loop\.sh" 2>/dev/null; }
+# Atomic install: temp file in the SAME directory, then rename (new inode). A running bash keeps
+# reading its old inode, so a swap can never be read half-old/half-new — the property that makes
+# phase A and phase B safe at ANY time, in-flight work or not.
+install_file() { # install_file <src> <dst>
+  local s="$1" d="$2" t
+  t="$(dirname "$d")/.$(basename "$d").new.$$"
+  cp "$s" "$t" && mv -f "$t" "$d"
+}
 
 log "=== deploy Mac orchestrator: $SRC_REF -> $O (phase $PHASE) ==="
 
@@ -49,14 +67,14 @@ log "  claims.sh $(wc -c < "$H/claims.sh" | tr -d ' ') bytes, sha256 $(shasum -a
 log "before: $(controller_pids | wc -l | tr -d ' ') controller pid(s), $(inflight) in-flight lane/merge session(s)"
 log "before: $O/claims.sh $([ -f "$O/claims.sh" ] && echo present || echo ABSENT)"
 
-# ---- 2. Phase A: copy everything but orch-loop.sh --------------------------------------
+# ---- 2. Phase A: copy everything but orch-loop.sh (atomically) -------------------------
 # Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/,
 # merged-not-closed.sh) is NOT in the harness, so it is never touched. merged-not-closed.sh
 # is a Mac-only script the agent-infra harness does not carry — deliberately preserved.
 for f in "$H"/*; do
   b="$(basename "$f")"
   [ "$b" = "orch-loop.sh" ] && continue
-  if [ -d "$f" ]; then cp -R "$f" "$O/"; else cp "$f" "$O/"; fi
+  if [ -d "$f" ]; then cp -R "$f" "$O/"; else install_file "$f" "$O/$b"; fi
 done
 log "phase A: copied $(ls "$H" | grep -vc '^orch-loop.sh$') entries"
 [ -f "$O/claims.sh" ] || { log "FATAL: claims.sh did not land in $O"; exit 1; }
@@ -67,7 +85,9 @@ log "               the controller itself still lacks the snapshot/restart half.
 
 [ "$PHASE" = "A" ] && { log "DONE (phase A only)"; rm -rf "$STAGE"; exit 0; }
 
-# ---- 3. Phase B: wait for a quiet moment ----------------------------------------------
+# ---- 3. Phase B: OPTIONAL preference wait for a quiet moment (WAIT=1) ------------------
+# Not a safety requirement any more: the swap below is atomic and the controller's exit does not
+# touch workers. Kept only as a preference for operators who dislike a mid-iteration restart.
 if [ "$WAIT" = "1" ]; then
   t0=$SECONDS
   while :; do
@@ -84,9 +104,9 @@ if [ "$WAIT" = "1" ]; then
   done
 fi
 
-# ---- 4. Phase B: swap orch-loop.sh, restart, verify ------------------------------------
-cp "$H/orch-loop.sh" "$O/orch-loop.sh"
-log "phase B: orch-loop.sh replaced ($(shasum -a 256 "$O/orch-loop.sh" | cut -c1-16))"
+# ---- 4. Phase B: swap orch-loop.sh (atomic), restart, verify ---------------------------
+install_file "$H/orch-loop.sh" "$O/orch-loop.sh"
+log "phase B: orch-loop.sh replaced (atomic rename; inode now $(ls -i "$O/orch-loop.sh" | awk '{print $1}'))"
 
 PIDS="$(controller_pids)"
 log "stopping controller pid(s): $(echo $PIDS | tr '\n' ' ')"
