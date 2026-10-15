@@ -1,0 +1,940 @@
+#!/usr/bin/env python3
+"""Tests for lane-watchdog — MUTATION tests for the three reaping gates.
+
+This file is a guard rail, not documentation. The watched script signals processes, so every test
+here exists to prove a specific way it could kill something it must not:
+
+  * a subtree that is WORKING                 -> never a candidate (gate 1)
+  * a parked child with a BUSY grandchild     -> never a candidate (gate 1, subtree not process)
+  * a lane's OWN pi                           -> never a candidate (only dispatched offspring)
+  * anything under a human terminal           -> refused outright (gate 2)
+  * a chain we cannot prove is the fleet's    -> refused outright (gate 2)
+  * a young process                           -> not ripe (gate 3)
+  * one frozen sample                         -> not ripe; needs ticks (gate 3)
+  * no `--apply`                              -> nothing is ever signalled
+
+If a change makes any of these pass for the wrong reason, the change removed a gate.
+"""
+import importlib.util
+import json
+import os
+import time
+
+import pytest
+
+_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lane-watchdog.py")
+
+# Every realistic table needs the fleet boundary in it, or gate 2 refuses it by default -- which is
+# the correct polarity ("an unproven target is reported, never reaped") and these tables honour it.
+CMUX = "/Applications/cmux.app/Contents/MacOS/cmux"
+BASE = {
+    1: dict(ppid=0, stat="Ss", cpu=0.0, cmd="/sbin/launchd"),
+    100: dict(ppid=1, stat="Ss", cpu=0.0, cmd=CMUX),
+}
+
+
+@pytest.fixture(scope="module")
+def W():
+    spec = importlib.util.spec_from_file_location("lane_watchdog_under_test", _PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_paths(W, monkeypatch, tmp_path):
+    """⛔ EVERY TEST IN THIS FILE RUNS INSIDE THIS FIXTURE (#1734, measured 2026-10-13).
+
+    `_log()` appends to the module-global `LOG`, which resolves to
+    `~/.pi/agent/state/lane-watchdog.jsonl` -- the PRODUCTION reaper log, and the artifact an operator
+    reads to tell "the reaper is fine and found nothing" from "the reaper has been inert for a week".
+    Tests that call `reap()` -- and `frozen_subtrees()`, which logs its abstentions directly -- wrote
+    the production log. The worst of them drives `reap()` against a LIVE pid to prove the fence, so
+    its rows carry a real host pid and read as production rows in that file. No count is asserted
+    here: it is a moving number in a file this docstring cannot revalidate, and the recipe below
+    measures it on demand.
+
+    Redirecting the three paths here rather than in each test makes this hermetic BY CONSTRUCTION: a
+    test added later is inside the fixture unless it deliberately undoes it. This is the same class
+    as #1696 (an unreadable input treated as a definite answer) and as the cache non-hermeticity
+    review cycle 4 found in `test_lane_status.py` -- applied to the EVIDENCE, where the damage is not
+    transient: it survives the run and is read later by someone who cannot know which rows are real.
+
+    The proof is external and depends on no test remembering anything -- run it before trusting this:
+
+        before=$(shasum -a 256 ~/.pi/agent/state/lane-watchdog.jsonl)
+        /usr/bin/python3 -m pytest scripts/test_lane_watchdog.py -q
+        after=$(shasum -a 256 ~/.pi/agent/state/lane-watchdog.jsonl)
+        [ "$before" = "$after" ]   # a full run must leave the production log BYTE-identical
+    """
+    home = os.path.expanduser("~/.pi/agent/state")
+    for name in ("STATE", "LOG", "LOCK"):
+        monkeypatch.setattr(W, name, str(tmp_path / name.lower()))
+        assert not getattr(W, name).startswith(home), f"{name} still points at production"
+
+
+def test_the_suite_never_points_at_the_production_state_files(W):
+    """⛔ THE FIXTURE MUST BE IN FORCE, NOT MERELY PRESENT (#1734). Deleting `_hermetic_paths` must
+    fail HERE. Without this test the fixture is a convention, and the next edit that removes it
+    silently resumes writing fixture rows into the reaper's operational history, where they cannot be
+    told from real ones."""
+    home = os.path.expanduser("~/.pi/agent/state")
+    for name in ("STATE", "LOG", "LOCK"):
+        value = getattr(W, name)
+        assert not value.startswith(home), f"{name} points at production during tests: {value}"
+
+
+def T(ppid, cpu=0.0, stat="Ss", cmd="pi"):
+    """One `ps` row."""
+    return dict(ppid=ppid, stat=stat, cpu=cpu, cmd=cmd)
+
+
+def stub_rule(tmp_path, status="holder", rc=0):
+    """A stand-in for `scripts/lib/pid-identity.sh`, so a test can put ANY verdict in front of the
+    identity fence without depending on a live process table."""
+    p = tmp_path / f"stub-rule-{status}-{rc}.sh"
+    p.write_text(f'#!/usr/bin/env bash\necho "{status} pid=${{2:-?}}"\nexit {rc}\n')
+    return str(p)
+
+
+def ripen(W, monkeypatch, tmp_path, argv):
+    """Put a genuinely ripe candidate in front of `main()`, with the tick internals stubbed."""
+    (tmp_path / "ripe.json").write_text(json.dumps(
+        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
+                 "subtree": [300]}}))
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
+    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    monkeypatch.setattr(W, "ps_table",
+                        lambda: {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+                                 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
+
+
+def test_cpu_seconds_parses_every_ps_shape(W):
+    assert W.cpu_seconds("0:09.69") == pytest.approx(9.69)
+    assert W.cpu_seconds("1:04:00") == pytest.approx(3840.0)
+    assert W.cpu_seconds("02-01:00:00") == pytest.approx(2 * 86400 + 3600.0)
+    assert W.cpu_seconds("garbage") == 0.0
+
+
+# ── GATE 1: zero CPU delta, measured over the whole SUBTREE ───────────────────
+
+def test_a_working_child_is_never_a_candidate(W):
+    """The one true positive this must never produce: a child doing work."""
+    a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=5.0)}
+    b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=12.5)}
+    assert W.frozen_subtrees(a, b) == [], "a child that burned 7.5s of CPU is WORKING"
+
+
+def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W):
+    """⛔ THE SUBTREE, NOT THE PROCESS. A `pi` wrapper sits at ~0 CPU while its own bash child does
+    the work -- judging the process alone would reap a subtree that is demonstrably busy. Measured
+    shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a `curl -sS --http1.1 -m 25`."""
+    a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
+         301: T(300, cpu=1.0, cmd="curl -sS --http1.1 -m 25 ...")}
+    b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
+         301: T(300, cpu=2.0, cmd="curl -sS --http1.1 -m 25 ...")}
+    assert W.frozen_subtrees(a, b) == [], "the grandchild is working -- nothing here is frozen"
+
+
+def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W):
+    """The real positive: three children of the orchestrator, `Ss`, dCPU exactly 0, no transcript."""
+    a = {**BASE, 1727: T(100, cpu=50.0), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
+    b = {**BASE, 1727: T(100, cpu=50.7), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
+    got = W.frozen_subtrees(a, b)
+    assert {c["pid"] for c in got} == {36186, 36189}
+    for c in got:
+        assert c["ppid"] == 1727 and c["d_cpu"] == 0.0
+
+
+def test_a_lane_own_pi_is_never_a_candidate(W):
+    """⛔ IT REAPS THE CHILD, NEVER THE LANE. The lane's pi holds the conversation and its context;
+    the frozen offspring hold nothing. Killing the parent destroys the work we are trying to save."""
+    a = {**BASE, 1727: T(100, cpu=50.0)}
+    b = {**BASE, 1727: T(100, cpu=50.0)}
+    assert W.frozen_subtrees(a, b) == [], "the lane's own pi must never be a candidate"
+
+
+def test_a_bash_child_is_not_a_candidate(W):
+    """Only dispatched `pi` offspring. A parked `bash` wrapper is not a stuck dispatch."""
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
+    assert W.frozen_subtrees(a, b) == []
+
+
+def test_a_live_tool_call_under_the_child_is_never_a_candidate(W):
+    """⛔ THE P0 REVIEW 2 KILLED. The first attempt at this rule rejected children with a SHELL
+    descendant -- which does not survive contact with bash: bash `exec`s a SINGLE SIMPLE COMMAND, so
+    `bash -c "gh run watch 123"` leaves NO shell in the tree and the poller IS the descendant. All
+    four pollers the rule named (gh run watch / npm ci / docker build / sleep 1800) passed it. An
+    adversarial review then ran it against the live table and found it flagging ITS OWN SESSION.
+
+    The rule that is actually true of a tool call and false of the measured orphan: a tool call
+    always leaves a NON-`pi` process under the child (the command bash exec'd into), while the orphan
+    had no descendants at all. So a candidate may only have `pi` under it.
+
+    The shape below is REAL -- measured on this box by the orchestrator: pi -> bash -> uv -> pytest,
+    and by the reviewer: a tool shell exec'd into its command.
+    """
+    # bash exec'd into the poller: NO shell survives, exactly as bash behaves
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+         400: T(300, cpu=0.5, cmd="sleep 1800")}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+         400: T(300, cpu=0.5, cmd="sleep 1800")}
+    assert W.frozen_subtrees(a, b) == [], "a poller bash exec'd into is NOT a hang"
+
+    # the orchestrator's measured live-work chain: pi -> bash -> uv -> pytest
+    a2 = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+          400: T(300, cpu=2.0, cmd="/bin/bash -c export PATH=... uv run pytest"),
+          401: T(400, cpu=3.0, cmd="uv run pytest"), 402: T(401, cpu=9.0, cmd="pytest")}
+    b2 = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+          400: T(300, cpu=2.0, cmd="/bin/bash -c export PATH=... uv run pytest"),
+          401: T(400, cpu=3.0, cmd="uv run pytest"), 402: T(401, cpu=9.0, cmd="pytest")}
+    assert W.frozen_subtrees(a2, b2) == [], "live pytest work is NOT a hang"
+
+    # and a nested `pi` is the ONLY descendant form allowed
+    a3 = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+          400: T(300, cpu=2.0, cmd="pi")}
+    b3 = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
+          400: T(300, cpu=2.0, cmd="pi")}
+    # (400 is itself a pi under a pi, so it is reported as a candidate too -- reaping either
+    # removes the subtree, and a vanished target is handled as success.)
+    assert 300 in {c["pid"] for c in W.frozen_subtrees(a3, b3)}, \
+        "a child whose only descendant is another pi is still a candidate"
+
+
+def test_the_frozen_bound_exceeds_the_harness_own_stall_bound(W):
+    """⛔ The threshold is justified by the harness's own 20-minute bound, so it must EXCEED it.
+    At 900s it did not, and the effective floor was lower still (the clock started during MIN_AGE)."""
+    assert W.FROZEN_MIN > 1200, "must exceed TASK_STREAM_STALL_MS (1200000ms = 1200s)"
+    assert W.MIN_AGE > 0
+
+
+def test_the_frozen_clock_does_not_start_during_the_min_age_window(W):
+    """A young candidate must accrue NOTHING -- otherwise the effective floor is
+    MIN_AGE - tick_spacing + FROZEN_MIN instead of MIN_AGE + FROZEN_MIN."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=100, d_cpu=0.0, subtree=[300])]
+    _, _, _, ticks = W.evaluate(cands, table, {}, now=1000.0)
+    assert ticks.get("300") is None, "a too-young child must not start its clock"
+    # and once it is old enough, the clock starts from THAT observation
+    cands2 = [dict(pid=300, ppid=200, age_s=99999, d_cpu=0.0, subtree=[300])]
+    _, _, _, ticks2 = W.evaluate(cands2, table, ticks, now=2000.0)
+    assert ticks2["300"]["first_seen"] == 2000.0
+
+
+def test_is_pi_does_not_match_an_argument_named_pi(W):
+    """`endswith("/pi")` also matched `grep -n foo /pi`."""
+    assert W.is_pi(T(1, cmd="pi")) is True
+    assert W.is_pi(T(1, cmd="/Users/x/.local/share/pi-node/current/bin/pi")) is True
+    assert W.is_pi(T(1, cmd="grep -n foo /pi")) is False
+    assert W.is_pi(T(1, cmd="/bin/bash -c x")) is False
+
+
+def test_the_cpu_tolerance_is_stated_and_tiny(W):
+    """The tolerance must be a NAMED constant, because a sub-0.1s twitch has the same signature
+    from a parked fork child, a human's prompt redraw, and a timer wake."""
+    assert 0 < W.CPU_TOL <= 0.5
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0 + W.CPU_TOL * 2)}
+    assert W.frozen_subtrees(a, b) == [], "above the tolerance is not frozen"
+
+
+# ── GATE 2: the ancestry walk ────────────────────────────────────────────────
+
+def test_a_human_terminal_ancestor_is_refused_outright(W):
+    """⛔ THE GATE THAT MUST NEVER BE WEAKENED. Near-miss 2026-09-17: a parked-CPU rule nearly
+    killed the owner's own interactive terminal; only the ancestry walk stopped it. And `ppid 1`
+    proves nothing -- a daemonising service reparents to 1 BY DESIGN."""
+    table = {1: T(0, cmd="/sbin/launchd"),
+             50: T(1, cmd="/Applications/Terminal.app/Contents/MacOS/Terminal"),
+             60: T(50, cmd="-zsh"), 70: T(60, cpu=1.0), 80: T(70, cpu=1.0)}
+    assert W.human_above(80, table) is True
+    assert W.human_above(70, table) is True
+
+
+def test_an_iterm_ancestor_is_refused(W):
+    table = {1: T(0, cmd="/sbin/launchd"),
+             50: T(1, cmd="/Applications/iTerm.app/Contents/MacOS/iTerm2"), 70: T(50, cpu=1.0)}
+    assert W.human_above(70, table) is True
+
+
+def test_a_cmux_owned_chain_is_not_a_human_chain(W):
+    """⛔ THE FLEET'S OWN CHAIN MUST STAY REAPABLE, or the watchdog can never act on this box.
+
+    Measured ancestry for every lane here: the chain runs through `/usr/bin/login` AND `-/bin/zsh`
+    before reaching cmux. So "any login shell in the chain is a human" refuses EVERY lane -- safe,
+    and a no-op. The discriminator is the BOUNDARY, not the presence of a marker.
+    """
+    table = {1: T(0, cmd="/sbin/launchd"), 882: T(1, cmd=CMUX),
+             1047: T(882, cmd="/usr/bin/login -flp danielospina /bin/bash --noprofile --norc"),
+             1049: T(1047, cmd="-/bin/zsh"), 1727: T(1049, cmd="pi"),
+             36186: T(1727, cpu=1.0)}
+    assert W.human_above(36186, table) is False, "the fleet's own chain must be reapable"
+    assert W.human_above(1727, table) is False
+
+
+def test_a_human_terminal_below_cmux_still_wins(W):
+    """The boundary is walked NEAREST-FIRST, so a human terminal between the process and cmux is
+    still refused -- ordering is the mechanism, not the mere presence of a marker."""
+    table = {1: T(0, cmd="/sbin/launchd"), 882: T(1, cmd=CMUX),
+             900: T(882, cmd="/Applications/Terminal.app/Contents/MacOS/Terminal"),
+             910: T(900, cmd="-zsh"), 920: T(910, cpu=1.0)}
+    assert W.human_above(920, table) is True
+
+
+def test_an_unprovable_chain_is_refused(W):
+    """⛔ THE DEFAULT IS REFUSE. A chain with neither a human terminal nor cmux is one we cannot
+    prove is ours, and an unproven target is reported, never reaped."""
+    table = {1: T(0, cmd="/sbin/launchd"), 500: T(1, cmd="/some/daemon"), 510: T(500)}
+    assert W.human_above(510, table) is True
+
+
+def test_a_refused_candidate_is_not_ripe(W, monkeypatch):
+    """The gate must STOP the action, not merely annotate it."""
+    table = {1: T(0, cmd="/sbin/launchd"),
+             50: T(1, cmd="/Applications/Terminal.app/Contents/MacOS/Terminal"),
+             60: T(50, cmd="-zsh"), 200: T(60, cpu=1.0), 300: T(200, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=99999, d_cpu=0.0, subtree=[300])]
+    ripe, watching, refused, _ = W.evaluate(cands, table, {}, now=1e9)
+    assert ripe == [] and len(refused) == 1
+    assert "HUMAN" in refused[0]["reason"]
+
+
+# ── GATE 3: progress vs its own expected distribution ────────────────────────
+
+def test_a_young_child_is_not_ripe(W):
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=30, d_cpu=0.0, subtree=[300])]
+    ripe, watching, refused, _ = W.evaluate(cands, table, {}, now=1e9)
+    assert ripe == [] and refused == [] and len(watching) == 1
+    assert "young" in watching[0]["reason"]
+
+
+def test_one_frozen_sample_is_not_enough(W):
+    """⛔ A child in a long model call sits at zero CPU with no transcript growth for MINUTES --
+    exactly the frozen signature. One window cannot tell them apart, so it takes ticks."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=99999, d_cpu=0.0, subtree=[300])]
+    ripe, _, _, ticks = W.evaluate(cands, table, {}, now=1000.0)
+    assert ripe == [], "a first observation must never be ripe"
+    assert ticks["300"]["first_seen"] == 1000.0
+
+    ripe, _, _, ticks = W.evaluate(cands, table, ticks, now=1000.0 + W.FROZEN_MIN / 2)
+    assert ripe == [], "not enough ticks yet"
+
+    state = {"300": {"first_seen": 1000.0, "ticks": W.FROZEN_TICKS}}
+    ripe, _, _, _ = W.evaluate(cands, table, state, now=1000.0 + W.FROZEN_MIN + 1)
+    assert len(ripe) == 1 and ripe[0]["pid"] == 300
+    assert ripe[0]["frozen_for"] >= W.FROZEN_MIN
+
+
+# ── the action ───────────────────────────────────────────────────────────────
+
+def test_reap_terminates_the_subtree_children_first(W, monkeypatch, tmp_path):
+    """Children before parents, so nothing is reparented mid-kill, and the PARENT is never in the
+    signal list. The identity fence has to answer `holder` first -- see the fence tests below."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append((p, s)))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    cand = dict(pid=300, ppid=200, subtree=[300, 301], d_cpu=0.0, age_s=99999,
+                starts={300: 1.0, 301: 2.0})
+    res = W.reap(cand, {}, table, 1)
+    assert res["ended"] is True
+    assert sorted(p for p, _ in killed) == [300, 301]
+    assert 200 not in [p for p, _ in killed], "the parent lane's pi must never be signalled"
+    assert all(s == W.signal.SIGTERM for _, s in killed)
+
+
+def test_a_vanished_process_is_not_an_error(W, monkeypatch, tmp_path):
+    """A candidate can exit between the FENCE and the signal. The process being gone is the end state
+    we wanted, so it is neither an error nor counted as a kill."""
+    def boom(p, s):
+        raise ProcessLookupError()
+    monkeypatch.setattr(W.os, "kill", boom)
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
+    table = {**BASE, 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=1,
+                      starts={300: 1.0}), {}, table, 1)
+    assert res["ended"] is True and res.get("error") is None
+    assert res["killed"] == [] and res["vanished"] == [300]
+
+
+def test_dry_run_never_signals(W, monkeypatch, capsys, tmp_path):
+    """`--apply` is the only path that signals, and it is off by default: the action is a kill."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "s.json"))
+    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    monkeypatch.setattr(W, "ps_table", lambda: {
+        **BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+        200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+    # ⛔ DRIVE IT ALL THE WAY TO `ripe`, or the test passes vacuously: with an empty state a
+    # candidate is only ever "first observation", so `killed == []` would hold even if --apply
+    # defaulted to True. This state is exactly what a ripe candidate looks like on the next tick.
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
+    import json as _json
+    (tmp_path / "ripe.json").write_text(_json.dumps(
+        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
+                 "subtree": [300]}}))
+    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py", "--json"])
+    W.main()
+    assert killed == [], "a dry run must never signal, even with a ripe candidate"
+    assert '"reaped": []' in capsys.readouterr().out
+
+
+def test_a_changed_subtree_resets_the_clock(W):
+    """⛔ THE FALSE POSITIVE THAT NEARLY SHIPPED. Measured 2026-10-12: a live lane's child read
+    'frozen' at CPU 0:03.46 -> 0:03.46 while its bash child ran `sleep 180 && gh run view ...`,
+    which is zero-CPU BY CONSTRUCTION. A working subtree hands its descendants new pids each
+    iteration, so identical composition across ticks is the thing that is actually dead."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=99999, d_cpu=0.0, subtree=[300, 301])]
+    _, _, _, ticks = W.evaluate(cands, table, {}, now=1000.0)
+    assert ticks["300"]["subtree"] == [300, 301]
+
+    # next tick the poll loop has replaced its child with a new pid -> clock resets, never ripe
+    cands2 = [dict(pid=300, ppid=200, age_s=99999, d_cpu=0.0, subtree=[300, 302])]
+    table2 = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 302: T(300, cpu=1.0)}
+    state = {"300": dict(ticks["300"], ticks=W.FROZEN_TICKS)}
+    ripe, watching, _, ticks2 = W.evaluate(cands2, table2, state, now=1000.0 + W.FROZEN_MIN + 5)
+    assert ripe == [], "a subtree whose composition changed is doing something"
+    assert any("changed" in w["reason"] for w in watching)
+    assert ticks2["300"]["first_seen"] == 1000.0 + W.FROZEN_MIN + 5, "the clock must restart"
+
+
+# ── THE FENCE ON THE SIGNAL ITSELF (#1696) ───────────────────────────────────
+# ⛔ THE ACTION IS A KILL, SO THE FENCE IS PART OF THE CONTRACT. `reap()` signalled by pid alone, so
+# a pid recycled between the measurement and the `os.kill` received a SIGTERM meant for a corpse.
+# Every case below is a way that signal could land on the wrong process.
+
+def test_a_victim_the_rule_does_not_recognise_is_never_signalled(W, monkeypatch, tmp_path):
+    """A recycled pid is a DIFFERENT process. The shared rule answers `off-fence`, so the signal is
+    withheld -- this is the data-loss case the fence exists for."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "off-fence"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [], "an off-fence victim must NEVER be signalled"
+    assert res["ended"] is False
+    assert res["abstained"][0]["reason"].startswith("off-fence")
+
+
+def test_a_victim_the_rule_recognises_is_signalled(W, monkeypatch, tmp_path):
+    """The mirror: the fence must not degrade into a blanket refusal. `holder` still ends the
+    freeze, so a mutation that makes every victim abstain fails here."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", stub_rule(tmp_path, "holder"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [300] and res["ended"] is True and res["abstained"] == []
+
+
+def test_an_unreadable_rule_abstains_instead_of_signalling(W, monkeypatch, tmp_path):
+    """A missing or broken rule is `unknown`, and unknown withholds the signal. The fail-open
+    alternative -- 'no identity, proceed' -- is the bug class this file has already shipped once.
+    Abstaining costs an inert reaper, which is why the abstention is LOGGED and counted."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setenv("PI_PID_IDENTITY_LIB", str(tmp_path / "missing-rule.sh"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300], d_cpu=0.0, age_s=99999,
+                      starts={300: 1000.0}), {}, table, 1)
+    assert killed == [], "an unrunnable identity rule must never authorise a kill"
+    assert res["abstained"][0]["reason"].startswith("unknown")
+
+
+def test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation(W):
+    """Integration with the ACTUAL `scripts/lib/pid-identity.sh` -- no stub, because a stub cannot
+    prove we invoke the real rule, with the real argument shape, at the real path."""
+    me = os.getpid()
+    starts = W.ps_table().get(me, {})
+    start = starts.get("start")
+    if start is None:
+        pytest.skip("this platform's `ps -o lstart=` is unreadable, so the fence abstains")
+    assert W.probe_pid(me, start)[0] is True, "a live pid's own start must be a holder"
+    assert W.probe_pid(me, start - 5000)[0] is False, "5000s off is NOT the same process"
+    assert W.probe_pid(me, None)[0] is False, \
+        "no recorded incarnation must never authorise a signal"
+
+
+def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
+    """`absent` is not `holder`."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    table = {**BASE, 200: T(100, cpu=1.0)}
+    res = W.reap(dict(pid=999999, ppid=200, subtree=[999999], d_cpu=0.0, age_s=99999,
+                      starts={999999: 1000.0}), {}, table, 1)
+    assert killed == [] and res["abstained"][0]["reason"].startswith("absent")
+
+
+def test_the_measured_incarnation_is_attached_to_the_candidate(W):
+    """The fence can only check the incarnation the candidate CARRIES, and it must come from the
+    SAME snapshot that judged the subtree parked: a later read would record the REPLACEMENT's start,
+    so a recycled pid would answer `holder` and be signalled. Remove the attach and every victim
+    abstains -- an ARMED reaper that silently never acts."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    table[300]["start"] = 1111.0
+    table[301]["start"] = 2222.0
+    cands = W.frozen_subtrees(dict(table), dict(table))
+    assert cands and cands[0]["starts"] == {300: 1111.0, 301: 2222.0}
+
+
+def test_lstart_is_parsed_without_strptime_and_in_either_platform_order(W):
+    """⛔ MEASURED: one `strptime` format string cannot express BOTH field orders `ps` emits --
+    macOS prints `Sun 11 Oct 23:41:02 2026` (day first) and Linux `Mon Oct 13 09:41:20 2026`
+    (month first) -- and the day-first one raises `ValueError`. Either mistake empties the map, and
+    an empty map means no fence, which means no signal.
+
+    ⚠️ CORRECTED (review cycle 1): this test used to attribute the `ValueError` to the LOCALE. That
+    was false -- with `LC_TIME` unset the month-first string parses FINE; only the ORDER fails."""
+    assert W._lstart_to_epoch("not a date at all") is None
+    oct13 = W._lstart_to_epoch("Mon Oct 13 09:41:20 2026")
+    assert oct13 is not None, \
+        "the parse must SUCCEED -- a locale-bound `strptime` returns None for this on this host"
+    assert oct13 == W._lstart_to_epoch("Mon 13 Oct 09:41:20 2026"), \
+        "both platform field orders must resolve to the same instant"
+
+
+# ── `main()`: the ARMED dispatch, and a state write that cannot be swallowed (#1696) ────────────
+
+def test_apply_dispatches_to_reap(W, monkeypatch, tmp_path):
+    """⛔ THE WIRING, NOT THE BEHAVIOUR. Stubbing `reap()` used to leave the whole suite green, so a
+    later edit could disconnect the fence from the action with CI still passing. This drives
+    `main()` with `--apply` and a genuinely ripe candidate and asserts the dispatch happens."""
+    seen = []
+
+    def spy(cand, a, b, ts):
+        seen.append(cand["pid"])
+        return dict(pid=cand["pid"], ended=True, killed=[cand["pid"]])
+    monkeypatch.setattr(W, "reap", spy)
+    ripen(W, monkeypatch, tmp_path, ["--apply", "--json"])
+    assert W.main() == 0
+    assert seen == [300], "`--apply` with a ripe candidate MUST dispatch to reap()"
+
+
+def test_without_apply_reap_is_never_dispatched(W, monkeypatch, tmp_path):
+    """The mirror of the test above: the SAME ripe candidate, no `--apply`, no dispatch."""
+    seen = []
+    monkeypatch.setattr(W, "reap", lambda *a, **k: seen.append(a[0]["pid"]))
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0
+    assert seen == [], "a dry run must never reach the kill path"
+
+
+def test_a_failed_state_write_is_loud_and_loses_no_observation(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696-A. The old body swallowed its own failure around a TRUNCATING `open(path, "w")`: a
+    failed write left the file empty or half-written -- indistinguishable from "no prior
+    observation" -- so the frozen clock restarted and the reaper became INERT FOREVER while every
+    run reported success. Now: atomic, loud, non-zero, and the previous observation survives."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    assert json.loads(state.read_text()) == before
+
+    def boom(*a, **k):
+        raise OSError("ENOSPC")
+    monkeypatch.setattr(W.os, "replace", boom)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    rc = W.main()
+
+    assert rc == 3, "a run that could not persist its observation must NOT report a clean pass"
+    assert json.loads(state.read_text()) == before, "the previous observation must survive intact"
+    assert "state-write-failed" in (tmp_path / "l.jsonl").read_text()
+    assert not list(tmp_path.glob(".lane-watchdog-state.*.tmp")), "no temp file may be left behind"
+    assert json.loads(capsys.readouterr().out)["state_write"] == "failed"
+
+
+def test_a_failed_FIRST_ps_read_does_not_wipe_the_clock(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 2. Gating only the SECOND read leaves the same defect standing through
+    the first: `frozen_subtrees(a, b)` finds no `table_a` row for any pid, so it returns NO
+    candidates, `ticks` comes back empty, and the state file is overwritten with `{}` -- every frozen
+    clock wiped, while the run reports `state_write: ok` and exits 0. No test covered an `a`-only
+    failure, because the existing one stubs `ps_table` so that BOTH reads fail."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    real = {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+            200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        return {} if calls["n"] == 1 else real          # the FIRST read fails
+    monkeypatch.setattr(W, "ps_table", flaky)
+    assert W.main() == 3, "a failed FIRST read must not report a clean pass"
+    assert json.loads(state.read_text()) == before, "a failed FIRST read must NOT wipe the clock"
+    assert "ps-unreadable" in (tmp_path / "l.jsonl").read_text()
+
+
+def test_an_unreadable_state_file_is_not_an_empty_one(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 3. `except Exception: state = {}` made an INTACT but unreadable (or
+    truncated) state file -- the exact artifact the old truncating write left behind --
+    indistinguishable from a first run. The clock was then reset for EVERY candidate (another full
+    FROZEN_MIN of blindness) and the intact observation was OVERWRITTEN, while the run reported
+    `state_write: ok` and exited 0. A MISSING file is a genuine first run; anything else refuses."""
+    state = tmp_path / "s.json"
+    W.write_state(str(state), {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}})
+    intact = state.read_text()
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    os.chmod(state, 0)                       # intact on disk, unreadable to its own owner
+    try:
+        assert W.main() == 3, "an unreadable state file must not report a clean pass"
+        assert json.loads(capsys.readouterr().out)["state_unreadable"] is True
+        assert "state-unreadable" in (tmp_path / "l.jsonl").read_text()
+    finally:
+        os.chmod(state, 0o600)
+    assert state.read_text() == intact, "an unreadable state file must NOT be overwritten"
+
+
+def test_a_missing_state_file_is_a_first_run(W, monkeypatch, tmp_path):
+    """The mirror: the gate must not turn "no such file" into a refusal, or a fresh host could
+    never start. `ripen()` writes a state file, so point STATE at one that does not exist."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "never-written.json"))
+    assert W.main() == 0, "a missing state file is a genuine first run, not an unreadable one"
+
+
+def test_a_successful_run_reports_the_state_write(W, monkeypatch, tmp_path, capsys):
+    """⛔ THE REPORT MUST SAY THE OBSERVATION WAS PERSISTED. `state_write` was emitted ONLY on
+    failure, so a healthy run and a run whose field was absent were indistinguishable -- and an
+    evidence line quoting `state_write=ok` was not producible by the code at all (#1696, cycle 1)."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0
+    assert json.loads(capsys.readouterr().out)["state_write"] == "ok"
+
+
+def test_an_unreadable_ps_is_not_persisted_as_an_empty_fleet(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 1. `ps_table()` returns `{}` on ANY failure, and `{}` was written as a
+    definite "no processes" -- filtering every candidate out of `alive` and wiping EVERY frozen
+    clock. One transient `ps` timeout reset the whole gate; a persistent one was an ARMED reaper
+    that never ripens while exiting 0 and logging nothing."""
+    before = {"300": {"first_seen": 1234.0, "ticks": 7, "subtree": [300]}}
+    state = tmp_path / "s.json"
+    W.write_state(str(state), before)
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    monkeypatch.setattr(W, "STATE", str(state))
+    monkeypatch.setattr(W, "ps_table", lambda: {})          # the read FAILED
+    rc = W.main()
+    assert rc == 3, "an unreadable `ps` must not report a clean pass"
+    assert json.loads(state.read_text()) == before, "a failed read must NOT wipe the frozen clock"
+    assert json.loads(capsys.readouterr().out)["ps_readable"] is False
+    assert "ps-unreadable" in (tmp_path / "l.jsonl").read_text()
+
+
+def test_an_uncreated_lock_is_loud_and_non_zero(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 1. Contention is normal and silent; an UNCREATABLE lock is an
+    environmental failure that makes the reaper inert -- and in the production invocation
+    (`nohup ... --apply >> "$LOG"`) it printed nothing and exited 0, never reaching the loud
+    state-write path because it returns before it."""
+    ripen(W, monkeypatch, tmp_path, ["--apply"])
+    blocker = tmp_path / "afile"
+    blocker.write_text("not a directory")
+    monkeypatch.setattr(W, "LOCK", str(blocker / "lock"))
+    assert W.main() == 3, "an inert run for an environmental reason must NOT look healthy"
+    assert "lock-unavailable" in (tmp_path / "l.jsonl").read_text()
+    assert "LOCK UNAVAILABLE" in capsys.readouterr().err
+
+
+def test_reap_fences_on_the_RECORDED_incarnation(W, monkeypatch):
+    """⛔ THE ARGUMENT, NOT JUST THE CALL (#1696, review cycle 1). A stub rule that ignores the start
+    cannot distinguish "we passed the incarnation we measured" from "we passed `None`, or re-read
+    `lstart` at signal time" -- and both of those one-line edits kept all 45 tests green while
+    turning the fence into a tautology. This uses the REAL rule and a LIVE pid: the recorded start
+    authorises, an off-by-5000s record does not, and no record at all does not."""
+    me = os.getpid()
+    start = W.ps_table().get(me, {}).get("start")
+    if start is None:
+        pytest.skip("this platform's `ps -o lstart=` is unreadable")
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    table = {**BASE, 200: T(100, cpu=1.0), me: T(200, cpu=1.0)}
+
+    def candidate(recorded):
+        return dict(pid=me, ppid=200, subtree=[me], d_cpu=0.0, age_s=99999, starts=recorded)
+
+    assert W.reap(candidate({me: start}), {}, table, 1)["killed"] == [me]
+    killed.clear()
+    res = W.reap(candidate({me: start - 5000}), {}, table, 1)
+    assert killed == [], "a record 5000s off must NOT authorise a signal"
+    assert res["abstained"][0]["reason"].startswith("off-fence")
+    res = W.reap(candidate({}), {}, table, 1)
+    assert killed == [], "no recorded incarnation must NOT authorise a signal"
+    assert res["abstained"][0]["reason"].startswith("unknown")
+
+
+def test_a_partly_abstained_candidate_has_not_ended(W, monkeypatch):
+    """⛔ #1696, review cycle 1: `ended` was true when NOTHING was signalled but a sibling abstained.
+    An abstained victim is still frozen, so the freeze did not provably end."""
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "probe_pid",
+                        lambda pid, start, lib=None: (pid == 301,
+                                                      "holder" if pid == 301 else "off-fence"))
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
+    res = W.reap(dict(pid=300, ppid=200, subtree=[300, 301], d_cpu=0.0, age_s=99999,
+                      starts={300: 1.0, 301: 2.0}), {}, table, 1)
+    assert killed == [301] and res["abstained"][0]["pid"] == 300
+    assert res["ended"] is False, "an abstained victim is still frozen -- it has not ended"
+
+
+def test_a_second_run_cannot_double_count_ticks(W, monkeypatch, tmp_path):
+    """⛔ THE LOCK IS A GATE, NOT A NICETY. Two concurrent runs would both read the same state and
+    both see the other's `first_seen`, so a candidate could reach FROZEN_TICKS in seconds instead of
+    minutes -- collapsing the rule that separates a stuck child from one in a long model call."""
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    first, why = W.acquire_lock()
+    assert first is not None and why is None, "the first run must acquire"
+    second, why2 = W.acquire_lock()
+    assert second is None, "a concurrent run must be refused"
+    # ⛔ CONTENTION IS NOT AN ENVIRONMENTAL FAILURE, and the two must stay distinguishable: `held` is
+    # normal and silent, `unavailable` is an inert reaper that must be loud (#1696, cycle 1).
+    assert why2 == "held", "a held lock must not be reported as an unusable one"
+    # released, a later run acquires again (a killed run cannot leave the fleet wedged)
+    import fcntl
+    fcntl.flock(first, fcntl.LOCK_UN)
+    third, _ = W.acquire_lock()
+    assert third is not None
+
+
+def test_a_locked_run_observes_nothing_and_signals_nothing(W, monkeypatch, capsys, tmp_path):
+    killed = []
+    monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "s.json"))
+    # ⛔ KEEP THE HANDLE. `main` holds its own for the whole run; a dropped reference closes the fd
+    # and silently releases the lock, so a test that discards it proves nothing.
+    held, _ = W.acquire_lock()                          # a run is already in progress
+    assert held is not None
+    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py", "--apply", "--json"])
+    assert W.main() == 0
+    assert killed == []
+    assert "another run holds the lock" in capsys.readouterr().out
+
+
+# ── the liveness gate: an established connection is NOT a hang ─────────────────
+# ⛔ Measured by review 2026-10-12: a WORKING `task` child sat exactly on the frozen shape --
+# zero descendants, subΔCPU 0.00 -- excluded only by a 0.44s CPU reading. A live provider call HOLDS
+# AN ESTABLISHED CONNECTION; the two genuinely-wedged children held none, in every sample.
+
+def test_a_child_holding_an_established_connection_is_never_a_candidate(W, monkeypatch):
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: True)
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    assert W.frozen_subtrees(a, b) == [], "a child in a live model call is NOT a hang"
+
+
+def test_an_unknown_connection_state_refuses(W, monkeypatch):
+    """⛔ UNKNOWN MUST REFUSE. lsof failing/timing out is not evidence of no connection, and this
+    gate authorises a kill -- every other unclear read in the file abstains."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: None)
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    assert W.frozen_subtrees(a, b) == [], "an unreadable connection state must refuse"
+
+
+def test_a_child_with_no_connection_is_still_a_candidate(W, monkeypatch):
+    """The gate must not make the detector a no-op: the measured orphan held no connection."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    assert [c["pid"] for c in W.frozen_subtrees(a, b)] == [300]
+
+
+def test_a_failed_lsof_never_reads_as_no_connection(W, monkeypatch):
+    """⛔ THE CALLEE, NOT THE CONSUMER — THIS IS THE READ THAT AUTHORISES THE KILL (2026-10-13).
+
+    `test_an_unknown_connection_state_refuses` proves the CONSUMER's polarity by monkeypatching
+    `has_live_connection` ITSELF, so it stayed green while the function returned `False` for an
+    lsof that FAILED — and `False` is the only value that puts a child in the reap set. Probe the
+    function, not its callers.
+
+    ⛔ THE EXPECTATIONS BELOW ARE MEASURED ON THIS HOST (lsof 4.91), because the first cut of this
+    fix inverted them: a dead pid and a live pid with no established TCP BOTH exit **1** with empty
+    stdout AND empty stderr, while a genuine failure exits 1 but writes to stderr. A `rc != 0 ->
+    None` rule would have made the reaper permanently INERT; a `bool(stdout)` rule made a failed
+    read a kill licence. Both are wrong, in opposite directions.
+    """
+    class R:
+        def __init__(self, rc, out="", err=""):
+            self.returncode, self.stdout, self.stderr = rc, out, err
+
+    def fake(rc, out="", err=""):
+        monkeypatch.setattr(W.subprocess, "run", lambda *a, **k: R(rc, out, err))
+        return W.has_live_connection(4242)
+
+    # ── the measured "ran fine, located nothing" shape: silence on both streams at rc=1 ──
+    assert fake(1) is False, "lsof rc=1 with no output is the genuine 'no connection'"
+    # ── anything that FAILED, however it reports, is UNKNOWN and must refuse ──
+    assert fake(1, err="lsof: illegal option character: -\n") is None, "a failing lsof is UNKNOWN"
+    assert fake(127) is None, "a missing lsof is UNKNOWN"
+    assert fake(-9) is None, "a signalled lsof is UNKNOWN"
+    assert fake(0) is None, "rc=0 with NO output is anomalous, not a clean 'no connection'"
+    assert fake(2, out="something") is None, "output with a dirty exit is UNKNOWN"
+    # a timeout / spawn failure raises, and must also refuse
+    def boom(*a, **k):
+        raise OSError("timed out")
+    monkeypatch.setattr(W.subprocess, "run", boom)
+    assert W.has_live_connection(4242) is None
+    # ── FALSE-BLOCK CONTROL: the one shape that means a connection is HELD ──
+    assert fake(0, out="COMMAND  PID USER FD TYPE\npi 4242 d 12u IPv4 0x1 0t0 TCP a->b:443 (ESTABLISHED)\n") is True
+
+
+def test_the_connection_probe_still_licenses_a_reap(W, monkeypatch):
+    """The other pole. If the probe never returns False the watchdog is an INERT enforcer, so the
+    'no connection' path must still reach the reap set through the REAL probe (not a stub)."""
+    class R:
+        returncode, stdout, stderr = 1, "", ""
+    monkeypatch.setattr(W.subprocess, "run", lambda *a, **k: R())
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    assert [c["pid"] for c in W.frozen_subtrees(a, b)] == [300]
+
+
+def test_a_live_connection_anywhere_in_the_subtree_refuses_the_candidate(W, monkeypatch):
+    """⛔ THE CONNECTION GATE MUST COVER THE SUBTREE, NOT JUST THE CANDIDATE ROOT (2026-10-13).
+
+    `reap()` signals EVERY pid in `cand["subtree"]`, but the gate asked only about `cand["pid"]`.
+    A nested dispatch (`pi -> pi`, which the `is_pi` rule above explicitly permits) is exactly the
+    shape where that matters. ⛔ MEASURED against this function, cmux(100) <- pi(10) <- pi(50) <- pi(60):
+
+        no connection held  -> candidates [(50, [50, 60]), (60, [60])]
+        60 holds one        -> []                     <- BEFORE the fix: [(50, [50, 60])]
+        50 holds one        -> [(60, [60])]           <- 60 is judged on itself, still eligible
+
+    So 60 — correctly excluded as its OWN candidate — was dragged into 50's kill list, i.e. the
+    provider call this gate exists to protect was killed through its parent.
+    """
+    tbl = {**BASE, 10: T(100, cpu=1.0), 50: T(10, cpu=1.0), 60: T(50, cpu=1.0)}
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 60)
+    assert W.frozen_subtrees(tbl, tbl) == [], (
+        "a live connection in the subtree must refuse the candidate that would signal it")
+    # ⛔ FALSE-BLOCK CONTROL: a connection on 50 refuses 50 only -- 60 is judged on 60 and stays
+    # eligible, or the reaper would be inert whenever any ancestor happened to hold one.
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 50)
+    assert [c["pid"] for c in W.frozen_subtrees(tbl, tbl)] == [60]
+
+
+def test_the_recycle_baseline_is_recorded_per_pid(W):
+    """⛔ `birth`/`recycled` LEAKED ACROSS CANDIDATES, DEFEATING THE RECYCLE GUARD (2026-10-13).
+
+    Both were bound in the candidate loop and then read again in the separate persistence loop, so
+    EVERY entry carried the LAST candidate's values. MEASURED by review: `birth[300]` persisted as
+    1999300.0 when its true value was 1995000.0. The recycle check is the only thing that resets
+    `first_seen` for a reused pid, so a poisoned baseline lets a genuinely recycled pid inherit the
+    dead process's clock and ripen on a three-day-old `frozen_for` — the exact P0 the guard and its
+    own test were written for. Siblings spawned in one parallel `task` round are born within seconds
+    of each other, i.e. the one moment the leaked baseline is close enough to mask a recycle. The
+    existing test could not see this: it supplies a SINGLE candidate.
+    """
+    tbl = {**BASE, 200: T(100, cpu=1.0), 300: T(100, cpu=1.0)}
+    now = 1_000_000.0
+    cands = [dict(pid=200, subtree=[200], age_s=1000, ppid=100, d_cpu=0.0),
+             dict(pid=300, subtree=[300], age_s=9000, ppid=100, d_cpu=0.0)]
+    _ripe, _watching, _refused, ticks = W.evaluate(cands, tbl, {}, now=now, min_age=1)
+    assert ticks["200"]["birth"] == now - 1000, (
+        "pid 200's baseline was poisoned by another candidate: %r" % ticks["200"]["birth"])
+    assert ticks["300"]["birth"] == now - 9000
+
+
+# ── fail-open P2s found by review cycle 3 ────────────────────────────────────
+
+def test_an_unreadable_age_refuses_rather_than_skipping_min_age(W, monkeypatch):
+    """⛔ `age_s < min_age` is FALSE when age is None, so MIN_AGE was skipped entirely and the
+    candidate ripened at +FROZEN_MIN regardless of how new it was. Verified by probe before the fix:
+    age_s=None ripened on the second pass at +1801s."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    cands = [dict(pid=300, ppid=200, age_s=None, d_cpu=0.0, subtree=[300])]
+    state = {"300": {"first_seen": 1000.0, "ticks": W.FROZEN_TICKS, "subtree": [300]}}
+    ripe, watching, _, _ = W.evaluate(cands, table, state, now=1000.0 + W.FROZEN_MIN + 5)
+    assert ripe == [], "an unreadable age must never ripen"
+    assert any("age unreadable" in w["reason"] for w in watching)
+
+
+def test_a_recycled_pid_does_not_inherit_the_dead_process_clock(W, monkeypatch):
+    """⛔ The observation is keyed by pid alone. Review measured a 601-second-old process ripening on
+    its FIRST observation with `frozen_for: 259200` taken from a three-day-old row for a recycled
+    pid. The process birth epoch must match."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    now = 1_000_000.0
+    # `age_s` says this process is 601s old, so its birth epoch is now-601
+    cands = [dict(pid=300, ppid=200, age_s=601, d_cpu=0.0, subtree=[300])]
+    # ... but the persisted row was written for a process born THREE DAYS ago
+    state = {"300": {"first_seen": now - 259200, "ticks": W.FROZEN_TICKS, "subtree": [300],
+                     "birth": now - 259200}}
+    ripe, watching, _, ticks = W.evaluate(cands, table, state, now=now)
+    assert ripe == [], "a recycled pid must not inherit the dead process's clock"
+    assert any("recycled" in w["reason"] for w in watching)
+    assert ticks["300"]["first_seen"] == now, "the clock must restart at this observation"
+    assert ticks["300"]["ticks"] == 1
+
+
+def test_descendants_terminates_on_a_cycle(W):
+    """A ppid cycle made the loop run forever; a hung run holds the flock for the life of the
+    process, so every later run exits `skipped` and the guard dies silently."""
+    import threading
+    table = {1: T(0), 2: T(3), 3: T(2)}          # 2 <-> 3 cycle, rooted at 1 via 2/3 unreachable
+    out = {}
+    t = threading.Thread(target=lambda: out.update(r=W.descendants(2, table)))
+    t.daemon = True
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "descendants() must terminate on a cyclic table"
+
+
+def test_an_unreadable_connection_probe_refuses_instead_of_silently_emptying(W, monkeypatch, tmp_path, capsys):
+    """⛔ #1696, review cycle 4. `has_live_connection` returns None when `lsof` is missing, errors or
+    times out (30s bound), and the gate read `is not False` -- so THREE different worlds produced
+    identical output: a child holding an established provider call, a child with no connection, and a
+    BROKEN PROBE. In all three the candidate set came back empty, the state file was overwritten with
+    the empty observation (another full FROZEN_MIN of blindness) and the run exited 0 with NOTHING
+    logged -- so an operator could not tell a working reaper from a disarmed one. Measured before the
+    fix: an unreadable probe and a live connection were byte-for-byte identical. This is the same
+    'an input that could not be read is treated as a definite answer' class the other three inputs
+    (ps, lock, state) already refuse on."""
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    ripe = tmp_path / "ripe.json"
+    before = ripe.read_bytes()
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: None)   # lsof broken
+    assert W.main() == 3, "an unreadable probe must refuse, not report a clean empty fleet"
+    assert json.loads(capsys.readouterr().out)["connection_unreadable"] >= 1
+    assert "connection-unreadable" in (tmp_path / "l.jsonl").read_text()
+    assert ripe.read_bytes() == before, "a refused run must not overwrite the observation state"
+
+
+def test_frozen_subtrees_records_an_unreadable_probe_instead_of_dropping_the_candidate(W, monkeypatch):
+    """The unit-level half: the pid is REPORTED, so the refusal above can name what it refused over."""
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: None)
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    unreadable = []
+    assert W.frozen_subtrees(table, table, unreadable=unreadable) == []
+    assert unreadable == [300], unreadable
+
+
+def test_a_working_probe_is_still_decisive_in_both_directions(W, monkeypatch):
+    """The mirror, so the new refusal cannot swallow a working probe: False (no connection) must
+    still yield the candidate, and True (an established connection) must still spare it."""
+    table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    unreadable = []
+    assert [c["pid"] for c in W.frozen_subtrees(table, table, unreadable=unreadable)] == [300]
+    assert unreadable == []
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: True)
+    assert W.frozen_subtrees(table, table) == []

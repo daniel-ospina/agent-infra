@@ -448,22 +448,63 @@ printf 'edited\n' >"$WT_DIRTY/base.txt"                       # tracked modifica
 # ignored-artifact gate.
 printf 'secret\n' >"$REPO/.gitignore"
 printf 'secret.env\n' >>"$REPO/.gitignore"
-"$REAL_GIT" -C "$REPO" add .gitignore
+printf '__pycache__/\n' >>"$REPO/.gitignore"
+printf '*.egg-info/\n' >>"$REPO/.gitignore"
+printf 'data/\n' >>"$REPO/.gitignore"
+# `sub/` must hold a TRACKED file or git collapses the whole directory to a
+# single `!! sub/` entry and the nested `__pycache__/` never appears on its own
+# — the estate's `tests/__pycache__/` rows exist for exactly this reason.
+mkdir -p "$REPO/sub"; printf 'keep\n' >"$REPO/sub/keep.txt"
+# G2f needs BOTH a space-free `website/` and a `website (copy)/`: the regression
+# it guards is the unquoted payload loop splitting `website (copy)/__pycache__/`
+# into `website` + `(copy)/__pycache__/` and `rm -rf`-ing the tracked `website/`.
+# Without an actual `website/` the split token matches nothing and the bug is
+# invisible, which is exactly why this fixture carries both.
+mkdir -p "$REPO/website" "$REPO/website (copy)"
+printf 'important\n' >"$REPO/website/important.txt"
+printf 'keep\n' >"$REPO/website (copy)/keep.txt"
+"$REAL_GIT" -C "$REPO" add .gitignore sub/keep.txt website/important.txt "website (copy)/keep.txt"
 GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
 WT_IGN="$(add_named_wt "$REPO" "$ENV-ignored" feat/g2-ignored)"
 printf 'token=abc\n' >"$WT_IGN/secret.env"                    # IGNORED non-ephemeral
 WT_EPH="$(add_named_wt "$REPO" "$ENV-ephemeral" feat/g2-eph)"
 mkdir -p "$WT_EPH/.venv/bin"; printf 'py\n' >"$WT_EPH/.venv/bin/python"
+# G2d: a worktree whose ONLY dirt is a regenerable build/test cache (nested
+# `__pycache__/` + a root `*.egg-info/`) is NOT work and must be reclaimable.
+# This is the measured dominant class: 2044 of the 3045 ignored entries on the
+# live 294-worktree estate are `__pycache__`.
+WT_CACHE="$(add_named_wt "$REPO" "$ENV-cache" feat/g2-cache)"
+mkdir -p "$WT_CACHE/sub/__pycache__" "$WT_CACHE/tortoise_graph.egg-info"
+printf 'x\n' >"$WT_CACHE/sub/__pycache__/m.pyc"
+printf 'y\n' >"$WT_CACHE/tortoise_graph.egg-info/PKG-INFO"
+# G2e: the NEGATIVE control. A gitignored artifact that is NOT a build cache is
+# operator data (`tortoise.db`, `*.npz`, `*.report.json` on the live estate) and
+# must keep preserving -- otherwise the allowlist has silently become the
+# blanket rule that destroys it.
+WT_DATA="$(add_named_wt "$REPO" "$ENV-data" feat/g2-data)"
+mkdir -p "$WT_DATA/data"; printf 'z\n' >"$WT_DATA/data/notes.txt"
+# G2f: a REGENERABLE cache whose path contains a SPACE. It must not enter the
+# `clean` payload — that payload is expanded UNQUOTED by remove_one and `rm
+# -rf`'d, so a spaced path would split and delete an unrelated TRACKED dir.
+WT_SPACE="$(add_named_wt "$REPO" "$ENV-space" feat/g2-space)"
+mkdir -p "$WT_SPACE/website (copy)/__pycache__"
+printf 'x\n' >"$WT_SPACE/website (copy)/__pycache__/m.pyc"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_DIRTY")" "reason=dirty" "G2a tracked modification => preserve dirty"
 assert_contains "$(row_for "$OUT" "$WT_DIRTY")" "base.txt" "G2a dirty reason names the offending path"
 assert_contains "$(row_for "$OUT" "$WT_IGN")" "reason=ignored-artifact" \
     "G2b gitignored non-ephemeral => preserve (git does NOT refuse these)"
 assert_contains "$(row_for "$OUT" "$WT_EPH")" "reason=reclaimable" "G2c .venv-only => reclaimable (measured 14-row class)"
+assert_contains "$(row_for "$OUT" "$WT_CACHE")" "reason=reclaimable" "G2d regenerable-cache-only (nested __pycache__, root *.egg-info) => reclaimable"
+assert_contains "$(row_for "$OUT" "$WT_DATA")" "reason=ignored-artifact" "G2e gitignored NON-cache artifact => preserve (allowlist is not a blanket rule)"
+assert_contains "$(row_for "$OUT" "$WT_SPACE")" "reason=reclaimable" "G2f a spaced regenerable-cache path must not split the unquoted deletion payload"
 run_reaper $ENV --apply --repo "$REPO" >/dev/null 2>&1
 assert_dir "$WT_DIRTY" "G2a --apply preserves the dirty worktree"
 assert_dir "$WT_IGN" "G2b --apply preserves the ignored-artifact worktree"
 assert_nodir "$WT_EPH" "G2c --apply removes the .venv-only worktree"
+assert_nodir "$WT_CACHE" "G2d --apply removes the regenerable-cache-only worktree"
+assert_dir "$WT_DATA" "G2e --apply preserves the non-cache ignored-artifact worktree"
+assert_nodir "$WT_SPACE" "G2f --apply removes the spaced-cache worktree (no partial rm -rf of the tracked sibling)"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/g2-eph | wc -l | tr -d ' ')" "1" \
     "G2c branch ref survives the checkout removal"
 
