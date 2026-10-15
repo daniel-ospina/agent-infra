@@ -9,8 +9,9 @@
  * Nothing recorded what a surface actually installed. The one version artifact that
  * existed, `.agent-infra-version`, holds a RELEASE STRING ("0.1.0") that is byte-identical
  * on every box whatever was really copied — measured 2026-10-14: 21/22 extensions identical
- * but `cmux-session.ts` deployed at 74,220 B against the repo's 55,408 B (+18.8 KB main does
- * not have), 4 stale scripts, and 79 installed scripts that exist in no repo file. A string
+ * but `cmux-session.ts` deployed at 74,220 B against the then-repo's 55,408 B (+18.8 KB the
+ * repo did not have; re-synced by #1793), 4 stale scripts, and 79 installed scripts that exist
+ * in no repo file. A string
  * cannot see any of that, and no commit was recorded at all.
  *
  * A commit COUNT cannot replace it either, and that is measured too: on this machine
@@ -26,7 +27,7 @@
  * -----------------------------
  * `<surface>/.agent-infra-stamp.json` pins the COMMIT the installer came from and a
  * PAYLOAD HASH of the operational files it installed. The commit alone cannot distinguish a
- * hand-copied or hand-edited install (the +18.8 KB above); the hash alone cannot say whether
+ * hand-copied or hand-edited install (the +18.8 KB divergence above); the hash alone cannot say whether
  * the install is on main's line (the `e8d5ce29` cell). Together they answer the question.
  *
  * VERDICTS — exactly three, and no fourth hiding in the output
