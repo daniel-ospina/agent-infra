@@ -333,7 +333,8 @@ function recoveryOnlyRoot(root: string): string {
   if (picked === null) return root;
   console.log(
     `[verification-gate] ↔ #3255: no verified entries for ${normalizeWorktreeRoot(root)}; ` +
-      `adopting ${picked} (same repo, has verified entries) as the git-op root`,
+      `recovering entries recorded for ${picked} (same repo) — the git-op root is NOT adopted: ` +
+      `the command's own cwd stays authoritative, and a root mismatch is diagnosed separately`,
   );
   return picked;
 }
