@@ -680,6 +680,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "worker-log freshness bound — an AGED, not family-named, bound",
   },
+  {
+    name: "SWEEP_MAX_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${SWEEP_MAX_AGE:-600}"',
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/sweep-quota.test.sh value + non-vacuity pin (fixtures 5, 11 and 13 drive the staleness floor: a stale stamp forces the fetch, a future stamp and a >10-digit stamp are both dropped)",
+    overrides: ["SWEEP_MAX_AGE=600"],
+    note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",
