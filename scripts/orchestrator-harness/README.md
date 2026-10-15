@@ -209,7 +209,8 @@ the fact: the PR body names the comment it was signed against.
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
-| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra` |
+| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra` — and a cell gets the whole farm, not this one file, from `pi-bootstrap/cell-install.sh` (below) |
+| **the operational layer** (`~/.pi/agent/{scripts,extensions,skills,AGENTS.md,settings.json}`) | a lane is only as guarded as its `pi`; without the layer a box has **no review-enforcer, no verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no skills** | installed by `pi-bootstrap/cell-install.sh`, and on a cell it runs from `cloud-cell-bringup.sh --check`. Measured 2026-10-15 on a live cell: `scripts/` did not exist at all (24/24 declared farm files absent), and the merge path died `rc=127` on the missing `record-review.sh` (agent-infra#1723) |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge without it.** Treat as a secret; never commit it |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
@@ -222,6 +223,18 @@ work unless they coordinate (see §5, "broad mode").
 ---
 
 ## 4. Install
+
+**On a cmux cloud cell**, the whole prerequisite list above is provisioned by
+`scripts/cloud-cell-bringup.sh --check`, which installs the operational layer from the
+agent-infra checkout already on the cell via `pi-bootstrap/cell-install.sh` and REFUSES to
+print `CELL READY` if the layer cannot be installed. `cell-install.sh` copies the farm set
+that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), every extension in
+`manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
+the skill tree, `templates/AGENTS.base.md` and a merged `settings.json`; run it with
+`--verify` to check an existing cell with no writes.
+
+**On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
+checkout:
 
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.

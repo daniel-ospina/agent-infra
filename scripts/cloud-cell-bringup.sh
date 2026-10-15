@@ -32,6 +32,19 @@
 #
 # Also note: `cmux vm exec` does NOT forward stdin — `gh auth login --with-token`
 # piped in HANGS until timeout (measured: exit 124). Push a secret file instead.
+#
+#  (4) THE OPERATIONAL LAYER IS NOT ON THE CELL (agent-infra#1723).  Measured 2026-10-15 on the
+#      live cell pi-lane-1 / vm-efa6cc8fdb974e61b5c054acf41d8846: $CELL_HOME/.pi/agent held only
+#      models.json, auth.json, .ai-review-gate-key, reviews/, state/, audit/ and shims/ — no
+#      scripts/ (the directory did not exist), no extensions/, no skills/, no AGENTS.md, no
+#      settings.json. So a cell lane ran with NO review-enforcer, verification-gate,
+#      main-worktree-guard, search-guard or audit-logger — not the same guards as a laptop lane —
+#      and its merge path died rc=127 on the missing $HOME/.pi/agent/scripts/record-review.sh,
+#      the exact path merge-one.sh:240 executes.
+#      FIX: install it BY CONSTRUCTION — pi-bootstrap/cell-install.sh, run from the --check path
+#      below, from an agent-infra checkout that is already on the cell. A cell that cannot
+#      receive the layer is REFUSED rather than certified: a green `CELL READY` over an
+#      unguarded cell is the false PASS this whole script exists to remove.
 
 set -uo pipefail
 
@@ -185,6 +198,55 @@ check_dispatch() {
   ok "dispatch provisioning pre-flight passed"
 }
 
+# ── the operational layer (agent-infra#1723) ─────────────────────────────────────
+# WHY, in one line: without this, a cell lane runs with no review-enforcer, no
+# verification-gate, no main-worktree-guard, no search-guard, no audit-logger and no skills,
+# and its merge path dies rc=127 on the missing scripts/record-review.sh — the exact path
+# merge-one.sh:240 executes. See the header's (4).
+#
+# FATAL, not best-effort, and deliberately unlike check_dispatch above: the supervisor's
+# cmd_check covers only record-review.sh + diff-normalize.py (2 of the 24 declared farm
+# files), so if this step is skipped nothing else ever installs the guards. A "CELL READY"
+# over an unguarded cell is exactly the false PASS this repo keeps removing, and the remedy
+# is one env var (`INFRA_ROOT=<checkout>`) — so refuse.
+check_operational_layer() {
+  local cand root="" installer os_release
+  # A cell keeps its agent-infra checkout in any of a few places (this script is normally
+  # pushed STANDALONE, so its own directory proves nothing). Identical candidate list to
+  # cell-install.sh's own resolver, plus ${BASH_SOURCE[0]}/.. for a run from the checkout.
+  for cand in "${INFRA_ROOT:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" \
+              "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" \
+              "$CELL_HOME/agent-infra" /tmp/cell-ai; do
+    [ -n "$cand" ] || continue
+    if [ -f "$cand/pi-bootstrap/cell-install.sh" ]; then root="$cand"; break; fi
+  done
+  if [ -z "$root" ]; then
+    die "no agent-infra checkout on this cell (looked at \$INFRA_ROOT, $(dirname "${BASH_SOURCE[0]}")/.., \$AGENT_INFRA_PATH, \${HARNESS}/.., $CELL_HOME/agent-infra, /tmp/cell-ai).
+       The operational layer (guards, skills, the merge-path record-review.sh) cannot be installed,
+       so this cell would run unguarded with a rc=127 merge path. Clone agent-infra onto the cell
+       and re-run:  INFRA_ROOT=<checkout> bash $0 --check"
+  fi
+  installer="$root/pi-bootstrap/cell-install.sh"
+  ok "installing the operational layer from $root"
+  # The installer both installs AND verifies (--install ends in verify_layer). Its exit status
+  # is captured from the COMMAND, never from a `| sed` pipeline — a decoration that swallows a
+  # failure is how a false PASS gets minted. Its output is indented so the layer's own
+  # failures never read as bring-up chatter.
+  local out rc=0
+  out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  if [ "$rc" -ne 0 ]; then
+    die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
+  fi
+  ok "operational layer present and verified ($CELL_HOME/.pi/agent)"
+  # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
+  # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
+  if [ -r /etc/os-release ]; then
+    os_release="$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}")"
+    ok "cell surface: ${os_release:-unknown} (Linux — cmux-session.ts and launchd are not installed)"
+  fi
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -197,7 +259,8 @@ main() {
       check_gh
       check_repo
       check_dispatch
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight)"
+      check_operational_layer
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

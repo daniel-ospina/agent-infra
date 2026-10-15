@@ -1,0 +1,639 @@
+#!/bin/bash
+# ============================================================
+# cell-install.sh — install the fleet's operational layer into a cmux cloud cell
+# ============================================================
+#
+# WHY THIS EXISTS (the defect, measured 2026-10-15 on the live cell `pi-lane-1`
+# vm-efa6cc8fdb974e61b5c054acf41d8846, HOME=/tmp/cell-home)
+# ---------------------------------------------------------------------------
+# A cell's ~/.pi/agent held ONLY models.json, auth.json, .ai-review-gate-key,
+# reviews/, state/, audit/ and shims/. Measured against the laptop:
+#
+#   | the operational layer                                        | laptop | cell |
+#   |--------------------------------------------------------------|--------|------|
+#   | ~/.pi/agent/scripts  (the declared farm set, 24 files)        | 24/24  | 0/24 (the directory did not exist) |
+#   | ~/.pi/agent/extensions                                        | 25 sym + 6 real | absent |
+#   | ~/.pi/agent/skills                                            | 304 items | absent |
+#   | ~/.pi/agent/AGENTS.md, settings.json, .mcp.json               | present | absent |
+#
+# The consequence is not cosmetic: a cell's pi runs with **no review-enforcer, no
+# verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no
+# auto-sync, and no skills** — so a cell lane is NOT under the same guards as a laptop
+# lane — and its merge path died `rc=127` because `~/.pi/agent/scripts/record-review.sh`
+# did not exist (`scripts/orchestrator-harness/merge-one.sh:240` executes that exact path).
+#
+# This script is the installer half: a Linux cell gets the layer the same way a Mac does —
+# by running the installer against an agent-infra checkout that is ALREADY on the cell.
+# It deliberately does NOT invent a download path (no tarball, no `git clone`): the cell
+# clones agent-infra (the harness lives there), and this script reads that checkout.
+#
+# ── SURFACE-AWARE SELECTION (why this is not a blanket `cp -R`) ───────────────
+# A cell is a headless Linux VM: no cmux desktop app, no launchd, no ~/Documents, no
+# eldato design checkout, no human at the console. Three of those are real selection
+# criteria; the rest of the layer is installed verbatim, because the whole point is that
+# a cell lane runs under the SAME guards as a laptop lane.
+#
+# 1. FARMED SCRIPTS — copied from the DECLARED farm set, never from a glob.
+#    `pi-bootstrap/setup.sh` is the single declaration of what the farm carries; this
+#    script PARSES its array declarations — the four it declares today (`fleet_srcs`,
+#    `lib_srcs`, `fleet_tools`, `merge_gate_srcs`) PLUS the two #1552/#1553 adds
+#    (`lane_root_srcs`, `lane_srcs`), so the mapping is already complete when that lands —
+#    plus its `scripts_dir` checkout-hygiene farm, and copies exactly those, preserving the
+#    relative layout setup.sh documents (`scripts/lib/`, `scripts/fleet/`). A farm array
+#    this script does not know how to lay out is a LOUD failure, never a silent skip: an
+#    unparsed farm would leave a cell with a partial layer that still reports success.
+#    The parse is the same shape as `scripts/run-bash-shards.sh --list`, which reads its
+#    own shard lines rather than keeping a second copy of them.
+#    NOTE the dest is `scripts/fleet/`, never `tools/fleet/`: pi's startup migration treats
+#    ANY entry under ~/.pi/agent/tools/ other than fd/rg as a legacy custom-tools directory
+#    and then BLOCKS every interactive boot on an untimed keypress prompt (#1277).
+#
+# 2. EXTENSIONS — every entry of `manifest.json` `files.extensions/.entries` (the consumer
+#    ship-list, which `scripts/check-pi-config-extensions.sh` check 4 keeps in exact parity
+#    with `extensions/`), MINUS a declared deny list. The default is parity, on purpose:
+#    a new guard extension must reach a cell without anyone remembering to add it here.
+#    The deny list is entries whose operation needs a surface a Linux cell does not have:
+#
+#      * `cmux-session.ts` — the bridge to the **cmux desktop app** (`cmux hooks pi install`
+#        owns and upgrades this file in place, and it `spawn`s the `cmux` CLI on every
+#        lifecycle hook). A cell is a headless VM: there is no app, and no `cmux` binary to
+#        spawn, so every hook would fail. Hand-copying it is additionally the #1760
+#        duplicate-payload defect — the live laptop file is v4 (+18.8 KB, #1138) while the
+#        repo snapshot is v2, so a copied one is stale the moment it lands.
+#
+#    Everything else is installed. That IS the per-entry decision:
+#      * the five guards — review-enforcer, verification-gate, main-worktree-guard,
+#        search-guard, audit-logger.ts — plus `shared/`, which every grouped extension
+#        imports at load time (without it the guards do not load at all);
+#      * the dispatch path a cell lane uses — builtin-tools/, subagent/, task-cwd-guard/,
+#        task-heartbeat.ts, provider-exhaustion.ts;
+#      * the skill layer — skill-enforcer.ts, skill-registry.ts, sequence-enforcer/,
+#        loop-enforcer/ (a cell lane reads the skills this same script installs);
+#      * survivability — clamp-output-floor.ts, compaction-watchdog.ts, http-pool-hygiene/
+#        (a headless lane must not die silently on a context clamp or a killed socket);
+#      * convergence + observability — auto-sync.ts, repo-freshness.ts, session-checks.ts,
+#        health-check/;
+#      * inert-without-a-credential, installed anyway — mcp-client/, the provider
+#        registrations (custom-provider-openrouter/, custom-provider-qwen/), reflect-hook.ts,
+#        tortoise-capture/, slack-bridge/. These read keys/surfaces the operator may set in
+#        the cell's keys.env, and each is documented to degrade gracefully. `carousel-designer.ts`
+#        and `design-reviewer.ts` are also installed: recorded decision #45 KEEPS them in
+#        agent-infra as canonical with a graceful no-op when ELDATO_ROOT is unset, so
+#        env-gating them here would be adopting over a decision.
+#
+# 3. SKILLS + AGENTS.md + settings.json — installed, because a cell lane reads `skills/…`
+#    from its cwd (fragile: the target repo need not carry them) and gets no AGENTS.md at
+#    all today.
+#      * `AGENTS.md` comes from `templates/AGENTS.base.md`, the repo's declared
+#        universal-rules artifact ("copy to your repo as AGENTS.md"). The repo's own
+#        `AGENTS.md` is agent-infra's *repo-scoped* materialization (base + an agent-infra
+#        tail) and would mis-scope a cell lane working in another repo. It is installed
+#        only when ABSENT and never overwritten: a machine-global file is hand-edited
+#        state, and silently replacing it is how live rules would be lost. ⛔ The laptop's
+#        live `~/.pi/agent/AGENTS.md` ("Global agent instructions" — fleet state & recovery,
+#        the lane-partition rule, the reaping gates, JEV) exists in NO repo file, so a cell
+#        receives the universal base WITHOUT that overlay; that gap is issue #1193, not
+#        something this script can close by inventing a file.
+#      * `settings.json` is MERGED (source wins per key, local extras survive; `retry`
+#        deep-merged), the same contract as setup.sh — a cell's local tuning must survive
+#        a re-run.
+#      * `models.json` and `auth.json` are NOT touched. They are the cell's identity and
+#        keys, the measured cell already has them, and the defect table above names only
+#        AGENTS.md / settings.json / .mcp.json as absent.
+#      * `.mcp.json` is deliberately NOT installed. `templates/.mcp.base.json`'s only
+#        NON-lazy server is `tortoise` ("always (core)"), and it resolves
+#        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3` — a checkout
+#        and venv a cell does not have. Installing it would make every cell session start
+#        spawn a core server that cannot exist. `mcp-client/` IS installed, so a cell may
+#        add its own `.mcp.json`; the dispatch→review→merge cycle needs no MCP surface.
+#
+# 4. ⛔ NOTHING is written under `~/.pi/agent/tools/` except pi's own fd/rg. See the #1277
+#    note above; this script installs nothing there, removes a legacy `tools/fleet/` if it
+#    finds one, and FAILS LOUDLY if any other entry exists — a machine that cannot boot an
+#    interactive pi is not a machine that can run a lane.
+#
+# ── CONTRACT ─────────────────────────────────────────────────────────────────
+#   bash pi-bootstrap/cell-install.sh [--install|--verify|--help]
+#
+#   --install (default)  install the layer, then VERIFY it; non-zero if either fails.
+#   --verify             check an already-installed layer against the checkout; no writes.
+#   --help               print this header.
+#
+#   ENV  CELL_HOME    the cell home (default /tmp/cell-home; the cell's real HOME)
+#        INFRA_ROOT  the agent-infra checkout to install FROM. When unset it is resolved
+#                    from this script's own checkout, then AGENT_INFRA_PATH, $HARNESS/..,
+#                    $CELL_HOME/agent-infra and /tmp/cell-ai, and the script FAILS if none
+#                    of them is a checkout — a cell that cannot receive the layer must not
+#                    be certified.
+#
+#   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
+#   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
+#   same reason links are not used for launchd-invoked scripts), so a re-run overwrites a
+#   cell-local mutation to a farmed/guard file. Local EXTRAS survive (nothing is deleted
+#   except a denied extension and a legacy tools/fleet/).
+#
+# Exit: 0 = installed + verified, 1 = a failure (details on stdout/stderr), 2 = usage.
+# ============================================================
+# shellcheck disable=SC2016,SC2250
+
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+DEST="$CELL_HOME/.pi/agent"
+MODE="${1:---install}"
+
+FAILURES=0
+fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
+die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
+say()  { printf '  %s\n' "$*"; }
+
+# ── the deny list: surfaces a Linux cell does not have ───────────────────────
+# Kept as data so the deny is readable and testable, and so the DEFAULT for a new
+# manifest entry is "install" — the direction that cannot lose a guard.
+DENY_EXTENSIONS=(
+  cmux-session.ts        # bridge to the cmux DESKTOP APP (and spawns the `cmux` CLI per hook)
+)
+
+# ── the farm layout (#1723) ──────────────────────────────────────────────────
+# <array name in setup.sh><TAB><source root under $INFRA_ROOT><TAB><destination under $DEST>
+# An array in setup.sh that is NOT named here is a loud failure (see read_farm_set).
+FARM_LAYOUT="$(printf '%s\n' \
+  $'fleet_srcs\tscripts\tscripts' \
+  $'merge_gate_srcs\tscripts\tscripts' \
+  $'lane_root_srcs\tscripts\tscripts' \
+  $'lane_srcs\tscripts/lane\tscripts' \
+  $'lib_srcs\tscripts/lib\tscripts/lib' \
+  $'fleet_tools\ttools/fleet\tscripts/fleet')"
+
+# Files pi itself auto-extracts into ~/.pi/agent/tools/ and therefore tolerates (#1277).
+# pi's own rule, matched EXACTLY (dist/migrations.js `checkDeprecatedExtensionDirs`: it
+# lowercases the entry and allows only these four, plus any hidden entry). An exact match is
+# load-bearing: a PREFIX match would certify `rgfoo.py` — a non-fd/rg entry pi blocks every
+# interactive boot on — which is precisely the false PASS this installer exists to remove.
+TOOLS_ALLOWED_NAMES=( fd rg fd.exe rg.exe )
+
+# A FLOOR on the declared farm set, and the minimum ship-list size. These are not the list —
+# setup.sh and manifest.json are — they are the guard against a parse that SILENTLY SHRINKS
+# (a regex that stops at the wrong `)`, a renamed array, a manifest key that moved): such a
+# parse would install less and then verify clean against its own truncated reading. 24 farm
+# files and 31 ship-list entries exist at the time of writing; the floors leave room for
+# legitimate growth while a collapse is loud.
+MIN_FARM_FILES=20
+MIN_SHIP_LIST=10
+
+# ── locating the checkout to install FROM ────────────────────────────────────
+# A candidate "is a checkout" only if it carries BOTH files this script reads: the farm
+# declaration and the ship-list. Anything weaker would let a stray directory half-install.
+is_infra_checkout() {
+  [ -n "${1:-}" ] && [ -f "$1/pi-bootstrap/setup.sh" ] && [ -f "$1/manifest.json" ]
+}
+
+resolve_infra_root() {
+  local cand
+  # Order matters: an explicit INFRA_ROOT wins, then the checkout this script itself was
+  # shipped in (the strongest signal — it IS the checkout the installer came from), then the
+  # ambient/derived locations an operator or the supervisor may have exported.
+  for cand in "${INFRA_ROOT:-}" "$SELF_DIR/.." "${AGENT_INFRA_PATH:-}" \
+              "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra" /tmp/cell-ai; do
+    [ -n "$cand" ] || continue
+    if is_infra_checkout "$cand"; then
+      (cd "$cand" && pwd)
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ── the declared farm set, read out of setup.sh (ONE declaration) ────────────
+# Prints `srcrel<TAB>destrel<TAB>base` rows. Fails loudly (non-zero) when setup.sh
+# declares a farm array this script has no layout for — the alternative is silently
+# installing a partial layer.
+read_farm_set() {
+  python3 - "$INFRA_ROOT/pi-bootstrap/setup.sh" "$FARM_LAYOUT" <<'PY'
+import os
+import re
+import sys
+
+setup_path, layout = sys.argv[1], sys.argv[2]
+layout_map = {}
+for row in layout.splitlines():
+    row = row.strip()
+    if not row:
+        continue
+    name, src, dest = row.split("\t")
+    layout_map[name] = (src, dest)
+
+try:
+    src = open(setup_path).read()
+except OSError as exc:
+    sys.exit("FATAL: cannot read %s (%s)" % (setup_path, exc))
+
+# Every top-level `name=(...)` array in setup.sh. Continuations are joined because the
+# regex spans newlines (DOTALL) and a backslash continuation is dropped as a token below.
+arrays = {}
+for m in re.finditer(r'^([A-Za-z_][A-Za-z0-9_]*)=\((.*?)\)\s*$', src, re.M | re.S):
+    arrays[m.group(1)] = re.findall(r'[^\s\\]+', m.group(2))
+
+if not arrays:
+    sys.exit(
+        "FATAL: no farm arrays found in %s — setup.sh's shape changed, so this parse would "
+        "install an EMPTY layer and still verify clean" % setup_path
+    )
+
+unknown = sorted(n for n in arrays if n not in layout_map)
+if unknown:
+    sys.exit(
+        "FATAL: pi-bootstrap/setup.sh declares farm array(s) this installer does not know: "
+        + ", ".join(unknown)
+        + "\n       A farm added to setup.sh must be added to FARM_LAYOUT in cell-install.sh"
+        + "\n       (<name><TAB><source-root><TAB><destination>), or a cell silently gets a PARTIAL layer."
+    )
+
+for name in sorted(arrays):
+    src_root, dest_root = layout_map[name]
+    for base in arrays[name]:
+        if not base:
+            continue
+        print("\t".join((src_root, dest_root, base)))
+
+# The checkout-hygiene farm is a directory glob, not an array: setup.sh iterates
+# `$scripts_dir/*` and skips *.plist and *.test.*. Same rule, same destination.
+m = re.search(r'^scripts_dir="\$INFRA_ROOT/([^"]+)"', src, re.M)
+if not m:
+    sys.exit("FATAL: setup.sh no longer declares scripts_dir=$INFRA_ROOT/... — the checkout-hygiene farm cannot be located")
+hyg_rel = m.group(1)
+hyg_dir = os.path.normpath(os.path.join(os.path.dirname(setup_path), "..", hyg_rel))
+if not os.path.isdir(hyg_dir):
+    sys.exit("FATAL: %s is not a directory — the checkout-hygiene farm is missing" % hyg_dir)
+for base in sorted(os.listdir(hyg_dir)):
+    if base.endswith(".plist") or ".test." in base:
+        continue
+    if os.path.isfile(os.path.join(hyg_dir, base)):
+        print("\t".join((hyg_rel, "scripts/checkout-hygiene", base)))
+PY
+}
+
+# ── the extension ship-list, read out of manifest.json (ONE declaration) ─────
+read_manifest_entries() {
+  python3 - "$INFRA_ROOT/manifest.json" <<'PY'
+import json
+import sys
+
+# The key carries a trailing slash ("extensions/"), and this read mirrors the canonical
+# one in scripts/check-pi-config-extensions.sh check 4 — the gate that keeps this list in
+# exact parity with the extensions/ tree. A divergence between the two reads would be a
+# second, silently-different ship-list.
+try:
+    manifest = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as exc:
+    sys.exit("FATAL: cannot read %s as JSON (%s)" % (sys.argv[1], exc))
+entries = ((manifest.get("files") or {}).get("extensions/") or {}).get("entries")
+if not isinstance(entries, list) or not entries:
+    sys.exit("FATAL: %s has no files.extensions/.entries list — the consumer ship-list cannot be read" % sys.argv[1])
+for entry in entries:
+    print(entry.rstrip("/"))
+PY
+}
+
+# install_file <src> <dest> — real copy via a sibling temp + rename, so a concurrent
+# reader (record-review.sh can run during a merge while this installs) never sees a
+# truncated file.
+install_file() {
+  local src="$1" dest="$2"
+  mkdir -p "$(dirname "$dest")" || return 1
+  rm -f "$dest.tmp.$$"
+  cp -f "$src" "$dest.tmp.$$" \
+    && chmod +x "$dest.tmp.$$" 2>/dev/null \
+    && mv -f "$dest.tmp.$$" "$dest" \
+    && return 0
+  rm -f "$dest.tmp.$$"
+  return 1
+}
+
+# ── 1. farmed scripts ────────────────────────────────────────────────────────
+install_farms() {
+  local rows src_rel dest_rel base src dst n=0
+  rows="$(read_farm_set)" || die "the declared farm set could not be read from setup.sh (see above)"
+  while IFS=$'\t' read -r src_rel dest_rel base; do
+    [ -n "${base:-}" ] || continue
+    src="$INFRA_ROOT/$src_rel/$base"
+    dst="$DEST/$dest_rel/$base"
+    if [ ! -f "$src" ]; then
+      die "declared farm file $src is MISSING from the checkout — refusing to install a partial layer"
+    fi
+    if [ -L "$dst" ]; then rm -f "$dst"; fi   # never install through a stale/foreign link
+    install_file "$src" "$dst" || die "could not install $dst"
+    n=$((n + 1))
+  done <<<"$rows"
+  if [ "$n" -lt "$MIN_FARM_FILES" ]; then
+    die "the declared farm set parsed to only $n file(s) (floor: $MIN_FARM_FILES) — setup.sh's shape changed and this parse would install a PARTIAL layer, then verify clean against its own truncated reading. Nothing was certified."
+  fi
+  say "scripts farm: $n file(s) installed (declared by pi-bootstrap/setup.sh)"
+}
+
+# ── 2. extensions ────────────────────────────────────────────────────────────
+denied_extension() {
+  local base="$1" d
+  for d in "${DENY_EXTENSIONS[@]}"; do
+    [ "$d" = "$base" ] && return 0
+  done
+  return 1
+}
+
+install_extensions() {
+  local entries base src dst n=0 removed=0 total=0
+  entries="$(read_manifest_entries)" || die "the extension ship-list could not be read from manifest.json (see above)"
+  total="$(printf '%s\n' "$entries" | grep -c . || true)"
+  if [ "$total" -lt "$MIN_SHIP_LIST" ]; then
+    die "manifest.json's extension ship-list parsed to only $total entr(y|ies) (floor: $MIN_SHIP_LIST) — the ship-list key moved and this parse would install almost nothing"
+  fi
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    src="$INFRA_ROOT/extensions/$base"
+    dst="$DEST/extensions/$base"
+    if denied_extension "$base"; then
+      # enforce the deny, including against a previous hand-push
+      if [ -e "$dst" ] || [ -L "$dst" ]; then
+        rm -rf "$dst"
+        say "removed denied extension: $base (its surface is absent on a Linux cell)"
+        removed=$((removed + 1))
+      fi
+      continue
+    fi
+    [ -e "$src" ] || die "manifest lists extensions/$base but it is absent from the checkout"
+    if [ -L "$dst" ]; then rm -f "$dst"; fi   # a link into a checkout can dangle on a cell
+    if [ -f "$src" ]; then
+      install_file "$src" "$dst" || die "could not install $dst"
+    else
+      # `SRC/. DEST/` is the only cp form that does not NEST when DEST exists (#93).
+      mkdir -p "$dst" && cp -R "$src/." "$dst/" || die "could not install $dst"
+    fi
+    n=$((n + 1))
+  done <<<"$entries"
+  say "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied by surface, $removed removed"
+}
+
+# Extension runtime dependencies. Four shipped extensions import bare packages
+# (builtin-tools/typebox, mcp-client/@modelcontextprotocol/sdk+typebox,
+# loop-enforcer/@sinclair/typebox, custom-provider-qwen/undici) resolved from THEIR OWN
+# node_modules — pi's loader does not provide them. Without this step the cell gets the
+# files and none of the tools: `builtin-tools` IS the `task` dispatcher a lane uses.
+install_extension_deps() {
+  local d base
+  command -v npm >/dev/null 2>&1 \
+    || die "npm is missing: the shipped extensions that declare runtime deps cannot load without it (builtin-tools alone is the 'task' dispatcher)"
+  for d in "$DEST"/extensions/*/; do
+    [ -f "$d/package.json" ] || continue
+    base="$(basename "$d")"
+    if (cd "$d" && npm install --omit=dev --no-audit --no-fund >/dev/null 2>&1); then
+      say "deps installed: $base"
+    else
+      fail "npm install failed for $base — that extension will not load (re-run with network, or: cd '$d' && npm install --omit=dev)"
+    fi
+  done
+}
+
+# ── 3. skills + config ───────────────────────────────────────────────────────
+install_skills() {
+  [ -d "$INFRA_ROOT/skills" ] || die "no skills/ directory in $INFRA_ROOT"
+  mkdir -p "$DEST/skills" && cp -R "$INFRA_ROOT/skills/." "$DEST/skills/" \
+    || die "could not install skills"
+  say "skills: $(find "$DEST/skills" -name SKILL.md 2>/dev/null | wc -l | tr -d ' ') SKILL.md file(s) installed"
+}
+
+# copy_repo_path <rel> — install a repo file or directory at its basename under $DEST.
+copy_repo_path() {
+  local rel="$1" src="$INFRA_ROOT/$1" dst="$DEST/$(basename "$1")"
+  [ -e "$src" ] || return 0
+  if [ -L "$dst" ]; then rm -f "$dst"; fi
+  if [ -f "$src" ]; then
+    install_file "$src" "$dst"
+  else
+    mkdir -p "$dst" && cp -R "$src/." "$dst/"
+  fi
+}
+
+install_config() {
+  local rel
+  for rel in pi-bootstrap/pi-config/agents \
+             pi-bootstrap/pi-config/behavior-control \
+             pi-bootstrap/pi-config/coding-rules.md \
+             pi-bootstrap/pi-config/response-rules-reminder.md \
+             pi-bootstrap/pi-config/skills-repos.yaml; do
+    copy_repo_path "$rel" || fail "could not install $rel"
+  done
+  say "agents + behavior-control + small config files installed"
+
+  # settings.json — MERGED, never clobbered (same contract as setup.sh: source wins per
+  # key, local extras survive, `retry` deep-merged per key so a local
+  # `retry.enabled: false` kill switch cannot be reset by a re-run).
+  local src="$INFRA_ROOT/pi-bootstrap/pi-config/settings.json"
+  if [ -f "$src" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - "$src" "$DEST/settings.json" <<'PY' || fail "settings.json merge failed"
+import json
+import os
+import sys
+
+src = json.load(open(sys.argv[1]))
+dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
+merged = {**dst, **src}
+if isinstance(src.get("retry"), dict) and isinstance(dst.get("retry"), dict):
+    retry = {**dst["retry"], **src["retry"]}
+    if isinstance(src["retry"].get("provider"), dict) and isinstance(dst["retry"].get("provider"), dict):
+        retry["provider"] = {**dst["retry"]["provider"], **src["retry"]["provider"]}
+    merged["retry"] = retry
+json.dump(merged, open(sys.argv[2], "w"), indent=2)
+PY
+      say "settings.json merged (local extras preserved)"
+    elif [ -f "$DEST/settings.json" ]; then
+      fail "python3 is missing and settings.json already exists — refusing to clobber it; merge by hand or install python3"
+    else
+      install_file "$src" "$DEST/settings.json" || fail "could not install settings.json"
+      say "settings.json copied (python3 not found — plain copy)"
+    fi
+  fi
+
+  # AGENTS.md — installed when ABSENT, never overwritten.
+  local base_agents="$INFRA_ROOT/templates/AGENTS.base.md"
+  if [ -f "$base_agents" ]; then
+    if [ ! -e "$DEST/AGENTS.md" ]; then
+      install_file "$base_agents" "$DEST/AGENTS.md" || fail "could not install AGENTS.md"
+      say "AGENTS.md installed from templates/AGENTS.base.md"
+    elif ! cmp -s "$base_agents" "$DEST/AGENTS.md"; then
+      say "AGENTS.md already present and DIFFERS from templates/AGENTS.base.md — left alone (a global rules file is hand-edited state). Reconcile by hand."
+    else
+      say "AGENTS.md already matches templates/AGENTS.base.md"
+    fi
+  else
+    fail "templates/AGENTS.base.md is missing from $INFRA_ROOT — a cell would get no global rules"
+  fi
+}
+
+# ── 4. the ~/.pi/agent/tools/ constraint (#1277) ─────────────────────────────
+# Migration (INSTALL only — `--verify` writes nothing, so neither this nor the empty-dir
+# cleanup below may be reachable from it). The farm used to write here: pi's startup scan
+# rejects ANY non-fd/rg entry and then blocks every interactive boot on an untimed keypress
+# prompt — the fleet's entire dispatch path.
+migrate_legacy_tools_farm() {
+  if [ -d "$DEST/tools/fleet" ]; then
+    rm -rf "$DEST/tools/fleet"
+    say "migrated the legacy tools/fleet/ out of pi's boot-blocking namespace (#1277)"
+  fi
+  # A tools/ left empty by the removal above is not a boot-blocker (pi's scan ignores an
+  # empty dir) but it is noise, and setup.sh removes it too — same surface, same output.
+  if [ -d "$DEST/tools" ] && [ -z "$(ls -A "$DEST/tools" 2>/dev/null)" ]; then
+    rmdir "$DEST/tools" 2>/dev/null || true
+  fi
+}
+
+# Check (both modes; READ-ONLY — it must not even remove an empty directory, because
+# `--verify` is documented as writing nothing and a reader may run it on a live cell).
+guard_tools_dir() {
+  [ -d "$DEST/tools" ] || return 0
+  local entry lower stray=""
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    case "$entry" in .*) continue ;; esac   # pi ignores hidden entries too (.DS_Store)
+    lower="$(printf '%s' "$entry" | tr '[:upper:]' '[:lower:]')"
+    local allowed=0 a
+    for a in "${TOOLS_ALLOWED_NAMES[@]}"; do
+      [ "$lower" = "$a" ] && { allowed=1; break; }
+    done
+    [ "$allowed" -eq 1 ] || stray="$stray $entry"
+  done <<<"$(ls -A "$DEST/tools" 2>/dev/null)"
+  if [ -n "$stray" ]; then
+    fail "$DEST/tools/ contains non-fd/rg entries:$stray — pi blocks EVERY interactive boot on these (#1277)"
+  fi
+}
+
+# ── verify ───────────────────────────────────────────────────────────────────
+# A cell is certified only by reading the ARTIFACT back. Every declared farm file must be
+# present AND byte-identical to the checkout (the repo copy is the copy that must run),
+# every guard must have landed, the deny must hold, and the tools/ namespace must be clean.
+GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-guard audit-logger.ts shared)
+
+verify_layer() {
+  local rows src_rel dest_rel base src dst farm_n=0
+  rows="$(read_farm_set)" || { fail "the declared farm set could not be re-read from setup.sh"; return 0; }
+  while IFS=$'\t' read -r src_rel dest_rel base; do
+    [ -n "${base:-}" ] || continue
+    farm_n=$((farm_n + 1))
+    src="$INFRA_ROOT/$src_rel/$base"
+    dst="$DEST/$dest_rel/$base"
+    if [ ! -f "$dst" ]; then
+      fail "farmed script MISSING: $dest_rel/$base"
+    elif ! cmp -s "$src" "$dst"; then
+      fail "farmed script DIFFERS from the checkout: $dest_rel/$base (a stale or hand-edited copy)"
+    fi
+  done <<<"$rows"
+  if [ "$farm_n" -lt "$MIN_FARM_FILES" ]; then
+    fail "the declared farm set re-read as only $farm_n file(s) (floor: $MIN_FARM_FILES) — verify would be checking a truncated list"
+  fi
+  say "verified $farm_n declared farm file(s) against the checkout"
+
+  local rec="$DEST/scripts/record-review.sh"
+  if [ ! -s "$rec" ] || [ ! -x "$rec" ]; then
+    fail "record-review.sh is missing, empty or not executable at $rec — merge-one.sh runs it directly, so every review would be re-paid for and never recorded (#1717)"
+  fi
+  if [ ! -s "$DEST/scripts/lib/diff-normalize.py" ]; then
+    fail "lib/diff-normalize.py is missing or empty — record-review.sh resolves it as its own sibling and degrades to the raw pre-#1362 digest"
+  fi
+
+  local entries
+  entries="$(read_manifest_entries)" || { fail "the extension ship-list could not be re-read from manifest.json"; return 0; }
+  if [ "$(printf '%s\n' "$entries" | grep -c . || true)" -lt "$MIN_SHIP_LIST" ]; then
+    fail "manifest.json's extension ship-list re-read as fewer than $MIN_SHIP_LIST entries — verify would be checking a truncated list"
+    return 0
+  fi
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    if denied_extension "$base"; then
+      [ -e "$DEST/extensions/$base" ] && fail "denied extension is PRESENT on the cell: extensions/$base"
+      continue
+    fi
+    [ -e "$DEST/extensions/$base" ] || fail "extension MISSING: extensions/$base"
+  done <<<"$entries"
+
+  local g
+  for g in "${GUARD_EXTENSIONS[@]}"; do
+    [ -e "$DEST/extensions/$g" ] \
+      || fail "GUARD MISSING: extensions/$g — the cell would run with fewer guards than a laptop lane"
+  done
+
+  # Every extension that DECLARES runtime deps must have the node_modules npm would have
+  # produced. The install path is gated on npm's exit code; verify cannot see that history,
+  # and a cell whose deps have since vanished (a wiped HOME, an aborted install) would
+  # otherwise certify clean while `builtin-tools` — the `task` dispatcher itself — fails to
+  # load. STRUCTURAL check: it proves a dep tree exists, not that it is intact.
+  local d seen_dep=0
+  for d in "$DEST"/extensions/*/; do
+    [ -f "$d/package.json" ] || continue
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("dependencies") else 1)' \
+      "$d/package.json" 2>/dev/null || continue
+    seen_dep=$((seen_dep + 1))
+    [ -d "$d/node_modules" ] \
+      || fail "DEPENDENCIES MISSING: extensions/$(basename "$d")/node_modules — that extension declares runtime deps and cannot load without them (cd '$d' && npm install --omit=dev)"
+  done
+  if [ "$seen_dep" -eq 0 ]; then
+    fail "no extension in $DEST/extensions declared any dependencies — the dependency check proved nothing (a truncated or hand-made extensions/ tree)"
+  else
+    say "verified $seen_dep extension(s) that declare runtime deps"
+  fi
+
+  [ -d "$DEST/skills" ] && [ -n "$(ls -A "$DEST/skills" 2>/dev/null)" ] \
+    || fail "skills/ is missing or empty"
+  [ -f "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing (a cell lane gets no global rules)"
+  [ -f "$DEST/settings.json" ] || fail "settings.json is missing"
+  if command -v python3 >/dev/null 2>&1 && [ -f "$DEST/settings.json" ]; then
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$DEST/settings.json" >/dev/null 2>&1 \
+      || fail "settings.json is not valid JSON"
+  fi
+
+  guard_tools_dir
+
+  if [ "$FAILURES" -eq 0 ]; then
+    say "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+  fi
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+main() {
+  case "$MODE" in
+    --help|-h) awk 'NR>1 { if ($0 ~ /^set -uo pipefail$/) exit; if ($0 ~ /^# shellcheck/) next; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"; exit 0 ;;
+    --install|--verify) ;;
+    *) printf 'usage: %s [--install|--verify|--help]\n' "$(basename "$0")" >&2; exit 2 ;;
+  esac
+
+  if ! INFRA_ROOT="$(resolve_infra_root)"; then
+    die "no agent-infra checkout found (looked at: \$INFRA_ROOT, \$AGENT_INFRA_PATH, $SELF_DIR/.., \${HARNESS}/.., $CELL_HOME/agent-infra, /tmp/cell-ai).
+       Without one a cell runs UNGUARDED (no review-enforcer, verification-gate, main-worktree-guard,
+       search-guard, audit-logger, and no skills) and its merge path dies rc=127 on the missing
+       scripts/record-review.sh. Clone agent-infra onto the cell and re-run with INFRA_ROOT=<path>."
+  fi
+  printf 'cell-install — mode=%s cell_home=%s infra_root=%s\n' "$MODE" "$CELL_HOME" "$INFRA_ROOT"
+
+  if [ "$MODE" = "--install" ]; then
+    mkdir -p "$DEST" || die "cannot create $DEST"
+    install_farms
+    install_extensions
+    install_extension_deps
+    install_skills
+    install_config
+    migrate_legacy_tools_farm
+  elif [ ! -d "$DEST" ]; then
+    # `--verify` writes NOTHING — not even the directory it would check. A cell home with
+    # no ~/.pi/agent is a cell without the layer; say that, rather than creating it and
+    # then reporting thirty missing files.
+    die "nothing is installed at $DEST — --verify checks an EXISTING layer and writes nothing; run --install first"
+  fi
+  verify_layer
+
+  if [ "$FAILURES" -gt 0 ]; then
+    printf 'FAILED: %d problem(s) — the cell must NOT be started\n' "$FAILURES" >&2
+    exit 1
+  fi
+}
+
+main "$@"

@@ -142,6 +142,7 @@ run_shard tests/record-review/run.sh                                       # the
 run_shard tests/gh-shim/run.sh                                             # #984 argv-level gh shim (also a per-PR job in ci.yml)
 run_shard tests/search-cost/run.sh                                         # #1069 fleet search cost (also a per-PR job in ci.yml)
 run_shard pi-bootstrap/tests/test-setup-no-nesting.sh                      # #449 setup regression (~2min; also a per-PR step in ci.yml)
+run_shard pi-bootstrap/tests/test-cell-install.sh                          # #1723 a Linux cell receives the operational layer (the farmed scripts, the guards, the skills, record-review.sh) BY CONSTRUCTION, and refuses a partial one
 
 echo "───────────────────────────────────────────────────────────────────"
 # Runtime self-check 1: every listed shard must have been EXECUTED. This is the arm that catches
