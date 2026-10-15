@@ -495,10 +495,10 @@ rl_status() {
 # A `304` never reaches here — the caller tests the status first.
 sweep_fail_kind() {
   local raw="${1:-}" err="${2:-}"
-  # ⛔ NOT `HTTP 4(29|03)`. A bare 403 is how a PERMISSION failure arrives — an invalid, expired or
-  # under-scoped token, or SSO/admin rights ("gh: Resource not accessible by integration (HTTP 403)")
-  # — and carries no rate-limit header, because there was no rate limit. Matching 403 here classified
-  # exactly the #1718 failure family as `rate-limit`, deferred the sweep for up to an hour, and logged
+  # ⛔ NOT `HTTP 4(29|03)`. A bare 403 is how a PERMISSION/SCOPE failure arrives — an expired or
+  # under-scoped token, SSO, admin rights ("gh: Resource not accessible by integration (HTTP 403)")
+  # — and it carries no rate-limit header, because there was no rate limit. Matching 403 here
+  # classified such a failure as `rate-limit`, deferred the sweep for up to an hour, and logged
   # `RATE-LIMITED ... CANNOT MERGE` over a stderr line that says otherwise: the same "instrument
   # reports the opposite of the truth" defect this block exists to remove. A 429 is unambiguous; a 403
   # must CORROBORATE the limit via a header or one of the named phrases, and otherwise falls through
@@ -647,14 +647,28 @@ while true; do
   # BEGIN sweep-listing (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
   NOW="$(date +%s)"
   SWEEP_LIST=""
+  # Bound the DIGITS before any `[ … -gt … ]`. `[` ERRORS at or above 2**63 (the is_limit hazard this
+  # file documents at the top), and an ERRORING `[` short-circuits a `&&` clamp into NOT firing — so a
+  # 19-digit value would sail past the clamp. `is_num` is deliberately unbounded (it must accept a
+  # 10-digit epoch), so the length test is what supplies the bound. Doing this FIRST means every
+  # comparison below is on a value that cannot error.
   DEFER_UNTIL="$(cat "$O/state/sweep-defer-until" 2>/dev/null || true)"; is_num "${DEFER_UNTIL:-}" || DEFER_UNTIL=0
+  [ "${#DEFER_UNTIL}" -le 10 ] || DEFER_UNTIL=0
+  LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
+  [ "${#LAST_FULL}" -le 10 ] || LAST_FULL=0
   # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
   # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
   # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
-  # degrades to a FULL sweep rather than a permanent stall (mirrors the sweep-stamp normalisation
-  # two lines below rather than trusting `is_num` for a bound it does not check).
+  # degrades to a FULL sweep rather than a permanent stall.
   [ "$DEFER_UNTIL" -gt $(( NOW + 3600 )) ] && DEFER_UNTIL=0
-  LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
+  # A FUTURE stamp is worse than a stale one. The floor below reads `NOW - LAST_FULL`, so a stamp
+  # ahead of NOW yields a NEGATIVE age, which is always `< SWEEP_MAX_AGE`: `If-None-Match` is then
+  # sent forever, every cycle is a 304, the per-PR reads are skipped forever, and a green PR sits
+  # unmerged behind a cached "unchanged" PERMANENTLY — the exact failure this floor exists to
+  # prevent, and silent, because the log reports a future full sweep. Reachable from a corrupt or
+  # hand-edited state file, or a BACKWARD clock step (NTP correction, VM snapshot restore). A stamp
+  # is written as `$NOW`, so any value ahead of NOW is invalid by construction: degrade to a sweep.
+  [ "$LAST_FULL" -gt "$NOW" ] && LAST_FULL=0
   ETAG="$(cat "$O/state/sweep-etag" 2>/dev/null || true)"
   # `If-None-Match` is sent only while the cached listing is younger than SWEEP_MAX_AGE. The floor is
   # REQUIRED, not belt-and-braces: a completed check run does NOT reliably change the listing's ETag

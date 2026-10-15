@@ -151,9 +151,9 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   [ "$got" = "other" ] && ok "sweep_fail_kind: an unrelated error is neither" \
                         || bad "sweep_fail_kind returned '$got' (want other)"
   # ⛔ A permission 403 is NOT a rate limit. It carries no rate-limit header, because there was no
-  # rate limit — it is the #1718 invalid/expired/under-scoped-token family. Mislabelling it deferred
-  # the sweep for up to an hour and printed `CANNOT MERGE` over a stderr line saying the token is the
-  # problem, so these must fall through to `other` and reach the operator.
+  # rate limit — it is a permission/scope failure (expired or under-scoped token, SSO, admin rights).
+  # Mislabelling it deferred the sweep for up to an hour and printed `CANNOT MERGE` over a stderr line
+  # saying the token is the problem, so these must fall through to `other` and reach the operator.
   got="$(sweep_fail_kind '' 'gh: Resource not accessible by integration (HTTP 403)')"
   [ "$got" = "other" ] && ok "sweep_fail_kind: a permission 403 is 'other', NOT rate-limit" \
                         || bad "sweep_fail_kind called a permission 403 '$got' (want other)"
@@ -299,6 +299,34 @@ if need "$T/block.sh" "the sweep-listing block" && need "$T/deps.sh" "the shippe
                     || bad "absurd deferral: the sweep was suppressed (state file obeyed verbatim)"
   grep -q 'DEFERRED' "$D/log" && bad "absurd deferral: still logged as a live DEFERRED" \
                                || ok "absurd deferral: not treated as a live deferral"
+
+  # ── 11) a FUTURE sweep-stamp must be DROPPED, not trusted ─────────────────────
+  # The floor computes `NOW - LAST_FULL`. A stamp ahead of NOW makes that NEGATIVE, so the floor never
+  # fires, If-None-Match is sent forever and every cycle is a 304 — the per-PR reads skip forever and a
+  # green PR sits unmerged permanently. Reachable from a corrupt state file or a BACKWARD clock step.
+  reset_mode; GHMODE=200; GHREMAIN=4990; GHRESET=0; GHAFTER=""
+  rm -f "$D/o/state/sweep-defer-until"
+  printf '%s\n' "$(( $(date +%s) + 3600 ))" > "$D/o/state/sweep-stamp"
+  printf 'W/"t1"\n' > "$D/o/state/sweep-etag"
+  drive "$D"
+  grep -q 'If-None-Match' "$D/calls" \
+    && bad "future stamp: an If-None-Match was still sent — the sweep can never age out" \
+    || ok "future stamp: the conditional header is dropped, forcing a full sweep"
+  [ -n "$LIST" ] && ok "future stamp: the forced 200 still yields the listing" \
+                 || bad "future stamp: no listing (the sweep would be blind)"
+
+  # ── 12) a value at/above 2**63 must not ERROR `[` (the clamp must still apply) ─
+  # `[` returns status 2 on such values, which short-circuits a `&&` clamp into NOT firing.
+  reset_mode; GHMODE=200
+  printf '99999999999999999999\n' > "$D/o/state/sweep-defer-until"
+  drive "$D"
+  case "$ERROUT" in
+    *"integer expression expected"*)
+      bad "huge deferral: \`[\` ERRORED on the value (the clamp never compared)" ;;
+    *) ok "huge deferral: no integer-expression error from \`[\`" ;;
+  esac
+  [ -s "$D/calls" ] && ok "huge deferral: the sweep still runs" \
+                    || bad "huge deferral: the sweep was suppressed"
 fi
 
 echo
