@@ -137,6 +137,20 @@ REQ_OVERRIDE=''
 eqv "tortoise's set -> gate authority" "gate" "$(merge_authority "pricing-artifact docs ai-review-gate")"
 eqv "a NAME that merely contains the gate is not the gate" "rail" "$(merge_authority "ai-review-gate-extra")"
 eqv "an empty set -> unknown (a stale contract refuses; never rail, never a raw merge)" "unknown" "$(merge_authority "")"
+# ⛔ round-8 review (classes B2/B3). A WHITESPACE-bearing set made the classifier (`str.split()`,
+# which splits on ANY whitespace) and `merge_authority` (a whole-name test delimited on a literal
+# SPACE) disagree about the SAME string — the gate was enforced while the authority answered
+# `rail`, so on a gate repo `merge-one.sh` took its rail branch and SKIPPED the fresh-context
+# reviewer and the signed record. A whitespace-ONLY set was worse: `' '.split()` is `[]` to the
+# classifier while a bare `-z` test called it non-empty and ROUTED it to `rail` instead of
+# refusing. Both are "an empty contract must refuse, never route".
+eqv "a whitespace-only set -> unknown (an empty contract must refuse, never route)" "unknown" "$(merge_authority " ")"
+eqv "a TAB-separated set is normalised, so the gate is still recognised" "gate" "$(merge_authority "$(printf 'ai-review-gate\tdocs')")"
+eqv "a NEWLINE-separated set is normalised too" "gate" "$(merge_authority "$(printf 'ai-review-gate\ndocs')")"
+eqv "a whitespace-only OVERRIDE is ABSENT, not a nameless env contract (fail-closed)" "fallback" \
+  "$( REQ_OVERRIDE=' '; REQ=''; REQ_SOURCE=''; resolve_required_checks daniel-ospina/readfail "$G"; printf '%s' "${REQ_SOURCE:-<EMPTY>}" )"
+eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b" \
+  "$( REQ_OVERRIDE="$(printf 'a\tb')"; REQ=''; REQ_SOURCE=''; resolve_required_checks daniel-ospina/agent-infra "$G"; printf '%s' "${REQ:-}" )"
 
 # (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
 #     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
@@ -396,6 +410,13 @@ case "${_cnt2:-}" in ''|*[!0-9]*|??????????*) echo "  ❌ a corrupt count was pr
 # mocked gh/tmux: rail authority must tmux-spawn merge-<PR> and issue NO raw merge; gate authority
 # must do the reverse.
 sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
+# The quoter the spawn line uses must be the SHIPPED one (extracted, not re-implemented) — the
+# spawn line calls `shq`, so the drive below must resolve it exactly as the shipped loop does.
+# shq is a ONE-LINER, so extract by whole-line grep: a `/^shq() {/,/^}/` sed RANGE never matches its
+# own end pattern on that line and swallows the next 57 lines of orch-loop.sh instead (measured).
+grep -E '^shq\(\) \{' "$ORCH" > "$TMP/shq.sh"
+# shellcheck disable=SC1090
+[ -s "$TMP/shq.sh" ] && . "$TMP/shq.sh"
 if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.sh" && bash -n "$TMP/greenarm.sh" 2>/dev/null; then
   drive_green() { # drive_green <authority> <req> [<gate-name>] -> writes $TMP/g.spy / g.tspy / LOG
     # `: >`, never `rm -f` (review P2, round 2): an ABSENT file made `! grep -q new-session`
@@ -408,6 +429,8 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
       tmux() { echo "TMUX $*" >> "$TMP/g.tspy"; [ "$1" = ls ] && return 0; return 0; }
       # shellcheck disable=SC1090
+      . "$TMP/shq.sh"
+      # shellcheck disable=SC1090
       . "$TMP/greenarm.sh" ) >/dev/null 2>&1
   }
   drive_green rail 'pipeline-compliance'
@@ -419,24 +442,24 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   grep -q 'GREEN -> rail worker' "$TMP/g.log" \
     && { echo "  ✅ GREEN+rail: the worker carries the resolved contract (REQ/REVIEW_GATE in the spawn line)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ GREEN+rail: no rail-worker log line — the arm did not take the rail path"; FAIL=$((FAIL+1)); }
-  grep -q 'REQ=pipeline' "$TMP/g.tspy" \
+  grep -qF -- "REQ=$(shq 'pipeline-compliance')" "$TMP/g.tspy" \
     && { echo "  ✅ GREEN+rail: the spawn line carries REQ=$(grep -o "REQ=[^ ]*" "$TMP/g.tspy" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ GREEN+rail: the spawn line carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
   # The quoting is load-bearing and must be pinned with a MULTI-NAME set (review P2, round 2):
-  # a single-token REQ makes `printf %q` a no-op, so the assertion above passes without it — but
+  # with a single token the quoting is a no-op, so the assertion above passes without it — but
   # `sh -c 'REQ=pricing-artifact docs … bash worker'` is `docs: command not found` (rc 127, the
   # worker never runs, no merge ever happens) on the real 7-name tortoise set. Drive it and
-  # require the EXACT %q-escaped token in the spawn line.
+  # require the EXACT POSIX-quoted token in the spawn line.
   _REQ7='pricing-artifact docs test-isolation license-surface legal-e2e python-ci-gate ai-review-gate'
   drive_green rail "$_REQ7"
-  _EXP7="REQ=$(printf '%q' "$_REQ7")"
+  _EXP7="REQ=$(shq "$_REQ7")"
   if grep -qF -- "$_EXP7" "$TMP/g.tspy"; then
-    echo "  ✅ GREEN+rail: a MULTI-name REQ arrives whole (the %q-escaped 7-name set is in the spawn line)"; PASS=$((PASS+1))
+    echo "  ✅ GREEN+rail: a MULTI-name REQ arrives whole (the POSIX-quoted 7-name set is in the spawn line)"; PASS=$((PASS+1))
   else
     echo "  ❌ GREEN+rail: the 7-name set did not survive the spawn line (expected [$_EXP7]; tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
   fi
   drive_green rail "$_REQ7" my-gate
-  _EXPG="REVIEW_GATE=$(printf '%q' 'my-gate')"
+  _EXPG="REVIEW_GATE=$(shq 'my-gate')"
   if grep -qF -- "$_EXPG" "$TMP/g.tspy"; then
     echo "  ✅ GREEN+rail: a NON-DEFAULT REVIEW_GATE is carried to the worker too (one resolution, one authority)"; PASS=$((PASS+1))
   else
@@ -451,22 +474,53 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
 else
   echo "  ❌ could not extract a SYNTACTICALLY VALID GREEN arm from orch-loop.sh (extraction or the arm itself is broken)"; FAIL=$((FAIL+1))
 fi
-# every merge spawn line must %q-quote the carried REQ — BOTH of them (review round 3: a single
+# every merge spawn line must POSIX-quote the carried REQ — BOTH of them (review round 3: a single
 # grep over a file with two identical lines let ONE de-quoted spawn stay green; an unquoted
 # 7-name REQ kills the worker at sh -c rc 127). Count, don't just find.
-_QPAT='REQ=$(printf '\''%q'\'' "$REQ")'
+_QPAT='REQ=$(shq "$REQ")'
 _NQ="$(grep -cF -- "$_QPAT" "$ORCH")"
 [ "${_NQ:-0}" = "2" ] \
-  && { echo "  ✅ every merge spawn line (${_NQ} of 2) %q-quotes the carried REQ"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ expected 2 %q-quoted spawn lines, found ${_NQ:-0} — one spawn's worker dies at sh -c on a multi-name REQ"; FAIL=$((FAIL+1)); }
+  && { echo "  ✅ every merge spawn line (${_NQ} of 2) POSIX-quotes the carried REQ"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ expected 2 POSIX-quoted spawn lines, found ${_NQ:-0} — one spawn's worker dies at sh -c on a multi-name REQ"; FAIL=$((FAIL+1)); }
 # …and the GATE NAME must travel with it (review round 7, P2): §h's old guard counted only REQ, so
 # dropping REVIEW_GATE from the spawn line stayed green — and a worker that re-resolves under the
 # DEFAULT gate name can land on a different authority than the controller classified under.
-_GPAT='REVIEW_GATE=$(printf '\''%q'\'' "$REVIEW_GATE")'
+_GPAT='REVIEW_GATE=$(shq "$REVIEW_GATE")'
 _NG="$(grep -cF -- "$_GPAT" "$ORCH")"
 [ "${_NG:-0}" = "2" ] \
-  && { echo "  ✅ every merge spawn line (${_NG} of 2) %q-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ expected 2 %q-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
+  && { echo "  ✅ every merge spawn line (${_NG} of 2) POSIX-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ expected 2 POSIX-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
+# ⛔ (h3) `printf %q` MUST NOT come back (round-8 adversarial review, class B6). `%q` emits `$'…'`
+# for any byte outside [[:print:]], and `$'…'` is NOT a quoting form in POSIX sh — `/bin/sh` is dash
+# on a Debian/Ubuntu cell, so the quoting is LOST and the remainder is re-parsed as COMMANDS
+# (measured: a required-check name carrying ESC executed an injected command on the merge host;
+# it does NOT reproduce on macOS, where `/bin/sh` is bash — which is why it went unnoticed).
+# The value must arrive WHOLE and execute NOTHING.
+if [ -s "$TMP/shq.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$TMP/shq.sh"
+  command -v shq >/dev/null 2>&1 \
+    && { echo "  ✅ shq() extracted from the shipped orch-loop.sh and is callable"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the extracted $TMP/shq.sh does not define shq() — extraction is broken"; FAIL=$((FAIL+1)); }
+  # a quote AND a control byte, plus shell metacharacters and ${IFS} — the exact shape that makes
+  # `printf %q` emit `$'…'` and lets dash re-parse the remainder as commands.
+  _PAY="a'$(printf '\033');touch\${IFS}$TMP/PWNED;#"
+  rm -f "$TMP/PWNED" "$TMP/shq-got"
+  /bin/sh -c "REQ=$(shq "$_PAY"); printf '%s' \"\$REQ\" > '$TMP/shq-got'" 2>/dev/null
+  if [ -f "$TMP/PWNED" ]; then
+    echo "  ❌ a control byte in a required-check name EXECUTED through the spawn shape — the carried contract is injectable under /bin/sh"; FAIL=$((FAIL+1))
+  elif [ "$(cat "$TMP/shq-got" 2>/dev/null)" = "$_PAY" ]; then
+    echo "  ✅ a quote + control-byte name survives a POSIX sh -c WHOLE and executes nothing (the shq contract)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the payload was mangled by the shipped shq (got [$(cat "$TMP/shq-got" 2>/dev/null | od -c | head -2 | tr '\n' ' ')])"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ shq() could not be extracted from orch-loop.sh — the injection drive did NOT run (a skipped check is not a pass)"; FAIL=$((FAIL+1))
+fi
+_QPCT="$(grep -cF "printf '%q'" "$ORCH")"
+[ "${_QPCT:-0}" = "0" ] \
+  && { echo "  ✅ no \`printf %q\` site remains in orch-loop.sh (its \`\$'…'\` output is not POSIX quoting)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ ${_QPCT} \`printf %q\` site(s) remain in orch-loop.sh — dash re-parses that value as commands"; FAIL=$((FAIL+1)); }
 
 # (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
 # without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE

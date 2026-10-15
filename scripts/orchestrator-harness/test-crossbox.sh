@@ -296,13 +296,18 @@ for s in EXIT INT TERM; do
   # here-string, not a pipe — `printf … | grep -q` takes SIGPIPE under pipefail (#841).
   if grep -q "$s" <<<"$t"; then
     ok "trap registered for $s"
-  elif [ "$s" = INT ] && [ -z "$(trap -p INT)" ]; then
-    # ⚠️ NOT a defect in this script (review round 7, diagnosed live). POSIX puts SIGINT (and
-    # SIGQUIT) at IGNORE in a `&` background job, and bash REFUSES to trap a signal inherited as
-    # ignored — so `trap 'exit 130' INT` above is a no-op and this assertion can never be met for a
-    # backgrounded run. Foreground (CI, selftest.sh) it holds. Print a SKIP so a backgrounded run
-    # does not report a false failure — the false positive this check produced in my own harness.
-    echo "  ⊘ trap for INT: SKIPPED — SIGINT was IGNORED on entry (this run was backgrounded; POSIX ignores INT in a \`&\` job and bash cannot trap an ignored signal)"
+  elif [ "$s" = INT ] && [ -z "$(trap -p INT)" ] && grep -qF "trap 'exit 130' INT" "$0"; then
+    # ⚠️ NOT a defect in this script (review round 7, diagnosed live; round 8, P3). POSIX puts SIGINT
+    # (and SIGQUIT) at IGNORE in a `&` background job, and bash REFUSES to trap a signal inherited as
+    # ignored — so `trap 'exit 130' INT` above is a no-op for a backgrounded run and this assertion
+    # can never be met there. Foreground (CI, selftest.sh) it holds.
+    # ⛔ The skip is CONFIRMED STATICALLY, because the dynamic read cannot tell the two cases apart:
+    # with SIGINT refused, `trap -p INT` prints EMPTY — byte-for-byte the same as "the trap line was
+    # deleted", which is precisely the regression this pin names (measured round 8: backgrounded
+    # refusal `[]`, no-trap `[]`, foreground `trap -- 'exit 130' SIGINT`). Skipping on the empty read
+    # ALONE made this pin unfalsifiable; requiring the source line makes deleting it go red even in a
+    # backgrounded run, so the pin can now fail on the thing it names.
+    echo "  ⊘ trap for INT: SKIPPED dynamically (SIGINT was IGNORED on entry — POSIX ignores INT in a \`&\` job and bash cannot trap an ignored signal), but the registration IS present in $0"
   else
     bad "no trap for $s"
   fi

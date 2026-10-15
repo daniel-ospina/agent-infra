@@ -337,16 +337,21 @@ default, so the two ends cannot disagree. `CYC=5` (a deliberately fast cycle) is
 **The CONTROLLER's spawn decisions are load-gated — not just lane dispatch.** A Mac reboot lands in an indexing
 storm (Spotlight, `PerfPowerServices`, `duetexpertd`) that routinely pushes 1-min load past 200. The
 lane gate already respected `MAX_LOAD`; the merge sweep did not, so a fresh boot got six reviewers
-piled onto the spike. `can_spawn()` now guards the four spawn sites in `orch-loop.sh` — conflict
-fixer, review-fix fixer, CI-red fixer, merge re-review — while the cheap actions (`gh pr merge`,
-`gh pr ready`, `gh run rerun`) stay ungated, so merges keep flowing during a spike and nothing is
-starved. ⛔ **That is the controller's *decisions*, not every spawn.** Three worker entry points
+piled onto the spike. `can_spawn()` now guards the five spawn sites in `orch-loop.sh` — conflict
+fixer, rail merge worker (GREEN), re-record fixer, re-record merge worker, CI-red fixer — while the
+cheap actions (`gh pr ready`, `gh run rerun`, and `gh pr merge` in *gate* mode) stay ungated, so
+**gate-mode** merges keep flowing during a spike and nothing is
+starved. ⚠️ **On a rail-mode repo the merge is itself a gated worker, so it does NOT keep flowing.**
+agent-infra#1764 moved the rail into a `merge-<PR>` worker (the inline rail run measured ~27 s of
+BLOCKED controller cycle, halting dispatch); that worker is slot- and load-gated like every other
+spawn, so a spike holds rail merges back with the rest. That is the intended trade, not an
+oversight. ⛔ **That is the controller's *decisions*, not every spawn.** Three worker entry points
 spawn a `pi` agent with no `MAX_LOAD` read of their own — `chain-<N>` → `merge-one.sh` (the
 first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh`, and `adopt-fix.sh` →
 `fix-one.sh`; tracked as agent-infra#1720.
 
 ⚠️ **`can_spawn()` tests load only.** The available-memory gate applies to *lane dispatch*, not to
-these four spawn sites — the two cover different populations. Raising `MAX_LOAD` therefore narrows
+these five spawn sites — the two cover different populations. Raising `MAX_LOAD` therefore narrows
 the band in which the spawn sites hold back (`16`–`99` is now permitted, where `16` used to hold).
 Closing that needs `can_spawn()` to consult memory as well, which changes the one-line shape its
 self-test extracts from the shipped file; tracked as agent-infra#1732 rather than half-done here.
@@ -679,8 +684,8 @@ These are kept as a record because each one is a *failure mode of the design*, n
 > check classifier in `orch-loop.sh` (agent-infra#1714, tortoise#8518), and this directory being
 > older than its source (agent-infra#1712 — see the provenance note at the top of this file).
 
-- **`can_spawn()` gates on load only, so the memory ceiling does not cover the four controller spawn
-  sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the four spawn
+- **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
+  sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
   sites are bounded by load alone, so raising `MAX_LOAD` widens the band in which they proceed while
   memory is already the binding gate. §4 states the gap; this is its tracker item.
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
@@ -758,7 +763,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
   the path the plist executes.
 - **Three worker launch paths spawn ungated (agent-infra#1720).** `chain-<N>` → `merge-one.sh` (the
   first-review path for every own-lane PR), `fix-one.sh` → `merge-one.sh` and `adopt-fix.sh` →
-  `fix-one.sh` read no `MAX_LOAD`; only the controller's four spawn *decisions* are gated, and §4
+  `fix-one.sh` read no `MAX_LOAD`; only the controller's five spawn *decisions* are gated, and §4
   says so.
 
 ---
@@ -803,6 +808,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 |---|---|
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
 | `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` CAS, lease-as-data, `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `merge-one.sh` and `fix-one.sh` |
+| `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included) |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
@@ -835,7 +841,7 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix**. `install.sh` compares the scripts it invokes — the seven loop
+those copies **plus every §7.4 fix**. `install.sh` compares the scripts it invokes — the nine loop
 scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not

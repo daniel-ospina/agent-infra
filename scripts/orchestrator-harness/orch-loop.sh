@@ -130,6 +130,17 @@ safe_ref() {
   case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
 }
+
+# shq <value> -> a POSIX-sh-safe single-quoted word.
+# ⛔ NOT `printf %q`. bash's %q emits `$'…'` for any byte outside [[:print:]], and `$'…'` is NOT a
+# quoting form in POSIX sh: on a Debian/Ubuntu cell `/bin/sh` is dash, so the quoting is LOST and
+# the remainder is re-parsed as COMMANDS. Measured 2026-10-15 (round-8 adversarial review, class
+# B6): the spawn line below carried a required-check name containing ESC and executed an injected
+# command on the merge host — `REQ=$'a\'\E;touch${IFS}/tmp/PWNED;#'`. `%q` is only safe where the
+# reader is bash (the macOS operator box), which is exactly why it went unnoticed.
+# Single-quoting with `'\''` escaping is POSIX and correct for EVERY byte (a newline included), so
+# it needs no character screen and cannot be defeated by a byte the screen forgot.
+shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
@@ -972,7 +983,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # can disagree (e.g. an operator REVIEW_GATE the tmux server does not export) and merge
             # under a different authority than the one that classified the PR. Passing the resolved
             # set as the worker's REQ makes it the override — one resolution, one authority.
-            if tmux new-session -d -s "merge-$PR" "REQ=$(printf '%q' "$REQ") REVIEW_GATE=$(printf '%q' "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+            # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
+            # that as quoting, so the value would execute (round-8 adversarial review, B6).
+            if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
             else
               echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
@@ -1061,8 +1074,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              # Same carried contract as the GREEN rail spawn above (review P2, round 1).
-              tmux new-session -d -s "merge-$PR" "REQ=$(printf '%q' "$REQ") REVIEW_GATE=$(printf '%q' "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
+              # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
+              # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
+              tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
             fi
           fi

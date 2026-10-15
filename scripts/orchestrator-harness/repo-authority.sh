@@ -74,6 +74,16 @@ _unrepresentable() {
   return 1
 }
 
+# _normalise_set <string> — collapse every whitespace RUN to one space and trim both ends, so the
+# bash matchers (which delimit a name on a literal SPACE) and the classifier's `str.split()` (which
+# splits on ANY whitespace) can never disagree about the SAME string. A whitespace-only value
+# normalises to EMPTY, which every caller here reads as "absent" — never as a non-empty contract.
+# ⛔ review round 8, classes B2/B3. `_override_usable` screened only a comma, so a tab-separated
+# override made `merge_authority` answer `rail` while the classifier enforced the gate: on a gate
+# repo `merge-one.sh` then took its RAIL branch, skipping the fresh-context reviewer and the signed
+# record — a §5.1 bypass — and a whitespace-only override routed to `rail` instead of refusing.
+_normalise_set() { printf '%s' "${1:-}" | tr '\n\t\r\v\f' '     ' | awk 'NF { $1 = $1; print }'; }
+
 # _override_usable <owner/repo> <space-joined REQ_OVERRIDE> — rc 1 (loud) if the override carries
 # a comma (review round 5). The override is itself SPACE-separated, so a name containing a space
 # is indistinguishable from two names there and cannot be screened; the comma IS detectable and is
@@ -115,9 +125,17 @@ required_checks() {
 # had no production caller; a fix landed in `resolve_required_checks` only, and a mutant of the
 # twin stayed green across every suite. Two copies of one policy is how that happens.
 resolve_required_checks() {
+  local _ov
   if [ -n "${REQ_OVERRIDE:-}" ]; then
-    if _override_usable "$1" "${REQ_OVERRIDE:-}"; then REQ="$REQ_OVERRIDE"; REQ_SOURCE=env; return 0; fi
-    REQ_OVERRIDE=""  # malformed: discard (loudly) and use the repo's own declaration — see above
+    _ov="$(_normalise_set "${REQ_OVERRIDE:-}")"
+    if [ -z "$_ov" ]; then
+      # ⛔ A whitespace-only override is NOT an override: `' '.split()` is `[]` for the classifier,
+      # so a non-empty-but-NAMELESS contract would ROUTE (`rail`) instead of refusing — the round-8
+      # B3 bypass. Discard it and fall through to the repo's own declaration (fail-closed).
+      printf 'repo-authority: %s: the REQ override is whitespace-only — it carries no names, so it is treated as ABSENT (fail-closed: the repo declaration is used instead)\n' "${1:-}" >&2
+    elif _override_usable "$1" "$_ov"; then REQ="$_ov"; REQ_SOURCE=env; return 0
+    fi
+    REQ_OVERRIDE=""  # malformed or nameless: discard (loudly) and use the repo's own declaration
   fi
   if REQ="$(required_checks "$1" "${2:-gh}")"; then REQ_SOURCE=protection; return 0; fi
   REQ="$FALLBACK_REQ"; REQ_SOURCE=fallback; return 0
@@ -133,8 +151,15 @@ resolve_required_checks() {
 # agent-infra's own AGENTS.md forbids ("merge via `scripts/admin-merge.sh <PR>`, never raw
 # `gh pr merge`").
 merge_authority() {
-  if [ -z "${1:-}" ]; then printf 'unknown\n'; return 0; fi
-  case " ${1:-} " in
+  # ⛔ NORMALISE FIRST (review round 8, B3). A whitespace-bearing set makes the classifier
+  # (`str.split()`, which splits on ANY whitespace) and this whole-name test (which delimited on a
+  # literal space) disagree about the same string — `rail` here, gate enforced there. And a
+  # whitespace-only set is `[]` to the classifier while a bare `-z` test called it non-empty and
+  # routed it to `rail`; both are "an empty contract must refuse, never route".
+  local _set
+  _set="$(_normalise_set "${1:-}")"
+  if [ -z "$_set" ]; then printf 'unknown\n'; return 0; fi
+  case " $_set " in
     *" $REVIEW_GATE "*) printf 'gate\n' ;;
     *)                  printf 'rail\n' ;;
   esac
