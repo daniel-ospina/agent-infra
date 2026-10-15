@@ -22,10 +22,12 @@
 #      reads as NOCHECKS (nothing merges) and is indistinguishable from a permission-shaped
 #      partial response, so `effective_required_checks` substitutes FALLBACK_REQ — deliberately
 #      NON-EMPTY names, and foreign to a repo that is not tortoise. ⚠️ On such a repo the
-#      fallback's gate name reads FAILED (not PENDING — review P2, round 1), so the CONTROLLER
-#      treats an unresolved contract as authority-unknown and takes no merge, auto-arm, or spawn
-#      action at all until protection is readable (orch-loop.sh, AUTHORITY_UNKNOWN): a fallback
-#      left to drive the FAILED arm would spawn a fresh-context reviewer per PR per cycle for as
+#      fallback's gate name reads FAILED (not PENDING — review P2, round 1), so an unresolved
+#      contract stops ALL action: the CONTROLLER's sweep merges/auto-arms/spawns nothing while
+#      protection is unreadable (orch-loop.sh, AUTHORITY_UNKNOWN), and merge-one.sh REFUSES on
+#      its own fallback read (exit 5) — which covers every ingress, including chain-merge.sh and
+#      fix-one.sh, which invoke it directly. A fallback left to drive the FAILED arm would
+#      otherwise spawn a fresh-context reviewer per PR per cycle for as
 #      long as the read fails. That is the fail-closed direction, and it is why the fallback is a
 #      real list rather than the empty string.
 #   2. The review gate is a REQUIRED name like any other: `merge_authority` reads it from the

@@ -65,6 +65,16 @@ gh() {
     *headRefOid*) echo "$SHA" ;;
     *"pr checks"*) echo "[]" ;;
     *--comments*) echo "stub: no reviewer comment" ;;
+    # required_status_checks (agent-infra#1764): merge-one resolves the repo's merge contract
+    # from branch protection; the mock must ANSWER it or the (correct) authority-unknown refusal
+    # exits 5 before the claim flow the suite drives. It emulates the POST-jq shape (one bare
+    # context per line, as `--jq '.contexts[]'` prints) and carries the gate, so the suite keeps
+    # exercising the gate-mode flow it was written for.
+    *required_status_checks*)
+      case "$*" in
+        *'.contexts[]'*) printf 'ai-review-gate\n' ;;
+        *)               printf '{"contexts":["ai-review-gate"]}' ;;
+      esac ;;
     *) echo "fake-gh unhandled: $*" >&2; return 1 ;;
   esac
 }

@@ -227,6 +227,20 @@ resolve_required_checks "$OR"
 MERGE_AUTHORITY="$(merge_authority "$REQ")"
 echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} authority=$MERGE_AUTHORITY" >> "$L.log"
 
+# ⛔ AUTHORITY-UNKNOWN REFUSAL (review P1, round 2). The CONTROLLER's AUTHORITY_UNKNOWN guard
+# covers only its own sweep — this script is ALSO invoked directly by chain-merge.sh and
+# fix-one.sh, and a worker whose OWN protection read failed fell back to FALLBACK_REQ (gate
+# authority, because the fallback carries the gate name) and could reach the raw merge below on a
+# rail repo whose gate row happened to read green — and always burned a full fresh-context
+# reviewer first. The guard therefore lives HERE, at the point of consequence: EVERY ingress is
+# covered, whatever spawned it. A worker is deliberately NOT handed a frozen contract by its
+# spawner — chain workers wait up to 90 minutes, and a fresh read that refuses beats a stale one
+# that merges.
+if [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; then
+  echo "[merge $PR] REFUSED: branch protection for $OR is unreadable (REQ_SOURCE=fallback, no REQ override) — the merge contract is UNKNOWN, so this worker merges nothing (agent-infra#1764)" >> "$L.log"
+  exit 5
+fi
+
 if [ "$MERGE_AUTHORITY" = "rail" ]; then
   # RAIL MODE. The reviewer is deliberately SKIPPED here: this repo's merge authority is the rail,
   # which posts its OWN head-bound evidence and merges — a review comment / signed record marker is

@@ -467,7 +467,9 @@ clear about what is and is not enforced:
   `ai-review-gate` to read `SUCCESS`. On a **rail-mode** repo (agent-infra) the harness instead
   invokes `scripts/admin-merge.sh`, which posts its own head-bound evidence and merges with
   `--admin`; the harness does not call `gh pr merge` there at all, and auto-merge is deliberately
-  never armed. A rogue *agent* cannot merge through the harness path; it could still `gh pr merge`
+  never armed. The same refusal is one layer deeper: a merge worker whose OWN branch-protection
+  read fails (REQ_SOURCE=fallback, no REQ override) exits 5 before reviewing or merging anything
+  — which covers every ingress, including `chain-merge.sh` and `fix-one.sh`. A rogue *agent* cannot merge through the harness path; it could still `gh pr merge`
   or `git push` directly if the token permits, which is a property of the token, not this code.
 - **What is deliberately not done:** the gate key is never placed in a prompt, a plist, a log or a
   command line, and no script creates a secret-bearing file.

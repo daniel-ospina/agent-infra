@@ -233,10 +233,12 @@ _parked="$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)"
 # must do the reverse.
 sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
 if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.sh" && bash -n "$TMP/greenarm.sh" 2>/dev/null; then
-  drive_green() { # drive_green <authority> -> writes $TMP/g.spy / $TMP/g.tspy / LOG
-    rm -f "$TMP/g.spy" "$TMP/g.tspy"; : > "$TMP/g.log"
+  drive_green() { # drive_green <authority> <req> -> writes $TMP/g.spy / $TMP/g.tspy / LOG
+    # `: >`, never `rm -f` (review P2, round 2): an ABSENT file made `! grep -q new-session`
+    # pass vacuously in the gate drive — the tmux mock never ran, so there was no file to read.
+    : > "$TMP/g.spy"; : > "$TMP/g.tspy"; : > "$TMP/g.log"
     ( PR=1765; OR=daniel-ospina/agent-infra; REPO="$TMP/grepo"; BR=fix/x; HEAD_N=deadbeef
-      MR=3; MERGE_AUTHORITY="$1"; REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'
+      MR=3; MERGE_AUTHORITY="$1"; REQ="$2"; REVIEW_GATE='ai-review-gate'
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
@@ -244,7 +246,7 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
       # shellcheck disable=SC1090
       . "$TMP/greenarm.sh" ) >/dev/null 2>&1
   }
-  drive_green rail
+  drive_green rail 'pipeline-compliance'
   if grep -q 'new-session' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
     echo "  ✅ GREEN+rail: a merge worker is spawned and NO raw merge is issued"; PASS=$((PASS+1))
   else
@@ -256,7 +258,20 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   grep -q 'REQ=pipeline' "$TMP/g.tspy" \
     && { echo "  ✅ GREEN+rail: the spawn line carries REQ=$(grep -o "REQ=[^ ]*" "$TMP/g.tspy" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ GREEN+rail: the spawn line carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
-  drive_green gate
+  # The quoting is load-bearing and must be pinned with a MULTI-NAME set (review P2, round 2):
+  # a single-token REQ makes `printf %q` a no-op, so the assertion above passes without it — but
+  # `sh -c 'REQ=pricing-artifact docs … bash worker'` is `docs: command not found` (rc 127, the
+  # worker never runs, no merge ever happens) on the real 7-name tortoise set. Drive it and
+  # require the EXACT %q-escaped token in the spawn line.
+  _REQ7='pricing-artifact docs test-isolation license-surface legal-e2e python-ci-gate ai-review-gate'
+  drive_green rail "$_REQ7"
+  _EXP7="REQ=$(printf '%q' "$_REQ7")"
+  if grep -qF -- "$_EXP7" "$TMP/g.tspy"; then
+    echo "  ✅ GREEN+rail: a MULTI-name REQ arrives whole (the %q-escaped 7-name set is in the spawn line)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+rail: the 7-name set did not survive the spawn line (expected [$_EXP7]; tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
+  fi
+  drive_green gate 'pipeline-compliance'
   if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'new-session' "$TMP/g.tspy"; then
     echo "  ✅ GREEN+gate: the squash merge path is UNCHANGED (no worker detour)"; PASS=$((PASS+1))
   else
@@ -264,6 +279,68 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   fi
 else
   echo "  ❌ could not extract a SYNTACTICALLY VALID GREEN arm from orch-loop.sh (extraction or the arm itself is broken)"; FAIL=$((FAIL+1))
+fi
+# every merge spawn line must %q-quote the carried REQ (both the GREEN rail spawn and the
+# re-record spawn — review P2, round 2's second half)
+grep -q 'REQ=$(printf '\''%q'\'' "$REQ")' "$ORCH" \
+  && { echo "  ✅ every merge spawn line %q-quotes the carried REQ"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a merge spawn line lost its %q quoting"; FAIL=$((FAIL+1)); }
+
+# (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
+# without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE
+# the classifier (a guard moved after the arms guards nothing).
+_au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
+_au_ln="$(grep -nF -- "$_au_expr" "$ORCH" | head -1 | cut -d: -f1)"
+_cls_ln="$(grep -nF 'V="$(gh pr checks' "$ORCH" | head -1 | cut -d: -f1)"
+if [ -n "$_au_ln" ] && [ -n "$_cls_ln" ] && [ "$_au_ln" -lt "$_cls_ln" ]; then
+  echo "  ✅ AUTHORITY_UNKNOWN guard exists and precedes the classifier (line $_au_ln < $_cls_ln)"; PASS=$((PASS+1))
+else
+  echo "  ❌ AUTHORITY_UNKNOWN guard missing or misplaced (guard@${_au_ln:-none} classifier@${_cls_ln:-none}) — deleted, the sweep acts on an unknown contract"; FAIL=$((FAIL+1))
+fi
+_au_hits=0; AUTHORITY_UNKNOWN=1
+for _p in a b; do eval "$([ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && echo continue || echo : )"; _au_hits=$((_au_hits+1)); done
+[ "$_au_hits" = "0" ] && { echo "  ✅ the guard's expression continues every PR when set"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the guard expression did not continue (hits=$_au_hits)"; FAIL=$((FAIL+1)); }
+AUTHORITY_UNKNOWN=0; _au_hits=0
+for _p in a b; do [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue; _au_hits=$((_au_hits+1)); done
+[ "$_au_hits" = "2" ] && { echo "  ✅ …and does NOT continue when clear"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the guard continued when clear (hits=$_au_hits)"; FAIL=$((FAIL+1)); }
+
+# (j) the WORKER refuses an unknown contract — BEHAVIOURAL (review P1, round 2): the controller
+# guard covers only the sweep; chain-merge.sh and fix-one.sh invoke merge-one.sh directly. Drive
+# the shipped guard: fallback + no override must exit 5 BEFORE any reviewer; fallback + override
+# must proceed (and then hit the missing-rail refusal, exit 6 — proving the override path).
+sed -n '/^if \[ "${REQ_SOURCE:-}" = "fallback" \] && \[ -z "${REQ_OVERRIDE:-}" \]; then$/,/^fi$/p' "$MERGE" > "$TMP/worker-guard.sh"
+if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; then
+  ( REQ_SOURCE=fallback; REQ_OVERRIDE=''; PR=1766; OR=daniel-ospina/agent-infra; \
+    L="$TMP/wg"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wgrc=$?
+  [ "$wgrc" = "5" ] && { echo "  ✅ a worker whose protection read FAILED refuses (exit 5) before any reviewer"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ worker guard exited $wgrc, not 5 — an unknown contract can still merge via a non-sweep ingress"; FAIL=$((FAIL+1)); }
+  ( REQ_SOURCE=fallback; REQ_OVERRIDE='pipeline-compliance'; PR=1766; OR=daniel-ospina/agent-infra; \
+    L="$TMP/wg2"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg2rc=$?
+  [ "$wg2rc" != "5" ] && { echo "  ✅ an explicit REQ override still proceeds (the refusal is about NOT KNOWING, not about overriding)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the worker guard refused a valid operator override"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the worker authority-unknown guard from merge-one.sh"; FAIL=$((FAIL+1))
+fi
+
+# (k) the FAILED arm's gate test is WHOLE-NAME (review P2, round 2): `grep -qF` matched a
+# substring, so REVIEW_GATE=compliance misrouted a red pipeline-compliance into the review arm
+# while merge_authority correctly said rail. Extract the shipped derivation and drive both.
+sed -n '/^        _gate_hit=0; _gifs=/,/^        IFS="\$_gifs"$/p' "$ORCH" > "$TMP/gatehit.sh"
+if [ -s "$TMP/gatehit.sh" ] && bash -n "$TMP/gatehit.sh" 2>/dev/null; then
+  REVIEW_GATE=compliance; V='FAILED:pipeline-compliance'; _gate_hit=1
+  # shellcheck disable=SC1090
+  . "$TMP/gatehit.sh"
+  [ "${_gate_hit:-}" = "0" ] && { echo "  ✅ gate hit is whole-name: compliance does NOT match pipeline-compliance"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ gate hit matched a substring (compliance vs pipeline-compliance) — a substring REVIEW_GATE misroutes red CI checks into the review arm"; FAIL=$((FAIL+1)); }
+  REVIEW_GATE=ai-review-gate; V='FAILED:ai-review-gate,docs'; _gate_hit=0
+  # shellcheck disable=SC1090
+  . "$TMP/gatehit.sh"
+  [ "${_gate_hit:-}" = "1" ] && { echo "  ✅ …and the exact gate name DOES match"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the exact gate name did not match"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the gate-hit derivation from orch-loop.sh"; FAIL=$((FAIL+1))
 fi
 
 echo

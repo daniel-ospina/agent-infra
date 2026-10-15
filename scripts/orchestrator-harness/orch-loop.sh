@@ -568,9 +568,11 @@ while true; do
       # ⚠️ review P2, round 1: the fallback set deliberately carries the review gate, which on a
       # foreign repo reads FAILED — NOT PENDING — and the FAILED arm would then spawn a
       # fresh-context reviewer per PR per cycle for as long as protection is unreadable. While
-      # the repo's own contract cannot be read, the controller takes NO merge, auto-arm, or
-      # spawn action at all (AUTHORITY_UNKNOWN, honoured in the sweep below).
-      echo "[req] ⚠️ $OR: branch protection UNREADABLE — the merge contract is UNKNOWN; no merge, auto-arm, or worker spawns this cycle (fail-closed, no burn loop)" >>"$LOG"
+      # the repo's own contract cannot be read, the SWEEP merges, auto-arms, and spawns nothing
+      # this cycle (AUTHORITY_UNKNOWN, honoured in the sweep below). Dispatch lanes are
+      # unaffected; and any merge worker invoked by another ingress (chain-merge, fix-one)
+      # refuses on ITS OWN unreadable read — see merge-one.sh's authority-unknown refusal.
+      echo "[req] ⚠️ $OR: branch protection UNREADABLE — the merge contract is UNKNOWN; the sweep merges, auto-arms, and spawns nothing this cycle (fail-closed, no burn loop; workers refuse on their own read)" >>"$LOG"
       AUTHORITY_UNKNOWN=1 ;;
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
@@ -803,7 +805,16 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           case " $REQ " in *" $_rn "*) CI_RED="$_rn"; break ;; esac
         done
         set +f; IFS="$_redifs"
-        if grep -qF -- "$REVIEW_GATE" <<<"$V"; then
+        # Whole-NAME gate test (review P2, round 2): `grep -qF` matched a SUBSTRING, so a
+        # REVIEW_GATE that is a substring of another red required check (compliance vs
+        # pipeline-compliance) misrouted that check into the review arm instead of the CI fixer
+        # that fetches its failing log — while merge_authority and CI_RED test whole names.
+        _gate_hit=0; _gifs="$IFS"; IFS=','
+        for _vn in ${V#FAILED:}; do
+          [ "$_vn" = "$REVIEW_GATE" ] && _gate_hit=1
+        done
+        IFS="$_gifs"
+        if [ "$_gate_hit" = "1" ]; then
           # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
           # marker at spawn — so restore it too (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
