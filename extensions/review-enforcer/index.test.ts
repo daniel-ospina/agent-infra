@@ -5366,6 +5366,20 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // execution coexist with the read.
         "echo gh issue comment 5; V=--admin; C=gh; PATH=/usr/bin; export PATH; $C pr merge 999 $V",
         "gh issue comment 5 --body x; V=--admin; C=gh; P=p; PATH=/usr/bin; export PATH; $C $P$'r' merge 999 $V",
+        // …and the decoy with BOTH the executable and the verb supplied by variables. The
+        // readable merge here lives inside a quoted ASSIGNMENT, so the guard's third test
+        // does not catch it — the caller's `mergeVerbInText` conjunct does (the text reads
+        // `gh pr merge`), which is why that conjunct is not redundant.
+        "V=--admin; export V; PATH=\"${PATH#*:}\"; export PATH; gh pr view 1 >/dev/null; S='gh pr merge 9 $V'; sh -c \"$S\"",
+        // …and the same trick with NO construct at an executable position: every word comes
+        // from an assignment whose value is readable (`P=pr`), so only the conjunct and the
+        // value-position guard together keep it.
+        "gh pr view 1 >/dev/null; V=--admin; C=gh; P=pr; M=merge; PATH=/usr/bin; export PATH; $C $P $M 999 $V",
+        // …and the same decoy with a CONSTRUCT-FREE PATH discard (`export PATH=/usr/bin`),
+        // where every token the guard can see is in an ARGUMENT position and the merge lives
+        // inside a quoted assignment glued to the `S=` word: the polarity reads this one
+        // positively (the decoy), so ONLY the caller's `mergeVerbInText` conjunct keeps it.
+        "V=--admin; export V; export PATH=/usr/bin; gh pr view 1 >/dev/null; S='gh pr merge 9 $V'; sh -c \"$S\"",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5472,8 +5486,11 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "pr merge 999 $V",
   ]) {
     ok(mergeVerbInText(cmd), `the text names a merge: ${cmd}`);
-    // …and therefore NEVER a positive non-merge read — the property the caller's boundary
-    // rests on, pinned here so the docstring's claim is not merely asserted in prose.
+    // …and the caller's boundary therefore keeps its decision for it: `mergeVerbInText` is
+    // a disjunct, so a shape it reads as a merge cannot defer EVEN IF the polarity reads it
+    // positively — which the decoy inside a quoted assignment shows is possible, and which
+    // is why this loop pins the property for THESE shapes while the caller pins the
+    // disjunction itself.
     ok(!readsNonMergeGhCall(cmd), `…and is not a positive non-merge read: ${cmd}`);
   }
   for (const cmd of [

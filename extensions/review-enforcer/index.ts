@@ -697,6 +697,16 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
 ]);
 
 /**
+ * Shell keywords that put the NEXT token in COMMAND position — where an executable word
+ * lives. A construct-bearing token there may be an executable the text has spelled away
+ * (`$C $P $M 999 $V`), so the guard refuses the read; the same construct in an ARGUMENT
+ * position (`gh api /repos/o/r --method POST $(mktemp)`) is ordinary and must NOT fail it.
+ * Separators are the other half of the test and live in the tokenizer's `gaps`, since the
+ * tokenizer splits them out of the tokens themselves.
+ */
+const EXEC_KEYWORD = /^(then|do|else|elif|!|time|sudo|command|env|exec)$/;
+
+/**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
  * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
  * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
@@ -720,11 +730,15 @@ export function readsNonMergeGhCall(command: string): boolean {
   const scan = scanTokens(command);
   // A POSITIVE READ MUST NOT COEXIST WITH A HIDDEN EXECUTION. A decoy readable `gh …`
   // elsewhere in the command satisfied the read while the real merge spelled its own words
-  // away (`echo gh issue comment 5; V=--admin; C=gh; $C pr merge 999 $V`) — measured as a
-  // live bypass of BOTH layers, with the argv layer discarded by the command itself. So a
-  // construct-bearing token where an executable or a verb belongs, or a path to a `gh`,
-  // fails the read: this is the fail-closed direction, and it is why the polarity cannot be
-  // satisfied by a decoy.
+  // away (`echo gh issue comment 5; V=--admin; C=gh; P=pr; M=merge; $C $P $M 999 $V`) —
+  // measured as a live bypass of BOTH layers, with the argv layer discarded by the command
+  // itself. So a construct-bearing token fails the read when it is
+  //   - a path to a `gh` (`/tmp/x/gh`, `$P/g''h`), or
+  //   - followed immediately by `pr`/`merge` (`$C pr merge`, `$P$'r' merge`), or
+  //   - in COMMAND position, where an executable word lives (`$C $P $M 999 $V`, and the
+  //     assignment compound that blinded this layer to a quoted `S='gh pr merge 9 $V'`).
+  // Each test can only turn a read into a refusal, which is the direction this is allowed
+  // to be wrong in — and without all three, a decoy buys a hidden merge its deference.
   for (let i = 0; i < scan.tokens.length; i++) {
     const tok = scan.tokens[i];
     const w = shellWord(tok);
@@ -732,6 +746,12 @@ export function readsNonMergeGhCall(command: string): boolean {
     if (!CONSTRUCT.test(tok)) continue;
     const next = shellWord(scan.tokens[i + 1]);
     if (next === "pr" || next === "merge") return false; // `$C pr merge`, `$P$'r' merge`
+    // Separators are NOT part of any token — the tokenizer splits on them and keeps them in
+    // `gaps` — so a command position is `i === 0`, or a separator in the gap before this
+    // token, or a shell keyword as the previous word (`then`, `do`, `env`, …).
+    const atCommandPosition = i === 0 || /[;&|({]/.test(scan.gaps[i]) ||
+      EXEC_KEYWORD.test(shellWord(scan.tokens[i - 1] ?? ""));
+    if (atCommandPosition) return false; // an executable word may be spelled away
   }
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {
@@ -756,16 +776,19 @@ export function readsNonMergeGhCall(command: string): boolean {
  * behind a construct in a verb position (`gh pr m`printf erge``, `gh p`printf r` merge`).
  *
  * This is the CANDIDATE rule's shared read (`isAdminMergeCommand` calls it on its
- * spliced-verb branch); the DEFERRAL's own boundary is `readsNonMergeGhCall`. The text
- * layer hands the argv layer the unresolvable FLAG — never the MERGE: a command read as a
- * merge is never a positive non-merge read (pinned), for two reasons that meet here — that is the only shape in which a
- * hidden `--admin` can reach gh AS AN ADMIN MERGE, and it is exactly the shape where the
- * argv layer can be told not to run for that command —
- * `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'` discards the injected
- * entry, so deferring to it would decide nothing and let the merge through. A command
- * the layer merely OVER-reads — a construct plus the word `admin` with no merge in it —
- * cannot merge anything, so deferring THAT is what removes the false block #1776 is
- * about.
+ * spliced-verb branch). The text layer hands the argv layer the unresolvable FLAG — never
+ * the MERGE: the caller's boundary is `hasLiteralAdminFlag || mergeVerbInText ||
+ * !readsNonMergeGhCall`, so a command the text READS as a merge cannot defer, for two
+ * reasons that meet here — that is the only shape in which a hidden `--admin` can reach gh
+ * AS AN ADMIN MERGE, and it is exactly the shape where the argv layer can be told not to
+ * run for that command — `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`
+ * discards the injected entry, so deferring to it would decide nothing and let the merge
+ * through. A command the layer merely OVER-reads — a construct plus the word `admin` with
+ * no merge in it — cannot merge anything, so deferring THAT is what removes the false block
+ * #1776 is about. The two predicates are INDEPENDENT halves, not one property: a readable
+ * merge can still sit inside a decoy command (`S='gh pr merge 9 $V'; sh -c "$S"`, measured
+ * `readsNonMergeGhCall === true`) — which is why the boundary is the disjunction above, and
+ * why neither half may be dropped as "redundant".
  */
 export function mergeVerbInText(command: string): boolean {
   const scan = scanTokens(command);
@@ -2891,8 +2914,8 @@ export default function (pi: ExtensionAPI) {
       // READS as a merge cannot be a positive non-merge read, which is pinned in the
       // predicate test rather than asserted here.
       if (isAdminMergeCommand(command) &&
-          (hasLiteralAdminFlag(command) || !readsNonMergeGhCall(command) ||
-           !ghShimWillEnforce(shimDir))) {
+          (hasLiteralAdminFlag(command) || mergeVerbInText(command) ||
+           !readsNonMergeGhCall(command) || !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.
