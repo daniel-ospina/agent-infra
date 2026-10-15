@@ -147,16 +147,30 @@ export function materializeGhShim(sourceDir: string | null): string | null {
     const src = fs.realpathSync(resolvePath(sourceDir, "gh"));
     const current = fs.existsSync(target) ? fs.realpathSync(target) : null;
     if (current !== src) {
+      // SWAP ATOMICALLY. `rm` then `symlink` leaves a window in which the neutral entry is
+      // ABSENT — and that entry is machine-global (`~/.pi/agent/shims`), so a bash call in
+      // the window (any OTHER session's) finds no `gh` there, falls through to the real gh,
+      // and defeats the deferral this install exists to serve (E3 review P2). `rename` over
+      // the path replaces it in one step on the same filesystem.
+      const staged = resolvePath(NEUTRAL_GH_SHIM_DIR, `.gh.${process.pid}.staged`);
       try {
-        fs.rmSync(target, { force: true });
+        fs.rmSync(staged, { force: true });
+        fs.symlinkSync(src, staged);
+        fs.renameSync(staged, target);
       } catch {
-        /* a missing target is the expected case */
-      }
-      try {
-        fs.symlinkSync(src, target);
-      } catch {
-        fs.copyFileSync(src, target);
-        fs.chmodSync(target, 0o755);
+        // No symlinks on this filesystem (or a cross-device rename): fall back to a copy,
+        // and drop the staging entry either way so a failure leaves no litter behind.
+        try {
+          fs.copyFileSync(src, target);
+          fs.chmodSync(target, 0o755);
+        } catch {
+          /* the caller fails closed on a link that is absent or unusable */
+        }
+        try {
+          fs.rmSync(staged, { force: true });
+        } catch {
+          /* nothing to remove */
+        }
       }
     }
     return NEUTRAL_GH_SHIM_DIR;
@@ -238,15 +252,23 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
  * defers only the unresolvable FLAG, and keeps this layer's fail-closed decision for any
  * command the text layer reads as a merge (`mergeVerbInText` — a `pr`/`merge` token pair,
  * or a token that blinds the read and sits IN A VERB POSITION: a substitution, brace
- * expansion, a redirection, or the substituted repo-flag value the token scan consumed
- * with it). The first class is therefore bounded by MEASUREMENT rather than by a claim: a
- * command that discards the PATH entry cannot get a merge deferred FOR ANY OF THE SHAPES
- * PINNED IN THE BOUNDARY TEST — a `$VAR`/`$'…'`/`${…}` flag, a brace-expanded verb, a verb
- * behind a substituted repo value, a verb behind a redirection the shell consumes — each
- * measured as a fail-open when found, each now a test arm. A spelling that still gets a
- * merge past the text layer lands in the second class (an alias is expanded inside gh,
- * after this process has run), and the post-merge detector, not this gate, is the
- * authority of record for both.
+ * expansion, a redirection, or a repo-flag value — including an empty quote pair the shell
+ * drops — that the token scan consumed with the flag). The first class is therefore
+ * bounded by MEASUREMENT rather than by a claim: a command that discards the PATH entry
+ * cannot get a merge deferred FOR ANY OF THE SHAPES PINNED IN THE BOUNDARY TEST — a
+ * `$VAR`/`$'…'`/`${…}` flag, a brace-expanded verb, an ANSI-C-quoted verb pair, a verb
+ * behind a substituted repo value, behind an empty-quoted repo flag, or behind a
+ * redirection the shell consumes — each measured as a fail-open when found, each now a
+ * test arm. A spelling that still gets a merge past the text layer lands in the second
+ * class (an alias is expanded inside gh, after this process has run), and the post-merge
+ * detector, not this gate, is the authority of record for both.
+ *
+ * The DEFERRAL'S OWN PREMISE is operator state, and is a declared limit rather than a
+ * chased one: `AGENT_GH_SHIM_DIR` is set by the launcher, never by a command (a command
+ * cannot change this process's environment), and pointing it at a directory that holds an
+ * executable `gh` which is NOT the shim (a bin directory with the real gh) makes "the argv
+ * layer is present" true in name only — the same class as `AGENT_GH_SHIM=0`, and visible
+ * for the same reason: both are the operator's own switches.
  */
 export function ghShimWillEnforce(shimDir: string | null): boolean {
   // Both halves are OURS and both must hold: the layer is switched on, AND the
@@ -425,7 +447,16 @@ function stripRepoArgs(command: string): string {
   // Requiring `=` or whitespace after the flag missed gh's valid pflag spelling
   // `gh -Rowner/repo pr merge 999 --admin`, which then skipped BOTH gates entirely
   // (cycle-3 review P0).
-  return command.replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
+  //
+  // An EMPTY QUOTE PAIR on the flag (`--repo"" owner/other`, `--repo'' …`, `-R""`) is
+  // dropped by bash before gh sees it (measured: gh receives `--repo owner/other`), so the
+  // `\S*` branch consumed only `--repo""` and left the VALUE in the stream — between `pr`
+  // and `merge`, which broke the verb-pair read and deferred a real admin merge to an argv
+  // layer the command had already discarded (E3 review P1; the base refused it). Removing
+  // the empty pairs first makes the value the flag's, as bash makes it.
+  return command
+    .replace(/""|''/g, "")
+    .replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
 }
 
 export function isGhPrMergeCommand(command: string): boolean {
@@ -634,7 +665,16 @@ function hasBareGhWord(command: string): boolean {
  */
 export function mergeVerbInText(command: string): boolean {
   const scan = scanTokens(command);
-  const at = (i: number) => dequote(scan.tokens[i] ?? "");
+  // An ANSI-C quote is resolved AWAY by bash before gh runs: `$'gh' $'pr' merge 999 $V`
+  // reaches gh as `gh pr merge 999 --admin`-equivalent argv, but dequoting leaves the
+  // sigil (`$gh`, `$pr`) so neither the pair nor the two anchors below matched it — while
+  // `hasAdminMergeFlag` still saw the `$` and made the command a candidate. The caller then
+  // deferred a MERGE, which is the one thing the deferral must never hand over (measured:
+  // with the PATH entry discarded, it went through). The LEADING `$` is what quoting
+  // produces; a `$` inside a word is a splice, which the construct-in-a-verb-position arm
+  // below already reads (`gh p$'r' merge …`).
+  const verbWord = (t: string | undefined) => dequote(t ?? "").replace(/^\$/, "");
+  const at = (i: number) => verbWord(scan.tokens[i]);
   for (let i = 1; i < scan.tokens.length; i++) {
     if (at(i) === "merge" && at(i - 1) === "pr") return true;
   }
@@ -668,6 +708,12 @@ export function mergeVerbInText(command: string): boolean {
   // argv layer — which the command itself can then disable by resetting PATH. The RAW
   // text still shows a construct-bearing token right after `gh`/`pr`. Erring here costs a
   // refusal; erring the other way costs the gate.
+  //
+  // This arm compares the raw WORDS as written: quoting is resolved by the token scan
+  // above (`verbWord`), which is the arm the ANSI-C-spelled pair needs, and the raw arm
+  // exists for the construct AFTER a word rather than for the word itself. Normalizing
+  // here as well was measured as redundant — the suite does not distinguish it — so it is
+  // not kept as an unverifiable second mechanism.
   const raw = command.trim().split(/\s+/);
   const rawAfterIsConstruct = (word: string): boolean => {
     for (let i = 0; i < raw.length - 1; i++) {
@@ -763,13 +809,17 @@ export function isAdminMergeCommand(command: string): boolean {
         // first slot: the caller's condition keeps its own decision for any `pr`/`merge`
         // PAIR (`mergeVerbInText`), so that would refuse every ordinary
         // `gh pr merge "$PR" --squash` — the #1776 false-positive class, at a far larger
-        // volume. The residual it leaves is DECLARED, not chased and not closable here: a
-        // flag whose VALUE is not in the command text (`V=$(cat f); gh pr merge $V`) with
-        // no explicit PR number gives a text scanner no `admin` word to read, so this layer
-        // is not a candidate at all and the deciding layer is the argv one — whose discard
-        // (`export PATH=…`) is the shim's own STATED LIMITS entry, not a gap this predicate
-        // can close. The same residual WITH a PR number does not exist (`laterBareNumber`
-        // makes it a candidate: measured).
+        // volume. The residual it leaves is DECLARED and is a CLASS claim, not a spelling
+        // claim: no test over this slot can separate a `$`-bearing PR VALUE from a
+        // `$`-bearing FLAG, and one quote character moves a command between the two
+        // readings (measured: the narrow arm `if (/^\$/.test(arg)) return true` closes the
+        // unquoted spelling AND blocks the pinned unquoted ordinary form, while
+        // `gh pr merge "$V"` stays allowed — so it buys nothing the class needs). What is
+        // left is a flag whose VALUE is not in the command text (`V=$(cat f); gh pr merge
+        // $V`) with no explicit PR number: a text scanner has no `admin` word to read, so
+        // this layer is not a candidate and the decider is the argv layer — whose discard
+        // (`export PATH=…`) is the shim's own STATED LIMITS entry. The same residual WITH a
+        // PR number does not exist (`laterBareNumber` makes it a candidate: measured).
         continue; // a genuine `$PR` position argument
       }
       return true;

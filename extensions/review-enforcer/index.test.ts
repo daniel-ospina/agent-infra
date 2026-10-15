@@ -5302,8 +5302,9 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
   //
   // ABOVE `cmds` IS THE DECLARED THREAT LIST for that boundary: a flag supplied by a
   // variable, by an ANSI-C quote, or by brace expansion; a verb behind a substituted repo
-  // value, behind brace expansion, or behind a redirection the shell consumes. Each arm
-  // was a measured fail-open when it was found (each is a shape bash rewrites into
+  // value, behind an empty quote pair on the repo flag, behind brace expansion, behind a
+  // redirection the shell consumes, or both verb words ANSI-C-quoted. Each arm was a
+  // measured fail-open when it was found (each is a shape bash rewrites into
   // `pr merge … --admin` while the raw tokenizer does not read the pair), and each now
   // fails the run if the class that covers it narrows again.
   await withTempHome(async () => {
@@ -5324,6 +5325,11 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // repo-flag stripper consumed `--repo=$(…)` together with its `$`, so the token
         // scan saw no verb at all until the raw-text arm was added.
         "PATH=\"/usr/bin\"; export PATH; gh pr --repo=$(cat .gh-repo) merge 999 $'--admin'",
+        // …and with an EMPTY QUOTE PAIR on the repo flag: bash drops the empty pair, so gh
+        // receives `--repo owner/other`, but the stripper consumed only `--repo""` and left
+        // the value between `pr` and `merge` (E3 review P1; the base refused it).
+        "export PATH=/usr/bin; gh pr --repo\"\" owner/other merge 999 $'--admin'",
+        "export PATH=/usr/bin; gh -R'' owner/other pr merge 999 $'--admin'",
         // …and with the VERB SPLICED BY BRACE EXPANSION, which carries no `$` and no
         // backtick: `gh {pr,merge} 999 $V` hands the real gh the argv
         // `pr merge 999 --admin`, and the pre-deferral code refused it.
@@ -5333,6 +5339,16 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // the raw tokenizer saw `pr` and `merge` in different positions — the verb read
         // was blinded by a token bash removes.
         "export PATH=/usr/bin; V=--admin; gh pr >/dev/null merge 999 $V",
+        // …and with BOTH VERB WORDS ANSI-C-QUOTED: bash resolves `$'gh' $'pr'` to `gh pr`
+        // (measured), while dequoting them leaves `$gh`/`$pr`, so the pair and the two word
+        // anchors all missed a merge the caller then deferred.
+        "export PATH=/usr/bin; $'gh' $'pr' merge 999 $'--admin'",
+        "export PATH=/usr/bin; V=$(cat .flag); $'gh' $'pr' merge 999 $V",
+        // …and the ANSI-C verb words ACROSS a repo pair, which only the token scan can see:
+        // `stripRepoArgs` removes `--repo owner/other`, and the RAW neighbours are then
+        // `--repo` and `merge`, neither of which is a construct — so this shape needs the
+        // pair arm to resolve `$'pr'`.
+        "export PATH=/usr/bin; $'gh' --repo owner/other $'pr' merge 999 $'--admin'",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
