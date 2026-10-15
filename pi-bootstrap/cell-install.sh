@@ -124,10 +124,11 @@
 #                    from this script's own checkout, then AGENT_INFRA_PATH, $HARNESS/..
 #                    and $CELL_HOME/agent-infra, and the script FAILS if none of them is a
 #                    checkout — a cell that cannot receive the layer must not be certified.
-#                    There is deliberately NO world-writable candidate (a fixed /tmp path
-#                    would let any local user put a checkout-shaped tree there and have
-#                    this script copy its extensions onto the cell and pi EXECUTE them);
-#                    pass INFRA_ROOT explicitly if the checkout is somewhere unusual.
+#                    An AMBIENT candidate must also be OWNED BY THIS USER: the cell's HOME is
+#                    a fixed path under a world-writable /tmp (/tmp/cell-home), so
+#                    'checkout-shaped' is not a trust signal by itself — whoever can
+#                    pre-create that path would choose the extensions and farmed scripts
+#                    that pi then EXECUTES. Pass INFRA_ROOT explicitly to override.
 #
 #   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
@@ -197,14 +198,36 @@ resolve_infra_root() {
   # Order matters: an explicit INFRA_ROOT wins, then the checkout this script itself was
   # shipped in (the strongest signal — it IS the checkout the installer came from), then the
   # ambient/derived locations an operator or the supervisor may have exported.
-  for cand in "${INFRA_ROOT:-}" "$SELF_DIR/.." "${AGENT_INFRA_PATH:-}" \
-              "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra"; do
+  for cand in "${INFRA_ROOT:-}" "$SELF_DIR/.."; do
     [ -n "$cand" ] || continue
     if is_infra_checkout "$cand"; then
       (cd "$cand" && pwd)
       return 0
     fi
   done
+  # The AMBIENT candidates must additionally be owned by the user running this script. The
+  # cell's HOME is a fixed path under a world-writable /tmp (/tmp/cell-home), so a
+  # checkout-shaped tree appearing there may have been planted by another local user — and
+  # everything under it is installed and then EXECUTED by pi (merge-one.sh runs the farmed
+  # record-review.sh directly). The two declarations above are the operator's own.
+  local refused=""
+  for cand in "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra"; do
+    [ -n "$cand" ] || continue
+    if is_infra_checkout "$cand"; then
+      if [ -O "$cand" ]; then
+        (cd "$cand" && pwd)
+        return 0
+      fi
+      refused="$refused $cand"
+    fi
+  done
+  if [ -n "$refused" ]; then
+    # STDERR, not `say`: the only caller assigns this function's STDOUT to a variable
+    # (`INFRA_ROOT="$(resolve_infra_root)"`), so a diagnostic printed on stdout is captured
+    # into that variable and never reaches the operator — dead code that also poisons the
+    # value. Nothing but the resolved path may go to stdout here.
+    printf '  refused (a checkout-shaped tree NOT owned by %s):%s — pass INFRA_ROOT=<checkout> to use one deliberately\n' "$(id -un)" "$refused" >&2
+  fi
   return 1
 }
 
@@ -383,22 +406,33 @@ install_extensions() {
 # node_modules — pi's loader does not provide them. Without this step the cell gets the
 # files and none of the tools: `builtin-tools` IS the `task` dispatcher a lane uses.
 #
-# The npm child runs with an EMPTY environment and package scripts disabled, and the loop
-# uses the SAME predicate as verify_layer (a non-empty `dependencies`). Both are load-bearing:
+# The npm child runs with a SCRUBBED environment, an explicit proxy/registry allowlist, and
+# package scripts disabled, and the loop uses the SAME predicate as verify_layer (a non-empty
+# `dependencies`). All three are load-bearing:
 #   * bring-up sources the cell's keys.env (`set -a; . keys.env; set +a`) BEFORE calling this
 #     installer, so every secret in it — the provider keys AND AI_REVIEW_GATE_KEY, the merge
 #     authority `ai-review-gate` verifies — is in this process's environment. `npm install`
 #     runs each dependency's lifecycle scripts with that environment inherited, and these
 #     extensions resolve floating ranges, so a compromised published version or any
 #     transitive dep could read the merge key and mint review markers for arbitrary code.
-#     `env -i` + `--ignore-scripts` removes the secret from the child and removes the
-#     execution path; the shipped deps are pure JS, so nothing needs a build step.
+#     --ignore-scripts is the control that blocks the READ; `env -i` removes the environment
+#     COPY, which is defence in depth, not the control — pi also writes the key to DISK
+#     ($HOME/.pi/agent/.ai-review-gate-key) and auth.json alongside it. Do not delete either
+#     flag believing the other covers it.
+#   * the allowlist keeps a cell behind a mirror or an HTTP proxy able to install at all: the
+#     previous invocation inherited the operator's npm configuration from keys.env, and
+#     `env -i` would otherwise drop it.
 #   * the predicate mismatch made install announce `deps installed: X` for extensions npm
 #     installed nothing for, and sent 5 needless network round-trips.
 install_extension_deps() {
-  local d base npm_home
+  local d base npm_home v
+  local npm_env=()
   command -v npm >/dev/null 2>&1 \
     || die "npm is missing: the shipped extensions that declare runtime deps cannot load without it (builtin-tools alone is the 'task' dispatcher)"
+  for v in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy \
+           npm_config_registry NPM_CONFIG_REGISTRY npm_config_cafile npm_config_strict_ssl; do
+    [ -n "${!v:-}" ] && npm_env+=("$v=${!v}")
+  done
   npm_home="$(mktemp -d "${TMPDIR:-/tmp}/cell-install-npm-home.XXXXXX")" || die "cannot create an npm HOME"
   for d in "$DEST"/extensions/*/; do
     [ -f "$d/package.json" ] || continue
@@ -406,6 +440,7 @@ install_extension_deps() {
       "$d/package.json" 2>/dev/null || continue
     base="$(basename "$d")"
     if (cd "$d" && env -i PATH="$PATH" HOME="$npm_home" TMPDIR="${TMPDIR:-/tmp}" \
+          ${npm_env[@]+"${npm_env[@]}"} \
           npm install --omit=dev --ignore-scripts --no-audit --no-fund >/dev/null 2>&1); then
       say "deps installed: $base"
     else
@@ -436,7 +471,16 @@ copy_repo_path() {
 }
 
 install_config() {
-  local rel
+  local rel cfg_fail=0
+  # settings.json is the SIXTH config source, and it is checked FIRST so that the step's
+  # success line below cannot print after its failure. (It used to be checked after the
+  # `say`, which is how `--install` could record "settings.json is MISSING" and then print
+  # "small config files installed" in the same breath.)
+  local src="$INFRA_ROOT/pi-bootstrap/pi-config/settings.json"
+  if [ ! -f "$src" ]; then
+    fail "pi-bootstrap/pi-config/settings.json is MISSING from $INFRA_ROOT — the cell would keep whatever settings it already had"
+    cfg_fail=1
+  fi
   for rel in pi-bootstrap/pi-config/agents \
              pi-bootstrap/pi-config/behavior-control \
              pi-bootstrap/pi-config/coding-rules.md \
@@ -446,16 +490,21 @@ install_config() {
     # a checkout missing (say) pi-config/agents installed nothing, printed success, and then
     # verified clean — a cell with no sub-agent definitions at all, which is the exact
     # partial-layer-reports-success case this script exists to remove.
-    [ -e "$INFRA_ROOT/$rel" ] \
-      || { fail "declared config path $rel is MISSING from $INFRA_ROOT — the cell would get no agents/behavior-control (pi resolves user-scope sub-agents from ~/.pi/agent/agents)"; continue; }
-    copy_repo_path "$rel" || fail "could not install $rel"
+    if [ ! -e "$INFRA_ROOT/$rel" ]; then
+      fail "declared config path $rel is MISSING from $INFRA_ROOT — the cell would get no agents/behavior-control (pi resolves user-scope sub-agents from ~/.pi/agent/agents)"
+      cfg_fail=1
+      continue
+    fi
+    copy_repo_path "$rel" || cfg_fail=1
   done
-  say "agents + behavior-control + small config files installed"
+  # The step's own narrative may not contradict its FAIL line: an unconditional `say` here
+  # used to print 'installed' straight after a recorded failure.
+  [ "$cfg_fail" -eq 0 ] && say "agents + behavior-control + small config files installed" || true
 
   # settings.json — MERGED, never clobbered (same contract as setup.sh: source wins per
   # key, local extras survive, `retry` deep-merged per key so a local
-  # `retry.enabled: false` kill switch cannot be reset by a re-run).
-  local src="$INFRA_ROOT/pi-bootstrap/pi-config/settings.json"
+  # `retry.enabled: false` kill switch cannot be reset by a re-run). The source's existence
+  # was checked (and recorded) at the top of this function.
   if [ -f "$src" ]; then
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$src" "$DEST/settings.json" <<'PY' || fail "settings.json merge failed"
@@ -500,7 +549,7 @@ PY
 
 # ── 4. the ~/.pi/agent/tools/ constraint (#1277) ─────────────────────────────
 # Migration (INSTALL only — `--verify` writes nothing, so neither this nor the empty-dir
-# cleanup below may be reachable from it). The farm used to write here: pi's startup scan
+# cleanup below may be REACHED from it). The farm used to write here: pi's startup scan
 # rejects ANY non-fd/rg entry and then blocks every interactive boot on an untimed keypress
 # prompt — the fleet's entire dispatch path.
 migrate_legacy_tools_farm() {
@@ -540,6 +589,23 @@ guard_tools_dir() {
 # present AND byte-identical to the checkout (the repo copy is the copy that must run),
 # every guard must have landed, the deny must hold, and the tools/ namespace must be clean.
 GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-guard audit-logger.ts shared)
+
+# shipped_content_matches <src-dir> <dst-dir> — every file in the SOURCE tree (minus
+# node_modules) must exist at the same relative path under the destination and be
+# byte-identical. Deliberately ONE-DIRECTIONAL: the installer never deletes a cell-local extra
+# (the header's contract — nothing is removed except a denied extension and a legacy
+# tools/fleet/), so a file that exists only on the cell is not a failure. A two-way `diff -rq`
+# refused such a cell and the installer could not repair it — a false block, not a finding.
+# A MISSING or EDITED shipped file still fails: that is drift.
+shipped_content_matches() {
+  local src="$1" dst="$2" f rel
+  while IFS= read -r f; do
+    rel="${f#"$src"/}"
+    case "$rel" in node_modules/*) continue ;; esac
+    cmp -s "$f" "$dst/$rel" || return 1
+  done < <(find "$src" -type f 2>/dev/null)
+  return 0
+}
 
 verify_layer() {
   local rows src_rel dest_rel base src dst farm_n=0
@@ -594,10 +660,8 @@ verify_layer() {
         || fail "extension DIFFERS from the checkout: extensions/$base (a stale or hand-edited copy)"
     elif [ ! -d "$edst" ]; then
       fail "extension SHAPE CHANGED: extensions/$base is a directory in the checkout and not one on the cell"
-    elif ! diff -rq -x node_modules "$esrc" "$edst" >/dev/null 2>&1; then
-      # A directory extension: compare the whole tree, excluding the node_modules npm
-      # created on the cell (a cell-local artifact, not shipped content).
-      fail "extension DIR DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)"
+    elif ! shipped_content_matches "$esrc" "$edst"; then
+      fail "extension CONTENT DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)"
     fi
   done <<<"$entries"
 
@@ -632,17 +696,50 @@ verify_layer() {
   # The config set. These five were installed blind and never read back, so a checkout
   # missing one produced a cell that verified clean with no sub-agent definitions at all —
   # pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch
-  # a reviewer, and extensions/subagent reports `Agents: none` without an error.
-  local cfg
+  # a reviewer, and extensions/subagent reports `Agents: none` without an error. Read back
+  # the CONTENT too: a hand-edited agents/verifier.md is the same class as a hand-edited
+  # guard — it is the artifact a lane dispatches reviewers with.
+  local cfg csrc cdst
   for cfg in agents behavior-control coding-rules.md response-rules-reminder.md skills-repos.yaml; do
-    [ -e "$DEST/$cfg" ] \
-      || fail "config artifact MISSING: $cfg (installed from $INFRA_ROOT/pi-bootstrap/pi-config/$cfg)"
+    csrc="$INFRA_ROOT/pi-bootstrap/pi-config/$cfg"
+    cdst="$DEST/$cfg"
+    if [ ! -e "$cdst" ]; then
+      fail "config artifact MISSING: $cfg (installed from $csrc)"
+    elif [ ! -e "$csrc" ]; then
+      fail "config artifact $cfg is not in the checkout ($csrc) — verify cannot vouch for it"
+    elif [ -f "$csrc" ]; then
+      cmp -s "$csrc" "$cdst" \
+        || fail "config artifact DIFFERS from the checkout: $cfg (a hand-edited cell copy — re-apply it as a checkout change)"
+    elif [ -d "$cdst" ] && ! shipped_content_matches "$csrc" "$cdst"; then
+      fail "config artifact CONTENT DIFFERS from the checkout: $cfg (a hand-edited or stale cell copy)"
+    elif [ -d "$cdst" ] && [ -z "$(ls -A "$cdst" 2>/dev/null)" ]; then
+      fail "config artifact $cfg is EMPTY (pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch a reviewer)"
+    fi
   done
-  if [ -d "$DEST/agents" ] && [ -z "$(ls -A "$DEST/agents" 2>/dev/null)" ]; then
-    fail "agents/ is EMPTY — pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch a reviewer"
-  fi
   [ -f "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing (a cell lane gets no global rules)"
   [ -f "$DEST/settings.json" ] || fail "settings.json is missing"
+  # settings.json is MERGED, so it can never be byte-compared — but every key the checkout
+  # declares must still be present and equal on the cell (the merge is source-wins, per key,
+  # with cell-local extras surviving). Without this, a checkout whose settings.json went
+  # missing certified a cell running the STALE settings it already had.
+  local ssrc="$INFRA_ROOT/pi-bootstrap/pi-config/settings.json"
+  if [ ! -f "$ssrc" ]; then
+    fail "pi-bootstrap/pi-config/settings.json is missing from $INFRA_ROOT — settings were never installed from this checkout"
+  elif [ -f "$DEST/settings.json" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$ssrc" "$DEST/settings.json" <<'PY' || fail "settings.json does not carry the checkout's keys (it kept a stale cell copy)"
+import json, sys
+
+def subset(src, dst, path=""):
+    if isinstance(src, dict):
+        if not isinstance(dst, dict):
+            return [path or "<root>"]
+        return [p for k, v in src.items() for p in subset(v, dst.get(k), path + "/" + k)]
+    return [] if src == dst else [path or "<root>"]
+
+bad = subset(json.load(open(sys.argv[1])), json.load(open(sys.argv[2])))
+sys.exit(1 if bad else 0)
+PY
+  fi
   if command -v python3 >/dev/null 2>&1 && [ -f "$DEST/settings.json" ]; then
     python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$DEST/settings.json" >/dev/null 2>&1 \
       || fail "settings.json is not valid JSON"

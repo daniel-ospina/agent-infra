@@ -229,8 +229,9 @@ the network, the provider, `gh` auth/push, the target-repo clone, the dispatch p
 **the operational layer** — that last one from the agent-infra checkout already on the cell via
 `pi-bootstrap/cell-install.sh`, and it REFUSES to print `CELL READY` if the layer cannot be
 installed. Two things a `CELL READY` does NOT speak for, and which the operator still owns:
-**`AI_REVIEW_GATE_KEY`** (push it in `keys.env`; the gate that enforces it is
-`cloud-cell-supervisor.sh check`) and **`AGENT_INFRA_PATH`**, which the `AGENTS.md` this step
+**`AI_REVIEW_GATE_KEY`** (push it in `keys.env`; what actually ENFORCES it is the
+`ai-review-gate` check on each PR — `cloud-cell-supervisor.sh check` only WARNS, and says so)
+and **`AGENT_INFRA_PATH`**, which the `AGENTS.md` this step
 installs declares as a prerequisite — nothing on the cell sets it (`session-checks` and
 `auto-sync` silently skip without it, and `sequence-enforcer` in gate mode reports an
 unpassable checkpoint), so export it in the cell session's environment. `cell-install.sh` copies

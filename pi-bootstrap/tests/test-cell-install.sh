@@ -99,7 +99,7 @@ expected_farm_rows() {
               "lib_srcs|lib|scripts/lib|required" \
               "fleet_tools|fleet|tools/fleet|required" \
               "lane_root_srcs||scripts|optional" \
-              "lane_srcs||scripts|optional"; do
+              "lane_srcs||scripts/lane|optional"; do
     name="${spec%%|*}"; rest="${spec#*|}"; req="${rest##*|}"; rest="${rest%|*}"
     dest="${rest%%|*}"; src="${rest##*|}"
     line="$(sed -n "s/^${name}=(\(.*\))$/\1/p" "$SETUP")"
@@ -353,9 +353,25 @@ rm -rf "$DEST/tools"
 echo "# drift injected by the test" >> "$DEST/extensions/review-enforcer/index.ts"
 run_verify
 rc=$?
-[ "$rc" -eq 1 ] && grep -q "extension DIR DIFFERS from the checkout: extensions/review-enforcer" "$LOG" \
+[ "$rc" -eq 1 ] && grep -q "extension CONTENT DIFFERS from the checkout: extensions/review-enforcer" "$LOG" \
   && ok "--verify refuses a hand-edited guard extension (existence is not certification)" \
   || fail "--verify CERTIFIED a hand-edited guard extension — a stale guard would load on the cell"
+# ... but a cell-local EXTRA inside an extension directory must NOT fail: the installer never
+# deletes one (its own contract), so refusing it would be a false block it cannot repair.
+cp "$ROOT/extensions/review-enforcer/index.ts" "$DEST/extensions/review-enforcer/index.ts"
+echo "# cell-local extra" > "$DEST/extensions/review-enforcer/cell-local-helper.ts"
+run_verify
+[ $? -eq 0 ] && ok "a cell-local extra in an extension directory is tolerated (extras survive, drift does not)" \
+  || fail "--verify refused a cell-local extra — a false block the installer cannot repair"
+rm -f "$DEST/extensions/review-enforcer/cell-local-helper.ts"
+# A hand-edited CONFIG artifact is the same class as a hand-edited guard: agents/ is where pi
+# resolves the sub-agent definitions a lane dispatches reviewers with.
+echo "# edited" >> "$DEST/agents/verifier.md"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "config artifact CONTENT DIFFERS from the checkout: agents" "$LOG" \
+  && ok "--verify refuses a hand-edited config artifact (agents/ is read back, not just listed)" \
+  || fail "--verify CERTIFIED a hand-edited agents/ definition"
 # The config set used to be installed blind and never read back: a checkout missing
 # pi-config/agents produced a certified cell whose lane could dispatch no sub-agent.
 rm -rf "$DEST/agents"
@@ -368,6 +384,51 @@ run_install >/dev/null 2>&1
 cmp -s "$ROOT/extensions/review-enforcer/index.ts" "$DEST/extensions/review-enforcer/index.ts" \
   && ok "re-install restored the drifted guard and the config set" \
   || fail "re-install did not restore the drifted guard"
+# settings.json is MERGED, so it can never be byte-compared — but the checkout's keys must all
+# be present on the cell. A checkout whose settings.json went missing used to install nothing,
+# say nothing, and verify clean over whatever stale settings the cell already had.
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["cellOnlySetting"]=True; json.dump(d,open(sys.argv[1],"w"))' \
+  "$DEST/settings.json"
+run_verify
+[ $? -eq 0 ] && ok "a cell-local settings key survives --verify (the merge is source-wins, per key)" \
+  || fail "--verify refused a legitimate cell-local settings key"
+# ... but a cell that lost the CHECKOUT's keys is running stale settings, and the merge is
+# exactly what is supposed to have prevented that.
+cp "$DEST/settings.json" "$TMP/settings-backup.json"
+python3 -c 'import json,sys; json.dump({"defaultProvider":"stale"}, open(sys.argv[1],"w"))' "$DEST/settings.json"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "settings.json does not carry the checkout's keys" "$LOG" \
+  && ok "--verify refuses a cell whose settings.json lost the checkout's keys (stale cell copy)" \
+  || fail "--verify CERTIFIED a cell running stale settings"
+cp "$TMP/settings-backup.json" "$DEST/settings.json"
+FAKE_CFG="$TMP/no-settings-checkout"
+# A checkout-shaped tree built from SYMLINKS to the real ones — never a `cp -R` of the repo
+# (this worktree's .worktrees/ holds a full second checkout). Only pi-bootstrap/pi-config is
+# real, and its settings.json is the one thing removed.
+mkdir -p "$FAKE_CFG/pi-bootstrap/pi-config"
+for d in scripts extensions skills templates tools manifest.json; do ln -s "$ROOT/$d" "$FAKE_CFG/$d"; done
+ln -s "$ROOT/pi-bootstrap/setup.sh" "$FAKE_CFG/pi-bootstrap/setup.sh"
+cp -R "$ROOT/pi-bootstrap/pi-config/." "$FAKE_CFG/pi-bootstrap/pi-config/"
+rm -f "$FAKE_CFG/pi-bootstrap/pi-config/settings.json"   # ONLY settings.json: the five loop sources are present
+out="$(CELL_HOME="$TMP/nosettings-home" INFRA_ROOT="$FAKE_CFG" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "pi-config/settings.json is MISSING" <<<"$out" \
+  && ok "a checkout with no settings.json fails the install (it used to succeed in silence)" \
+  || fail "a missing settings.json exited $rc without refusing"
+grep -q "small config files installed" <<<"$out" \
+  && fail "the config step printed its success line after a recorded failure (settings.json)" \
+  || ok "the config step does not print its success line when settings.json was missing"
+rm -rf "$FAKE_CFG/pi-bootstrap/pi-config/agents"   # now one of the config LOOP's five sources
+out="$(CELL_HOME="$TMP/nosettings-home" INFRA_ROOT="$FAKE_CFG" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
+rc=$?
+grep -q "declared config path pi-bootstrap/pi-config/agents is MISSING" <<<"$out" \
+  && ok "a missing config source is a recorded failure, not a skip (rc=$rc)" \
+  || fail "a missing config source was not reported"
+grep -q "small config files installed" <<<"$out" \
+  && fail "the config step printed its success line after a recorded failure (agents)" \
+  || ok "the config step does not print its success line when a loop source was missing"
+rm -rf "$FAKE_CFG" "$TMP/nosettings-home"
 
 # A dependency tree that has VANISHED is a partial layer, and verify cannot see that npm ever
 # ran — the install path is gated on npm's exit code, verify has only the artifact.
