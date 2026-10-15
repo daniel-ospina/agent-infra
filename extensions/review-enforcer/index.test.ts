@@ -5188,6 +5188,14 @@ testAsync("#1776: the text gate stands down when the argv layer will enforce (th
       ok(String(ev.input.command).startsWith("export PATH="),
         "the argv layer's PATH prefix WAS injected for this command");
       const reason = String((res && res.reason) ?? "");
+      // The POSITIVE companion of the negative assertions below. Without it, "the text
+      // gate stood down" and "the handler stopped handling this command" are
+      // indistinguishable — an early return after the PATH injection would satisfy every
+      // negative. This command reaches no merge, so the DISPATCH gate is the refuser, and
+      // its durable audit tag is the contract (the prose below is only the message).
+      ok(res && res.block === true, "…and the command is still REFUSED, by another gate");
+      ok(tempAuditLines().some((l) => l.event === "gate_block" && l.reason === "no_reviewers_dispatch"),
+        "…the dispatch gate, by its durable audit tag");
       ok(!/admin-merge|admin merge|resolvable PR number/i.test(reason),
         `the ADMIN-MERGE gate is not what refused it (reason: ${reason || "<none>"})`);
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
@@ -5224,6 +5232,10 @@ testAsync("#1776: with the argv layer OFF the text gate still refuses an unresol
         "the env kill switch disables the deferral even with a shim dir");
       const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
       ok(res && res.block === true, "…so the fail-closed text gate still refuses it");
+      // Identify the refuser by its DURABLE contract (the audit tag the rest of this
+      // suite relies on), not by a substring of its human-facing message.
+      ok(tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "…and the ADMIN-MERGE gate is the refuser, by its durable audit tag");
       ok(/admin-merge/.test(String(res && res.reason)), "…and says which gate refused");
     } finally {
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
@@ -5289,13 +5301,18 @@ testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installe
       const cmd = "V=--admin; gh pr merge 999 $V";
       ok(!hasLiteralAdminFlag(cmd), "the flag is a guess");
       const ev = { toolName: "bash", input: { command: cmd } };
-      await fire("tool_call", ev);
+      const res = await fire("tool_call", ev);
       // The premise is OBSERVED, not assumed: the handler patched this very command,
       // so the argv layer is what runs when it executes (the decision reads the same
       // value `withGhShim` was given — the cached `activeGhShimDir()`, not a fresh
       // resolution, so the injection and the decision cannot drift).
       ok(String(ev.input.command).startsWith("export PATH="),
         "the argv layer's PATH prefix WAS injected for this command");
+      // The POSITIVE companion: what refused it is pinned too, so an early return that
+      // skipped the later gates cannot pass this test.
+      ok(res && res.block === true, "the registry gate still refuses it");
+      ok(tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "no_review_record"),
+        "…by its durable audit tag");
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
         "the evidence gate did not run on a guessed flag");
     } finally {
