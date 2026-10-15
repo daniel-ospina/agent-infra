@@ -2663,6 +2663,40 @@ grep -q "^ *-> absent from main" "$TMP/err" && pass "(f) …as absent from main'
   || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
   || pass "(f) no merge attempted"
+
+# ── the SAME rule for `job-unreadable::<slug>` (#7131) in the new helpers ──
+# This pins the MERGE RESOLUTION, not just the branch: splitting main's inline
+# `main_files` block into `main_baseline_units` / `failure_file_key` dropped
+# main's `job-unreadable::` arm from both. The branch's own side keeps only the
+# generic `s/::.*//` / `%%::*`, which collapses EVERY pruned-log job onto the
+# literal `job-unreadable` — so a main baseline red on a DIFFERENT job matches
+# the PR's job and the operator is told the lane is re-measuring main's failure
+# when it is not. That is exactly the false conclusion #7131 exists to prevent.
+# Main is red on `test (h)`; the PR's pruned job is `test (d)`, so the PR's unit
+# is NOT on main and must read "absent from main's failure set", naming the JOB
+# SLUG — never the bare `job-unreadable` prefix.
+new_scen jobunreadable-resid
+sha_ju='aa71310000000000000000000000000000000077'
+printf '%s\n' "$sha_ju" > "$SCEN/head"
+lane_fail "$sha_ju" 7150 > "$SCEN/runs-$sha_ju"
+: > "$SCEN/pruned-log-7150"                  # the PR run's log is PROVEN absent
+printf 'test (d)\n' > "$SCEN/jobs-failed-7150"
+printf '3\n' > "$SCEN/jobs-count-7150"
+# main is red on the SAME family (a pruned log) but a DIFFERENT job.
+lane_fail mainju 7151 > "$SCEN/runs-main"
+: > "$SCEN/pruned-log-7151"
+printf 'test (h)\n' > "$SCEN/jobs-failed-7151"
+printf '3\n' > "$SCEN/jobs-count-7151"
+run_admin 44 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a job-unreadable main has on a DIFFERENT job BLOCKS (exit $rc)" \
+  || fail "(g) a PR-unique job-unreadable was certified (exit $rc)"
+grep -q "no failure in job-unreadable" "$TMP/err" && fail "(g) the bare 'job-unreadable' prefix was reported as the unit" \
+  || pass "(g) …never the bare 'job-unreadable' prefix as a unit"
+grep -q "no failure in test-d" "$TMP/err" && pass "(g) …the JOB SLUG is named as the unit" \
+  || fail "(g) a different-job main baseline was mis-reported: $(grep 'no failure in\|measured on this lane' "$TMP/err" | head -1)"
+grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted on a PR-unique job-unreadable" \
+  || pass "(g) no merge attempted"
+
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
