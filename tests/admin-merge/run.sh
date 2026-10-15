@@ -903,6 +903,19 @@ repro_script_extra() {  # <path> <extra-nodeid>
   chmod +x "$1"
 }
 
+# A reproduction that RECORDS the ids the rail actually handed it (the runner's
+# stdin), then reports <nodeid> FAILED. Used to prove a non-nodeid family is NOT
+# passed to the runner: pytest refuses a non-path argument with exit 4 having run
+# NOTHING, so an id the runner must never see has to be asserted absent from its
+# input, not merely inferred from the outcome (#3715 review, P2).
+repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'tee %q | grep -F %q | sed "s/^/FAILED /"\n' "$3" "$2"
+  } > "$1"
+  chmod +x "$1"
+}
+
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
@@ -1500,6 +1513,18 @@ fi
 grep -q "CLEARED as reproduced on the base" "$SCEN/comment" \
   && pass "#3715: the evidence heading does not overclaim 'all EXEMPT'" \
   || fail "#3715: the evidence heading still folds a reproduced id into 'all EXEMPT'"
+# THE PLACEHOLDER, NOT ONLY THE HEADING (#3715 review, P2). The heading was made
+# conditional on `repro_count`; the body under "must be empty" was not, so the
+# SAME evidence comment claimed both "(none — no failure was exempted)" and "the
+# decision exempts every failure this PR carries". The cleared id was reproduced
+# on the base, not exempted — the body must say so. Both directions are asserted
+# because the overclaim is a claim about the RECORD, not a cosmetic string.
+grep -q "the 1 cleared id(s) were reproduced on the base" "$SCEN/comment" \
+  && pass "#3715: the empty-residual placeholder names the base reproduction, not a non-existent exemption" \
+  || fail "#3715: the placeholder still claims the decision exempted the failure the base reproduced"
+grep -qF "(empty — the decision exempts every failure this PR carries)" "$SCEN/comment" \
+  && fail "#3715: the placeholder contradicts the '(none — no failure was exempted)' block in the same comment" \
+  || pass "#3715: the overclaiming placeholder is not emitted when the base cleared the residual"
 grep -q "pr merge 42 --admin" "$SCEN/calls" \
   && pass "#3715: the merge proceeds once the reproduced failure is cleared" \
   || fail "#3715: no --admin merge after a reproduced-on-base residual"
@@ -1604,6 +1629,79 @@ for bad in 00 99999999999999999999; do
     || fail "#3715: ADMIN_MERGE_REPRO_TIMEOUT=$bad was not reported as could-not-run"
 done
 
+# HALF 5c — a runner that FAILED TO RUN is not a runner that "ran and found
+# nothing" (#3715 review, P2). The subshell status was discarded, so an exit-1
+# capture with no output (a crash, missing dependencies, an argv the runner
+# refused) left `ids` reading a legitimate empty set and the rail reporting "NO
+# refused failure reproduced there" — a POSITIVE measurement that the base passed
+# tests it never executed. `false` is exactly that shape.
+new_scen repro-base-runfail
+repro_base_sha
+HEAD_RF="eded000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RF" > "$SCEN/head"
+lane_fail "$HEAD_RF" 946 > "$SCEN/runs-$HEAD_RF"
+log_failed "$PRE" > "$SCEN/log-946"
+lane_fail main6262 986 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-986"
+cp "$SCEN/log-946" "$SCEN/log-after-946"
+REPRO_CMD=false
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a runner that FAILED clears nothing (exit $rc)" \
+                || { fail "#3715: a runner that exited non-zero still cleared the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "the reproduction could not RUN" "$SCEN/err" \
+  && pass "#3715: a non-zero runner status is reported as could-not-run" \
+  || fail "#3715: a non-zero runner status was not reported as could-not-run"
+grep -q "NO refused failure reproduced there" "$SCEN/err" \
+  && fail "#3715: a runner that FAILED was reported as a ran-and-found-nothing MEASUREMENT" \
+  || pass "#3715: a failed runner is never reported as 'no refused failure reproduced'"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#3715: a failed runner was read as a clearance" \
+  || pass "#3715: a failed runner cleared nothing"
+
+# HALF 5d — a NON-NODEID identity must never reach the runner (#3715 review, P2).
+# `collect-error::<file>`, `watchdog-kill::<reason>` and `job-unreadable::<slug>`
+# name no pytest nodeid; passed to pytest as an ARGUMENT one of them makes it exit
+# 4 having run NOTHING, aborting the WHOLE base run — the false block #3715 exists
+# to remove, hidden behind a "no failure reproduced" report. The runner's INPUT is
+# asserted DIRECTLY (the seam records what it was handed), because the outcome
+# alone cannot tell "not asked" from "asked and not reported".
+new_scen repro-base-nonnodeargv
+repro_base_sha
+HEAD_NN="ecec000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NN" > "$SCEN/head"
+CE_NN='collect-error::tests/test_other_pre.py'
+NODE_NN='tests/test_genuinely_new3.py::test_pr_broke_it_3'
+lane_fail "$HEAD_NN" 947 > "$SCEN/runs-$HEAD_NN"
+{ printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/test_other_pre.py - ImportError: no module named z\n'
+  log_failed "$NODE_NN"
+} > "$SCEN/log-947"
+printf '3\n' > "$SCEN/jobs-count-947"
+lane_fail main7373 987 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-987"
+cp "$SCEN/log-947" "$SCEN/log-after-947"
+repro_script_log "$SCEN/repro-log.sh" "$NODE_NN" "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a mixed residual still blocks on the non-nodeid id (exit $rc)" \
+                || { fail "#3715: a collect-error in a mixed residual was cleared"; sed 's/^/      /' "$SCEN/err"; }
+[ -s "$SCEN/repro-request.txt" ] \
+  && pass "#3715: the reproduction seam recorded the ids it was handed" \
+  || fail "#3715: the reproduction seam recorded no input — the input assertions would be vacuous"
+grep -qF -- "$CE_NN" "$SCEN/repro-request.txt" \
+  && fail "#3715: the collect-error id was handed to the runner — pytest would exit 4 having run NOTHING" \
+  || pass "#3715: the collect-error id is NOT in the runner's input"
+grep -qF -- "$NODE_NN" "$SCEN/repro-request.txt" \
+  && pass "#3715: the runnable nodeid IS in the runner's input" \
+  || { fail "#3715: the runner was handed nothing to run"; sed 's/^/      /' "$SCEN/repro-request.txt" 2>/dev/null; }
+grep -q "^   pre-existing: $NODE_NN" "$SCEN/err" \
+  && pass "#3715: the runnable nodeid in the same residual still clears on the base" \
+  || { fail "#3715: the runnable nodeid was not cleared — the non-nodeid id aborted the whole base run"; sed 's/^/      /' "$SCEN/err"; }
+grep -qF -- "$CE_NN" "$SCEN/err" \
+  && pass "#3715: the collect-error id stays in the refusal (a unit is not a measurement)" \
+  || fail "#3715: the collect-error id vanished from the refusal"
+
 # HALF 6 — the clearable set is `candidates ∩ reproduced`, NOT the base's whole
 # failing set. A runner that volunteers an id outside its argv (the `ids --log`
 # parser recovers nodeid-shaped tokens from ANYWHERE in the capture) must not
@@ -1632,6 +1730,14 @@ grep -q "^   pre-existing: $MEAS6" "$SCEN/err" \
 grep -q "$MEAS6" "$SCEN/err" \
   && pass "#3715: the MEASURED id still blocks (named in the surviving refusal)" \
   || fail "#3715: the MEASURED id vanished from the refusal"
+# BASELINE-DISCRIMINATING (#3715 review, P2): the outcome assertions above are
+# ALSO what the pre-PR rail produces — it blocks every residual unconditionally,
+# so "exit != 0" and "the measured id is named" pass for an unrelated reason.
+# This one can ONLY be produced by the new path: the base reproduces the
+# CLEARABLE id (NEW6) and the rail reports the clearance.
+grep -q "^   pre-existing: $NEW6" "$SCEN/err" \
+  && pass "#3715: the base reproduces the CLEARABLE id, so the clearance actually happened" \
+  || fail "#3715: the clearable id was not reported pre-existing — the intersection could be vacuous"
 
 # HALF 7 — MEASURED-ABSENT is not the measurement gap. main runs the FILE (a
 # sibling failure is in main-fails), so the file IS measured; an id inside it
@@ -1749,6 +1855,14 @@ grep -q 'UNATTRIBUTABLE' "$SCEN/err" \
 grep -q -- '--admin' "$SCEN/calls" \
   && fail "#3715: a merge was attempted over an UNATTRIBUTABLE residual" \
   || pass "#3715: no merge over an unattributable residual"
+# BASELINE-DISCRIMINATING (#3715 review, P2): the pre-PR rail blocks the residual
+# unconditionally, so every assertion above is green WITHOUT the reproduction. The
+# repro_scope EXCLUSION message can only be emitted by the new empty-candidate
+# path, so it is the assertion that pins "UNATTRIBUTABLE ids never reach the
+# candidate set" rather than "the rail blocks unattributable residuals".
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#3715: the empty-candidate reason names the repro_scope UNATTRIBUTABLE/guard-step exclusion" \
+  || fail "#3715: an unattributable residual never reached the repro_scope exclusion message"
 
 # HALF 11 — the base reproduction must NOT pre-empt the E5 rotation rule. A
 # clearance that empties the residual would otherwise SKIP the re-run, which is
@@ -1779,6 +1893,16 @@ grep -q 'UNATTRIBUTABLE' "$SCEN/err" \
 grep -q -- '--admin' "$SCEN/calls" \
   && fail "#3715: a merge was attempted over a rotated identity" \
   || pass "#3715: no merge over a rotated identity"
+# BASELINE-DISCRIMINATING (#3715 review, P2): "exit != 0" and "UNATTRIBUTABLE is
+# named" are both produced by the pre-PR rail. These two can only come from the
+# new path: the base CLEARED RB1 (a clearance that happened), and the forced
+# second sample is the mechanism the clearance must not skip.
+grep -q "^   pre-existing: $RB1" "$SCEN/err" \
+  && pass "#3715: the base clearance actually happened before the forced second sample" \
+  || fail "#3715: no clearance was reported, so the forced re-run was never exercised"
+grep -q "re-running to collect a SECOND" "$SCEN/out" \
+  && pass "#3715: a clearance that empties the residual still forces the E5 second sample" \
+  || fail "#3715: the forced second sample was not taken after the clearance"
 
 # --- 4c (bis). a collect-error on main for the residual's FILE is a UNIT, not a
 # MEASUREMENT (#3715) -------------------------------------------------------
