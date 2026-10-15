@@ -333,16 +333,21 @@ jobs:
         # established (including "no claim visible").
         run: python3.12 tools/fleet/claim_lanes.test.py
       - name: Ref-claim reader mutation evidence (#1777, zero-dep)
-        # 19 mutations, each reintroducing the defect its test exists to catch:
+        # 23 mutations, each reintroducing the defect its test exists to catch:
         # a failed read read as an absence, an empty registry read as a failed
         # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
         # when metadata fails, the LOCAL ref space read instead of the registry,
-        # the cwd read instead of the target repo, a negative lease accepted, the
-        # PR inferred from the ls-remote ORDER instead of the match (so a
-        # lower-sorting claim key hides a live holder), an un-normalised sha, a
-        # short sha consumed by a coincidental decoy prefix, a multi-PR head
-        # reduced to one match by ref order, and the cascade order inverted. Its
-        # own step so neither verdict suppresses the other.
+        # the cwd read instead of the target repo, a negative lease accepted, a
+        # NON-FINITE staleness bound accepted (argparse takes `nan`, and every
+        # comparison against it is False — a stale snapshot certified fresh), a
+        # RELATIVE remote left relative (one --repo answering per cwd) or an
+        # absolute/scp-like one misclassified as relative, a
+        # credential in the remote URL echoed into the report, the PR inferred
+        # from the ls-remote ORDER instead of the match (so a lower-sorting claim
+        # key hides a live holder), an un-normalised sha, a short sha consumed by
+        # a coincidental decoy prefix, a multi-PR head reduced to one match by ref
+        # order, and the cascade order inverted. Its own step so neither verdict
+        # suppresses the other.
         run: python3.12 tools/fleet/claim_lanes.test.py --mutations
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts

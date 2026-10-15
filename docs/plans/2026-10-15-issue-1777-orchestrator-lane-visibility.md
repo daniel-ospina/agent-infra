@@ -174,7 +174,7 @@ collide with the first: the docs name the ref sense explicitly and record the se
 
 ## 3. Tests (every claimed behaviour needs a test that fails without the change)
 
-### `tools/fleet/liveness.test.py` — T21–T26 + 6 paired mutations
+### `tools/fleet/liveness.test.py` — T21–T27 + 6 paired mutations
 
 | id | assertion | mutation (must go RED) |
 |---|---|---|
@@ -297,7 +297,7 @@ fixed and pinned, so **B10 is a class, not a single input**:
 ⚠️ **BOUND REACHED — disclosed, not glossed.** The adversarial bound is **2 cycles**, and both were
 spent (`[ADVERSARIAL-BOUND] cycles=2 threats=10 covered=10 residuals=none`). The cycle-2 fixes were
 not re-reviewed by a third fresh reviewer; what stands behind them instead is that each is pinned by a
-mutation-proven test (19 mutations, all RED-required) plus green suites. Any third-party doubt about
+mutation-proven test (23 mutations, all RED-required) plus green suites. Any third-party doubt about
 `_select` should be directed at L16–L18 rather than at this prose.
 
 ---
@@ -322,8 +322,8 @@ weight is zero).
 
 ## 6. Acceptance criteria
 
-1. `python3.12 tools/fleet/liveness.test.py` green (26 tests) and `--mutations` all RED-as-required.
-2. `python3.12 tools/fleet/claim_lanes.test.py` green (18 tests) and `--mutations` all caught (19).
+1. `python3.12 tools/fleet/liveness.test.py` green (27 tests) and `--mutations` all RED-as-required.
+2. `python3.12 tools/fleet/claim_lanes.test.py` green (23 tests) and `--mutations` all caught (23).
 3. `python3.12 tools/fleet/lane_liveness.test.py` green with the DISCLOSURE leg and its red control.
 4. **Headline invariant:** T24 proves every claim-shaped verdict is `unknown`, named, `holder_pid is
    None`, and `escalatable(...) is False`; T25/T26 prove the existing ordering and existing verdicts are

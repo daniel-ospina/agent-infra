@@ -125,8 +125,22 @@ can no longer read as a verdict. Doc: docs/ops/fleet-liveness.md, section 5
 item 7 (the population boundary) and section 7 (the ref-claim registry).
 
 ── (5) THE SUITES THAT PIN ALL OF THIS ─────────────────────────────────
-$ python3 tools/fleet/liveness.test.py               # 26 tests
-$ python3 tools/fleet/liveness.test.py --mutations   # 30 mutations, all required RED
-$ python3 tools/fleet/claim_lanes.test.py            # 18 tests
-$ python3 tools/fleet/claim_lanes.test.py --mutations# 19 mutations, all required RED
-$ python3 tools/fleet/lane_liveness.test.py          # the scheduled report + RED control
+$ python3 tools/fleet/liveness.test.py
+PASS=27 FAIL=0
+$ python3 tools/fleet/liveness.test.py --mutations
+MUTATIONS=30 CAUGHT=30 MISSED=0
+$ python3 tools/fleet/claim_lanes.test.py
+PASS=23 FAIL=0
+$ python3 tools/fleet/claim_lanes.test.py --mutations
+MUTATIONS=23 CAUGHT=23 MISSED=0
+$ python3 tools/fleet/lane_liveness.test.py
+
+PASS=109 FAIL=0
+$ python3 tools/fleet/lane_liveness.test.py          # its RED control is printed above PASS:
+                                                    #   RED-CONTROL mutations=10 caught=10 missed=0
+$ bash scripts/check-agents-materialized.sh ; echo "rc=$?"
+rc=0
+$ node scripts/check-workflow-lock.mjs
+✅ workflow content lock matches (3 files)
+$ bash pi-bootstrap/tests/test-setup-no-nesting.sh | tail -1
+OK: no nesting, active files refreshed, farm links preserved (clone path: …)

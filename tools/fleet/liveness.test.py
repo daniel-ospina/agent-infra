@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty tests with twenty-four paired mutations: every mutation re-
+Twenty-seven tests with thirty paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the twenty (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the twenty-seven (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,7 +17,7 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 20 tests, green
+    python3 tools/fleet/liveness.test.py                # the 27 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -36,6 +36,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -931,9 +932,9 @@ def t21_claims_unreadable_abstains():
     check(v.reason == "claims-unreadable", "the abstention is named; got %s" % v.reason)
     check(v.holder_pid is None, "no incarnation may be asserted from an unreadable read")
     check("rc=128" in v.detail, "the cause is surfaced; got %r" % v.detail)
-    # The load-bearing distinction: unreadable is NOT an absence.
-    check(cr.claims == () and cr.present is False,
-          "the fixture is the 'could not read' shape, not the 'read, found none' shape")
+    # The load-bearing distinction: unreadable is NOT an absence — proven by the
+    # reason CHANGING when the same empty claim set is readable, not by re-asserting
+    # the fixture we just built (a self-fulfilling check proves nothing).
     v_empty = liv.evaluate(_claim_ev(claim_read=liv.ClaimRead(readable=True, present=False)))
     check(v_empty.reason == "no-claim-visible" and v_empty.reason != v.reason,
           "an unreadable read and a genuinely empty read must be DIFFERENT reasons")
@@ -1049,6 +1050,28 @@ def t26_claim_logic_inert_without_claim_read():
               % (want_state, want_reason, v.state, v.reason))
     check(hasattr(liv, "claim_verdict") and hasattr(liv, "ClaimRead"),
           "the claim vocabulary exists but is reachable only via claim_read")
+
+
+@test("T27 the mutation harness cannot read a NON-RUNNING test as 'caught' (#1777)")
+def t27_mutation_verdict_requires_a_real_failure():
+    """Pinned by a direct truth-table assertion, not a paired mutation.
+
+    A mutation is caught only when the paired test RAN and FAILED. The pre-fix
+    harness used `returncode != 0`, and `run_tests` ALSO returns 1 when the filter
+    matched nothing (``PASS=0 FAIL=0``) — so a renamed test id, or a typo in the
+    map, reported every mutation CAUGHT while verifying nothing: a false-PASS
+    generator inside the very evidence the suite's mutation claims rest on. The
+    decision lives in THIS file, which the harness never mutates, so it is pinned
+    where it lives (the same truth table is pinned in `claim_lanes.test.py` L23).
+    """
+    caught = _mutation_verdict
+    check(caught(0, "PASS=1 FAIL=0") is False, "a green run is not a caught mutation")
+    check(caught(1, "PASS=0 FAIL=1") is True, "a failed paired test IS caught")
+    check(caught(1, "PASS=0 FAIL=0") is False,
+          "a filter that matched NO test is not a caught mutation")
+    check(caught(1, "  ok   T1 x\nPASS=1 FAIL=0\n") is False, "same, with noise around it")
+    check(caught(1, "FAIL T1 x\nPASS=0 FAIL=2\n") is True, "more than one failure counts")
+    check(caught(1, "") is False, "an unparseable run is not a caught mutation")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1320,6 +1343,23 @@ def _mutated_env(mut):
     return tmp, out, env
 
 
+def _mutation_verdict(returncode: int, body: str) -> bool:
+    """Is this mutation CAUGHT? Only if the paired test RAN and FAILED.
+
+    ⛔ `returncode != 0` is NOT the test: ``run_tests`` also exits 1 when the
+    filter matched nothing at all (``PASS=0 FAIL=0``), so a renamed test id — or a
+    typo in the map — would report every mutation CAUGHT while verifying nothing.
+    The runner publishes its own summary line, so the summary is the verdict.
+    """
+    if returncode == 0:
+        return False
+    for line in body.splitlines():
+        m = re.match(r"\s*PASS=(\d+) FAIL=(\d+)\s*$", line)
+        if m:
+            return int(m.group(2)) > 0
+    return False
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired test RED ──")
     print("   (the mutated file is written to a temp dir; the real source is never touched)\n")
@@ -1335,7 +1375,7 @@ def run_mutations():
             body = proc.stdout.decode("utf-8", "replace")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        red = proc.returncode != 0
+        red = _mutation_verdict(proc.returncode, body)
         print("── %s mutation → %s ───────────────────────────────────────" % (mut.test_name, mut.why))
         for line in body.splitlines():
             print("   | %s" % line)
@@ -1343,7 +1383,11 @@ def run_mutations():
             print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % proc.returncode)
         else:
             bad += 1
-            print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
+            if "PASS=0" in body and "FAIL=0" in body:
+                print("   ❌ NOT RUN — no test matched `%s`; this mutation verified NOTHING\n"
+                      % mut.test_name)
+            else:
+                print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
     print("MUTATIONS=%d CAUGHT=%d MISSED=%d" % (len(MUTATIONS), len(MUTATIONS) - bad, bad))
     return bad == 0
 

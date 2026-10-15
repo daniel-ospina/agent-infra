@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Eighteen tests with nineteen paired mutations: every mutation re-introduces the
-defect its test exists to catch, so "the test fails without the fix" is an
+Twenty-three tests with twenty-three paired mutations: every mutation re-introduces
+the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
 
-    python3.12 tools/fleet/claim_lanes.test.py              # the 15 tests, green
+    python3.12 tools/fleet/claim_lanes.test.py              # the 23 tests, green
     python3.12 tools/fleet/claim_lanes.test.py --mutations  # each mutation, RED
 
 `--mutations` writes BOTH modules — a mutated copy of one and a verbatim copy of
@@ -28,6 +28,10 @@ Evidence for the incident (#1777), which is what the fixtures reproduce:
   * the lease polarity is ``claims.sh``'s own (absent / ``0`` / non-digit /
     >18 digits ⇒ unknown, and unknown is NOT expired), checked against the
     SHIPPED shell primitives rather than against a transcription of them.
+  * a relative ``origin`` names ONE absolute target from any cwd, while an
+    absolute/scp-like remote passes through VERBATIM; a credential in the remote URL is
+    never echoed; a NON-FINITE staleness bound is refused; and the CLI's default (text)
+    output is asserted — the cycle-1 review findings.
 
 Injected, never guessed:
   * CLAIM_LANES_MODULE — the reader under test (default: ./claim_lanes.py)
@@ -41,6 +45,7 @@ import contextlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -730,12 +735,209 @@ def l18_multi_pr_head_is_declared():
               % (other.siblings,))
 
 
-# ── CLI helper (used by L2) ──────────────────────────────────────────────
-def _cli_rc(args):
-    proc = subprocess.run([sys.executable, MODULE_PATH, *args],
+# ── CLI helper (used by L2, L19 and L20) ──────────────────────────────────
+def _cli(args, cwd=None):
+    return subprocess.run([sys.executable, MODULE_PATH, *args], cwd=cwd,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                           env=dict(os.environ, CLAIM_HOST=HOST))
-    return proc.returncode
+
+
+def _cli_rc(args):
+    return _cli(args).returncode
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L19 — the CLI contract: usage is 2, and the FILE driver works end to end
+# ══════════════════════════════════════════════════════════════════════════
+@test("L19 CLI: usage exits 2, and FILE mode reads a snapshot end-to-end (#1777/D2)")
+def l19_cli_usage_and_file_mode():
+    d = tempfile.mkdtemp(prefix="claims-cli-")
+    try:
+        snap = write_snapshot(d, "refs/claims/5-abcdef123456\t%s:1\t%d\n"
+                              % (HOST, NOW_S + 60))
+        # `--snapshot` without its staleness bound: the BOUND is the guard, and
+        # inventing one would silently decide how stale a claim may be.
+        check(_cli_rc(["--snapshot", snap]) == 2,
+              "--snapshot without --max-age-s is a usage error (2), never a silent read")
+        check(_cli_rc(["--snapshot", snap, "--max-age-s", "0"]) == 2,
+              "a zero staleness bound is refused, not read as 'anything goes'")
+        check(_cli_rc(["--snapshot", snap, "--max-age-s", "-1"]) == 2,
+              "a negative staleness bound is refused")
+        # ⛔ Measured fail-OPEN (cycle-1 D2): argparse's `type=float` accepts
+        # nan/inf, and EVERY comparison against a non-finite bound is False — so
+        # `nan` accepted a 10-day-old snapshot as fresh (exit 0) instead of
+        # abstaining. The value IS the guard, so the value is what is checked.
+        check(_cli_rc(["--snapshot", snap, "--max-age-s", "nan"]) == 2,
+              "a NON-FINITE staleness bound is refused; it cannot be compared")
+        check(_cli_rc(["--snapshot", snap, "--max-age-s", "inf"]) == 2,
+              "an infinite staleness bound is refused for the same reason")
+        check(_cli_rc(["--timeout", "nan", "--remote-url", "file:///nope.git"]) == 2,
+              "a non-finite --timeout is a named usage error, not a traceback")
+        check(_cli_rc(["--timeout", "inf", "--remote-url", "file:///nope.git"]) == 2,
+              "an infinite --timeout is refused too")
+        check(_cli_rc([]) == 2, "no target at all is a usage error — the cwd is never implied")
+        check(_cli_rc(["--snapshot", snap, "--now", str(NOW_S)]) == 2,
+              "a missing bound outranks the read: usage is decided before the file")
+        # ── the FILE driver, end to end ───────────────────────────────────
+        check(_cli_rc(["--snapshot", snap, "--max-age-s", "600", "--now", str(NOW_S),
+                       "--pr", "5"]) == 0,
+              "a FRESH snapshot with a visible claim exits 0 (the positive answer)")
+        with open(snap, "r", encoding="utf-8") as fh:
+            body = fh.read()
+        stale = write_snapshot(d, body, age_s=99999)
+        check(_cli_rc(["--snapshot", stale, "--max-age-s", "600", "--now", str(NOW_S)]) == 3,
+              "a STALE snapshot abstains (3) instead of deciding")
+        check(_cli_rc(["--snapshot", os.path.join(d, "missing"), "--max-age-s", "600"]) == 3,
+              "a missing snapshot abstains (3) instead of reading as an empty one")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L20 — the DEFAULT output is the text report (the operator's actual view)
+# ══════════════════════════════════════════════════════════════════════════
+@test("L20 CLI: the default output is the TEXT report, and it declares the gap (#1777)")
+def l20_cli_default_output_is_text():
+    refs = [("refs/claims/5-abcdef123456", "%s:1" % HOST, str(NOW_S + 60))]
+    with bare_remote(refs) as remote:
+        proc = _cli(["--remote-url", remote, "--pr", "5", "--now", str(NOW_S)])
+    check(proc.returncode == 0, "a visible claim exits 0; stderr=%r" % proc.stderr.strip())
+    out = proc.stdout
+    check("verdict: unknown (ABSTENTION)" in out,
+          "the DEFAULT rendering is the text report, and it names the abstention; got %r"
+          % out[:240])
+    check("ABSTENTION" in out and "reason=claim-held" in out,
+          "the reason is stated, not implied; got %r" % out[:240])
+    check("ADVISORY:" in out, "the advisory rides the default output; got %r" % out[:240])
+    check("reader limits (what this read cannot see)" in out,
+          "the reader's own limits are printed with the default verdict")
+    check("holder_pid: never set" in out,
+          "the no-incarnation rule is visible to the operator, not only in the source")
+    check(not out.lstrip().startswith("{"),
+          "--json was not asked for, so the default must not be JSON")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L21 — a relative `origin` names ONE absolute target, from any cwd
+# ══════════════════════════════════════════════════════════════════════════
+@test("L21 a relative `origin` resolves to ONE absolute target, from any cwd (D2)")
+def l21_relative_origin_is_absolute():
+    # ⛔ Measured (cycle-1 B/deep): with `origin=../origin.git` — an ordinary
+    # sibling clone — the SAME `--repo` read `claims-unreadable` from one cwd and
+    # `fetch rc=128` from another, because `ls-remote` resolved the relative url
+    # against the CALLER's cwd while `fetch -C <tmp>` resolved it against the temp
+    # bare repo. One argument, two questions; the reader must name one target.
+    d = tempfile.mkdtemp(prefix="claims-rel-")
+    try:
+        bare = os.path.join(d, "origin.git")
+        git(["init", "-q", "--bare", bare])
+        commit_claim(bare, "refs/claims/5-abcdef123456", "%s:1" % HOST, str(NOW_S + 60))
+        work = os.path.join(d, "work")
+        git(["init", "-q", work])
+        git(["-C", work, "remote", "add", "origin", "../origin.git"])
+        old = os.getcwd()
+        try:
+            for cwd in (d, work, os.path.dirname(d)):
+                os.chdir(cwd)
+                cr = cl.read_pull("origin", repo=work, host=HOST, now=NOW_S)
+                check(cr.readable is True,
+                      "readable from cwd=%s; got %r" % (cwd, cr.detail))
+                check([c.key for c in cr.claims] == ["5-abcdef123456"],
+                      "the same claim from cwd=%s; got %r"
+                      % (cwd, [c.key for c in cr.claims]))
+                check(cr.claims[0].owner == "%s:1" % HOST,
+                      "metadata read from the SAME target; got %r" % cr.claims[0].owner)
+                check(cr.claims[0].scope == "local", "and it is this box's claim")
+        finally:
+            os.chdir(old)
+        # A relative url with NO repo has no non-cwd base, so it is refused rather
+        # than guessed (the cwd is never used implicitly).
+        try:
+            cl._one_target("../origin.git", None)
+            raise Failure("a relative remote with no --repo must be a usage error")
+        except cl.UsageError:
+            pass
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    # ── the pass-through half ─────────────────────────────────────────────
+    # A ref git already resolves VERBATIM must not be "normalised" into a filesystem
+    # path. This is the cycle-1 regression the VERIFY gate caught: a bare `host:path`
+    # scp remote (no `user@`) was classified relative, so a valid URL git SSHes to was
+    # refused (`--remote-url github.com:org/repo.git` → exit 2) or misresolved under
+    # `--repo`. git's own rule is the test: a COLON BEFORE ANY SLASH makes it scp-like.
+    for raw in ("https://github.com/o/r.git", "ssh://git@github.com/o/r.git",
+                "file:///tmp/x.git", "/tmp/x.git", "user@host:path/r.git",
+                "github.com:org/repo.git", "git@github.com:org/repo.git",
+                "file:/tmp/x.git", "host:/abs/path.git"):
+        got = cl._one_target(raw, None)          # no repo: it must NOT need one
+        check(got == raw, "an already-resolved remote passes through verbatim: %r -> %r"
+              % (raw, got))
+    # git expands a tilde against HOME, so `~/x.git` is already one target too — it must
+    # NOT be rewritten under the repo (the second regression the verify gate caught).
+    check(cl._one_target("~/probe.git", None) == os.path.expanduser("~/probe.git"),
+          "a tilde remote is expanded, not resolved under the repo: %r"
+          % cl._one_target("~/probe.git", None))
+    # ... while a genuine relative path STILL needs the repo, and resolves to ONE target.
+    d2 = tempfile.mkdtemp(prefix="claims-onetarget-")
+    try:
+        for rel in ("../origin.git", "relative.git", "./x/y.git"):
+            check(cl._one_target(rel, d2) == os.path.abspath(os.path.join(d2, rel)),
+                  "a relative path resolves against the repo: %r" % rel)
+    finally:
+        shutil.rmtree(d2, ignore_errors=True)
+    for rel in ("../origin.git", "relative.git"):
+        try:
+            cl._one_target(rel, None)
+            raise Failure("a relative remote with no --repo must be a usage error: %r" % rel)
+        except cl.UsageError:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L22 — a credential in the remote URL is never echoed into any rendering
+# ══════════════════════════════════════════════════════════════════════════
+@test("L22 a credential in the remote URL never reaches `source`, text or JSON (#1777)")
+def l22_credentials_are_redacted():
+    token = "ghp_SECRETTOKENc0ffee"
+    raw = "https://user:%s@127.0.0.1:1/r.git" % token
+    check(cl._redact_url(raw) == "https://127.0.0.1:1/r.git",
+          "userinfo is stripped: got %r" % cl._redact_url(raw))
+    # 127.0.0.1:1 refuses instantly (no DNS, no network): the read FAILS, which is
+    # the point — `source` is built before the read, so the echo is what is tested.
+    cr = cl.read_pull(raw, host=HOST, now=NOW_S)
+    check(cr.readable is False, "an unreachable remote is an unreadable read")
+    check(token not in cr.source, "the token must not survive into `source`: %r" % cr.source)
+    check("127.0.0.1:1/r.git" in cr.source, "the target is still named: %r" % cr.source)
+    v = liv.evaluate(cl.to_evidence(cr))
+    for rendering, text in (("text", cl.render_text(cr, v)),
+                            ("json", cl.render_json(cr, v))):
+        check(token not in text, "the token must not appear in the %s rendering" % rendering)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L23 — the harness's own truth table (a non-running test is not a caught one)
+# ══════════════════════════════════════════════════════════════════════════
+@test("L23 the mutation harness cannot read a NON-RUNNING test as 'caught' (#1777)")
+def l23_mutation_verdict_requires_a_real_failure():
+    """Pinned by a direct truth-table assertion, not a paired mutation.
+
+    A mutation is caught only when the paired test RAN and FAILED. The pre-fix
+    harness used `returncode != 0`, and `run_tests` ALSO returns 1 when the filter
+    matched nothing (``PASS=0 FAIL=0``) — so a renamed test id, or a typo in the
+    map, reported every mutation CAUGHT while verifying nothing: a false-PASS
+    generator inside the very evidence the suite's mutation claims rest on. The
+    decision lives in THIS file, which the harness never mutates, so it is pinned
+    where it lives.
+    """
+    caught = _mutation_verdict
+    check(caught(0, "PASS=1 FAIL=0") is False, "a green run is not a caught mutation")
+    check(caught(1, "PASS=0 FAIL=1") is True, "a failed paired test IS caught")
+    check(caught(1, "PASS=0 FAIL=0") is False,
+          "a filter that matched NO test is not a caught mutation")
+    check(caught(1, "  ok   L1 x\nPASS=1 FAIL=0\n") is False, "same, with noise around it")
+    check(caught(1, "FAIL L1 x\nPASS=0 FAIL=2\n") is True, "more than one failure counts")
+    check(caught(1, "") is False, "an unparseable run is not a caught mutation")
+    check(caught(1, "PASS=nope FAIL=1") is False, "a malformed summary is not a caught mutation")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -844,9 +1046,10 @@ MUTATIONS = [
     ),
     Mutation(
         "L14", "reader",
-        '    if remote != "origin":\n        return remote',
-        '    return "origin"',
-        "`origin` is never resolved, so the read lands in the CWD's repo (a wrong-target read)",
+        '    resolved = remote\n    if remote == "origin":',
+        '    resolved = "origin"\n    if False:',
+        "`origin` is never resolved, so the read names a path under the repo (or the CWD's "
+        "repo) instead of the caller's remote target",
     ),
     Mutation(
         "L15", "classifier",
@@ -896,6 +1099,34 @@ MUTATIONS = [
         "a multi-PR head is reduced to targets[0] again, so the PR (and its published "
         "sibling list) follows the ref order (the cycle-2 N2 bypass)",
     ),
+    Mutation(
+        "L19", "reader",
+        '    if not math.isfinite(num):',
+        '    if False:',
+        "a NON-FINITE duration is accepted, and every comparison against it is False — so "
+        "`--max-age-s nan` silently certifies a stale snapshot as fresh (the D2 fail-open)",
+    ),
+    Mutation(
+        "L21", "reader",
+        '    return os.path.abspath(os.path.join(repo, s))',
+        '    return s',
+        "a RELATIVE remote is left relative, so ls-remote and fetch resolve it against two "
+        "different directories and one --repo answers per cwd",
+    ),
+    Mutation(
+        "L21", "reader",
+        "    r\"|[^/@\\s]+:\"                           # `host:path` — git's own scp test (colon before any `/`)\n",
+        "",
+        "a bare `host:path` scp remote is classified RELATIVE, so a URL git resolves "
+        "verbatim is refused (or, under --repo, rewritten into a bogus local path)",
+    ),
+    Mutation(
+        "L22", "reader",
+        '    return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))',
+        '    return sanitize(str(url or ""))',
+        "credentials in the remote URL are echoed into `source` (and from there into the "
+        "report and an issue body)",
+    ),
 ]
 
 
@@ -938,6 +1169,24 @@ def _mutated_env(mut):
     return tmp, env
 
 
+def _mutation_verdict(returncode: int, body: str) -> bool:
+    """Is this mutation CAUGHT? Only if the paired test RAN and FAILED.
+
+    ⛔ `returncode != 0` is NOT the test: ``run_tests`` also exits 1 when the
+    filter matched nothing at all (``PASS=0 FAIL=0``), so a renamed test id — or a
+    typo in the map — would report every mutation CAUGHT while verifying nothing.
+    Published by the runner as its own summary line, so the summary is the source
+    of the verdict.
+    """
+    if returncode == 0:
+        return False
+    for line in body.splitlines():
+        m = re.match(r"\s*PASS=(\d+) FAIL=(\d+)\s*$", line)
+        if m:
+            return int(m.group(2)) > 0
+    return False
+
+
 def run_mutations():
     print("── MUTATION EVIDENCE — each mutation must make its paired test RED ──")
     print("   (the mutated pair is written to a temp dir; the real files are never touched)\n")
@@ -953,7 +1202,7 @@ def run_mutations():
             body = proc.stdout.decode("utf-8", "replace")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-        red = proc.returncode != 0
+        red = _mutation_verdict(proc.returncode, body)
         print("── %s mutation → %s ───────────────────────────────────────" % (mut.test_name, mut.why))
         for line in body.splitlines():
             print("   | %s" % line)
@@ -961,7 +1210,11 @@ def run_mutations():
             print("   ✅ RED (the paired test caught the defect, rc=%d)\n" % proc.returncode)
         else:
             bad += 1
-            print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
+            if "FAIL=0" in body and "PASS=0" in body:
+                print("   ❌ NOT RUN — no test matched `%s`; this mutation verified NOTHING\n"
+                      % mut.test_name)
+            else:
+                print("   ❌ NOT RED — the paired test did NOT catch its own defect\n")
     print("MUTATIONS=%d CAUGHT=%d MISSED=%d" % (len(MUTATIONS), len(MUTATIONS) - bad, bad))
     return bad == 0
 

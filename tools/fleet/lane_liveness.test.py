@@ -34,8 +34,8 @@ DRY-RUN / rc=2) plus the legs this surface adds:
                 ALSO a filed issue body (#1272)
 
 RED CONTROL (the part fleet-cost-weekly.test.sh has no equivalent of) — a green
-suite is only a pin if it can FAIL. Nine mutations, each run against the leg
-that must catch it (seven mutate the report; two mutate the CLASSIFIER it
+suite is only a pin if it can FAIL. Ten mutations, each run against the leg
+that must catch it (eight mutate the report; two mutate the CLASSIFIER it
 consumes, which is the seam #1254 actually broke):
   * escalate every state        → CLEAN must go red
   * escalate nothing            → TRIP must go red
@@ -46,6 +46,7 @@ consumes, which is the seam #1254 actually broke):
   * policy text loses the 24h carve-out → TURN-BOUNDARY must go red
   * policy text names one reason for a state several paths reach → TURN-BOUNDARY must go red
   * drop the markdown-cell escape → MD-ESCAPE must go red
+  * drop the population-gap declaration → DISCLOSURE must go red (#1777)
 A mutation the suite does not catch is reported as a suite failure.
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;

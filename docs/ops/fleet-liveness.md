@@ -234,7 +234,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
 > all pinned by `tools/fleet/liveness.test.py` (**T1–T20 with 24 paired mutations**, plus
-> **T21–T26 with 6 more** for the #1777 claim evidence) and by the
+> **T21–T27 with 6 more** for the #1777 claim evidence) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -440,9 +440,16 @@ python3 tools/fleet/claim_lanes.py --snapshot ~/orchestrator/state/claims-snapsh
 
 The read is bound to the target: `--repo PATH` (its `origin`) or `--remote-url URL`, never the
 current directory (the controller runs from launchd with cwd `$HOME`, which is how `claim_snapshot`
-once came back empty while the origin held three live claims). `GIT_TERMINAL_PROMPT=0` and a
-timeout on every `git` call. **Local refs are never read** — a stale `refs/claims/*` in the
-caller's own repo cannot become a verdict.
+once came back empty while the origin held three live claims). That target is then made **absolute**:
+a *relative* `origin` (an ordinary sibling clone, `../origin.git`) would otherwise be resolved against
+the caller's cwd by `ls-remote` but against the temp bare repo by `fetch` — one argument, two reads —
+so a relative ref is resolved once against the repo it came from, and refused outright when there is
+no repo to resolve it against. `GIT_TERMINAL_PROMPT=0` and a timeout on every `git` call, with
+`--max-age-s` and `--timeout` validated **finite and positive at the door** (argparse accepts `nan`,
+and every comparison against a non-finite bound is False — an unvalidated `nan` certified a stale
+snapshot as fresh). A remote URL is echoed **redacted** (`user:token@` stripped) because `source`
+rides into both renderings and from there into an issue body. **Local refs are never read** — a stale
+`refs/claims/*` in the caller's own repo cannot become a verdict.
 
 **The head key is matched, not assumed.** Given `--sha`, the reader finds the matching head across
 the whole registry and binds the PR from **what matched** — never from the order `git ls-remote`
@@ -514,11 +521,11 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 26 tests
+python3 tools/fleet/liveness.test.py               # 27 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (30)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
-python3 tools/fleet/claim_lanes.test.py            # 18 reader tests
-python3 tools/fleet/claim_lanes.test.py --mutations  # 19 mutations, each must go RED
+python3 tools/fleet/claim_lanes.test.py            # 23 reader tests
+python3 tools/fleet/claim_lanes.test.py --mutations  # 23 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```
 

@@ -289,17 +289,21 @@ committing to that branch.
 
 So **grepping the sessions directory for a branch is not a liveness test**, and "the report does not
 list it" is not "nobody is on it". For *which lanes exist*, read the durable, holder-authored
-**ref-claim registry** — `refs/claims/<pr>-<sha12>`, written by
-`scripts/orchestrator-harness/claims.sh` and read by `tools/fleet/claim_lanes.py`. **Every claim
+**ref-claim registry** — `refs/claims/<pr>-<sha12>`, written by agent-infra's
+`scripts/orchestrator-harness/claims.sh` and read by its `tools/fleet/claim_lanes.py`. **Every claim
 verdict is an abstention**: `claim-held` asserts a declared **ownership** window, never that a process
 is alive, and `claims-unreadable` / `no-claim-visible` / `claim-owner-unparseable` /
 `holder-on-foreign-box` / `claim-holder-unverifiable` are **not** freedom — an absent key is a
 HEAD-scoped, transient fact (refs are deleted on release and pruned on expiry, and a live lane has a
 *designed* no-claim window between `fix-one.sh`'s release and `merge-one.sh`'s re-claim).
 
-**One verdict function** (`tools/fleet/liveness.py`), never a second: a reader acquires evidence, it
-does not decide a state. The five states, the ordering, the abstention doctrine, and the four inputs:
-`docs/ops/fleet-liveness.md`.
+**One verdict function** (agent-infra's `tools/fleet/liveness.py`), never a second: a reader acquires
+evidence, it does not decide a state. The five states, the ordering, the abstention doctrine, and the
+four inputs: agent-infra's `docs/ops/fleet-liveness.md`.
+
+The paths above are **agent-infra's**; a consumer repo that has not materialized that tree still owes
+the RULE — an absence is not a verdict, and a lane's absence from a population is not evidence about
+the lane.
 
 ## Sub-agent Dispatch
 
