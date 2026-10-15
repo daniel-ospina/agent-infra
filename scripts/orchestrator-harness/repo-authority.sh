@@ -190,6 +190,20 @@ merge_authority() {
     printf 'unknown\n'; return 0
   fi
   if [ -z "$_set" ]; then printf 'unknown\n'; return 0; fi
+  # ⛔ round-12 review, P2. The classifier tests the gate name as ONE WHOLE TOKEN (`rgate in
+  # want`), while the `case` below matches it as a SUBSTRING SPAN of the space-joined set. Those
+  # agree for every single-token name and DIVERGE for a name containing whitespace: with
+  # REVIEW_GATE='docs license-surface' and the set 'pipeline-compliance docs license-surface', the
+  # span MATCHED (authority=gate, so the GREEN arm issued a RAW `gh pr merge`) while the classifier
+  # never enforced the gate (no such TOKEN existed) — an UNREVIEWED change merges. Measured at
+  # ed5ba51e. A whitespace-bearing name is not representable as one token in this space-joined
+  # model, so it REFUSES rather than answering `gate`; reachable from an ambient / keys.env
+  # REVIEW_GATE, which the harness otherwise does not screen.
+  case "${REVIEW_GATE:-}" in
+    *[[:space:]]*)
+      printf 'repo-authority: REVIEW_GATE=[%s] contains whitespace — REQ is space-joined, so a name with an internal space can never be matched as ONE token by the classifier; the merge authority is UNKNOWN and nothing merges (fail-closed)\n' "${REVIEW_GATE:-}" >&2
+      printf 'unknown\n'; return 0 ;;
+  esac
   case " $_set " in
     *" $REVIEW_GATE "*) printf 'gate\n' ;;
     *)                  printf 'rail\n' ;;

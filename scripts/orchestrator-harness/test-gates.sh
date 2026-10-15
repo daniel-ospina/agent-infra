@@ -174,6 +174,17 @@ eqv "\\x1c: both readers agree the gate IS required (Python whitespace, not POSI
 eqv "\\x1d: both readers agree the gate IS required" "authority=gate classifier=required" "$(_agree "$(printf 'ai-review-gate\035docs')")"
 eqv "NBSP: both readers agree the gate IS required (the case no \`tr\` set can express)" "authority=gate classifier=required" "$(_agree "$(printf 'ai-review-gate\302\240docs')")"
 eqv "a set WITHOUT the gate: both readers agree it is NOT required (the other direction)" "authority=rail classifier=not-required" "$(_agree 'pipeline-compliance docs')"
+# ⛔ round-12 review, P2: `merge_authority` matched $REVIEW_GATE as a SUBSTRING SPAN of the
+# space-joined set while the classifier tests it as ONE TOKEN, so a gate NAME CONTAINING A SPACE
+# made the authority `gate` (the GREEN arm's RAW merge) while the classifier never enforced it — an
+# UNREVIEWED change merges. Measured at ed5ba51e: REVIEW_GATE='docs license-surface' over the set
+# 'pipeline-compliance docs license-surface' answered `gate`, and the classifier said NOT enforced.
+eqv "a WHITESPACE-bearing REVIEW_GATE refuses — it could raw-merge while never being enforced" "unknown" \
+  "$( REVIEW_GATE='docs license-surface'; merge_authority 'pipeline-compliance docs license-surface' )"
+eqv "a whitespace-only REVIEW_GATE refuses too" "unknown" \
+  "$( REVIEW_GATE=' '; merge_authority 'pipeline-compliance docs' )"
+eqv "…and a normal single-token REVIEW_GATE is unaffected (no over-refusal)" "gate" \
+  "$( REVIEW_GATE='ai-review-gate'; merge_authority 'pipeline-compliance ai-review-gate' )"
 eqv "a whitespace-only OVERRIDE is ABSENT, not a nameless env contract (fail-closed)" "fallback" \
   "$( REQ_OVERRIDE=' '; REQ=''; REQ_SOURCE=''; resolve_required_checks daniel-ospina/readfail "$G"; printf '%s' "${REQ_SOURCE:-<EMPTY>}" )"
 eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b" \
@@ -589,12 +600,22 @@ _QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | awk '{ if (sub(/\\$/, "")) printf "
 # which extracts and runs the shipped fragment. A text pin here was redundant and could be satisfied
 # by a comment, so it was removed rather than kept as a weaker twin of the drive.
 _au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
-# ⛔ round-11 review, P3: `_agree` below runs on a UTF-8 host, where THIS commit's encoding defect is
-# INVISIBLE — reverting the normaliser to a hard-coded "utf-8" left the suite green. So the shipped
-# decode/encode source is pinned directly, and the revert goes red.
-grep -vE '^[[:space:]]*#' "$RA" | grep -qF 'sys.getfilesystemencoding()' \
-  && { echo "  ✅ _normalise_set decodes with the FILESYSTEM encoding — the same source os.environ uses"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ _normalise_set no longer uses sys.getfilesystemencoding() — under a single-byte locale the classifier and the authority can disagree again (the §5.1 bypass) "; FAIL=$((FAIL+1)); }
+# ⛔ round-11 review, P3: `_agree` below runs on a UTF-8 host, where THIS commit's encoding defect
+# is INVISIBLE — reverting the normaliser to a hard-coded "utf-8" left the suite green.
+# ⛔ round-12 review, P3: a TOKEN-presence grep was STILL dodgeable (`enc = "utf-8" or
+# sys.getfilesystemencoding()` keeps the token and stayed green), and it pinned the decode only.
+# The pin is now the exact ASSIGNMENT (a shadowing literal cannot survive it) plus BOTH call sites
+# reading the variables, and it REJECTS a literal passed to decode.
+_RA_CODE="$(grep -vE '^[[:space:]]*#' "$RA")"
+_enc_ok=1
+grep -qF 'enc = sys.getfilesystemencoding() or "utf-8"' <<<"$_RA_CODE" || _enc_ok=0
+grep -qF 'err = sys.getfilesystemencodeerrors() or "surrogateescape"' <<<"$_RA_CODE" || _enc_ok=0
+grep -qF 'decode(enc, err)' <<<"$_RA_CODE" || _enc_ok=0
+grep -qF 'encode(enc, err)' <<<"$_RA_CODE" || _enc_ok=0
+if grep -qE 'decode\("utf-8"' <<<"$_RA_CODE"; then _enc_ok=0; fi
+[ "$_enc_ok" = 1 ] \
+  && { echo "  ✅ _normalise_set decodes AND encodes with the FILESYSTEM codec (the exact assignment, no shadowing literal) — the same source os.environ uses"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ _normalise_set no longer decodes/encodes with sys.getfilesystemencoding()/encodeerrors() — under a single-byte locale the classifier and the authority can disagree again (the §5.1 bypass) "; FAIL=$((FAIL+1)); }
 _au_ln="$(grep -nF -- "$_au_expr" "$ORCH" | head -1 | cut -d: -f1)"
 _cls_ln="$(grep -nF 'V="$(gh pr checks' "$ORCH" | head -1 | cut -d: -f1)"
 if [ -n "$_au_ln" ] && [ -n "$_cls_ln" ] && [ "$_au_ln" -lt "$_cls_ln" ]; then
@@ -665,7 +686,7 @@ if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; 
   done
   # ⚠️ review round 3: §j sourced the fragment standalone, so the guard's POSITION was unpinned
   # — moved after run_agent it would refuse only AFTER the reviewer ran and was paid for.
-  _wg_ln="$(grep -n 'REFUSED: branch protection' "$MERGE" | head -1 | cut -d: -f1)"
+  _wg_ln="$(grep -n 'REFUSED: the merge contract is UNKNOWN' "$MERGE" | head -1 | cut -d: -f1)"
   _ra_ln="$(grep -n '^run_agent "' "$MERGE" | head -1 | cut -d: -f1)"
   [ -n "$_wg_ln" ] && [ -n "$_ra_ln" ] && [ "$_wg_ln" -lt "$_ra_ln" ] \
     && { echo "  ✅ the refusal sits BEFORE the reviewer (line $_wg_ln < run_agent @ $_ra_ln)"; PASS=$((PASS+1)); } \

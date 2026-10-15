@@ -251,7 +251,19 @@ echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} author
 if [ -z "${REQ:-}" ] \
    || { [ "$MERGE_AUTHORITY" != "gate" ] && [ "$MERGE_AUTHORITY" != "rail" ]; } \
    || { [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; }; then
-  echo "[merge $PR] REFUSED: branch protection for $OR is unreadable (REQ_SOURCE=fallback, no REQ override) — the merge contract is UNKNOWN, so this worker merges nothing (agent-infra#1764)" >> "$L.log"
+  # ⛔ round-12 review, P3: this named ONE cause (an unreadable protection read) for ALL the
+  # refusal causes, so the allow-list refusal — reached with a READABLE contract and a valid
+  # override — told the operator to chase a gh fault that did not exist, and the line contradicted
+  # its own REQ_SOURCE. Name the actual cause.
+  _wr=""
+  if [ -z "${REQ:-}" ]; then _wr="REQ is EMPTY"; fi
+  if [ "$MERGE_AUTHORITY" != "gate" ] && [ "$MERGE_AUTHORITY" != "rail" ]; then
+    _wr="${_wr:+$_wr; }the merge authority is '${MERGE_AUTHORITY:-<unset>}' (neither gate nor rail)"
+  fi
+  if [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; then
+    _wr="${_wr:+$_wr; }branch protection was UNREADABLE (REQ_SOURCE=fallback) and no override was supplied"
+  fi
+  echo "[merge $PR] REFUSED: the merge contract is UNKNOWN — ${_wr:-no cause recorded}. This worker merges nothing (agent-infra#1764)." >> "$L.log"
   exit 5
 fi
 
