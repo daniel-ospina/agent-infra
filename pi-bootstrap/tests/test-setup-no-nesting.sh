@@ -181,17 +181,25 @@ check_ci_runner_gate_farmed() {
   fi
 }
 
-# #1552 — the `fleet_srcs` farm is the ONLY delivery path for the lane-orchestration layer the
-# fleet's own dispatch decisions rest on (lane-guard, safe-send, turn-classify, the heartbeat…).
-# 27 of its entries existed on exactly ONE disk and in no repo file until #1552. Pin the WHOLE
-# declared list, not just the new entries, because the two claims are different: "the array says
-# it" and "the box has it". The loop that consumes the array SKIPS an entry whose repo file is
-# absent (`[ -f "$f" ] || continue`), so a declared-but-unlanded entry fails SILENT — and the
-# measured cost of that silence is #1738 (a committed, reviewed, merged, farmed fix that sat
-# inert for 27 hours because nothing could answer "is the code on this machine the code in the
-# repo?"). Byte-identity is the other half: the farm's whole purpose is that the REPO copy is
-# the copy that RUNS, and a stale destination is exactly what #1552 measured (28 deployed files
-# byte-identical, 4 stale, before this change).
+# #1552 — pin the `fleet_srcs` farm's DECLARED list, because "the array says it" and "the box has
+# it" are different claims and nothing sat between them. The loop that consumes the array SKIPS an
+# entry whose repo file is absent (`[ -f "$f" ] || continue`), so a declared-but-unlanded entry fails
+# SILENT; and the farm's whole purpose is that the REPO copy is the copy that RUNS, so a stale
+# destination is the failure it exists against. 27 of the 36 entries joined in #1552 (the laptop-only
+# lane layer: ask-owner.py, lane-guard.py, safe-send.sh, turn-classify.py, orchestrator-heartbeat.sh
+# and the rest).
+#
+# ⚠️ SCOPE — what this guard does NOT cover, stated so nobody over-reads the green:
+#   * It pins the DECLARED set only. The VERSIONED half of the same layer (lane-status.py,
+#     lane-actions.py, lane-watchdog.py, objective.py, heartbeat-loop.sh, cadence-nudge.sh,
+#     publish-live-workspaces.py) is in NO farm list, so it is neither asserted nor delivered —
+#     a declared #1552 residual, not an oversight: `lane-status.py` is AHEAD at the destination,
+#     so farming it would REGRESS the running classifier (see the note at the fleet_srcs array).
+#   * It cannot see a stale DEPLOYED copy or an un-restarted long-lived process: it diffs repo bytes
+#     against a $DEST that THIS run just populated. #1738's 27 inert hours were a stale RUNNING
+#     process — #1738's own evidence records the deployed file as BYTE-IDENTICAL to origin/main —
+#     so #1738 is NOT this guard's motivating incident and must not be cited as a repo↔live
+#     identity failure. That identity instrument is #1760/#1759's, and it is not this one.
 check_fleet_srcs_farmed() {
   local label="$1"
   local line entry dest checked=0 declared=0
@@ -213,8 +221,11 @@ check_fleet_srcs_farmed() {
   done
   # The summary must never print `ok:` on a run that failed entries (review: an `ok:` beside a
   # FAIL is the same false-clean read this whole function exists to close), so the prefix is
-  # decided by the count, not printed unconditionally.
-  if [ "$checked" -eq "$declared" ]; then
+  # decided by the count, not printed unconditionally. `declared -gt 0` is required too: a
+  # whitespace-only array (`fleet_srcs=( )`) makes the anchored sed capture " ", runs the loop
+  # zero times, and would otherwise satisfy `0 -eq 0` and report a clean 0/0 — the maximal
+  # silent skip reported as green (review finding, mutation-verified).
+  if [ "$declared" -gt 0 ] && [ "$checked" -eq "$declared" ]; then
     echo "ok: $label fleet_srcs farm byte-identical for $checked/$declared declared entries (#1552)"
   else
     echo "PARTIAL: $label fleet_srcs farm verified only $checked/$declared declared entries (#1552)"
@@ -688,6 +699,9 @@ echo "# stale farm mutation" >> "$DEST/scripts/record-review.sh"   # #562 farm r
 if [ -f "$DEST/scripts/ci_runner_gate.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/ci_runner_gate.sh"  # #1719 farm refresh
 fi
+if [ -f "$DEST/scripts/lane-guard.py" ]; then
+  echo "# stale farm mutation" >> "$DEST/scripts/lane-guard.py"  # #1552 farm refresh (lane layer)
+fi
 if [ -f "$DEST/scripts/lib/pid-identity.sh" ]; then
   echo "# stale farm mutation" >> "$DEST/scripts/lib/pid-identity.sh"  # #1178 farm refresh
 fi
@@ -732,6 +746,18 @@ else
 fi
 check_identity_lib_farmed "run2"
 check_fleet_tools_farmed "run2"
+# #1552 — the refresh half, not just the membership half. run1 pins "the declared list landed";
+# run2 pins "a mutated destination is overwritten by the repo copy", which is the property the
+# farm exists for and the one #1552 measured drift against (a stale destination cannot be seen
+# from run1's freshly-populated $DEST). Representative entry, not all 36: the refresh is one loop.
+check_fleet_srcs_farmed "run2"
+if [ ! -f "$DEST/scripts/lane-guard.py" ]; then
+  : # already reported by check_fleet_srcs_farmed "run2" (a missing file is not "refreshed")
+elif grep -q "stale farm mutation" "$DEST/scripts/lane-guard.py"; then
+  fail "stale farm mutation survived re-run (farmed lane-guard.py was not refreshed)"
+else
+  echo "ok: farmed lane-guard.py refreshed on re-run (#1552)"
+fi
 if grep -q "stale farm mutation" "$DEST/scripts/fleet/lane_liveness.py" 2>/dev/null; then
   fail "stale farm mutation survived re-run (farmed lane_liveness.py was not refreshed)"
 else

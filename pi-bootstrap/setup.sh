@@ -296,17 +296,32 @@ fi
 # copy the copy that runs — without it a box keeps executing a hand-copied
 # duplicate (a merged fix never reaches it) and a second box has no fallback gate.
 #
-# #1552 — the LAPTOP-ONLY lane-orchestration layer joins this farm. Every entry below
-# existed on exactly ONE disk (~/.pi/agent/scripts) and in no repo file, so a repair to the
+# #1552 — the LAPTOP-ONLY lane-orchestration layer joins this farm. Each of the 27 entries
+# below existed on exactly ONE disk (~/.pi/agent/scripts) and in no repo file, so a repair to the
 # fleet's own dispatch guard could not go through the gate that guard exists to protect
-# (measured: a fix for a broken gate was applied in place, unreviewed and unreproducible
-# on a rebuilt machine — the remedy for a broken gate was itself ungated). They are farmed
-# FLAT for the same reason as the rest of this list: the lane layer resolves its siblings
-# as `$SCRIPTS/<name>` at $DEST/scripts/, and this farm's destination is $DEST/scripts/.
-# The versioned half of the same layer already sits there (lane-status.py, lane-actions.py,
-# lane-watchdog.py, heartbeat-loop.sh, objective.py, cadence-nudge.sh).
-# ⛔ Keep this assignment on ONE line: ci_runner_gate.test.sh reads it with
-# `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array silently reads as EMPTY.
+# (measured: a fix for a broken gate was applied in place, unreviewed and unreproducible on a
+# rebuilt machine — the remedy for a broken gate was itself ungated). They farm FLAT for the same
+# reason as the rest of this list: the layer resolves its siblings as `$SCRIPTS/<name>` at
+# $DEST/scripts/, which is this farm's destination.
+#
+# ⚠️ PARTIAL BY CONSTRUCTION — declared here, not left to be discovered. The VERSIONED half of the
+# SAME layer (`lane-status.py`, `lane-actions.py`, `lane-watchdog.py`, `objective.py`,
+# `heartbeat-loop.sh`, `cadence-nudge.sh`, `publish-live-workspaces.py`) is present in scripts/ but
+# is in NO farm list, so a box rebuilt from this file gets these consumers WITHOUT their producers.
+# Adding them is not a list-only edit and is deliberately out of #1552's scope, because the two
+# copies have drifted in OPPOSITE directions and each direction is its own hazard:
+#   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005; the live copy
+#     carries the #1777 abstention text, in flight). Farming the repo copy would OVERWRITE the
+#     running classifier with an older one — the fail-dangerous overwrite #1553's review named.
+#   * `cadence-nudge.sh` — the REPO is ahead (repo 422 lines / live 409). Farming it would change
+#     the running cadence as a side effect of a versioning PR, which is not this PR's to make.
+# So the closure is a declared residual of #1552 (see its residual comment), and the repo↔deployed
+# identity instrument that would report it continuously is #1760/#1759's — not this list's.
+# The same applies to the three `state/`-resident dependencies these files read fail-silently
+# (`state/queues/claim.py`, `state/lane-confirm.py`, `state/lane-triage.py`).
+# ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
+# `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
+# membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
 # Tests are not farmed (the farm contract above): scripts/test_objective.py and
 # scripts/test_turn_classify_state.py land in the repo and stay there.
 fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh ask-owner.py beta-progress.py cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
