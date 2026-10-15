@@ -383,7 +383,7 @@ jobs:
       # finding). Post-merge, a RED here reaches auto-file-on-failure through
       # this job's `needs:` entry, same as the vendored suite above it. Test
       # half of tortoise#3761; the canonical module never leaves this repo.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_lane_orchestration.py scripts/test_admin_merge_head.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

@@ -8,8 +8,17 @@
 # the fleet read "0 open PRs / VERDICT=STALLED" while 100 PRs were open. The same
 # failure silently degraded turn-classify's question scan ("3 repo(s) unreadable").
 # Pin the two directories here so no child depends on how the loop was launched.
+#
+# HOME IS DERIVED, NOT HARD-PINNED (#1553 review, P1). The literal author home path
+# made the farmed loop a SILENT NO-OP on any other machine:
+# the detached re-exec below overrode the inherited HOME, then `cd "$HOME" || exit 0`
+# exited 0 having done nothing. `${PI_FLEET_HOME:-$HOME}` preserves the author's box
+# exactly (HOME is already correct there) while letting a farmed box point the loop at
+# its OWN home with PI_FLEET_HOME.
+export PI_FLEET_HOME="${PI_FLEET_HOME:-$HOME}"
+export HOME="$PI_FLEET_HOME"
 export PI_FLEET_PATH_PINNED=1
-export PATH="/Users/danielospina/bin:/Users/danielospina/.pi/agent/shims:$PATH"
+export PATH="$HOME/bin:$HOME/.pi/agent/shims:$PATH"
 # RAISE THE CLI DEADLINE. Measured 2026-10-01: `cmux workspace list` takes 0.2-2s on a
 # quiet box but 13.4-15.1s at load 130+, against a fixed 15s CLI deadline — so a slow
 # answer is indistinguishable from a hang (`Error: Command timed out`). That made the
@@ -153,13 +162,15 @@ fi
 # launchd is not involved, but a detached process still inherits the environment it
 # was started with, which may be a cmux pane's interactive shell. Pin the two
 # variables everything downstream actually needs rather than trusting that.
-export HOME="/Users/danielospina"
+# Derived, not hard-pinned — see the PATH-pin note at the top of this file.
+export PI_FLEET_HOME="${PI_FLEET_HOME:-$HOME}"
+export HOME="$PI_FLEET_HOME"
 # `~/.pi/agent/shims` is where `gh` lives on this box (a symlink to the agent-infra
 # gh-shim). It was MISSING from the first version of this PATH, and the very first
 # tick logged "NOTE ask-owner scan produced nothing usable" — the gate was silently
 # dead while the heartbeat reported a green. Add a PATH entry only when it is
 # needed, but never omit this one silently.
-export PATH="/Users/danielospina/bin:/Applications/cmux.app/Contents/Resources/bin:/Users/danielospina/.pi/agent/bin:/Users/danielospina/.pi/agent/shims:/Users/danielospina/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="$HOME/bin:/Applications/cmux.app/Contents/Resources/bin:$HOME/.pi/agent/bin:$HOME/.pi/agent/shims:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export CMUX_QUIET=1     # the deprecation notice otherwise PREFIXES --json output
 cd "$HOME" || exit 0
 
