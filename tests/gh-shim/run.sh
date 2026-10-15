@@ -536,16 +536,19 @@ for badnum in 0 01006 0001 9007199254740993 9999999999999999; do
   fi
 done
 
-# ── 12. the argv shapes the TEXT layer hands over, pinned at BOTH layers (#1776) ─
-# The extension declines its GUESS on the admin-merge question whenever this shim is
-# installed (`ghShimWillEnforce`), so the shapes whose flag is not a literal token are
-# decided HERE and nowhere else. They are pinned in BOTH polarities — refused with no
-# evidence, and ALLOWED with evidence — because a mis-parse can refuse for the wrong
-# reason, but it cannot let the merge through with the caller's argv intact.
-# (a)-(d) put the repo flag in each position the scanner cannot read through; (e) is the
-# non-literal FLAG behind that repo flag — the shape the text layer really does hand over,
-# since a literal `--admin` would keep its decision and never reach the deferral at all.
-echo "== 12. the shapes the text layer hands over (#1776) =="
+# ── 12. the shapes around the deferral: what the TEXT layer hands over, and what it
+#        keeps for itself (#1776). The extension declines its GUESS on the admin-merge
+#        question whenever this shim is installed and executable (`ghShimWillEnforce`),
+#        so the shapes whose flag is not a literal token are decided HERE and nowhere
+#        else. Pinned in BOTH polarities — refused with no evidence, and ALLOWED with
+#        evidence — because a mis-parse can refuse for the wrong reason, but it cannot
+#        let the merge through with the caller's argv intact.
+#        (a)-(d) are SHIM-ONLY arms: each ends in a LITERAL `--admin`, which keeps the
+#        text-layer decision (pinned end-to-end in the extension suite), so they are
+#        here to prove this layer refuses them too, not because they are deferred.
+#        (e) is the deferred shape: the flag supplied by a VARIABLE, so the text layer
+#        cannot see it and this layer is the only one that can.
+echo "== 12. the shapes around the deferral (#1776) =="
 for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
              '--repo owner/other pr merge 123' '--repo=owner/other pr merge 123'; do
   tag="defer$(echo "$shape" | tr -dc 'a-z0-9')"
@@ -557,14 +560,17 @@ for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
   else
     fail "\`gh $shape --admin\` was ALLOWED with no evidence (rc=$rc)"
   fi
-  # (b) certifying evidence for the current head → allowed, argv forwarded INTACT.
+  # (b) certifying evidence for the current head → allowed, and the forwarded argv must
+  # be the ORIGINAL spelling, ANCHORED. An unanchored `--repo owner/other` also matches
+  # the VERIFIER's own normalised call — a different line in the same file — so it would
+  # pass even if the forwarded spelling had been mangled.
   new_scen "$tag-yes"
   jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
   bash "$SHIM" $shape --admin >/dev/null 2>"$TMP/err"; rc=$?
-  if [ "$rc" -eq 0 ] && grep -q -- "--repo owner/other" "$SCEN/calls"; then
-    pass "  …with head-bound evidence → allowed, and the repo reached the lookup"
+  if [ "$rc" -eq 0 ] && grep -q -- "^$shape --admin$" "$SCEN/calls"; then
+    pass "  …with head-bound evidence → allowed, and the ORIGINAL argv was forwarded intact"
   else
-    fail "  …evidence did not open \`gh $shape --admin\` (rc=$rc): $(head -1 "$TMP/err")"
+    fail "  …evidence did not open \`gh $shape --admin\` intact (rc=$rc): $(head -1 "$TMP/err")"
   fi
 done
 # The verb SPLICED, so the resolved argv is the only place the word `merge` exists —

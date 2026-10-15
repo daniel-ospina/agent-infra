@@ -121,6 +121,32 @@ function withShimInstalled<T>(fn: () => T): T {
   }
 }
 
+/** Move the operator's REAL neutral shim link aside and return a restorer.
+ *
+ *  `NEUTRAL_GH_SHIM_DIR` is fixed at import from the real home, which `withTempHome`
+ *  does not move, so a test that exercises materialization touches the operator's own
+ *  link. Call this INSIDE a try (so a throw in the arrange cannot strand the link as
+ *  `<neutral>.test-backup-<pid>`) and call the restorer in `finally`. `lstat`, not
+ *  `existsSync`: a DANGLING link is a present entry — a removed worktree leaves exactly
+ *  that — and it must still be restored. */
+function moveNeutralShimAside(): () => void {
+  const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
+  const backup = `${neutral}.test-backup-${process.pid}`;
+  const had = fs.lstatSync(neutral, { throwIfNoEntry: false }) !== undefined;
+  fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
+  if (had) fs.renameSync(neutral, backup);
+  return () => {
+    try {
+      fs.rmSync(neutral, { force: true });
+    } catch {
+      /* absent */
+    }
+    if (had && fs.lstatSync(backup, { throwIfNoEntry: false }) !== undefined) {
+      fs.renameSync(backup, neutral);
+    }
+  };
+}
+
 function test(name: string, fn: () => void) {
   try {
     fn();
@@ -3963,40 +3989,92 @@ test("ghShimWillEnforce: decided from our own state, never from the command text
 });
 
 test("materializeGhShim: a non-executable source is refused, and never displaces a working link (#1776)", () => {
-  // The neutral path is the OPERATOR'S real one — `NEUTRAL_GH_SHIM_DIR` is fixed at
-  // import from the real home, which `withTempHome` does not move — so this test moves
-  // it aside and restores it exactly. A run against a broken revision must not be able
-  // to leave a real session holding a dangling shim.
-  const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
-  const backup = `${neutral}.test-backup-${process.pid}`;
-  const hadNeutral = fs.lstatSync(neutral, { throwIfNoEntry: false }) !== undefined;
   const source = resolveGhShimDir();
   ok(source !== null, "this checkout's shim resolves");
   let noExec: string | null = null;
+  let restore: (() => void) | null = null;
   try {
+    // The operator's real link moves aside INSIDE the try, so a throw in the arrange
+    // cannot strand it as <neutral>.test-backup-<pid>.
+    restore = moveNeutralShimAside();
     // ARRANGE a WORKING link, so "never displaces a working link" is literally what is
     // asserted rather than a comparison against whatever this machine happened to have.
-    // The move-aside lives INSIDE the try: a throw between moving the operator's link
-    // and the finally would otherwise strand it as <neutral>.test-backup-<pid>.
-    fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
-    if (hadNeutral) fs.renameSync(neutral, backup);
     noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-src."));
     fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
     fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
+    const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
     fs.symlinkSync(fs.realpathSync(resolvePath(source as string, "gh")), neutral);
     const before = fs.realpathSync(neutral);
     equal(materializeGhShim(noExec), null, "a shim that cannot execute is not installed");
     equal(fs.realpathSync(neutral), before, "…and the working link is left exactly as it was");
+    // A DANGLING link — what a removed worktree leaves behind — must be read as ABSENT
+    // and replaced: `existsSync` follows the link, so this is the path that actually
+    // recovers a session whose shim moved.
+    const gone = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-gone."));
+    fs.writeFileSync(resolvePath(gone, "gh"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(resolvePath(gone, "gh"), 0o755);
+    fs.rmSync(neutral, { force: true });
+    fs.symlinkSync(resolvePath(gone, "gh"), neutral);
+    fs.rmSync(gone, { recursive: true, force: true }); // the link now dangles
+    equal(materializeGhShim(source as string), NEUTRAL_GH_SHIM_DIR,
+      "a dangling link is replaced, not trusted");
+    equal(fs.realpathSync(neutral), fs.realpathSync(resolvePath(source as string, "gh")),
+      "…and it points at the working source again");
   } finally {
     if (noExec !== null) fs.rmSync(noExec, { recursive: true, force: true });
-    try {
-      fs.rmSync(neutral, { force: true });
-    } catch {
-      /* already gone */
-    }
-    if (hadNeutral && fs.lstatSync(backup, { throwIfNoEntry: false }) !== undefined) {
-      fs.renameSync(backup, neutral);
-    }
+    if (restore !== null) restore();
+  }
+});
+
+testAsync("#1776: the per-call revalidation re-resolves after the cached shim loses its execute bit", async () => {
+  // The cache keeps a session from re-resolving on every bash call; the revalidation
+  // keeps a session that outlives its shim from injecting a directory the shell will
+  // skip. This is the one `isExecutableShim` call site whose failure mode is a silent
+  // ABSENCE rather than a refusal — an `existsSync` revalidation keeps the stale dir and
+  // the argv layer never runs — so it is pinned end-to-end, through the handler.
+  const prevShim = process.env.AGENT_GH_SHIM;
+  const prevDir = process.env.AGENT_GH_SHIM_DIR;
+  const prevMode = process.env.PI_MODE;
+  let install: string | null = null;
+  let restore: (() => void) | null = null;
+  try {
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(() => {
+      throw ghError("gh: could not resolve host github.com");
+    });
+    restore = moveNeutralShimAside();
+    install = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-install."));
+    fs.writeFileSync(resolvePath(install, "gh"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(resolvePath(install, "gh"), 0o755);
+    process.env.AGENT_GH_SHIM_DIR = install;
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start");
+    const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
+    const first = { toolName: "bash", input: { command: "echo one" } };
+    await fire("tool_call", first);
+    ok(String(first.input.command).startsWith("export PATH="),
+      "the first call is patched — the argv layer is on PATH");
+    equal(fs.realpathSync(neutral), fs.realpathSync(resolvePath(install, "gh")),
+      "…and the cached dir is the shim we pointed at");
+    fs.chmodSync(resolvePath(install, "gh"), 0o644); // it loses its execute bit mid-session
+    const second = { toolName: "bash", input: { command: "echo two" } };
+    await fire("tool_call", second);
+    ok(String(second.input.command).startsWith("export PATH="),
+      "the next call is still patched — it re-resolved to a usable shim");
+    const resolved = fs.realpathSync(neutral);
+    ok(resolved !== fs.realpathSync(resolvePath(install, "gh")),
+      "…NOT the stale non-executable directory: the cache was invalidated");
+    equal(resolved, fs.realpathSync(resolvePath(resolveGhShimDir() as string, "gh")),
+      "…it fell back to this checkout's shim");
+  } finally {
+    _setRunGhOverride(null);
+    if (install !== null) fs.rmSync(install, { recursive: true, force: true });
+    if (restore !== null) restore();
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+    if (prevDir === undefined) delete process.env.AGENT_GH_SHIM_DIR; else process.env.AGENT_GH_SHIM_DIR = prevDir;
+    if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
   }
 });
 
@@ -4466,7 +4544,21 @@ test("resolveGhShimDir: resolves this checkout's shim, and an unusable override 
   const fallback = resolveGhShimDir();
   ok(fallback !== null && fallback !== "/nonexistent/shim",
     "an unusable override FALLS BACK rather than silently disabling the layer");
-  delete process.env.AGENT_GH_SHIM_DIR;
+  // A candidate that EXISTS but cannot execute is skipped for the same reason — the
+  // shell skips such a PATH entry, so it is not a shim. Without this arm, reverting the
+  // candidate scan to `existsSync` would keep the whole suite green.
+  const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-cand."));
+  try {
+    fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
+    process.env.AGENT_GH_SHIM_DIR = noExec;
+    const fromNoExec = resolveGhShimDir();
+    ok(fromNoExec !== null && fromNoExec !== noExec,
+      "a present-but-non-executable override is SKIPPED, and the next candidate wins");
+  } finally {
+    fs.rmSync(noExec, { recursive: true, force: true });
+    delete process.env.AGENT_GH_SHIM_DIR;
+  }
 });
 
 test("evidenceBodyIsCertifying: a marker alone is a vacuous pass", () => {
