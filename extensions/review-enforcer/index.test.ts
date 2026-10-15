@@ -3972,12 +3972,15 @@ test("materializeGhShim: a non-executable source is refused, and never displaces
   const hadNeutral = fs.lstatSync(neutral, { throwIfNoEntry: false }) !== undefined;
   const source = resolveGhShimDir();
   ok(source !== null, "this checkout's shim resolves");
-  if (hadNeutral) fs.renameSync(neutral, backup);
-  const noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-src."));
+  let noExec: string | null = null;
   try {
     // ARRANGE a WORKING link, so "never displaces a working link" is literally what is
     // asserted rather than a comparison against whatever this machine happened to have.
+    // The move-aside lives INSIDE the try: a throw between moving the operator's link
+    // and the finally would otherwise strand it as <neutral>.test-backup-<pid>.
     fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
+    if (hadNeutral) fs.renameSync(neutral, backup);
+    noExec = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-src."));
     fs.writeFileSync(resolvePath(noExec, "gh"), "#!/bin/sh\nexit 0\n");
     fs.chmodSync(resolvePath(noExec, "gh"), 0o644);
     fs.symlinkSync(fs.realpathSync(resolvePath(source as string, "gh")), neutral);
@@ -3985,13 +3988,15 @@ test("materializeGhShim: a non-executable source is refused, and never displaces
     equal(materializeGhShim(noExec), null, "a shim that cannot execute is not installed");
     equal(fs.realpathSync(neutral), before, "…and the working link is left exactly as it was");
   } finally {
-    fs.rmSync(noExec, { recursive: true, force: true });
+    if (noExec !== null) fs.rmSync(noExec, { recursive: true, force: true });
     try {
       fs.rmSync(neutral, { force: true });
     } catch {
       /* already gone */
     }
-    if (hadNeutral) fs.renameSync(backup, neutral);
+    if (hadNeutral && fs.lstatSync(backup, { throwIfNoEntry: false }) !== undefined) {
+      fs.renameSync(backup, neutral);
+    }
   }
 });
 
@@ -4404,7 +4409,8 @@ test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash ca
   equal((shimmed as string).split("\n").length, 2, "the prefix is one line plus the command");
   ok((shimmed as string).endsWith(ORIG), "the caller's command is preserved verbatim");
   ok((shimmed as string).startsWith('export PATH="/repo/scripts/gh-shim":"$PATH"'), "PATH is prepended, quoted");
-  equal(withGhShim(ORIG, null), null, "no shim installed → nothing injected (never a broken PATH)");
+  equal(withShimInstalled(() => withGhShim(ORIG, null)), null,
+    "no shim installed → nothing injected (never a broken PATH)");
   // The kill switch: this touches EVERY bash call, so it must be switchable.
   // SAVE/RESTORE, never a bare assignment — an un-restored mutation becomes the
   // posture of every LATER test in this file and silently makes the declared
@@ -5069,11 +5075,13 @@ testAsync("#1776: the text gate stands down when the argv layer will enforce (th
     const prevMode = process.env.PI_MODE;
     delete process.env.AGENT_GH_SHIM; // default posture: the shim IS installed
     process.env.PI_MODE = "print";
-    // A gh failure is the sharpest available probe: if the evidence gate RAN, the
-    // head lookup would throw and it would fail closed with ITS message. This
-    // session has dispatched no reviewer, so the ordinary dispatch gate still
-    // refuses the command — that is a DIFFERENT gate, and the assertions below
-    // separate the two.
+    // The admin gate's OWN discriminator is the short-circuit below: this command has
+    // no `gh pr merge` segment, so `extractMergePrNumber` is null and the gate would
+    // refuse it for carrying no resolvable PR number — the audit assertion below is
+    // what proves the admin gate did NOT run. The injected gh failure is a backstop for
+    // the other branch (a command that DID reach the head lookup and would then fail
+    // closed with the gate's own message), so a future edit cannot quietly start calling
+    // the operator's real gh from this test.
     _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
     try {
       const { pi, fire } = mockPi();
