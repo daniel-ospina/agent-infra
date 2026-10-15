@@ -7224,6 +7224,42 @@ test("#1485 (review P3): countPiInPsOutput counts the `pi` basename exactly", ()
   equal(countPiInPsOutput(""), 0, "empty output is a real 0");
 });
 
+test("#1485 (review P2): countPiProcs fails CLOSED to -1 when `ps` cannot run — never a confident 0", () => {
+  // Why this exists: the other piProcs assertions accept `-1 OR a count`, so
+  // `catch { return 0 }` — the exact "no fleet" misdiagnosis #1485 removes —
+  // survived every guard (mutation-proven by review). Drive the PRODUCTION
+  // catch with a failing `ps` shim; the pure parser cannot reach it.
+  const dir = mkdtempSync(join(tmpdir(), "t1485-psless-"));
+  const savedPath = process.env.PATH ?? "";
+  try {
+    writeFileSync(join(dir, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    process.env.PATH = `${dir}:${savedPath}`;
+    equal(countPiProcs(), -1, "an unavailable `ps` is UNKNOWN (-1), never a confident 0");
+  } finally {
+    process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // Source pin: the shim drives the catch today, but a refactor could stop
+  // routing through `countPiInPsOutput` — the catch must keep the sentinel.
+  const start = source.indexOf("export function countPiProcs()");
+  const open = source.indexOf("{", start);
+  let depth = 0;
+  let end = -1;
+  for (let i = open; i >= 0 && i < source.length; i++) {
+    if (source[i] === "{") depth++;
+    else if (source[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  const body = start >= 0 && end > open ? source.slice(open, end) : "";
+  ok(body.length > 0, "countPiProcs source located (a rename must update this pin)");
+  ok(/catch\s*\{[^}]*return\s+-1\s*;?/.test(body), "countPiProcs' catch must return -1 — never 0 (re-arms the 'no fleet' misdiagnosis)");
+});
+
 testAsync("#783/T2: asyncRepoState reads branch/headSha/dirty/paths from a real repo", async () => {
   const dir = mkdtempSync(join(tmpdir(), "t2-repo-"));
   try {

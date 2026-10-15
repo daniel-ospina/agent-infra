@@ -940,6 +940,21 @@ test("the two duplicated getSystemLoad probes read the same OS sources", () => {
   ok(slackGet.includes("sysctl -n vm.loadavg"), "slack-bridge's getSystemLoad no longer reads sysctl vm.loadavg");
 });
 
+test("#1485 (review P2): probeSystemLoad's failure arms return null, never a confident 0", () => {
+  // `getSystemLoad()` coalesces the tri-state probe to 0 for BOUND SCALING; the
+  // `Alive state:` REPORTING path relies on the probe itself returning null so a
+  // failed read renders `load1=unknown`. On Linux CI /proc/loadavg always
+  // exists, so BOTH failure arms (a non-finite read, and the catch) are
+  // unreachable behaviourally — a `null` → `0` mutation there keeps every
+  // behavioural guard green (mutation-proven by review). Pin the shape instead,
+  // exactly as `probeLoad1`'s production leg is pinned in builtin-tools.
+  const body = extractFunctionBody(builtinSrc, "probeSystemLoad");
+  const nulls = (body.match(/\bnull\b/g) ?? []).length;
+  ok(nulls >= 3, `both non-finite arms AND the catch must answer null (found ${nulls} in probeSystemLoad)`);
+  ok(/catch\s*\{[^}]*return\s+null/.test(body), "the catch must return null — a failed probe is UNKNOWN, never 0");
+  ok(!/return\s+0\b/.test(body), "probeSystemLoad must never return 0 — 0 is getSystemLoad()'s coalescing, not the probe's answer");
+});
+
 test("the §3 default for TASK_FIRST_OUTPUT_TIMEOUT_MS is the code's own default", () => {
   // The one per-row default pin (see LIMITS): this issue made the override live,
   // so the number the doc publishes to an operator must be the getter's number.
