@@ -966,11 +966,164 @@ try {
       );
     } else {
       // Case-SENSITIVE filesystem: the differently-cased name is a genuinely different file and
-      // MUST stay payload — excluding it by name would be a hole.
-      eq("case-sensitive FS — a differently-cased name stays payload", true, true);
+      // MUST stay payload — excluding it by name would be a hole. Create it BEFORE stamping so the
+      // stamp legitimately covers it, and assert tampering goes red. (The old form of this branch
+      // asserted `true === true`, a gate that cannot fire — and every CI runner here is Linux, so on
+      // CI the arm tested nothing at all.)
+      fs.writeFileSync(path.join(s4, upper), "not a stamp\n");
+      eq("control — stamps with a differently-cased sibling present", run(["--write", "--surface", s4, "--repo", ORIGIN]).code, 0);
+      eq(
+        "control — and is green",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        0
+      );
+      fs.writeFileSync(path.join(s4, upper), "tampered\n");
+      eq(
+        "a differently-cased SIBLING is payload — tampering with it goes red",
+        run(["--surface", s4, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+        1
+      );
+      fs.rmSync(path.join(s4, upper));
     }
     fs.renameSync(path.join(s4, upper), path.join(s4, ".agent-infra-stamp.json"));
     fs.rmSync(s4, { recursive: true, force: true });
+  }
+
+  // ── 39. a file named like our temp sibling is PAYLOAD, not ours ────────────────────────
+  console.log("\n39. a file named like our temp sibling is PAYLOAD, not ours");
+  {
+    // The exclusion must be anchored to the surface's own directory. Matching `<stamp>.tmp-*` by
+    // NAME at any depth made an installed file — or a whole DIRECTORY — invisible to the digest, so
+    // a tampered payload still reported in-sync.
+    const s5 = path.join(TMP, "tmpname");
+    fs.mkdirSync(path.join(s5, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s5, "skills", "sub"), { recursive: true });
+    fs.symlinkSync(".", path.join(s5, "scripts"));
+    const evil = path.join(s5, "skills", "sub", ".agent-infra-stamp.json.tmp-evil.sh");
+    fs.writeFileSync(evil, "payload-v1\n");
+    eq("control — stamps with the oddly-named file present", run(["--write", "--surface", s5, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(evil, "TAMPERED\n");
+    eq(
+      "tampering with a <stamp>.tmp-* file at depth is DRIFT",
+      run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(evil);
+    const evilDir = path.join(s5, "extensions", ".agent-infra-stamp.json.tmp-d");
+    fs.mkdirSync(evilDir, { recursive: true });
+    fs.writeFileSync(path.join(evilDir, "evil.ts"), "export const evil = 1;\n");
+    eq("control — stamps with the oddly-named DIRECTORY present", run(["--write", "--surface", s5, "--repo", ORIGIN]).code, 0);
+    eq("control — green", run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+    fs.writeFileSync(path.join(evilDir, "evil.ts"), "export const evil = 2;\n");
+    eq(
+      "tampering INSIDE a <stamp>.tmp-* directory is DRIFT",
+      run(["--surface", s5, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    fs.rmSync(s5, { recursive: true, force: true });
+  }
+
+  // ── 40. a hardlink to the stamp under a payload root must not break --write ─────────────
+  console.log("\n40. a hardlink to the stamp under a payload root must not break --write");
+  {
+    // Excluding by IDENTITY alone made `--write` non-idempotent here: it hashed with the link
+    // excluded, then the rename installed a NEW inode, so the link became a normal payload file and
+    // the surface sat in drift that no further --write could clear.
+    const s6 = path.join(TMP, "hardlink");
+    fs.mkdirSync(path.join(s6, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s6, "skills"), { recursive: true });
+    fs.symlinkSync(".", path.join(s6, "scripts"));
+    write("extensions/e.ts", "export const e = 1;\n", s6);
+    eq("control — stamps", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    fs.linkSync(path.join(s6, ".agent-infra-stamp.json"), path.join(s6, "skills", ".agent-infra-stamp.json"));
+    eq(
+      "a hardlink has its own PATH, so it is payload and the surface drifts",
+      run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      1
+    );
+    eq("control — --write converges", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    const after = run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("control — and verify AGREES after that write", after.code, 0);
+    eq("control — a second write then verifies too", run(["--write", "--surface", s6, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — still agreed",
+      run(["--surface", s6, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    fs.rmSync(s6, { recursive: true, force: true });
+  }
+
+  // ── 41. --json must mean JSON on the write and help paths too ─────────────────────────
+  console.log("\n41. --json means JSON on the write and help paths too");
+  {
+    const s7 = path.join(TMP, "jsonwrite");
+    fs.mkdirSync(path.join(s7, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s7, "skills"), { recursive: true });
+    fs.mkdirSync(path.join(s7, "scripts"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s7);
+    const w = run(["--write", "--json", "--surface", s7, "--repo", ORIGIN]);
+    eq("--write --json exits 0", w.code, 0);
+    let parsed = null;
+    try {
+      parsed = JSON.parse(w.stdout);
+    } catch {
+      parsed = null;
+    }
+    eq("--write --json prints parseable JSON (not a human line)", parsed === null, false);
+    eq("and it names the surface it wrote", parsed === null ? null : parsed.written[0].surface, s7);
+    const h = run(["--json", "--help"]);
+    eq("--json --help exits 0", h.code, 0);
+    let hp = null;
+    try {
+      hp = JSON.parse(h.stdout);
+    } catch {
+      hp = null;
+    }
+    eq("--json --help prints parseable JSON", hp === null, false);
+    fs.rmSync(s7, { recursive: true, force: true });
+  }
+
+  // ── 42. an unreadable DEFAULT repos root must end the scan, not empty it ────────────────
+  console.log("\n42. an unreadable DEFAULT repos root must end the scan, not silently empty it");
+  {
+    // The default root is $HOME/Documents/GitHub. Absence there is legitimate (no linked repos);
+    // being UNABLE TO READ it is not — collapsing EACCES to [] reported a green over a scope nobody
+    // read, which on this box is every linked repo.
+    const h = path.join(TMP, "fakehome");
+    const defRoot = path.join(h, "Documents", "GitHub");
+    fs.mkdirSync(path.join(defRoot, "repoX", "scripts"), { recursive: true });
+    // A dir counts as a LINKED repo only when it carries a stamp or the legacy version file.
+    fs.writeFileSync(path.join(defRoot, "repoX", ".agent-infra-version"), "0.1.0\n");
+    // The pi surface must EXIST too, so the default set is non-empty without repoX. Otherwise the
+    // mutant that collapses EACCES to [] still exits 2 ("no surfaces found") and the arm cannot
+    // tell the two apart — a check that cannot fail, which is the defect this arm exists to guard.
+    fs.mkdirSync(path.join(h, ".pi", "agent", "scripts"), { recursive: true });
+    const env = { HOME: h };
+    const c = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], { env });
+    eq("control — the default root IS scanned", c.stdout.includes("repoX"), true);
+    eq("control — and the pi surface is there too", c.stdout.includes(path.join(h, ".pi", "agent")), true);
+    fs.chmodSync(defRoot, 0o000);
+    try {
+      const u = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch"], { env });
+      eq("an unreadable default root is exit 2 (cannot verify)", u.code, 2);
+      eq("and it names the root it could not read", u.stderr.includes(defRoot), true);
+      eq("and says so rather than reporting an empty scope", u.stdout.includes("repoX"), false);
+    } finally {
+      fs.chmodSync(defRoot, 0o755);
+    }
+    fs.rmSync(h, { recursive: true, force: true });
+  }
+
+  // ── 43. in-sync prints WHY ──────────────────────────────────────────────────────────────
+  console.log("\n43. in-sync prints why, so a stale-but-faithful install is legible");
+  {
+    // HONEST SCOPE promises the commit and its relation are printed for the reader. Suppressing
+    // `reason` for in-sync withheld exactly that, from exactly the verdict the promise is about.
+    stampNow();
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch"]);
+    eq("control — in-sync", v.code, 0);
+    eq("the reason line is printed for in-sync too", v.stdout.includes("payload matches its stamp"), true);
   }
 
 } finally {

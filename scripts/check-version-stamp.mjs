@@ -208,29 +208,29 @@ export function payloadEntries(rootDir, relRoot) {
       // fail-open in a tool whose whole job is to notice that an install changed.
       const lowerName = name.toLowerCase();
       const lowerBase = STAMP_BASENAME.toLowerCase();
-      if (lowerName.startsWith(lowerBase)) {
-        // Same FILE, whatever the spelling. A case-INSENSITIVE filesystem lets the same stamp be
-        // reached as `.AGENT-INFRA-STAMP.JSON`, and `realpathSync` echoes the case it was ASKED
-        // about rather than canonicalising to the on-disk one (measured on APFS) — so a path-string
-        // comparison cannot recognise it, and the stamp got digested, making write/verify diverge
-        // forever. Compare IDENTITY (dev+ino), which is right on both filesystem kinds: on a
-        // case-SENSITIVE one a differently-cased name really is a different file and stays payload.
-        let same = lowerName.slice(lowerBase.length).startsWith(".tmp-"); // this tool's own temp sibling
-        if (!same) {
+      // ⛔ Only the SURFACE's OWN stamp and its own temp siblings may be excluded, and the gate is
+      // the PATH, never the name: matching the name at any depth made an installed file called
+      // `<stamp>.tmp-x` — or a DIRECTORY of that name, hiding a whole subtree — invisible to the
+      // digest, so a tampered payload reported in-sync. Anchoring the parent also settles a
+      // hardlink: a link to the stamp under a payload root has a different path, so it stays
+      // payload and `--write` converges instead of invalidating the equality it just hashed.
+      if (lowerName.startsWith(lowerBase) && path.dirname(abs) === surfaceReal) {
+        const suffix = lowerName.slice(lowerBase.length);
+        let same = suffix.startsWith(".tmp-"); // this tool's own temp sibling
+        if (!same && suffix === "") {
+          // Same FILE, whatever the spelling. A case-INSENSITIVE filesystem lets the same stamp be
+          // reached as `.AGENT-INFRA-STAMP.JSON`, and `realpathSync` echoes the case it was ASKED
+          // about rather than canonicalising to the on-disk one (measured on APFS) — so a path-string
+          // comparison cannot recognise it, and the stamp got digested, making write/verify diverge
+          // forever. Compare IDENTITY (dev+ino), which is right on both filesystem kinds: on a
+          // case-SENSITIVE one a differently-cased name really is a different file and stays payload.
           try {
             const a = fs.statSync(abs);
             const b = fs.statSync(ownStamp);
             same = a.dev === b.dev && a.ino === b.ino;
           } catch {
-            // The stamp may not exist yet (`--write` hashes BEFORE writing it) — fall back to the
-            // string form.
-            let resolved = abs;
-            try {
-              resolved = fs.realpathSync(abs);
-            } catch {
-              resolved = abs;
-            }
-            same = resolved === ownStamp;
+            // The stamp may not exist yet (`--write` hashes BEFORE writing it) — fall back to strings.
+            same = abs === ownStamp;
           }
         }
         if (same) continue;
@@ -758,11 +758,12 @@ export function linkedSurfaces(reposRoot) {
   try {
     names = fs.readdirSync(root);
   } catch (err) {
-    // A root the operator NAMED (--repos-root or $AGENT_INFRA_REPOS_ROOT) that cannot be read is a
-    // cannot-verify — never "there are no linked repos". The latter reports a green over a scope
-    // nobody read, which is the vacuous pass this file refuses for the total set (the sibling
-    // `sync` dies on the same condition). The built-in default may legitimately be absent.
-    if (namedRoot) throw new PayloadReadError(root, err);
+    // Absence is legitimate ONLY for the built-in default. Any other failure — and ANY failure at
+    // all on a root the operator NAMED (--repos-root or $AGENT_INFRA_REPOS_ROOT), absence included
+    // — is a cannot-verify: returning [] reports a green over a scope nobody read. The unread
+    // DEFAULT root had this hole after the named root was fixed, so the fleet's ~20 linked repos
+    // silently left the scan and the run still said in-sync / exit 0.
+    if (err.code !== "ENOENT" || namedRoot) throw new PayloadReadError(root, err);
     return [];
   }
   const out = [];
@@ -913,7 +914,9 @@ function main(argv) {
     return 2;
   }
   if (opts.help) {
-    console.log(usage());
+    // `--json` promises stdout is machine-readable, and a usage text is not JSON. A consumer that
+    // piped us through `jq` got a parse error on a successful run.
+    console.log(opts.json ? JSON.stringify({ usage: usage() }, null, 2) : usage());
     return 0;
   }
 
@@ -967,6 +970,10 @@ function main(argv) {
 
   // ── --write: stamp, then stop. Mirrors `check-workflow-lock.mjs --update-lock`. ──
   if (opts.write) {
+    // `--json` must mean "stdout is JSON" on EVERY path that prints to stdout: the write path used
+    // to print its human line regardless, so `--write --json | jq` failed to parse a run that had
+    // succeeded, with no signal that the flag was dropped.
+    const written = [];
     for (const dir of surfaces) {
       try {
         // Never CONJURE a surface. `--write` on a mistyped path created the tree and reported a
@@ -1025,15 +1032,31 @@ function main(argv) {
         } else if (stamp.payload.files === 0) {
           console.error(`ℹ️  ${dir} was stamped with an EMPTY payload — no files under ${PAYLOAD_ROOTS.join(", ")}`);
         }
-        console.log(
-          `✅ stamped ${dir} — commit ${(stamp.agentInfra.commit ?? "none").slice(0, 9)}, ` +
-            `${stamp.payload.files} files, ${stamp.payload.hash.slice(0, 12)}…${note}`
-        );
+        const entry = {
+          surface: dir,
+          version: stamp.version ?? null,
+          commit: stamp.agentInfra.commit,
+          dirty: stamp.agentInfra.dirty,
+          files: stamp.payload.files,
+          hash: stamp.payload.hash,
+          note: note === "" ? null : note,
+        };
+        if (opts.json) written.push(entry);
+        else {
+          console.log(
+            `✅ stamped ${dir} — commit ${(stamp.agentInfra.commit ?? "none").slice(0, 9)}, ` +
+              `${stamp.payload.files} files, ${stamp.payload.hash.slice(0, 12)}…${note}`
+          );
+        }
       } catch (err) {
         console.error(`❌ could not stamp ${dir}: ${err.message}`);
+        // A `--json` consumer must always get JSON on stdout, including on the failure path — an
+        // empty stdout with exit 2 is unparseable, and the caller cannot tell a crash from a refusal.
+        if (opts.json) console.log(JSON.stringify({ written, error: err.message }, null, 2));
         return 2;
       }
     }
+    if (opts.json) console.log(JSON.stringify({ written, counts: { written: written.length } }, null, 2));
     return 0;
   }
 
@@ -1072,7 +1095,11 @@ function main(argv) {
       const sha = r.stamp?.agentInfra?.commit;
       const who = typeof sha === "string" ? `commit ${sha.slice(0, 9)}` : "no commit";
       console.log(`${icon} ${r.verdict.padEnd(9)} ${r.surface}  (${who})`);
-      if (r.verdict !== "in-sync") console.log(`     ${r.reason}`);
+      // Printed for EVERY verdict, `in-sync` included. HONEST SCOPE promises the commit and its
+      // relation are shown to the reader, and the relation lives in `reason` — suppressing it for
+      // the one verdict the promise is about told the reader that the thing the check deliberately
+      // does not report is being reported ("in-sync" read as "up to date").
+      console.log(`     ${r.reason}`);
     }
     if (!opts.quiet) {
       console.log(
@@ -1112,5 +1139,12 @@ if (IS_MAIN) {
   // discards whatever is still queued. Measured: `--json | jq` truncated the report at the 64 KiB
   // pipe buffer on 10/10 runs — a silent loss, with the exit code still looking correct. Setting
   // `exitCode` lets the event loop drain the writes before the process ends.
-  process.exitCode = main(process.argv.slice(2));
+  try {
+    process.exitCode = main(process.argv.slice(2));
+  } catch (err) {
+    // An uncaught throw would exit 1 — the code this tool DOCUMENTS as `drift`. A crash is not a
+    // verdict, it is a cannot-verify, so it must not be read as "your install changed".
+    console.error(`❌ check-version-stamp: unexpected failure — ${err && err.stack ? err.stack : String(err)}`);
+    process.exitCode = 2;
+  }
 }
