@@ -1016,6 +1016,47 @@ async function main() {
     rmSync(join(verDir, "latest.json.lock"), { recursive: true, force: true });
   });
 
+  test("scenario 21e (#1225/#1573, #1092): a verified DANGLING SYMLINK must not be pruned by another lane's write", async () => {
+    // The prune tests PRESENCE WITHOUT following the link (#1092 hashes a
+    // symlink's link bytes and needs no existing target, so a verified dangling
+    // symlink is legitimate). `existsSync` reads it as absent and pruned it —
+    // re-blocking an already-verified change on the next foreign write.
+    const repoL = join(TEST_ROOT, "repo-link");
+    mkdirSync(repoL, { recursive: true });
+    git(repoL, "init -b main");
+    git(repoL, "config user.email e2e@test");
+    git(repoL, "config user.name e2e");
+    writeFileSync(join(repoL, "keep.txt"), "k1\n");
+    git(repoL, "add keep.txt");
+    git(repoL, "commit -m baseline");
+    // A dangling symlink plus a staged fresh edit, so the PASS is diff-scoped
+    // and writeBridge actually runs (and prunes).
+    symlinkSync("does-not-exist-target", join(repoL, "dangling.txt"));
+    writeFileSync(join(repoL, "keep.txt"), "k2\n");
+    git(repoL, "add keep.txt");
+    const realL = realpathSync(repoL);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    const seeded = existsSync(bridgePath)
+      ? JSON.parse(readFileSync(bridgePath, "utf-8"))
+      : { status: "PASS", verified_files: [] };
+    seeded.verified_files = [
+      ...(Array.isArray(seeded.verified_files) ? seeded.verified_files : []),
+      { path: `${realL}::dangling.txt`, hash: sha("link-bytes") },
+    ];
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    writeFileSync(bridgePath, JSON.stringify(seeded));
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: keep.txt. Classification: backend. Project root: ${repoL}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoL, "keep.txt"), hash: sha("k2\n") }] }) }],
+    });
+    const after = JSON.parse(readFileSync(bridgePath, "utf-8"));
+    const paths = after.verified_files.map((vf: any) => String(vf.path));
+    ok(paths.some((p: string) => p.endsWith("::dangling.txt")),
+      `a verified dangling symlink must survive a foreign write (presence via lstat, never existsSync), got: ${JSON.stringify(paths)}`);
+  });
+
   test("scenario 22 (#825/#264): sub-agent commit on UNVERIFIED files is blocked with a self-verify instruction", async () => {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");

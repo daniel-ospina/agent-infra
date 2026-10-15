@@ -485,7 +485,15 @@ function writeBridge(projectRoot: string, files: string[]): void {
             // old snapshot did, so nothing else would ever remove these — they
             // would accumulate without bound in the machine-global bridge, and
             // every git op whose mtime changed re-parses and scans every entry.
-            if (!existsSync(resolve(parsed.root, parsed.path))) continue;
+            // Presence must be tested WITHOUT following the link: the gate's
+            // own #1092 file rule hashes a symlink's LINK bytes and needs no
+            // existing target, so a verified DANGLING symlink is legitimate.
+            // `existsSync` follows the link, reads such a symlink as absent,
+            // and would prune the entry — re-creating the #1225/#1573 loss on
+            // the next foreign write, for the #1092 path class.
+            let present = false;
+            try { lstatSync(resolve(parsed.root, parsed.path)); present = true; } catch { present = false; }
+            if (!present) continue;
           }
           merged.set(vf.path, vf);
         }
