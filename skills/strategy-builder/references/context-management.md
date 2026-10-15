@@ -50,7 +50,7 @@ Resume from Phase [N]. Previous session completed through Phase [N-1].
 
 ## Subagent Usage
 
-- Parallel research queries (3-5 agents on different topics simultaneously)
+- Parallel research queries (3-5 agents on different topics simultaneously) — the group shares ONE `web_search` budget of 2 calls in flight (not 2 per agent); stagger them so the aggregate stays within the `research` skill's Step 3 bound
 - Adversarial review (sequential: attacker → defender → synthesizer)
 - Competitor intelligence mining (1 agent per competitor)
 - Clean room VP comparison (2 agents independently)
