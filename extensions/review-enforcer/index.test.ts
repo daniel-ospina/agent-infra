@@ -5330,6 +5330,11 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // the value between `pr` and `merge` (E3 review P1; the base refused it).
         "export PATH=/usr/bin; gh pr --repo\"\" owner/other merge 999 $'--admin'",
         "export PATH=/usr/bin; gh -R'' owner/other pr merge 999 $'--admin'",
+        // …and with a QUOTED repo value that contains a SPACE: one word to bash, two to a
+        // `\S+`-based reader, so the leftover `f)\"` sat between the verb words (same
+        // finding class as the empty pair, A-cycle review P1).
+        "export PATH=/usr/bin; gh pr --repo \"$(cat f)\" merge 999 $'--admin'",
+        "export PATH=/usr/bin; gh -R \"$(cat f)\" pr merge 999 $'--admin'",
         // …and with the VERB SPLICED BY BRACE EXPANSION, which carries no `$` and no
         // backtick: `gh {pr,merge} 999 $V` hands the real gh the argv
         // `pr merge 999 --admin`, and the pre-deferral code refused it.

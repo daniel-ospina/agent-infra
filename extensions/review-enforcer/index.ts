@@ -454,9 +454,14 @@ function stripRepoArgs(command: string): string {
   // and `merge`, which broke the verb-pair read and deferred a real admin merge to an argv
   // layer the command had already discarded (E3 review P1; the base refused it). Removing
   // the empty pairs first makes the value the flag's, as bash makes it.
+  //
+  // A QUOTED value with a space inside it (`--repo "$(cat f)"`) is one word to bash and
+  // two to `\S+`, so the same residue landed between the verb words and defeated the pair
+  // read (A-cycle review P1, again refused by the base). The value is therefore consumed as
+  // a whole quoted word first, then as a bare one.
   return command
     .replace(/""|''/g, "")
-    .replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
+    .replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s*(?:"[^"]*"|'[^']*'|\S+)|\S*)/g, "$1");
 }
 
 export function isGhPrMergeCommand(command: string): boolean {

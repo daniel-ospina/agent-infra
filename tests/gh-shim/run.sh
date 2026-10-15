@@ -549,16 +549,21 @@ done
 
 # ── 12. the shapes around the deferral: what the TEXT layer hands over, and what it
 #        keeps for itself (#1776). The extension declines its GUESS on the admin-merge
-#        question whenever this shim is installed and executable (`ghShimWillEnforce`),
-#        so the shapes whose flag is not a literal token are decided HERE and nowhere
-#        else. Pinned in BOTH polarities — refused with no evidence, and ALLOWED with
-#        evidence — because a mis-parse can refuse for the wrong reason, but it cannot
-#        let the merge through with the caller's argv intact.
+#        question whenever this shim is installed and executable (`ghShimWillEnforce`) —
+#        but only for a command it does not READ as a merge (`mergeVerbInText`), and a
+#        shape whose merge verb it reads keeps the fail-closed text-layer decision
+#        (pinned end-to-end in the extension suite). So the arms below pin THIS layer's
+#        refusals for the whole family, and the one shape the extension does hand over is
+#        the #1775 over-read: a construct plus the word `admin` with NO merge in the text
+#        (a PR title supplying the word). Pinned in BOTH polarities — refused with no
+#        evidence, and ALLOWED with evidence — because a mis-parse can refuse for the
+#        wrong reason, but it cannot let the merge through with the caller's argv intact.
 #        (a)-(d) are SHIM-ONLY arms: each ends in a LITERAL `--admin`, which keeps the
-#        text-layer decision (pinned end-to-end in the extension suite), so they are
-#        here to prove this layer refuses them too, not because they are deferred.
-#        (e) is the deferred shape: the flag supplied by a VARIABLE, so the text layer
-#        cannot see it and this layer is the only one that can.
+#        text-layer decision, so they are here to prove this layer refuses them too, not
+#        because they are deferred.
+#        (e) is NOT deferred either: the flag comes from a VARIABLE, but the verb is read
+#        (the stripper leaves `$M` in the verb position), so the extension decides it and
+#        this arm pins the argv layer's refusal of the same command.
 echo "== 12. the shapes around the deferral (#1776) =="
 for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
              '--repo owner/other pr merge 123' '--repo=owner/other pr merge 123'; do
@@ -584,8 +589,9 @@ for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
     fail "  …evidence did not open \`gh $shape --admin\` intact (rc=$rc): $(head -1 "$TMP/err")"
   fi
 done
-# The verb SPLICED, so the resolved argv is the only place the word `merge` exists —
-# the shape that defeated every text-side attempt.
+# The verb SPLICED, so the resolved argv is the only place the word `merge` exists.
+# (The text layer reads this one too — `$M` lands in the verb position after the repo flag
+# is stripped — so the arm pins THIS layer's refusal, not a text-side defeat.)
 new_scen defer-spliced
 M=merge
 bash "$SHIM" pr --repo owner/other "$M" 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
