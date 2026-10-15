@@ -3969,7 +3969,7 @@ test("materializeGhShim: a non-executable source is refused, and never displaces
   // to leave a real session holding a dangling shim.
   const neutral = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
   const backup = `${neutral}.test-backup-${process.pid}`;
-  const hadNeutral = existsSync(neutral);
+  const hadNeutral = fs.lstatSync(neutral, { throwIfNoEntry: false }) !== undefined;
   const source = resolveGhShimDir();
   ok(source !== null, "this checkout's shim resolves");
   if (hadNeutral) fs.renameSync(neutral, backup);
@@ -5118,7 +5118,9 @@ testAsync("#1776: with the argv layer OFF the text gate still refuses an unresol
       await fire("session_start");
       const cmd = "V=--admin; gh pr merge 999 $V";
       ok(!hasLiteralAdminFlag(cmd), "the flag is a guess, not a literal token");
-      ok(!ghShimWillEnforce(resolveGhShimDir()),
+      const shimDir = resolveGhShimDir();
+      ok(shimDir !== null, "this checkout's shim resolves");
+      ok(!ghShimWillEnforce(shimDir),
         "the env kill switch disables the deferral even with a shim dir");
       const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
       ok(res && res.block === true, "…so the fail-closed text gate still refuses it");
