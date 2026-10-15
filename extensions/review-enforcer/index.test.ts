@@ -3975,6 +3975,17 @@ test("ghShimWillEnforce: decided from our own state, never from the command text
     fs.chmodSync(resolvePath(noExec, "gh"), 0o755);
     ok(isExecutableShim(noExec), "the same file WITH the execute bit is a shim");
     ok(ghShimWillEnforce(noExec), "…and the deferral fires");
+    // X_OK is TRUE for a DIRECTORY, but the shell only runs a regular file — measured:
+    // with a directory named `gh` first on PATH, bash ran the next candidate. A
+    // directory must therefore not count as a shim either.
+    const dirGhost = fs.mkdtempSync(resolvePath(os.tmpdir(), "gh-shim-dir."));
+    try {
+      fs.mkdirSync(resolvePath(dirGhost, "gh"));
+      ok(!isExecutableShim(dirGhost), "a DIRECTORY named `gh` is not a shim (X_OK is true for dirs)");
+      ok(!ghShimWillEnforce(dirGhost), "…so the deferral does not fire on it either");
+    } finally {
+      fs.rmSync(dirGhost, { recursive: true, force: true });
+    }
     // Command text is not an input — structurally: this predicate has no such
     // parameter, so no spelling can create or destroy the argv layer. The end-to-end
     // form of that claim is pinned by the `#1776` handler tests below, which observe a
@@ -5315,6 +5326,40 @@ testAsync("#1776: a GUESSED flag is handed to the argv layer when it is installe
         "…by its durable audit tag");
       ok(!tempAuditLines().some((l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
         "the evidence gate did not run on a guessed flag");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// The OUTCOME the change exists to deliver, pinned directly: with the argv layer
+// installed, the #1775 command is no longer refused once the session has dispatched a
+// reviewer. Without a dispatch the uniform >=1-dispatch gate refuses it for an unrelated
+// reason, which is exactly why the stand-down test above cannot distinguish "the admin
+// gate stood down" from "another gate happened to refuse it" — this test can.
+testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (the false positive is gone)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the admin gate ran at all, its head lookup would fail and
+    // it would block. Reaching `undefined` below therefore means it did NOT run.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" }); // one reviewer dispatch
+      const cmd = 'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"';
+      ok(isAdminMergeCommand(cmd), "the TEXT layer still over-reads it (the predicate is unchanged)");
+      const ev = { toolName: "bash", input: { command: cmd } };
+      const res = await fire("tool_call", ev);
+      equal(res, undefined, "…and the command is NOT blocked (the false positive #1776 removed)");
+      ok(String(ev.input.command).startsWith("export PATH="),
+        "…with the argv layer on PATH, which is what decides the admin-merge question for it");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;

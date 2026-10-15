@@ -104,7 +104,15 @@ export function resolveGhShimDir(): string | null {
  */
 export function isExecutableShim(dir: string): boolean {
   try {
-    fs.accessSync(resolvePath(dir, "gh"), fs.constants.X_OK);
+    const p = resolvePath(dir, "gh");
+    // A regular file, because the shell only runs a regular file: a DIRECTORY named `gh`
+    // passes X_OK (search permission) but bash SKIPS the PATH entry — measured on this
+    // box: with a directory named `gh` first on PATH, the next candidate ran. Treating
+    // it as a shim would defer to a layer that never runs, the exact fail-open this
+    // predicate exists to close. `statSync` follows the neutral symlink, which is what
+    // the shell does with the path it is given.
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
     return true;
   } catch {
     return false;
@@ -128,9 +136,10 @@ export function materializeGhShim(sourceDir: string | null): string | null {
   // A non-executable SOURCE is not a shim (see `isExecutableShim`): bash skips such a
   // PATH entry, so installing it would leave the real gh running while every caller
   // believes the argv layer is present. Refuse BEFORE touching the neutral path, so a
-  // broken source can never displace a working link. The same check after the link is
-  // made covers the other direction: a target that lost its execute bit after being
-  // linked here.
+  // broken source can never displace a working link. The linked target is NOT re-checked
+  // here: the decision point (`ghShimWillEnforce`) re-reads the same datum and fails
+  // closed, so a second check could only duplicate it — and would be unreachable apart
+  // from a TOCTOU window on the source's mode, i.e. a guard no test could cover.
   if (!isExecutableShim(sourceDir)) return null;
   try {
     fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
@@ -150,7 +159,7 @@ export function materializeGhShim(sourceDir: string | null): string | null {
         fs.chmodSync(target, 0o755);
       }
     }
-    return isExecutableShim(NEUTRAL_GH_SHIM_DIR) ? NEUTRAL_GH_SHIM_DIR : null;
+    return NEUTRAL_GH_SHIM_DIR;
   } catch {
     return null;
   }
