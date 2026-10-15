@@ -533,6 +533,29 @@ jobs:
         # That refusal is the behaviour, so wiring the checker here would be red for the wrong reason.
         # Zero-dep (`node:*` only), no `npm ci`.
         run: node --test scripts/check-version-stamp.test.mjs
+      - name: cmux-session snapshot pin — extensions/cmux-session.test.ts (#1138)
+        # Same shape as the step above, one layer down: a suite that pins a
+        # version-controlled snapshot, wired nowhere, so it enforced nothing.
+        # extensions/cmux-session.ts is a bootstrap SNAPSHOT of a file cmux
+        # upgrades IN PLACE on the farm (~/.pi/agent/extensions/cmux-session.ts),
+        # so the snapshot can silently fall behind with nothing in main saying so
+        # — measured: main carried the v2 snapshot (55,408 B) while the farm ran
+        # v4 (74,220 B, sha256 35764c49…), and that delta was in no ref at all.
+        # HONEST SCOPE: the literals live in the same commit as the file, so this
+        # cannot observe the FARM advancing — cmux upgrading the live file leaves
+        # this repo holding the previous payload with a green suite. What it
+        # catches is an unrecorded swap of the committed snapshot (the v2-in-main
+        # shape #1138 describes). The farm-advance residual is named on #1138.
+        # The step is what makes the pins BITE. Against the old v2 blob THREE
+        # tests fail (the handler test — v2 registers no `agent_start` — plus both
+        # pins; 1 passed, 3 failed, exit 1); against a v4 payload carrying a
+        # line-1-preserving edit the payload assertion alone goes red (3 passed,
+        # 1 failed, exit 1) — the false PASS a marker literal cannot see, which is
+        # #1760's payload-hash decision applied to this snapshot.
+        # Zero-dep by construction (the pi package is a TYPE-only import, erased
+        # by tsx; node stdlib otherwise), so it runs in THIS job, which performs
+        # no `npm ci`.
+        run: npx tsx extensions/cmux-session.test.ts
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).
