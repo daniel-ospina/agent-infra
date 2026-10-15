@@ -307,7 +307,8 @@ fi
 # ⚠️ PARTIAL BY CONSTRUCTION — declared here, not left to be discovered. The VERSIONED half of the
 # SAME layer (`lane-status.py`, `lane-actions.py`, `lane-watchdog.py`, `objective.py`,
 # `heartbeat-loop.sh`, `cadence-nudge.sh`, `publish-live-workspaces.py`) is present in scripts/ but
-# is in NO farm list, so a box rebuilt from this file gets these consumers WITHOUT their producers.
+# is in NO farm list, so a box rebuilt from this file gets the farmed CONSUMERS (the 27 below plus
+# the 9 pre-existing) WITHOUT those seven PRODUCERS.
 # Adding them is not a list-only edit and is deliberately out of #1552's scope, because the two
 # copies have drifted in OPPOSITE directions and each direction is its own hazard:
 #   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005; the live copy
@@ -317,8 +318,14 @@ fi
 #     the running cadence as a side effect of a versioning PR, which is not this PR's to make.
 # So the closure is a declared residual of #1552 (see its residual comment), and the repo↔deployed
 # identity instrument that would report it continuously is #1760/#1759's — not this list's.
-# The same applies to the three `state/`-resident dependencies these files read fail-silently
-# (`state/queues/claim.py`, `state/lane-confirm.py`, `state/lane-triage.py`).
+# The same applies one directory over, to the `state/`-resident dependencies of these files. TWO of
+# them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
+# (a non-zero exit is read as "screened, not stalled"; see the filed #1797) and
+# `state/lane-triage.py` (`2>/dev/null || log "NOTE triage unavailable"`). The third,
+# `state/queues/claim.py`, is NOT in that class: its read fails LOUDLY — `claim_next()` raises
+# `QueueReadError` and the caller prints `READ-FAILED <lane>: … withholding this lane (NOT read as
+# empty)` — while its RELEASE paths (`free`/`done`) do ignore their result. None of the three is in
+# any farm list.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
 # `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)

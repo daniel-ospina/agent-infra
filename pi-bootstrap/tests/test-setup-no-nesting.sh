@@ -229,6 +229,11 @@ check_fleet_srcs_farmed() {
     echo "ok: $label fleet_srcs farm byte-identical for $checked/$declared declared entries (#1552)"
   else
     echo "PARTIAL: $label fleet_srcs farm verified only $checked/$declared declared entries (#1552)"
+    # `PARTIAL:` is a summary line, not a failure token — so on its own the guard would still exit 0
+    # on a zero-declared array (a sibling assertion catches it today only incidentally). Make the
+    # summary authoritative: zero declared entries IS the failure.
+    [ "$declared" -gt 0 ] \
+      || fail "$label: fleet_srcs declared ZERO entries — array empty or unreadable, and 0/0 must never read as clean"
   fi
 }
 
@@ -747,9 +752,11 @@ fi
 check_identity_lib_farmed "run2"
 check_fleet_tools_farmed "run2"
 # #1552 — the refresh half, not just the membership half. run1 pins "the declared list landed";
-# run2 pins "a mutated destination is overwritten by the repo copy", which is the property the
-# farm exists for and the one #1552 measured drift against (a stale destination cannot be seen
-# from run1's freshly-populated $DEST). Representative entry, not all 36: the refresh is one loop.
+# run2 re-runs check_fleet_srcs_farmed over ALL 36 declared entries against a mutated destination,
+# so every mutated entry must be overwritten by the repo copy. That is the property the farm exists
+# for and the one #1552 measured drift against (a stale destination cannot be seen from run1's
+# freshly-populated $DEST). The representative-entry sentinel on lane-guard.py below is a SECOND,
+# independent assertion that the mutation is really gone.
 check_fleet_srcs_farmed "run2"
 if [ ! -f "$DEST/scripts/lane-guard.py" ]; then
   : # already reported by check_fleet_srcs_farmed "run2" (a missing file is not "refreshed")
