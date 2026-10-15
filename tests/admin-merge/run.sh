@@ -10972,6 +10972,47 @@ grep -q "not every guard workflow has been observed yet" "$SCEN/out" \
   || fail "(f) the wait SETTLED on a partial generation — the completeness test is missing"
 grep -q "pr merge" "$SCEN/calls" && pass "(f) …and merged only after both legs were seen" || fail "(f) no merge attempted"
 
+# (g) A GUARD LEG ALREADY TERMINAL AT THE FIRST PROBE READ MUST STILL SETTLE
+# (review P2, PR #1640). The two guard legs land 11-87s apart, so leg A can be
+# COMPLETED by the time the rail's first probe runs while leg B is still running.
+# Completeness is "every guard workflow OBSERVED AT THIS HEAD" — pending OR
+# already terminal — so the already-green leg satisfies it and the wait settles
+# once leg B finishes. Recording only PENDING legs made the predicate
+# unsatisfiable for this shape: the probe looped to the bound and produced
+# exactly the pre-#1417 refusal #1417 exists to remove.
+new_scen selfedit-pretty
+HEAD_SG="d141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SG" > "$SCEN/head"
+# read 1 — leg A (pipeline-compliance) has ALREADY finished; leg B (workflow-lock)
+# is still running.
+{ lane_pass "$HEAD_SG" 41501
+  lane_ev completed success "$HEAD_SG" 41502 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SG" 41503 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-1"
+# read 2+ — leg B finished green too
+{ lane_pass "$HEAD_SG" 41501
+  lane_ev completed success "$HEAD_SG" 41502 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SG" 41503 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/runs-$HEAD_SG"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_pass maing 41505 > "$SCEN/runs-main"
+lane_jobs 41502 'pipeline-compliance:success'
+lane_jobs 41503 'workflow-lock:success'
+write_pr_checks "$(check_run 5302 'ci / lint' completed skipped 7368 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7368 pull_request 'CI'
+main_green_surface
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_SELF_EDIT_WAIT=2 bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(g) a guard leg already terminal at the first read still merges (exit 0)" \
+  || { fail "(g) the rail refused because an already-green guard leg was never seen pending (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "body-edit run generation (#1417) is still pending" "$SCEN/out" \
+  && pass "(g) …and it WAITED for the still-running leg rather than refusing" \
+  || fail "(g) the wait never ran for the pre-terminal-leg shape"
+grep -q "pr merge" "$SCEN/calls" && pass "(g) …and the merge happened" || fail "(g) no merge attempted"
+
 # (e) THE KNOB IS VALIDATED LIKE EVERY OTHER TIMING KNOB — an unreadable bound
 # makes the comparison ERROR (test returns 2, the body is SKIPPED), and a skipped
 # bound inside a wait loop is the fail-open this rail refuses elsewhere.

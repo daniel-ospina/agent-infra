@@ -2891,9 +2891,17 @@ pending_run_id() {
 # foreign leg. The two guard legs come from two DIFFERENT workflows created with
 # an 11-87s spread, so leg A can finish before leg B exists; a subset-only
 # predicate then sees an empty pending set and SETTLES — a merge the pre-#1417
-# rail refused. The wait therefore settles only after it has observed PENDING AT
-# LEAST ONE RUN FOR EVERY known guard workflow; a partial generation keeps
-# waiting (to $SELF_EDIT_WAIT) for the missing leg rather than settling.
+# rail refused. The wait therefore settles only after it has observed AT LEAST
+# ONE RUN FOR EVERY known guard workflow at this head — pending OR already
+# terminal, because an already-green leg proves the workflow ran and an ABSENT
+# one does not; a partial generation keeps waiting (to $SELF_EDIT_WAIT) for the
+# missing leg rather than settling.
+#
+# A TERMINAL LEG SATISFIES COMPLETENESS (review P2, PR #1640). A leg that
+# finished before the first probe read is still an observed leg; requiring that
+# it was seen PENDING made the predicate unsatisfiable for that shape, so the
+# probe ran to $SELF_EDIT_WAIT and returned 1 — the pre-#1417 refusal #1417
+# exists to remove.
 #
 # FAILURE POLARITY. Every unreadable path here (a failed listing, a nonexistent
 # field, an empty selection) leaves the parser's `pending` counter untouched, so
@@ -2921,9 +2929,10 @@ guard_workflow_key() {
 }
 
 # guard_generation_complete <seen-key-list> — TRUE when EVERY known guard
-# workflow has been observed PENDING at least once. The list is space-delimited
-# with a leading AND trailing space, so the `case` glob cannot match a key that
-# is merely a prefix of a longer one.
+# workflow has been observed AT THIS HEAD at least once — pending OR already
+# terminal (a green leg still proves the workflow ran; see the block comment).
+# The list is space-delimited with a leading AND trailing space, so the `case`
+# glob cannot match a key that is merely a prefix of a longer one.
 guard_generation_complete() {
   local seen="${1:- }" k
   for k in $GUARD_WORKFLOW_KEYS; do
@@ -2936,8 +2945,9 @@ guard_generation_complete() {
 # its OWN `[3/4]` body edit created has finished, so §1b's re-read sees it.
 #
 # Return 0 ONLY when this head's unfinished set was EXACTLY that generation, EVERY
-# known guard workflow was observed pending at some point (completeness — see the
-# block comment), and it has now completed (so the caller re-reads the surface).
+# known guard workflow was observed at this head — pending or terminal
+# (completeness — see the block comment) — and it has now completed (so the caller
+# re-reads the surface).
 # Return 1 in every other case — a pending run that is NOT ours, nothing pending
 # at all, an unreadable listing, a partial generation at the bound, or the
 # generation still pending at $SELF_EDIT_WAIT — and the caller then falls through
@@ -2962,11 +2972,19 @@ settle_self_edit_generation() {
     # shellcheck disable=SC2086
     while IFS=$'\t' read -r status conclusion id key; do
       [ -n "$status" ] || continue
-      [ "$status" = "completed" ] && continue
+      # ⛔ CLASSIFY BEFORE THE COMPLETED SKIP (review P2, PR #1640). A guard leg
+      # that is ALREADY TERMINAL is still an observed leg at this head, so it is
+      # recorded and satisfies completeness; it just does not count as pending.
+      # Only a leg never seen at this head is unobserved, and that alone keeps
+      # the wait going. (Recording only PENDING legs made the predicate
+      # unsatisfiable when one guard leg finished before the first read — the
+      # probe then ran to the bound and produced the pre-#1417 refusal.)
       if gk="$(guard_workflow_key "$key")"; then
-        self_n=$((self_n + 1))
         case "$seen_keys" in *" $gk "*) ;; *) seen_keys="$seen_keys$gk " ;; esac
+        [ "$status" = "completed" ] && continue
+        self_n=$((self_n + 1))
       else
+        [ "$status" = "completed" ] && continue
         foreign_n=$((foreign_n + 1))
       fi
     done < <($GH run list --commit "$head" --limit 100 \
@@ -3000,7 +3018,7 @@ settle_self_edit_generation() {
         for k in $GUARD_WORKFLOW_KEYS; do
           case "$seen_keys" in *" $k "*) ;; *) missing="$missing ${k}" ;; esac
         done
-        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL incomplete after ${SELF_EDIT_WAIT}s — not every guard workflow was ever observed pending (never seen:${missing:- none}); §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
+        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL incomplete after ${SELF_EDIT_WAIT}s — not every guard workflow was ever observed at this head (never seen:${missing:- none}); §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
       fi
       return 1
     fi
