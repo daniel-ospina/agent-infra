@@ -394,6 +394,55 @@ assert_branch_exists stacked-one "dry-run deleted nothing (stacked)"
 assert_branch_exists stale-tracking-one "dry-run deleted nothing (stale-tracking)"
 
 echo ""
+echo "== 4b. a TAG sharing a branch name must not defeat the keep rules =="
+# `%(refname:short)` DISAMBIGUATES against tags: with tag `wt-one` present, git
+# renders branch refs/heads/wt-one as `heads/wt-one`. Every keep-rule and gate
+# keys on the PLAIN name, so before the `%(refname:lstrip=2)` fix this branch
+# missed the worktree rule (and open-pr-one missed the OPEN-PR rule) and was
+# mis-selected by a gate. Mutation proof: revert lstrip=2 to :short and the
+# `keep` assertions below go red and `Selected:` gains two phantom entries.
+git tag wt-one "$WT_SHA"
+git tag open-pr-one "$OPEN_SHA"
+run_script bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$PR_MAP"
+assert_eq "$RC" "0" "tag-collision dry-run exits 0"
+assert_match "$OUT" '^  keep +worktree +wt-one$' 'a same-named TAG does not defeat the worktree keep rule'
+assert_match "$OUT" '^  keep +open-pr +open-pr-one$' 'a same-named TAG does not defeat the OPEN-PR keep rule'
+assert_no_match "$OUT" '^  delete +[a-z-]+ +heads/wt-one$' 'a same-named TAG does not make the worktree branch selectable'
+assert_no_match "$OUT" '^  delete +[a-z-]+ +heads/open-pr-one$' 'a same-named TAG does not make the OPEN-PR branch selectable'
+assert_contains "$OUT" "Selected:  4 (merged: 1, redundant: 2, remotecopy: 1)" "the tag collision leaves the selection set unchanged"
+assert_contains "$OUT" "Kept:      12 (worktree: 1, main: 1, open-pr: 1, not-stale: 1, merged-tip-moved: 1, merged-base-not-main: 1, non-origin-upstream: 1, localonly: 5)" "the tag collision leaves the keep reasons unchanged"
+assert_branch_exists wt-one "tag collision deleted nothing (worktree branch)"
+assert_branch_exists open-pr-one "tag collision deleted nothing (OPEN-PR branch)"
+# Remove the tags so they cannot perturb a later section's expectations.
+git tag -d wt-one open-pr-one >/dev/null
+
+echo ""
+echo "== 4c. a FAILED worktree enumeration aborts the pass (fail-closed) =="
+# `git worktree list --porcelain` is the ONLY source of the worktree keep-rule.
+# An unguarded failure yields an EMPTY lookup and silently no rule, so a branch
+# checked out in a worktree would be classed as if none held it. The guard must
+# abort instead of classifying. A git shim makes the enumeration fail while
+# every other git command passes through.
+REAL_GIT="$(command -v git)"
+FAKEBIN="$FIX/gitshim"
+mkdir -p "$FAKEBIN"
+cat > "$FAKEBIN/git" <<GITSHIM
+#!/usr/bin/env bash
+if [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "list" ]; then
+    echo "fatal: simulated worktree enumeration failure" >&2
+    exit 128
+fi
+exec "$REAL_GIT" "\$@"
+GITSHIM
+chmod +x "$FAKEBIN/git"
+run_script env PATH="$FAKEBIN:$PATH" bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$PR_MAP"
+assert_eq "$RC" "1" "a failed worktree enumeration exits 1 (fail-closed)"
+assert_contains "$OUT" "could not enumerate worktrees" "a failed worktree enumeration names the cause"
+assert_not_contains "$OUT" "── SELECTED" "a failed worktree enumeration classifies NOTHING"
+assert_not_contains "$OUT" '^  delete ' "a failed worktree enumeration selects no branch"
+rm -rf "$FAKEBIN"
+
+echo ""
 echo '== 5. the launcher shape: bash -s (BASH_SOURCE empty) + --repo =='
 # This is EXACTLY how templates/launchd/com.tortoise.branch-reaper.plist runs
 # the script: the shared launcher streams it to `bash -s`, and under `bash -s`
@@ -655,6 +704,33 @@ assert_branch_exists fresh-one "fresh branch survives --execute"
 assert_branch_exists open-pr-one "OPEN-PR branch survives --execute"
 assert_branch_exists upstream-gone-one "deleted-upstream branch survives --execute"
 assert_branch_exists main "main survives --execute"
+
+echo ""
+echo "== 9b. --execute with nothing selected must NOT claim DRY-RUN =="
+# The header already says `EXECUTE (will delete)`; the nothing-to-delete arm
+# printed `DRY-RUN: nothing to delete`, contradicting the mode it just
+# announced. A fresh repo with only main selects nothing, so the arm is reached
+# with --execute. Mutation proof: restore the unconditional DRY-RUN line and
+# the `EXECUTE: nothing to delete` assertion goes red.
+ORIGIN6="$FIX/origin6.git"
+REPO6="$FIX/repo6"
+new_repo "$REPO6" "$ORIGIN6"
+cd "$REPO6"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+echo base > file.txt
+git add file.txt
+old_commit "init"
+git push -q origin main
+run_script bash "$REPO6/scripts/cleanup-stale-branches.sh" --scope local --execute --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "--execute with nothing selected exits 0"
+assert_contains "$OUT" "Mode:    EXECUTE (will delete)" "--execute announces the EXECUTE mode"
+assert_contains "$OUT" "── EXECUTE: nothing to delete ──" "--execute with nothing selected says EXECUTE, not DRY-RUN"
+assert_not_contains "$OUT" "DRY-RUN: nothing to delete" "--execute does not print the DRY-RUN nothing-to-delete line"
+# The dry-run arm must keep its own label (both directions pinned).
+run_script bash "$REPO6/scripts/cleanup-stale-branches.sh" --scope local --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "dry-run with nothing selected exits 0"
+assert_contains "$OUT" "── DRY-RUN: nothing to delete ──" "dry-run with nothing selected still says DRY-RUN"
 
 echo ""
 echo "== 10. remote scope: default scope + unchanged behaviour =="

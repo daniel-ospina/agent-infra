@@ -658,11 +658,20 @@ run_local_scope() {
     fi
 
     # ── branches checked out anywhere (main checkout + every worktree) ──
-    local wt_lookup="" wb
+    # ⛔ FAIL-CLOSED: an unguarded enumeration whose failure yields an EMPTY
+    # wt_lookup silently defeats the worktree keep-rule (a checked-out branch
+    # would then be classified as if no worktree held it). The rule's job is to
+    # keep such a branch, so a failure to read the worktree list must abort the
+    # pass, exactly like the refs/heads enumeration below.
+    local wt_lookup="" wb wt_out
+    if ! wt_out="$(git worktree list --porcelain)"; then
+        echo "ERROR: could not enumerate worktrees (git worktree list --porcelain failed)" >&2
+        return 1
+    fi
     while IFS= read -r wb; do
         [ -n "$wb" ] || continue
         wt_lookup="${wt_lookup}"$'\t'"$wb"$'\t'
-    done < <(git worktree list --porcelain | sed -n 's|^branch refs/heads/||p')
+    done < <(printf '%s\n' "$wt_out" | sed -n 's|^branch refs/heads/||p')
 
     local main_ref_ok=0
     if git rev-parse --verify -q "origin/$MAIN_BRANCH" >/dev/null 2>&1; then
@@ -683,8 +692,17 @@ run_local_scope() {
     # check ran against a commit SHA (`rev-parse` resolves a 40-hex string,
     # `rev-list --count <own-tip>..<br>` is 0, and the branch was classed
     # `remotecopy`). The test's `keep localonly` assertions are what caught it.
+    #
+    # ⛔ FIELD 1 IS `%(refname:lstrip=2)`, NOT `%(refname:short)`. `:short`
+    # DISAMBIGUATES against tags: with a tag sharing a branch's name, git renders
+    # the branch as `heads/<name>` (verified: a tag `foo` makes the branch print
+    # `heads/foo`). Every keep-rule and gate keys on the PLAIN name, so such a
+    # branch would miss the worktree and OPEN-PR rules and no gate could resolve
+    # it (`refs/heads/heads/foo` does not exist) — a false selection reported as
+    # a delete that then fails. `lstrip=2` strips `refs/heads/` unconditionally,
+    # so the name is plain regardless of any same-named tag.
     if ! branches="$(git for-each-ref \
-            --format='%(refname:short)%09%(committerdate:unix)%09%(objectname)%09%(upstream:short)' \
+            --format='%(refname:lstrip=2)%09%(committerdate:unix)%09%(objectname)%09%(upstream:short)' \
             refs/heads)"; then
         echo "ERROR: could not enumerate refs/heads" >&2
         return 1
@@ -841,7 +859,13 @@ run_local_scope() {
         done <<<"$delete_list"
         echo ""
     else
-        echo "── DRY-RUN: nothing to delete ──"
+        # The header above already says EXECUTE (will delete); the nothing-to-
+        # delete arm must not contradict it with a DRY-RUN label.
+        if [ "$EXECUTE" = true ]; then
+            echo "── EXECUTE: nothing to delete ──"
+        else
+            echo "── DRY-RUN: nothing to delete ──"
+        fi
         echo ""
     fi
 

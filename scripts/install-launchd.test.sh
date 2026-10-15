@@ -648,7 +648,12 @@ if [ -f "$BR_INSTALLED" ]; then
         && grep -q "<string>$HOME3/tortoise</string>" "$BR_INSTALLED" \
         && ok "branch-reaper passes the checkout explicitly (bash -s empties BASH_SOURCE)" \
         || bad "branch-reaper passes the checkout explicitly"
+    # ⛔ BOTH the flag AND its value: a plist that ships `--scope remote` (a
+    # different, and when armed differently destructive, job) must not pass an
+    # assertion that exists to pin the LOCAL scope. This is the only place in
+    # the repo that reads the value, so pinning the flag alone was a false PASS.
     grep -q "<string>--scope</string>" "$BR_INSTALLED" \
+        && grep -q "<string>local</string>" "$BR_INSTALLED" \
         && ok "branch-reaper selects the local scope" \
         || bad "branch-reaper selects the local scope"
     grep -q "<string>--execute</string>" "$BR_INSTALLED" \
