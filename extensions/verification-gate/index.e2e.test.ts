@@ -16,11 +16,12 @@
  */
 
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
@@ -925,6 +926,94 @@ async function main() {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
     }
+  });
+
+  test("scenario 21c (#1225/#1573 P0): a merge PRUNES entries for files deleted under a still-live root (bounded bridge)", async () => {
+    // A merge never rewrites the bridge down to the writer's own registry the
+    // way the old snapshot did, so an entry for a DELETED file under a live
+    // root would otherwise live forever and the machine-global file would grow
+    // without bound (every git op re-parses and scans every entry).
+    const repoP = join(TEST_ROOT, "repo-prune");
+    mkdirSync(repoP, { recursive: true });
+    git(repoP, "init -b main");
+    git(repoP, "config user.email e2e@test");
+    git(repoP, "config user.name e2e");
+    writeFileSync(join(repoP, "keep.txt"), "k1\n");
+    git(repoP, "add keep.txt");
+    git(repoP, "commit -m baseline");
+    // Stage a fresh edit so the proactive PASS is diff-scoped and actually
+    // merges (a PASS that matches nothing in the diff writes no bridge at all).
+    writeFileSync(join(repoP, "keep.txt"), "k2\n");
+    git(repoP, "add keep.txt");
+    const realP = realpathSync(repoP);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    // Add (do not replace) two entries for a LIVE root, one of them for a file
+    // that no longer exists on disk.
+    const seeded = existsSync(bridgePath)
+      ? JSON.parse(readFileSync(bridgePath, "utf-8"))
+      : { status: "PASS", verified_files: [] };
+    seeded.verified_files = [
+      ...(Array.isArray(seeded.verified_files) ? seeded.verified_files : []),
+      { path: `${realP}::keep.txt`, hash: sha("k1\n") },
+      { path: `${realP}::deleted-long-ago.txt`, hash: sha("gone\n") },
+    ];
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    writeFileSync(bridgePath, JSON.stringify(seeded));
+    // A write (any PASS merge) must prune the deleted file's entry and keep the live one.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: keep.txt. Classification: backend. Project root: ${repoP}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoP, "keep.txt"), hash: sha("k2\n") }] }) }],
+    });
+    const after = JSON.parse(readFileSync(bridgePath, "utf-8"));
+    const paths = after.verified_files.map((vf: any) => String(vf.path));
+    ok(!paths.some((p: string) => p.endsWith("deleted-long-ago.txt")),
+      `a deleted file's entry under a live root must be pruned, got: ${JSON.stringify(paths)}`);
+    ok(paths.some((p: string) => p.endsWith("::keep.txt")), "the live file's entry must survive the prune");
+  });
+
+  test("scenario 21d (#1225/#1573): an unremovable lock path must not WEDGE writeBridge — the lock degrades promptly", () => {
+    // A directory at `<bridge>.lock` makes openSync throw EEXIST while the
+    // stale-read throws every iteration. Pre-fix the loop `continue`d past its
+    // ONLY deadline check and busy-looped forever at ~100% CPU inside the
+    // tool_call hook that called writeBridge. A synchronous unbounded loop
+    // cannot be asserted on in-process (it would hang the suite), so drive the
+    // exported lock seam in a CHILD with a timeout: a regression fails as
+    // ETIMEDOUT instead of hanging the whole run.
+    const home = join(TEST_ROOT, "lock-home");
+    const verDir = join(home, ".pi", "agent", "verification");
+    mkdirSync(join(verDir, "latest.json.lock"), { recursive: true }); // a DIRECTORY, not a lock file
+    const modUrl = new URL("./index.js", import.meta.url).href;
+    const script = join(home, "probe.mjs");
+    writeFileSync(
+      script,
+      `process.env.HOME = ${JSON.stringify(home)};\n` +
+        `const m = await import(${JSON.stringify(modUrl)});\n` +
+        `const t = Date.now();\n` +
+        `const release = m.acquireBridgeLock();\n` +
+        `console.log(JSON.stringify({ degraded: release === null, ms: Date.now() - t }));\n` +
+        `if (release) release();\n`,
+    );
+    let stdout = "";
+    try {
+      stdout = execFileSync("npx", ["tsx", script], {
+        encoding: "utf-8",
+        // Generous: the child re-resolves tsx through npx (as the CI job's own
+        // `npx tsx` steps do). `res.ms` below is what actually bounds the
+        // degrade, and it excludes this startup.
+        timeout: 60000,
+        cwd: fileURLToPath(new URL(".", import.meta.url)),
+      });
+    } catch (err: any) {
+      throw new Error(
+        `acquireBridgeLock must degrade within its bound; the child did not return — the unbounded lock loop is back: ${err?.message ?? err}`,
+      );
+    }
+    const res = JSON.parse(stdout.trim().split("\n").pop()!);
+    ok(res.degraded === true, "an unremovable lock path must degrade unlocked (return null), never spin");
+    ok(res.ms < 10000, `the degrade must be promptly bounded, took ${res.ms}ms`);
+    rmSync(join(verDir, "latest.json.lock"), { recursive: true, force: true });
   });
 
   test("scenario 22 (#825/#264): sub-agent commit on UNVERIFIED files is blocked with a self-verify instruction", async () => {

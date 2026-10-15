@@ -373,10 +373,17 @@ function diagnoseRootMismatch(root: string): void {
 const BRIDGE_LOCK_WAIT_MS = 500;
 const BRIDGE_LOCK_STALE_MS = 10_000;
 
-function acquireBridgeLock(): (() => void) | null {
+export function acquireBridgeLock(): (() => void) | null {
   const lockFile = `${bridgePath()}.lock`;
   const deadline = Date.now() + BRIDGE_LOCK_WAIT_MS;
   for (;;) {
+    // The deadline is checked at the TOP of EVERY iteration, so no branch can
+    // spin past it. A persistent EEXIST whose target is not a readable lock
+    // file (a directory, a dangling symlink, an unreadable path) used to hit
+    // `catch { continue }` below — skipping the only deadline check and
+    // busy-looping forever at ~100% CPU inside the tool_call hook that called
+    // writeBridge, instead of the bounded degrade the constants claim.
+    if (Date.now() >= deadline) return null; // degrade unlocked; merge is fail-closed
     try {
       const fd = openSync(lockFile, "wx", 0o600);
       writeSync(fd, String(process.pid));
@@ -400,9 +407,19 @@ function acquireBridgeLock(): (() => void) | null {
           stale = true; // empty/unreadable lock (e.g. the legacy 0-byte file)
         }
         if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
-      } catch { continue; } // lock vanished — retry
+      } catch {
+        // The path EXISTS (openSync said EEXIST) but is not a readable lock
+        // file — a directory, a dangling symlink, or it vanished between the
+        // two calls. Reclaim it and retry; if it exists and cannot be removed
+        // it is not a lock we can ever take, so degrade unlocked NOW rather
+        // than spinning (a synchronous spin here wedges the tool_call hook
+        // that called writeBridge, at ~100% CPU). The deadline at the top of
+        // the loop bounds every remaining path.
+        try { unlinkSync(lockFile); continue; } catch { /* not removable / already gone */ }
+        if (!existsSync(lockFile)) continue; // vanished between open and read — retry
+        return null; // exists but is not a removable lock — degrade unlocked
+      }
       if (stale) { try { unlinkSync(lockFile); } catch { /* raced */ } continue; }
-      if (Date.now() >= deadline) return null; // degrade unlocked; merge is fail-closed
       const spinUntil = Date.now() + 10;
       while (Date.now() < spinUntil) { /* brief spin — holders are sub-ms */ }
     }
@@ -448,8 +465,8 @@ function writeBridge(projectRoot: string, files: string[]): void {
     // recovery registers an entry only when its STORED hash still matches the
     // file on disk under the committing root (match-or-drop, #190), so a
     // preserved entry that no longer matches is inert (fail-closed). Entries
-    // whose root no longer exists are dropped, bounding the file to live
-    // worktrees.
+    // whose root no longer exists, or whose file was deleted under a live
+    // root, are dropped — bounding the file to live worktrees and live files.
     const release = acquireBridgeLock();
     try {
       const merged = new Map<string, VerifiedFile>();
@@ -463,6 +480,12 @@ function writeBridge(projectRoot: string, files: string[]): void {
             let alive = rootAlive.get(parsed.root);
             if (alive === undefined) { alive = existsSync(parsed.root); rootAlive.set(parsed.root, alive); }
             if (!alive) continue; // dead worktree — prune
+            // Prune files that no longer exist under a LIVE root. A merge never
+            // rewrites the file down to the writer's own registry the way the
+            // old snapshot did, so nothing else would ever remove these — they
+            // would accumulate without bound in the machine-global bridge, and
+            // every git op whose mtime changed re-parses and scans every entry.
+            if (!existsSync(resolve(parsed.root, parsed.path))) continue;
           }
           merged.set(vf.path, vf);
         }
