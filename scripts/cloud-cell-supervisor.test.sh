@@ -58,9 +58,47 @@ for f in "$SUP" "$BRINGUP"; do
 done
 
 # sup <cmd> — run the real supervisor against $T/keys.env, capturing rc in SUP_RC and output in SUP_OUT.
+#
+# ── a HERMETIC, agent-infra-shaped git repo (agent-infra#1745) ───────────────────────────────────
+# The provenance gate compares the harness tree against a git REF, so a fixture harness must BE a git
+# tree carrying an origin/main — and it has to be a LOCAL one. Pointing the gate at the real checkout
+# would make the suite reach the network, write worktrees into the operator's repo, and prune ITS
+# worktree records (the `git worktree prune` path). This builds a throwaway repo whose
+# scripts/orchestrator-harness/ carries the required worker scripts, a BARE origin (so a real
+# `git fetch` runs), and hands out detached worktrees at origin/main to check.
+AI="$T/ai"; AI_ORIGIN="$T/ai-origin.git"
+ai_init_repo() {
+  git init -q "$1"
+  git -C "$1" config user.email test@test.local
+  git -C "$1" config user.name test
+  git -C "$1" config commit.gpgsign false
+  git -C "$1" commit -q --allow-empty -m base
+}
+ai_worktree() { git -C "$AI" worktree add -q --detach "$1" origin/main; }
+make_ai_repo() {
+  local w
+  git init -q --bare "$AI_ORIGIN"
+  git init -q "$AI"
+  git -C "$AI" config user.email test@test.local
+  git -C "$AI" config user.name test
+  git -C "$AI" config commit.gpgsign false
+  mkdir -p "$AI/scripts/orchestrator-harness"
+  for w in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+    : > "$AI/scripts/orchestrator-harness/$w"
+  done
+  git -C "$AI" add -A
+  git -C "$AI" commit -q -m base
+  git -C "$AI" branch -M main
+  git -C "$AI" remote add origin "$AI_ORIGIN"
+  git -C "$AI" push -q origin main
+  git -C "$AI" fetch -q origin
+}
+make_ai_repo
+
 SUP_RC=0; SUP_OUT=''
 sup() {
   SUP_OUT="$(CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai1713-test-$$" O="$T/o" REPO="$T/not-a-repo" \
+             HARNESS_REPO="$AI" HARNESS_FETCH=0 \
              bash "$SUP" "$1" 2>&1)"
   SUP_RC=$?
 }
@@ -218,7 +256,9 @@ esac
 # server-existence probe makes `start` die on every cold cell, which is the common path.
 say_case "the merge key reaches a WORKER across the second tmux boundary"
 
-W="$T/wk"; mkdir -p "$W/harness" "$W/repo/.git" "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
+W="$T/wk"; mkdir -p "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
+ai_init_repo "$W/repo"
+ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
@@ -364,7 +404,7 @@ wk_case() {
   sess="ai1711-$kind-$route-$server"
   env AI_REVIEW_GATE_KEY="$amb" PATH="$W/bin:$bin:$PATH" AI1711_STATE="$st" AI1711_SOCK="$sock" \
       CELL_HOME="$W/cellhome" HOME="$W/cellhome" ENV_FILE="$envf" \
-      SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" SCOPE=own \
+      SESSION="$sess" O="$W/o" REPO="$W/repo" HARNESS="$W/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 SCOPE=own \
       bash "$SUP" start >"$W/start.$kind.$route.$server.out" 2>&1 || rc=$?
   for i in $(seq 1 80); do [ -f "$W/worker-key" ] && break; sleep 0.25; done
   if [ "$rc" -ne 0 ]; then
@@ -450,7 +490,9 @@ fi
 # controller exists, so it must REFUSE such a repo — with the reason — rather than leave the failure
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
-F="$T/cellcheck"; mkdir -p "$F/harness" "$F/repo/.git" "$F/home" "$F/o" "$F/bin"
+F="$T/cellcheck"; mkdir -p "$F/home" "$F/o" "$F/bin"
+ai_init_repo "$F/repo"
+ai_worktree "$F/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
@@ -473,7 +515,7 @@ cellcheck() {
   # $1 = PROBE_RC, $2 = TORTOISE_REPO to make AMBIENT in the supervisor's own shell ('' = none).
   # `TORTOISE=` is cleared so the alias cannot make an unforeseen case look like the one under test.
   CC_OUT="$(PROBE_RC="$1" TORTOISE_REPO="${2:-}" TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai1736-check-$$" \
-            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
+            O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"
   CC_RC=$?
 }
 cellcheck 3
@@ -534,6 +576,201 @@ case "$CC_OUT" in
   *) ok "check: no warning when the repo vendors its own pre-flight tool" ;;
 esac
 rm -f "$F/repo/tools/collision_preflight.py"
+
+# ── 9) HARNESS PROVENANCE: a cell cannot run a harness older than its repo (agent-infra#1745) ────
+# Measured 2026-10-14 on the two live cells: each ran a harness at `e8d5ce29`, and
+# `git merge-base --is-ancestor e8d5ce29 origin/main` says that commit is NOT on main's line — while
+# `check` printed `CELL CAN RUN A CONTROLLER`, because it asked whether a harness EXISTED and never
+# WHICH one. Both directions are pinned below: the states that MUST be refused (untracked, diverged,
+# unresolved ref, a $O edited after seeding, a full disk) and the one that must NOT be (behind — main
+# advances between any two commands, so refusing THAT would false-block an honest restart on a tree
+# that IS on main's line). Every refusal is produced by really moving the tree, never by stubbing the
+# verdict, so a mutation that neuters the gate reddens this section.
+say_case "harness provenance: reports, records, refuses and mends (agent-infra#1745)"
+
+P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
+ai_init_repo "$P/repo"
+for f in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  : > "$P/o/$f"; : > "$P/untracked/$f"
+done
+printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
+# A tmux double so `start` is exercised without ever creating a real session: has-session is false
+# until new-session "starts" one — exactly the sequence cmd_start checks after its sleep.
+cat > "$P/bin/tmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
+  new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$P/bin/tmux"
+# A `df` reporting a nearly-full disk — the non-vacuity arm for the free-space floor.
+cat > "$P/lowbin/df" <<'SH'
+#!/bin/bash
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf '/dev/root 1000000 999999 1 100%% /\n'
+SH
+chmod +x "$P/lowbin/df"
+
+PH=""; PPATH=""; PREF=""; PROV_OUT=''; PROV_RC=0
+prov() {
+  local sub="$1"; shift
+  rm -f "$P/tmuxup"
+  PROV_OUT="$(PATH="${PPATH:+$PPATH:}$P/bin:$PATH" PROV_TMUX_UP="$P/tmuxup" \
+              CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
+              O="$P/o" REPO="$P/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="${PREF:-origin/main}" \
+              HARNESS_PIN_DIR="$P/pin" HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" \
+              bash "$SUP" "$sub" "$@" 2>&1)"
+  PROV_RC=$?
+}
+
+# (a) UNTRACKED — the hand-placed copy, this cell's oldest failure mode.
+PH="$P/untracked"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a harness with no git identity (the hand-copy case)" \
+                     || bad "check: accepted an untracked harness — output: $PROV_OUT"
+case "$PROV_OUT" in
+  *"NO git identity"*) ok "check: names the untracked state and prescribes apply" ;;
+  *) bad "check: the untracked refusal does not name the state — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"CELL CAN RUN"*) bad "check: printed the CELL CAN RUN banner for a hand-copied harness" ;;
+  *) ok "check: no CELL CAN RUN banner for a hand-copied harness" ;;
+esac
+
+# (b) CURRENT — must pass, and must REPORT the commit (the #1745 indicator).
+ai_worktree "$P/harness"
+PH="$P/harness/scripts/orchestrator-harness"
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "check PASSES a harness AT the ref (no false block)" \
+                     || bad "check: FALSE BLOCK of a harness at origin/main — $PROV_OUT"
+case "$PROV_OUT" in
+  *"harness commit"*) ok "check: REPORTS the harness commit it would run (#1745 indicator)" ;;
+  *) bad "check: no harness commit reported — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"CELL CAN RUN"*) ok "check: reaches the banner on a current harness" ;;
+  *) bad "check: no banner on a current harness — $PROV_OUT" ;;
+esac
+
+# (c) BEHIND — on main's line, one commit back. Reported as DRIFT, NOT refused.
+WANT0="$(git -C "$AI" rev-parse origin/main)"
+git -C "$AI" commit -q --allow-empty -m ahead
+git -C "$AI" push -q origin main
+git -C "$AI" fetch -q origin
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "check does NOT refuse a BEHIND harness (refusing it would false-block a restart)" \
+                     || bad "check: FALSE BLOCK of a harness that is merely behind — $PROV_OUT"
+case "$PROV_OUT" in
+  *"BEHIND"*) ok "check: reports a behind harness as DRIFT (#1745 indicator)" ;;
+  *) bad "check: a behind harness is not reported — $PROV_OUT" ;;
+esac
+
+# (d) DIVERGED — the measured incident: a commit off main's line.
+git -C "$AI" worktree add -q -b side1745 "$P/sidewt" origin/main
+: > "$P/sidewt/marker"
+git -C "$P/sidewt" add -A
+git -C "$P/sidewt" commit -q -m offline
+git -C "$AI" worktree add -q --detach "$P/div" "$(git -C "$P/sidewt" rev-parse HEAD)"
+PH="$P/div/scripts/orchestrator-harness"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a harness NOT on main's line (the measured incident)" \
+                     || bad "check: accepted a diverged harness — $PROV_OUT"
+case "$PROV_OUT" in
+  *"NOT an ancestor"*) ok "check: decides by ANCESTRY, not a commit count" ;;
+  *) bad "check: the diverged refusal does not name ancestry — $PROV_OUT" ;;
+esac
+case "$PROV_OUT" in
+  *"CELL CAN RUN"*) bad "check: printed the CELL CAN RUN banner for an off-main harness" ;;
+  *) ok "check: no CELL CAN RUN banner for an off-main harness" ;;
+esac
+
+# (e) APPLY — the one-step mend, and the record it writes.
+prov apply
+[ "$PROV_RC" -eq 0 ] && ok "apply pins a diverged harness to origin/main" || bad "apply failed: $PROV_OUT"
+WANT="$(git -C "$AI" rev-parse origin/main)"
+GOT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$GOT" = "$WANT" ] && ok "apply RECORDS the applied commit in \$O/.agent-infra-stamp.json" \
+                     || bad "apply recorded '$GOT', want '$WANT' — $PROV_OUT"
+[ "$WANT" != "$WANT0" ] && ok "fixture check: the ref really moved before the mend" \
+                        || bad "fixture broken: origin/main did not advance, so (c)/(e) prove nothing"
+[ -f "$P/home/.harness-path" ] && ok "apply records WHERE it pinned the harness" || bad "apply did not record the harness path"
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+case "$PH" in
+  "$P/pin/scripts/orchestrator-harness") ok "apply pinned into HARNESS_PIN_DIR" ;;
+  *) bad "apply pinned to '$PH' instead of \$HARNESS_PIN_DIR" ;;
+esac
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "after apply, check is green — the mend closes the drift" || bad "check still refuses after apply: $PROV_OUT"
+# `status` answers the question from the record, with no git access needed.
+prov status
+case "$PROV_OUT" in
+  *"$(printf '%s' "$WANT" | cut -c1-12)"*) ok "status prints the recorded harness commit" ;;
+  *) bad "status does not print the recorded commit — $PROV_OUT" ;;
+esac
+
+# (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
+printf '\n# hand edit\n' >> "$P/o/orch-loop.sh"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a seeded copy edited after it was recorded" \
+                     || bad "check: accepted a hand-edited \$O — $PROV_OUT"
+case "$PROV_OUT" in
+  *"changed AFTER it was recorded"*) ok "check: names the post-seed edit" ;;
+  *) bad "check: the post-seed edit is not named — $PROV_OUT" ;;
+esac
+prov apply >/dev/null 2>&1
+prov check
+[ "$PROV_RC" -eq 0 ] && ok "apply clears the post-seed drift (non-vacuity in the other direction)" \
+                     || bad "re-apply did not clear the post-seed drift: $PROV_OUT"
+
+# (g) START MENDS — the operator's "simple job of applying it there" must be ONE command.
+PH="$P/div/scripts/orchestrator-harness"
+prov start
+[ "$PROV_RC" -eq 0 ] && ok "start succeeds having applied the harness itself (one step, no manual copy)" \
+                     || bad "start failed: $(printf '%s' "$PROV_OUT" | tail -2 | tr '\n' ' ')"
+GOT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$GOT" = "$WANT" ] && ok "start recorded origin/main's commit, not the stale tree it was pointed at" \
+                     || bad "start recorded '$GOT', want '$WANT'"
+
+# (h) THE FREE-SPACE FLOOR — a full disk is what breaks a cell FIRST, and it used to read healthy.
+# ⛔ PH is re-read from the record FIRST: (g) left it pointing at the diverged tree, so without this
+# the two assertions below pass because the HARNESS is refused, not because the disk is — a false
+# pass in the test itself (found by mutating the floor to `if false` and watching it stay green).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+PPATH="$P/lowbin"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES a cell below the free-space floor (the full-disk false pass)" \
+                     || bad "check: accepted a cell with 1MB free — $PROV_OUT"
+case "$PROV_OUT" in
+  *"free on"*) ok "check: names the free-space floor and why it is fatal" ;;
+  *) bad "check: the disk refusal is not explained — $PROV_OUT" ;;
+esac
+PPATH=""
+
+# (i) UNRESOLVABLE REF — cannot-verify must never be read as a pass.
+PREF="origin/nope"
+prov check
+[ "$PROV_RC" -ne 0 ] && ok "check REFUSES when the ref cannot be resolved (cannot-verify is not a pass)" \
+                     || bad "check: accepted an unresolvable ref — $PROV_OUT"
+case "$PROV_OUT" in
+  *"cannot verify"*) ok "check: names the unverifiable state" ;;
+  *) bad "check: the unresolvable-ref refusal is not explained — $PROV_OUT" ;;
+esac
+PREF=""
+
+# (j) A REPO NAMED BY A LINKED WORKTREE IS ACCEPTED — `REPO/.git` is a FILE there, and the old `-d`
+# test refused it with "FATAL: no git repo", a false block that forced a full clone to exist.
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+git -C "$P/repo" worktree add -q --detach "$P/repowt" HEAD 2>/dev/null || true
+PROV_OUT="$(PATH="$P/bin:$PATH" CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" \
+            O="$P/o" REPO="$P/repowt" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+            HARNESS_PIN_FILE="$P/home/.harness-path" HARNESS="$PH" bash "$SUP" check 2>&1)"
+PROV_RC=$?
+case "$PROV_OUT" in
+  *"no git repo at"*|*"is not a git checkout"*) bad "check FALSE-BLOCKED a linked-worktree REPO" ;;
+  *) ok "check accepts a linked-worktree REPO (.git is a file, not a directory)" ;;
+esac
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

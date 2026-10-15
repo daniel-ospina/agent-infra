@@ -11,7 +11,14 @@
 # a MERGE ACTOR with incomplete back-pressure, not as a full peer of the laptop.
 #
 # Runs ON THE CELL (Linux). Usage:
-#   bash cloud-cell-supervisor.sh start|stop|status|logs|check
+#   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#
+#   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
+#           whole of "apply the proper harness"; `start` runs it before every launch, so it is
+#           normally not needed by hand — it exists for a cell you want to fix without starting.
+#   prune   reclaim the regenerable disk the lanes leave behind (.venv per worktree, caches) and
+#           report the review scratch that accumulates under /tmp. --scratch[=DAYS] also deletes
+#           scratch checkouts older than DAYS. A full disk is what breaks a cell FIRST.
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
@@ -23,6 +30,48 @@
 # within ~25s the controller armed AUTO-MERGE on #8425 and #8420 (`gh pr merge --auto`),
 # which does NOT go through the gate key. So removing the key does not confine a cell
 # to producing — it can still cause merges. Treat every started cell as a MERGE ACTOR.
+#
+# ── HARNESS PROVENANCE (agent-infra#1745) ────────────────────────────────────────────────────────
+# MEASURED 2026-10-14, on these two cells: each ran up to FOUR `orch-loop.sh` trees at once, and the
+# one copy carrying a git identity was commit `e8d5ce29` — which `git merge-base --is-ancestor
+# e8d5ce29 origin/main` says is NOT on main's line — while the copy whose BYTES matched main sat in
+# `/home/cmux/scripts/orchestrator-harness` with no git identity at all. `check` printed `CELL CAN RUN
+# A CONTROLLER` through all of it: it asked whether a harness EXISTED, never WHICH one. "Which commit
+# did this cell install?" had no answer, and a hand-copy was indistinguishable from a clone.
+#
+# WHAT IS RECORDED, AND WHY EACH HALF IS NEEDED
+#   commit  — the harness tree's own HEAD, written to $O/.agent-infra-stamp.json by `apply`/`start`.
+#             Answers "which code will run", and is the only thing comparable to the repo. A tree
+#             with no git identity reads `untracked` (the hand-copy case) and is NEVER read as
+#             current.
+#   payload — a sha256 over the *.sh this script seeded into $O. The commit cannot see a POST-SEED
+#             edit to the running copy (the class #1760 measured on a sibling surface: a deployed
+#             file 18.8 KB larger than the repo's); the hash cannot say whether the commit is on
+#             main's line. Together they answer the question.
+#
+# ⛔ THE COMPARISON IS HASH EQUALITY OR `merge-base --is-ancestor` — NEVER A COMMIT COUNT. Measured
+# 2026-10-14: `git rev-list --count e8d5ce29..origin/main` printed 1 while `--is-ancestor` printed
+# NO. A tree that is not on main's line at all reads as "1 behind" to a counter, and the count MOVES
+# as main advances without the tree changing. The relation is therefore one of exactly:
+#   current   HEAD == the ref
+#   behind    HEAD is an ancestor of the ref (older, but on the line)
+#   diverged  HEAD is NOT an ancestor of the ref — the measured incident, and the one that merged
+#             real PRs off the shared queue while `check` called the cell healthy
+#   untracked the tree has no git identity, or HEAD cannot be resolved (a hand-placed copy)
+#   unknown   the ref itself does not resolve — cannot verify, and cannot-verify is never a pass
+#
+# WHAT EACH VERB DOES WITH IT
+#   start   MENDS: fetches, pins $HARNESS_REF into a detached worktree, then seeds $O. A cell
+#           therefore cannot be started on a stale or hand-copied tree, and `start` is one command.
+#   apply   the same, without starting.
+#   check   reports the relation, and REFUSES `untracked`/`diverged`/`unknown` outright. `behind` is
+#           reported as DRIFT and does NOT refuse: main advances between any two operator commands,
+#           so refusing `behind` would FALSE-BLOCK an honest restart on a tree that IS on main's
+#           line — the refusal belongs to the two states that cannot be mended by getting fresher.
+#   The mend is a detached `git worktree add` ON PURPOSE: `git checkout <branch>` and `git reset
+#   --hard` are BLOCKED inside the cell's main checkout by the same guard the laptop runs (measured
+#   on both cells), which is why every hand-fix so far ended as a second copy under
+#   /home/cmux/scripts. `git fetch` and `worktree add --detach` are permitted.
 
 set -uo pipefail
 
@@ -230,6 +279,230 @@ repo_vendors_tool() {
     || [ -f "$REPO/.worktrees/dispatch-scout/tools/collision_preflight.py" ]
 }
 
+# ── harness provenance (agent-infra#1745) ────────────────────────────────────────────────────────
+# See the header block for the measured failure and why both halves of the record are needed.
+HARNESS_REPO="${HARNESS_REPO:-}"
+HARNESS_REF="${HARNESS_REF:-origin/main}"
+HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+HARNESS_FETCH="${HARNESS_FETCH:-1}"
+HARNESS_APPLIED=""
+MIN_FREE_MB="${MIN_FREE_MB:-500}"
+SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
+STAMP="$O/.agent-infra-stamp.json"
+
+# Resolution order, most explicit first: an operator's $HARNESS (applied above, and never
+# overridden), then the path `apply` pinned, then this script's sibling harness, then the target
+# repo's own scripts/ tree. Only an EMPTY $HARNESS reaches the fallbacks here.
+if [ -z "$HARNESS" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+  HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+fi
+if [ -z "$HARNESS" ] && [ -d "$REPO/scripts/orchestrator-harness" ]; then
+  HARNESS="$REPO/scripts/orchestrator-harness"
+fi
+
+# The checkout the ref resolves IN — one that carries `origin/main`. Preferred in this order so the
+# usual operator path (`bash <clone>/scripts/cloud-cell-supervisor.sh …`) needs nothing extra set.
+if [ -z "$HARNESS_REPO" ]; then
+  for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" "$HARNESS" "$REPO"; do
+    [ -n "$_cand" ] || continue
+    if git -C "$_cand" rev-parse --show-toplevel >/dev/null 2>&1; then
+      HARNESS_REPO="$(git -C "$_cand" rev-parse --show-toplevel)"; break
+    fi
+  done
+  unset _cand
+fi
+
+# coreutils on the cell; shasum on a BSD userland. Both print `<hash>  <name>`.
+SHA_CMD="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
+
+# Available 1K blocks. Empty when df cannot answer — read as "cannot judge", never as "enough".
+free_mb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print $4}'; }
+
+# ⛔ `--verify --quiet` is load-bearing, not tidiness: a bare `git rev-parse <unknown>` ECHOES its
+# argument to stdout (`git rev-parse origin/nope` prints `origin/nope`) while exiting non-zero — so a
+# plain capture reads an unresolvable ref as a resolved one and the `unknown` verdict can never fire.
+harness_commit() { git -C "$HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null; }
+harness_subject() { git -C "$HARNESS" log -1 --format=%s 2>/dev/null | cut -c1-68; }
+
+# HEAD's relation to $HARNESS_REF. Sets HARNESS_COMMIT / REF_COMMIT / HARNESS_REL (see the header).
+classify_harness() {
+  HARNESS_COMMIT=""; REF_COMMIT=""; HARNESS_REL=""
+  [ -n "$HARNESS_REPO" ] || { HARNESS_REL="unknown"; return 0; }
+  if [ "$HARNESS_FETCH" = 1 ]; then
+    git -C "$HARNESS_REPO" fetch --quiet origin main >/dev/null 2>&1 || true
+  fi
+  REF_COMMIT="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
+  [ -n "$REF_COMMIT" ] || { HARNESS_REL="unknown"; return 0; }
+  HARNESS_COMMIT="$(harness_commit)"
+  [ -n "$HARNESS_COMMIT" ] || { HARNESS_REL="untracked"; return 0; }
+  [ "$HARNESS_COMMIT" = "$REF_COMMIT" ] && { HARNESS_REL="current"; return 0; }
+  if git -C "$HARNESS_REPO" merge-base --is-ancestor "$HARNESS_COMMIT" "$REF_COMMIT" 2>/dev/null; then
+    HARNESS_REL="behind"
+  else
+    HARNESS_REL="diverged"
+  fi
+}
+
+# sha256 over the *.sh this script SEEDED into $O — the "did the running copy change after seeding"
+# half. Empty when $O is absent (pre-start), and an empty digest is never read as a match: callers
+# compare it against a recorded non-empty hash, and `[ "$recorded" != "$live" ]` is true for it.
+o_payload_hash() {
+  local f
+  { [ -d "$O" ] || return 0
+    cd "$O" || return 0
+    for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f"; done
+  } | $SHA_CMD | awk '{print $1}'
+}
+
+# One field out of the stamp. Anchored on the quoted KEY, so `commit` cannot match `refCommit`
+# (there is no quote before the `c` inside it).
+stamp_field() {
+  [ -f "$STAMP" ] || return 0
+  sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$STAMP" | head -1
+}
+
+stamp_write() {
+  local payload dirty
+  classify_harness
+  payload="$(o_payload_hash)"
+  if [ -n "$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" ]; then dirty=true; else dirty=false; fi
+  cat > "$STAMP" <<STAMPEOF
+{
+  "version": 1,
+  "surface": "cloud-cell",
+  "harness": "$HARNESS",
+  "commit": "${HARNESS_COMMIT:-}",
+  "ref": "$HARNESS_REF",
+  "refCommit": "${REF_COMMIT:-}",
+  "relation": "${HARNESS_REL:-}",
+  "agentInfraDirty": $dirty,
+  "payloadSha256": "$payload",
+  "recordedAt": "$(date -u +%FT%TZ)"
+}
+STAMPEOF
+}
+
+# Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:
+# a $HARNESS already AT the ref is left exactly where it is (so an operator's `/tmp/harness-main` is
+# never disturbed), and only a stale/hand-copied tree is replaced. This is the whole of "apply the
+# proper harness" — `start` runs it before every launch, so no manual copy step exists any more.
+harness_apply() {
+  [ -n "$HARNESS_REPO" ] || die "cannot apply a harness: no git checkout resolved (set HARNESS_REPO=<agent-infra checkout>)"
+  git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 || die "HARNESS_REPO=$HARNESS_REPO is not a git checkout — nothing to apply from"
+  if [ "$HARNESS_FETCH" = 1 ]; then
+    git -C "$HARNESS_REPO" fetch --quiet origin main >/dev/null 2>&1 \
+      || die "git fetch failed in $HARNESS_REPO — check the network, and the disk ($0 prune)"
+  fi
+  local want dir cur
+  want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
+  [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO — cannot pin a harness to verify against"
+  cur="$(harness_commit)"
+  if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ]; then
+    HARNESS_APPLIED=unchanged
+  else
+    dir="$HARNESS_PIN_DIR"
+    case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
+    git -C "$HARNESS_REPO" worktree remove --force "$dir" >/dev/null 2>&1 || true
+    rm -rf "$dir"
+    git -C "$HARNESS_REPO" worktree prune >/dev/null 2>&1 || true
+    mkdir -p "$(dirname "$dir")" || die "cannot create $(dirname "$dir")"
+    git -C "$HARNESS_REPO" worktree add --detach "$dir" "$want" >/dev/null 2>&1 \
+      || die "git worktree add --detach $dir $want failed — free space ($0 prune) and retry"
+    HARNESS="$dir/scripts/orchestrator-harness"
+    [ -f "$HARNESS/orch-loop.sh" ] || die "the applied worktree carries no harness at $HARNESS"
+    printf '%s\n' "$HARNESS" > "$HARNESS_PIN_FILE" || die "cannot record the applied harness path in $HARNESS_PIN_FILE"
+    HARNESS_APPLIED=changed
+  fi
+  classify_harness
+}
+
+# Seed $O and record what was seeded. Kept separate from harness_apply() so `check` always runs
+# AFTER a record exists on the start path — an unstamped cell must mean "nobody applied/started
+# yet", never "start ran and failed to record".
+#
+# ⛔ SEEDING IS ATOMIC PER FILE (copy to a temp name, then `mv -f`), and that is load-bearing, not
+# tidiness: a running controller's lanes execute `bash '$O/<worker>.sh'`, and a plain `cp` TRUNCATES
+# the live script before rewriting it — so a spawn landing in that window runs a truncated worker.
+# That window is what would make `apply --force` unsafe on the live cell it is meant to repair. A
+# rename within one filesystem is atomic, so a spawn sees the old bytes or the new ones, never half.
+seed_and_stamp() {
+  local src f tmp n=0
+  mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
+  [ -d "$HARNESS" ] || die "no harness at $HARNESS to seed \$O from"
+  for src in "$HARNESS"/*.sh; do
+    [ -f "$src" ] || continue
+    f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
+    cp -p "$src" "$tmp" || die "cannot stage $f into $O — free space ($0 prune)"
+    mv -f "$tmp" "$O/$f" || { rm -f "$tmp"; die "cannot install $f into $O"; }
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || die "no *.sh scripts in $HARNESS — nothing to seed into $O"
+  stamp_write || die "cannot record the harness provenance at $STAMP"
+}
+
+# A full disk is not a warning on a cell. MEASURED 2026-10-15: at 111MB free the controller log
+# filled with `No space left on device` from claims.sh and orch-loop.sh while the loop kept running
+# and reporting lanes — the same "failed precondition as success" shape this file refuses elsewhere,
+# with the added cost that `git` writes fail too (so nothing can be reviewed, recorded or merged).
+cmd_check_disk() {
+  local mb; mb="$(free_mb "$CELL_HOME")"
+  case "${mb:-}" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$mb" -lt "$MIN_FREE_MB" ]; then
+    die "only ${mb}MB free on $(dirname "$CELL_HOME") — below the ${MIN_FREE_MB}MB floor. At this level git writes and the controller's own state writes fail with I/O errors and the loop keeps reporting lanes. Free space first: $0 prune"
+  fi
+  if [ "$mb" -lt "$((MIN_FREE_MB * 4))" ]; then
+    say "warn: ${mb}MB free on $(dirname "$CELL_HOME") — under $((MIN_FREE_MB * 4))MB. 'prune' reclaims the regenerable caches."
+  fi
+}
+
+# The provenance half of `check`. Three refusals that CANNOT be mended by getting fresher (untracked,
+# diverged, unknown) and one that can (behind) — see the header block for why.
+cmd_check_provenance() {
+  classify_harness
+  local sc sp sr live
+  case "$HARNESS_REL" in
+    current)
+      say "ok: harness commit ${HARNESS_COMMIT:0:12} == $HARNESS_REF (${REF_COMMIT:0:12}) — $(harness_subject)" ;;
+    behind)
+      say "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is BEHIND $HARNESS_REF (${REF_COMMIT:0:12}). It is on"
+      say "       main's line, so 'start' would mend it — but a cell running it is a cell running old code."
+      say "       Remedy: $0 apply" ;;
+    diverged)
+      say "DRIFT — harness commit ${HARNESS_COMMIT:0:12} is NOT an ancestor of $HARNESS_REF (${REF_COMMIT:0:12})."
+      say "       This is the measured 2026-10-14 incident: a tree off main's line merged real PRs off the"
+      say "       shared queue while check called the cell healthy. Refusing."
+      say "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
+    untracked)
+      say "DRIFT — the harness at ${HARNESS:-<unresolved>} has NO git identity, so 'which commit is this cell"
+      say "       running?' has no answer. A hand-placed copy is this cell's oldest failure mode (#1745)."
+      say "       Remedy: $0 apply   (pins to $HARNESS_REF in $HARNESS_PIN_DIR)" ;;
+    *)
+      say "DRIFT — cannot verify the harness: $HARNESS_REF does not resolve in ${HARNESS_REPO:-<no checkout resolved>}."
+      say "       Cannot-verify is never a pass. Remedy: set HARNESS_REPO to an agent-infra checkout, then $0 apply" ;;
+  esac
+  case "$HARNESS_REL" in
+    current|behind) ;;
+    *) die "harness provenance: DRIFT ($HARNESS_REL) — nothing was started; see the lines above";;
+  esac
+  if [ -f "$STAMP" ]; then
+    sc="$(stamp_field commit)"; sp="$(stamp_field payloadSha256)"; sr="$(stamp_field relation)"
+    live="$(o_payload_hash)"
+    if [ -z "$sp" ] || [ -z "$live" ] || [ "$sp" != "$live" ]; then
+      die "DRIFT — the seeded copy at $O changed AFTER it was recorded (recorded payload ${sp:0:12} vs live ${live:0:12}). Something edited the running harness by hand; a copy that differs from its own record is the failure #1745 exists to expose. Remedy: $0 apply"
+    fi
+    if [ -n "$HARNESS_COMMIT" ] && [ -n "$sc" ] && [ "$sc" != "$HARNESS_COMMIT" ]; then
+      die "DRIFT — $O was recorded from ${sc:0:12} but the harness now at $HARNESS is ${HARNESS_COMMIT:0:12}: the tree moved under the record. Remedy: $0 apply"
+    fi
+    say "ok: recorded install — commit ${sc:0:12}, relation '${sr}', payload ${sp:0:12}"
+  elif tmux has-session -t "$SESSION" 2>/dev/null; then
+    die "a controller is RUNNING (tmux '$SESSION') with NO harness provenance recorded at $STAMP — 'which commit is this cell running?' has no answer for a live merge actor. Remedy: stop, then $0 apply"
+  else
+    say "ok: no install recorded yet (pre-start) — 'start' or 'apply' writes $STAMP"
+  fi
+}
+
 # ── check: can this cell actually run a controller? ─────────────────────────────
 cmd_check() {
   validate_scope
@@ -238,7 +511,14 @@ cmd_check() {
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
-  [ -d "$REPO/.git" ] || die "no git repo at $REPO"
+  [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
+  # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
+  # refused a worktree with "FATAL: no git repo at <path>" even though every git command in it works
+  # — a false block that forced operators to keep a full clone around for `REPO` while running the
+  # harness from a worktree. `rev-parse --git-dir` is the real question; ask it instead.
+  git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "$REPO is not a git checkout (no .git directory or linked-worktree .git file)"
+  cmd_check_disk
   mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
   # orch-loop.sh spawns its workers as `bash '$O/<script>'` (fix-one.sh, merge-one.sh, …), NOT
   # from $HARNESS. cmd_start seeds $O from $HARNESS; assert it, so a stale/empty $O is a loud
@@ -252,6 +532,11 @@ cmd_check() {
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
+
+  # ── which commit is this cell running? (agent-infra#1745) ────────────────────────────────────
+  # Placed BEFORE the dispatch-provisioning probe: a tree off main's line can pass every later
+  # check, and this is the one that says the code itself is not the code we think it is.
+  cmd_check_provenance
 
   # ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ──────────────────
   # The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
@@ -360,15 +645,28 @@ cmd_start() {
   # metacharacter-free — refuse loudly here rather than let tmux's sh -c parse it. Empty values
   # are skipped (cmd_check reports an unresolvable HARNESS with its own message).
   local v
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR; do
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
-  # Seed the running copy: orch-loop.sh spawns its workers from $O, not from $HARNESS, so a
-  # cell whose $O is empty runs the inline sweep but can never review, fix or dispatch.
-  # Idempotent; mirrors install.sh's deploy step. cmd_check below then asserts the seed landed.
-  mkdir -p "$O/logs" "$O/state" || die "cannot create state dir $O"
-  cp -p "$HARNESS"/*.sh "$O/" || die "cannot seed \$O from $HARNESS"
+  # ── the harness this cell will run, fixed BEFORE anything is seeded (agent-infra#1745) ────────
+  # `start` is the one command that applies the proper harness: fetch, pin to $HARNESS_REF in a
+  # detached worktree, seed, record. A cell therefore cannot be started on a stale or hand-copied
+  # tree, and the operator's manual copy step is gone. A live session already returned at the guard
+  # above, so the cache prune below cannot pull a venv out from under a running lane — which is why
+  # it is safe to run unattended here and not on the explicit `prune` path.
+  local mb; mb="$(free_mb "$CELL_HOME")"
+  case "${mb:-}" in
+    ''|*[!0-9]*) ;;
+    *) [ "$mb" -lt "$((MIN_FREE_MB * 2))" ] && cmd_prune --caches ;;
+  esac
+  harness_apply
+  seed_and_stamp
+  say "harness: ${HARNESS_COMMIT:0:12} (${HARNESS_REL}) at $HARNESS${HARNESS_APPLIED:+ [applied]}"
+  # Re-check the value harness_apply() may have REPLACED: the loop above validated the one that was
+  # set when the shell started, and an unreplaced-but-unsafe derived path would otherwise reach the
+  # tmux command string unguarded.
+  safe_argv "$HARNESS" || die "\$HARNESS must not contain a quote or shell metacharacter: $HARNESS"
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.
@@ -452,6 +750,13 @@ cmd_status() {
   if tmux has-session -t "$SESSION" 2>/dev/null; then say "controller: RUNNING (tmux '$SESSION')"
   else say "controller: STOPPED"; fi
   say "state dir: $O"
+  # agent-infra#1745: the answer to "which commit is this cell running?", from the record `start`
+  # wrote. Printed even when the controller is stopped — a stale cell is a stale cell.
+  if [ -f "$STAMP" ]; then
+    say "harness: $(stamp_field commit | cut -c1-12) [$(stamp_field relation)] from $(stamp_field harness)"
+  elif [ -n "$HARNESS" ]; then
+    say "harness: UNRECORDED at $HARNESS ($(harness_commit | cut -c1-12)) — run: $0 apply"
+  fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
   # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
@@ -466,11 +771,120 @@ cmd_status() {
 
 cmd_logs() { tail -30 "$O/logs/orch-loop.log" 2>/dev/null || say "no log yet at $O/logs/orch-loop.log"; }
 
+# ── apply: put the PROPER harness on this cell (agent-infra#1745) ─────────────────────────────────
+# The owner's complaint was that "apply our harness to the cell" should be one simple job and had
+# taken days. It is this command, and `start` runs the same code — so it is normally not typed.
+cmd_apply() {
+  validate_scope
+  local force=0 a
+  for a in "$@"; do
+    case "$a" in
+      --force) force=1 ;;
+      *) die "usage: $0 apply [--force]" ;;
+    esac
+  done
+  safe_argv "${HARNESS_REPO:-}" || die "\$HARNESS_REPO must not contain a quote or shell metacharacter"
+  safe_argv "${HARNESS_PIN_DIR:-}" || die "\$HARNESS_PIN_DIR must not contain a quote or shell metacharacter"
+  safe_argv "${HARNESS_PIN_FILE:-}" || die "\$HARNESS_PIN_FILE must not contain a quote or shell metacharacter"
+  local before_c; before_c="$(harness_commit)"
+  if tmux has-session -t "$SESSION" 2>/dev/null && [ "$force" != 1 ]; then
+    die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
+  fi
+  harness_apply
+  seed_and_stamp
+  say "harness applied: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
+  say "  path:   $HARNESS"
+  say "  ref:    $HARNESS_REF in $HARNESS_REPO"
+  say "  record: $STAMP"
+}
+
+# ── prune: reclaim the disk the lanes regenerate (agent-infra#1745) ───────────────────────────────
+# MEASURED 2026-10-15: the live cell's /dev/root was 30G/32G used with 111MB free, and the controller
+# log carried `No space left on device` from claims.sh and orch-loop.sh. The single largest consumer
+# was a 5.6G `.venv` in ONE worktree (`uv sync`) plus a 969M `.venv` at the clone root; ~50 review
+# scratch checkouts filled the rest of /tmp. This deletes only what is REGENERABLE by definition.
+rm_cache() {
+  [ -e "$1" ] || return 0
+  local mb; mb="$(du -sm "$1" 2>/dev/null | awk '{print $1}')"
+  if rm -rf "$1" 2>/dev/null; then say "prune: -${mb:-?}MB $1"; else say "warn: could not remove $1"; fi
+}
+
+# Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
+# may hold unmerged work, and that is the one thing this verb must not destroy.
+registered_worktree() {
+  local p="$1" r
+  for r in "$REPO" "$HARNESS_REPO"; do
+    [ -n "$r" ] || continue
+    git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}' | grep -qxF "$p"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cmd_prune() {
+  local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
+  for a in "$@"; do
+    case "$a" in
+      --caches) caches_only=1 ;;
+      --scratch) do_scratch=1 ;;
+      --scratch=*) do_scratch=1; days="${a#*=}" ;;
+      *) die "usage: $0 prune [--caches] [--scratch[=DAYS]]" ;;
+    esac
+  done
+  case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
+  local before after mb r root d
+  before="$(free_mb "$CELL_HOME")"
+  tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
+  for r in "$REPO" "$HARNESS_REPO"; do
+    [ -n "$r" ] || continue
+    git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+    # (1) worktree registrations whose directory is already gone — admin records, no bytes, but they
+    # make `worktree list` lie about what is on the cell.
+    git -C "$r" worktree prune >/dev/null 2>&1 || true
+    # (2) regenerable caches at each worktree root. `--maxdepth 5` keeps the pycache sweep bounded.
+    for root in "$(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')" "$r"; do
+      [ -d "$root" ] || continue
+      rm_cache "$root/.venv"; rm_cache "$root/node_modules"; rm_cache "$root/.pytest_cache"
+      find "$root" -maxdepth 5 -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
+    done
+  done
+  [ "$caches_only" = 1 ] && { after="$(free_mb "$CELL_HOME")"; [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"; return 0; }
+  # (3) /tmp review scratch. REPORTED, never deleted implicitly: a scratch checkout is source, and
+  # the brief is explicit that source may be unmerged work. --scratch deletes only what is (a) a git
+  # checkout, (b) NOT a registered worktree, and (c) older than DAYS.
+  local kept="" freed_scratch=0
+  for d in /tmp/*/; do
+    d="${d%/}"
+    [ -d "$d" ] || continue
+    case "$d" in /tmp/cell|/tmp/cell-*|/tmp/harness*|/tmp/cell-home) continue ;; esac
+    [ -e "$d/.git" ] || continue
+    registered_worktree "$d" && continue
+    if [ "$do_scratch" = 1 ] && [ -n "$(find "$d" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ]; then
+      rm_cache "$d"; freed_scratch=1
+    else
+      mb="$(du -sm "$d" 2>/dev/null | awk '{print $1}')"
+      kept="$kept
+  ${mb:-?}M  $d"
+    fi
+  done
+  if [ -n "$kept" ]; then
+    say "prune: scratch checkouts still on disk (source — NOT deleted; use --scratch[=DAYS] to reclaim):"
+    printf '%s\n' "$kept"
+  fi
+  [ "$freed_scratch" = 1 ] || true
+  after="$(free_mb "$CELL_HOME")"
+  [ -n "$before" ] && [ -n "$after" ] && say "prune: free ${before}MB → ${after}MB"
+}
+
 case "${1:-status}" in
   check)  cmd_check ;;
   start)  cmd_start ;;
+  apply)  shift; cmd_apply "$@" ;;
+  prune)  shift; cmd_prune "$@" ;;
   stop)   cmd_stop ;;
   status) cmd_status ;;
   logs)   cmd_logs ;;
-  *)      say "usage: $0 check|start|stop|status|logs"; exit 2 ;;
+  *)      say "usage: $0 check|start|stop|status|logs|apply|prune"; exit 2 ;;
 esac
