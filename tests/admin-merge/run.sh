@@ -53,6 +53,17 @@
 #  16. A FAILED MERGE FAILS LOUD: the exit status is checked, gh's stderr is
 #      surfaced, and a head-bound RETRACTION is posted so the success marker is
 #      never left standing over an unmerged PR (B1 lost #3754/#3755 to it).
+#  16b. AND A FAILED *READ* IS NOT A FAILED MERGE (#1298): the exit status is a
+#      statement about the SEND, and a lost answer to a MUTATION is ambiguous BY
+#      DEFINITION about whether the mutation ran. A non-zero 'gh pr merge' whose
+#      response read timed out over a PR GitHub ALREADY MERGED was reported as
+#      "the merge did NOT happen", with a DURABLE retraction posted over a MERGED
+#      PR (tortoise #4413). Both merge arms now read the PR's state through ONE
+#      door and answer with THREE outcomes — merged / not_merged / unreadable —
+#      where "unreadable" is never rendered as either claim: `[merge_unreadable]`
+#      marks the undeterminable case and NO retraction is posted, while a genuine
+#      unmerged state still retracts (now resting on the artifact, not the status).
+#      §70-§74 pin all three outcomes, including that only the LAST poll decides.
 #  17. A DRAFT IS REFUSED EARLY: gh refuses to merge a draft and commit-workflow
 #      opens drafts, so the rail refuses before any CI work, by name.
 #  18. THE RE-RUN BOUND IS DERIVED PER SHARD (#1167): no global constant. The
@@ -283,6 +294,22 @@ case "$key" in
       # the `pr merge` handler below only when the merge actually happens, so a
       # scenario can model a `gh pr merge` that exits 0 while the PR stays OPEN
       # (a queued `--auto`) by setting `merge-noop` instead.
+      # #1298: a STATE READ THAT FAILS needs its own seam, because the defect is exactly
+      # a failed read rendered as a value — with no way to fail this read, no scenario
+      # could drive the false "did NOT happen" the non-zero arm produced. The diagnostic
+      # goes to stderr so the undeterminable branch's diagnostic-quoting arm is exercised
+      # on a REAL rail run, not only in the unit suite.
+      [ -f "$SCEN/merge-state-unreadable" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
+      # `merge-state-fail-after N` — the read SUCCEEDS for the first N attempts and fails
+      # afterwards, so "only the LAST attempt's observation decides the verdict" is
+      # expressible (a readable OPEN followed by an unreadable attempt is UNREADABLE, not
+      # not_merged — the state at the END is what the verdict is about).
+      if [ -f "$SCEN/merge-state-fail-after" ]; then
+        n=$(( $(cat "$SCEN/merge-state-read-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$n" > "$SCEN/merge-state-read-count"
+        [ "$n" -le "$(cat "$SCEN/merge-state-fail-after")" ] \
+          || { printf 'gh: could not read the pull request\n' >&2; exit 1; }
+      fi
       if [ -f "$SCEN/merged" ]; then
         printf 'MERGED\t2026-09-23T00:00:00Z\n'
       else
@@ -495,6 +522,16 @@ case "$key" in
     fi
     exit 0 ;;
   "pr merge")
+    # ── #1298: THE MERGE THAT HAPPENED AND WHOSE RESPONSE WAS LOST. GitHub PROCESSED
+    # the merge (so the PR is MERGED and a landed commit exists) while the CLIENT's
+    # response read timed out — the exact tortoise #4413 shape. `merged` is touched even
+    # though the command exits non-zero, because the two facts are INDEPENDENT: the exit
+    # status describes the SEND, the PR's state describes the ARTIFACT.
+    if [ -f "$SCEN/merge-lost-response" ]; then
+      cat "$SCEN/merge-lost-response" >&2
+      touch "$SCEN/merged"
+      exit 1
+    fi
     if [ -f "$SCEN/fail-merge" ]; then
       cat "$SCEN/fail-merge" >&2
       exit 1
@@ -8870,6 +8907,188 @@ fi
 printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
   && pass "#7504: the fallback remediation carries the --repo the run was given" \
   || fail "#7504: the fallback remediation dropped --repo (round-2 fix lost): $success_line"
+
+# ── 1298. A MERGE WHOSE RESPONSE READ FAILED IS NOT "DID NOT HAPPEN" ─────────
+# `gh pr merge` exited non-zero because the RESPONSE was lost (a network timeout)
+# while GitHub had ALREADY merged the PR — the exact shape measured on tortoise
+# #4413. The pre-fix non-zero arm read the exit status as a fact about the
+# REPOSITORY, asserted "the merge did NOT happen", and posted a DURABLE retraction
+# over a MERGED PR. Every assertion in §70/§73/§74 FAILS on the rail with the
+# re-read removed (mutation log in the PR); §71/§72 are the controls that pin the
+# other two outcomes of the same three-way branch.
+NOTHAPPEN='the merge of PR #42 did NOT happen'
+
+echo "== 70. #1298: a merge whose response read TIMED OUT is not reported as 'did NOT happen' =="
+new_scen merge-lost-response
+HEAD_1298A="1298129812981298129812981298129812981298"
+printf '%s\n' "$HEAD_1298A" > "$SCEN/head"
+NRX='tests/test_rail.py::test_response_lost'
+NRY='tests/test_rail.py::test_known_on_main'
+lane_fail "$HEAD_1298A" 9701 > "$SCEN/runs-$HEAD_1298A"
+log_failed "$NRX" > "$SCEN/log-9701"
+{ lane_fail main9702 9702; lane_fail main9703 9703; lane_fail main9704 9704; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9702"
+log_failed "$NRX" > "$SCEN/log-9703"
+log_failed "$NRX" > "$SCEN/log-9704"
+# THE SHAPE UNDER TEST: the merge ran; the ANSWER to it was lost.
+printf 'Post "https://api.github.com/graphql": read tcp 192.168.100.2:51949->140.82.112.5:443: read: operation timed out\n' > "$SCEN/merge-lost-response"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -eq 0 ] \
+  && pass "a merge whose response was lost still exits 0 — the merge DID happen" \
+  || fail "the rail failed a merge the API reports as MERGED (exit $rc)"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "the rail asserted the merge did NOT happen on a MERGED PR — the #1298 defect" \
+  || pass "the rail does NOT assert the merge did not happen"
+grep -qF '[merge_response_lost]' "$SCEN/out" \
+  && pass "the lost response is machine-distinguishable ([merge_response_lost])" \
+  || fail "the lost response carries no machine-readable marker"
+grep -q 'the merge DID happen' "$SCEN/out" \
+  && pass "  …and the run says what it established (the merge DID happen)" \
+  || fail "  …but the run does not state what it established"
+grep -qF 'operation timed out' "$SCEN/err" \
+  && pass "  …and gh's own timeout text is surfaced, not discarded" \
+  || fail "  …but the read's own words were discarded"
+grep -q 'at landedfeed000000000000000000000000000000' "$SCEN/out" \
+  && pass "  …and the LANDED commit is re-read from the API and printed" \
+  || fail "  …but the landed commit was not printed (the artifact was not resolved)"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "a RETRACTION was posted over a MERGED PR — durable, and the exact harm of #1298"
+else
+  pass "NO retraction is posted over a MERGED PR"
+fi
+
+echo "== 71. #1298 control: a merge that really did NOT happen still retracts, on the ARTIFACT =="
+new_scen merge-refused-artifact
+HEAD_1298B="1298129812981298129812981298129812981299"
+printf '%s\n' "$HEAD_1298B" > "$SCEN/head"
+lane_fail "$HEAD_1298B" 9711 > "$SCEN/runs-$HEAD_1298B"
+log_failed "$NRX" > "$SCEN/log-9711"
+{ lane_fail main9712 9712; lane_fail main9713 9713; lane_fail main9714 9714; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9712"
+log_failed "$NRX" > "$SCEN/log-9713"
+log_failed "$NRX" > "$SCEN/log-9714"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "a refused merge still exits non-zero" \
+  || fail "a refused merge returned 0"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && pass "  …and the refusal still says the merge did NOT happen" \
+  || fail "  …but the refusal lost its loudness"
+grep -q 'state=OPEN' "$SCEN/err" \
+  && pass "  …resting on the ARTIFACT (state=OPEN), not on the exit status alone" \
+  || fail "  …but the refusal does not cite the artifact it rests on"
+[ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2" \
+  && pass "  …and the evidence marker is retracted, as before" \
+  || fail "  …but the evidence marker was left standing over an unmerged PR"
+
+echo "== 72. #1298: an UNREADABLE state is 'could not determine', not 'did NOT happen' =="
+new_scen merge-state-unreadable
+HEAD_1298C="1298129812981298129812981298129812981300"
+printf '%s\n' "$HEAD_1298C" > "$SCEN/head"
+lane_fail "$HEAD_1298C" 9721 > "$SCEN/runs-$HEAD_1298C"
+log_failed "$NRX" > "$SCEN/log-9721"
+{ lane_fail main9722 9722; lane_fail main9723 9723; lane_fail main9724 9724; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9722"
+log_failed "$NRX" > "$SCEN/log-9723"
+log_failed "$NRX" > "$SCEN/log-9724"
+printf 'Post "https://api.github.com/graphql": read tcp 10.0.0.1:1->140.82.112.5:443: read: operation timed out\n' > "$SCEN/fail-merge"
+# THE SHAPE UNDER TEST: the merge response AND the state read both fail.
+touch "$SCEN/merge-state-unreadable"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=2
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "an undeterminable outcome exits non-zero" \
+  || fail "an undeterminable outcome exited 0"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …with a machine-readable marker ([merge_unreadable])" \
+  || fail "  …but the undeterminable case carries no machine-readable marker"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "  …but it ALSO rendered the failed read as 'the merge did not happen' (the #1298 shape)" \
+  || pass "  …and does NOT claim the merge did not happen"
+grep -qF 'PR #42 is NOT merged' "$SCEN/err" \
+  && fail "  …but it rendered the failed read as 'PR #42 is NOT merged'" \
+  || pass "  …and does not claim the PR is unmerged"
+grep -q 'NOT a claim' "$SCEN/err" \
+  && pass "  …and says plainly that it makes no claim about the PR" \
+  || fail "  …but does not state that it makes no claim about the PR"
+grep -qF 'could not read the pull request' "$SCEN/err" \
+  && pass "  …and quotes the read's own diagnostic" \
+  || fail "  …but the read's diagnostic was discarded"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+
+echo "== 73. #1298: exit 0 with an UNREADABLE state is 'could not determine', not 'not merged' =="
+new_scen merge-confirmed-state-unreadable
+HEAD_1298D="1298129812981298129812981298129812981301"
+printf '%s\n' "$HEAD_1298D" > "$SCEN/head"
+lane_fail "$HEAD_1298D" 9731 > "$SCEN/runs-$HEAD_1298D"
+log_failed "$NRX" > "$SCEN/log-9731"
+{ lane_fail main9732 9732; lane_fail main9733 9733; lane_fail main9734 9734; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9732"
+log_failed "$NRX" > "$SCEN/log-9733"
+log_failed "$NRX" > "$SCEN/log-9734"
+# The merge command SUCCEEDS (so `merged` is set by the fake) and the ARTIFACT read
+# still cannot answer: the exit status is not the artifact in this direction either.
+touch "$SCEN/merge-state-unreadable"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=1
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] \
+  && pass "exit 0 with an unreadable artifact is not reported as a merge" \
+  || fail "the rail claimed a merge it never observed"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …and it carries the machine-readable marker too" \
+  || fail "  …but the zero-exit undeterminable case carries no marker"
+grep -qF 'PR #42 is NOT merged' "$SCEN/err" \
+  && fail "  …but it rendered the failed READ as 'PR #42 is NOT merged'" \
+  || pass "  …and does not claim the PR is unmerged"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+
+echo "== 74. #1298: only the LAST read decides — OPEN then unreadable is UNDETERMINABLE =="
+new_scen merge-state-late-fail
+HEAD_1298E="1298129812981298129812981298129812981302"
+printf '%s\n' "$HEAD_1298E" > "$SCEN/head"
+lane_fail "$HEAD_1298E" 9741 > "$SCEN/runs-$HEAD_1298E"
+log_failed "$NRX" > "$SCEN/log-9741"
+{ lane_fail main9742 9742; lane_fail main9743 9743; lane_fail main9744 9744; } > "$SCEN/runs-main"
+log_failed "$NRY" > "$SCEN/log-9742"
+log_failed "$NRX" > "$SCEN/log-9743"
+log_failed "$NRX" > "$SCEN/log-9744"
+printf 'gh: Pull Request is still a draft\n' > "$SCEN/fail-merge"
+# Attempt 1 reads OPEN; attempts 2+ fail. The state at the END is unknown, and an
+# earlier observation cannot stand in for it — otherwise a merge that landed during
+# the poll would be retracted on the strength of a stale read.
+printf '1\n' > "$SCEN/merge-state-fail-after"
+export ADMIN_MERGE_VERIFY_ATTEMPTS=2
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "a stale OPEN followed by an unreadable read is not a merge" \
+  || fail "the rail reported a merge from a stale-OPEN poll"
+grep -qF '[merge_unreadable]' "$SCEN/err" \
+  && pass "  …the verdict comes from the LAST attempt, so it is UNDETERMINABLE" \
+  || fail "  …but the verdict rested on an earlier attempt that the poll superseded"
+grep -qF "$NOTHAPPEN" "$SCEN/err" \
+  && fail "  …but it claimed the merge did not happen from a superseded observation" \
+  || pass "  …and it does not claim the merge did not happen"
+if [ -f "$SCEN/comment-2" ] && grep -q 'admin-merge-retraction:' "$SCEN/comment-2"; then
+  fail "  …but a RETRACTION was posted over an UNKNOWN state"
+else
+  pass "  …and NO retraction is posted over an unknown state"
+fi
+unset ADMIN_MERGE_VERIFY_ATTEMPTS
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
