@@ -196,10 +196,11 @@ check_ci_runner_gate_farmed() {
 #     a declared #1552 residual, not an oversight: `lane-status.py` is AHEAD at the destination,
 #     so farming it would REGRESS the running classifier (see the note at the fleet_srcs array).
 #   * It cannot see a stale DEPLOYED copy or an un-restarted long-lived process: it diffs repo bytes
-#     against a $DEST that THIS run just populated. #1738's 27 inert hours were a stale RUNNING
-#     process — #1738's own evidence records the deployed file as BYTE-IDENTICAL to origin/main —
-#     so #1738 is NOT this guard's motivating incident and must not be cited as a repo↔live
-#     identity failure. That identity instrument is #1760/#1759's, and it is not this one.
+#     against a $DEST that THIS run just populated. #1738 is the NEAR-MISS that prompted looking for
+#     this gap, NOT an instance of it: #1738's own evidence records the deployed file as
+#     BYTE-IDENTICAL to origin/main, so the farm HAD delivered it — what failed there was the
+#     INVOCATION, and #1738 states it deliberately did not establish the mechanism. So #1738 must not
+#     be cited as a repo↔live identity failure; that instrument is #1760/#1759's, not this one.
 check_fleet_srcs_farmed() {
   local label="$1"
   local line entry dest checked=0 declared=0

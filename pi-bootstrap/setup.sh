@@ -318,8 +318,8 @@ fi
 #     the running cadence as a side effect of a versioning PR, which is not this PR's to make.
 # So the closure is a declared residual of #1552 (see its residual comment), and the repo↔deployed
 # identity instrument that would report it continuously is #1760/#1759's — not this list's.
-# The same applies one directory over, to the `state/`-resident dependencies of these files. TWO of
-# them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
+# The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
+# TWO of them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
 # (a non-zero exit is read as "screened, not stalled"; see the filed #1797) and
 # `state/lane-triage.py` (`2>/dev/null || log "NOTE triage unavailable"`). The third,
 # `state/queues/claim.py`, is NOT in that class: its read fails LOUDLY — `claim_next()` raises
