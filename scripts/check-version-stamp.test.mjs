@@ -69,6 +69,9 @@ function run(args, opts = {}) {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     cwd: opts.cwd ?? REPO_ROOT,
+    // `opts.env` lets an arm drive $AGENT_INFRA_PI_HOME / $AGENT_INFRA_REPOS_ROOT / $HOME without
+    // mutating this process's own environment — the suite must stay hermetic.
+    env: { ...process.env, ...(opts.env ?? {}) },
   });
   return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
@@ -675,6 +678,119 @@ try {
     }
     stampNow();
     eq("control — re-stamped from a clean checkout is green", verify().code, 0);
+  }
+
+  // ── 24. a NAMED repos root that cannot be read is cannot-verify, not "no repos" ──────────────
+  console.log("\n24. a named-but-unreadable repos root must not yield a green over an unread scope");
+  {
+    const pi = path.join(TMP, "pi-surface2");
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", pi);
+    const env = { AGENT_INFRA_PI_HOME: pi };
+    run(["--write", "--surface", pi, "--repo", ORIGIN], { env });
+    const named = path.join(TMP, "no-such-root");
+    const v = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--repos-root", named], { env });
+    eq("a named unreadable repos root → exit 2", v.code, 2);
+    contains("the refusal names the root", v.stderr + v.stdout, "no-such-root");
+    // CONTROL: the BUILT-IN default root may legitimately be absent, and must not be fatal.
+    const home = path.join(TMP, "fake-home");
+    fs.mkdirSync(home, { recursive: true });
+    const ok = run(["--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"], {
+      env: { ...env, HOME: home, AGENT_INFRA_REPOS_ROOT: "" },
+    });
+    eq("control — an ABSENT default root is not fatal", ok.code, 0);
+    fs.rmSync(pi, { recursive: true, force: true });
+  }
+
+  // ── 25. a root resolving to the containing directory must not digest the stamp ──────────────
+  console.log("\n25. `scripts -> .` must not fold the tool's own stamp into the digest");
+  {
+    const s2 = path.join(TMP, "selfref");
+    fs.mkdirSync(path.join(s2, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s2, "skills"), { recursive: true });
+    write("extensions/e.ts", "export const e = 1;\n", s2);
+    fs.symlinkSync(".", path.join(s2, "scripts"));
+    const w = run(["--write", "--surface", s2, "--repo", ORIGIN]);
+    eq("control — the self-referential surface stamps", w.code, 0);
+    const v = run(["--surface", s2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+    eq("write then verify AGREE (no phantom drift)", v.code, 0);
+    contains("and it reads in-sync", v.stdout, "in-sync");
+    const s = JSON.parse(fs.readFileSync(path.join(s2, ".agent-infra-stamp.json"), "utf8"));
+    eq("the stamp is not counted as payload", s.payload.files > 0, true);
+    eq("its own artifact is not reported in the payload", String(s.payload.hash).length, 64);
+    eq("control — a second write converges", run(["--write", "--surface", s2, "--repo", ORIGIN]).code, 0);
+    fs.rmSync(s2, { recursive: true, force: true });
+  }
+
+  // ── 26. --write says so when it erases drift ─────────────────────────────────────────────
+  console.log("\n26. --write announces a re-baseline instead of silently laundering drift");
+  {
+    stampNow();
+    write("scripts/one.sh", "#!/bin/bash\necho drift\n", SURFACE);
+    eq("control — the edit is drift", verify().code, 1);
+    const w = stampNow();
+    eq("--write exits 0", w.code, 0);
+    contains("the write announces the re-baseline", w.stdout, "RE-BASELINED");
+    eq("control — the surface is green again", verify().code, 0);
+    clearStamp();
+    contains("a FIRST stamp is not called a re-baseline", stampNow().stdout, "RE-BASELINED", false);
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", SURFACE);
+    stampNow();
+  }
+
+  // ── 27. an annotated TAG object is not a commit ──────────────────────────────────────────
+  console.log("\n27. an annotated tag object must not satisfy the commit-presence gate");
+  {
+    git(ORIGIN, "tag", "-a", "v-test", "-m", "annotated");
+    const tagSha = git(ORIGIN, "rev-parse", "v-test");
+    eq("precondition — the object is a tag", git(ORIGIN, "cat-file", "-t", tagSha), "tag");
+    const good = stamp();
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: tagSha } });
+    const v = verify();
+    eq("a tag object → exit 1, never in-sync", v.code, 1);
+    contains("the reason reports it as not present", v.stdout, "not present");
+    git(ORIGIN, "tag", "-d", "v-test");
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the real commit is green again", verify().code, 0);
+  }
+
+  // ── 28. a DANGLING symlink root is not an absent root ────────────────────────────────────
+  console.log("\n28. a dangling symlink root is a cannot-verify, not an absent root");
+  {
+    const s3 = path.join(TMP, "dangling");
+    fs.mkdirSync(path.join(s3, "extensions"), { recursive: true });
+    fs.mkdirSync(path.join(s3, "skills"), { recursive: true });
+    fs.symlinkSync("/nonexistent-AAA", path.join(s3, "scripts"));
+    const w = run(["--write", "--surface", s3, "--repo", ORIGIN]);
+    eq("a dangling root cannot be stamped → exit 2", w.code, 2);
+    contains("the refusal names the root", w.stderr + w.stdout, "scripts");
+    fs.rmSync(path.join(s3, "scripts"));
+    write("scripts/one.sh", "#!/bin/bash\necho one\n", s3);
+    eq("control — a real root stamps", run(["--write", "--surface", s3, "--repo", ORIGIN]).code, 0);
+    eq(
+      "control — and verifies",
+      run(["--surface", s3, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code,
+      0
+    );
+    fs.rmSync(s3, { recursive: true, force: true });
+  }
+
+  // ── 29. a rejected-but-well-formed stamp still reports the commit it names ───────────────
+  console.log("\n29. a stamp rejected on one field must still report the commit it carries");
+  {
+    const good = stamp();
+    const commit = good.agentInfra.commit;
+    writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, roots: ["skills"] } });
+    const v = verify();
+    eq("narrowed roots → exit 1", v.code, 1);
+    contains("the reason names the roots", v.stdout, "payload.roots");
+    const j = JSON.parse(
+      run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--json"]).stdout
+    );
+    eq("--json still carries the stamp's commit", j.results[0].stamp?.agentInfra?.commit, commit);
+    contains("the human line names the commit, not (no commit)", v.stdout, commit.slice(0, 9));
+    contains("the human line does not claim (no commit)", v.stdout, "(no commit)", false);
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the restored stamp is green", verify().code, 0);
   }
 
 } finally {

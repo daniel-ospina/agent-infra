@@ -174,7 +174,19 @@ export function payloadEntries(rootDir, relRoot) {
   try {
     real = fs.realpathSync(start);
   } catch (err) {
-    if (absent(err)) return out; // absent root — nothing under it to digest
+    // ENOENT means "absent" ONLY when the path itself is absent. A DANGLING SYMLINK also raises
+    // ENOENT here while the path plainly exists: reading that as an absent root records "no
+    // payload", and re-pointing the link elsewhere then stays invisible — the same false "the
+    // install did not change" this fix class exists to close.
+    if (absent(err)) {
+      let lst = null;
+      try {
+        lst = fs.lstatSync(start);
+      } catch {
+        lst = null;
+      }
+      if (lst === null) return out; // genuinely absent — a consumer may exempt a root
+    }
     throw new PayloadReadError(start, err);
   }
   const walk = (absDir, relDir) => {
@@ -186,6 +198,11 @@ export function payloadEntries(rootDir, relRoot) {
       throw new PayloadReadError(absDir, err);
     }
     for (const name of names.sort()) {
+      // The stamp is this tool's OWN artifact, never installed payload. A payload root that
+      // resolves to a directory CONTAINING it (e.g. `scripts -> .`) would otherwise fold the stamp
+      // into the digest — and since `buildStamp` hashes before that file is written, every write
+      // would be stale the moment it landed and write/verify could never agree.
+      if (name === STAMP_BASENAME || name.startsWith(`${STAMP_BASENAME}.tmp-`)) continue;
       const abs = path.join(absDir, name);
       const rel = relDir === "" ? name : `${relDir}/${name}`;
       let st;
@@ -275,7 +292,11 @@ export function resolveRepo(explicit) {
   // checkout cannot answer, the honest answer is "cannot verify" — not a verdict computed against
   // whatever checkout this script happens to live in. Silently substituting one repo for another is
   // the fail-open this whole check exists to refuse (a check that answers a question nobody asked).
-  const named = typeof explicit === "string" && explicit !== "";
+  // ANY string means the caller named a repo — including "" (see the --repo guard in parseArgs).
+  // An empty value must NOT fall through to a fallback: the verdict would then be computed against
+  // a checkout the operator never named, which is the fail-open this function's own docstring
+  // refuses.
+  const named = typeof explicit === "string";
   const candidates = named ? [explicit] : [process.env.AGENT_INFRA_PATH, MODULE_ROOT];
   for (const c of candidates) {
     if (typeof c !== "string" || c === "") continue;
@@ -438,7 +459,11 @@ export function readStamp(surfaceDir) {
   } catch (err) {
     return { ok: false, reason: `stamp is not valid JSON: ${err.message}` };
   }
-  return validateStamp(raw);
+  const verdict = validateStamp(raw);
+  // Carry the parsed object even on refusal: a stamp can be structurally sound and rejected on one
+  // field (e.g. a narrowed `payload.roots`), and reporting "(no commit)" for a stamp that plainly
+  // names one is a false statement about the artifact the reader is looking at.
+  return verdict.ok ? verdict : { ...verdict, stamp: raw };
 }
 
 // ──────────────────────────────────────────────────────────── ancestry / verdicts ──
@@ -492,7 +517,7 @@ export function classifySurface(surfaceDir, repo, target) {
   const abs = path.resolve(surfaceDir);
   const found = readStamp(abs);
   if (!found.ok) {
-    return { surface: abs, verdict: "unstamped", reason: found.reason, stamp: null, payload: null };
+    return { surface: abs, verdict: "unstamped", reason: found.reason, stamp: found.stamp ?? null, payload: null };
   }
   const stamp = found.stamp;
   // Verify over the FULL root universe, not the stamp's recorded subset: a stamp written before a
@@ -554,12 +579,15 @@ export function classifySurface(surfaceDir, repo, target) {
   // and 128 for "no such object", and `git()` collapses both to null — so without this an install
   // whose commit is absent (GC'd, shallow clone, a foreign stamp) reads as a DEFINITE divergence
   // instead of the unanswerable question it is.
-  const present = git(repo, ["cat-file", "-e", `${stamp.agentInfra.commit}^{commit}`]) !== null;
-  if (!present) {
+  // `cat-file -e <sha>^{commit}` PEELS, so an annotated TAG object satisfies it and would be
+  // presented as a commit. `rev-parse --verify` returns the PEELED sha instead, and a commit peels
+  // to ITSELF — requiring equality is what makes "present" also mean "is a commit".
+  const peeled = git(repo, ["rev-parse", "--verify", "-q", `${stamp.agentInfra.commit}^{commit}`]);
+  if (peeled === null || peeled !== stamp.agentInfra.commit) {
     return {
       surface: abs,
       verdict: "unstamped",
-      reason: `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is not present in ${repo} — ancestry is unanswerable (GC'd, shallow, or a stamp from another checkout)`,
+      reason: `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is not present in ${repo} as a commit object — ancestry is unanswerable (GC'd, shallow, a tag object, or a stamp from another checkout)`,
       stamp,
       payload,
     };
@@ -613,6 +641,7 @@ export function linkedSurfaces(reposRoot) {
   // the header and --help) must agree; before this the env var was promised in two of them and
   // read in none, so an operator who scoped the scan silently got an unscoped one.
   const env = process.env.AGENT_INFRA_REPOS_ROOT;
+  const namedRoot = Boolean((reposRoot && reposRoot !== "") || (env && env !== ""));
   const root =
     reposRoot && reposRoot !== ""
       ? path.resolve(reposRoot)
@@ -622,7 +651,12 @@ export function linkedSurfaces(reposRoot) {
   let names;
   try {
     names = fs.readdirSync(root);
-  } catch {
+  } catch (err) {
+    // A root the operator NAMED (--repos-root or $AGENT_INFRA_REPOS_ROOT) that cannot be read is a
+    // cannot-verify — never "there are no linked repos". The latter reports a green over a scope
+    // nobody read, which is the vacuous pass this file refuses for the total set (the sibling
+    // `sync` dies on the same condition). The built-in default may legitimately be absent.
+    if (namedRoot) throw new PayloadReadError(root, err);
     return [];
   }
   const out = [];
@@ -651,7 +685,8 @@ function usage() {
     "  --surface <dir>     check/stamp <dir> (repeatable); default = the pi surface + linked repos",
     "  --no-repos          default surfaces only: the pi surface",
     "  --repos-root <dir>  where linked repos live (default $AGENT_INFRA_REPOS_ROOT, else ~/Documents/GitHub)",
-    "  --write             stamp the surface(s) instead of verifying them (mirrors --update-lock)",
+    "  --write             stamp the surface(s) instead of verifying them (mirrors --update-lock);",
+    "                      RE-BASELINES: whatever is on disk is accepted, so any existing drift is erased",
     "  --ref <git-ref>     target ref to compare ancestry against (default origin/main, else main)",
     "  --repo <checkout>   agent-infra checkout the ref resolves in (default AGENT_INFRA_PATH)",
     "  --no-fetch          do not refresh the target ref first",
@@ -739,20 +774,31 @@ function main(argv) {
     return 2;
   }
 
-  const surfaces =
-    opts.surfaces.length > 0
-      ? opts.surfaces.map((s) => path.resolve(s))
-      // The pi surface is a DEFAULT surface and is checked UNCONDITIONALLY; `--no-repos` disables
-      // only the linked-repo scan. Testing `opts.noRepos` on the pi branch too made the flag whose
-      // documented meaning is "only the pi surface" hand back an EMPTY set — the tool then refused
-      // to check anything, the exact opposite of the documented behaviour.
-      : [piSurface(), ...(opts.noRepos ? [] : linkedSurfaces(opts.reposRoot))].filter((dir) => {
-          try {
-            return fs.statSync(dir).isDirectory();
-          } catch {
-            return false;
-          }
-        });
+  let surfaces;
+  try {
+    surfaces =
+      opts.surfaces.length > 0
+        ? opts.surfaces.map((s) => path.resolve(s))
+        // The pi surface is a DEFAULT surface and is checked UNCONDITIONALLY; `--no-repos` disables
+        // only the linked-repo scan. Testing `opts.noRepos` on the pi branch too made the flag whose
+        // documented meaning is "only the pi surface" hand back an EMPTY set — the tool then refused
+        // to check anything, the exact opposite of the documented behaviour.
+        : [piSurface(), ...(opts.noRepos ? [] : linkedSurfaces(opts.reposRoot))].filter((dir) => {
+            try {
+              return fs.statSync(dir).isDirectory();
+            } catch {
+              return false;
+            }
+          });
+  } catch (err) {
+    // A repos root the operator NAMED that cannot be read is a cannot-verify, never "no linked
+    // repos": the latter reports a green over a scope nobody read (see linkedSurfaces).
+    if (err instanceof PayloadReadError) {
+      console.error(`❌ check-version-stamp: ${err.message}`);
+      return 2;
+    }
+    throw err;
+  }
 
   // AN EMPTY SURFACE SET IS NOT A GREEN ONE. Reporting "✅ in-sync" over nothing is the vacuous
   // pass this whole check exists to refuse, so it is exit 2 ("cannot verify"), matching
@@ -766,7 +812,17 @@ function main(argv) {
   if (opts.write) {
     for (const dir of surfaces) {
       try {
+        const prior = readStamp(dir);
         const stamp = writeStamp(dir, repo);
+        // A write ACCEPTS whatever is on disk now, so say it when one erased a difference:
+        // otherwise an operator cannot tell a first stamp from a drift being laundered into a
+        // green baseline, on the one command that can hide drift.
+        let note = "";
+        if (prior.ok && prior.stamp.payload.hash !== stamp.payload.hash) {
+          note = ` — RE-BASELINED (was drift: payload ${prior.stamp.payload.hash.slice(0, 12)}… → ${stamp.payload.hash.slice(0, 12)}…)`;
+        } else if (!prior.ok && prior.reason !== "no stamp file") {
+          note = ` — WARNING: replaced a stamp that was not valid (${prior.reason})`;
+        }
         // The stamp is written either way — the state is recorded — but a dirty source is said
         // LOUDLY, because this stamp can never certify `in-sync` (verification reads it as drift).
         if (stamp.agentInfra.dirty === true) {
@@ -777,7 +833,7 @@ function main(argv) {
         }
         console.log(
           `✅ stamped ${dir} — commit ${(stamp.agentInfra.commit ?? "none").slice(0, 9)}, ` +
-            `${stamp.payload.files} files, ${stamp.payload.hash.slice(0, 12)}…`
+            `${stamp.payload.files} files, ${stamp.payload.hash.slice(0, 12)}…${note}`
         );
       } catch (err) {
         console.error(`❌ could not stamp ${dir}: ${err.message}`);
