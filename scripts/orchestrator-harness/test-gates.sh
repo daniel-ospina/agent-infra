@@ -13,6 +13,7 @@ set -u
 # guard against the DEPLOYED copy, which is its original purpose there.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH="${ORCH:-$HERE/orch-loop.sh}"
+MERGE="$HERE/merge-one.sh"
 PASS=0; FAIL=0
 
 # --- extract the rule functions from the live controller ---
@@ -54,6 +55,156 @@ if [ -z "$old" ]; then echo "  ✅ old form returned EMPTY for (27,0,8) — the 
 else echo "  ❌ old form gated it — the fix would be a no-op"; FAIL=$((FAIL+1)); fi
 new="$(mp_reason 27 0 8)"
 [ -n "$new" ] && { echo "  ✅ new form gates it: $new"; PASS=$((PASS+1)); } || { echo "  ❌ new form still lets it through"; FAIL=$((FAIL+1)); }
+
+echo
+echo "=== THE REPO'S OWN ANSWERS: required checks + merge authority (agent-infra#1764) ==="
+# The required-check list and the review authority are read from the TARGET REPO's branch
+# protection. This is the regression for the defect that deadlocked every merge: the loop carried
+# TORTOISE's protection contexts as a constant, so on agent-infra (whose only required check is
+# `pipeline-compliance`) it named eight checks that can never appear, forced
+# `FAILED:ai-review-gate` on a PR with 22 passing checks, and the queue could not drain.
+# Both repo SHAPES are pinned, plus the fail-closed arm.
+RA="$HERE/repo-authority.sh"
+if [ ! -f "$RA" ]; then echo "❌ repo-authority.sh is missing — the per-repo contract moved"; exit 1; fi
+# shellcheck source=/dev/null
+. "$RA"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+cat > "$TMP/gh" <<'SH'
+#!/usr/bin/env bash
+# Stub: only the required_status_checks read is modelled. The API shape is the real one
+# (gh api … --jq '.contexts[]' prints one context per line).
+case "$*" in
+  *branches/main/protection/required_status_checks*)
+    case "$*" in
+      *agent-infra*) printf 'pipeline-compliance\n' ;;
+      *readfail*)    exit 1 ;;
+      *)             printf 'pricing-artifact\ndocs\ntest-isolation\nlicense-surface\nlegal-e2e\npython-ci-gate\nai-review-gate\n' ;;
+    esac
+    exit 0 ;;
+esac
+exit 1
+SH
+chmod +x "$TMP/gh"
+G="$TMP/gh"
+eqv() { # eqv <label> <expected> <actual>
+  if [ "$2" = "$3" ]; then echo "  ✅ $1"; PASS=$((PASS+1))
+  else echo "  ❌ $1 — expected [$2], got [$3]"; FAIL=$((FAIL+1)); fi
+}
+
+# (a) the resolver reads each repo's OWN protection
+eqv "agent-infra resolves to [pipeline-compliance]" "pipeline-compliance" "$(required_checks daniel-ospina/agent-infra "$G")"
+eqv "tortoise resolves to its eight-name set" "pricing-artifact docs test-isolation license-surface legal-e2e python-ci-gate ai-review-gate" "$(required_checks daniel-ospina/tortoise "$G")"
+required_checks daniel-ospina/readfail "$G" >/dev/null 2>&1; rrc=$?
+[ "$rrc" -ne 0 ] && { echo "  ✅ an unreadable protection read reports FAILURE (rc=$rrc), not an empty set"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ an unreadable protection read exited 0 — a fail-OPEN read"; FAIL=$((FAIL+1)); }
+
+# (b) the effective set: env wins; protection is used otherwise; unreadable -> NON-EMPTY fallback.
+# ⛔ REQ_SOURCE is set by the function in the CURRENT shell, so each call whose source is asserted
+# is made WITHOUT a command substitution (which would run it in a subshell and lose the global).
+REQ_OVERRIDE='custom-check'
+over="$(effective_required_checks daniel-ospina/agent-infra "$G")"
+eqv "REQ_OVERRIDE wins over the protection read" "custom-check" "$over"
+effective_required_checks daniel-ospina/agent-infra "$G" >/dev/null
+eqv "…and its source is reported as 'env'" "env" "$REQ_SOURCE"
+REQ_OVERRIDE=''
+prot="$(effective_required_checks daniel-ospina/agent-infra "$G")"
+eqv "without an override the repo's protection is used" "pipeline-compliance" "$prot"
+effective_required_checks daniel-ospina/agent-infra "$G" >/dev/null
+eqv "…and its source is reported as 'protection'" "protection" "$REQ_SOURCE"
+fb="$(effective_required_checks daniel-ospina/readfail "$G")"
+eqv "an UNREADABLE protection read falls back to the shipped non-empty set" "$FALLBACK_REQ" "$fb"
+effective_required_checks daniel-ospina/readfail "$G" >/dev/null
+eqv "…and its source is reported as 'fallback'" "fallback" "$REQ_SOURCE"
+[ -n "$fb" ] && { echo "  ✅ the fallback is NON-EMPTY (an empty required set must never be the answer)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the fallback is empty — the fail-open the fallback exists to prevent"; FAIL=$((FAIL+1)); }
+REQ_OVERRIDE=''
+
+# (b2) the PRODUCTION caller shape (agent-infra#1764 review round 2): resolve_required_checks
+# sets BOTH globals in the caller's shell. The direct-call tests above prove the resolver's
+# contract; these prove the globals survive the way orch-loop.sh and merge-one.sh actually call
+# it — the exact defect live-measured after round 1 (`REQ="$(…)"` subshells REQ_SOURCE away, so
+# the ⚠️ fallback warning can never fire and merge-one's log printed source=?).
+REQ_SOURCE=''; resolve_required_checks daniel-ospina/agent-infra "$G"
+eqv "caller shape: REQ resolved" "pipeline-compliance" "${REQ:-}"
+eqv "caller shape: REQ_SOURCE survives to the caller" "protection" "${REQ_SOURCE:-<EMPTY>}"
+REQ_SOURCE=''; resolve_required_checks daniel-ospina/readfail "$G"
+eqv "caller shape (unreadable): REQ is the non-empty fallback" "$FALLBACK_REQ" "${REQ:-}"
+eqv "caller shape (unreadable): REQ_SOURCE is 'fallback' (the warning CAN fire)" "fallback" "${REQ_SOURCE:-<EMPTY>}"
+REQ_OVERRIDE='custom-check'; REQ_SOURCE=''; resolve_required_checks daniel-ospina/agent-infra "$G"
+eqv "caller shape (override): REQ_OVERRIDE wins" "custom-check" "${REQ:-}"
+eqv "caller shape (override): REQ_SOURCE is 'env'" "env" "${REQ_SOURCE:-<EMPTY>}"
+REQ_OVERRIDE=''
+# (c) the authority follows from the set, by WHOLE NAME (a substring is not a match)
+eqv "tortoise's set -> gate authority" "gate" "$(merge_authority "pricing-artifact docs ai-review-gate")"
+eqv "a NAME that merely contains the gate is not the gate" "rail" "$(merge_authority "ai-review-gate-extra")"
+eqv "an empty set -> rail (never a raw merge)" "rail" "$(merge_authority "")"
+
+# (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
+#     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
+awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$ORCH" | sed 's/^" 2>\/dev\/null))$//' \
+  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+if [ -s "$TMP/classify.py" ]; then
+  clr() { printf '%s' "$2" | REQ="$1" REVIEW_GATE=ai-review-gate python3 "$TMP/classify.py" 2>/dev/null; }
+  AISURF='[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]'
+  TORTSURF='[{"name":"ai-review-gate","state":"SUCCESS"},{"name":"python-ci-gate","state":"SUCCESS"},{"name":"docs","state":"SKIPPED"},{"name":"test-isolation","state":"SUCCESS"},{"name":"license-surface","state":"SUCCESS"},{"name":"legal-e2e","state":"NEUTRAL"},{"name":"pricing-artifact","state":"SUCCESS"}]'
+  TORTREQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  eqv "REGRESSION: the OLD answer (tortoise's REQ on agent-infra's surface) was FAILED:ai-review-gate" \
+      "FAILED:ai-review-gate" "$(clr "$TORTREQ" "$AISURF")"
+  eqv "the FIX: agent-infra's own REQ on the same surface reads GREEN" \
+      "GREEN" "$(clr 'pipeline-compliance' "$AISURF")"
+  eqv "tortoise's shape still reads GREEN on its own REQ (behaviour preserved)" \
+      "GREEN" "$(clr "$TORTREQ" "$TORTSURF")"
+  # the fail-closed rule INSIDE the correct set must not be weakened by the scoping
+  eqv "a required check that never reported stays PENDING" \
+      "PENDING:pipeline-compliance" "$(clr 'pipeline-compliance' '[{"name":"ci / lint","state":"SUCCESS"}]')"
+  eqv "a required check that reported red stays FAILED" \
+      "FAILED:pipeline-compliance" "$(clr 'pipeline-compliance' '[{"name":"pipeline-compliance","state":"FAILURE"}]')"
+  eqv "a missing review gate on a repo that REQUIRES it stays FAILED" \
+      "FAILED:ai-review-gate" "$(clr "$TORTREQ" '[{"name":"docs","state":"SUCCESS"}]')"
+  # the review-gate NAME is an input too: a repo whose gate is spelled differently must still have
+  # its gate ENFORCED (SKIPPED is not satisfied). A revert to the 'ai-review-gate' literal reads
+  # this surface as GREEN and is RED here.
+  clrg() { printf '%s' "$3" | REQ="$1" REVIEW_GATE="$2" python3 "$TMP/classify.py" 2>/dev/null; }
+  eqv "a custom review-gate name is enforced (the name is an input)" \
+      "FAILED:my-gate" "$(clrg 'my-gate other' 'my-gate' '[{"name":"my-gate","state":"SKIPPED"},{"name":"other","state":"SUCCESS"}]')"
+else
+  echo "  ❌ could not extract the classifier from $ORCH"; FAIL=$((FAIL+1))
+fi
+
+# (e) the WIRING — a resolver that nothing calls is not a fix. The constants-and-functions above
+# can all be right while the loop still uses a literal, so the CALL SITES are pinned too. This is
+# the check that fails if #1764 is "fixed" by changing repo-authority.sh and not wiring it in.
+if grep -q 'REQ="ai-review-gate python-ci-gate docs test-isolation' "$ORCH"; then
+  echo "  ❌ orch-loop.sh still carries a hardcoded required-check constant"; FAIL=$((FAIL+1))
+else
+  echo "  ✅ orch-loop.sh carries NO hardcoded required-check constant"; PASS=$((PASS+1))
+fi
+wpin() { # wpin <label> <file> <fixed-string>
+  if grep -qF "$3" "$2"; then echo "  ✅ $1"; PASS=$((PASS+1)); else echo "  ❌ $1 — [$3] not found in $(basename "$2")"; FAIL=$((FAIL+1)); fi
+}
+eqv "agent-infra's set -> rail authority" "rail" "$(merge_authority "pipeline-compliance")"
+wpin "orch-loop.sh resolves the required set in the CALLER's shell" "$ORCH" 'resolve_required_checks "$OR"'
+wpin "orch-loop.sh derives the merge authority from that set" "$ORCH" 'MERGE_AUTHORITY="$(merge_authority "$REQ")"'
+wpin "the classifier receives the resolved set + gate name" "$ORCH" 'REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3'
+wpin "the controller branches on the merge authority" "$ORCH" 'MERGE_AUTHORITY" = "rail"'
+wpin "merge-one.sh resolves the same contract" "$MERGE" 'resolve_required_checks "$OR"'
+# (f) the missing-rail REFUSAL is BEHAVIOURAL, not textual. A grep pin cannot tell a live guard
+# from one neutered to `if false` (the refusal echo stays in the file either way) — that is the
+# inert-enforcer class this repo treats as category A. So the rail branch is EXTRACTED and DRIVEN
+# with the rail absent: it must exit 6 (a refusal), not fall through to the rest of the script.
+{ grep -m1 '^is_num() {' "$MERGE"; grep -m1 '^is_limit() {' "$MERGE"
+  awk '/^if \[ "\$MERGE_AUTHORITY" = "rail" \]; then/{f=1} f&&/^# ── 1\) fresh-context review/{f=0} f' "$MERGE"; } > "$TMP/railbranch.sh"
+if [ -s "$TMP/railbranch.sh" ] && grep -q 'refusing to fall back to a raw gh pr merge' "$TMP/railbranch.sh"; then
+  mkdir -p "$TMP/railrepo" "$TMP/railO/state"
+  ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+    L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=deadbeef; RAIL_TRIES=3; \
+    . "$TMP/railbranch.sh" ) >/dev/null 2>&1; mrc=$?
+  [ "$mrc" = "6" ] && { echo "  ✅ a missing rail EXITS 6 (refusal) with no gh pr merge fallback"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a missing rail exited $mrc, not 6 — the guard is inert or absent"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the rail branch from merge-one.sh"; FAIL=$((FAIL+1))
+fi
+wpin "merge-one.sh runs the repo's rail, not a raw merge" "$MERGE" 'bash "$RAIL" "$PR" --repo "$OR" -- --squash'
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

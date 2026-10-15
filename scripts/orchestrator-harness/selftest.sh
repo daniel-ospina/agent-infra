@@ -55,11 +55,17 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim; only the bash-side $REQ is substituted.
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
+# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
+# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+CL_GATE="ai-review-gate"
 awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed "s/'\\\$REQ'/'$REQ'/" | sed -n '1,/^print(/p' > "$TMP/classify.py"
-cl() { printf '%s' "$1" | python3 "$TMP/classify.py" 2>/dev/null; }
+  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
+# clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
+# ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
+clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
 if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
@@ -76,6 +82,25 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+# (z) THE REPO SHAPE THAT WAS DEADLOCKED (agent-infra#1764). Measured live on agent-infra PR #1763:
+# 22 checks, every one SUCCESS/NEUTRAL, and ZERO `ai-review-gate` runs — against agent-infra's OWN
+# required set (`pipeline-compliance`). The pre-fix classifier named `ai-review-gate` as the
+# authority by CONSTANT, so `gate` was empty, `gate_ok` false, and it forced
+# `FAILED:ai-review-gate` here: no PR could ever read GREEN and the merge queue could not drain.
+# Exact verdict, so a regression to the constant (or any re-introduced absence-is-RED rule for a
+# name this repo does not require) is RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"ci / skill-lint","state":"SUCCESS"},{"name":"ci / script-validate","state":"SUCCESS"},{"name":"test","state":"SUCCESS"},{"name":"pi-config-extensions","state":"SUCCESS"},{"name":"setup-suite","state":"SUCCESS"},{"name":"ci / unit-test","state":"SUCCESS"},{"name":"ci / typecheck","state":"SUCCESS"},{"name":"search-cost","state":"SUCCESS"},{"name":"workflow-lock","state":"SUCCESS"},{"name":"workflow-drift","state":"SUCCESS"},{"name":"actionlint","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]')"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: agent-infra's shape (22 checks, no ai-review-gate) reads GREEN on its own required set" $rc
+# (z2) …and the scoping above does NOT weaken the fail-closed rule INSIDE that set: a required
+# check this repo has not reported stays PENDING, never GREEN ("a missing check is not a green
+# check"), and a red one stays RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"ci / lint","state":"SUCCESS"}]')"
+[ "$got" = "PENDING:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a required check that never reported is PENDING, not GREEN" $rc
+got="$(clreq 'pipeline-compliance' '[{"name":"pipeline-compliance","state":"FAILURE"}]')"
+[ "$got" = "FAILED:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red required check is FAILED on a non-review-gate repo" $rc
 
 # ── 3b) the classifier's POLARITY — an allow-list, not a deny-list ───────────────
 # agent-infra#1714: the classifier named the red conclusions and filed EVERYTHING ELSE as PENDING,
@@ -235,6 +260,7 @@ SH
     printf '%s\n' "OR='example/repo'"
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
+    printf '%s\n' "REVIEW_GATE='ai-review-gate'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -808,28 +834,23 @@ review of this very file, and 19 of its checks fail when it is dropped into the
 MD
 grep -qE "$OVERC" "$TMP/overclaim.md" && rc=0 || rc=1
 ck "the drift guard matches the pre-fix phrasings (non-vacuous)" $rc
-# The REQUIRED-check count is the page's own invariant, not a drifting number: it is fixed by the
-# repo's protection. It must equal REQ and the README must never spell a different count beside
-# the list it ships (it said "eight"/"8" against a live set of 7).
-nreq="$(sed -n 's/^REQ="\(.*\)"$/\1/p' "$LOOP" | tr ' ' '\n' | grep -c .)"
-case "$nreq" in 7) rword=seven;; 8) rword=eight;; *) rword="" ;; esac
-[ -n "$rword" ] && grep -qE "($nreq|$rword) required check" "$HERE/README.md" && rc=0 || rc=1
-ck "README states the required-check count REQ has ($nreq)" $rc
+# The required-check set is PER-REPO now (agent-infra#1764): resolved from the target repo's
+# branch protection, with FALLBACK_REQ as the fail-closed last resort. A fixed count in the README
+# would be wrong for one of the two repos, so the guard is INVERTED: the README must DESCRIBE the
+# per-repo resolution, the shipped fallback must be non-empty (an unreadable endpoint must not
+# become an empty required set), and the README must not spell a fixed count beside it.
+nreq="$(sed -n 's/^FALLBACK_REQ="\(.*\)"$/\1/p' "$HERE/repo-authority.sh" | tr ' ' '\n' | grep -c .)"
+[ "$nreq" -ge 1 ] && rc=0 || { rc=1; echo "      fallback names: $nreq"; }
+ck "the shipped FALLBACK_REQ is NON-EMPTY ($nreq names — the unreadable-protection arm fails CLOSED)" $rc
+grep -q 'branch protection' "$HERE/README.md" && rc=0 || rc=1
+ck "README documents the per-repo required-check resolution" $rc
 numerals='([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten) required check'
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(grep -oE "$numerals" "$HERE/README.md")
-[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad required check'"; }
-ck "README never disagrees with REQ on the required-check count" $rc
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(printf 'read the 8 required checks\nand the eight required check names\n' | grep -oE "$numerals")
+bad="$(grep -oE "$numerals" "$HERE/README.md" | head -1)"
+[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad'"; }
+ck "README states no fixed required-check count (the set is per-repo now)" $rc
+bad="$(printf 'read the 7 required checks\nand the eight required check names\n' | grep -oE "$numerals" | head -1)"
 [ -n "$bad" ] && rc=0 || rc=1
-ck "non-vacuity: the required-count guard flags the pre-fix '8'/'eight' (saw '$bad')" $rc
+ck "non-vacuity: the count guard still flags a fixed count of required checks (saw '$bad')" $rc
 grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
 ck "README points at the self-test" $rc
 
@@ -989,7 +1010,7 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # fixture: start=3 with a bail marker must leave NFC2=2 (refunded, then read) — not 3. Moving the
   # read back above the refund is RED, and the cap predicate on the shipped NFC2 is then false, so
   # the arm spawns instead of parking.
-  awk 'index($0,"docs|test-isolation")>0{b=1}
+  awk 'index($0,"# CI-red arm (agent-infra")>0{b=1}
        b&&index($0,"if grep -q python-ci-gate")>0{b=0}
        b' "$LOOP" \
     | grep -E '^ *(NFC2=|is_num "\$NFC2"|refund_bailed_fixer "\$PR")' > "$TMP/ci-arm-seq.sh"
@@ -1006,8 +1027,36 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   fi
 fi
 
-grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
-ck "a non-review required check failure is routed to the fixer" $rc
+# The CI-red arm is DERIVED from the repo's required set now (#1764): the pre-fix form named
+# tortoise's five checks as a literal, so a red `pipeline-compliance` on agent-infra matched
+# nothing and the PR sat red with no worker. Pin BOTH halves — the literal is gone AND the arm is
+# driven by $REQ — so a revert to a name list, or a broken derivation, is RED.
+grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=1 || rc=0
+ck "the CI-red arm no longer names tortoise's checks as a literal" $rc
+grep -q 'CI_RED=' "$LOOP" && rc=0 || rc=1
+ck "the CI-red arm derives its red name from the required set" $rc
+# The derivation is EXTRACTED and DRIVEN against both repo shapes: a red pipeline-compliance must
+# be recognised as a required name (fixer), and the review gate must be excluded (it has its own
+# arm), on agent-infra's set and on tortoise's.
+sed -n '/^        CI_RED=""$/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
+if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the shipped orch-loop.sh"; then
+  REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'; V='FAILED:pipeline-compliance'
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "pipeline-compliance" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' req=$REQ"; }
+  ck "CI-red derivation: a red agent-infra required check is recognised (no name list needed)" $rc
+  REQ='pipeline-compliance'; V='FAILED:ci / lint'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (non-required must not route)"; }
+  ck "CI-red derivation: a non-required red does not route to the fixer" $rc
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:ai-review-gate,docs'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "docs" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (review gate must be excluded)"; }
+  ck "CI-red derivation: the review gate is excluded (it has its own arm), tortoise's docs still routes" $rc
+fi
 grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the CI-red fixer is logged and capped like other fix loops" $rc
 grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
@@ -1808,15 +1857,18 @@ if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; the
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
 fi
-# Assert each of the four spawn SITES, not a count — a count is satisfied by decoy comments,
+# Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
+# NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
+# and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# Each is asserted to carry can_spawn, which is the property under test.
 fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "2" ] && rc=0 || rc=1
 ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
-[ "$merge_site" = "1" ] && rc=0 || rc=1
-ck "the merge re-review spawn carries the load gate" $rc
+[ "$merge_site" = "2" ] && rc=0 || rc=1
+ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1

@@ -138,10 +138,10 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
    (1) merge sweep              (2) capacity-gated dispatch      (3) backlog refresh
         │                               │                                │
         │  for every open non-draft PR  │  read candidates.txt            │  refresh-candidates.sh
-        │  read the 7 required checks   │  skip if in dispatched.txt      │  pre-flight each issue
+        │  read repo's required checks  │  skip if in dispatched.txt      │  pre-flight each issue
         │                               │  dispatch-merge.sh:             │  (collision_preflight.py)
-        │   GREEN   → gh pr merge       │    git worktree add             │  append CLEAN ones
-        │   PENDING → --auto            │    tmux new lane-<N>  ──┐       │
+        │   GREEN   → merge authority   │    git worktree add             │  append CLEAN ones
+        │   PENDING → auto (gate mode)  │    tmux new lane-<N>  ──┐       │
         │   FAILED  → see below         │    tmux new chain-<N> ──┤       │
         └───────────────────────────────┴─────────────────────────┼───────┘
                                                                   │
@@ -152,10 +152,17 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
         chain-<N>  → chain-merge.sh : poll for the PR to appear, then
                         ▼
         merge-<PR> → merge-one.sh :
+                        the repo's merge authority decides the whole step (agent-infra#1764)
+                        gate mode (the repo REQUIRES `ai-review-gate`):
                         1. fresh-context reviewer → posts its review as a PR comment (the audit artifact)
                         2. CLEAN   → record-review.sh (HMAC-signed marker into the PR body)
                                      → wait for ai-review-gate SUCCESS → gh pr merge --squash
                             ISSUES  → touch state/needsfix-<PR>-<head>   ← hands off to the fixer path
+                        rail mode (the repo does NOT require the gate — e.g. agent-infra):
+                        1. `scripts/admin-merge.sh <PR>` — the repo's own rail, which posts its own
+                           head-bound evidence and merges. No reviewer is run and `gh pr merge` is
+                           NEVER called: it would land on the required checks alone, bypassing the rail.
+                           Refused 3x at one head → PARK that head.
                         ▼
         fix-<PR>   → fix-one.sh  : materialises a worktree for the branch (including foreign
                                    branches), runs a fixer over the reviewer's findings, pushes a
@@ -168,7 +175,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 |---|---|---|---|
 | `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR |
 | `chain-<N>` | `chain-merge.sh` | — | wait for the lane's PR, then delegate to `merge-one.sh` |
-| `merge-<PR>` | `merge-one.sh` | — | fresh review → signed record → wait green → squash-merge |
+| `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = the repo's own `scripts/admin-merge.sh` |
 | `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings **or a failing required check**, push, re-run the merge chain |
 
 ### State files (`$O/`)
@@ -208,8 +215,9 @@ the fact: the PR body names the comment it was signed against.
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
-| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra` |
-| **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge without it.** Treat as a secret; never commit it |
+| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there |
+| **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
+| the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
 
@@ -375,11 +383,17 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 
 ## 5. Merge policy and safety invariants
 
-1. **The gate is never bypassed.** A merge requires `record-review.sh` to have written a
-   signed marker for the *exact head SHA* into the PR body, and the `ai-review-gate` check to go
-   **`SUCCESS`** — `SKIPPED`/`NEUTRAL`/absent do **not** count, because that means no signed review
-   exists. `merge-one.sh` refuses to merge if the recorded head ≠ the current head, so
-   a post-review push invalidates the evidence automatically.
+1. **The gate is never bypassed — but WHICH gate is the repo's own answer (agent-infra#1764).**
+   The required-check list is read from the target repo's branch protection, not hardcoded. A repo
+   that requires `ai-review-gate` (tortoise) must have it `<SUCCESS>` —
+   `SKIPPED`/`NEUTRAL`/absent do **not** count, because that means no signed review exists — and
+   `merge-one.sh` additionally refuses to merge if the recorded head ≠ the current head, so a
+   post-review push invalidates the evidence automatically. A repo that does NOT require it
+   (agent-infra: `pipeline-compliance`) is merged through its **own rail**
+   (`scripts/admin-merge.sh`), which posts its own head-bound evidence; the harness never falls back
+   to a raw `gh pr merge` there. Either way the fail-closed rule holds *inside* the repo's own
+   required set: a required check that has not reported is `PENDING`, never green, and an
+   unreadable protection endpoint uses `FALLBACK_REQ` (non-empty), never an empty set.
 1b. **One owner per PR, per box.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a
    `fix-<PR>`, and the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first.
    Without it a freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence
@@ -447,12 +461,14 @@ clear about what is and is not enforced:
 - **Prompt injection is possible.** `fix-one.sh` reads the PR's comments into the fixer prompt as
   the authoritative review, and `merge-one.sh` feeds the reviewer the PR title, body and diff. A
   malicious PR body can therefore attempt to steer an agent that has shell access.
-- **What actually constrains it.** `gh pr merge` is called in exactly two places — the inline
-  sweep in `orch-loop.sh` and `merge-one.sh` (the chain/fixer path) — and **both** are reached only
-  after `record-review.sh` has written a signed marker for the exact head (§5.1), with
-  `merge-one.sh` additionally waiting for `ai-review-gate` to read `SUCCESS`. A rogue *agent* cannot
-  merge through the harness path; it could still `gh pr merge` or `git push` directly if the token
-  permits, which is a property of the token, not this code.
+- **What actually constrains it.** `gh pr merge` is reached only on a **gate-mode** repo (one whose
+  branch protection requires `ai-review-gate`), and only after `record-review.sh` has written a
+  signed marker for the exact head (§5.1), with `merge-one.sh` additionally waiting for
+  `ai-review-gate` to read `SUCCESS`. On a **rail-mode** repo (agent-infra) the harness instead
+  invokes `scripts/admin-merge.sh`, which posts its own head-bound evidence and merges with
+  `--admin`; the harness does not call `gh pr merge` there at all, and auto-merge is deliberately
+  never armed. A rogue *agent* cannot merge through the harness path; it could still `gh pr merge`
+  or `git push` directly if the token permits, which is a property of the token, not this code.
 - **What is deliberately not done:** the gate key is never placed in a prompt, a plist, a log or a
   command line, and no script creates a secret-bearing file.
 - **Open item (tortoise#8246):** contain the workers properly — a read-only key path, no
@@ -645,7 +661,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | the claim-file guard added in the first fix round introduced a permanent stall | the controller treated *the existence of* `mergeclaim-<PR>.lock` as "in flight", but only `merge-one.sh` removes it — a SIGKILLed worker or a reboot mid-merge left the PR skipped forever with no fixer and no re-record | `claim_live()` tests the recorded pid with `kill -0` and removes a dead owner's claim |
 | 6 self-test checks passed vacuously because an empty extraction did not fail the check | the round-1 vacuity fix was incomplete: checks depending on `sess()`, the claim block or the reaper passed when the shipped script had no such code | `need()` turns a missing extraction into a FAIL |
 | **a hung worker held a concurrency slot for 9 hours** | `pi -p` has no timeout and the caps count **tmux sessions**, so a hung reviewer (or a runaway `find /` it spawned) permanently reduced merge throughput while the queue looked busy — three slots were dead weight overnight on 2026-10-12 | portable `run_agent()` wall-clock limit (bash `wait` + watchdog subshell, since macOS ships no `timeout`) plus a `reap_stale_workers()` sweep that kills any worker silent for `STALE_MIN` minutes |
-| **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours | those checks now route to `fix-one.sh` too, capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
+| **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours. ⛔ **And the name list was itself a tortoise constant (#1764):** on agent-infra a red `pipeline-compliance` matched none of those five, so the fix reappeared there | those checks now route to `fix-one.sh` too — but the arm is now **derived from the repo's own required set** (#1764), so a red required check routes on *any* repo (agent-infra's `pipeline-compliance` included) — capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
 
 ### 7.5 Still open, deliberately not fixed here
 
@@ -837,8 +853,13 @@ old limits: the operator believes a limits change took effect when it did not. C
 
 Everything else is still tortoise-shaped and must be changed on another target: the branch
 suffix (`tm`), `feat/<N>-tm` naming, `lane.sh`'s `uv sync --extra embeddings --extra parity`, the
-`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation, and the seven required check names
-(`ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact`).
+`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest` invocation.
+The required-check list is NOW repo-aware: it is read from the target repo's branch protection
+(`gh api repos/$OR/branches/main/protection/required_status_checks`), `REQ=…` overrides the read,
+and `FALLBACK_REQ` in `repo-authority.sh` is the non-empty fail-closed last resort when protection
+cannot be read. The merge authority follows from that set: a repo requiring the review gate merges
+via `gh pr merge` after the gate goes green, and a repo that does not is merged through its own
+`scripts/admin-merge.sh` (agent-infra#1764).
 Two things that were on this list are now repo-aware: the collision pre-flight tool is resolved per
 repo (the target repo's own copy, else a `TORTOISE_REPO` checkout) and the scout venv step is skipped for
 a repo with no `pyproject.toml` — and a repo that can be provisioned is verified at `check` time —

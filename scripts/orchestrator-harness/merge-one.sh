@@ -43,6 +43,17 @@ export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
 
+# ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
+# The SAME home orch-loop.sh uses, so the two cannot disagree about what this repo requires or
+# which merge authority it has. REQ in the environment is an operator override; capture it ONCE
+# (REQ is overwritten below with the resolved value).
+_M1_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
+elif [ -f "$_M1_HERE/repo-authority.sh" ]; then . "$_M1_HERE/repo-authority.sh"
+else echo "[merge $PR] FATAL repo-authority.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; fi
+REQ_OVERRIDE="${REQ:-}"
+REQ=""
+
 # Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
 # model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
 # silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
@@ -205,6 +216,60 @@ fi
 # second worker for the same PR. Release first, drop the lock last.
 trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
 
+# ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
+# Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
+# chain below is exactly what it always was (wait for the gate, then squash). On a repo that does
+# NOT require it, `gh pr merge` would land the PR on the required checks alone with no head-bound
+# evidence — the bypass agent-infra's AGENTS.md forbids — so the repo's OWN rail is the authority.
+# ⛔ resolve_required_checks, NOT `REQ="$(effective_required_checks …)"`: the command substitution
+# subshells the resolver and REQ_SOURCE cannot survive it (the log line below would print source=?).
+resolve_required_checks "$OR"
+MERGE_AUTHORITY="$(merge_authority "$REQ")"
+echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} authority=$MERGE_AUTHORITY" >> "$L.log"
+
+if [ "$MERGE_AUTHORITY" = "rail" ]; then
+  # RAIL MODE. The reviewer is deliberately SKIPPED here: this repo's merge authority is the rail,
+  # which posts its OWN head-bound evidence and merges — a review comment / signed record marker is
+  # the TORTOISE contract and is consumed by nothing on this repo, so minting one would only edit a
+  # PR body for no gate.
+  # ⛔ A MISSING RAIL REFUSES. It never degrades to `gh pr merge`: that is the bypass this branch
+  # exists to prevent, and a silent downgrade is exactly how a guard becomes decorative.
+  RAIL="$REPO/scripts/admin-merge.sh"
+  if [ ! -f "$RAIL" ]; then
+    echo "[merge $PR] REFUSED: merge authority for $OR is its rail, but $RAIL does not exist — refusing to fall back to a raw gh pr merge (agent-infra#1764)" >> "$L.log"
+    exit 6
+  fi
+  # BOUNDED RETRY, keyed on the head. A rail refusal is head-specific (it blocks on THIS tree), so
+  # a later push re-arms it; the SAME head is retried at most RAIL_TRIES times so a permanently
+  # blocked PR is not re-analysed every cycle — the API burn #1764 reports. At the cap the head is
+  # PARKED, which the sweep already honours (`parked-$PR` == the current head).
+  if ! is_limit "${RAIL_TRIES:-3}"; then
+    echo "[merge $PR] RAIL_TRIES='${RAIL_TRIES:-}' is not an integer in range — using 3" >> "$L.log"
+    RAIL_TRIES=3
+  fi
+  RC_F="$O/state/railcount-$PR"; RC_H=""; RC_N=0
+  if [ -f "$RC_F" ]; then read -r RC_H RC_N < "$RC_F" 2>/dev/null || true; fi
+  is_num "${RC_N:-}" || RC_N=0
+  # A head we have not seen before resets the count — the retry budget belongs to the HEAD.
+  [ "${RC_H:-}" = "${HEAD:-}" ] || RC_N=0
+  if [ "$RC_N" -ge "$RAIL_TRIES" ]; then
+    printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
+    if [ ! -f "$O/state/parked-$PR" ]; then
+      echo "${HEAD:-}" > "$O/state/parked-$PR"
+      echo "[merge $PR] PARKED — the rail refused $RC_N time(s) at head=${HEAD:-?}; a new push re-arms it" >> "$L.log"
+    fi
+    exit 0
+  fi
+  RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
+  if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
+    echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
+    touch "$O/state/merged-$PR.done"
+  else
+    echo "[merge $PR] rail refused (attempt $RC_N/$RAIL_TRIES) at head=${HEAD:-?} — the sweep retries this head until the cap, then PARK" >> "$L.log"
+  fi
+  exit 0
+fi
+
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
@@ -241,10 +306,24 @@ case "$LAST" in
     rc=$?
     echo "[merge $PR] record-review rc=$rc" >> "$L.log"
     [ $rc -ne 0 ] && { echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3; }
-    # ── 3) wait for the required ai-review-gate to go green (read the LATEST check row) ──
+    # ── 3) wait for the REPO'S review gate to go green (read the LATEST check row) ──
+    # Reached only in `gate` mode, so this repo DOES require the gate. The NAME is an input
+    # (agent-infra#1764): it was the literal `ai-review-gate`, which is tortoise's name. The jq
+    # filter previously hardcoded it inside a single-quoted expression; gh's --jq takes no --arg,
+    # so the name travels via the environment and is selected in python (never spliced into a jq
+    # program, where a name containing a quote would change the program).
     gate=""
     for i in $(seq 1 30); do
-      gate="$(gh pr checks "$PR" --repo "$OR" --json name,state --jq '[.[]|select(.name=="ai-review-gate")][0].state' 2>/dev/null)"
+      gate="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null | GATE_NAME="$REVIEW_GATE" python3 -c "
+import sys,json,os
+n=os.environ.get('GATE_NAME') or 'ai-review-gate'
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+rows=d if isinstance(d,list) else (d.get('check_runs') or [])
+for c in rows:
+    if isinstance(c,dict) and str(c.get('name') or '')==n:
+        print(str(c.get('state') or '').upper()); break
+" 2>/dev/null)"
       echo "[merge $PR] gate=$gate (try $i)" >> "$L.log"
       [ "$gate" = "SUCCESS" ] && break
       sleep 30
