@@ -249,15 +249,23 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   fi
   RC_F="$O/state/railcount-$PR"; RC_H=""; RC_N=0
   if [ -f "$RC_F" ]; then read -r RC_H RC_N < "$RC_F" 2>/dev/null || true; fi
-  is_num "${RC_N:-}" || RC_N=0
+  # is_limit, not is_num (review P2, round 1): the value feeds `[ -ge ]` and `$(( + 1 ))`, so a
+  # huge digit string must be rejected here, exactly like RAIL_TRIES/REVIEW_TIMEOUT above —
+  # `[ 99999999999999999999 -ge 3 ]` errors FALSE on bash 3.2 and the cap is silently missed.
+  is_limit "${RC_N:-}" || RC_N=0
   # A head we have not seen before resets the count — the retry budget belongs to the HEAD.
   [ "${RC_H:-}" = "${HEAD:-}" ] || RC_N=0
   if [ "$RC_N" -ge "$RAIL_TRIES" ]; then
     printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
-    if [ ! -f "$O/state/parked-$PR" ]; then
-      echo "${HEAD:-}" > "$O/state/parked-$PR"
+    # Write the park UNCONDITIONALLY (review P1, round 1): the guarded write left a park from a
+    # PREVIOUS head in place forever. A new head then reached the cap, saw the stale file, never
+    # recorded itself, and exit 0'd — and the sweep (which honours a park only when its CONTENT
+    # matches the current head) re-spawned a rail worker every cycle forever, the exact burn the
+    # cap exists to close. The LOG line stays novel-only (per head) so the log does not repeat.
+    if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD:-}" ]; then
       echo "[merge $PR] PARKED — the rail refused $RC_N time(s) at head=${HEAD:-?}; a new push re-arms it" >> "$L.log"
     fi
+    echo "${HEAD:-}" > "$O/state/parked-$PR"
     exit 0
   fi
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"

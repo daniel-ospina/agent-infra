@@ -560,10 +560,18 @@ while true; do
   # fallback warning in the case below would never fire.
   resolve_required_checks "$OR"
   MERGE_AUTHORITY="$(merge_authority "$REQ")"
+  AUTHORITY_UNKNOWN=0
   case "${REQ_SOURCE:-}" in
     protection) echo "[req] $OR: required checks from branch protection: $REQ" >>"$LOG" ;;
     env)        echo "[req] $OR: required checks from the REQ environment override: $REQ" >>"$LOG" ;;
-    fallback)   echo "[req] ⚠️ $OR: branch protection UNREADABLE — FAIL-CLOSED fallback: $REQ (a foreign repo's names cannot appear, so every PR reads PENDING and nothing merges unattended)" >>"$LOG" ;;
+    fallback)
+      # ⚠️ review P2, round 1: the fallback set deliberately carries the review gate, which on a
+      # foreign repo reads FAILED — NOT PENDING — and the FAILED arm would then spawn a
+      # fresh-context reviewer per PR per cycle for as long as protection is unreadable. While
+      # the repo's own contract cannot be read, the controller takes NO merge, auto-arm, or
+      # spawn action at all (AUTHORITY_UNKNOWN, honoured in the sweep below).
+      echo "[req] ⚠️ $OR: branch protection UNREADABLE — the merge contract is UNKNOWN; no merge, auto-arm, or worker spawns this cycle (fail-closed, no burn loop)" >>"$LOG"
+      AUTHORITY_UNKNOWN=1 ;;
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
   echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $([ "$MERGE_AUTHORITY" = gate ] && printf 'IS required' || printf 'is NOT required'))" >>"$LOG"
@@ -615,6 +623,10 @@ while true; do
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
+    # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
+    # spawns — the one action worse than doing nothing here would be acting on a contract this
+    # repo never declared (review P2, round 1).
+    [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 -c "
 import sys,json
 import os
@@ -704,7 +716,12 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
+            # a park left by a previous head must be REFRESHED or the new head never parks.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
+            fi
+            echo "${HEAD_N:-}" > "$O/state/parked-$PR"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
@@ -738,7 +755,12 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             : # a rail worker already owns this PR
           elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+            # ⚠️ carry the RESOLVED contract into the worker (review P2, round 1): the controller
+            # resolved REQ/REVIEW_GATE for THIS cycle, but a worker that re-resolves independently
+            # can disagree (e.g. an operator REVIEW_GATE the tmux server does not export) and merge
+            # under a different authority than the one that classified the PR. Passing the resolved
+            # set as the worker's REQ makes it the override — one resolution, one authority.
+            if tmux new-session -d -s "merge-$PR" "REQ=$(printf '%q' "$REQ") REVIEW_GATE=$(printf '%q' "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
             else
               echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
@@ -765,11 +787,19 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # name list. The arm below used to name tortoise's five doc/CI checks, so a red
         # `pipeline-compliance` on agent-infra matched NOTHING and the PR sat red with no worker at
         # all: the same repo-dependent-constant defect as the required-check list (#1764).
+        # ⚠️ review P2, round 1: the pre-#1764 arm deliberately EXCLUDED python-ci-gate — the
+        # rerun block at the bottom of this case owns it, and routing a flaky CI lane into the
+        # code-pushing fixer is churn the rerun already handles. RERUN_RED names that one check
+        # (the same name the rerun block greps for); a repo that does not carry it is unaffected
+        # and every OTHER required red name still reaches the fixer — including agent-infra's
+        # pipeline-compliance, which the old literal arm could not match at all.
+        RERUN_RED="python-ci-gate"
         CI_RED=""
         _redifs="$IFS"; IFS=','; set -f
         for _rn in ${V#FAILED:}; do
           [ -n "$_rn" ] || continue
           [ "$_rn" = "$REVIEW_GATE" ] && continue
+          [ "$_rn" = "$RERUN_RED" ] && continue
           case " $REQ " in *" $_rn "*) CI_RED="$_rn"; break ;; esac
         done
         set +f; IFS="$_redifs"
@@ -810,7 +840,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
+              # Same carried contract as the GREEN rail spawn above (review P2, round 1).
+              tmux new-session -d -s "merge-$PR" "REQ=$(printf '%q' "$REQ") REVIEW_GATE=$(printf '%q' "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
             fi
           fi
@@ -836,7 +867,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park).
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
+            fi
+            echo "${HEAD_N:-}" > "$O/state/parked-$PR"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then

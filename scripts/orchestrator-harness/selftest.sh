@@ -1038,7 +1038,7 @@ ck "the CI-red arm derives its red name from the required set" $rc
 # The derivation is EXTRACTED and DRIVEN against both repo shapes: a red pipeline-compliance must
 # be recognised as a required name (fixer), and the review gate must be excluded (it has its own
 # arm), on agent-infra's set and on tortoise's.
-sed -n '/^        CI_RED=""$/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
+sed -n '/^        RERUN_RED=/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
 if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the shipped orch-loop.sh"; then
   REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'; V='FAILED:pipeline-compliance'
   # shellcheck disable=SC1090
@@ -1056,6 +1056,15 @@ if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the s
   . "$TMP/ci-red-classify.sh"
   [ "${CI_RED:-}" = "docs" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (review gate must be excluded)"; }
   ck "CI-red derivation: the review gate is excluded (it has its own arm), tortoise's docs still routes" $rc
+  # Review P2, round 1 — the RERUN carve-out: python-ci-gate is owned by the rerun block at the
+  # bottom of the case, exactly as in the pre-#1764 arm, so a flaky CI lane must NOT route to the
+  # code-pushing fixer (it would also double-fire: rerun AND fixer).
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:python-ci-gate'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (python-ci-gate must stay with the rerun block, not the fixer)"; }
+  ck "CI-red derivation: python-ci-gate is EXCLUDED (the rerun block owns it — the pre-#1764 carve-out is preserved)" $rc
 fi
 grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the CI-red fixer is logged and capped like other fix loops" $rc

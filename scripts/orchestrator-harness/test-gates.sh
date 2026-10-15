@@ -206,6 +206,66 @@ else
 fi
 wpin "merge-one.sh runs the repo's rail, not a raw merge" "$MERGE" 'bash "$RAIL" "$PR" --repo "$OR" -- --squash'
 
+# (g) the rail park is REFRESHED on a head change — BEHAVIOURAL (review P1, round 1). The guarded
+# write left a PREVIOUS head's park in place forever: a new head reached the cap, saw the stale
+# file, never recorded itself, and exit 0'd — so the sweep (which honours a park only when its
+# CONTENT matches the current head) re-spawned a rail worker every cycle forever, the exact burn
+# RAIL_TRIES exists to close. Driven with a REFUSING rail at the cap and a stale older-head park:
+# the park file must come back holding the NEW head.
+mkdir -p "$TMP/railrepo/scripts" "$TMP/railO/state"
+printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"   # a rail that REFUSES
+chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+printf '%s %s\n' bbbb2222 3 > "$TMP/railO/state/railcount-1764"
+printf '%s\n' aaaa1111  > "$TMP/railO/state/parked-1764"                  # a STALE park, older head
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=bbbb2222; RAIL_TRIES=3; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; prc=$?
+_parked="$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)"
+[ "$prc" = "0" ] && [ "$_parked" = "bbbb2222" ] \
+  && { echo "  ✅ the rail park is REFRESHED on a head change (a stale older-head park cannot block it)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ rail park not refreshed: rc=$prc parked=[$_parked] (expected bbbb2222 — the stale aaaa1111 park survived the cap, so the spawn loop reopens)"; FAIL=$((FAIL+1)); }
+
+# (h) the controller's GREEN arm dispatches the rail — BEHAVIOURAL (review P2, round 1): the
+# 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
+# (`= "rail" ] && false`) still satisfies while every PR falls through to a raw merge on a rail
+# repo — the exact bypass this branch exists to prevent. So the arm is EXTRACTED and DRIVEN with
+# mocked gh/tmux: rail authority must tmux-spawn merge-<PR> and issue NO raw merge; gate authority
+# must do the reverse.
+sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
+if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.sh" && bash -n "$TMP/greenarm.sh" 2>/dev/null; then
+  drive_green() { # drive_green <authority> -> writes $TMP/g.spy / $TMP/g.tspy / LOG
+    rm -f "$TMP/g.spy" "$TMP/g.tspy"; : > "$TMP/g.log"
+    ( PR=1765; OR=daniel-ospina/agent-infra; REPO="$TMP/grepo"; BR=fix/x; HEAD_N=deadbeef
+      MR=3; MERGE_AUTHORITY="$1"; REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'
+      LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
+      sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
+      gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
+      tmux() { echo "TMUX $*" >> "$TMP/g.tspy"; [ "$1" = ls ] && return 0; return 0; }
+      # shellcheck disable=SC1090
+      . "$TMP/greenarm.sh" ) >/dev/null 2>&1
+  }
+  drive_green rail
+  if grep -q 'new-session' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
+    echo "  ✅ GREEN+rail: a merge worker is spawned and NO raw merge is issued"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+rail: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — a rail repo must never reach a raw merge"; FAIL=$((FAIL+1))
+  fi
+  grep -q 'GREEN -> rail worker' "$TMP/g.log" \
+    && { echo "  ✅ GREEN+rail: the worker carries the resolved contract (REQ/REVIEW_GATE in the spawn line)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+rail: no rail-worker log line — the arm did not take the rail path"; FAIL=$((FAIL+1)); }
+  grep -q 'REQ=pipeline' "$TMP/g.tspy" \
+    && { echo "  ✅ GREEN+rail: the spawn line carries REQ=$(grep -o "REQ=[^ ]*" "$TMP/g.tspy" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+rail: the spawn line carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
+  drive_green gate
+  if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'new-session' "$TMP/g.tspy"; then
+    echo "  ✅ GREEN+gate: the squash merge path is UNCHANGED (no worker detour)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+gate: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — gate authority must merge directly as before"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ could not extract a SYNTACTICALLY VALID GREEN arm from orch-loop.sh (extraction or the arm itself is broken)"; FAIL=$((FAIL+1))
+fi
+
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

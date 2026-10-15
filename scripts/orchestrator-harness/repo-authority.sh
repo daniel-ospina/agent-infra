@@ -21,9 +21,13 @@
 #   1. An unreadable protection endpoint NEVER becomes an EMPTY required set. An empty `want`
 #      reads as NOCHECKS (nothing merges) and is indistinguishable from a permission-shaped
 #      partial response, so `effective_required_checks` substitutes FALLBACK_REQ — deliberately
-#      NON-EMPTY names, and foreign to a repo that is not tortoise, so every PR stays PENDING and
-#      nothing merges unattended. That is the fail-closed direction, and it is why the fallback
-#      is a real list rather than the empty string.
+#      NON-EMPTY names, and foreign to a repo that is not tortoise. ⚠️ On such a repo the
+#      fallback's gate name reads FAILED (not PENDING — review P2, round 1), so the CONTROLLER
+#      treats an unresolved contract as authority-unknown and takes no merge, auto-arm, or spawn
+#      action at all until protection is readable (orch-loop.sh, AUTHORITY_UNKNOWN): a fallback
+#      left to drive the FAILED arm would spawn a fresh-context reviewer per PR per cycle for as
+#      long as the read fails. That is the fail-closed direction, and it is why the fallback is a
+#      real list rather than the empty string.
 #   2. The review gate is a REQUIRED name like any other: `merge_authority` reads it from the
 #      resolved set, never from a per-PR observation, so "absent on THIS PR" can never demote it —
 #      only "this repo does not require it" can.
