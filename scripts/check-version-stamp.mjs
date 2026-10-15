@@ -32,10 +32,12 @@
  * VERDICTS — exactly three, and no fourth hiding in the output
  * ------------------------------------------------------------
  *   unstamped  no stamp file, or a stamp that cannot answer the question it exists to
- *              answer (unparseable, wrong `version`, missing/ill-formed commit or hash, or
+ *              answer (unparseable, wrong `version`, missing/ill-formed commit or hash,
  *              `commit: null` because the surface was installed from a tarball with no git
- *              identity). A hand-installed surface lands here BY CONSTRUCTION — absence is
- *              never read as "current". Fail-closed, never fail-open.
+ *              identity, a stamped commit that is not present in this checkout, a payload
+ *              root that cannot be read, or a `payload.roots` that is not the fixed root set).
+ *              A hand-installed surface lands here BY CONSTRUCTION — absence is never read as
+ *              "current". Fail-closed, never fail-open.
  *   in-sync    BOTH hold: the surface's recomputed payload hash equals the hash recorded in
  *              ITS OWN stamp (nobody edited the install after it was stamped), AND the stamped
  *              commit is an ancestor of (or equal to) the target ref — i.e. the install is a
@@ -64,6 +66,13 @@
  *     churns independently of the install; including it would make every surface drift on
  *     every dependency resolution (see #1069 for what that class costs). Named here so the
  *     exclusion is a stated limit, not a silent hole.
+ *   - It does NOT see file MODE. The digest is content-only, so a `chmod` that drops (or adds) an
+ *     exec bit on an installed `scripts/*.sh` — or any other permission change — leaves the hash
+ *     identical and the surface `in-sync`. Modes are not part of "what was installed" here.
+ *   - A payload root that RESOLVES (via symlink) outside the surface is followed, and the walk
+ *     under it is UNBOUNDED (see the symlinked-root convention above). That is deliberate for a
+ *     linked consumer, and it is stated so the containment this does NOT provide is a known
+ *     limit rather than an assumed one.
  *
  * CLI
  * ---
@@ -128,21 +137,43 @@ const REF_DEFAULT = "origin/main";
  *   - Missing root → no entries (not an error): a surface legitimately lacks a root when the
  *     consumer exempts it (`manifest.json` `check.exemptions`).
  */
+/**
+ * A payload read that failed for a reason OTHER than absence. Absence is a legitimate state (a
+ * consumer may exempt a root); `EACCES`/`EPERM`/`ELOOP`/`EIO` are not — they mean the digest would
+ * be a statement about bytes nobody read. Raising it is what keeps an unreadable directory from
+ * being read as an empty one and a changed surface from reporting `in-sync`.
+ */
+export class PayloadReadError extends Error {
+  constructor(abs, err) {
+    super(`cannot read ${abs}: ${err?.code ?? err?.message ?? String(err)}`);
+    this.name = "PayloadReadError";
+    this.path = abs;
+    this.code = err?.code ?? null;
+  }
+}
+
+/** `ENOENT` is "absent". Every other errno is a cannot-verify. */
+function absent(err) {
+  return err?.code === "ENOENT";
+}
+
 export function payloadEntries(rootDir, relRoot) {
   const out = {};
   const start = path.join(rootDir, relRoot);
   let real;
   try {
     real = fs.realpathSync(start);
-  } catch {
-    return out; // absent or dangling root — nothing under it to digest
+  } catch (err) {
+    if (absent(err)) return out; // absent root — nothing under it to digest
+    throw new PayloadReadError(start, err);
   }
   const walk = (absDir, relDir) => {
     let names;
     try {
       names = fs.readdirSync(absDir);
-    } catch {
-      return;
+    } catch (err) {
+      if (absent(err)) return;
+      throw new PayloadReadError(absDir, err);
     }
     for (const name of names.sort()) {
       const abs = path.join(absDir, name);
@@ -150,14 +181,16 @@ export function payloadEntries(rootDir, relRoot) {
       let st;
       try {
         st = fs.lstatSync(abs);
-      } catch {
-        continue;
+      } catch (err) {
+        if (absent(err)) continue; // vanished between readdir and lstat
+        throw new PayloadReadError(abs, err);
       }
       if (st.isSymbolicLink()) {
         let target;
         try {
           target = fs.readlinkSync(abs);
-        } catch {
+        } catch (err) {
+          if (!absent(err)) throw new PayloadReadError(abs, err);
           target = "<unreadable-link>";
         }
         out[rel] = `link:${target}`;
@@ -171,8 +204,9 @@ export function payloadEntries(rootDir, relRoot) {
       if (!st.isFile()) continue; // FIFO/socket/device: not an installed payload file
       try {
         out[rel] = createHash(PAYLOAD_ALGO).update(fs.readFileSync(abs)).digest("hex");
-      } catch {
-        out[rel] = "<unreadable>";
+      } catch (err) {
+        if (absent(err)) continue; // vanished between lstat and read
+        throw new PayloadReadError(abs, err);
       }
     }
   };
@@ -272,11 +306,13 @@ export function buildStamp(surfaceDir, repo) {
   const roots = PAYLOAD_ROOTS;
   const payload = hashPayload(surfaceDir, roots);
   const id = installIdentity(repo);
+  const surface = path.resolve(surfaceDir);
+  const root = path.resolve(repo);
   return {
     version: STAMP_VERSION,
-    kind: path.resolve(surfaceDir).startsWith(path.resolve(repo) + path.sep)
-      ? "agent-infra-checkout"
-      : "installed-surface",
+    // The checkout itself IS a valid surface (agent-infra checked against agent-infra), and it must
+    // not read as `installed-surface` merely because `root + sep` is not a prefix of `root`.
+    kind: surface === root || surface.startsWith(root + path.sep) ? "agent-infra-checkout" : "installed-surface",
     installedAt: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
     agentInfra: {
       version: manifestVersion(repo),
@@ -292,11 +328,25 @@ export function buildStamp(surfaceDir, repo) {
   };
 }
 
-/** Write the stamp for `surfaceDir`. → the stamp object. Throws only on a genuine IO failure. */
+/**
+ * Write the stamp for `surfaceDir`. → the stamp object. Throws only on a genuine IO failure.
+ *
+ * Write-temp-then-rename, never in place. An in-place `writeFileSync` truncates the real stamp
+ * first, so a failure in the window (ENOSPC/EFBIG/EIO) leaves the surface with a DESTROYED stamp
+ * where a valid one used to be — data loss on the one artifact that makes the surface checkable.
+ * The rename is atomic, and it also replaces a symlinked stamp PATH rather than writing through it.
+ */
 export function writeStamp(surfaceDir, repo) {
   const stamp = buildStamp(surfaceDir, repo);
   fs.mkdirSync(surfaceDir, { recursive: true });
-  fs.writeFileSync(stampPath(surfaceDir), JSON.stringify(stamp, null, 2) + "\n");
+  const target = stampPath(surfaceDir);
+  const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(stamp, null, 2) + "\n");
+    fs.renameSync(tmp, target);
+  } finally {
+    fs.rmSync(tmp, { force: true }); // no-op after a successful rename; the failure path cleans up
+  }
   return stamp;
 }
 
@@ -345,6 +395,16 @@ export function validateStamp(raw) {
   if (!Array.isArray(pl.roots) || pl.roots.some((r) => typeof r !== "string")) {
     return { ok: false, reason: "payload.roots is not an array of strings" };
   }
+  // The recorded roots must be EXACTLY the fixed root set. An older, hand-written or foreign stamp
+  // can otherwise declare a narrower universe than the reader recomputes over (or the same universe
+  // in a different order/duplication) and the two would silently diverge. Comparing the serialized
+  // form makes the reader's universe unable to differ from the writer's.
+  if (JSON.stringify(pl.roots) !== JSON.stringify(PAYLOAD_ROOTS)) {
+    return {
+      ok: false,
+      reason: `payload.roots ${JSON.stringify(pl.roots)} != the fixed payload roots ${JSON.stringify(PAYLOAD_ROOTS)}`,
+    };
+  }
   return { ok: true, stamp: raw };
 }
 
@@ -379,16 +439,26 @@ export function resolveRef(repo, ref) {
   return { ref, sha };
 }
 
+/** A conservative remote-branch name: no leading '-', no whitespace, no shell/refspec metacharacters. */
+const SAFE_BRANCH = /^[A-Za-z0-9._\/-]+$/;
+
 /**
- * Refresh the target ref. → `{ fetched: bool, warning: string|null }`.
- * A failed fetch is LOUD and non-fatal: the check continues against the local ref and says so.
+ * Refresh the target ref. → `{ fetched, warning, error }`.
+ * A failed FETCH is LOUD and non-fatal: the check continues against the local ref and says so.
+ * A bad REF NAME is fatal (exit 2): it is a refusal to run the fetch at all, not a stale ref.
  * Silently continuing would report "in-sync" from a ref that may have moved — the stale-flag
  * false pass, in the one place it costs the most.
  */
 export function refreshRef(repo, ref) {
   if (!ref.startsWith("origin/")) return { fetched: false, warning: null };
   const branch = ref.slice("origin/".length);
-  const ok = git(repo, ["fetch", "--quiet", "origin", branch]) !== null;
+  if (branch === "" || branch.startsWith("-") || !SAFE_BRANCH.test(branch)) {
+    return { fetched: false, warning: null, error: `bad ref '${ref}' — refusing to fetch a branch name that is not safe` };
+  }
+  // `--` terminates option parsing. Without it a ref such as `origin/--upload-pack=<cmd>` is taken
+  // by git AS an option and `<cmd>` runs; the leading-dash and charset checks above are a second
+  // layer, and `--` is the one that holds even if that layer is ever loosened.
+  const ok = git(repo, ["fetch", "--quiet", "origin", "--", branch]) !== null;
   return {
     fetched: ok,
     warning: ok ? null : `could not fetch ${ref} — comparing the LOCAL ref, which may be stale`,
@@ -411,7 +481,15 @@ export function classifySurface(surfaceDir, repo, target) {
   const stamp = found.stamp;
   // Verify over the FULL root universe, not the stamp's recorded subset: a stamp written before a
   // root existed must not be able to narrow what the recomputation looks at (see buildStamp).
-  const payload = hashPayload(abs, PAYLOAD_ROOTS);
+  let payload;
+  try {
+    payload = hashPayload(abs, PAYLOAD_ROOTS);
+  } catch (err) {
+    if (err instanceof PayloadReadError) {
+      return { surface: abs, verdict: "unstamped", reason: `cannot read the payload — ${err.message}`, stamp, payload: null };
+    }
+    throw err;
+  }
   if (payload.hash !== stamp.payload.hash) {
     return {
       surface: abs,
@@ -424,14 +502,36 @@ export function classifySurface(surfaceDir, repo, target) {
   if (stamp.agentInfra.commit === target.sha) {
     return { surface: abs, verdict: "in-sync", reason: "payload matches its stamp; commit == target", stamp, payload };
   }
+  // Resolve the stamped commit FIRST. `git merge-base --is-ancestor` exits 1 for "not an ancestor"
+  // and 128 for "no such object", and `git()` collapses both to null — so without this an install
+  // whose commit is absent (GC'd, shallow clone, a foreign stamp) reads as a DEFINITE divergence
+  // instead of the unanswerable question it is.
+  const present = git(repo, ["cat-file", "-e", `${stamp.agentInfra.commit}^{commit}`]) !== null;
+  if (!present) {
+    return {
+      surface: abs,
+      verdict: "unstamped",
+      reason: `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is not present in ${repo} — ancestry is unanswerable (GC'd, shallow, or a stamp from another checkout)`,
+      stamp,
+      payload,
+    };
+  }
   // A COUNT IS NEVER CONSULTED HERE. `git merge-base --is-ancestor` is the only test.
   const isAncestor =
     git(repo, ["merge-base", "--is-ancestor", stamp.agentInfra.commit, target.sha]) !== null;
   if (!isAncestor) {
+    // Three cases, three statements. If the TARGET is an ancestor of the stamp, the stamp is a
+    // DESCENDANT of it (a rollback comparison) — reporting that as "off main's line" was false.
+    // It is still `drift` (an install of a descendant is not an install of the target), but the
+    // reason must say which case it is.
+    const targetIsAncestor =
+      git(repo, ["merge-base", "--is-ancestor", target.sha, stamp.agentInfra.commit]) !== null;
     return {
       surface: abs,
       verdict: "drift",
-      reason: `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is NOT an ancestor of ${target.ref} (${target.sha.slice(0, 9)}) — this install is off main's line`,
+      reason: targetIsAncestor
+        ? `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is AHEAD of ${target.ref} (${target.sha.slice(0, 9)}) — a rollback comparison, not an ancestor`
+        : `stamped commit ${stamp.agentInfra.commit.slice(0, 9)} is NOT an ancestor of ${target.ref} (${target.sha.slice(0, 9)}) — this install is off main's line`,
       stamp,
       payload,
     };
@@ -461,7 +561,16 @@ export function piSurface() {
  * `unstamped`. Depth-2, no recursion beyond it, mirroring `sync`'s own `find -maxdepth 2`.
  */
 export function linkedSurfaces(reposRoot) {
-  const root = reposRoot && reposRoot !== "" ? path.resolve(reposRoot) : path.join(os.homedir(), "Documents", "GitHub");
+  // Argument wins, then $AGENT_INFRA_REPOS_ROOT, then the default. The three sites (this default,
+  // the header and --help) must agree; before this the env var was promised in two of them and
+  // read in none, so an operator who scoped the scan silently got an unscoped one.
+  const env = process.env.AGENT_INFRA_REPOS_ROOT;
+  const root =
+    reposRoot && reposRoot !== ""
+      ? path.resolve(reposRoot)
+      : env && env !== ""
+        ? path.resolve(env)
+        : path.join(os.homedir(), "Documents", "GitHub");
   let names;
   try {
     names = fs.readdirSync(root);
@@ -525,7 +634,14 @@ function parseArgs(argv) {
       return argv[++i];
     };
     switch (a) {
-      case "--surface": opts.surfaces.push(need(a)); break;
+      case "--surface": {
+        const value = need(a);
+        // `path.resolve("")` is the CWD, so an empty value would stamp the directory the command
+        // happened to run in — a write OUTSIDE the named surface. Refuse it (exit 2).
+        if (value === "") throw new Error("--surface needs a non-empty value");
+        opts.surfaces.push(value);
+        break;
+      }
       case "--write": opts.write = true; break;
       case "--json": opts.json = true; break;
       case "--quiet": opts.quiet = true; break;
@@ -608,6 +724,10 @@ function main(argv) {
   let warning = null;
   if (opts.fetch) {
     const r = refreshRef(repo, ref);
+    if (r.error !== undefined) {
+      console.error(`❌ check-version-stamp: ${r.error}`);
+      return 2;
+    }
     warning = r.warning;
   }
   const target = resolveRef(repo, ref);
@@ -623,7 +743,10 @@ function main(argv) {
   if (opts.json) {
     console.log(JSON.stringify({ ref: target.ref, sha: target.sha, warning, counts, results }, null, 2));
   } else {
-    if (!opts.quiet && warning !== null) console.error(`⚠️  ${warning}`);
+    // A stale ref is a WARNING, not report chrome: `--quiet` suppresses the preamble/summary,
+    // never the fact that the comparison may be against a ref that did not move. The exit code is
+    // unchanged — an offline machine can still answer the payload question.
+    if (warning !== null) console.error(`⚠️  ${warning}`);
     for (const r of results) {
       const icon = r.verdict === "in-sync" ? "✅" : r.verdict === "drift" ? "❌" : "⚠️ ";
       const who = r.stamp?.agentInfra?.commit ? `commit ${r.stamp.agentInfra.commit.slice(0, 9)}` : "no commit";

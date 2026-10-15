@@ -20,7 +20,7 @@
  * Run: node scripts/check-version-stamp.test.mjs
  */
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,6 +28,8 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(REPO_ROOT, "scripts", "check-version-stamp.mjs");
+// The module's pure pieces, driven directly by the arms that need to call them rather than shell out.
+const mod = await import(CLI);
 
 let passed = 0;
 let failed = 0;
@@ -59,18 +61,16 @@ function contains(label, haystack, needle, shouldContain = true) {
     : `expected NOT to contain ${JSON.stringify(needle)}; got:\n${haystack}`);
 }
 
-/** Run the CLI. Never throws — the exit code IS the assertion target. */
+/** Run the CLI. Never throws — the exit code IS the assertion target, and BOTH streams are kept. */
 function run(args, opts = {}) {
-  try {
-    const stdout = execFileSync(process.execPath, [CLI, ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      cwd: opts.cwd ?? REPO_ROOT,
-    });
-    return { code: 0, stdout, stderr: "" };
-  } catch (err) {
-    return { code: err.status ?? -1, stdout: err.stdout ?? "", stderr: err.stderr ?? "" };
-  }
+  // spawnSync, not execFileSync: a SUCCESSFUL run's stderr (warnings) must be observable too, and
+  // `execFileSync` only surfaces stderr by throwing.
+  const r = spawnSync(process.execPath, [CLI, ...args], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    cwd: opts.cwd ?? REPO_ROOT,
+  });
+  return { code: r.status ?? -1, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
 }
 
 function git(cwd, ...args) {
@@ -332,12 +332,259 @@ try {
     fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
     const unlinked = path.join(root, "not-linked");
     fs.mkdirSync(unlinked, { recursive: true });
-    const mod = await import(path.join(REPO_ROOT, "scripts", "check-version-stamp.mjs"));
     const found = mod.linkedSurfaces(root);
     eq("a repo carrying only .agent-infra-version is discovered", found.includes(linked), true);
     eq("a directory that is not linked is not discovered", found.includes(unlinked), false);
     eq("the unlinked directory is not silently counted as a surface", found.length, 1);
   }
+
+  // ── 10. an option-shaped ref must be REFUSED, not handed to `git fetch` as an option ─────
+  // `--ref origin/--upload-pack=<cmd>` used to reach `git fetch origin --upload-pack=<cmd>` and
+  // execute <cmd>. The fix is two-layer: `--` terminates option parsing, and the branch name is
+  // validated (no leading '-', conservative charset).
+  console.log("\n10. security — an option-shaped ref is refused, not executed");
+  {
+    const marker = path.join(TMP, "f1-pwned");
+    fs.rmSync(marker, { force: true });
+
+    // CONTROL first: a real branch still fetches through the hardened path.
+    git(ORIGIN, "remote", "add", "origin", ORIGIN);
+    try {
+      const good = mod.refreshRef(ORIGIN, "origin/main");
+      eq("control — a real origin/<branch> still fetches", good.fetched, true);
+      eq("control — a good fetch carries no warning", good.warning, null);
+    } finally {
+      git(ORIGIN, "remote", "remove", "origin");
+    }
+
+    const evil = `origin/--upload-pack=touch ${marker};echo`;
+    const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", evil]);
+    eq("option-shaped ref → exit 2 (cannot verify)", v.code, 2);
+    eq("the injected command did NOT run", fs.existsSync(marker), false);
+    contains("the refusal names a bad ref", v.stderr + v.stdout, "bad ref");
+  }
+
+  // ── 11. an unreadable payload directory is cannot-verify, NEVER read as empty/in-sync ─────
+  // Stamped with `extensions/` absent, then `extensions/` appears and cannot be read. Treated as
+  // empty it contributes nothing, the digest equals the stamp, and a CHANGED surface goes green.
+  console.log("\n11. fail-closed — a payload directory that cannot be read");
+  {
+    const surface2 = path.join(TMP, "surface-unreadable");
+    fs.rmSync(surface2, { recursive: true, force: true });
+    fs.mkdirSync(path.join(surface2, "skills", "one"), { recursive: true });
+    fs.writeFileSync(path.join(surface2, "skills", "one", "SKILL.md"), "# one\n");
+    const w = run(["--write", "--surface", surface2, "--repo", ORIGIN]);
+    eq("control — stamped with extensions/ absent", w.code, 0);
+    eq("control — that surface is green", run(["--surface", surface2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]).code, 0);
+
+    fs.mkdirSync(path.join(surface2, "extensions"), { recursive: true });
+    fs.writeFileSync(path.join(surface2, "extensions", "smuggled.ts"), "export const x = 1;\n");
+    const ext2 = path.join(surface2, "extensions");
+    fs.chmodSync(ext2, 0o000);
+    let revokeWorked = false;
+    try {
+      try {
+        fs.readdirSync(ext2);
+      } catch {
+        revokeWorked = true;
+      }
+      if (!revokeWorked) {
+        ok("skipped — chmod did not revoke read access (running as root?)");
+      } else {
+        const v = run(["--surface", surface2, "--repo", ORIGIN, "--ref", "main", "--no-fetch", "--quiet"]);
+        eq("unreadable dir → exit 1, never 0", v.code, 1);
+        contains("unreadable dir is unstamped (cannot verify)", v.stdout, "unstamped");
+        contains("the reason names the path", v.stdout, "extensions");
+        contains("the reason names the errno", v.stdout, "EACCES");
+      }
+    } finally {
+      fs.chmodSync(ext2, 0o755);
+    }
+  }
+
+  // ── 12. a failed stamp write must leave the PREVIOUS stamp intact (atomic temp+rename) ────
+  console.log("\n12. data-loss — a failed --write must not destroy the existing stamp");
+  {
+    stampNow();
+    const before = fs.readFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), "utf8");
+    fs.chmodSync(SURFACE, 0o555); // no new file can be created in the directory
+    let failed;
+    try {
+      // A sibling temp write cannot be created here, so the write fails. In-place truncation would
+      // already have destroyed the stamp; temp+rename must leave it untouched.
+      failed = run(["--write", "--surface", SURFACE, "--repo", ORIGIN]);
+    } finally {
+      fs.chmodSync(SURFACE, 0o755);
+    }
+    const after = fs.readFileSync(path.join(SURFACE, ".agent-infra-stamp.json"), "utf8");
+    if (failed.code === 0) {
+      ok("skipped — the write succeeded anyway (read-only dir not enforced here)");
+    } else {
+      eq("the write FAILED (control)", failed.code, 2);
+      eq("the previous stamp is byte-identical", after, before);
+      eq("and it is still valid/green", verify().code, 0);
+    }
+  }
+
+  // ── 13. ancestry outcomes are THREE, not two ─────────────────────────────────────────────
+  // `merge-base --is-ancestor` exits 1 (not an ancestor) and 128 (no such object), and `git()`
+  // collapsed both to null — so a DESCENDANT of the target read as "off main's line" (false), and
+  // an absent stamped commit read as a definite divergence instead of cannot-verify.
+  console.log("\n13. ancestry — ahead-of-target and absent-commit differ from off-the-line");
+  {
+    stampNow();
+    const good = stamp();
+
+    // (a) the stamped commit is a DESCENDANT of the target.
+    git(ORIGIN, "checkout", "-q", "-b", "ahead");
+    write("extensions/ahead.ts", "export const ahead = 1;\n", ORIGIN);
+    git(ORIGIN, "add", "-A");
+    git(ORIGIN, "commit", "-q", "-m", "ahead");
+    const ahead = git(ORIGIN, "rev-parse", "HEAD");
+    git(ORIGIN, "checkout", "-q", "main");
+    const targetSha = git(ORIGIN, "rev-parse", "HEAD");
+    let targetIsAncestor = true;
+    try {
+      execFileSync("git", ["-C", ORIGIN, "merge-base", "--is-ancestor", targetSha, ahead]);
+    } catch {
+      targetIsAncestor = false;
+    }
+    eq("precondition — target IS an ancestor of the stamped commit", targetIsAncestor, true);
+
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: ahead } });
+    const va = verify();
+    eq("descendant of target → exit 1 (still drift)", va.code, 1);
+    contains("reason says AHEAD of the ref", va.stdout, "AHEAD of");
+    contains("reason is NOT the false 'off main's line'", va.stdout, "off main's line", false);
+
+    // (b) the stamped commit is not in this repo at all.
+    const ghost = "0".repeat(39) + "1";
+    writeStampRaw(SURFACE, { ...good, agentInfra: { ...good.agentInfra, commit: ghost } });
+    const vb = verify();
+    eq("absent stamped commit → exit 1, never 0", vb.code, 1);
+    contains("absent commit is unstamped (cannot verify)", vb.stdout, "unstamped");
+    contains("reason names the missing object", vb.stdout, "not present");
+    contains("absent commit is NOT called a divergence", vb.stdout, "off main's line", false);
+
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — the good stamp is green again", verify().code, 0);
+  }
+
+  // ── 14. payload.roots must be EXACTLY the fixed set (reader's universe == writer's) ───────
+  console.log("\n14. fail-closed — payload.roots cannot narrow the reader's universe");
+  {
+    stampNow();
+    const good = stamp();
+    eq("control — the untouched stamp is green", verify().code, 0);
+
+    for (const roots of [[], ["skills"]]) {
+      // The CORRECT hash is kept: a mismatched root list alone must be refused, so the arm cannot
+      // pass merely because the digests happened to differ.
+      writeStampRaw(SURFACE, { ...good, payload: { ...good.payload, roots } });
+      const v = verify();
+      eq(`roots=${JSON.stringify(roots)} → exit 1`, v.code, 1);
+      contains(`roots=${JSON.stringify(roots)} is unstamped, never in-sync`, v.stdout, "unstamped");
+      contains(`roots=${JSON.stringify(roots)} reason names the roots`, v.stdout, "payload.roots");
+    }
+
+    writeStampRaw(SURFACE, { ...good });
+    eq("control — restored stamp is green", verify().code, 0);
+  }
+
+  // ── 15. `kind` at the repo root is agent-infra-checkout, not installed-surface ───────────
+  console.log("\n15. kind — the surface that IS the checkout");
+  {
+    eq("kind at the repo root is agent-infra-checkout", mod.buildStamp(ORIGIN, ORIGIN).kind, "agent-infra-checkout");
+    eq("kind inside the checkout is agent-infra-checkout", mod.buildStamp(path.join(ORIGIN, "scripts"), ORIGIN).kind, "agent-infra-checkout");
+    eq("kind away from the repo is installed-surface", mod.buildStamp(SURFACE, ORIGIN).kind, "installed-surface");
+  }
+
+  // ── 16. $AGENT_INFRA_REPOS_ROOT is honoured; an explicit argument wins over it ────────────
+  console.log("\n16. discovery — $AGENT_INFRA_REPOS_ROOT scopes the scan");
+  {
+    const envRoot = path.join(TMP, "env-repos");
+    const linked = path.join(envRoot, "linked-repo");
+    fs.mkdirSync(linked, { recursive: true });
+    fs.writeFileSync(path.join(linked, ".agent-infra-version"), "0.1.0\n");
+    const argRoot = path.join(TMP, "arg-repos");
+    const argLinked = path.join(argRoot, "arg-repo");
+    fs.mkdirSync(argLinked, { recursive: true });
+    fs.writeFileSync(path.join(argLinked, ".agent-infra-version"), "0.1.0\n");
+
+    const saved = process.env.AGENT_INFRA_REPOS_ROOT;
+    process.env.AGENT_INFRA_REPOS_ROOT = envRoot;
+    try {
+      const found = mod.linkedSurfaces(undefined);
+      eq("the env-var root is scanned", found.includes(linked), true);
+      const viaArg = mod.linkedSurfaces(argRoot);
+      eq("an explicit argument wins over the env var", viaArg.includes(argLinked) && !viaArg.includes(linked), true);
+    } finally {
+      if (saved === undefined) delete process.env.AGENT_INFRA_REPOS_ROOT;
+      else process.env.AGENT_INFRA_REPOS_ROOT = saved;
+    }
+  }
+
+  // ── 17. an empty --surface is refused (path.resolve("") is the CWD) ──────────────────────
+  console.log("\n17. safety — an empty --surface must not stamp the CWD");
+  {
+    const cwd = path.join(TMP, "empty-surface-cwd");
+    fs.mkdirSync(cwd, { recursive: true });
+    const v = run(["--surface", "", "--repo", ORIGIN, "--write"], { cwd });
+    eq("empty --surface → exit 2", v.code, 2);
+    eq("nothing was stamped in the CWD", fs.existsSync(path.join(cwd, ".agent-infra-stamp.json")), false);
+    contains("the refusal names the empty value", v.stderr + v.stdout, "non-empty");
+  }
+
+  // ── 18. a failed fetch warns on stderr even under --quiet, and never changes the exit code ─
+  console.log("\n18. staleness — the fetch warning survives --quiet");
+  {
+    stampNow();
+    eq("control — the surface is green", verify().code, 0);
+    git(ORIGIN, "update-ref", "refs/remotes/origin/main", git(ORIGIN, "rev-parse", "HEAD"));
+    git(ORIGIN, "remote", "add", "origin", path.join(TMP, "no-such-remote"));
+    try {
+      const v = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/main", "--quiet"]);
+      contains("--quiet still shows the fetch warning on stderr", v.stderr, "could not fetch");
+      eq("--quiet exit is unchanged by the warning", v.code, 0);
+      const j = run(["--surface", SURFACE, "--repo", ORIGIN, "--ref", "origin/main", "--quiet", "--json"]);
+      contains("--json records the warning field", JSON.stringify(JSON.parse(j.stdout).warning), "could not fetch");
+    } finally {
+      git(ORIGIN, "remote", "remove", "origin");
+    }
+  }
+
+  // ── 19. a symlink in the payload is digested as its TARGET STRING, not its content ────────
+  // Mutation-sensitive: a mutant that FOLLOWS the link digests identical CONTENT on both sides and
+  // cannot see the re-point; a mutant that ignores links cannot see it either. Only recording the
+  // target string makes a re-point visible.
+  console.log("\n19. mutation — a re-pointed symlink is drift, an unchanged one is in-sync");
+  {
+    const a = path.join(SURFACE, "scripts", "same-a.sh");
+    const b = path.join(SURFACE, "scripts", "same-b.sh");
+    fs.writeFileSync(a, "#!/bin/bash\necho identical\n");
+    fs.writeFileSync(b, "#!/bin/bash\necho identical\n");
+    const link = path.join(SURFACE, "scripts", "link.sh");
+    fs.rmSync(link, { force: true });
+    fs.symlinkSync("same-a.sh", link);
+    stampNow();
+    eq("control — an unchanged symlink is in-sync", verify().code, 0);
+
+    fs.rmSync(link);
+    fs.symlinkSync("same-b.sh", link); // identical CONTENT, different TARGET STRING
+    const v = verify();
+    eq("a re-pointed symlink is drift", v.code, 1);
+    contains("the re-pointed link names the payload reason", v.stdout, "payload hash");
+
+    fs.rmSync(link);
+    fs.symlinkSync("same-a.sh", link);
+    eq("control — re-pointing back is green", verify().code, 0);
+
+    fs.rmSync(link);
+    fs.rmSync(a, { force: true });
+    fs.rmSync(b, { force: true });
+    stampNow();
+  }
+
 } finally {
   fs.rmSync(TMP, { recursive: true, force: true });
 }
