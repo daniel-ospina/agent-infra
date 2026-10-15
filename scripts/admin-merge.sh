@@ -1608,7 +1608,8 @@ require_draft() {
 #   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
 #   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
 #                        `0` on the one path that reads nothing: a refused knob
-#   MERGE_ART_DIAG       the LAST attempt's stderr (one bounded line), when it wrote one
+#   MERGE_ART_DIAG       the DECIDING (last) attempt's stderr (one bounded line), empty
+#                        when that attempt wrote none — never an earlier attempt's text
 poll_merge_artifact() {
   local pr="$1"
   MERGE_ART_VERDICT="unreadable"
@@ -1627,19 +1628,33 @@ poll_merge_artifact() {
   # different budget for a typo) and — measured — a leading-zero value reached this
   # arithmetic site, where `attempt <= 08` errors and the loop body NEVER RUNS: the rail
   # then prints `[merge_unreadable] … (08 attempt(s))` on a run where ZERO reads were
-  # attempted, which is #1690's symptom one arm over. `merge_art_knobs_ok` is also called
-  # from `validate_timing_knobs` at startup, so the real path refuses BY NAME (exit 2)
-  # before any CI work — and a SOURCED path (which skips `main`) is covered here.
+  # attempted, which is #1690's symptom one arm over. The STARTUP path refuses the same
+  # three classes BY NAME before any CI work, through `validate_timing_knobs`' own inline
+  # checks (which can name WHICH class was bad, as its per-cause messages do); this helper
+  # exists for the paths that never reach it, because ANY path that SOURCES the rail
+  # bypasses `main` — and that is where the arithmetic lives.
   merge_art_knobs_ok || { refuse_bad_merge_art_knobs; return 1; }
   MERGE_ART_ATTEMPTS="$attempts"
   local attempt=0 rc=0 observed="" state_part="" rest="" err=""
-  local errtmp
+  local errtmp outtmp
   # The same O_EXCL creation and the same parent-owns-the-file rule as the head and
   # draft reads (#1690/#1750 review): the file is `mktemp`-generated, read from the
   # file-scope `READ_ERRTMP` so the EXIT trap can remove it, and created here only on
   # a path with no `main` (the suites that source the rail).
   errtmp="${READ_ERRTMP:-}"
   [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art.XXXXXX" 2>/dev/null)"
+  # ⛔ THE READ IS CAPTURED TO A FILE, NOT STRAIGHT INTO A VARIABLE (#1298 review). A bash
+  # string CANNOT hold a NUL byte: `$(...)` deletes NULs silently, with no error and no
+  # warning, so a producer emitting `MER<NUL>GED` would be read as `MERGED` — a value
+  # GitHub did not say, rendered as a MERGE, which is the one direction that cannot be
+  # walked back (the evidence marker is standing and no retraction is posted). GitHub's
+  # `state` is an enum and cannot carry a NUL, so this was LATENT — but this guard must not
+  # rest on the producer's output shape, which is the same reason the `sed`-over-JSON
+  # projection above was rejected. The file is inside the per-run `$TMP` when there is one
+  # (so the EXIT trap removes it wholesale) and `mktemp`-generated otherwise, exactly like
+  # `errtmp` — never a FIXED name, which two concurrent runs would share.
+  outtmp="${TMP:+$TMP/merge-art.out}"
+  [ -n "$outtmp" ] || outtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art-out.XXXXXX" 2>/dev/null)"
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over the
     # whole JSON takes the LAST `"state"` anywhere in the output, so a nested or
@@ -1650,8 +1665,13 @@ poll_merge_artifact() {
     # one tab-separated `<state>\t<mergedAt>`, mergedAt sentineled because it is null
     # for an unmerged PR.
     # shellcheck disable=SC2086
-    observed="$($GH pr view "$pr" ${repo_args[@]+"${repo_args[@]}"} \
-        --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' 2>"$errtmp")" && rc=0 || rc=$?
+    if $GH pr view "$pr" ${repo_args[@]+"${repo_args[@]}"} \
+        --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' \
+        >"$outtmp" 2>"$errtmp"; then
+      rc=0
+    else
+      rc=$?
+    fi
     # ⛔ THE WHOLE VALUE, NOT A LINE OF IT (#1690's review, applied to this read). The
     # version this replaces took `head -1` and `${x%%$'\t'*}`, which are an ANY-FIRST-LINE
     # test and an ANY-SEPARATOR test: a read that answered the projection AND a trailing
@@ -1661,8 +1681,14 @@ poll_merge_artifact() {
     # pipe, so the `writer | grep -q` idiom banned repo-wide (#841) is not reintroduced
     # either — and that matters here: under `set -uo pipefail` a SIGPIPE-killed writer
     # makes the pipeline non-zero, which would classify a VALID read as unreadable.
+    #
+    # ⛔ AND A NUL IS TESTED AT THE BYTE LEVEL, because no bash string can carry one. The
+    # read above is a FILE, so the test is exact: `tr -d '\000'` applied to the file equals
+    # the file IFF it held no NUL. A missing or unreadable file makes `cmp` exit 2, which is
+    # not "equal", so this test fails CLOSED (unreadable) rather than open.
     state_part=""; rest=""
-    if [ "$rc" -eq 0 ]; then
+    if [ "$rc" -eq 0 ] && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
+      observed="$(cat "$outtmp")"
       case "$observed" in
         *$'\n'*)       : ;;                  # more than one line: not the projection
         *$'\t'*$'\t'*) : ;;                  # more than one separator: not the projection
@@ -1685,10 +1711,15 @@ poll_merge_artifact() {
       *)           MERGE_ART_STATE="<unreadable>"
                    MERGE_ART_MERGED_AT="<unreadable>" ;;
     esac
-    # Keep the LAST attempt's diagnostic (one line, bounded): a later attempt's error is
-    # the one closest to the verdict the operator actually reads (#1690/#1750).
+    # ⛔ THE DIAGNOSTIC BELONGS TO THE ATTEMPT THAT DECIDED (#1298 review). This kept the
+    # last NON-EMPTY stderr, so when the deciding attempt wrote none — a real `gh` shape:
+    # exit 0 with a non-projected answer and empty stderr — the callers printed an EARLIER
+    # attempt's transient error as "the state read reported: …". That names the wrong cause
+    # (a timeout, remedy: re-run) for a different one (the producer's shape changed), and it
+    # is the one thing that separates a blip from a config error. Assigning unconditionally
+    # lets the callers' `if [ -n … ]` / else-arm tell the truth about the deciding read.
     err="$(tail -n 1 "$errtmp" 2>/dev/null)"
-    [ -n "$err" ] && MERGE_ART_DIAG="${err:0:200}"
+    MERGE_ART_DIAG="${err:0:200}"
     if [ "$MERGE_ART_STATE" = "MERGED" ]; then
       break
     fi
@@ -1699,7 +1730,7 @@ poll_merge_artifact() {
     [ "$attempt" -ge "$attempts" ] && break
     sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
   done
-  rm -f "$errtmp"
+  rm -f "$errtmp" "$outtmp"
   case "$MERGE_ART_STATE" in
     MERGED)      MERGE_ART_VERDICT="merged" ;;
     OPEN|CLOSED) MERGE_ART_VERDICT="not_merged" ;;

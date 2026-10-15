@@ -842,7 +842,7 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
 }
@@ -855,7 +855,7 @@ run_admin() {
 # assert on the rail's own output use this.
 run_admin_here() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 \
+    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
@@ -9101,19 +9101,22 @@ unset ADMIN_MERGE_VERIFY_ATTEMPTS
 # §70-§74 drive the WHOLE rail, so they can only express what the hermetic `gh` can
 # serve: a non-zero exit, or a well-formed `<state>\t<mergedAt>`. That leaves the
 # SHAPE guards — the multi-line test, the double-separator test, the missing-separator
-# test and the exit-status test — UNEXERCISED: deleting them leaves §70-§74 green
-# (measured: the `shape` mutation reddens exactly 4 assertions, and all 4 are here).
-# This section loads the rail's FUNCTION DEFINITIONS and calls the read directly, so
-# every declared shape has an assertion that goes RED when its guard is removed.
+# test, the exit-status test and the byte-level NUL test — UNEXERCISED: deleting them
+# leaves §70-§74 green (measured: the `shape` mutation reddens exactly 5 assertions, and
+# all 5 are here). This section loads the rail's FUNCTION DEFINITIONS and calls the read
+# directly, so every declared shape has an assertion that goes RED when its guard is
+# removed or answered wrongly.
 #
 # MUTATION EVIDENCE — each row is a one-line change applied to a COPY of the rail
-# (never the working tree; driver kept beside the logs), run against all 41 assertions
+# (never the working tree; driver kept beside the logs), run against all 44 assertions
 # of §70-§75:
 #   nonzero    the non-zero arm's re-read removed    15 fail: §70×6 §72×6 §74×3
 #   noretrat   the non-zero arm's not_merged gate shut 3 fail: §71×3
 #   zeroexit   the zero-exit retraction gate reverted  3 fail: §73×3
-#   shape      the whole-value/exit-status test reverted 4 fail: §75×4
-#   allowlist  the final verdict reverted to a DENY-LIST 19 fail: §72×6 §73×3 §74×3 §75×7
+#   shape      the whole-value/exit-status/NUL tests reverted 5 fail: §75×5
+#   allowlist  the final verdict reverted to a DENY-LIST 21 fail: §72×6 §73×3 §74×3 §75×9
+#   nul-blind  the byte-level NUL test removed         1 fail: §75×1
+#   diag-stale the deciding attempt's EMPTY stderr overwritten by an earlier one 1 fail: §75×1
 # EVERY section is reddened by at least one row, and NO row reddens all of them: the
 # assertions are load-bearing and targeted rather than a blanket count.
 echo "== 75. #1298: the merge-artifact read validates the whole value (allow-list, not deny-list) =="
@@ -9130,11 +9133,19 @@ set -uo pipefail
 sleep() { :; }             # the subject is the READ, not the pacing between attempts
 repo_args=()
 POLL_GH() {                # the read's only dependency: ONE gh call per attempt
-  local n
+  local n r e
   n=$(( $(cat "$POLL_CNT" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$n" > "$POLL_CNT"
-  [ -n "${POLL_ERR:-}" ] && printf '%s\n' "$POLL_ERR" >&2
+  if [ -n "${POLL_SEQ:-}" ]; then       # per-attempt: line N of three sibling files
+    printf '%s' "$(sed -n "${n}p" "$POLL_SEQ.raw")"
+    e="$(sed -n "${n}p" "$POLL_SEQ.err")"
+    [ -n "$e" ] && printf '%s\n' "$e" >&2
+    r="$(sed -n "${n}p" "$POLL_SEQ.rc")"
+    return "${r:-0}"
+  fi
+  if [ -n "${POLL_RAW_FILE:-}" ]; then cat "$POLL_RAW_FILE"; fi   # raw BYTES, NULs included
   [ -n "${POLL_RAW:-}" ] && printf '%s' "$POLL_RAW"
+  [ -n "${POLL_ERR:-}" ] && printf '%s\n' "$POLL_ERR" >&2
   return "${POLL_RC:-0}"
 }
 poll_merge_artifact 42
@@ -9143,11 +9154,13 @@ printf 'verdict=%s|state=%s|merged_at=%s|attempts=%s|calls=%s|diag=%s\n' \
   "${MERGE_ART_VERDICT-<unset>}" "${MERGE_ART_STATE-<unset>}" "${MERGE_ART_MERGED_AT-<unset>}" \
   "${MERGE_ART_ATTEMPTS-<unset>}" "${calls:-0}" "${MERGE_ART_DIAG-}"
 POLLEOF
-poll_shape() {   # poll_shape <label> <raw> <rc> [attempts] [err]
-  local label="$1" raw="$2" rc="$3" attempts="${4:-1}" err="${5:-}"
+# poll_run — the ONE driver. <label> <attempts> <seq-prefix> <rawfile> <raw> <rc> <err>
+poll_run() {
+  local label="$1" attempts="$2" seq="$3" rawfile="$4" raw="$5" rc="$6" err="$7"
   local cnt="$TMP/poll-calls-$label" line
   : > "$cnt"
-  env BELT_DEFS="$BELT_DEFS" POLL_CNT="$cnt" POLL_RAW="$raw" POLL_RC="$rc" POLL_ERR="$err" \
+  env BELT_DEFS="$BELT_DEFS" POLL_CNT="$cnt" POLL_SEQ="$seq" POLL_RAW_FILE="$rawfile" \
+      POLL_RAW="$raw" POLL_RC="$rc" POLL_ERR="$err" \
       ADMIN_MERGE_GH=POLL_GH ADMIN_MERGE_VERIFY_ATTEMPTS="$attempts" \
       bash "$POLL_PROBE" > "$TMP/poll-out" 2>"$TMP/poll-err"
   line="$(cat "$TMP/poll-out")"
@@ -9158,12 +9171,22 @@ poll_shape() {   # poll_shape <label> <raw> <rc> [attempts] [err]
   POLL_CALLS="${line#*calls=}";   POLL_CALLS="${POLL_CALLS%%|*}"
   POLL_DIAG="${line#*diag=}"
 }
+poll_shape() { poll_run "$1" "${4:-1}" "" "" "$2" "$3" "${5:-}"; }
+# The same, but the answer is served from a FILE, so a byte a bash variable cannot
+# carry (a NUL) can be produced. This is the ONLY way to express that shape.
+poll_file_shape() { poll_run "$1" 1 "" "$2" "" "$3" "${4:-}"; }
+# The same, with a DIFFERENT answer per attempt (line N of "$TMP/seq-<label>.{raw,err,rc}",
+# written by the call site), so "only the last attempt decides" is exercised directly.
+poll_seq_shape() { poll_run "$1" "$2" "$TMP/seq-$1" "" "" "" ""; }
 # expect_poll <label> <want-verdict> <want-state> <what the shape proves>
+# `calls=1` is asserted as well, deliberately: without it a shape assertion can pass
+# because NO read happened at all (the pre-initialised unreadable globals), which is the
+# vacuous form of exactly the defect this section exists to pin.
 expect_poll() {
-  if [ "$POLL_VERDICT" = "$2" ] && [ "$POLL_STATE" = "$3" ]; then
-    pass "(shape) $4 → verdict=$2 state=$3"
+  if [ "$POLL_VERDICT" = "$2" ] && [ "$POLL_STATE" = "$3" ] && [ "$POLL_CALLS" = 1 ]; then
+    pass "(shape) $4 → verdict=$2 state=$3 after 1 read"
   else
-    fail "(shape) $4 → verdict=$POLL_VERDICT state=$POLL_STATE (want $2/$3)"
+    fail "(shape) $4 → verdict=$POLL_VERDICT state=$POLL_STATE calls=$POLL_CALLS (want $2/$3 after 1 read)"
   fi
 }
 
@@ -9178,8 +9201,14 @@ expect_poll ok-open not_merged OPEN "a well-formed OPEN read"
 poll_shape ok-closed "$(printf 'CLOSED\t-')" 0
 expect_poll ok-closed not_merged CLOSED "a well-formed CLOSED read"
 
-# ⛔ EACH MALFORMED SHAPE IS ITS OWN ASSERTION. These are the guards a whole-rail
-# scenario cannot reach, and every one of them goes RED if its guard is deleted.
+# ⛔ EACH MALFORMED SHAPE IS ITS OWN ASSERTION, and each depends on a NAMED guard:
+# the four PROJECTION guards are deletion-sensitive (the `shape` mutation below reddens
+# exactly the four: missing separator, two separators, multi-line, and a non-zero exit
+# carrying plausible stdout), while the three STATE-TOKEN assertions are sensitive to the
+# guard's ANSWER rather than to its presence — removing the inner `*)` arm is unobservable
+# because the function's pre-initialised sentinels, and the final verdict case, already
+# answer `unreadable`; the `allowlist` mutation (which flips that answer to `not_merged`)
+# is what reddens them. Both directions are load-bearing; neither is claimed beyond that.
 poll_shape no-separator "MERGED" 0
 expect_poll no-separator unreadable '<unreadable>' "a bare MERGED with NO separator (the ANY-SEPARATOR trap)"
 poll_shape two-separators "$(printf 'MERGED\tx\ty')" 0
@@ -9212,6 +9241,33 @@ else
   fail "(shape) OPEN with a bound of 2 → verdict=$POLL_VERDICT calls=$POLL_CALLS attempts=$POLL_ATTEMPTS"
 fi
 
+# ⛔ A NUL CANNOT TRAVEL IN A BASH VARIABLE, so this shape needs a FILE: no `${VAR}` and no
+# `$(...)` can carry one — which is exactly the gap the read's byte-level test closes. The
+# fixture's byte count is asserted too, so the case cannot pass vacuously by losing the byte
+# it is about (9 = MER + NUL + GED + TAB + 1).
+printf 'MER\000GED\t-' > "$TMP/nul-state"
+[ "$(wc -c < "$TMP/nul-state" | tr -d ' ')" = 9 ] \
+  && pass "(shape) the NUL fixture really carries 9 bytes (MER + NUL + GED + TAB + '-')" \
+  || fail "(shape) the NUL fixture lost its NUL ($(wc -c < "$TMP/nul-state") bytes)"
+poll_file_shape nul-in-state "$TMP/nul-state" 0
+expect_poll nul-in-state unreadable '<unreadable>' "a NUL byte inside the state token (bash deletes it in \$(...), silently)"
+
+# ⛔ THE DIAGNOSTIC MUST BELONG TO THE ATTEMPT THAT DECIDED. Attempt 1 fails with a
+# transient-looking timeout; attempt 2 — the one that DECIDES — answers with an unusable
+# value and writes NOTHING to stderr. The read must report NO diagnostic rather than
+# attempt 1's text: attributing a timeout to a shape failure names the wrong cause, and the
+# two have different remedies (re-run vs. look at the producer).
+seqp="$TMP/seq-diag-decides"
+printf '%s\n' "$(printf 'PENDING\t-')" '' > "$seqp.raw"
+printf '%s\n' 'first-attempt-boom: read: operation timed out' '' > "$seqp.err"
+printf '%s\n' 0 0 > "$seqp.rc"
+poll_seq_shape diag-decides 2
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 2 ] && [ -z "$POLL_DIAG" ]; then
+  pass "(shape) the deciding attempt's EMPTY stderr is reported as NO diagnostic, not attempt 1's timeout"
+else
+  fail "(shape) diag-decides → verdict=$POLL_VERDICT calls=$POLL_CALLS diag=[$POLL_DIAG]"
+fi
+
 # ⛔ A LEADING-ZERO BOUND MUST NOT REPORT AN ARTIFACT NOBODY READ (#1690's symptom,
 # one arithmetic site over). The refusal is asserted by NAME and by CALLS=0: the
 # defect was never that the rail refused — it was that it refused while PRINTING an
@@ -9230,7 +9286,6 @@ if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 0 ] && [ "$POLL_ATTEMPT
 else
   fail "(shape) ADMIN_MERGE_VERIFY_ATTEMPTS=0 → verdict=$POLL_VERDICT calls=$POLL_CALLS"
 fi
-
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow
