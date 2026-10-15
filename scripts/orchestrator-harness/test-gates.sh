@@ -154,9 +154,22 @@ eqv "a NEWLINE-separated set is normalised too" "gate" "$(merge_authority "$(pri
 # `merge_authority` answered `rail` — the identical §5.1 bypass (rail ⇒ no fresh-context reviewer, no
 # signed record), still open. The normaliser now uses the classifier's own rule, so all three read
 # `gate`, and adding a fourth exotic separator cannot reopen the class.
-eqv "a \\x1c-joined set agrees with the classifier (Python whitespace, not POSIX)" "gate" "$(merge_authority "$(printf 'ai-review-gate\034docs')")"
-eqv "a \\x1d-joined set agrees with the classifier" "gate" "$(merge_authority "$(printf 'ai-review-gate\035docs')")"
-eqv "an NBSP-joined set agrees with the classifier (the case no `tr` set can express)" "gate" "$(merge_authority "$(printf 'ai-review-gate\302\240docs')")"
+# ⛔ round-10 review, P3: the assertions below originally drove ONLY `merge_authority`, so a
+# normaliser/classifier MISMATCH — the exact bug they exist to catch — passed them (and did). They
+# now assert BOTH readers on the same string, in both directions, and the classifier's RULE itself
+# is pinned to the shipped line so a change to either side turns one of these red.
+_CLS_RULE="want=(os.environ.get('REQ') or '').split()"
+grep -vE '^[[:space:]]*#' "$ORCH" | grep -qF -- "$_CLS_RULE" \
+  && { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); }
+_agree() { # _agree <set> -> both readers' verdicts on the SAME string
+  printf 'authority=%s classifier=%s' "$(merge_authority "${1:-}")" \
+    "$(REQ="${1:-}" python3 -c 'import os;print("required" if "ai-review-gate" in (os.environ.get("REQ") or "").split() else "not-required")')"
+}
+eqv "\\x1c: both readers agree the gate IS required (Python whitespace, not POSIX)" "authority=gate classifier=required" "$(_agree "$(printf 'ai-review-gate\034docs')")"
+eqv "\\x1d: both readers agree the gate IS required" "authority=gate classifier=required" "$(_agree "$(printf 'ai-review-gate\035docs')")"
+eqv "NBSP: both readers agree the gate IS required (the case no \`tr\` set can express)" "authority=gate classifier=required" "$(_agree "$(printf 'ai-review-gate\302\240docs')")"
+eqv "a set WITHOUT the gate: both readers agree it is NOT required (the other direction)" "authority=rail classifier=not-required" "$(_agree 'pipeline-compliance docs')"
 eqv "a whitespace-only OVERRIDE is ABSENT, not a nameless env contract (fail-closed)" "fallback" \
   "$( REQ_OVERRIDE=' '; REQ=''; REQ_SOURCE=''; resolve_required_checks daniel-ospina/readfail "$G"; printf '%s' "${REQ_SOURCE:-<EMPTY>}" )"
 eqv "a TAB-separated OVERRIDE is normalised onto the space-joined contract" "a b" \
@@ -500,6 +513,19 @@ _NG="$(grep -cF -- "$_GPAT" "$ORCH")"
 [ "${_NG:-0}" = "2" ] \
   && { echo "  ✅ every merge spawn line (${_NG} of 2) POSIX-quotes the carried REVIEW_GATE"; PASS=$((PASS+1)); } \
   || { echo "  ❌ expected 2 POSIX-quoted REVIEW_GATE carriers, found ${_NG:-0} — a worker can re-resolve under the default gate name and disagree about the authority"; FAIL=$((FAIL+1)); }
+  # ⛔ round-10 review, P2. The arm's final `else` issued a RAW `gh pr merge` for ANY authority that
+  # was not `rail` — INCLUDING `unknown`, which `_normalise_set` now returns when it cannot run. So a
+  # normaliser failure could raw-merge: the exact bypass this change exists to prevent. Drive the
+  # shipped arm with an UNKNOWN authority; it must merge nothing.
+  drive_green unknown "$_REQ7"
+  if ! grep -q -- '--squash' "$TMP/g.spy"; then
+    echo "  ✅ GREEN+unknown: NO raw merge is issued (an authority that names neither gate nor rail merges nothing)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ GREEN+unknown: a RAW merge was issued for an unknown authority — spy=[$(tr '\n' ';' < "$TMP/g.spy")]"; FAIL=$((FAIL+1))
+  fi
+  grep -q 'merge authority is' "$TMP/g.log" \
+    && { echo "  ✅ GREEN+unknown: the refusal is LOGGED, naming the authority (a silent no-op is indistinguishable from a hang)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+unknown: no refusal log line — the arm refuses silently"; FAIL=$((FAIL+1)); }
 # ⛔ ANY spelling of `printf %q`, not just `printf '%q'` (round-9 review, P3: the single-quoted
 # spelling alone let `printf %q "$1"` through). Comments are excluded (`^[^#]*`) because this file
 # DOCUMENTS the rule in prose — an unanchored match counted its own documentation as a violation.
@@ -528,17 +554,26 @@ if [ -s "$TMP/shq.sh" ]; then
   if [ -f "$TMP/PWNED" ]; then
     echo "  ❌ a control byte in a required-check name EXECUTED through the spawn shape — the carried contract is injectable under /bin/sh"; FAIL=$((FAIL+1))
   elif [ "$(cat "$TMP/shq-got" 2>/dev/null)" = "$_PAY" ]; then
-    echo "  ✅ a quote + control-byte name survives a POSIX sh -c WHOLE and executes nothing (shell=${_DKIND:-?} at ${_DSH})"; PASS=$((PASS+1))
-    # A bash sh does NOT prove the POSIX property — it accepts what dash rejects. Say so; the
-    # always-on guarantee is the broadened `printf %q`-absence pin below, which needs no shell.
-    [ "${_DKIND:-}" = "bash" ] && echo "  ⊘ note: POSIX-sh safety itself was NOT exercised here — this box's sh is bash (it accepts \$'…'), so a \$'…'-based quoter would still pass. CI's ubuntu runner is dash."
+    if [ "${_DKIND:-}" = "bash" ]; then
+      # ⛔ A SKIP IS NOT A PASS (round-10 review, P3). bash ACCEPTS `$'…'`, so it cannot discriminate
+      # a dash-unsafe quoter — and counting this green is exactly what let a `printf %q` quoter pass
+      # this suite on macOS. The always-on guarantee is the `printf %q`-absence pin below.
+      echo "  ⊘ POSIX-sh injection drive SKIPPED — this box's sh is bash, which accepts \$'…' and so cannot discriminate a dash-unsafe quoter; CI's ubuntu sh is dash. (The `printf %q`-absence pin below still applies.)"
+    else
+      echo "  ✅ a quote + control-byte name survives a POSIX sh -c WHOLE and executes nothing (shell=${_DKIND:-?} at ${_DSH})"; PASS=$((PASS+1))
+    fi
   else
     echo "  ❌ the payload was mangled by the shipped shq (got [$(cat "$TMP/shq-got" 2>/dev/null | od -c | head -2 | tr '\n' ' ')])"; FAIL=$((FAIL+1))
   fi
 else
   echo "  ❌ shq() could not be extracted from orch-loop.sh — the injection drive did NOT run (a skipped check is not a pass)"; FAIL=$((FAIL+1))
 fi
-_QPCT="$(grep -cE '^[^#]*printf[[:space:]]+.?%q' "$ORCH")"
+# ⛔ ANY spelling of `printf %q` ANYWHERE after `printf` on a non-comment line. The previous form
+# required `%q` to sit one character after `printf`'s whitespace, so `printf -- '%q'`, `printf "%q"`
+# and `printf 'REQ=%q'` all passed it (round-10 review, P3 — "any spelling" was false).
+# Full-line comments are stripped first because this file DOCUMENTS the rule in prose — an
+# unanchored match counted its own documentation as a violation.
+_QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -cE 'printf.*%q')"
 [ "${_QPCT:-0}" = "0" ] \
   && { echo "  ✅ no \`printf %q\` site remains in orch-loop.sh (any spelling; its \`\$'…'\` output is not POSIX quoting)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ ${_QPCT} \`printf %q\` site(s) remain in orch-loop.sh — dash re-parses that value as commands"; FAIL=$((FAIL+1)); }
@@ -547,6 +582,13 @@ _QPCT="$(grep -cE '^[^#]*printf[[:space:]]+.?%q' "$ORCH")"
 # without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE
 # the classifier (a guard moved after the arms guards nothing).
 _au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
+# ⛔ round-10 review, P2: the DERIVATION ignored MERGE_AUTHORITY, so an authority of `unknown`
+# (which `_normalise_set` now returns when it cannot run) left AUTHORITY_UNKNOWN=0 and fell through
+# to the merge arms — where the GREEN arm's old bare `else` issued a RAW merge. Pin the clause in
+# non-comment code only, so a comment mention cannot satisfy it.
+grep -vE '^[[:space:]]*#' "$ORCH" | grep -qF -- '[ "${MERGE_AUTHORITY:-}" = "unknown" ]' \
+  && { echo "  ✅ the AUTHORITY_UNKNOWN derivation ALSO trips on an unknown MERGE_AUTHORITY (not only on REQ/fallback)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the derivation ignores MERGE_AUTHORITY — an unreadable authority is not treated as unknown, so the merge arms run on it"; FAIL=$((FAIL+1)); }
 _au_ln="$(grep -nF -- "$_au_expr" "$ORCH" | head -1 | cut -d: -f1)"
 _cls_ln="$(grep -nF 'V="$(gh pr checks' "$ORCH" | head -1 | cut -d: -f1)"
 if [ -n "$_au_ln" ] && [ -n "$_cls_ln" ] && [ "$_au_ln" -lt "$_cls_ln" ]; then

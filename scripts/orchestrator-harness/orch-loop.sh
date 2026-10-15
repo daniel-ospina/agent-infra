@@ -678,7 +678,7 @@ while true; do
   MERGE_AUTHORITY="$(merge_authority "$REQ")"
   # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
   # to read as `rail` and silently reroute a gate repo — unknown refuses, exactly like fallback.
-  if [ -z "${REQ:-}" ] || [ "${REQ_SOURCE:-}" = "fallback" ]; then
+  if [ -z "${REQ:-}" ] || [ "${REQ_SOURCE:-}" = "fallback" ] || [ "${MERGE_AUTHORITY:-}" = "unknown" ]; then
     AUTHORITY_UNKNOWN=1
   else
     AUTHORITY_UNKNOWN=0
@@ -991,8 +991,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
             fi
           fi
-        else
+        elif [ "$MERGE_AUTHORITY" = "gate" ]; then
+          # ⛔ EXPLICIT `gate` ONLY (round-10 review, P2). This arm used to be a bare `else`, so
+          # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
+          # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
+          # happens only on an authority that NAMES the gate.
           gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
+        else
+          echo "#$PR GREEN but the merge authority is '${MERGE_AUTHORITY:-<unset>}' — NO merge (fail-closed: only an explicit 'gate' or 'rail' authority may merge)" >>"$LOG"
         fi ;;
       PENDING:*)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true

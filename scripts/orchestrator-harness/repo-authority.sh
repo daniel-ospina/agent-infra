@@ -96,8 +96,16 @@ _normalise_set() {
   [ -n "$py" ] || return 1
   printf '%s' "${1:-}" | "$py" -c '
 import sys
-d = sys.stdin.buffer.read().decode("utf-8", "surrogateescape")
-sys.stdout.buffer.write(" ".join(d.split()).encode("utf-8", "surrogateescape"))
+# ⛔ DECODE EXACTLY AS THE CLASSIFIER DOES (round-10 review, P2). The classifier reads
+# os.environ["REQ"], which Python decodes with the FILESYSTEM encoding — NOT utf-8. Hard-coding
+# utf-8 made the two definitions differ on a host whose filesystem encoding is single-byte:
+# measured under a localedef ISO-8859-1 locale, a lone 0xA0 decoded to NBSP for the classifier
+# (whitespace, so it SPLIT and enforced the gate) and to a surrogate here (not whitespace, so it
+# did not, and merge_authority answered `rail`) — the same §5.1 bypass, one environment away.
+enc = sys.getfilesystemencoding() or "utf-8"
+err = sys.getfilesystemencodeerrors() or "surrogateescape"
+d = sys.stdin.buffer.read().decode(enc, err)
+sys.stdout.buffer.write(" ".join(d.split()).encode(enc, err))
 ' 2>/dev/null || return 1
 }
 
