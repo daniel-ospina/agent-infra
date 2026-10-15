@@ -261,8 +261,17 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   # a later push re-arms it; the SAME head is retried at most RAIL_TRIES times so a permanently
   # blocked PR is not re-analysed every cycle — the API burn #1764 reports. At the cap the head is
   # PARKED, which the sweep already honours (`parked-$PR` == the current head).
-  if ! is_limit "${RAIL_TRIES:-3}"; then
-    echo "[merge $PR] RAIL_TRIES='${RAIL_TRIES:-}' is not an integer in range — using 3" >> "$L.log"
+  # ⚠️ review round 5 — P1: `RAIL_TRIES` must be DEFAULTED, not merely tested. The guard below
+  # only assigns it in the INVALID branch, so with the variable unset (the production default:
+  # nothing in install.sh, the launchd plist, the README or a cell keys.env sets it) lines 276
+  # and 294 expanded it bare under `set -u` and the worker died `unbound variable` BEFORE
+  # `bash "$RAIL"` was ever reached — rail mode was dead on arrival, no agent-infra PR could
+  # drain, the retry cap could never park, and the sweep re-spawned a worker every cycle. That
+  # is #1764's own deadlock, reintroduced on the new path. The default is assigned HERE so every
+  # later expansion is safe.
+  RAIL_TRIES="${RAIL_TRIES:-3}"
+  if ! is_limit "$RAIL_TRIES"; then
+    echo "[merge $PR] RAIL_TRIES='$RAIL_TRIES' is not an integer in range — using 3" >> "$L.log"
     RAIL_TRIES=3
   fi
   RC_F="$O/state/railcount-$PR"; RC_H=""; RC_N=0

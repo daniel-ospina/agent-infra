@@ -206,6 +206,11 @@ else
 fi
 wpin "merge-one.sh runs the repo's rail, not a raw merge" "$MERGE" 'bash "$RAIL" "$PR" --repo "$OR" -- --squash'
 
+# RAIL_TRIES is deliberately NOT set here (review round 5, P1): the drive used to supply it, so
+# the suite could not tell a shipped script that DEFAULTS it from one that expands it bare under
+# `set -u`. With it unset — the production default, since nothing in install.sh, the launchd plist,
+# the README or a cell keys.env sets it — the shipped text died `unbound variable` at the cap
+# comparison and the park was never written, i.e. rail mode was dead and the spawn loop reopened.
 # (g) the rail park is REFRESHED on a head change — BEHAVIOURAL (review P1, round 1). The guarded
 # write left a PREVIOUS head's park in place forever: a new head reached the cap, saw the stale
 # file, never recorded itself, and exit 0'd — so the sweep (which honours a park only when its
@@ -218,12 +223,26 @@ chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
 printf '%s %s\n' bbbb2222 3 > "$TMP/railO/state/railcount-1764"
 printf '%s\n' aaaa1111  > "$TMP/railO/state/parked-1764"                  # a STALE park, older head
 ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
-  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=bbbb2222; RAIL_TRIES=3; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=bbbb2222; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; prc=$?
 _parked="$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)"
 [ "$prc" = "0" ] && [ "$_parked" = "bbbb2222" ] \
   && { echo "  ✅ the rail park is REFRESHED on a head change (a stale older-head park cannot block it)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ rail park not refreshed: rc=$prc parked=[$_parked] (expected bbbb2222 — the stale aaaa1111 park survived the cap, so the spawn loop reopens)"; FAIL=$((FAIL+1)); }
+
+# (g2) the rail is ACTUALLY INVOKED with RAIL_TRIES UNSET — the exact line (and only line) the
+# round-5 P1 made unreachable: the worker died `unbound variable` at the cap comparison, so
+# `bash "$RAIL"` was never reached and no rail-mode PR could ever merge. A fresh head with a rail
+# that SUCCEEDS must reach it and record the merge; a text pin on that line proves nothing.
+rm -f "$TMP/railO/state/railcount-1764" "$TMP/railO/state/merged-1764.done"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/railrepo/scripts/admin-merge.sh"   # a rail that SUCCEEDS
+chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=cccc3333; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; src2=$?
+[ "$src2" = "0" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
+  && { echo "  ✅ the rail IS invoked with RAIL_TRIES unset (the merge is recorded — rail mode is reachable)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the rail was never invoked (rc=$src2, merged-marker=$([ -f "$TMP/railO/state/merged-1764.done" ] && echo yes || echo no)) — rail mode is DEAD, exactly the #1764 deadlock)"; FAIL=$((FAIL+1)); }
 
 # (h) the controller's GREEN arm dispatches the rail — BEHAVIOURAL (review P2, round 1): the
 # 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
@@ -528,7 +547,7 @@ fi
 # an outage — but a silent flip from `rail` to `gate` re-enables the raw merge this branch exists
 # to prevent, and REQ/REVIEW_GATE are read from the environment (a cloud cell sources keys.env
 # with `set -a`). Drive the shipped block: a disagreeing override warns, an agreeing one does not.
-sed -n '/^  if \[ "\${REQ_SOURCE:-}" = "env" \]; then$/,/^  fi$/p' "$ORCH" > "$TMP/ovr.sh"
+sed -n '/^  if \[ "\${REQ_SOURCE:-}" = "env" \] ||/,/^  fi$/p' "$ORCH" > "$TMP/ovr.sh"
 if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
   _ovr() { # <own-set> <authority> <override-set> -> prints the log
     ( OR=daniel-ospina/agent-infra; LOG="$TMP/ovr.log"; : > "$LOG"; REQ_SOURCE=env; REQ="$3"
@@ -546,6 +565,42 @@ if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
     *"CHANGES the merge authority"*) echo "  ❌ an override that AGREES with the repo's declaration drew a false change warning"; FAIL=$((FAIL+1)) ;;
     *) echo "  ✅ an override that agrees with the repo's own declaration warns about nothing"; PASS=$((PASS+1)) ;;
   esac
+  # ⚠️ review round 5: a REVIEW_GATE override moves the authority AND the classifier's gate_ok onto
+  # a different name, and it is read from the environment the same way REQ is — so the detector must
+  # not be gated on REQ_SOURCE alone (a `set -a`-exported REVIEW_GATE would flip the authority with
+  # no log line at all). REVIEW_GATE_SOURCE is what carries that fact out of repo-authority.sh.
+  _o3="$(REVIEW_GATE_SOURCE=env; OR=daniel-ospina/tortoise; LOG="$TMP/ovr3.log"; : > "$LOG"; REQ_SOURCE=protection; REQ="ai-review-gate docs"; \
+    MERGE_AUTHORITY='rail'; required_checks() { printf '%s\n' 'ai-review-gate docs'; }; \
+    # shellcheck disable=SC1090
+    . "$TMP/ovr.sh" >/dev/null 2>&1; cat "$LOG")"
+  case "$_o3" in
+    *"CHANGES the merge authority"*) echo "  ✅ a REVIEW_GATE override is detected even when the required set came from protection"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a REVIEW_GATE override flipped the authority silently (REQ_SOURCE=protection) — log=[$_o3]"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (t) a MALFORMED override is discarded, loudly, and never travels the contract (review round 5).
+  # The screen lived only in required_checks, so an override skipped it: `REQ='ci,lint'` reached the
+  # classifier as a comma-joined RED set, split there, and a red required check matched no worker at
+  # all — silently. Discarding (rather than merely refusing) is what keeps the authority-unknown
+  # refusal armed, since that refusal keys on REQ_OVERRIDE being EMPTY.
+  _og="$TMP/ovr-gh"; printf '#!/bin/bash\ncase "$*" in *required_status_checks*) printf "pipeline-compliance\\n" ;; *) exit 1 ;; esac\n' > "$_og"; chmod +x "$_og"
+  REQ_OVERRIDE='ci,lint'; REQ=''; REQ_SOURCE=''
+  # ⛔ called DIRECTLY, never in `$( )`: a command substitution runs the resolver in a subshell and
+  # REQ/REQ_SOURCE cannot survive it — the exact trap this branch exists to close (and the trap this
+  # assertion fell into the first time it was written).
+  resolve_required_checks daniel-ospina/agent-infra "$_og" 2>"$TMP/ov.err"
+  _ov_req="$REQ"; _ov_src="${REQ_SOURCE:-}"; _ov_kept="${REQ_OVERRIDE:-}"
+  if [ "$_ov_req" = "pipeline-compliance" ] && [ "$_ov_src" = "protection" ] && [ -z "$_ov_kept" ] \
+     && grep -q 'contains a comma' "$TMP/ov.err" 2>/dev/null; then
+    echo "  ✅ a comma-bearing REQ override is discarded loudly and the repo's own declaration is used"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a malformed override leaked through: REQ=[$_ov_req] source=[$_ov_src] override-left=[$_ov_kept] err=[$(cat "$TMP/ov.err" 2>/dev/null)]"; FAIL=$((FAIL+1))
+  fi
+  REQ_OVERRIDE='ci,lint'; REQ=''; REQ_SOURCE=''
+  resolve_required_checks daniel-ospina/agent-infra /nonexistent-gh 2>/dev/null
+  [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ] \
+    && { echo "  ✅ …and with the read ALSO failing it lands on the fallback with the override EMPTY (so every caller still REFUSES) — not on a non-empty override that would defeat the refusal"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ a discarded override still defeated the refusal: source=[${REQ_SOURCE:-?}] override-left=[${REQ_OVERRIDE:-}] REQ=[$REQ]"; FAIL=$((FAIL+1)); }
+  REQ_OVERRIDE=''
 else
   echo "  ❌ could not extract the override-authority warning from orch-loop.sh"; FAIL=$((FAIL+1))
 fi

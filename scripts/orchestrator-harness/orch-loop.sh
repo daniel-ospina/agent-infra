@@ -587,16 +587,18 @@ while true; do
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
   echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $([ "$MERGE_AUTHORITY" = gate ] && printf 'IS required' || printf 'is NOT required'))" >>"$LOG"
-  # ⚠️ review round 4: REQ_OVERRIDE is a deliberate operator escape hatch (documented in README),
-  # and REQ/REVIEW_GATE are read from the environment — which a cloud cell sources with `set -a`,
-  # so a stray export could set REQ. An override that CHANGES the authority away from the repo's
-  # own declaration would silently re-enable the raw merge this whole change exists to prevent on
-  # a rail repo. The override still wins (it is how a contract is pinned during an outage), but
-  # the flip is never silent: re-read the repo's own declaration and shout when they disagree.
-  if [ "${REQ_SOURCE:-}" = "env" ]; then
+  # ⚠️ review rounds 4-5: REQ_OVERRIDE is a deliberate operator escape hatch (documented in
+  # README), and REQ/REVIEW_GATE are read from the environment — which a cloud cell sources with
+  # `set -a`, so a stray export reaches here. An override that CHANGES the authority away from
+  # the repo's own declaration would silently re-enable the raw merge this whole change exists to
+  # prevent on a rail repo; a REVIEW_GATE override does the same AND moves the classifier's
+  # gate_ok onto a different name. The override still wins (it is how a contract is pinned during
+  # an outage), but the flip is never silent: re-read the repo's own declaration and shout when
+  # the two disagree.
+  if [ "${REQ_SOURCE:-}" = "env" ] || [ "${REVIEW_GATE_SOURCE:-default}" = "env" ]; then
     _own_auth="$(merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
     if [ "$_own_auth" != "unknown" ] && [ "$_own_auth" != "$MERGE_AUTHORITY" ]; then
-      echo "[authority] ⚠️ $OR: the REQ override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; override REQ='$REQ') — the override wins, but verify it is intended" >>"$LOG"
+      echo "[authority] ⚠️ $OR: an operator override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; REQ='$REQ' REQ_SOURCE=${REQ_SOURCE:-?} REVIEW_GATE='$REVIEW_GATE' REVIEW_GATE_SOURCE=${REVIEW_GATE_SOURCE:-default}) — the override wins, but verify it is intended" >>"$LOG"
     fi
   fi
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED

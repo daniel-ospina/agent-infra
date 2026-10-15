@@ -36,13 +36,50 @@
 #   3. A rail-managed repo whose rail is missing REFUSES; it never degrades to `gh pr merge`.
 set -u
 
-# The review-gate check NAME is itself repo-dependent (tortoise: `ai-review-gate`).
+# The review-gate check NAME is itself repo-dependent (tortoise: `ai-review-gate`). Record whether
+# it came from the environment (review round 5): a REVIEW_GATE that overrides the default moves the
+# merge authority — and the classifier's gate_ok — onto a different name. That is sometimes
+# intended (a repo with a differently-named gate), but it must never be SILENT, exactly like an
+# authority-changing REQ override: it is read from the environment, and a cloud cell sources
+# keys.env with `set -a`, so a stray export reaches here. REVIEW_GATE_SOURCE is what lets the
+# controller's warning fire for this case too.
+REVIEW_GATE_SOURCE="default"
+if [ -n "${REVIEW_GATE:-}" ] && [ "$REVIEW_GATE" != "ai-review-gate" ]; then REVIEW_GATE_SOURCE="env"; fi
 REVIEW_GATE="${REVIEW_GATE:-ai-review-gate}"
 
 # LAST-RESORT ONLY, and the one place the pre-#1764 constant still lives — as the documented
 # fallback for a repo whose protection cannot be read (see the header). It is NOT a default, and
 # it never overrides a successful read or an explicit REQ.
 FALLBACK_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+
+# _unrepresentable <owner/repo> <newline-delimited names> — rc 1 (loud) if any NAME carries
+# whitespace or a comma.
+# ⚠️ GitHub allows both in a context name (`ci / lint`, `a,b`), but neither can travel this
+# contract: the set is SPACE-joined (the classifier splits on whitespace) and the RED set the
+# controller derives is COMMA-joined (the FAILED arm splits on commas), so such a name silently
+# becomes two names — the PR sits PENDING forever or misroutes to the wrong arm, with nothing
+# logged (review rounds 3-4). The test is PER NAME, on the raw newline-delimited lines.
+# Supporting such names end-to-end (bash splits, the python split, case matching) is a redesign;
+# REFUSING loudly is the fail-closed answer: this counts as a FAILED read, so the fallback
+# applies and the sweep — and every merge worker — refuses to act on a contract it cannot
+# represent.
+_unrepresentable() {
+  grep -Eq '[[:space:],]' <<<"${2:-}" || return 0
+  printf 'repo-authority: %s: a required context name contains whitespace or a comma [%s] — the space-joined contract (and the comma-joined RED list) cannot represent it; treating the read as FAILED (fail-closed)\n' "${1:-}" "$(grep -E '[[:space:],]' <<<"${2:-}" | tr '\n' ' ')" >&2
+  return 1
+}
+
+# _override_usable <owner/repo> <space-joined REQ_OVERRIDE> — rc 1 (loud) if the override carries
+# a comma (review round 5). The override is itself SPACE-separated, so a name containing a space
+# is indistinguishable from two names there and cannot be screened; the comma IS detectable and is
+# the destructive one, because it splits the comma-joined RED list — a red required check then
+# reaches no worker at all. An unusable override is discarded by the resolvers, which fall through
+# to the repo's own declaration (and, if that read also fails, to the refusal).
+_override_usable() {
+  grep -q ',' <<<"${2:-}" || return 0
+  printf 'repo-authority: %s: the REQ override [%s] contains a comma — the comma-joined RED list cannot represent it, so the override is IGNORED (fail-closed: the repo declaration is used instead, or every caller refuses)\n' "${1:-}" "${2:-}" >&2
+  return 1
+}
 
 # required_checks <owner/repo> [<gh-binary>]
 # Print the repo's required status-check contexts, space-separated, once each.
@@ -55,20 +92,7 @@ required_checks() {
   raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || return 1
   # De-duplicate and join on one line: the classifier splits on whitespace, and a newline would
   # otherwise reach it as part of the value rather than as a separator.
-  # ⚠️ A context whose NAME contains whitespace or a comma (GitHub allows both: `ci / lint`,
-  # `a,b`) cannot travel this contract. The set is SPACE-joined (the classifier splits on
-  # whitespace) and the RED set the controller derives is COMMA-joined (the FAILED arm splits on
-  # commas), so either character inside a name silently becomes two names — the PR sits PENDING
-  # forever or misroutes to the wrong arm, with nothing logged (review rounds 3-4). The test is
-  # PER NAME, on the raw newline-delimited lines — a line containing whitespace or a comma is an
-  # unrepresentable name. Supporting such names end-to-end (bash splits, the python split, case
-  # matching) is a redesign; REFUSING loudly is the fail-closed answer: this counts as a FAILED
-  # read, so the fallback applies and the sweep — and every merge worker — refuses to act on a
-  # contract it cannot represent.
-  if grep -Eq '[[:space:],]' <<<"$raw"; then
-    printf 'repo-authority: %s: a required context name contains whitespace or a comma [%s] — the space-joined contract (and the comma-joined RED list) cannot represent it; treating the read as FAILED (fail-closed)\n' "$or" "$(grep -E '[[:space:],]' <<<"$raw" | tr '\n' ' ')" >&2
-    return 1
-  fi
+  _unrepresentable "$or" "$raw" || return 1
   joined="$(printf '%s\n' "$raw" | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
   joined="${joined% }"
   [ -n "$joined" ] || return 1
@@ -86,9 +110,15 @@ required_checks() {
 effective_required_checks() {
   local or="${1:-}" gh="${2:-gh}" req
   if [ -n "${REQ_OVERRIDE:-}" ]; then
-    REQ_SOURCE=env
-    printf '%s\n' "$REQ_OVERRIDE"
-    return 0
+    if _override_usable "$or" "$REQ_OVERRIDE"; then
+      REQ_SOURCE=env
+      printf '%s\n' "$REQ_OVERRIDE"
+      return 0
+    fi
+    # ⚠️ review round 5: a malformed override is DISCARDED (loudly) rather than refused, because
+    # leaving it set defeats the authority-unknown refusal (that refusal keys on REQ_OVERRIDE
+    # being EMPTY). Discarding falls through to the repo's own declaration — the safe answer.
+    REQ_OVERRIDE=""
   fi
   if req="$(required_checks "$or" "$gh")"; then
     REQ_SOURCE=protection
@@ -107,7 +137,10 @@ effective_required_checks() {
 # never fire. This wrapper performs the same three-way resolution in the current shell, where
 # both globals land.
 resolve_required_checks() {
-  if [ -n "${REQ_OVERRIDE:-}" ]; then REQ="$REQ_OVERRIDE"; REQ_SOURCE=env; return 0; fi
+  if [ -n "${REQ_OVERRIDE:-}" ]; then
+    if _override_usable "$1" "${REQ_OVERRIDE:-}"; then REQ="$REQ_OVERRIDE"; REQ_SOURCE=env; return 0; fi
+    REQ_OVERRIDE=""  # malformed: discard (loudly) and use the repo's own declaration — see above
+  fi
   if REQ="$(required_checks "$1" "${2:-gh}")"; then REQ_SOURCE=protection; return 0; fi
   REQ="$FALLBACK_REQ"; REQ_SOURCE=fallback; return 0
 }
