@@ -16,6 +16,25 @@ else
   REPO="$1"; OR="$2"; PR="$3"; BR="$4"
 fi
 case "${PR:-}" in ''|*[!0-9]*) echo "[merge] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
+# Guard-before-use for env tunables. Every OTHER limit in this file is validated before it is
+# used; `REVIEW_TIMEOUT` was the lone exception and it fed ARITHMETIC (P1, 2026-10-14 adversarial
+# review — see the coercion note at the claim block).
+# ⛔ REJECT LEADING ZEROS (P2, second review round, 2026-10-14): the first fix used
+# `''|*[!0-9]*`, which ACCEPTS `08` — so `CLAIM_LEASE=$(( 08 + 1200 ))` still reached the arithmetic.
+# On /bin/bash 3.2.57 `$(( ))` parses base 0, where a leading 0 means OCTAL, and `08`/`09` are not
+# octal; the failed assignment ABORTS the rest of the enclosing `if` body and resumes after `fi`
+# with status 0, so claim_acquire never ran and the worker reported success. Accept only `0` or
+# `[1-9][0-9]*`.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
+# accepted `9223372036854775807`; `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))` then wrapped NEGATIVE,
+# `claims.sh`'s `until=$(( now + ttl ))` was negative, `_lease_of`'s `[0-9]*` could not parse the minus
+# sign, and an unparseable lease is read as LIVE — so that PR/head was frozen across ALL boxes with
+# no automatic recovery (`claim_prune` can never reap it). FAIL-CLOSED, the opposite of the design's
+# fail-open policy. `is_limit` (is_num AND at most 9 digits) is the predicate orch-loop.sh applies to
+# every other tunable for exactly this reason, and 9 digits cannot overflow the sum below.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+KIND=reviewer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
@@ -30,25 +49,44 @@ cd "$REPO" || exit 1
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
-  echo "[timeout] agent pid=$pid wall_limit=${t}s rc=$rc" >> "$log"
+  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
+  # reviewer wall-time — the load-bearing number for fleet capacity (it was unmeasured).
+  elapsed=$(( $(date +%s) - start ))
+  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
+  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
+  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
+  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
+  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
+  mkdir -p "$O/state"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
   return "$rc"
 }
 git fetch origin "$BR" --quiet 2>/dev/null || true   # external (other-machine) branches may not be fetched locally
 
-# ── single-owner claim ────────────────────────────────────────────────────────
+# HEAD is resolved BEFORE the claim: the cross-box claim key is <PR>-<head-sha12> (claim_key()
+# truncates the sha to 12), not <PR>
+# (agent-infra#1709 rec 1). It is also the key record-review/needsfix already use.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+
+# ── single-owner claim: local lock, then the cross-box git-ref claim ──────────
 # Three paths reach this script: chain-<N> (waits for a lane's PR), fix-<PR>, and the
 # controller's merge sweep. Only the last two are visible to the controller by session name,
 # so without a shared claim a freshly opened PR gets TWO concurrent reviewers racing the same
 # head: duplicate evidence comments, duplicate record-review writes, and an
 # ISSUES/CLEAN interleaving where one worker's needsfix marker lands after the other merged.
 # Atomic noclobber create is the lock; the controller also tests this file.
+# ⛔ THE LOCK MUST BE TAKEN BEFORE THE LOG IS TRUNCATED. The loser below appends its refusal to
+# the winner's log; if the truncation ran first, the loser would wipe the live worker's log (and
+# the "cross-box claim: acquired …" evidence this ordering exists to protect) on its way to
+# discovering it does not own the PR. (P2, 2026-10-14 review round.)
 CLAIM="$O/state/mergeclaim-$PR.lock"
 claim() { ( set -o noclobber; echo $$ > "$CLAIM" ) 2>/dev/null; }
 if ! claim; then
@@ -67,8 +105,105 @@ trap 'exit 143' TERM
 trap 'exit 130' INT
 trap 'rm -f "$CLAIM"' EXIT
 
-HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# The log is TRUNCATED here — AFTER the local lock, so a losing duplicate never touches it, and
+# BEFORE any cross-box claim evidence is appended, so the "cross-box claim: acquired …" line
+# survives. Truncating at the end of the claim block silently deleted that evidence on every run.
 echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
+
+# ── cross-box claim (agent-infra#1709 recs 1-3) ───────────────────────────────
+# The noclobber lock above is atomic on ONE box only: three boxes driving this repo are three
+# independent filesystems, so it stops nothing between them. The boxes share exactly one
+# durable store — the repository — and creating a ref with `git push` is an atomic CAS.
+#
+# FAIL-OPEN, ON PURPOSE. If the claim store is unreachable (network blip, a rejected push for
+# an unrelated reason) we proceed and SAY SO in the log. #1709's headline finding is that
+# no mechanism guarantees two machines never run the same job, so the design must tolerate
+# duplicates: every side effect on this path is idempotent per head (one evidence comment, a
+# record-review marker keyed on $HEAD, and `gh pr merge` twice is a no-op). Failing CLOSED
+# would stall the whole fleet on one transient error — the strictly worse failure. The log
+# line makes the fallback visible rather than silent.
+CROSS_OWN=""
+CROSS_RC=0
+
+# Release the cross-box claim, BOUNDED to ~20s. `claim_release` is one network push and a
+# black-holed connection can hang for minutes; this runs on the EXIT path, so it must not hold the
+# process open (P3, 2026-10-14 adversarial review). Returns claim_release's status (1 = nothing to
+# release), so a caller can tell a fenced release from a refusal.
+# ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
+# release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the fenced
+# push leaves the ref intact, and every box then refuses that head until the lease expires (up to
+# REVIEW_TIMEOUT+1200 = 50 min). That is accepted because the alternative is strictly worse: an
+# UNBOUNDED exit path (and, before the ordering fix above, one that dropped the local lock FIRST)
+# lets the controller spawn a second worker for the same head. DO NOT remove the bound — the
+# ordering defect it fixes is real. A future improvement is to move the release OFF the exit path
+# (a detached retry), not to wait longer here.
+release_claim_bounded() {
+  local p w rc
+  [ -n "${CROSS_OWN:-}" ] || return 1
+  claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1 &
+  p=$!
+  ( sleep 20; kill -TERM "$p" 2>/dev/null; sleep 5; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  return "$rc"
+}
+
+# ⛔ Coerce REVIEW_TIMEOUT BEFORE the arithmetic below (P1, 2026-10-14 adversarial review). On
+# /bin/bash 3.2.57 — what the launchd plist invokes — a FAILED arithmetic assignment aborts the
+# remainder of the enclosing `if` body and resumes after `fi` with status 0. Reproduced with the
+# real merge-one.sh and REVIEW_TIMEOUT=30m: `CLAIM_LEASE=$(( 30m + 1200 ))` aborted the claim block,
+# claim_acquire was NEVER called, the log carried NO "cross-box claim" line at all, and the worker
+# still reported success. The trigger is plausible because `30m`/`1800s` are VALID for `sleep`, so
+# the operator's intended timeout works while the claim silently vanishes. Coerce rather than
+# reject: a bad tunable must not cost the fleet its cross-box safety.
+if ! is_limit "${REVIEW_TIMEOUT:-1800}"; then
+  echo "[merge $PR] REVIEW_TIMEOUT='${REVIEW_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 1800 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
+  REVIEW_TIMEOUT=1800
+fi
+
+if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$O/claims.sh"
+  # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
+  # the duplicate work this exists to prevent: REVIEW_TIMEOUT (default 1800) + the 30x30s gate
+  # wait below (900) + the merge itself. Derived, not a bare constant — and passed explicitly,
+  # because sourcing claims.sh above sets CLAIM_TTL=1800 and would silently win over a default.
+  # Overflow-safe by construction: the guard above leaves REVIEW_TIMEOUT <= 999999999, so this sum
+  # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
+  # that skips this guard still cannot mint a lease the reader is unable to parse.
+  CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+  claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
+  CROSS_RC=$?
+  case "$CROSS_RC" in
+    0) CROSS_OWN="$CLAIM_COMMIT"
+       echo "[merge $PR] cross-box claim: $CLAIM_RESULT" >> "$L.log" ;;
+    1) echo "[merge $PR] cross-box claim REFUSED: $CLAIM_RESULT — another box owns head $HEAD; exiting" >> "$L.log"
+       rm -f "$CLAIM"; exit 0 ;;
+    *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log"
+       # P2 (2026-10-14 adversarial review): the CREATE path can SUCCEED on the remote and fail only
+       # the read-back. claims.sh surfaces the commit it pushed; release it, fenced, so the PR is not
+       # stalled fleet-wide until the lease expires (up to REVIEW_TIMEOUT+1200 = 50 min of every box
+       # refusing to review it). CROSS_OWN stays set only when this fenced release FAILS, so the EXIT
+       # trap retries it.
+       if [ -n "${CLAIM_COMMIT:-}" ]; then
+         CROSS_OWN="$CLAIM_COMMIT"
+         if release_claim_bounded; then
+           CROSS_OWN=""
+           echo "[merge $PR] cross-box claim: released the orphaned claim commit ${CLAIM_COMMIT:0:12} after the read-back failure" >> "$L.log"
+         else
+           echo "[merge $PR] cross-box claim: could not release the orphaned commit ${CLAIM_COMMIT:0:12} — the EXIT trap will retry" >> "$L.log"
+         fi
+       fi ;;
+  esac
+fi
+# agent-infra's TERM/INT handlers above only TERMINATE (the #1715 fix); each `exit` runs this
+# EXIT trap, so the cross-box release folds in here rather than into a returning handler.
+# ⛔ ORDER (P3, 2026-10-14 adversarial review): the release runs FIRST and is BOUNDED. The old trap
+# did `rm -f "$CLAIM"` first and then an UNTIMED `claim_release` push — a black-holed connection hung
+# the exit path for minutes with the local pid lock already gone, so the controller could spawn a
+# second worker for the same PR. Release first, drop the lock last.
+trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
 
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF
