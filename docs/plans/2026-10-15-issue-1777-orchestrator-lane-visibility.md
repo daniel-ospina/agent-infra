@@ -196,9 +196,17 @@ L8 snapshot drift (≠3 fields) ⇒ unreadable · L9 snapshot empty (0 bytes) �
 `selftest.sh:893` extraction technique) to produce real messages and assert the Python parser agrees
 across {future, past, `0`, `-5`, 19-digit, non-digit, absent} · L11 reader emits no state (no
 `STATES`/verdict names in `__all__`) · L12 local refs are never read (a bogus local ref beside an empty
-origin still reads absent) · L13 output hygiene (hostile owner string neutralized) · L14 per-repo
+origin still reads absent) · L13 output hygiene (hostile owner string neutralized in the text
+rendering **and** in the JSON verdict `detail`/`witnesses`, the path a downstream consumer may
+re-render) · L14 per-repo
 binding: cwd repo ≠ target repo ⇒ reads the target · L15 multi-claim precedence: the cascade is total
-and mutually exclusive.
+and mutually exclusive · L16 the PR is bound from the **match**, never the `ls-remote` order ·
+L17 a short `--sha` is a **prefix union**, so a decoy cannot consume the query · L18 two PRs on one
+head sha return **every** match, order-independently · L19 CLI usage exits 2 and FILE mode reads a
+snapshot end-to-end · L20 the default output is the TEXT report and declares the coverage gap ·
+L21 a relative `origin` resolves to ONE absolute target, from any cwd · L22 a credential in the
+remote URL never reaches `source`, text or JSON · L23 the mutation harness cannot read a
+non-running test as "caught".
 
 ### `tools/fleet/lane_liveness.test.py` — DISCLOSURE leg + mutation
 
@@ -297,7 +305,7 @@ fixed and pinned, so **B10 is a class, not a single input**:
 ⚠️ **BOUND REACHED — disclosed, not glossed.** The adversarial bound is **2 cycles**, and both were
 spent (`[ADVERSARIAL-BOUND] cycles=2 threats=10 covered=10 residuals=none`). The cycle-2 fixes were
 not re-reviewed by a third fresh reviewer; what stands behind them instead is that each is pinned by a
-mutation-proven test (23 mutations, all RED-required) plus green suites. Any third-party doubt about
+mutation-proven test (24 mutations, all RED-required) plus green suites. Any third-party doubt about
 `_select` should be directed at L16–L18 rather than at this prose.
 
 ---
@@ -323,7 +331,7 @@ weight is zero).
 ## 6. Acceptance criteria
 
 1. `python3.12 tools/fleet/liveness.test.py` green (27 tests) and `--mutations` all RED-as-required.
-2. `python3.12 tools/fleet/claim_lanes.test.py` green (23 tests) and `--mutations` all caught (23).
+2. `python3.12 tools/fleet/claim_lanes.test.py` green (23 tests) and `--mutations` all caught (24).
 3. `python3.12 tools/fleet/lane_liveness.test.py` green with the DISCLOSURE leg and its red control.
 4. **Headline invariant:** T24 proves every claim-shaped verdict is `unknown`, named, `holder_pid is
    None`, and `escalatable(...) is False`; T25/T26 prove the existing ordering and existing verdicts are

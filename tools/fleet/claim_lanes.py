@@ -649,6 +649,16 @@ def to_evidence(cr: liveness.ClaimRead, **kw) -> liveness.Evidence:
 
 # ── rendering (the CLI is the in-tree caller of liveness.evaluate) ──────
 def render_json(cr: liveness.ClaimRead, verdict: "liveness.Verdict") -> str:
+    # The verdict is liveness.evaluate's, never this reader's — but its `detail`
+    # carries the attacker-influencable `owner=<commit-message string>`
+    # (`liveness._claim_detail`), and `render_text` already sanitizes the same
+    # string. Every other untrusted field of this payload is sanitized, so
+    # leaving the verdict raw was the one inconsistent path (#1272); sanitize its
+    # string fields here, at the render boundary, rather than inside the pure
+    # verdict library.
+    vd = verdict.to_dict()
+    vd["detail"] = sanitize(vd["detail"], 400)          # matches render_text's limit
+    vd["witnesses"] = [sanitize(w, 300) for w in vd["witnesses"]]
     return json.dumps({
         "advisory": ADVISORY,
         "source": sanitize(cr.source, 500),
@@ -671,7 +681,7 @@ def render_json(cr: liveness.ClaimRead, verdict: "liveness.Verdict") -> str:
             for c in cr.claims
         ],
         # The verdict is liveness.evaluate's, never this reader's.
-        "verdict": verdict.to_dict(),
+        "verdict": vd,
     }, sort_keys=True, indent=2)
 
 

@@ -557,6 +557,22 @@ def l13_output_hygiene():
     payload = json.loads(cl.render_json(cr, v))
     check("\n" not in payload["claims"][0]["owner"], "JSON carries no raw newline")
     check(payload["advisory"] == cl.ADVISORY, "JSON carries the fixed advisory")
+    # The SAME attacker-influencable owner string rides in the verdict's `detail`
+    # (`liveness._claim_detail`), not just in `claims[].owner` — so "every
+    # rendering" is only true if the machine rendering neutralises it there too.
+    # The claims[] checks above do not cover this field (#1784 review, P2).
+    vdetail = payload["verdict"]["detail"]
+    check("owner=" in vdetail and "evil" in vdetail,
+          "the owner identity is still reported, not dropped: %r" % vdetail)
+    check(vdetail == cl.sanitize(v.detail, 400),
+          "the JSON verdict detail is the sanitized text rendering: %r" % vdetail)
+    check(vdetail.count("|") - vdetail.count("\\|") == 0,
+          "no unescaped pipe reaches the JSON verdict detail: %r" % vdetail)
+    check("`" not in vdetail,
+          "no backtick reaches the JSON verdict detail: %r" % vdetail)
+    check("\x07" not in vdetail,
+          "no control character reaches the JSON verdict detail: %r" % vdetail)
+    check(payload["verdict"]["witnesses"] == [], "witnesses stays a list")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1043,6 +1059,13 @@ MUTATIONS = [
         '    out = out.replace("|", "\\\\|").replace("`", "\'")',
         '    out = out',
         "render-hostile owner input is no longer neutralised (a forged column/newline)",
+    ),
+    Mutation(
+        "L13", "reader",
+        '    vd["detail"] = sanitize(vd["detail"], 400)',
+        '    vd["detail"] = vd["detail"]',
+        "the JSON verdict detail keeps the attacker-influencable owner string raw while "
+        "render_text sanitizes it — the one inconsistent path (#1784 P2)",
     ),
     Mutation(
         "L14", "reader",
