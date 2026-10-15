@@ -298,7 +298,7 @@ case "$key" in
       # a failed read rendered as a value — with no way to fail this read, no scenario
       # could drive the false "did NOT happen" the non-zero arm produced. The diagnostic
       # goes to stderr so the undeterminable branch's diagnostic-quoting arm is exercised
-      # on a REAL rail run, not only in the unit suite.
+      # on a REAL rail run, not only through §75's direct-drive probe.
       [ -f "$SCEN/merge-state-unreadable" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
       # `merge-state-fail-after N` — the read SUCCEEDS for the first N attempts and fails
       # afterwards, so "only the LAST attempt's observation decides the verdict" is
@@ -4887,7 +4887,8 @@ echo "== 43. a leading zero is refused (the octal/decimal split) =="
 # the live pacing divergence (accounted as 8 by arithmetic, slept as 10).
 for spec in "ADMIN_MERGE_RERUN_FLOOR|0700" \
             "ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK|03900" "ADMIN_MERGE_POLL_INTERVAL|010" \
-            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010"; do
+            "ADMIN_MERGE_HEAD_ATTEMPTS|08" "ADMIN_MERGE_HEAD_READ_SLEEP|010" \
+            "ADMIN_MERGE_VERIFY_ATTEMPTS|08"; do
   knob="${spec%%|*}"; val="${spec#*|}"
   new_scen "leading-zero-$knob"
   env "$knob=$val" bash "$ADM" --print-bounds >"$TMP/out" 2>"$TMP/err"
@@ -8913,9 +8914,14 @@ printf '%s' "$success_line" | grep -qF -e "--repo acme/widgets" \
 # while GitHub had ALREADY merged the PR — the exact shape measured on tortoise
 # #4413. The pre-fix non-zero arm read the exit status as a fact about the
 # REPOSITORY, asserted "the merge did NOT happen", and posted a DURABLE retraction
-# over a MERGED PR. Every assertion in §70/§73/§74 FAILS on the rail with the
-# re-read removed (mutation log in the PR); §71/§72 are the controls that pin the
-# other two outcomes of the same three-way branch.
+# over a MERGED PR.
+#
+# §70/§72/§74 carry the assertions that go RED on a rail whose non-zero arm does not
+# re-read; §71 and §73 are the no-regression controls — a genuine refusal must still
+# retract, and the zero-exit arm must still separate the three outcomes — and each has
+# its OWN mutation that reddens it. The full 41-assertion mutation matrix, measured on
+# a copy of the rail per row, is in §75's header. §75 drives the READ directly, because
+# the whole-rail scenarios cannot express the malformed SHAPES.
 NOTHAPPEN='the merge of PR #42 did NOT happen'
 
 echo "== 70. #1298: a merge whose response read TIMED OUT is not reported as 'did NOT happen' =="
@@ -9089,6 +9095,142 @@ else
   pass "  …and NO retraction is posted over an unknown state"
 fi
 unset ADMIN_MERGE_VERIFY_ATTEMPTS
+
+# ── 75. THE MERGE-ARTIFACT READ VALIDATES THE WHOLE VALUE, AND ITS ANSWER IS AN
+#      ALLOW-LIST (#1298) ────────────────────────────────────────────────────────
+# §70-§74 drive the WHOLE rail, so they can only express what the hermetic `gh` can
+# serve: a non-zero exit, or a well-formed `<state>\t<mergedAt>`. That leaves the
+# SHAPE guards — the multi-line test, the double-separator test, the missing-separator
+# test and the exit-status test — UNEXERCISED: deleting them leaves §70-§74 green
+# (measured: the `shape` mutation reddens exactly 4 assertions, and all 4 are here).
+# This section loads the rail's FUNCTION DEFINITIONS and calls the read directly, so
+# every declared shape has an assertion that goes RED when its guard is removed.
+#
+# MUTATION EVIDENCE — each row is a one-line change applied to a COPY of the rail
+# (never the working tree; driver kept beside the logs), run against all 41 assertions
+# of §70-§75:
+#   nonzero    the non-zero arm's re-read removed    15 fail: §70×6 §72×6 §74×3
+#   noretrat   the non-zero arm's not_merged gate shut 3 fail: §71×3
+#   zeroexit   the zero-exit retraction gate reverted  3 fail: §73×3
+#   shape      the whole-value/exit-status test reverted 4 fail: §75×4
+#   allowlist  the final verdict reverted to a DENY-LIST 19 fail: §72×6 §73×3 §74×3 §75×7
+# EVERY section is reddened by at least one row, and NO row reddens all of them: the
+# assertions are load-bearing and targeted rather than a blanket count.
+echo "== 75. #1298: the merge-artifact read validates the whole value (allow-list, not deny-list) =="
+# The rail's definitions with the `main "$@"` entrypoint stripped. §44 created this
+# loader; REUSE it rather than carrying a second copy of the `sed '$d'` assumption
+# (the rail's entry-point guard comment names that exact constraint) — and create it
+# only when §44 did not run, which is the case for a harness that drives §70-§75 alone.
+: "${BELT_DEFS:=$TMP/belt-defs.sh}"
+[ -f "$BELT_DEFS" ] || sed '$d' "$ADM" > "$BELT_DEFS"
+POLL_PROBE="$TMP/poll-probe.sh"
+cat > "$POLL_PROBE" <<'POLLEOF'
+set -uo pipefail
+. "$BELT_DEFS"
+sleep() { :; }             # the subject is the READ, not the pacing between attempts
+repo_args=()
+POLL_GH() {                # the read's only dependency: ONE gh call per attempt
+  local n
+  n=$(( $(cat "$POLL_CNT" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$n" > "$POLL_CNT"
+  [ -n "${POLL_ERR:-}" ] && printf '%s\n' "$POLL_ERR" >&2
+  [ -n "${POLL_RAW:-}" ] && printf '%s' "$POLL_RAW"
+  return "${POLL_RC:-0}"
+}
+poll_merge_artifact 42
+calls="$(cat "$POLL_CNT" 2>/dev/null)"
+printf 'verdict=%s|state=%s|merged_at=%s|attempts=%s|calls=%s|diag=%s\n' \
+  "${MERGE_ART_VERDICT-<unset>}" "${MERGE_ART_STATE-<unset>}" "${MERGE_ART_MERGED_AT-<unset>}" \
+  "${MERGE_ART_ATTEMPTS-<unset>}" "${calls:-0}" "${MERGE_ART_DIAG-}"
+POLLEOF
+poll_shape() {   # poll_shape <label> <raw> <rc> [attempts] [err]
+  local label="$1" raw="$2" rc="$3" attempts="${4:-1}" err="${5:-}"
+  local cnt="$TMP/poll-calls-$label" line
+  : > "$cnt"
+  env BELT_DEFS="$BELT_DEFS" POLL_CNT="$cnt" POLL_RAW="$raw" POLL_RC="$rc" POLL_ERR="$err" \
+      ADMIN_MERGE_GH=POLL_GH ADMIN_MERGE_VERIFY_ATTEMPTS="$attempts" \
+      bash "$POLL_PROBE" > "$TMP/poll-out" 2>"$TMP/poll-err"
+  line="$(cat "$TMP/poll-out")"
+  POLL_VERDICT="${line#verdict=}"; POLL_VERDICT="${POLL_VERDICT%%|*}"
+  POLL_STATE="${line#*state=}";   POLL_STATE="${POLL_STATE%%|*}"
+  POLL_AT="${line#*merged_at=}";  POLL_AT="${POLL_AT%%|*}"
+  POLL_ATTEMPTS="${line#*attempts=}"; POLL_ATTEMPTS="${POLL_ATTEMPTS%%|*}"
+  POLL_CALLS="${line#*calls=}";   POLL_CALLS="${POLL_CALLS%%|*}"
+  POLL_DIAG="${line#*diag=}"
+}
+# expect_poll <label> <want-verdict> <want-state> <what the shape proves>
+expect_poll() {
+  if [ "$POLL_VERDICT" = "$2" ] && [ "$POLL_STATE" = "$3" ]; then
+    pass "(shape) $4 → verdict=$2 state=$3"
+  else
+    fail "(shape) $4 → verdict=$POLL_VERDICT state=$POLL_STATE (want $2/$3)"
+  fi
+}
+
+poll_shape ok-merged "$(printf 'MERGED\t2026-09-23T00:00:00Z')" 0
+if [ "$POLL_VERDICT" = merged ] && [ "$POLL_AT" = "2026-09-23T00:00:00Z" ] && [ "$POLL_CALLS" = 1 ]; then
+  pass "(shape) a well-formed MERGED read is read as merged, with its mergedAt, after ONE call"
+else
+  fail "(shape) MERGED read → verdict=$POLL_VERDICT at=$POLL_AT calls=$POLL_CALLS"
+fi
+poll_shape ok-open "$(printf 'OPEN\t-')" 0
+expect_poll ok-open not_merged OPEN "a well-formed OPEN read"
+poll_shape ok-closed "$(printf 'CLOSED\t-')" 0
+expect_poll ok-closed not_merged CLOSED "a well-formed CLOSED read"
+
+# ⛔ EACH MALFORMED SHAPE IS ITS OWN ASSERTION. These are the guards a whole-rail
+# scenario cannot reach, and every one of them goes RED if its guard is deleted.
+poll_shape no-separator "MERGED" 0
+expect_poll no-separator unreadable '<unreadable>' "a bare MERGED with NO separator (the ANY-SEPARATOR trap)"
+poll_shape two-separators "$(printf 'MERGED\tx\ty')" 0
+expect_poll two-separators unreadable '<unreadable>' "TWO separators (not the one-line projection)"
+poll_shape multiline "$(printf 'MERGED\t2026-01-01T00:00:00Z\nOPEN\t-')" 0
+expect_poll multiline unreadable '<unreadable>' "a MULTI-LINE answer (the ANY-FIRST-LINE trap)"
+poll_shape empty-state "$(printf '\t-')" 0
+expect_poll empty-state unreadable '<unreadable>' "an EMPTY state token (the absence of an answer, not a state named '')"
+poll_shape undocumented "$(printf 'PENDING\t-')" 0
+expect_poll undocumented unreadable '<unreadable>' "an UNDOCUMENTED state token — the allow-list, not 'anything that is not MERGED'"
+poll_shape lowercase "$(printf 'merged\t-')" 0
+expect_poll lowercase unreadable '<unreadable>' "a lowercase state token"
+poll_shape nonzero-plausible "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 1 1 "gh: read: operation timed out"
+expect_poll nonzero-plausible unreadable '<unreadable>' "a NON-ZERO exit carrying a plausible stdout (a failed read is not a value)"
+# …and the FAILED read was a READ: an unreadable verdict must not mean "no read ran".
+[ "$POLL_CALLS" = 1 ] \
+  && pass "(shape) the malformed read WAS attempted (calls=1), so 'unreadable' is about a read that happened" \
+  || fail "(shape) the unreadable verdict came from $POLL_CALLS read(s)"
+# …and the diagnostic travels on its own channel rather than being discarded.
+grep -qF 'operation timed out' <<<"$POLL_DIAG" \
+  && pass "(shape) the read's own stderr is captured into the diagnostic" \
+  || fail "(shape) the read's stderr was discarded (diag=[$POLL_DIAG])"
+
+# A readable non-MERGED answer polls the WHOLE bound (the merge may still be landing),
+# so the bound is exercised rather than the first attempt short-circuiting the loop.
+poll_shape open-two "$(printf 'OPEN\t-')" 0 2
+if [ "$POLL_VERDICT" = not_merged ] && [ "$POLL_CALLS" = 2 ] && [ "$POLL_ATTEMPTS" = 2 ]; then
+  pass "(shape) a readable non-MERGED answer polls the full bound (2 attempts, 2 calls)"
+else
+  fail "(shape) OPEN with a bound of 2 → verdict=$POLL_VERDICT calls=$POLL_CALLS attempts=$POLL_ATTEMPTS"
+fi
+
+# ⛔ A LEADING-ZERO BOUND MUST NOT REPORT AN ARTIFACT NOBODY READ (#1690's symptom,
+# one arithmetic site over). The refusal is asserted by NAME and by CALLS=0: the
+# defect was never that the rail refused — it was that it refused while PRINTING an
+# attempt count and a '[merge_unreadable] — could NOT be READ' claim for zero reads.
+poll_shape knob-leading-zero "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 0 08
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 0 ] && [ "$POLL_ATTEMPTS" = 0 ] \
+   && grep -qF 'refusing a bad merge-artifact knob' "$TMP/poll-err"; then
+  pass "(shape) a LEADING-ZERO bound is refused BY NAME with ZERO reads (not 'could not read' after 0 reads)"
+else
+  fail "(shape) ADMIN_MERGE_VERIFY_ATTEMPTS=08 → verdict=$POLL_VERDICT calls=$POLL_CALLS; stderr: $(head -1 "$TMP/poll-err")"
+fi
+poll_shape knob-nonpositive "$(printf 'MERGED\t2026-01-01T00:00:00Z')" 0 0
+if [ "$POLL_VERDICT" = unreadable ] && [ "$POLL_CALLS" = 0 ] && [ "$POLL_ATTEMPTS" = 0 ] \
+   && grep -qF 'refusing a bad merge-artifact knob' "$TMP/poll-err"; then
+  pass "(shape) a ZERO bound is refused BY NAME rather than silently attempting a different budget"
+else
+  fail "(shape) ADMIN_MERGE_VERIFY_ATTEMPTS=0 → verdict=$POLL_VERDICT calls=$POLL_CALLS"
+fi
+
 
 # ── 63. #1358 — A NEWLINE IN A WORKFLOW NAME CANNOT FORGE A CERTIFICATE ──
 # Adversarial cycle 1 (2026-09-23) reproduced this as a FAIL-OPEN. A workflow

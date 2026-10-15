@@ -593,6 +593,17 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # default costs the suite no wall-clock time.
 HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-5}"
 HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-2}"
+# ── THE MERGE-ARTIFACT READ'S RETRY BUDGET (#1298) ──────────────────────
+# Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
+# exactly like HEAD_ATTEMPTS — and NOT inline in the reader, which is how
+# `ADMIN_MERGE_HEAD_ATTEMPTS=08` reached a loop and printed
+# `[head_unreadable] — could not READ the head (0 attempts)` on a run where ZERO
+# reads were attempted (#1690 review round 4). `poll_merge_artifact` is the SAME
+# shape: a `for ((attempt = 1; attempt <= attempts; attempt++))` whose bound is
+# supplied by an operator env var, so `08` is invalid OCTAL there and the loop body
+# never executes. Validation therefore has to happen BEFORE any arithmetic consumes
+# it, on the startup path AND on a sourced path (see `merge_art_knobs_ok`).
+VERIFY_ATTEMPTS="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -1223,6 +1234,28 @@ validate_timing_knobs() {
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — beyond the usable"
     say_err "   range (max ${TIMING_KNOB_MAX}s)."
   fi
+  # The merge-artifact read's bound is the SAME class as the head read's (#1298), and
+  # it was the last knob still carrying a bare `case … attempts=6` default: an
+  # all-digit value with a LEADING ZERO passes that guard and is invalid octal to bash
+  # ARITHMETIC, so the loop body never ran and the rail printed
+  # `[merge_unreadable] — could NOT be READ (08 attempt(s))` — a claim about the
+  # instrument on a run where the instrument never ran. Refuse it BY NAME instead.
+  if counter_has_leading_zero "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL, so '08' is not 8 but an ERROR that aborts"
+    say_err "   the merge-artifact read's loop body. The rail would then report that it could not read"
+    say_err "   whether PR merged while attempting ZERO reads. Write it without the leading zero."
+  elif ! counter_is_positive "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — the merge-artifact"
+    say_err "   read's retry budget must be a POSITIVE integer: a non-numeric value errors the loop's"
+    say_err "   arithmetic, and a non-positive one attempts no read at all."
+  elif counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX})."
+  fi
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
   # `ADMIN_MERGE_LANE_PARITY=declared_of` (a typo) or `Declared-Off` would have
@@ -1268,6 +1301,28 @@ refuse_bad_head_knobs() {
   say_err "admin-merge: ✗ refusing a bad head-read knob (ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}',"
   say_err "   ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}') — refusing to report on a head read"
   say_err "   whose retry budget is not a validated positive integer. Fix the value and re-run."
+  return 1
+}
+
+# ── THE MERGE-ARTIFACT READ'S KNOB INVARIANT BELONGS TO THE READ (#1298) ─
+# Same reason as `head_read_knobs_ok` (#1690 review rounds 4-5): `validate_timing_knobs`
+# runs only inside `main()`, so ANY path that SOURCES the rail bypasses it — and this
+# read OWNS the arithmetic that consumes the knob, so it is where the invariant has to
+# hold. It REJECTS rather than defaulting: the pre-refactor inline `case …) attempts=6`
+# silently turned a typo into a different budget, and (measured, #1690 review round 4)
+# a leading-zero value left the loop body never running while the refusal still printed
+# an attempt count.
+merge_art_knobs_ok() {
+  counter_is_positive "$VERIFY_ATTEMPTS" \
+    && ! counter_has_leading_zero "$VERIFY_ATTEMPTS" \
+    && ! counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"
+}
+
+# refuse_bad_merge_art_knobs -> 1 (having said why) when the bound is unusable.
+refuse_bad_merge_art_knobs() {
+  say_err "admin-merge: ✗ refusing a bad merge-artifact knob (ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}')"
+  say_err "   — refusing to report on whether the PR merged with a retry budget that is not a validated"
+  say_err "   positive integer without a leading zero (max ${TIMING_KNOB_MAX}). Fix the value and re-run."
   return 1
 }
 
@@ -1551,31 +1606,31 @@ require_draft() {
 #   MERGE_ART_VERDICT    merged | not_merged | unreadable
 #   MERGE_ART_STATE      the observed state, or `<unreadable>`
 #   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
-#   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages)
+#   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
+#                        `0` on the one path that reads nothing: a refused knob
 #   MERGE_ART_DIAG       the LAST attempt's stderr (one bounded line), when it wrote one
 poll_merge_artifact() {
   local pr="$1"
   MERGE_ART_VERDICT="unreadable"
   MERGE_ART_STATE="<unreadable>"
   MERGE_ART_MERGED_AT="<unreadable>"
+  # ⛔ EVERY EXIT PATH SETS EVERY GLOBAL (#1298 review). The knob refusal below returns
+  # BEFORE the loop, so leaving this unset made the callers' `(${MERGE_ART_ATTEMPTS}
+  # attempt(s))` an unbound-variable ABORT under `set -u` — the rail would die with a
+  # shell error instead of printing the refusal it had just composed. `0` is also the
+  # TRUE count on that path (zero reads ran), which is the distinction #1690 was about.
+  MERGE_ART_ATTEMPTS="0"
   MERGE_ART_DIAG=""
-  local attempts="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
-  # A non-numeric bound would make `[ "$attempt" -ge "$attempts" ]` exit 2 on every
-  # pass, so the poll would never terminate — a HANG, not a refusal. So would a bound
-  # at or above the integer ceiling (all digits, so the guard below cannot see it:
-  # `-ge` can never be satisfied and `[` starts erroring past int64 — adversarial
-  # cycle 2, reproduced). Ten digits is already far beyond any sane bound, so anything
-  # longer falls back to the default. This guard is the PRE-EXISTING one, kept
-  # verbatim, because the zero-exit arm has polled through it since #1359.
-  case "$attempts" in ''|*[!0-9]*|??????????*) attempts=6 ;; esac
-  # ⛔ A BOUND THAT ATTEMPTS NOTHING MUST NOT REPORT AN UNREADABLE ARTIFACT. A bound of
-  # 0 would make the loop body never execute, and the rail would then say the merge
-  # could not be determined on a run where ZERO reads were attempted — a claim about
-  # the instrument on a run where the instrument never ran. That is #1690's own
-  # symptom (its review round 4 measured `ADMIN_MERGE_HEAD_ATTEMPTS=0` printing
-  # `[head_unreadable] — could not READ the head (0 attempts)`), so the same class of
-  # bound is clamped here: at least one read is always attempted.
-  [ "$attempts" -ge 1 ] || attempts=1
+  local attempts="$VERIFY_ATTEMPTS"
+  # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
+  # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
+  # different budget for a typo) and — measured — a leading-zero value reached this
+  # arithmetic site, where `attempt <= 08` errors and the loop body NEVER RUNS: the rail
+  # then prints `[merge_unreadable] … (08 attempt(s))` on a run where ZERO reads were
+  # attempted, which is #1690's symptom one arm over. `merge_art_knobs_ok` is also called
+  # from `validate_timing_knobs` at startup, so the real path refuses BY NAME (exit 2)
+  # before any CI work — and a SOURCED path (which skips `main`) is covered here.
+  merge_art_knobs_ok || { refuse_bad_merge_art_knobs; return 1; }
   MERGE_ART_ATTEMPTS="$attempts"
   local attempt=0 rc=0 observed="" state_part="" rest="" err=""
   local errtmp
@@ -5688,7 +5743,28 @@ ${parity_forgiven_note}"
     poll_merge_artifact "$PR"
     merge_state="$MERGE_ART_STATE"
     merge_merged_at="$MERGE_ART_MERGED_AT"
-    if [ "$MERGE_ART_VERDICT" = "unreadable" ]; then
+    if [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
+      say_err "⛔ admin-merge: FAILED — gh pr merge reported SUCCESS (exit 0), but PR #$PR is NOT merged."
+      say_err "   The API reports state=$merge_state mergedAt=$merge_merged_at after ${MERGE_ART_ATTEMPTS} attempt(s)."
+      say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. A QUEUED merge is"
+      say_err "   not a merge: the rail certifies the ARTIFACT, not the command's exit code. If you"
+      say_err "   passed '--auto' through MERGE_ARGS, that is the cause."
+      write_merge_retraction "$PR" "$head" \
+        "gh pr merge exited 0, but the API reports this PR as state=$merge_state (mergedAt=$merge_merged_at) after ${MERGE_ART_ATTEMPTS} attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
+        "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    fi
+    # ⛔ THE RETRACTION GATE IS AN ALLOW-LIST, MATCHING ITS SIBLING ARM (#1298 review).
+    # This arm used to retract on `verdict != merged` — a DENY-LIST, so ANY verdict that
+    # was neither `merged` nor the explicitly-caught `unreadable` would fall through to a
+    # DURABLE retraction asserting "the merge did NOT happen" on a state nobody read as
+    # refused. `not_merged` is now the only licensed retraction, and everything else —
+    # today only `unreadable`, tomorrow any verdict this read grows — lands here and
+    # claims NEITHER outcome. The polarity is the rule `poll_merge_artifact` states: an
+    # unnamed value must never fall through a gap into a claim about the repository.
+    if [ "$MERGE_ART_VERDICT" != "merged" ]; then
       say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge reported SUCCESS (exit 0), but the"
       say_err "   state of PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does"
       say_err "   NOT know whether it merged."
@@ -5707,19 +5783,6 @@ ${parity_forgiven_note}"
       say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
     fi
-    if [ "$MERGE_ART_VERDICT" != "merged" ]; then
-      say_err "⛔ admin-merge: FAILED — gh pr merge reported SUCCESS (exit 0), but PR #$PR is NOT merged."
-      say_err "   The API reports state=$merge_state mergedAt=$merge_merged_at after ${MERGE_ART_ATTEMPTS} attempt(s)."
-      say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
-      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
-      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. A QUEUED merge is"
-      say_err "   not a merge: the rail certifies the ARTIFACT, not the command's exit code. If you"
-      say_err "   passed '--auto' through MERGE_ARGS, that is the cause."
-      write_merge_retraction "$PR" "$head" \
-        "gh pr merge exited 0, but the API reports this PR as state=$merge_state (mergedAt=$merge_merged_at) after ${MERGE_ART_ATTEMPTS} attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
-        "$TMP/merge.err" "gh pr merge said:"
-      exit 1
-    fi
   fi
 
   if [ "$merge_status" -ne 0 ]; then
@@ -5733,12 +5796,19 @@ ${parity_forgiven_note}"
     merge_state="$MERGE_ART_STATE"
     merge_merged_at="$MERGE_ART_MERGED_AT"
     if [ "$MERGE_ART_VERDICT" = "merged" ]; then
-      # ⛔ THE MERGE HAPPENED. `gh pr merge` exited non-zero because its RESPONSE could
-      # not be read, NOT because GitHub refused the merge. Reporting this as "did NOT
+      # ⛔ THE MERGE HAPPENED. `gh pr merge` exited non-zero and the PR is MERGED — the
+      # two facts are INDEPENDENT, and the artifact decides. Reporting this as "did NOT
       # happen" is #1298: the rail's loudest statement would be false, and a DURABLE
       # retraction would annotate a MERGED PR forever. NO RETRACTION IS POSTED — there
       # is nothing to correct: the marker's own claim ("the evidence comment was
       # posted") is true and stays true.
+      #
+      # ⛔ THE MARKER ASSERTS ONLY WHAT WAS OBSERVED (#1298 review, io-contract).
+      # `[merge_response_lost]` names the CLASS this fix exists for, but a non-zero exit
+      # plus MERGED is also consistent with a refusal that coincided with a merged PR
+      # (gh answering "already merged", or another actor landing it). So the emitted
+      # lines state the OBSERVATIONS and point at the only evidence of the CAUSE — the
+      # command's own output — rather than asserting a networking incident.
       merge_response_lost="$merge_status"
       merge_status=0    # fall through to the landed-commit read and the success line
     elif [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
@@ -5836,10 +5906,12 @@ ${parity_forgiven_note}"
   # ordinary success (a consumer must not have to parse the prose), and it is stated on
   # the SAME run as the success line rather than in a comment somebody has to find.
   if [ "$merge_response_lost" -ne 0 ]; then
-    info "admin-merge: ⚠️  [merge_response_lost] gh pr merge exited ${merge_response_lost} and its RESPONSE"
-    info "   could not be read — the merge DID happen (state=$merge_state, read back from the API, not"
-    info "   inferred from the exit status). This is a lost answer, NOT a refused merge: no retraction"
-    info "   was posted, and the evidence marker still stands over a MERGED PR."
+    info "admin-merge: ⚠️  [merge_response_lost] gh pr merge exited ${merge_response_lost} while the API reports"
+    info "   state=$merge_state — the merge DID happen, decided by the ARTIFACT and not by the exit status."
+    info "   The non-zero exit is NOT read as a refused merge: no retraction was posted, and the evidence"
+    info "   marker still stands over a MERGED PR. This marker asserts only what was OBSERVED (a non-zero"
+    info "   exit and a MERGED state); the command's own output below is the only evidence of WHY it was"
+    info "   non-zero — a lost response is the case this fix exists for, not the only one it admits."
     # ⛔ THE READ'S OWN WORDS, ON THE DIAGNOSTIC CHANNEL (#1690 review, round 4: a refusal
     # that cannot say WHAT it measured can only prescribe "re-run it"). Discarding this is
     # how a transient timeout and a permanent cause became the same sentence — and it is the
