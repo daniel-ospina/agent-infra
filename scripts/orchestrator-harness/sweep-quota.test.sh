@@ -150,6 +150,20 @@ if need "$T/quota.sh" "the sweep-quota helper block"; then
   got="$(sweep_fail_kind '' 'gh: Not Found (HTTP 404)')"
   [ "$got" = "other" ] && ok "sweep_fail_kind: an unrelated error is neither" \
                         || bad "sweep_fail_kind returned '$got' (want other)"
+  # ⛔ A permission 403 is NOT a rate limit. It carries no rate-limit header, because there was no
+  # rate limit — it is the #1718 invalid/expired/under-scoped-token family. Mislabelling it deferred
+  # the sweep for up to an hour and printed `CANNOT MERGE` over a stderr line saying the token is the
+  # problem, so these must fall through to `other` and reach the operator.
+  got="$(sweep_fail_kind '' 'gh: Resource not accessible by integration (HTTP 403)')"
+  [ "$got" = "other" ] && ok "sweep_fail_kind: a permission 403 is 'other', NOT rate-limit" \
+                        || bad "sweep_fail_kind called a permission 403 '$got' (want other)"
+  got="$(sweep_fail_kind '' 'gh: This organization has SAML SSO enabled. (HTTP 403)')"
+  [ "$got" = "other" ] && ok "sweep_fail_kind: an SSO 403 is 'other', NOT rate-limit" \
+                        || bad "sweep_fail_kind called an SSO 403 '$got' (want other)"
+  # A 429 is unambiguous with no other evidence, and must NOT be lost by the 403 correction.
+  got="$(sweep_fail_kind '' 'gh: Something went wrong (HTTP 429)')"
+  [ "$got" = "rate-limit" ] && ok "sweep_fail_kind: a bare 429 is still a RATE-LIMIT" \
+                            || bad "sweep_fail_kind returned '$got' (want rate-limit)"
   now="$(date +%s)"
   got="$(sweep_defer_until '')"
   [ "$got" -ge $(( now + 60 )) ] && [ "$got" -le $(( now + 3600 )) ] \
@@ -273,6 +287,18 @@ if need "$T/block.sh" "the sweep-listing block" && need "$T/deps.sh" "the shippe
   [ -n "$until" ] && [ "$until" -gt "$(date +%s)" ] \
     && ok "low remaining: a future deferral is recorded" \
     || bad "low remaining: no deferral recorded ('$until')"
+
+  # ── 10) an IMPLAUSIBLE deferral is clamped on READ, not obeyed ───────────────
+  # Both writers bound the value (<= now+3600), so an absurd one can only arrive from a corrupt or
+  # hand-edited state file — but that is exactly the state whose corruption would stop the fleet
+  # merging forever, since nothing else removes it. It must degrade to a FULL sweep, not a stall.
+  reset_mode; GHMODE=200; GHREMAIN=4990; GHRESET=0; GHAFTER=""
+  printf '9999999999\n' > "$D/o/state/sweep-defer-until"
+  drive "$D"
+  [ -s "$D/calls" ] && ok "absurd deferral: clamped on read — the sweep still runs" \
+                    || bad "absurd deferral: the sweep was suppressed (state file obeyed verbatim)"
+  grep -q 'DEFERRED' "$D/log" && bad "absurd deferral: still logged as a live DEFERRED" \
+                               || ok "absurd deferral: not treated as a live deferral"
 fi
 
 echo

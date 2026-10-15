@@ -453,11 +453,17 @@ review_slots() { # <open_prs>
 #     does not charge a 304 to the primary rate limit, so the sweep's listing is free;
 #   * the RESPONSE HEADERS as the health signal — `x-ratelimit-remaining` / `-reset` / `Retry-After`
 #     — instead of polling `/rate_limit`, which the docs explicitly say not to trust and which was
-#     measured reporting 4933 remaining while every call failed (#1762).
+#     measured reporting 4933 remaining while every call failed (#1762). This governs the DEFERRAL
+#     DECISION only. The `[res]` line still prints a `/rate_limit` counter (`res_line`, advisory and
+#     deliberately not read for this decision) — do not read a healthy `gh_gql=` there as "the sweep
+#     can list PRs".
 # The listing moves to REST (`gh api`) because conditional requests are a REST feature — GraphQL has
 # no ETag — and `resources.core` is a SEPARATE 5,000/hr bucket from the GraphQL one the per-PR reads
-# below still spend. Those per-PR reads are deliberately unchanged (issue direction #4): this fix
-# moves the listing and its health signal, nothing else.
+# below still spend. Those per-PR reads stay on GraphQL — moving them to REST is the issue's own
+# direction 1 / research item 4 and is NOT this PR — but a 304 SKIPS them for that cycle (an
+# identical list means an identical PR set). "Unchanged" therefore means "not moved to REST", never
+# "run every cycle": the skip is bounded by SWEEP_MAX_AGE, which drops `If-None-Match` once the
+# cached listing ages out.
 #
 # BEGIN sweep-quota (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
 # rl_header <name>: the value of one HTTP header in a raw `gh api --include` response, or empty.
@@ -489,9 +495,17 @@ rl_status() {
 # A `304` never reaches here — the caller tests the status first.
 sweep_fail_kind() {
   local raw="${1:-}" err="${2:-}"
+  # ⛔ NOT `HTTP 4(29|03)`. A bare 403 is how a PERMISSION failure arrives — an invalid, expired or
+  # under-scoped token, or SSO/admin rights ("gh: Resource not accessible by integration (HTTP 403)")
+  # — and carries no rate-limit header, because there was no rate limit. Matching 403 here classified
+  # exactly the #1718 failure family as `rate-limit`, deferred the sweep for up to an hour, and logged
+  # `RATE-LIMITED ... CANNOT MERGE` over a stderr line that says otherwise: the same "instrument
+  # reports the opposite of the truth" defect this block exists to remove. A 429 is unambiguous; a 403
+  # must CORROBORATE the limit via a header or one of the named phrases, and otherwise falls through
+  # to `other`, where the real stderr reaches the operator.
   if [ "$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-remaining')" = "0" ] \
      || [ -n "$(printf '%s\n' "$raw" | rl_header 'retry-after')" ] \
-     || grep -qiE 'rate limit|abuse detection|secondary rate|HTTP 4(29|03)' <<<"$err" ; then
+     || grep -qiE 'rate limit|abuse detection|secondary rate|HTTP 429' <<<"$err" ; then
     echo rate-limit
   elif grep -qiE 'timeout|timed out|TLS|tls:|dial|connection|no such host|network|EOF|reset by peer|refused' <<<"$err" ; then
     echo network
@@ -634,6 +648,12 @@ while true; do
   NOW="$(date +%s)"
   SWEEP_LIST=""
   DEFER_UNTIL="$(cat "$O/state/sweep-defer-until" 2>/dev/null || true)"; is_num "${DEFER_UNTIL:-}" || DEFER_UNTIL=0
+  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
+  # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
+  # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
+  # degrades to a FULL sweep rather than a permanent stall (mirrors the sweep-stamp normalisation
+  # two lines below rather than trusting `is_num` for a bound it does not check).
+  [ "$DEFER_UNTIL" -gt $(( NOW + 3600 )) ] && DEFER_UNTIL=0
   LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
   ETAG="$(cat "$O/state/sweep-etag" 2>/dev/null || true)"
   # `If-None-Match` is sent only while the cached listing is younger than SWEEP_MAX_AGE. The floor is
@@ -651,7 +671,7 @@ while true; do
     # A previous listing was refused for rate limiting. Calling again before the reset is exactly the
     # hammering the docs warn about — and every call would fail until then. The reset (or
     # Retry-After) is already recorded, so the sweep waits it out rather than burning attempts.
-    echo "[sweep] ⛔ RATE-LIMITED — sweep DEFERRED for another $(( (DEFER_UNTIL - NOW + 59) / 60 ))m (until $(date -r "$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "epoch $DEFER_UNTIL")). THIS CELL CANNOT MERGE, NOT IDLE." >> "$LOG"
+    echo "[sweep] ⛔ RATE-LIMITED — sweep DEFERRED for another $(( (DEFER_UNTIL - NOW + 59) / 60 ))m (until $(date -d "@$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || date -r "$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "epoch $DEFER_UNTIL")). THIS CELL CANNOT MERGE, NOT IDLE." >> "$LOG"
   else
     if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
         ".[]|{number,headRefName:.head.ref,isDraft:.draft}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" \
