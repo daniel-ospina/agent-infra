@@ -125,12 +125,18 @@ CLAMP=300000
 # read_regime_floor_by_execution <instrument> — ask the instrument for its floor.
 # Mirrors `patch-pi-retry.sh --cap`: the shell that owns the value is the one
 # that answers, so no later assignment, `declare`, or chained second assignment
-# can make the answer differ from the behaviour. `FLEET_REGIME_TB` is unset for
-# the call (see above). A non-zero exit or a non-integer answer is fail-closed:
-# this echoes the reason and returns 1, so a caller must not read it as a floor.
+# can make the answer differ from the behaviour. The instrument's ambient tuning
+# seams are unset for the call (see above): `FLEET_REGIME_TB`, and the window
+# seams `FLEET_WINDOW_DAYS`/`WATCH_WINDOW_DAYS` — both instruments validate
+# `--days` BEFORE the print branch, so a stale/typo'd ambient window would make
+# the instrument refuse before it prints and this read would false-BLOCK on a
+# value that has nothing to do with the floor. The read is blind to the
+# operator's environment; an ambient seam must not move or defeat it.
+# A non-zero exit or a non-integer answer is fail-closed: this echoes the reason
+# and returns 1, so a caller must not read it as a floor.
 read_regime_floor_by_execution() {
   local instrument="$1" answer rc
-  answer="$(env -u FLEET_REGIME_TB bash "$instrument" --print-regime-floor 2>&1)"
+  answer="$(env -u FLEET_REGIME_TB -u FLEET_WINDOW_DAYS -u WATCH_WINDOW_DAYS bash "$instrument" --print-regime-floor 2>&1)"
   rc=$?
   case "$answer" in
     ''|*[!0-9]*) printf 'did not print a plain integer (got %s, rc=%s)' "'$answer'" "$rc"; return 1 ;;

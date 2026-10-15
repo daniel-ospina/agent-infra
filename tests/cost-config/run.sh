@@ -1604,9 +1604,10 @@ rm -rf "$TMP36"
 
 echo ""
 # ── 37. the derived reserve relation must be anchored to the INSTRUMENTS, not to a
-#      second copy of the constant. The guard READS the regime floor from
-#      fleet-cost-report.sh (`FLEET_REGIME_TB:-<n>`) and watch-truncation.sh (its
-#      clamp-bucket boundary) and requires them to AGREE. Drift either one alone
+#      second copy of the constant. The guard READS the regime floor from the
+#      instruments BY EXECUTION (`<instrument> --print-regime-floor`, #1342 — it no
+#      longer parses their assignment text or anchors on the watcher's bucket label)
+#      and requires the two answers to AGREE. Drift either one alone
 #      and the guard must refuse to certify a floor it can no longer derive —
 #      exit 2, not a green. (Added under #1316: without this, the “derived
 #      relation” would be tautological — two local constants, one comparison.)
@@ -2214,6 +2215,25 @@ bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "an out-of-range integer from --print-regime-floor → exit 2 (fail-closed, not a certified floor)"; else fail "expected exit 2 on an out-of-range answer, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "outside the representable range" "$OUT"; then pass "the out-of-range refusal is explicit (not misreported as a non-integer)"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (g) an ambient WINDOW seam must NOT false-BLOCK the guard. Both instruments validate `--days`
+#     BEFORE the print branch, so a stale/typo'd FLEET_WINDOW_DAYS or WATCH_WINDOW_DAYS makes
+#     `<instrument> --print-regime-floor` refuse (rc=2); the guard's execution read turned that
+#     into its own exit 2, naming a floor problem for a value unrelated to the floor — a
+#     regression vs the pre-#1342 parse, which never executed the instruments. The read unsets
+#     both seams, so the guard must stay green (it certifies the COMMITTED default).
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+# Non-vacuity: the seam IS live — the instrument refuses before it prints.
+FLEET_WINDOW_DAYS=abc bash "$TMP45/scripts/fleet-cost-report.sh" --print-regime-floor >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ] && grep -q -- '--days must be a positive integer' "$OUT"; then pass "the ambient FLEET_WINDOW_DAYS seam is live in the instrument (it refuses before printing)"; else fail "45 fixture (g): expected the report to refuse an invalid ambient window, got $code"; sed -n '1,10p' "$OUT"; fi
+for seam in "FLEET_WINDOW_DAYS=abc" "WATCH_WINDOW_DAYS=abc"; do
+  env "$seam" bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then pass "ambient $seam does not false-BLOCK the guard (exit 0)"; else fail "ambient $seam false-BLOCKed the guard — expected exit 0, got $code"; sed -n '1,30p' "$OUT"; fi
+done
+if grep -q "matches the instruments' 283616 floor" "$OUT"; then pass "the guard still certifies the committed 283616 floor under an ambient window seam"; else fail "expected the guard to name the committed 283616 floor under an ambient window seam"; sed -n '1,30p' "$OUT"; fi
 rm -rf "$TMP45"
 
 if [ "$failures" -eq 0 ]; then
