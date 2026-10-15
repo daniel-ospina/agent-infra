@@ -549,9 +549,9 @@ async function main() {
     const paths = bridge.verified_files.map((vf: any) => vf.path);
     // #190: the bridge now persists FULL compound keys (worktree-root::rel) so
     // recovery can be worktree-isolated (#37) with stored-hash match-or-drop.
-    // The bridge holds the MOST RECENT merge — after the #132 scenarios that is
-    // scenario 11's plain-text-PASS merge of fileG.txt (fileA.txt was merged in
-    // scenarios 2-5 and overwritten). Compound keying is the new contract.
+    // #1225/#1573: the bridge is a MERGED multi-root registry, not a single
+    // snapshot — scenario 11's plain-text-PASS merge of fileG.txt is present
+    // ALONGSIDE earlier scenarios' entries. Compound keying is the contract.
     ok(paths.some((p: string) => p.includes("::") && p.endsWith("fileG.txt")), `bridge keys must be compound (root::rel), got: ${JSON.stringify(paths)}`);
     ok(paths.every((p: string) => p.includes("::")), `bridge must not contain bare repo-relative keys, got: ${JSON.stringify(paths)}`);
   });
@@ -855,6 +855,72 @@ async function main() {
       });
       equal(res, undefined, "parent-verified file must pass in the sub-agent via bridge inheritance (no re-dispatch)");
       git(repo, "commit -m sub1");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 21b (#1225/#1573 P0): a concurrent lane's bridge write must not erase another root's verified entries", async () => {
+    // The P0: writeBridge() published a WHOLE-FILE SNAPSHOT of the writer's own
+    // registry, so any other lane's merge erased every foreign-root entry. A
+    // parent's verified file was then gone before its task child read the
+    // bridge, and the child blocked a change that had already been verified.
+    // This pins the mechanism end-to-end: parent PASS in repo W -> a second
+    // lane's PASS in repo D -> the child in W still commits.
+    const repoW = join(TEST_ROOT, "repo-clobber-w");
+    mkdirSync(repoW, { recursive: true });
+    git(repoW, "init -b main");
+    git(repoW, "config user.email e2e@test");
+    git(repoW, "config user.name e2e");
+    writeFileSync(join(repoW, "fileW.txt"), "w1\n");
+    git(repoW, "add fileW.txt");
+    git(repoW, "commit -m baseline");
+    writeFileSync(join(repoW, "fileW.txt"), "w2\n");
+    git(repoW, "add fileW.txt");
+    const realW = realpathSync(repoW);
+    // Parent session verifies fileW → bridge carries <realW>::fileW.txt.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileW.txt. Classification: backend. Project root: ${repoW}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoW, "fileW.txt"), hash: sha("w2\n") }] }) }],
+    });
+    // A concurrent lane in a DIFFERENT repo verifies its own file and writes the
+    // bridge. Pre-fix this REPLACED the whole file, dropping <realW>::fileW.txt.
+    const repoD = join(TEST_ROOT, "repo-clobber-d");
+    mkdirSync(repoD, { recursive: true });
+    git(repoD, "init -b main");
+    git(repoD, "config user.email e2e@test");
+    git(repoD, "config user.name e2e");
+    writeFileSync(join(repoD, "fileD.txt"), "d1\n");
+    git(repoD, "add fileD.txt");
+    git(repoD, "commit -m baseline");
+    writeFileSync(join(repoD, "fileD.txt"), "d2\n");
+    git(repoD, "add fileD.txt");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileD.txt. Classification: backend. Project root: ${repoD}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoD, "fileD.txt"), hash: sha("d2\n") }] }) }],
+    });
+    // The bridge must hold BOTH roots (merge), not only the last writer's.
+    const bridge = JSON.parse(readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf-8"));
+    const roots = new Set(bridge.verified_files.map((vf: any) => String(vf.path).split("::")[0]));
+    ok(roots.has(realW), `foreign-lane write must preserve the parent root's entries; roots on disk: ${JSON.stringify([...roots])}`);
+    // Sub-agent commits W's parent-verified file — must pass with no re-dispatch.
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'clobber'", cwd: repoW },
+      });
+      equal(res, undefined, "parent-verified file must still pass after a concurrent lane wrote the bridge (#1225/#1573)");
+      git(repoW, "commit -m clobber");
     } finally {
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
       if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;

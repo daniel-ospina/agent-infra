@@ -3,7 +3,7 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { relative, resolve, isAbsolute, join, dirname, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync, openSync, closeSync, writeSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
@@ -360,6 +360,55 @@ function diagnoseRootMismatch(root: string): void {
   );
 }
 
+// ── #1225/#1573 P0: the bridge is a SHARED, MULTI-ROOT registry ──────────
+// `writeBridge` used to publish a whole-file SNAPSHOT of the writer's own
+// registry, so any concurrent lane's write erased every other root's entries
+// (#1225 measured three consecutive silent losses). A parent's verified entries
+// were then gone before its task child read them, and the child blocked a
+// change that had already been verified — the P0 this fix closes. Writers now
+// MERGE by compound key and publish with an atomic rename (a reader never sees
+// a torn file). Concurrent writers serialize on an O_EXCL pidfile lock; the
+// holder holds for <1 ms, and a lock timeout degrades to an unlocked merge,
+// which is fail-closed (a lost merge means re-verification, never an allow).
+const BRIDGE_LOCK_WAIT_MS = 500;
+const BRIDGE_LOCK_STALE_MS = 10_000;
+
+function acquireBridgeLock(): (() => void) | null {
+  const lockFile = `${bridgePath()}.lock`;
+  const deadline = Date.now() + BRIDGE_LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      const fd = openSync(lockFile, "wx", 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => {
+        try {
+          // ownership check before unlink — a stale-reclaim cycle must not
+          // delete a lock a THIRD process now holds.
+          if (readFileSync(lockFile, "utf-8").trim() === String(process.pid)) unlinkSync(lockFile);
+        } catch { /* already released */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return null; // read-only dir — degrade unlocked
+      // Stale-lock self-heal: dead holder PID, or age past the threshold.
+      let stale = false;
+      try {
+        const holder = Number(readFileSync(lockFile, "utf-8").trim());
+        if (Number.isInteger(holder) && holder > 0) {
+          try { process.kill(holder, 0); } catch { stale = true; } // ESRCH — holder is dead
+        } else {
+          stale = true; // empty/unreadable lock (e.g. the legacy 0-byte file)
+        }
+        if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
+      } catch { continue; } // lock vanished — retry
+      if (stale) { try { unlinkSync(lockFile); } catch { /* raced */ } continue; }
+      if (Date.now() >= deadline) return null; // degrade unlocked; merge is fail-closed
+      const spinUntil = Date.now() + 10;
+      while (Date.now() < spinUntil) { /* brief spin — holders are sub-ms */ }
+    }
+  }
+}
+
 function writeBridge(projectRoot: string, files: string[]): void {
   try {
     // #190 review: the bridge is a same-user trust channel — 0o700/0o600 so
@@ -392,12 +441,51 @@ function writeBridge(projectRoot: string, files: string[]): void {
       console.error("[verification-gate] bridge write skipped — no files could be hashed");
       return;
     }
-    const payload = {
-      status: "PASS",
-      verified_files: verifiedFiles,
-      timestamp: new Date().toISOString(),
-    };
-    writeFileSync(bridgePath(), JSON.stringify(payload), { mode: 0o600 });
+    // #1225/#1573: MERGE into the shared registry — never overwrite it. The
+    // writer's OWN keys win (a re-verification updates in place); every
+    // foreign-root entry is preserved, so a concurrent lane cannot silently
+    // erase another root's verification. Preservation is security-neutral:
+    // recovery registers an entry only when its STORED hash still matches the
+    // file on disk under the committing root (match-or-drop, #190), so a
+    // preserved entry that no longer matches is inert (fail-closed). Entries
+    // whose root no longer exists are dropped, bounding the file to live
+    // worktrees.
+    const release = acquireBridgeLock();
+    try {
+      const merged = new Map<string, VerifiedFile>();
+      const existing = readBridge();
+      if (existing && existing.status === "PASS" && Array.isArray(existing.verified_files)) {
+        const rootAlive = new Map<string, boolean>();
+        for (const vf of existing.verified_files) {
+          if (!vf || typeof vf.path !== "string" || typeof vf.hash !== "string") continue;
+          const parsed = parseCompoundKey(vf.path);
+          if (parsed) {
+            let alive = rootAlive.get(parsed.root);
+            if (alive === undefined) { alive = existsSync(parsed.root); rootAlive.set(parsed.root, alive); }
+            if (!alive) continue; // dead worktree — prune
+          }
+          merged.set(vf.path, vf);
+        }
+      }
+      for (const vf of verifiedFiles) merged.set(vf.path, vf); // writer's own keys win
+      const payload = {
+        status: "PASS",
+        verified_files: Array.from(merged.values()),
+        timestamp: new Date().toISOString(),
+      };
+      // Atomic publish: a concurrent reader sees either the old file or the new
+      // one, never a truncated JSON body (which would read as no bridge).
+      const tmp = `${bridgePath()}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+        renameSync(tmp, bridgePath());
+      } catch (e) {
+        try { unlinkSync(tmp); } catch { /* nothing to clean */ }
+        throw e;
+      }
+    } finally {
+      if (release) release();
+    }
   } catch (e) {
     console.error("[verification-gate] bridge write failed:", (e as Error).message);
   }
@@ -454,7 +542,7 @@ function recoverBridgeForRoot(normRoot: string): number {
   for (const vf of bridge.verified_files) {
     try {
       const parsed = parseCompoundKey(vf.path);
-      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert
+      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert (#37/#190 root isolation)
       // #190 review: containment — an out-of-root rel (../) is inert against
       // the block check (git names are repo-relative) but hashFile would read
       // outside the root; drop such keys before hashing.
