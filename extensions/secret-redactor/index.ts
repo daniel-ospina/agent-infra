@@ -91,9 +91,20 @@ const SECRET_WORD = "(secret|password|passwd|credentials?)";
  *  `my_secret`, `credentials_file`) or a camelCase SUFFIX (`clientSecret`, `dbPassword`),
  *  never an arbitrary substring: the unanchored form matched ordinary data — `secretary`,
  *  `credentialsFile`, `passwordPolicy`, `secretariatOffice` were collected and rewritten
- *  out of tool results (review round 8). `token` was already anchored this way. */
+ *  out of tool results (review round 8). `token` was already anchored this way.
+ *  That anchoring then under-narrowed the OTHER direction: a camelCase PREFIX compound
+ *  (`secretKey`, `secretAccessKey`, `passwordHash`, `credentialId`) puts the credential
+ *  word neither in a whole `_`/`-` segment nor at the leaf END, so those leaves were
+ *  emitted verbatim — a configured secret under an ordinary credential field name, which
+ *  no pattern catches. `SECRET_COMPOUND_RE` re-admits the prefix family, but only when
+ *  EVERY following word is itself credential vocabulary; that is what keeps round 8's
+ *  negatives negative (`credentialsFile` → `File`, `passwordPolicy` → `Policy`,
+ *  `secretary` → `ary`, `secretariatOffice` → `ariatOffice` — none is a compound word)
+ *  (review round 9). */
+const SECRET_COMPOUND_WORD = "(key|value|hash|id|token|secret|access)";
+const SECRET_COMPOUND_RE = `${SECRET_WORD}([_-]?${SECRET_COMPOUND_WORD})+$`;
 const SECRET_LEAF_RE = new RegExp(
-  `(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|(^|[_-])${SECRET_WORD}([_-]|$)|${SECRET_WORD}$|(^|[_-])key$)`,
+  `(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|(^|[_-])${SECRET_WORD}([_-]|$)|${SECRET_WORD}$|${SECRET_COMPOUND_RE}|(^|[_-])key$)`,
   "i",
 );
 /** Leaves that END in `key` but hold ordinary relational/identity data, not a
