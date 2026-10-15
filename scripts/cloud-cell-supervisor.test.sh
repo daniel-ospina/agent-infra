@@ -724,8 +724,8 @@ GOT="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json"
 [ -f "$P/home/.harness-path" ] && ok "apply records WHERE it pinned the harness" || bad "apply did not record the harness path"
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 case "$PH" in
-  "$P/pin/scripts/orchestrator-harness") ok "apply pinned into HARNESS_PIN_DIR" ;;
-  *) bad "apply pinned to '$PH' instead of \$HARNESS_PIN_DIR" ;;
+  "$P/pin"/*/scripts/orchestrator-harness) ok "apply pinned into HARNESS_PIN_DIR/<commit>" ;;
+  *) bad "apply pinned to '$PH' instead of \$HARNESS_PIN_DIR/<commit>" ;;
 esac
 prov check
 [ "$PROV_RC" -eq 0 ] && ok "after apply, check is green — the mend closes the drift" || bad "check still refuses after apply: $PROV_OUT"
@@ -858,7 +858,7 @@ prov check
 [ "$PROV_RC" -eq 0 ] && ok "after the mend, check is green — a dirty tree is repairable" \
                      || bad "check still refuses after the mend: $PROV_OUT"
 # Direction (b): edit the SOURCE after a clean record. Only $O is re-hashed, so this used to pass.
-printf '\n# hand-edit to the SOURCE, after the record\n' >> "$P/pin/scripts/orchestrator-harness/merge-one.sh"
+printf '\n# hand-edit to the SOURCE, after the record\n' >> "$PH/merge-one.sh"
 prov check
 [ "$PROV_RC" -ne 0 ] && ok "check REFUSES a SOURCE edited after the record (the \$O-only hash misses it)" \
                      || bad "check: accepted a post-record SOURCE edit — $PROV_OUT"
@@ -998,6 +998,81 @@ prunesup --scratch=0
                                        || bad "prune --scratch DELETED a registered worktree — unmerged work lost"
 [ -e "$R/scratch/stale" ] && bad "prune --scratch did not delete an old, unregistered scratch checkout" \
                           || ok "prune --scratch deleted an old, unregistered scratch checkout"
+
+# ── (iii) the second review round: validated floor, atomic stamp, mirroring, per-commit pins ─────
+say_case "review round: floor validation, atomic stamp, seeding mirror, per-commit pins (#1745)"
+
+# ⛔ A non-numeric floor is refused at LOAD. `[ "$mb" -lt "$MIN_FREE_MB" ]` with a non-numeric value
+# prints `integer expression expected` and evaluates FALSE — the branch is never taken, so the ONE
+# check that exists because a full disk read healthy is silently disarmed.
+FLOOR_OUT="$(CELL_HOME="$P/home" ENV_FILE="$P/keys.env" SESSION="ai1745-$$" O="$P/o" REPO="$P/repo" \
+             HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$PH" MIN_FREE_MB=abc bash "$SUP" status 2>&1)"
+FLOOR_RC=$?
+[ "$FLOOR_RC" -ne 0 ] && ok "a non-numeric MIN_FREE_MB is refused at load, not silently ignored" \
+                      || bad "a non-numeric MIN_FREE_MB was accepted — the floor would never fire"
+case "$FLOOR_OUT" in
+  *"MIN_FREE_MB must be"*) ok "the refusal names MIN_FREE_MB" ;;
+  *) bad "the MIN_FREE_MB refusal is not explained — $FLOOR_OUT" ;;
+esac
+
+# ⛔ The stamp is written TEMP-THEN-RENAME. An in-place `cat >` truncates the real record FIRST, so an
+# ENOSPC in that window (the exact condition this change exists for) destroys the one artifact that
+# makes the surface checkable. Assert both halves: a usable record, and no staging file left behind.
+PH="$P/div/scripts/orchestrator-harness"
+prov apply
+[ "$PROV_RC" -eq 0 ] && ok "apply records (fixture for the atomicity and mirror arms below)" \
+                     || bad "apply failed: $PROV_OUT"
+grep -q '"commit"' "$P/o/.agent-infra-stamp.json" 2>/dev/null \
+  && ok "the stamp is present and carries a commit after apply" || bad "no usable stamp after apply"
+[ -z "$(ls "$P/o"/.agent-infra-stamp.json.tmp-* 2>/dev/null)" ] \
+  && ok "no staging file survives the stamp write (temp-then-rename, not truncate-in-place)" \
+  || bad "a staging temp stamp was left on disk — the write is not atomic"
+# The DISCRIMINATOR between a rename and an in-place rewrite is the inode: `mv -f` installs a NEW file,
+# while `cat > "$STAMP"` reuses the existing one. Asserting only "no temp left + a valid stamp" is
+# satisfied by BOTH, so it is decorative; this is the assertion a mutation back to `cat >` reddens.
+INO_BEFORE="$(ls -i "$P/o/.agent-infra-stamp.json" 2>/dev/null | awk '{print $1}')"
+prov apply >/dev/null 2>&1
+INO_AFTER="$(ls -i "$P/o/.agent-infra-stamp.json" 2>/dev/null | awk '{print $1}')"
+[ -n "$INO_BEFORE" ] && [ -n "$INO_AFTER" ] && [ "$INO_BEFORE" != "$INO_AFTER" ] \
+  && ok "the record is REPLACED by rename (new inode), not rewritten in place — ENOSPC cannot truncate it" \
+  || bad "the stamp kept inode '$INO_BEFORE' across an apply — it is rewritten in place, so an ENOSPC mid-write destroys it"
+
+# ⛔ MIRRORING: orch-loop.sh/merge-one.sh invoke workers BY NAME from $O, so a worker RENAMED upstream
+# would leave its old copy live in $O and still invocable while the record described the harness.
+: > "$P/o/renamed-away-worker.sh"
+prov apply
+[ ! -e "$P/o/renamed-away-worker.sh" ] \
+  && ok "seeding MIRRORS: a stale \$O worker the harness no longer ships is removed" \
+  || bad "a stale worker stayed in \$O — it is still invocable by name"
+
+# ⛔ PER-COMMIT PINS: create-new, never destroy-then-create. Pinning into ONE shared path meant `rm -rf`
+# of the tree the cell was running from, with the replacement created only afterwards — a crash in that
+# window leaves the cell with NO harness and a controller that will not start.
+case "$(cat "$P/home/.harness-path" 2>/dev/null)" in
+  "$P/pin"/*/scripts/orchestrator-harness) ok "the pin lives at HARNESS_PIN_DIR/<commit> (create-new, not replace-in-place)" ;;
+  *) bad "the pin is not per-commit: $(cat "$P/home/.harness-path" 2>/dev/null)" ;;
+esac
+mkdir -p "$R/pin/000000000000/scripts/orchestrator-harness" "$R/pin/111111111111/scripts/orchestrator-harness"
+printf '%s\n' "$R/pin/111111111111/scripts/orchestrator-harness" > "$R/home/.harness-path"
+prunesup
+[ ! -e "$R/pin/000000000000" ] && ok "prune reclaims a SUPERSEDED harness pin (per-commit pinning would otherwise leak disk)" \
+                              || bad "prune kept a superseded harness pin — the new pin scheme leaks disk"
+[ -d "$R/pin/111111111111" ] && ok "prune KEEPS the ACTIVE harness pin" \
+                             || bad "prune deleted the ACTIVE pin — the cell no longer has its harness"
+# An empty pin file means "which pin is live" is NOT KNOWN: an unknown is an abstention, not a licence.
+: > "$R/home/.harness-path"
+prunesup
+[ -d "$R/pin/111111111111" ] && ok "an UNKNOWN active pin is an abstention — no pin is deleted" \
+                             || bad "prune deleted a pin while it could not tell which one is active"
+
+# ⛔ A linked worktree under $SCRATCH_ROOT has a `.git` FILE, not a directory, and is checked-out source
+# that may hold unmerged work — never scratch, even when $REPO/$HARNESS_REPO do not register it.
+mkdir -p "$R/scratch/linkedwt"
+printf 'gitdir: /nowhere\n' > "$R/scratch/linkedwt/.git"
+touch -t 202001010000 "$R/scratch/linkedwt"
+prunesup --scratch=0
+[ -d "$R/scratch/linkedwt" ] && ok "prune --scratch SPARES a linked worktree (\$SCRATCH_ROOT/.git is a FILE — unmerged work)" \
+                             || bad "prune --scratch deleted a linked worktree — unmerged work lost"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

@@ -293,6 +293,10 @@ SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # driven hermetically by the test suite; a cell uses the default.
 SCRATCH_ROOT="${SCRATCH_ROOT:-/tmp}"
 STAMP="$O/.agent-infra-stamp.json"
+# ⛔ A non-numeric floor silently disables the ONE check that exists because a full disk read healthy:
+# `[ "$mb" -lt "$MIN_FREE_MB" ]` prints `integer expression expected` and evaluates FALSE, so the
+# branch is never taken and the cell is blessed. Validated at load, where the operator still sees it.
+case "$MIN_FREE_MB" in ''|*[!0-9]*) die "MIN_FREE_MB must be a whole number of megabytes (got '$MIN_FREE_MB')" ;; esac
 
 # Resolution order, most explicit first: an operator's $HARNESS (applied above, and never
 # overridden), then the path `apply` pinned, then this script's sibling harness, then the target
@@ -384,11 +388,16 @@ stamp_field_raw() {
 }
 
 stamp_write() {
-  local payload dirty
+  local payload dirty tmp
   classify_harness
   payload="$(o_payload_hash)"
   if [ -n "$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" ]; then dirty=true; else dirty=false; fi
-  cat > "$STAMP" <<STAMPEOF
+  # ⛔ TEMP-THEN-RENAME, never `cat > "$STAMP"`. An in-place write truncates the real stamp FIRST, so a
+  # failure in that window (ENOSPC — the exact condition this whole change exists for) destroys the one
+  # artifact that makes the surface checkable, where a valid record used to be. `seed_and_stamp` below
+  # already stages its own writes for the same reason.
+  tmp="$STAMP.tmp-$$"
+  cat > "$tmp" <<STAMPEOF
 {
   "version": 1,
   "surface": "cloud-cell",
@@ -402,6 +411,7 @@ stamp_write() {
   "recordedAt": "$(date -u +%FT%TZ)"
 }
 STAMPEOF
+  mv -f "$tmp" "$STAMP" || { rm -f "$tmp"; die "cannot record the harness provenance at $STAMP"; }
 }
 
 # Is the harness's WORKING TREE dirty? HEAD can equal the ref while the tree carries hand edits, and
@@ -425,18 +435,38 @@ linked_worktree_of() {
 # values an operator cannot plausibly set, while `HARNESS_PIN_DIR=$CELL_HOME` (or $HOME, or $O) drove
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
-# worktree of $HARNESS_REPO or an empty directory.
+# worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only 12-hex-char pin dirs.
 assert_pin_dir_safe() {
-  local dir="$1" p
+  local dir="$1" p entries ok
   case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
   for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
     [ -n "$p" ] || continue
     case "$p" in "$dir"|"$dir"/*) die "refusing HARNESS_PIN_DIR='$dir': it CONTAINS $p, which this cell needs. Point it at a dedicated worktree path (default $CELL_HOME/harness).";; esac
   done
   [ -e "$dir" ] || [ -L "$dir" ] || return 0
-  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0
-  if [ -d "$dir" ] && [ -z "$(ls -A "$dir" 2>/dev/null)" ]; then return 0; fi
-  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it exists and is neither an empty directory nor a linked worktree of ${HARNESS_REPO:-<unresolved>}. Remove it by hand if you are sure it holds nothing."
+  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0     # the legacy flat pin (one worktree = the root)
+  if [ -d "$dir" ]; then
+    [ -z "$(ls -A "$dir" 2>/dev/null)" ] && return 0
+    # A pin ROOT: `apply` names each pin by the 12 hex chars of its commit, so the root HOLDS
+    # worktrees rather than BEING one. Accept only that shape — a directory whose every entry is a
+    # 12-hex-character directory — so an operator's own directory is still refused. ⛔ Deliberately NOT
+    # "is each entry in `git worktree list`": on macOS a `$TMPDIR`-derived path carries a `//`, which
+    # git normalizes in its listing output, so a literal path comparison reports our OWN pin as foreign
+    # and the guard becomes a false block. The `rm -rf` never touches the root itself.
+    entries=0 ok=1
+    for p in "$dir"/*; do
+      [ -e "$p" ] || continue
+      entries=$((entries + 1))
+      [ -d "$p" ] || { ok=0; break; }
+      case "$(basename "$p")" in
+        ????????????) case "$(basename "$p")" in *[!0-9a-f]*) ok=0 ;; esac ;;
+        *) ok=0 ;;
+      esac
+      [ "$ok" = 1 ] || break
+    done
+    [ "$ok" = 1 ] && [ "$entries" -gt 0 ] && return 0
+  fi
+  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it exists and is neither an empty directory, a linked worktree, nor a pin root of ${HARNESS_REPO:-<unresolved>}. Remove it by hand if you are sure it holds nothing."
 }
 
 # Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:
@@ -465,11 +495,22 @@ harness_apply() {
   if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ] && ! harness_dirty; then
     HARNESS_APPLIED=unchanged
   else
-    dir="$HARNESS_PIN_DIR"
-    assert_pin_dir_safe "$dir"
-    git -C "$HARNESS_REPO" worktree remove --force "$dir" >/dev/null 2>&1 || true
-    rm -rf "$dir"
-    git -C "$HARNESS_REPO" worktree prune >/dev/null 2>&1 || true
+    # ⛔ PIN PER COMMIT, and create-new rather than destroy-then-create. Pinning into ONE shared
+    # $HARNESS_PIN_DIR meant `rm -rf` of the very tree the cell is running from, with the replacement
+    # only created afterwards: a crash in that window (ENOSPC is exactly when it happens) leaves the
+    # cell with NO harness at all, and the operator's only clue is a controller that will not start.
+    # The previous pin now survives until `prune` reclaims it.
+    dir="$HARNESS_PIN_DIR/$(printf '%s' "$want" | cut -c1-12)"
+    # ⛔ The BASE is validated, not the per-commit child. Passing the child made the deny-list compare
+    # the wrong way round — `HARNESS_PIN_DIR=$CELL_HOME` would put the child BELOW the cell home, so
+    # "does this path contain the cell home" was false and the guard that exists to stop `rm -rf` over
+    # the cell home silently stopped firing. The child is strictly under a validated root by construction.
+    assert_pin_dir_safe "$HARNESS_PIN_DIR"
+    # ⛔ No bare `git worktree prune`. It has no path filter and deregisters EVERY record whose working
+    # directory is missing, unrelated siblings included — and for a DETACHED worktree the admin HEAD is
+    # the commit's last durable handle, so a later `gc` collects it (#1141; this repo forbids the call).
+    # Only the single path being reused is removed.
+    git -C "$HARNESS_REPO" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf "$dir"
     mkdir -p "$(dirname "$dir")" || die "cannot create $(dirname "$dir")"
     git -C "$HARNESS_REPO" worktree add --detach "$dir" "$want" >/dev/null 2>&1 \
       || die "git worktree add --detach $dir $want failed — free space ($0 prune) and retry"
@@ -502,6 +543,13 @@ seed_and_stamp() {
     n=$((n + 1))
   done
   [ "$n" -gt 0 ] || die "no *.sh scripts in $HARNESS — nothing to seed into $O"
+  # ⛔ MIRROR, do not merely overlay. `orch-loop.sh`/`merge-one.sh` invoke workers BY NAME from $O, so a
+  # script RENAMED upstream would leave its old copy live in $O and still invocable — the record would
+  # describe the harness while the cell ran a worker the harness no longer ships.
+  for f in "$O"/*.sh; do
+    [ -f "$f" ] || continue
+    [ -f "$HARNESS/$(basename "$f")" ] || { rm -f "$f"; say "seed: removed stale $(basename "$f") — the harness no longer ships it"; }
+  done
   stamp_write || die "cannot record the harness provenance at $STAMP"
 }
 
@@ -939,7 +987,21 @@ cmd_prune() {
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
-  local before after mb r root d
+  local before after mb r root d active_pin
+  # (0) Harness pins superseded by the current one. `apply` names each pin by its commit, so a main
+  # advance leaves the previous pin behind; only the path $HARNESS_PIN_FILE names is kept. Without this
+  # per-commit pinning is a disk LEAK — the very thing `prune` exists to stop. An empty pin file means
+  # "which pin is live" is NOT KNOWN, and an unknown is an abstention: nothing is deleted.
+  active_pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  if [ -n "$active_pin" ]; then
+    for d in "$HARNESS_PIN_DIR"/*/; do
+      d="${d%/}"
+      [ -d "$d" ] || continue
+      case "$active_pin" in "$d"/*) continue ;; esac
+      say "prune: reclaiming superseded harness pin $d"
+      rm_cache "$d"
+    done
+  fi
   before="$(free_mb "$CELL_HOME")"
   tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
   for r in "$REPO" "$HARNESS_REPO"; do
@@ -967,6 +1029,10 @@ cmd_prune() {
     case "$d" in "$SCRATCH_ROOT/cell"|"$SCRATCH_ROOT/cell-"*|"$SCRATCH_ROOT/harness"*|"$SCRATCH_ROOT/cell-home") continue ;; esac
     [ -e "$d/.git" ] || continue
     registered_worktree "$d" && continue
+    # ⛔ A linked worktree's `.git` is a FILE, not a directory. It is checked-out source that may hold
+    # unmerged work, so it is never scratch — `registered_worktree` alone misses it for a repo this
+    # cell does not happen to have registered ($REPO/$HARNESS_REPO).
+    [ -f "$d/.git" ] && continue
     if [ "$do_scratch" = 1 ] && [ -n "$(find "$d" -maxdepth 0 -mtime +"$days" 2>/dev/null)" ]; then
       rm_cache "$d"; freed_scratch=1
     else
