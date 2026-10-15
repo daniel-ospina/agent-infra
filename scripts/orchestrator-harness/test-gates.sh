@@ -181,12 +181,43 @@ fi
 wpin() { # wpin <label> <file> <fixed-string>
   if grep -qF "$3" "$2"; then echo "  ✅ $1"; PASS=$((PASS+1)); else echo "  ❌ $1 — [$3] not found in $(basename "$2")"; FAIL=$((FAIL+1)); fi
 }
+wline() { # wline <label> <file> <fixed-WHOLE-line at column 0>
+  # A plain substring pin cannot tell `resolve_required_checks "$OR"` from the SAME text
+  # wrapped in a command substitution (`REQ="$(resolve_required_checks "$OR")"`) — the wrap
+  # subshells the resolver and drops REQ_SOURCE. Anchored to the whole line, the wrapped form
+  # no longer matches (review round 8, P2).
+  if grep -qxF "$3" "$2"; then echo "  ✅ $1"; PASS=$((PASS+1)); else echo "  ❌ $1 — the line [$3] is not present at column 0 (a wrapped/subshelled call does not count)"; FAIL=$((FAIL+1)); fi
+}
 eqv "agent-infra's set -> rail authority" "rail" "$(merge_authority "pipeline-compliance")"
 wpin "orch-loop.sh resolves the required set in the CALLER's shell" "$ORCH" 'resolve_required_checks "$OR"'
 wpin "orch-loop.sh derives the merge authority from that set" "$ORCH" 'MERGE_AUTHORITY="$(merge_authority "$REQ")"'
 wpin "the classifier receives the resolved set + gate name" "$ORCH" 'REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3'
 wpin "the controller branches on the merge authority" "$ORCH" 'MERGE_AUTHORITY" = "rail"'
-wpin "merge-one.sh resolves the same contract" "$MERGE" 'resolve_required_checks "$OR"'
+wline "merge-one.sh resolves the same contract in the CALLER's shell (whole line, not wrapped in a command substitution)" "$MERGE" 'resolve_required_checks "$OR"'
+# (e2) …and BEHAVIOURALLY. The grep above cannot see a command substitution around the call (the
+# wrapped form CONTAINS the same substring), so the round-2 defect — REQ_SOURCE lost, `source=?`
+# printed, the fallback warning never firing, and the authority-unknown refusal tripping on every
+# PR — could return with every pin green (review round 8, P2; the PR body listed this mutant as
+# verified RED). Extract merge-one.sh's shipped contract block and DRIVE it: with a resolver that
+# sets BOTH globals, a direct call leaves REQ/REQ_SOURCE/AUTHORITY set; the subshell shape leaves
+# REQ empty and fires the refusal (exit 5).
+awk '/^# ── the repo.s merge authority \(agent-infra#1764\)/{f=1} /^if \[ "\$MERGE_AUTHORITY" = "rail" \]; then/{f=0} f' "$MERGE" > "$TMP/contract.sh"
+if [ -s "$TMP/contract.sh" ] && bash -n "$TMP/contract.sh" 2>/dev/null; then
+  _c_out="$( REQ_OVERRIDE=''; REQ=''; L="$TMP/contract.log"; OR=daniel-ospina/agent-infra; PR=1764
+    resolve_required_checks() { REQ='pipeline-compliance'; REQ_SOURCE='protection'; return 0; }
+    merge_authority() { printf 'rail\n'; }
+    # shellcheck disable=SC1090
+    . "$TMP/contract.sh"
+    printf 'REQ=%s SRC=%s AUTH=%s' "$REQ" "${REQ_SOURCE:-}" "$MERGE_AUTHORITY" )" 2>/dev/null
+  _c_rc=$?
+  if [ "$_c_rc" = "0" ] && [ "$_c_out" = "REQ=pipeline-compliance SRC=protection AUTH=rail" ]; then
+    echo "  ✅ merge-one.sh's resolver runs in the CALLER's shell — REQ and REQ_SOURCE survive the call"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the resolver did not survive its call site (rc=$_c_rc out=[$_c_out]) — a command-substitution wrap drops REQ_SOURCE and trips the authority-unknown refusal on every PR"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ could not extract merge-one.sh's repo-authority contract block"; FAIL=$((FAIL+1))
+fi
 # (f) the missing-rail REFUSAL is BEHAVIOURAL, not textual. A grep pin cannot tell a live guard
 # from one neutered to `if false` (the refusal echo stays in the file either way) — that is the
 # inert-enforcer class this repo treats as category A. So the rail branch is EXTRACTED and DRIVEN
@@ -204,6 +235,16 @@ else
   echo "  ❌ could not extract the rail branch from merge-one.sh"; FAIL=$((FAIL+1))
 fi
 wpin "merge-one.sh runs the repo's rail, not a raw merge" "$MERGE" 'bash "$RAIL" "$PR" --repo "$OR" -- --squash'
+# …and the ABSENCE of a raw merge ON THE RAIL PATH (review round 8, P2). The pin above is a
+# PRESENCE grep, so `gh pr merge …` added ALONGSIDE the rail call stays green — and the rail-branch
+# drives below did not stub `gh`, so the bypass was invisible to them. Static absence first
+# (anchored to a COMMAND line, so the `raw gh pr merge` warning text in an echo cannot match),
+# then a behavioural `gh` spy on PATH in the rail-success drive below.
+if grep -qE '^[[:space:]]*gh[[:space:]]+pr[[:space:]]+merge' "$TMP/railbranch.sh"; then
+  echo "  ❌ merge-one.sh's rail branch issues a raw 'gh pr merge' — the exact bypass this branch forbids"; FAIL=$((FAIL+1))
+else
+  echo "  ✅ merge-one.sh's rail branch issues NO raw 'gh pr merge' (static absence pin)"; PASS=$((PASS+1))
+fi
 
 # RAIL_TRIES is deliberately NOT set here (review round 5, P1): the drive used to supply it, so
 # the suite could not tell a shipped script that DEFAULTS it from one that expands it bare under
@@ -244,9 +285,23 @@ printf '%s\n' "\$PWD" "\$*" > "$TMP/railO/rail-argv.txt"
 exit 0
 RAILSTUB
 chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
-( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+# A `gh` spy on PATH for the rail-success drive: the rail branch is invoked with a rail that
+# SUCCEEDS, and any raw `gh pr merge` added to that branch (the bypass) must be recorded here —
+# the behavioural half of the absence pin (the stubs above never put `gh` on PATH).
+mkdir -p "$TMP/ghspy"
+cat > "$TMP/ghspy/gh" <<'GHSPY'
+#!/bin/bash
+printf '%s\n' "$*" >> "${GH_SPY:?gh-spy invoked without GH_SPY}"
+exit 0
+GHSPY
+chmod +x "$TMP/ghspy/gh"
+: > "$TMP/railO/gh-spy.txt"
+( PATH="$TMP/ghspy:$PATH"; export GH_SPY="$TMP/railO/gh-spy.txt"; MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=cccc3333; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; src2=$?
+[ ! -s "$TMP/railO/gh-spy.txt" ] \
+  && { echo "  ✅ …and the rail path issued NO gh call at all (a gh spy on PATH saw nothing)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the rail path invoked gh: [$(tr '\n' ';' < "$TMP/railO/gh-spy.txt")] — the raw-merge bypass this branch forbids"; FAIL=$((FAIL+1)); }
 [ "$src2" = "0" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
   && { echo "  ✅ the rail IS invoked with RAIL_TRIES unset (the merge is recorded — rail mode is reachable)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ the rail was never invoked (rc=$src2, merged-marker=$([ -f "$TMP/railO/state/merged-1764.done" ] && echo yes || echo no)) — rail mode is DEAD, exactly the #1764 deadlock)"; FAIL=$((FAIL+1)); }
