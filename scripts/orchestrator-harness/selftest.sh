@@ -21,6 +21,19 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
+# ── PLATFORM GATE (agent-infra#1769 review) ──────────────────────────────────────
+# install.sh is macOS-only BY CONSTRUCTION: its preflight is
+# `[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"`,
+# and every check that drives it to a rendered plist needs `plutil` and launchd. Wiring this suite
+# into `scripts/run-bash-shards.sh` (the shard list BOTH CI lanes run on ubuntu-latest) therefore
+# reddened `bash-suites` and would redden main's `script-validate` — the #1369 class the shard list
+# exists to close. Those checks are SKIPPED LOUDLY off macOS instead of failing: a silently-absent
+# suite would be the SAME class again. `skipd` counts and names each skip, and the final summary
+# reports the count, so a green Linux run cannot hide a suite that did not run.
+PLATFORM="$(uname)"
+skip=0
+skipd() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; skip=$((skip+1)); }
+on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # OFFLINE: install.sh probes the REAL `gh` (`gh auth status`) and dies without a live authenticated
 # session, so the install/render checks below would need network. A `gh` stub that reports success
 # is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
@@ -510,6 +523,7 @@ ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 # EXECUTES pi — so a sandbox HOME must expose a runnable pi, exactly as a real install's HOME does.
 mkdir -p "$SB/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmod +x "$SB/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
@@ -529,6 +543,9 @@ if [ -f "$PL" ]; then
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
 fi
+else
+  skipd "install.sh renders a plist (§6) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6b) install.sh on a fresh checkout: dir-only gitignore, .worktrees not created yet ─
 # install.sh is the FIRST step on a fresh box (README §4) and dispatch-merge.sh creates the
@@ -543,6 +560,7 @@ printf '.worktrees/\n' > "$FR/repo/.gitignore"
 ck "non-vacuity: the pre-fix bare .worktrees guard fails on a fresh checkout" $rc
 grep -q 'check-ignore -q .worktrees/' "$INST" && rc=0 || rc=1
 ck "install.sh's gitignore guard uses the directory form .worktrees/" $rc
+if on_darwin; then
 SB2="$TMP/sb2"; mkdir -p "$SB2/Library/LaunchAgents" "$SB2/.config" "$SB2/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
@@ -551,6 +569,9 @@ HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$T
 PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
+else
+  skipd "install.sh renders on a fresh checkout (§6b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6c) the self-test resolves REPO to the checkout, not its parent ─────────────
 # It passed `$HERE/../../..` (the PARENT of the repo root) to install.sh, which died
@@ -570,6 +591,7 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # Render in a sandbox with a CONTROLLED PATH whose tools live in one fixture dir: the rendered PATH
 # must contain it (so the check is red under the hardcoded base) and no shim/.pi segment. `uv` is
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
+if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
 for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
@@ -582,6 +604,9 @@ case ":$PLP:" in *":$FB:"*) rc=0;; *) rc=1; echo "      rendered PATH=$PLP lacks
 ck "the rendered plist PATH is resolved, not the pre-fix hardcoded base" $rc
 case ":$PLP:" in *"/shims"*|*"/.pi/"*) rc=1;; *) rc=0;; esac
 ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
+else
+  skipd "install.sh's plist PATH render checks (§6d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6e) install.sh CREATES the plist directory ─────────────────────────────────
 # Every sandbox above pre-creates $HOME/Library/LaunchAgents, so `mkdir -p "$(dirname "$PLIST")"`
@@ -589,6 +614,7 @@ ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
 # HOME has no such directory — the render died with a raw redirect error after $O's state dirs were
 # already created (the pre-fix half-install). Assert the directory is absent first (non-vacuity),
 # then that install succeeds and the plist exists.
+if on_darwin; then
 SB4="$TMP/sb4"; mkdir -p "$SB4/.config" "$SB4/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB4/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB4/.pi/agent/scripts/record-review.sh"
@@ -601,6 +627,9 @@ inst_rc=$?
 [ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
+else
+  skipd "install.sh creates the plist directory (§6e) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
@@ -1316,6 +1345,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
+if on_darwin; then
 PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
@@ -1333,6 +1363,9 @@ done
 got="$(render_scope __UNSET__)"
 [ "$got" = "auto" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted 'auto'"; }
 ck "an UNSET SCOPE renders the auto default" $rc
+else
+  skipd "install.sh's plist SCOPE render checks (§16b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # set-but-EMPTY is FATAL on BOTH launchers — a blank plist / keys.env entry must not become `auto`,
 # which is the shared-queue drain the override exists to prevent. install.sh:
@@ -1408,9 +1441,13 @@ SB5="$TMP/sb5"; mkdir -p "$SB5/Library/LaunchAgents" "$SB5/.config" "$SB5/.pi/ag
 ln -s "$HOME/.config/gh" "$SB5/.config/gh" 2>/dev/null || true
 mkdir -p "$SB5/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB5/.local/share/pi-node/current/bin/pi"; chmod +x "$SB5/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 ( HOME="$SB5" O="$TMP/clean-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.clean.err" ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh refused a clean \$O: $(tail -2 "$TMP/inst.clean.err")"; }
 ck "install.sh accepts a clean \$O (non-vacuity for the guard loop below)" $rc
+else
+  skipd "install.sh accepts a clean \$O (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
   ( HOME="$SB5" O="$TMP/$bad" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.og.err" ); rc=$?
   [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.og.err" && rc=0 \
@@ -1426,6 +1463,7 @@ ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
 # A ZERO-BYTE key file is not a key: `-f` blessed it, and the daemon then recorded reviews
 # UNSIGNED and failed ai-review-gate — the env-only failure with the file branch taken (README §7.4).
+if on_darwin; then
 : > "$SB/.pi/agent/.ai-review-gate-key"
 ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
 case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed an empty key file" ;; *) rc=0 ;; esac
@@ -1450,6 +1488,9 @@ chmod 600 "$SB/.pi/agent/.ai-review-gate-key"
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      install.sh did not name an unreadable key file: $(printf '%s\n' "$ikout" | grep -i 'key' | head -2)";; esac
 ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" $rc
+else
+  skipd "install.sh's gate-key file verdict (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
@@ -2320,6 +2361,7 @@ grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
 ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
 grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
 ck "the reaper reads STALE_MIN in base 10" $rc
+if on_darwin; then
 # ── install.sh's render guards, DRIVEN (not grepped) ─────────────────────────────
 # Source-text pins are exactly what this file was told to stop doing: `if false && grep …` leaves the
 # text intact and the guard dead. So RUN the real installer. This is §6's sandbox pattern, seeded with
@@ -2418,6 +2460,9 @@ grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
 ck "the freshly rendered plist is valid XML" $rc
+else
+  skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -2667,5 +2712,21 @@ else
 fi
 
 echo
+# ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
+# A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
+# `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
+# off macOS every skip is an install.sh-driven group and the run must still have exercised the bulk
+# of the suite (the classifier/reaper/parity checks), so a widened gate cannot go unnoticed.
+if on_darwin; then
+  [ "$skip" -eq 0 ] && rc=0 || { rc=1; echo "      platform gate skipped $skip group(s) on Darwin — the gated checks MUST run here"; }
+  ck "platform gate: macOS runs every gated check (a skip is never a pass)" $rc
+else
+  [ "$skip" -gt 0 ] && [ "$pass" -ge 250 ] && rc=0 \
+    || { rc=1; echo "      skip=$skip pass=$pass — a $PLATFORM run must skip ONLY the install.sh groups, not the suite"; }
+  ck "platform gate: $PLATFORM skips only install.sh-driven checks and still runs the suite ($pass checks)" $rc
+fi
+if [ "$skip" -gt 0 ]; then
+  echo "==> $skip install-check group(s) SKIPPED (platform=$PLATFORM; install.sh is macOS-only) — a skip is NOT a pass"
+fi
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -273,13 +273,21 @@ printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"; chmod +
 # is unreachable, no park is written, and the sweep re-runs the rail forever — the burn RAIL_TRIES
 # exists to close.
 printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"; chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+# ⛔ TRUNCATE BEFORE THE DRIVE (review round 7, P2): the log is SHARED with the missing-rail drive
+# above (same $L), which already wrote a `REFUSED` line into it — so the `_hits` half of the
+# assertion below was satisfied by a STALE artifact and could never fail. Proven by mutation:
+# deleting the empty-head `REFUSED` echo from merge-one.sh (leaving `exit 7`) still reported 88/0.
+# `: >`, never `rm -f`: an ABSENT file is not what the assertion reads (drive_green does the same).
+: > "$TMP/railO/merge.log.log"
 ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=''; \
   . "$TMP/railbranch.sh" ) >/dev/null 2>&1; ehrc=$?
 _hits=0; for _i in 1 2 3 4; do
   ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
     L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=''; . "$TMP/railbranch.sh" ) >/dev/null 2>&1
-  grep -qs 'REFUSED' "$TMP/railO/merge.log.log" && _hits=1
+  # The message is specific to the EMPTY-head refusal, not just any `REFUSED` — a stale or
+  # different refusal cannot satisfy it.
+  grep -qs 'REFUSED: the PR head could not be read' "$TMP/railO/merge.log.log" && _hits=1
 done
 [ "$ehrc" = "7" ] && [ "$_hits" = "1" ] \
   && { echo "  ✅ an EMPTY head REFUSES (exit 7) instead of running an un-keyed, never-parking retry loop"; PASS=$((PASS+1)); } \
