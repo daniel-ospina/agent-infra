@@ -73,6 +73,8 @@ const MIN_LEN = 12;
 /** Read regardless of readdir: the known fleet stores. */
 const FALLBACK_STORES = ["tortoise-config.json", "jev-config.json", ".mcp.json", "models.json"];
 
+const SECRET_WORD = "(secret|password|passwd|credentials?)";
+
 /** Secret-ish on the LEAF key (`authToken`, `apiKey`, `clientSecret`, `OPENAI_KEY`…)
  *  or on the path. The `(^|[_-])key$` alternative mirrors the env collector's `_KEY`
  *  suffix so a SCREAMING_SNAKE literal in a config store (`OPENAI_KEY`, `MASTER_KEY`,
@@ -84,8 +86,16 @@ const FALLBACK_STORES = ["tortoise-config.json", "jev-config.json", ".mcp.json",
  *  EVERY `*_key` leaf, so `sort_key`/`foreign_key`/`primary_key` — the snake_case
  *  spelling of the very words above — were redacted too (review round 6). The env
  *  collector's `_KEY` suffix names a CREDENTIAL shape; it is not a licence to treat
- *  every `_key` field as one. */
-const SECRET_LEAF_RE = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|secret|password|passwd|credential|(^|[_-])key$)/i;
+ *  every `_key` field as one.
+ *  Each credential WORD in `SECRET_WORD` must be a WHOLE segment (`secret`, `secret_key`,
+ *  `my_secret`, `credentials_file`) or a camelCase SUFFIX (`clientSecret`, `dbPassword`),
+ *  never an arbitrary substring: the unanchored form matched ordinary data — `secretary`,
+ *  `credentialsFile`, `passwordPolicy`, `secretariatOffice` were collected and rewritten
+ *  out of tool results (review round 8). `token` was already anchored this way. */
+const SECRET_LEAF_RE = new RegExp(
+  `(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|(^|[_-])${SECRET_WORD}([_-]|$)|${SECRET_WORD}$|(^|[_-])key$)`,
+  "i",
+);
 /** Leaves that END in `key` but hold ordinary relational/identity data, not a
  *  credential (`sort_key`, `foreign_key`, `primary_key`, `cache_key`, `partition_key`,
  *  `dedup_key`, …) plus the bare, ambiguous `key`. Vetoed from `SECRET_LEAF_RE`'s
@@ -157,6 +167,8 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
         // The label is `store:path` — the traversal ROOT is the store label, so it must
         // be stripped from the display path or it repeats (`store:store.apiKey`).
         const p = path === label ? "" : path.slice(label.length + 1);
+        // The path is built from the store's KEYS and a key can itself BE a secret, so
+        // `scrubLabels` runs over every label before it can reach a marker or warning.
         into.push({ label: `${label}:${p || "(root)"}`, value: node });
       }
       return;
@@ -170,6 +182,27 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
     }
   };
   walk(obj, label);
+}
+
+/** A label embeds the traversal PATH, and that path is built from the store's object
+ *  KEYS — a key can itself BE a secret (`{"<apiKey>": {"password": …}}`). The marker
+ *  and the warning are both built from labels, so an un-scrubbed path re-emitted the
+ *  very secret being redacted, twice, into the transcript (review round 8). Scrub every
+ *  label through the same substitution the content gets, so a label is position-
+ *  independent of user data. Runs on the already-length-sorted list, so a longer secret
+ *  is replaced before its shorter substring. */
+function scrubLabels(secrets: Secret[]): void {
+  const scrub = (text: string): string => {
+    let out = text;
+    for (const s of secrets) {
+      if (s.value && out.includes(s.value)) out = out.split(s.value).join("[REDACTED]");
+    }
+    for (const [label, re] of PATTERNS) {
+      out = out.replace(new RegExp(re.source, re.flags), `[REDACTED:${label}]`);
+    }
+    return out;
+  };
+  for (const s of secrets) s.label = scrub(s.label);
 }
 
 /** Every top-level *.json in the agent dir (a store added later is covered), falling
@@ -211,7 +244,9 @@ function loadSecrets(): Secret[] {
       out.push({ label: `env:${k}`, value: v });
     }
   }
-  return out.filter((s) => s.value.length >= MIN_LEN).sort((a, b) => b.value.length - a.value.length);
+  const result = out.filter((s) => s.value.length >= MIN_LEN).sort((a, b) => b.value.length - a.value.length);
+  scrubLabels(result);
+  return result;
 }
 
 let cache: Secret[] = [];

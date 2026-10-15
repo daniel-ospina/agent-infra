@@ -26,7 +26,12 @@
  *     collected, and an env name the relational veto used to drop (`PRIMARY_KEY`,
  *     `SECONDARY_KEY`, `CACHE_KEY`, `ID_KEY`) IS collected; and
  *   - an own `__proto__` key survives redaction and does not reparent the result
- *     (it was dropped by the prototype setter and its value became the prototype).
+ *     (it was dropped by the prototype setter and its value became the prototype);
+ *   - a config KEY that is itself a secret is scrubbed out of the redaction LABEL, so
+ *     the marker and the warning cannot re-emit it (the label embedded the raw path);
+ *   - a credential WORD in a leaf name must be a WHOLE segment or a camelCase SUFFIX:
+ *     `secretary`/`credentialsFile`/`passwordPolicy`/`secretariatOffice` are NOT
+ *     collected, while `clientSecret`/`secret_key`/`dbPassword`/`credentials` still are.
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -63,6 +68,17 @@ const PRIMARY_ENV_SECRET = "primaryenvsecretvalue0001";
 const SECONDARY_ENV_SECRET = "secondaryenvsecretvalue02";
 const CACHE_ENV_SECRET = "cacheenvsecretvalue00003";
 const ID_ENV_SECRET = "idenvsecretvalue000000004";
+// Review round 8: the label embedded the traversal PATH (built from object KEYS, and a
+// key can itself BE a secret); the LEAF matcher matched credential WORDS as substrings.
+const AUTH_CONFIG_LEAF_SECRET = "authconfigleafsecret0008";
+const CLIENT_SECRET_VALUE = "clientsecretvalue00000009";
+const SECRET_KEY_LEAF_VALUE = "snakesecretvalue0000010";
+const DB_PASSWORD_VALUE = "dbpasswordvalue0000011";
+const CREDENTIALS_LEAF_VALUE = "credentialsvalue0000012";
+const CREDENTIALS_FILE_VALUE = "/home/user/credentials-store.json";
+const PASSWORD_POLICY_VALUE = "min-length-12-chars";
+const SECRETARIAT_VALUE = "room-204-floor-3";
+const TOKENIZER_PATH_VALUE = "/models/tokenizer-llama3";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -124,6 +140,36 @@ writeFileSync(
     rsa_public_key: RSA_PUBLIC_KEY_MATERIAL,
     app_public_key: APP_PUBLIC_KEY_MATERIAL,
     stripe_public_key: STRIPE_PUBLIC_KEY_MATERIAL,
+  }),
+);
+// Review round 8, finding 1: a config KEY that is itself a secret. The marker and the
+// appended warning are built from the traversal path, so the label re-emitted the
+// secret it had just redacted.
+writeFileSync(
+  join(AGENT, "auth-config.json"),
+  JSON.stringify({ auths: { [CONFIG_SECRET]: { password: AUTH_CONFIG_LEAF_SECRET } } }),
+);
+// Review round 8, finding 2: ordinary STRING-valued leaves whose name merely CONTAINS a
+// credential word were collected as secrets and rewritten out of tool results.
+writeFileSync(
+  join(AGENT, "app-config.json"),
+  JSON.stringify({
+    secretary: SECRETARY_NAME,
+    credentialsFile: CREDENTIALS_FILE_VALUE,
+    passwordPolicy: PASSWORD_POLICY_VALUE,
+    secretariatOffice: SECRETARIAT_VALUE,
+    tokenizerPath: TOKENIZER_PATH_VALUE,
+  }),
+);
+// ...and the ANCHORED forms that must STILL be collected, so the anchoring cannot
+// silently over-narrow (guard the fix in the other direction).
+writeFileSync(
+  join(AGENT, "wordkeys-config.json"),
+  JSON.stringify({
+    clientSecret: CLIENT_SECRET_VALUE,
+    secret_key: SECRET_KEY_LEAF_VALUE,
+    dbPassword: DB_PASSWORD_VALUE,
+    credentials: CREDENTIALS_LEAF_VALUE,
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
@@ -405,6 +451,41 @@ async function main(): Promise<void> {
     equal(Object.getPrototypeOf(out.details), Object.prototype, "the rebuilt object must not be reparented");
     ok(Object.prototype.hasOwnProperty.call(out.details, "__proto__"), "the __proto__ entry must survive");
     ok(!JSON.stringify(out.details).includes(CONFIG_SECRET), "the secret must be redacted");
+  });
+
+  // ── review round 8: label path leakage + unanchored credential WORDS ──────
+  await test("a secret used as a config KEY is not re-emitted in the marker or warning", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `password=${AUTH_CONFIG_LEAF_SECRET}` }] });
+    ok(out, "the leaf secret under a secret-named KEY must still be redacted");
+    ok(!JSON.stringify(out).includes(AUTH_CONFIG_LEAF_SECRET), "the leaf secret must not survive");
+    ok(
+      !JSON.stringify(out).includes(CONFIG_SECRET),
+      "the secret in KEY position must not be re-emitted in the marker or the warning",
+    );
+  });
+
+  await test("ordinary string-valued leaves containing a credential WORD are NOT collected", async () => {
+    for (const line of [
+      `secretary=${SECRETARY_NAME}`,
+      `credentialsFile=${CREDENTIALS_FILE_VALUE}`,
+      `passwordPolicy=${PASSWORD_POLICY_VALUE}`,
+      `secretariatOffice=${SECRETARIAT_VALUE}`,
+      `tokenizerPath=${TOKENIZER_PATH_VALUE}`,
+    ]) {
+      strictEqual(await run({ toolName: "x", content: [{ type: "text", text: line }] }), undefined, line);
+    }
+  });
+
+  await test("anchored credential WORD leaves are still collected", async () => {
+    for (const [leaf, value] of [
+      ["clientSecret", CLIENT_SECRET_VALUE],
+      ["secret_key", SECRET_KEY_LEAF_VALUE],
+      ["dbPassword", DB_PASSWORD_VALUE],
+      ["credentials", CREDENTIALS_LEAF_VALUE],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
+      ok(out && !JSON.stringify(out).includes(value), `${leaf} must still be collected`);
+    }
   });
 
   // ── negatives: no over-redaction, no touch when clean ──────────────────────
