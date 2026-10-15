@@ -55,6 +55,18 @@ required_checks() {
   raw="$("$gh" api "repos/$or/branches/main/protection/required_status_checks" --jq '.contexts[]' 2>/dev/null)" || return 1
   # De-duplicate and join on one line: the classifier splits on whitespace, and a newline would
   # otherwise reach it as part of the value rather than as a separator.
+  # ⚠️ A context whose NAME contains whitespace (GitHub allows it: `ci / lint`) cannot travel the
+  # space-joined contract — the classifier would read it as three names and the PR would sit
+  # PENDING forever (review round 3). The JOIN itself uses spaces, so the test is PER NAME, on
+  # the raw newline-delimited lines — a line with INTERNAL whitespace is an unrepresentable
+  # name. Supporting multiword names through the whole pipeline (bash splits, python split,
+  # case matching) is a redesign; REFUSING loudly is the fail-closed answer: this counts as a
+  # FAILED read, so the fallback applies and the sweep — and every merge worker — refuses to act
+  # on a contract it cannot represent.
+  if grep -Eq '[^[:space:]]+[[:space:]]+[^[:space:]]+' <<<"$raw"; then
+    printf 'repo-authority: %s: a required context name contains whitespace [%s] — the space-joined contract cannot represent it; treating the read as FAILED (fail-closed)\n' "$or" "$(grep -E '[^[:space:]]+[[:space:]]+[^[:space:]]+' <<<"$raw" | tr '\n' ' ')" >&2
+    return 1
+  fi
   joined="$(printf '%s\n' "$raw" | awk 'NF && !seen[$0]++' | tr '\n' ' ')"
   joined="${joined% }"
   [ -n "$joined" ] || return 1
@@ -98,13 +110,17 @@ resolve_required_checks() {
   REQ="$FALLBACK_REQ"; REQ_SOURCE=fallback; return 0
 }
 
-# merge_authority <required-check-string> -> `gate` | `rail`
+# merge_authority <required-check-string> -> `gate` | `rail` | `unknown`
+# ⚠️ An EMPTY set is `unknown` (review round 3): a stale or partial repo-authority.sh used to
+# yield REQ="" here, which read as `rail` and silently rerouted a gate repo onto the rail —
+# an empty contract must refuse, never route.
 # A repo that REQUIRES the review gate uses that check as the merge authority, and a plain
 # squash merge lands. A repo that does NOT must use its own merge rail: `gh pr merge` there
 # would land the PR on the required checks alone, with no head-bound evidence — the bypass
 # agent-infra's own AGENTS.md forbids ("merge via `scripts/admin-merge.sh <PR>`, never raw
 # `gh pr merge`").
 merge_authority() {
+  if [ -z "${1:-}" ]; then printf 'unknown\n'; return 0; fi
   case " ${1:-} " in
     *" $REVIEW_GATE "*) printf 'gate\n' ;;
     *)                  printf 'rail\n' ;;

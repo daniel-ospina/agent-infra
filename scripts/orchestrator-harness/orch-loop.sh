@@ -109,6 +109,10 @@ _HERE_RA="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
 elif [ -f "$_HERE_RA/repo-authority.sh" ]; then . "$_HERE_RA/repo-authority.sh"
 else echo "orch-loop: FATAL repo-authority.sh not found (looked in $O and ${_HERE_RA:-<unresolved>}) — refusing to run without the per-repo merge contract" >&2; exit 78; fi
+# ⚠️ review round 3: a PRESENT but stale/partial repo-authority.sh sources cleanly and silently
+# yields REQ="" — which used to read as `rail`. The resolver must actually exist.
+command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority >/dev/null 2>&1 \
+  || { echo "orch-loop: FATAL repo-authority.sh at $O is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >&2; exit 78; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
 
@@ -560,7 +564,13 @@ while true; do
   # fallback warning in the case below would never fire.
   resolve_required_checks "$OR"
   MERGE_AUTHORITY="$(merge_authority "$REQ")"
-  AUTHORITY_UNKNOWN=0
+  # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
+  # to read as `rail` and silently reroute a gate repo — unknown refuses, exactly like fallback.
+  if [ -z "${REQ:-}" ] || [ "${REQ_SOURCE:-}" = "fallback" ]; then
+    AUTHORITY_UNKNOWN=1
+  else
+    AUTHORITY_UNKNOWN=0
+  fi
   case "${REQ_SOURCE:-}" in
     protection) echo "[req] $OR: required checks from branch protection: $REQ" >>"$LOG" ;;
     env)        echo "[req] $OR: required checks from the REQ environment override: $REQ" >>"$LOG" ;;

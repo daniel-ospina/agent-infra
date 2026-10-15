@@ -137,7 +137,7 @@ REQ_OVERRIDE=''
 # (c) the authority follows from the set, by WHOLE NAME (a substring is not a match)
 eqv "tortoise's set -> gate authority" "gate" "$(merge_authority "pricing-artifact docs ai-review-gate")"
 eqv "a NAME that merely contains the gate is not the gate" "rail" "$(merge_authority "ai-review-gate-extra")"
-eqv "an empty set -> rail (never a raw merge)" "rail" "$(merge_authority "")"
+eqv "an empty set -> unknown (a stale contract refuses; never rail, never a raw merge)" "unknown" "$(merge_authority "")"
 
 # (d) the shipped classifier against BOTH shapes. Rendered from the measured surfaces:
 #     agent-infra PR #1763 = 22 checks, all non-red, NO ai-review-gate row.
@@ -280,11 +280,14 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
 else
   echo "  ❌ could not extract a SYNTACTICALLY VALID GREEN arm from orch-loop.sh (extraction or the arm itself is broken)"; FAIL=$((FAIL+1))
 fi
-# every merge spawn line must %q-quote the carried REQ (both the GREEN rail spawn and the
-# re-record spawn — review P2, round 2's second half)
-grep -q 'REQ=$(printf '\''%q'\'' "$REQ")' "$ORCH" \
-  && { echo "  ✅ every merge spawn line %q-quotes the carried REQ"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ a merge spawn line lost its %q quoting"; FAIL=$((FAIL+1)); }
+# every merge spawn line must %q-quote the carried REQ — BOTH of them (review round 3: a single
+# grep over a file with two identical lines let ONE de-quoted spawn stay green; an unquoted
+# 7-name REQ kills the worker at sh -c rc 127). Count, don't just find.
+_QPAT='REQ=$(printf '\''%q'\'' "$REQ")'
+_NQ="$(grep -cF -- "$_QPAT" "$ORCH")"
+[ "${_NQ:-0}" = "2" ] \
+  && { echo "  ✅ every merge spawn line (${_NQ} of 2) %q-quotes the carried REQ"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ expected 2 %q-quoted spawn lines, found ${_NQ:-0} — one spawn's worker dies at sh -c on a multi-name REQ"; FAIL=$((FAIL+1)); }
 
 # (i) AUTHORITY_UNKNOWN is REAL (review P2, round 2 — it had zero coverage and could be deleted
 # without a red). Two halves: the guard's EXPRESSION does continue when set, and it sits BEFORE
@@ -298,28 +301,56 @@ else
   echo "  ❌ AUTHORITY_UNKNOWN guard missing or misplaced (guard@${_au_ln:-none} classifier@${_cls_ln:-none}) — deleted, the sweep acts on an unknown contract"; FAIL=$((FAIL+1))
 fi
 _au_hits=0; AUTHORITY_UNKNOWN=1
-for _p in a b; do eval "$([ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && echo continue || echo : )"; _au_hits=$((_au_hits+1)); done
-[ "$_au_hits" = "0" ] && { echo "  ✅ the guard's expression continues every PR when set"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ the guard expression did not continue (hits=$_au_hits)"; FAIL=$((FAIL+1)); }
+# ⚠️ review round 3: the previous half evaluated a TEST-LOCAL copy of the expression, so a
+# shipped guard wrapped in a dead branch stayed green. Drive the SHIPPED pre-classifier block
+# (HEAD_N fetch → parked check → authority check) with mocked gh: when set, NO PR reaches the
+# sentinel after it; when clear, both do.
+sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && continue/p' "$ORCH" > "$TMP/aublock.sh"
+if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
+  mkdir -p "$TMP/auO/state"
+  _au_run() { # _au_run <flag> -> prints how many PRs passed the guard
+    _c=0
+    _ghsave="$(declare -f gh 2>/dev/null)"
+    for PR in 1111 2222; do
+      AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"
+      gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
+      # shellcheck disable=SC1090
+      . "$TMP/aublock.sh"
+      _c=$((_c+1))   # reached only when no `continue` fired
+    done
+    [ -n "$_ghsave" ] && eval "$_ghsave" || unset -f gh 2>/dev/null
+    echo "$_c"
+  }
+  [ "$(_au_run 1)" = "0" ] && { echo "  ✅ the SHIPPED guard continues every PR when set (dead-branch wrapping would break extraction or this)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the shipped guard did not continue every PR when set"; FAIL=$((FAIL+1)); }
+  [ "$(_au_run 0)" = "2" ] && { echo "  ✅ …and lets every PR through when clear"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the shipped guard continued when clear"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the shipped AUTHORITY_UNKNOWN block from orch-loop.sh"; FAIL=$((FAIL+1))
+fi
 AUTHORITY_UNKNOWN=0; _au_hits=0
-for _p in a b; do [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue; _au_hits=$((_au_hits+1)); done
-[ "$_au_hits" = "2" ] && { echo "  ✅ …and does NOT continue when clear"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ the guard continued when clear (hits=$_au_hits)"; FAIL=$((FAIL+1)); }
 
 # (j) the WORKER refuses an unknown contract — BEHAVIOURAL (review P1, round 2): the controller
 # guard covers only the sweep; chain-merge.sh and fix-one.sh invoke merge-one.sh directly. Drive
 # the shipped guard: fallback + no override must exit 5 BEFORE any reviewer; fallback + override
 # must proceed (and then hit the missing-rail refusal, exit 6 — proving the override path).
-sed -n '/^if \[ "${REQ_SOURCE:-}" = "fallback" \] && \[ -z "${REQ_OVERRIDE:-}" \]; then$/,/^fi$/p' "$MERGE" > "$TMP/worker-guard.sh"
+sed -n '/^if \[ -z "${REQ:-}" \] || \[ "$MERGE_AUTHORITY" = "unknown" \]/,/^fi$/p' "$MERGE" > "$TMP/worker-guard.sh"
 if [ -s "$TMP/worker-guard.sh" ] && bash -n "$TMP/worker-guard.sh" 2>/dev/null; then
-  ( REQ_SOURCE=fallback; REQ_OVERRIDE=''; PR=1766; OR=daniel-ospina/agent-infra; \
+  ( REQ_SOURCE=fallback; REQ_OVERRIDE=''; REQ=''; MERGE_AUTHORITY='unknown'; PR=1766; OR=daniel-ospina/agent-infra; \
     L="$TMP/wg"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wgrc=$?
   [ "$wgrc" = "5" ] && { echo "  ✅ a worker whose protection read FAILED refuses (exit 5) before any reviewer"; PASS=$((PASS+1)); } \
     || { echo "  ❌ worker guard exited $wgrc, not 5 — an unknown contract can still merge via a non-sweep ingress"; FAIL=$((FAIL+1)); }
-  ( REQ_SOURCE=fallback; REQ_OVERRIDE='pipeline-compliance'; PR=1766; OR=daniel-ospina/agent-infra; \
+  ( REQ_SOURCE=fallback; REQ_OVERRIDE='pipeline-compliance'; REQ='pipeline-compliance'; MERGE_AUTHORITY='rail'; PR=1766; OR=daniel-ospina/agent-infra; \
     L="$TMP/wg2"; O="$TMP"; . "$TMP/worker-guard.sh" ) >/dev/null 2>&1; wg2rc=$?
   [ "$wg2rc" != "5" ] && { echo "  ✅ an explicit REQ override still proceeds (the refusal is about NOT KNOWING, not about overriding)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the worker guard refused a valid operator override"; FAIL=$((FAIL+1)); }
+  # ⚠️ review round 3: §j sourced the fragment standalone, so the guard's POSITION was unpinned
+  # — moved after run_agent it would refuse only AFTER the reviewer ran and was paid for.
+  _wg_ln="$(grep -n 'REFUSED: branch protection' "$MERGE" | head -1 | cut -d: -f1)"
+  _ra_ln="$(grep -n '^run_agent "' "$MERGE" | head -1 | cut -d: -f1)"
+  [ -n "$_wg_ln" ] && [ -n "$_ra_ln" ] && [ "$_wg_ln" -lt "$_ra_ln" ] \
+    && { echo "  ✅ the refusal sits BEFORE the reviewer (line $_wg_ln < run_agent @ $_ra_ln)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the refusal moved after the reviewer (refusal@${_wg_ln:-none} run_agent@${_ra_ln:-none}) — it must fire before any reviewer is paid"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract the worker authority-unknown guard from merge-one.sh"; FAIL=$((FAIL+1))
 fi
@@ -341,6 +372,91 @@ if [ -s "$TMP/gatehit.sh" ] && bash -n "$TMP/gatehit.sh" 2>/dev/null; then
     || { echo "  ❌ the exact gate name did not match"; FAIL=$((FAIL+1)); }
 else
   echo "  ❌ could not extract the gate-hit derivation from orch-loop.sh"; FAIL=$((FAIL+1))
+fi
+
+# (l) the PENDING arm never arms --auto on a rail repo — BEHAVIOURAL (review round 3: the guard
+# had zero coverage; `if true` kept 59/0 green while --auto merged on the required checks alone,
+# bypassing the rail — the exact bypass this branch exists to prevent).
+sed -n '/^      PENDING:\*)$/,/^      FAILED:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/pendingarm.sh"
+if [ -s "$TMP/pendingarm.sh" ] && bash -n "$TMP/pendingarm.sh" 2>/dev/null; then
+  _drive_pending() { # <authority> -> writes g.spy / g.log
+    : > "$TMP/g.spy"; : > "$TMP/g.log"
+    ( PR=1767; OR=daniel-ospina/agent-infra; MERGE_AUTHORITY="$1"; LOG="$TMP/g.log"; O="$TMP/gO"
+      gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
+      # shellcheck disable=SC1090
+      . "$TMP/pendingarm.sh" ) >/dev/null 2>&1
+  }
+  _drive_pending rail
+  if ! grep -q -- '--auto' "$TMP/g.spy" && grep -q 'NOT armed' "$TMP/g.log"; then
+    echo "  ✅ PENDING+rail: --auto is NOT armed (the log says so)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ PENDING+rail: spy=[$(tr '\n' ';' < "$TMP/g.spy")] log=[$(tr '\n' ';' < "$TMP/g.log")] — arming --auto on a rail repo bypasses the rail"; FAIL=$((FAIL+1))
+  fi
+  _drive_pending gate
+  if grep -q -- '--auto' "$TMP/g.spy"; then
+    echo "  ✅ PENDING+gate: --auto IS armed (tortoise's behaviour unchanged)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ PENDING+gate: spy=[$(tr '\n' ';' < "$TMP/g.spy")] — gate repos must arm --auto exactly as before"; FAIL=$((FAIL+1))
+  fi
+else
+  echo "  ❌ could not extract a valid PENDING arm from orch-loop.sh"; FAIL=$((FAIL+1))
+fi
+
+# (m) BOTH orch-loop park refreshes are driven (review round 3: they were only grep-pinned, so
+# the stale-park re-spawn loop could silently return). Extract each 4-line block by its unique
+# PARKED message and drive it with a STALE older-head park at the cap: the new head must land.
+_drive_park() { # <anchor-regex> <label>
+  awk -v anc="$1" 'index($0, anc) > 0 { print prev; print; if ((getline c) > 0) print c; if ((getline d) > 0) print d; exit } { prev=$0 }' "$ORCH" > "$TMP/parkblk.sh"
+  if [ -s "$TMP/parkblk.sh" ] && bash -n "$TMP/parkblk.sh" 2>/dev/null; then
+    mkdir -p "$TMP/pkO/state"; printf '%s\n' aaaa1111 > "$TMP/pkO/state/parked-2317"
+    ( PR=2317; HEAD_N=bbbb2222; NFC=3; NFC2=3; V='FAILED:docs'; LOG="$TMP/pkO/park.log"; O="$TMP/pkO"
+      # shellcheck disable=SC1090
+      . "$TMP/parkblk.sh" ) >/dev/null 2>&1
+    _pk="$(cat "$TMP/pkO/state/parked-2317" 2>/dev/null)"
+    [ "$_pk" = "bbbb2222" ] && { echo "  ✅ $2: the park is REFRESHED to the new head (a stale older-head park cannot block it)"; PASS=$((PASS+1)); } \
+      || { echo "  ❌ $2: parked=[$_pk] (expected bbbb2222) — the stale-park re-spawn loop is back"; FAIL=$((FAIL+1)); }
+  else
+    echo "  ❌ $2: could not extract the park block"; FAIL=$((FAIL+1))
+  fi
+}
+_drive_park 'PARKED (still CONFLICTING after' 'CONFLICTING-arm park refresh'
+_drive_park 'PARKED (CI still red after' 'CI-red-arm park refresh'
+
+# (n) a spaced context name is REJECTED as a failed read (review round 3: `ci / lint` in the
+# required set would split into three names and sit PENDING forever — silently). It must
+# refuse LOUDLY: rc 1 from required_checks, fallback from the resolver, stderr names the cause.
+_spg="$TMP/spaced-gh"
+printf '#!/bin/bash\ncase "$*" in *required_status_checks*) printf "ci / lint\\n" ;; *) exit 1 ;; esac\n' > "$_spg"; chmod +x "$_spg"
+_sp_out="$(required_checks daniel-ospina/spaced "$_spg" 2>"$TMP/spaced.err")"; _sp_rc=$?
+if [ "$_sp_rc" != "0" ] && grep -q 'contains whitespace' "$TMP/spaced.err" 2>/dev/null; then
+  echo "  ✅ a spaced required name (\`ci / lint\`) is a FAILED read, loudly — not a silent 3-name split"; PASS=$((PASS+1))
+else
+  echo "  ❌ a spaced required name was not rejected loudly (rc=$_sp_rc err=[$(cat "$TMP/spaced.err" 2>/dev/null)])"; FAIL=$((FAIL+1))
+fi
+REQ_SOURCE=''; resolve_required_checks daniel-ospina/spaced "$_spg" 2>/dev/null
+[ "${REQ_SOURCE:-}" = "fallback" ] && { echo "  ✅ …and the resolver answers fallback (authority-unknown: the sweep and every worker refuse)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the resolver did not treat the spaced read as fallback (source=${REQ_SOURCE:-?})"; FAIL=$((FAIL+1)); }
+
+# (o) a PRESENT but STALE repo-authority.sh is a FATAL, not a silent rail (review round 3: it
+# sourced cleanly, yielded REQ="", read as `rail`, and rerouted a gate repo). Extract the
+# shipped source block and drive it with a stub $O whose repo-authority.sh lacks the resolver.
+sed -n '/^_HERE_RA=/,/^  || { echo "orch-loop: FATAL repo-authority.sh at/p' "$ORCH" > "$TMP/srcblock.sh"
+if [ -s "$TMP/srcblock.sh" ] && bash -n "$TMP/srcblock.sh" 2>/dev/null; then
+  mkdir -p "$TMP/staleO"; printf '#!/usr/bin/env bash\nFALLBACK_REQ="stale"\n' > "$TMP/staleO/repo-authority.sh"
+  # unset first: this suite defines the resolver functions at the top, and they would leak into
+  # the subshell and make `command -v` pass — the exact false green the presence check exists for.
+  ( unset -f resolve_required_checks merge_authority effective_required_checks required_checks 2>/dev/null
+    O="$TMP/staleO" REQ='ai-review-gate'; . "$TMP/srcblock.sh" ) >/dev/null 2>&1; _st_rc=$?
+  [ "$_st_rc" = "78" ] && { echo "  ✅ a stale repo-authority.sh (resolver absent) is FATAL exit 78 — never a silent rail"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ stale repo-authority.sh exited $_st_rc, not 78 — an empty contract can still read as rail"; FAIL=$((FAIL+1)); }
+  # …and the good copy sources clean (the same block with the real $O).
+  _GD="$(cd "$(dirname "$ORCH")" && pwd)"
+  ( unset -f resolve_required_checks merge_authority effective_required_checks required_checks 2>/dev/null
+    O="$_GD" REQ='ai-review-gate'; . "$TMP/srcblock.sh" ) >/dev/null 2>&1; _gd_rc=$?
+  [ "$_gd_rc" = "0" ] && { echo "  ✅ the shipped repo-authority.sh passes the same presence check"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the presence check rejects the SHIPPED repo-authority.sh (rc=$_gd_rc)"; FAIL=$((FAIL+1)); }
+else
+  echo "  ❌ could not extract the repo-authority source block from orch-loop.sh"; FAIL=$((FAIL+1))
 fi
 
 echo

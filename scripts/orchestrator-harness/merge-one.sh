@@ -51,6 +51,10 @@ _M1_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
 elif [ -f "$_M1_HERE/repo-authority.sh" ]; then . "$_M1_HERE/repo-authority.sh"
 else echo "[merge $PR] FATAL repo-authority.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; fi
+# ⚠️ review round 3: a PRESENT but stale/partial repo-authority.sh sources cleanly, yields
+# REQ="" (read as `rail`), and the refusal below never fires — the resolver must actually exist.
+command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority >/dev/null 2>&1 \
+  || { echo "[merge $PR] FATAL repo-authority.sh is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
 
@@ -236,7 +240,7 @@ echo "[merge $PR] repo-authority: required=[$REQ] source=${REQ_SOURCE:-?} author
 # covered, whatever spawned it. A worker is deliberately NOT handed a frozen contract by its
 # spawner — chain workers wait up to 90 minutes, and a fresh read that refuses beats a stale one
 # that merges.
-if [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; then
+if [ -z "${REQ:-}" ] || [ "$MERGE_AUTHORITY" = "unknown" ] || { [ "${REQ_SOURCE:-}" = "fallback" ] && [ -z "${REQ_OVERRIDE:-}" ]; }; then
   echo "[merge $PR] REFUSED: branch protection for $OR is unreadable (REQ_SOURCE=fallback, no REQ override) — the merge contract is UNKNOWN, so this worker merges nothing (agent-infra#1764)" >> "$L.log"
   exit 5
 fi
