@@ -20,8 +20,12 @@
 # no real gh/pi) AND the "dependency is missing" cases are reachable at all: with /usr/bin on PATH,
 # git and python3 are present on every box and the negative cases could not exist.
 #
-# Two checks are marked RED→GREEN: they assert the two behaviours #1717 introduces, and both fail
-# on the pre-fix tree (see the PR body for the recorded before/after run).
+# LABELLING RULE. A check labelled `RED→GREEN` is one that FAILS on the pre-PR tree
+# (`origin/main`) — it is evidence FOR the behaviour this change introduces. A check with no such
+# label is a REGRESSION PIN or a COVERAGE pin: it guards a behaviour that already worked (or a shape
+# no other case drives) and is NOT evidence for this change. Do not read a pin as a delta claim —
+# the suite header used to assert a fixed COUNT of RED→GREEN checks, which is exactly the kind of
+# figure that re-stales as cases are added, so it now states the rule instead.
 #
 #   bash scripts/orchestrator-harness/cloud-cell-record-dep.test.sh
 set -uo pipefail
@@ -59,6 +63,12 @@ mkstubs() { # mkstubs <dir>
     ln -sf "$p" "$d/$b"
   done
   ln -sf "$BASH_BIN" "$d/bash"
+  # openssl: the merge worker now VERIFIES the marker's HMAC, not just its shape (#784), so the
+  # fixtures that sign must exercise a REAL signer. Symlinked, deliberately not stubbed: a stub can
+  # never intercept the verifier anyway (merge-one.sh prepends /opt/homebrew/bin:/usr/local/bin to
+  # PATH itself), and a stub emitting a matching digest would silently make the fixture unfaithful.
+  # ⚠️ If the host has no openssl this line silently skips; see the §8k note for the consequence.
+  p="$(command -v openssl 2>/dev/null)" && ln -sf "$p" "$d/openssl"
   # gh: `cmd_check` runs `gh auth status`; merge-one.sh runs `pr view`/`pr checks`/`pr merge`.
   cat > "$d/gh" <<'SH'
 #!/bin/bash
@@ -267,6 +277,11 @@ ck "the refusal names the provisioning failure" $rc
 HEAD="0123456789abcdef0123456789abcdef01234567"
 PR=7
 MRG="$TMP/mrg"
+# The gate key the fixtures SIGN with and that run_merge hands the worker as AI_REVIEW_GATE_KEY.
+# The worker verifies the HMAC as well as the shape (#784), so a fixture writing a shape-only
+# `sig=<64 zeros>` line is now (correctly) a FORGERY — §8g pins that — and the happy-path fixture
+# must sign for real, exactly as record-review.test.sh's TEST_GATE_KEY does.
+TEST_GATE_KEY="test-gate-key-1717"
 
 mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, state dirs
   rm -rf "$MRG"
@@ -275,13 +290,32 @@ mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, 
   : > "$MRG/pi-count"
   : > "$MRG/pr-body"
 }
-# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it posts the SIGNED marker
-# into the PR body — the artifact ai-review-gate reads. `rc=0` alone is not that artifact, which is
-# the fail-open §8f pins. The gh stub above serves this file back for `pr view --json body`.
+# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it SIGNS the marker text with
+# the gate key and posts it into the PR body — the artifact ai-review-gate reads. `rc=0` alone is
+# not that artifact (the fail-open §8f pins). It signs LIVE, over its own $1/$2, rather than baking a
+# fixed digest in: that is what makes §8g meaningful, because a faithful signer and a forger emit the
+# SAME shape and only the HMAC tells them apart. The gh stub above serves this file back for
+# `pr view --json body`.
 mkrecorder_posts() {
   cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
 #!/bin/bash
-printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "0000000000000000000000000000000000000000000000000000000000000000" >> '$MRG/pr-body'
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+  chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+# The SAME replica on a box that CANNOT SIGN: with no key (or no openssl) `record-review.sh` posts an
+# UNSIGNED marker — the ` sig=` field is simply ABSENT — and still exits 0. That is the shape the
+# guard's key/tool arms exist for, and the ONLY shape that can distinguish a candidate-first order
+# from a key-first one: when the line is signed-but-unverifiable the candidate list is non-empty, so
+# the candidate arm is skipped and the key arm fires under EITHER order. (Reviewer B, final pass:
+# §8i passed on the very revision it was written to pin until this replica replaced the signing one.)
+mkrecorder_unsigned() {
+  cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget)\n' "\$1" "\$2" >> '$MRG/pr-body'
 exit 0
 EOF
   chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
@@ -307,7 +341,7 @@ run_merge() {
     }
     git() { return 0; }
     export -f pi gh git
-    env -u AI_REVIEW_GATE_KEY PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" \
+    env PATH="$MRG/stubs" HOME="$MRG/home" O="$MRG/o" AI_REVIEW_GATE_KEY="${FAKE_KEY_OVERRIDE-$TEST_GATE_KEY}" \
       PI_COUNT="$MRG/pi-count" FAKE_HEAD="${FAKE_HEAD_OVERRIDE-$HEAD}" FAKE_PR="$PR" FAKE_VERDICT="${FAKE_VERDICT:-}" \
       FAKE_BODY_FILE="$MRG/pr-body" \
       "$BASH_BIN" "$MERGE" "$MRG/repo" acme/widget "$PR" fix/x
@@ -483,6 +517,132 @@ ck "a parked no-marker head does not re-pay on the next run" $rc
 [ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
 ck "the no-marker park refuses re-review with exit 5" $rc
 
+# 8g) RED→GREEN — a marker with the RIGHT SHAPE but a FORGED SIGNATURE is NOT evidence (#784). The
+# PR body is attacker-WRITABLE, so a guard matching only `sig=[0-9a-f]{64}` reads green on this body,
+# never parks, and exits 4 at the gate — one paid review per cycle forever, reopened by the very
+# artifact the guard reads. Only the HMAC can tell a forged line from a signed one, and this case is
+# non-vacuous: on the shape-only worker (`8fcb3715`) the same body MERGES — §8g, §8i and §8k are
+# the cases that fail there, and these three checks are §8g's share. §9 — NOT this case — is what
+# fails when the signature is verified against the WRONG TEXT (e.g. the whole line including
+# ` sig=`), because there the honest marker is rejected too; here a forged line mismatches under
+# either text. (No total is embedded here on purpose: a count in the file re-stales the moment a
+# case is added. The measured figures belong in the PR body, which is a dated record.)
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "0000000000000000000000000000000000000000000000000000000000000000" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a forged sig fell through to the merge"; }
+ck "RED→GREEN: a forged (shape-only) marker does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "RED→GREEN: a forged marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'VERIFIES against its signature'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the forged-marker park says the SIGNATURE did not verify" $rc
+
+# 8h) COVERAGE — a GENUINELY signed marker for a DIFFERENT head is not evidence for THIS head. The
+# signature is valid, so HMAC verification alone accepts it; what rejects it is the head anchor in
+# the match (`@ $LIVE_HEAD`). A marker is a claim about ONE revision, and accepting a replayed one
+# would let evidence for an unreviewed tree satisfy the guard at the live head.
+# ⓘ NON-DISCRIMINATING REGRESSION PIN. Head anchoring PRE-DATES this change, so this case also
+# passes on the PR's previous head (`8fcb3715`, the shape-only guard) — it is NOT evidence for this
+# delta. (It does fail on `origin/main`, where no marker match existed at all.) It is kept because an
+# edit that dropped the anchor while adding the HMAC would otherwise go unnoticed.
+OTHER_HEAD="89abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+txt="review recorded: reviews/\$1.json verdict=clean @ $OTHER_HEAD (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "$OTHER_HEAD" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a marker signed for another head fell through to the merge"; }
+ck "a correctly-signed marker for a DIFFERENT head does not merge" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "a replayed (wrong-head) marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *"NO signed marker for head=$HEAD"*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the wrong-head park names the head it could not find evidence for" $rc
+
+# 8i) RED→GREEN — a marker that is present but UNVERIFIABLE (no key on this box) is not evidence
+# either, and the park must name THAT cause rather than blame the post: with no key the post can
+# succeed, exit 0, and still be worthless, because an unsigned marker is one ai-review-gate rejects.
+# The recorder replica is the UNSIGNED one, deliberately — see its comment above. Measured against
+# the pre-PR worker: these checks FAIL there (the shape-only guard needed no key, so it merged).
+mkmrg
+mkrecorder_unsigned
+out="$(FAKE_KEY_OVERRIDE='' run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "an unverifiable marker fell through to the merge"; }
+ck "an unverifiable marker (no key) does not merge" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'NO AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the no-key park names the missing KEY, not a missing post" $rc
+# The remedy must match the cause. The recorder resolves the key exactly as this worker does, so
+# "record it by hand" re-posts an unsigned marker from the same box — the keyless park must prescribe
+# PROVISIONING, and must NOT carry the post-blame clause that belongs to the no-candidate arm.
+reason="$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"
+case "$reason" in *'Provision the key'*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
+ck "the no-key park prescribes provisioning the key" $rc
+case "$reason" in *'best-effort'*) rc=1; note "the keyless park blames the evidence post: $reason";; *) rc=0 ;; esac
+ck "the no-key park does not blame the evidence post" $rc
+
+# 8j) REGRESSION PIN — an EARLIER shape-matching line that does not verify must not VETO a later line
+# that does. record-review.sh APPENDS its marker, so after a gate-key rotation the body carries the
+# old-key marker for the CURRENT head FIRST and the valid one after it. Verifying only the first
+# match parked that head even though `ai-review-gate` itself reads it GREEN — a stranded merge whose
+# printed remedy (unpark, re-record, retry) parks identically, because the recorder appends rather
+# than replaces.
+# ⓘ NOT RED→GREEN against the pre-PR tree, and it must not be read as evidence for the HMAC
+# hardening: the shape-only guard accepted on ANY matching line, so it merges there too. What it is
+# is a REGRESSION PIN on the ANY-LINE width — it merges here and on the pre-PR guard, and it would
+# PARK a first-match-only form, which is also why the widening is well-founded: `ai-review-gate`
+# itself passes when ANY candidate verifies.
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "$(printf '%064d' 0)" >> '$MRG/pr-body'
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"
+[ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "a stale first marker does not veto a valid later one (no stranded merge)" $rc
+[ ! -f "$MRG/o/state/parked-$PR" ] && rc=0 || rc=1
+ck "the valid later marker writes no park" $rc
+
+# 8k) STRUCTURAL — a signature that cannot be VERIFIED must name the missing TOOL as its own cause
+# rather than blame the evidence post: the recorder uses the same `command openssl`, so on an
+# openssl-less box it posts an UNSIGNED marker and the candidate list is EMPTY — meaning a
+# candidate-first order would report "NO signed marker … the post failed" and prescribe a re-record
+# that re-posts another unsigned marker. merge-one.sh therefore tests the key and the tool BEFORE the
+# candidate list, and this pins both the probe and its reason.
+# ⚠️ STATED LIMITATION: this is a STRUCTURAL check, not a behavioural one. The branch cannot be staged
+# in this suite because merge-one.sh prepends `/opt/homebrew/bin:/usr/local/bin` to PATH itself, so
+# `openssl` resolves on any dev box however the fixture arranges its stub directory. It is reachable
+# on a cell that genuinely lacks the tool; this suite cannot create one.
+# (All three checks below also FAIL on the shape-only worker, where the probe and the ordering do not
+# exist — so they are non-vacuous pins, not mere text checks.)
+grep -q 'command -v openssl' "$MERGE" && rc=0 || { rc=1; note "$MERGE does not probe openssl"; }
+ck "the worker probes openssl before trusting a signature (its own cause, not 'post failed')" $rc
+grep -q 'openssl IS NOT INSTALLED' "$MERGE" && rc=0 || { rc=1; note "no park reason names a missing openssl"; }
+ck "a missing openssl has its own named park reason" $rc
+# ⛔ THE ORDER IS THE FINDING, not merely the presence of a probe. When the recorder has no openssl
+# it posts an UNSIGNED marker, so the candidate list is EMPTY — and a tool probe placed AFTER the
+# candidate arm is therefore unreachable on exactly the path its own rationale names, leaving the
+# park to report "NO signed marker … the post failed" and prescribe a re-record that re-posts
+# another unsigned marker. The key/tool arms must precede the candidate arm.
+ml="$(grep -n 'command -v openssl' "$MERGE" | head -1 | cut -d: -f1)"
+ca="$(grep -n -- '-z "$MARK_CAND"' "$MERGE" | head -1 | cut -d: -f1)"
+[ -n "$ml" ] && [ -n "$ca" ] && [ "$ml" -lt "$ca" ] && rc=0 \
+  || { rc=1; note "openssl probe at line '${ml:-none}', candidate arm at '${ca:-none}' — the probe must come FIRST"; }
+ck "the key/tool arms precede the candidate arm (wrong-cause ordering)" $rc
+
 # 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
 # merge, so the terminal state is a response to the failure and not a blanket refusal to merge.
 # The recorder must POST the signed marker (not merely exit 0) — that is now the precondition the
@@ -496,6 +656,27 @@ ck "non-vacuity: a successful record reaches MERGED" $rc
 ck "non-vacuity: a successful record writes no park" $rc
 [ "$(pi_calls)" = "1" ] && rc=0 || rc=1
 ck "non-vacuity: exactly one review is run on the happy path" $rc
+
+# 9b) COVERAGE — the marker the signer emits in PRODUCTION carries `diff=<64hex>`
+# (`record-review.sh:2150`), and no other case drives that shape through the guard: `mkrecorder_posts`
+# posts the legacy no-`diff=` form. A later tightening of the pattern that breaks the diff-bearing
+# line would otherwise stay green here while every honest merge parked in production. It is the `.*`
+# between the head and `sig=` that admits both forms — this pins it.
+DIFFH="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+mkmrg
+cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
+#!/bin/bash
+txt="review recorded: reviews/\$1.json verdict=clean @ \$2 diff=$DIFFH (acme/widget)"
+sig="\$(printf '%s' "\$txt" | command openssl dgst -sha256 -hmac "\$AI_REVIEW_GATE_KEY" | awk '{print \$NF}')"
+printf 'review recorded: reviews/%s.json verdict=clean @ %s diff=$DIFFH (acme/widget) sig=%s\n' "\$1" "\$2" "\$sig" >> '$MRG/pr-body'
+exit 0
+EOF
+chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+out="$(run_merge)"
+[ -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "a DIFF-BEARING marker (the production shape) merges" $rc
+[ ! -f "$MRG/o/state/parked-$PR" ] && rc=0 || rc=1
+ck "a diff-bearing marker writes no park" $rc
 
 # ══ the controller's own park: the reason must move with the marker ══════════════════════════
 # 10) `parkreason-<PR>` is the only in-band remedy a human sees (merge-one.sh's exit-5 refusal prints

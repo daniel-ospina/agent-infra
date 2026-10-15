@@ -483,15 +483,90 @@ case "$LAST" in
     # fresh PAID review every cycle — the exact #1717 loop, one state over. So verify the artifact
     # the gate actually reads: the SIGNED marker for THIS head in the PR body. Absence (or an
     # unsigned marker, which the gate also rejects) is the same terminal failure as a non-zero rc.
+    # ⛔ AND THE SHAPE IS NOT EVIDENCE EITHER — THE SIGNATURE MUST BE VERIFIED (#784, same class).
+    # The PR body is ATTACKER-WRITABLE, so `sig=[0-9a-f]{64}` on its own is satisfied by a forged
+    # `sig=<64 hex>` line: this check would read green while no signed marker exists, the gate could
+    # never go green at this head, and the `gate != SUCCESS` arm below would exit 4 WITHOUT a park —
+    # the #1717 paid loop, reopened by the very artifact the check reads. A PR or an agent can defeat
+    # it, which is a category-A bypass by this repo's own A/B test. record-review.sh made exactly
+    # this argument for its own carry-forward arm (:1174-1180) and verifies the HMAC over the marker
+    # text; this is the SAME computation, duplicated for the reason `cloud-cell-bringup.sh:57` gives
+    # for its own duplication — these are cell scripts pushed standalone onto a cell, with no library
+    # to source (that citation is deliberate: the rationale is NOT in record-review.sh).
     LIVE_HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # record-review.sh re-binds a carried record to the LIVE head, so the artifact is keyed to the
     # head the gate will judge; fall back to the reviewed head when that read itself fails.
     [ -n "$LIVE_HEAD" ] || LIVE_HEAD="$HEAD"
     BODY="$(gh pr view "$PR" --repo "$OR" --json body --jq .body 2>/dev/null)"
-    if ! printf '%s\n' "$BODY" \
-         | grep -qE "review recorded: reviews/${PR}[.]json verdict=clean @ ${LIVE_HEAD} .*sig=[0-9a-f]{64}"; then
-      park "record-review.sh returned rc=0 but NO signed marker for head=$LIVE_HEAD reached the PR body — its evidence post is best-effort and skips silently when the body read/PATCH fails or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-      echo "[merge $PR] ABORT: rc=0 but no signed marker in the PR body" >> "$L.log"; exit 3
+    # The signing KEY is resolved exactly as record-review.sh resolves it (env first, then the key
+    # file). An ABSENT key is its OWN terminal cause, not a missing post: with no key the recorder
+    # posts an UNSIGNED marker, which the gate also rejects — so the park must say so rather than
+    # blame the post.
+    MARK_KEY="${AI_REVIEW_GATE_KEY:-}"
+    if [ -z "$MARK_KEY" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+      MARK_KEY="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+    fi
+    MARK_KEY="$(printf '%s' "$MARK_KEY" | tr -d '[:space:]')"
+    # The pattern is ANCHORED to the WHOLE line, and that is what makes the matched line exactly the
+    # text the signer signed: grep returns the ENTIRE line, so an unanchored pattern would return any
+    # prefix or suffix around the marker as well and the HMAC would be computed over the wrong string
+    # (a false park). The anchors are about the BOUNDARIES OF THE SIGNED TEXT — not about straddling:
+    # grep is line-oriented and can never match across two body lines.
+    MARK_CAND="$(printf '%s\n' "$BODY" \
+      | grep -E "^review recorded: reviews/${PR}[.]json verdict=clean @ ${LIVE_HEAD} .*sig=[0-9a-f]{64}$" || true)"
+    # ⛔ EVERY candidate line is verified, and ANY one may satisfy the guard — NOT just the first.
+    # record-review.sh APPENDS its marker, so a body can carry an EARLIER shape-matching line for
+    # this same head (one signed under a key that has since rotated, or left by a body edit) sitting
+    # BEFORE the line that is valid now. First-match-wins would reject the body on that stale line
+    # and PARK a head `ai-review-gate` itself reads GREEN: fail-closed, but a stranded merge whose
+    # printed remedy (unpark, re-record, retry) parks identically, because the recorder appends
+    # rather than replaces. Widening the SEARCH cannot admit a forgery — a forged line simply fails
+    # every check — so this restores the pre-hardening width without weakening the property.
+    # A pipeline's exit status is the FUNCTION's own status, so this needs no subshell-safe state.
+    verify_any_marker() { # verify_any_marker <key> — candidate lines on stdin
+      local line txt sig exp
+      while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        # The signer signs the marker text UP TO (excluding) ` sig=`, and `${line% sig=*}` strips
+        # from the LAST occurrence — which the `sig=[0-9a-f]{64}$` anchor guarantees is the
+        # signature separator. `command openssl` bypasses an exported shell function, exactly as
+        # record-review.sh does.
+        txt="${line% sig=*}"; sig="${line##* sig=}"
+        exp="$(printf '%s' "$txt" | command openssl dgst -sha256 -hmac "$1" 2>/dev/null | awk '{print $NF}' || true)"
+        if [ -n "$exp" ] && [ "$sig" = "$exp" ]; then return 0; fi
+      done
+      return 1
+    }
+    marker_ok=0; marker_why=""; marker_how=""
+    # ⛔ THE KEY AND THE TOOL ARE CHECKED BEFORE THE CANDIDATE LIST, because on the box this park is
+    # for they are what is actually broken. With no key, or with no openssl, the local recorder
+    # cannot SIGN — record-review.sh posts an UNSIGNED marker (no `sig=` at all) and exits 0 — so the
+    # anchored pattern finds NOTHING, and a candidate-first order would report that absence as a
+    # failed EVIDENCE POST. That names the wrong cause and prescribes a remedy that cannot work.
+    # ⛔ AND EACH ARM CARRIES ITS OWN REMEDY (`marker_how`), for the same reason. The recorder
+    # resolves the key and the tool exactly as this worker does, so "record it by hand" cannot fix
+    # either of the first two arms — it re-posts an unsigned marker from the same box and parks
+    # identically. `parkreason-<PR>` is the only remedy a human sees in-band.
+    if [ -z "$MARK_KEY" ]; then
+      marker_why="NO AI_REVIEW_GATE_KEY is available here (env or \$HOME/.pi/agent/.ai-review-gate-key), so no marker on this PR body can be verified — and the recorder on this box could not have signed one either, because an unsigned marker is one ai-review-gate rejects"
+      marker_how="Provision the key for the WORKER's environment (a cell sources keys.env with 'set -a', so check it survives into the tmux environment the worker runs in), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    elif ! command -v openssl >/dev/null 2>&1; then
+      # The recorder signs with the same `command openssl`, so on this box the marker is unsigned
+      # (or was signed on ANOTHER box); either way THIS box cannot verify it.
+      marker_why="openssl IS NOT INSTALLED on this box, so the recorder here could not have signed a marker and no marker on this PR body can be verified"
+      marker_how="Install openssl (a hard dependency of this path — the recorder signs with it and this worker verifies with it), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    elif [ -z "$MARK_CAND" ]; then
+      marker_why="NO signed marker for head=$LIVE_HEAD is in the PR body"
+      marker_how="the recorder's evidence post is best-effort and skips silently when the body read or PATCH fails, or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    elif printf '%s\n' "$MARK_CAND" | verify_any_marker "$MARK_KEY"; then
+      marker_ok=1
+    else
+      marker_why="NO marker for head=$LIVE_HEAD in the PR body VERIFIES against its signature — the PR body is not a trust boundary, so a forged, re-keyed or unsigned line is NOT evidence (#784)"
+      marker_how="re-record the review at this head so a freshly signed marker is appended (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    fi
+    if [ "$marker_ok" -ne 1 ]; then
+      park "record-review.sh returned rc=0, but the signed marker ai-review-gate reads is not verifiably there: $marker_why — $marker_how"
+      echo "[merge $PR] ABORT: rc=0 but $marker_why" >> "$L.log"; exit 3
     fi
     # ── 3) wait for the REPO'S review gate to go green (read the LATEST check row) ──
     # Reached only in `gate` mode, so this repo DOES require the gate. The NAME is an input
