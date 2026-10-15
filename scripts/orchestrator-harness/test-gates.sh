@@ -98,22 +98,21 @@ required_checks daniel-ospina/readfail "$G" >/dev/null 2>&1; rrc=$?
 [ "$rrc" -ne 0 ] && { echo "  ✅ an unreadable protection read reports FAILURE (rc=$rrc), not an empty set"; PASS=$((PASS+1)); } \
   || { echo "  ❌ an unreadable protection read exited 0 — a fail-OPEN read"; FAIL=$((FAIL+1)); }
 
-# (b) the effective set: env wins; protection is used otherwise; unreadable -> NON-EMPTY fallback.
-# ⛔ REQ_SOURCE is set by the function in the CURRENT shell, so each call whose source is asserted
-# is made WITHOUT a command substitution (which would run it in a subshell and lose the global).
+# (b) the resolved set: env wins; protection is used otherwise; unreadable -> NON-EMPTY fallback.
+# ⛔ REQ/REQ_SOURCE are set by the resolver in the CURRENT shell, so it is called WITHOUT a command
+# substitution (which would run it in a subshell and lose the globals) — and there is exactly ONE
+# resolver (round 6 removed the `effective_required_checks` twin that let a fix land in one copy).
 REQ_OVERRIDE='custom-check'
-over="$(effective_required_checks daniel-ospina/agent-infra "$G")"
-eqv "REQ_OVERRIDE wins over the protection read" "custom-check" "$over"
-effective_required_checks daniel-ospina/agent-infra "$G" >/dev/null
+resolve_required_checks daniel-ospina/agent-infra "$G"
+eqv "REQ_OVERRIDE wins over the protection read" "custom-check" "$REQ"
 eqv "…and its source is reported as 'env'" "env" "$REQ_SOURCE"
 REQ_OVERRIDE=''
-prot="$(effective_required_checks daniel-ospina/agent-infra "$G")"
-eqv "without an override the repo's protection is used" "pipeline-compliance" "$prot"
-effective_required_checks daniel-ospina/agent-infra "$G" >/dev/null
+resolve_required_checks daniel-ospina/agent-infra "$G"
+eqv "without an override the repo's protection is used" "pipeline-compliance" "$REQ"
 eqv "…and its source is reported as 'protection'" "protection" "$REQ_SOURCE"
-fb="$(effective_required_checks daniel-ospina/readfail "$G")"
+resolve_required_checks daniel-ospina/readfail "$G"
+fb="$REQ"
 eqv "an UNREADABLE protection read falls back to the shipped non-empty set" "$FALLBACK_REQ" "$fb"
-effective_required_checks daniel-ospina/readfail "$G" >/dev/null
 eqv "…and its source is reported as 'fallback'" "fallback" "$REQ_SOURCE"
 [ -n "$fb" ] && { echo "  ✅ the fallback is NON-EMPTY (an empty required set must never be the answer)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ the fallback is empty — the fail-open the fallback exists to prevent"; FAIL=$((FAIL+1)); }
@@ -234,8 +233,16 @@ _parked="$(cat "$TMP/railO/state/parked-1764" 2>/dev/null)"
 # round-5 P1 made unreachable: the worker died `unbound variable` at the cap comparison, so
 # `bash "$RAIL"` was never reached and no rail-mode PR could ever merge. A fresh head with a rail
 # that SUCCEEDS must reach it and record the merge; a text pin on that line proves nothing.
-rm -f "$TMP/railO/state/railcount-1764" "$TMP/railO/state/merged-1764.done"
-printf '#!/bin/bash\nexit 0\n' > "$TMP/railrepo/scripts/admin-merge.sh"   # a rail that SUCCEEDS
+# The stub RECORDS its argv and cwd, so the invocation CONTRACT is driven too, not just greped
+# (review round 6, P2): the real rails are called as `<PR> --repo <OR> -- --squash` from $REPO.
+rm -f "$TMP/railO/state/railcount-1764" "$TMP/railO/state/merged-1764.done" "$TMP/railO/rail-argv.txt"
+# ⚠️ review round 6: the stub must RECORD argv and cwd (via a heredoc, so the inner $PWD/$* are not
+# eaten by an outer printf) — the invocation CONTRACT is then driven, not merely greped.
+cat > "$TMP/railrepo/scripts/admin-merge.sh" <<RAILSTUB
+#!/bin/bash
+printf '%s\n' "\$PWD" "\$*" > "$TMP/railO/rail-argv.txt"
+exit 0
+RAILSTUB
 chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
 ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
   L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=cccc3333; \
@@ -243,6 +250,40 @@ chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
 [ "$src2" = "0" ] && [ -f "$TMP/railO/state/merged-1764.done" ] \
   && { echo "  ✅ the rail IS invoked with RAIL_TRIES unset (the merge is recorded — rail mode is reachable)"; PASS=$((PASS+1)); } \
   || { echo "  ❌ the rail was never invoked (rc=$src2, merged-marker=$([ -f "$TMP/railO/state/merged-1764.done" ] && echo yes || echo no)) — rail mode is DEAD, exactly the #1764 deadlock)"; FAIL=$((FAIL+1)); }
+_rail_cwd="$(sed -n 1p "$TMP/railO/rail-argv.txt" 2>/dev/null)"; _rail_args="$(sed -n 2p "$TMP/railO/rail-argv.txt" 2>/dev/null)"
+case "$_rail_args" in
+  "1764 --repo daniel-ospina/agent-infra -- --squash") [ "$_rail_cwd" = "$TMP/railrepo" ] \
+    && { echo "  ✅ …and the rail is invoked with the documented contract, from the target repo ($_rail_args)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ the rail ran from cwd=$_rail_cwd, not the target repo"; FAIL=$((FAIL+1)); } ;;
+  *) echo "  ❌ the rail was invoked as [$_rail_args] — expected '1764 --repo daniel-ospina/agent-infra -- --squash'"; FAIL=$((FAIL+1)) ;;
+esac
+# …and the success signal must be FALSIFIABLE (review round 6, P2): after a rail that REFUSES at the
+# same head, the merge marker must be ABSENT. A mutant that swallows the rail's exit status
+# (`} || true; then`) stayed green without this.
+rm -f "$TMP/railO/state/merged-1764.done" "$TMP/railO/state/railcount-1764"
+printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"; chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=dddd4444; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1
+[ ! -f "$TMP/railO/state/merged-1764.done" ] \
+  && { echo "  ✅ a REFUSING rail records no merge (the success signal is falsifiable, not write-only)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a refusing rail still recorded a MERGE — the success signal is unfalsifiable"; FAIL=$((FAIL+1)); }
+# …and an EMPTY head REFUSES rather than running an un-keyed retry loop (review round 6, P2): with
+# HEAD empty the count file is written as " N", `read` yields RC_N="", RC_N resets every pass, the cap
+# is unreachable, no park is written, and the sweep re-runs the rail forever — the burn RAIL_TRIES
+# exists to close.
+printf '#!/bin/bash\nexit 1\n' > "$TMP/railrepo/scripts/admin-merge.sh"; chmod +x "$TMP/railrepo/scripts/admin-merge.sh"
+( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+  L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=''; \
+  . "$TMP/railbranch.sh" ) >/dev/null 2>&1; ehrc=$?
+_hits=0; for _i in 1 2 3 4; do
+  ( MERGE_AUTHORITY=rail; REPO="$TMP/railrepo"; PR=1764; OR=daniel-ospina/agent-infra; \
+    L="$TMP/railO/merge.log"; O="$TMP/railO"; HEAD=''; . "$TMP/railbranch.sh" ) >/dev/null 2>&1
+  grep -qs 'REFUSED' "$TMP/railO/merge.log.log" && _hits=1
+done
+[ "$ehrc" = "7" ] && [ "$_hits" = "1" ] \
+  && { echo "  ✅ an EMPTY head REFUSES (exit 7) instead of running an un-keyed, never-parking retry loop"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ an empty head exited $ehrc (want 7, log-hit=$_hits) — the cap is unreachable without a head, so the rail is re-run every cycle"; FAIL=$((FAIL+1)); }
 
 # (h) the controller's GREEN arm dispatches the rail — BEHAVIOURAL (review P2, round 1): the
 # 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
@@ -550,8 +591,11 @@ fi
 sed -n '/^  if \[ "\${REQ_SOURCE:-}" = "env" \] ||/,/^  fi$/p' "$ORCH" > "$TMP/ovr.sh"
 if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
   _ovr() { # <own-set> <authority> <override-set> -> prints the log
+    # required_checks is stubbed to return the OWN declaration (arg 1) regardless of the repo
+    # argument — the block under test calls it as `required_checks "$OR"`, so a stub keyed on $1
+    # would hand it the repo NAME and the baseline authority would be computed from nonsense.
     ( OR=daniel-ospina/agent-infra; LOG="$TMP/ovr.log"; : > "$LOG"; REQ_SOURCE=env; REQ="$3"
-      MERGE_AUTHORITY="$2"; required_checks() { printf '%s\n' "$1"; }
+      MERGE_AUTHORITY="$2"; OWN_SET="$1"; required_checks() { printf '%s\n' "$OWN_SET"; }
       # shellcheck disable=SC1090
       . "$TMP/ovr.sh" >/dev/null 2>&1; cat "$LOG" )
   }
@@ -560,22 +604,29 @@ if [ -s "$TMP/ovr.sh" ] && bash -n "$TMP/ovr.sh" 2>/dev/null; then
     *"CHANGES the merge authority"*) echo "  ✅ an override that flips rail->gate is logged as an authority CHANGE (never silent)"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ an authority-changing override was silent — log=[$_o1]"; FAIL=$((FAIL+1)) ;;
   esac
-  _o2="$(_ovr 'pipeline-compliance' 'rail' 'pipeline-compliance')"
+  _o2="$(_ovr 'ai-review-gate docs' 'gate' 'ai-review-gate docs')"
   case "$_o2" in
     *"CHANGES the merge authority"*) echo "  ❌ an override that AGREES with the repo's declaration drew a false change warning"; FAIL=$((FAIL+1)) ;;
-    *) echo "  ✅ an override that agrees with the repo's own declaration warns about nothing"; PASS=$((PASS+1)) ;;
+    *) echo "  ✅ an override that agrees with the repo's own declaration warns about nothing (gate repo, gate name required)"; PASS=$((PASS+1)) ;;
   esac
-  # ⚠️ review round 5: a REVIEW_GATE override moves the authority AND the classifier's gate_ok onto
-  # a different name, and it is read from the environment the same way REQ is — so the detector must
-  # not be gated on REQ_SOURCE alone (a `set -a`-exported REVIEW_GATE would flip the authority with
-  # no log line at all). REVIEW_GATE_SOURCE is what carries that fact out of repo-authority.sh.
-  _o3="$(REVIEW_GATE_SOURCE=env; OR=daniel-ospina/tortoise; LOG="$TMP/ovr3.log"; : > "$LOG"; REQ_SOURCE=protection; REQ="ai-review-gate docs"; \
-    MERGE_AUTHORITY='rail'; required_checks() { printf '%s\n' 'ai-review-gate docs'; }; \
+  # ⚠️ review round 6, P1: this drive must be PRODUCTION-FAITHFUL. It used to hand-set
+  # MERGE_AUTHORITY='rail' while leaving REVIEW_GATE at the default — a pair the shipped derivation
+  # can never produce — and the real case (REVIEW_GATE=<a name the rail repo already requires>)
+  # makes `merge_authority` answer `gate` from that SAME overridden name. So `_own_auth` computed
+  # from $REVIEW_GATE equalled MERGE_AUTHORITY BY CONSTRUCTION and the detector could never fire
+  # while agent-infra issued a raw `gh pr merge`. Here REVIEW_GATE is the real alternate name and
+  # the authority is DERIVED, so an inert detector fails this test.
+  _o3="$(REVIEW_GATE_SOURCE=env; REVIEW_GATE=pipeline-compliance; OR=daniel-ospina/agent-infra; LOG="$TMP/ovr3.log"; : > "$LOG"; REQ_SOURCE=protection; REQ="pipeline-compliance"; \
+    MERGE_AUTHORITY="$(merge_authority "$REQ")"; required_checks() { printf '%s\n' 'pipeline-compliance'; }; \
     # shellcheck disable=SC1090
     . "$TMP/ovr.sh" >/dev/null 2>&1; cat "$LOG")"
   case "$_o3" in
-    *"CHANGES the merge authority"*) echo "  ✅ a REVIEW_GATE override is detected even when the required set came from protection"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ a REVIEW_GATE override flipped the authority silently (REQ_SOURCE=protection) — log=[$_o3]"; FAIL=$((FAIL+1)) ;;
+    *"CHANGES the merge authority"*) echo "  ✅ a REVIEW_GATE override that flips a rail repo to GATE authority IS detected (the detector is not inert)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a REVIEW_GATE override flipped agent-infra rail->gate SILENTLY (log=[$_o3]) — the raw merge this branch forbids"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_o3" in
+    *"RAW gh pr merge"*) echo "  ✅ …and the warning names the consequence (a raw merge, not merely a different label)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the authority-change warning does not name the consequence — log=[$_o3]"; FAIL=$((FAIL+1)) ;;
   esac
   # (t) a MALFORMED override is discarded, loudly, and never travels the contract (review round 5).
   # The screen lived only in required_checks, so an override skipped it: `REQ='ci,lint'` reached the
@@ -613,13 +664,13 @@ if [ -s "$TMP/srcblock.sh" ] && bash -n "$TMP/srcblock.sh" 2>/dev/null; then
   mkdir -p "$TMP/staleO"; printf '#!/usr/bin/env bash\nFALLBACK_REQ="stale"\n' > "$TMP/staleO/repo-authority.sh"
   # unset first: this suite defines the resolver functions at the top, and they would leak into
   # the subshell and make `command -v` pass — the exact false green the presence check exists for.
-  ( unset -f resolve_required_checks merge_authority effective_required_checks required_checks 2>/dev/null
+  ( unset -f resolve_required_checks merge_authority required_checks 2>/dev/null
     O="$TMP/staleO" REQ='ai-review-gate'; . "$TMP/srcblock.sh" ) >/dev/null 2>&1; _st_rc=$?
   [ "$_st_rc" = "78" ] && { echo "  ✅ a stale repo-authority.sh (resolver absent) is FATAL exit 78 — never a silent rail"; PASS=$((PASS+1)); } \
     || { echo "  ❌ stale repo-authority.sh exited $_st_rc, not 78 — an empty contract can still read as rail"; FAIL=$((FAIL+1)); }
   # …and the good copy sources clean (the same block with the real $O).
   _GD="$(cd "$(dirname "$ORCH")" && pwd)"
-  ( unset -f resolve_required_checks merge_authority effective_required_checks required_checks 2>/dev/null
+  ( unset -f resolve_required_checks merge_authority required_checks 2>/dev/null
     O="$_GD" REQ='ai-review-gate'; . "$TMP/srcblock.sh" ) >/dev/null 2>&1; _gd_rc=$?
   [ "$_gd_rc" = "0" ] && { echo "  ✅ the shipped repo-authority.sh passes the same presence check"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the presence check rejects the SHIPPED repo-authority.sh (rc=$_gd_rc)"; FAIL=$((FAIL+1)); }

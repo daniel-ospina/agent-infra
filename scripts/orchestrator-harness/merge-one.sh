@@ -225,7 +225,7 @@ trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
 # chain below is exactly what it always was (wait for the gate, then squash). On a repo that does
 # NOT require it, `gh pr merge` would land the PR on the required checks alone with no head-bound
 # evidence — the bypass agent-infra's AGENTS.md forbids — so the repo's OWN rail is the authority.
-# ⛔ resolve_required_checks, NOT `REQ="$(effective_required_checks …)"`: the command substitution
+# ⛔ resolve_required_checks, NOT a command substitution around it: `REQ="$(resolve_required_checks …)"`
 # subshells the resolver and REQ_SOURCE cannot survive it (the log line below would print source=?).
 resolve_required_checks "$OR"
 MERGE_AUTHORITY="$(merge_authority "$REQ")"
@@ -269,6 +269,16 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   # drain, the retry cap could never park, and the sweep re-spawned a worker every cycle. That
   # is #1764's own deadlock, reintroduced on the new path. The default is assigned HERE so every
   # later expansion is safe.
+  # ⛔ REFUSE ON AN EMPTY HEAD (review round 6, P2). The retry budget is HEAD-KEYED, so without a
+  # head it cannot be kept: `printf '%s %s' "" "$RC_N"` writes " 1", `read -r RC_H RC_N` strips the
+  # leading blank (RC_H=1, RC_N=""), `is_limit ""` fails and RC_N resets to 0 on EVERY pass — the
+  # cap is unreachable, no park is ever written, and the sweep re-runs the rail every cycle: the
+  # per-cycle API burn RAIL_TRIES exists to close. A transient head-read failure is retried next
+  # cycle, which is the fail-closed direction.
+  if [ -z "${HEAD:-}" ]; then
+    echo "[merge $PR] REFUSED: the PR head could not be read (empty) — a head-keyed retry budget cannot be kept without it, and an un-keyed rail retry is the per-cycle API burn RAIL_TRIES exists to close" >> "$L.log"
+    exit 7
+  fi
   RAIL_TRIES="${RAIL_TRIES:-3}"
   if ! is_limit "$RAIL_TRIES"; then
     echo "[merge $PR] RAIL_TRIES='$RAIL_TRIES' is not an integer in range — using 3" >> "$L.log"

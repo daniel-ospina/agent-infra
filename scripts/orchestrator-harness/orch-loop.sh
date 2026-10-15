@@ -559,9 +559,9 @@ while true; do
   # already set in the environment this costs NO gh call at all (the resolver short-circuits on
   # REQ_OVERRIDE). The required set is the repo's declaration of what must gate a merge; the
   # merge authority follows from it, so both are read from ONE home.
-  # ⛔ resolve_required_checks, NOT `REQ="$(effective_required_checks …)"`: the command
-  # substitution subshells the resolver, REQ_SOURCE cannot survive the assignment, and the ⚠️
-  # fallback warning in the case below would never fire.
+  # ⛔ resolve_required_checks, NEVER `REQ="$(resolve_required_checks …)"`: the command substitution
+  # subshells the resolver, REQ_SOURCE cannot survive the assignment, and the ⚠️ fallback warning
+  # in the case below would never fire.
   resolve_required_checks "$OR"
   MERGE_AUTHORITY="$(merge_authority "$REQ")"
   # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
@@ -587,18 +587,22 @@ while true; do
     *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
   esac
   echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $([ "$MERGE_AUTHORITY" = gate ] && printf 'IS required' || printf 'is NOT required'))" >>"$LOG"
-  # ⚠️ review rounds 4-5: REQ_OVERRIDE is a deliberate operator escape hatch (documented in
-  # README), and REQ/REVIEW_GATE are read from the environment — which a cloud cell sources with
-  # `set -a`, so a stray export reaches here. An override that CHANGES the authority away from
-  # the repo's own declaration would silently re-enable the raw merge this whole change exists to
-  # prevent on a rail repo; a REVIEW_GATE override does the same AND moves the classifier's
-  # gate_ok onto a different name. The override still wins (it is how a contract is pinned during
-  # an outage), but the flip is never silent: re-read the repo's own declaration and shout when
-  # the two disagree.
+  # ⚠️ review rounds 4-6: REQ_OVERRIDE is a documented operator pin (README: "`REQ=…` in the cell
+  # env / keys.env overrides the read"), and REQ/REVIEW_GATE are read from the environment — which
+  # a cloud cell sources with `set -a`, so a stray export reaches here. An override that CHANGES
+  # the authority away from the repo's own declaration would silently re-enable the raw merge this
+  # whole change exists to prevent on a rail repo; a REVIEW_GATE override does the same AND moves
+  # the classifier's gate_ok onto a different name. The override still wins (it is how a contract
+  # is pinned during an outage), but the flip is never silent.
+  # ⛔ THE BASELINE IS THE DEFAULT GATE NAME, NOT `$REVIEW_GATE` (review round 6, P1). Computing
+  # `_own_auth` from the overridden name made the comparison `X vs X` — provably inert — while a
+  # `REVIEW_GATE` export flipped agent-infra to `gate` and issued a RAW `gh pr merge` with no log
+  # line at all. With REVIEW_GATE_DEFAULT the question actually asked is "what would this repo's
+  # own declaration say with no gate-name override?", which is the thing an override changes.
   if [ "${REQ_SOURCE:-}" = "env" ] || [ "${REVIEW_GATE_SOURCE:-default}" = "env" ]; then
-    _own_auth="$(merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
+    _own_auth="$(REVIEW_GATE="$REVIEW_GATE_DEFAULT" merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
     if [ "$_own_auth" != "unknown" ] && [ "$_own_auth" != "$MERGE_AUTHORITY" ]; then
-      echo "[authority] ⚠️ $OR: an operator override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; REQ='$REQ' REQ_SOURCE=${REQ_SOURCE:-?} REVIEW_GATE='$REVIEW_GATE' REVIEW_GATE_SOURCE=${REVIEW_GATE_SOURCE:-default}) — the override wins, but verify it is intended" >>"$LOG"
+      echo "[authority] ⚠️ $OR: an operator override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; REQ='$REQ' REQ_SOURCE=${REQ_SOURCE:-?} REVIEW_GATE='$REVIEW_GATE' REVIEW_GATE_SOURCE=${REVIEW_GATE_SOURCE:-default}) — the override wins, but verify it is intended$([ "$MERGE_AUTHORITY" = gate ] && printf ' — GATE authority issues a RAW gh pr merge, which on a rail repo lands the PR on the required checks alone with no head-bound evidence')" >>"$LOG"
     fi
   fi
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED

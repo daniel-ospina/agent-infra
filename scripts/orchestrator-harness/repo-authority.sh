@@ -13,14 +13,16 @@
 # ONE HOME for the two inputs, SOURCED by BOTH orch-loop.sh and merge-one.sh so the two cannot
 # drift:
 #   required_checks          -> the repo's own branch-protection contexts
-#   effective_required_checks-> that set, honouring the REQ operator override, else FALLBACK_REQ
+#   resolve_required_checks  -> that set, honouring the REQ operator override, else FALLBACK_REQ
+#                               (ONE resolver: an earlier duplicate pair is what let a round-5 fix
+#                                land in one copy and not the other — review round 6, P2)
 #   merge_authority          -> gate (the review-gate check is the authority) | rail (the repo's
 #                               own merge rail is the authority)
 #
 # ⛔ FAIL-CLOSED, THREE WAYS.
 #   1. An unreadable protection endpoint NEVER becomes an EMPTY required set. An empty `want`
 #      reads as NOCHECKS (nothing merges) and is indistinguishable from a permission-shaped
-#      partial response, so `effective_required_checks` substitutes FALLBACK_REQ — deliberately
+#      partial response, so `resolve_required_checks` substitutes FALLBACK_REQ — deliberately
 #      NON-EMPTY names, and foreign to a repo that is not tortoise. ⚠️ On such a repo the
 #      fallback's gate name reads FAILED (not PENDING — review P2, round 1), so an unresolved
 #      contract stops ALL action: the CONTROLLER's sweep merges/auto-arms/spawns nothing while
@@ -36,16 +38,19 @@
 #   3. A rail-managed repo whose rail is missing REFUSES; it never degrades to `gh pr merge`.
 set -u
 
-# The review-gate check NAME is itself repo-dependent (tortoise: `ai-review-gate`). Record whether
-# it came from the environment (review round 5): a REVIEW_GATE that overrides the default moves the
-# merge authority — and the classifier's gate_ok — onto a different name. That is sometimes
-# intended (a repo with a differently-named gate), but it must never be SILENT, exactly like an
-# authority-changing REQ override: it is read from the environment, and a cloud cell sources
-# keys.env with `set -a`, so a stray export reaches here. REVIEW_GATE_SOURCE is what lets the
-# controller's warning fire for this case too.
+# The review-gate check NAME is itself repo-dependent (tortoise: `ai-review-gate`).
+# REVIEW_GATE_DEFAULT is the name the DETECTOR compares against: a `REVIEW_GATE` that is merely
+# echoed back can never disagree with itself (review round 6, P1 — the round-5 detector was
+# arithmetically inert), so the question "did the override change the authority?" is answered with
+# the DEFAULT gate name, which is what the repo's declaration would give with no override at all.
+# Record whether it came from the environment: such an override moves the merge authority — and the
+# classifier's gate_ok — onto a different name. That is sometimes intended (a repo whose gate has
+# another name), but it must never be SILENT: it is read from the environment, and a cloud cell
+# sources keys.env with `set -a`, so a stray export reaches here.
+REVIEW_GATE_DEFAULT="ai-review-gate"
 REVIEW_GATE_SOURCE="default"
-if [ -n "${REVIEW_GATE:-}" ] && [ "$REVIEW_GATE" != "ai-review-gate" ]; then REVIEW_GATE_SOURCE="env"; fi
-REVIEW_GATE="${REVIEW_GATE:-ai-review-gate}"
+if [ -n "${REVIEW_GATE:-}" ] && [ "$REVIEW_GATE" != "$REVIEW_GATE_DEFAULT" ]; then REVIEW_GATE_SOURCE="env"; fi
+REVIEW_GATE="${REVIEW_GATE:-$REVIEW_GATE_DEFAULT}"
 
 # LAST-RESORT ONLY, and the one place the pre-#1764 constant still lives — as the documented
 # fallback for a repo whose protection cannot be read (see the header). It is NOT a default, and
@@ -99,43 +104,16 @@ required_checks() {
   printf '%s\n' "$joined"
 }
 
-# effective_required_checks <owner/repo> [<gh-binary>]
-# Print the required-check string the classifier must use, and set the global REQ_SOURCE to the
-# home it came from (`env` | `protection` | `fallback`). Never fails: the fallback is the
-# fail-closed answer.
-# ⛔ READ THE OVERRIDE FROM REQ_OVERRIDE, NOT REQ. Both callers overwrite REQ every cycle with
-# the resolved value; reading REQ here would make the second cycle believe the FIRST cycle's
-# resolution was an operator override and freeze it. REQ_OVERRIDE is captured once, before the
-# first resolution.
-effective_required_checks() {
-  local or="${1:-}" gh="${2:-gh}" req
-  if [ -n "${REQ_OVERRIDE:-}" ]; then
-    if _override_usable "$or" "$REQ_OVERRIDE"; then
-      REQ_SOURCE=env
-      printf '%s\n' "$REQ_OVERRIDE"
-      return 0
-    fi
-    # ⚠️ review round 5: a malformed override is DISCARDED (loudly) rather than refused, because
-    # leaving it set defeats the authority-unknown refusal (that refusal keys on REQ_OVERRIDE
-    # being EMPTY). Discarding falls through to the repo's own declaration — the safe answer.
-    REQ_OVERRIDE=""
-  fi
-  if req="$(required_checks "$or" "$gh")"; then
-    REQ_SOURCE=protection
-    printf '%s\n' "$req"
-    return 0
-  fi
-  REQ_SOURCE=fallback
-  printf '%s\n' "$FALLBACK_REQ"
-}
-
-# resolve_required_checks <owner/repo> [<gh-binary>]
+# `resolve_required_checks` <owner/repo> [<gh-binary>]
 # Sets REQ and REQ_SOURCE in the CALLER'S shell — the one production callers use.
-# ⛔ A CALLER CANNOT DO THIS ITSELF: `REQ="$(effective_required_checks …)"` runs the resolver in
+# ⛔ A CALLER CANNOT DO THIS ITSELF: `REQ="$(resolve_required_checks …)"` runs the resolver in
 # a command-substitution SUBSHELL, so REQ_SOURCE cannot survive the assignment (measured live:
-# REQ=[pipeline-compliance] REQ_SOURCE=[<EMPTY>]) and the operational fallback warning below can
-# never fire. This wrapper performs the same three-way resolution in the current shell, where
-# both globals land.
+# REQ=[pipeline-compliance] REQ_SOURCE=[<EMPTY>]) and the operational fallback warning can never
+# fire. This wrapper performs the same three-way resolution in the current shell, where both
+# globals land.
+# ⛔ ONE RESOLVER, DELIBERATELY (review round 6). An `effective_required_checks` twin existed and
+# had no production caller; a fix landed in `resolve_required_checks` only, and a mutant of the
+# twin stayed green across every suite. Two copies of one policy is how that happens.
 resolve_required_checks() {
   if [ -n "${REQ_OVERRIDE:-}" ]; then
     if _override_usable "$1" "${REQ_OVERRIDE:-}"; then REQ="$REQ_OVERRIDE"; REQ_SOURCE=env; return 0; fi
