@@ -48,6 +48,7 @@ SHARDS = HERE / "run-bash-shards.sh"
 SETUP = REPO_ROOT / "pi-bootstrap" / "setup.sh"
 TURN_CLASSIFY = HERE / "lane" / "turn-classify.py"
 LANE_GUARD = HERE / "lane" / "lane-guard.py"
+LANE_TRIAGE = HERE / "lane" / "lane-triage.py"
 LOOP = HERE / "heartbeat-loop.sh"
 REGISTRY_TS = REPO_ROOT / "extensions" / "shared" / "heartbeat-progress-edges.ts"
 
@@ -472,3 +473,105 @@ def test_registry_does_not_advertise_a_dead_idle_min():
         "the stall registry advertises IDLE_MIN, which no code reads"
     )
     assert 'name: "CAP_IDLE_MIN"' in ts_src, "CAP_IDLE_MIN must stay registered"
+
+
+# ── P1 (review @a2ae413c): lane-triage's pane read must not fail open ─────────
+#
+# `pane_spinning` is the ONLY pane override on the DONE_READY path, and the caller passes a
+# lane through as free capacity on a definite `False` alone. `run()` never inspects the
+# return code, so a cmux that exited non-zero with empty stdout came back as `False` --
+# a CMUX outage then advertised a BUSY lane as free. Driven in-process against a stubbed `run`.
+
+
+class _FakeProc:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _load_lane_triage():
+    spec = importlib.util.spec_from_file_location("lane_triage_under_test", LANE_TRIAGE)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_pane_spinning_reads_a_failed_read_as_unknown(monkeypatch):
+    """PRE-FIX this fails: a failed read returned False == a definite "not spinning".
+
+    A CMUX OUTAGE ADVERTISED A BUSY LANE AS FREE. Absence of a signal is not evidence of
+    absence — only a definite False (pane read, no spinner) may pass a lane through.
+    """
+    mod = _load_lane_triage()
+    monkeypatch.setattr(mod, "run", lambda *a, **k: _FakeProc(stdout="", returncode=1))
+    assert mod.pane_spinning("WS1") is None, "a failed read is UNKNOWN, not 'not spinning'"
+
+
+def test_pane_spinning_reads_an_empty_pane_as_unknown(monkeypatch):
+    """rc=0 with an empty pane is still not a pane read."""
+    mod = _load_lane_triage()
+    monkeypatch.setattr(mod, "run", lambda *a, **k: _FakeProc(stdout="   \n", returncode=0))
+    assert mod.pane_spinning("WS1") is None
+
+
+def test_pane_spinning_unknown_ws_is_unknown(monkeypatch):
+    """PRE-FIX this fails: a missing workspace (registry gap) was a definite False."""
+    mod = _load_lane_triage()
+    assert mod.pane_spinning(None) is None
+    assert mod.pane_spinning("") is None
+
+
+def test_pane_spinning_still_distinguishes_spinner_from_idle(monkeypatch):
+    """The over-fix guard: an idle pane must still pass through as a definite False.
+
+    Returning None unconditionally would withhold every DONE_READY lane and the capacity
+    signal would go silent; a live spinner must still read True.
+    """
+    mod = _load_lane_triage()
+    monkeypatch.setattr(mod, "run", lambda *a, **k: _FakeProc(stdout="Working… esc to interrupt"))
+    assert mod.pane_spinning("WS1") is True
+    monkeypatch.setattr(mod, "run", lambda *a, **k: _FakeProc(stdout="user@host repo %\n"))
+    assert mod.pane_spinning("WS1") is False
+
+
+# ── P2 (review @a2ae413c): lane-guard loads the classifier from its committed home ──
+
+
+def test_lane_guard_loads_the_classifier_from_its_committed_location():
+    """PRE-FIX this fails: `_load_lane_status` only ever looked at its sibling.
+
+    The committed layout is `scripts/lane-status.py` + `scripts/lane/lane-guard.py`, so from a
+    checkout the module load raised FileNotFoundError and `safe-send.sh` -- which reaches the
+    guard by sibling path -- refused EVERY send. Mirrors lane-wip.py's repo-root fallback.
+    """
+    spec = importlib.util.spec_from_file_location("lane_guard_load_under_test", LANE_GUARD)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    ls = mod._load_lane_status()
+    for name in ("resolve_session", "session_file", "read_screen", "ui_working",
+                 "declared_children", "parse_child_lines", "pending_child"):
+        assert callable(getattr(ls, name, None)), f"lane-status.py is missing {name}"
+
+
+def test_lane_guard_refuses_when_the_reverify_read_is_unreadable(tmp_path, monkeypatch):
+    """PRE-FIX this fails: the step-6 read's `""` was read as "nothing appeared".
+
+    `read_screen` returns "" on any cmux failure, and "" contains no spinner and parses no
+    child lines — so the one branch whose job is to catch a turn that BEGINS during the probe
+    certified CONSUMABLE without the evidence it declares.
+    """
+    mod, fake = _guard_fixture(tmp_path, monkeypatch)
+    real = fake.read_screen
+    calls = {"n": 0}
+
+    def flaky(ws, lines=80):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return ""                      # the re-verify read fails
+        return real(ws, lines)
+
+    monkeypatch.setattr(fake, "read_screen", flaky)
+    obs = mod.probe("WS1", "L1", 0.0, 0.0, 100.0)
+    assert calls["n"] == 2, f"expected the re-verify read to run: {calls}"
+    assert obs["ok"] is False, f"an unreadable re-verify read must not certify CONSUMABLE: {obs}"
+    assert "UNREADABLE" in obs["reason"], obs["reason"]

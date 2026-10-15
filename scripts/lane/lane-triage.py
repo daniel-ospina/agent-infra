@@ -47,12 +47,19 @@ def pane_spinning(ws):
     lane that is mid-work -- the exact dispatch-into-a-busy-lane failure this file exists to prevent.
     """
     if not ws:
-        return False
+        return None                      # registry gap -> UNKNOWN, not a definite "not spinning"
     try:
-        out = run(["cmux", "read-screen", "--workspace", ws, "--lines", "8"], timeout=25).stdout
+        p = run(["cmux", "read-screen", "--workspace", ws, "--lines", "8"], timeout=25)
     except Exception:
         return None                      # UNKNOWN, not False -- absence is not evidence
-    return ("Working" in out) or ("esc to interrupt" in out)
+    # A non-zero exit or an empty pane is a FAILED READ, not a pane that is provably not
+    # spinning. `run()` does not raise on a non-zero status, so without this check a cmux
+    # outage (or a read that returns nothing) came back as a definite False -- and the
+    # caller passes a lane through as free capacity on a definite False alone, so a CMUX
+    # OUTAGE ADVERTISED A BUSY LANE AS FREE. Absence of a signal is not evidence of absence.
+    if p.returncode != 0 or not (p.stdout or "").strip():
+        return None                      # UNKNOWN: could not read the pane
+    return ("Working" in p.stdout) or ("esc to interrupt" in p.stdout)
 
 
 def run(args, timeout=300):

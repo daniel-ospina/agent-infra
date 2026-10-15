@@ -52,6 +52,13 @@ import sys
 import time
 
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+# The classifier's canonical home is the repo root (scripts/, promoted by #1670); the farm
+# copies it FLAT into $DEST/scripts beside this file, so the sibling resolves there. Running
+# lane-guard.py straight out of scripts/lane/ has no sibling in that directory -- fall back to
+# the repo-root copy rather than trying to load a path that does not exist (mirrors
+# lane-wip.py). Without this the committed artifact refuses EVERY send from a checkout.
+if not os.path.exists(os.path.join(SCRIPTS, "lane-status.py")):
+    SCRIPTS = os.path.dirname(SCRIPTS)
 
 # A hung cmux must become a FAST refusal, not a slow non-answer. safe-send.sh raises this
 # ceiling for its own calls (60s); the GUARD deliberately keeps a tighter one, because its
@@ -169,7 +176,14 @@ def probe(ws: str, label: str, window: float, min_idle: float, budget: float) ->
         obs["reason"] = f"probe budget {budget}s exhausted before the re-verify read — refusing unanswered"
         return obs
     screen2 = ls.read_screen(ws, lines=14) or ""
-    if "Working" in (screen2 or ""):
+    # `read_screen` returns "" on ANY cmux failure, and "" contains no spinner and parses no
+    # child lines -- so an unreadable re-verify read used to be promoted to a PASS, certifying
+    # CONSUMABLE without the evidence this step exists to gather. Step 3 refuses an empty read;
+    # so must the re-verify read: unknown is not idle.
+    if not screen2.strip():
+        obs["reason"] = "pane UNREADABLE at the re-verify read — busy/idle UNKNOWN, not idle"
+        return obs
+    if "Working" in screen2:
         obs["reason"] = "a `Working` spinner APPEARED during the probe — a turn started while we checked"
         return obs
     if (ls.parse_child_lines(screen2) or []):
