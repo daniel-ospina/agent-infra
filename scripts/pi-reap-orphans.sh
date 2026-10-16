@@ -39,6 +39,19 @@
 #                    exists for (caught by the #1142 real reproduction).
 #   4. our own uid — never signal another user's process (we could not, and
 #                    probing it is not ours to do).
+#   5. identity stable — the pid's START IDENTITY is read at classification time
+#                    and re-read immediately before EACH signal (the SIGTERM and
+#                    the SIGKILL escalation). The observation window spans the
+#                    whole lsof pass (up to REAP_ORPHAN_LSOF_TIMEOUT, default
+#                    60 s), so between the snapshot that NAMED a candidate and
+#                    the signal that acts on it a pid may have been REUSED by an
+#                    unrelated process. A bare pid is therefore not a safe
+#                    signal target: on a mismatch, an empty read, or an
+#                    unevaluable read the candidate is PRESERVEd
+#                    (`identity-changed` / `identity-unknown`) and NEVER
+#                    signalled. The post-signal probe only asks whether the pid
+#                    exists, so without this binding a replacement process could
+#                    even be reported REAPED (#1863 F11).
 #
 # WHY THE CWD MUST BE UNDER A SCRATCH ROOT BY DEFAULT. `launchd` user agents are
 # ppid=1 BY CONSTRUCTION, so signals 1+3 alone would eventually aim this tool at
@@ -104,6 +117,11 @@
 #   human-ancestry-unknown > cpu-unmeasurable > elapsed-unmeasurable >
 #   too-young > cpu-idle >
 #   cwd-unknown > cwd-live > cwd-unreadable > cwd-out-of-scope > reapable
+#
+#   The identity gates are enforced in the candidate loop, NOT in
+#   classify_one(): identity_unknown > identity_changed. They must be
+#   re-evaluated immediately before each signal, so they cannot be a
+#   classification-time verdict alone.
 #
 # ppid==1 is a HINT that selects candidates cheaply. It is never the test:
 # the test is ancestry (human-owned) plus a FLAT cpu-time floor
@@ -452,6 +470,41 @@ ps_row() {
     awk -F'\t' -v p="$2" '$1 == p { print; exit }' "$1" 2>/dev/null
 }
 
+# ── process identity: the signal's TOCTOU binding (#1863 F11) ──────────
+# `lstart` is the process START TIME — stable for the life of a process and
+# distinct across a pid REUSE (to ps's one-second resolution). Read it for a
+# REAPABLE candidate at classification time, then re-read immediately before
+# EACH signal and require it to still match. Any mismatch, empty, or
+# unevaluable read PRESERVES the candidate; a signal is never sent blind.
+# This probe runs ONLY for REAPABLE candidates (a tiny population) — never for
+# the ppid==1 table at large.
+proc_identity() { # <pid> -> normalized start identity on stdout ("" if unknown)
+    local p="$1" f out=""
+    is_pos_int "${p:-}" || return 0
+    f="$(scratch_file ident)"
+    [ -n "$f" ] || return 0
+    if run_bounded "$REAP_ORPHAN_PS_TIMEOUT" "$f" "$PS_BIN" -o lstart= -p "$p"; then
+        # Collapse ps's column padding so two reads of the SAME process compare
+        # equal byte-for-byte.
+        out="$(tr -s '[:space:]' ' ' <"$f" 2>/dev/null | sed -e 's/^ //' -e 's/ $//')"
+    fi
+    rm -f "$f"
+    [ -n "$out" ] && printf '%s' "$out"
+    return 0
+}
+
+# identity_matches <pid> <expected> — 0 ONLY when the current identity can be
+# read and equals the one captured at classification. Every other outcome
+# (missing/empty/different/unevaluable) returns 1, so the caller preserves.
+identity_matches() {
+    local got
+    [ -n "${2:-}" ] || return 1
+    got="$(proc_identity "$1")"
+    [ -n "$got" ] || return 1
+    [ "$got" = "$2" ] || return 1
+    return 0
+}
+
 # lsof_cwd_load — ONE bounded `lsof -a -d cwd -Fpn` pass (never `+D`, which is a
 # directory walk). FAIL-CLOSED: a missing/failed/timed-out/empty result returns
 # 1 and the whole pass aborts. There is no argv fallback here (unlike the
@@ -706,7 +759,7 @@ report_row() { # <verdict> <pid> <reason> <detail>
 # misses an operator needs to see. So: full detail for REAPABLE and NEAR-MISS
 # rows, plus a complete per-reason HISTOGRAM in the summary (nothing is hidden —
 # the counts are exact and the log holds every row). --verbose prints all.
-NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable elapsed-unmeasurable human-owned human-ancestry-unknown "
+NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable elapsed-unmeasurable human-owned human-ancestry-unknown identity-unknown identity-changed "
 is_near_miss() { case "$NEAR_MISS_REASONS" in *" $1 "*) return 0 ;; esac; return 1; }
 
 print_footer() { # <now>
@@ -848,7 +901,7 @@ run() {
     say ""
 
     START_EPOCH="$(now_epoch)"
-    local row ca cb elapsed cmd crumb verdict reason detail term_rc alive
+    local row ca cb elapsed cmd crumb verdict reason detail term_rc alive ident
     # awk, not a bash loop, is what makes this a single pass over the table: the
     # filter is ppid==1 and ppid==1 only, and it must be cheap on a loaded host.
     while IFS= read -r row_line; do
@@ -875,10 +928,35 @@ run() {
         verdict="$(printf '%s' "$crumb" | cut -f1)"
         reason="$(printf '%s' "$crumb" | cut -f2)"
         detail="$(printf '%s' "$crumb" | cut -f3-)"
+        # F11: bind the signal to process identity. Capture the candidate's
+        # stable start identity at classification time; an identity that cannot
+        # be read is not a licence to signal, so the verdict is downgraded to
+        # PRESERVE BEFORE it is reported. identity_matches() is re-evaluated
+        # immediately before EACH signal below.
+        ident=""
+        if [ "$verdict" = "reap" ]; then
+            ident="$(proc_identity "$pid")"
+            if [ -z "$ident" ]; then
+                verdict=preserve
+                reason=identity-unknown
+                detail="no stable start identity could be read — no signal will be sent $cmd"
+            fi
+        fi
         report_row "$verdict" "$pid" "$reason" "$detail"
         if [ "$verdict" = "reap" ]; then
             REAP_C=$((REAP_C + 1))
             if [ "$MODE" = apply ]; then
+                # Re-read the identity immediately before the first signal. A pid
+                # reused since classification must not receive this SIGTERM.
+                if ! identity_matches "$pid" "$ident"; then
+                    say "         PRESERVED — identity-changed (pid $pid no longer matches the classified process; NO signal sent)"
+                    log "PRESERVED pid=$pid reason=identity-changed stage=pre-term expected=[$ident]"
+                    [ -n "$REASON_TMP" ] && printf 'identity-changed\n' >>"$REASON_TMP" 2>/dev/null
+                    # The candidate WAS classified reapable (already counted), but
+                    # nothing was signalled — the summary counts what happened.
+                    REAP_C=$((REAP_C - 1)); PRESERVE_C=$((PRESERVE_C + 1))
+                    continue
+                fi
                 "$KILL_BIN" -TERM "$pid" 2>/dev/null
                 term_rc=$?
                 if [ "$term_rc" != 0 ]; then
@@ -901,16 +979,27 @@ run() {
                     log "REAPED pid=$pid signal=SIGTERM"
                     REAPED=$((REAPED + 1))
                 else
-                    "$KILL_BIN" -KILL "$pid" 2>/dev/null
-                    sleep 1
-                    if ps_load "$PS_PROBE" 2>/dev/null && ! pid_alive "$PS_PROBE" "$pid"; then
-                        say "         REAPED — required SIGKILL (ignored SIGTERM)"
-                        log "REAPED pid=$pid signal=SIGKILL"
-                        REAPED=$((REAPED + 1))
+                    # F11: re-bind before the escalation. The SIGTERM went to the
+                    # VERIFIED process; if the pid has since been REUSED the
+                    # SIGKILL must not follow it, and the original's death is then
+                    # unprovable — so the outcome is a PRESERVE, not a reap.
+                    if ! identity_matches "$pid" "$ident"; then
+                        say "         PRESERVED — identity-changed before SIGKILL (pid $pid is no longer the classified process; NO SIGKILL sent)"
+                        log "PRESERVED pid=$pid reason=identity-changed stage=pre-kill expected=[$ident]"
+                        [ -n "$REASON_TMP" ] && printf 'identity-changed\n' >>"$REASON_TMP" 2>/dev/null
+                        REAP_C=$((REAP_C - 1)); PRESERVE_C=$((PRESERVE_C + 1))
                     else
-                        say "         KILL-FAILED — pid $pid is still alive (or its death could not be proven)"
-                        log "KILL-FAILED pid=$pid"
-                        FAILED=$((FAILED + 1))
+                        "$KILL_BIN" -KILL "$pid" 2>/dev/null
+                        sleep 1
+                        if ps_load "$PS_PROBE" 2>/dev/null && ! pid_alive "$PS_PROBE" "$pid"; then
+                            say "         REAPED — required SIGKILL (ignored SIGTERM)"
+                            log "REAPED pid=$pid signal=SIGKILL"
+                            REAPED=$((REAPED + 1))
+                        else
+                            say "         KILL-FAILED — pid $pid is still alive (or its death could not be proven)"
+                            log "KILL-FAILED pid=$pid"
+                            FAILED=$((FAILED + 1))
+                        fi
                     fi
                 fi
             else

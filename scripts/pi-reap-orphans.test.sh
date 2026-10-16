@@ -50,6 +50,8 @@
 #   flags / env validation   O20  (--help, unknown arg, bad numbers)
 #   verbose vs summary       O21  (non-verbose still reports exact counts)
 #   real reproduction        R1   (--repro only)
+#   identity binding (F11)   O27  (identity changed/unknown => PRESERVE, no
+#                                  signal; a stable identity still reaps)
 
 set -uo pipefail
 
@@ -90,6 +92,39 @@ add_spawned() { SPAWNED="$SPAWNED $1"; }
 mkdir -p "$T/bin"
 cat >"$T/bin/ps" <<'SHIM'
 #!/usr/bin/env bash
+# IDENTITY probe: `ps -o lstart= -p PID`. Answered from FAKE_IDENT_SEQ (a
+# `|`-separated walk — lstart contains COLONS in its time field, so `:` cannot be
+# the delimiter; past the end the LAST value repeats) so a fixture can make a
+# pid's start identity CHANGE between classification and signal — the #1863 F11
+# regression. The literal token __EMPTY__ models an unevaluable read. This branch
+# runs BEFORE the snapshot walk so identity probes never consume a fixture table.
+# With no FAKE_IDENT_SEQ set the identity is STABLE, which is what the
+# pre-existing apply fixtures rely on.
+for a in "$@"; do
+    case "$a" in
+        *lstart*)
+            idx=0
+            if [ -n "${FAKE_IDENT_COUNTER:-}" ]; then
+                idx="$(cat "$FAKE_IDENT_COUNTER" 2>/dev/null || printf 0)"
+                printf '%s' "$((idx + 1))" >"$FAKE_IDENT_COUNTER"
+            fi
+            idx="${idx:-0}"
+            seq="${FAKE_IDENT_SEQ:-}"
+            if [ -z "$seq" ]; then
+                printf 'Wed Oct 15 10:04:03 2025\n'
+                exit 0
+            fi
+            IFS='|' read -r -a vals <<<"$seq"
+            if [ "${#vals[@]}" -eq 0 ]; then exit 0; fi
+            last=$((${#vals[@]} - 1))
+            [ "$idx" -gt "$last" ] && idx="$last"
+            v="${vals[$idx]}"
+            [ "$v" = "__EMPTY__" ] && exit 0
+            printf '%s\n' "$v"
+            exit 0
+            ;;
+    esac
+done
 # Emits the Nth fixture table from FAKE_PS_SEQ (colon-separated paths); past the
 # end the LAST table repeats. A counter file makes the walk deterministic across
 # the reaper's A / B / post-signal probes.
@@ -179,6 +214,8 @@ lsof_fixture() {
 # Prints "RC=<n>" then the reaper's output. Reads $RUN_ARGS for flags.
 RUN_LOG=""
 RUN_KILL=""
+# Identity walk for the F11 fixtures; empty => the shim's STABLE default.
+RUN_IDENT_SEQ=""
 run_reaper() {
     local label="$1" ps_seq="$2" lsof_table="$3"; shift 3
     # These MUST be set OUTSIDE the command substitution below: assignments made
@@ -188,9 +225,11 @@ run_reaper() {
     RUN_KILL="$T/$label.kills"
     rm -f "$RUN_KILL"
     : >"$T/$label.counter"
+    : >"$T/$label.identcounter"
     local rc=0
     out="$(
         FAKE_PS_SEQ="$ps_seq" FAKE_PS_COUNTER="$T/$label.counter" \
+        FAKE_IDENT_SEQ="${RUN_IDENT_SEQ:-}" FAKE_IDENT_COUNTER="$T/$label.identcounter" \
         FAKE_LSOF_TABLE="$lsof_table" FAKE_KILL_LOG="$RUN_KILL" \
         PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
         REAP_ORPHAN_STATE_DIR="$T/$label.state" REAP_ORPHAN_LOG="$RUN_LOG" \
@@ -639,6 +678,51 @@ if ! diff -q "$REAPER" "$MUT" >/dev/null 2>&1; then
 else
     bad "O26 the mutation did not apply (human_anchor not rewritten) — the proof is void"
 fi
+
+# ── O27: the signal is bound to process identity (#1863 F11) ───────────
+# The observation→signal window spans the whole lsof pass, so a pid REUSED
+# between classification and signal must never be signalled. A pid whose start
+# identity changed (or could not be read) is PRESERVEd; a stable identity must
+# still reap, so the binding cannot disable the tool.
+echo "— O27: identity binding — a reused/changed pid is PRESERVED, never signalled —"
+DEADCWD27="$CWD_ROOT/gone27"; mkdir -p "$DEADCWD27"
+L27="$(lsof_fixture ls27 "$ORPH:$DEADCWD27")"
+rmdir "$DEADCWD27"
+IDENT_S="Wed Oct 15 10:04:03 2025"
+IDENT_C="Wed Oct 15 11:22:44 2025"
+
+# O27a: STABLE identity still reaps (the binding must not disable the tool).
+RUN_IDENT_SEQ="$IDENT_S|$IDENT_S"
+OUT="$(run_reaper o27a "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_SEQ=""
+assert_contains "$(kills o27a)" "-TERM $ORPH" "O27a a STABLE identity is still signalled (the binding does not disable the reap)"
+assert_contains "$OUT" "REAPED" "O27a ... and the reap completes"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O27a ... exit 0"
+
+# O27b: identity changes before SIGTERM -> PRESERVE, NO signal at all.
+RUN_IDENT_SEQ="$IDENT_S|$IDENT_C"
+OUT="$(run_reaper o27b "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_SEQ=""
+assert_contains "$OUT" "identity-changed" "O27b a pid whose identity changed before SIGTERM is PRESERVED (reason named)"
+assert_nofile "$T/o27b.kills" "O27b ... and NO signal is delivered"
+assert_contains "$OUT" "reaped=0" "O27b ... nothing is reported reaped"
+
+# O27c: identity changes before the SIGKILL escalation -> no SIGKILL.
+STILL27="$(fake_ps psStill27 "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:01.00' '00:05:00' /bin/sh-spin)")"
+RUN_IDENT_SEQ="$IDENT_S|$IDENT_S|$IDENT_C"
+OUT="$(run_reaper o27c "$A:$B:$STILL27" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_SEQ=""
+assert_contains "$(kills o27c)" "-TERM $ORPH" "O27c SIGTERM was delivered to the VERIFIED process"
+assert_absent "$(kills o27c)" "-KILL" "O27c ... but a pid that changed before escalation is NEVER KILLed"
+assert_contains "$OUT" "identity-changed" "O27c ... and the escalation preserve is reported"
+
+# O27d: an unevaluable identity read is not a licence to signal.
+RUN_IDENT_SEQ="__EMPTY__|$IDENT_S"
+OUT="$(run_reaper o27d "$A:$B:$GONE" "$L27" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+RUN_IDENT_SEQ=""
+assert_contains "$OUT" "reason=identity-unknown" "O27d an unreadable start identity is PRESERVED (fail-closed)"
+assert_nofile "$T/o27d.kills" "O27d ... and NO signal is delivered"
 
 echo ""
 echo "── hermetic suite: $PASS passed, $FAIL failed ──"
