@@ -18,11 +18,16 @@ DRY-RUN / rc=2) plus the legs this surface adds:
     TURN-BOUNDARY a lane whose transcript ended is `running-quiet` however long
                 it rests (short of the 24h retirement proof; this fixture's row
                 reason is `turn-ended`, but the emitted POLICY sentence asserts
-                only the state, since several paths reach it), while a
-                lane frozen with an OPEN turn is still `wedged` — the #1254
-                contract at the report layer. The child-exclusion scenario (a
-                task child's newer record must not become the parent's verdict)
-                is asserted inside CLEAN, paired with its own RED control.
+                only the state, since several paths reach it), while a lane
+                frozen with an OPEN turn is held at `running-quiet`/`tool-in-flight`
+                by the transcript-derived tool veto (#5389 a, the #5387 false
+                cut) — the row still NAMES the in-flight call — and the SAME
+                shape with the call dated past the 4h AGE backstop is `wedged`,
+                pinning that the veto is bounded (T9) and that the #1254
+                contract still holds at the report layer. The child-exclusion
+                scenario (a task child's newer record must not become the
+                parent's verdict) is asserted inside CLEAN, paired with its own
+                RED control.
     COMPACTION    a lane whose last transcript entry is a `compaction` abstains
                 (`unknown`/`tail-after-compaction`), never a decided turn (#1254 P1)
     MD-ESCAPE   no store/transcript-derived value (the `reason` cell's
@@ -60,6 +65,7 @@ real fleet, the store, or the network.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import json
 import os
 import re
@@ -130,10 +136,17 @@ PID_STALE = 3333
 PID_CHILD = 4444
 WS_TURN_DONE = "44444444-4444-4444-8444-444444444444"
 WS_TURN_OPEN = "55555555-5555-4555-8555-555555555555"
+# #5389 (a) — the SAME open turn, but its call is dated past the 4h AGE
+# backstop: the transcript-derived tool veto is bounded, so this lane must read
+# `wedged` again (T9). Without it the leg would lose the report-layer pin that
+# `wedged` is still reachable once the veto expires.
+WS_TURN_OPEN_EXPIRED = "66666666-6666-4666-8666-666666666666"
 SID_TURN_DONE = "eeeeeeee-0000-4000-8000-000000000005"
 SID_TURN_OPEN = "ffffffff-0000-4000-8000-000000000006"
+SID_TURN_OPEN_EXPIRED = "abcdabcd-0000-4000-8000-000000000007"
 PID_TURN_DONE = 5555
 PID_TURN_OPEN = 6666
+PID_TURN_OPEN_EXPIRED = 6667
 # #1272 — hostile fixture values for the markdown-escape leg. ``Lane.name`` is
 # ``os.path.basename(cwd)`` (a directory name) and ``Lane.workspace`` / ``Lane.sid``
 # are store keys — none is validated as a UUID — so all three reach the report
@@ -339,6 +352,19 @@ def turn_open_lane():
                    non_idle=False, cwd="/tmp/turn-open"))
 
 
+def turn_open_expired_lane():
+    """An open turn whose in-flight call is PAST the 4h AGE backstop (#5389 a).
+
+    `tool_from_jsonl` sets `turn_active=True`, so a derived tool is bounded by
+    the watchdog's own `tool-stall` backstop (4h), not by `tool-silence`'s 20
+    min. Once the call is older than that, the veto must EXPIRE — this fixture
+    is what pins "bounded, never forever" (T9) at the report layer.
+    """
+    return ("turn-open-expired", WS_TURN_OPEN_EXPIRED, SID_TURN_OPEN_EXPIRED,
+            record(SID_TURN_OPEN_EXPIRED, WS_TURN_OPEN_EXPIRED, PID_TURN_OPEN_EXPIRED,
+                   updated_at=NOW_S, non_idle=False, cwd="/tmp/turn-open-expired"))
+
+
 def md_active_dead_lane():
     """A DEAD lane whose label, workspaceId and sid are hostile (its pid is absent
     from ps): it exercises the table lane/workspace/sid cells AND the active
@@ -361,6 +387,19 @@ def msg_entry(role, **msg):
     base = {"role": role}
     base.update(msg)
     return {"type": "message", "message": base}
+
+
+def stamped_msg_entry(role, epoch_ms, **msg):
+    """A message entry carrying its OWN timestamp, so a derived tool can be aged.
+
+    `msg_entry` omits `timestamp`, so `tool_from_jsonl` falls back to the file
+    mtime and the derived call always reads fresh. Dating the entry is how the
+    TURN-BOUNDARY leg reproduces a call past the 4h backstop.
+    """
+    entry = msg_entry(role, **msg)
+    entry["timestamp"] = (datetime.datetime.fromtimestamp(
+        epoch_ms / 1000.0, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z")
+    return entry
 
 
 def write_transcript(fx, sid, cwd, entries, *, age_s=1800):
@@ -550,12 +589,15 @@ def leg_closed_workspace(module=None):
 
 
 def leg_turn_boundary(module=None):
-    print("── TURN-BOUNDARY — resting is not wedged; an open turn still is (#1254) ──")
-    fx = Fixture([turn_done_lane(), turn_open_lane()],
-                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN)])
+    print("── TURN-BOUNDARY — resting is not wedged; an open turn is held by the tool "
+          "veto, then wedged past its 4h backstop (#1254 / #5389) ──")
+    fx = Fixture([turn_done_lane(), turn_open_lane(), turn_open_expired_lane()],
+                 ps_rows=[ps_row(PID_TURN_DONE), ps_row(PID_TURN_OPEN),
+                          ps_row(PID_TURN_OPEN_EXPIRED)])
     try:
-        # Both transcripts are frozen 30 min (past S = 20 min, inside the 24h
-        # idle proof). The ONLY difference is the turn boundary.
+        # All transcripts are frozen 30 min (past S = 20 min, inside the 24h
+        # idle proof). The ONLY differences are the turn boundary and the age of
+        # the open call.
         write_transcript(fx, SID_TURN_DONE, "/tmp/turn-done",
                          [msg_entry("assistant", stopReason="stop",
                                     content=[{"type": "text", "text": "done"}])])
@@ -563,6 +605,14 @@ def leg_turn_boundary(module=None):
                          [msg_entry("assistant", stopReason="toolUse",
                                     content=[{"type": "toolCall", "name": "bash",
                                               "id": "call_00_OPEN"}])])
+        # The SAME open turn, with the call dated past the 4h AGE backstop: the
+        # transcript-derived veto (turn_active=True) is bounded, so this lane
+        # falls through to `wedged` again.
+        write_transcript(fx, SID_TURN_OPEN_EXPIRED, "/tmp/turn-open-expired",
+                         [stamped_msg_entry("assistant", NOW_MS - 5 * 3600 * 1000,
+                                            stopReason="toolUse",
+                                            content=[{"type": "toolCall", "name": "bash",
+                                                      "id": "call_00_EXPIRED"}])])
         rc, out, gh = run_report(fx, "--json", module=module)
         assert_eq(rc, 0, "neither lane escalates (both have a live holder)")
         parsed = json.loads(out.splitlines()[0])
@@ -575,16 +625,31 @@ def leg_turn_boundary(module=None):
             ok("the report's evidence names the terminal stopReason")
         else:
             bad("the report must say WHY the lane is resting (terminal stopReason absent)")
+        # #5389 (a): an unanswered call is now DERIVED from the transcript, so
+        # the lane is held by the tool veto rather than read as wedged. The row
+        # must still name the call the veto is waiting on.
         opened = verdicts.get("turn-open", {})
-        assert_eq(opened.get("state"), "wedged", "a frozen OPEN turn is still wedged")
-        assert_eq(opened.get("reason"), "turn-open:pending-tool-call",
-                  "the wedged reason names the open turn")
+        assert_eq(opened.get("state"), "running-quiet",
+                  "an open turn whose tool veto holds is running-quiet, never wedged (#5389 a)")
+        assert_eq(opened.get("reason"), "tool-in-flight",
+                  "the reason names the tool veto")
         if "call_00_OPEN" in out:
-            ok("the report names the unanswered call")
+            ok("the tool-in-flight row names the in-flight call as evidence")
+        else:
+            bad("the tool-in-flight row must name the in-flight call")
+        # ... and the veto is BOUNDED: past the 4h backstop the SAME shape is
+        # wedged again (T9). This is what keeps the #1254 pin at the report layer.
+        expired = verdicts.get("turn-open-expired", {})
+        assert_eq(expired.get("state"), "wedged",
+                  "past the 4h AGE backstop the veto expires and the open turn is wedged (T9)")
+        assert_eq(expired.get("reason"), "turn-open:pending-tool-call",
+                  "the wedged reason names the open turn")
+        if "call_00_EXPIRED" in out:
+            ok("the report names the expired unanswered call")
         else:
             bad("the wedged row must name the open call")
         assert_eq(parsed["counts"].get("wedged"), 1,
-                  "exactly one wedged lane: the open turn, not the resting one")
+                  "exactly one wedged lane: the open turn past its tool backstop, not the resting one")
         # P2: the emitted policy text must say what the code does — a resting
         # lane is running-quiet only SHORT OF the 24h retirement proof (past it
         # the `idle`/`jsonl-old` branch returns first).

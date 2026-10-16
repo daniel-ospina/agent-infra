@@ -125,17 +125,18 @@ can no longer read as a verdict. Doc: docs/ops/fleet-liveness.md, section 5
 item 7 (the population boundary) and section 7 (the ref-claim registry).
 
 ── (5) THE SUITES THAT PIN ALL OF THIS ─────────────────────────────────
+(re-run at the merge head after `origin/main` integration; counts below match it)
 $ python3 tools/fleet/liveness.test.py
-PASS=27 FAIL=0
+PASS=31 FAIL=0
 $ python3 tools/fleet/liveness.test.py --mutations
-MUTATIONS=30 CAUGHT=30 MISSED=0
+MUTATIONS=38 CAUGHT=38 MISSED=0
 $ python3 tools/fleet/claim_lanes.test.py
-PASS=23 FAIL=0
+PASS=24 FAIL=0
 $ python3 tools/fleet/claim_lanes.test.py --mutations
-MUTATIONS=24 CAUGHT=24 MISSED=0
+MUTATIONS=27 CAUGHT=27 MISSED=0
 $ python3 tools/fleet/lane_liveness.test.py
 
-PASS=109 FAIL=0
+PASS=112 FAIL=0
 $ python3 tools/fleet/lane_liveness.test.py          # its RED control is printed above PASS:
                                                     #   RED-CONTROL mutations=10 caught=10 missed=0
 $ bash scripts/check-agents-materialized.sh ; echo "rc=$?"

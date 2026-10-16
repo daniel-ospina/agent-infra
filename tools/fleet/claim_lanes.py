@@ -164,7 +164,6 @@ READER_LIMITS = (
 
 _OWNER_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]{1,128}):(?P<pid>[0-9]{1,18})$")
 _LEASE_RE = re.compile(r"^[0-9]{1,%d}$" % LEASE_MAX_DIGITS)
-_URL_USERINFO_RE = re.compile(r"://[^/@\s]*@")
 # A remote reference that is already ONE target, mirrored on git's own rule: a scheme URL
 # (`https://`, `file://`, `ssh://`), an absolute path, or an scp-like `host:path` — with or
 # WITHOUT a `user@` — where the colon comes before any slash. Anything else (no colon, so
@@ -175,6 +174,10 @@ _ABSOLUTE_REMOTE_RE = re.compile(
     r"|[^/@\s]+@[^/@\s:]+:"                 # `user@host:path`
     r"|[^/@\s]+:"                           # `host:path` — git's own scp test (colon before any `/`)
     r"|/)")                                  # an absolute filesystem path
+# A URL embedded in FREE TEXT — git echoes the URL it failed on (`unable to access
+# 'https://…'`), and its own anonymizer leaves a password whose tail holds `@`
+# intact. The quoted/space-bounded `rest` captures the whole URL, not the prose.
+_TEXT_URL_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<rest>[^\s'\"]+)")
 
 
 class UsageError(Exception):
@@ -213,9 +216,47 @@ def short_host(name: Optional[str] = None) -> str:
     return (name if name is not None else socket.gethostname()).split(".")[0]
 
 
+def _redact_text(text: str) -> str:
+    """Strip userinfo and query strings from every URL EMBEDDED in free text.
+
+    git echoes the URL it failed on (``unable to access 'https://…'``), and its own
+    anonymizer leaves a password whose tail holds ``@`` intact — measured: the
+    rendered ``detail`` carried ``https://ssw0rdLEAK@…`` and a raw
+    ``?access_token=…``. Since ``detail`` can be pasted into an issue, the same
+    redaction the ``source`` gets is applied to text before it is rendered.
+    """
+    def repl(m):
+        rest = re.split(r"[?#]", m.group("rest"), maxsplit=1)[0]
+        authority, slash, path = rest.partition("/")
+        if "@" in authority:
+            authority = authority[authority.rfind("@") + 1:]
+        return m.group("scheme") + authority + slash + path
+    return _TEXT_URL_RE.sub(repl, str(text or ""))
+
+
 def _redact_url(url: str) -> str:
-    """Never echo credentials: a remote URL may carry ``user:token@``."""
-    return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))
+    """Never echo credentials: userinfo goes WHOLE, and so does any query string.
+
+    ⛔ Two shapes a first-``@`` userinfo pattern misses, both measured (#1777 review):
+    a password whose tail contains ``@`` (``https://user:pa@ss@host`` — a regex
+    stopping at the first ``@`` redacts only ``pa@`` and leaves ``ss@host``), and a
+    token in the QUERY string (``https://host/r.git?access_token=…``), which no
+    userinfo pattern touches. The rendered ``source``/``detail`` may be pasted into
+    an issue, so both are removed.
+
+    Display only: git still receives the untouched url.
+    """
+    raw = str(url or "")
+    if not raw:
+        return ""
+    if "://" in raw:
+        return sanitize(_redact_text(raw))
+    # scp-like `[user@]host:path` — userinfo precedes the LAST `@`, and only when a
+    # colon follows it (git's own scp test).
+    head, slash, tail = raw.partition("/")
+    if "@" in head and ":" in head.rsplit("@", 1)[-1]:
+        raw = head[head.rfind("@") + 1:] + slash + tail
+    return sanitize(raw)
 
 
 def _bounded_seconds(value, flag: str) -> float:
@@ -364,6 +405,13 @@ def _resolve_remote(remote: str, repo: Optional[str], timeout: float) -> str:
     """
     resolved = remote
     if remote == "origin":
+        if not repo:
+            # `--remote-url origin` with no --repo is a caller mistake, not a crash:
+            # there is no checkout whose `origin` could be resolved. Report the
+            # declared usage exit (2), never a TypeError traceback (exit 1).
+            raise UsageError(
+                "`origin` needs a --repo PATH to resolve against — pass --repo PATH "
+                "(its `origin` is read) or a --remote-url URL")
         rc, out, _err, failure = _git(["-C", repo, "remote", "get-url", "origin"], timeout)
         url = out.strip().splitlines()[0].strip() if out.strip() else ""
         if failure or rc != 0 or not url:
@@ -378,9 +426,10 @@ def _git_error(err: str) -> str:
 
     Measured: a fetch failure's last line was `and the repository exists.` — the
     tail of "Please make sure you have the correct access rights and the
-    repository exists" — which names no cause at all.
+    repository exists" — which names no cause at all. The text is redacted too:
+    git echoes the URL it failed on (including a credential it did not anonymize).
     """
-    clean = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    clean = [_redact_text(ln.strip()) for ln in (err or "").splitlines() if ln.strip()]
     for ln in clean:
         if ln.startswith("fatal:") or ln.startswith("error:"):
             return sanitize(ln, 200)
@@ -444,6 +493,7 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
             fetch_detail = ifail or ("init rc=%d" % irc)
         for sha_hex, ref in refs:
             owner, raw_until, commit = "?", "0", ""
+            committed_at: Optional[int] = None
             if metadata_ok:
                 crc, cout, _cerr, cfail = _git(["-C", tmp, "cat-file", "commit", sha_hex], timeout)
                 if cfail or crc != 0:
@@ -458,8 +508,9 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
                         fetch_detail = cfail or ("cat-file rc=%d" % crc)
                 else:
                     commit = sha_hex
-                    owner, raw_until = _owner_and_lease(cout)
-            claims.append(_row(ref, owner, raw_until, ns, host, now, commit))
+                    owner, raw_until = _owner_and_lease(_commit_body(cout))
+                    committed_at = _commit_time(cout)
+            claims.append(_row(ref, owner, raw_until, ns, host, now, commit, committed_at))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -473,13 +524,45 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
     )
 
 
-def _owner_and_lease(msg: str) -> Tuple[str, str]:
-    """The last ``owner=`` / ``lease_until=`` in a commit message (``_lease_of`` parity).
+def _commit_body(obj: str) -> str:
+    """The commit MESSAGE only — headers stripped, exactly as ``claims.sh`` does.
 
-    Mirrors ``claims.sh``'s ``_lease_of``: the greedy leading ``.*`` in its sed
-    means the LAST occurrence of each field wins, and an ABSENT field yields
-    ``?`` / ``0`` — an absence is reported as an unparseable VALUE, never as
-    "no claim", which is what keeps presence alone refuting freedom.
+    ⛔ ``git cat-file commit`` prints the WHOLE object: tree/author/committer/gpgsig
+    headers, a blank line, then the message. ``claims.sh``'s ``_lease_of`` strips
+    them (``sed -n '/^$/,$p' | tail -n +2``); feeding the raw object to the field
+    parser lets a HEADER supply ``owner=``/``lease_until=`` — and headers are minted
+    by whoever pushes — so the two readers disagree about one lease (the Python
+    reader sees an expired lease where ``claims.sh`` sees an unparseable one).
+    """
+    _headers, sep, body = (obj or "").partition("\n\n")
+    return body.replace("\r", "") if sep else ""
+
+
+_COMMITTER_TIME_RE = re.compile(r"^committer .*? ([0-9]{1,}) [+-][0-9]{4}[ \t]*$", re.M)
+
+
+def _commit_time(obj: str) -> Optional[int]:
+    """The committer epoch from the HEADER block, or ``None``.
+
+    The header block only (before the first blank line): a message body line that
+    happens to read ``committer …`` must never be read as the timestamp. The value
+    is pusher-minted, so it is displayed as an age and never decides anything.
+    """
+    headers, sep, _body = (obj or "").partition("\n\n")
+    if not sep:
+        return None
+    m = _COMMITTER_TIME_RE.search(headers)
+    return int(m.group(1)) if m else None
+
+
+def _owner_and_lease(msg: str) -> Tuple[str, str]:
+    """The last ``owner=`` / ``lease_until=`` in a commit MESSAGE (``_lease_of`` parity).
+
+    Mirrors ``claims.sh``'s ``_lease_of``: it reads the message BODY only (feed it
+    ``_commit_body``'s output — a header must never supply the payload), the greedy
+    leading ``.*`` in its sed means the LAST occurrence of each field wins, and an
+    ABSENT field yields ``?`` / ``0`` — an absence is reported as an unparseable
+    VALUE, never as "no claim", which is what keeps presence alone refuting freedom.
     """
     o = re.findall(r"owner=([^ \n]*)", msg or "")
     u = re.findall(r"lease_until=([0-9]*)", msg or "")
@@ -487,15 +570,18 @@ def _owner_and_lease(msg: str) -> Tuple[str, str]:
 
 
 def _row(ref: str, owner: str, raw_until: str, ns: str, host: str, now: int,
-         commit: str = "") -> liveness.Claim:
+         commit: str = "", committed_at: Optional[int] = None) -> liveness.Claim:
     owner_host, owner_pid, scope = parse_owner(owner, host)
     key = ref.rsplit("/", 1)[-1]
     pr, _sep, sha12 = key.partition("-")
     until, state = parse_lease(raw_until, now)
+    # The claim's AGE rides as non-liveness detail (a snapshot carries no commit, so
+    # the age is honestly ABSENT there rather than invented).
+    age_s = None if committed_at is None else max(0, now - committed_at)
     return liveness.Claim(
         ref=ref, key=key, pr=pr, sha12=sha12, owner=owner or "?", owner_host=owner_host,
         owner_pid=owner_pid, lease_until=until, lease_state=state, scope=scope,
-        commit=commit,
+        commit=commit, age_s=age_s,
     )
 
 

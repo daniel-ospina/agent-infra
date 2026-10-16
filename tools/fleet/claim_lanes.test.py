@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Twenty-three tests with twenty-four paired mutations: every mutation re-introduces
+Twenty-four tests with twenty-seven paired mutations: every mutation re-introduces
 the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
 
-    python3.12 tools/fleet/claim_lanes.test.py              # the 23 tests, green
+    python3.12 tools/fleet/claim_lanes.test.py              # the 24 tests, green
     python3.12 tools/fleet/claim_lanes.test.py --mutations  # each mutation, RED
 
 `--mutations` writes BOTH modules — a mutated copy of one and a verbatim copy of
@@ -476,6 +476,43 @@ def l10_lease_parity_with_shipped_shell():
                   "%s must be (None, unknown), got %r/%s" % (label, until, state))
         check(cl.LEASE_MAX_DIGITS == 18, "the magnitude bound is 18, not 9; got %r"
               % cl.LEASE_MAX_DIGITS)
+        # ── extraction parity: a HOSTILE HEADER must not supply the payload ────
+        # The pull reader uses `cat-file commit`, which prints the WHOLE object.
+        # `claims.sh`'s `_lease_of` strips the headers first; the Python reader must
+        # agree, or a header (minted by whoever pushes) supplies owner=/lease_until=
+        # and the two readers disagree about ONE lease (#1777 review P1).
+        hostile = ("tree %s\n" % EMPTY_TREE +
+                   "author x <e@e> 1792092574 +0000\n"
+                   "committer x owner=evil-host:4242 lease_until=999999999999999999 "
+                   "<e@e> 1792092574 +0000\n\n"
+                   "claim nonce=deadbeef\n")
+        check(cl._owner_and_lease(cl._commit_body(hostile)) == ("?", "0"),
+              "a header must NOT supply owner/lease; got %r"
+              % (cl._owner_and_lease(cl._commit_body(hostile)),))
+        check(cl._owner_and_lease(cl._commit_body(
+                  "tree t\n\nclaim owner=good-host:7 lease_until=123\n")) ==
+              ("good-host:7", "123"),
+              "the message BODY is still parsed (last occurrence wins)")
+        # ... and the same through the real reader, so the call site (not just the
+        # helper) is pinned. The committer DATE stays readable (it is the claim age).
+        hostile_env = dict(os.environ, **GIT_ENV)
+        hostile_env["GIT_COMMITTER_NAME"] = \
+            "x owner=evil-host:4242 lease_until=999999999999999999"
+        hostile_env["GIT_COMMITTER_DATE"] = "%d +0000" % (NOW_S - 600)
+        proc = subprocess.run(
+            ["git", "-C", d, "commit-tree", EMPTY_TREE, "-m", "claim nonce=deadbeef"],
+            env=hostile_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check(proc.returncode == 0, "hostile commit-tree failed: %s" % proc.stderr.strip())
+        git(["-C", d, "update-ref", "refs/claims/7-aaaaaaaaaaaa", proc.stdout.strip()])
+        cr = cl.read_pull(d, host=HOST, now=NOW_S)
+        check(cr.readable is True, "the hostile remote is readable: %r" % cr.detail)
+        row = [c for c in cr.claims if c.key == "7-aaaaaaaaaaaa"]
+        check(len(row) == 1, "the hostile claim is present; got %r" % [c.key for c in cr.claims])
+        check(row[0].owner == "?", "the header must not name an owner; got %r" % row[0].owner)
+        check(row[0].lease_state == "unknown",
+              "the header lease must not be read; got %r" % row[0].lease_state)
+        check(row[0].age_s == 600, "the committer date is still read as the age; got %r"
+              % row[0].age_s)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -923,11 +960,41 @@ def l22_credentials_are_redacted():
     cr = cl.read_pull(raw, host=HOST, now=NOW_S)
     check(cr.readable is False, "an unreachable remote is an unreadable read")
     check(token not in cr.source, "the token must not survive into `source`: %r" % cr.source)
+    check(token not in cr.detail, "git echoes the URL in stderr, so not into `detail`: %r"
+          % cr.detail)
     check("127.0.0.1:1/r.git" in cr.source, "the target is still named: %r" % cr.source)
     v = liv.evaluate(cl.to_evidence(cr))
     for rendering, text in (("text", cl.render_text(cr, v)),
                             ("json", cl.render_json(cr, v))):
         check(token not in text, "the token must not appear in the %s rendering" % rendering)
+    # ⛔ Two shapes the FIRST-`@` / no-query redaction left in place (#1777 review):
+    # a password whose tail contains `@` (a regex stopping at the first `@` redacts
+    # only up to it) and a token in the QUERY string (no userinfo pattern touches it).
+    pw = "pa@ssw0rdLEAK"
+    pw_url = "https://user:%s@127.0.0.1:1/r.git" % pw
+    check(cl._redact_url(pw_url) == "https://127.0.0.1:1/r.git",
+          "an `@` inside the password is stripped with the rest of the userinfo: got %r"
+          % cl._redact_url(pw_url))
+    qs = "https://127.0.0.1:1/r.git?access_token=ghp_QUERYLEAK"
+    check("QUERYLEAK" not in cl._redact_url(qs),
+          "a query-string credential is stripped: got %r" % cl._redact_url(qs))
+    cr_pw = cl.read_pull(pw_url, host=HOST, now=NOW_S)
+    check(pw not in cr_pw.source, "the password tail must not survive: %r" % cr_pw.source)
+    check(pw not in cr_pw.detail,
+          "git echoes the URL in stderr, so the password tail must not reach `detail`: %r"
+          % cr_pw.detail)
+    cr_qs = cl.read_pull(qs, host=HOST, now=NOW_S)
+    check("QUERYLEAK" not in cr_qs.source, "the query token must not survive: %r" % cr_qs.source)
+    check("QUERYLEAK" not in cr_qs.detail,
+          "git echoes the URL in stderr, so the query token must not reach `detail`: %r"
+          % cr_qs.detail)
+    for label, c in (("password-tail", cr_pw), ("query", cr_qs)):
+        secret = pw if label == "password-tail" else "QUERYLEAK"
+        v = liv.evaluate(cl.to_evidence(c))
+        for rendering, text in (("text", cl.render_text(c, v)),
+                                ("json", cl.render_json(c, v))):
+            check(secret not in text,
+                  "the %s credential must not appear in the %s rendering" % (label, rendering))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -954,6 +1021,30 @@ def l23_mutation_verdict_requires_a_real_failure():
     check(caught(1, "FAIL L1 x\nPASS=0 FAIL=2\n") is True, "more than one failure counts")
     check(caught(1, "") is False, "an unparseable run is not a caught mutation")
     check(caught(1, "PASS=nope FAIL=1") is False, "a malformed summary is not a caught mutation")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L24 — `--remote-url origin` with no --repo is a USAGE exit, never a traceback
+# ══════════════════════════════════════════════════════════════════════════
+@test("L24 `origin` with no --repo is a USAGE exit (2), never a TypeError traceback (#1777)")
+def l24_origin_without_repo_is_usage():
+    # `--remote-url origin` is a legal argparse value ("read this remote directly
+    # instead of --repo's origin"), and it is the natural way to name the origin
+    # remote. With no --repo there is no checkout to resolve it against: the
+    # declared contract is exit 2 (usage), and a consumer branches on rc.
+    try:
+        cl._resolve_remote("origin", None, 5.0)
+        raise Failure("`origin` with no --repo must be a usage error")
+    except cl.UsageError:
+        pass
+    except TypeError as exc:
+        raise Failure("`origin` with no --repo escaped as %s: %s" % (type(exc).__name__, exc))
+    check(_cli_rc(["--remote-url", "origin", "--pr", "1"]) == 2,
+          "the CLI must exit 2 (usage), not 1 (an uncaught TypeError)")
+    # With a --repo the same value resolves — the guard must not over-block.
+    with bare_remote() as remote, work_repo(remote) as work:
+        check(cl._resolve_remote("origin", work, 5.0) == remote,
+              "`origin` resolves against the repo's own remote when one is given")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -991,8 +1082,8 @@ MUTATIONS = [
     ),
     Mutation(
         "L4", "reader",
-        '            claims.append(_row(ref, owner, raw_until, ns, host, now, commit))',
-        '            _unreachable = _row(ref, owner, raw_until, ns, host, now, commit)',
+        '            claims.append(_row(ref, owner, raw_until, ns, host, now, commit, committed_at))',
+        '            _unreachable = _row(ref, owner, raw_until, ns, host, now, commit, committed_at)',
         "a metadata failure DROPS the claim, so presence stops refuting freedom",
     ),
     Mutation(
@@ -1039,6 +1130,14 @@ MUTATIONS = [
         '    if not _LEASE_RE.match(s):\n        return None, "unknown"',
         '    if not _LEASE_RE.match(s) and s != "-5":\n        return None, "unknown"',
         "the reader accepts a negative lease as a real value and reads it expired",
+    ),
+    Mutation(
+        "L10", "reader",
+        '    _headers, sep, body = (obj or "").partition("\\n\\n")\n'
+        '    return body.replace("\\r", "") if sep else ""',
+        '    return (obj or "").replace("\\r", "")',
+        "the commit HEADERS are parsed as if they were the message, so a header supplies "
+        "owner=/lease_until= and the reader disagrees with claims.sh about one lease",
     ),
     Mutation(
         "L11", "reader",
@@ -1145,10 +1244,25 @@ MUTATIONS = [
     ),
     Mutation(
         "L22", "reader",
-        '    return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))',
-        '    return sanitize(str(url or ""))',
-        "credentials in the remote URL are echoed into `source` (and from there into the "
-        "report and an issue body)",
+        '        rest = re.split(r"[?#]", m.group("rest"), maxsplit=1)[0]\n',
+        '',
+        "the query string is NOT stripped, so a `?access_token=…` credential survives "
+        "into `source`/`detail` (and from there into the report and an issue body)",
+    ),
+    Mutation(
+        "L22", "reader",
+        '        if "@" in authority:\n'
+        '            authority = authority[authority.rfind("@") + 1:]\n',
+        '',
+        "userinfo is not stripped, so a credential (including one whose password tail "
+        "holds `@`) is echoed into `source`/`detail`",
+    ),
+    Mutation(
+        "L24", "reader",
+        '        if not repo:\n',
+        '        if False:\n',
+        "`origin` with no --repo reaches git as a None path and escapes as an uncaught "
+        "TypeError (exit 1), not the declared usage exit 2",
     ),
 ]
 

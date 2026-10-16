@@ -20,7 +20,7 @@ Follow the research protocol in `references/protocols.md`: abundance principle, 
 
 ## 2. Research Tracks (Run 4 Sub-Agents in Parallel)
 
-Dispatch 4 sub-agents via `task` tool, one per track. Each agent must read the strategy sections it needs before constructing queries.
+Dispatch 4 sub-agents via `task` tool, one per track. Each agent must read the strategy sections it needs before constructing queries. **All four share one Perplexity key — stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound (at most 2 concurrent `web_search` calls; a wider fan-out 429s and silently truncates the batch), and have each agent report `attempted / returned` for its own track.**
 
 ### Track A: Sales Culture & Communication Norms
 
