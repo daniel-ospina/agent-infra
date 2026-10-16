@@ -506,8 +506,8 @@ install_config() {
       continue
     fi
     # A copy that FAILS must be COUNTED, not merely silence the success line below: the dest
-    # can be a file where the checkout has a directory (`mkdir -p` then fails), and the round-1
-    # form recorded that (`|| fail "could not install $rel"`).
+    # can be a file where the checkout has a directory (`mkdir -p` then fails), and a silent
+    # skip would report the config set as installed while only the success line was suppressed.
     copy_repo_path "$rel" || { fail "could not install $rel (a dest that is not the same shape as the source?)"; cfg_fail=1; }
   done
   # The step's own narrative may not contradict its FAIL line: an unconditional `say` here

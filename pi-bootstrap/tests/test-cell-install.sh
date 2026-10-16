@@ -31,7 +31,8 @@
 #   (i) `--verify` refuses a source tree it cannot compare IN FULL and does not treat that as
 #       a match: an emptied tree (either loop), a subtree it cannot read, a shipped file
 #       whose name carries a newline, and a shipped SYMLINK (copied as a link, never
-#       byte-compared) — and follows a symlinked source directory instead of calling it empty.
+#       byte-compared) — and follows a symlinked source directory instead of calling it empty,
+#       while a LINKED node_modules (an excluded namespace) is NOT refused.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -482,29 +483,44 @@ fi
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard"
 mkdir -p "$EMPTY_EXT/extensions/task-cwd-guard"
 cp -R "$ROOT/extensions/task-cwd-guard/." "$EMPTY_EXT/extensions/task-cwd-guard/"
-printf 'same\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"
-printf 'same\n' > "$TMP/emptyext-home/.pi/agent/extensions/task-cwd-guard/evil"
-printf 'EVIL\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
+# A shipped SYMLINK: copied as a link, so it was never byte-compared.
+ln -s /etc/hostname "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
 out3="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
 grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out3" \
-  && ok "a shipped filename containing a NEWLINE is refused, not lost from the comparison" \
-  || fail "a newline-bearing filename was not refused — the list is lossy, so no comparison over it can be trusted"
-rm -f "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
-ln -s /etc/hostname "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
-out4="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
-grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out4" \
   && ok "a shipped SYMLINK is refused (cp -R copies it as a link, so it was never byte-compared)" \
   || fail "a shipped symlink was certified without ever being compared"
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
 # ... and the same refusal must NOT fire on the one namespace that is excluded by construction:
-# a LINKED node_modules (a hoisted or shared dep store) is legitimate.
+# a LINKED node_modules (a hoisted or shared dep store) is legitimate. Asserted against a tree
+# that is otherwise clean, and by the run's UNCHANGED problem count — a message about this
+# extension would add one, and an assertion that merely greps for the name would be satisfied
+# by a refusal triggered from anywhere else in the same output. The baseline is measured here
+# rather than assumed, because the pins above leave this fixture in their own state.
+base="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
 ln -s "$TMP/emptynm" "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"
 mkdir -p "$TMP/emptynm"
-out5="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
-grep -q 'extension task-cwd-guard' <<<"$out5" \
-  && fail "a linked node_modules made the extension fail verification: $(grep 'task-cwd-guard' <<<"$out5" | head -1)" \
-  || ok "a LINKED node_modules is not refused (the excluded namespace covers the entry itself)"
+out4="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+if grep -q 'task-cwd-guard' <<<"$out4"; then
+  fail "a linked node_modules made the extension fail verification: $(grep 'task-cwd-guard' <<<"$out4" | head -1)"
+else
+  nbase="$(grep -o 'FAILED: [0-9]* problem(s)' <<<"$base" | head -1)"
+  nafter="$(grep -o 'FAILED: [0-9]* problem(s)' <<<"$out4" | head -1)"
+  [ -n "$nbase" ] && [ "$nbase" = "$nafter" ] \
+    && ok "a LINKED node_modules is not refused (excluded by construction; the problem count is unchanged: $nafter)" \
+    || fail "a linked node_modules changed the outcome: [$nbase] before, [$nafter] after"
+fi
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"; rmdir "$TMP/emptynm"
+# A name containing a NEWLINE: the line-based list drops the entry and duplicates a sibling's
+# line in its place, so the file itself may never be compared at all. The sibling whose name
+# equals the pre-newline prefix is here so that the duplicate-line shape is represented.
+printf 'same\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"
+printf 'same\n' > "$TMP/emptyext-home/.pi/agent/extensions/task-cwd-guard/evil"
+printf 'EVIL\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
+out5="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out5" \
+  && ok "a shipped filename containing a NEWLINE is refused, not lost from the comparison" \
+  || fail "a newline-bearing filename was not refused — the list is lossy, so no comparison over it can be trusted"
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
 rm -rf "$EMPTY_EXT" "$TMP/emptyext-home"
 rm -rf "$DEST/agents"
 run_verify
