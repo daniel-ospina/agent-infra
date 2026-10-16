@@ -2661,84 +2661,71 @@ git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
 cd "$REPO"
 echo ""
 echo "== 33. the delete is pinned to the CLASSIFIED oid by git's own LEASE (F1) =="
-# fetch=A, `pushInsteadOf A→B`, `insteadOf B→C`. The delete-time verification
-# runs `git ls-remote <resolved push url>` — but ls-remote is a FETCH, so it
-# applies `url.<base>.insteadOf` to the ALREADY-RESOLVED push url (B→C) and
-# proves repo C's foo at the classified oid. `git push origin --delete` applies
-# `pushInsteadOf` to origin's FETCH url (A→B) and does NOT then apply
-# `insteadOf`, so it lands on repo B — whose foo is a DIFFERENT, UNMERGED commit
-# that exists nowhere else. When the fetch and push targets differ git applies
-# NO compare-and-swap: pre-fix the sweep reported `Deleted: 1 / Refused: 0`,
-# rc=0, and B's commit was destroyed. The delete's `--force-with-lease` sends the
-# classified oid as the expected old value through the SAME resolution as the
-# delete, so B's receive-pack REFUSES.
-F1L_A="$FIX/f1lease-a.git"
-F1L_B="$FIX/f1lease-b.git"
-F1L_C="$FIX/f1lease-c.git"
+# The lease is the compare-and-swap: `git push origin --delete
+# --force-with-lease=refs/heads/<br>:<classified oid>` sends the classified oid
+# as the expected old value through the SAME resolution as the delete, so the
+# receiving repository refuses unless its ref is exactly what the sweep
+# classified. `verify_remote_target` reads that same ref through `git ls-remote`
+# a moment earlier; a ref that MOVES in that window is invisible to it, and the
+# lease is what catches it. A git wrapper moves origin's ref AFTER the ls-remote
+# read and BEFORE the real push, so the lease must refuse with `stale info`.
+# (The pre-F29 A→B→C fixture that used to live here is now the F29 endpoint
+# guard's subject — that rewrite never reaches the push — so the lease is
+# exercised here WITHOUT any rewriting, which the F29 guard does not preempt.)
+F1L_ORIGIN="$FIX/f1lease-origin.git"
 F1L_REPO="$FIX/f1lease-repo"
-new_repo "$F1L_REPO" "$F1L_A"
+new_repo "$F1L_REPO" "$F1L_ORIGIN"
 cd "$F1L_REPO"
 mkdir -p scripts
 cp "$SCRIPT" scripts/
 F1L_SCRIPT="$F1L_REPO/scripts/cleanup-stale-branches.sh"
 echo base > f1l.txt; git add f1l.txt; old_commit "init"; git push -q origin main
-# A's foo: merged into A's main, stale → a genuine candidate.
-git checkout -q -b foo main
-echo afoo > afoo.txt; git add afoo.txt; old_commit "foo-on-A"
-git push -q -u origin foo
+F1L_BASE="$(git rev-parse main)"
+# doomed — merged into main and stale, so it IS a genuine candidate.
+git checkout -q -b doomed main
+echo d > d.txt; git add d.txt; old_commit "doomed"
+git push -q -u origin doomed
 git checkout -q main
-git merge -q --ff-only foo
+git merge -q --ff-only doomed
 git push -q origin main
-F1L_A_OID="$(git -C "$F1L_A" rev-parse refs/heads/foo)"
-# C: a MIRROR of A's foo (same oid) — so the fetch-side verification PASSES.
-# ⛔ F26: C must also mirror A's main. The merge premise now re-reads main from
-# the resolved PUSH url, which `insteadOf B→C` rewrites to C — with no main there
-# the merge gate would refuse FIRST and this section's subject (the delete's
-# LEASE refusing B's unmerged foo) would never be exercised.
-git init -q --bare "$F1L_C"
-git push -q "$F1L_C" refs/heads/main:refs/heads/main
-git push -q "$F1L_C" refs/heads/foo:refs/heads/foo
-# B: foo holds a UNIQUE, UNMERGED commit that exists nowhere else.
-git init -q --bare "$F1L_B"
-git checkout -q -b b-foo main
-echo dangerB > dangerB.txt; git add dangerB.txt; old_commit "foo-on-B"
-F1L_B_OID="$(git rev-parse HEAD)"
-git push -q "$F1L_B" refs/heads/b-foo:refs/heads/foo
-git checkout -q main
-if [ "$F1L_A_OID" != "$F1L_B_OID" ]; then
-    ok "lease fixture: repo A's and repo B's foo differ (the divergence is real) (F1)"
+F1L_OID="$(git -C "$F1L_ORIGIN" rev-parse refs/heads/doomed)"
+# The oid the ref MOVES to: main's PRE-doomed base, which ALREADY EXISTS in the
+# bare. Using a present object is deliberate — `git update-ref` refuses to point
+# a ref at an absent object, so a locally-only commit would leave the ref
+# untouched and the lease would spuriously pass.
+F1L_MOVED="$F1L_BASE"
+if [ "$F1L_OID" != "$F1L_MOVED" ]; then
+    ok "lease fixture: the moved oid differs from the classified oid (F1)"
 else
-    bad "lease fixture: A and B share one oid — the fixture does not exercise the divergence (F1)"
+    bad "lease fixture: the moved oid equals the classified oid — no race to exercise (F1)"
 fi
-# The rewrite chain: fetch stays A, push resolves to B, and B itself rewrites to
-# C for any FETCH-side read of B.
-git config "url.$F1L_B.pushInsteadOf" "$F1L_A"
-git config "url.$F1L_C.insteadOf" "$F1L_B"
-if [ "$(git remote get-url --push origin)" = "$F1L_B" ]; then
-    ok "lease fixture: get-url --push resolves origin's push url to repo B (F1)"
-else
-    bad "lease fixture: get-url --push did not resolve to B — the fixture is wrong (F1)"
+# Real git, so the wrapper can call it by absolute path without recursing.
+F1L_REAL_GIT="$(command -v git)"
+F1L_WRAP="$FIX/f1lease-wrap"
+mkdir -p "$F1L_WRAP"
+cat > "$F1L_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: move origin's ref on the push's OWN invocation, i.e. after
+# verify_remote_target's ls-remote read and before the real push, then delegate.
+REAL_GIT="${F1L_REAL_GIT:?F1L_REAL_GIT unset}"
+if [ "$1" = "push" ]; then
+    "$REAL_GIT" -C "${F1L_ORIGIN:?F1L_ORIGIN unset}" update-ref refs/heads/doomed "${F1L_MOVED:?F1L_MOVED unset}"
 fi
-# Prove the fixture models the divergence: the verification target (`ls-remote
-# B`) is re-rewritten to C, so it reads C's oid — the classified one — and
-# PASSES. This is exactly the false proof the lease must survive.
-F1L_LS_B="$(git ls-remote "$F1L_B" refs/heads/foo 2>/dev/null | awk '{print $1}')"
-if [ "$F1L_LS_B" = "$F1L_A_OID" ]; then
-    ok "lease fixture: the fetch-side verification reads repo C and PASSES (the false proof) (F1)"
-else
-    bad "lease fixture: ls-remote B did not read C's oid ($F1L_LS_B vs $F1L_A_OID) — the fixture is wrong (F1)"
-fi
-run_script bash "$F1L_SCRIPT" --repo "$F1L_REPO" --scope remote --execute
-assert_eq "$RC" "1" "the A→B→C divergence REFUSES the delete (F1)"
-assert_contains "$OUT" "REFUSING to delete origin/foo" "the lease rejection is a REFUSAL, not a failure (F1)"
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F1L_WRAP/git"
+run_script env PATH="$F1L_WRAP:$PATH" F1L_REAL_GIT="$F1L_REAL_GIT" F1L_ORIGIN="$F1L_ORIGIN" F1L_MOVED="$F1L_MOVED" \
+    bash "$F1L_SCRIPT" --repo "$F1L_REPO" --scope remote --execute
+assert_eq "$RC" "1" "a ref that MOVED between the proof and the push REFUSES the delete (F1)"
+assert_contains "$OUT" "REFUSING to delete origin/doomed" "the lease rejection is a REFUSAL, not a failure (F1)"
 assert_contains "$OUT" "stale info" "the refusal names the lease rejection (F1)"
 assert_contains "$OUT" "Deleted: 0" "nothing was deleted (F1)"
 assert_contains "$OUT" "Refused: 1" "the lease refusal is counted once (F1)"
 assert_contains "$OUT" "Failed:  0" "a lease refusal is NOT also counted as a failure (F1)"
-if [ "$(git -C "$F1L_B" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$F1L_B_OID" ]; then
-    ok "repo B's unique UNMERGED foo SURVIVES (the lease pinned the delete) (F1)"
+if [ "$(git -C "$F1L_ORIGIN" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$F1L_MOVED" ]; then
+    ok "the MOVED ref SURVIVES (the lease pinned the delete to the classified oid) (F1)"
 else
-    bad "repo B's foo was DELETED — data loss (F1)"
+    bad "the moved ref was DELETED — the lease did not compare-and-swap (F1)"
 fi
 
 cd "$REPO"
@@ -3836,6 +3823,8 @@ assert_eq "$RC" "1" "F25: a partially-numeric commit date is REFUSED"
 f25_helper "9223372036854775808"
 assert_eq "$RC" "1" "F25: 2^63 is REFUSED as over-range"
 assert_contains "$OUT" "more than 15 digits" "F25: the over-range refusal names the 15-DIGIT bound (F27)"
+assert_contains "$OUT" "15-digit policy bound" "F25: the refusal states the 15-digit POLICY bound, not a numeric impossibility (F30)"
+assert_not_contains "$OUT" "cannot be compared" "F25: the refusal does NOT claim the value cannot be compared (F30)"
 assert_not_contains "$OUT" "integer range" "F25: the refusal does NOT misname the rule as bash's integer range (F27)"
 f25_helper "9999999999999999"
 assert_eq "$RC" "1" "F25: a 16-digit over-range value is REFUSED"
@@ -4028,6 +4017,212 @@ if [ "$(git -C "$F26_A" rev-parse -q --verify refs/heads/foo 2>/dev/null || echo
     ok "F26 control: repo A's foo was reaped by the ordinary single-URL sweep"
 else
     bad "F26 control: the ordinary single-URL sweep no longer deletes a merged stale branch"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 48. F29: the proof endpoint must BE the delete endpoint, or the sweep REFUSES =="
+# `git ls-remote` is a FETCH: it re-applies `url.<base>.insteadOf` on top of
+# origin's RESOLVED push url, while `git push origin` does not. With
+# `url.B.pushInsteadOf=A` + `url.C.insteadOf=B`:
+#   * the classification uses A (fetch), where main CONTAINS foo's tip;
+#   * `get-url --push` resolves the DELETE to B;
+#   * the merge proof `git ls-remote B` is re-rewritten to C, whose main ALSO
+#     contains the tip — so the premise is PROVED against C, a repository the
+#     delete never touches;
+#   * `git push origin` lands on B, whose main NEVER contained the tip and whose
+#     foo sits at the classified oid, so the lease PASSES and B's ref is
+#     destroyed with rc=0. B's own main is never consulted. This test pins the
+#     pre-fix behaviour RED: without the endpoint guard, B's foo is deleted and
+#     the sweep exits 0.
+F29_A="$FIX/f29-a.git"
+F29_B="$FIX/f29-b.git"
+F29_C="$FIX/f29-c.git"
+F29_REPO="$FIX/f29-repo"
+new_repo "$F29_REPO" "$F29_A"
+cd "$F29_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F29_SCRIPT="$F29_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f29.txt; git add f29.txt; old_commit "init"; git push -q origin main
+F29_BASE="$(git rev-parse main)"
+git checkout -q -b foo main
+echo FOO > foo.txt; git add foo.txt; old_commit "foo"
+F29_FOO="$(git rev-parse HEAD)"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+F29_A_MAIN="$(git rev-parse main)"
+if git merge-base --is-ancestor "$F29_FOO" "$F29_A_MAIN"; then
+    ok "F29 fixture: repo A's main CONTAINS foo's classified tip (the fetch-side premise holds)"
+else
+    bad "F29 fixture: repo A's main does not contain foo — the fixture is wrong"
+fi
+# B is the DELETE target: it serves foo at the SAME oid, but its own main is the
+# PRE-foo base, so it never contained the tip.
+git init -q --bare "$F29_B"
+git push -q "$F29_B" "$F29_BASE:refs/heads/main"
+git push -q "$F29_B" "refs/heads/foo:refs/heads/foo"
+if ! git -C "$F29_B" merge-base --is-ancestor "$F29_FOO" refs/heads/main 2>/dev/null; then
+    ok "F29 fixture: repo B's main does NOT contain foo's tip (the delete target's own premise FAILS)"
+else
+    bad "F29 fixture: repo B's main already contains foo — the fixture is wrong"
+fi
+# C is what the PROOF re-rewrites to: a complete mirror of A, so the merge
+# premise PASSES there and the wrong-repository proof is genuinely exercised.
+git init -q --bare "$F29_C"
+git push -q "$F29_C" "$F29_A_MAIN:refs/heads/main"
+git push -q "$F29_C" "refs/heads/foo:refs/heads/foo"
+git config "url.$F29_B.pushInsteadOf" "$F29_A"
+git config "url.$F29_C.insteadOf" "$F29_B"
+assert_eq "$(git remote get-url --push origin)" "$F29_B" "F29 fixture: get-url --push resolves the DELETE endpoint to repo B"
+assert_eq "$(git ls-remote --get-url "$F29_B")" "$F29_C" "F29 fixture: ls-remote's endpoint from B is re-rewritten to repo C (the proof endpoint)"
+assert_eq "$(git ls-remote "$F29_B" refs/heads/foo 2>/dev/null | awk '{print $1}')" "$F29_FOO" "F29 fixture: the wrong-repository proof reads C's foo at the classified oid (it would PASS)"
+run_script bash "$F29_SCRIPT" --repo "$F29_REPO" --scope remote --execute
+assert_eq "$RC" "1" "F29: a chained insteadOf rewrite REFUSES the sweep (RED if the guard is removed — pre-fix rc=0)"
+assert_contains "$OUT" "resolve to DIFFERENT repositories" "F29: the refusal names the two divergent endpoints"
+assert_contains "$OUT" "url.<base>.insteadOf" "F29: the refusal names the insteadOf rewrite channel"
+assert_contains "$OUT" "Refusing the sweep" "F29: the refusal is a sweep-level stand-down"
+if [ "$(git -C "$F29_B" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$F29_FOO" ]; then
+    ok "F29: repo B's foo SURVIVES (the guard refuses before the lease can pass)"
+else
+    bad "F29: repo B's foo was DELETED — the wrong-repository delete is back"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 49. F29 controls: the endpoint guard does NOT false-refuse legitimate setups =="
+# Each control is a setup where the proof endpoint and the delete endpoint ARE
+# the same URL, so the sweep must still classify and delete. `assert_not_contains
+# "resolve to DIFFERENT repositories"` is the false-refusal negative.
+
+# ── control 1: no rewriting at all (a single ordinary remote whose merged foo
+#    must still be classified and deleted) ─────────────────────────────
+F29N_ORIGIN="$FIX/f29n-origin.git"
+F29N_REPO="$FIX/f29n-repo"
+new_repo "$F29N_REPO" "$F29N_ORIGIN"
+cd "$F29N_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F29N_SCRIPT="$F29N_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f29n.txt; git add f29n.txt; old_commit "init"; git push -q origin main
+git checkout -q -b foo main
+echo FOO > foo.txt; git add foo.txt; old_commit "foo"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+F29N_FOO="$(git -C "$F29N_ORIGIN" rev-parse refs/heads/foo)"
+run_script bash "$F29N_SCRIPT" --repo "$F29N_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F29 control (no rewriting): the ordinary single-remote sweep still runs (rc=0)"
+assert_not_contains "$OUT" "resolve to DIFFERENT repositories" "F29 control (no rewriting): no false endpoint refusal"
+assert_contains "$OUT" "Deleted: 1" "F29 control (no rewriting): the merged stale branch IS deleted"
+if [ "$(git -C "$F29N_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "F29 control (no rewriting): the ordinary merged branch was reaped"
+else
+    bad "F29 control (no rewriting): the ordinary merged branch was NOT reaped"
+fi
+
+# ── control 2: pushurl set, NO insteadOf. fetch=A, push=B (a complete mirror),
+#    so the proof and the delete agree on B ──────────────────────────────
+F29P_A="$FIX/f29p-a.git"
+F29P_B="$FIX/f29p-b.git"
+F29P_REPO="$FIX/f29p-repo"
+new_repo "$F29P_REPO" "$F29P_A"
+cd "$F29P_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F29P_SCRIPT="$F29P_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f29p.txt; git add f29p.txt; old_commit "init"; git push -q origin main
+git checkout -q -b foo main
+echo FOO > foo.txt; git add foo.txt; old_commit "foo"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+F29P_FOO="$(git -C "$F29P_A" rev-parse refs/heads/foo)"
+git init -q --bare "$F29P_B"
+git push -q "$F29P_B" refs/heads/main:refs/heads/main
+git push -q "$F29P_B" refs/heads/foo:refs/heads/foo
+git config remote.origin.pushurl "$F29P_B"
+assert_eq "$(git remote get-url --push origin)" "$F29P_B" "F29 control (pushurl): get-url --push is repo B"
+run_script bash "$F29P_SCRIPT" --repo "$F29P_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F29 control (pushurl set, no insteadOf): no false refusal (rc=0)"
+assert_not_contains "$OUT" "resolve to DIFFERENT repositories" "F29 control (pushurl set): the guard does not refuse"
+assert_contains "$OUT" "Deleted: 1" "F29 control (pushurl set): the branch is deleted on the push target"
+if [ "$(git -C "$F29P_B" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "F29 control (pushurl set): repo B's merged foo was reaped"
+else
+    bad "F29 control (pushurl set): repo B's merged foo was NOT reaped (F29P_FOO=$F29P_FOO)"
+fi
+
+# ── control 3: pushurl set AND insteadOf on the pushurl (B→C). get-url --push
+#    resolves to C, `git push origin` lands on C, and the proof reads C — all
+#    one URL, so this legitimate setup must NOT refuse ─────────────────
+F29Q_A="$FIX/f29q-a.git"
+F29Q_B="$FIX/f29q-b.git"
+F29Q_C="$FIX/f29q-c.git"
+F29Q_REPO="$FIX/f29q-repo"
+new_repo "$F29Q_REPO" "$F29Q_A"
+cd "$F29Q_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F29Q_SCRIPT="$F29Q_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f29q.txt; git add f29q.txt; old_commit "init"; git push -q origin main
+git checkout -q -b foo main
+echo FOO > foo.txt; git add foo.txt; old_commit "foo"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+git init -q --bare "$F29Q_B"
+git init -q --bare "$F29Q_C"
+git push -q "$F29Q_C" refs/heads/main:refs/heads/main
+git push -q "$F29Q_C" refs/heads/foo:refs/heads/foo
+git config remote.origin.pushurl "$F29Q_B"
+git config "url.$F29Q_C.insteadOf" "$F29Q_B"
+assert_eq "$(git remote get-url --push origin)" "$F29Q_C" "F29 control (pushurl+insteadOf): get-url --push resolves through insteadOf to C"
+run_script bash "$F29Q_SCRIPT" --repo "$F29Q_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F29 control (pushurl set + insteadOf): no false refusal (rc=0)"
+assert_not_contains "$OUT" "resolve to DIFFERENT repositories" "F29 control (pushurl set + insteadOf): the guard does not refuse"
+assert_contains "$OUT" "Deleted: 1" "F29 control (pushurl set + insteadOf): the branch is deleted on the resolved target"
+if [ "$(git -C "$F29Q_C" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "F29 control (pushurl set + insteadOf): repo C's merged foo was reaped"
+else
+    bad "F29 control (pushurl set + insteadOf): repo C's merged foo was NOT reaped"
+fi
+
+# ── control 4: pushInsteadOf alone (no pushurl). fetch=A, push rewrites to B, a
+#    complete mirror; ls-remote B reads B, so the endpoints agree ────────
+F29S_A="$FIX/f29s-a.git"
+F29S_B="$FIX/f29s-b.git"
+F29S_REPO="$FIX/f29s-repo"
+new_repo "$F29S_REPO" "$F29S_A"
+cd "$F29S_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F29S_SCRIPT="$F29S_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f29s.txt; git add f29s.txt; old_commit "init"; git push -q origin main
+git checkout -q -b foo main
+echo FOO > foo.txt; git add foo.txt; old_commit "foo"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+git init -q --bare "$F29S_B"
+git push -q "$F29S_B" refs/heads/main:refs/heads/main
+git push -q "$F29S_B" refs/heads/foo:refs/heads/foo
+git config "url.$F29S_B.pushInsteadOf" "$F29S_A"
+assert_eq "$(git remote get-url --push origin)" "$F29S_B" "F29 control (pushInsteadOf): get-url --push rewrites to repo B"
+run_script bash "$F29S_SCRIPT" --repo "$F29S_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F29 control (pushInsteadOf alone): no false refusal (rc=0)"
+assert_not_contains "$OUT" "resolve to DIFFERENT repositories" "F29 control (pushInsteadOf alone): the guard does not refuse"
+assert_contains "$OUT" "Deleted: 1" "F29 control (pushInsteadOf alone): the branch is deleted on the rewritten target"
+if [ "$(git -C "$F29S_B" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "F29 control (pushInsteadOf alone): repo B's merged foo was reaped"
+else
+    bad "F29 control (pushInsteadOf alone): repo B's merged foo was NOT reaped"
 fi
 
 cd "$REPO"

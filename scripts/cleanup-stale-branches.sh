@@ -155,7 +155,12 @@
 #      locally absent rewritten main) is a refusal, never a pass. ⛔ The proof
 #      is read from the PUSH url, never the FETCH url: the delete lands on the
 #      former, so a merge premise proved in the latter is proved against a
-#      repository the delete never touches (F26).
+#      repository the delete never touches (F26). ⛔ F29: `git ls-remote` is
+#      itself a FETCH, so it re-applies `url.<base>.insteadOf` ON TOP OF the
+#      resolved push url while `git push origin` does not; the sweep therefore
+#      REFUSES before classifying unless `git ls-remote --get-url` expands that
+#      single push url to ITSELF — the proof endpoint must be provably the
+#      delete endpoint, not merely intended to be.
 #   2. the target ref: origin's real refs/heads/<br> equals the OID captured
 #      from the tracking ref (`git ls-remote <origin's resolved push url>` vs
 #      that OID). This is an early, loud DIAGNOSTIC — NOT the safety mechanism:
@@ -164,6 +169,10 @@
 #      origin's fetch url and never then applies `insteadOf`. When the resolved
 #      push url is itself an `insteadOf` base the two disagree and this
 #      comparison proves repository C while the delete lands on repository B.
+#      ⛔ F29: that divergence is now REFUSED before classification by the
+#      endpoint guard below, so this check runs only once the two endpoints are
+#      provably one URL; it remains as an early diagnostic for the residual
+#      fetch→push race.
 #   3. the delete LEASE: `git push origin --delete --force-with-lease=…:<oid>`
 #      sends the classified OID as the expected old value through the SAME
 #      resolution as the delete, so the receiving repository itself refuses
@@ -769,9 +778,9 @@ validate_commit_date() {
     value="${value#"${value%%[!0]*}"}"
     [ -n "$value" ] || value=0
     if [ "${#value}" -gt 15 ]; then
-        echo "ERROR: the commit date of $ref ($value) has more than 15 digits, so it" >&2
-        echo "ERROR: is outside this sweep's 15-digit bound and cannot be compared with the" >&2
-        echo "ERROR: cutoff. Refusing the sweep rather than letting the failed comparison read" >&2
+        echo "ERROR: the commit date of $ref ($value) has more than 15 digits, so it is" >&2
+        echo "ERROR: outside this sweep's 15-digit policy bound and is not compared with the" >&2
+        echo "ERROR: cutoff. Refusing the sweep rather than letting an out-of-policy value read" >&2
         echo "ERROR: as a verdict — a false 'not stale' on the remote scope and a false 'stale'" >&2
         echo "ERROR: on the local one." >&2
         return 1
@@ -880,8 +889,13 @@ verify_remote_target() {
 #
 # This reads the DELETE TARGET's refs. The target is pinned separately — by
 # verify_remote_target and by the delete's force-with-lease — and the caller
-# resolves the single push url first (zero or >1 is a refusal), so the proof and
-# the delete name the same repository.
+# resolves the single push url first (zero or >1 is a refusal). It ALSO refuses
+# the whole sweep before this function runs unless `git ls-remote --get-url`
+# expands that single push url to ITSELF (F29), so a `url.<base>.insteadOf`
+# rewrite cannot make this FETCH-side proof read a repository other than the one
+# `git push origin` deletes from. What this function guarantees is therefore
+# that the merge premise holds in the repository the caller has already PROVED
+# is the delete endpoint — not merely in the one it intended.
 verify_merged_into_real_main() {
     local push_url="$1" tracking_oid="$2" ls_out="" real_main_oid="" n=0
     if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
@@ -1029,6 +1043,42 @@ run_remote_scope() {
         echo "ERROR: 'git push origin' reaches ALL of them, so verifying one proves nothing about the" >&2
         echo "ERROR: others — the delete would report success while leaving the rest in place (and an" >&2
         echo "ERROR: unverified copy could be the one holding unmerged commits). Refusing the sweep." >&2
+        return 1
+    fi
+
+    # ⛔ F29: PROVE THE PROOF ENDPOINT IS THE DELETE ENDPOINT, or REFUSE.
+    #
+    # `$push_url` is `git remote get-url --push origin` — git's own resolution of
+    # the DELETE endpoint (`git push origin` lands exactly there). The merge
+    # premise and the target check below, however, read it with
+    # `git ls-remote "$push_url"`, and ls-remote is a FETCH: it applies
+    # `url.<base>.insteadOf` ON TOP OF the already-resolved push url. When
+    # `$push_url` is itself the base of an `insteadOf` mapping, the proof reads a
+    # DIFFERENT repository than the delete lands on. Measured: with
+    # `url.B.pushInsteadOf=A` and `url.C.insteadOf=B`, `get-url --push` → B,
+    # `git ls-remote B` → C, and `git push origin` → B; C's main contained the
+    # classified tip, B's never did, and B's unique ref was destroyed with rc=0.
+    #
+    # `git ls-remote --get-url "$push_url"` is git's own FETCH-side expansion of
+    # the same URL the proof uses, and it contacts nothing. Equal to `$push_url`
+    # ⇒ the proof and the delete name the SAME URL. Anything else ⇒ an
+    # `insteadOf` rewrite (or a resolution failure, which yields empty)
+    # separates them, and the sweep stands down. The refusal is at SWEEP level
+    # because no single repository can be pinned at all: the premise is
+    # unprovable, not merely unproven. This also covers the multi-hop case
+    # (`pushurl=B` + `insteadOf B→C` + `insteadOf C→D`), where the fetch-side
+    # read re-rewrites the resolved url even though `pushurl` IS set — so the
+    # guard is NOT conditioned on `pushurl` being unset.
+    local proof_url=""
+    proof_url="$(git ls-remote --get-url "$push_url" 2>/dev/null || true)"
+    if [ "$proof_url" != "$push_url" ]; then
+        echo "ERROR: the merge proof and the delete resolve to DIFFERENT repositories, so no" >&2
+        echo "ERROR: premise can be proved about the repository the delete lands on:" >&2
+        echo "ERROR:   delete endpoint (git push origin):  $push_url" >&2
+        echo "ERROR:   proof endpoint  (git ls-remote):    ${proof_url:-<unresolvable>}" >&2
+        echo "ERROR: git ls-remote is a FETCH, so it re-applies url.<base>.insteadOf on top of" >&2
+        echo "ERROR: origin's resolved push url; 'git push origin' does not. Refusing the sweep" >&2
+        echo "ERROR: rather than prove a merge premise in a repository the delete never touches." >&2
         return 1
     fi
     echo ""
