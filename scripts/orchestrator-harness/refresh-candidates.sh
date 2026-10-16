@@ -223,14 +223,17 @@ gh_env_verdict() {
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ⛔ THE PROBE MUST USE THE HOST THE PRE-FLIGHT QUERIES. The pre-flight passes `--repo owner/name`
-  # and lets gh infer the host from the remote, so a host-qualified $OR (a GHES cell) must drive the
-  # probe too — otherwise the probe validates github.com, finds no credential for it, and refuses a
-  # cell that would have worked (#1853 review). GH_HOST is the explicit override.
-  case "${OR%%/*}" in
-    *.*) host="${OR%%/*}" ;;
-    *) host="${GH_HOST:-github.com}" ;;
-  esac
+  # ⛔ THE PROBE MUST USE THE HOST THE PRE-FLIGHT WILL USE. The pre-flight is invoked with `--repo .`
+  # and hands gh a host-STRIPPED slug, so gh resolves the host exactly as it does for any host-less
+  # call: `GH_HOST` if set, else the host gh is configured with. `$OR`'s prefix does NOT select that
+  # host (measured on gh 2.97.0: a bare `--repo owner/name` uses the configured host, not the
+  # remote's, and the pre-flight's own gh calls carry no `--hostname`) — consulting it here would
+  # probe a host the pre-flight never contacts, in both directions (#1853 review).
+  # ⚠️ DECLARED RESIDUAL: gh's configured host is not readable without parsing prose, so the
+  # fallback is github.com. A GHES cell whose gh is configured for an enterprise host and which does
+  # NOT set GH_HOST therefore probes github.com, finds no credential there, and refuses PERMANENTLY.
+  # GH_HOST is the documented way to name the host for a host-less call — set it on such a cell.
+  host="${GH_HOST:-github.com}"
   # ONE call captures both the status and the output.
   out="$(gh auth status --hostname "$host" 2>&1)" && return 0
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. `gh auth status` cannot tell a
@@ -248,11 +251,16 @@ gh_env_verdict() {
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   # A credential IS stored but could not be validated. Is it REJECTED, or merely UNREACHABLE? Only
-  # the API can say, and only a 401 is unambiguous: a 403 is rate limiting (transient by nature) and
-  # a transport failure carries no HTTP status at all. MEASURED on gh 2.97.0: a bogus stored token ->
+  # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used, and it is NOT
+  # "just rate limiting": /rate_limit is rate-limit-exempt, so a 403 there means an SSO/SAML
+  # enforcement, a missing scope, an IP-allowlist block or a suspended account — conditions a retry
+  # cannot change — while a transport failure carries no HTTP status at all. The ambiguous middle is
+  # returned TRANSIENT on purpose: a wrong TRANSIENT costs a loud rc=1 retry, while a wrong PERMANENT
+  # stops dispatch until a human clears the marker. MEASURED on gh 2.97.0: a bogus stored token ->
   # `gh: Bad credentials (HTTP 401)`; a dead proxy -> `proxyconnect tcp: … connection refused` with no
-  # status. A rejected credential is permanent because a retry cannot change it, and leaving it as a
-  # silent transient is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
+  # status.
+  # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
+  # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$(gh api --hostname "$host" rate_limit 2>&1)"; then
     echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for $host is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
@@ -276,6 +284,10 @@ cmd_check() {
   # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
   # process that actually runs it — which is the divergence this whole change exists for, and which
   # no operator-side check can see. The run path below is the one that judges it.
+  # ⚠️ DECLARED RESIDUAL (pre-existing, and outside this change's scope): those two operator-side
+  # checks call `gh auth status` UNSCOPED, so a stale UNRELATED host refuses a cell whose target host
+  # is fine. scripts/cloud-cell-supervisor.sh and scripts/cloud-cell-bringup.sh are owned by another
+  # lane; the run-path probe below is host-scoped, so this one is not.
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then

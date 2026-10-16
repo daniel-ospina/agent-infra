@@ -1425,9 +1425,7 @@ PY
       # ⛔ BOUND THE EVIDENCE TO THIS RUN. $LOG is append-only and never rotated, so a bare
       # `grep NOT PROVISIONABLE "$LOG"` would quote a PREVIOUS cycle's refusal as this block's
       # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
-      # The mark is a LINE count (`awk`), not a newline count (`wc -l`): the `echo` above has just
-      # terminated any partial tail, so the two agree today, and counting lines keeps the window
-      # from ever being one too LARGE — which would skip the refusal it exists to quote.
+      # The mark is a LINE index, and the `echo` above has just terminated any partial tail.
       log_mark="$(awk 'END{print NR}' "$LOG" 2>/dev/null)"; [ -n "$log_mark" ] || log_mark=0
       ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"

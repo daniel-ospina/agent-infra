@@ -580,7 +580,7 @@ esac
 # the repo's OWN copy — so a VENDORED producer could, and a degraded CLEAN counted as usable would
 # let a broken environment queue an issue it could not actually judge. The guard must drop it.
 # ⛔ The report echoes the candidate's own `title:` line, so the marker match must be ANCHORED: an
-# unanchored search would let an issue TITLE containing the phrase set the flag.
+# unanchored search would let an issue TITLE containing the phrase set the flag. Pinned by case 1k.
 mk_case clean-degraded
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
@@ -614,6 +614,34 @@ esac
 case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
   *42*) bad "CLEAN is DEGRADED: the degraded CLEAN was written to checked.txt (blacklisted)" ;;
   *) ok "CLEAN is DEGRADED: not written to checked.txt (left unchecked for the next pass)" ;;
+esac
+
+# ── 1k) A TITLE THAT QUOTES THE MARKER DOES NOT DEGRADE A CLEAN (agent-infra#1853 review P2) ─────
+# The anchor on the `ALSO INCOMPLETE` match is LOAD-BEARING, not stylistic: the pre-flight report
+# echoes the candidate's own `title:` line, so an unanchored search would let an ISSUE TITLE that
+# contains the phrase set the degraded flag and silently drop a genuine CLEAN. This case FAILS on
+# the unanchored form (`grep -q 'ALSO INCOMPLETE'`): the issue is left unchecked and never queued.
+mk_case title-quotes-marker
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("title: fix the ALSO INCOMPLETE: reporting path")
+print("VERDICT: CLEAN")
+raise SystemExit(0)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "title quotes the marker: rc=0 (no \"judged NOTHING\" abort over a genuine CLEAN)" \
+               || bad "title quotes the marker: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"DEGRADED"*) bad "title quotes the marker: a TITLE set the degraded flag — output: $OUT" ;;
+  *) ok "title quotes the marker: the CLEAN is NOT read as DEGRADED" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "title quotes the marker: the genuinely-CLEAN candidate IS queued" ;;
+  *) bad "title quotes the marker: the CLEAN was dropped — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
@@ -670,6 +698,9 @@ rf "$D" check TORTOISE="$D/tort"
 # rc=3 is the PERMANENT code orch-loop.sh keys on; a transient failure would be 1. The reason must
 # be the missing tool, NOT the old, misleading "uv sync failed".
 mk_case no-tool
+# A sentinel makes "nothing queued" DISCRIMINATING (see the LANDED case): an empty file cannot
+# distinguish "nothing was queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "no tool anywhere: rc=3 (PERMANENT — not the transient code)" \
                || bad "no tool anywhere: rc=$RC (want 3) — output: $OUT"
@@ -681,11 +712,11 @@ case "$OUT" in
   *"uv sync failed"*) bad "no tool anywhere: misreported as a uv failure" ;;
   *) ok "no tool anywhere: not misreported as a uv/environment failure" ;;
 esac
-if [ -s "$D/o/candidates.txt" ]; then
-  bad "no tool anywhere: candidates were queued — $(cat "$D/o/candidates.txt")"
-else
-  ok "no tool anywhere: nothing is queued (never a silent empty backlog)"
-fi
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "no tool anywhere: candidates were queued — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "no tool anywhere: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "no tool anywhere: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 4) a REAL pyproject + a failing uv sync is TRANSIENT (rc=1), loud, and not swallowed ────────
 # The other half of the distinction: an environment failure is NOT the not-applicable case.
