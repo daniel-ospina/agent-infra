@@ -147,12 +147,15 @@
 # refs/remotes/origin/<br>, but the destructive action targets origin's REAL
 # refs/heads/<br>, so before each delete THREE things are proved, and the delete
 # is REFUSED — loudly, and with a non-zero exit — on any failure:
-#   1. the MERGE PREMISE against origin's REAL main (`git ls-remote origin
-#      refs/heads/<main>` + `git merge-base --is-ancestor`). The classification
-#      used the LOCAL origin/<main>, which a narrowed refspec can leave stale;
-#      if main was rewritten, a branch whose commits are no longer in main must
-#      not be deleted. An unknown object (a locally absent rewritten main) is a
-#      refusal, never a pass.
+#   1. the MERGE PREMISE against the DELETE TARGET's REAL main (`git ls-remote
+#      <origin's resolved push url> refs/heads/<main>` + `git merge-base
+#      --is-ancestor`). The classification used the LOCAL origin/<main>, which a
+#      narrowed refspec can leave stale; if main was rewritten, a branch whose
+#      commits are no longer in main must not be deleted. An unknown object (a
+#      locally absent rewritten main) is a refusal, never a pass. ⛔ The proof
+#      is read from the PUSH url, never the FETCH url: the delete lands on the
+#      former, so a merge premise proved in the latter is proved against a
+#      repository the delete never touches (F26).
 #   2. the target ref: origin's real refs/heads/<br> equals the OID captured
 #      from the tracking ref (`git ls-remote <origin's resolved push url>` vs
 #      that OID). This is an early, loud DIAGNOSTIC — NOT the safety mechanism:
@@ -705,7 +708,7 @@ is_member() {
 # ── Shared: commit-date validation (F18/F22/F24/F25) ──────────────
 # validate_commit_date <ref> <value> — return 0 (printing nothing) for a value
 # this sweep can compare with $CUTOFF_EPOCH, and return 1 with a diagnostic on
-# stderr NAMING <ref> for an EMPTY, NON-NUMERIC or OVER-RANGE value.
+# stderr NAMING <ref> for an EMPTY, NON-NUMERIC or OVER-15-DIGIT value.
 #
 # ⛔ ONE implementation, called by BOTH the remote and the local scope. The two
 # scopes each grew their own copy of this check and then DRIFTED: the remote
@@ -731,8 +734,12 @@ is_member() {
 #     runs `set +e`, so the same value instead printed the branch with an EMPTY
 #     date.
 #   * `0000000000000009` (16 raw characters, numeric value 9) was FALSELY refused
-#     as "outside bash's integer range", although `[ 0000000000000009 -lt 100 ]`
-#     is 0 on bash 3.2.57.
+#     by a RAW-LENGTH bound, and the refusal misnamed its own rule as "outside
+#     bash's integer range". That reason is FALSE on bash 3.2.57: `[
+#     0000000000000009 -lt 100 ]` is 0, and so is `[ 1000000000000000 -lt
+#     1700000000 ]` — no error, numerically fine; only a value past 2^63 (e.g.
+#     9223372036854775808) makes the comparison return status 2. The bound is a
+#     deliberate 15-DIGIT POLICY, and the diagnostic says so (F27).
 # Leading zeros are therefore stripped BEFORE the bound is tested. 15 DIGITS is
 # the file's own bound — the same one `--cutoff`, `--pr-limit` and
 # CLEANUP_BRANCH_LOG_MAX_BYTES are validated with — and it is now tested on the
@@ -762,10 +769,11 @@ validate_commit_date() {
     value="${value#"${value%%[!0]*}"}"
     [ -n "$value" ] || value=0
     if [ "${#value}" -gt 15 ]; then
-        echo "ERROR: the commit date of $ref ($value) is outside bash's integer range, so it" >&2
-        echo "ERROR: cannot be compared with the cutoff. Refusing the sweep rather than letting" >&2
-        echo "ERROR: the failed comparison read as a verdict — a false 'not stale' on the remote" >&2
-        echo "ERROR: scope and a false 'stale' on the local one." >&2
+        echo "ERROR: the commit date of $ref ($value) has more than 15 digits, so it" >&2
+        echo "ERROR: is outside this sweep's 15-digit bound and cannot be compared with the" >&2
+        echo "ERROR: cutoff. Refusing the sweep rather than letting the failed comparison read" >&2
+        echo "ERROR: as a verdict — a false 'not stale' on the remote scope and a false 'stale'" >&2
+        echo "ERROR: on the local one." >&2
         return 1
     fi
     return 0
@@ -834,12 +842,12 @@ verify_remote_target() {
     return 0
 }
 
-# ── merge-premise re-proof against origin's REAL main (F2) ──────
-# verify_merged_into_real_main <classified_oid>
+# ── merge-premise re-proof against the DELETE TARGET's REAL main (F2/F26) ──
+# verify_merged_into_real_main <push_url> <classified_oid>
 #
-# Returns 0 (printing nothing) only when origin's REAL main line provably
-# contains the tip this sweep classified. On anything else it prints a one-line
-# reason and returns 1 — the caller REFUSES that delete.
+# Returns 0 (printing nothing) only when the DELETE TARGET's REAL main line
+# provably contains the tip this sweep classified. On anything else it prints a
+# one-line reason and returns 1 — the caller REFUSES that delete.
 #
 # ⛔ The classification is `git branch -r --merged origin/main`, which reads the
 # LOCAL remote-tracking ref. That ref is only as fresh as the fetch refspec lets
@@ -849,22 +857,35 @@ verify_remote_target() {
 # If main has since been REWRITTEN, a branch whose commits are no longer in real
 # main is still classified `--merged` and destroyed. `verify_remote_target` does
 # NOT close this: it proves the branch's real ref equals the TRACKED oid, never
-# that the oid is in main. Re-reading main STRAIGHT FROM ORIGIN (ls-remote
-# ignores the fetch refspec) and requiring the classified tip to be an ancestor
-# of it does.
+# that the oid is in main. Re-reading main STRAIGHT FROM THE DELETE TARGET
+# (ls-remote ignores the fetch refspec) and requiring the classified tip to be
+# an ancestor of it does.
+#
+# ⛔ THE MERGE PREMISE IS READ FROM THE PUSH URL, NOT THE FETCH URL (F26). The
+# `refs/remotes/origin/*` the classification used are built from
+# remote.origin.url — the FETCH url — but the delete lands wherever
+# `git push origin` resolves, which honours remote.origin.pushurl and
+# `url.<base>.pushInsteadOf`. With pushurl pointing at repository B, proving the
+# merge against A's main proves the premise in a repository the delete never
+# touches: B can serve the same branch at the same OID (the ordinary mirror
+# shape) while B's main does NOT contain it, so every gate passes and the delete
+# removes a branch that is not merged in the repository it lands on. Re-reading
+# main from the resolved PUSH url follows the delete: when the two URLs are the
+# same repository this is behaviourally identical, and when they differ the
+# proof must follow the delete, never the fetch.
 #
 # ⛔ An UNKNOWN object is a REFUSAL, never a pass: when main was rewritten, its
 # new commit may not exist locally, and `git merge-base --is-ancestor` then
 # fails. Failure — of any kind — is a refusal.
 #
-# This reads origin's FETCH-side refs, which is the repository the merge premise
-# was evaluated against (`refs/remotes/origin/*` are built from the fetch url).
-# The DELETE target is pinned separately — by verify_remote_target and by the
-# delete's force-with-lease, which is what makes the two agree.
+# This reads the DELETE TARGET's refs. The target is pinned separately — by
+# verify_remote_target and by the delete's force-with-lease — and the caller
+# resolves the single push url first (zero or >1 is a refusal), so the proof and
+# the delete name the same repository.
 verify_merged_into_real_main() {
-    local tracking_oid="$1" ls_out="" real_main_oid="" n=0
-    if ! ls_out="$(git ls-remote origin "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
-        printf '%s' "git ls-remote origin refs/heads/$MAIN_BRANCH FAILED, so origin's REAL $MAIN_BRANCH cannot be resolved"
+    local push_url="$1" tracking_oid="$2" ls_out="" real_main_oid="" n=0
+    if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
+        printf '%s' "git ls-remote $push_url refs/heads/$MAIN_BRANCH FAILED, so the DELETE TARGET's REAL $MAIN_BRANCH cannot be resolved"
         return 1
     fi
     # Same exact-name discipline as verify_remote_target: `ls-remote <pattern>`
@@ -879,11 +900,11 @@ verify_merged_into_real_main() {
         real_main_oid="${line%%$'\t'*}"
     done <<<"$ls_out"
     if [ "$n" != "1" ]; then
-        printf '%s' "git ls-remote origin matched $n ref(s) named exactly refs/heads/$MAIN_BRANCH — origin's real $MAIN_BRANCH is not provable"
+        printf '%s' "git ls-remote $push_url matched $n ref(s) named exactly refs/heads/$MAIN_BRANCH — the DELETE TARGET's real $MAIN_BRANCH is not provable"
         return 1
     fi
     if ! git merge-base --is-ancestor "$tracking_oid" "$real_main_oid" >/dev/null 2>&1; then
-        printf '%s' "origin's REAL refs/heads/$MAIN_BRANCH is $real_main_oid, which does NOT provably contain the classified tip $tracking_oid"
+        printf '%s' "the DELETE TARGET's REAL refs/heads/$MAIN_BRANCH is $real_main_oid, which does NOT provably contain the classified tip $tracking_oid"
         return 1
     fi
     return 0
@@ -1272,7 +1293,7 @@ run_remote_scope() {
             local local_branch="${branch#origin/}"
             # F20: the SAME two gates the execute loop applies, at plan time.
             local plan_refusal=""
-            if ! plan_refusal="$(verify_merged_into_real_main "$tracking_oid")"; then
+            if ! plan_refusal="$(verify_merged_into_real_main "$push_url" "$tracking_oid")"; then
                 printf '  # REFUSED — --execute will not run this: %s\n' "$plan_refusal"
                 continue
             fi
@@ -1317,13 +1338,14 @@ run_remote_scope() {
         # them. That is a different question from "is origin's real ref the ref
         # we classified", so it is a separate gate, not a weaker one.
         local refusal=""
-        if ! refusal="$(verify_merged_into_real_main "$tracking_oid")"; then
+        if ! refusal="$(verify_merged_into_real_main "$push_url" "$tracking_oid")"; then
             echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
             echo "     $refusal" >&2
             echo "     The branch was classified merged from the LOCAL refs/remotes/origin/$MAIN_BRANCH," >&2
-            echo "     but origin's REAL refs/heads/$MAIN_BRANCH does not provably contain the classified" >&2
-            echo "     tip. A narrowed positive refspec leaves refs/remotes/origin/$MAIN_BRANCH stale while" >&2
-            echo "     the fetch exits 0 — if main was rewritten, the branch's commits are no longer in" >&2
+            echo "     but the DELETE TARGET's REAL refs/heads/$MAIN_BRANCH does not provably contain the" >&2
+            echo "     classified tip. A narrowed positive refspec leaves refs/remotes/origin/$MAIN_BRANCH stale" >&2
+            echo "     while the fetch exits 0, or the push target's main is not the fetch target's — if main was" >&2
+            echo "     rewritten (or the push url names another repository) the branch's commits are no longer in" >&2
             echo "     main and deleting it would destroy the only copy." >&2
             REFUSED=$((REFUSED + 1))
             continue

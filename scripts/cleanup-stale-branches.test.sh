@@ -1938,9 +1938,14 @@ git checkout -q main
 git merge -q --ff-only chain-doomed
 git push -q origin main
 R51_A_OID="$(git -C "$R51_A" rev-parse refs/heads/chain-doomed)"
-# Repo B is a MIRROR of A's merged branch — the same OID — so a verification
-# against B passes. B is what `get-url --push` resolves to.
+# Repo B is a MIRROR of A — the same OID for the branch AND the same main — so
+# a verification against B passes. B is what `get-url --push` resolves to.
+# ⛔ F26: B must carry a `main` too. The merge premise now re-reads main from the
+# resolved PUSH url, so a bare repo holding only the branch can no longer pass
+# the gate — and this section is about the REWRITE being applied once, not about
+# an unprovable main. A complete mirror keeps the section's intent intact.
 git init -q --bare "$R51_B"
+git push -q "$R51_B" refs/heads/main:refs/heads/main
 git push -q "$R51_B" refs/heads/chain-doomed:refs/heads/chain-doomed
 # Repo C holds a UNIQUE, UNMERGED chain-doomed that exists nowhere else.
 git init -q --bare "$R51_C"
@@ -2686,7 +2691,12 @@ git merge -q --ff-only foo
 git push -q origin main
 F1L_A_OID="$(git -C "$F1L_A" rev-parse refs/heads/foo)"
 # C: a MIRROR of A's foo (same oid) — so the fetch-side verification PASSES.
+# ⛔ F26: C must also mirror A's main. The merge premise now re-reads main from
+# the resolved PUSH url, which `insteadOf B→C` rewrites to C — with no main there
+# the merge gate would refuse FIRST and this section's subject (the delete's
+# LEASE refusing B's unmerged foo) would never be exercised.
 git init -q --bare "$F1L_C"
+git push -q "$F1L_C" refs/heads/main:refs/heads/main
 git push -q "$F1L_C" refs/heads/foo:refs/heads/foo
 # B: foo holds a UNIQUE, UNMERGED commit that exists nowhere else.
 git init -q --bare "$F1L_B"
@@ -3777,8 +3787,10 @@ echo "== 46. F25: the commit-date family is bounded by the NORMALISED NUMERIC VA
 #     rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the pass runs
 #     `set +e`, so the same value printed the branch with an EMPTY date instead.
 #   * `0000000000000009` (16 characters, numeric 9) was FALSELY refused as
-#     "outside bash's integer range", although `[ 0000000000000009 -lt 100 ]` is 0
-#     on bash 3.2.57.
+#     "outside bash's integer range" — a reason that was itself FALSE (the bound
+#     is a 15-DIGIT policy: `[ 0000000000000009 -lt 100 ]` and `[
+#     1000000000000000 -lt 1700000000 ]` are both 0 on bash 3.2.57). The
+#     diagnostic now names the digit bound (F27).
 # The shared helper now strips leading zeros BEFORE the bound, and the remote
 # `date` call re-reads the digits as base 10 (`$((10#$v))`), so a zero-padded
 # value can never reach `date` as a date string. This section pins the WHOLE
@@ -3788,10 +3800,22 @@ echo "== 46. F25: the commit-date family is bounded by the NORMALISED NUMERIC VA
 # ACCEPTANCE; the REMOTE half pins that `date` is never handed the raw string.
 F25_HELPER="$FIX/f25-helper.sh"
 sed -n '/^validate_commit_date()/,/^}/p' "$SCRIPT" > "$F25_HELPER"
-if grep -qF 'value="${value#' "$F25_HELPER"; then
-    ok "F25: the SHARED validate_commit_date was extracted from the script under test"
+# ⛔ F28: pin the extraction BEHAVIOURALLY, never by matching the helper's body.
+# A `grep -qF 'value="${value#'` sanity check went RED under any
+# behaviour-preserving refactor of the leading-zero normalisation, with the
+# misleading message "could not extract validate_commit_date". Source the
+# extracted file, require the function to exist, and probe one ACCEPT and one
+# REFUSE verdict — the extraction is what is being checked, not its spelling.
+if bash -c '
+    source "$1" >/dev/null 2>&1 || exit 1
+    declare -F validate_commit_date >/dev/null 2>&1 || exit 1
+    validate_commit_date f25-probe 1577836800 >/dev/null 2>&1 || exit 1
+    if validate_commit_date f25-probe not-a-date >/dev/null 2>&1; then exit 1; fi
+    exit 0
+' _ "$F25_HELPER"; then
+    ok "F25: the SHARED validate_commit_date was extracted and rules behaviourally (accept/refuse probe)"
 else
-    bad "F25: could not extract validate_commit_date from the script — the unit half cannot run"
+    bad "F25: could not extract a working validate_commit_date from the script — the unit half cannot run"
 fi
 f25_helper() { # $1 = the value the shared helper is asked to rule on
     run_script bash -c 'source "$1"; validate_commit_date "f25-helper" "$2"' _ "$F25_HELPER" "$1"
@@ -3811,11 +3835,14 @@ assert_eq "$RC" "1" "F25: a partially-numeric commit date is REFUSED"
 # ── REFUSED: genuinely over the file's 15-digit bound ─────────────
 f25_helper "9223372036854775808"
 assert_eq "$RC" "1" "F25: 2^63 is REFUSED as over-range"
-assert_contains "$OUT" "outside bash's integer range" "F25: the over-range refusal says WHY"
+assert_contains "$OUT" "more than 15 digits" "F25: the over-range refusal names the 15-DIGIT bound (F27)"
+assert_not_contains "$OUT" "integer range" "F25: the refusal does NOT misname the rule as bash's integer range (F27)"
 f25_helper "9999999999999999"
 assert_eq "$RC" "1" "F25: a 16-digit over-range value is REFUSED"
+assert_contains "$OUT" "more than 15 digits" "F25: a numerically-fine 16-digit value is refused by the DIGIT bound, not by overflow (F27)"
 f25_helper "1000000000000000"
 assert_eq "$RC" "1" "F25: 10^15 (16 digits) is REFUSED"
+assert_contains "$OUT" "more than 15 digits" "F25: 10^15 is refused with the true reason — 1000000000000000 is numerically in range (F27)"
 
 # ── ACCEPTED: zero-padded values, judged by NUMERIC VALUE ─────────
 # These are the assertions that go RED if the leading-zero strip is removed:
@@ -3919,8 +3946,89 @@ cat > "$F25_MAP" <<JSON
 JSON
 run_script bash "$F25_SCRIPT" --repo "$F25_REPO" --scope local --pr-map-file "$F25_MAP" --execute
 assert_eq "$RC" "0" "F25 local: a zero-padded committer date does NOT refuse the local sweep (rc=0)"
-assert_not_contains "$OUT" "outside bash's integer range" "F25 local: the 16-character zero-padded value is NOT refused as over-range"
+assert_not_contains "$OUT" "more than 15 digits" "F25 local: the 16-character zero-padded value is NOT refused as over-range"
 assert_branch_absent f25-local-zpad "F25 local: the zero-padded local branch IS treated as stale and reaped"
+
+echo ""
+echo "== 47. F26: the merge premise follows the PUSH url, not the FETCH url ="
+# `git ls-remote origin` reads the FETCH url (remote.origin.url), but
+# `git push origin` honours remote.origin.pushurl. With fetch -> A and push -> B,
+# the sweep classified against A's tracking refs and (pre-F26) proved the merge
+# against A's main, while the delete landed on B. If B serves the same branch at
+# the same oid (the ordinary mirror shape) but B's main does NOT contain it, the
+# name+oid check and the force-with-lease both pass and the delete removes a
+# branch that is not merged IN THE REPOSITORY IT LANDS ON. The merge premise must
+# therefore be read from the resolved PUSH url.
+F26_A="$FIX/f26-a.git"
+F26_B="$FIX/f26-b.git"
+F26_REPO="$FIX/f26-repo"
+new_repo "$F26_REPO" "$F26_A"
+cd "$F26_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F26_SCRIPT="$F26_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f26.txt; git add f26.txt; old_commit "init"; git push -q origin main
+F26_BASE="$(git rev-parse main)"
+# foo — merged into A's main and stale, so it IS a candidate against A's main.
+git checkout -q -b foo main
+echo f > f.txt; git add f.txt; old_commit "foo"
+F26_FOO="$(git rev-parse HEAD)"
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+git push -q origin foo
+F26_A_MAIN="$(git rev-parse main)"
+git fetch origin --prune --quiet
+if git merge-base --is-ancestor "$F26_FOO" "$F26_A_MAIN"; then
+    ok "F26 fixture: repo A's main CONTAINS foo's classified tip (the fetch-side premise holds)"
+else
+    bad "F26 fixture: repo A's main does not contain foo — the fixture is wrong"
+fi
+# Repo B: a separate bare whose OWN main is the PRE-foo base (so it does NOT
+# contain foo's tip), but which serves refs/heads/foo at the SAME oid.
+git init -q --bare "$F26_B"
+git push -q "$F26_B" "$F26_BASE:refs/heads/main"
+git push -q "$F26_B" "refs/heads/foo:refs/heads/foo"
+if git -C "$F26_B" merge-base --is-ancestor "$F26_FOO" refs/heads/main; then
+    bad "F26 fixture: repo B's main already contains foo's tip — the fixture is wrong"
+else
+    ok "F26 fixture: repo B's main does NOT contain foo's tip (the push-side premise FAILS)"
+fi
+assert_eq "$(git -C "$F26_B" rev-parse refs/heads/foo)" "$F26_FOO" "F26 fixture: repo B serves foo at the SAME oid as repo A (the ordinary mirror shape)"
+# The divergence itself: fetch from A, push to B.
+git config remote.origin.pushurl "$F26_B"
+assert_eq "$(git remote get-url origin)" "$F26_A" "F26 fixture: origin's FETCH url is repo A"
+assert_eq "$(git remote get-url --push origin)" "$F26_B" "F26 fixture: origin's PUSH url is repo B"
+assert_eq "$(git rev-parse origin/foo)" "$F26_FOO" "F26 fixture: origin/foo is classified from A at foo's tip (merged into A's main)"
+# (1) The divergence MUST REFUSE, and B's foo MUST SURVIVE.
+run_script bash "$F26_SCRIPT" --repo "$F26_REPO" --scope remote --execute
+if [ "$RC" -ne 0 ]; then
+    ok "F26: a push-side main that lacks the tip REFUSES the delete (rc=$RC)"
+else
+    bad "F26: the sweep exited 0 — it deleted B's foo on a premise proved against A"
+fi
+assert_contains "$OUT" "Found 1 stale merged branch(es)" "F26: foo IS classified as a candidate (the refusal is the gate, not an empty selection)"
+assert_contains "$OUT" "REFUSING to delete origin/foo" "F26: the divergence refusal names the branch"
+assert_contains "$OUT" "does NOT provably contain the classified tip" "F26: the refusal names the failed merge premise ON THE PUSH TARGET"
+assert_contains "$OUT" "Refused: 1" "F26: the unprovable entry is counted as refused"
+if [ "$(git -C "$F26_B" rev-parse -q --verify refs/heads/foo 2>/dev/null || echo GONE)" = "$F26_FOO" ]; then
+    ok "F26: repo B's foo SURVIVES — no delete landed on a repository whose main never contained it"
+else
+    bad "F26: repo B's foo was DELETED on a premise proved against the FETCH repo — the wrong-target delete"
+fi
+# (2) The NORMAL single-URL case must still classify and delete. With no
+# pushurl, fetch and push are the SAME repository (A), whose main DOES contain
+# foo's tip, so the same gates pass and foo is reaped.
+git config --unset remote.origin.pushurl
+assert_eq "$(git remote get-url --push origin)" "$F26_A" "F26 control: with no pushurl the PUSH target is the FETCH target (repo A)"
+run_script bash "$F26_SCRIPT" --repo "$F26_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F26 control: the single-URL case still classifies and deletes (rc=0)"
+assert_contains "$OUT" "Deleted: 1" "F26 control: the genuinely-merged branch IS deleted when fetch and push agree"
+if [ "$(git -C "$F26_A" rev-parse -q --verify refs/heads/foo 2>/dev/null || echo GONE)" = "GONE" ]; then
+    ok "F26 control: repo A's foo was reaped by the ordinary single-URL sweep"
+else
+    bad "F26 control: the ordinary single-URL sweep no longer deletes a merged stale branch"
+fi
 
 cd "$REPO"
 echo ""
