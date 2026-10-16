@@ -1,6 +1,11 @@
 # dangerous-ops.txt — manifest for skill-enforcer gate enforcement
 # Format: skillName # pattern # mode # optional_message
 # mode: hard (blocks until skill read) | nudge (reminds, escalates to block after threshold)
+# The pattern is matched against the bash COMMAND for a `bash` call, and against the TOOL NAME
+# for every other call (`mcp__*`, builtin and extension tools alike) — a `hard` rule is
+# evaluated in all of those channels, so a rule never sits armed and unreachable (#1328).
+# The `read` tool is never gated: reading <skill>/SKILL.md is the remedy for every gate, so a
+# `hard` pattern that also matches "read" is reported at load instead of deadlocking every gate.
 
 commit-workflow # git commit|git push|git merge|git add|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
 

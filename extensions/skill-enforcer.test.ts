@@ -197,6 +197,76 @@ function armCopyFarm(): { root: string; driver: string } {
   return c;
 }
 
+/**
+ * A copy-farm whose manifest is written by the TEST, plus a runner that fires a
+ * fixed list of `tool_call` events through the extension's OWN handlers and
+ * reports, per event, whether the gate blocked and which skill did it.
+ *
+ * The shipped manifest carries no `hard` rule for a builtin tool — precisely
+ * #1328's premise — so the positive case can only be exercised against a
+ * manifest supplied here. Copy (not symlink) so the manifest sits next to the
+ * copied module. `skills` creates `<root>/skills/<n>/SKILL.md` fixtures, which
+ * makes a channel's block *satisfiable* (and its advertised remedy real).
+ */
+function armGateFarm(manifest: string | null, skills: string[] = []): {
+  root: string;
+  run: (events: Array<Record<string, unknown>>) => { json: any; stdout: string; stderr: string };
+} {
+  const c = makeFarm("copy");
+  mkdirSync(join(c.root, "enforcement"), { recursive: true });
+  if (manifest === null) copyFileSync(REAL_MANIFEST, join(c.root, "enforcement", "dangerous-ops.txt"));
+  else writeFileSync(join(c.root, "enforcement", "dangerous-ops.txt"), manifest);
+  for (const name of skills) {
+    mkdirSync(join(c.root, "skills", name), { recursive: true });
+    writeFileSync(join(c.root, "skills", name, "SKILL.md"), `# ${name}\n`);
+  }
+  const driver = join(c.root, "gate-driver.cjs");
+  const run = (events: Array<Record<string, unknown>>) => {
+    writeFileSync(driver, gateDriverSource(events));
+    return runDriver(driver, childEnv({}));
+  };
+  return { root: c.root, run };
+}
+
+// CommonJS so the console patch is installed before the extension is required.
+function gateDriverSource(events: Array<Record<string, unknown>>): string {
+  return `
+const logs = [];
+const ol = console.log, oe = console.error;
+console.log = (...a) => logs.push("log: " + a.join(" "));
+console.error = (...a) => logs.push("err: " + a.join(" "));
+(async () => {
+let mod = null, loadError = null;
+try { mod = require("./extensions/skill-enforcer.ts"); } catch (e) { loadError = String((e && e.stack) || e); }
+if (!mod) { console.log = ol; console.error = oe; process.stdout.write(JSON.stringify({ loadError, logs })); return; }
+if (typeof mod._setSkillReadsFileForTest === "function") mod._setSkillReadsFileForTest(process.cwd() + "/gate-reads.json");
+const handlers = [];
+let hookError = null;
+try { mod.default({ on: (n, f) => { if (n === "tool_call") handlers.push(f); } }); } catch (e) { hookError = "hookError: " + String((e && e.message) || e); }
+async function fire(event) {
+  for (const f of handlers) { const r = await f(event, {}); if (r && r.block) return r; }
+  return null;
+}
+const results = [];
+for (const e of ${JSON.stringify(events)}) {
+  const r = await fire(e);
+  results.push({ tool: e.toolName, blocked: !!(r && r.block), reason: (r && r.reason) || null });
+}
+console.log = ol; console.error = oe;
+process.stdout.write(JSON.stringify({
+  loadError,
+  hookError,
+  logs,
+  ok: mod.MANIFEST_LOAD && mod.MANIFEST_LOAD.ok,
+  error: (mod.MANIFEST_LOAD && mod.MANIFEST_LOAD.error) || null,
+  warnings: (mod.MANIFEST_LOAD && mod.MANIFEST_LOAD.warnings) || [],
+  counts: mod.manifestCounts ? mod.manifestCounts() : null,
+  results,
+}, null, 1));
+})();
+`;
+}
+
 // CommonJS so the console patch is installed BEFORE the extension is required
 // (module-load `reportManifestState()` must be captured).
 function driverSource(): string {
@@ -607,6 +677,105 @@ async function main() {
     // Suppression must work through a NON-prefix path — the old key check did not.
     await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", "commit-workflow", "SKILL.md") } });
     equal(await pi.fire("before_agent_start", { prompt: "let me commit this" }), undefined);
+  });
+
+  section("D2. gate channel completeness — a `hard` rule can never be inert (#1328)");
+  // The matching SUBJECT is chosen by channel: bash → the command text, every
+  // other tool → its tool name. `hard` rules must therefore fire in all three
+  // channels. The bash and `mcp__*` legs are CONTROLS: they worked before the
+  // fix and must keep working after it. `web_search` is the leg that was inert.
+  const GATE_MANIFEST = [
+    "bash-skill # git commit # hard # bash channel",
+    "mcp-skill # mcp__svc__do_thing # hard # mcp channel",
+    "builtin-skill # web_search # hard # builtin-tool channel, issue 1328",
+    "",
+  ].join("\n");
+  const gateFarm = armGateFarm(GATE_MANIFEST, ["builtin-skill"]);
+  const builtinSkillMd = join(gateFarm.root, "skills", "builtin-skill", "SKILL.md");
+  const gr = gateFarm.run([
+    { toolName: "bash", input: { command: "git commit -m x" } },
+    { toolName: "mcp__svc__do_thing", input: {} },
+    { toolName: "web_search", input: { query: "x" } },
+    { toolName: "todo_write", input: { todos: [] } },
+    // The gate must stay SATISFIABLE in the new channel, not merely blocking.
+    { toolName: "read", input: { path: builtinSkillMd } },
+    { toolName: "web_search", input: { query: "x" } },
+  ]);
+
+  await test("#1328 — a `hard` rule fires on bash, on `mcp__*`, AND on a builtin tool", () => {
+    ok(gr.json, `gate driver produced no JSON.\nstdout:\n${gr.stdout}\nstderr:\n${gr.stderr}`);
+    equal(gr.json.loadError, null, String(gr.json.loadError));
+    equal(gr.json.hookError, null, String(gr.json.hookError));
+    equal(gr.json.ok, true, `the fixture manifest must load, or every leg is vacuous: ${JSON.stringify(gr.json)}`);
+    deepEqual(gr.json.counts, { skills: 3, rules: 3 }, JSON.stringify(gr.json));
+    const results = (gr.json.results ?? []) as Array<{ tool: string; blocked: boolean; reason: string | null }>;
+    equal(results.length, 6, JSON.stringify(gr.json));
+    equal(results[3].blocked, false, "no rule names todo_write — a non-matching tool must pass");
+    ok(results[0].blocked && String(results[0].reason).includes("bash-skill"), `bash channel: ${JSON.stringify(results[0])}`);
+    ok(results[1].blocked && String(results[1].reason).includes("mcp-skill"), `mcp channel: ${JSON.stringify(results[1])}`);
+    ok(
+      results[2].blocked && String(results[2].reason).includes("builtin-skill"),
+      `#1328 — a \`hard\` rule naming a builtin tool must FIRE, not be accepted-and-inert: ${JSON.stringify(results[2])}`,
+    );
+    equal(results[4].blocked, false, `reading the named SKILL.md must not itself block: ${JSON.stringify(results[4])}`);
+    equal(
+      results[5].blocked,
+      false,
+      `the gate must be SATISFIABLE through the new channel once ${builtinSkillMd} is read: ${JSON.stringify(results[5])}`,
+    );
+  });
+
+  await test("a `nudge` rule still never blocks — the unified loop honours `mode` (#1328 regression control)", () => {
+    const nudgeFarm = armGateFarm("nudge-skill # web_search # nudge # reminds, never blocks\n");
+    const r = nudgeFarm.run([{ toolName: "web_search", input: { query: "x" } }]);
+    ok(r.json, `gate driver produced no JSON.\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    equal(r.json.ok, true, `a nudge-only manifest must load: ${JSON.stringify(r.json)}`);
+    deepEqual(r.json.counts, { skills: 1, rules: 1 }, JSON.stringify(r.json));
+    equal(r.json.results[0].blocked, false, `a nudge rule must never block: ${JSON.stringify(r.json.results[0])}`);
+  });
+
+  await test("`read` is never a subject: the remedy tool cannot be blocked, and the collision is loud", () => {
+    // `git read-tree` is a plausible bash gate whose pattern ALSO matches the
+    // `read` tool name. Without the exemption that rule would block every read
+    // in the session and make EVERY gate unsatisfiable at once; without the
+    // warning it would instead be a silently inert manifest line (#1328 again).
+    const collide = armGateFarm("git-skill # git read-tree|read # hard # also collides with the read tool\n");
+    const r = collide.run([
+      { toolName: "read", input: { path: join(collide.root, "README.md") } },
+      { toolName: "bash", input: { command: "git read-tree HEAD" } },
+    ]);
+    ok(r.json, `gate driver produced no JSON.\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    equal(r.json.loadError, null, String(r.json.loadError));
+    equal(r.json.ok, true, `a collision is a WARNING, not a defect (the rule stays armed for bash): ${JSON.stringify(r.json)}`);
+    equal(r.json.results[0].blocked, false, `the remedy tool must never be blocked: ${JSON.stringify(r.json.results[0])}`);
+    ok(r.json.results[1].blocked, `the bash channel must keep working: ${JSON.stringify(r.json.results[1])}`);
+    ok(
+      (r.json.warnings as string[]).some(w => w.includes("read") && w.includes("never blocked")),
+      `the collision must be loud, not silent: ${JSON.stringify(r.json.warnings)}`,
+    );
+    ok(
+      (r.json.logs as string[]).some(l => l.startsWith("err: ") && l.includes("never blocked")),
+      `the warning must reach stderr: ${JSON.stringify(r.json.logs)}`,
+    );
+  });
+
+  await test("the shipped manifest gains no false block on any builtin/extension tool", () => {
+    // Regression control for the channel-completion change: every `hard` rule in
+    // the REAL manifest is a bash regex, so no builtin or extension tool name
+    // may newly match one. This list is the fleet's registered tool names.
+    const names = [
+      "read", "write", "edit", "grep", "find", "web_search", "web_fetch", "todo_write",
+      "task", "subagent", "design_reviewer", "carousel_designer", "loop_enforcer",
+      "mcp_catalog", "mcp_load", "mcp_finish_auth",
+    ];
+    const realFarm = armGateFarm(null);
+    const r = realFarm.run(names.map(name => ({ toolName: name, input: { path: join(REAL_MANIFEST, "..", "..", "README.md") } })));
+    ok(r.json, `gate driver produced no JSON.\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    equal(r.json.ok, true, `the real manifest must load: ${JSON.stringify(r.json)}`);
+    deepEqual(r.json.counts, { skills: 4, rules: 6 }, JSON.stringify(r.json));
+    const blocked = (r.json.results as Array<{ tool: string; blocked: boolean }>).filter(x => x.blocked);
+    deepEqual(blocked, [], `no builtin tool may newly match a shipped bash rule: ${JSON.stringify(blocked)}`);
+    deepEqual(r.json.warnings, [], `the shipped manifest must raise no warning: ${JSON.stringify(r.json.warnings)}`);
   });
 
   section("E. persisted reads — T13");

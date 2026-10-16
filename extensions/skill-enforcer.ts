@@ -10,6 +10,26 @@
 // #1321 fail-open. `realpathSync(__filename)` recovers the real module location
 // under jiti AND Node's native loader; use MODULE_DIR/REPO_DIR, never `__dirname`.
 //
+// ── ONE SUBJECT PER CALL; EVERY `hard` RULE IS EVALUATED (#1328) ──────────
+// The blocking gate picks its match SUBJECT by CHANNEL: a bash call is judged
+// on its command text, every other call — `mcp__*` and builtin/extension tools
+// alike — on its tool name. It used to be two channel-specific branches (an
+// `mcp__*` branch, then a bash-only branch), so a `hard` rule naming any other
+// tool was accepted, counted as armed by the banner, and could never fire: an
+// inert enforcer, the same class as #1321's empty manifest. Every `tool_call`
+// maps to exactly one subject, so a `hard` rule is now unreachable only when
+// its pattern matches neither a command nor a tool name — a pattern defect,
+// not a channel defect. (The `nudge` × {bash, `mcp__*`} cell of the same matrix
+// is still dead and is tracked separately in #1820.)
+//
+// ⚠️ EXCEPTION — `read` IS NEVER A SUBJECT. Reading `<skill>/SKILL.md` is the
+// only documented way to clear ANY gate, so a manifest rule must never block the
+// `read` tool: a pattern that merely contains "read" (`git read-tree`) would
+// otherwise make every gate in the manifest unsatisfiable at once. `read` calls
+// therefore stay ungated, and `loadManifest` reports such a rule LOUDLY (the
+// issue's own option b, applied where it is decidable) so it is never silently
+// inert — which is the #1328 class this change closes.
+//
 // ── READ IDENTITY IS A NAME, NOT A PATH FRAGMENT (#1322) ──────────────────
 // pi serves skills from `~/.pi/agent/skills/<name>/SKILL.md` (real dirs);
 // consumer repos keep them at `operations/skills/` or `.agents/skills/`;
@@ -389,6 +409,17 @@ export function loadManifest(path: string): ManifestLoad {
       }
     }
     if (patterns.length === 0) continue;
+    // ── `read` is the REMEDY, never a subject (#1328) ─────────────────────
+    // The blocking gate skips the `read` tool (see the header), because reading
+    // the SKILL.md is how every gate is cleared. A `hard` pattern that also
+    // matches "read" would otherwise make EVERY gate in this manifest
+    // unsatisfiable at once, so it is reported here instead of passing as a
+    // healthy, armed rule — the same "declared but silent" class as #1328.
+    if (modeField === "hard" && patterns.some((p) => p.test("read"))) {
+      warnings.push(
+        `${path}:${lineNo} — entry "${skillName}" is a \`hard\` rule whose pattern also matches the \`read\` tool, which is never blocked (reading the SKILL.md is the remedy for every gate); the rule does NOT apply to \`read\` calls`,
+      );
+    }
     const rule: ManifestRule = {
       patterns,
       mode: modeField,
@@ -620,28 +651,24 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
-    // Check MCP tool calls
-    const mcpTool = (event as any).toolName ?? "";
-    if (mcpTool.startsWith("mcp__")) {
-      for (const [skillName, rules] of Object.entries(MANIFEST)) {
-        for (const rule of rules) {
-          if (rule.mode !== "hard") continue;
-          for (const p of rule.patterns) {
-            if (p.test(mcpTool) && !readFiles.has(skillName)) return blockReason(skillName, rule, mcpTool);
-          }
-        }
-      }
-      return undefined;
-    }
-
-    // Check bash commands
-    if (!cmd) return undefined;
+    // ── ONE SUBJECT PER CALL, EVERY `hard` RULE EVALUATED (#1328) ──────────
+    // See the header note. The channel discriminator is the tool name: a bash
+    // call is judged on its command text, any other tool on its own name, so a
+    // `hard` rule naming a builtin or extension tool now blocks instead of
+    // being accepted-and-inert. `read` is the remedy for every gate and is
+    // never a subject (header, #1328).
+    if (toolName === "read") return undefined;
+    const isBash = isToolCallEventType("bash", event);
+    const subject = isBash ? cmd : toolName;
+    if (!subject) return undefined;
 
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(cmd) && !readFiles.has(skillName)) return blockReason(skillName, rule, skillName);
+          if (p.test(subject) && !readFiles.has(skillName)) {
+            return blockReason(skillName, rule, isBash ? skillName : toolName);
+          }
         }
       }
     }
@@ -656,7 +683,16 @@ export default function (pi: ExtensionAPI) {
     }
 
     const toolName = (event as any).toolName ?? "";
-    // Skip bash and MCP — already handled by the blocking handler above
+    // Skip bash and MCP: the blocking handler above owns those two channels.
+    // ⚠️ That handler skips `mode !== "hard"` rules, so a NUDGE rule whose
+    // pattern targets a bash command or an `mcp__*` tool is evaluated by
+    // NEITHER handler and can never fire — the shipped
+    // `how-to-use-tortoise # tortoise_ # nudge` broad catch-all is one (measured
+    // 2026-10-14: 5 consecutive `mcp__tortoise__tortoise_search` calls produce no
+    // block, no reminder, no injection, no nudge log). Not fixed here: closing
+    // it would newly apply nudge escalation — a block at the 3rd call — to
+    // read-only MCP queries, which #1321's T11 required must not block. Filed as
+    // #1820; the decision, not the mechanism, is missing.
     if (toolName === "bash" || toolName.startsWith("mcp__")) return undefined;
     if (!toolName) return undefined;
 
