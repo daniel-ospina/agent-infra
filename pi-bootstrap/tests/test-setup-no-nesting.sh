@@ -199,7 +199,8 @@ check_ci_runner_gate_farmed() {
 #     against a $DEST that THIS run just populated. #1738 is the NEAR-MISS that prompted looking for
 #     this gap, NOT an instance of it: #1738's own evidence records the deployed file as
 #     BYTE-IDENTICAL to origin/main, so the DEPLOYED COPY WAS CURRENT (delivered by some path other
-#     than this farm — `lane-watchdog.py` is in no farm array) — what failed there was the
+#     than this farm — `lane-watchdog.py` was in no farm array when #1738 was diagnosed; it joined
+#     `fleet_srcs` in #1552) — what failed there was the
 #     INVOCATION. (The mechanism WAS found, in a later comment on #1738 titled "Root cause — found,
 #     and fixed in production": bash's parse-once semantics — the running loop had already parsed its
 #     body, so the edited launch block was never reached. That is a DIFFERENT mechanism from
@@ -265,6 +266,12 @@ LANE_PRODUCERS="lane-status.py lane-actions.py lane-watchdog.py objective.py hea
 # summary would otherwise report a clean 0/0 — the maximal silent skip, read as green. This pins the
 # count the list must carry, so DROPPING a producer is a failure, not a quieter green.
 LANE_PRODUCERS_EXPECTED=7
+# ...and the CANONICAL SET, because the count alone is not the claim. A count-preserving substitution —
+# DROP `objective.py` and DUPLICATE `lane-actions.py`, still seven entries — keeps `considered` at 7 and
+# `missing` empty, so it passed every check while `objective.py` went unguarded and printed the
+# byte-identical `DECLARED-GAP` line (review H7, PR #1855). The membership check below compares the
+# sorted names against this set, so a drop, a duplicate, an addition and a rename all fail alike.
+LANE_PRODUCERS_CANONICAL="lane-status.py lane-actions.py lane-watchdog.py objective.py heartbeat-loop.sh cadence-nudge.sh publish-live-workspaces.py"
 LANE_PRODUCERS_EXEMPT="lane-status.py heartbeat-loop.sh"
 # Whole-word membership, the `ci_runner_gate.test.sh` idiom: a plain `grep -F` for the basename is
 # also satisfied by `lane-actions.py.old`, i.e. by the exact rename that leaves the producer
@@ -295,6 +302,16 @@ check_producer_farm_declared() {
   # fails rather than reporting a quieter green.
   if [ "$considered" -lt 1 ] || [ "$considered" -ne "$LANE_PRODUCERS_EXPECTED" ]; then
     fail "$label: LANE_PRODUCERS carries $considered of $LANE_PRODUCERS_EXPECTED producers — an empty or undersized list must never read as clean (#1552)"
+    floor_ok=0
+  fi
+  # SET BINDING (review H7) — the count floor above is blind to a COUNT-PRESERVING substitution, which
+  # is the shape `objective.py` was actually lost in. Compare the sorted names to the canonical set so
+  # the guard's SUBJECT is bound, not merely its size.
+  local actual_set canonical_set
+  actual_set="$(printf '%s\n' $LANE_PRODUCERS | sort)"
+  canonical_set="$(printf '%s\n' $LANE_PRODUCERS_CANONICAL | sort)"
+  if [ "$actual_set" != "$canonical_set" ]; then
+    fail "$label: LANE_PRODUCERS is not the canonical producer set — a dropped, duplicated, added or renamed producer must never read as clean (got:$(printf ' %s' $LANE_PRODUCERS)) (#1552)"
     floor_ok=0
   fi
   [ -z "$missing" ] \
@@ -333,6 +350,15 @@ if [ "$(producer_floor_probe "floor-probe-short" "lane-actions.py lane-watchdog.
   echo "ok: an UNDERSIZED LANE_PRODUCERS (6/7) trips the population floor"
 else
   fail "an UNDERSIZED LANE_PRODUCERS (6/7) did NOT trip the population floor — a dropped producer read as clean"
+fi
+# H7 (review, PR #1855) — COUNT-PRESERVING substitution: drop `objective.py` and duplicate
+# `lane-actions.py`, so the list still carries seven entries, every one declared or exempt. The count
+# floor cannot see this (`considered` is still 7) and `missing` stays empty, so ONLY the set binding
+# catches it; pre-fix it printed the byte-identical `DECLARED-GAP 5/7` line.
+if [ "$(producer_floor_probe "set-probe-swap" "lane-status.py lane-actions.py lane-watchdog.py lane-actions.py heartbeat-loop.sh cadence-nudge.sh publish-live-workspaces.py")" -gt 0 ]; then
+  echo "ok: a COUNT-PRESERVING substitution (objective.py dropped, lane-actions.py duplicated) trips the set binding"
+else
+  fail "a COUNT-PRESERVING substitution did NOT trip the set binding — objective.py read as guarded while absent"
 fi
 
 # #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
