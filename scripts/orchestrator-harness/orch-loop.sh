@@ -96,7 +96,25 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
+# The required-check list and the review authority are REPO-DEPENDENT inputs. This line used to
+# BE tortoise's branch-protection list, so a controller pointed at agent-infra named eight checks
+# that can never appear there, every PR read `FAILED:ai-review-gate`, and the merge queue could
+# not drain. They now live in repo-authority.sh, SOURCED here and by merge-one.sh so the two
+# cannot drift.
+# ⛔ REQ in the environment is an operator override and WINS. Capture it ONCE: the cycle below
+# overwrites REQ with the resolved value, so reading REQ as "the override" on the next cycle
+# would freeze the first cycle's answer (see REQ_OVERRIDE's note in repo-authority.sh).
+_HERE_RA="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
+elif [ -f "$_HERE_RA/repo-authority.sh" ]; then . "$_HERE_RA/repo-authority.sh"
+else echo "orch-loop: FATAL repo-authority.sh not found (looked in $O and ${_HERE_RA:-<unresolved>}) — refusing to run without the per-repo merge contract" >&2; exit 78; fi
+# ⚠️ review round 3: a PRESENT but stale/partial repo-authority.sh sources cleanly and silently
+# yields REQ="" — which used to read as `rail`. The resolver must actually exist.
+command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority >/dev/null 2>&1 \
+  || { echo "orch-loop: FATAL repo-authority.sh at $O is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >&2; exit 78; }
+REQ_OVERRIDE="${REQ:-}"
+REQ=""
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
@@ -112,6 +130,17 @@ safe_ref() {
   case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
 }
+
+# shq <value> -> a POSIX-sh-safe single-quoted word.
+# ⛔ NOT `printf %q`. bash's %q emits `$'…'` for any byte outside [[:print:]], and `$'…'` is NOT a
+# quoting form in POSIX sh: on a Debian/Ubuntu cell `/bin/sh` is dash, so the quoting is LOST and
+# the remainder is re-parsed as COMMANDS. Measured 2026-10-15 (round-8 adversarial review, class
+# B6): the spawn line below carried a required-check name containing ESC and executed an injected
+# command on the merge host — `REQ=$'a\'\E;touch${IFS}/tmp/PWNED;#'`. `%q` is only safe where the
+# reader is bash (the macOS operator box), which is exactly why it went unnoticed.
+# Single-quoting with `'\''` escaping is POSIX and correct for EVERY byte (a newline included), so
+# it needs no character screen and cannot be defeated by a byte the screen forgot.
+shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
@@ -635,6 +664,75 @@ while true; do
   fi
   echo "[scope] open=$OPEN_N -> $SCOPE_MODE ($SCOPE_WHY)" >> "$LOG"
   # END scope-select
+  # ── repo authority for THIS cycle (agent-infra#1764) ────────────────────────
+  # Resolved per cycle: branch protection can change while the controller runs. With REQ already set
+  # in the environment the RESOLVER costs no gh call (it short-circuits on REQ_OVERRIDE), but the
+  # authority-flip DETECTOR below does re-read branch protection on the cycles where an override is
+  # active (review round 7 — the earlier comment claimed zero gh calls and was wrong). The required
+  # set is the repo's declaration of what must gate a merge; the merge authority follows from it,
+  # so both are read from ONE home.
+  # ⛔ resolve_required_checks, NEVER `REQ="$(resolve_required_checks …)"`: the command substitution
+  # subshells the resolver, REQ_SOURCE cannot survive the assignment, and the ⚠️ fallback warning
+  # in the case below would never fire.
+  resolve_required_checks "$OR"
+  MERGE_AUTHORITY="$(merge_authority "$REQ")"
+  # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
+  # to read as `rail` and silently reroute a gate repo — unknown refuses, exactly like fallback.
+  # ⛔ ALLOW-LIST POLARITY (round-11 review, P2). This was a DENY list — an empty REQ, `fallback`,
+  # or the literal `unknown` — so any OTHER value was treated as a KNOWN authority and the sweep
+  # acted on it. An authority the controller does not recognise is exactly as unknown as an
+  # unreadable one, so the test now names the two values it TRUSTS and treats everything else as
+  # unknown. (`merge_authority` prints only gate|rail|unknown today, so this is latent — but it was
+  # one new value away from the raw merge this whole change exists to prevent.)
+  if [ -z "${REQ:-}" ] \
+     || { [ "${MERGE_AUTHORITY:-}" != "gate" ] && [ "${MERGE_AUTHORITY:-}" != "rail" ]; } \
+     || [ "${REQ_SOURCE:-}" = "fallback" ]; then
+    AUTHORITY_UNKNOWN=1
+  else
+    AUTHORITY_UNKNOWN=0
+  fi
+  case "${REQ_SOURCE:-}" in
+    protection) echo "[req] $OR: required checks from branch protection: $REQ" >>"$LOG" ;;
+    env)        echo "[req] $OR: required checks from the REQ environment override: $REQ" >>"$LOG" ;;
+    fallback)
+      # ⚠️ review P2, round 1: the fallback set deliberately carries the review gate, which on a
+      # foreign repo reads FAILED — NOT PENDING — and the FAILED arm would then spawn a
+      # fresh-context reviewer per PR per cycle for as long as protection is unreadable. While
+      # the repo's own contract cannot be read, the SWEEP merges, auto-arms, and spawns nothing
+      # this cycle (AUTHORITY_UNKNOWN, honoured in the sweep below). Dispatch lanes are
+      # unaffected; and any merge worker invoked by another ingress (chain-merge, fix-one)
+      # refuses on ITS OWN unreadable read — see merge-one.sh's authority-unknown refusal.
+      echo "[req] ⚠️ $OR: branch protection UNREADABLE — the merge contract is UNKNOWN; the sweep merges, auto-arms, and spawns nothing this cycle (fail-closed, no burn loop; workers refuse on their own read)" >>"$LOG"
+      AUTHORITY_UNKNOWN=1 ;;
+    *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
+  esac
+  # ⛔ round-11 review, P3: for an authority of `unknown` this line asserted the gate "is NOT
+  # required" — a determination the controller cannot make (unknown means it does not know). A
+  # three-way suffix, so the log never states a conclusion it did not reach.
+  case "$MERGE_AUTHORITY" in
+    gate) _gate_rel="IS required" ;;
+    rail) _gate_rel="is NOT required" ;;
+    *)    _gate_rel="is UNKNOWN (the contract could not be read — the sweep merges nothing this cycle)" ;;
+  esac
+  echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $_gate_rel)" >>"$LOG"
+  # ⚠️ review rounds 4-6: REQ_OVERRIDE is a documented operator pin (README: "`REQ=…` in the cell
+  # env / keys.env overrides the read"), and REQ/REVIEW_GATE are read from the environment — which
+  # a cloud cell sources with `set -a`, so a stray export reaches here. An override that CHANGES
+  # the authority away from the repo's own declaration would silently re-enable the raw merge this
+  # whole change exists to prevent on a rail repo; a REVIEW_GATE override does the same AND moves
+  # the classifier's gate_ok onto a different name. The override still wins (it is how a contract
+  # is pinned during an outage), but the flip is never silent.
+  # ⛔ THE BASELINE IS THE DEFAULT GATE NAME, NOT `$REVIEW_GATE` (review round 6, P1). Computing
+  # `_own_auth` from the overridden name made the comparison `X vs X` — provably inert — while a
+  # `REVIEW_GATE` export flipped agent-infra to `gate` and issued a RAW `gh pr merge` with no log
+  # line at all. With REVIEW_GATE_DEFAULT the question actually asked is "what would this repo's
+  # own declaration say with no gate-name override?", which is the thing an override changes.
+  if [ "${REQ_SOURCE:-}" = "env" ] || [ "${REVIEW_GATE_SOURCE:-default}" = "env" ]; then
+    _own_auth="$(REVIEW_GATE="$REVIEW_GATE_DEFAULT" merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
+    if [ "$_own_auth" != "unknown" ] && [ "$_own_auth" != "$MERGE_AUTHORITY" ]; then
+      echo "[authority] ⚠️ $OR: an operator override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; REQ='$REQ' REQ_SOURCE=${REQ_SOURCE:-?} REVIEW_GATE='$REVIEW_GATE' REVIEW_GATE_SOURCE=${REVIEW_GATE_SOURCE:-default}) — the override wins, but verify it is intended$([ "$MERGE_AUTHORITY" = gate ] && printf ' — GATE authority issues a RAW gh pr merge, which on a rail repo lands the PR on the required checks alone with no head-bound evidence')" >>"$LOG"
+    fi
+  fi
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED
   # listing yields ZERO iterations and prints NOTHING — the sweep silently does nothing for the
   # whole cycle. Capture it, check rc, log the failure, and feed the loop from the captured text.
@@ -764,15 +862,20 @@ while true; do
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | python3 -c "
+    # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
+    # spawns — the one action worse than doing nothing here would be acting on a contract this
+    # repo never declared (review P2, round 1).
+    [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue
+    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 -c "
 import sys,json
+import os
 try: d=json.load(sys.stdin)
 except Exception: print('NOCHECKS'); raise SystemExit
 # The source is either the check-runs API shape (an object carrying a check_runs list) or the flat
 # list \`gh pr checks --json\` prints. Both normalise to one row list; anything else is unreadable.
 rows=d.get('check_runs') if isinstance(d,dict) else d
 if not isinstance(rows,list): print('NOCHECKS'); raise SystemExit
-want='$REQ'.split()
+want=(os.environ.get('REQ') or '').split()
 # ⛔ ALLOW-LISTS, NEVER A DENY-LIST (agent-infra#1714). A conclusion is NON-RED only if it is NAMED
 # here - the identical five spellings admin-merge.sh (NON_RED_CONC) and record-review.sh
 # (target_head_red) use, so the harness and the merge rail cannot disagree. 'not in the red set' is
@@ -810,17 +913,26 @@ for c in rows:
     prev=groups.get(k)
     if prev is None or cid>=prev[0]: groups[k]=(cid,status,concl)
 rank={'nonred':0,'pending':1,'red':2}
+# The repo's review-gate NAME is an INPUT (agent-infra#1764), not the literal 'ai-review-gate'.
+# It is read from the env the bash side passes in, with the same default repo-authority.sh uses.
+rgate=os.environ.get('REVIEW_GATE') or 'ai-review-gate'
 named={}
 gate=[]
 for k in groups:
     status=groups[k][1]; concl=groups[k][2]
     v='pending' if status in INFLIGHT else ('nonred' if concl in NONRED else 'red')
-    if k[1]=='ai-review-gate': gate.append((v,concl))
+    if k[1]==rgate: gate.append((v,concl))
     if k[1] not in named or rank[v]>rank[named[k[1]]]: named[k[1]]=v
-# ai-review-gate IS the merge authority, so it must be an explicit SUCCESS. SKIPPED/NEUTRAL there
-# means no signed review exists; reading that as satisfied would merge without evidence. This is
-# also why GREEN always carries at least one MEASURING success: a surface of nothing but
-# cancelled/stale/skipped/neutral rows can never read green - those are non-red, never green.
+# THE REVIEW GATE IS THE MERGE AUTHORITY **WHERE THE REPO REQUIRES IT**, so it must be an explicit
+# SUCCESS there. SKIPPED/NEUTRAL means no signed review exists; reading that as satisfied would
+# merge without evidence. This is also why GREEN always carries at least one MEASURING success: a
+# surface of nothing but cancelled/stale/skipped/neutral rows can never read green - those are
+# non-red, never green.
+# ⛔ SCOPED BY 'rgate in want', WHICH IS THE WHOLE POINT (#1764). On a repo whose protection does
+# not require the gate (agent-infra), the name is NOT in 'want' and the rule below never fires -
+# otherwise its ABSENCE forced RED and deadlocked the queue. The rule is NOT weakened: on tortoise
+# the gate IS required, so a missing/red/skipped gate still blocks exactly as before. The
+# fail-closed posture is unchanged and stays INSIDE the repo's own required set.
 gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
 # Read it in this order: RED if any required check is red (a completed red is final - nothing in
 # flight can un-fail it); otherwise NOT YET KNOWN while any is in flight or never reported;
@@ -828,7 +940,7 @@ gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
 # and NOCHECKS reaches neither the merge nor the fixer arm below.
 fail=[n for n in want if named.get(n)=='red']
 pend=[n for n in want if named.get(n)=='pending' or n not in named]
-if 'ai-review-gate' in want and not gate_ok and 'ai-review-gate' not in fail: fail.insert(0,'ai-review-gate')
+if rgate in want and not gate_ok and rgate not in fail: fail.insert(0,rgate)
 print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PENDING:'+','.join(pend) if pend else ('GREEN' if want else 'NOCHECKS'))))
 " 2>/dev/null)"
     # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
@@ -843,7 +955,12 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
+            # a park left by a previous head must be REFRESHED or the new head never parks.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
+            fi
+            echo "${HEAD_N:-}" > "$O/state/parked-$PR"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
@@ -859,11 +976,90 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         fi ;;
     esac
     case "$V" in
-      GREEN)     gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG" ;;
-      PENDING:*) gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true ;;
+      GREEN)
+        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        if [ "$MERGE_AUTHORITY" = "rail" ]; then
+          # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
+          # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
+          # and merges. We NEVER call `gh pr merge` here: on this repo it would land the PR on the
+          # required checks alone, bypassing the rail — the bypass agent-infra's AGENTS.md forbids.
+          #
+          # IT RUNS IN A WORKER, NOT INLINE. MEASURED 2026-10-15: one rail run on a green
+          # agent-infra PR (#1763, all 22 checks non-red) takes ~27s even with --dry-run --no-rerun,
+          # and the rail's re-run path waits for a re-run to finish. Inline, a 30-PR drain is ~13
+          # minutes of a BLOCKED controller cycle with dispatch halted — the very starvation this
+          # issue is about. The worker is single-owner (merge-one.sh's local lock + cross-box claim)
+          # and slot- and load-gated like every other spawn.
+          if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
+            : # a rail worker already owns this PR
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            # ⚠️ carry the RESOLVED contract into the worker (review P2, round 1): the controller
+            # resolved REQ/REVIEW_GATE for THIS cycle, but a worker that re-resolves independently
+            # can disagree (e.g. an operator REVIEW_GATE the tmux server does not export) and merge
+            # under a different authority than the one that classified the PR. Passing the resolved
+            # set as the worker's REQ makes it the override — one resolution, one authority.
+            # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
+            # that as quoting, so the value would execute (round-8 adversarial review, B6).
+            if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
+            else
+              echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
+            fi
+          fi
+        elif [ "$MERGE_AUTHORITY" = "gate" ]; then
+          # ⛔ EXPLICIT `gate` ONLY (round-10 review, P2). This arm used to be a bare `else`, so
+          # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
+          # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
+          # happens only on an authority that NAMES the gate.
+          gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
+        else
+          echo "#$PR GREEN but the merge authority is '${MERGE_AUTHORITY:-<unset>}' — NO merge (fail-closed: only an explicit 'gate' or 'rail' authority may merge)" >>"$LOG"
+        fi ;;
+      PENDING:*)
+        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        if [ "$MERGE_AUTHORITY" = "gate" ]; then
+          gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true
+        else
+          # RAIL MODE: `--auto` must NOT be armed. It merges the moment the REPO'S required checks
+          # pass, which on a rail-managed repo bypasses the rail entirely — the same bypass the
+          # GREEN arm avoids. Wait for the next cycle; once every required check is non-red the
+          # GREEN arm dispatches the rail.
+          echo "#$PR PENDING (rail mode: auto-merge deliberately NOT armed — arming it would bypass the rail)" >>"$LOG"
+        fi ;;
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
-        if grep -q ai-review-gate <<<"$V"; then
+        # Which red names are REQUIRED checks other than the review gate? Derived from the
+        # classifier's own output and from THIS repo's required set ($REQ) — never from a literal
+        # name list. The arm below used to name tortoise's five doc/CI checks, so a red
+        # `pipeline-compliance` on agent-infra matched NOTHING and the PR sat red with no worker at
+        # all: the same repo-dependent-constant defect as the required-check list (#1764).
+        # ⚠️ review P2, round 1: the pre-#1764 arm deliberately EXCLUDED python-ci-gate — the
+        # rerun block at the bottom of this case owns it, and routing a flaky CI lane into the
+        # code-pushing fixer is churn the rerun already handles. RERUN_RED names that one check
+        # (the same name the rerun block greps for); a repo that does not carry it is unaffected
+        # and every OTHER required red name still reaches the fixer — including agent-infra's
+        # pipeline-compliance, which the old literal arm could not match at all.
+        RERUN_RED="python-ci-gate"
+        CI_RED=""
+        _redifs="$IFS"; IFS=','; set -f
+        for _rn in ${V#FAILED:}; do
+          [ -n "$_rn" ] || continue
+          [ "$_rn" = "$REVIEW_GATE" ] && continue
+          [ "$_rn" = "$RERUN_RED" ] && continue
+          case " $REQ " in *" $_rn "*) CI_RED="$_rn"; break ;; esac
+        done
+        set +f; IFS="$_redifs"
+        # Whole-NAME gate test (review P2, round 2): `grep -qF` matched a SUBSTRING, so a
+        # REVIEW_GATE that is a substring of another red required check (compliance vs
+        # pipeline-compliance) misrouted that check into the review arm instead of the CI fixer
+        # that fetches its failing log — while merge_authority and CI_RED test whole names.
+        _gate_hit=0; _gifs="$IFS"; IFS=','; set -f
+        for _vn in ${V#FAILED:}; do
+          [ "$_vn" = "$REVIEW_GATE" ] && _gate_hit=1
+        done
+        set +f; IFS="$_gifs"
+        if [ "$_gate_hit" = "1" ]; then
           # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
           # marker at spawn — so restore it too (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
@@ -900,17 +1096,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
+              # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
+              # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
+              tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
             fi
           fi
-        elif grep -qE 'docs|test-isolation|license-surface|legal-e2e|pricing-artifact' <<<"$V"; then
-          # A required check OTHER than the review gate or python CI is red — docs lint, a
-          # committed conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran
-          # those, so such a PR sat red forever with no worker at all (observed: #8278 carried two
-          # docs-lint findings — MD056, an unescaped '|' in a table row, and MD046, fence style;
-          # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
-          # which now also receives the failing CI log, capped like every other fix loop.
+        elif [ -n "$CI_RED" ]; then
+          # CI-red arm (agent-infra#1764: derived from the repo's required set, not a name list)
+          # A required check OTHER than the review gate is red — docs lint, a committed conflict
+          # marker, legal-e2e, test isolation, or agent-infra's `pipeline-compliance`. Nothing
+          # re-recorded or reran those, so such a PR sat red forever with no worker at all
+          # (observed: #8278 carried two docs-lint findings — MD056, an unescaped '|' in a table
+          # row, and MD046, fence style; #8193 a new MD018 finding; both had zero workers for
+          # hours). Route them to the fixer, which now also receives the failing CI log, capped
+          # like every other fix loop.
           # ⛔ THE REFUND MUST PRECEDE THE READ (P2, third review round, 2026-10-14). The CONFLICTING
           # arm above and the ai-review-gate arm below both read the count AFTER the refund; this arm
           # read it BEFORE, so the decrement was immediately overwritten by `$NFC2 + 1` and the refund
@@ -924,7 +1124,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { echo "${HEAD_N:-}" > "$O/state/parked-$PR"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park).
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
+            fi
+            echo "${HEAD_N:-}" > "$O/state/parked-$PR"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then

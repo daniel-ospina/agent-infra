@@ -83,7 +83,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   git -C "$AI" add -A
@@ -262,7 +262,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
@@ -505,7 +505,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
@@ -603,7 +603,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
@@ -1296,6 +1296,23 @@ CELL_HOME="$K/home" ENV_FILE="$K/keys.env" SESSION="ai1745-k-$$" O="$K/o" REPO="
                               || bad "prune reclaimed the pin the record names as active"
 [ ! -e "$K/pin/cccccccccccc" ] && ok "prune still reclaimed a genuinely superseded pin (the guard is not a blanket refusal)" \
                                 || bad "prune kept a genuinely superseded pin — the reclaim arm is now vacuous"
+# ⚠️ Review round 4: repo-authority.sh is SOURCED by orch-loop.sh and merge-one.sh from $O
+# (repo-authority.sh's own per-repo merge contract), so a cell whose $O lacks it dies `exit 78`
+# on the FIRST cycle — but `check` used to certify it as "CELL CAN RUN A CONTROLLER". The file is
+# a required worker for exactly the reason claims.sh already is; pin it.
+say_case "check refuses a cell whose \$O lacks repo-authority.sh (review round 4)"
+rm -f "$F/o/repo-authority.sh"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a missing repo-authority.sh refuses (the controller would die exit 78)" \
+                   || bad "check: certified a cell whose \$O lacks repo-authority.sh"
+case "$CC_OUT" in
+  *"repo-authority.sh"*) ok "check: names the missing worker" ;;
+  *) bad "check: does not name repo-authority.sh — output: $CC_OUT" ;;
+esac
+: > "$F/o/repo-authority.sh"  # restore the fixture for any later case
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
+                   || bad "check: still refuses with the worker restored (rc=$CC_RC)"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
