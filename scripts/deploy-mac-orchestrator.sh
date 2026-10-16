@@ -157,6 +157,10 @@ else
   # instead: this file measures that a transient `bash $O/orch-loop.sh` (a peer fixture launching the
   # real path) can appear inside the scope and exit at once, and signalling it is the failure this
   # branch exists to avoid. The COUNT was asserted above; this keeps the TARGETS the ones asserted.
+  # Deliberate consequence, stated: if the captured pid exits inside this window AND a different
+  # scoped process is alive at the kill point, that process is NOT signalled — a survivor is reported
+  # at the verification step below ("the scope also names [...] — not signalled") and left to the
+  # lock, because reaping an unasserted target is the failure this branch exists to avoid.
   _stopped=""
   for _p in $PIDS; do
     if kill -0 "$_p" 2>/dev/null; then kill -9 "$_p" 2>/dev/null || true; _stopped="$_stopped $_p"; fi

@@ -756,7 +756,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "=9",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: "DECLARED, NOT READ — the same shape as SCAN_MAX_AGE_S below, and its sibling `STALE_MIN` (:60, 12 m) is inert the same way. The name describes a real classification rule, but no code path in this file expands either symbol: a word-boundary grep returns the two declarations and nothing else, and neither is exported. The threshold that actually decides is implemented elsewhere and with a different number — `lane-status.py`'s `stale > 600` and `turn-end.py`'s `IDLE_MIN_S = 600`, i.e. 10 minutes, not 9. Registered so the DECLARED bound is in the vocabulary; the divergence is recorded on #1811 rather than silently relied on.",
+    note: "DECLARED, NOT READ — the same shape as SCAN_MAX_AGE_S below, and its sibling `STALE_MIN` (:60, 12 m) is inert the same way. The name describes a real classification rule, but no code path in its owner script, `scripts/orchestrator-heartbeat.sh`, expands either symbol: a word-boundary grep there returns the two declarations and nothing else, and neither is exported. The threshold that actually decides is implemented elsewhere and with a different number — `lane-status.py`'s `stale > 600` and `turn-end.py`'s `IDLE_MIN_S = 600`, i.e. 10 minutes, not 9. Registered so the DECLARED bound is in the vocabulary; the divergence is recorded on #1811 rather than silently relied on.",
   },
   {
     name: "CAP_IDLE_MIN",
@@ -764,7 +764,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "=20",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: "the FREE-CAPACITY eligibility bound, in MINUTES: a lane must be stale at least this long before it is a candidate for the free list (a lane merely BETWEEN steps is the measured false positive the clause's 9 m sibling is meant to avoid). Eligibility is not an offer — a candidate with no live pi OF ITS OWN (the pid record, or a pane probe when the record is silent) is then DROPPED, never offered, because a dead pane still carries its last session file and would otherwise read as idle-forever. (A lane with a child in flight is filtered out earlier and never reaches this bound at all.) Deliberately above IDLE_MIN.",
+    note: "the FREE-CAPACITY eligibility bound, in MINUTES: a lane must be stale at least this long before it is a candidate for the free list (a lane merely BETWEEN steps is the measured false positive the clause's 9 m sibling is meant to avoid). Eligibility is not an offer — WHEN the live-record set is non-empty, a candidate with no live pi OF ITS OWN (the pid record, or a pane probe when the record is silent) is then DROPPED, never offered, because a dead pane still carries its last session file and would otherwise read as idle-forever. (The precondition is real: if `cmux sessions list` returns nothing at all the record set is empty, the filter is skipped, and the candidate falls through to the offer — disclosed in the PR body, not fixed here.) A lane with a child in flight is filtered out earlier and never reaches this bound at all. Deliberately above IDLE_MIN.",
   },
   {
     name: "SCAN_MAX_AGE_S",
