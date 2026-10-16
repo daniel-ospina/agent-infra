@@ -354,6 +354,59 @@ refund_bailed_fixer() {
   return 0
 }
 
+# fixcount_sync <pr> <head> — reset the fixer-attempt counter when the PR's head has moved.
+#
+# ⛔ A BARE COUNTER IS NOT A CAP, IT IS A PERMANENT RECORD (measured 2026-10-16). `fixcount-<PR>`
+# was the ONLY per-PR marker not keyed on the head: `needsfix-<PR>-<head>` is keyed by construction,
+# and `parked-<PR>` stores the head INSIDE the file — so both already re-arm on a push and the park
+# check above (`[ "$(cat parked-$PR)" = "$HEAD_N" ]`) is deliberately skipped for a new revision.
+# The counter did not, and that is the defect: a PR that reached MAX_FIX_TRIES at revision A was
+# PARKED the moment revision B appeared, because `[ "$NF" -ge "$MAX_FIX_TRIES" ]` was already true
+# before B had had a single fix attempt. Measured on a live box: #8370 and #8443 sat in exactly that
+# state and were un-parked by hand by resetting `fixcount` to 0.
+#
+# ⛔ THE HEAD IS STORED BESIDE THE COUNT, NOT IN THE COUNT'S FILENAME, AND THAT IS DELIBERATE.
+# `state/fixcount-<PR>` must stay a BARE INTEGER whose path does not depend on a head: `fix-one.sh`
+# reads and writes it on its load-refusal REFUND path, which runs at process exit where its own
+# `gh pr view` head may have FAILED (empty) — and a head it cannot name is a head it cannot use to
+# build a path. Keeping the filename bare keeps every INCREMENT site (all three `echo $((N+1)) >`
+# lines) and the whole refund UNCHANGED, and puts the head comparison at the three READ sites, each
+# of which already holds HEAD_N. It also bounds state growth by construction: the counter and this
+# marker are PER-PR, never per-head, so a PR pushed N times still owns exactly two files rather than
+# N counters — `state/` cannot accumulate one file per sha and needs no prune pass.
+#
+# An UNKNOWN head never resets. `HEAD_N` is empty whenever `gh pr view` fails, and "we could not
+# read the head" is not evidence that it changed; resetting there would hand out a free attempt
+# (refunding work) on every transient API failure, while the pre-existing arms already refuse to
+# PARK on an unknown head for the mirror-image reason.
+fixcount_sync() { # <pr> <head>
+  local pr="$1" head="${2:-}" hf="$O/state/fixcount-head-$1" prev
+  [ -n "$head" ] || return 0
+  prev="$(cat "$hf" 2>/dev/null || true)"
+  [ "$prev" = "$head" ] && return 0
+  printf '%s\n' "$head" > "$hf"
+  # Mismatch == this revision has never had an attempt. Clearing the bare counter (rather than
+  # parsing and normalising its digits) is what makes the reset immune to the leading-zero class
+  # every other arithmetic site here has to guard: this function never does arithmetic on it.
+  rm -f "$O/state/fixcount-$pr"
+  return 0
+}
+
+# ⛔ `launchctl unload` REMOVES THE JOB, NOT THE PROCESS — AND THAT IS WHY THIS LOCK EXISTS.
+# The safe-looking way to adopt a new harness onto a live box is
+#     launchctl unload <plist>            # "stopped"
+#     cp <harness>/*.sh "$O"/           # deploy
+#     launchctl load -w <plist>           # restart
+# and it is wrong twice over: (a) the orphaned controller keeps running and `bash` reads a script
+# it is already executing INCREMENTALLY, so overwriting those files mid-script is undefined
+# behaviour; (b) the freshly loaded job starts a SECOND controller that can never take this lock,
+# so it logs `already running` and exits every cycle while the orphan drives the queue. The box then
+# LOOKS stopped (`launchctl list` shows nothing) while a stale process is still sweeping, reviewing
+# and merging. The safe stop is to TERM the pid the controller recorded in this lock (never
+# `pkill -f`: prompts are passed as argv, so a pattern can match prompt text and kill an unrelated
+# worker). Measured 2026-10-16 while adopting a new harness onto a live box. The docs correction
+# belongs in README §6 / ARCHITECTURE (held by another lane); orch-loop.sh carries this note because
+# this is where the trap actually bites.
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -1131,6 +1184,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
+          # A NEW head starts the attempt budget again: without this the cap reached at the old
+          # revision parks the new one before it is ever tried (see fixcount_sync).
+          fixcount_sync "$PR" "${HEAD_N:-}"
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
@@ -1248,6 +1304,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
+            # Same rule as the other two arms: the counter counts attempts at a REVISION.
+            fixcount_sync "$PR" "${HEAD_N:-}"
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
@@ -1301,6 +1359,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
           # marker, so restore is 0 (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
+          # Same rule as the other two arms: the counter counts attempts at a REVISION.
+          fixcount_sync "$PR" "${HEAD_N:-}"
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
