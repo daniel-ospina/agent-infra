@@ -121,15 +121,21 @@ mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/too
 # commit each, and a LOCAL `refs/remotes/origin/main` on the harness so HARNESS_REL is `current` with
 # no network and no reference to the operator's checkout. HARNESS_REPO is a fixture path (set in
 # cell_check/cell_start) precisely so no probe can reach the real one.
-git -C "$CELL_REPO" init -q
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" init -q
 # ⛔ HOST-CONFIG-PROOF, not `-c commit.gpgsign=false` alone. A global `commit.gpgsign = true` **or** a
 # global `core.hooksPath` pointing at a hook that fails (or any `init.templateDir` injecting one) makes
 # these commits die, the `update-ref` below then fails (`HEAD: not a valid SHA1`), `classify_harness`
 # reads `unknown`, and EVERY `cell_check` is refused — the whole suite reddens on a dev box while
 # staying green on CI, the mirror of the #1348/#1369 runner-only class this fixture exists to close.
-# Measured on this fixture: 78 passed / 17 failed under a `gpgsign = true` global config AND under a
-# `core.hooksPath` global config, 95/0 after. Neutralising the HOST config (rather than one key at a
-# time) closes the class; the fixture's identity travels in `-c`, so nothing else is lost.
+# Measured on this fixture before this change: 78 passed / 17 failed under a `core.hooksPath` global
+# config, 95/0 after. (`gpgsign = true` does not reproduce that figure any more — the round-1 fix
+# `-c commit.gpgsign=false`, replaced here, already neutralised it; that is the point of moving to the
+# host-neutral prefix, which covers the whole config rather than the one key that was noticed first.)
+# Neutralising the HOST config closes the class; the fixture's identity travels in `-c`, so nothing
+# else is lost. Every git call the fixture makes is prefixed, `init` included: a host
+# `init.templateDir` injects hooks into the new repo, and an unprefixed `init` would leave the call
+# below failing and the cell repo with no commit while every assertion still passed.
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
 cp "$HERE"/*.sh "$CELL_HARNESS/"
