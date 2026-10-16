@@ -134,6 +134,12 @@ def _orchestrator_env() -> dict:
             pl = plistlib.load(f)
     except Exception:
         return {}
+    # The ROOT shape is guarded too: `plistlib.load` happily returns a list/str/int for a
+    # well-formed plist whose top level is not a mapping, and `pl.get` would then raise OUTSIDE
+    # the try -- aborting the whole pass instead of falling back. Shape-guard the root, then the
+    # EnvironmentVariables value.
+    if not isinstance(pl, dict):
+        return {}
     env = pl.get("EnvironmentVariables")
     return env if isinstance(env, dict) else {}
 

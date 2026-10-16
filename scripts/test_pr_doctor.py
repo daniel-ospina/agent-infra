@@ -105,6 +105,22 @@ def test_capacity_rejects_a_bad_value_and_uses_the_default(monkeypatch, bad):
     assert pr.capacity()["max_fix"] == pr.DEFAULT_MAX_FIX
 
 
+def test_capacity_tolerates_a_plist_whose_root_is_not_a_dict(monkeypatch, tmp_path):
+    """A well-formed plist whose root is not a mapping must fall back, never raise.
+
+    `plistlib.load` succeeds for a top-level array/string/int, so the shape guard has to cover
+    the ROOT too -- otherwise a corrupted or hand-edited plist aborts the whole pass (the
+    pre-fix code never read the plist at all) instead of using the env/defaults.
+    """
+    import plistlib
+    plist = tmp_path / "loop.plist"
+    with open(plist, "wb") as f:
+        plistlib.dump([{"Label": "com.eldato.orchestrator-loop"}], f)
+    monkeypatch.setattr(pr, "ORCH_PLIST", str(plist))
+    monkeypatch.setenv("MAX_FIX", "16")
+    assert pr.capacity() == {"max_fix": 16, "max_review": pr.DEFAULT_MAX_REVIEW}
+
+
 def test_orch_plist_path_is_pinned_to_install_sh_label():
     """The ONE home must not silently evaporate if the launchd label is renamed.
 
