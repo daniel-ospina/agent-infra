@@ -1396,7 +1396,7 @@ merge_art_knobs_ok() {
 }
 
 # refuse_bad_merge_art_attempts_override <value> -> 1 (having said why) when the
-# SINGLE-SHOT override is unusable (#1709 rec 7 review). The override is a CALLER's
+# SINGLE-SHOT override is unusable. The override is a CALLER's
 # arithmetic bound on the one door, so it gets the knob's own three refusals, named —
 # rather than the silent substitution that would reproduce #1690's defaulting.
 refuse_bad_merge_art_attempts_override() {
@@ -1697,7 +1697,8 @@ require_draft() {
 #   MERGE_ART_STATE      the observed state, or `<unreadable>`
 #   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
 #   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
-#                        `0` on the one path that reads nothing: a refused knob
+#                        `0` on the two paths that read nothing: a refused knob, or a
+#                        rejected attempts override (`return 1` on both)
 #   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
 #                        bounded line), empty when that attempt wrote none — never an
 #                        earlier attempt's text
@@ -1712,12 +1713,11 @@ poll_merge_artifact() { # <pr> [attempts-override]
   # (`''`) is the optional-arg contract and keeps the configured window — both in-rail
   # callers pass no override. A PRESENT value is a CALLER's arithmetic bound, so it is
   # REFUSED BY NAME unless it is a validated positive integer within TIMING_KNOB_MAX
-  # (refuse_bad_merge_art_attempts_override) — never silently defaulted. The first version
-  # of this accepted any all-digit value with no leading zero and DEFAULTED every other
-  # shape, which is #1690's defaulting one arm over: `… 08` quietly polled the configured
-  # window, and `… 1000000000` — one past TIMING_KNOB_MAX — became a bound the loop's
-  # arithmetic cannot hold, the very symptom this block exists to prevent. A caller's typo
-  # must be LOUD, not silently substituted.
+  # (refuse_bad_merge_art_attempts_override) — never silently defaulted. Defaulting is
+  # #1690's failure one arm over: a present-but-unvalidated override would have `… 08`
+  # quietly poll the configured window, and `… 1000000000` — one past TIMING_KNOB_MAX —
+  # become a bound the loop's arithmetic cannot hold, the very symptom this block exists to
+  # prevent. A caller's typo must be LOUD, not silently substituted.
   # (Pinned by tests/admin-merge/run.sh's `override-probe` block.)
   local pr="$1" attempts_override="${2:-}"
   MERGE_ART_VERDICT="unreadable"
@@ -1731,13 +1731,14 @@ poll_merge_artifact() { # <pr> [attempts-override]
   MERGE_ART_ATTEMPTS="0"
   MERGE_ART_DIAG=""
   local attempts="$VERIFY_ATTEMPTS"
-  # ⛔ ABSENT keeps the window (optional arg); PRESENT is VALIDATED, NOT DEFAULTED (#1709
-  # rec 7 review). The three refusals below are the same three the knob itself is refused
-  # for, so no path can put an arithmetic bound in here that `merge_art_knobs_ok` would have
-  # rejected had it been the knob — which is exactly what the block comment above claims.
-  # `return 1` here is the same shape as the knob refusal below: the globals are already set
-  # (MERGE_ART_ATTEMPTS is the TRUE `0`, i.e. zero reads ran), so every caller's message
-  # stays truthful and no unbound-variable abort can reach `set -u`.
+  # ⛔ ABSENT keeps the window (optional arg); PRESENT is VALIDATED, NOT DEFAULTED. The
+  # three refusals below are the same three the knob itself is refused for, so no path can
+  # put an arithmetic bound in here that `merge_art_knobs_ok` would have rejected had it
+  # been the knob. `return 1` here is the same shape as the knob refusal below: the globals
+  # are already set (MERGE_ART_ATTEMPTS is the TRUE `0`, i.e. zero reads ran), so no caller
+  # can hit an unbound-variable abort under `set -u` and the count they report is true. The
+  # refusal is distinguished from a failed read by the STATUS, not by the verdict — the
+  # step-0a caller checks it, so a caller typo is never re-narrated as an unreadable read.
   if [ -n "$attempts_override" ]; then
     if counter_has_leading_zero "$attempts_override" \
        || ! counter_is_positive "$attempts_override" \
@@ -5335,8 +5336,18 @@ main() {
   # a false block, the other failure direction — for no safety gain. The residual is
   # declared rather than implied: a duplicate whose PRE-check read fails can still
   # post its second evidence comment. It cannot corrupt state.
+  # ⛔ A REFUSED OVERRIDE IS A CALLER ERROR, NOT A READ FAILURE, so it is not folded into
+  # the unreadable arm below: that arm prints "could not READ the state of PR #…", which for
+  # a refusal would name the wrong cause (a GitHub blip) for a caller's bad bound, and would
+  # attribute a claim about reality to a read that never ran. `poll_merge_artifact` returns
+  # NON-ZERO exactly on a refusal, so the status separates the two cases here. (The rail's
+  # own knob is validated at startup, so this is the only refusal reachable from step 0a.)
   # shellcheck disable=SC2086
-  poll_merge_artifact "$PR" 1
+  if ! poll_merge_artifact "$PR" 1; then
+    say_err "admin-merge: ✗ the already-merged pre-check could not run — its attempts override was REFUSED (above)."
+    say_err "   This is a CALLER error, not a read failure: refusing rather than reading the artifact with an unvalidated bound."
+    exit 2
+  fi
   if [ "$MERGE_ART_VERDICT" = "merged" ]; then
     info "admin-merge: ✅ PR #$PR is ALREADY MERGED (state=MERGED, mergedAt=$MERGE_ART_MERGED_AT) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt"
     exit 0

@@ -3216,7 +3216,7 @@ case "$RECORD_ERR" in
     *)            ok "15.7 the different-artifact run did NOT take the no-op path" ;;
 esac
 
-# 15.8 the LEGACY MIGRATION still runs when the record write is SKIPPED (review finding).
+# 15.8 the LEGACY MIGRATION still runs when the record write is SKIPPED.
 #      The comment on the guard CLAIMS the legacy-migration and evidence-post blocks below
 #      still run — code the no-op path does not itself execute — so it must be PINNED, not
 #      asserted. The run below is a true same-head DUPLICATE (the diff matches what is on

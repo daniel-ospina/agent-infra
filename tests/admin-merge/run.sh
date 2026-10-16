@@ -12256,7 +12256,7 @@ grep -q "ALREADY MERGED" "$SCEN/out" \
   && fail "an UNMERGED PR was no-op'd as already merged" \
   || pass "an unmerged PR is not skipped — the rail proceeds past the pre-check"
 # ⛔ "THE RAIL PROCEEDED" MUST BE AN OBSERVABLE OF THE DECISION, NOT THE PRE-CHECK'S OWN
-# READ (review finding): the fake logs argv BEFORE any branch (line ~235), so a
+# READ: the fake logs argv BEFORE any branch (line ~235), so a
 # `grep state,mergedAt` is satisfied by the pre-check itself and a mutant that REFUSED right
 # after it would still be green. The HEAD read is the first thing AFTER the decision, so it
 # is the observable. (This scenario's head fixture is ABSENT, so the rail proceeds and then
@@ -12299,7 +12299,7 @@ grep -q 'headRefOid' "$SCEN/calls" \
   && pass "  …and the rail PROCEEDED past the unreadable pre-check (it went on to read the head)" \
   || fail "  …but the rail did not proceed (a failed read became a refusal)"
 
-# ⛔ AND THE OVERRIDE ITSELF IS VALIDATED, NOT DEFAULTED (review finding). The pre-check
+# ⛔ AND THE OVERRIDE ITSELF IS VALIDATED, NOT DEFAULTED. The pre-check
 # passes a literal `1`, but the second arg is a CALLER's arithmetic bound on the ONE door,
 # so a bad one must be REFUSED BY NAME — not silently replaced by the configured window
 # (#1690's defaulting, one arm over) and not accepted past the arithmetic range
@@ -12316,6 +12316,13 @@ POLL_GH() {                # every attempt answers OPEN, so the BOUND decides th
   local n
   n=$(( $(cat "$POLL_CNT" 2>/dev/null || echo 0) + 1 ))
   printf '%s' "$n" > "$POLL_CNT"
+  # ⛔ A BOUND ON THE STUB ITSELF. If an over-max override were ever ACCEPTED (the
+  # `counter_exceeds_max` arm weakened or dropped), the loop would run ~1e9 iterations and
+  # WEDGE the suite rather than reddening it — this box has no `timeout` binary and the CI
+  # job sets no `timeout-minutes`. Exiting non-zero here makes that regression a fast, loud
+  # failure (no stdout line ⇒ `ov_run`'s count assertion reddens) instead of a hang. 20 is
+  # far above the 6 the absent-override control uses, so no green row can reach it.
+  [ "$n" -le 20 ] || { printf 'override-probe: the poll loop exceeded any sane bound (n=%s)\n' "$n" >&2; exit 3; }
   printf 'OPEN\t-\n'
 }
 rc=0
