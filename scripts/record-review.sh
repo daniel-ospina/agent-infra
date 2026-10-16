@@ -2177,7 +2177,9 @@ fi
 # The legacy-migration and evidence-post blocks below still run: they are already
 # idempotent, and skipping them would only make a duplicate STRAND the legacy key
 # (the failure this whole block exists to avoid) — the record file is the one
-# side effect that was not idempotent.
+# side effect that was not idempotent. ⛔ This is a CLAIM ABOUT CODE THE NO-OP PATH
+# DOES NOT EXECUTE, so it is pinned by record-review.test.sh §15.8 (a same-head
+# duplicate with a legacy key present must still remove it) rather than asserted.
 if [ -f "$FILE" ] && [ "$(record_identity "$FILE")" = "$(record_identity "$TMP")" ]; then
   rm -f "$TMP"
   echo "#1709 rec 7 idempotent: $REPO#$PR already records verdict=$VERDICT at head ${SHA:0:12}… with the same binding — record NOT rewritten (reviewed_at preserved)" >&2
