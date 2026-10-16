@@ -203,6 +203,13 @@ disk_free_mb() { # disk_free_mb <path>
 # run_agent, a `0100` reading at floor 500 REFUSED (77) under the `case` form and ALLOWED under the
 # `is_num` form. Unreachable from the shipped probe (`printf "%d"` never emits a leading zero) and
 # exactly the kind of divergence this file's "ONE predicate" rule exists to stop.
+# ⚠️ STATED LIMIT, DELIBERATELY LEFT AS ONE (review round, P3): an ALL-DIGIT reading too long for the
+# comparison — 19+ digits, i.e. above int64 — is READABLE here but makes `[ -ge ]` ERROR (rc=2), which
+# `disk_ok`/`disk_low` return as non-zero. So such a reading is REFUSED (fail-CLOSED, no agent starts)
+# WITHOUT the "could not read free space" warning. Narrowing this reader to reject it would flip the
+# class to UNREADABLE = WARN + ALLOW: a real fail-open traded for one missing log line. Unreachable in
+# practice — `df -Pk`'s 4th column is digit-validated and divided by 1024, so reaching 19 digits needs
+# ~2^63 MiB free.
 disk_readable() { # disk_readable <free-mb>
   case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
 }
