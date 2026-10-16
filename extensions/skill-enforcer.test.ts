@@ -22,7 +22,7 @@
  * workstation) and reports as skipped otherwise.
  */
 import { ok, equal, deepEqual } from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, existsSync, realpathSync, readdirSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, copyFileSync, linkSync, existsSync, realpathSync, readdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -38,6 +38,9 @@ import hook, {
   MODULE_DIR,
   REPO_DIR,
   canonicalSkillName,
+  canonicalSkillFile,
+  canonicalSkillsRoot,
+  CANONICAL_FARM_ERROR,
   skillRoots,
   skillDisplayPath,
   skillFileFor,
@@ -73,6 +76,9 @@ function tmpDir(prefix: string): string {
   return d;
 }
 function cleanup() {
+  // Restore the real HOME BEFORE removing the fixture, so nothing post-exit
+  // resolves `~/.pi` into a directory that is about to disappear.
+  if (FIXTURE_HOME) process.env.HOME = REAL_HOME;
   for (const d of TMP) rmSync(d, { recursive: true, force: true });
 }
 
@@ -144,11 +150,55 @@ const PI_STUB_PKG = "@earendil-works/pi-coding-agent";
 // Sections A-F still exercise THIS checkout's module (in-process import); only
 // section G (the deployed-layout leg) swaps, which is exactly the defect.
 const EXT_SRC = process.env.SE_TEST_MODULE_SRC ?? join(REPO_ROOT, "extensions", "skill-enforcer.ts");
-const PI_SKILLS = join(homedir(), ".pi", "agent", "skills");
-const WORKTREE_SKILL = join(PI_SKILLS, "using-git-worktrees", "SKILL.md");
 const WORKTREE_CMD = "git worktree add /tmp/se-probe";
+
+// ── Hermetic DEPLOYED layout (#1327) ─────────────────
+// The suite must run against the provenance model, which means a REAL skill
+// file must be reachable through the path pi serves. Rather than write into the
+// developer's `~/.pi` (forbidden — see the hermeticity leg), `main()` swaps
+// `process.env.HOME` to a fixture before the first session and gives it the
+// deployed shape: `~/.pi/agent/skills` as a real directory of per-skill symlinks
+// into the canonical farm. That is also the shape that lets a leg plant a
+// forgery NEXT TO the real skill, which is #1327 in the deployed layout.
+const REAL_HOME = homedir();
 /** The developer's OWN reader cache — the child runs must never touch it. */
-const REAL_READS_FILE = join(homedir(), ".pi", "agent", "skill-reads.json");
+const REAL_READS_FILE = join(REAL_HOME, ".pi", "agent", "skill-reads.json");
+let FIXTURE_HOME = "";
+let PI_SKILLS = "";
+let WORKTREE_SKILL = "";
+/** Skills the suite's fixture HOME serves, beyond the ones it plants per leg. */
+const FIXTURE_SKILLS = ["commit-workflow", "using-git-worktrees", "issue-scoping", "how-to-use-tortoise"];
+
+/** Materialise a skill under `<base>/<shape>/<name>/SKILL.md`. `forged` writes
+ *  content the canonical farm does not have — the #1327 forgery. `copy` is
+ *  byte-identical but a DIFFERENT inode (the sync.sh folder-copy machine). */
+function plantSkill(
+  base: string,
+  shape: string,
+  name: string,
+  mode: "forged" | "copy" | "hardlink" | "dir-symlink",
+): string {
+  const dir = join(base, ...shape.split("/"), name);
+  const canonical = join(REPO_ROOT, "skills", name, "SKILL.md");
+  if (mode === "dir-symlink") {
+    mkdirSync(dirname(dir), { recursive: true });
+    symlinkSync(join(REPO_ROOT, "skills", name), dir, "dir");
+    return join(dir, "SKILL.md");
+  }
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, "SKILL.md");
+  if (mode === "forged") writeFileSync(file, "anything at all\n");
+  else if (mode === "copy") copyFileSync(canonical, file);
+  else linkSync(canonical, file);
+  return file;
+}
+
+/** Run `fn` with `process.cwd()` at `dir` — `skillRoots()` reads cwd per call. */
+async function inDir<T>(dir: string, fn: () => T | Promise<T>): Promise<T> {
+  const prev = process.cwd();
+  process.chdir(dir);
+  try { return await fn(); } finally { process.chdir(prev); }
+}
 
 /**
  * A `~/.pi/agent/extensions`-shaped farm. `kind` decides whether the extension
@@ -239,6 +289,19 @@ const after = await fire({ toolName: "bash", input: { command: ${JSON.stringify(
 // ambient SKILLS_PREFIX override says.
 await fire({ toolName: "read", input: { path: "/tmp/evil/skills/commit-workflow/SKILL.md" } });
 const evil = await fire({ toolName: "bash", input: { command: "git commit -m x" } });
+// #1327 probe: a SKILL.md FORGED inside a trusted root (cwd/skills/, which is
+// the agent's own checkout) must not clear the git gate either...
+const fs = require("node:fs"), path = require("node:path");
+const forgedDir = path.join(process.cwd(), "skills", "commit-workflow");
+fs.mkdirSync(forgedDir, { recursive: true });
+const forgedSkill = path.join(forgedDir, "SKILL.md");
+fs.writeFileSync(forgedSkill, "not the real skill\\n");
+await fire({ toolName: "read", input: { path: forgedSkill } });
+const forged = await fire({ toolName: "bash", input: { command: "git commit -m x" } });
+// ...and the POSITIVE CONTROL for that leg: the real skill at the canonical path
+// still clears the same gate, so forgedCommitBlocked cannot pass vacuously.
+await fire({ toolName: "read", input: { path: ${JSON.stringify(join(REPO_ROOT, "skills", "commit-workflow", "SKILL.md"))} } });
+const realCommit = await fire({ toolName: "bash", input: { command: "git commit -m x" } });
 // Restore only now, so the FACTORY-time banner is captured too — the pre-fix
 // module announces itself here (and not at all under PI_MODE=print), which is
 // the artifact the red leg is about.
@@ -250,6 +313,10 @@ process.stdout.write(JSON.stringify({
   blockedBeforeRead: !!(before && before.block),
   blockedAfterRead: !!(after && after.block),
   evilCommitBlocked: !!(evil && evil.block),
+  forgedCommitBlocked: !!(forged && forged.block),
+  realCommitBlocked: !!(realCommit && realCommit.block),
+  canonicalFarm: mod.CANONICAL_SKILLS_RESOLUTION ?? (mod.canonicalSkillsRoot ? mod.canonicalSkillsRoot() : null),
+  canonicalFarmError: mod.CANONICAL_FARM_ERROR ?? null,
   blockReason: (before && before.reason) || null,
   // Defensive: the PRE-FIX module has none of these (that is the red signal),
   // and a driver that throws would report nothing at all.
@@ -305,6 +372,10 @@ function describeRun(r: { json: any; stderr: string }): string {
       counts: r.json?.counts,
       blockedBeforeRead: r.json?.blockedBeforeRead,
       blockedAfterRead: r.json?.blockedAfterRead,
+      forgedCommitBlocked: r.json?.forgedCommitBlocked,
+      realCommitBlocked: r.json?.realCommitBlocked,
+      canonicalFarm: r.json?.canonicalFarm,
+      canonicalFarmError: r.json?.canonicalFarmError,
       health: r.json?.health,
       logs: r.json?.logs,
     },
@@ -316,7 +387,7 @@ function describeRun(r: { json: any; stderr: string }): string {
 function findJiti(): string | null {
   const explicit = process.env.PI_JITI_PATH;
   if (explicit && existsSync(explicit)) return explicit;
-  const base = join(homedir(), ".local", "share", "pi-node");
+  const base = join(REAL_HOME, ".local", "share", "pi-node");
   if (!existsSync(base)) return null;
   try {
     for (const v of readdirSync(base)) {
@@ -329,6 +400,27 @@ function findJiti(): string | null {
 
 // ── suite ────────────────────────────────────────────
 async function main() {
+  // ── Hermetic DEPLOYED fixture (#1327) ────────────────
+  // Swap HOME BEFORE any session: the extension resolves `~/.pi/agent/skills`
+  // per call, and the provenance legs must read a REAL skill through the path pi
+  // serves. Writing the developer's own ~/.pi is refused (see the hermeticity
+  // leg). `npm_config_cache` keeps `npx tsx` on the developer's cache so the
+  // fixture HOME cannot make a child try to download the runner.
+  FIXTURE_HOME = tmpDir("se-home-");
+  process.env.HOME = FIXTURE_HOME;
+  process.env.npm_config_cache ??= join(REAL_HOME, ".npm");
+  PI_SKILLS = join(FIXTURE_HOME, ".pi", "agent", "skills");
+  WORKTREE_SKILL = join(PI_SKILLS, "using-git-worktrees", "SKILL.md");
+  mkdirSync(join(PI_SKILLS, "reviewers"), { recursive: true });
+  for (const name of FIXTURE_SKILLS) {
+    symlinkSync(join(REPO_ROOT, "skills", name), join(PI_SKILLS, name), "dir");
+  }
+  symlinkSync(
+    join(REPO_ROOT, "skills", "reviewers", "duplication-architecture"),
+    join(PI_SKILLS, "reviewers", "duplication-architecture"),
+    "dir",
+  );
+
   section("A. manifest load semantics — T2/T3/T4/T10 (#1321)");
   const dir = tmpDir("se-manifest-");
 
@@ -484,18 +576,24 @@ async function main() {
     equal(r.path, REAL_MANIFEST);
   });
 
-  section("C. canonical skill identity — T5/T6/T7 (#1322)");
+  section("C. canonical skill identity — T5/T6/T7 (#1322) + provenance (#1327)");
   const NAME = "commit-workflow";
-  const rooted: Array<[string, string]> = [
-    ["pi user skills", join(homedir(), ".pi", "agent", "skills", NAME, "SKILL.md")],
-    ["pi project skills", join(process.cwd(), ".pi", "skills", NAME, "SKILL.md")],
-    ["repo skills/", join(process.cwd(), "skills", NAME, "SKILL.md")],
-    ["consumer operations/skills/", join(process.cwd(), "operations", "skills", NAME, "SKILL.md")],
-    ["repo .agents/skills/", join(process.cwd(), ".agents", "skills", NAME, "SKILL.md")],
-    ["module-repo skills/", join(REPO_ROOT, "skills", NAME, "SKILL.md")],
-  ];
-  await test("T5 — every served/consumer root resolves to the SAME canonical key", () => {
-    for (const [label, p] of rooted) equal(canonicalSkillName(p), NAME, label);
+  const CANONICAL = join(REPO_ROOT, "skills", NAME, "SKILL.md");
+
+  await test("T5 — every served/consumer root resolves to the SAME canonical key", async () => {
+    // Each layout must carry the REAL skill (a link or a copy of it) to register.
+    const shapes = ["skills", "operations/skills", ".agents/skills", ".pi/skills"];
+    for (const shape of shapes) {
+      for (const mode of ["hardlink", "copy", "dir-symlink"] as const) {
+        const base = tmpDir(`se-root-${mode}-`);
+        const p = plantSkill(base, shape, NAME, mode);
+        await inDir(base, () => equal(canonicalSkillName(p), NAME, `${shape} (${mode})`));
+      }
+    }
+    // The pi-served path (a per-skill symlink under the fixture HOME) and the
+    // canonical farm path itself, both without any fixture base.
+    equal(canonicalSkillName(join(PI_SKILLS, NAME, "SKILL.md")), NAME, "pi user skills");
+    equal(canonicalSkillName(CANONICAL), NAME, "module-repo skills/");
   });
 
   await test("T7 — a path outside every trusted root does NOT register", () => {
@@ -507,10 +605,66 @@ async function main() {
     ]) equal(canonicalSkillName(p), null, `${p} must not satisfy a gate`);
   });
 
+  // ── #1327 — the residual this issue closes ──────────
+  await test("#1327 — a SKILL.md FORGED inside a trusted root does NOT register", async () => {
+    for (const shape of ["skills", "operations/skills", ".agents/skills", ".pi/skills"]) {
+      const base = tmpDir(`se-forged-${shape.replace(/\//g, "-")}-`);
+      const p = plantSkill(base, shape, NAME, "forged");
+      await inDir(base, () =>
+        equal(canonicalSkillName(p), null, `${shape}/${NAME}/SKILL.md carries a forged SKILL.md — it must not satisfy a gate (#1327)`),
+      );
+    }
+  });
+
+  await test("#1327 — the forgery is refused even through the path pi SERVES (per-skill dir, fixture HOME)", () => {
+    // The deployed fixture HOME is a real `~/.pi/agent/skills` directory of
+    // symlinks, so a forgery can be planted NEXT TO the real skills — the exact
+    // shape #1327 describes (`~/.pi/agent/skills wherever it is writable`).
+    const fakeHome = tmpDir("se-forged-home-");
+    const skills = join(fakeHome, ".pi", "agent", "skills");
+    mkdirSync(skills, { recursive: true });
+    symlinkSync(join(REPO_ROOT, "skills", "how-to-use-tortoise"), join(skills, "how-to-use-tortoise"), "dir");
+    const forged = plantSkill(join(fakeHome, ".pi", "agent"), "skills", NAME, "forged");
+    const real = join(skills, "how-to-use-tortoise", "SKILL.md");
+    const prev = process.env.HOME;
+    process.env.HOME = fakeHome;
+    try {
+      equal(canonicalSkillName(real), "how-to-use-tortoise", "the real neighbour must still register");
+      equal(canonicalSkillName(forged), null, "the forged neighbour must not");
+    } finally {
+      process.env.HOME = prev;
+    }
+  });
+
+  await test("#1327 — a name the canonical farm does not ship can never register, whatever is planted", async () => {
+    const base = tmpDir("se-ghost-");
+    const skills = join(base, "skills");
+    mkdirSync(skills, { recursive: true });
+    const ghost = join(skills, "totally-made-up-skill", "SKILL.md");
+    mkdirSync(join(skills, "totally-made-up-skill"), { recursive: true });
+    writeFileSync(ghost, "frontmatter-ish:\nname: totally-made-up-skill\n");
+    await inDir(base, () => equal(canonicalSkillName(ghost), null, "no canonical copy exists for this name"));
+    equal(canonicalSkillFile("totally-made-up-skill"), null, "canonical lookup must agree");
+  });
+
+  await test("#1327 — an extra byte on otherwise canonical content is NOT the skill", async () => {
+    const base = tmpDir("se-tamper-");
+    const p = plantSkill(base, "skills", NAME, "copy");
+    writeFileSync(p, readFileSync(CANONICAL, "utf-8") + "\n<!-- tampered -->\n");
+    await inDir(base, () => equal(canonicalSkillName(p), null, "a tampered copy is not the skill — content identity is exact"));
+  });
+
   await test("relative + trailing-slash paths normalise; nested skills key on the owning dir", () => {
-    equal(canonicalSkillName(`skills/${NAME}/SKILL.md`), NAME);
-    equal(canonicalSkillName(join(REPO_ROOT, "skills", NAME, "SKILL.md") + "/"), NAME);
-    equal(canonicalSkillName(join(homedir(), ".pi", "agent", "skills", "reviewers", "duplication-architecture", "SKILL.md")), "duplication-architecture");
+    equal(canonicalSkillName(`skills/${NAME}/SKILL.md`), NAME, "cwd is the repo, which carries the canonical skill");
+    equal(canonicalSkillName(CANONICAL + "/"), NAME);
+    const nested = join(PI_SKILLS, "reviewers", "duplication-architecture", "SKILL.md");
+    ok(existsSync(nested), `fixture missing: ${nested}`);
+    equal(canonicalSkillName(nested), "duplication-architecture");
+    equal(
+      canonicalSkillFile("duplication-architecture"),
+      join(REPO_ROOT, "skills", "reviewers", "duplication-architecture", "SKILL.md"),
+      "a nested skill's canonical file is found under its nested shape, not at the farm root",
+    );
     equal(canonicalSkillName(join(REPO_ROOT, "skills", NAME, "README.md")), null);
     equal(canonicalSkillName(""), null);
   });
@@ -533,6 +687,14 @@ async function main() {
     ok(skillRoots().length > 0);
   });
 
+  await test("#1327 — the canonical provenance anchor is the farm beside THIS module, and it exists", () => {
+    equal(CANONICAL_FARM_ERROR, null, `the checkout must carry skills/ next to the module: ${CANONICAL_FARM_ERROR}`);
+    deepEqual(canonicalSkillsRoot(), { path: join(REPO_ROOT, "skills"), source: "module" });
+    for (const name of Object.keys(MANIFEST_RULES)) {
+      equal(canonicalSkillFile(name), join(REPO_ROOT, "skills", name, "SKILL.md"), `${name} must have a canonical copy (a gate nobody can satisfy is a false block)`);
+    }
+  });
+
   section("D. read-tracking + the git positive control — #1321 Ind 2, #1322 Ind 1/2/3");
   await test("git commit is BLOCKED before the read, and the reason names the skill + an existing path", async () => {
     const { pi } = await newSession();
@@ -547,16 +709,20 @@ async function main() {
   await test("a read through the pi-served ~/.pi/agent/skills path clears it, and registers ONE canonical key", async () => {
     const { pi, reads } = await newSession();
     equal((await pi.fire("tool_call", COMMIT))?.block, true);
-    await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", "commit-workflow", "SKILL.md") } });
+    await pi.fire("tool_call", { toolName: "read", input: { path: join(PI_SKILLS, "commit-workflow", "SKILL.md") } });
     equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "the read must clear the gate");
     deepEqual(persistedNames(reads), ["commit-workflow"], "skill-reads.json must hold the canonical NAME (#1322 Ind 3)");
   });
 
   await test("T6 — a read through .agents/skills/ clears the gate too", async () => {
     const { pi, reads } = await newSession();
-    await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, ".agents", "skills", "commit-workflow", "SKILL.md") } });
-    equal((await pi.fire("tool_call", COMMIT))?.block, undefined);
-    deepEqual(persistedNames(reads), ["commit-workflow"]);
+    const base = tmpDir("se-agents-");
+    const planted = plantSkill(base, ".agents/skills", "commit-workflow", "hardlink");
+    await inDir(base, async () => {
+      await pi.fire("tool_call", { toolName: "read", input: { path: planted } });
+      equal((await pi.fire("tool_call", COMMIT))?.block, undefined);
+      deepEqual(persistedNames(reads), ["commit-workflow"]);
+    });
   });
 
   await test("T7 — reading a forged unanchored path does NOT clear the gate", async () => {
@@ -564,6 +730,34 @@ async function main() {
     await pi.fire("tool_call", { toolName: "read", input: { path: "/tmp/evil/skills/commit-workflow/SKILL.md" } });
     equal((await pi.fire("tool_call", COMMIT))?.block, true, "a forged path must not satisfy the gate");
     deepEqual(persistedNames(reads), []);
+  });
+
+  // ── #1327 — the closed residual, end-to-end through the gate handler ──────
+  await test("#1327 — a forged SKILL.md INSIDE a trusted root does NOT clear an armed gate", async () => {
+    const base = tmpDir("se-forged-e2e-");
+    const forged = plantSkill(base, "skills", "commit-workflow", "forged");
+    await inDir(base, async () => {
+      const { pi, reads } = await newSession();
+      equal((await pi.fire("tool_call", COMMIT))?.block, true, "the git gate must be ARMED before the read (else this leg is vacuous)");
+      await pi.fire("tool_call", { toolName: "read", input: { path: forged } });
+      equal((await pi.fire("tool_call", COMMIT))?.block, true, "`mkdir -p <root>/commit-workflow && read` must not satisfy the gate (#1327)");
+      deepEqual(persistedNames(reads), [], "a forgery must not persist as a read either");
+    });
+  });
+
+  await test("#1327 — the SAME forged look-alike is accepted when it IS the canonical bytes", async () => {
+    // The complement: a byte-identical copy (the sync.sh folder-copy machine) and
+    // a hard link both prove the skill's instructions were reached.
+    for (const mode of ["copy", "hardlink"] as const) {
+      const base = tmpDir(`se-real-${mode}-`);
+      const planted = plantSkill(base, "skills", "commit-workflow", mode);
+      await inDir(base, async () => {
+        const { pi } = await newSession();
+        equal((await pi.fire("tool_call", COMMIT))?.block, true);
+        await pi.fire("tool_call", { toolName: "read", input: { path: planted } });
+        equal((await pi.fire("tool_call", COMMIT))?.block, undefined, `${mode} must clear the gate`);
+      });
+    }
   });
 
   await test("#6131 — the operator-taking verbs hard-block until the skill is read, then clear", async () => {
@@ -594,7 +788,7 @@ async function main() {
     const { pi } = await newSession();
     await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, "skills", "writing-plans", "SKILL.md") } });
     ok((await pi.fire("tool_call", { toolName: "write", input: { path: "x.ts" } }))?.block, "writing-plans without issue-scoping must block write");
-    await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", "issue-scoping", "SKILL.md") } });
+    await pi.fire("tool_call", { toolName: "read", input: { path: join(PI_SKILLS, "issue-scoping", "SKILL.md") } });
     equal((await pi.fire("tool_call", { toolName: "write", input: { path: "x.ts" } }))?.block, undefined);
   });
 
@@ -605,7 +799,7 @@ async function main() {
     ok(String(nudge.message.content).includes(skillDisplayPath("commit-workflow")), String(nudge.message.content));
     ok(existsSync(skillDisplayPath("commit-workflow")));
     // Suppression must work through a NON-prefix path — the old key check did not.
-    await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", "commit-workflow", "SKILL.md") } });
+    await pi.fire("tool_call", { toolName: "read", input: { path: join(PI_SKILLS, "commit-workflow", "SKILL.md") } });
     equal(await pi.fire("before_agent_start", { prompt: "let me commit this" }), undefined);
   });
 
@@ -617,7 +811,7 @@ async function main() {
     equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "a legacy entry must still satisfy the gate");
     // Any subsequent read re-persists the whole set, so this is also the check
     // that the OLD entry is rewritten in canonical form (no path-shaped keys).
-    await pi.fire("tool_call", { toolName: "read", input: { path: join(homedir(), ".pi", "agent", "skills", "issue-scoping", "SKILL.md") } });
+    await pi.fire("tool_call", { toolName: "read", input: { path: join(PI_SKILLS, "issue-scoping", "SKILL.md") } });
     deepEqual(persistedNames(reads), ["commit-workflow", "issue-scoping"]);
   });
 
@@ -634,8 +828,8 @@ async function main() {
 
   await test("T13 — a PATH-SHAPED entry naming a ghost under a trusted root is refused, loudly", async () => {
     const { pi, reads } = await newSession();
-    // Shape alone must not be enough: canonicalSkillName never touches the
-    // filesystem, so the existence check is the only thing standing here.
+    // `canonicalSkillName` is now identity-checked, so the NAME comes from the
+    // shape and the canonical farm decides whether that name is a real skill.
     writeFileSync(reads, JSON.stringify([{ file: join(REPO_ROOT, "skills", "definitely-not-a-real-skill-xyz", "SKILL.md"), readAt: Date.now() }]));
     const errs: string[] = [];
     const orig = console.error;
@@ -643,6 +837,21 @@ async function main() {
     try { await pi.fire("session_start", {}); } finally { console.error = orig; }
     ok(errs.join("\n").includes("unresolvable"), `a ghost path entry must be diagnosed, got: ${errs.join("|")}`);
     equal((await pi.fire("tool_call", COMMIT))?.block, true);
+  });
+
+  await test("T13 residual (#1327 boundary) — a persisted entry naming a REAL skill restores on the NAME alone", async () => {
+    // Declared, not silent: the 24 h persistence window (#7416, by design; #1331
+    // owns the window itself) is keyed on the NAME. #1327 narrowed the entry to
+    // "must name a skill agent-infra ships" — it did NOT re-prove the recorded
+    // path's provenance, and this pins that boundary explicitly.
+    const base = tmpDir("se-t13-residual-");
+    const forged = plantSkill(base, "skills", "commit-workflow", "forged");
+    await inDir(base, async () => {
+      const { pi, reads } = await newSession();
+      writeFileSync(reads, JSON.stringify([{ file: forged, readAt: Date.now() }]));
+      await pi.fire("session_start", {});
+      equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "the accepted T13 residual: a real NAME restores for <=24 h");
+    });
   });
 
   await test("a corrupt reads file is diagnosed, not silently dropped, and does not throw", async () => {
@@ -666,6 +875,16 @@ async function main() {
   await test("no gate key is built from SKILLS_PREFIX any more (only the display fallback)", () => {
     const hits = SOURCE.match(/SKILLS_PREFIX\}\$\{/g) ?? [];
     equal(hits.length, 1, `expected exactly one SKILLS_PREFIX key construction (the display fallback), got ${hits.length}`);
+  });
+  await test("#1327 — the read gate resolves the CANONICAL file and compares identity, shape alone is not enough", () => {
+    ok(
+      /canonicalSkillFileForRel\(match\.rel\)/.test(SOURCE),
+      "canonicalSkillName must map the read's REL path onto the canonical farm — reverting to the shape-only match reopens #1327",
+    );
+    ok(
+      /sameSkillFile\(match\.path, canonical\)/.test(SOURCE),
+      "the canonical file must be compared for identity (same inode or same bytes) before the name is accepted",
+    );
   });
 
   section("G. symlink-farm integration — T1/T8 (#1321, the deployed layout)");
@@ -742,16 +961,59 @@ async function main() {
 
   await test("#1322 Ind 1/2 — in the deployed layout, reading the skill through ~/.pi/agent/skills clears an ARMED rule", () => {
     const c = armCopyFarm();
-    const r = runDriver(c.driver, childEnv({}));
+    // AGENT_INFRA_PATH pins the canonical farm (the copy layout has no sibling
+    // `skills/`), so this leg exercises PROVENANCE, not the degraded shape path.
+    const r = runDriver(c.driver, childEnv({ AGENT_INFRA_PATH: REPO_ROOT }));
     // `blockedBeforeRead` is the behavioural arming guard — if the farm were not
     // armed it would be false and the test would be vacuous.
     equal(r.json.blockedBeforeRead, true, `${WORKTREE_CMD} must be blocked before the skill is read\n${describeRun(r)}`);
     equal(
       r.json.blockedAfterRead,
       false,
-      `#1322 — the read came through the pi-served path, so the gate must clear\n${describeRun(r)}`,
+      `#1322 — the read came through the pi-served path (a symlink into the canonical farm), so the gate must clear\n${describeRun(r)}`,
     );
     equal(r.json.ok, true, describeRun(r));
+  });
+
+  // ── #1327 — the residual this issue closes, through the deployed loader ────
+  await test("#1327 — in the deployed layout, a FORGED SKILL.md inside a trusted root does not clear an armed rule", () => {
+    const c = armCopyFarm();
+    const r = runDriver(c.driver, childEnv({ AGENT_INFRA_PATH: REPO_ROOT }));
+    equal(r.json.evilCommitBlocked, true, `control: the unanchored /tmp read must not clear the gate\n${describeRun(r)}`);
+    equal(
+      r.json.forgedCommitBlocked,
+      true,
+      `#1327 — a forged <cwd>/skills/commit-workflow/SKILL.md must NOT satisfy the git gate\n${describeRun(r)}`,
+    );
+    equal(
+      r.json.realCommitBlocked,
+      false,
+      `positive control: the same gate MUST clear once the real skill is read, else the leg above is vacuous\n${describeRun(r)}`,
+    );
+  });
+
+  await test("#1327 — with no canonical farm the gates FAIL CLOSED, loudly (never a silent shape-only fallback)", () => {
+    const c = armCopyFarm();
+    const r = runDriver(c.driver, childEnv({}));
+    equal(
+      typeof r.json.canonicalFarmError,
+      "string",
+      `the module must report the missing farm\n${describeRun(r)}`,
+    );
+    ok(
+      r.json.logs.some((l: string) => l.startsWith("err: ") && l.includes("❌") && l.includes("canonical skill farm")),
+      `a missing farm must be loud + unconditional\n${describeRun(r)}`,
+    );
+    equal(r.json.health?.loaded, false, `health-check must see it\n${describeRun(r)}`);
+    ok(
+      /canonical skill farm/.test(String(r.json.health?.error)),
+      `the health error must name the cause\n${describeRun(r)}`,
+    );
+    equal(
+      r.json.blockedAfterRead,
+      true,
+      `no farm ⇒ no read can be certified, so the armed gate must still block\n${describeRun(r)}`,
+    );
   });
 
   await test("T1 (real loader) — jiti loads the symlinked farm with the same result, or is reported skipped", () => {
