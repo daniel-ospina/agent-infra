@@ -388,6 +388,26 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ⛔ THE FILE STUB ALONE IS NOT ENOUGH FOR THESE ARMS, AND WHAT IT PRODUCES IS THE WORST KIND OF
+# FAILURE (P1, found 2026-10-16 while fixing #1828, reproduced live). Every caller this section
+# drives runs `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a SYSTEM `pi` AHEAD
+# of $RIG/bin — so on any box that has one (this cell has /usr/local/bin/pi) the file stub was
+# SHADOWED and the arm tested nothing. Two consequences, both silent in the direction that matters:
+#   • the positive controls' `grep PI_RAN` failed against an empty log — a false RED that reads
+#     as a broken gate rather than as a shadowed stub; and
+#   • worse, the arm INVOKED THE REAL AGENT (a full pi session against the fix-7 prompt), so a
+#     test run spent model tokens and wrote into the operator's session/logs.
+# A shell FUNCTION is resolved BEFORE any PATH lookup, so it cannot be shadowed by the caller's
+# PATH edit; the stub is therefore defined as an exported function as well as a file. The file stub
+# is KEPT because it is what the pre-export `drive` checks above resolve — and because dropping the
+# `export -f` below costs a RED control (fail-closed), never another silently-real agent.
+pi() { echo PI_RAN >> "$PI_LOG"; return 0; }
+export -f pi
+# ...and pin the MECHANISM, not only its effect: the whole fix rests on the function surviving into
+# the callers' environment, so assert it is there BY NAME. Otherwise a future edit that drops the
+# `export -f` resurfaces as a confusing positive-control red instead of naming its own cause.
+env | grep -q '^BASH_FUNC_pi' ; rc=$?
+ck "the rig's pi stub is EXPORTED into the callers' environment (a function beats the callers' PATH prepend)" $rc
 # `gh` is stubbed to FAIL: an empty `gh pr view` head SKIPS fix-one.sh's cross-box claim block, so
 # these checks exercise the gate and the refund, not the claim machinery (which has its own suite).
 fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 > "$RIG/argv7"; }
