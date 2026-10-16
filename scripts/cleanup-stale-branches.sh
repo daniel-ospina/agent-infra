@@ -1566,8 +1566,15 @@ run_local_scope() {
     # tip: `rev-parse --verify` succeeds, the ahead-count is 0, it is classed
     # `remotecopy`, and `-d` deletes the only durable copy of its commits. A
     # failure (offline, unreachable origin) must NOT be read as "the refs are
-    # fresh": the gate is DISABLED instead, loudly, exactly as a missing
-    # origin/main disables the redundant gate below.
+    # fresh": this gate is DISABLED instead, loudly.
+    # ⚠️ That stands down the REMOTECOPY gate ONLY — not the `redundant` gate
+    # below, which is ref-LOCAL: it compares the branch against the local
+    # refs/remotes/origin/main tracking ref, and a failed fetch leaves that ref
+    # resolvable (merely stale), so `main_ref_ok` stays 1 and the gate still
+    # fires. Deliberate, and pinned by tests (a `redundant` branch needs no
+    # remote). It is safe for reachability — a `redundant` selection is by
+    # construction an ancestor of that tracking ref, so `-d` leaves the commits
+    # reachable — but it is NOT the same shape as a missing origin/main.
     # ⛔ A fetch that EXITS 0 does not prove the refs were REFRESHED. A NEGATIVE
     # refspec in remote.origin.fetch (an entry beginning with `^`, e.g.
     # `^refs/heads/foo`) makes `--prune` SKIP the excluded ref while the fetch
