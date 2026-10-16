@@ -76,8 +76,23 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    base, so the gate refuses with `base_advanced` rather than merge a diff nobody
    certified; a base branch that merely ADVANCES does not move it, so the record
    survives unrelated merges to main. When either side cannot be read the gate
-   refuses with `base_unverifiable` instead — fail-closed, and re-record clears it. If
-   the head moved after the record (fix commits, merge of main): re-run the
+   refuses with `base_unverifiable` instead — fail-closed, and re-record clears it. A
+   head move (fix commits, merge of main) does NOT by itself invalidate the review —
+   the review is of the DIFF, and the record/marker carry a signed `diff=` bound to it
+   (tortoise#2982). Decide by the ARTIFACT, not by the sha:
+   `~/.pi/agent/scripts/record-review.sh --print-diff-hash <PR> <owner/repo>` prints
+   the PR's live three-dot digest the same way the gate computes it — compare it with
+   the `diff=` on the recorded marker (or `diff_sha256` in the record).
+   **Unchanged → no review is owed.** The `ai-review-gate` accepts the stale-sha marker
+   because its signed `diff=` equals the live diff (rule (b)), and the
+   review-enforcer's carry arm mirrors that, so the verdict stands and the ceremony
+   stays green with NO new review cycle. Re-anchoring the record to the current head is
+   OPTIONAL and mechanical — `~/.pi/agent/scripts/record-review.sh <PR>
+   <reviewed-head-sha> <verdict> <owner/repo>` names the sha the review was taken at,
+   and the carry-forward arm re-binds it to the CURRENT head (a carry needs no
+   `--evidence`). Do NOT re-run the reviewers: the bytes they certified are unchanged.
+   **Changed (fix commits, or a base merge that touched a reviewed file) → a fresh
+   review IS owed.** Re-run the
    review appropriate to the tier (the `code-review` skill at
    standard/complex; the micro flow at micro) on the new head, then re-record
    at the SAME verdict —
@@ -106,9 +121,14 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    no evidence (its evidence is the prior signed marker it re-verified, and its
    record says `"mint":"carried"`), and `clean-micro`/`clean-low` are unaffected.
    (The script is not on PATH — use the explicit path.)
-   NEVER re-record a moved head without a fresh review: the `ai-review-gate` required check
-   verifies signature + full-sha freshness, and the review-enforcer blocks the merge command
-   without a matching record, so the ceremony stays red until evidence is genuinely refreshed.
+   A moved head is NOT by itself a stale record: the `ai-review-gate` required check
+   verifies the signature and accepts the record at the head sha OR at an UNCHANGED
+   reviewed diff (the signed `diff=`, tortoise#2982), and the review-enforcer's carry arm
+   mirrors that for the merge command. So a base-only move (`gh pr update-branch`, a
+   rebase, an unrelated merge of main) keeps the ceremony green WITHOUT a new review
+   cycle. NEVER re-record a DIFF THAT CHANGED without a fresh review: there the
+   carry-forward arm refuses (exit 3), and the ceremony correctly stays red until the
+   new bytes are genuinely reviewed.
 
 **Human escalation (only for):** P0 findings requiring an architectural or security decision —
 irreversible operations, data loss, security breach — and only after the code-review fixer loop
@@ -265,8 +285,8 @@ fi
 
 **If auto-merge PAUSES** (branch went behind while armed — GitHub reports the PR as
 "auto-merge paused", NOT failed): the review record sha is still the armed head;
-rebase the branch, RE-RUN the affected pre-flight regression tests, re-record the
-review at the new head (condition 6 — the sha moved), then re-arm:
+rebase the branch, RE-RUN the affected pre-flight regression tests, then decide by the
+ARTIFACT — a base-only move is not a stale review (condition 6) — then re-arm:
 
 ```bash
 DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
@@ -277,11 +297,17 @@ git fetch origin "$DEFAULT_BRANCH" --quiet   # refresh the tracking ref FIRST �
 git -c commit.gpgsign=false rebase "origin/$DEFAULT_BRANCH"   # or: git merge origin/$DEFAULT_BRANCH per condition 5
 # RE-RUN the affected pre-flight regression tests here
 git push --force-with-lease
-# The head sha moved → run the `code-review` skill at the new head (fresh review;
-# it auto-records on clean convergence). Do NOT re-record via record-review.sh
-# alone — condition 6 forbids recording a moved head without a fresh review, and
-# the ai-review-gate full-sha freshness check keeps the arm red until evidence is
-# genuinely refreshed.
+# The head sha moved. Decide by the DIFF, not the sha (condition 6):
+#   record-review.sh --print-diff-hash <PR_NUMBER> <owner/repo>  → compare with the
+#   recorded marker's diff=.  UNCHANGED (the normal rebase outcome — the rebase
+#   re-rendered the same change): the verdict STANDS. The ai-review-gate's rule (b)
+#   accepts the stale-sha marker and the review-enforcer's carry arm mirrors it, so
+#   NO re-review is owed. Re-anchor the record only if you want it on the new head:
+#   record-review.sh <PR_NUMBER> <reviewed-sha> <verdict> <owner/repo> — the
+#   carry-forward arm re-binds it (a carry needs no --evidence). Do NOT re-run the
+#   reviewers.  CHANGED (fix commits — bytes the reviewer never saw): run the
+#   `code-review` skill at the new head (fresh review; it auto-records on clean
+#   convergence) — the carry refuses (exit 3) exactly then.
 # Code-bearing PRs: also dispatch a fresh [VGATE] at the new head (condition 3) —
 # the rebase changed the verified files' hashes (docs-only sets are shape-exempt).
 # Then re-arm:
