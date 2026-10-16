@@ -189,10 +189,12 @@
 # config guard), a NARROWED POSITIVE refspec (`+refs/heads/main:refs/remotes/
 # origin/main`, what `git remote set-branches` and `clone --single-branch` leave
 # behind) and the plain fetch→push race can all make it stale while the fetch
-# exits 0. The fetch itself is status-checked explicitly, because the opt-in
-# report log runs the pass under `set +e` (see the dispatch tail) where errexit
-# does not apply. The config guards are early, loud, and strictly additional;
-# the three proofs above are what close the class.
+# exits 0. The fetch itself is status-checked explicitly, because errexit is not
+# a backstop here: the opt-in report log runs the pass under `set +e` (see the
+# dispatch tail), AND under `--scope both` `run_remote_scope || rc=1` suppresses
+# errexit for the WHOLE function body, log or no log (F37). The config guards are
+# early, loud, and strictly additional; the three proofs above are what close the
+# class.
 #
 # The exit status means "everything the sweep selected was reaped": a REFUSAL and
 # any other non-zero push exit (a generic `Failed`) both make it non-zero, so a
@@ -474,9 +476,12 @@ cd "$REPO_ROOT"
 # adjustment") and that host has NO GNU `date -d` fallback, so BOTH arms fail and
 # the function prints nothing. `2>/dev/null` on BOTH arms keeps BSD date's usage
 # text out of the report; `|| true` makes the function's STATUS 0 so a failing
-# `date` is ruled on by the validator below, never by `set -e` (which would exit
-# before any diagnostic, and does NOT fire at all under CLEANUP_BRANCH_LOG's
-# `set +e` — the shipped launchd configuration).
+# `date` is ruled on by the validator below, never by `set -e`: errexit exits
+# before any diagnostic, and it does NOT fire at all under CLEANUP_BRANCH_LOG's
+# `set +e` (the shipped launchd configuration) NOR in `--scope both`, where
+# `run_remote_scope || rc=1` suppresses it for the whole function body (F37). The
+# explicit validator is therefore the ONLY thing ruling on this value, in every
+# mode.
 cutoff_epoch() {
     date -v-${CUTOFF_DAYS}d +%s 2>/dev/null || date -d "${CUTOFF_DAYS} days ago" +%s 2>/dev/null || true
 }
@@ -488,9 +493,11 @@ cutoff_epoch() {
 # ⛔ F31: THE CUTOFF EPOCH WAS THE ONE SAFETY INPUT WITH NO EXPLICIT STATUS
 # CHECK. Every other safety input is guarded (the `git fetch` call site states
 # the rule; validate_commit_date applies it to the commit dates), but the cutoff
-# epoch was consumed UNGUARDED by BOTH scopes. Without CLEANUP_BRANCH_LOG the
-# failing `date` tripped `set -e` (loud, but with a raw BSD `date` usage message
-# that never mentions the flag); WITH it the pass runs `set +e`, `CUTOFF_EPOCH`
+# epoch was consumed UNGUARDED by BOTH scopes. In `--scope remote` without
+# CLEANUP_BRANCH_LOG, the failing `date` tripped `set -e` (loud, but with a raw BSD
+# `date` usage message that never mentions the flag). Under CLEANUP_BRANCH_LOG,
+# AND in `--scope both` (where `run_remote_scope || rc=1` suppresses errexit for
+# the whole function body — F37), the pass runs without `set -e`: `CUTOFF_EPOCH`
 # stayed EMPTY, and every integer comparison returned status 2, which `if`/`||`
 # reads as FALSE. That INVERTS the staleness predicate on BOTH legs: the remote
 # scope dropped its candidate list behind `✅ No stale merged branches found`
@@ -790,11 +797,12 @@ is_member() {
 # two OPPOSITE failures:
 #   * `0000000009` (10 raw characters) PASSED the bound, and then
 #     `date -r 0000000009` FAILED on macOS — it parses that argument as a DATE,
-#     not as seconds, and macOS has no `date -d` fallback — so under `set -e`
-#     the assignment aborted the whole remote sweep with a raw `date` usage
-#     message, rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the pass
-#     runs `set +e`, so the same value instead printed the branch with an EMPTY
-#     date.
+#     not as seconds, and macOS has no `date -d` fallback. In `--scope remote`
+#     without CLEANUP_BRANCH_LOG that aborted the whole sweep under `set -e`, with
+#     a raw `date` usage message, rc=1, NO plan and NO delete. Under
+#     CLEANUP_BRANCH_LOG, AND in `--scope both` (where `run_remote_scope || rc=1`
+#     suppresses errexit for the whole function body — F37), the pass runs without
+#     `set -e`, so the same value instead printed the branch with an EMPTY date.
 #   * `0000000000000009` (16 raw characters, numeric value 9) was FALSELY refused
 #     by a RAW-LENGTH bound, and the refusal misnamed its own rule as "outside
 #     bash's integer range". That reason is FALSE on bash 3.2.57: `[
@@ -911,8 +919,8 @@ verify_remote_target() {
 # provably contains the tip this sweep classified. On anything else it prints a
 # one-line reason and returns 1 — the caller REFUSES that delete. The oid is read
 # by read_remote_main_oid and passed in; HOW OFTEN the caller reads it is the
-# caller's decision: the PLAN reads it once per sweep, the EXECUTE leg re-reads
-# it once PER ENTRY (F34).
+# caller's decision, and BOTH callers now read it ONCE PER ENTRY — the plan (F36)
+# and the execute leg (F34). No caller may snapshot it for the sweep.
 #
 # ⛔ The classification is `git branch -r --merged origin/main`, which reads the
 # LOCAL remote-tracking ref. That ref is only as fresh as the fetch refspec lets
@@ -953,42 +961,48 @@ verify_remote_target() {
 # that the merge premise holds in the repository the caller has already PROVED
 # is the delete endpoint — not merely in the one it intended.
 #
-# ⛔ F33/F34: THE REAL MAIN IS READ ONCE PER SWEEP FOR THE PLAN ONLY; THE
-# EXECUTE LEG RE-READS IT PER ENTRY. (The plan and the execute loop both call the
-# per-entry CHECK; each call used to run its own `git ls-remote <push_url>
-# refs/heads/<main>`, which is N identical network round trips.) The PLAN deletes
-# nothing, so ONE read is safe there: the worst a stale snapshot can do is print
-# a plan that `--execute` will REFUSE at run time — and the printed command is
-# re-gated by execute's own per-entry read, so a pasted line cannot delete on the
-# stale premise either. The EXECUTE leg may NOT snapshot: main is NOT constant
-# across a sweep. A force-push to main between candidate N and N+1 invalidates
-# the premise for every LATER candidate, and a snapshot would keep validating
-# them against a main that no longer contains their tips — deleting precisely the
-# unmerged branches this gate exists to protect. That is F34: the hoist assumed
-# "one value that cannot change for the purpose of ONE sweep", which is FALSE.
-# The lease pins the BRANCH ref, never main, so nothing else re-checks the merge
-# premise per entry. Restoring the per-entry read restores the freshness the
-# parent (and the safety property) had.
+# ⛔ F34/F36: NO LEG SNAPSHOTS THE REAL MAIN — THE PLAN AND THE EXECUTE LEG BOTH
+# RE-READ IT ONCE PER ENTRY, IMMEDIATELY BEFORE THEY EVALUATE THAT ENTRY. (The
+# plan and the execute loop both call the per-entry CHECK; each call used to run
+# its own `git ls-remote <push_url> refs/heads/<main>`, which is N identical
+# network round trips.) main is NOT constant across a sweep: a force-push to it
+# between candidate N and N+1 invalidates the premise for every LATER candidate,
+# so a once-per-sweep snapshot keeps validating them against a main that no
+# longer contains their tips — deleting precisely the unmerged branches this gate
+# exists to protect. That is F34 (execute) and F36 (the plan).
 #
-# Measured with a `git` shim over 6 candidates: dry-run `ls-remote` = 2N+1 = 13
-# before the F33 hoist, N+2 = 8 with it (1 endpoint proof + 1 real main + N
-# target checks). The EXECUTE leg costs 2N+1 = 13 (1 endpoint proof + N
-# real-main reads + N target checks) — the freshness is the whole point.
+# ⛔ F36: THE PLAN IS NOT EXEMPT, AND THE "EXECUTE RE-GATES A PASTED LINE"
+# JUSTIFICATION WAS FALSE. The plan's output is a RAW, PASTE-SAFE
+# `git push origin --delete --force-with-lease=…` — `quote_argv` exists precisely
+# so the printed line re-parses to the executed argv. NOTHING re-gates a PASTED
+# line except re-running `--execute`: the lease pins the BRANCH OID and cannot
+# check the MERGE PREMISE. A snapshot therefore made the plan print an EXECUTABLE
+# delete for an entry the plan itself would have REFUSED had it read main like
+# execute does, and pasting that line destroyed the branch's unique commits. The
+# plan must evaluate the SAME premise at the SAME time as execute; a call count is
+# not a safety argument. (This is the second time the once-per-sweep optimisation
+# has been reversed — it was reverted on execute as F34 and is now reverted here.)
+# If a snapshot were ever kept, the plan could not print executable commands at
+# all; the per-entry read is what lets it print them honestly.
+#
+# Measured with a `git` shim over 6 candidates: BOTH legs cost 2N+1 = 13
+# `ls-remote` calls (1 endpoint proof + N real-main reads + N target checks). The
+# plan and execute counts are IDENTICAL — that equality is the parity property
+# this gate wants, and the freshness is the whole point.
 #
 # ⛔ The read is split from the check because the callers CAPTURE the check's
 # refusal reason through `$(...)`, i.e. in a SUBSHELL: a memo written inside the
 # check is discarded the moment the subshell exits, so "memoise inside the
 # function" is not available here. Splitting the read from the check and PASSING
 # the oid in keeps ONE implementation of the check (forked implementations are
-# this branch's recurring defect) and keeps every refusal message in one place,
-# whether the caller reads once (plan) or per entry (execute). The re-read that
-# is GENUINELY per-entry (`verify_remote_target`) is untouched, as is the
-# delete's force-with-lease, which is the real compare-and-swap.
+# this branch's recurring defect) and keeps every refusal message in one place.
+# The re-read that is GENUINELY per-entry (`verify_remote_target`) is untouched,
+# as is the delete's force-with-lease, which is the real compare-and-swap.
 #
 # read_remote_main_oid <push_url> — resolve the DELETE TARGET's REAL
-# refs/heads/<main>. The CALLER decides how often: the plan calls it once per
-# sweep, the execute leg once per entry (F34). Prints the oid and returns 0, or
-# prints the one-line reason and returns 1.
+# refs/heads/<main>. BOTH callers invoke it ONCE PER ENTRY — the plan here (F36)
+# and the execute leg immediately before its delete (F34). Prints the oid and
+# returns 0, or prints the one-line reason and returns 1.
 read_remote_main_oid() {
     local push_url="$1" ls_out="" real_main_oid="" n=0 line=""
     if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
@@ -1052,13 +1066,16 @@ run_remote_scope() {
 
     # ── Fetch and prune remote tracking refs ──────────────────────
     echo "[$(date '+%H:%M:%S')] Fetching and pruning remote refs..."
-    # ⛔ THIS STATUS IS CHECKED EXPLICITLY, never via errexit. The opt-in report
-    # log runs the whole pass inside `set +e` (see the dispatch tail: it must read
-    # PIPESTATUS through the tee), and under `set +e` a bare `git fetch` that
-    # FAILS falls through: the stale tracking refs are classified, and
-    # `git push origin --delete` then destroys the real branch. `CLEANUP_BRANCH_LOG`
-    # is set by templates/launchd/com.tortoise.branch-reaper.plist, i.e. by the
-    # normal operator invocation, so this is the DEFAULT path, not an edge case.
+    # ⛔ THIS STATUS IS CHECKED EXPLICITLY, never via errexit. errexit is NOT a
+    # backstop for this read: the opt-in report log runs the whole pass inside
+    # `set +e` (see the dispatch tail: it must read PIPESTATUS through the tee),
+    # AND under `--scope both` `run_remote_scope || rc=1` suppresses errexit for
+    # the ENTIRE function body, log or no log (F37). Without the explicit check a
+    # bare `git fetch` that FAILS falls through: the stale tracking refs are
+    # classified, and `git push origin --delete` then destroys the real branch.
+    # `CLEANUP_BRANCH_LOG` is set by
+    # templates/launchd/com.tortoise.branch-reaper.plist, i.e. by the normal
+    # operator invocation, so this is the DEFAULT path, not an edge case.
     if ! git fetch origin --prune --quiet; then
         echo "ERROR: git fetch origin --prune --quiet FAILED — remote-tracking refs may be STALE." >&2
         echo "ERROR: refs/remotes/origin/<br> can hold an OLD merged tip while origin's real" >&2
@@ -1274,9 +1291,11 @@ run_remote_scope() {
     local NON_ORIGIN_REMOTE=()
     local CUTOFF_EPOCH
     # ⛔ F31: THE CUTOFF EPOCH IS A SAFETY INPUT — refuse loudly when it cannot be
-    # computed. Under CLEANUP_BRANCH_LOG the pass runs `set +e`, so an empty epoch
-    # made every comparison below return status 2, which `if` reads as FALSE: the
-    # candidate was dropped behind `✅ No stale merged branches found`.
+    # computed. Under CLEANUP_BRANCH_LOG, AND in `--scope both` (where
+    # `run_remote_scope || rc=1` suppresses errexit for the whole function body —
+    # F37), the pass runs without `set -e`, so an empty epoch made every
+    # comparison below return status 2, which `if` reads as FALSE: the candidate
+    # was dropped behind `✅ No stale merged branches found`.
     CUTOFF_EPOCH="$(cutoff_epoch)"
     if ! validate_cutoff_epoch "$CUTOFF_EPOCH"; then
         return 1
@@ -1339,8 +1358,10 @@ run_remote_scope() {
             local COMMIT_DATE_HR
             # ⛔ F25: `date -r` reads its argument as a DATE STRING on macOS, so a
             # zero-padded `%ct` such as `0000000009` is rejected (`illegal option
-            # -- d`, no `date -d` on macOS) and, under `set -e`, aborted the whole
-            # remote sweep with rc=1 before any plan was printed. `$((10#$...))`
+            # -- d`, no `date -d` on macOS); in `--scope remote` without the log that
+            # aborted the whole sweep under `set -e` with rc=1 before any plan was
+            # printed, and in the modes where errexit is suppressed (F37) the same
+            # value instead emptied the date. `$((10#$...))`
             # re-reads the digit string as base 10, so `date` ALWAYS receives plain
             # seconds — the helper above already bounded the normalised value to
             # ≤15 digits, so this arithmetic cannot overflow.
@@ -1387,12 +1408,19 @@ run_remote_scope() {
         # failure left `_stale_sorted` EMPTY, `STALE_BRANCHES` an empty array,
         # and the sweep printed `✅ No stale merged branches found` and exited 0:
         # a CLEAN sweep over candidates it had already found and then silently
-        # discarded. (Without the log `set -e` aborts loudly, so the FALSE PASS
-        # is specific to the scheduled invocation.) `pipefail` is set globally
-        # and is NOT undone by `set +e`, so the assignment's status below sees a
-        # failing `printf`/`awk`/`sort`/`cut` even though the pipeline's LAST
-        # stage succeeded. Refuse loudly — a pipeline failure is not an empty
-        # candidate list, and reporting one as the other is the false PASS.
+        # discarded. ⛔ F37: `set -e` IS NOT A BACKSTOP HERE, AND IT MUST NOT BE
+        # CITED AS ONE. Bash suppresses errexit for the ENTIRE function body when
+        # the function is the LEFT OPERAND of `||`, and `run_scopes` calls
+        # `run_remote_scope || rc=1` under `--scope both` — so with or WITHOUT the
+        # log a failing `sort` did NOT abort: the run printed `✅ No stale merged
+        # branches found` and continued into the local leg. (Measured with this
+        # guard removed, `--scope both`, no log.) THIS guard is therefore the ONLY
+        # protection, it must fail CLOSED in EVERY mode, and nothing in the remote
+        # scope may lean on errexit. `pipefail` is set globally and is NOT undone
+        # by `set +e`, so the assignment's status below sees a failing
+        # `printf`/`awk`/`sort`/`cut` even though the pipeline's LAST stage
+        # succeeded. Refuse loudly — a pipeline failure is not an empty candidate
+        # list, and reporting one as the other is the false PASS.
         local _stale_sorted="" _stale_order_rc=0
         _stale_sorted="$(printf '%s\n' "${STALE_BRANCHES[@]}" \
             | awk -F'\t' '{ print length($1) "\t" $0 }' \
@@ -1441,26 +1469,17 @@ run_remote_scope() {
     echo ""
 
     # ⛔ `real_main_oid`/`real_main_resolve_reason` hold the DELETE TARGET's real
-    # main for the leg that is ABOUT TO RUN. The read is split from the check
+    # main for the entry ABOUT TO BE EVALUATED. The read is split from the check
     # because the check's refusal reason is captured through `$(...)` — a
     # subshell — so a memo written inside the check would be discarded with the
-    # subshell. HOW OFTEN it is read depends on the leg (F33/F34): the PLAN reads
-    # it ONCE for the sweep, the EXECUTE leg RE-READS it per entry. A failed read
-    # yields an EMPTY oid plus the reason, which the check reports per entry with
-    # the SAME message a per-entry read would have produced. Nothing is read when
-    # there is no candidate (the empty arm returns above).
+    # subshell. ⛔ F34/F36: BOTH legs re-read it ONCE PER ENTRY; neither snapshots
+    # it for the sweep. A failed read yields an EMPTY oid plus the reason, which
+    # the check reports per entry with the SAME message a per-entry read would
+    # have produced. Nothing is read when there is no candidate (the empty arm
+    # returns above).
     local real_main_oid="" real_main_resolve_reason=""
 
     if [ "$EXECUTE" = false ]; then
-        # ⛔ F33: THE PLAN MAY SNAPSHOT MAIN ONCE. It deletes nothing, so a stale
-        # snapshot can only print a plan that `--execute` will REFUSE — and
-        # execute re-gates each entry against a FRESH read at run time, so even a
-        # pasted line cannot delete on the stale premise. Reading once here keeps
-        # the plan at N+2 ls-remote calls instead of 2N+1.
-        if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
-            real_main_resolve_reason="$real_main_oid"
-            real_main_oid=""
-        fi
         echo "── DRY-RUN: no branches deleted ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --execute"
         echo ""
@@ -1476,8 +1495,9 @@ run_remote_scope() {
         # verify_remote_target the execute loop calls — never a second
         # implementation that can drift (the defect class this branch has been
         # closing) — and a refused entry is printed ONLY as a comment, never as
-        # an executable command. The commands the plan shows are then exactly the
-        # ones `--execute` would run at plan time.
+        # an executable command, and its premise is read PER ENTRY (F36) — so the
+        # two legs evaluate the same premise at the same time: the commands the
+        # plan shows are exactly the ones `--execute` would run at plan time.
         for entry in "${STALE_BRANCHES[@]}"; do
             branch="${entry%%$'\t'*}"
             # ⛔ Build the command ONCE, as an array, and PRINT it through
@@ -1496,6 +1516,22 @@ run_remote_scope() {
             # repository instead of deleting unconditionally.
             local tracking_oid="${entry##*$'\t'}"
             local local_branch="${branch#origin/}"
+            # ⛔ F36: RE-READ the DELETE TARGET's real main FOR THIS ENTRY, exactly
+            # as the execute loop does (F34) — the plan must evaluate the SAME
+            # premise at the SAME time. A once-per-sweep snapshot made the plan
+            # print an EXECUTABLE `git push origin --delete` for an entry it would
+            # itself have REFUSED had it read main per entry: a mid-sweep rewrite
+            # left the later candidate validated against a main that no longer
+            # contained its tip. Because the printed line is a raw, paste-safe
+            # command, NOTHING re-gates it except re-running --execute, and the
+            # lease pins the BRANCH ref, never main — so a paste destroyed the
+            # branch's unique commits. `read_remote_main_oid` is the SAME function
+            # the execute loop calls — one implementation, one message set, and
+            # the two legs' call counts are now IDENTICAL (2N+1).
+            if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
+                real_main_resolve_reason="$real_main_oid"
+                real_main_oid=""
+            fi
             # F20: the SAME two gates the execute loop applies, at plan time.
             local plan_refusal=""
             if ! plan_refusal="$(verify_merged_into_real_main "$real_main_oid" "$real_main_resolve_reason" "$tracking_oid")"; then
@@ -1542,16 +1578,17 @@ run_remote_scope() {
         # have NO commits in real main (main rewritten), and deleting it destroys
         # them. That is a different question from "is origin's real ref the ref
         # we classified", so it is a separate gate, not a weaker one.
-        # ⛔ F34: RE-READ the DELETE TARGET's real main FOR THIS ENTRY, immediately
-        # before the delete. main is NOT constant across a sweep: a force-push to
-        # it between the previous candidate and this one invalidates the merge
-        # premise for every LATER candidate, so a once-per-sweep snapshot would
-        # keep validating them against a main that no longer contains their tips
-        # and delete precisely the unmerged branches this gate exists to protect.
-        # The lease pins the BRANCH ref, never main, so THIS read is the only
-        # thing that can catch the rewrite. (The plan snapshots above because it
-        # deletes nothing; execute may not.) `read_remote_main_oid` is the SAME
-        # function the plan calls — one implementation, one message set.
+        # ⛔ F34/F36: RE-READ the DELETE TARGET's real main FOR THIS ENTRY,
+        # immediately before the delete. main is NOT constant across a sweep: a
+        # force-push to it between the previous candidate and this one invalidates
+        # the merge premise for every LATER candidate, so a once-per-sweep
+        # snapshot would keep validating them against a main that no longer
+        # contains their tips and delete precisely the unmerged branches this gate
+        # exists to protect. The lease pins the BRANCH ref, never main, so THIS
+        # read is the only thing that can catch the rewrite. The plan performs the
+        # IDENTICAL per-entry read (F36) — neither leg snapshots — so the plan and
+        # execute evaluate the same premise at the same time. `read_remote_main_oid`
+        # is the SAME function the plan calls — one implementation, one message set.
         if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
             real_main_resolve_reason="$real_main_oid"
             real_main_oid=""
@@ -2340,6 +2377,15 @@ run_scopes() {
             # returning 1 would be followed by `run_local_scope`, whose 0 then
             # becomes PIPESTATUS[0] — a REFUSED remote sweep reported as success
             # (exit 0).
+            # ⛔ F37: `run_remote_scope || rc=1` — the `||` on the NEXT line -
+            # ALSO suppresses errexit for the WHOLE `run_remote_scope` body, log or
+            # no log, because a function that is the LEFT OPERAND of `||` runs with
+            # errexit disabled for its entire body (measured: with the F35 guard
+            # removed, `--scope both` and no log, a failing `sort` did not abort and
+            # the sweep reported a clean pass). The remote scope must therefore
+            # status-check every input EXPLICITLY and may never lean on `set -e` as
+            # a backstop; the F35 ordering guard is the ONLY protection against a
+            # false pass there, which is why it must fail closed in every mode.
             # ⛔ The two legs are INDEPENDENT: a refused remote sweep says nothing
             # about the local one, and `--help` promises "remote, then local".
             # Short-circuiting with `run_remote_scope || return 1` silently

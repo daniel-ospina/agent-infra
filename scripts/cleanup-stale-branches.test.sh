@@ -4343,15 +4343,21 @@ fi
 
 cd "$REPO"
 echo ""
-echo "== 51. F33: the DELETE TARGET's real main is read ONCE per sweep, not per candidate =="
+echo "== 51. F34/F36: BOTH legs read the DELETE TARGET's real main PER ENTRY, not once per sweep =="
 # verify_merged_into_real_main re-read `refs/heads/<main>` from the push url on
 # EVERY candidate, so a plan over N stale branches did 2N+1 ls-remote calls
 # (N main reads + N target checks + 1 endpoint proof), and the execute leg did the
-# same before its pushes. One sweep needs ONE real-main read; the per-candidate
-# check is a LOCAL `git merge-base --is-ancestor` against it. A git shim counts
-# every `ls-remote` the sweep issues. The count assertion (N+2=8) is RED (13)
-# when the hoist is reverted, and the per-entry verify_remote_target read MUST
-# remain, so the count must stay above 2.
+# same before its pushes. The F33 hoist cut the PLAN to N+2 = 8 (1 endpoint proof
+# + 1 real main + N target checks) and was justified by "execute re-gates a pasted
+# line" — FALSE, because the plan's output is a raw paste-safe command and the
+# lease pins the BRANCH ref, never main. F36 restores the plan's per-entry read
+# for the same reason F34 restored execute's: main is not constant across a sweep.
+# A git shim counts every `ls-remote` the sweep issues. The plan count assertion
+# (2N+1=13) is RED (8) when the snapshot is reinstated, and the per-entry
+# verify_remote_target read MUST remain, so the count must stay above 2.
+# ⛔ The plan and execute counts must be EQUAL — that equality is the parity
+# property, and a call count alone is never the safety argument (the optimisation
+# has now been reversed twice).
 F33_ORIGIN="$FIX/f33-origin.git"
 F33_REPO="$FIX/f33-repo"
 new_repo "$F33_REPO" "$F33_ORIGIN"
@@ -4390,25 +4396,26 @@ F33_CALLS="$(wc -l <"$F33_COUNT" | tr -d '[:space:]')"
 assert_eq "$RC" "0" "F33: the dry-run still classifies and prints a plan (rc=0)"
 assert_contains "$OUT" "Found 6 stale merged branch(es)" "F33: all 6 candidates are still classified"
 assert_eq "$(grep -c '^  git push origin --delete' <<<"$OUT" || true)" "6" "F33: the plan still prints one delete per candidate"
-assert_eq "$F33_CALLS" "8" "F33: 6 candidates cost N+2=8 ls-remote calls (1 endpoint + 1 real main + 6 target checks), not 2N+1=13"
+assert_eq "$F33_CALLS" "13" "F36: 6 candidates cost 2N+1=13 ls-remote calls (1 endpoint + 6 real-main reads + 6 target checks) — the plan reads main PER ENTRY, not N+2=8"
 if [ "$F33_CALLS" -gt 2 ]; then
     ok "F33: the per-entry verify_remote_target read was NOT dropped (count=$F33_CALLS)"
 else
     bad "F33: the sweep dropped the per-entry target read (count=$F33_CALLS)"
 fi
 
-# ⛔ F34: the EXECUTE leg must NOT reuse the plan's snapshot — it RE-READS main
-# per entry. The count is asserted deliberately, so the F33 hoist cannot silently
-# re-absorb the destructive leg: plan = N+2 = 8, execute = 2N+1 = 13 (1 endpoint
-# proof + N real-main reads + N target checks). The freshness requirement is the
-# property; this count is its observable signature.
+# ⛔ F34/F36: NO leg may reuse a snapshot — BOTH RE-READ main per entry. The
+# count is asserted deliberately, so the F33 hoist cannot silently re-absorb
+# either leg, and the two counts MUST be EQUAL: plan = 2N+1 = 13, execute =
+# 2N+1 = 13 (1 endpoint proof + N real-main reads + N target checks each). The
+# freshness requirement is the property; this count is its observable signature.
 : > "$F33_COUNT"
 run_script env PATH="$F33_WRAP:$PATH" F33_REAL_GIT="$F33_REAL_GIT" F33_COUNT="$F33_COUNT" \
     bash "$F33_SCRIPT" --repo "$F33_REPO" --scope remote --execute
 F33_EXEC_CALLS="$(wc -l <"$F33_COUNT" | tr -d '[:space:]')"
-assert_eq "$RC" "0" "F33/F34: --execute still deletes every merged candidate (rc=0)"
-assert_contains "$OUT" "Deleted: 6" "F33/F34: all 6 merged candidates are deleted"
+assert_eq "$RC" "0" "F34/F36: --execute still deletes every merged candidate (rc=0)"
+assert_contains "$OUT" "Deleted: 6" "F34/F36: all 6 merged candidates are deleted"
 assert_eq "$F33_EXEC_CALLS" "13" "F34: execute costs 2N+1=13 ls-remote calls (1 endpoint + 6 real-main reads + 6 target checks), not N+2 — main is re-read per entry"
+assert_eq "$F33_CALLS" "$F33_EXEC_CALLS" "F36: the PLAN and EXECUTE legs cost the SAME number of ls-remote calls — the parity property, not a count"
 
 cd "$REPO"
 echo ""
@@ -4593,6 +4600,176 @@ run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MO
 assert_eq "$RC" "0" "F35 control: a working ordering pipeline still plans (rc=0)"
 assert_contains "$OUT" "Found 2 stale merged branch(es)" "F35 control: both candidates are still classified"
 assert_eq "$(grep -c '^  git push origin --delete' <<<"$OUT" || true)" "2" "F35 control: the plan still prints a delete per candidate"
+
+cd "$REPO"
+echo ""
+echo "== 54. F36 (P1, DATA LOSS BY PASTE): the PLAN must read the DELETE TARGET's real main PER ENTRY =="
+# REGRESSION: the plan read the DELETE TARGET's real main ONCE (the F33 hoist) and
+# validated every later candidate against that snapshot, while `--execute` re-read
+# it per entry (F34). The two legs then evaluated DIFFERENT premises at the SAME
+# instant: a mid-sweep rewrite of origin/main left the plan printing an EXECUTABLE
+# `git push origin --delete --force-with-lease=…` for an entry it would itself
+# have REFUSED had it read main like execute. The plan's output is a RAW,
+# paste-safe command (`quote_argv` exists precisely so it re-parses to the
+# executed argv); NOTHING re-gates a PASTED line except re-running `--execute`,
+# and the lease pins the BRANCH ref, never main — so the paste destroyed the
+# branch's unique commits. The justification once written at the snapshot
+# ("execute re-gates a pasted line") was FALSE.
+# origin main = A -> plan-b2(X) -> plan-longfirst(Y). The shim rewrites origin/main
+# back to A during the FIRST per-entry target `ls-remote` (plan-longfirst's), i.e.
+# after main has been read for the earlier candidate and BEFORE the later one is
+# evaluated. Longest-first ordering evaluates plan-longfirst first.
+F36_ORIGIN="$FIX/f36-origin.git"
+F36_REPO="$FIX/f36-repo"
+new_repo "$F36_REPO" "$F36_ORIGIN"
+cd "$F36_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F36_SCRIPT="$F36_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f36.txt; git add f36.txt; old_commit "init"; git push -q origin main
+F36_BASE_OID="$(git rev-parse HEAD)"
+# plan-b2 = X: pushed, merged into real main, and an ANCESTOR of main(Y) — so it
+# IS a candidate, and its tip must NOT be reachable from the rewritten main A.
+git checkout -q -b plan-b2 main
+echo x > f36-x.txt; git add f36-x.txt; old_commit "plan-b2"
+F36_B2_OID="$(git rev-parse HEAD)"
+git push -q -u origin plan-b2
+git checkout -q main
+git merge -q --ff-only plan-b2
+# plan-longfirst = Y: pushed and merged into real main (origin/main -> Y). LONGER
+# name, so longest-first ordering evaluates it BEFORE plan-b2.
+git checkout -q -b plan-longfirst main
+echo y > f36-y.txt; git add f36-y.txt; old_commit "plan-longfirst"
+F36_LF_OID="$(git rev-parse HEAD)"
+git push -q -u origin plan-longfirst
+git checkout -q main
+git merge -q --ff-only plan-longfirst
+git push -q origin main
+if git merge-base --is-ancestor "$F36_B2_OID" "$F36_LF_OID" 2>/dev/null; then
+    ok "F36 fixture: plan-b2's tip IS in origin/main(Y), so it IS classified a candidate (F36)"
+else
+    bad "F36 fixture: plan-b2 would not be classified merged — the fixture is wrong (F36)"
+fi
+if ! git merge-base --is-ancestor "$F36_B2_OID" "$F36_BASE_OID" 2>/dev/null; then
+    ok "F36 fixture: plan-b2's tip is NOT reachable from the rewritten main A (F36)"
+else
+    bad "F36 fixture: plan-b2's tip is still in A — the fixture is wrong (F36)"
+fi
+F36_REAL_GIT="$(command -v git)"
+F36_WRAP="$FIX/f36-wrap"
+F36_MARK="$FIX/f36-rewrite-mark"
+mkdir -p "$F36_WRAP"
+cat > "$F36_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: on the FIRST per-entry target `ls-remote` (plan-longfirst's),
+# force origin/main back to A using real git, then delegate. Models a mid-sweep
+# main rewrite that lands after main was read for the earlier candidate and
+# before the later candidate is evaluated.
+if [ "$1" = "ls-remote" ] && [ "${2:-}" != "--get-url" ] \
+    && [ "${3:-}" = "refs/heads/plan-longfirst" ] && [ ! -e "${F36_MARK:?F36_MARK unset}" ]; then
+    : >"$F36_MARK"
+    "${F36_REAL_GIT:?F36_REAL_GIT unset}" -C "${F36_ORIGIN:?F36_ORIGIN unset}" \
+        update-ref refs/heads/main "${F36_BASE:?F36_BASE unset}"
+fi
+exec "${F36_REAL_GIT:?F36_REAL_GIT unset}" "$@"
+WRAP
+chmod +x "$F36_WRAP/git"
+rm -f "$F36_MARK"
+run_script env PATH="$F36_WRAP:$PATH" F36_REAL_GIT="$F36_REAL_GIT" F36_ORIGIN="$F36_ORIGIN" \
+    F36_BASE="$F36_BASE_OID" F36_MARK="$F36_MARK" \
+    bash "$F36_SCRIPT" --repo "$F36_REPO" --scope remote
+F36_PLAN="$OUT"
+assert_eq "$RC" "0" "F36: the dry-run still classifies and prints a plan (rc=0)"
+assert_contains "$F36_PLAN" "Found 2 stale merged branch(es)" "F36: both candidates are still classified"
+assert_contains "$F36_PLAN" "origin/plan-b2" "F36: the later candidate is listed"
+assert_contains "$F36_PLAN" "# REFUSED — --execute will not run this" "F36: the later candidate is REFUSED as a COMMENT, never as an executable line"
+assert_contains "$F36_PLAN" "does NOT provably contain the classified tip" "F36: the REFUSED note carries the real merge-premise reason"
+assert_eq "$(grep -c '^  git push origin --delete' <<<"$F36_PLAN" || true)" "1" "F36: only the candidate evaluated BEFORE the rewrite is printed as an executable delete"
+assert_eq "$(grep -c '^  git push origin --delete.*plan-b2' <<<"$F36_PLAN" || true)" "0" "F36: the REFUSED candidate is NOT printed as an executable delete"
+# A VERBATIM PASTE of the plan's command block must NOT delete plan-b2. Under the
+# pre-fix snapshot the entry was printed as an EXECUTABLE push whose lease PASSES
+# (origin's real plan-b2 IS at the classified oid), so the paste deleted it while
+# `--execute` refused — the data-loss path.
+F36_PASTE="$FIX/f36-paste.sh"
+{
+    printf '#!/usr/bin/env bash\n'
+    awk '/^Deletion commands that would run/ { grab=1; next } grab && /^$/ { exit } grab { print }' <<<"$F36_PLAN"
+} > "$F36_PASTE"
+run_script bash "$F36_PASTE"
+assert_eq "$RC" "0" "F36: a paste of the plan exits 0"
+if [ "$(git -C "$F36_ORIGIN" rev-parse -q --verify refs/heads/plan-b2 2>/dev/null || echo GONE)" = "$F36_B2_OID" ]; then
+    ok "F36: a PASTE of the printed plan does NOT delete the REFUSED branch plan-b2 (F36)"
+else
+    bad "F36: a paste of the printed plan DELETED plan-b2 — the data-loss path is back (F36)"
+fi
+# PARITY CONTROL: on the SAME fixture (origin restored to main=Y and BOTH branches
+# re-pushed, so the control does not depend on what the paste did), `--execute`
+# under the same rewrite deletes exactly the ONE candidate the plan printed
+# executable and REFUSES the one the plan marked REFUSED. That is the F36 property
+# — the plan's executable set and execute's action set are the SAME at the same
+# instant — and it is why the surviving executable line above is NOT a divergence
+# from execute.
+git push -q origin plan-longfirst
+git push -q origin plan-b2
+git push -q origin main:refs/heads/main
+if [ "$(git -C "$F36_ORIGIN" rev-parse refs/heads/main)" = "$F36_LF_OID" ]; then
+    ok "F36 control: origin/main is restored to Y for the parity run (F36)"
+else
+    bad "F36 control: origin/main was not restored — the control fixture is wrong (F36)"
+fi
+rm -f "$F36_MARK"
+run_script env PATH="$F36_WRAP:$PATH" F36_REAL_GIT="$F36_REAL_GIT" F36_ORIGIN="$F36_ORIGIN" \
+    F36_BASE="$F36_BASE_OID" F36_MARK="$F36_MARK" \
+    bash "$F36_SCRIPT" --repo "$F36_REPO" --scope remote --execute
+assert_eq "$RC" "1" "F36 control: the mid-sweep rewrite makes --execute REFUSE the later candidate (rc=1)"
+assert_contains "$OUT" "REFUSING to delete origin/plan-b2" "F36 control: --execute refuses the SAME branch the plan refused"
+assert_contains "$OUT" "Deleted: 1" "F36 control: --execute deletes exactly the ONE candidate the plan printed executable"
+assert_contains "$OUT" "Refused: 1" "F36 control: --execute refuses exactly the ONE candidate the plan marked REFUSED"
+if [ "$(git -C "$F36_ORIGIN" rev-parse -q --verify refs/heads/plan-b2 2>/dev/null || echo GONE)" = "$F36_B2_OID" ]; then
+    ok "F36 control: --execute leaves plan-b2 intact — plan and execute agree on the premise (F36)"
+else
+    bad "F36 control: --execute deleted plan-b2 although the plan refused it (F36)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 55. F37: under --scope both errexit is suppressed, so the F35 guard is the ONLY protection =="
+# Bash suppresses errexit for the ENTIRE function body when the function is the
+# LEFT OPERAND of `||`, and `run_scopes` calls `run_remote_scope || rc=1` under
+# `--scope both`. So the comment that claimed "without the log set -e aborts
+# loudly, so the FALSE PASS is specific to the scheduled invocation" was FALSE:
+# with the F35 guard removed, `--scope both` AND NO log did not abort — the sweep
+# printed `No stale merged branches found` and continued into the local leg.
+# (measured 2026-10, this branch). At HEAD the F35 guard closes the path, so this
+# section pins the CORRECTED claim: the guard must fire in `--scope both`, with
+# the log AND without it, and no `set -e` may be relied on anywhere in the remote
+# scope.
+F37_LOG_A="$FIX/f37-both-with-log.log"
+F37_LOG_B="$FIX/f37-both-no-log.log"
+# (a) --scope both WITH the report log.
+: > "$F37_LOG_A"
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=fail \
+    CLEANUP_BRANCH_LOG="$F37_LOG_A" \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope both --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "1" "F37 (--scope both, with log): a failing ordering pipeline REFUSES (rc=1)"
+assert_contains "$OUT" "could not order the stale branch list" "F37 (--scope both, with log): the F35 guard fires even though run_remote_scope is the || left operand"
+assert_not_contains "$OUT" "No stale merged branches found" "F37 (--scope both, with log): no false PASS from the suppressed errexit"
+assert_not_contains "$(cat "$F37_LOG_A")" "No stale merged branches found" "F37 (--scope both, with log): the LOG records no false PASS"
+# (b) --scope both WITHOUT the log — the case the old comment called "aborts loudly".
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=fail \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope both --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "1" "F37 (--scope both, no log): the guard REFUSES rather than relying on errexit (rc=1)"
+assert_contains "$OUT" "could not order the stale branch list" "F37 (--scope both, no log): the F35 guard is the protection, not set -e"
+assert_not_contains "$OUT" "No stale merged branches found" "F37 (--scope both, no log): no false PASS"
+# control: a WORKING sort still classifies under --scope both, so the guard is not
+# over-firing and the local leg still runs.
+: > "$F37_LOG_B"
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=pass \
+    CLEANUP_BRANCH_LOG="$F37_LOG_B" \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope both --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "F37 control: a working ordering pipeline still runs both legs (rc=0)"
+assert_contains "$OUT" "Found 2 stale merged branch(es)" "F37 control: the remote leg still classifies both candidates"
+assert_contains "$OUT" "Selected:" "F37 control: the local leg still runs after the remote one"
 
 cd "$REPO"
 echo ""
