@@ -73,7 +73,21 @@ export const REPO_DIR = resolve(MODULE_DIR, "..");
 // ── Skill read persistence across sessions ──────────
 // ponytail: persist readFiles to ~/.pi/agent/skill-reads.json.
 // Restore on session_start for reads in the last 24h. Eliminates
-// re-read friction after reload (#7416).
+// re-read friction after reload (eldato #7416).
+//
+// ⛔ CONSEQUENCE FOR GATE SEMANTICS (#1331): the 24 h TTL is a bound on IDLENESS,
+// NOT on the age of the read. persistReadFiles() writes `readAt: now` for EVERY
+// entry in readFiles — a restored one included — and it runs after each tracked
+// read and at session_shutdown. So a skill read once keeps satisfying its gate
+// while a session starts at least once every 24 h, and "read this session" in a
+// gate message means "restored into this session". The window is stated at the
+// gate-description sites a lane reads — the manifest header
+// (enforcement/dangerous-ops.txt) and AGENTS.md §Skill Reading Protocol — so a
+// reader finds the decision BEFORE deciding the TTL is legacy.
+// OVERRIDES: the common "explicit sign-off per session" default — a persisted read
+// clears the gate and each session that restores it re-stamps it, because re-read
+// friction after a reload was the larger cost. Deleting the window would silently
+// reverse that recorded decision; the route is a reopen (#1331).
 const DEFAULT_SKILL_READS_FILE = join(homedir(), ".pi", "agent", "skill-reads.json");
 let SKILL_READS_FILE = DEFAULT_SKILL_READS_FILE;
 const READ_PERSIST_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
