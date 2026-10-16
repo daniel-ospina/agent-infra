@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- branch reaper (#1787): a daily LOCAL-branch pass over the tortoise repo.
+         The reaper itself is agent-infra/scripts/cleanup-stale-branches.sh,
+         farmed to {{HOME}}/.pi/agent/scripts/ by pi-bootstrap/setup.sh's
+         fleet-scripts farm.
+
+         WHY LOCAL SCOPE. This estate squash-merges, so a merged branch is NOT
+         an ancestor of main and the remote scope's `merged` criterion is
+         nearly blind to it (measured 2026-10-15: tortoise carries 1,153
+         branches with a MERGED PR while that criterion reports 199). The local
+         scope selects a stale branch only when a MERGED pull request exists
+         for it, or it has no commits outside origin/main, or its upstream
+         already holds everything it does — and it never selects a branch
+         checked out in a worktree, main, a branch with an OPEN PR, or one
+         whose local commits exist nowhere else.
+
+         WHY THE ENTRY POINT IS THE CHECKOUT'S OWN PYTHON, NOT `bash`.
+         macOS TCC is per-binary and denies a launchd-spawned `bash` the read of
+         a script under ~/Documents ("Operation not permitted") AND a
+         launchd-spawned `git` the read of the repo there ("not a git
+         repository"). The reaper's whole job is `git` against that checkout, so
+         a `bash <script>` entry point cannot work no matter where the script
+         lives. The binary that DOES hold the access is the checkout's own
+         interpreter ({{TORTOISE_REPO}}/.venv/bin/python), the same one the
+         working com.tortoise.worktree-reaper agent runs. So launchd starts that
+         interpreter on pi-reap-worktrees-launchd.py, which reads the script
+         itself and hands it to bash on stdin; bash and the `git` it spawns
+         inherit the access from that process.
+
+         WHY `repo` IS PASSED. The shared launcher runs the script with
+         `bash -s`, and under `bash -s` BASH_SOURCE is EMPTY, so the script's own
+         checkout inference has nothing to resolve. The repo argument is the seam that
+         tells it which checkout to sweep.
+
+         SHIPS IN DRY-RUN. The argument list below carries the scope flag but NO
+         execute flag, so the pass classifies and reports and deletes nothing.
+         Arming it is a deliberate, per-machine operator decision: add the
+         reaper's execute flag HERE and re-run scripts/install-launchd.sh.
+         Removing nothing is NOT arming — with no execute flag the reaper
+         dry-runs, which is the shipped state.
+
+         The repo argument is {{TORTOISE_REPO}}. A machine without a tortoise
+         checkout leaves that placeholder unresolved, and install-launchd.sh
+         then SKIPS this template by design (unresolved placeholder) instead of
+         installing a broken target.
+
+         WHERE THE REPORT GOES. The reaper PRINTS its report; it writes no file
+         unless CLEANUP_BRANCH_LOG is set. So this job sets it: a scheduled pass
+         appends its report to
+         {{HOME}}/.pi/agent/state/cleanup-stale-branches.log, and the script
+         TRUNCATES that file before a pass once it exceeds
+         CLEANUP_BRANCH_LOG_MAX_BYTES (1 MiB default), so it holds the most
+         recent passes and cannot grow without bound — the same shape as the
+         worktree reaper's REAP_WT_LOG. No StandardOutPath/StandardErrorPath for
+         the same reason the other reapers omit them: an unbounded
+         launchd-captured log is the surface they already avoid, and the script's
+         own file is the retrievable, bounded copy. Before this key existed an
+         unarmed pass printed to the unified log only, which nobody can retrieve. -->
+    <key>Label</key>
+    <string>com.tortoise.branch-reaper</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{TORTOISE_REPO}}/.venv/bin/python</string>
+        <string>{{HOME}}/.pi/agent/scripts/pi-reap-worktrees-launchd.py</string>
+        <string>--script</string>
+        <string>{{HOME}}/.pi/agent/scripts/cleanup-stale-branches.sh</string>
+        <string>--repo</string>
+        <string>{{TORTOISE_REPO}}</string>
+        <string>--scope</string>
+        <string>local</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The reaper shells out to `gh`, `jq` and `git`; a launchd job gets
+             neither the operator's PATH nor their rc files, so PATH is rendered
+             from the installer's own (with the unreadable pi shim dir removed
+             by install-launchd.sh, #1719/#427). -->
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <!-- The retrievable, capped report log (see the header note). The script
+             creates the state directory, so the file always lands. -->
+        <key>CLEANUP_BRANCH_LOG</key>
+        <string>{{HOME}}/.pi/agent/state/cleanup-stale-branches.log</string>
+    </dict>
+    <key>StartInterval</key>
+    <!-- 86400s = daily. Branch accumulation is slow (the 2026-10-15 sweep found
+         2,125 in tortoise after a long gap), so a daily classification pass is
+         enough to keep ~/.pi/agent/state/cleanup-stale-branches.log (the report
+         this job writes) current without a busy job. -->
+    <integer>86400</integer>
+</dict>
+</plist>
