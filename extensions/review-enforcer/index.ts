@@ -603,15 +603,21 @@ function dequote(tok: string): string {
   return tok.replace(/["'\\`]/g, "").replace(GLUED_SEPARATOR, "");
 }
 
-/** Would the shell RUN this word as `gh` (rather than merely quoting the string)? */
-function isGhWordAt(scan: ScanTokens, i: number): boolean {
-  const tok = scan.tokens[i];
-  if (tok === undefined || dequote(tok) !== "gh") return false;
-  const start = scan.starts[i];
-  // A splice INSIDE the word (`g"h"`, `''gh`, `\gh`) is the command name wherever
-  // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
-  const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
-  if (partiallyUnquoted) return true;
+/**
+ * Is the token at `i` in COMMAND position — where the shell RUNS a word rather than passing
+ * it as an argument? True at the start of the command, after an unquoted separator (`;`, `&`,
+ * `|`, `(`, `{`, or a NEWLINE — bash separates commands on both), after a command introducer
+ * (`env`, `time`, …), after `sh -c`, a redirection, an assignment prefix, or a reserved word
+ * (`if`, `while`, …).
+ *
+ * ONE model, TWO consumers: `isGhWordAt` asks "is this word RUN as `gh`?", and the positive
+ * read in `readsNonMergeGhCall` asks "could an executable word have been spelled away here?".
+ * They MUST agree. The divergence between them was a live bypass (adversarial review, shape
+ * 12): this guard knew only `;`-gaps and a shorter keyword list, so the same
+ * `$C $P $M 999 $V` decoy written one line lower read as an ARGUMENT position and the
+ * command reached the real `gh` as `pr merge 999 --admin`.
+ */
+function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
   let prev = i === 0 ? null : scan.tokens[i - 1];
   // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
   // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
@@ -633,6 +639,18 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
     /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
     /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prev)
   );
+}
+
+/** Would the shell RUN this word as `gh` (rather than merely quoting the string)? */
+function isGhWordAt(scan: ScanTokens, i: number): boolean {
+  const tok = scan.tokens[i];
+  if (tok === undefined || dequote(tok) !== "gh") return false;
+  const start = scan.starts[i];
+  // A splice INSIDE the word (`g"h"`, `''gh`, `\gh`) is the command name wherever
+  // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
+  const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
+  if (partiallyUnquoted) return true;
+  return isCommandPositionAt(scan, i);
 }
 
 function hasBareGhWord(command: string): boolean {
@@ -697,16 +715,6 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
 ]);
 
 /**
- * Shell keywords that put the NEXT token in COMMAND position — where an executable word
- * lives. A construct-bearing token there may be an executable the text has spelled away
- * (`$C $P $M 999 $V`), so the guard refuses the read; the same construct in an ARGUMENT
- * position (`gh api /repos/o/r --method POST $(mktemp)`) is ordinary and must NOT fail it.
- * Separators are the other half of the test and live in the tokenizer's `gaps`, since the
- * tokenizer splits them out of the tokens themselves.
- */
-const EXEC_KEYWORD = /^(then|do|else|elif|!|time|sudo|command|env|exec)$/;
-
-/**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
  * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
  * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
@@ -746,12 +754,7 @@ export function readsNonMergeGhCall(command: string): boolean {
     if (!CONSTRUCT.test(tok)) continue;
     const next = shellWord(scan.tokens[i + 1]);
     if (next === "pr" || next === "merge") return false; // `$C pr merge`, `$P$'r' merge`
-    // Separators are NOT part of any token — the tokenizer splits on them and keeps them in
-    // `gaps` — so a command position is `i === 0`, or a separator in the gap before this
-    // token, or a shell keyword as the previous word (`then`, `do`, `env`, …).
-    const atCommandPosition = i === 0 || /[;&|({]/.test(scan.gaps[i]) ||
-      EXEC_KEYWORD.test(shellWord(scan.tokens[i - 1] ?? ""));
-    if (atCommandPosition) return false; // an executable word may be spelled away
+    if (isCommandPositionAt(scan, i)) return false; // an executable word may be spelled away
   }
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {

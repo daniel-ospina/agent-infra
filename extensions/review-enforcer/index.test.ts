@@ -5376,6 +5376,16 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // inside a quoted assignment glued to the `S=` word: the polarity reads this one
         // positively (the decoy), so ONLY the caller's `mergeVerbInText` conjunct keeps it.
         "V=--admin; export V; export PATH=/usr/bin; gh pr view 1 >/dev/null; S='gh pr merge 9 $V'; sh -c \"$S\"",
+        // …and the SAME decoy with the constructed executable at the start of its OWN LINE.
+        // The command-position guard originally knew only a `;`-gap and a short keyword
+        // list, so a newline read as an ARGUMENT position and this command satisfied the
+        // positive read while reaching the real gh as `pr merge 999 --admin` (adversarial
+        // review, shape 12 — the model is now `isCommandPositionAt`, shared with
+        // `isGhWordAt`, so the two can no longer disagree about where a command starts).
+        "gh pr view 1\nexport V=--admin\nexport C=gh P=pr M=merge\nexport PATH=/usr/bin\n$C $P $M 999 $V",
+        // …and with the constructed executable as an `if` condition: the same divergence,
+        // reached through a reserved word instead of a newline.
+        "gh pr view 1; V=--admin; C=gh; P=pr; M=merge; PATH=/usr/bin; export PATH; if $C $P $M 999 $V; then :; fi",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5473,6 +5483,11 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "X=$(date) gh issue comment 5", // i === 0 — an assignment prefix may BE the command
     "V=--admin; if true; then $C $P $M 999 $V; fi; gh issue comment 5", // `then`
     "V=--admin; env $C $P $M 999 $V; gh issue comment 5", // `env`
+    // …and the two command positions the guard originally missed (shape 12): an UNQUOTED
+    // NEWLINE, and a reserved word its keyword list did not carry. The model is now shared
+    // with `isGhWordAt`, so this pins the agreement rather than a second list.
+    "gh pr view 1\n$C $P $M 999 $V", // a newline separates commands like `;`
+    "V=--admin; if $C $P $M 999 $V; then :; fi; gh issue comment 5", // `if`
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }
