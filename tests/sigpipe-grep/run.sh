@@ -2020,12 +2020,12 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the TWENTY-THREE fixtures below. NON-VACUOUS: all twenty-three are reported
+#   13a  DETECTION — the TWENTY-NINE fixtures below. NON-VACUOUS: all twenty-nine are reported
 #        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
 #        (NOT `HEAD`, which by the time you read this is the widened guard and reports all
-#        twenty-three as hits at rc 1) — so this whole block fails before the widening. Verified
-#        2026: the pre-change guard exits 0 on all twenty-three, the head guard exits 1 naming all
-#        twenty-three.
+#        twenty-nine as hits at rc 1) — so this whole block fails before the widening. Verified
+#        2026: the pre-change guard exits 0 on all twenty-nine, the head guard exits 1 naming all
+#        twenty-nine.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2085,6 +2085,22 @@ printf '%s\n' '#!/usr/bin/env bash' 'grep -f $(grep -v x f | head -1) f | grep -
 printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(printf x | head) f | grep -q bar'           > "$E/scripts/nestedprintf.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'eval "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/evalnest.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'sh -c "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/shcnest.sh"
+# The spellings that reach the SAME false clean THROUGH a MULTI-TOKEN prefix, each measured at
+# rc 141 on the same payload: a wrapper two or more tokens back because its option has a
+# SEPARATED ARGUMENT (`env -u FOO -i grep`, `env -u FOO -- grep`) or because it carries several
+# options (`stdbuf -i0 -o0 grep`) — a one-token lookback lands on the option or on its argument
+# and never reaches the wrapper; a QUOTED `env -S` BODY carrying a data pipe (the single-quoted
+# spelling; `envsbody.sh` above is the double-quoted one), where restarting at the body close
+# re-opened quoting so the outer pipe was never charged; and an unquoted BRACED VARIABLE among
+# the producer arguments, whose `}` a group-depth-0 test read as a group close and so cleared the
+# writer. Each was reported CLEAN before this round (review of #864); `envbody.sh` is covered by
+# the wrapper-body pass already, and is kept as the single-quoted pin of that class.
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -i grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'stdbuf -i0 -o0 grep -E "a|b" f | grep -q bar' > "$E/scripts/multiopt2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -- grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt3.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -S 'grep -E \"a|b\" f' | grep -q bar"     > "$E/scripts/envbody.sh"
+printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" ${y} f | grep -q bar'  > "$E/scripts/vararg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head) ${y} f | grep -q bar' > "$E/scripts/procsubstvar.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2097,8 +2113,11 @@ if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" 
    && grep -q 'evalbody\.sh' "$OUT" && grep -q 'envsbody\.sh' "$OUT" \
    && grep -q 'nestedsubst\.sh' "$OUT" && grep -q 'nestedcmdsubst\.sh' "$OUT" \
    && grep -q 'nestedprintf\.sh' "$OUT" && grep -q 'evalnest\.sh' "$OUT" \
-   && grep -q 'shcnest\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution conjunctions)"
+   && grep -q 'shcnest\.sh' "$OUT" \
+   && grep -q 'multiopt\.sh' "$OUT" && grep -q 'multiopt2\.sh' "$OUT" \
+   && grep -q 'multiopt3\.sh' "$OUT" && grep -q 'envbody\.sh' "$OUT" \
+   && grep -q 'vararg\.sh' "$OUT" && grep -q 'procsubstvar\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
