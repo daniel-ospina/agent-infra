@@ -151,6 +151,22 @@ every read-only command. Unresolvable targets (`$VAR` pathspec, unresolvable
 unreadable `git status` stays fail-CLOSED, matching the repo's write-gate
 convention.
 
+**#1125 — a `cat-file-revert` HINT with no write surface is not a discard, so
+its unresolvable pathspec no longer fails closed.** The form models committed
+content reproduced onto its own path (`git show HEAD:x > x`), and the handler
+intersects the hint with the command's bash write targets for exactly that
+reason. With NO write target there is nowhere for the content to land — yet the
+unresolvable-pathspec arm ran BEFORE the intersection, so a purely read-only
+probe whose path is a loop variable was refused. That blocked the sanctioned
+read-only triage tool `scripts/stale-main-triage.sh` (its
+`git cat-file -e "origin/$BRANCH:$f"`) from every agent, and the 2026-09-17
+fleet-durability sweep's per-file `git cat-file -e` loop in three repos. The
+arm is now ordered after the "can this hint land at all" question: an
+unresolvable hint still fails closed whenever the command DOES carry a write
+surface (`git show HEAD:$f > $f` stays blocked), which is why #1139's
+set-scoped exemption for `hub-worktree.sh`'s `git show "HEAD:$rest" > …`
+remains necessary.
+
 **#1139 — the framework's own sanctioned scripts are exempt from the M5 walk,
 and the fail-closed message no longer misattributes the cause.** #1129 exempted
 `SANCTIONED_SCRIPT_RELPATHS` from M4's content walk *only*; M5 never consulted
@@ -286,7 +302,13 @@ legal states: checked out on `main`/`master` and a clean working tree
 (`git status --porcelain` empty — **untracked files count as dirty**). M4
 enforces this at runtime: **when the session cwd IS the hub and it is off-main
 or dirty, every git operation outside the sanctioned recovery allowlist is
-BLOCKED**, and write/edit in the hub is blocked too.
+BLOCKED**, and write/edit in the hub is blocked too. Every M4 block reason
+**names the disordered checkout** (absolute path) and echoes the resolved
+condition — `off-main: <branch>` / `dirty: N path(s)` (#1125). `"the shared main
+checkout"` alone is ambiguous on a machine carrying several checkouts: it sent
+two agents to the WRONG repository for ~40 minutes and produced a
+destructive-command request against a healthy repo, because the disorder was in
+a DIFFERENT checkout the message never named.
 
 | Allowed (sanctioned recovery) | Blocked |
 |---|---|
@@ -1304,7 +1326,7 @@ marker fixes **guard-blocked** sessions only.
 |---|---|---|
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout still blocked; a linked-worktree copy still blocked; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` fail-CLOSED case), and both escape hatches |
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout still blocked; a linked-worktree copy still blocked; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` fail-CLOSED case), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)

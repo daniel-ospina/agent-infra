@@ -165,8 +165,8 @@ let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
-let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null } = () => ({ disorder: null, branch: null });
-let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
+let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } = () => ({ disorder: null, branch: null, path: null, dirtyPaths: 0 });
+let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
@@ -543,12 +543,27 @@ function _coordinatedDeleteBlock(branchNames: string[]): { block: true; reason: 
 // sessions are exempt (D5 — isolated by construction). Agent-infra is NOT
 // exempt: the #99 carve-out is removed (#615) — its main checkout gets the
 // same M4 discipline as every other hub.
-function _hubState(): { disorder: string | null; branch: string | null } {
+function _hubState(): { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } {
   try {
     return readHubDisorder(resolve(process.cwd()));
   } catch {
-    return { disorder: null, branch: null }; // degrade — never false-block
+    return { disorder: null, branch: null, path: null, dirtyPaths: 0 }; // degrade — never false-block
   }
+}
+
+/** #1125 — the M4 WRITE/EDIT block must NAME the checkout and echo the resolved
+ *  condition, exactly as the bash-route block does (classify-git
+ *  `_m4CheckoutLines`). `"the shared main checkout"` is ambiguous across a
+ *  machine carrying several checkouts; unnamed, it sent two agents to the wrong
+ *  repository for ~40 minutes and produced a destructive-command request
+ *  against a healthy repo. Returns null when the path could not be resolved
+ *  (the message stays as it was — no fabricated context). */
+function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number }): string | null {
+  if (!st.path) return null;
+  const bits: string[] = [];
+  if (st.disorder === "off_main" || st.disorder === "both") bits.push(`off-main: ${st.branch ?? "<detached>"}`);
+  if (st.disorder === "dirty" || st.disorder === "both") bits.push(`dirty: ${st.dirtyPaths} path(s)`);
+  return `   Checkout: ${st.path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
 }
 
 // #436 (B carve-out): collision-free NEW-FILE write allowance in a disordered
@@ -1853,6 +1868,24 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
 
     for (const d of set.discs) {
+      // #1125 — a `cat-file-revert` HINT is a discard ONLY when the reproduced
+      // committed content LANDS on a path: the form's whole model is `git show
+      // HEAD:x > x`, and index.ts intersects the hint with the command's bash
+      // write targets for exactly that reason. With NO write target in the
+      // command/script there is nowhere for the content to land, so the hint
+      // cannot be a revert whatever its pathspec spells — and a read-only probe
+      // (`git cat-file -e "origin/$BRANCH:$f"`, `git show "$ref:$f"`) is that
+      // shape. Failing closed on its unresolvable pathspec refused a command
+      // with no discard effect at all: the sanctioned read-only triage tool
+      // `scripts/stale-main-triage.sh` could not be RUN by an agent, and the
+      // fleet-durability sweep's per-file `git cat-file -e` loop was blocked in
+      // three repos (2026-09-17 evidence on #1125). This is not a new
+      // allowance: the `lands.length === 0 → continue` arm below already treats
+      // "no write target" as "no discard" for RESOLVABLE hints, and the
+      // unresolvable check still runs (and still fails closed) whenever the
+      // command DOES carry a write surface — `git show HEAD:$f > $f` keeps
+      // blocking, as does a resolvable redirect.
+      if (d.form === "cat-file-revert" && writeTargets.length === 0) continue;
       // Fail closed on anything whose blast radius is not statically known:
       // `--pathspec-from-file` (the list lives in a FILE), an unresolvable
       // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
@@ -2623,7 +2656,7 @@ export default function (pi: ExtensionAPI) {
             }
           } catch { /* empty set → only the hub's current branch protects */ }
           if (st.branch) checkedOutNames.add(st.branch);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames);
+          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st);
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -2667,6 +2700,7 @@ export default function (pi: ExtensionAPI) {
         // active TTL marker cannot write into the hub.
         const targetPath = (event.input as { path?: string }).path ?? "";
         const st = _hubState();
+        const ctxLine = _m4CheckoutLine(st);
         if (st.disorder) {
           const targetTop = resolveTargetTopLevel(targetPath);
           const mainTop = _mainTopLevel();
@@ -2691,6 +2725,7 @@ export default function (pi: ExtensionAPI) {
                   block: true,
                   reason: [
                     `⛔ New-file write blocked — new-file cap exhausted in a disordered hub (#628).`,
+                    ...(ctxLine ? [ctxLine] : []),
                     `   This session has created ${newFileCount - 1} new files directly in the`,
                     `   shared main checkout while it is OFF-MAIN or DIRTY (cap ${HUB_NEW_FILE_BLOCK_CAP}).`,
                     `   New files are additive (they cannot collide with a sibling's uncommitted`,
@@ -2708,6 +2743,7 @@ export default function (pi: ExtensionAPI) {
               block: true,
               reason: [
                 `⛔ File edits blocked — the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+                ...(ctxLine ? [ctxLine] : []),
                 `   The hub's only legal states are main+clean. Non-recovery edits are`,
                 `   blocked even under the TTL marker (D3).`,
                 `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
