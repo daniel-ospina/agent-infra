@@ -253,6 +253,14 @@ check_fleet_tools_farmed() {
   else
     fail "$label: farmed map-sessions.py differs from (or is missing vs) tools/fleet/map-sessions.py"
   fi
+  # #1777 — the ref-claim reader. It imports the sibling liveness.py, so farming it
+  # without the classifier is the same loud exit-2 abort, and a stale copy means an
+  # operator reads a DIFFERENT claim polarity than the repo's.
+  if diff -q "$ROOT/tools/fleet/claim_lanes.py" "$DEST/scripts/fleet/claim_lanes.py" >/dev/null 2>&1; then
+    echo "ok: $label farmed claim_lanes.py == repo copy (#1777)"
+  else
+    fail "$label: farmed claim_lanes.py differs from (or is missing vs) tools/fleet/claim_lanes.py"
+  fi
   # The farmed driver must actually start from the farmed layout: it imports its
   # sibling classifier and forks the shared identity library. `--help` is the
   # read-only mode (no cmux call, no store read, no issue); the pinned
@@ -572,8 +580,8 @@ grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG"
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
 grep -q "scripts lib farm: 2 copied (pid-identity.sh + diff-normalize.py, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the shared-library farm copies (#1178/#1362)"
-grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
+grep -q "scripts/fleet farm: 5 copied (lane-liveness + claim-lanes + fleet-health + map-sessions, #1178/#1777)" "$RUNS_LOG" \
+  || fail "run 1 did not report the fleet-tools farm copy (5 files, #1178/#1777)"
 check_tools_dir_clean "run1-final"
 
 # --- run 1b: #1277 legacy migration + durable regression guard -----------------
@@ -586,7 +594,7 @@ check_tools_dir_clean "run1-final"
 # the farm FAIL LOUD rather than recreate one.
 echo "== run 1b: legacy tools/fleet migration + tools/ regression guard (#1277)"
 mkdir -p "$DEST/tools/fleet"
-for f in lane_liveness.py liveness.py fleet-health.py map-sessions.py; do
+for f in lane_liveness.py liveness.py claim_lanes.py fleet-health.py map-sessions.py; do
   echo "# legacy farm replica (the pi boot-blocker)" > "$DEST/tools/fleet/$f"
 done
 if [ -f "$DEST/tools/fleet/lane_liveness.py" ]; then
