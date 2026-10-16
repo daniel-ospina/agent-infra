@@ -44,13 +44,17 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ⛔ `O` is deliberately NOT pre-cleared here. Every sibling in this directory honours an env
-# `O=<dir>` (`install.sh:16`, `report.sh:18`, `orch-loop.sh`), and install.sh's own printed remedy
-# uses that form (`O='$O' bash install.sh`). Clearing it made line 66's `${O:-...}` fallback
+# `O=<dir>` (`install.sh`, `report.sh`, `orch-loop.sh` all assign `O="${O:-...}"`), and this
+# script's own printed remedy uses that form. Clearing it made the `${O:-...}` fallback below
 # unconditional, so `O=<dir> check-deployed-drift.sh --repo <r>` silently verified
-# `$HOME/orchestrator` instead: measured, a drifted surface named on the command line exited 1
-# while the SAME surface named by env printed `OK` and exited 0 — a false PASS asserted about a
-# directory the operator never named. `REPO`/`REF`/`REL` have no such env convention upstream, so
-# they stay cleared (they are resolved from --flags and defaults below).
+# `$HOME/orchestrator` instead: measured, a drifted surface named with `--o` exited 1 while the SAME
+# surface named by env printed `OK` and exited 0 — a false PASS asserted about a directory the
+# operator never named.
+# `REPO`/`REF`/`REL` are still cleared, because this script resolves them from `--repo`/`--ref`/
+# `--rel` (plus `HARNESS_REPO` and its own worktree). That is a deliberate choice about THIS script;
+# `REPO` in particular DOES have an env convention in `install.sh`/`report.sh`/`orch-loop.sh`, and
+# this comment previously claimed none existed. File/line citations are deliberately absent: an
+# earlier revision cited a sibling line that this same change had already shifted.
 REPO=""; REF=""; REL=""; QUIET=0; FETCH=1
 DEFAULT_REF="${HARNESS_REF:-origin/main}"
 
