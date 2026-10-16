@@ -9,7 +9,8 @@
 # no audit-logger, and its merge path died rc=127 on the missing record-review.sh.
 #
 # This suite pins `pi-bootstrap/cell-install.sh` (the installer half) by reading the
-# ARTIFACT back — never by trusting its output:
+# ARTIFACT back — never by trusting its output. The list below is the load-bearing set, not an
+# inventory of every assertion:
 #
 #   (a) the DECLARED farm set lands, byte-identical, at the layout setup.sh documents —
 #       computed by an INDEPENDENT reader in this file, so "installed == declared" is a
@@ -28,11 +29,11 @@
 #       never the keys.env the cell exported — and with --ignore-scripts;
 #   (h) `--verify` refuses a hand-edited guard EXTENSION and a missing config artifact
 #       (agents/) — existence alone was certified before;
-#   (i) `--verify` refuses a source tree it cannot compare IN FULL rather than treating it as
-#       a match: an emptied tree (either loop), a subtree it cannot read, a shipped SYMLINK
-#       (copied as a link, never byte-compared) and a shipped file whose name carries a
-#       newline — while a LINKED node_modules (an excluded namespace) is NOT refused, and a
-#       symlinked source directory is followed instead of being called empty;
+#   (i) `--verify` on a tree it cannot compare IN FULL: a shipped SYMLINK is REFUSED (copied
+#       as a link, never byte-compared), a LINKED node_modules is NOT (an excluded namespace),
+#       and a shipped file whose name carries a newline is REFUSED (the line-based list is
+#       lossy) — as are an emptied tree (either loop) and a subtree it cannot read; a
+#       symlinked source DIRECTORY is followed rather than called empty;
 #   (j) `--verify` refuses an extension whose dependency tree is MISSING (it declares runtime
 #       deps but has no node_modules), and refuses a CONFIG copy that fails instead of
 #       reporting the config set as installed.
@@ -478,11 +479,8 @@ else
     && ok "a source tree that cannot be read in full is REFUSED, not certified over a partial file list" \
     || fail "an unreadable subtree produced a certified comparison over the files find could reach"
 fi
-# Three ways a file goes unread while the call still reports a match. A shipped SYMLINK is
-# copied as a link, so it is never byte-compared. The node_modules namespace is excluded by
-# construction, so a LINKED one is legitimate and must NOT be refused. And a name containing a
-# NEWLINE makes the line-based list lossy — the entry is dropped and a sibling's line is
-# duplicated in its place — so that tree is refused rather than interpreted.
+# Three source shapes that make a shipped file go unread, or that must not be refused. Each
+# pin below states its own mechanism; the first two are refused by the same code path.
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard"
 mkdir -p "$EMPTY_EXT/extensions/task-cwd-guard"
 cp -R "$ROOT/extensions/task-cwd-guard/." "$EMPTY_EXT/extensions/task-cwd-guard/"
@@ -493,23 +491,20 @@ grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out3" \
   && ok "a shipped SYMLINK is refused (cp -R copies it as a link, so it was never byte-compared)" \
   || fail "a shipped symlink was certified without ever being compared"
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
-# (2) a LINKED node_modules, which must NOT be refused: the whole verify OUTPUT is compared with
-# a baseline measured immediately before the link is added, so that an unrelated problem naming
-# this extension is never attributed to the link, and an unchanged output is a stronger
-# statement than an unchanged problem count. The baseline is measured here rather than assumed,
-# because the pins above leave this fixture carrying their own problems.
+# (2) a LINKED node_modules, which must NOT be refused. Compared against a baseline measured
+# immediately before the link is added, so a problem that was ALREADY there cannot be read as
+# caused by the link.
 base="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
 ln -s "$TMP/emptynm" "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"
 mkdir -p "$TMP/emptynm"
 out4="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
 if [ "$(grep '^FAIL: ' <<<"$out4" | sort)" = "$(grep '^FAIL: ' <<<"$base" | sort)" ]; then
-  ok "a LINKED node_modules is not refused (excluded by construction — the verify output is unchanged)"
+  ok "a LINKED node_modules is not refused (excluded by construction — no new FAIL line)"
 else
-  fail "a linked node_modules changed the verify output: $(diff <(grep '^FAIL: ' <<<"$base") <(grep '^FAIL: ' <<<"$out4") | head -3 | tr '\n' ' ')"
+  fail "a linked node_modules added or removed a FAIL line: $(diff <(grep '^FAIL: ' <<<"$base") <(grep '^FAIL: ' <<<"$out4") | head -3 | tr '\n' ' ')"
 fi
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"; rmdir "$TMP/emptynm"
-# (3) a name containing a NEWLINE. The sibling whose content matches is what the lossy list
-# duplicates in the entry's place, so it is part of the shape under test.
+# (3) a name containing a NEWLINE: the sibling is what the lossy list duplicates in its place.
 printf 'same\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"
 printf 'same\n' > "$TMP/emptyext-home/.pi/agent/extensions/task-cwd-guard/evil"
 printf 'EVIL\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
