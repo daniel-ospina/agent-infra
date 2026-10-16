@@ -163,9 +163,15 @@ eqv "a NEWLINE-separated set is normalised too" "gate" "$(merge_authority "$(pri
 # one of the _agree assertions red, which was false — on a UTF-8 host both readers coincide, and
 # reverting the normaliser to a hard-coded "utf-8" left the suite green.)
 _CLS_RULE="want=(os.environ.get('REQ') or '').split()"
-grep -vE '^[[:space:]]*#' "$ORCH" | grep -qF -- "$_CLS_RULE" \
-  && { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } \
-  || { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); }
+# Capture, then classify in the SHELL — never `… | grep -qF`: the quiet grep exits at
+# its FIRST match, the upstream `grep -vE` takes SIGPIPE (141), and under `pipefail`
+# a FAILING drift guard reads as a pass (#864's class; the producer here writes the
+# whole non-comment stream, so it is a live window, not a shape flag).
+_ORCH_RULE_HITS="$(grep -vE '^[[:space:]]*#' "$ORCH" 2>/dev/null || true)"
+case "$_ORCH_RULE_HITS" in
+  *"$_CLS_RULE"*) { echo "  ✅ the classifier still splits with Python .split() — the rule _normalise_set shares"; PASS=$((PASS+1)); } ;;
+  *) { echo "  ❌ the classifier's split rule changed in orch-loop.sh; _normalise_set shares it and must change with it (the two MUST agree) "; FAIL=$((FAIL+1)); } ;;
+esac
 _agree() { # _agree <set> -> both readers' verdicts on the SAME string
   printf 'authority=%s classifier=%s' "$(merge_authority "${1:-}")" \
     "$(REQ="${1:-}" python3 -c 'import os;print("required" if "ai-review-gate" in (os.environ.get("REQ") or "").split() else "not-required")')"

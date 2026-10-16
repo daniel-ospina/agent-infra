@@ -2020,9 +2020,11 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the eight fixtures below. NON-VACUOUS: all eight are reported CLEAN by
-#        #841's guard (`git show HEAD:scripts/check-no-sigpipe-grep.sh`), so this whole block
-#        fails before the widening.
+#   13a  DETECTION — the SIXTEEN fixtures below. NON-VACUOUS: all sixteen are reported CLEAN by
+#        #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
+#        (NOT `HEAD`, which by the time you read this is the widened guard and reports all sixteen
+#        as hits at rc 1) — so this whole block fails before the widening. Verified 2026: the
+#        pre-change guard exits 0 on all sixteen, the head guard exits 1 naming all sixteen.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2045,7 +2047,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'x=$(grep -v foo f | grep -q bar)'          
 # also carries a data pipe in its own argument: raw_idiom's `[^|]*` bridge cannot cross that
 # pipe, and scan_idiom's boundary test rejected the path — so the conjunction was reported
 # CLEAN at rc 141 while every single-dimension fixture above was flagged (review of #864).
-# These three are that conjunction, and each FAILS on the widening without the path handling.
+# These four are that conjunction, and each FAILS on the widening without the path handling.
 printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" f | grep -q bar'      > "$E/scripts/bypath.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env /usr/bin/grep -E "a|b" f | grep -q bar'  > "$E/scripts/wrapbypath.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | /usr/bin/grep -E "a|b" | grep -q needle' > "$E/scripts/stagedbypath.sh"

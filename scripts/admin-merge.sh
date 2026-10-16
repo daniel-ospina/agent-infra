@@ -2327,12 +2327,15 @@ lane_has_test_shard() {
   [ -s "$f" ] || return 1
   printf '%s\n' "$LANE_LIFECYCLE_JOBS" > "$TMP/lane-lifecycle.txt"
   # NO PIPE. A quiet grep downstream of any still-writing producer is the SIGPIPE
-  # false-negative class of #864, not only the builtin-writer form of #841: grep exits
-  # at its FIRST match, the upstream grep takes SIGPIPE (141), and under `pipefail`
-  # that status wins — so this function answers "no test shard" for a set that HAS
-  # one and the lane-parity check certifies on nothing. Capture first, then classify in
-  # the SHELL: a `case` needs no second process at all — there is no pipe to lose a
-  # status to, which is the same remedy the head/verdict resolvers above use.
+  # class of #864, not only the builtin-writer form of #841: grep exits at its FIRST
+  # match, the upstream grep takes SIGPIPE (141), and under `pipefail` that status
+  # wins — so this function returns NON-ZERO for a set that HAS a non-lifecycle name,
+  # and the caller at the lane-parity check reads non-zero as "only lifecycle jobs"
+  # and returns 2, refusing the merge: a FALSE BLOCK (fail-closed), pinned by
+  # tests/admin-merge/run.sh "a parity family of ONLY lifecycle jobs → BLOCK".
+  # Capture first, then classify in the SHELL: a `case` needs no second process at
+  # all — there is no pipe to lose a status to, which is the same remedy the
+  # head/verdict resolvers above use.
   remaining="$(grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" || true)"
   case "$remaining" in
     *[![:space:]]*) return 0 ;;
