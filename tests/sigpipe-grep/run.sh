@@ -2175,6 +2175,19 @@ printf '%s\n' '#!/usr/bin/env bash' "\$'\\147rep' -E \"a|b\" f | grep -q bar"   
 printf '%s\n' '#!/usr/bin/env bash' "env -i \$'\\147rep' -E \"a|b\" f | grep -q bar" > "$E/scripts/ansiwrap.sh"
 printf '%s\n' '#!/usr/bin/env bash' "gre''p -v zzz \"\$P\" | grep -q bar"          > "$E/scripts/splitgv.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -u <(echo a;b) -i grep -E "a|b" f | grep -q bar'   > "$E/scripts/procsubstopt.sh"
+# The SIXTH round closed the spelling family STRUCTURALLY instead of adding spellings: the line is
+# decoded ONCE into the text the shell will run and the same two matchers run on it. These pins are
+# the three sides that per-site fixes kept missing — bash brace-hex (`\x{70}`), the escaped WRAPPER
+# word, and the CONSUMER word — each measured at rc 141 under `pipefail` on a >64 KiB payload with
+# the match on line 1 against 0 for the capture-then-classify form, and each CLEAN before this fix.
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x{70}' -E \"a|b\" f | grep -q bar"        > "$E/scripts/bracehex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x{67}rep' -E \"a|b\" f | grep -q bar"        > "$E/scripts/bracehexlead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\x{6f}' \"\$T\" | grep -q bar"             > "$E/scripts/bracehexecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x65nv' -i grep -E \"a|b\" f | grep -q bar"   > "$E/scripts/escwrap.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | gre\$'\\x70' -q bar"        > "$E/scripts/consansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\147rep' -q bar"        > "$E/scripts/consansilead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x2dq' bar"        > "$E/scripts/consansiflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\x65nv' -i grep -q bar" > "$E/scripts/consansiwrap.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2227,6 +2240,18 @@ else
   fail "an ANSI-C escaped producer word was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
 fi
+# 13a3. THE LINE-WIDE DECODE pins: bash brace-hex, the escaped WRAPPER word and the CONSUMER word.
+#       These three are why the fix is ONE decode rather than another per-site spelling: each is the
+#       SAME conjunction on a side the previous local fixes did not cover.
+if [ "$rc" -eq 1 ] && grep -q 'bracehex\.sh' "$OUT" && grep -q 'bracehexlead\.sh' "$OUT" \
+   && grep -q 'bracehexecho\.sh' "$OUT" && grep -q 'escwrap\.sh' "$OUT" \
+   && grep -q 'consansi\.sh' "$OUT" && grep -q 'consansilead\.sh' "$OUT" \
+   && grep -q 'consansiflag\.sh' "$OUT" && grep -q 'consansiwrap\.sh' "$OUT"; then
+  pass "a word spelled with an ANSI-C escape is DETECTED on all three sides of the pipe (producer, wrapper, consumer) and in bash brace-hex form"
+else
+  fail "an ANSI-C spelled word on a side the decode must cover was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
 #      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
 #      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
@@ -2237,9 +2262,12 @@ printf '%s\n' '#!/usr/bin/env bash' 'grep -q needle <<<"$(grep -v x f || true)"'
 printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f | grep needle'                                                > "$E/scripts/notquiet.sh"
 printf '%s\n' '#!/usr/bin/env bash' "print''f -v VAR \"%s\" \"a|b\" | grep -q p"                             > "$E/scripts/printfvsplit.sh"
 printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\164' -e \"a|b\" f | grep -q p"                                   > "$E/scripts/ansiprefixarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x{74}' -e \"a|b\" f | grep -q p"                                 > "$E/scripts/bracehexarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x76' bar"                                  > "$E/scripts/consansinonquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x=\$'grep' ; echo ok"                                                        > "$E/scripts/mentionansi.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 0 ]; then
-  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C argument to a non-producer, and a non-quiet consumer all pass (exit 0)"
+  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C or brace-hex argument to a non-producer, a decoded non-quiet consumer, a mention, and a non-quiet consumer all pass (exit 0)"
 else
   fail "false positive on a safe grep-producer form (exit $rc):"
   sed -n '1,10p' "$OUT"
