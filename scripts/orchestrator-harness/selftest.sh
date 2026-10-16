@@ -21,6 +21,19 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
+# ── PLATFORM GATE (agent-infra#1769 review) ──────────────────────────────────────
+# install.sh is macOS-only BY CONSTRUCTION: its preflight is
+# `[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"`,
+# and every check that drives it to a rendered plist needs `plutil` and launchd. Wiring this suite
+# into `scripts/run-bash-shards.sh` (the shard list BOTH CI lanes run on ubuntu-latest) therefore
+# reddened `bash-suites` and would redden main's `script-validate` — the #1369 class the shard list
+# exists to close. Those checks are SKIPPED LOUDLY off macOS instead of failing: a silently-absent
+# suite would be the SAME class again. `skipd` counts and names each skip, and the final summary
+# reports the count, so a green Linux run cannot hide a suite that did not run.
+PLATFORM="$(uname)"
+skip=0
+skipd() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; skip=$((skip+1)); }
+on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # OFFLINE: install.sh probes the REAL `gh` (`gh auth status`) and dies without a live authenticated
 # session, so the install/render checks below would need network. A `gh` stub that reports success
 # is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
@@ -55,11 +68,17 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim; only the bash-side $REQ is substituted.
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
+# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
+# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+CL_GATE="ai-review-gate"
 awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed "s/'\\\$REQ'/'$REQ'/" | sed -n '1,/^print(/p' > "$TMP/classify.py"
-cl() { printf '%s' "$1" | python3 "$TMP/classify.py" 2>/dev/null; }
+  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
+# clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
+# ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
+clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
 if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
@@ -76,6 +95,25 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+# (z) THE REPO SHAPE THAT WAS DEADLOCKED (agent-infra#1764). Measured live on agent-infra PR #1763:
+# 22 checks, every one SUCCESS/NEUTRAL, and ZERO `ai-review-gate` runs — against agent-infra's OWN
+# required set (`pipeline-compliance`). The pre-fix classifier named `ai-review-gate` as the
+# authority by CONSTANT, so `gate` was empty, `gate_ok` false, and it forced
+# `FAILED:ai-review-gate` here: no PR could ever read GREEN and the merge queue could not drain.
+# Exact verdict, so a regression to the constant (or any re-introduced absence-is-RED rule for a
+# name this repo does not require) is RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"ci / skill-lint","state":"SUCCESS"},{"name":"ci / script-validate","state":"SUCCESS"},{"name":"test","state":"SUCCESS"},{"name":"pi-config-extensions","state":"SUCCESS"},{"name":"setup-suite","state":"SUCCESS"},{"name":"ci / unit-test","state":"SUCCESS"},{"name":"ci / typecheck","state":"SUCCESS"},{"name":"search-cost","state":"SUCCESS"},{"name":"workflow-lock","state":"SUCCESS"},{"name":"workflow-drift","state":"SUCCESS"},{"name":"actionlint","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]')"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: agent-infra's shape (22 checks, no ai-review-gate) reads GREEN on its own required set" $rc
+# (z2) …and the scoping above does NOT weaken the fail-closed rule INSIDE that set: a required
+# check this repo has not reported stays PENDING, never GREEN ("a missing check is not a green
+# check"), and a red one stays RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"ci / lint","state":"SUCCESS"}]')"
+[ "$got" = "PENDING:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a required check that never reported is PENDING, not GREEN" $rc
+got="$(clreq 'pipeline-compliance' '[{"name":"pipeline-compliance","state":"FAILURE"}]')"
+[ "$got" = "FAILED:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red required check is FAILED on a non-review-gate repo" $rc
 
 # ── 3b) the classifier's POLARITY — an allow-list, not a deny-list ───────────────
 # agent-infra#1714: the classifier named the red conclusions and filed EVERYTHING ELSE as PENDING,
@@ -235,6 +273,7 @@ SH
     printf '%s\n' "OR='example/repo'"
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
+    printf '%s\n' "REVIEW_GATE='ai-review-gate'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -484,6 +523,7 @@ ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 # EXECUTES pi — so a sandbox HOME must expose a runnable pi, exactly as a real install's HOME does.
 mkdir -p "$SB/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmod +x "$SB/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
@@ -503,6 +543,9 @@ if [ -f "$PL" ]; then
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
 fi
+else
+  skipd "install.sh renders a plist (§6) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6b) install.sh on a fresh checkout: dir-only gitignore, .worktrees not created yet ─
 # install.sh is the FIRST step on a fresh box (README §4) and dispatch-merge.sh creates the
@@ -517,6 +560,7 @@ printf '.worktrees/\n' > "$FR/repo/.gitignore"
 ck "non-vacuity: the pre-fix bare .worktrees guard fails on a fresh checkout" $rc
 grep -q 'check-ignore -q .worktrees/' "$INST" && rc=0 || rc=1
 ck "install.sh's gitignore guard uses the directory form .worktrees/" $rc
+if on_darwin; then
 SB2="$TMP/sb2"; mkdir -p "$SB2/Library/LaunchAgents" "$SB2/.config" "$SB2/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
@@ -525,6 +569,9 @@ HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$T
 PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
+else
+  skipd "install.sh renders on a fresh checkout (§6b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6c) the self-test resolves REPO to the checkout, not its parent ─────────────
 # It passed `$HERE/../../..` (the PARENT of the repo root) to install.sh, which died
@@ -544,6 +591,7 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # Render in a sandbox with a CONTROLLED PATH whose tools live in one fixture dir: the rendered PATH
 # must contain it (so the check is red under the hardcoded base) and no shim/.pi segment. `uv` is
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
+if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
 for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
@@ -556,6 +604,9 @@ case ":$PLP:" in *":$FB:"*) rc=0;; *) rc=1; echo "      rendered PATH=$PLP lacks
 ck "the rendered plist PATH is resolved, not the pre-fix hardcoded base" $rc
 case ":$PLP:" in *"/shims"*|*"/.pi/"*) rc=1;; *) rc=0;; esac
 ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
+else
+  skipd "install.sh's plist PATH render checks (§6d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6e) install.sh CREATES the plist directory ─────────────────────────────────
 # Every sandbox above pre-creates $HOME/Library/LaunchAgents, so `mkdir -p "$(dirname "$PLIST")"`
@@ -563,6 +614,7 @@ ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
 # HOME has no such directory — the render died with a raw redirect error after $O's state dirs were
 # already created (the pre-fix half-install). Assert the directory is absent first (non-vacuity),
 # then that install succeeds and the plist exists.
+if on_darwin; then
 SB4="$TMP/sb4"; mkdir -p "$SB4/.config" "$SB4/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB4/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB4/.pi/agent/scripts/record-review.sh"
@@ -575,6 +627,9 @@ inst_rc=$?
 [ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
+else
+  skipd "install.sh creates the plist directory (§6e) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
@@ -808,28 +863,23 @@ review of this very file, and 19 of its checks fail when it is dropped into the
 MD
 grep -qE "$OVERC" "$TMP/overclaim.md" && rc=0 || rc=1
 ck "the drift guard matches the pre-fix phrasings (non-vacuous)" $rc
-# The REQUIRED-check count is the page's own invariant, not a drifting number: it is fixed by the
-# repo's protection. It must equal REQ and the README must never spell a different count beside
-# the list it ships (it said "eight"/"8" against a live set of 7).
-nreq="$(sed -n 's/^REQ="\(.*\)"$/\1/p' "$LOOP" | tr ' ' '\n' | grep -c .)"
-case "$nreq" in 7) rword=seven;; 8) rword=eight;; *) rword="" ;; esac
-[ -n "$rword" ] && grep -qE "($nreq|$rword) required check" "$HERE/README.md" && rc=0 || rc=1
-ck "README states the required-check count REQ has ($nreq)" $rc
+# The required-check set is PER-REPO now (agent-infra#1764): resolved from the target repo's
+# branch protection, with FALLBACK_REQ as the fail-closed last resort. A fixed count in the README
+# would be wrong for one of the two repos, so the guard is INVERTED: the README must DESCRIBE the
+# per-repo resolution, the shipped fallback must be non-empty (an unreadable endpoint must not
+# become an empty required set), and the README must not spell a fixed count beside it.
+nreq="$(sed -n 's/^FALLBACK_REQ="\(.*\)"$/\1/p' "$HERE/repo-authority.sh" | tr ' ' '\n' | grep -c .)"
+[ "$nreq" -ge 1 ] && rc=0 || { rc=1; echo "      fallback names: $nreq"; }
+ck "the shipped FALLBACK_REQ is NON-EMPTY ($nreq names — the unreadable-protection arm fails CLOSED)" $rc
+grep -q 'branch protection' "$HERE/README.md" && rc=0 || rc=1
+ck "README documents the per-repo required-check resolution" $rc
 numerals='([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten) required check'
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(grep -oE "$numerals" "$HERE/README.md")
-[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad required check'"; }
-ck "README never disagrees with REQ on the required-check count" $rc
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(printf 'read the 8 required checks\nand the eight required check names\n' | grep -oE "$numerals")
+bad="$(grep -oE "$numerals" "$HERE/README.md" | head -1)"
+[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad'"; }
+ck "README states no fixed required-check count (the set is per-repo now)" $rc
+bad="$(printf 'read the 7 required checks\nand the eight required check names\n' | grep -oE "$numerals" | head -1)"
 [ -n "$bad" ] && rc=0 || rc=1
-ck "non-vacuity: the required-count guard flags the pre-fix '8'/'eight' (saw '$bad')" $rc
+ck "non-vacuity: the count guard still flags a fixed count of required checks (saw '$bad')" $rc
 grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
 ck "README points at the self-test" $rc
 
@@ -989,7 +1039,7 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # fixture: start=3 with a bail marker must leave NFC2=2 (refunded, then read) — not 3. Moving the
   # read back above the refund is RED, and the cap predicate on the shipped NFC2 is then false, so
   # the arm spawns instead of parking.
-  awk 'index($0,"docs|test-isolation")>0{b=1}
+  awk 'index($0,"# CI-red arm (agent-infra")>0{b=1}
        b&&index($0,"if grep -q python-ci-gate")>0{b=0}
        b' "$LOOP" \
     | grep -E '^ *(NFC2=|is_num "\$NFC2"|refund_bailed_fixer "\$PR")' > "$TMP/ci-arm-seq.sh"
@@ -1006,8 +1056,45 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   fi
 fi
 
-grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
-ck "a non-review required check failure is routed to the fixer" $rc
+# The CI-red arm is DERIVED from the repo's required set now (#1764): the pre-fix form named
+# tortoise's five checks as a literal, so a red `pipeline-compliance` on agent-infra matched
+# nothing and the PR sat red with no worker. Pin BOTH halves — the literal is gone AND the arm is
+# driven by $REQ — so a revert to a name list, or a broken derivation, is RED.
+grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=1 || rc=0
+ck "the CI-red arm no longer names tortoise's checks as a literal" $rc
+grep -q 'CI_RED=' "$LOOP" && rc=0 || rc=1
+ck "the CI-red arm derives its red name from the required set" $rc
+# The derivation is EXTRACTED and DRIVEN against both repo shapes: a red pipeline-compliance must
+# be recognised as a required name (fixer), and the review gate must be excluded (it has its own
+# arm), on agent-infra's set and on tortoise's.
+sed -n '/^        RERUN_RED=/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
+if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the shipped orch-loop.sh"; then
+  REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'; V='FAILED:pipeline-compliance'
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "pipeline-compliance" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' req=$REQ"; }
+  ck "CI-red derivation: a red agent-infra required check is recognised (no name list needed)" $rc
+  REQ='pipeline-compliance'; V='FAILED:ci / lint'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (non-required must not route)"; }
+  ck "CI-red derivation: a non-required red does not route to the fixer" $rc
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:ai-review-gate,docs'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "docs" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (review gate must be excluded)"; }
+  ck "CI-red derivation: the review gate is excluded (it has its own arm), tortoise's docs still routes" $rc
+  # Review P2, round 1 — the RERUN carve-out: python-ci-gate is owned by the rerun block at the
+  # bottom of the case, exactly as in the pre-#1764 arm, so a flaky CI lane must NOT route to the
+  # code-pushing fixer (it would also double-fire: rerun AND fixer).
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:python-ci-gate'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (python-ci-gate must stay with the rerun block, not the fixer)"; }
+  ck "CI-red derivation: python-ci-gate is EXCLUDED (the rerun block owns it — the pre-#1764 carve-out is preserved)" $rc
+fi
 grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the CI-red fixer is logged and capped like other fix loops" $rc
 grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
@@ -1258,6 +1345,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
+if on_darwin; then
 PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
@@ -1275,6 +1363,9 @@ done
 got="$(render_scope __UNSET__)"
 [ "$got" = "auto" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted 'auto'"; }
 ck "an UNSET SCOPE renders the auto default" $rc
+else
+  skipd "install.sh's plist SCOPE render checks (§16b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # set-but-EMPTY is FATAL on BOTH launchers — a blank plist / keys.env entry must not become `auto`,
 # which is the shared-queue drain the override exists to prevent. install.sh:
@@ -1350,9 +1441,13 @@ SB5="$TMP/sb5"; mkdir -p "$SB5/Library/LaunchAgents" "$SB5/.config" "$SB5/.pi/ag
 ln -s "$HOME/.config/gh" "$SB5/.config/gh" 2>/dev/null || true
 mkdir -p "$SB5/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB5/.local/share/pi-node/current/bin/pi"; chmod +x "$SB5/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 ( HOME="$SB5" O="$TMP/clean-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.clean.err" ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh refused a clean \$O: $(tail -2 "$TMP/inst.clean.err")"; }
 ck "install.sh accepts a clean \$O (non-vacuity for the guard loop below)" $rc
+else
+  skipd "install.sh accepts a clean \$O (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
   ( HOME="$SB5" O="$TMP/$bad" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.og.err" ); rc=$?
   [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.og.err" && rc=0 \
@@ -1368,6 +1463,7 @@ ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
 # A ZERO-BYTE key file is not a key: `-f` blessed it, and the daemon then recorded reviews
 # UNSIGNED and failed ai-review-gate — the env-only failure with the file branch taken (README §7.4).
+if on_darwin; then
 : > "$SB/.pi/agent/.ai-review-gate-key"
 ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
 case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed an empty key file" ;; *) rc=0 ;; esac
@@ -1392,6 +1488,9 @@ chmod 600 "$SB/.pi/agent/.ai-review-gate-key"
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      install.sh did not name an unreadable key file: $(printf '%s\n' "$ikout" | grep -i 'key' | head -2)";; esac
 ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" $rc
+else
+  skipd "install.sh's gate-key file verdict (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
@@ -1655,6 +1754,16 @@ printf '#!/bin/bash\necho 200\n' > "$BG/stub/curl"
 printf '#!/bin/bash\necho LANE_READY\n' > "$BG/stub/pi"
 printf '#!/bin/bash\nshift; exec "$@"\n' > "$BG/stub/timeout"
 printf '#!/bin/bash\nexit 0\n' > "$BG/stub/docker"
+# ⛔ `uv` and `tmux` are REQUIRED BY cloud-cell-bringup.sh's own toolchain check
+# (`check_tools`: `for c in git gh node python3 uv tmux`), so they must be stubbed here exactly
+# like the tools above. Without them this check passes ONLY on a box that happens to have both,
+# and the shard is RED on the Linux CI runner — the ubuntu-24.04 image ships neither (verified
+# against actions/runner-images Ubuntu2404-Readme.md, which lists no `uv` and no `tmux`). That is
+# the measured difference between a dev container (selftest.sh 330/0) and `bash-suites` on
+# agent-infra#1769 (`==> 328 passed, 2 failed`, both bringup checks): a platform-dependent
+# dependency smuggled into the shard list BOTH lanes run, which is the #1369 class itself.
+printf '#!/bin/bash\nprintf "uv 0.0.0-stub\\n"\n' > "$BG/stub/uv"
+printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
@@ -1808,15 +1917,18 @@ if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; the
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
 fi
-# Assert each of the four spawn SITES, not a count — a count is satisfied by decoy comments,
+# Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
+# NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
+# and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# Each is asserted to carry can_spawn, which is the property under test.
 fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "2" ] && rc=0 || rc=1
 ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
-[ "$merge_site" = "1" ] && rc=0 || rc=1
-ck "the merge re-review spawn carries the load gate" $rc
+[ "$merge_site" = "2" ] && rc=0 || rc=1
+ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
@@ -2259,6 +2371,7 @@ grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
 ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
 grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
 ck "the reaper reads STALE_MIN in base 10" $rc
+if on_darwin; then
 # ── install.sh's render guards, DRIVEN (not grepped) ─────────────────────────────
 # Source-text pins are exactly what this file was told to stop doing: `if false && grep …` leaves the
 # text intact and the guard dead. So RUN the real installer. This is §6's sandbox pattern, seeded with
@@ -2357,6 +2470,9 @@ grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
 ck "the freshly rendered plist is valid XML" $rc
+else
+  skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -2606,5 +2722,21 @@ else
 fi
 
 echo
+# ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
+# A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
+# `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
+# off macOS every skip is an install.sh-driven group and the run must still have exercised the bulk
+# of the suite (the classifier/reaper/parity checks), so a widened gate cannot go unnoticed.
+if on_darwin; then
+  [ "$skip" -eq 0 ] && rc=0 || { rc=1; echo "      platform gate skipped $skip group(s) on Darwin — the gated checks MUST run here"; }
+  ck "platform gate: macOS runs every gated check (a skip is never a pass)" $rc
+else
+  [ "$skip" -gt 0 ] && [ "$pass" -ge 250 ] && rc=0 \
+    || { rc=1; echo "      skip=$skip pass=$pass — a $PLATFORM run must skip ONLY the install.sh groups, not the suite"; }
+  ck "platform gate: $PLATFORM skips only install.sh-driven checks and still runs the suite ($pass checks)" $rc
+fi
+if [ "$skip" -gt 0 ]; then
+  echo "==> $skip install-check group(s) SKIPPED (platform=$PLATFORM; install.sh is macOS-only) — a skip is NOT a pass"
+fi
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
