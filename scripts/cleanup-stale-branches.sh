@@ -702,6 +702,48 @@ is_member() {
     return 1
 }
 
+# ── Shared: commit-date validation (F18/F22/F24) ──────────────────
+# validate_commit_date <ref> <value> — return 0 (printing nothing) for a value
+# this sweep can compare with $CUTOFF_EPOCH, and return 1 with a diagnostic on
+# stderr NAMING <ref> for an EMPTY, NON-NUMERIC or OVER-LONG value.
+#
+# ⛔ ONE implementation, called by BOTH the remote and the local scope. The two
+# scopes each grew their own copy of this check and then DRIFTED: the remote
+# guard refused an empty/non-numeric value but passed an over-long all-digit one
+# (`''|*[!0-9]*` does not match `9223372036854775808`), while the local guard
+# bound the digit count and refused it. A failed numeric comparison returns
+# status 2, the `if` reads FALSE, and the candidate is then dropped or
+# misclassified with no diagnostic — on the remote scope behind
+# `✅ No stale merged branches found`, exit 0 (a FALSE PASS a scheduler cannot
+# see). F18, F22 and F24 are the same defect at the two call sites; the single
+# helper is what keeps them from diverging a third time.
+#
+# ⛔ 15 DIGITS is the file's own bound — the same one `--cutoff`, `--pr-limit`
+# and CLEANUP_BRANCH_LOG_MAX_BYTES are validated with: a value matching ^[0-9]+$
+# can still exceed bash's integer range, and the digit count is tested BEFORE any
+# arithmetic, so the overflow is never reached. A genuine all-digit date
+# (including epoch 0, which IS stale) passes and is evaluated normally by the
+# caller — this helper rules on READABILITY, never on staleness.
+validate_commit_date() {
+    local ref="$1" value="${2:-}"
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "ERROR: could not read the commit date of $ref, so it cannot be shown to be" >&2
+            echo "ERROR: stale. An unreadable date is an internal error, not a staleness verdict;" >&2
+            echo "ERROR: refusing the sweep so an unproven branch is never treated as a candidate." >&2
+            return 1
+            ;;
+    esac
+    if [ "${#value}" -gt 15 ]; then
+        echo "ERROR: the commit date of $ref ($value) is outside bash's integer range, so it" >&2
+        echo "ERROR: cannot be compared with the cutoff. Refusing the sweep rather than letting" >&2
+        echo "ERROR: the failed comparison read as a verdict — a false 'not stale' on the remote" >&2
+        echo "ERROR: scope and a false 'stale' on the local one." >&2
+        return 1
+    fi
+    return 0
+}
+
 # ── delete-time target verification (R3-1) ────────────────────────
 # verify_remote_target <push_url> <local_branch> <classified_oid>
 #
@@ -1048,29 +1090,30 @@ run_remote_scope() {
         # Check if branch commit date is before cutoff
         local COMMIT_DATE
         COMMIT_DATE="$(git log --no-color -1 --format='%ct' "$branch" 2>/dev/null || true)"
-        # ⛔ F18: AN UNREADABLE DATE IS AN INTERNAL ERROR, NOT A NON-CANDIDATE.
-        # Every ref reaching here was LISTED by the merge classification, so it
-        # must have a readable commit date. The old `|| echo "0"` + `= "0"` guard
-        # missed the ONE shape that mattered: with `color.ui=always` (or
-        # `color.branch=always`) the classification's ref names came back wrapped
-        # in SGR escapes, `git log -1 --format='%ct' "\e[31morigin/foo\e[m"`
-        # exits 0 with EMPTY output (verified on git 2.50.1), the `= "0"` guard
-        # did not fire, and `[ "" -lt "$CUTOFF_EPOCH" ]` returned status 2, which
-        # the `if` reads as FALSE. The ref was dropped with NO diagnostic while
-        # the sweep printed `✅ No stale merged branches found` and exited 0.
-        # The classification now runs `--no-color` (call site above), so this
-        # cannot recur through that route — and this guard makes ANY future route
-        # LOUD: an empty or non-numeric value REFUSES the whole sweep instead of
+        # ⛔ F18/F24: AN UNREADABLE OR OVER-LONG DATE IS AN INTERNAL ERROR, NOT A
+        # NON-CANDIDATE. Every ref reaching here was LISTED by the merge
+        # classification, so it must have a readable commit date. The old
+        # `|| echo "0"` + `= "0"` guard missed the ONE shape that mattered: with
+        # `color.ui=always` (or `color.branch=always`) the classification's ref
+        # names came back wrapped in SGR escapes, `git log -1 --format='%ct'
+        # "\e[31morigin/foo\e[m"` exits 0 with EMPTY output (verified on git
+        # 2.50.1), the `= "0"` guard did not fire, and `[ "" -lt "$CUTOFF_EPOCH" ]`
+        # returned status 2, which the `if` reads as FALSE. The ref was dropped
+        # with NO diagnostic while the sweep printed `✅ No stale merged branches
+        # found` and exited 0. F24: the SAME false PASS came back for an
+        # OVER-LONG all-digit value — `''|*[!0-9]*` accepts `9223372036854775808`,
+        # `[ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]` returns status 2, the `if`
+        # reads FALSE, and the candidate is dropped behind a success status again.
+        # ⛔ ONE implementation, called from BOTH scopes (F24). The local scope
+        # carried its own copy with the file's own 15-digit bound, so the two had
+        # already drifted twice: a value this guard let through as a silent
+        # non-candidate was refused there. validate_commit_date is now the single
+        # bound for both, and this guard makes ANY future route LOUD — an empty,
+        # non-numeric or over-long value REFUSES the whole sweep instead of
         # silently shrinking the candidate set behind a success status.
-        case "$COMMIT_DATE" in
-            ''|*[!0-9]*)
-                echo "ERROR: could not read the commit date of $branch, which the merge" >&2
-                echo "ERROR: classification listed. An unreadable date is an internal error, not" >&2
-                echo "ERROR: an empty candidate set; refusing the remote sweep so a partial" >&2
-                echo "ERROR: selection is never reported as a clean one." >&2
-                return 1
-                ;;
-        esac
+        if ! validate_commit_date "$branch" "$COMMIT_DATE"; then
+            return 1
+        fi
 
         # ⛔ DELIMITER IS TAB, NOT `|`: `|` is a LEGAL git branch-name character
         # (`git check-ref-format --branch 'a|b'` accepts it), so a remote branch
@@ -1528,29 +1571,23 @@ run_local_scope() {
             keep_list="${keep_list}worktree"$'\t'"$br"$'\n'
             keep_worktree=$((keep_worktree + 1)); keep_total=$((keep_total + 1)); continue
         fi
-        # ⛔ F22: AN UNREADABLE OR OVER-LONG COMMITTER DATE IS AN INTERNAL ERROR,
-        # NEVER A STALENESS VERDICT. `git for-each-ref` can read objects `git log`
-        # cannot format, and `%(committerdate:unix)` prints a value ABOVE bash's
-        # integer range as an all-digit wrapped number. A bare
+        # ⛔ F22/F24: AN UNREADABLE OR OVER-LONG COMMITTER DATE IS AN INTERNAL
+        # ERROR, NEVER A STALENESS VERDICT. `git for-each-ref` can read objects
+        # `git log` cannot format, and `%(committerdate:unix)` prints a value
+        # ABOVE bash's integer range as an all-digit wrapped number. A bare
         # `[ "$cdate" -ge "$CUTOFF_EPOCH" ]` then returns status 2, the `||` reads
-        # FALSE, and the branch is treated as STALE — so the FAILURE GROWS the
-        # candidate set. The remote guard above (F18) takes the opposite, safe
-        # polarity: it refuses. This mirrors it, with the file's own 15-digit
-        # bound (the same bound `--cutoff` is validated with), so an empty,
-        # non-numeric or over-long date REFUSES the whole local sweep and names
-        # the ref, instead of falling through as "stale".
-        case "$cdate" in
-            ''|*[!0-9]*)
-                echo "ERROR: could not read the commit date of $br, so it cannot be shown to be" >&2
-                echo "ERROR: stale. An unreadable date is an internal error, not a stale branch;" >&2
-                echo "ERROR: refusing the local sweep so an unproven branch is never deleted." >&2
-                return 1
-                ;;
-        esac
-        if [ "${#cdate}" -gt 15 ]; then
-            echo "ERROR: the commit date of $br ($cdate) is outside bash's integer range, so" >&2
-            echo "ERROR: its staleness cannot be proven. Refusing the local sweep rather than" >&2
-            echo "ERROR: treating an over-long value as stale — that would GROW the candidate set." >&2
+        # FALSE, and the branch is treated as STALE — so on THIS scope the
+        # failure GROWS the candidate set, the OPPOSITE polarity to the remote
+        # scope above, where the same failure SHRINKS it and hides the candidate
+        # behind a clean sweep. Both are internal errors, so both refuse.
+        # ⛔ ONE bound for BOTH scopes (F24): validate_commit_date carries the
+        # file's own 15-digit bound (the same bound `--cutoff` is validated with),
+        # so an empty, non-numeric or over-long date REFUSES the whole local sweep
+        # and names the ref, instead of falling through as "stale". Calling the
+        # SAME helper the remote scope calls is the fix for the drift: the local
+        # guard used to refuse an over-long value while the remote one did not,
+        # because the check was written twice.
+        if ! validate_commit_date "$br" "$cdate"; then
             return 1
         fi
         # 3. not stale

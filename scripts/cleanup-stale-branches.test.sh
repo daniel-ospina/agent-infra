@@ -3680,6 +3680,90 @@ run_script bash "$F22_SCRIPT" --repo "$F22_REPO" --scope local --pr-map-file "$F
 assert_eq "$RC" "0" "F22: with the pathological ref removed, the sweep runs clean"
 assert_branch_absent f22-epoch "F22: a genuine epoch-0 commit (cdate 0) IS still treated as stale and reaped"
 
+echo ""
+echo "== 45. F24: an OVER-LONG all-digit commit date is REFUSED by BOTH scopes =="
+# The remote guard's `''|*[!0-9]*` case ACCEPTED an over-long all-digit value
+# (`9223372036854775808`): `[ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]` returned
+# status 2, the `if` read FALSE, and the candidate was DROPPED with no
+# diagnostic while the sweep printed `✅ No stale merged branches found` and
+# exited 0 — the SAME false PASS F18 closes for an EMPTY value, and the exact
+# case the F18 comment claimed could no longer happen. The local scope (F22) had
+# its own copy of the check WITH the 15-digit bound, so the two scopes had
+# drifted. Both now call the single validate_commit_date; this section pins the
+# REMOTE call site (F22 pins the local one) and re-pins the local one from this
+# same fixture. Removing the helper's `[ "${#value}" -gt 15 ]` bound turns
+# BOTH halves RED.
+F24_ORIGIN="$FIX/f24-origin.git"
+F24_REPO="$FIX/f24-repo"
+new_repo "$F24_REPO" "$F24_ORIGIN"
+cd "$F24_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F24_SCRIPT="$F24_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f24.txt; git add f24.txt; old_commit "init"; git push -q origin main
+F24_MAIN_SHA="$(git rev-parse main)"
+F24_TREE="$(git rev-parse "$F24_MAIN_SHA^{tree}")"
+
+# CONTROL: a GENUINE all-digit date must still be evaluated normally. `f24-old`
+# is the initial (2020) commit, merged into main and older than the cutoff, so a
+# sweep that sees only it classifies it as stale and exits 0 — proof the helper
+# rules on READABILITY, never on staleness.
+git push -q origin refs/heads/main:refs/heads/f24-old
+run_script bash "$F24_SCRIPT" --repo "$F24_REPO" --scope remote
+assert_eq "$RC" "0" "F24 control: a genuine old all-digit date is still evaluated (rc=0)"
+assert_contains "$OUT" "origin/f24-old" "F24 control: the stale merged branch with a readable date IS selected"
+
+# The over-long value: 2^63, written with --literally so git does not sanitise
+# it. origin's main AND f24-over point at it, so `--merged origin/main` LISTS
+# f24-over (it is main's own commit) and the guard is reached for it.
+F24_OVER_OID="$(printf 'tree %s\nparent %s\nauthor A <a@b> 9223372036854775808 +0000\ncommitter A <a@b> 9223372036854775808 +0000\n\nf24 over\n' \
+    "$F24_TREE" "$F24_MAIN_SHA" | git hash-object -t commit -w --stdin --literally)"
+git update-ref refs/heads/main "$F24_OVER_OID"
+git update-ref refs/heads/f24-over "$F24_OVER_OID"
+git push -q --force origin main f24-over
+F24_CDATE="$(git log --no-color -1 --format='%ct' refs/remotes/origin/f24-over 2>/dev/null || true)"
+assert_eq "$F24_CDATE" "9223372036854775808" "F24 fixture: git log prints the over-long date verbatim (the guard's input)"
+
+run_script bash "$F24_SCRIPT" --repo "$F24_REPO" --scope remote --execute
+if [ "$RC" -ne 0 ]; then
+    ok "F24: an over-long remote commit date REFUSES the sweep (rc=$RC, not a silent clean sweep)"
+else
+    bad "F24: the over-long remote date did NOT fail the sweep (rc=0) — the candidate was dropped silently"
+fi
+assert_contains "$OUT" "commit date of origin/f24-over" "F24: the remote refusal NAMES the ref it could not evaluate"
+assert_not_contains "$OUT" "No stale merged branches found" "F24: the refusal does NOT print the clean-sweep line"
+assert_not_contains "$OUT" "integer expression expected" "F24: the failed comparison does not leak a bare bash diagnostic"
+if [ "$(git -C "$F24_ORIGIN" rev-parse -q --verify refs/heads/f24-over || echo GONE)" = "$F24_OVER_OID" ]; then
+    ok "F24: the over-long-date branch SURVIVES the refused remote sweep"
+else
+    bad "F24: the over-long-date branch was deleted despite the refusal"
+fi
+
+# The LOCAL call site, from the SAME shared helper. A local branch at the
+# synthetic commit must refuse too — naming ITS OWN ref, which proves each call
+# site passes its ref through to the one implementation. The MERGED PR makes the
+# branch gate-eligible, so if the bound is removed it is selected and deleted
+# (`rc=0`) — the mutation this section catches.
+git update-ref refs/heads/f24-local-over "$F24_OVER_OID"
+F24_MAP="$FIX/f24-pr-map.json"
+cat > "$F24_MAP" <<JSON
+[
+  {"headRefName":"f24-local-over","state":"MERGED","headRefOid":"$F24_OVER_OID","baseRefName":"main"}
+]
+JSON
+run_script bash "$F24_SCRIPT" --repo "$F24_REPO" --scope local --pr-map-file "$F24_MAP" --execute
+if [ "$RC" -ne 0 ]; then
+    ok "F24: the SAME over-long date REFUSES the local sweep too (rc=$RC)"
+else
+    bad "F24: the local over-long date did NOT fail the sweep (rc=0) — the two call sites still differ"
+fi
+assert_contains "$OUT" "commit date of f24-local-over" "F24: the local refusal names its OWN ref (the shared helper is called from both sites)"
+if [ "$(git rev-parse -q --verify refs/heads/f24-local-over || echo GONE)" = "$F24_OVER_OID" ]; then
+    ok "F24: the over-long-date local branch SURVIVES the refused local sweep"
+else
+    bad "F24: the over-long-date local branch was deleted despite the refusal — the local guard did not fire"
+fi
+
 cd "$REPO"
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
