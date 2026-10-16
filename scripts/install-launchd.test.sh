@@ -203,6 +203,12 @@ run_installer() { # <home> [extra env assignments...]
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
+        # #1863 F10: TORTOISE_REPO is NOT part of the fresh-HOME fixture, and
+        # inheriting an ambient one made the bootstrap-count assertion depend on
+        # the operator's box (a real tortoise checkout adds the two
+        # {{TORTOISE_REPO}}-gated jobs, so the count became 11, not 9). Clear it
+        # so section 1 counts only the templates its fake HOME can resolve.
+        export TORTOISE_REPO=""
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
         shift
         bash "$INSTALLER" "$@"

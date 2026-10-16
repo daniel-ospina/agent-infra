@@ -18,9 +18,10 @@
 # DETECTION SIGNAL (the issue's own contract). A process is REAPED only when ALL
 # hold, evaluated over two `ps` snapshots and one `lsof` pass:
 #
-#   1. orphaned    — ppid == 1 (launchd) in BOTH snapshots. A live parent is
-#                    an orchestrator that may still collect the child; we never
-#                    take that away.
+#   1. orphaned    — ppid == 1 (launchd) in the candidate snapshot (B). ppid==1
+#                    is a HINT that selects candidates cheaply, never the test —
+#                    the ancestry gate below is. A live parent is an orchestrator
+#                    that may still collect the child; we never take that away.
 #   2. deleted cwd — the process's working directory no longer exists. This is
 #                    the unambiguous "your parent is gone" tell: the harness
 #                    finished, cleaned up its scratch dir, and never reaped the
@@ -63,6 +64,9 @@
 #     PRESERVE / `cwd-unreadable`. Deleted and unreadable are different facts;
 #     only `deleted` is a licence to signal.
 #   * a cpu-time string that does not parse => PRESERVE / `cpu-unmeasurable`.
+#   * an elapsed/etime string that does not parse => PRESERVE /
+#     `elapsed-unmeasurable`. An age that cannot be evaluated is NOT "old
+#     enough" — the flat age floor can only be applied to a measured age.
 #
 # SIGTERM FIRST, SIGKILL ONLY AFTER A GRACE PERIOD. The incident process exited
 # cleanly on TERM; KILL is the backstop for one that will not. Both outcomes are
@@ -87,14 +91,6 @@
 #                        100 = one whole CPU-second)
 #   --sample-seconds N   gap between the two ps snapshots (default 3)
 #   --min-elapsed-seconds N  never signal a process younger than this (default
-#                        60)
-#   --any-cwd       drop the scratch-root restriction on the deleted cwd
-#   --verbose       print every preserved row, not only the near misses
-#   --list          print ppid=1 candidates with cwd state and exit (no kill,
-#                   no lock, no log)
-#   --help          this text
-#   --sample-seconds N   gap between the two ps snapshots (default 3)
-#   --min-elapsed-seconds N  never signal a process younger than this (default
 #                        60; the leak class outlives its harness by minutes, and
 #                        a fresh reparented child is still being set up)
 #   --any-cwd       drop the scratch-root restriction on the deleted cwd
@@ -105,14 +101,26 @@
 #
 # Gate order (first failure decides) — keep in sync with classify_one():
 #   not-orphan(hint) > self-tree > launchd > wrong-uid > human-owned >
-#   human-ancestry-unknown > cpu-unmeasurable > too-young > cpu-idle >
+#   human-ancestry-unknown > cpu-unmeasurable > elapsed-unmeasurable >
+#   too-young > cpu-idle >
 #   cwd-unknown > cwd-live > cwd-unreadable > cwd-out-of-scope > reapable
 #
 # ppid==1 is a HINT that selects candidates cheaply. It is never the test:
-# the test is ancestry (human-owned) plus progress judged against the
-# process's own expected distribution. See the ancestry section above.
+# the test is ancestry (human-owned) plus a FLAT cpu-time floor
+# (REAP_ORPHAN_MIN_CPU_CENTISECONDS). There is NO per-process expected
+# distribution — an earlier revision of this comment claimed one and it does not
+# exist. See the ancestry section above.
 #
-# Env seams: PS_BIN LSOF_BIN KILL_BIN REAP_ORPHAN_LOG REAP_ORPHAN_DRY_RUN
+# ⚠️ KNOWN FALSE POSITIVE — recorded for the MANUAL ARMING step (see the plist's
+# arming note). Because the progress test is a flat floor and the only shape
+# gates are ppid==1 + deleted cwd + scratch root, a DAEMONISING service that
+# reparents to launchd, runs from a scratch-root cwd that is later deleted, and
+# advances CPU past the floor is classified `reapable` — at this layer it is
+# indistinguishable from a leaked test child. This is why the job ships
+# DISARMED and arming requires a human to read the dry-run log first.
+#
+# Env seams: PS_BIN LSOF_BIN KILL_BIN STAT_BIN REAP_ORPHAN_STAT_FLAVOR
+#   REAP_ORPHAN_LOG REAP_ORPHAN_DRY_RUN
 #   REAP_ORPHAN_SAMPLE_SECONDS REAP_ORPHAN_MIN_CPU_CENTISECONDS
 #   REAP_ORPHAN_MIN_ELAPSED_SECONDS REAP_ORPHAN_TERM_GRACE_SECONDS
 #   REAP_ORPHAN_PS_TIMEOUT REAP_ORPHAN_LSOF_TIMEOUT REAP_ORPHAN_BUDGET_SECONDS
@@ -208,17 +216,20 @@ Usage:
   --list          print ppid=1 candidates with cwd state and exit
   --help          this text
 
-REAPED means ALL hold: ppid=1 in both ps snapshots, cwd DELETED (not merely
-unreadable), cpu-time advanced >= --min-cpu-centiseconds, uid == ours, and the
-cwd under a scratch root unless --any-cwd. Everything else is PRESERVEd with its
-deciding reason. A probe that cannot be evaluated aborts the pass (exit 3)
-rather than counting as a pass.
+REAPED means ALL hold: ppid=1 in the candidate table (snapshot B; a cheap HINT,
+never the test — ancestry decides), cwd DELETED (not merely unreadable), cpu-time
+advanced >= --min-cpu-centiseconds, uid == ours, and the cwd under a scratch root
+unless --any-cwd. Everything else is PRESERVEd with its deciding reason. A probe
+that cannot be evaluated aborts the pass (exit 3) rather than counting as a pass.
 EOF
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
 say() { printf '%s\n' "$*"; log "REAP $*"; }
-log() { printf '%s\n' "$*" >>"$REAP_ORPHAN_LOG" 2>/dev/null || true; }
+# `--list` is a read-only diagnostic: no lock, no log, no signal. The ps/lsof
+# loaders below log on their failure paths, so the guard lives HERE rather than
+# at each call site.
+log() { [ "$LIST_ONLY" = 1 ] && return 0; printf '%s\n' "$*" >>"$REAP_ORPHAN_LOG" 2>/dev/null || true; }
 
 now_epoch() { /bin/date +%s 2>/dev/null || date +%s; }
 
@@ -643,7 +654,12 @@ classify_one() {
     if [ "$delta" -lt 0 ]; then
         printf 'preserve\tcpu-unmeasurable\tcpu went backwards (%s->%s cs) %s\n' "$ca" "$cb" "$cmd"; return 0
     fi
-    if [ -n "$elapsed" ] && [ "$elapsed" -lt "$REAP_ORPHAN_MIN_ELAPSED_SECONDS" ]; then
+    # An age we cannot read is NOT "old enough": the flat floor below can only be
+    # applied to a measured age. Preserve, exactly like cpu-unmeasurable.
+    if [ -z "$elapsed" ]; then
+        printf 'preserve\telapsed-unmeasurable\telapsed=?(unparseable) %s\n' "$cmd"; return 0
+    fi
+    if [ "$elapsed" -lt "$REAP_ORPHAN_MIN_ELAPSED_SECONDS" ]; then
         printf 'preserve\ttoo-young\telapsed=%ss < %ss %s\n' "$elapsed" "$REAP_ORPHAN_MIN_ELAPSED_SECONDS" "$cmd"; return 0
     fi
     if [ "$delta" -lt "$REAP_ORPHAN_MIN_CPU_CENTISECONDS" ]; then
@@ -690,7 +706,7 @@ report_row() { # <verdict> <pid> <reason> <detail>
 # misses an operator needs to see. So: full detail for REAPABLE and NEAR-MISS
 # rows, plus a complete per-reason HISTOGRAM in the summary (nothing is hidden —
 # the counts are exact and the log holds every row). --verbose prints all.
-NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable human-owned human-ancestry-unknown "
+NEAR_MISS_REASONS=" cwd-unknown cwd-live cwd-unreadable cwd-out-of-scope cpu-unmeasurable elapsed-unmeasurable human-owned human-ancestry-unknown "
 is_near_miss() { case "$NEAR_MISS_REASONS" in *" $1 "*) return 0 ;; esac; return 1; }
 
 print_footer() { # <now>
@@ -779,18 +795,26 @@ run() {
             exit 3
         fi
         ps_normalize "$PS_B" >"$NORM_A"
-        while IFS=$'\t' read -r pid ppid uid cpu el cmd; do
+        # Split on a NON-WHITESPACE separator: TAB is IFS whitespace, so an empty
+        # cpu/elapsed field collapses and every later field slides left (#1863
+        # F1). `\x01` cannot appear in a ps command, so the positions are exact.
+        while IFS= read -r row_line; do
+            IFS=$'\x01' read -r pid ppid uid cpu el cmd <<<"${row_line//$'\t'/$'\x01'}"
             [ -n "$pid" ] || continue
             [ "$ppid" = 1 ] || continue
             [ "$pid" = 1 ] && continue
-            printf '%s\tppid=1\tuid=%s\tcpu=%ss\tcwd=%s\t%s\n' \
+            printf '%s\tppid=1\tuid=%s\tcpu=%scs\tcwd=%s\t%s\n' \
                 "$pid" "$uid" "${cpu:-?}" "$(cwd_describe "$pid")" "$cmd"
         done <"$NORM_A"
         exit 0
     fi
 
     mkdir -p "$STATE_DIR" 2>/dev/null || true
-    if [ "$MODE" = apply ] && ! : >>"$REAP_ORPHAN_LOG" 2>/dev/null; then
+    # Gate BOTH modes: the DEPLOYED mode is dry-run (the plist ships
+    # REAP_ORPHAN_DRY_RUN=1) and it promises the report lands in the log. An
+    # ungated dry-run exited 0 with no log line when the path was unwritable —
+    # the installed-but-inert state #1862 exists to eliminate.
+    if ! : >>"$REAP_ORPHAN_LOG" 2>/dev/null; then
         echo "FAIL-CLOSED abort: REAP_ORPHAN_LOG unwritable ($REAP_ORPHAN_LOG) (exit 3)" >&2
         exit 3
     fi
@@ -827,7 +851,12 @@ run() {
     local row ca cb elapsed cmd crumb verdict reason detail term_rc alive
     # awk, not a bash loop, is what makes this a single pass over the table: the
     # filter is ppid==1 and ppid==1 only, and it must be cheap on a loaded host.
-    while IFS=$'\t' read -r pid ppid uid cb elapsed cmd; do
+    while IFS= read -r row_line; do
+        # TAB is IFS whitespace, so an empty cpu/elapsed field would collapse and
+        # shift the command into `elapsed` — the age floor then compared a string,
+        # errored, and evaluated FALSE, silently SKIPPING the floor (#1863 F1).
+        # Split on a non-whitespace separator so empty fields keep their position.
+        IFS=$'\x01' read -r pid ppid uid cb elapsed cmd <<<"${row_line//$'\t'/$'\x01'}"
         [ -n "$pid" ] || continue
         if [ "$(( $(now_epoch) - START_EPOCH ))" -ge "$REAP_ORPHAN_BUDGET_SECONDS" ] && [ "$REAP_ORPHAN_BUDGET_SECONDS" -gt 0 ]; then
             printf 'preserve pid=%s\n         reason=deferred  pass budget %ss exhausted — not classified\n' \

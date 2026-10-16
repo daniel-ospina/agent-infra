@@ -673,10 +673,12 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   // — reap axis: the ORPHAN reaper (scripts/pi-reap-orphans.sh, #1862). The
-  //   reverse scan found all five the moment the reaper was versioned, exactly as
-  //   it did for the heartbeat bounds in #1552. Registered rather than exempted:
-  //   each IS a real liveness bound governing whether a candidate may be
-  //   signalled. The two properties the issue requires live here and in the
+  //   reverse scan found FIVE the moment the reaper was versioned, exactly as it
+  //   did for the heartbeat bounds in #1552; the SIXTH, the active-CPU floor,
+  //   ends in `_CENTISECONDS`, which the suffix set did not carry until #1863 —
+  //   it was invisible to the name scan, not absent. Registered rather than
+  //   exempted: each IS a real liveness bound governing whether a candidate may
+  //   be signalled. The two properties the issue requires live here and in the
   //   ancestry gate: an ACTIVE CPU advance (never a PARKED test, cf. #1343) on an
   //   AGE FLOOR, and a POSITIVE human-ancestry refusal.
   {
@@ -687,6 +689,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     overrides: ['REAP_ORPHAN_SAMPLE_SECONDS="$2"'],
     note: "the two-`ps`-snapshot window the CPU-time delta is measured over; the second assignment is the `--sample-seconds` CLI override",
+  },
+  {
+    name: "REAP_ORPHAN_MIN_CPU_CENTISECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_MIN_CPU_CENTISECONDS:-1}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_MIN_CPU_CENTISECONDS="$2"'],
+    note: "the ACTIVE-CPU floor: cpu-time must advance by at least this many CENTISECONDS across the sample window (1 = any measurable advance; 100 = one CPU-second). CPU time stays in centiseconds because `ps -o time` prints MM:SS.ss and integer-second truncation read a sustained 10%-of-a-core leak as 0 -> 0 (`cpu-idle`). The `--min-cpu-centiseconds` CLI override is the second assignment.",
   },
   {
     name: "REAP_ORPHAN_MIN_ELAPSED_SECONDS",
@@ -1096,6 +1107,10 @@ export const SCAN_BOUND_SUFFIXES = [
   "_S",
   "_SEC",
   "_SECONDS",
+  // The orphan reaper's active-CPU floor is measured in CENTISECONDS (`ps -o
+  // time` resolution); without this the reverse name scan could not see it at
+  // all (#1863 F9).
+  "_CENTISECONDS",
   "_MIN",
   "_MINUTES",
   "_HOURS",

@@ -304,6 +304,22 @@ OUT="$(run_reaper o8c "$GONE:$ABSENT_B" "$L7" --apply --min-elapsed-seconds 1 --
 assert_contains "$OUT" "reason=cpu-unmeasurable" "O8c a pid absent from snapshot A is unevaluable, not a reap"
 assert_nofile "$T/o8c.kills" "O8c ... and nothing is signalled"
 
+# O8d — an UNPARSEABLE etime (#1863 F1). `ps_normalize` leaves `elapsed` EMPTY,
+# and because TAB is IFS *whitespace* the old candidate loop collapsed the empty
+# field and slid the command into `elapsed`; the age floor then compared a string
+# ("integer expression expected"), evaluated FALSE, and SKIPPED the floor — a
+# fresh reparented child could be signalled. The empty position must be preserved
+# and an unevaluable age PRESERVED (fail-closed), never silently skipped.
+BADETIME_A="$(fake_ps psBadEtA "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:00.10' '1:2:3:4' /bin/sh-spin)")"
+BADETIME_B="$(fake_ps psBadEtB "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                            "$(ps_row_line $ORPH 1 "$MY_UID" '0:09.00' '1:2:3:4' /bin/sh-spin)")"
+OUT="$(run_reaper o8d "$BADETIME_A:$BADETIME_B" "$L7" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=elapsed-unmeasurable" "O8d an unparseable etime is unevaluable and PRESERVED (the age floor is never skipped)"
+assert_absent "$OUT" "reason=reapable" "O8d ... never reapable"
+assert_absent "$OUT" "integer expression expected" "O8d ... and the shifted-field compare error is gone"
+assert_nofile "$T/o8d.kills" "O8d ... and nothing is signalled"
+
 # ── O9: too-young ──────────────────────────────────────────────────────
 echo "— O9/O10/O11: age floor, uid, and the orphan requirement itself —"
 DEADCWD9="$CWD_ROOT/gone9"; mkdir -p "$DEADCWD9"
@@ -431,6 +447,24 @@ assert_contains "$OUT" "ppid=1" "--list prints the orphan population"
 assert_nofile "$T/o17.kills" "--list signals nothing"
 assert_nofile "$T/o17.state/log" "--list does NOT write the log"
 assert_nofile "$T/o17.state/pi-reap-orphans.lock" "--list does NOT take the lock"
+# F3 (#1863): `ps_normalize` stores cpu in CENTISECONDS (`csecs`), so the label
+# must be `cs` — printing `s` reported 1.23s as `cpu=123s` (100x wrong). From
+# snapshot B the ORPH row is `0:00.90` = 90cs.
+assert_contains "$OUT" "cpu=90cs" "--list prints cpu in CENTISECONDS (cs), never mislabelled seconds"
+
+# O17b — `--list` is documented READ-ONLY ("no lock, no log, no signal"), but
+# `ps_load`/`lsof_cwd_load` logged their failure paths before the list branch, so
+# a failed `--list` CREATED the log. The contract must hold on the failure path
+# too. The state dir is created first so a real log() call WOULD create the file
+# (otherwise the assertion is vacuous).
+mkdir -p "$T/o17b.state"
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o17b.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof-does-not-exist" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o17b.state" REAP_ORPHAN_LOG="$T/o17b.state/log" \
+       reap_invoke --list --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O17b --list with a missing lsof still fails closed (exit 3)"
+assert_nofile "$T/o17b.state/log" "O17b ... and --list writes NO log line (read-only holds on the failure path)"
 
 mkdir -p "$T/o18.state/pi-reap-orphans.lock"
 printf '%s\n' "$$" >"$T/o18.state/pi-reap-orphans.lock/pid"
@@ -492,6 +526,18 @@ out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o19.counter" FAKE_LSOF_TABLE="$L"
        reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
 assert_rc "$rc" 3 "O19 an unwritable log on an ARMED pass aborts with exit 3"
 assert_contains "$out" "REAP_ORPHAN_LOG unwritable" "O19 ... naming the log"
+
+# O19b — the SAME gate must apply to the DEPLOYED mode. The plist ships
+# REAP_ORPHAN_DRY_RUN=1 and promises the report lands in the log; an ungated
+# dry-run exited 0 with NO report when the log path was unwritable — exactly the
+# "installed-but-inert" state #1862 exists to eliminate.
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o19b.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o19.state" REAP_ORPHAN_LOG="$T/o19-blocked/log" \
+       reap_invoke --dry-run --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O19b an unwritable log on a DRY-RUN pass also aborts with exit 3 (not a silent inert pass)"
+assert_contains "$out" "REAP_ORPHAN_LOG unwritable" "O19b ... naming the log"
 
 # ── O20: flags and env validation ──────────────────────────────────────
 echo "— O20/O21: flags, env validation, and honest reporting —"

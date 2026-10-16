@@ -9,8 +9,9 @@
          a core for 4h32m (135 CPU-min, ~27% of host CPU) with
          cwd=/private/tmp/execver already removed — invisible, no orchestrator
          waiting on it, exited cleanly on SIGTERM.
-         The detector requires ALL of: ppid=1 in two independent ps snapshots,
-         a cwd that resolves to a DELETED directory (never "unreadable" — that
+         The detector requires ALL of: ppid=1 in the candidate ps snapshot (a
+         cheap HINT, never the test — the ancestry gate decides), a cwd that
+         resolves to a DELETED directory (never "unreadable" — that
          is a different state and PRESERVES), CPU-time advancing by at least
          REAP_ORPHAN_MIN_CPU_CENTISECONDS across the sample window, our uid, and
          an elapsed floor. It signals SIGTERM, waits a grace period, then
@@ -29,6 +30,10 @@
          bump — an unowned always-on killer is exactly what the reaper policy
          forbids. Nothing is lost while disarmed: every pass reports the
          reapable set to ~/.pi/agent/state/pi-reap-orphans.log.
+         ⚠️ KNOWN FALSE POSITIVE at arming time: the progress test is a FLAT cpu
+         floor, not a per-process expected distribution, so a DAEMONISING service
+         that reparents to launchd with a scratch-root cwd that has since been
+         deleted can classify as reapable. Read the dry-run log before arming.
          Canonical script: agent-infra/scripts/pi-reap-orphans.sh
          (COPIED to ~/.pi/agent/scripts/ by pi-bootstrap/setup.sh scripts
          farm; #427: launchd cannot read ~/Documents repos under macOS TCC).
