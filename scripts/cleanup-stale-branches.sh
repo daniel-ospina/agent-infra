@@ -62,8 +62,7 @@
 #               refs/remotes/origin/<br> at the old tip, `rev-parse --verify`
 #               succeeds, the ahead-count is 0, and `-d` removes the only
 #               durable copy of those commits. If the fetch FAILS, the
-#               remotecopy gate is DISABLED (fail-closed, and said loudly) —
-#               exactly as a missing origin/main disables the redundant gate.
+#               remotecopy gate is DISABLED (fail-closed, and said loudly).
 #               ⛔ An exit status of 0 is not proof the refs were refreshed: a
 #               NEGATIVE refspec in origin's fetch config (an entry beginning
 #               with `^`) makes `--prune` SKIP the excluded ref while the fetch
@@ -468,8 +467,62 @@ REPO_ROOT="$(cd "$REPO_ROOT" && pwd)"
 
 cd "$REPO_ROOT"
 
+# cutoff_epoch — the cutoff as epoch seconds, or the EMPTY STRING when this
+# host's `date` cannot express it.
+#
+# ⛔ F31: `date -v-<N>d +%s` fails on macOS for 6-11 digit N ("Cannot apply date
+# adjustment") and that host has NO GNU `date -d` fallback, so BOTH arms fail and
+# the function prints nothing. `2>/dev/null` on BOTH arms keeps BSD date's usage
+# text out of the report; `|| true` makes the function's STATUS 0 so a failing
+# `date` is ruled on by the validator below, never by `set -e` (which would exit
+# before any diagnostic, and does NOT fire at all under CLEANUP_BRANCH_LOG's
+# `set +e` — the shipped launchd configuration).
 cutoff_epoch() {
-    date -v-${CUTOFF_DAYS}d +%s 2>/dev/null || date -d "${CUTOFF_DAYS} days ago" +%s
+    date -v-${CUTOFF_DAYS}d +%s 2>/dev/null || date -d "${CUTOFF_DAYS} days ago" +%s 2>/dev/null || true
+}
+
+# validate_cutoff_epoch <value> — return 0 (printing nothing) for a cutoff epoch
+# this sweep can compare every commit date with, and return 1 with a diagnostic
+# NAMING --cutoff for an EMPTY, NON-NUMERIC or OVER-15-DIGIT value.
+#
+# ⛔ F31: THE CUTOFF EPOCH WAS THE ONE SAFETY INPUT WITH NO EXPLICIT STATUS
+# CHECK. Every other safety input is guarded (the `git fetch` call site states
+# the rule; validate_commit_date applies it to the commit dates), but the cutoff
+# epoch was consumed UNGUARDED by BOTH scopes. Without CLEANUP_BRANCH_LOG the
+# failing `date` tripped `set -e` (loud, but with a raw BSD `date` usage message
+# that never mentions the flag); WITH it the pass runs `set +e`, `CUTOFF_EPOCH`
+# stayed EMPTY, and every integer comparison returned status 2, which `if`/`||`
+# reads as FALSE. That INVERTS the staleness predicate on BOTH legs: the remote
+# scope dropped its candidate list behind `✅ No stale merged branches found`
+# (exit 0 — a false PASS a scheduler cannot see) while the local scope treated a
+# FRESH branch as STALE and DELETED it (exit 0). One guard, called by BOTH
+# scopes, is what keeps the two from diverging. The accepted `--cutoff` RANGE is
+# unchanged: this rules on whether the cutoff is COMPUTABLE, not on which N is
+# allowed.
+validate_cutoff_epoch() {
+    local value="${1:-}"
+    case "$value" in
+        ''|*[!0-9]*)
+            echo "ERROR: could not compute the epoch for --cutoff $CUTOFF_DAYS days (got '${value:-<empty>}')," >&2
+            echo "ERROR: so no commit date can be compared with the cutoff. An uncomputable cutoff is an" >&2
+            echo "ERROR: internal error, not a staleness verdict: unchecked it empties the remote candidate" >&2
+            echo "ERROR: list behind a success status and reads a FRESH branch as stale on the local one." >&2
+            echo "ERROR: Refusing the sweep." >&2
+            return 1
+            ;;
+    esac
+    # Same normalised-value bound as validate_commit_date (F25/F27): strip the
+    # leading zeros so the 15-digit policy bound tests the VALUE, not its
+    # spelling.
+    value="${value#"${value%%[!0]*}"}"
+    [ -n "$value" ] || value=0
+    if [ "${#value}" -gt 15 ]; then
+        echo "ERROR: --cutoff $CUTOFF_DAYS days resolves to an epoch with more than 15 digits ('$value')," >&2
+        echo "ERROR: outside this sweep's 15-digit policy bound. Refusing the sweep rather than letting" >&2
+        echo "ERROR: an out-of-policy cutoff invert the staleness comparison." >&2
+        return 1
+    fi
+    return 0
 }
 
 # ── Shared: the PR-state seam ─────────────────────────────────────
@@ -852,11 +905,12 @@ verify_remote_target() {
 }
 
 # ── merge-premise re-proof against the DELETE TARGET's REAL main (F2/F26) ──
-# verify_merged_into_real_main <push_url> <classified_oid>
+# verify_merged_into_real_main <real_main_oid> <resolve_reason> <classified_oid>
 #
 # Returns 0 (printing nothing) only when the DELETE TARGET's REAL main line
 # provably contains the tip this sweep classified. On anything else it prints a
-# one-line reason and returns 1 — the caller REFUSES that delete.
+# one-line reason and returns 1 — the caller REFUSES that delete. The oid is read
+# ONCE per sweep by read_remote_main_oid (F33) and passed in.
 #
 # ⛔ The classification is `git branch -r --merged origin/main`, which reads the
 # LOCAL remote-tracking ref. That ref is only as fresh as the fetch refspec lets
@@ -896,8 +950,29 @@ verify_remote_target() {
 # `git push origin` deletes from. What this function guarantees is therefore
 # that the merge premise holds in the repository the caller has already PROVED
 # is the delete endpoint — not merely in the one it intended.
-verify_merged_into_real_main() {
-    local push_url="$1" tracking_oid="$2" ls_out="" real_main_oid="" n=0
+#
+# ⛔ F33: THE DELETE TARGET's REAL main IS READ ONCE PER SWEEP, then passed to
+# the per-entry CHECK. The plan and the execute loop both call the check per
+# candidate, and each call used to run its own `git ls-remote <push_url>
+# refs/heads/<main>` — N identical network round trips for one value that cannot
+# change for the purpose of ONE sweep. Measured with a `git` shim over 6
+# candidates: dry-run `ls-remote` = 2N+1 = 13 before, N+2 = 8 after (1 endpoint
+# proof + 1 real main + N target checks).
+#
+# ⛔ The read is split from the check because the callers CAPTURE the check's
+# refusal reason through `$(...)`, i.e. in a SUBSHELL: a memo written inside the
+# check is discarded the moment the subshell exits, so "memoise inside the
+# function" is not available here. Hoisting the read to the sweep and PASSING it
+# in keeps ONE implementation of the check (forked implementations are this
+# branch's recurring defect) and keeps every refusal message in one place. The
+# re-read that is GENUINELY per-entry (`verify_remote_target`) is untouched, as
+# is the delete's force-with-lease, which is the real compare-and-swap.
+#
+# read_remote_main_oid <push_url> — resolve the DELETE TARGET's REAL
+# refs/heads/<main> ONCE. Prints the oid and returns 0, or prints the one-line
+# reason and returns 1.
+read_remote_main_oid() {
+    local push_url="$1" ls_out="" real_main_oid="" n=0 line=""
     if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
         printf '%s' "git ls-remote $push_url refs/heads/$MAIN_BRANCH FAILED, so the DELETE TARGET's REAL $MAIN_BRANCH cannot be resolved"
         return 1
@@ -906,7 +981,6 @@ verify_merged_into_real_main() {
     # matches path-component SUFFIXES, so a count-and-take-first would accept a
     # differently named ref. Require exactly one line whose ref name is EXACTLY
     # refs/heads/main.
-    local line
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         [ "${line#*$'\t'}" = "refs/heads/$MAIN_BRANCH" ] || continue
@@ -915,6 +989,21 @@ verify_merged_into_real_main() {
     done <<<"$ls_out"
     if [ "$n" != "1" ]; then
         printf '%s' "git ls-remote $push_url matched $n ref(s) named exactly refs/heads/$MAIN_BRANCH — the DELETE TARGET's real $MAIN_BRANCH is not provable"
+        return 1
+    fi
+    printf '%s' "$real_main_oid"
+    return 0
+}
+
+# verify_merged_into_real_main <real_main_oid> <resolve_reason> <classified_oid>
+# — the per-entry CHECK against the ONCE-read main. <real_main_oid> is what
+# read_remote_main_oid printed; when that read FAILED it is EMPTY and
+# <resolve_reason> carries the reason, which is printed verbatim so the refusal
+# is the SAME one a per-entry read would have produced.
+verify_merged_into_real_main() {
+    local real_main_oid="$1" resolve_reason="$2" tracking_oid="$3"
+    if [ -z "$real_main_oid" ]; then
+        printf '%s' "$resolve_reason"
         return 1
     fi
     if ! git merge-base --is-ancestor "$tracking_oid" "$real_main_oid" >/dev/null 2>&1; then
@@ -1166,7 +1255,14 @@ run_remote_scope() {
     # to be merged into anything. They are reported, never silently skipped.
     local NON_ORIGIN_REMOTE=()
     local CUTOFF_EPOCH
+    # ⛔ F31: THE CUTOFF EPOCH IS A SAFETY INPUT — refuse loudly when it cannot be
+    # computed. Under CLEANUP_BRANCH_LOG the pass runs `set +e`, so an empty epoch
+    # made every comparison below return status 2, which `if` reads as FALSE: the
+    # candidate was dropped behind `✅ No stale merged branches found`.
     CUTOFF_EPOCH="$(cutoff_epoch)"
+    if ! validate_cutoff_epoch "$CUTOFF_EPOCH"; then
+        return 1
+    fi
 
     while IFS= read -r branch; do
         # Strip leading whitespace, skip origin/main and origin/HEAD
@@ -1305,6 +1401,20 @@ run_remote_scope() {
     done
     echo ""
 
+    # ⛔ F33: read the DELETE TARGET's real main ONCE for this sweep and hand it
+    # to the per-entry check below. The read is HERE, not inside the check,
+    # because the check's refusal reason is captured through `$(...)` — a
+    # subshell — so a memo written inside the check would be discarded with the
+    # subshell and every entry would re-read main (the 2N+1 defect). A failed read
+    # yields an EMPTY oid plus the reason, which the check reports per entry with
+    # the SAME message a per-entry read would have produced. Nothing is read when
+    # there is no candidate (the empty arm returns above).
+    local real_main_oid="" real_main_resolve_reason=""
+    if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
+        real_main_resolve_reason="$real_main_oid"
+        real_main_oid=""
+    fi
+
     if [ "$EXECUTE" = false ]; then
         echo "── DRY-RUN: no branches deleted ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --execute"
@@ -1343,7 +1453,7 @@ run_remote_scope() {
             local local_branch="${branch#origin/}"
             # F20: the SAME two gates the execute loop applies, at plan time.
             local plan_refusal=""
-            if ! plan_refusal="$(verify_merged_into_real_main "$push_url" "$tracking_oid")"; then
+            if ! plan_refusal="$(verify_merged_into_real_main "$real_main_oid" "$real_main_resolve_reason" "$tracking_oid")"; then
                 printf '  # REFUSED — --execute will not run this: %s\n' "$plan_refusal"
                 continue
             fi
@@ -1388,7 +1498,7 @@ run_remote_scope() {
         # them. That is a different question from "is origin's real ref the ref
         # we classified", so it is a separate gate, not a weaker one.
         local refusal=""
-        if ! refusal="$(verify_merged_into_real_main "$push_url" "$tracking_oid")"; then
+        if ! refusal="$(verify_merged_into_real_main "$real_main_oid" "$real_main_resolve_reason" "$tracking_oid")"; then
             echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
             echo "     $refusal" >&2
             echo "     The branch was classified merged from the LOCAL refs/remotes/origin/$MAIN_BRANCH," >&2
@@ -1637,7 +1747,13 @@ run_local_scope() {
     fi
 
     local CUTOFF_EPOCH
+    # ⛔ F31: same guard, same polarity here — an empty epoch made
+    # `[ "$cdate" -ge "$CUTOFF_EPOCH" ]` return status 2, the `if` read FALSE, and
+    # a FRESH branch was classified STALE and deleted.
     CUTOFF_EPOCH="$(cutoff_epoch)"
+    if ! validate_cutoff_epoch "$CUTOFF_EPOCH"; then
+        return 1
+    fi
 
     local branches
     # ⛔ FIELD ORDER MATTERS: `read` with IFS=TAB collapses a RUN of tabs and

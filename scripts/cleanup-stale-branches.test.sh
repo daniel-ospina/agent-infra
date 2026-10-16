@@ -4227,6 +4227,178 @@ fi
 
 cd "$REPO"
 echo ""
+echo "== 50. F31: an uncomputable --cutoff epoch REFUSES the sweep in BOTH scopes =="
+# `date -v-1000000d +%s` fails on macOS ("Cannot apply date adjustment") and
+# there is no GNU `date -d` fallback here, so cutoff_epoch returns EMPTY. Every
+# OTHER safety input has an explicit status check; the cutoff epoch did not. In
+# the no-log path the failing command substitution tripped `set -e` (loud, but
+# with a raw BSD `date` usage message that never names the flag). Under
+# CLEANUP_BRANCH_LOG — the shipped launchd configuration — the pass runs
+# `set +e`, so the empty epoch survived and every integer comparison returned
+# status 2, which `if`/`||` reads as FALSE. That INVERTS the predicate: the
+# remote candidate list emptied behind `✅ No stale merged branches found`
+# (exit 0) and the local scope treated a FRESH branch as STALE and deleted it
+# (exit 0). The fresh branch MUST survive and the flag MUST be named.
+F31_ORIGIN="$FIX/f31-origin.git"
+F31_REPO="$FIX/f31-repo"
+new_repo "$F31_REPO" "$F31_ORIGIN"
+cd "$F31_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F31_SCRIPT="$F31_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f31.txt; git add f31.txt; old_commit "init"; git push -q origin main
+# a remote candidate: merged into main and OLD (stale). The local branch is
+# deleted after the merge so the LOCAL scope below sees only main/fresh/stale.
+git checkout -q -b f31-remote main
+echo r > f31-r.txt; git add f31-r.txt; old_commit "f31-remote"
+F31_REMOTE_SHA="$(git rev-parse HEAD)"
+git push -q -u origin f31-remote
+git checkout -q main
+git merge -q --ff-only f31-remote
+git push -q origin main
+git branch -d f31-remote >/dev/null
+# a FRESH local candidate: a MERGED PR at the tip, but NOW-dated (not stale)
+git checkout -q -b f31-fresh main
+echo f > f31-f.txt; git add f31-f.txt
+git commit -q -m "f31-fresh"     # NOW-dated on purpose
+F31_FRESH_SHA="$(git rev-parse HEAD)"
+# a STALE local candidate: a MERGED PR at an OLD tip (the control must delete it)
+git checkout -q -b f31-stale main
+echo s > f31-s.txt; git add f31-s.txt; old_commit "f31-stale"
+F31_STALE_SHA="$(git rev-parse HEAD)"
+git checkout -q main
+F31_MAP="$FIX/f31-pr-map.json"
+cat > "$F31_MAP" <<JSON
+[
+  {"headRefName":"f31-fresh","state":"MERGED","headRefOid":"$F31_FRESH_SHA","baseRefName":"main"},
+  {"headRefName":"f31-stale","state":"MERGED","headRefOid":"$F31_STALE_SHA","baseRefName":"main"}
+]
+JSON
+F31_LOG="$FIX/f31.log"
+
+# (a) remote, WITHOUT the log
+run_script bash "$F31_SCRIPT" --repo "$F31_REPO" --scope remote --cutoff 1000000
+assert_eq "$RC" "1" "F31 remote (no log): an uncomputable cutoff epoch REFUSES (rc=1)"
+assert_contains "$OUT" "--cutoff" "F31 remote (no log): the refusal NAMES the flag"
+assert_not_contains "$OUT" "Cannot apply date adjustment" "F31 remote (no log): BSD date's usage text does not leak"
+assert_not_contains "$OUT" "No stale merged branches found" "F31 remote (no log): the refusal is not a clean 'nothing is stale'"
+
+# (b) remote, WITH the report log — the FALSE PASS the finding measured
+: > "$F31_LOG"
+run_script env CLEANUP_BRANCH_LOG="$F31_LOG" bash "$F31_SCRIPT" --repo "$F31_REPO" --scope remote --cutoff 1000000
+assert_eq "$RC" "1" "F31 remote (with log): REFUSES instead of the FALSE PASS (rc=1)"
+assert_contains "$OUT" "--cutoff" "F31 remote (with log): the refusal NAMES the flag"
+assert_not_contains "$OUT" "No stale merged branches found" "F31 remote (with log): the candidate list is NOT emptied behind a success line"
+assert_not_contains "$(cat "$F31_LOG")" "No stale merged branches found" "F31 remote (with log): the LOG does not record a false PASS"
+
+# (c) local, WITH the log — pre-fix this DELETED the FRESH branch with rc=0
+: > "$F31_LOG"
+run_script env CLEANUP_BRANCH_LOG="$F31_LOG" bash "$F31_SCRIPT" --repo "$F31_REPO" --scope local --pr-map-file "$F31_MAP" --cutoff 1000000 --execute
+assert_eq "$RC" "1" "F31 local (with log): REFUSES instead of deleting a fresh branch (rc=1)"
+assert_contains "$OUT" "--cutoff" "F31 local (with log): the refusal NAMES the flag"
+if [ "$(git -C "$F31_REPO" rev-parse -q --verify refs/heads/f31-fresh 2>/dev/null || echo GONE)" = "$F31_FRESH_SHA" ]; then
+    ok "F31 local (with log): the FRESH branch SURVIVES the uncomputable cutoff"
+else
+    bad "F31 local (with log): the FRESH branch was DELETED — the staleness predicate inverted"
+fi
+if [ "$(git -C "$F31_REPO" rev-parse -q --verify refs/heads/f31-stale 2>/dev/null || echo GONE)" = "$F31_STALE_SHA" ]; then
+    ok "F31 local (with log): the refused sweep deleted NOTHING"
+else
+    bad "F31 local (with log): the refused sweep still deleted a branch"
+fi
+
+# (d) local, WITHOUT the log
+run_script bash "$F31_SCRIPT" --repo "$F31_REPO" --scope local --pr-map-file "$F31_MAP" --cutoff 1000000 --execute
+assert_eq "$RC" "1" "F31 local (no log): REFUSES (rc=1)"
+assert_contains "$OUT" "--cutoff" "F31 local (no log): the refusal NAMES the flag"
+if [ "$(git -C "$F31_REPO" rev-parse -q --verify refs/heads/f31-fresh 2>/dev/null || echo GONE)" = "$F31_FRESH_SHA" ]; then
+    ok "F31 local (no log): the FRESH branch SURVIVES"
+else
+    bad "F31 local (no log): the FRESH branch was DELETED"
+fi
+
+# control: a normal --cutoff 14 still classifies and deletes exactly as before.
+run_script bash "$F31_SCRIPT" --repo "$F31_REPO" --scope remote --cutoff 14 --execute
+assert_eq "$RC" "0" "F31 control: --cutoff 14 still runs the remote sweep (rc=0)"
+assert_contains "$OUT" "Deleted: 1" "F31 control: the stale remote branch is still reaped"
+if [ "$(git -C "$F31_ORIGIN" rev-parse -q --verify refs/heads/f31-remote 2>/dev/null || echo GONE)" = "GONE" ]; then
+    ok "F31 control: origin's stale merged f31-remote was deleted"
+else
+    bad "F31 control: the default path no longer deletes a stale merged branch (f31-remote=$F31_REMOTE_SHA)"
+fi
+run_script bash "$F31_SCRIPT" --repo "$F31_REPO" --scope local --pr-map-file "$F31_MAP" --cutoff 14 --execute
+assert_eq "$RC" "0" "F31 control: --cutoff 14 still runs the local sweep (rc=0)"
+assert_contains "$OUT" "keep   not-stale  f31-fresh" "F31 control: the FRESH merged branch is classified not-stale"
+assert_contains "$OUT" "Selected:  1 (merged: 1, redundant: 0, remotecopy: 0)" "F31 control: only the stale merged branch is selected"
+if [ "$(git -C "$F31_REPO" rev-parse -q --verify refs/heads/f31-stale 2>/dev/null || echo GONE)" = "GONE" ]; then
+    ok "F31 control: the stale local merged branch IS deleted at the default cutoff"
+else
+    bad "F31 control: the stale local merged branch was NOT deleted"
+fi
+if [ "$(git -C "$F31_REPO" rev-parse -q --verify refs/heads/f31-fresh 2>/dev/null || echo GONE)" = "$F31_FRESH_SHA" ]; then
+    ok "F31 control: the fresh branch SURVIVES --cutoff 14"
+else
+    bad "F31 control: the fresh branch was deleted at --cutoff 14"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 51. F33: the DELETE TARGET's real main is read ONCE per sweep, not per candidate =="
+# verify_merged_into_real_main re-read `refs/heads/<main>` from the push url on
+# EVERY candidate, so a plan over N stale branches did 2N+1 ls-remote calls
+# (N main reads + N target checks + 1 endpoint proof), and the execute leg did the
+# same before its pushes. One sweep needs ONE real-main read; the per-candidate
+# check is a LOCAL `git merge-base --is-ancestor` against it. A git shim counts
+# every `ls-remote` the sweep issues. The count assertion (N+2=8) is RED (13)
+# when the hoist is reverted, and the per-entry verify_remote_target read MUST
+# remain, so the count must stay above 2.
+F33_ORIGIN="$FIX/f33-origin.git"
+F33_REPO="$FIX/f33-repo"
+new_repo "$F33_REPO" "$F33_ORIGIN"
+cd "$F33_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F33_SCRIPT="$F33_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f33.txt; git add f33.txt; old_commit "init"; git push -q origin main
+F33_I=1
+while [ "$F33_I" -le 6 ]; do
+    git checkout -q -b "f33-b$F33_I" main
+    echo "$F33_I" > "f33-$F33_I.txt"; git add "f33-$F33_I.txt"; old_commit "f33-$F33_I"
+    git push -q -u origin "f33-b$F33_I"
+    git checkout -q main
+    git merge -q --ff-only "f33-b$F33_I"
+    git push -q origin main
+    F33_I=$((F33_I + 1))
+done
+F33_REAL_GIT="$(command -v git)"
+F33_WRAP="$FIX/f33-wrap"
+F33_COUNT="$FIX/f33-count"
+mkdir -p "$F33_WRAP"
+cat > "$F33_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: count every `ls-remote` the sweep issues, then delegate to real git.
+if [ "$1" = "ls-remote" ]; then
+    printf '1\n' >>"${F33_COUNT:?F33_COUNT unset}"
+fi
+exec "${F33_REAL_GIT:?F33_REAL_GIT unset}" "$@"
+WRAP
+chmod +x "$F33_WRAP/git"
+: > "$F33_COUNT"
+run_script env PATH="$F33_WRAP:$PATH" F33_REAL_GIT="$F33_REAL_GIT" F33_COUNT="$F33_COUNT" \
+    bash "$F33_SCRIPT" --repo "$F33_REPO" --scope remote
+F33_CALLS="$(wc -l <"$F33_COUNT" | tr -d '[:space:]')"
+assert_eq "$RC" "0" "F33: the dry-run still classifies and prints a plan (rc=0)"
+assert_contains "$OUT" "Found 6 stale merged branch(es)" "F33: all 6 candidates are still classified"
+assert_eq "$(grep -c '^  git push origin --delete' <<<"$OUT" || true)" "6" "F33: the plan still prints one delete per candidate"
+assert_eq "$F33_CALLS" "8" "F33: 6 candidates cost N+2=8 ls-remote calls (1 endpoint + 1 real main + 6 target checks), not 2N+1=13"
+if [ "$F33_CALLS" -gt 2 ]; then
+    ok "F33: the per-entry verify_remote_target read was NOT dropped (count=$F33_CALLS)"
+else
+    bad "F33: the sweep dropped the per-entry target read (count=$F33_CALLS)"
+fi
+
+cd "$REPO"
+echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
