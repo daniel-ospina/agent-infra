@@ -308,7 +308,7 @@ fi
 # SAME layer (`lane-status.py`, `lane-actions.py`, `lane-watchdog.py`, `objective.py`,
 # `heartbeat-loop.sh`, `cadence-nudge.sh`, `publish-live-workspaces.py`) is present in scripts/ but
 # is in NO farm list, so a box rebuilt from this file gets the farmed CONSUMERS (the 27 below plus
-# the 9 pre-existing) WITHOUT those seven PRODUCERS.
+# the 10 pre-existing) WITHOUT those seven PRODUCERS.
 # Adding them is not a list-only edit and is deliberately out of #1552's scope, because the copies
 # have drifted — measured AT THIS COMMIT, one-directionally:
 #   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005; the live copy
@@ -336,7 +336,11 @@ fi
 # membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
 # Tests are not farmed (the farm contract above): scripts/test_objective.py and
 # scripts/test_turn_classify_state.py land in the repo and stay there.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py ci_runner_gate.sh ask-owner.py beta-progress.py cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
+# #1787 adds cleanup-stale-branches.sh: the daily com.tortoise.branch-reaper job
+# runs the FARMED copy through the shared launcher with an explicit --repo, and
+# install-launchd.sh's broken-target guard refuses the whole install when the
+# farmed script is absent.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
