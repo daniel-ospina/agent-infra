@@ -118,12 +118,12 @@
 #   --install (default)  install the layer, then VERIFY it; non-zero if either fails.
 #   --verify             check an already-installed layer against the checkout; no writes.
 #                        It compares CONTENT, not existence: the farmed scripts, the extensions
-#                        (files byte-compared, directories file-by-file), the config set,
-#                        settings.json's keys, and every `skills/*/SKILL.md` — and it refuses
-#                        (non-zero) when a comparison cannot be made IN FULL. That matters beyond
-#                        this script: cloud-cell-bringup.sh --check runs `--verify` BEFORE it
-#                        installs, so this read-back is what decides whether a cell's existing
-#                        layer is REPAIRED or CERTIFIED.
+#                        (files byte-compared, directories file-by-file), the config set, the whole
+#                        `skills/` tree, and settings.json's keys — and it refuses (non-zero) when
+#                        a comparison cannot be made IN FULL. That matters beyond this script:
+#                        cloud-cell-bringup.sh --check runs `--verify` BEFORE it installs, so this
+#                        read-back is what decides whether a cell's existing layer is REPAIRED or
+#                        CERTIFIED.
 #   --help               print this header.
 #
 #   ENV  CELL_HOME    the cell home (default /tmp/cell-home; the cell's real HOME)
@@ -192,9 +192,6 @@ TOOLS_ALLOWED_NAMES=( fd rg fd.exe rg.exe )
 # legitimate growth while a collapse is loud.
 MIN_FARM_FILES=20
 MIN_SHIP_LIST=10
-# 124 SKILL.md files ship today; the floor exists to catch a TRUNCATED READING (a walk that found
-# almost nothing) rather than to track the tree's growth.
-MIN_SKILL_FILES=80
 
 # ── locating the checkout to install FROM ────────────────────────────────────
 # A candidate "is a checkout" only if it carries BOTH files this script reads: the farm
@@ -759,42 +756,26 @@ verify_layer() {
     say "verified $seen_dep extension(s) that declare runtime deps"
   fi
 
-  # skills/. The install is a `cp -R` of the whole tree, so the read-back compares the SET and the
-  # CONTENT: every SKILL.md the checkout has must be on the cell, byte for byte. What this check
-  # used to be — `[ -d ]` plus a non-empty `ls` — refuses an absent tree but CERTIFIES a partial
-  # one, and a cell that lost most of its skills is exactly that shape. It was invisible until
-  # `--check` began verifying BEFORE it installs: with a read-back that weak, a cell holding 1 of
-  # 124 skills passed verify, took the fast path, and was certified without the repair the install
-  # path would have performed.
+  # skills/. The install is a `cp -R` of the WHOLE tree, so the read-back compares the whole tree.
+  # A walk that visits only the 124 SKILL.md entry points certifies a cell missing every
+  # `references/`, `workflow/`, `templates/` and `scripts/` file a skill tells a lane to read —
+  # ~180 files — and a skill whose entry point survived is not the skill. This is the same
+  # one-directional comparison the extension and config loops use, so the refusals come with it:
+  # an emptied tree (2), and a tree it cannot compare IN FULL (3) — an unreadable subtree, a
+  # non-regular entry (a symlink is copied as a link), or a name the file list cannot represent.
+  # No count floor here, unlike the farm set and the ship-list: those are PARSES, which can
+  # truncate silently, while this walk's truncation is a non-zero `find` status that is refused
+  # as uncomparable rather than counted.
   if [ ! -d "$DEST/skills" ]; then
     fail "skills/ is missing"
   else
-    local ssrc srel sdst nskills=0 skill_fails=0 slink
-    while IFS= read -r ssrc; do
-      [ -n "$ssrc" ] || continue
-      srel="${ssrc#"$INFRA_ROOT"/skills/}"
-      nskills=$((nskills + 1))
-      sdst="$DEST/skills/$srel"
-      if [ ! -f "$sdst" ]; then
-        fail "SKILL MISSING: skills/$srel is not on the cell"
-        skill_fails=$((skill_fails + 1))
-      elif ! cmp -s "$ssrc" "$sdst"; then
-        fail "SKILL CONTENT DIFFERS from the checkout: skills/$srel (a stale or hand-edited copy)"
-        skill_fails=$((skill_fails + 1))
-      fi
-    done < <(find -H "$INFRA_ROOT/skills" -name SKILL.md -type f 2>/dev/null)
-    if [ "$nskills" -lt "$MIN_SKILL_FILES" ]; then
-      fail "skills/ holds only $nskills SKILL.md file(s) in the checkout (floor: $MIN_SKILL_FILES) — verify would be checking a truncated list"
-      skill_fails=$((skill_fails + 1))
-    fi
-    # A symlinked entry under skills/ installs as a LINK (cp -R copies it as one), so the cell's
-    # skill would point outside the cell and `find` would not descend into it to compare anything.
-    slink="$(find -H "$INFRA_ROOT/skills" -type l 2>/dev/null | head -3)"
-    if [ -n "$slink" ]; then
-      fail "skills/ ships a SYMLINK ($slink) — the install copies it as a link, so verify cannot vouch for the skill it points at"
-      skill_fails=$((skill_fails + 1))
-    fi
-    [ "$skill_fails" -ne 0 ] || say "verified $nskills SKILL.md file(s) against the checkout"
+    shipped_content_matches "$INFRA_ROOT/skills" "$DEST/skills"
+    case $? in
+      0) say "verified the skills tree against the checkout" ;;
+      2) fail "skills/ ships NO files in the checkout ($INFRA_ROOT/skills) — verify cannot vouch for an empty tree" ;;
+      3) fail "skills/ could not be compared IN FULL ($INFRA_ROOT/skills) — refusing to certify a subset: an unreadable tree, a non-regular entry, or a name the file list cannot represent" ;;
+      *) fail "SKILLS CONTENT DIFFERS from the checkout: skills/ (a stale, truncated or hand-edited copy)" ;;
+    esac
   fi
   # The config set. These five were installed blind and never read back, so a checkout
   # missing one produced a cell that verified clean with no sub-agent definitions at all —

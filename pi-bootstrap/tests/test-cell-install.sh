@@ -24,12 +24,12 @@
 #   (e) `--verify` refuses a cell missing a guard, a stray entry under ~/.pi/agent/tools/
 #       (pi blocks every interactive boot on one, #1277), or an unlocatable checkout — and
 #       the tools/ migration removes a legacy tools/fleet/ farm;
-#   (e2) `--verify` compares the SKILLS tree against the checkout (a missing or hand-edited
-#       SKILL.md is refused, and so is a checkout whose `find` returned almost nothing or
-#       reached a symlinked entry) and refuses an EMPTY AGENTS.md — skills/ was
-#       existence-plus-non-empty until #1723's `--check` began verifying before it installs,
-#       which made a weak read-back the difference between repairing a partial tree and
-#       certifying it;
+#   (e2) `--verify` compares the WHOLE skills tree against the checkout (a missing SKILL.md, a
+#       missing support file under references//workflow//templates/, or a hand-edited skill is
+#       refused, and so is a tree it cannot compare IN FULL: an unreadable subtree or a
+#       symlinked entry) and refuses an EMPTY AGENTS.md — skills/ was existence-plus-non-empty
+#       until #1723's `--check` began verifying before it installs, which made a weak read-back
+#       the difference between repairing a partial tree and certifying it;
 #   (f) an npm-less cell is refused rather than certified with a partial layer;
 #   (g) the npm child runs with a SCRUBBED environment — an allowlisted proxy/registry only,
 #       never the keys.env the cell exported — and with --ignore-scripts;
@@ -404,12 +404,24 @@ run_verify
   || fail "--verify refused a cell-local extra — a false block the installer cannot repair"
 rm -f "$DEST/extensions/review-enforcer/cell-local-helper.ts"
 # skills/ was `[ -d ]` plus a non-empty `ls` until #1723's `--check` began verifying BEFORE it
-# installs: a cell holding 1 of the checkout's SKILL.md files passed that check, so the fast path
-# would CERTIFY it and skip the re-copy that repairs it. The read-back now compares the whole set.
+# installs: a cell holding 1 of the checkout's 124 SKILL.md files passed that check, so the fast
+# path would CERTIFY it and skip the re-copy that repairs it. It now compares the WHOLE tree —
+# `skills/` ships 304 files, and a skill whose entry point survived but whose references/,
+# workflow/ and templates/ files are gone is not the skill those files describe.
+rm -f "$DEST/skills/commit-workflow/workflow/01-preflight.md"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "SKILLS CONTENT DIFFERS from the checkout: skills/" "$LOG" \
+  && ok "--verify refuses a skills tree missing a SUPPORT file the checkout ships (not just SKILL.md)" \
+  || fail "--verify CERTIFIED a cell missing skills/commit-workflow/workflow/01-preflight.md"
+run_install >/dev/null 2>&1
+[ -f "$DEST/skills/commit-workflow/workflow/01-preflight.md" ] \
+  && ok "re-install restored the missing support file" \
+  || fail "re-install did not restore the missing support file"
 rm -f "$DEST/skills/commit-workflow/SKILL.md"
 run_verify
 rc=$?
-[ "$rc" -eq 1 ] && grep -q "SKILL MISSING: skills/commit-workflow/SKILL.md" "$LOG" \
+[ "$rc" -eq 1 ] && grep -q "SKILLS CONTENT DIFFERS from the checkout: skills/" "$LOG" \
   && ok "--verify refuses a skills tree missing a SKILL.md the checkout ships" \
   || fail "--verify CERTIFIED a cell missing skills/commit-workflow/SKILL.md (a partial skills tree)"
 run_install >/dev/null 2>&1
@@ -418,7 +430,7 @@ run_install >/dev/null 2>&1
 echo "# hand-edited" >> "$DEST/skills/commit-workflow/SKILL.md"
 run_verify
 rc=$?
-[ "$rc" -eq 1 ] && grep -q "SKILL CONTENT DIFFERS from the checkout: skills/commit-workflow/SKILL.md" "$LOG" \
+[ "$rc" -eq 1 ] && grep -q "SKILLS CONTENT DIFFERS from the checkout: skills/" "$LOG" \
   && ok "--verify refuses a hand-edited SKILL.md (a skill is read back, not just counted)" \
   || fail "--verify CERTIFIED a hand-edited SKILL.md"
 run_install >/dev/null 2>&1   # refresh the hand-edited skill before the AGENTS.md pin
@@ -711,32 +723,44 @@ else
 fi
 
 # -------------------------------------------------------------------------
-hdr "run 8: the skills read-back has its own floor and refuses a symlinked entry"
-# The same two guards the farm parse has, on the tree the fast path now depends on. The fixture is
-# a COMPLETE checkout except for skills/ — a 1-file tree plus a linked entry — because the farm
-# floor would otherwise fire first and the skills read-back would never run (that is what run 7
-# pins). Its sibling DIRECTORY links are the established find -H shape (see run 3's empties).
-SK="$TMP/shrunk-skills"
-mkdir -p "$SK/pi-bootstrap/pi-config" "$SK/extensions" "$SK/skills/one"
+hdr "run 8: the skills read-back refuses a tree it cannot compare in full"
+# The reviewer's P1: `find` prints a PARTIAL list when it cannot descend, and exits non-zero. A
+# read-back that discards that status (and its stderr) compares the part it reached and reports a
+# match — so a cell missing an unreachable SKILL.md is certified. The fixture is a COMPLETE
+# checkout with a real (mutable) skills tree; its sibling links are the find -H shape run 3 uses.
+SK="$TMP/skills-checkout"
+SKHOME="$TMP/skills-checkout-home"
+mkdir -p "$SK/pi-bootstrap/pi-config" "$SK/extensions" "$SK/skills"
 for d in scripts templates tools manifest.json; do ln -s "$ROOT/$d" "$SK/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$SK/pi-bootstrap/setup.sh"
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$SK/pi-bootstrap/pi-config/"
 for d in "$ROOT"/extensions/*; do b="$(basename "$d")"; ln -s "$d" "$SK/extensions/$b"; done
-printf '# one\n' > "$SK/skills/one/SKILL.md"
-ln -s "$ROOT/skills/commit-workflow" "$SK/skills/linked-skill"
-out="$(CELL_HOME="$TMP/shrunk-skills-home" INFRA_ROOT="$SK" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
+cp -R "$ROOT/skills/." "$SK/skills/"
+out="$(CELL_HOME="$SKHOME" INFRA_ROOT="$SK" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
 rc=$?
-if [ "$rc" -eq 1 ] && grep -q "skills/ holds only 1 SKILL.md file(s)" <<<"$out"; then
-  ok "a checkout whose skills tree holds a single SKILL.md is refused by the floor (rc=1)"
+[ "$rc" -eq 0 ] && ok "a complete fixture with a real skills tree installs clean" \
+  || fail "the run-8 fixture did not install (rc=$rc): $(grep -m1 'FAIL:' <<<"$out")"
+if [ "$(id -u)" = "0" ]; then
+  ok "skipped the unreadable-skills pin: running as root, where chmod 000 does not block a read"
 else
-  fail "a 1-file skills tree exited $rc without the floor refusing: $(grep -m1 'SKILL.md file' <<<"$out")"
+  mkdir -p "$SK/skills/.unreadable" && printf '# hidden\n' > "$SK/skills/.unreadable/SKILL.md"
+  chmod 000 "$SK/skills/.unreadable"
+  out="$(CELL_HOME="$SKHOME" INFRA_ROOT="$SK" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+  rc=$?
+  chmod 700 "$SK/skills/.unreadable"
+  [ "$rc" -eq 1 ] && grep -q "skills/ could not be compared IN FULL" <<<"$out" \
+    && ok "an unreadable skills subtree is REFUSED, not certified over the part find reached" \
+    || fail "an unreadable source subtree produced a certified skills comparison (rc=$rc)"
 fi
-grep -q "skills/ ships a SYMLINK" <<<"$out" \
+# `cp -R` copies a symlink AS a link, so the cell's skill would point outside the cell and nothing
+# descends into it to compare — the same refusal the extension and config loops make.
+ln -s "$ROOT/skills/commit-workflow" "$SK/skills/linked-skill"
+out="$(CELL_HOME="$SKHOME" INFRA_ROOT="$SK" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "skills/ could not be compared IN FULL" <<<"$out" \
   && ok "a symlinked entry under skills/ is refused, not followed into the cell" \
   || fail "a symlinked skills entry was certified — the install copies it as a link"
-grep -q 'FAILED: 2 problem(s)' <<<"$out" \
-  && ok "the fixture refused exactly those two things — the skills read-back is not failing for an unasserted reason" \
-  || fail "the skills fixture produced a problem count other than 2 ($(grep -o 'FAILED: [0-9]* problem(s)' <<<"$out" | head -1))"
+rm -f "$SK/skills/linked-skill"
 
 # -------------------------------------------------------------------------
 hdr "syntax"
