@@ -1121,24 +1121,41 @@ async function partC() {
     const handlers = new Map();
     mod.default({ on(n, fn) { if (!handlers.has(n)) handlers.set(n, []); handlers.get(n).push(fn); } });
     const inertToolCall = handlers.get("tool_call")?.[0];
-    // The framework checkout is the SESSION cwd for both arms; the command is
-    // the sanctioned helper's own path. Only the loaded guard differs.
+    // The framework checkout owns the SANCTIONED path; the SESSION cwd is a
+    // HERMETIC repo that carries tracked dirt, and both arms are driven from
+    // there. #1060 made the session cwd's dirt load-bearing: the M5 arm is now
+    // decided on state, so a fixture that sat in the (clean, in CI) framework
+    // checkout made C1's expectation depend on whether whoever ran the suite
+    // happened to have uncommitted edits — which is precisely how the arm was
+    // decided anyway, and which CI caught. The hermetic dirty cwd makes the
+    // pair deterministic AND stronger: the ONLY difference between C1 and C2 is
+    // the loaded guard, the command is identical, and the candidate checkout
+    // holds real tracked dirt the discard would destroy.
     const frameworkCheckout = realpathSync(join(HERE, "..", ".."));
     const sanctioned = join(frameworkCheckout, "scripts", "checkout-hygiene", "hub-worktree.sh");
     const cmd = `bash "${sanctioned}"`;
-    process.chdir(frameworkCheckout);
+    const cHub = join(tmpc, "c-hub");
+    execSync(`git init -q -b main "${cHub}"`, { cwd: tmpc, stdio: "ignore" });
+    execSync("git config user.email t@t && git config user.name t", { cwd: cHub, stdio: "ignore" });
+    writeFileSync(join(cHub, "wip.txt"), "v1\n");
+    execSync("git add -A && git commit -qm init", { cwd: cHub, stdio: "ignore" });
+    writeFileSync(join(cHub, "wip.txt"), "MUTANT\n"); // tracked dirt
+    process.chdir(cHub);
     expectTrue("C0: the fixture guard loads with its non-M5 machinery intact (the anchor is the only difference)",
       !warnings.some((w) => /DISABLED/.test(w)), `warnings=${JSON.stringify(warnings).slice(0, 240)}`);
     const inert = await inertToolCall?.({ toolName: "bash", input: { command: cmd } }, undefined);
-    expectTrue("C1 (#1139 T6): an anchor carrying NO listed script FAILS CLOSED (the exemption is inert, not fail-open)",
-      !!inert && inert.block === true,
+    expectTrue("C1 (#1139 T6): an anchor carrying NO listed script keeps the discard GATED — with tracked dirt in the candidate checkout that is a BLOCK (the exemption is inert, never fail-open)",
+      !!inert && inert.block === true && /#709/.test(inert.reason ?? "") && /cat-file-revert/.test(inert.reason ?? ""),
       `handler returned ${JSON.stringify(inert)?.slice(0, 240)}`);
     // Control: the SAME command, SAME cwd, through the anchor-CORRECT guard.
+    // The exemption drops the harvested set, so the discard arm has nothing to
+    // decide even though the candidate checkout is dirty — which is what makes
+    // C1 a test of the ANCHOR and not of the dirt.
     const real = await import(pathToFileURL(INDEX_TS).href);
     const rh = new Map();
     real.default({ on(n, fn) { if (!rh.has(n)) rh.set(n, []); rh.get(n).push(fn); } });
     const anchored = await rh.get("tool_call")[0]({ toolName: "bash", input: { command: cmd } }, undefined);
-    expectTrue("C2 control: the SAME command through the anchor-CORRECT guard is ALLOWED",
+    expectTrue("C2 control: the SAME command through the anchor-CORRECT guard is ALLOWED (the exemption fires on a dirty candidate)",
       anchored === undefined || anchored === null,
       `handler returned ${JSON.stringify(anchored)?.slice(0, 240)}`);
   } catch (e) {
