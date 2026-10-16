@@ -22,7 +22,10 @@
 #
 # Prereqs on the cell (see cloud-cell-bringup.sh --check):
 #   HOME writable · repo cloned · gh authenticated with push · provider key valid
+#   + git/python3/pi on PATH, ~/.pi/agent/scripts/record-review.sh ('start' provisions it)
 #   + the merge authority key (AI_REVIEW_GATE_KEY) if this cell is to MERGE.
+# 'check' refuses to certify a cell missing any of the above: each one, absent, turns a loop step
+# into a silent no-op or an unbounded paid retry (#1717).
 #
 # ⛔ MEASURED 2026-10-13 — A CELL WITHOUT THE MERGE KEY IS **NOT** MERGE-INERT.
 # An earlier draft of this file claimed a keyless cell was a safe "producer cell"
@@ -89,6 +92,22 @@ O="${O:-$CELL_HOME/orchestrator}"
 # in a follow-up tortoise PR (agent-infra#1700 / tortoise#8432), so it is no longer a valid default
 # here. An unresolvable path fails loudly in cmd_check, never silently.
 HARNESS="${HARNESS:-}"
+# The record step (#1717). merge-one.sh EXECUTES this path to mint the signed marker that
+# ai-review-gate verifies, so it is a hard dependency of the ONLY merge path — but a fresh cell does
+# not have it (the file ships in the agent-infra checkout, not in the target repo). Two functions,
+# not two variables, because $ENV_FILE is sourced later in this file and may repoint $CELL_HOME: the
+# consumers must resolve it at call time. NO environment override — a knob that points the record
+# step at another file is a way to defeat the gate, not a configuration.
+recorder_path() { printf '%s\n' "$CELL_HOME/.pi/agent/scripts/record-review.sh"; }
+recorder_src()  { printf '%s\n' "$HARNESS/../record-review.sh"; }
+# The recorder's DECLARED SIBLING (#1362/#1717). record-review.sh resolves its diff normalizer from
+# its OWN directory (`$(dirname "${BASH_SOURCE[0]}")/lib/diff-normalize.py`), so the two must be
+# provisioned together, preserving the relative position — exactly as pi-bootstrap/setup.sh's lib
+# farm pins it. Without it the recorder degrades to the RAW pre-#1362 digest (no false accept, but
+# every base-only `gh pr update-branch` refuses carry-forward and buys a FRESH PAID review), which is
+# the same paid-loop class as the missing recorder itself. Resolved from the harness checkout.
+recorder_lib_path() { printf '%s\n' "$(dirname "$(recorder_path)")/lib/diff-normalize.py"; }
+recorder_lib_src()  { printf '%s\n' "$HARNESS/../lib/diff-normalize.py"; }
 SESSION="${SESSION:-orch}"
 # OR is interpolated into the session command string, so it is defaulted here — the guard below reads
 # it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
@@ -699,6 +718,26 @@ cmd_check() {
   fi
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
+  # ⛔ RUNTIME DEPENDENCIES, not just the binaries this block already named (#1717). Each one is
+  # INVOKED by the loop, and each one absent turns a step into a silent no-op or an unbounded paid
+  # retry — so a cell missing one must not be certified:
+  #   git     → worktree/fetch/push in fix-one.sh, dispatch-merge.sh, adopt-fix.sh. Nothing else
+  #             tests it: the `-d $REPO/.git` check below passes on a box with no git at all.
+  #   python3 → orch-loop.sh's check classifier and fix-one.sh's FAILING_CHECKS. Absent, the
+  #             classifier's $V is EMPTY, NO case arm matches, and every PR is skipped in silence —
+  #             a dead sweep that is indistinguishable from a quiet queue.
+  #   pi      → the worker runtime (lane.sh, fix-one.sh, merge-one.sh). Absent, every review and
+  #             every fixer fails 127 and the cell produces nothing.
+  # All three are fatal HERE because a cell invokes each directly (above). Parity with install.sh is
+  # true for `pi` only: install.sh's fatal gate is `for bin in tmux gh pi` (install.sh:84), and it
+  # never probes git or python3. The requirement is this script's own, not a mirrored one.
+  local dep
+  for dep in git python3 pi; do
+    command -v "$dep" >/dev/null 2>&1 || die "$dep missing on PATH — the loop invokes it (harness README §3)"
+  done
+  # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
+  # and install.sh warns rather than dying for it — so the two surfaces agree.
+  command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
   # ⛔ A LINKED WORKTREE HAS A `.git` FILE, NOT A DIRECTORY (agent-infra#1745). The old `-d` test
@@ -728,6 +767,41 @@ cmd_check() {
   # Placed BEFORE the dispatch-provisioning probe: a tree off main's line can pass every later
   # check, and this is the one that says the code itself is not the code we think it is.
   cmd_check_provenance
+  # ⛔ THE RECORD STEP IS A HARD DEPENDENCY OF THE ONLY MERGE PATH (#1717). merge-one.sh mints the
+  # signed marker ai-review-gate verifies by RUNNING this file, and neither cell script used to
+  # check or provision it. The pre-fix failure: cmd_check printed "CELL CAN RUN A CONTROLLER", the
+  # cell ran a full fresh-context review (up to REVIEW_TIMEOUT = 1800 s, PAID), record-review.sh
+  # then returned 127, and merge-one.sh exited BEFORE writing a parked marker — so the next cycle
+  # saw an unmarked FAILED:ai-review-gate and spawned another review. One paid review per cycle,
+  # forever, with no terminal state. Refuse the certification instead.
+  # Judge the path the CONSUMER uses: the session forces HOME=$CELL_HOME after sourcing keys.env.
+  # Presence + executability are NOT enough: the file must be a non-empty REGULAR file. `[ -x ]` is
+  # true for a directory (`merge-one.sh` then buys the paid review and fails 126), and an EMPTY file
+  # is executable too — bash runs a shebang-less empty script and it exits 0, minting no marker. So
+  # an empty recorder would be certified, the gate would never go green, nothing would be parked,
+  # and the loop would re-pay for a fresh review every cycle: the same #1717 loop, one input over.
+  # The sibling check below already reasons about the zero-byte shape; judge the recorder the same way.
+  local rec; rec="$(recorder_path)"
+  if [ ! -e "$rec" ]; then
+    die "record-review.sh MISSING at $rec — it is the only merge path, so every review would be re-paid for and never recorded. 'start' provisions it from $(recorder_src), or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -f "$rec" ]; then
+    die "record-review.sh at $rec is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) AFTER a paid review. Remove it and re-run 'start', or: rm -rf '$rec' && cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -s "$rec" ]; then
+    die "record-review.sh at $rec is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so the gate could never go green, nothing would be parked, and the loop would re-pay for a fresh review every cycle. Re-provision it: 'start', or: cp '$(recorder_src)' '$rec' && chmod +x '$rec'"
+  elif [ ! -x "$rec" ]; then
+    die "record-review.sh at $rec is NOT EXECUTABLE — merge-one.sh runs it directly, so the record step would fail (126) AFTER a paid review. Fix: chmod +x '$rec'"
+  fi
+  # The recorder's OWN runtime dependency (#1362/#1717): it resolves lib/diff-normalize.py from its
+  # sibling directory. Absent, the recorder still runs — but it takes the RAW pre-#1362 digest arm
+  # (`⚠️ #1362` warning in its output), the marker's diff_sha256 stops matching what the consumer
+  # computes live, and EVERY base-only head move (`gh pr update-branch`) refuses carry-forward and
+  # buys a fresh PAID review. Certifying a cell in that state is the same false PASS this block
+  # exists to remove, one step down the cost ladder. Judge it beside the recorder it belongs to.
+  local reclib; reclib="$(recorder_lib_path)"
+  if [ ! -f "$reclib" ] || [ ! -s "$reclib" ]; then
+    die "diff-normalize.py MISSING (or not a regular file, or empty) at $reclib — record-review.sh resolves it as its own sibling, and without it every base-only update re-pays for a fresh review. 'start' provisions it from $(recorder_lib_src), or: mkdir -p '$(dirname "$reclib")' && cp '$(recorder_lib_src)' '$reclib' && chmod +x '$reclib'"
+  fi
+  say "ok: record step present and executable ($rec, with $(recorder_lib_path))"
 
   # ── dispatch provisioning: can this repo be pre-flighted? (agent-infra#1736) ──────────────────
   # The refresh step refills the dispatch backlog, and orch-loop.sh runs it in a BACKGROUNDED
@@ -874,6 +948,41 @@ cmd_start() {
   # set when the shell started, and an unreplaced-but-unsafe derived path would otherwise reach the
   # tmux command string unguarded.
   safe_argv "$HARNESS" || die "\$HARNESS must not contain a quote or shell metacharacter: $HARNESS"
+  # Provision the record step (#1717), mirroring seed_and_stamp above: hard dependency of the only
+  # merge path, absent on a fresh cell. Provisioned when ABSENT OR EMPTY (never merely because an
+  # `-e` test failed), so an operator's complete newer copy is never clobbered — while a
+  # partial/zero-byte one cannot persist across restarts. NEVER overwritten by whatever a keys.env
+  # points at.
+  local rec rsrc rlib rlibsrc rtmp ltmp
+  rec="$(recorder_path)"; rsrc="$(recorder_src)"
+  rlib="$(recorder_lib_path)"; rlibsrc="$(recorder_lib_src)"
+  # `[ ! -s ]`, not `[ ! -e ]`: a ZERO-BYTE recorder (a copy killed mid-write, or a full disk) is
+  # the same fault as an absent one and must not survive a retry — it is worse than absent, because
+  # it exits 0 without minting a marker, so nothing is parked and the loop re-pays (#1717).
+  if [ ! -s "$rec" ]; then
+    [ -e "$rec" ] && [ ! -f "$rec" ] && die "$rec exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$(dirname "$rec")" || die "cannot create $(dirname "$rec")"
+    # Atomic: write a sibling tmp then rename into place, so a concurrent reader can never observe a
+    # half-written recorder (the same reason pi-bootstrap/setup.sh farms its libs to a tmp + mv).
+    rtmp="${rec}.tmp.$$"
+    cp -p "$rsrc" "$rtmp" 2>/dev/null || { rm -f "$rtmp"; die "record-review.sh missing at $rec and cannot provision it from $rsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$rtmp" || { rm -f "$rtmp"; die "cannot make $rec executable"; }
+    mv -f "$rtmp" "$rec" || { rm -f "$rtmp"; die "cannot install the provisioned recorder at $rec"; }
+    say "provisioned record step: $rsrc -> $rec"
+  fi
+  # …and its declared sibling, ALWAYS (not only when the recorder was absent): an operator's older
+  # recorder copy can sit beside a missing lib, and cmd_check below refuses that cell. Preserve the
+  # relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py) and refresh only
+  # when ABSENT, so a newer operator copy is never clobbered — same rule as the recorder above.
+  if [ ! -f "$rlib" ] || [ ! -s "$rlib" ]; then
+    [ -e "$rlib" ] && [ ! -f "$rlib" ] && die "$rlib exists but is not a regular file — remove it, then re-run 'start'"
+    mkdir -p "$(dirname "$rlib")" || die "cannot create $(dirname "$rlib")"
+    ltmp="${rlib}.tmp.$$"
+    cp -p "$rlibsrc" "$ltmp" 2>/dev/null || { rm -f "$ltmp"; die "diff-normalize.py missing at $rlib and cannot provision it from $rlibsrc — the harness checkout must be a full agent-infra checkout"; }
+    chmod +x "$ltmp" || { rm -f "$ltmp"; die "cannot make $rlib executable"; }
+    mv -f "$ltmp" "$rlib" || { rm -f "$ltmp"; die "cannot install the provisioned normalizer at $rlib"; }
+    say "provisioned record-step library: $rlibsrc -> $rlib"
+  fi
   # The key verdict must NOT be swallowed on the only path that starts a cell: an operator who
   # exported the key ambiently (or left an empty assignment in keys.env) would otherwise get a
   # keyless cell with no signal. Run the check once, fail loudly, and surface its output on stderr.

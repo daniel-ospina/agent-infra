@@ -1389,12 +1389,34 @@ git -C "$HFIX" config user.email selftest@test.local
 git -C "$HFIX" config user.name selftest
 git -C "$HFIX" config commit.gpgsign false
 mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+# #1717: the checkout `start` provisions the recorder from is `$HARNESS/../record-review.sh`, and the
+# recorder's declared sibling must sit beside it — so the PAIR is committed into the fixture checkout.
+# Untracked, it would also make the tree dirty and the #1745 provenance gate would refuse it.
+mkdir -p "$HFIX/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$HFIX/scripts/record-review.sh"; chmod +x "$HFIX/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$HFIX/scripts/lib/diff-normalize.py"
 git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
 git -C "$HFIX" branch -M main
 git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
 
 git init -q "$TMP/cellrepo"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one — the stub is for the shapes that do not die at validate_scope() first.
+# The recorder's declared sibling must exist too (non-empty), or cmd_check refuses the cell on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the CI runner `pi` is not
+# installed, so every fixture that reaches that probe must stub it instead of leaning on the host
+# PATH — otherwise the suite reddens on the runner only (the #1348/#1369 lane-split class). git and
+# python3 are stubbed too so the probe is hermetic rather than host-dependent.
+# The runtime-dependency probe (#1717) needs `pi` on PATH and the CI runner does not install it, so
+# it alone is stubbed. `git`/`python3` must be REAL: the #1745 provenance gate runs `git rev-parse`
+# in $HFIX and repo-authority's `_normalise_set` runs Python — a stub `git` (empty output) makes
+# every `check`/`start` below die `cannot resolve origin/main in $HFIX` before the key verdicts run.
+printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/pi"; chmod +x "$STUB_TM/pi"
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1519,6 +1541,21 @@ TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
 # before any session command can be recorded.
 git init -q "$TMP/tm/repo"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe (#1717) needs `pi` on PATH (absent on the CI runner), so it is
+# stubbed. `git`/`python3` stay REAL for the same reason as $STUB_TM above (`start` here pins $HFIX).
+printf '#!/bin/bash\nexit 0\n' > "$TM/pi"; chmod +x "$TM/pi"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
@@ -1635,6 +1672,13 @@ KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
 # must be one or every case below dies at the repo gate before reaching the key verdicts.
 git init -q "$KC/repo"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"

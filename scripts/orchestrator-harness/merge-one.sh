@@ -3,6 +3,14 @@
 # merge-one.sh --argv <file>            (4 lines: repo, owner/repo, pr, branch)
 # Full chain for ONE PR: fresh-context review -> evidence comment -> record-review -> wait green -> merge.
 # This box holds the AI_REVIEW_GATE_KEY, so it owns the merge authority for its own PRs.
+#
+# ⛔ TERMINAL STATE (#1717). Every failure that leaves the signed marker absent — the record step
+# cannot run, the reviewer posted no evidence comment, the record itself failed — writes
+# `$O/state/parked-<PR>` (the head a human must look at) BEFORE exiting, instead of exiting
+# silently. That file is what the controller's parked guard reads, so the loop stops instead of
+# spawning another review; and this script refuses to re-review an already-parked head itself, so
+# the chain-<N> and fix-one.sh paths (which never consult the controller) cannot re-pay either.
+# A later push changes the head and re-arms the PR by construction.
 set -u
 # --argv exists because these values are attacker-influenced (a PR branch name may contain quotes,
 # semicolons, $ and backticks) and the controller must launch us from a tmux `sh -c` string.
@@ -337,6 +345,86 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
   exit 0
 fi
 
+# ── 0) terminal state and the record dependency — BEFORE the paid review (#1717) ──────────────
+# `park` records the terminal state at the head that was reviewed. It is deliberately the SAME
+# marker the controller's own park paths write (`parked-<PR>` = the head, so a new push re-arms),
+# plus a `parkreason-<PR>` that names WHY — the controller cannot say why, and "PARKED" with no
+# reason is a state nobody can act on.
+park() { # park <reason…>
+  local why="$*"
+  # ⛔ THE REASON BELONGS TO THE HEAD THIS PARK IS KEYED TO. An EMPTY HEAD means the
+  # unresolvable-head branch below (a transient `gh` blip) reached park() while an earlier park at a
+  # real head is still in place: it writes no marker, and re-writing the reason there would replace
+  # the real, actionable cause with the transient one — so when gh recovers the worker matches the
+  # park, exits 5, and the exit-5 log (the only in-band remedy on the chain-<N>/fix-one.sh paths)
+  # would name the wrong cause. With no head there is no new park to describe, so the first reason
+  # wins. A NON-EMPTY HEAD is a fresh park — a moved head re-arms the PR and the already-parked
+  # guard cannot have fired for it — so its reason must REPLACE a stale one from an earlier head.
+  if [ -n "${HEAD:-}" ] || [ ! -s "$O/state/parked-$PR" ]; then
+    printf '%s\n' "$why" > "$O/state/parkreason-$PR"
+  fi
+  [ -n "${HEAD:-}" ] && printf '%s\n' "$HEAD" > "$O/state/parked-$PR"
+  echo "[merge $PR] PARKED head=${HEAD:-?} — $why" >> "$L.log"
+}
+
+# ⛔ THE HEAD IS THE SAME CLASS OF PRE-REVIEW DEPENDENCY AS THE RECORDER (#1717). The `gh pr view`
+# above swallows its own failure (2>/dev/null), so one transient API/network/rate-limit blip leaves
+# HEAD empty — and the PRE-FIX flow still ran the WHOLE fresh-context review (up to REVIEW_TIMEOUT =
+# 1800 s, PAID), only for record-review.sh to refuse an empty sha ("head_sha must be a full 40-char
+# hex sha — refusing to record"). park() then could not write `parked-<PR>` AT ALL (there is no head
+# to key it to, and the controller's guard requires a non-empty head too), so the controller saw no
+# park at its HEAD_N, re-spawned a worker, and paid again every cycle — the exact unbounded paid
+# loop #1717 removes. Refuse BEFORE the paid step, against the same 40-char hex shape
+# record-review.sh enforces, and leave the actionable terminal reason.
+head_ok=0
+case "${HEAD:-}" in '' | *[!0-9a-f]*) head_ok=1 ;; esac
+[ "${#HEAD}" -eq 40 ] || head_ok=1
+if [ "$head_ok" -ne 0 ]; then
+  park "could not resolve PR #$PR head (gh pr view returned '${HEAD:-<empty>}') — the record step needs a full 40-char hex sha, so a review paid for here could never be recorded or merged. Re-run once gh is reachable, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: unresolvable head '${HEAD:-<empty>}' — not paying for a review whose record step could never sign" >> "$L.log"
+  exit 3
+fi
+
+# Honour the park HERE, not only in the controller. chain-<N> and fix-one.sh invoke this script
+# directly, and the controller's parked guard is invisible to them; without this the park would
+# hold only the path that was already fixed. Exit 5 = "refused, already parked at this head".
+if [ -n "${HEAD:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD" ]; then
+  echo "[merge $PR] PARKED at head=$HEAD — refusing to re-review (reason: $(cat "$O/state/parkreason-$PR" 2>/dev/null)). A push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'" >> "$L.log"
+  exit 5
+fi
+
+# ⛔ THE RECORD STEP IS THE ONLY MERGE PATH, AND IT USED TO BE PAID TO DISCOVER IT WAS MISSING
+# (#1717). record-review.sh mints the signed marker ai-review-gate verifies; on a fresh cell the
+# file is absent. The pre-fix flow ran the WHOLE fresh-context review (up to REVIEW_TIMEOUT = 1800 s,
+# PAID) and only then failed — and its `exit 3` skipped the `*)` arm that writes the fixer marker,
+# so the next cycle saw an unmarked FAILED:ai-review-gate and spawned another review. One paid
+# review per cycle, forever. Refuse BEFORE the paid step, and leave the terminal marker.
+# The probe must require a NON-EMPTY REGULAR FILE, not merely presence + executability: `[ -x ]` is
+# true for a directory (the paid review is then bought, and the record step fails 126), and an EMPTY
+# file is executable and exits 0 WITHOUT minting the marker — so nothing is parked and the loop
+# re-pays, which is the #1717 loop one input over. Same shape cmd_check enforces.
+RECORDER="$HOME/.pi/agent/scripts/record-review.sh"
+if [ ! -e "$RECORDER" ]; then
+  park "record-review.sh MISSING at $RECORDER — the record step cannot run, so this PR can never be signed or merged. Provision it (cp it into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER missing — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+if [ ! -f "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is NOT A REGULAR FILE — merge-one.sh runs it directly, so a directory (or any other non-regular file) fails (126) after a PAID review. Remove it and re-provision (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER not a regular file — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+if [ ! -s "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is EMPTY (0 bytes) — an empty file is executable and exits 0 WITHOUT minting the signed marker, so ai-review-gate can never go green and the loop would re-pay for a fresh review every cycle. Re-provision it (start, or cp into \$HOME/.pi/agent/scripts/ and chmod +x), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER is empty — not paying for a review whose record step cannot sign" >> "$L.log"
+  exit 3
+fi
+if [ ! -x "$RECORDER" ]; then
+  park "record-review.sh at $RECORDER is NOT EXECUTABLE — the record step would fail (126) after a PAID review. Fix: chmod +x '$RECORDER', then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  echo "[merge $PR] ABORT: $RECORDER not executable — not paying for a review whose record step cannot run" >> "$L.log"
+  exit 3
+fi
+
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
 cat > "$L-reviewer.txt" <<EOF
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
@@ -367,12 +455,77 @@ case "$LAST" in
     URL="$(printf '%s' "$LAST" | grep -oE 'https?://[^ ]+' | head -1)"
     CID="$(printf '%s' "$URL" | grep -oE '[0-9]+$')"
     echo "[merge $PR] evidence comment id=${CID:-?} url=$URL" >> "$L.log"
-    if [ -z "${CID:-}" ]; then echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2; fi
+    if [ -z "${CID:-}" ]; then
+      # The reviewer said CLEAN but named no comment, so there is no artifact to sign — the gate can
+      # NEVER go green at this head. Park it: the pre-fix bare `exit 2` left no marker, so the loop
+      # re-paid for a fresh review every cycle (#1717).
+      park "reviewer reported CLEAN but posted no comment URL — no evidence artifact to sign, so ai-review-gate can never go green at this head. The comment usually EXISTS (the reviewer posts it before the verdict): find it on PR #$PR and record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:<id>), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      echo "[merge $PR] ABORT: no comment id" >> "$L.log"; exit 2
+    fi
     # ── 2) record the review (writes the signed marker into the PR body) ──
-    "$HOME/.pi/agent/scripts/record-review.sh" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
+    "$RECORDER" "$PR" "$HEAD" clean "$OR" --evidence "comment:$CID" >> "$L.log" 2>&1
     rc=$?
     echo "[merge $PR] record-review rc=$rc" >> "$L.log"
-    [ $rc -ne 0 ] && { echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3; }
+    if [ $rc -ne 0 ]; then
+      # No signed marker exists, so the gate cannot pass and the PR cannot merge. The pre-fix
+      # `exit 3` left no marker at ALL, so the next cycle saw an unmarked FAILED:ai-review-gate and
+      # spawned another fresh (paid) review — forever (#1717). Park, and name the failing rc.
+      park "record-review.sh failed rc=$rc at head=$HEAD — the signed marker is NOT in the PR body, so the loop would re-pay for a fresh review every cycle. Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      echo "[merge $PR] ABORT: record failed" >> "$L.log"; exit 3
+    fi
+    # ⛔ `rc=0` IS NOT PROOF THE SIGNED MARKER REACHED THE PR BODY (#1717, fail-open).
+    # record-review.sh posts the marker into the PR body BEST-EFFORT and never fails the record, so
+    # it has reachable rc=0 paths with NO post at all: the body GET failed ("evidence post skipped;
+    # record still saved"), the body PATCH failed ("could not post review evidence … record still
+    # saved"), or gh is missing / the repo is undetectable ("the ai-review-gate required check will
+    # fail until evidence is posted manually"). Trusting rc=0 there means the gate can NEVER go
+    # green, the `gate != SUCCESS` arm below exits 4 WITHOUT a park, and the controller re-spawns a
+    # fresh PAID review every cycle — the exact #1717 loop, one state over. So verify the artifact
+    # the gate actually reads: the SIGNED marker for THIS head in the PR body.
+    # ⛔ VERIFY THE SIGNATURE, NOT ITS SHAPE (#1717 review, P1 — fail-open). THE PR BODY IS
+    # ATTACKER-WRITABLE, so `sig=[0-9a-f]{64}` is not evidence that a signed marker exists: any
+    # 64-hex string on a correctly-shaped line satisfied the pre-fix shape regex, the gate could
+    # then never go green, the `gate != SUCCESS` arm exited 4 WITHOUT a park, and the loop re-paid
+    # for a fresh review every cycle — the #1717 loop Re-opened one state over. The producer
+    # (`record-review.sh`) already resolves the key and verifies the HMAC before trusting a prior
+    # marker; the consumer must do the same. Resolve the key EXACTLY as the producer does
+    # (env first, then the key file, whitespace-stripped) and recompute the HMAC over the marker
+    # text up to (excluding) ` sig=`.
+    LIVE_HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # record-review.sh re-binds a carried record to the LIVE head, so the artifact is keyed to the
+    # head the gate will judge; fall back to the reviewed head when that read itself fails.
+    [ -n "$LIVE_HEAD" ] || LIVE_HEAD="$HEAD"
+    BODY="$(gh pr view "$PR" --repo "$OR" --json body --jq .body 2>/dev/null)"
+    GATE_KEY_RAW="${AI_REVIEW_GATE_KEY:-}"
+    if [ -z "$GATE_KEY_RAW" ] && [ -f "$HOME/.pi/agent/.ai-review-gate-key" ]; then
+      GATE_KEY_RAW="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+    fi
+    GATE_KEY="$(printf '%s' "$GATE_KEY_RAW" | tr -d '[:space:]')"
+    # The candidate line for the LIVE head. ANCHORED, so `sig` is the LAST field and the text before
+    # it is byte-for-byte what the producer signed. A here-string, never a printf pipe into a quiet
+    # grep (#841).
+    MARKER_LINE="$(grep -m1 -E "^review recorded: reviews/${PR}\\.json verdict=clean @ ${LIVE_HEAD} (diff=[0-9a-f]{64} )?\\(.*\\) sig=[0-9a-f]{64}$" <<<"$BODY" || true)"
+    marker_ok=0
+    if [ -z "$MARKER_LINE" ]; then
+      marker_why="record-review.sh returned rc=0 but NO signed marker for head=$LIVE_HEAD reached the PR body — its evidence post is best-effort and skips silently when the body read/PATCH fails or gh/repo is unavailable, so ai-review-gate can never go green at this head and the loop would re-pay for a fresh review every cycle. If the reviewer's comment exists, record it by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    elif [ -z "$GATE_KEY" ]; then
+      marker_why="a marker for head=$LIVE_HEAD is in the PR body but the gate key is UNAVAILABLE (AI_REVIEW_GATE_KEY and \$HOME/.pi/agent/.ai-review-gate-key are both empty), so its HMAC cannot be verified and the PR body is attacker-writable — an unverifiable marker is not evidence. Provision the key (or set AI_REVIEW_GATE_KEY in the cell env), then re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    elif ! command -v openssl >/dev/null 2>&1; then
+      marker_why="a marker for head=$LIVE_HEAD is in the PR body but openssl is NOT available on this box, so its HMAC cannot be verified and the PR body is attacker-writable — an unverifiable marker is not evidence. Install openssl, then re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+    else
+      MARKER_TEXT="${MARKER_LINE% sig=*}"
+      MARKER_SIG="${MARKER_LINE##* sig=}"
+      MARKER_EXPECT="$(printf '%s' "$MARKER_TEXT" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
+      if [ -n "$MARKER_EXPECT" ] && [ "$MARKER_SIG" = "$MARKER_EXPECT" ]; then
+        marker_ok=1
+      else
+        marker_why="a marker for head=$LIVE_HEAD is in the PR body but its HMAC does NOT verify (the PR body is attacker-writable, so a bare 64-hex sig is not evidence — a forged marker must not satisfy this guard). Re-record by hand (record-review.sh $PR $HEAD clean $OR --evidence comment:$CID) with the same gate key the ai-review-gate check uses, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      fi
+    fi
+    if [ "$marker_ok" -ne 1 ]; then
+      park "$marker_why"
+      echo "[merge $PR] ABORT: no VERIFIED signed marker in the PR body for head=$LIVE_HEAD" >> "$L.log"; exit 3
+    fi
     # ── 3) wait for the REPO'S review gate to go green (read the LATEST check row) ──
     # Reached only in `gate` mode, so this repo DOES require the gate. The NAME is an input
     # (agent-infra#1764): it was the literal `ai-review-gate`, which is tortoise's name. The jq
@@ -395,6 +548,12 @@ for c in rows:
       [ "$gate" = "SUCCESS" ] && break
       sleep 30
     done
+    # ⛔ NOT parked, deliberately (verified by reading the controller, not assumed): the signed
+    # marker IS in the PR body by here (the check above proved it, rather than trusting rc=0), so
+    # this head can still merge. A park would make the loop's
+    # top-of-cycle parked guard `continue` past a PR whose gate turns green a minute later — a
+    # stranded merge, strictly worse than the cost of the retry. A record failure cannot be
+    # stranded, which is why THAT is parked.
     if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
     # ── 4) merge ──
     if gh pr merge "$PR" --repo "$OR" --squash >> "$L.log" 2>&1; then

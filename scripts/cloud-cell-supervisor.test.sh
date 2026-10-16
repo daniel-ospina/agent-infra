@@ -86,6 +86,12 @@ make_ai_repo() {
   for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  # #1717: the apply-pinned harness (`$HARNESS/../record-review.sh`) and the recorder's declared
+  # sibling are IN the checkout, so every worktree — including a pinned one at $P/pin/<sha>/ — carries
+  # them. Without this, `start` after `apply` dies "cannot provision it from …/pin/<sha>/scripts/…".
+  mkdir -p "$AI/scripts/lib"
+  printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"; chmod +x "$AI/scripts/record-review.sh"
+  printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
   git -C "$AI" add -A
   git -C "$AI" commit -q -m base
   git -C "$AI" branch -M main
@@ -267,6 +273,19 @@ ai_worktree "$W/harness"
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
 for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
+# #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
+# cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
+# normalizer as its OWN sibling). So the fixture must carry the PAIR one directory up from the
+# harness, exactly where recorder_src()/recorder_lib_src() look, or every §7 case dies before the
+# session launch. The `pi` stub is the new runtime-dependency probe: the CI runner installs none, so
+# a fixture that leans on the host PATH reddens on the runner only (agent-infra#1348/#1369 class).
+printf '#!/bin/bash\nexit 0\n' > "$W/record-review.sh"; chmod +x "$W/record-review.sh"
+mkdir -p "$W/lib"; printf '#!/usr/bin/env python3\n' > "$W/lib/diff-normalize.py"
+# ONLY `pi` is stubbed: it is the one runtime the CI runner does not install, and cmd_check requires
+# it. `git` and `python3` must be the REAL binaries here — main's #1745 provenance runs `git
+# rev-parse` in the fixture worktree and repo-authority's `_normalise_set` runs Python, so a stub
+# `git` (empty output) makes every start die `cannot resolve <ref>` before key delivery is exercised.
+printf '#!/bin/bash\nexit 0\n' > "$W/bin/pi"; chmod +x "$W/bin/pi"
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
 cat > "$W/harness/orch-loop.sh" <<EOF
@@ -512,6 +531,20 @@ for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chai
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
+# #1717: cmd_check now also refuses a cell without the record step (and its declared sibling), so a
+# dispatch-provisioning fixture must be a cell that PASSES that earlier probe — otherwise every
+# assertion below is decided by the recorder refusal, not by the probe under test. Same treatment
+# as §7: the pair (one directory up from the harness AND in the cell's HOME), plus the
+# `pi`/`git`/`python3` runtime stubs the CI runner does not install.
+mkdir -p "$F/home/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$F/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$F/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$F/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$F/record-review.sh"; chmod +x "$F/record-review.sh"
+mkdir -p "$F/lib"; printf '#!/usr/bin/env python3\n' > "$F/lib/diff-normalize.py"
+# `pi` only, for the same reason as §7: a stub `git`/`python3` defeats the real harness's provenance
+# and per-repo merge-contract reads (both are present on every box and on the CI runner).
+printf '#!/bin/bash\nexit 0\n' > "$F/bin/pi"; chmod +x "$F/bin/pi"
 # Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
 # against the wrong repo cannot pass silently) and exits with $PROBE_RC.
 cat > "$F/harness/refresh-candidates.sh" <<'SH'
@@ -610,6 +643,17 @@ for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chai
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
+# #1717: cmd_check refuses a cell without the record step (and its declared sibling), so the
+# provenance fixture must pass that probe — otherwise every assertion below is decided by the
+# recorder refusal. The HOME copy is the path the CONSUMER uses; the `$P/record-review.sh` +
+# `$P/lib/` pair is what `recorder_src()`/`recorder_lib_src()` read for the un-pinned (`unchanged`)
+# start, and the copies in the $AI checkout cover the pinned (`apply`) start. `pi` alone is stubbed.
+mkdir -p "$P/home/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$P/home/.pi/agent/scripts/record-review.sh"; chmod +x "$P/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$P/home/.pi/agent/scripts/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$P/record-review.sh"; chmod +x "$P/record-review.sh"
+mkdir -p "$P/lib"; printf '#!/usr/bin/env python3\n' > "$P/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$P/bin/pi"; chmod +x "$P/bin/pi"
 # A tmux double so `start` is exercised without ever creating a real session: has-session is false
 # until new-session "starts" one — exactly the sequence cmd_start checks after its sleep.
 cat > "$P/bin/tmux" <<'SH'
