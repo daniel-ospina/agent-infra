@@ -1665,7 +1665,11 @@ it no longer matches and `base_unverifiable` when either side cannot be read
 (absent/invalid in the record, or a `gh`/API failure). A benign advance of the
 base branch, which changes its tip but not the merge base, does NOT block: the
 certified diff is unchanged. It does NOT re-derive the content shape (the record
-is the attestation, and the producer guard is the only place the shape is read).
+is the attestation — `review-enforcer` binds the head and the merge base, not the
+shape). The shape itself is read in exactly TWO places, both over the ONE class
+the producer declares: `record-review.sh`'s own guard at mint time, and
+`check-pipeline-compliance.sh` check (c), which SOURCES that class to refuse a
+`verdict=clean-low` marker on a diff that is not Low-shaped (#1356).
 
 The two `base_*` refusals are different events, and they are NOT cleared the same
 way. `base_advanced` means the certified diff ITSELF changed — re-check whether

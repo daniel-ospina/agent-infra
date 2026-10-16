@@ -408,9 +408,14 @@ ok "plist valid"
 # executes it — leaving it out let a fix to the claim CAS sit in the repo while $O ran the old one
 # (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
 # reason (#1764): it is sourced by both, and a $O copy without it holds the resolver the daemon
-# needs to know what the target repo actually requires.
+# needs to know what the target repo actually requires. spawn-gate.sh is the SAME class again
+# (review round 2, P2): it is sourced by lane.sh and fix-one.sh — orch-loop.sh deliberately does NOT
+# source it (see its own header; it keeps a private can_spawn for its decision sites) — and it CARRIES
+# the gate codes those two callers branch on. A $O copy left behind at a pre-#1765 revision is a caller
+# missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
+# are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -420,11 +425,189 @@ if [ -n "$DRIFTED" ]; then
   warn "  cp '$HERE'/*.sh '$O'/";
 fi
 
+# ── harness provenance (agent-infra#1745) ────────────────────────────────────────
+# "Which commit is this box running?" had no answer on the deployed laptop. The daemon executes
+# `$O/<script>`, and `$O` (=~/orchestrator) is not a git checkout at all:
+#
+#     $ cd ~/orchestrator && git rev-parse --show-toplevel
+#     fatal: not a git repository
+#
+# So the measurable state was not "an old commit" — it was NO answer, and nothing recorded which
+# harness `install.sh` had installed. The cloud cells got a record in #1790; this writes the SAME
+# artifact, $O/.agent-infra-stamp.json with the SAME fields and the SAME fold, so there is ONE
+# stamp concept across surfaces and not a second format. This file IS the harness version record
+# (the `HARNESS_VERSION` of #1745's laptop half).
+#
+# The record has two halves for the same reason the cell's does: `commit` names the SOURCE tree
+# (what code was installed) and `payloadSha256` covers the `*.sh` the daemon will actually execute
+# (the commit cannot see a post-install hand edit to $O; the hash cannot say whether the commit is
+# on the repo's line). `check-deployed-drift.sh` reads both.
+#
+# ⛔ NEVER FAIL UNDER `set -euo pipefail`. The measured laptop state is a source that is not a git
+# repo; that box must still install, and must still RECORD — an explicit `UNKNOWN` is an answer the
+# check can act on, where a missing record is the fail-open this whole change exists to close. Every
+# git call is guarded and the write is atomic (temp-then-rename), so a half-written stamp can never
+# replace a good one.
+# ── harness provenance (agent-infra#1745) BEGIN ──
+STAMP="$O/.agent-infra-stamp.json"
+PROV_REF="${HARNESS_REF:-origin/main}"
+PROV_SHA="sha256sum"
+command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
+# The checkout $HERE lives in. `worktree list` names the MAIN worktree first, so a linked worktree
+# (or a pinned copy) does not become its own repo — the trap cloud-cell-supervisor.sh documents.
+# Empty when $HERE is not a git checkout at all: the measured laptop state, not an error.
+PROV_REPO="$(git -C "$HERE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" || true
+
+# sha256 over the `*.sh` seeded into $O, folded in the SAME order and with the SAME separator as
+# cloud-cell-supervisor.sh's o_payload_hash, so the two records are comparable byte for byte.
+prov_payload_hash() {
+  [ -d "$O" ] || return 0
+  local out n
+  # An EMPTY $O must not record the well-known empty-input digest (`e3b0c442…`) as if it were a
+  # payload: a record must name the bytes it installed or say it cannot. Count first, then hash.
+  n=0
+  for f in "$O"/*.sh; do [ -f "$f" ] && n=$((n + 1)); done
+  [ "$n" -gt 0 ] || return 1
+  # ⛔ The pipeline is GUARDED. install.sh runs `set -euo pipefail`, so an unreadable `$O/*.sh` (a
+  # hardened copy) or a sha tool that cannot run would abort the installer THROUGH this command
+  # substitution — after the plist is already in place and BEFORE the stamp is written, leaving
+  # exactly the installed-but-unstamped state #1745 removes. Fail to a clean UNKNOWN instead:
+  # `exit 3` inside the subshell, `|| return 1` here, and the caller turns empty into UNKNOWN.
+  out="$( set -o pipefail
+    (
+      cd "$O" || exit 3
+      for f in *.sh; do [ -f "$f" ] || continue; $PROV_SHA "$f" || exit 3; done
+    ) | $PROV_SHA | awk '{print $1}' )" || return 1
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# HEAD's relation to PROV_REF. Hash equality or `merge-base --is-ancestor`, NEVER a commit count —
+# measured 2026-10-14 on the cells, `rev-list --count e8d5ce29..origin/main` printed 1 while
+# `--is-ancestor` printed NO, so a tree off main's line reads as "1 behind" to a counter.
+prov_classify() {
+  PROV_COMMIT="$(git -C "$HERE" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+  PROV_REFCOMMIT=""; PROV_REL="untracked"
+  [ -n "$PROV_COMMIT" ] || return 0
+  PROV_REL="unknown"
+  [ -n "$PROV_REPO" ] || return 0
+  PROV_REFCOMMIT="$(git -C "$PROV_REPO" rev-parse --verify --quiet "$PROV_REF^{commit}" 2>/dev/null || true)"
+  [ -n "$PROV_REFCOMMIT" ] || return 0
+  if [ "$PROV_COMMIT" = "$PROV_REFCOMMIT" ]; then
+    PROV_REL="current"
+  elif git -C "$PROV_REPO" merge-base --is-ancestor "$PROV_COMMIT" "$PROV_REFCOMMIT" 2>/dev/null; then
+    PROV_REL="behind"
+  else
+    PROV_REL="diverged"
+  fi
+}
+
+# 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
+prov_dirty() {
+  local out
+  out="$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" || return 2
+  [ -n "$out" ]
+}
+
+write_provenance() {
+  local commit rel dirty_word payload tmp drc _depf _depb dep_why
+  # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
+  # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
+  # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
+  # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
+  # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
+  # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
+  # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
+  # FIELD, so the record itself cannot be read as "this commit describes these bytes".
+  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
+  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # differ while this field still said `true` — so the record read "this commit describes these bytes"
+  # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
+  # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a
+  # surface `check-deployed-drift.sh` refused.
+  # ⛔ BOTH DIRECTIONS. `check-deployed-drift.sh`'s byte half also fails a `$O/*.sh` the repo does not
+  # ship ("a hand-placed or retired script", its own words), so a one-way `$HERE -> $O` comparison
+  # still blessed a hand-edited deployment the check refused — the same gap one step narrower
+  # (also reproduced in review).
+  #
+  # The list of what differed is built HERE, not read from `$DRIFTED`: that variable is computed
+  # OUTSIDE this block (install.sh's daemon-script loop), so it is EMPTY in exactly this field's own
+  # case — a mismatch in a script outside the daemon list — and UNSET when the block is extracted and
+  # sourced on its own, which under `set -u` made the warning below die with "DRIFTED: unbound
+  # variable" (both measured in review; the second was audible in the shipped suite's stderr).
+  # `dep_why` is declared in this function's `local` at the top; do NOT re-declare it here.
+  dep_why=""
+  for _depf in "$HERE"/*.sh; do
+    _depb="${_depf##*/}"
+    { [ -f "$O/$_depb" ] && cmp -s "$_depf" "$O/$_depb"; } || dep_why="$dep_why ${_depb}(differs-or-missing)"
+  done
+  for _depf in "$O"/*.sh; do
+    _depb="${_depf##*/}"
+    [ -f "$HERE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
+  done
+  local dep_match=true
+  # An `if`, not `[ … ] && …`: the bare AND-OR list's status is 1 in the normal (in-sync) case, and a
+  # future reader should not have to re-derive whether `set -e` tolerates that shape.
+  if [ -n "$dep_why" ]; then dep_match=false; fi
+  prov_classify
+  commit="${PROV_COMMIT:-}"; [ -n "$commit" ] || commit=UNKNOWN
+  rel="${PROV_REL:-unknown}"
+  drc=0; prov_dirty || drc=$?
+  case "$drc" in
+    0) dirty_word=true ;;
+    1) dirty_word=false ;;
+    *) dirty_word=null ;;   # JSON null: a record that CANNOT say it was clean is never read as clean
+  esac
+  payload="$(prov_payload_hash)" || payload=""
+  [ -n "$payload" ] || payload=UNKNOWN
+  # ⛔ TEMP-THEN-RENAME, never `cat > "$STAMP"`. An in-place write truncates the real record FIRST,
+  # so an ENOSPC in that window destroys the one artifact that makes the box checkable — the same
+  # rule the cell's stamp_write follows.
+  tmp="$STAMP.tmp.$$"
+  if ! cat > "$tmp" <<STAMPEOF
+{
+  "version": 1,
+  "surface": "laptop",
+  "harness": "$HERE",
+  "commit": "$commit",
+  "ref": "$PROV_REF",
+  "refCommit": "${PROV_REFCOMMIT:-UNKNOWN}",
+  "relation": "$rel",
+  "agentInfraDirty": $dirty_word,
+  "deployedMatchesSource": $dep_match,
+  "payloadSha256": "$payload",
+  "recordedAt": "$(date -u +%FT%TZ)"
+}
+STAMPEOF
+  then
+    rm -f "$tmp"; warn "could not write the harness provenance at $STAMP"; return 0
+  fi
+  mv -f "$tmp" "$STAMP" 2>/dev/null || { rm -f "$tmp"; warn "could not record the harness provenance at $STAMP"; return 0; }
+  if [ "$commit" = UNKNOWN ]; then
+    warn "harness provenance: the source at $HERE is not a git checkout — recorded commit UNKNOWN"
+    warn "  'which commit is this box running?' has no answer until install.sh runs from a checkout (#1745)"
+  else
+    ok "provenance recorded: $commit [$rel] (payload ${payload:0:12}) → $STAMP"
+  fi
+  if [ "$dirty_word" = true ]; then
+    warn "the source tree at $HERE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
+  fi
+  if [ "$dep_match" = false ]; then
+    warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
+    warn "  the record names $commit, but the box is not running those bytes — cp '$HERE'/*.sh '$O'/"
+  fi
+  return 0
+}
+write_provenance
+# ── harness provenance (agent-infra#1745) END ──
+
 cat <<EOF
 
 ✅ Installed $LABEL
 
   harness   $O
+  provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR)
   limits    lanes=$MAX_LANES review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s

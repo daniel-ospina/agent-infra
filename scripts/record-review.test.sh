@@ -2907,8 +2907,11 @@ fi
 #     to POST the moment a -f/-F parameter is added, and this endpoint is
 #     GET-only, so `-f` without `-X GET` 404s — the exact defect this fix
 #     addresses (a dead rerun behind a false "gh/API failure" warning).
-if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- ' -f '; then
-    if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- '-X GET'; then
+#     NO PIPE INTO THE QUIET GREP: capture first, then classify the capture (#864). The piped
+#     form's upstream grep takes SIGPIPE when the quiet grep exits at its first match, and
+#     `pipefail` turns that 141 into a false "parameter absent" here.
+if grep -q -- ' -f ' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
+    if grep -q -- '-X GET' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
         ok "14.1b the check-runs read is an explicit GET (transport)"
     else
         bad "14.1b the check-runs read adds -f with NO -X GET → real gh POSTs → 404 (log: $(cat "$LOG"))"
@@ -3172,10 +3175,11 @@ else
 fi
 assert_contains "$RECORD_ERR" "#1709 rec 7 idempotent" "15.4 the no-op is named on stderr, not silent"
 
-# 15.5-15.6 the IDENTITY predicate directly: only the VOLATILE fields
-#        (`reviewed_at`, the carry provenance) are dropped — the deterministic
-#        fields, and in particular the EVIDENCE ref, ARE the identity, so a
-#        different artifact is a different attestation and must still rewrite.
+# 15.5-15.6 the IDENTITY PREDICATE directly — NOT the guard's wiring, which §15.7 drives
+#        through the real runner: only the VOLATILE fields (`reviewed_at`, the carry
+#        provenance) are dropped. The deterministic fields — and in particular the
+#        EVIDENCE ref — ARE the identity, so a predicate that dropped one would call a
+#        different artifact the same attestation and swallow its re-record.
 idem_ident() { bash -c 'source "$1" >/dev/null 2>&1 || exit 1; record_identity "$2"' _ "$RECORD" "$1"; }
 printf '{"pr":1,"head_sha":"S","diff_sha256":"D","mint":"fresh","evidence":"comment:1","verdict":"clean","repo":"r","reviewed_at":"2026-01-01T00:00:00Z"}\n' > "$T/idem-a.json"
 printf '{"pr":1,"head_sha":"S","diff_sha256":"D","mint":"carried","carried_from":"H","carried_at":"2026-01-02T00:00:00Z","evidence":"comment:1","verdict":"clean","repo":"r","reviewed_at":"2025-01-01T00:00:00Z"}\n' > "$T/idem-b.json"
@@ -3188,10 +3192,53 @@ fi
 if [ "$(idem_ident "$T/idem-a.json")" != "$(idem_ident "$T/idem-c.json")" ]; then
     ok "15.6 a DIFFERENT evidence ref is a different attestation (it still rewrites)"
 else
-    bad "15.6 the evidence ref was dropped from the identity — a re-record on new evidence would be swallowed"
+    bad "15.6 the evidence ref was dropped from the identity — the predicate cannot tell two attestations apart"
 fi
 
-# 15.7 MUTATION PIN — the guard is what makes 15.3 true. A copy with the
+# 15.7 RUNNER-LEVEL: the SAME head with a DIFFERENT artifact still REWRITES. §15.1-§15.3
+#      pin the equal-identity no-op and §15.5/§15.6 pin the predicate
+#      DIRECTLY — but neither drives the shipped script through the guard's ELSE arm, so a
+#      guard weakened to compare only `head_sha` would leave every vector above green while
+#      silently SWALLOWING a re-record of a different artifact at the same head, which is
+#      the one failure rec 7 must not introduce. A second diff file gives the same head a
+#      different `diff_sha256`, through the real runner.
+D_F2="$T/diff-idem-2.txt"; printf 'diff --git a/x b/x\n+goodbye\n' > "$D_F2"
+D1_SHA="$(printf '%s' "$IDEM_2" | sed -n 's/.*"diff_sha256":"\([^"]*\)".*/\1/p')"
+run_record_diff "$PR_IDEM" "$SHA" "PR body" "$D_F2"
+[ "$RECORD_RC" = "0" ] \
+    && ok "15.7 a same-head re-record on a DIFFERENT diff succeeds" \
+    || bad "15.7 same-head re-record on a different diff (rc=$RECORD_RC; err=$RECORD_ERR)"
+D2_SHA="$(sed -n 's/.*"diff_sha256":"\([^"]*\)".*/\1/p' "$IDEM_PATH" 2>/dev/null)"
+if [ -n "$D2_SHA" ] && [ "$D2_SHA" != "$D1_SHA" ]; then
+    ok "15.7 the record CHANGED (diff_sha256 ${D1_SHA:0:12}… → ${D2_SHA:0:12}…): the guard did not swallow it"
+else
+    bad "15.7 the guard swallowed a same-head re-record of a DIFFERENT artifact (diff_sha256 stayed '${D2_SHA:-<none>}')"
+fi
+case "$RECORD_ERR" in
+    *idempotent*) bad "15.7 the different-artifact run took the NO-OP path — the guard over-fired on an inequality" ;;
+    *)            ok "15.7 the different-artifact run did NOT take the no-op path" ;;
+esac
+
+# 15.8 the LEGACY MIGRATION still runs when the record write is SKIPPED.
+#      The comment on the guard CLAIMS the legacy-migration and evidence-post blocks below
+#      still run — code the no-op path does not itself execute — so it must be PINNED, not
+#      asserted. The run below is a true same-head DUPLICATE (the diff matches what is on
+#      disk, so the identity is equal and the write is skipped) with a legacy key present.
+printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"old"}\n' \
+    "$PR_IDEM" "$SHA" > "$F_HOME/.pi/agent/reviews/$PR_IDEM.json"
+run_record_diff "$PR_IDEM" "$SHA" "PR body" "$D_F2"
+[ "$RECORD_RC" = "0" ] \
+    && ok "15.8 the duplicate run still exits 0 with a legacy key present" \
+    || bad "15.8 duplicate run with a legacy key (rc=$RECORD_RC; err=$RECORD_ERR)"
+case "$RECORD_ERR" in
+    *idempotent*) ok "15.8  …and the write really WAS skipped, so the migration claim is tested on the no-op path" ;;
+    *)            bad "15.8 the run rewrote the record — the legacy claim was NOT tested on the skip path" ;;
+esac
+[ ! -f "$F_HOME/.pi/agent/reviews/$PR_IDEM.json" ] \
+    && ok "15.8 the legacy key is MIGRATED AWAY even though the record write was skipped" \
+    || bad "15.8 the duplicate run took the no-op path and STRANDED the legacy key"
+
+# 15.9 MUTATION PIN — the guard is what makes 15.3 true. A copy with the
 #      idempotency guard disarmed MUST rewrite the record on the second run
 #      (reviewed_at moves), proving 15.3 is load-bearing rather than green by
 #      accident.
@@ -3207,9 +3254,9 @@ assert old in text, "mutation anchor not found"
 open(dst, "w").write(text.replace(old, new))
 PY
 if cmp -s "$T/mut-idem/record-review.sh" "$RECORD"; then
-    bad "15.7 mutation: the mutant copy is IDENTICAL to the script"
+    bad "15.9 mutation: the mutant copy is IDENTICAL to the script"
 else
-    ok "15.7 mutation: the mutant copy differs from the script"
+    ok "15.9 mutation: the mutant copy differs from the script"
 fi
 PR_IDEM_M=424801
 IDEM_M_PATH="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-$PR_IDEM_M.json"
@@ -3220,9 +3267,9 @@ sleep 1
 run_record_diff_with "$T/mut-idem/record-review.sh" "$PR_IDEM_M" "$SHA" "PR body" "$D_F"
 IDEM_M2="$(cat "$IDEM_M_PATH" 2>/dev/null || true)"
 if [ -n "$IDEM_M1" ] && [ "$IDEM_M1" != "$IDEM_M2" ]; then
-    ok "15.7 MUTATION: without the guard the duplicate REWRITES the record — 15.3 is load-bearing"
+    ok "15.9 MUTATION: without the guard the duplicate REWRITES the record — 15.3 is load-bearing"
 else
-    bad "15.7 mutation: the guardless copy still produced an identical record — 15.3 does not test the guard"
+    bad "15.9 mutation: the guardless copy still produced an identical record — 15.3 does not test the guard"
 fi
 
 

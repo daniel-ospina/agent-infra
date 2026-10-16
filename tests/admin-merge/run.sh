@@ -3138,8 +3138,9 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # site the FAILURE ARM IS SKIPPED — a FAIL-OPEN enforcer that reports green on a regressed rail).
 # That is the precise failure these four scenarios exist to prevent, so shipping it inside them
 # would have been the joke telling itself. The repo's own `check-no-sigpipe-grep.sh` cannot see it
-# (it scans `scripts .husky pi-bootstrap` and its predicate is builtin-writer-into-quiet-grep, not
-# `grep | grep -q`). Capture-independent, per-line, pipe-free:
+# HERE — because this file is outside its scan set (`scripts .husky pi-bootstrap`), NOT because of
+# its predicate: since #864 that predicate recognises a `grep` producer too, so `grep | grep -q`
+# is exactly what it would flag if `tests/` were scanned. Capture-independent, per-line, pipe-free:
 post_read_call_made() {
   local l
   while IFS= read -r l; do
@@ -12255,6 +12256,18 @@ rc=$?
 grep -q "ALREADY MERGED" "$SCEN/out" \
   && fail "an UNMERGED PR was no-op'd as already merged" \
   || pass "an unmerged PR is not skipped — the rail proceeds past the pre-check"
+# ⛔ "THE RAIL PROCEEDED" MUST BE AN OBSERVABLE OF THE DECISION, NOT THE PRE-CHECK'S OWN
+# READ: the fake logs argv BEFORE any branch (line ~235), so a
+# `grep state,mergedAt` is satisfied by the pre-check itself and a mutant that REFUSED right
+# after it would still be green. The HEAD read is the first thing AFTER the decision, so it
+# is the observable. (This scenario's head fixture is ABSENT, so the rail proceeds and then
+# refuses on the head — which the rc assertion below pins.)
+grep -q 'headRefOid' "$SCEN/calls" \
+  && pass "  …and the rail actually proceeded (it read the head AFTER the pre-check)" \
+  || fail "  …but the rail stopped at the pre-check (no head read followed) — a readable OPEN became a refusal"
+[ "$rc" -ne 0 ] \
+  && pass "  …and it is the ABSENT head fixture that refuses (rc=$rc)" \
+  || fail "  …but the rail exited 0 with the pre-check as the only gate — the head refusal is gone"
 # (The rail then refuses on the absent head fixture, which is this scenario's only
 # other feature; the point here is that it PROCEEDED, not that it merged.)
 STATE_READS="$(grep -c 'state,mergedAt' "$SCEN/calls" 2>/dev/null || true)"
@@ -12278,9 +12291,83 @@ grep -qF '[merged_precheck_unreadable]' "$SCEN/err" \
 grep -q "ALREADY MERGED" "$SCEN/out" \
   && fail "an UNREADABLE state was rendered as 'already merged'" \
   || pass "an unreadable state is never rendered as merged"
-grep -q 'state,mergedAt' "$SCEN/calls" \
-  && pass "  …and the rail PROCEEDED past the unreadable pre-check" \
+# ⛔ AND "PROCEEDED" IS AGAIN AN OBSERVABLE OF THE DECISION, NOT THE FAILED READ: the
+# argv log records the pre-check's OWN `state,mergedAt` call even though the fake then fails
+# it, so the previous `grep state,mergedAt` here was satisfied by the attempt itself and a
+# mutant that WARNED AND REFUSED would have kept this block green. The head read only
+# happens if the rail FELL THROUGH, which is the residual's own claim.
+grep -q 'headRefOid' "$SCEN/calls" \
+  && pass "  …and the rail PROCEEDED past the unreadable pre-check (it went on to read the head)" \
   || fail "  …but the rail did not proceed (a failed read became a refusal)"
+
+# ⛔ AND THE OVERRIDE ITSELF IS VALIDATED, NOT DEFAULTED. The pre-check
+# passes a literal `1`, but the second arg is a CALLER's arithmetic bound on the ONE door,
+# so a bad one must be REFUSED BY NAME — not silently replaced by the configured window
+# (#1690's defaulting, one arm over) and not accepted past the arithmetic range
+# (TIMING_KNOB_MAX). Driven directly against the rail's own definitions, like §75.
+: "${BELT_DEFS:=$TMP/belt-defs.sh}"
+[ -f "$BELT_DEFS" ] || sed '$d' "$ADM" > "$BELT_DEFS"
+OV_PROBE="$TMP/override-probe.sh"
+cat > "$OV_PROBE" <<'OVEOF'
+set -uo pipefail
+. "$BELT_DEFS"
+sleep() { :; }             # the subject is the BOUND, not the pacing between attempts
+repo_args=()
+POLL_GH() {                # every attempt answers OPEN, so the BOUND decides the call count
+  local n
+  n=$(( $(cat "$POLL_CNT" 2>/dev/null || echo 0) + 1 ))
+  printf '%s' "$n" > "$POLL_CNT"
+  # ⛔ A BOUND ON THE STUB ITSELF. If an over-max override were ever ACCEPTED (the
+  # `counter_exceeds_max` arm weakened or dropped), the loop would run ~1e9 iterations and
+  # WEDGE the suite rather than reddening it — this box has no `timeout` binary and the CI
+  # job sets no `timeout-minutes`. Exiting non-zero here makes that regression a fast, loud
+  # failure (no stdout line ⇒ `ov_run`'s count assertion reddens) instead of a hang. 20 is
+  # far above the 6 the absent-override control uses, so no green row can reach it.
+  [ "$n" -le 20 ] || { printf 'override-probe: the poll loop exceeded any sane bound (n=%s)\n' "$n" >&2; exit 3; }
+  printf 'OPEN\t-\n'
+}
+rc=0
+poll_merge_artifact 42 ${POLL_OVERRIDE:-} || rc=$?
+calls="$(cat "$POLL_CNT" 2>/dev/null)"
+printf 'rc=%s|attempts=%s|calls=%s|verdict=%s\n' \
+  "$rc" "${MERGE_ART_ATTEMPTS-<unset>}" "${calls:-0}" \
+  "${MERGE_ART_VERDICT-<unset>}"
+OVEOF
+# ov_run <label> <override> [attempts-knob]
+ov_run() {
+  local label="$1" ov="$2" cnt="$TMP/ov-calls-$1"
+  : > "$cnt"
+  env BELT_DEFS="$BELT_DEFS" POLL_CNT="$cnt" POLL_OVERRIDE="$ov" \
+      ADMIN_MERGE_GH=POLL_GH ADMIN_MERGE_VERIFY_ATTEMPTS="${3:-6}" \
+      bash "$OV_PROBE" >"$TMP/ov-out-$label" 2>"$TMP/ov-err-$label"
+  OV_LINE="$(cat "$TMP/ov-out-$label")"
+  OV_ERR="$(cat "$TMP/ov-err-$label")"
+  OV_RC="${OV_LINE#rc=}"; OV_RC="${OV_RC%%|*}"
+  OV_ATTEMPTS="${OV_LINE#*attempts=}"; OV_ATTEMPTS="${OV_ATTEMPTS%%|*}"
+  OV_CALLS="${OV_LINE#*calls=}"; OV_CALLS="${OV_CALLS%%|*}"
+}
+# The CONTROL first: an ABSENT override keeps the configured window (6 calls), which is what
+# makes the 1-call row below evidence about the override rather than about the loop.
+ov_run absent ""
+[ "$OV_CALLS" = "6" ] && [ "$OV_RC" = "0" ] \
+  && pass "override: ABSENT keeps the configured window (6 calls, rc 0)" \
+  || fail "override: absent did not keep the window (calls=$OV_CALLS rc=$OV_RC)"
+ov_run one 1
+[ "$OV_CALLS" = "1" ] && [ "$OV_RC" = "0" ] \
+  && pass "override: the pre-check's literal 1 makes exactly ONE read" \
+  || fail "override: '1' did not single-shot the door (calls=$OV_CALLS rc=$OV_RC)"
+# Each invalid shape: REFUSED (non-zero, zero reads, the true count reported) and NAMED.
+for ov_bad in 08 0 abc 1000000000; do
+  ov_run "bad-$ov_bad" "$ov_bad"
+  ok_bad=1
+  [ "$OV_RC" != "0" ] || ok_bad=0
+  [ "$OV_CALLS" = "0" ] || ok_bad=0
+  [ "$OV_ATTEMPTS" = "0" ] || ok_bad=0
+  grep -qF 'attempts override' "$TMP/ov-err-bad-$ov_bad" || ok_bad=0
+  [ "$ok_bad" = "1" ] \
+    && pass "override: '$ov_bad' is REFUSED BY NAME (rc=$OV_RC, 0 reads, count reported as 0)" \
+    || fail "override: '$ov_bad' was NOT refused (rc=$OV_RC calls=$OV_CALLS attempts=$OV_ATTEMPTS err=$(head -1 "$TMP/ov-err-bad-$ov_bad"))"
+done
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

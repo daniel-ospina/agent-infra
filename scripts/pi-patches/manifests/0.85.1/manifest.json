@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "issue": "#1214, #1263, #1316",
   "writtenAgainst": {
     "pi-coding-agent": "0.85.1",
@@ -16,7 +16,9 @@
       "verifyPresent": [
         "const MIN_USABLE_MAX_TOKENS = 1024;",
         "if (available < MIN_USABLE_MAX_TOKENS)"
-      ]
+      ],
+      "preContext": "import { estimateContextTokens } from \"../utils/estimate.js\";\n",
+      "postContext": "\n"
     },
     {
       "id": "b2-clamp-floor-bundle-http",
@@ -27,7 +29,9 @@
       "verifyPresent": [
         "MIN_USABLE_MAX_TOKENS=1024",
         "available<MIN_USABLE_MAX_TOKENS?"
-      ]
+      ],
+      "preContext": "lingTokens+prefixTokens,lastUsageIndex:estimate.lastUsageIndex}}",
+      "postContext": ""
     },
     {
       "id": "b3-clamp-floor-bundle-bedrock",
@@ -38,7 +42,9 @@
       "verifyPresent": [
         "MIN_USABLE_MAX_TOKENS=1024",
         "available<MIN_USABLE_MAX_TOKENS?"
-      ]
+      ],
+      "preContext": "lingTokens+prefixTokens,lastUsageIndex:estimate.lastUsageIndex}}",
+      "postContext": ""
     },
     {
       "id": "d1-summarization-budget-esm",
@@ -49,7 +55,9 @@
       "verifyPresent": [
         "maxTokens = previousSummary ? Math.max(summaryCap",
         "const priorTokens = previousSummary"
-      ]
+      ],
+      "preContext": "y, thinkingLevel, streamFn, env, retry, callbacks, sessionId) {\n",
+      "postContext": "\n    // Use update prompt if we have a previous summary, otherwi"
     },
     {
       "id": "d2-summarization-budget-bundle",
@@ -60,7 +68,9 @@
       "verifyPresent": [
         "maxTokens=previousSummary?Math.max(summaryCap",
         "/*pi-patch:#1263(d)*/let modelCeiling="
-      ]
+      ],
+      "preContext": "sSummary,thinkingLevel,streamFn,env2,retry,callbacks,sessionId){",
+      "postContext": ",basePrompt=previousSummary?UPDATE_SUMMARIZATION_PROMPT:SUMMARIZ"
     },
     {
       "id": "d3-summarization-budget-bundle-request",
@@ -71,7 +81,9 @@
       "verifyPresent": [
         "thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=",
         "maxTokens=previousSummary?Math.max(summaryCap"
-      ]
+      ],
+      "preContext": "ons,request,context){let{model,reserveTokens,customInstructions,",
+      "postContext": ",basePrompt=previousSummary?UPDATE_SUMMARIZATION_PROMPT2:SUMMARI"
     },
     {
       "id": "e1-summarization-clamp-esm",
@@ -82,7 +94,9 @@
       "verifyPresent": [
         "skipContextClamp: true",
         "sessionId, skipContextClamp: true };"
-      ]
+      ],
+      "preContext": "p and the summary is incomplete`;\n    }\n    return undefined;\n}\n",
+      "postContext": "\n    if (model.reasoning && thinkingLevel && thinkingLevel !== \""
     },
     {
       "id": "e2-summarization-clamp-bundle",
@@ -93,7 +107,9 @@
       "verifyPresent": [
         "skipContextClamp:!0",
         "env:env2,sessionId,skipContextClamp:!0"
-      ]
+      ],
+      "preContext": "ed: generation hit the token cap and the summary is incomplete`}",
+      "postContext": "return model.reasoning&&thinkingLevel&&thinkingLevel!==\"off\"&&(o"
     },
     {
       "id": "e3-clamp-exemption-esm",
@@ -105,7 +121,9 @@
         "? summarizationMaxTokens(model, context, options?.maxTokens",
         "promptTokens + CONTEXT_SAFETY_TOKENS >= model.contextWindow",
         "does not fit the model context window"
-      ]
+      ],
+      "preContext": "\n",
+      "postContext": "\n        signal: options?.signal,\n        telemetryContext: opti"
     },
     {
       "id": "e4-clamp-exemption-bundle-http",
@@ -117,7 +135,9 @@
         "?summarizationMaxTokens(model,context,options?.maxTokens",
         "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow",
         "does not fit the model context window"
-      ]
+      ],
+      "preContext": "",
+      "postContext": "signal:options?.signal,telemetryContext:options?.telemetryContex"
     },
     {
       "id": "e5-clamp-exemption-bundle-bedrock",
@@ -129,7 +149,9 @@
         "?summarizationMaxTokens(model,context,options?.maxTokens",
         "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow",
         "does not fit the model context window"
-      ]
+      ],
+      "preContext": "",
+      "postContext": "signal:options?.signal,telemetryContext:options?.telemetryContex"
     },
     {
       "id": "e6-reclamp-anthropic-esm",
@@ -139,7 +161,9 @@
       "replace": "    const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n    // pi-patch #1316(e): the provider adapter clamps AGAIN, after buildBaseOptions, for the\n    // budget-based thinking branch. The same marker gate as buildBaseOptions, or the summarization\n    // exemption is undone here for every reasoning model on this API.\n    const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
       "verifyPresent": [
         "options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"
-      ]
+      ],
+      "preContext": "r the thinking budget would become the entire max_tokens value.\n",
+      "postContext": "\n    return stream(model, context, {\n        ...base,\n        ma"
     },
     {
       "id": "e7-reclamp-bedrock-esm",
@@ -149,7 +173,9 @@
       "replace": "        const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n        // pi-patch #1316(e): same second-clamp gate as anthropic-messages — see that entry.\n        const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
       "verifyPresent": [
         "options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"
-      ]
+      ],
+      "preContext": "or the thinking budget would become the entire maxTokens value.\n",
+      "postContext": "\n        return stream(model, context, {\n            ...base,\n  "
     },
     {
       "id": "e8-reclamp-anthropic-bundle",
@@ -159,7 +185,9 @@
       "replace": ",/*pi-patch:#1316(e)*/maxTokens=options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
       "verifyPresent": [
         "options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"
-      ]
+      ],
+      "preContext": "okens,model.maxTokens,options.reasoning,options.thinkingBudgets)",
+      "postContext": "...base,maxTokens,thinkingEnabled:!0,thinkingBudgetTokens:Math.m"
     },
     {
       "id": "e9-reclamp-bedrock-bundle",
@@ -169,7 +197,9 @@
       "replace": ",/*pi-patch:#1316(e)*/maxTokens=options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
       "verifyPresent": [
         "options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"
-      ]
+      ],
+      "preContext": "okens,model.maxTokens,options.reasoning,options.thinkingBudgets)",
+      "postContext": "...base,maxTokens,reasoning:options.reasoning,thinkingBudgets:{."
     }
   ]
 }

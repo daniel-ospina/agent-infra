@@ -169,6 +169,18 @@ const installed = {
 
 const { manifest, path: manifestPath } = loadManifest(installed);
 
+/**
+ * POSITIONAL proof that an entry is applied (#1341). `text.includes(entry.replace)` is an
+ * EXISTENTIAL test — "does this payload appear ANYWHERE?" — so a payload a revert left behind
+ * VERBATIM inside an inert string literal or comment satisfied it over a tree whose patched region
+ * was GONE, and `--check` exited 0 over a broken tree: a false PASS. The manifest carries the text
+ * that surrounds the payload in the correctly patched file, so the proof requires the payload WITH
+ * its context — a payload pasted elsewhere is refused, an in-place patched region passes.
+ */
+function patchedRegion(entry) {
+	return `${entry.preContext}${entry.replace}${entry.postContext}`;
+}
+
 // ── 1. VERSION PIN — an upgrade must be LOUD, never a silent revert ──────────────────────────
 const drift = Object.entries(manifest.writtenAgainst).filter(([pkg, version]) => installed[pkg] !== version);
 if (drift.length > 0) {
@@ -225,6 +237,26 @@ if (MODE === "revert") {
 }
 
 // ── 3. APPLY (idempotent) ────────────────────────────────────────────────────────────────────
+// A manifest entry without its positional context cannot be proved positionally, and falling back to
+// the existential check is exactly the false PASS this hardening removes — so refuse loudly rather
+// than degrade. (The context is derived by make-manifest.mjs from the patched file, and clamped so
+// it never reaches into another entry's patched region, which would refuse a valid partially
+// patched tree.) Checked here rather than before the revert branch, so `--revert` stays available
+// on a manifest written by an older generator.
+for (const entry of manifest.entries) {
+	if (
+		typeof entry.preContext !== "string" ||
+		typeof entry.postContext !== "string" ||
+		entry.preContext.length + entry.postContext.length === 0
+	) {
+		fail(2, [
+			`${entry.id}: the manifest carries no positional context (preContext/postContext).`,
+			'Without it the "already applied" proof falls back to "the payload appears somewhere",',
+			"which a neutralised-but-verbatim payload satisfies — the false PASS of #1341.",
+			`Re-derive the manifest: node ${join(HERE, "make-manifest.mjs")}`,
+		]);
+	}
+}
 const perFile = new Map();
 for (const entry of manifest.entries) {
 	if (!perFile.has(entry.file)) perFile.set(entry.file, []);
@@ -246,18 +278,21 @@ for (const [file, entries] of perFile) {
 	for (const entry of entries) {
 		const occurrences = next.split(entry.find).length - 1;
 		if (occurrences === 0) {
-			// The proof that the patched form is present is the entry's OWN replacement payload,
-			// verbatim — NEVER the scattered `verifyPresent` substrings. A substring test answers a
-			// different question ("does this text appear anywhere?"), so a comment that merely QUOTES
-			// the needles satisfied it and read as "already applied" over a tree whose fix code was
-			// gone — a false PASS. A comment cannot supply the payload.
-			const verified = next.includes(entry.replace);
+			// The proof that the patched form is present is the entry's OWN replacement payload WITH
+			// ITS POSITIONAL CONTEXT, verbatim — NEVER the scattered `verifyPresent` substrings, and
+			// never the bare payload either. A substring test answers "does this text appear
+			// anywhere?", so a comment that merely QUOTES the needles satisfied it and read as
+			// "already applied" over a tree whose fix code was gone; the bare-payload test left the
+			// same hole for a payload retained verbatim but neutralised, e.g. quoted into an inert
+			// string literal by a partial revert (#1341). Requiring the surrounding text too makes
+			// the proof positional, so a payload pasted elsewhere cannot satisfy it.
+			const verified = next.includes(patchedRegion(entry));
 			if (verified) {
 				report.push(`  = ${entry.id} — already applied`);
 				continue;
 			}
 			fail(2, [
-				`${entry.id} (${file}): the anchor is absent AND the patched payload is absent.`,
+				`${entry.id} (${file}): the anchor is absent AND the patched region (payload + its context) is absent.`,
 				"The tree is neither pristine nor patched — this file has been modified by something else.",
 				`expected one of: ${entry.verifyPresent.join(" | ")}`,
 				"NOTHING WAS WRITTEN — no file in this tree has been touched. Restore from backup, or re-derive the manifest.",
@@ -299,14 +334,31 @@ if (MODE === "apply") {
 }
 
 // ── 4. VERIFY — source shape ─────────────────────────────────────────────────────────────────
-// The patched REGION must be present verbatim. A `verifyPresent` substring loop here is the same
-// scattered-substring false PASS the already-applied branch above was hardened against: a comment
-// quoting the needles would satisfy it over a tree with no fix code.
+// The patched REGION — payload plus the context it must carry — must be present verbatim. A
+// `verifyPresent` substring loop here is the same scattered-substring false PASS the
+// already-applied branch above was hardened against (a comment quoting the needles would satisfy
+// it over a tree with no fix code), and a bare-payload test here is the same false PASS for a
+// payload retained but neutralised (#1341).
 const shapeErrors = [];
 for (const entry of manifest.entries) {
 	const text = readFileSync(join(PI_ROOT, entry.file), "utf8");
-	if (!text.includes(entry.replace)) {
-		shapeErrors.push(`${entry.id}: the patched payload is not present verbatim in ${entry.file}`);
+	if (!text.includes(patchedRegion(entry))) {
+		shapeErrors.push(`${entry.id}: the patched region (payload + its context) is not present verbatim in ${entry.file}`);
+	}
+}
+
+// ── 4b. VERIFY — every patched file still PARSES ───────────────────────────────────────────────
+// A SECONDARY net, not the primary gate: it catches a payload pasted where it cannot be code, or a
+// partial revert that broke a delimiter — but it does NOT catch the variant that made #1341 a false
+// PASS at all (a payload quoted into a template literal parses). The positional proof above is what
+// refuses that; this only closes the shapes that happen to be syntax errors too.
+const parseErrors = [];
+for (const file of new Set(manifest.entries.map((entry) => entry.file))) {
+	try {
+		execFileSync(process.execPath, ["--check", join(PI_ROOT, file)], { stdio: ["ignore", "ignore", "pipe"] });
+	} catch (error) {
+		const detail = String(error.stderr ?? error.message ?? "").trim().split("\n").slice(0, 3).join(" ");
+		parseErrors.push(`${file} does not parse as JavaScript: ${detail}`);
 	}
 }
 
@@ -376,13 +428,18 @@ console.log(`  manifest: ${manifestPath}`);
 console.log(`  pi root:  ${PI_ROOT}`);
 for (const line of report) console.log(line);
 
-if (shapeErrors.length > 0 || behaviourErrors.length > 0) {
+if (shapeErrors.length > 0 || parseErrors.length > 0 || behaviourErrors.length > 0) {
 	if (MODE === "check") {
 		console.log("❌ NOT APPLIED — the fix is not in effect:");
-		for (const e of [...shapeErrors, ...behaviourErrors]) console.log(`   - ${e}`);
+		for (const e of [...shapeErrors, ...parseErrors, ...behaviourErrors]) console.log(`   - ${e}`);
 		process.exit(1);
 	}
-	fail(4, ["verification FAILED after applying:", ...shapeErrors.map((e) => `shape: ${e}`), ...behaviourErrors.map((e) => `behaviour: ${e}`)]);
+	fail(4, [
+		"verification FAILED after applying:",
+		...shapeErrors.map((e) => `shape: ${e}`),
+		...parseErrors.map((e) => `parse: ${e}`),
+		...behaviourErrors.map((e) => `behaviour: ${e}`),
+	]);
 }
 
 if (MODE === "check") {
