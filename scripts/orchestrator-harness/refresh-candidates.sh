@@ -359,8 +359,11 @@ mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O";
 # directory, where every write below fails. Those failures are invisible in exactly the way that
 # matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
 # stale pool, and the pass reports `checked N; backlog now M` at rc 0 having persisted nothing. A probe
-# write at entry makes it ONE named refusal instead (#1853 review). A write failure that only BEGINS
-# mid-run (a disk that fills afterwards) is still absorbed by the loop's appends — a declared residual.
+# write at entry makes it ONE named refusal instead (#1853 review). The probe covers a state dir that
+# was ALREADY unwritable at entry; the state writes below are each checked in their own right, so a
+# write failure that only BEGINS mid-run (a disk that fills afterwards) is refused at THAT write
+# rather than absorbed. What remains unhandled is narrower: a line left PARTIALLY written by an
+# interrupted write is not rolled back.
 if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
   exit "$EXIT_TRANSIENT"
