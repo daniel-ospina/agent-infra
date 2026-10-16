@@ -388,11 +388,83 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *) bad "gh unauthenticated: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 
+# ── the host is READ from gh, never hardcoded ───────────────────────────────────────
+# The pre-flight hands gh a host-LESS slug, so gh resolves the host itself and the probe has to name
+# THAT host. A hardcoded `github.com` asked about the wrong host on a cell whose gh is configured for
+# an enterprise host, and the refusal it produced was PERMANENT — a marker only a human can clear, on
+# an environment that could dispatch perfectly well (#1853 review). This stub's gh is configured for
+# an enterprise host ONLY, so the pre-fix probe asks github.com, finds no credential, and latches.
+echo; echo "── the probe names the host gh RESOLVES, not a hardcoded github.com ──"
+mk_case ghes-host
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "auth status")
+    case "$*" in
+      # What `--json hosts` + gh's EMBEDDED `--jq` prints for this configuration: the one host gh is
+      # configured for. The stub answers with the RESOLVED value, because the assertion is about
+      # which host the probe asks for — a stub that printed raw JSON could not be told apart from a
+      # parse that silently failed and fell back to github.com.
+      *"--json hosts"*) printf 'ghe.example.com\n'; exit 0 ;;
+      *"--hostname ghe.example.com"*) exit 0 ;;
+    esac
+    printf 'To get started with GitHub CLI, please run: gh auth login\n' >&2; exit 1 ;;
+  "auth token") case "$*" in *"--hostname ghe.example.com"*) exit 0 ;; esac; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh GH_LOG="$D/gh-log"
+[ "$RC" -eq 0 ] && ok "GHES host: a cell gh is configured for an enterprise host is NOT refused" \
+               || bad "GHES host: rc=$RC (want 0) — the probe asked about the wrong host — output: $OUT"
+grep -q 'auth status --json hosts' "$D/gh-log" 2>/dev/null \
+  && ok "GHES host: the host was READ from gh's machine-readable surface, not parsed out of prose" \
+  || bad "GHES host: gh was never asked for its configured hosts — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
+grep -q -- '--hostname ghe.example.com' "$D/gh-log" 2>/dev/null \
+  && ok "GHES host: the probe named the host gh reports" \
+  || bad "GHES host: ghe.example.com was never probed — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
+grep -q -- '--hostname github.com' "$D/gh-log" 2>/dev/null \
+  && bad "GHES host: probed a hardcoded github.com" \
+  || ok "GHES host: no hardcoded github.com probe"
+
+# ── an unreadable pool listing is NOT an empty backlog ───────────────────────────────────────────
+# The three pool queries run in a group whose status the pipeline discards, and each hides its reason
+# behind `2>/dev/null` — so a listing that fails (a host-qualified `$OR` on a host with no credential
+# is the case the host probe above cannot name) reached the summary as `checked 0; backlog now 0` at
+# rc 0: a merge-only cell reporting a healthy empty queue (#1853 review). It must abort LOUDLY and
+# TRANSIENTLY: nothing here knows which host failed, so it must not latch the marker only a human can
+# clear.
+echo; echo "── an unreadable pool listing is not an empty backlog ──"
+mk_case pool-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth status"*) exit 0 ;;
+  "issue list"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "unreadable pool: rc=1 (TRANSIENT — the ambiguous case never latches the permanent marker)" \
+               || bad "unreadable pool: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"could not be READ"*) ok "unreadable pool: the abort is LOUD and says the listing failed" ;;
+  *) bad "unreadable pool: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now"*) bad "unreadable pool: still reported a healthy empty backlog" ;;
+  *) ok "unreadable pool: no \"checked N; backlog now 0\" over an unreadable pool" ;;
+esac
+
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
-# cmd_check and cloud-cell-bringup.sh's check_dispatch each ALREADY run `gh auth status` themselves
-# (under $CELL_HOME), and orchestrator-harness's selftest pins exactly one `gh auth status` call
-# under `$CELL_HOME` for each of them — so a second `gh auth status` from here would redden an owned
-# suite AND ask the question in the wrong layer: those
+# cmd_check and cloud-cell-bringup.sh's check_gh (which its check_dispatch calls) each ALREADY run
+# `gh auth status` themselves (under $CELL_HOME), and orchestrator-harness's selftest pins exactly
+# one `gh auth status` call under `$CELL_HOME` for each of them — so a second `gh auth status` from
+# here would redden an owned suite AND ask the question in the wrong layer: those
 # checks run in the OPERATOR's shell, while the pre-flight inherits the HOME of whatever process
 # actually started the controller. The run path is the enforcement point. This case pins that
 # `--check` did not quietly acquire a second gh call or a new refusal.

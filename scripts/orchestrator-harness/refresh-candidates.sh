@@ -217,23 +217,33 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 # (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker that only a human
 # can clear (#1853 review).
 # `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
-gh_env_verdict() {
-  local host out
+# The host to probe is the host the PRE-FLIGHT's own gh calls resolve, and it is READ, not guessed.
+# Those calls pass a host-LESS repo slug (`--repo .`, whose remote host `_remote_slug` strips), so gh
+# picks the host itself: `GH_HOST` if set, else github.com when gh is configured for it, else the
+# configured host (measured on gh 2.97.0). `$OR`'s prefix does NOT select it, so consulting that here
+# would probe a host the pre-flight never contacts. The host cannot be named by OMISSION either: an
+# UNSCOPED `gh auth status` fails when any UNRELATED configured host has a problem, while `--hostname`
+# names exactly one. `gh auth status --json hosts` exposes the configured set machine-readably, so no
+# prose is parsed and no external `jq` is needed (gh embeds its own).
+gh_default_host() {
+  local host
+  if [ -n "${GH_HOST:-}" ]; then printf '%s\n' "$GH_HOST"; return 0; fi
+  host="$(gh auth status --json hosts --jq '(.hosts // {}) as $h
+    | if ($h | length) == 0 or ($h | has("github.com")) then "github.com"
+      elif ([$h | to_entries[] | select(.value[0].active == true) | .key] | length) > 0
+        then ([$h | to_entries[] | select(.value[0].active == true) | .key] | first)
+      else ([$h | to_entries[] | .key] | first) end' 2>/dev/null)"
+  case "$host" in '' | null) host="github.com" ;; esac
+  printf '%s\n' "$host"
+}
+
+# 0 = gh can authenticate for host $1; 1 = TRANSIENT; 3 = PERMANENT (with the reason printed).
+gh_probe_host() {
+  local host="$1" out
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ⛔ THE PROBE MUST USE THE HOST THE PRE-FLIGHT WILL USE. The pre-flight is invoked with `--repo .`
-  # and hands gh a host-STRIPPED slug, so gh resolves the host exactly as it does for any host-less
-  # call: `GH_HOST` if set, else the host gh is configured with. `$OR`'s prefix does NOT select that
-  # host (measured on gh 2.97.0: a bare `--repo owner/name` uses the configured host, not the
-  # remote's, and the pre-flight's own gh calls carry no `--hostname`) — consulting it here would
-  # probe a host the pre-flight never contacts, in both directions (#1853 review).
-  # ⚠️ DECLARED RESIDUAL: gh's configured host is not readable without parsing prose, so the
-  # fallback is github.com. A GHES cell whose gh is configured for an enterprise host and which does
-  # NOT set GH_HOST therefore probes github.com, finds no credential there, and refuses PERMANENTLY.
-  # GH_HOST is the documented way to name the host for a host-less call — set it on such a cell.
-  host="${GH_HOST:-github.com}"
   # ONE call captures both the status and the output.
   out="$(gh auth status --hostname "$host" 2>&1)" && return 0
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. `gh auth status` cannot tell a
@@ -247,7 +257,7 @@ gh_env_verdict() {
   if ! gh auth token --hostname "$host" >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: no gh credential is STORED for $host in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
     printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
+    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   # A credential IS stored but could not be validated. Is it REJECTED, or merely UNREACHABLE? Only
@@ -273,14 +283,24 @@ gh_env_verdict() {
   return "$EXIT_TRANSIENT"
 }
 
+gh_env_verdict() {
+  local rc
+  # The probe covers the host the pre-flight's own host-LESS calls resolve. The harness's POOL
+  # LISTING is a different call — it names `$OR` directly — and it is guarded where it runs: an
+  # unreadable listing must not be read as an empty one (see `.pool` in cmd_run).
+  gh_probe_host "$(gh_default_host)"; rc=$?
+  return "$rc"
+}
+
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
 cmd_check() {
   local scout tool_dir
   # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
-  # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and BOTH
-  # of them already run `gh auth status` themselves (under $CELL_HOME) — and orchestrator-harness's
-  # selftest pins exactly one `gh auth status` call under `$CELL_HOME` for each of them, so a second
-  # `gh auth status` from here would redden an owned suite. More importantly it is the WRONG LAYER:
+  # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and each of
+  # those already performs ONE `gh auth status` itself — the supervisor's in cmd_check, the bringup's
+  # in check_gh (which check_dispatch calls). orchestrator-harness's selftest pins exactly one such
+  # call under `$CELL_HOME` for each of them, so a second `gh auth status` from here would redden an
+  # owned suite. More importantly it is the WRONG LAYER:
   # those checks run in the
   # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
   # process that actually runs it — which is the divergence this whole change exists for, and which
@@ -517,6 +537,20 @@ touch "$O/checked.txt" "$O/candidates.txt"
   gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>/dev/null
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
+
+# ⛔ AN UNREADABLE POOL IS NOT AN EMPTY POOL — the same rule the open-issue listing above enforces.
+# The three queries above run inside a group whose status this pipeline DISCARDS, and each hides its
+# own reason behind `2>/dev/null`, so a listing that fails comes out as `checked 0; backlog now 0` at
+# rc 0 — the merge-only cell this whole gate exists to catch, certified by the gate itself (#1853
+# review). The probe above names only the host a host-LESS call resolves, while this listing names
+# `$OR` directly, so a host-qualified `$OR` is exactly the case the probe cannot cover. Re-read the
+# listing directly, so an empty pool is only believed when `$OR` is actually readable. TRANSIENT on
+# purpose: this says nothing about WHICH host failed, and a marker only a human can clear must not be
+# latched on a guess.
+if [ ! -s "$O/.pool" ] && ! gh issue list --repo "$OR" --state open --limit 1 --json number >/dev/null 2>&1; then
+  echo "[refresh] ABORT: $OR could not be READ, so an empty candidate pool is not an empty backlog — the pool listing above failed silently (#1736)"
+  exit "$EXIT_TRANSIENT"
+fi
 
 n=0
 # `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,
