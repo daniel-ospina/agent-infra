@@ -228,9 +228,13 @@ agents in the hub) is prevented by discipline, not just guards:
    ```
 2. **Delete-on-merge.** Every worktree created for a PR/issue must be removed
    when its branch merges: `git worktree remove <path>` (no `--force` — it
-   refuses tracked WIP). If the branch merged but the worktree lingers, prune
-   with `git worktree prune`. Accumulated worktrees are the tortoise 178-
-   worktree failure mode (#1218).
+   refuses tracked WIP). If the branch merged but the worktree lingers, remove
+   THAT worktree's own record — read its `gitdir:` line from `<path>/.git` and
+   delete only that admin dir; **never** a bare `git worktree prune`, which
+   deregisters every record whose directory is not stat-able right now
+   (unmounted volume, permission blip, stale mount) and destroys unrelated
+   sibling checkouts while their files stay on disk (#1141). Accumulated
+   worktrees are the tortoise 178-worktree failure mode (#1218).
 3. **Corruption canary.** The shared canary
    (`~/.pi/agent/scripts/checkout-hygiene/corruption_canary.py`, canonical in
    agent-infra) detects the mass-replace corruption class (.bak files +

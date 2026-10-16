@@ -13,23 +13,40 @@
 #       at 270K — below the 283,616 trigger — and would classify every
 #       post-clamp compaction as ceiling). Expected post-clamp: 0.
 #       Escalate when > 0.
-#   (b) cache-share of spend over COMPACTING sessions in the shipped
-#       300K-clamp regime (max compaction tokensBefore ≥ FLEET_REGIME_TB
-#       283616 = the 300K-clamp compaction trigger, 300000 − 16384 — sessions
-#       compacting in the 283.6–300K band ARE post-clamp, not legacy; the
-#       floor only excludes the pre-clamp 200K-transient legacy sessions
-#       (~196–205K), whose smaller window has different cache economics and
-#       never belonged to the clamp):
+#   (b) cache-share of spend over COMPACTING sessions in the clamp population
+#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 283616 = the 300K-clamp
+#       compaction trigger, 300000 − 16384 — sessions compacting AT/ABOVE the
+#       trigger ARE post-clamp, not legacy; the floor only excludes the
+#       pre-clamp 200K-transient legacy sessions (~196–205K), whose smaller
+#       window has different cache economics and never belonged to the clamp).
+#       The population is regime-MIXED for one window after the 2026-09-21
+#       withdrawal — see REGIME HISTORY below:
 #       Σ cost.cacheRead+cacheWrite / Σ cost.total over MESSAGE usage, pooled
 #       over the whole window. Compaction summarizer calls (cacheRead≈0,
 #       distinct LLM call) are reported separately, excluded from (b) so the
-#       metric matches the pre-registered 65–70% band (measured regime-pure
-#       message-only: 85.9% pre-clamp / ~70% post-clamp — #373-era anchors,
+#       metric matches the pre-registered 65–70% band (measured message-only
+#       in a single-regime window: 85.9% pre-clamp / ~70% post-clamp — #373-era
 #       clamp-level independent; compaction-included would read ~62% and
 #       false-alarm). Escalate below the floor (FLEET_CACHE_FLOOR default
 #       0.65 = the pre-registered band low) — real drift below the 300K-clamp
 #       regime trips; small-n weeks (n<3 compacting sessions) are reported not
 #       escalated (a single-session share is noise).
+#
+# REGIME HISTORY (withdrawal, 2026-09-21): the #1213/#1226 300K→700K re-clamp
+# is WITHDRAWN (the deployed floor fix — `MIN_USABLE_MAX_TOKENS = 1024`,
+# pi-patch #1214(b) — closes the one-token silent death the wider window was
+# bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
+# at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
+# compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
+# in that era's session files (measured 2026-09-21) sit at/above the 650000
+# trigger (650,134–650,426), putting the 2 sessions carrying them into n_clamp
+# and into the cache-share pools of a run whose window still reaches them. The
+# number is still reported
+# (it is the same cache economics — cache-level independent); read n_clamp on
+# the first post-withdrawal run knowing it mixes regimes for that one window.
+# The TRUNCATION instrument is unaffected: it buckets only
+# stopReason:"length" records, and the retired era produced none — its bucket
+# is empty (watch-truncation.sh, header).
 #   (c) output+reasoning share over non-cache tokens — the #365 TREND
 #       instrument (recorded every run, never escalates). Formula matches the
 #       pre-registered "real median 58%": per-session (output+reasoning) /
@@ -43,13 +60,14 @@
 #
 # Usage:
 #   fleet-cost-report.sh [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR]
+#   fleet-cost-report.sh --print-regime-floor   print the resolved floor and exit
 #   Exit 0 clean · 1 escalation (a or b tripped) · 2 usage/environment error
 #
 # Env seams (tests + tuning):
 #   PI_SESSIONS_DIR / --sessions-dir   session JSONL root (default ~/.pi/agent/sessions)
 #   FLEET_WINDOW_DAYS / --days         report window (default 7)
 #   FLEET_CACHE_FLOOR                  cache-share escalation floor (default 0.65)
-#   FLEET_REGIME_TB                    regime purity floor (default 283616 =
+#   FLEET_REGIME_TB                    clamp-population floor (default 283616 =
 #                                       the 300K-clamp compaction trigger)
 #   SPM_SH                             shared-parser script path override (tests)
 # NOTE: the ceiling classification (tokensBefore ≥ 900000) lives in the SHARED
@@ -64,14 +82,21 @@ SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
 WINDOW_DAYS="${FLEET_WINDOW_DAYS:-7}"
 CACHE_FLOOR="${FLEET_CACHE_FLOOR:-0.65}"
 REGIME_TB="${FLEET_REGIME_TB:-283616}"
+# Frozen ONCE, before anything reads it: `--print-regime-floor` reports this value
+# and the banding below interpolates this value, so freezing is what makes those
+# two the SAME by construction — a later assignment cannot make the answer
+# diverge from the behaviour (#1088's lesson, applied to this interface, #1342).
+readonly REGIME_TB
 SINCE=""
+PRINT_REGIME_FLOOR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days) WINDOW_DAYS="${2:-}"; shift 2 ;;
         --since) SINCE="${2:-}"; shift 2 ;;
         --sessions-dir) SESSIONS_DIR="${2:-}"; shift 2 ;;
-        *) echo "usage: $0 [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR]" >&2; exit 2 ;;
+        --print-regime-floor) PRINT_REGIME_FLOOR=1; shift ;;
+        *) echo "usage: $0 [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR] [--print-regime-floor]" >&2; exit 2 ;;
     esac
 done
 
@@ -87,6 +112,26 @@ if [ -n "$SINCE" ]; then
         echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
         exit 2
     fi
+fi
+
+# ── the regime floor must be a plain integer before ANY use ─────────────
+# A bad value used to reach the Python heredoc's `float()` and die with a
+# traceback; a clean usage error is the fail-closed shape.
+case "$REGIME_TB" in
+    ''|*[!0-9]*) echo "ERROR: FLEET_REGIME_TB must be a plain integer (got '$REGIME_TB')" >&2; exit 2 ;;
+esac
+
+# ── --print-regime-floor: report the RESOLVED floor and exit ─────────────
+# The cost-config guard calls this rather than parsing this file's assignment
+# text (#1342, repeating the #1088 review's rule for `$CAP_MS`). The floor is
+# frozen from FLEET_REGIME_TB at the top, so this prints the exact value the
+# banding below applies — an ambient override or a later assignment cannot make
+# the answer differ from the behaviour. Side-effect free and dependency-free by
+# construction: it runs BEFORE the shared-parser and sessions-dir checks, so it
+# works in a fixture root and in CI where neither exists.
+if [ "$PRINT_REGIME_FLOOR" -eq 1 ]; then
+    printf '%s\n' "$REGIME_TB"
+    exit 0
 fi
 
 [ -x "$SPM_SH" ] || { echo "ERROR: shared parser not found: $SPM_SH" >&2; exit 2; }
@@ -169,12 +214,13 @@ rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
 rows = [r for r in rows if not r.get("error")]
 
 comps = [r for r in rows if r["compacting"]]
-# regime-pure clamp population: compactions at/above the 300K-clamp
-# compaction trigger (283,616 = 300,000 − 16,384) — incl. the 283.6–300K band
+# clamp population: compactions at/above the 300K-clamp
+# compaction trigger (283,616 = 300,000 − 16,384) — incl. the band
 # a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
 # 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
 # only the sub-trigger legacy/200K-window sessions (~196–205K) are excluded
-# from the cache-share economics pool.
+# from the cache-share economics pool. NOT single-regime for one window after
+# the 2026-09-21 withdrawal — see REGIME HISTORY above.
 clamp_comps = [r for r in comps if r["max_tokensBefore"] >= regime_tb]
 legacy_comps = [r for r in comps if r["max_tokensBefore"] < regime_tb]
 n_comp_recs = sum(r["comp_count"] for r in comps)

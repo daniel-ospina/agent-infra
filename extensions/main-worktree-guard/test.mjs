@@ -7,7 +7,7 @@ import { resolve, dirname, relative, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -1015,6 +1015,202 @@ dexpect("push --dry-run NOT delete", `git push origin --dry-run feat/x`, { verdi
 dexpect("pull --rebase origin main → syncSource main", `git -c commit.gpgsign=false pull --rebase origin main`, { verdict: "block:pull", syncSource: "main" });
 dexpect("merge origin/main → syncSource", `git fetch origin && git merge origin/main`, { verdict: "block:merge", syncSource: "origin/main" });
 dexpect("rebase origin/main → syncSource", `git rebase origin/main`, { verdict: "block:rebase", syncSource: "origin/main" });
+
+// ── #1144: the sync invocation's EFFECT record (not its verb) ──────────────
+// The shared-baseline ownership allowance used to fire on the VERB alone
+// (merge/pull/rebase) whenever the session sat on its own baseline branch, so
+// `git rebase origin/main` on the SHARED tortoise hub's main moved that branch
+// under 11 live sessions with NO hatch — while the comparable
+// `git reset --hard` was refused and demanded AGENT_ALLOW_MAIN_EDITS=1.
+// index.ts now decides the sync arm on this record plus the LIVE checkout
+// preconditions (see test-branch-ownership.mjs for the predicate and
+// test-module-load.mjs for the end-to-end proof).
+const seff = (cmd) => classifyGitCommandDetailed(cmd).syncEffect ?? null;
+expectBool("#1144: rebase → syncEffect.rebaseEffect (can replace the tip)",
+  seff("git rebase origin/main")?.rebaseEffect === true, true);
+expectBool("#1144: rebase → NOT ffOnly",
+  seff("git rebase origin/main")?.ffOnly === false, true);
+expectBool("#1144: pull --ff-only → ffOnly (the one provable fast-forward)",
+  seff("git pull --ff-only origin main")?.ffOnly === true, true);
+expectBool("#1144: pull --ff-only → not rebaseEffect",
+  seff("git pull --ff-only origin main")?.rebaseEffect === false, true);
+expectBool("#1144: pull --rebase → rebaseEffect (rewriting effect via a non-rebase verb)",
+  seff("git pull --rebase origin main")?.rebaseEffect === true, true);
+expectBool("#1144: pull -r → rebaseEffect",
+  seff("git pull -r origin main")?.rebaseEffect === true, true);
+expectBool("#1144: bare pull → not ffOnly (pull.rebase config can make it a rebase)",
+  seff("git pull origin main")?.ffOnly === false, true);
+expectBool("#1144: bare merge → not ffOnly (a non-ff merge mints a merge commit)",
+  seff("git merge origin/main")?.ffOnly === false, true);
+expectBool("#1144: merge --ff-only → ffOnly",
+  seff("git merge --ff-only origin/main")?.ffOnly === true, true);
+// LAST-WINS: git's parse-options applies the LAST ff-family flag, so
+// `--ff-only --no-ff` is a MERGE COMMIT, not a fast-forward. A presence-only
+// check would admit it — this is the adversarial spelling the record must kill.
+expectBool("#1144: --ff-only then --no-ff → ffOnly false (last flag wins)",
+  seff("git merge --ff-only --no-ff origin/main")?.ffOnly === false, true);
+expectBool("#1144: --no-ff then --ff-only → ffOnly true (last flag wins)",
+  seff("git merge --no-ff --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: --ff-only then --rebase → rebaseEffect (rebase wins → refused)",
+  seff("git pull --ff-only --rebase origin main")?.rebaseEffect === true, true);
+expectBool("#1144: merge --squash → leavesDirty (stages state in the shared tree)",
+  seff("git merge --squash origin/main")?.leavesDirty === true, true);
+expectBool("#1144: merge --no-commit → leavesDirty",
+  seff("git merge --no-commit origin/main")?.leavesDirty === true, true);
+expectBool("#1144: no sync verb (push) → no syncEffect",
+  classifyGitCommandDetailed("git push origin main").syncEffect == null, true);
+// The parsed record describes the FIRST sync op; the command-level flag says
+// whether that record can stand for the WHOLE command's effect.
+expectBool("#1144: single sync invocation → syncOnlyInvocation true",
+  classifyGitCommandDetailed("git pull --ff-only").syncOnlyInvocation === true, true);
+expectBool("#1144: `pull --ff-only && rebase` → syncOnlyInvocation false (first-op evidence cannot cover the command)",
+  classifyGitCommandDetailed("git pull --ff-only && git rebase origin/main").syncOnlyInvocation === false, true);
+// ── value slots / dynamic / terminator: a token that is not an OPTION is not evidence ──
+expectBool("#1144: `merge -m --ff-only` → NOT ffOnly (value slot; real git merges NON-ff)",
+  seff("git merge -m --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --message --ff-only` → NOT ffOnly (value slot)",
+  seff("git merge --message --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --ff-only -m msg` → ffOnly stays true (option order)",
+  seff("git merge --ff-only -m msg origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -- --ff-only` → unverifiable (`--` makes it a ref name)",
+  seff("git merge -- --ff-only")?.unverifiable === true, true);
+expectBool("#1144: `pull --ff-only $(echo --no-ff)` → unverifiable (shell resolves after the read)",
+  seff("git pull --ff-only $(echo --no-ff) origin main")?.unverifiable === true, true);
+expectBool("#1144: plain `pull --ff-only` → verifiable",
+  seff("git pull --ff-only origin main")?.unverifiable === false, true);
+expectBool("#1144: attached short value `-Xours` consumes no next token",
+  seff("git merge --ff-only -Xours origin/main")?.ffOnly === true, true);
+// ── cycle-2 reviewer: git's left-to-right short scan + fail-closed option shapes ──
+expectBool("#1144: `merge -Xours --ff-only` → ffOnly true (attached value, real flag follows)",
+  seff("git merge -Xours --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -Xours --ff-only` → NOT unverifiable (known attached-value shape)",
+  seff("git merge -Xours --ff-only origin/main")?.unverifiable === false, true);
+expectBool("#1144: `merge -mX --ff-only` → ffOnly true (value attached inside the token)",
+  seff("git merge -mX --ff-only origin/main")?.ffOnly === true, true);
+expectBool("#1144: `merge -qm --ff-only` → ffOnly false (arg-taker ends the cluster → next token is its value)",
+  seff("git merge -qm --ff-only origin/main")?.ffOnly === false, true);
+expectBool("#1144: `merge --mess --ff-only` → unverifiable (ABBREVIATED value option cannot be proven)",
+  seff("git merge --mess --ff-only origin/main")?.unverifiable === true, true);
+expectBool("#1144: `merge --ff-only --gpg-sign --no-ff` → unverifiable (OPTARG does not consume `--no-ff`)",
+  seff("git merge --ff-only --gpg-sign --no-ff origin/main")?.unverifiable === true, true);
+expectBool("#1144: `merge --strategy-o --ff-only` → unverifiable (unknown abbreviation fails closed)",
+  seff("git merge --strategy-o --ff-only origin/main")?.unverifiable === true, true);
+expectBool("#1144: `pull -qr --ff-only` → rebaseEffect true (`r` in a short cluster)",
+  seff("git pull -qr --ff-only origin main")?.rebaseEffect === true, true);
+expectBool("#1144: `merge --ff-only --no-edit origin/main` → ffOnly true, verifiable (allowlisted boolean)",
+  (() => { const e = seff("git merge --ff-only --no-edit origin/main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+expectBool("#1144: `merge --ff-only --strategy=ort origin/main` → ffOnly true, verifiable (self-contained value)",
+  (() => { const e = seff("git merge --ff-only --strategy=ort origin/main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+expectBool("#1144: `checkout main && fetch origin` → stateCarveOutClean true (no refspec cannot write refs)",
+  classifyGitCommandDetailed("git checkout main && git fetch origin").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && fetch origin +main:refs/heads/main` → stateCarveOutClean false (refspec writes refs)",
+  classifyGitCommandDetailed("git checkout main && git fetch origin +main:refs/heads/main").stateCarveOutClean === false, true);
+expectBool("#1144: invocationHints emitted per git invocation (`-C <wt> status && reset`) — 2 entries",
+  classifyGitCommandDetailed("git -C /tmp/wt status && git reset --hard origin/main").invocationHints?.length === 2, true);
+// ── M3 carve-out laundering (#1144 reviewer P1) ──
+expectBool("#1144: `checkout main` alone → stateCarveOutClean true (sanctioned return preserved)",
+  classifyGitCommandDetailed("git checkout main").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && status` → stateCarveOutClean true (read-only sibling)",
+  classifyGitCommandDetailed("git checkout main && git status").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && reset --hard` → stateCarveOutClean false (destructive sibling)",
+  classifyGitCommandDetailed("git checkout main && git reset --hard origin/main").stateCarveOutClean === false, true);
+expectBool("#1144: `checkout main && fetch` (bare, no refspec) → stateCarveOutClean true (cannot write refs/heads/*)",
+  classifyGitCommandDetailed("git checkout main && git fetch").stateCarveOutClean === true, true);
+expectBool("#1144: `checkout main && fetch --depth 1 --quiet origin` → stateCarveOutClean true (no refspec)",
+  classifyGitCommandDetailed("git checkout main && git fetch --depth 1 --quiet origin").stateCarveOutClean === true, true);
+// #1144 cycle-3 reviewer P0: the carve-out predicate is a claim about the WHOLE
+// command's invocation list, so it must consult `hiddenStateSubst` exactly as
+// the sync arm and the worktree exemption do. A shell payload contributes no
+// invocation, so the visible list can look clean while the classifier's own
+// verdict is block:reset — the carve-out would close a command it never saw.
+expectBool("#1144 B9-carve-out-hidden: `checkout main && eval \"reset --hard\"` → stateCarveOutClean FALSE (hidden payload)",
+  classifyGitCommandDetailed('git checkout main && eval "git reset --hard origin/main"').stateCarveOutClean === false, true);
+expectBool("#1144 B9-carve-out-hidden: its visible twin is also FALSE (the discriminator is the visible list)",
+  classifyGitCommandDetailed("git checkout main && git reset --hard origin/main").stateCarveOutClean === false, true);
+expectBool("#1144 B9-carve-out-hidden: hiddenStateSubst is the evidence the clean claim is unprovable",
+  classifyGitCommandDetailed('git checkout main && eval "git reset --hard origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B9-carve-out-hidden: a hidden git QUERY also clears the clean claim (fail closed — the list is incomplete either way)",
+  (() => { const d = classifyGitCommandDetailed('git checkout main && eval "git status"'); return d.hiddenStateSubst === true && d.stateCarveOutClean === false; })(), true);
+// #1144 cycle-3 reviewer P2: the read-only sibling test is argument-scoped for
+// verbs with a read-only FORM and a mutating form — the pure queries that
+// false-blocked the ceremony are admitted, their mutating cousins stay gated.
+expectBool("#1144 P2: `checkout main && worktree list` → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git worktree list").stateCarveOutClean === true, true);
+expectBool("#1144 P2: `checkout main && stash list` → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git stash list").stateCarveOutClean === true, true);
+expectBool("#1144 P2: `checkout main && tag` (list form) → stateCarveOutClean true (pure query)",
+  classifyGitCommandDetailed("git checkout main && git tag").stateCarveOutClean === true, true);
+expectBool("#1144 P2 control: `checkout main && worktree add` → stateCarveOutClean false (mutating form)",
+  classifyGitCommandDetailed("git checkout main && git worktree add /tmp/x").stateCarveOutClean === false, true);
+expectBool("#1144 P2 control: `checkout main && tag v1` → stateCarveOutClean false (creates a ref)",
+  classifyGitCommandDetailed("git checkout main && git tag v1").stateCarveOutClean === false, true);
+expectBool("#1144 P2 control: `checkout main && stash` (bare = push) → stateCarveOutClean false (mutating form)",
+  classifyGitCommandDetailed("git checkout main && git stash").stateCarveOutClean === false, true);
+
+// ── #1144 follow-up closures: B6o (short value slot) · B9d-hidden (eval payload
+// riding a visible sync) · B8-hidden (eval payload riding a worktree-exempt
+// leading segment). Each of these is an INCOMPLETE closure of a class already
+// declared in the #1144 surface, found by a fresh-context adversarial reviewer
+// against the parent commit — so they are pinned here, beside the classes they
+// extend, and end-to-end in test-module-load.mjs.
+//
+// B6o — the short value slot. `-o` is `pull`'s `--server-option`, an ARG-TAKER:
+// real git consumes `--ff-only` as its VALUE and performs a NON-fast-forward
+// pull (probe: rc 0, MERGE COMMIT, branch moved). The long twin
+// (`--server-option --ff-only`) was already unverifiable, so only the short
+// letter was open.
+expectBool("#1144 B6o: `pull -o --ff-only` → ffOnly FALSE (`--ff-only` is -o's VALUE, not a flag)",
+  seff("git pull -o --ff-only origin main")?.ffOnly === false, true);
+expectBool("#1144 B6o: `pull -o --ff-only` → verifiable (the value slot is a KNOWN arg-taker, not an unknown shape)",
+  seff("git pull -o --ff-only origin main")?.unverifiable === false, true);
+// The general rule the entry must not replace: any short letter that is neither
+// a known arg-taker nor a known boolean may be an arg-taker this table does not
+// enumerate, so the token after it is of UNKNOWN kind → fail closed.
+expectBool("#1144 B6o: an UNENUMERATED short letter fails closed (`pull -Z --ff-only` → unverifiable)",
+  seff("git pull -Z --ff-only origin main")?.unverifiable === true, true);
+// …and the short/long asymmetry self-heals: `-p` is refused exactly as its long
+// twin `--prune` is, because neither is in its allowlist.
+expectBool("#1144 B6o: `pull --ff-only -p` → unverifiable (short `-p` mirrors refused `--prune`)",
+  seff("git pull --ff-only -p origin main")?.unverifiable === true, true);
+expectBool("#1144 B6o: `pull --ff-only --prune` → unverifiable (the refused long twin)",
+  seff("git pull --ff-only --prune origin main")?.unverifiable === true, true);
+// The known-benign shorts must NOT be caught by the general rule (no false
+// block on the curated boolean set) — `-q` is the short spelling of an
+// allowlisted long (`--quiet`).
+expectBool("#1144 B6o: `pull -q --ff-only` → ffOnly true, verifiable (known-boolean short)",
+  (() => { const e = seff("git pull -q --ff-only origin main"); return e?.ffOnly === true && e?.unverifiable === false; })(), true);
+
+// B9d-hidden — `git pull --ff-only && eval "git rebase origin/main"`. The eval
+// payload executes git but contributes NO invocation, so the walk sees exactly
+// one invocation (the pull) and `syncOnlyInvocation` claimed TRUE — the sync
+// arm then trusted the pull's fast-forward record for a command that rewrites
+// the branch immediately after. "Only git invocation" is a claim about the whole
+// command; hidden substitution makes it unprovable → false.
+expectBool("#1144 B9d-hidden: `pull --ff-only && eval \"rebase\"` → syncOnlyInvocation FALSE (hidden git payload)",
+  classifyGitCommandDetailed('git pull --ff-only && eval "git rebase origin/main"').syncOnlyInvocation === false, true);
+expectBool("#1144 B9d-hidden: the same command reports hiddenStateSubst (the evidence the claim is unprovable)",
+  classifyGitCommandDetailed('git pull --ff-only && eval "git rebase origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B9d-hidden: hidden eval BEFORE the sync op also fails closed (`eval \"pull --rebase\" && pull --ff-only`)",
+  classifyGitCommandDetailed('eval "git pull --rebase origin main" && git pull --ff-only').syncOnlyInvocation === false, true);
+expectBool("#1144 B9d-hidden control: a truly lone `pull --ff-only` → syncOnlyInvocation TRUE (allowance's purpose)",
+  classifyGitCommandDetailed("git pull --ff-only").syncOnlyInvocation === true, true);
+
+// B8-hidden — the legacy arm's per-invocation worktree exemption keys on
+// `invocationHints`, which a hidden substitution leaves COMPLETE-looking:
+// `git -C <wt> status && eval "git reset --hard origin/main"` walks to one
+// worktree-scoped invocation while the eval payload resets the SHARED hub. The
+// classifier must flag it so the exemption fails closed (index.ts →
+// `_allInvocationsWorktreeScoped`).
+expectBool("#1144 B8-hidden: `-C <wt> status && eval \"reset --hard\"` → hiddenStateSubst TRUE",
+  classifyGitCommandDetailed('git -C /tmp/wt status && eval "git reset --hard origin/main"').hiddenStateSubst === true, true);
+expectBool("#1144 B8-hidden: its visible twin reports the same worktree-complete-looking invocation list (2 entries) — the discriminator is the hidden flag",
+  (() => {
+    const hidden = classifyGitCommandDetailed('git -C /tmp/wt status && eval "git reset --hard origin/main"');
+    const visible = classifyGitCommandDetailed("git -C /tmp/wt status && git reset --hard origin/main");
+    return hidden.invocationHints?.length === 1 && visible.invocationHints?.length === 2;
+  })(), true);
+expectBool("#1144 B8-hidden control: a wholly worktree-scoped destructive op reports NO hidden substitution (exemption preserved)",
+  classifyGitCommandDetailed("git -C /tmp/wt reset --hard origin/main").hiddenStateSubst === false, true);
 
 // M3 subclassification surfaces (branchOp via shared classifyBranchOp)
 import { classifyBranchOp as sharedClassifyBranchOp, resolveEffectiveRepo as sharedResolveEffectiveRepo, resolveRepoFromInv as sharedResolveRepoFromInv, extractGitInvocation as sharedExtractGitInvocation, decideM2 as sharedDecideM2, decideM3 as sharedDecideM3, localBranchExists as sharedLocalBranchExists, ownershipAllowed as sharedOwnershipAllowed } from "../shared/branch-ownership.mjs";
@@ -4909,6 +5105,15 @@ try {
   expectBool("#1129: the mandated preflight + the recovery helper are the listed scripts",
     pinSrc.includes('"scripts/check-pipeline-compliance.sh"') &&
     pinSrc.includes('"scripts/checkout-hygiene/hub-worktree.sh"'), true);
+  // #1484, second instance (the #1141 class): the review RECORDER. Pinned for the
+  // same reason the two above are — the list must stay NAMED and explicit, so a
+  // later tidy-up cannot silently drop the entry and re-block every hub-rooted
+  // lane from recording a completed review. Note the pin is intentionally on the
+  // CHECKOUT spelling only: the farm copy at ~/.pi/agent/scripts/record-review.sh
+  // is a realpath-keyed miss and is tracked separately (agent-infra #1603) — do
+  // NOT "fix" that here by widening this list to a directory or a name pattern.
+  expectBool("#1484 (2nd instance): the review RECORDER is the listed script",
+    pinSrc.includes('"scripts/record-review.sh"'), true);
   expectBool("#1129 P0 boundary: no DIRECTORY-wide exemption (destructive helpers stay gated)",
     !pinSrc.includes("cleanup-worktree.sh") &&
     !pinSrc.includes("cleanup-stale-branches.sh") &&
@@ -4952,6 +5157,104 @@ try {
   expectBool("#1129: the block message names the realpath actually read + the verdict source",
     pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
 
+  // (b2) THE SAME EXEMPTION, APPLIED TO M5 (#1139). #1129 exempted the
+  // framework's scripts from M4's content walk only; M5's working-tree-discard
+  // walk never asked, so `hub-worktree.sh` stayed blocked from a hub-rooted
+  // session — its salvage path reverts the hub's dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`, whose SHELL LOOP VARIABLE
+  // pathspec the extractor can only surface as an unresolvable
+  // `cat-file-revert` hint, which fails closed. Source pins: ONE list and ONE
+  // anchor helper (a second, drift-prone copy is the regression shape), the
+  // exemption scoped to the harvested SET (never to the command), and the
+  // message correction.
+  expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
+    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
+  expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
+    pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
+    pinSrc.includes("if (s.script === null) return true;") &&
+    pinSrc.includes("for (const set of gatedSets) {") &&
+    pinSrc.includes("gatedSets.every((s) => s.discs.length === 0)") &&
+    !pinSrc.includes("for (const set of sets) {"), true);
+  expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m5_script_exemption") &&
+    // ... and the row says what the relaxation HID, aggregated BY REALPATH
+    // (review fold-in: a row written from inside the filter predicate fires
+    // even when the dropped set carried no discards, and summing raw push sites
+    // double-counts one file pushed as two sets — review cycle-2 P2).
+    pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
+    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
+    // realpath always yields the same discard list, so `sets_exempted=1` with
+    // `discards_dropped=2` misstated the suppression the row exists to report.
+    pinSrc.includes("prev.discards = Math.max(prev.discards, s.discs.length);"), true);
+  // The remedy must never print a path that cannot run (review cycle-2 P2).
+  expectBool("#1139: the fail-closed remedy is printed only when that file exists",
+    pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
+    !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
+  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+    pinSrc.includes("catch { rel = null; }") &&
+    pinSrc.includes("if (rel === null) return true;"), true);
+  expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
+    pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
+    // ... and does NOT dequote-then-split, which invents a seed for unquoted
+    // input (`cat a b` → `a b`) and over-splits a quoted one (`cat "a b"` →
+    // `a` + `b`): both pin a FALSE BLOCK on a file the shell never reads
+    // (review cycle-2 P1).
+    !pinSrc.includes("const dequoted = ") &&
+    !pinSrc.includes("words.slice(i).join(\" \")"), true);
+  // The tokenizer is the SHARED one (one shell-word tokenizer in the repo, not a
+  // second drift-prone copy), bound with the stale-module typeof guard. Pinned
+  // BEHAVIOURALLY via the real import (line 10) — if classify-git stops exporting
+  // it, test.mjs fails to load rather than silently regressing the pipe walk.
+  expectBool("#1139: the pipe walk reuses classify-git's exported quote-aware tokenizer",
+    typeof wtShellWords === "function" &&
+    wtShellWords('cat "a b"').length === 2 &&
+    wtShellWords("cat a b").length === 3 &&
+    wtShellWords('"a""b"').length === 1 &&
+    // review cycle-3 P2: an escaped quote does NOT close the word, and the rest
+    // of the line must not be swallowed into the token
+    wtShellWords('cat "a\\" b" | bash').length === 4 &&
+    wtShellWords('cat "a\\" b" | bash')[1] === '"a\\" b"' &&
+    pinSrc.includes("if (typeof _m5.wtShellWords === \"function\") wtShellWords = _m5.wtShellWords;"), true);
+  // review cycle-3 P1: the per-token dequote must follow the SHELL's rules — the
+  // blanket `[\"']`-and-backslash strip mis-read literal quotes/escapes and
+  // seeded files the shell never reads (one of them a fail-open REGRESSION).
+  expectBool("#1139: the per-token dequote is shell-faithful (single quotes literal, per-context backslash)",
+    pinSrc.includes("function _dequoteShellWord(raw: string): string") &&
+    pinSrc.includes("const _DQ_ESCAPABLE = new Set(") &&
+    pinSrc.includes("const tok = _dequoteShellWord(raw);") &&
+    !pinSrc.includes('raw.replace(/\\\\(.)/g, "$1").replace(/["\']/g, "")'), true);
+  expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
+    pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
+    !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);
+  expectBool("#1139: the fail-closed arm stopped claiming a dirty tree",
+    pinSrc.includes("the discard's effect could not be verified, failing closed (#709)") &&
+    pinSrc.includes("NOT a claim that the checkout is dirty") &&
+    // Cause-neutral (review fold-in): the arm serves nine reasons and only two
+    // are target-resolution failures, so no single-cause headline.
+    !pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
+    // The misattribution itself: this sentence was printed in BOTH arms,
+    // unconditionally, so a clean checkout was told it had uncommitted work.
+    !pinSrc.includes("uncommitted changes to tracked files that this command would revert.") &&
+    // The `!== null` contract — `unverifiable ? …` would render the DIRTY arm
+    // (with the hatch) for an empty-string reason.
+    pinSrc.includes("unverifiable !== null") && !pinSrc.includes("unverifiable ?"), true);
+  expectBool("#1139: the fail-closed arm stopped offering the bypass hatch as its remedy",
+    pinSrc.includes("not its remedy") &&
+    // The dirty arm (which really did read a dirty scope) KEEPS the hatch.
+    pinSrc.includes("Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1"), true);
+  const reasonFnStart = pinSrc.indexOf("function _worktreeDiscardBlockReason");
+  const reasonFnEnd = reasonFnStart === -1 ? -1 : pinSrc.indexOf("\nfunction ", reasonFnStart + 10);
+  const reasonFn = reasonFnStart === -1 ? "" : pinSrc.slice(reasonFnStart, reasonFnEnd === -1 ? pinSrc.length : reasonFnEnd);
+  expectBool("#1139 (review): the fail-closed remedy prints the framework checkout's OWN absolute path (no advice loop)",
+    reasonFn.includes("resolve(_frameworkRoot, \"scripts/checkout-hygiene/hub-worktree.sh\")") &&
+    !reasonFn.includes("bash scripts/checkout-hygiene/hub-worktree.sh <branch>") &&
+    reasonFn.includes("address the FRAMEWORK CHECKOUT's own copy, because a") &&
+    reasonFn.includes("worktree-local copy of it is gated by design (#1139):"), true);
+
   // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
   // exemption; they are contained. A lone markdown fence is enough to gate a
   // file `block`, which is the spelling-not-behaviour shape the follow-up must
@@ -4986,7 +5289,11 @@ try {
     try { execSync(`git worktree remove --force "${m4Tmp}/wt"`, { stdio: "ignore" }); } catch {}
     try { execSync(`rm -rf "${m4Tmp}"`, { stdio: "ignore" }); } catch {}
   }
-  try { execSync("git worktree prune", { stdio: "ignore" }); } catch {}
+  // No bare `git worktree prune`: with no `cwd` it would prune whatever repo the
+  // suite was invoked from — a real checkout holding unrelated sibling worktree
+  // records, any of which is deregistered if its directory is not stat-able at
+  // that instant (#1141). The `worktree remove` above already dropped its own
+  // record, and the fixture repo itself is deleted by the line above.
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -51,7 +51,7 @@ verdict: DEFER (spike-only) — OVERRIDDEN BY OWNER 2026-09-10, see rev 4 overri
 
 ### Corrected evidence base (this is the load-bearing claim — revision 1 stated it wrongly)
 
-Revision 1 claimed "four guards touch adjacent concerns" with none owning duplication. **The audit's own labels contradict that** — three of the four were explicitly marked as *not* duplication-related (`AS2`: "Contradiction ≠ similarity"; `CSD5`: "Document-level redundancy, not component-level"; Agent #6 row: "None of those three reviewers does codebase-wide duplication-vs-existing analysis"). Inflating a weak signal 4× is exactly the post-rationalization the adversarial check exists to catch.
+Revision 1 claimed "four guards touch adjacent concerns" with none owning duplication. **The audit's own labels contradict that** — three of the four were explicitly marked as *not* duplication-related (`AS2`: "Contradiction ≠ similarity"; `CSD5`: "Document-level redundancy, not component-level"; Agent #6 row — now merged reviewer **C** (Architecture & Data), see below: "None of those three reviewers does codebase-wide duplication-vs-existing analysis"). Inflating a weak signal 4× is exactly the post-rationalization the adversarial check exists to catch.
 
 **Accurate count, from the audit's own labels:**
 
@@ -59,7 +59,7 @@ Revision 1 claimed "four guards touch adjacent concerns" with none owning duplic
 |---|---|---|
 | **Dedup by purpose**, both partial | **2** | `improvement-opportunities` IO3 (epic-Coherence-Review only) **and** `research-protocol` §1.5 — which is literally titled "Skill deduplication gate" (≥80% coverage → extend vs new), i.e. dedup by purpose too. Revision 2 filed §1.5 as merely "adjacent" and kept IO3 as the sole dedup guard; that split turned on *enforcement timing*, not purpose |
 | Overlap / relationship guards (not dedup) | **3** | `epic-decompose` MECE gate (intra-epic issue set); `issue-scoping` Phase 3 `PARTIAL_IMPLEMENTATIONS` (collected, never adjudicated); `ux-verification` component catalog (UI-only) |
-| Unrelated to duplication | **6** | `parallel_work_check` C1/C2 (fix/path-level); `code-review` Step 0.9 (file-level overlap, advisory); `architectural-soundness` AS2 (contradiction ≠ similarity); `cross-substep-drift` CSD5 (doc-level); `improvement-opportunities` IO7 (ADR suggestion); `code-review` Agent #6 dispatch set |
+| Unrelated to duplication | **6** | `parallel_work_check` C1/C2 (fix/path-level); `code-review` Step 0.9 (file-level overlap, advisory); `architectural-soundness` AS2 (contradiction ≠ similarity); `cross-substep-drift` CSD5 (doc-level); `improvement-opportunities` IO7 (ADR suggestion); `code-review` Reviewer C (Architecture & Data) dispatch set — called "Agent #6" when this row was written, merged into reviewer **C** in `code-review` v3.3.0 (agent-infra #1538/#1539) |
 
 Revision 2's revision-note claim to have "corrected the adjacent-guard count" was itself inaccurate — the count was never the problem, only membership. **Total is 11, unchanged.**
 

@@ -77,7 +77,7 @@ Every infra issue, gate, guard, workflow step, or refactor is classified **A** o
 
 **The pattern to follow when something is broken:**
 1. **Diagnose first** — read the error, trace the root cause, confirm what's actually failing (skills: `debug-workflow`, `find-bugs`)
-2. **Research the canonical architecture and SOTA solution** — use the research skill to confirm what the canonical architecture and state-of-the-art solution are; we want to be a fast follower on best practices everywhere that is not unique to us.
+2. **Research the canonical architecture and SOTA solution** — use the research skill to confirm what the canonical architecture and state-of-the-art solution are; we want to be a fast follower on best practices everywhere that is not unique to us — **except where it contradicts a recorded decision**, which the contradiction test in USER QUESTIONS PROTOCOL settles first.
 3. **Fix the root cause with durable solutions** — reconnect, repair config, fix the bug. This is the default. Avoid patchy solutions that compound debt; we want clean architecture that is simple yet complete. If you need to change the current architecture, escalate.
 4. **If you cannot fix it** (needs credentials, external service access, decision) — **STOP and escalate**: report the diagnosis + proposed fallback to the human, get explicit approval BEFORE changing the architecture, backend, or workflow
 5. **Never ship a fallback as if it were the plan** — a workaround (embedded DB instead of managed, self-host instead of cloud, local instead of remote) is a red flag that must be surfaced, not absorbed
@@ -98,9 +98,21 @@ When choosing between two approaches, prefer the one that produces the better ou
 
 ## ⛔ USER QUESTIONS PROTOCOL: research and ask without jargon
 
-When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
+**⛔ ASK THE CONTRADICTION TEST FIRST — BEFORE YOUR OTHER TESTS.** Before adopting anything a research pass returns (a convergent standard, a SOTA pattern, a comparable's practice), ask **"is there a decision this would contradict?"** — and ask it *first*, ahead of cost, quality, convergence strength, or fit. A convergent answer that contradicts a decision **is not a candidate for adoption at all**: not "adopt with a caveat", not "escalate and adopt", not a footnote, and not something to park with the owner as an option. **Convergence describes what the field does. It does not describe what we have decided to be.** An owner decision outranks it — and **if you believe the standard should win, the route is to reopen the decision**: reopen it in its own home (its issue, plan doc, or Tortoise point), **put the evidence in front of the owner, and argue it.** Adopting over a decision is *never* the route — it silently reverses a deliberate choice, and nothing in the change will say so. **Why the edge is sharp:** if a standard could override a decision, the next lane to read a vendor's documentation holds the pen on our product's promises, and the decision survives only until someone else does research — which is not a decision, it is a default that holds until the next pass. **Refusing an adoption is not a verdict on the finding.** A contradicting finding is **accurate and valuable, and it is the evidence for that reopen** — the refusal tests the decision's *authority over the matter*, never the research's *accuracy*. Discarding it is how a reopen loses its case. Not adopting over a decision, and not dropping a decision-free candidate, are the two halves of this contradiction test: a convergent answer that no decision reaches is a live question to be **argued with the owner**, not a candidate to be killed by analogy.
 
-## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions.
+A **recorded decision** means an owner ruling, a decision section in a plan doc, a decision comment on an issue, or a Tortoise point carrying one — not merely an existing practice, and not a thing the code happens to do today.
+
+**⛔ MARK A DELIBERATE DEPARTURE WITH AN `OVERRIDES:` LINE — ON THE ISSUE.** The contradiction test only bites if an adopter can tell a **deliberate ruling against the grain** from **an accident of history** — and a record that states the choice but not *what it overrides* reads identically either way, so the ruling survives only until a helpful reader holding a vendor's page treats it as legacy and tidies it away. Every decision that goes against the common/industry default therefore carries one line:
+
+> **OVERRIDES:** <the default, named concretely — the window, the pattern, the vendor practice> — <one sentence of reason>.
+
+The marker belongs **on the artifact a lane actually reads: the ISSUE** (a comment on the decision issue), with the decision ledger carrying the same line as the index. A marker that lives only in a ledger is invisible to the lane holding the vendor page — and that is exactly the lane that overwrites the ruling. Cost: one line. Effect: the ruling reads as **intentional at the point where adoption happens**, instead of as an accident waiting to be tidied.
+
+**The hard stop is the decision, not the marker — the `OVERRIDES` line only makes the contradiction findable.** A convergent standard that contradicts **any recorded decision, marked or not**, is **not a candidate for adoption at all**; the route is a **reopen** — evidence in front of the owner, argued — never a quiet adoption, never "adopt with a caveat", and never an inference that convergence has made the default right. The marker's job is to make an against-the-grain ruling **visible to the adopter before the research has to rediscover it** — not to decide whether the decision blocks, which it does either way.
+
+When you need to ask the user a question, first research it to ensure it indeed needs the user. If a SOTA solution exists where competitors/comparable implementations converge, **and it contradicts no recorded decision (run the contradiction test above FIRST)**, and is aligned with the rest of our work, use it and don't bother the user. If you need to ask the user, ensure you present: context, options, analysis, and recommendation, all without jargon (specific terms should be canonical, e.g. as per ontology document)
+
+## ⛔ SESSION RECAP PROTOCOL: don't recount trivia about what happened, present state and decisions
 
 If you're going to present a recap at the end of a turn or session, don't say things like "Cycle 3 found the worst bug of the whole lane" or "Two corrections I had to make about my own work" unless they're changing the scope, architecture or UX that was agreed. Instead present the state, key design principles/decisions made, and cleanly present any user decisions needed (see USER QUESTIONS PROTOCOL) or next steps. If the next steps are just to continue, do not stop and just continue (see NEVER PAUSE WITHOUT A REASON)
 
@@ -147,6 +159,36 @@ Every review cycle MUST re-review in a FRESH context — via `task` where the sk
 - Same-model self-review in the same conversation degrades without an external signal
 - The model defends prior decisions rather than critically re-evaluating
 - `task` spawns `pi -p` in a new process with no session memory — the closest available proxy for an independent reviewer
+
+#### Finding Verification — a review finding is a CLAIM, not a fact
+
+**Before applying ANY review finding, verify it against the primary source it cites.** Open the line
+range, the frozen file, the `gh` output, the commit. The reviewer's prose is not the source; the source
+is. **A finding that cites nothing is not applicable** — report it back as `unverifiable` and do not
+apply it. This applies to every consumer of a finding: the fixer loop, a plan's disposition table, a
+scoping comment, an artifact correction.
+
+- **A `⚠️ CORRECTED` marker is NOT evidence.** It records that the text *changed* — never that the
+  change was *right*. That is what makes it dangerous: it asserts "the previous text was wrong", so a
+  reader who trusts the marker is actively steered to the falsehood, and the replaced text was the
+  correct one.
+- **"Also present elsewhere" is not "absent here".** A value that appears in both `H3` and `H4` has
+  not been shown to belong to `H4` alone.
+- **A disposition is not done until it is verified.** "All 6 corrected" is a claim about process with
+  no artifact behind it — check the artifact, or delete the claim rather than reword it.
+- **When a finding is falsified, correct the review record in place** — mark it `⛔ DO NOT APPLY`
+  where it lives, so the next lane cannot re-apply it to an artifact that has already been fixed.
+
+**Why this is a gate, not advice.** A missed finding leaves the artifact as it was. A **false
+correction changes it, and marks the change as an improvement** — and the review document is the
+record other lanes read, so the error propagates to artifacts that were already correct. The measured
+cost: five false corrections applied verbatim in one review cycle, three originating in the review
+document itself, and one of them moved a pipeline order so that entity resolution would have degraded
+to the ambiguous bare-form path — **a false correction was one merge away from shipping the exact
+duplicate-manufacturing failure the design exists to prevent** (`tortoise#5014`; mechanism:
+`tortoise`'s `docs/architecture/EXTRACTOR-V4-ARCHITECTURE.md` §16.2 — the section whose four binding
+rules this one is taken from — and its evidence record, `tortoise`'s
+`docs/architecture/REVIEW-CONSOLIDATED-2026-09-23.md` B2.1).
 
 #### Exit Conditions — ALL Must Be True (Clean Completion)
 
@@ -217,6 +259,23 @@ When encountering any bug, test failure, or unexpected behavior:
 This applies even for "obvious" fixes — the cost of a wrong diagnosis is higher than the cost of verification. Apparent symptoms routinely mislead; the skill enforces the methodology that finds what actually broke.
 
 ---
+
+## ⛔ Reading verification state — a rollup is not a result
+
+**A check-run rollup is NOT "is main green".** GitHub keeps every attempt (up to 1,000 per name per check suite, after which older ones are auto-deleted), so one commit can carry dozens of check-runs and the SAME job can hold both `failure` and `success`. **A re-run ADDS a red — it does not clear one** — so the more a flaky check is retried, the redder a green commit looks. Retrying is the correct response to flake and it makes the aggregate worse. (One commit carried dozens of check-runs, one job holding 10 attempts at measurement. Every re-run grows these counts — re-measure before quoting a number, or cite the mechanism and not the integers.)
+
+Read the RUNS, on the EXACT sha, newest attempt per check:
+
+1. `git fetch origin main && git rev-parse origin/main` — a bare `rev-parse` reads the LOCAL remote-tracking ref, only as fresh as the last fetch, and a stale sha yields a false **green** (the inverse error, and the more dangerous one). `git ls-remote origin refs/heads/main` needs no fetch.
+2. `gh api "repos/<o>/<r>/commits/<SHA>/check-runs?per_page=100&filter=all" --paginate --jq '.check_runs[]'` — pin `filter=all` (the default is not all: on real commits it returned 26 of 40), and merge every page, because `--paginate` emits one JSON object PER PAGE.
+3. **Resolve the workflow before grouping.** A check-run's `name` is the JOB name, not the workflow's, and two workflows can publish the same job name — grouping on the name alone merges them, so the newest of one masks the other (measured: two `packaging-smoke` runs, one `cancelled`, the other `success`). Take the run id from `details_url`, resolve its workflow, and group by **(app.slug, workflow, job name)**, newest attempt per group ordered by **`id`** — `started_at` is nullable (a queued attempt has none) and is a tiebreak only. A check-run with no resolvable Actions workflow groups under its `app.slug` alone; leaving any check-run ungrouped is unsafe, because a check that forms no group can never make the verdict red. Do not group by `check_suite.id`: every re-run gets its own suite, which would shatter one check into one group per attempt.
+4. **Decide the verdict by POLARITY, not by vocabulary.** A group whose newest attempt is not `completed` is **in flight** (`queued`, `in_progress`, `waiting`, `requested`, `pending`). Of the completed ones, only `success`, `neutral` and `skipped` are green; `cancelled` and `stale` are non-red. **EVERY OTHER CONCLUSION IS RED — including one GitHub has not documented yet, and a null one.** That allow-list polarity is not invented here: it is the merge rail's, adopted after a real incident in which an unrecognised conclusion was neither red nor pending and a merge went ahead on it — so an unnamed value must never be allowed to fall through a gap.
+   Read the surface in this order: **RED if any group is red** — a completed red is final, and nothing in flight can un-fail it; **otherwise NOT YET KNOWN while any group is in flight**; **otherwise GREEN only if the surface is non-empty and every group is non-red.** A missing check is not a green check: if the surface is empty, report that you read nothing there and stop — never extrapolate from absence to green.
+5. Never `/commits/<sha>/status` — legacy endpoint: where CI is check-runs it returns `state=pending` with `statuses=0`, which reads as "not green" from a field that was never populated.
+
+**What this rule does NOT decide: mergeability — and step 4's verdict is not a merge gate.** For "may I merge", read the rail, not this rule: `scripts/admin-merge.sh` groups checks by **`(app, name)`** and treats `{success, neutral, skipped, cancelled, stale}` as non-red. Its key merges two workflows that share a job name — the conflation step 3 above separates — and the rail states that as an accepted residual, so it is referenced here, not overridden. **Read the rail to merge; read this rule to know whether the tree is healthy.**
+
+A per-name rollup answers *"has main EVER been red?"* — almost always yes — not *"is main green now?"*. **This false red has already produced a wrong "main is red" conclusion that stalled work on a green main** — the defect is `tortoise#4877`, and the instruction-file divergence it exposed is `agent-infra#1399`.
 
 ## Sub-agent Dispatch
 
@@ -412,6 +471,8 @@ Before recording any information, find the correct home first:
 4. **Raw coding gotcha** (trips you up mid-code, no natural docs home)? → One concise line in `MEMORY.md`
 
 <!-- REPO-SPECIFIC: Add your doc routing rules (e.g., "For topic-to-file routing, see docs/00_index.md") -->
+<!-- REPO-SPECIFIC (agent-infra): doc routing — this repo has no docs index. -->
+**Fleet session liveness** (the five states, the identity ordering, the abstention doctrine): see `docs/ops/fleet-liveness.md`.
 
 ### Entity Annotation
 

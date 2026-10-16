@@ -142,7 +142,12 @@ if $EXECUTE; then
       echo "⏭️  $WT removal refused by git (check it) — branch $BN kept"
     fi
   done
-  git worktree prune 2>/dev/null || true
+  # No blanket `git worktree prune` here: it deregisters EVERY record whose
+  # directory is not stat-able at that instant (unmounted volume, permission
+  # blip, stale mount), so it can destroy an unrelated sibling checkout while its
+  # files stay on disk (#1141). Each `git worktree remove` above already dropped
+  # its own record; already-prunable records are reclaimed by
+  # scripts/pi-reap-worktrees.sh, whose prune is named-repo and gated.
 else
   echo ""
   echo "dry-run — nothing removed. Re-run with --execute to remove the listed"

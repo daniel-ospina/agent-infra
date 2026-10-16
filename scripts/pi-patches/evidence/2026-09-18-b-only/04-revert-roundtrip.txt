@@ -1,0 +1,51 @@
+### VERIFY 4 — revert restores the tree; --check goes RED again
+
+### apply.sh --revert
+✅ reverted 3 file(s) from /Users/danielospina/.pi/agent/state/pi-patches/backup-0.85.1-5a8d4f6f
+   ⚠ the clamp death fix is now ABSENT — re-apply before running long sessions.
+revert EXIT=0
+
+### apply.sh --check after revert (must be RED, exit 1)
+pi-patches check — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /Users/danielospina/.local/share/pi-node/node-v22.23.2-darwin-arm64/lib/node_modules/@earendil-works/pi-coding-agent
+  - b1-clamp-floor-esm — NOT applied
+  - b2-clamp-floor-bundle-http — NOT applied
+  - b3-clamp-floor-bundle-bedrock — NOT applied
+❌ NOT APPLIED — the fix is not in effect:
+   - b1-clamp-floor-esm: missing "const MIN_USABLE_MAX_TOKENS = 1024;" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b1-clamp-floor-esm: missing "if (available < MIN_USABLE_MAX_TOKENS)" in node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+   - b2-clamp-floor-bundle-http: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b2-clamp-floor-bundle-http: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/chunk-AXIIZGTV.js
+   - b3-clamp-floor-bundle-bedrock: missing "MIN_USABLE_MAX_TOKENS=1024" in dist/bundle/chunks/bedrock-converse-stream.js
+   - b3-clamp-floor-bundle-bedrock: missing "available<MIN_USABLE_MAX_TOKENS?" in dist/bundle/chunks/bedrock-converse-stream.js
+   - bundled runtime: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - bundled runtime: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - bundled runtime: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - bundled runtime: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+   - pi-ai ESM: available=0 maxTokens=8000 → 1, expected 1024 (no budget left -> must NOT be 1)
+   - pi-ai ESM: available=-50000 maxTokens=8000 → 1, expected 1024 (estimate overran the window -> must NOT be 1)
+   - pi-ai ESM: available=1023 maxTokens=100000 → 1023, expected 1024 (just below the floor)
+   - pi-ai ESM: available=0 maxTokens=100 → 1, expected 100 (caller cap below the floor is honoured)
+
+check EXIT=1
+
+### diff -r: installed PI_ROOT vs a pristine 0.85.1 master (/tmp/pi-pristine-master)
+### content differences in files present in BOTH trees:
+  (none — every file present in both trees is byte-identical)
+  (the 95 'Only in' lines are docs/examples/node_modules absent from the partial pristine copy, not edits)
+
+### per-file identity, every file the patch set has ever touched, vs the pristine master:
+  IDENTICAL  dist/core/agent-session.js
+  IDENTICAL  dist/core/agent-session.d.ts
+  IDENTICAL  dist/bundle/chunks/chunk-JVUZSMYM.js
+  IDENTICAL  dist/bundle/chunks/chunk-AXIIZGTV.js
+  IDENTICAL  dist/bundle/chunks/bedrock-converse-stream.js
+  IDENTICAL  node_modules/@earendil-works/pi-ai/dist/api/simple-options.js
+
+### per-file identity vs the PRE-PATCH backups (the files original apply.sh copied before writing):
+  IDENTICAL  dist/core/agent-session.js
+  IDENTICAL  dist/bundle/chunks/chunk-JVUZSMYM.js
+  IDENTICAL  dist/bundle/chunks/chunk-AXIIZGTV.js
+  IDENTICAL  dist/bundle/chunks/bedrock-converse-stream.js
+  IDENTICAL  node_modules/@earendil-works/pi-ai/dist/api/simple-options.js

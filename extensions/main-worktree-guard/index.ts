@@ -155,6 +155,13 @@ let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) =
 // default null → the inline realpath-first fallback runs; never null-holes the
 // exemption (a stale module must not silently disable it) and never throws.
 let _frameworkRootFromModuleUrl: ((moduleUrl: string) => string) | null = null;
+// #1139 (review cycle-2 P1): the pipe-seed walk's tokenizer. Fail-safe default
+// is the previous whitespace split (a stale module without `wtShellWords` keeps
+// today's quote-blind behaviour rather than seeding nothing at all — fewer seeds
+// would be the fail-OPEN direction); the same commit ships both halves, and
+// test.mjs pins the export so the skew fails a test instead of silently
+// reverting.
+let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
@@ -297,6 +304,9 @@ try {
   // frameworkRootFromModuleUrl). Namespace read + typeof guard, same skew
   // contract as #709/#627 above — a stale module leaves the inline fallback.
   if (typeof _m5.frameworkRootFromModuleUrl === "function") _frameworkRootFromModuleUrl = _m5.frameworkRootFromModuleUrl;
+  // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
+  // contract as above).
+  if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
   // #967/#1484: the invocation's positional args feed the subcommand
   // reachability filter. Stale-module skew guard: a missing export leaves the
   // fail-safe default ([] → no reachability proof → the whole script gates).
@@ -1259,9 +1269,12 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
 // instead: a discard-family command is blocked when the checkout it targets is
 // carrying uncommitted state the discard would destroy — in the hub AND in a
 // linked worktree. Read-only commands, clean targets, untracked-only dirt and
-// index-only restores stay allow. Placed AFTER the env/marker hatch return, so
-// both hatches bypass it unchanged (task children are unhatched by #617/#623,
-// which is why this is the enforcement surface for them).
+// index-only restores stay allow, and so do the framework's OWN sanctioned
+// scripts (#1139 — SANCTIONED_SCRIPT_RELPATHS, the set-scoped exemption in the
+// script walk below; a non-sanctioned script's discards stay gated). Placed
+// AFTER the env/marker hatch return, so both hatches bypass it unchanged (task
+// children are unhatched by #617/#623, which is why this is the enforcement
+// surface for them).
 
 /** Bounded porcelain probe for a discard's target checkout.
  *  @returns true = would destroy uncommitted work; false = nothing to destroy;
@@ -1272,16 +1285,68 @@ function _discardStatusPorcelain(probeCwd: string, d: { scope: string; pathspecs
     if (d.scope === "paths" && d.pathspecs.length > 0) args.push("--", ...d.pathspecs);
     // execFileSync (array args, no shell): pathspecs are DATA — a path
     // containing shell metacharacters can never become a command.
+    //
+    // #1139 (review P1): stderr is PIPED, not ignored. With a terminal `ignore`
+    // Node leaves `error.stderr` null and `error.message` is only
+    // `Command failed: git status …`, so the not-a-checkout test below could
+    // NEVER match and the documented fail-open carve-out was DEAD CODE — a
+    // discard whose resolved target is not a checkout was always blocked with
+    // `null` (and, before #1139, with a message claiming the checkout was
+    // dirty). Capturing stderr is what makes the branch reachable.
     const out = execFileSync("git", args, {
-      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"],
     });
     return discardDestroysWip(String(out), d);
   } catch (e) {
     const msg = String((e as { stderr?: unknown })?.stderr ?? "") + String((e as { message?: string })?.message ?? e);
-    // Not a checkout (or a bare repo): there is no working tree to destroy.
+    // Not a checkout (or a bare repo): there is no working tree to destroy, so
+    // this is the probe's one ALLOW arm. Everything else — an unreadable status
+    // on a REAL checkout (index.lock contention, permissions, the 5s timeout) —
+    // is `null` and fails closed at the caller.
     if (/not a git repository|must be run in a work tree|does not have a working tree/i.test(msg)) return false;
     return null; // unverifiable → fail closed
   }
+}
+
+/** Characters a backslash escapes INSIDE double quotes (POSIX: `$`, `` ` ``, `"`, `\`, newline).
+ *  Outside quotes and inside them the rule differs, which is what
+ *  `_dequoteShellWord` and the shared `wtShellWords` tokenizer must agree on. */
+const _DQ_ESCAPABLE = new Set(["\"", "$", "`", "\\", "\n"]);
+
+/**
+ * Strip ONE shell word's quoting/escaping, the way the shell does (#1139,
+ * review cycle-3 P1). `wtShellWords` returns words with their quotes and
+ * escapes still in place; resolving a file path from one therefore needs a
+ * faithful unquote, not a blanket character strip.
+ *
+ * HISTORY — the first two attempts were both wrong, in opposite directions.
+ * A whitespace split with the quotes LEFT ON never resolved `"undo.sh"`
+ * (fail-OPEN: a discard in a quoted piped script ran ungated). Replacing every
+ * `["']` and every backslash anywhere in the token then mis-read the cases
+ * where those characters are LITERAL: `'a\b.sh'` is one file named `a\b.sh`,
+ * but the blanket strip produced `ab.sh` — a seed for a file the shell never
+ * reads, and (worse than the residual it left) a REGRESSION against the
+ * parent commit, where `a\b.sh` had been seeded correctly. The rules below are
+ * the shell's: single quotes are literal until closed, a backslash escapes
+ * anything outside quotes, and inside double quotes only `$`, `` ` ``, `"`,
+ * `\` and newline.
+ */
+function _dequoteShellWord(raw: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === "'") { if (c === "'") quote = null; else out += c; continue; }
+    if (quote === "\"") {
+      if (c === "\"") { quote = null; continue; }
+      if (c === "\\" && _DQ_ESCAPABLE.has(raw[i + 1] ?? "")) { out += raw[i + 1]; i++; continue; }
+      out += c; continue;
+    }
+    if (c === "'" || c === "\"") { quote = c; continue; }
+    if (c === "\\") { out += raw[i + 1] ?? ""; i++; continue; }
+    out += c;
+  }
+  return out;
 }
 
 /** Shared block reason for M5. */
@@ -1291,23 +1356,88 @@ function _worktreeDiscardBlockReason(
   unverifiable: string | null,
 ): string {
   const target = d.pathspecs.length > 0 ? d.pathspecs.slice(0, 5).join(", ") : "(the whole working tree)";
+  // #1139 — the two arms must not read alike, and the fail-closed arm must not
+  // name a cause it did not establish. The old single wording asserted "This
+  // checkout carries uncommitted changes to tracked files that this command
+  // would revert" in BOTH arms, which on a provably clean checkout
+  // (`git status --porcelain` empty) sent the reader hunting a phantom dirty
+  // tree — and printed the AGENT_ALLOW_MAIN_EDITS=1 bypass hatch as the remedy
+  // for a discard the guard never located.
+  //
+  // The fail-closed arm is reached with NINE different reasons, and only two of
+  // them are target-resolution failures (`the target pathspec …`, `the
+  // invocation's effective repo …`). The rest are payload/script/status
+  // failures (script-indirection, piped-shell-payload, eval-payload, the three
+  // interpreter `-c` arms, and `the target checkout's status could not be read`
+  // — where the target WAS resolved and only the probe failed). So the arm's
+  // headline and remedy stay CAUSE-NEUTRAL and defer the specifics to the
+  // `⚠️ ${unverifiable}` line above them (review fold-in: a header naming
+  // "target not statically resolvable" for every one of the nine is the same
+  // misattribution class this function exists to remove).
+  // #1139: the remedy must be a REAL file — in the geometry where the guard is
+  // loaded from a checkout with no `scripts/` (the T6 fixture), `_frameworkRoot`
+  // is non-null but the path does not exist, and printing it would hand the
+  // reader a command that cannot run (review cycle-2 P2).
+  let sanctionedHelper: string | null = null;
+  if (_frameworkRoot) {
+    const p = resolve(_frameworkRoot, "scripts/checkout-hygiene/hub-worktree.sh");
+    try { if (existsSync(p)) sanctionedHelper = p; } catch { sanctionedHelper = null; }
+  }
   return [
-    `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
+    unverifiable !== null
+      ? `⛔ Working-tree discard blocked — the discard's effect could not be verified, failing closed (#709).`
+      : `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
     `   Form: ${d.form}   Target: ${target}`,
     `   Checkout: ${probeCwd}`,
-    ...(unverifiable ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
+    ...(unverifiable !== null ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
     `   The guard gates the EFFECT, not the verb: \`git checkout -- <path>\``,
     `   classifies as a plain path restore, so it used to run ungated in a`,
     `   linked worktree (where pi -p mutation-test fixers run) and in a CLEAN`,
-    `   hub — the 2026-09-10 leaked-mutant path. This checkout carries`,
-    `   uncommitted changes to tracked files that this command would revert.`,
-    `   → Probe a mutation on a COPY, never in place (#664):`,
-    `       cp <file> /tmp/probe-<file>   # mutate + test the copy, then rm it`,
-    `       # or: git worktree add /tmp/probe <ref>, test inside it`,
-    `   → Inspect first: git status --porcelain; git diff <path>.`,
-    `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
-    `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
-    `     marker — both bypass this gate unchanged.`,
+    `   hub — the 2026-09-10 leaked-mutant path.`,
+    ...(unverifiable !== null
+      ? [
+          `   ⚠️ This block is NOT a claim that the checkout is dirty: the guard`,
+          `   could not verify what this command would discard (see the reason`,
+          `   line above), so it never compared it against real uncommitted work.`,
+          `   Check first:`,
+          `       git status --porcelain`,
+          `   → Resolve what the guard could not — the reason line above names`,
+          `     which of these it is: a literal path / literal \`cd\` (no \`$VAR\` or`,
+          `     placeholder), a target whose status you can read, or a script`,
+          `     whose discards are statically visible.`,
+          `   → The sanctioned recovery surface, if that is what you wanted —`,
+          `     address the FRAMEWORK CHECKOUT's own copy, because a`,
+          `     worktree-local copy of it is gated by design (#1139):`,
+          ...(sanctionedHelper
+            ? [`       bash "${sanctionedHelper}" <branch>`]
+            : [`       bash <framework-checkout>/scripts/checkout-hygiene/hub-worktree.sh <branch>`]),
+          `   → This arm fails closed because the EFFECT was unverifiable, not`,
+          `     because uncommitted work was found, so AGENT_ALLOW_MAIN_EDITS=1 is`,
+          `     not its remedy: the hatch suppresses the whole gate instead of`,
+          `     resolving the reason.`,
+        ]
+      : [
+          `   This checkout carries uncommitted changes to tracked files that`,
+          `   this command would revert (\`git status --porcelain\` was read for`,
+          `   this scope).`,
+          `   → Probe a mutation on a COPY, never in place (#664):`,
+          `       D=$(git rev-parse --show-toplevel)/.worktrees/scratch-$$`,
+          `       git worktree add --detach "$D" <ref>; ( cd "$D" && <cmd> )`,
+          `       rm -rf "$D"                        # TREE first, then the record:`,
+          `       git worktree remove --force "$D"   # this drops the record even when it`,
+          `       # FAILS to delete the dir, so the reverse order hides a survivor.`,
+          `       # Remove THAT record too if needed — a bare \`git worktree prune\``,
+          `       # deregisters every worktree whose dir is not stat-able right now,`,
+          `       # unrelated siblings included (#1141).`,
+          `     A worktree shares the object store. NEVER \`git clone\` / \`cp -R\` /`,
+          `     \`rsync\` the repo into /tmp: the copy outlives its owner and costs`,
+          `     ~2.4M files of I/O per cycle (#1141). Where it exists, prefer`,
+          `     \`scripts/scratch-worktree.sh run ...\` — it removes the worktree itself.`,
+          `   → Inspect first: git status --porcelain; git diff <path>.`,
+          `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+          `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
+          `     marker — both bypass this gate unchanged.`,
+        ]),
   ].join("\n");
 }
 
@@ -1401,10 +1531,24 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
-  // A script path that is not statically resolvable (`bash $S`, `cat x.sh |
-  // sh`) cannot be read and walked — fail closed (reviewer round-5 P1).
+  // An unresolvable script path (`bash $S`, `cat x.sh | sh`) is refused
+  // unconditionally: the discard target is unknown, and an unreadable script may
+  // discard uncommitted work in ANY checkout, so it cannot be assumed safe
+  // (#709). The reason below names only what was measured — the shared helper
+  // already renders "NOT a claim that the checkout is dirty" (#1139/PR #1152),
+  // so this arm must never name a state it did not observe. What this change
+  // touches is the MESSAGE only; the arm already failed closed.
   if (_scriptPath && /[$`]/.test(_scriptPath)) {
-    return _worktreeDiscardBlockReason({ form: "script-indirection", scope: "all", pathspecs: [] }, execCwd, "the script path is not statically resolvable");
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      // WHAT was measured (the path's text), WHAT it costs (an unreadable script
+      // may discard anywhere), and the edit that makes it verifiable.
+      "the script path contains a $ or a backtick, so it is not statically " +
+        "resolvable — the shell may expand it at runtime, and an unreadable script may " +
+        "discard uncommitted work in ANY checkout; pass the path literally (e.g. " +
+        "`bash ./tools/your-script.sh`) so its contents can be read and verified",
+    );
   }
 
   // Probe sets: the command itself, plus any script FILES it runs/sources
@@ -1434,7 +1578,23 @@ function _worktreeDiscardBlock(command: string): string | null {
     const pipeSeg = String(command).split("|");
     const execPlaceholder = /(?:^|\s)(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]+\s+)?\{/.test(String(command));
     if (pipeSeg.length > 1 && pipesToShell) {
-      for (const tok of String(pipeSeg.slice(0, -1).join("|")).split(/\s+/)) {
+      // #1139 (review cycle-1 P1, T4-pipe): the whitespace split kept the SHELL
+      // QUOTES, so `cat "undo.sh" | bash` resolved `'"undo.sh"'`, realpathSync
+      // threw, the file was never read — and a discard inside it ran UNGATED,
+      // while the identical unquoted spelling was walked.
+      //
+      // FIXED WITH THE SHARED, QUOTE-AWARE TOKENIZER (review cycle-2 P1). The
+      // first attempt dequoted the whole segment then split on whitespace, which
+      // does NOT reconstruct shell words: it INVENTED a seed for unquoted input
+      // (`cat a b | bash` seeded `a`, `b` AND the non-existent `a b`) and
+      // over-split a quoted one (`cat "a b" | bash` seeded `a` and `b`), so a
+      // file that the shell NEVER reads could pin a false block. `wtShellWords`
+      // returns exactly one token per shell word; each token is then dequoted
+      // per-token (quotes + backslash escapes), and NOTHING is re-joined — so
+      // every seed is a string the shell itself would read as one word, and
+      // `cat -n "a b.sh" | bash` still resolves `a b.sh`.
+      for (const raw of wtShellWords(String(pipeSeg.slice(0, -1).join("|")))) {
+        const tok = _dequoteShellWord(raw);
         if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
         try {
           const real = realpathSync(resolve(execCwd, tok));
@@ -1593,9 +1753,95 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
-  if (sets.every((s) => s.discs.length === 0)) return null;
+  // #1139 — M5's own sanctioned-script exemption, the M5 twin of #1129's M4
+  // exemption (`_backdoorBlock`). SAME list, SAME anchor: `SANCTIONED_SCRIPT_RELPATHS`
+  // resolved under the running guard's OWN checkout, realpath-keyed on both
+  // sides. Without it M4 and M5 disagree about the framework's recovery
+  // helper — M4 exempts `hub-worktree.sh` while M5 blocks it anyway, which is
+  // what made the file's own comment ("Recovery scripts … keep working")
+  // false.
+  //
+  // The reported block: the salvage path reverts the hub's tracked dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`. The pure extractor can only
+  // surface that as a `cat-file-revert` HINT whose pathspec is the SHELL LOOP
+  // VARIABLE `$rest`, and the unresolvable-pathspec rule below then fails
+  // closed — on a provably clean checkout, for a script whose every discard is
+  // preceded by its own capture+push (and which refuses to clean the hub when
+  // that push fails).
+  //
+  // SCOPE — the SET is dropped, never the command: `sets[0]` (the command's own
+  // argv) always carries `script: null` and is always gated, and a script
+  // reached through a second hop keeps its OWN set, so `bash /tmp/wrapper.sh`
+  // that sources the sanctioned file is still gated on everything the wrapper
+  // itself says. SAFETY — this is why a path-keyed exemption is safe HERE: a
+  // set's `script` is always the file the set's discards were READ from (the
+  // seed walk stores `realpathSync(resolve(execCwd, p))`'s content with `p`;
+  // every other push site reads the file it stores), so the exemption can only
+  // ever drop discards that came from the sanctioned file's OWN bytes. Naming
+  // the sanctioned path from elsewhere buys nothing — the content is still
+  // that file's, and a wrapper's own discards stay in the wrapper's set.
+  // KEYING — a copy at the same relpath in another checkout is NOT
+  // exempt (the anchor is the guard's own checkout, not a repo fingerprint and
+  // not the invoking cwd); the hub's own `scripts/` spelling still matches when
+  // a session addresses it through a symlink, because both sides are realpath'd.
+  // A wrong anchor here is fail-OPEN on other sessions' uncommitted work, which
+  // is why this reuses the hardened #1129 helper instead of re-deriving one.
+  //
+  // AUDIT — one row per command, emitted only when a set was ACTUALLY dropped,
+  // aggregating BY REALPATH and recording HOW MANY discards the relaxation hid.
+  // A row that said only "an exemption fired" cannot answer "did this exemption
+  // suppress a block?" (review fold-in); a row written from inside the filter
+  // predicate fires even when nothing was dropped; and summing raw push-sites
+  // double-counts, because the same sanctioned file can be pushed as TWO sets in
+  // one command (the bounded walk's `seen` set is local to the walk; the inline
+  // `-c` / `$( )` push sites never consult it), which reported 2 / 2 for
+  // `bash <s>; bash -c 'source <s>'` (review cycle-2 P2).
+  const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
+  const gatedSets = sets.filter((s) => {
+    if (s.script === null) return true; // the command's own argv is never exempt
+    let rel: string | null = null;
+    // Fail closed on a probe failure: keep the set gated.
+    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
+    if (rel === null) return true;
+    let real = resolve(execCwd, s.script);
+    try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
+    const prev = exempted.get(real);
+    if (prev) {
+      // The same realpath always yields the same discard list (the content is
+      // read from that file), so repeated push sites must NOT add up: `max`
+      // keeps `discards_dropped` consistent with `sets_exempted` — a row saying
+      // 1 set hid 2 discards misstates the suppression it exists to report
+      // (review cycle-3 P2).
+      prev.discards = Math.max(prev.discards, s.discs.length);
+      for (const d of s.discs) prev.forms.add(d.form);
+    } else {
+      exempted.set(real, { rel, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });
+    }
+    return false;
+  });
+  if (exempted.size > 0) {
+    const rows = [...exempted.entries()];
+    try {
+      appendJsonl({
+        event: "m5_script_exemption",
+        extension: "main-worktree-guard",
+        script: rows[0][1].rel,
+        script_realpath: rows[0][0],
+        scripts: rows.map(([, v]) => v.rel),
+        sets_exempted: rows.length,
+        discards_dropped: rows.reduce((n, [, v]) => n + v.discards, 0),
+        discard_forms: [...new Set(rows.flatMap(([, v]) => [...v.forms]))],
+        framework_root: _frameworkRoot,
+        session_cwd: sessionCwd,
+        command: command.slice(0, 300),
+        session_id: _currentSessionId(),
+      });
+    } catch { /* audit is best-effort — never blocks */ }
+  }
 
-  for (const set of sets) {
+  if (gatedSets.every((s) => s.discs.length === 0)) return null;
+
+  for (const set of gatedSets) {
     // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
     // bash WRITE targets (pure string walk) to find where the content lands.
     let writeTargets: string[] = [];
@@ -1728,6 +1974,33 @@ const SANCTIONED_SCRIPT_RELPATHS = [
   "scripts/check-pipeline-compliance.sh",
   // The recovery helper most guard messages recommend.
   "scripts/checkout-hygiene/hub-worktree.sh",
+  // #1141 — the mandated scratch-checkout helper. It is the fix for the
+  // /tmp copy debris, and it is NOT usable from a hub-rooted session without
+  // this exemption: its content carries `git worktree add/remove/prune`,
+  // `sparse-checkout` and `read-tree`, so the content walk blocked exactly the
+  // hub-rooted reviewers the rule is written for — who then fell back to the
+  // improvisation the issue exists to stop (code-review cycle-2 P1, driven
+  // through this module's real handler). Same class as hub-worktree.sh (worktree
+  // create/remove, resolved at runtime), and TIGHTER than it: removal is
+  // confined by `owns()` to a path that is under the scratch root AND carries
+  // the tool's marker AND whose admin gitdir is under the COMMON
+  // .git/worktrees/ AND whose admin dir's own `gitdir` back-link names that
+  // checkout — the last of which is written by git, so it cannot be forged to
+  // deregister a worktree the caller does not control (code-review-cycle-9 P1),
+  // so it cannot be pointed at the hub or another checkout.
+  "scripts/scratch-worktree.sh",
+  // #1484/#1141 class, second instance — the review RECORDER. `record-review.sh` is mandated by the
+  // review/merge path and its git surface is READ-ONLY (`merge-tree` incl. `--write-tree`,
+  // `merge-base`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`, `diff`) — no `checkout`/`reset`/
+  // `clean`/`stash`/`commit`/`push`/`rebase`/`worktree remove`. It is therefore LESS privileged
+  // than the two entries above, which do `worktree add/remove/prune`, `sparse-checkout` and
+  // `read-tree`. Without this entry its content walk blocks exactly the hub-rooted lanes the merge
+  // path is written for, and the only remaining route is the improvisation this guard exists to
+  // stop: measured 2026-10-05, a lane that had completed a review (tortoise #7433, comment
+  // 6000279278) could review but never RECORD, which left a reviewed-but-unlandable PR — and the
+  // same step gates every `blocked` row of the drain, since the rail requires a record bound to the
+  // current head.
+  "scripts/record-review.sh",
 ];
 const _frameworkRoot: string | null = (() => {
   try {
@@ -1974,6 +2247,167 @@ function _rebaseline(pid: number, branch: string) {
   if (baseline && branch) {
     baselines.set(pid, { ...baseline, branch }); // head refreshed lazily (unused in decisions)
   }
+}
+
+// ── #1144: effect-shaped sync allowance ─────────────────────────────────────
+// The allowance's sync arm (pull/merge/rebase) is decided on the operation's
+// EFFECT, never on its verb. Live 2026-09-17: `git rebase origin/main` on the
+// SHARED tortoise hub's `main` moved that branch (rewriting the local tip onto
+// origin/main) under 11 live sessions with NO hatch, while the comparable
+// `git reset --hard origin/main` was refused and demanded
+// AGENT_ALLOW_MAIN_EDITS=1. A verb cannot be enumerated to safety: this
+// enforcement is a string scan, so both its false-positive surface (prose that
+// only DESCRIBES a verb) and its false-negative surface (a spelling it does not
+// enumerate) are functions of TEXT, not of EFFECT. See
+// shared/branch-ownership.mjs → syncEffectAllowed (the predicate) and
+// classify-git.mjs → syncEffectOf (the parsed half).
+const SYNC_ALLOWANCE_KINDS = new Set<string>(["pull", "merge", "rebase"]);
+
+/** Is the checkout at `cwd` free of uncommitted work? Unverifiable (git error,
+ *  no cwd) collapses to false — the sync arm must not fire on a guess. */
+function _checkoutTreeClean(cwd: string | null | undefined): boolean {
+  if (!cwd) return false;
+  try {
+    const porcelain = execSync("git status --porcelain", {
+      encoding: "utf-8", cwd, timeout: 5000,
+    }).trim();
+    return porcelain.length === 0;
+  } catch {
+    return false; // fail closed — never admit a shared-branch move unverified
+  }
+}
+
+/** Assemble the `effect` record the sync arm needs from the LIVE checkout
+ *  preconditions (own repo, clean tree) and the classifier's parsed effect +
+ *  only-git-invocation flag. Returns null when the parsed half is absent so
+ *  the predicate fails closed. */
+function _syncAllowanceEffect(eff: any, baseline: any, det: any) {
+  const parsed = det?.syncEffect ?? null;
+  if (!parsed) return null;
+  const scopeOwnRepo = !!(baseline?.repoKey && eff?.repoKey && baseline.repoKey === eff.repoKey);
+  return {
+    parsedEffect: parsed,
+    onlyGitInvocation: det?.syncOnlyInvocation === true,
+    scopeOwnRepo,
+    treeClean: _checkoutTreeClean(eff?.effectiveCwd ?? eff?.cwd ?? null),
+  };
+}
+
+/** #1144 (reviewer P0): resolve the SYNC invocation's OWN repo. `eff` is
+ *  resolved from the state-mutating / first invocation's hints, so a compound
+ *  whose first segment is `git -C <worktree> …` made `eff.isWorktree` true and
+ *  worktree-exempted a LATER sync op that actually runs at the shell cwd
+ *  (`git -C <wt> status && git rebase origin/main` — the `-C` binds only the
+ *  status; the rebase moves the SHARED hub). Returns null when the sync
+ *  invocation's target cannot be resolved → the predicate fails closed. */
+function _syncEffectiveRepo(det: any) {
+  if (!branchOwnership) return null;
+  try {
+    if (det?.syncInvVisible === false) {
+      // extractor-invisible payload → it runs at the shell cwd (fail closed,
+      // never a worktree exemption the repo layer cannot verify)
+      return branchOwnership.resolveEffectiveRepo("git status", process.cwd());
+    }
+    if (det?.syncHints) return branchOwnership.resolveRepoFromInv(det.syncHints, process.cwd());
+    return null; // no boundary-aware hints for the sync op → unverifiable
+  } catch {
+    return null;
+  }
+}
+
+/** #1144 (cycle-2 reviewer P0) — the LEGACY_BLOCK arm's worktree exemption.
+ *  `eff.isWorktree` is resolved from ONE invocation's hints, so a compound
+ *  command beginning with `git -C <worktree> …` made it true and laundered a
+ *  LATER destructive segment that runs at the shell cwd
+ *  (`git -C <wt> status && git reset --hard origin/main` moved the shared hub).
+ *  Returns:
+ *    true      — EVERY git invocation in the command resolves to a worktree
+ *    false     — at least one does not (or is invisible/unresolvable) → block
+ *    undefined — the classifier emitted no per-invocation data (degraded
+ *                build): the caller keeps its previous behaviour rather than
+ *                hard-blocking every destructive op in a worktree session. */
+function _allInvocationsWorktreeScoped(det: any): boolean | undefined {
+  // #1144 follow-up (P0-3): a hidden shell substitution (`git -C <wt> status
+  // && eval "git reset --hard origin/main"`, `… && "$(git reset --hard
+  // origin/main)"`) EXECUTES a destructive git op that contributes NO
+  // invocation, so `invocationHints` looks complete while the list is not.
+  // "Every git invocation resolves inside a worktree" is then unprovable — and
+  // the exemption exists precisely to skip the destructive block — so fail
+  // closed. (The visible twin and the `sh -c` twin already block because their
+  // second invocation IS in the list.) Checked BEFORE the empty-list degrade:
+  // a zero-visible-invocation compound hiding its git still must not inherit
+  // `eff.isWorktree`.
+  if (det?.hiddenStateSubst === true) return false;
+  const invs = det?.invocationHints;
+  if (!Array.isArray(invs) || invs.length === 0) return undefined;
+  if (!branchOwnership) return undefined;
+  for (const inv of invs) {
+    if (inv?.visible === false) return false; // shell cwd, unverifiable → fail closed
+    try {
+      const r = inv?.hints ? branchOwnership.resolveRepoFromInv(inv.hints, process.cwd()) : null;
+      if (!r || r.isWorktree !== true) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** The sync arm's refusal. It states WHY, and — per #1144 — names the
+ *  fast-forward forms whose effect IS safe, instead of pointing only at the
+ *  human hatch: the asymmetry (hatch-required via one verb, hatch-free via
+ *  another) is what made the verb-shaped allowance read as a defect. */
+function _syncAllowanceBlockReason(kind: string, baseline: any, eff: any, det: any, effect: any): string {
+  const parsed = det?.syncEffect ?? null;
+  const branch = baseline?.branch ? `"${baseline.branch}"` : "(no session baseline recorded)";
+  const why: string[] = [];
+  if (!baseline) {
+    why.push("   No baseline was recorded for this checkout, so ownership of the");
+    why.push("   branch cannot be established — the allowance fails closed.");
+  } else if (eff?.currentBranch !== baseline.branch) {
+    why.push(`   This checkout is on "${eff?.currentBranch ?? "HEAD"}", not this session's`);
+    why.push(`   baseline ${branch} — the allowance only ever covers the session's OWN branch.`);
+  } else if (parsed?.rebaseEffect === true) {
+    why.push("   A rebase-integration REPLACES the baseline tip instead of advancing it —");
+    why.push("   that is the same branch move as the `reset`/`clean` this gate refuses.");
+  } else if (parsed?.ffOnly !== true) {
+    why.push("   Only a PROVABLE fast-forward is admitted. This form may resolve to a");
+    why.push("   rebase (git config pull.rebase / branch.<name>.rebase) or mint a merge");
+    why.push("   commit on the shared branch, so it fails closed.");
+  }
+  if (parsed?.unverifiable === true) {
+    why.push("   The flag cannot be PROVEN to be an option here: a `--` terminator makes");
+    why.push("   it a path/ref name, an unresolvable expansion is resolved by the shell");
+    why.push("   AFTER this check, and an option shape outside the known flag sets can");
+    why.push("   silently swallow or free an ff token — either way the effective");
+    why.push("   fast-forward flag is unknown.");
+  }
+  if (parsed?.leavesDirty === true) {
+    why.push("   It also leaves staged/index state in the shared tree (--squash/--no-commit).");
+  }
+  if (effect && effect.onlyGitInvocation !== true) {
+    why.push("   The command contains other git operations, so the fast-forward evidence");
+    why.push("   cannot cover what else it may do to the branch. → Run the sync on its own.");
+  }
+  if (effect && effect.scopeOwnRepo !== true) {
+    why.push("   It targets a DIFFERENT repository than the one this session's baseline was");
+    why.push("   recorded in.");
+  }
+  if (effect && effect.treeClean !== true) {
+    why.push("   This checkout has uncommitted changes — nothing may move the branch now.");
+  }
+  return [
+    `⛔ ${kind} blocked in the shared MAIN checkout — the fast-forward-only allowance does not cover it (#1144).`,
+    `   Branch: ${branch} (this session's baseline, in a checkout SHARED between agents).`,
+    ...why,
+    "   → Permitted without a hatch: `git pull --ff-only` / `git merge --ff-only`",
+    "     (a fast-forward cannot move the tip backwards or rewrite a commit).",
+    "   → Work in an isolated worktree: invoke the using-git-worktrees skill.",
+    "   → Or stamp the ~/.pi/agent/.allow-main-edits marker (15-min TTL) —",
+    "     reachable from an ALREADY-RUNNING session — or set",
+    "     AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) for deliberate",
+    "     solo sessions.",
+  ].join("\n");
 }
 
 // ── M1: warn on branch deviation (every tool_call, all tool types) ────────
@@ -2448,6 +2882,29 @@ export default function (pi: ExtensionAPI) {
       }
       const allowActive = _isAllowMainEdits();
 
+      // #1144 (cycle-3 reviewer F3): a branch-state op's re-baseline is an
+      // EFFECT of the command RUNNING, so it may only be APPLIED when the
+      // command is actually admitted. Pre-fix, `_rebaseline` ran as soon as
+      // `decideM3` sanctioned the carve-out — before the later gates had
+      // decided — so a REFUSED compound (`git checkout main && git reset
+      // --hard origin/main`, `… && git rebase origin/main`) still moved
+      // `baselines[pid].branch` to the branch the refused checkout never
+      // selected. Every later M1/M2/M3 decision keys on that field, so the
+      // guard's own state named a branch the session is not on (a
+      // stale-baseline false block, and a misleading `baseline "x" → current
+      // …` M1 warning). The pending closure is applied exactly once, at the
+      // admission returns below — the carve-out's own early return, or any
+      // later gate that allows.
+      let pendingRebaseline: (() => void) | null = null;
+      const admitAfterM3 = (): undefined => {
+        if (pendingRebaseline) {
+          const apply = pendingRebaseline;
+          pendingRebaseline = null;
+          apply();
+        }
+        return undefined;
+      };
+
       // M3: branch-state gate — applies in ANY main checkout (resolved,
       // target-aware). Worktree-effective commands are exempt (cycle-4
       // verified: -C <wt> --git-dir=<main>/.git checkout operates on MAIN →
@@ -2546,20 +3003,50 @@ export default function (pi: ExtensionAPI) {
           });
           if (m3?.block) return { block: true, reason: m3.reason };
           if (m3?.reBaseline) {
-            // Synchronous re-baseline: the own-baseline RENAME (create-new
-            // never re-baselines since #626 — in-hub create-new is blocked)
-            // adopts the new branch NOW — the next tool_call emits ZERO M1
-            // warns (AC3). Record the renamed-to branch — scoped to the
-            // BASELINE repo — so its post-ceremony LOCAL delete is still
-            // allowed after the #376 return re-baselines to the original
-            // (#376 review fold-in).
-            if (branchOp.op === "rename" && branchOp.to) {
-              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+            // The re-baseline records the branch this sanctioned state op moves
+            // the session to — the own-baseline RENAME (create-new never
+            // re-baselines since #626 — in-hub create-new is blocked) adopts
+            // the new branch NOW — the next tool_call emits ZERO M1 warns
+            // (AC3) — and the renamed-to branch is recorded scoped to the
+            // BASELINE repo, so its post-ceremony LOCAL delete is still allowed
+            // after the #376 return re-baselines to the original (#376 review
+            // fold-in). Both are applied only on ADMISSION (see below).
+            const reBaseline = m3.reBaseline;
+            // #1144 (cycle-3 reviewer F3): the re-baseline and the rename's
+            // owned-branch record are consequences of the command RUNNING, so
+            // they are applied only when a gate actually admits the command —
+            // never here, where the later gates have not decided yet.
+            const applyRebaseline = () => {
+              if (branchOp.op === "rename" && branchOp.to) {
+                if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
+                  _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
+                }
               }
+              _rebaseline(pid, reBaseline);
+            };
+            // #1144 (reviewer P1): the carve-out may only close the WHOLE
+            // command when every other git invocation is read-only. Pre-fix
+            // this `return undefined` laundered a destructive LATER segment in
+            // an agent-infra hub — `git checkout main && git reset --hard
+            // origin/main` (and `… && git rebase origin/main`) ran with the
+            // sanctioned return's blessing. Otherwise fall through to the
+            // remaining gates, which see the command's real verdict.
+            // #1144 (cycle-3 reviewer P0): `stateCarveOutClean` is a claim about
+            // the WHOLE command's invocation list, so the classifier folds
+            // `hiddenStateSubst` into it — a hidden shell payload (`eval "git
+            // reset --hard …"`, `$(…)`, backticks) contributes no invocation and
+            // would otherwise leave the list looking clean. The flag is consulted
+            // at classification time, the same way `syncOnlyInvocation` and
+            // `_allInvocationsWorktreeScoped` consult it.
+            if (det.stateCarveOutClean === true) {
+              applyRebaseline();
+              return undefined;
             }
-            _rebaseline(pid, m3.reBaseline);
-            return undefined;
+            // Not closed by the carve-out — the later gates decide. Defer the
+            // re-baseline until one of them admits: a REFUSED command must not
+            // move the baseline every later M1/M2/M3 decision keys on (#1144
+            // F3). `admitAfterM3()` applies it at each admission return.
+            pendingRebaseline = applyRebaseline;
           }
         }
       }
@@ -2572,7 +3059,7 @@ export default function (pi: ExtensionAPI) {
       // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
 
-      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return undefined;
+      if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return admitAfterM3();
 
       // ── Ownership allowance (agent-infra main, own baseline branch) ──
       // Predicate split (plan deviation 7): sync ops (pull/rebase/merge) gate on
@@ -2605,12 +3092,22 @@ export default function (pi: ExtensionAPI) {
           : ((det.deleteTargets && det.deleteTargets.length > 0)
             ? det.deleteTargets
             : (det.newBranch ? [det.newBranch] : []));
+        // #1144: sync ops are admitted on their EFFECT, never their verb. The
+        // record is built from the classifier's parsed effect of THIS
+        // invocation plus the LIVE checkout preconditions OF THE SYNC OP'S OWN
+        // REPO (syncEff — never the command-level `eff`, whose hints may come
+        // from a different, worktree-scoped segment). A sync kind with no
+        // record fails closed (see syncEffectAllowed).
+        const isSyncKind = SYNC_ALLOWANCE_KINDS.has(allowanceKind);
+        const syncEff = isSyncKind ? _syncEffectiveRepo(det) : null;
+        const effect = isSyncKind ? _syncAllowanceEffect(syncEff, baseline, det) : undefined;
         if (branchOwnership.ownershipAllowed({
           opKind: allowanceKind,
           currentBranch: eff.currentBranch,
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
+          effect,
           // #376 review fold-in: branches this pid renamed its own baseline
           // to (scoped to THIS repo) stay locally deletable after the ceremony
           // return re-bases the baseline (own-branch hygiene). create-new is
@@ -2638,8 +3135,19 @@ export default function (pi: ExtensionAPI) {
           // Unknown baseline (no way to tell own from foreign) → keep the
           // allowance's base decision exactly as before.
           const foreignDelete = baselineBranch !== null && wcDeletes.some((b) => b !== baselineBranch);
-          if (!foreignDelete) return undefined;
+          if (!foreignDelete) return admitAfterM3();
           // foreign later-segment delete present → fall through to the #73 arms.
+        } else if (isSyncKind && syncEff?.isWorktree !== true) {
+          // #1144: the sync allowance DENIED. Fall to the legacy arm for the
+          // verdict but with the effect-specific refusal. The exemption keys on
+          // the SYNC OP'S OWN resolved repo (reviewer P0): a leading
+          // `git -C <worktree> …` segment must not exempt a later sync op that
+          // runs at the shell cwd (the shared hub). An unresolvable sync target
+          // (`syncEff === null`) is refused — fail closed, never exempt.
+          return {
+            block: true,
+            reason: _syncAllowanceBlockReason(allowanceKind, baseline, syncEff ?? eff, det, effect),
+          };
         }
       }
 
@@ -2657,7 +3165,7 @@ export default function (pi: ExtensionAPI) {
       if (det.verdict === "block:push-delete" && det.pushTargets.length > 0) {
         const blocked = _coordinatedDeleteBlock(det.pushTargets);
         if (blocked) return blocked;
-        return undefined; // foreign deletes with no checked-out targets — allowed (today's behavior)
+        return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
         const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
@@ -2727,7 +3235,7 @@ export default function (pi: ExtensionAPI) {
           }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
-        return undefined; // on-baseline or unverifiable-but-exempt
+        return admitAfterM3(); // on-baseline or unverifiable-but-exempt
       }
 
       // ── Legacy destructive blocks (main checkout only) ──
@@ -2738,7 +3246,13 @@ export default function (pi: ExtensionAPI) {
         "block:force-push",
       ];
       if (LEGACY_BLOCK.includes(det.verdict)) {
-        if (eff && eff.isWorktree) return undefined;
+        // #1144 cycle-2 P0: the exemption must hold for EVERY git invocation in
+        // the command, not just the one `eff` was resolved from — otherwise a
+        // leading `git -C <worktree> …` segment launders a destructive segment
+        // that actually runs at the shell cwd (`git -C <wt> status && git reset
+        // --hard origin/main`). `undefined` (no per-invocation data) keeps the
+        // previous single-invocation behaviour.
+        if (eff && eff.isWorktree && _allInvocationsWorktreeScoped(det) !== false) return admitAfterM3();
         const kind = det.verdict.slice("block:".length);
         return {
           block: true,
@@ -2748,7 +3262,7 @@ export default function (pi: ExtensionAPI) {
           ].join("\n"),
         };
       }
-      return undefined;
+      return admitAfterM3();
     }
 
     // ── write/edit: TARGET-aware hub-main gate (#618/#621) ──

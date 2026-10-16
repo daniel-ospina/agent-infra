@@ -305,6 +305,204 @@ export function skimGitGlobalFlags(command) {
 
 function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
 
+/**
+ * #1144 — the EFFECT of a sync invocation (merge/pull/rebase), not its verb.
+ *
+ * The shared-checkout ownership allowance used to admit a sync op on the VERB
+ * alone whenever the session sat on its own baseline branch. Live 2026-09-17:
+ * `git rebase origin/main` on the SHARED tortoise hub's `main` moved that
+ * branch (rewriting the local tip onto origin/main) under 11 live `pi`
+ * sessions with NO hatch — while the comparable `git reset --hard origin/main`
+ * was refused and demanded AGENT_ALLOW_MAIN_EDITS=1. A verb-shaped rule cannot
+ * be repaired by enumerating more verbs: this enforcement is a string scan, so
+ * both its false-positive surface (prose that only DESCRIBES a verb) and its
+ * false-negative surface (a spelling it does not enumerate) are functions of
+ * TEXT, not of EFFECT.
+ *
+ * This record answers the effect questions index.ts combines with the LIVE
+ * checkout preconditions (`branch-ownership.mjs` → `syncEffectAllowed`):
+ *
+ *   ffOnly      — the invocation carries a PROVABLE fast-forward guarantee
+ *                 (`--ff-only`), the only sync effect that cannot move the
+ *                 baseline tip backwards or rewrite a commit.
+ *   rebaseEffect— the invocation can REPLACE the tip instead of advancing it:
+ *                 `rebase` itself, or a rebase mode reached through another
+ *                 verb (`pull --rebase` / `-r`) or through git config
+ *                 (`pull.rebase` — see the caller's fail-closed rule for the
+ *                 bare spellings, which cannot be proven fast-forward here).
+ *   leavesDirty — `--squash` / `--no-commit`: the op leaves staged/index state
+ *                 in the shared tree instead of leaving it clean.
+ *   unverifiable— true when a lexical ff proof is impossible and the op must
+ *                 therefore FAIL CLOSED: a `--` pathspec/ref terminator (`git
+ *                 merge -- --ff-only` merges a REF NAMED --ff-only) or an
+ *                 unresolvable shell expansion (`git pull --ff-only $(echo
+ *                 --no-ff)` is a NON-fast-forward merge at execution time,
+ *                 because the shell resolves the token after this read).
+ *
+ * OPTION-VALUE SLOTS matter as much as LAST-WINS: a token consumed as another
+ * option's VALUE is not an option. `git merge -m --ff-only origin/main` sets
+ * the merge MESSAGE to "--ff-only" and performs a NON-fast-forward merge
+ * (probe-verified: rc 0, 2-parent merge commit) — a presence-only check admits
+ * exactly that spelling. The same slot model the push path uses
+ * (`_markOptionValueSlots`) is applied here for the sync verbs.
+ *
+ * LAST-WINS matters: git's parse-options applies the LAST member of the
+ * ff-family (`--ff`, `--no-ff`, `--ff-only`), so `git merge --ff-only --no-ff`
+ * is a MERGE COMMIT and must NOT read as fast-forward (a presence-only check
+ * would admit exactly that spelling). Unambiguous long-option abbreviations
+ * are accepted in the SAFE direction only (`--ff-o`, `--ff-on`, `--ff-onl` =
+ * `--ff-only`; `--no-f` = `--no-ff`).
+ *
+ * @param {string} verb — "merge" | "pull" | "rebase" (the sync invocation)
+ * @param {string[]} args — that invocation's argv (verb excluded)
+ * @returns {{verb: string, ffOnly: boolean, rebaseEffect: boolean, leavesDirty: boolean, unverifiable: boolean}}
+ */
+
+/** Long options that are provably BOOLEAN for the sync verbs — safe to ignore
+ *  while proving the fast-forward effect. Deliberately small: the sanctioned
+ *  forms are bare `git pull --ff-only` / `git merge --ff-only`. */
+const SYNC_BOOLEAN_LONGS = new Set([
+  "--quiet", "--verbose", "--progress", "--no-progress", "--edit", "--no-edit",
+  "--stat", "--no-stat", "--summary", "--no-summary", "--commit", "--no-commit",
+  "--squash", "--no-squash", "--autostash", "--no-autostash", "--rebase", "--no-rebase",
+  "--ff", "--no-ff", "--ff-only", "--verify", "--no-verify", "--keep", "--no-keep",
+  "--rerere-autoupdate", "--no-rerere-autoupdate", "--allow-unrelated-histories",
+  "--no-gpg-sign", "--verify-signatures", "--no-verify-signatures",
+]);
+/** Long options that CONSUME the next argv token as their value. Anything
+ *  option-shaped outside this set and outside SYNC_BOOLEAN_LONGS (and the
+ *  ff-family) makes the proof UNVERIFIABLE, so the op fails closed.
+ *
+ *  Why a boolean allowlist rather than a value-option list (cycle-2 reviewer
+ *  P1): a hand-maintained value-option table cannot mirror git's parser, and
+ *  the mismatch runs unsafe. `git merge --mess --ff-only origin/main` — an
+ *  ABBREVIATED `--message` — is not in the table, so the ff token read as a
+ *  flag while real git made it the merge MESSAGE and produced a NON-fast-forward
+ *  merge commit (probe-verified rc 0). `--gpg-sign` is the mirror trap: its
+ *  argument is OPTIONAL and parse-options does NOT consume a `-`-prefixed
+ *  token, so `--gpg-sign --no-ff` left `--no-ff` as a real flag while the table
+ *  swallowed it. Both are closed by refusing every unlisted option shape.
+ *  `--gpg-sign` is therefore deliberately in NEITHER set. */
+const SYNC_VALUE_LONGS = new Set([
+  "--message", "--file", "--strategy", "--strategy-option", "--onto", "--exec",
+  "--cleanup", "--depth", "--upload-pack", "--receive-pack", "--jobs", "--refmap",
+  "--into-name",
+]);
+/** Short options that take an argument. Attached vs separate is decided by
+ *  git's own rule, scanned left-to-right: an arg-taker followed by MORE
+ *  characters has the rest as its value (`-Xours`, `-mX`), while an arg-taker
+ *  at the END of the cluster consumes the next argv (`-m`, `-qm`).
+ *
+ *  #1144 follow-up (P0-2): `o` (`--server-option`, an arg-taker on `pull`) was
+ *  MISSING, so `git pull -o --ff-only origin main` modelled `--ff-only` as a
+ *  live flag while real git consumed it as `-o`'s VALUE — a non-fast-forward
+ *  pull admitted as a provable fast-forward (probe: rc 0, MERGE COMMIT, branch
+ *  moved; the control `git pull --ff-only origin main` correctly aborts
+ *  rc 128). The push path already models this exact option (`VALUE_OPTS`
+ *  includes `-o`/`--push-option`). */
+const SYNC_VALUE_SHORTS = new Set(["m", "F", "s", "X", "o"]);
+/** Short options that are provably BOOLEAN for the sync verbs — they cannot
+ *  consume the next argv token, so they cannot free or swallow an ff flag.
+ *
+ *  Deliberately the SHORT SPELLING OF `SYNC_BOOLEAN_LONGS`, for the same
+ *  reason that set is curated rather than complete: a value table cannot mirror
+ *  git's parser, so the only safe shape is "known-benign or fail closed". Every
+ *  OTHER single-dash cluster letter (`-p`/`--prune`, `-a`, `-f`, `-t`, `-j`,
+ *  `-S`, and anything unenumerated) makes the ff proof UNVERIFIABLE
+ *  (P0-2's stronger fix: a short letter outside this set cannot be proven not
+ *  to be an arg-taker, so the token after it is of unknown kind). This is also
+ *  why the short/long asymmetry self-heals: `-p` is refused exactly as
+ *  `--prune` is, because neither is in its allowlist. `r` is handled separately
+ *  (it forces the rewriting `rebase` effect, which the predicate refuses
+ *  anyway). */
+const SYNC_BOOLEAN_SHORTS = new Set(["q", "v", "e", "n", "r", "k"]);
+
+/** Model one sync invocation's argv: which tokens are option VALUES, and which
+ *  option-shaped tokens cannot be proven benign. */
+function _syncArgModel(args) {
+  const valueSlot = new Array(args.length).fill(false);
+  const unknown = [];
+  let rebaseShort = false;
+  let noCommitShort = false;
+  for (let i = 0; i < args.length; i++) {
+    if (valueSlot[i]) continue; // already consumed as a value — never an option
+    const t = args[i];
+    if (t === "--") continue; // the terminator is handled by the caller
+    if (t.startsWith("--")) {
+      const eq = t.indexOf("=");
+      const name = eq === -1 ? t : t.slice(0, eq);
+      if (/^--ff(-o(n(l(y)?)?)?)?$/.test(name) || name === "--no-ff" || name === "--no-f") continue; // ff-family
+      if (SYNC_BOOLEAN_LONGS.has(name)) continue;
+      if (eq === -1 && SYNC_VALUE_LONGS.has(name)) { if (i + 1 < args.length) valueSlot[i + 1] = true; continue; }
+      if (eq !== -1 && SYNC_VALUE_LONGS.has(name)) continue; // --opt=value
+      unknown.push(t);
+      continue;
+    }
+    if (t.startsWith("-") && t.length > 1) {
+      let clusterUnknown = false;
+      for (let k = 1; k < t.length; k++) {
+        const c = t[k];
+        if (c === "r") rebaseShort = true;
+        if (c === "n") noCommitShort = true;
+        if (SYNC_VALUE_SHORTS.has(c)) {
+          // An arg-taker: the rest of the token is its value when present
+          // (`-Xours`), otherwise it consumes the NEXT argv token (`-m`,
+          // `-o --ff-only`). Either way it is not an ff flag and nothing
+          // after it in this token is an option.
+          if (k === t.length - 1 && i + 1 < args.length) valueSlot[i + 1] = true;
+          break;
+        }
+        // Any letter that is neither an arg-taker nor a known boolean makes
+        // the ff proof unverifiable — it may be an arg-taker this table does
+        // not enumerate, which would swallow or free the ff token.
+        if (!SYNC_BOOLEAN_SHORTS.has(c)) clusterUnknown = true;
+      }
+      if (clusterUnknown) unknown.push(t);
+    }
+  }
+  return { valueSlot, unknown, rebaseShort, noCommitShort };
+}
+
+export function syncEffectOf(verb, args) {
+  const a = (args || []).map(_stripQuotes);
+  // A `--` terminator makes every following token a path/ref, never an option;
+  // an unresolvable expansion can flip the effective flag after this read.
+  // Both defeat a lexical ff proof → fail closed.
+  const terminator = a.includes("--");
+  const dynamic = a.some((t) => t.includes("$") || t.includes("`"));
+  const { valueSlot, unknown, rebaseShort, noCommitShort } = _syncArgModel(a);
+  // ff-family LAST-WINS (exact forms + safe unambiguous abbreviations),
+  // counting only tokens that are genuinely OPTIONS for this invocation.
+  const ffMode = (t) => {
+    if (t === "--ff") return "ff";
+    if (/^--ff-o(n(l(y)?)?)?$/.test(t)) return "ff-only";
+    if (t === "--no-ff" || t === "--no-f") return "no-ff";
+    return null;
+  };
+  let lastFfMode = null;
+  for (let i = 0; i < a.length; i++) {
+    if (valueSlot[i] || a[i] === "--") continue;
+    const m = ffMode(a[i]);
+    if (m) lastFfMode = m;
+  }
+  const optionAt = (f) => a.some((t, i) => !valueSlot[i] && t === f);
+  return {
+    verb,
+    ffOnly: lastFfMode === "ff-only",
+    // `-r` is `--rebase` for pull and `--rebase-merges` for rebase — both are
+    // rewriting effects; a cluster containing `r` counts too (over-matching is
+    // the safe direction). `rebase` needs no flag to be a rewrite.
+    rebaseEffect: verb === "rebase" || rebaseShort || optionAt("--rebase") || optionAt("--rebase-merges"),
+    // `-n` is `--no-commit` for merge; `--squash` stages without committing.
+    leavesDirty: noCommitShort || optionAt("--squash") || optionAt("--no-commit"),
+    // Unproven option shapes fail closed: an abbreviated/optional-argument long
+    // option (`--mess`, `--gpg-sign`) can silently swallow or free an ff token.
+    unverifiable: terminator || dynamic || unknown.length > 0,
+  };
+}
+
+
+
 function _refspecDst(refspec) {
   if (!refspec || refspec === "") return null;
   const r = _stripQuotes(refspec);
@@ -2648,7 +2846,7 @@ export function wtShellInlinePayloads(command) {
   for (const seg of segs) {
     const head = _wtHeadInterpreter(seg);
     if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     for (let i = 0; i < toks.length; i++) {
       const t = toks[i];
       if (!(t === "-c" || t === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(t) && !t.startsWith("--")))) continue;
@@ -2671,14 +2869,25 @@ export function wtShellInlinePayloads(command) {
  * which hid the verb and made the fail-closed arm allow a real discard
  * (reviewer round-7 P1).
  */
-function _wtShellWords(s) {
+export function wtShellWords(s) {
   const out = [];
   let cur = "";
   let started = false;
   let quote = null;
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
-    if (quote) { cur += ch; if (ch === quote) quote = null; continue; }
+    if (quote) {
+      // #1139 (review cycle-3 P2): a backslash INSIDE double quotes escapes only
+      // `$"` / backtick / backslash / newline — otherwise it is literal, and the
+      // quote after it does NOT close the word. Treating `\"` as a closing quote
+      // split `cat "a\" b" | bash` into two words and swallowed the rest of the
+      // line, so a caller resolving file paths from these tokens seeded the
+      // wrong files. (The unquoted branch below already handles `\`.)
+      if (quote === '"' && ch === "\\" && '"$`\\\n'.includes(s[i + 1] ?? "")) {
+        cur += ch + (s[i + 1] ?? ""); i++; started = true; continue;
+      }
+      cur += ch; if (ch === quote) quote = null; continue;
+    }
     if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; started = true; continue; }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; started = true; continue; }
     if (ch === " " || ch === "\t" || ch === "\r") {
@@ -2728,7 +2937,7 @@ export function wtPipelineFeedsShell(command) {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
-    const toks = _wtShellWords(seg);
+    const toks = wtShellWords(seg);
     const idx = toks.findIndex((t) => basename(String(t)) === base);
     return toks.slice(idx + 1).every((t) => t.startsWith("-") || STDIN_ALIAS.test(t) || REDIRECT.test(t));
   });
@@ -2969,6 +3178,21 @@ export function classifyGitCommandDetailed(command) {
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
+  // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
+  // `$(git reset …)`, backticks, a piped-stdin shell, a heredoc-fed interpreter)
+  // EXECUTES git but contributes NO invocation to the walk — it collapses to an
+  // opaque token. Every downstream consumer that reasons "the invocation list is
+  // the whole command" (the sync arm's `onlyGitInvocation`, the legacy arm's
+  // per-invocation worktree exemption) is therefore UNSOUND unless this is
+  // consulted. Computed up front (and exposed as `out.hiddenStateSubst`) so the
+  // zero-invocation early return carries it too, and ORs the
+  // branch-state-mutating scan with the hub-gate's hardened unverifiable-git
+  // shape set (round-6→19 review-hardened; the two consumers reuse it so the
+  // construct coverage cannot drift).
+  const hiddenStateSubst =
+    _hasHiddenStateSubst(String(command ?? "")) ||
+    _unverifiableGitContent(String(command ?? ""));
+  out.hiddenStateSubst = hiddenStateSubst;
   if (invocations.length === 0) {
     // Round-5 (security F1): the raw destructive-pattern pass must run BEFORE
     // the zero-invocation early return — `eval "git reset --hard"` /
@@ -3149,7 +3373,94 @@ export function classifyGitCommandDetailed(command) {
     if (syncInv.verb === "merge") out.syncSource = pos[0] ?? null;
     else if (pos.length > 1) out.syncSource = pos[1] ?? null; // pull/rebase [remote] [ref]
     else out.syncSource = pos[0] ?? null;
+    // #1144: the EFFECT of the sync invocation — the allowance's sync arm is
+    // decided on this (plus the LIVE tree-clean / own-repo preconditions),
+    // never on the verb. See syncEffectOf's doc block.
+    out.syncEffect = syncEffectOf(syncInv.verb, args);
+    // #1144: the parsed effect is only TRUSTWORTHY as a description of the
+    // command's whole effect when the sync invocation is the command's ONLY
+    // git invocation. The classifier assigns ONE verdict from ONE verb while
+    // `syncEffect` describes the first sync op, so
+    // `git pull --ff-only && git rebase origin/main` classifies block:rebase
+    // with a fast-forward-looking record — trusting it would admit the rebase.
+    //
+    // #1144 follow-up (P0-1): "only git invocation" is a claim about the WHOLE
+    // command, and a hidden shell substitution makes it UNPROVABLE —
+    // `git pull --ff-only && eval "git rebase origin/main"` walks to exactly
+    // one invocation (the pull) while the eval payload rewrites the branch
+    // after the guard's read. The verb list cannot see it; the effect record
+    // describes the wrong operation. Fail closed: hidden substitution ⇒ the
+    // only-git-invocation claim is false, so the sync arm refuses.
+    out.syncOnlyInvocation =
+      invocations.length === 1 && invocations[0] === syncInv && !hiddenStateSubst;
+    // #1144 (reviewer P0): the sync op's OWN repo resolution. `eff` is resolved
+    // from the state-mutating / first invocation's hints, so a compound whose
+    // FIRST segment is `git -C <worktree> …` made `eff.isWorktree` true and
+    // worktree-exempted a LATER sync op that actually runs at the shell cwd
+    // (`git -C <wt> status && git rebase origin/main` — the rebase ignores the
+    // `-C` and moves the shared hub). syncHints feeds a sync-specific repo
+    // resolution exactly as stateHints/commitHints/pushHints already do.
+    out.syncInvVisible = syncInv.cmdVisible !== false;
+    out.syncHints = syncInv.cmdVisible !== false
+      ? { cdChain: syncInv.cdChain, cHints: syncInv.cHints, gitDirHint: syncInv.gitDirHint, vars: syncInv.vars }
+      : null;
   }
+
+  // #1144 (reviewer P1): the M3 carve-outs (the #376 return-to-original in
+  // particular) `return undefined` for the WHOLE command from index.ts, which
+  // silently laundered a destructive LATER segment in an agent-infra hub —
+  // `git checkout main && git reset --hard origin/main` / `… && git rebase
+  // origin/main` ran with the carve-out's blessing. A carve-out may only close
+  // the command when every OTHER git invocation is read-only (the guard's own
+  // HUB_READONLY_VERBS set, plus a refspec-less `fetch`).
+  // #1144 (cycle-2 reviewer P3): `fetch` IS read-only for the carve-out's
+  // purpose UNLESS it carries a refspec (`+src:dst` / `:dst` writes refs).
+  //
+  // #1144 (cycle-3 reviewer P0): `!hiddenStateSubst` is REQUIRED here. This
+  // predicate is a claim about the WHOLE command's invocation list, so it is
+  // unsound without the same hidden-substitution guard `syncOnlyInvocation`
+  // (above) and `_allInvocationsWorktreeScoped` (index.ts) already carry — and
+  // this is the THIRD consumer of that invariant. A shell payload
+  // (`eval "git reset --hard …"`, `$(…)`, backticks) EXECUTES git but
+  // contributes NO invocation, so the visible list looks clean and the carve-out
+  // closed the whole command: `git checkout main && eval "git reset --hard
+  // origin/main"` ran in the shared hub with the sanctioned return's blessing
+  // while its visible twin was refused. Hidden substitution ⇒ the list is
+  // incomplete ⇒ not provably clean.
+  //
+  // #1144 (cycle-3 reviewer P2): the read-only test is ARGUMENT-scoped
+  // (`_isCarveOutReadOnlyInvocation`), not just the verb-only HUB_READONLY_VERBS
+  // set, so the pure-query forms of mixed verbs (`worktree list`, `stash list`,
+  // bare `tag`) no longer false-block the sanctioned `checkout main && …`
+  // ceremony.
+  //
+  // #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation (the one
+  // decideM3 sanctioned — `stateInv`) is exempted BY IDENTITY, never by a verb
+  // allowlist. index.ts returns from the whole handler at the first
+  // `reBaseline`, so a sibling the read-only test wrongly admits is never seen
+  // by the M3 loop; a blanket `true` for the branch-state family therefore
+  // admitted an independent later mutation (`checkout main && switch -f
+  // feat/x`, `… && update-ref refs/heads/main HEAD`, `… && branch -M main
+  // stolen`). `stateInv` is the sanctioned return itself, so exempting it and
+  // requiring every OTHER invocation to be provably read-only is the whole
+  // guard.
+  out.stateCarveOutClean = !hiddenStateSubst && invocations.every((v) =>
+    v === stateInv || _isCarveOutReadOnlyInvocation(v));
+
+  // #1144 (cycle-2 reviewer P0): per-invocation repo hints. The LEGACY_BLOCK
+  // arm exempts worktree-isolated destructive ops from `eff.isWorktree`, but
+  // `eff` comes from ONE invocation, so `git -C <worktree> status && git reset
+  // --hard origin/main` was laundered: the leading worktree segment made `eff`
+  // a worktree while the reset actually ran at the shell cwd and moved the
+  // shared hub. index.ts resolves each hint and exempts only when EVERY git
+  // invocation in the command is worktree-isolated.
+  out.invocationHints = invocations.map((v) => ({
+    verb: v.verb,
+    visible: v.cmdVisible !== false,
+    hints: v.cmdVisible !== false
+      ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+      : null,
+  }));
 
   // ── branch-state verbs (M3 gate) ──
   if (stateInv) {
@@ -3370,18 +3681,10 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
-  // #591 (round-3→5 fold): a shell construct may hide a branch-state git
-  // invocation from the count above (collapse to opaque tokens → stateOpCount
-  // undercounts). Exposed here so index.ts can refuse the M3 benign-force
-  // carve-out when hidden state mutation is present. The scan ORs the
-  // branch-state-mutating substitution scan (_hasHiddenStateSubst) with the
-  // hub-gate's hardened unverifiable-git shape set (_unverifiableGitContent:
-  // piped-stdin shells, process substitution, heredocs, alias/function
-  // definitions, spawner $VARs — round-6→19 review-hardened; the carve-out
-  // bound reuses it so the construct coverage cannot drift).
-  out.hiddenStateSubst =
-    _hasHiddenStateSubst(String(command ?? "")) ||
-    _unverifiableGitContent(String(command ?? ""));
+  // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
+  // zero-invocation guard) and already on `out` — it now feeds not only the M3
+  // benign-force carve-out but the sync arm's `onlyGitInvocation` claim
+  // (P0-1) and the legacy arm's per-invocation worktree exemption (P0-3).
 
   // #596 round-4 (reviewer P1a follow-up): the M2 commit/push repo must come
   // from the classifier's boundary-aware walk of the commit/push invocation,
@@ -3939,6 +4242,58 @@ const HUB_READONLY_VERBS = new Set([
   // arg-taking scripts).
   "check-ignore",
 ]);
+
+/**
+ * #1144 (cycle-3 reviewer P2): is this invocation provably a PURE QUERY, for
+ * the M3 carve-out's "every OTHER git invocation is read-only" test?
+ *
+ * A verb-only set (HUB_READONLY_VERBS) misses every verb with a read-only FORM
+ * and a mutating form, so the common post-ceremony pattern
+ * `git checkout main && git worktree list` / `… && git stash list` /
+ * `… && git tag` was false-blocked (safe direction, but a regression against
+ * base and against the README's stated contract). Argument-scoped and
+ * fail-closed: anything not PROVEN to be a query returns false, so the mutating
+ * cousins (`worktree add|prune|remove`, bare `stash` = push, `tag <name>`,
+ * `stash push/drop`) stay gated.
+ *
+ * #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation is NOT judged
+ * here — `stateCarveOutClean` exempts it by identity (`v === stateInv`). A
+ * blanket `true` for the branch-state verb family (checkout/switch/
+ * symbolic-ref/update-ref/branch) admitted an INDEPENDENT later mutation of the
+ * same family, because index.ts returns from the whole handler on the first
+ * `reBaseline`: `checkout main && switch -f feat/x` / `… && update-ref
+ * refs/heads/main HEAD` / `… && branch -M main stolen` rode the return into the
+ * shared hub. Only the PROVABLE read-only forms of those verbs qualify now.
+ * @param {{verb: string, args?: string[]}} v
+ * @returns {boolean}
+ */
+function _isCarveOutReadOnlyInvocation(v) {
+  const verb = v.verb;
+  const args = v.args || [];
+  if (HUB_READONLY_VERBS.has(verb)) return true;
+  // A refspec-less fetch cannot write refs/heads/* (cycle-2 reviewer P3).
+  if (verb === "fetch") return !args.some((x) => _stripQuotes(x).includes(":"));
+  const pos = args.filter((x) => !x.startsWith("-"));
+  // `worktree` bare and `worktree list` are queries; add/prune/remove mutate.
+  if (verb === "worktree") return pos.length === 0 || pos[0] === "list";
+  // `tag` bare lists; `tag <name>` creates, delete/verify forms are not queries.
+  if (verb === "tag") return pos.length === 0;
+  // `stash list`/`stash show` are queries; bare `stash` = push, drop/pop apply.
+  if (verb === "stash") return pos[0] === "list" || pos[0] === "show";
+  // #1144 (cycle-3 reviewer F1): the branch-state family — a mutating sibling
+  // is NOT read-only. Bare `branch` (list) and `symbolic-ref <name>` (query)
+  // stay read-only; a second checkout/switch, any `update-ref`, a ref-writing
+  // symbolic-ref, and every branch mutation fall through as non-read-only.
+  if (verb === "branch") return !_branchInvMutatesBranchState(args);
+  // A symbolic-ref QUERY is exactly `<name>` with only --quiet/--short; -d
+  // (and every abbreviation of --delete) writes, and any unenumerated flag
+  // fails closed rather than being read as a query.
+  if (verb === "symbolic-ref") {
+    return pos.length === 1 && args.every((a) =>
+      !a.startsWith("-") || a === "-q" || a === "--quiet" || a === "-s" || a === "--short");
+  }
+  return false;
+}
 
 /** Mutating git verbs with NO sanctioned recovery form — always blocked. */
 const HUB_MUTATING_VERBS = new Set([

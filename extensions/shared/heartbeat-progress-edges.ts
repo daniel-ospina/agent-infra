@@ -116,14 +116,37 @@ export const OUT_OF_FAMILY_TERMS = [
   "getSubagentBackstopFreshMs",
   "getToolStallMs",
   "getStreamStallMs",
+  // #1030: camelCase (not `_MS`), so the name scan cannot see it — listed
+  // deliberately, with its own value+behaviour pin in builtin-tools.test.ts.
+  "resolveStreamStallMs",
   "getFirstMessageMs",
+  "getFirstOutputTimeoutMs",
   "getTaskMaxDispatchMs",
   "getCutGapMs",
   "getEffectiveCutGapMs",
+  "getCpuStallMs",
+  // #5195: camelCase (not `_MS`), so the name scan cannot see it — listed
+  // deliberately, with its own value+behaviour pin in builtin-tools.test.ts.
+  "getProgressAgeMs",
   "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
   "DEFAULT_MAX_DISPATCH_MS",
+  // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
+  // carry no stall-family token (the STALLED threshold is now the DERIVED
+  // per-shard bound, so the FLOOR and the fail-safe are the operator-reachable
+  // constants). Listed deliberately, with their value pins in this registry and
+  // their behaviour pinned by tests/admin-merge/run.sh §41.
+  "RERUN_FLOOR",
+  "FAILSAFE_RERUN_TIMEOUT",
+  // #1500 Leg B: the dispatched child's default bash bound, and the getter that
+  // resolves it. Neither name carries a stall-family TOKEN (`_S` IS a bound
+  // suffix — `SCAN_BOUND_SUFFIXES` — but `inFamily` needs token AND suffix), so
+  // the name scan cannot see them. `getToolTimeoutSeconds` is a FUNCTION and is
+  // registered below as well, because every name in this list must also be a
+  // registry entry.
+  "DEFAULT_TOOL_TIMEOUT_S",
+  "getToolTimeoutSeconds",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -143,9 +166,16 @@ export function isActivityEdge(event: string): event is ActivityEdge {
   return (ACTIVITY_EDGE_EVENTS as readonly string[]).includes(event);
 }
 
-/** Every child-registered pi event (activity + lifecycle). */
+/** #783 §6.6 / #1505: the events the dispatch child registers that are not
+ * activity or lifecycle edges — a `tool_call` handler (#1500 Leg B) mutates
+ * `input.timeout` before a bash call runs and feeds no clock, so it belongs to
+ * neither table. Declared here so `childRegisteredEvents()` stays the single
+ * source of the child's registration set and the parity test keeps its bite. */
+export const PREVENTION_EVENTS = ["tool_call"] as const;
+
+/** Every `pi.on(...)` event the dispatch child registers. */
 export function childRegisteredEvents(): string[] {
-  return [...ACTIVITY_EDGE_EVENTS, ...LIFECYCLE_EVENTS];
+  return [...ACTIVITY_EDGE_EVENTS, ...LIFECYCLE_EVENTS, ...PREVENTION_EVENTS];
 }
 
 /**
@@ -351,10 +381,12 @@ export const HEARTBEAT_KILL_REASONS = [
   "silence-threshold",
   "stream-stall",
   "tool-silence",
+  "tool-dead",
   "tool-stall",
   "first-message-stall",
   "max-dispatch",
   "cut",
+  "no-progress",
 ] as const;
 
 export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
@@ -363,10 +395,15 @@ export type HeartbeatKillReasonName = (typeof HEARTBEAT_KILL_REASONS)[number];
 export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string>> = {
   "zero-output": "FIRST_OUTPUT_TIMEOUT_MS — the tier-1 deadline that populates the entry's `firstOutputTimeoutMs`",
   "silence-threshold": "HEARTBEAT_TIMEOUT_MS (T)",
-  "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S)",
+  "stream-stall": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — resolvable PER DISPATCH from the task tool's stream_stall_ms arg (#1030) via resolveStreamStallMs, 60 s floor on every path",
   // Shares S with stream-stall: one constant, two conditions. Naming them as one
   // term would be wrong; naming them as two unrelated bounds would be wrong too.
-  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition",
+  "tool-silence": "max(60 s, TASK_STREAM_STALL_MS) override (env), else max(60 s, DEFAULT_STREAM_STALL_MS) (S) — same bound as stream-stall, different condition; the dispatch override (stream_stall_ms, #1030) moves this clause too. Since #5389 it fires CONJUNCTIVELY with C as well (positive no-progress evidence from the CPU channel), so `TASK_CPU_STALL_MS=0` stands it down too and at the shipped defaults the binding condition is max(S, C) = C",
+  // #928: the CPU-liveness bound (C) for a SILENT in-flight tool. The effective
+  // value is resolved by getCpuStallMs (env override, 60 s floor, blank → the
+  // default — never disabled by a typo), and 0 is the explicit off switch.
+  "tool-dead": "max(60 s, TASK_CPU_STALL_MS) override (env) — 0 = OFF (explicit off switch), else DEFAULT_CPU_STALL_MS = 30 min (C); effective bound resolved by getCpuStallMs. Fires conjunctively with S, so the binding condition is max(S, C) = C",
+
   // The EFFECTIVE bound is max(60 s, TASK_TOOL_STALL_MS) when the env override
   // is a positive finite number; otherwise max(60 s, fraction × cap). Recording
   // only the fraction would let the bound move through a path the registry
@@ -375,6 +412,10 @@ export const KILL_REASON_BOUNDS: Readonly<Record<HeartbeatKillReasonName, string
   "tool-stall": "max(60 s, TASK_TOOL_STALL_MS) override (env), else max(60 s, TASK_TOOL_STALL_FRACTION × effective hard cap from DEFAULT_HARD_CAP_MS) (L) — floored further by HEARTBEAT_TIMEOUT_MS while no turn is active",
   "first-message-stall": "max(60 s, TASK_FIRST_MESSAGE_MS) override (env), else max(60 s, DEFAULT_FIRST_MESSAGE_MS) (M) — then load-scaled and latched at the dispatch site",
   "max-dispatch": "max(60 s, TASK_MAX_DISPATCH_MS) override (env), else OFF — DEFAULT_MAX_DISPATCH_MS = 0 disables the cap (D)",
+  // #5195: the ONLY progress-keyed bound. Not load-scaled and not latched — a
+  // bound that WIDENS is how the class this clause catches escaped every other
+  // clause, so widening is exactly what it must not do. 0 = explicit off.
+  "no-progress": "max(60 s, 3 × the effective heartbeat interval, TASK_PROGRESS_AGE_MS) override (env) — 0 = OFF (explicit off switch, never a typo), else DEFAULT_PROGRESS_AGE_MS (45 min), both floored at the REPORTING CADENCE (the parent can only see progress when the child reports it, and the tick interval is operator-settable to 300 s). Deliberately NOT load-scaled and NOT latched; measured against PROGRESS (a completed unit of work or content-grounded child progress), never against elapsed dispatch time",
   "cut": "getEffectiveCutGapMs() / getCutGapMs() / TASK_HEARTBEAT_CUT_GAP_MS",
 };
 
@@ -397,6 +438,15 @@ export const PROGRESS_DRIVERS: readonly ProgressDriver[] = [
     owner: "extensions/builtin-tools/index.ts",
     mechanism: "parsed child marker kinds → everSawRealActivity/everSawMsg/everSawTool/firstActivityAt",
     sharesDeclaration: true,
+  },
+  {
+    id: "child-content-progress",
+    owner: "extensions/task-heartbeat.ts",
+    mechanism:
+      "assistantMessageEvent content inspection → `progress=<0|1>` on the tick; the parent stamps lastProgressAt from it (and from a parsed tool_end)",
+    sharesDeclaration: false,
+    reason:
+      "#5195 — this is deliberately a SECOND, independent classifier, and it does NOT consume the edge table above. The edge table answers 'which pi events are LIFE SIGNS' (and every edge advances the child's activity clock). This driver answers a different question — 'did a unit of work COMPLETE, or did the model produce real CONTENT' — and it must NOT share the life-sign table, because sharing it is the bug: a tick/life-sign-only classification is forgeable by a process that is alive but doing nothing, which is exactly how the empty-turn loop and the drip stream escaped all nine existing clauses. Registered here so the divergence is DECLARED rather than accidental (the #1068 discipline: a driver that does not share the classification must say why).",
   },
   {
     id: "checkpoint-gate",
@@ -497,7 +547,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "= 1_200_000;",
     axis: "kill",
     guardedBy: NONE,
-    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (env override, 60 s floor)",
+    note: "S — gates BOTH stream-stall and tool-silence; the EFFECTIVE bound is resolved by getStreamStallMs (a positive finite env override, else the default; FAIL-CLOSED, 60 s floor), or PER DISPATCH by resolveStreamStallMs (#1030)",
   },
   {
     name: "DEFAULT_TOOL_STALL_MS",
@@ -564,6 +614,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     note: "checkpoint park trigger — parks state, kills nothing",
   },
+  {
+    name: "RERUN_FLOOR",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_RERUN_FLOOR:-1200}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's re-run bound FLOOR (#1167): the bound is max(FLOOR, 2 × max(green duration) for the shard), and that DERIVED per-shard bound is the rail's ONLY STALLED threshold — a remote run exposes no within-job activity signal, so there is no second window to order against it. The FLOOR only ever RAISES a bound, so it cannot false-block a healthy run. Env seam ADMIN_MERGE_RERUN_FLOOR; shipped default 1200 s; behaviour pinned by tests/admin-merge/run.sh §41.",
+  },
+  {
+    name: "FAILSAFE_RERUN_TIMEOUT",
+    owners: ["scripts/admin-merge.sh"],
+    value: "${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}",
+    axis: "gate",
+    guardedBy: NONE,
+    note: "the merge gate's derivation FAIL-SAFE (#1167): the bound used when the per-shard derivation is unavailable. The shipped default (3900 s) is deliberately well above RERUN_FLOOR's 1200, because a derivation that failed must never produce a SMALL bound. Env seam ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK; behaviour pinned by tests/admin-merge/run.sh §41.",
+  },
   // — reap axis (interactive session reaper) —
   {
     name: "REAP_IDLE_HOURS",
@@ -613,6 +679,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "reap",
     guardedBy: NONE,
     note: "worker-log freshness bound — an AGED, not family-named, bound",
+  },
+  {
+    name: "SWEEP_MAX_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${SWEEP_MAX_AGE:-600}"',
+    axis: "hygiene",
+    guardedBy:
+      "scripts/orchestrator-harness/sweep-quota.test.sh behaviour + non-vacuity pin (fixtures 5, 11 and 13 drive the staleness floor: a stale stamp forces the fetch, a future stamp and a >10-digit stamp are both dropped); the VALUE is asserted by THIS registry's forward check, not by the suite — the suite sets its own SWEEP_MAX_AGE in the environment it drives",
+    overrides: ["SWEEP_MAX_AGE=600"],
+    note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
   // — retention axis —
   {
@@ -739,7 +815,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: null,
     axis: "kill",
     guardedBy: BT_TEST,
-    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is set, else max(60 s, DEFAULT_STREAM_STALL_MS). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+    note: "FUNCTION, not a const: the EFFECTIVE stream-stall/tool-silence bound (S) — max(60 s, TASK_STREAM_STALL_MS) when the override is a POSITIVE FINITE number, else MAX(60 s, DEFAULT_STREAM_STALL_MS). A non-finite or non-positive override (`Infinity`, `1e400`, `NaN`, `0`, negative) fails CLOSED to the default rather than being clamped up — the same inert-enforcer guard getToolStallMs and getTaskHardCapMs carry, added here in #1030's review cycle 1 (before it, `Number(env) || DEFAULT` let `TASK_STREAM_STALL_MS=Infinity` disarm the silence clauses, and the per-dispatch resolver's own fail-closed fallback inherited that). Registered for the same reason as getToolStallMs: without it the env path and the 60 s floor are invisible and only the literal is recorded.",
+  },
+  {
+    name: "resolveStreamStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the PER-DISPATCH resolver for S (#1030) — a positive finite override is honoured VERBATIM above a 60 s floor (never load-rescaled, per docs/ops/load-policy.md §3), and every bad shape (Infinity, 1e400, NaN, 0, negative, non-numeric) falls back to getStreamStallMs(). Registered for the same reason as its two sources: this is a THIRD path by which the silence bound moves, and a reader who saw only the env path and the literal would believe S cannot be raised per dispatch. A value at or above the age backstop is WARNED about (streamStallInertWarning), never clamped.",
   },
   {
     name: "getFirstMessageMs",
@@ -748,6 +832,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the EFFECTIVE first-message bound (M) — max(60 s, TASK_FIRST_MESSAGE_MS) when set, else max(60 s, DEFAULT_FIRST_MESSAGE_MS).",
+  },
+  {
+    name: "getFirstOutputTimeoutMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE tier-1 FIRST-OUTPUT bound (#1073) — max(60 s, TASK_FIRST_OUTPUT_TIMEOUT_MS) when the override is a positive finite number, else 60 s; a non-finite override fails CLOSED to 60 s so `1e400` cannot disarm the zero-output detector. The 60 s default is the literal the getter body carries (pinned against §3 of docs/ops/load-policy.md by load-scale-contract.test.ts); this entry exists so the effective bound is in the vocabulary, like every other env-overridable getter here.",
   },
   {
     name: "getTaskMaxDispatchMs",
@@ -766,10 +858,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   {
     name: "FIRST_OUTPUT_TIMEOUT_MS",
     owners: ["extensions/builtin-tools/index.ts"],
-    value: "= 60_000;",
+    // #1073 — this used to be the local literal `= 60_000;`. The bound is now
+    // READ from the env-aware getter, so the registry records the DERIVATION
+    // (that the clause's deadline keeps resolving through the getter, i.e. the
+    // documented TASK_FIRST_OUTPUT_TIMEOUT_MS override stays live) rather than
+    // a literal the declaration no longer carries. The 60 s number itself is
+    // pinned by the getter's own body — builtin-tools.test.ts
+    // value+behaviour pin, plus load-scale-contract.test.ts's §3-doc pin — and
+    // the effective bound is registered separately as `getFirstOutputTimeoutMs`.
+    value: "= getFirstOutputTimeoutMs();",
     axis: "kill",
-    guardedBy: NONE,
-    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test keeps it visible. It is also not referenced by name in any test — the registry's forward assertion is what pins the literal, hence NONE rather than BT_TEST.",
+    guardedBy: BT_TEST,
+    note: "the tier-1 FIRST-OUTPUT deadline (zero-output clause), per-dispatch and DERIVED from getFirstOutputTimeoutMs() so TASK_FIRST_OUTPUT_TIMEOUT_MS is live (#1073 — before that wiring the doc named an env var nothing read). Function-local, and its name carries no stall/silence family token, so only the clause→bound closure test plus this entry keep it visible.",
   },
   {
     name: "DEFAULT_HARD_CAP_MS",
@@ -778,6 +878,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "6h base of the EFFECTIVE hard cap (TASK_HARD_CAP_MS overrides it, 60 s floor) — the cap the tool-stall (L) derivation multiplies by 2/3.",
+  },
+  {
+    name: "DEFAULT_TOOL_TIMEOUT_S",
+    owners: ["extensions/task-heartbeat.ts"],
+    value: "= 7200;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#1500 Leg B: the default wall-clock bound on a DISPATCHED child's `bash` call, filled in by the `tool_call` handler only when the caller supplied no `timeout`. Derived from the measured completed-call tail (max 5417.8 s over 658,981 calls; 0 > 7200 s) — deliberately NOT from the killed population, which is absent from a completed-call corpus by construction.",
+  },
+  {
+    name: "getToolTimeoutSeconds",
+    owners: ["extensions/task-heartbeat.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: env override TASK_TOOL_TIMEOUT_S — absent → DEFAULT_TOOL_TIMEOUT_S (7200 s); non-positive / non-finite / unparseable → null = DISARMED, with a once-only warning from toolTimeoutDisarmWarning; a finite positive value is CLAMPED to floor(2147483647/1000) s so pi's own resolveTimeoutMs does not reject the call (`Invalid timeout: maximum is 2147483.647 seconds`) rather than letting a Node timer overflow. Mirrors getToolStallMs.",
   },
   {
     name: "DEFAULT_MAX_DISPATCH_MS",
@@ -810,6 +926,38 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "kill",
     guardedBy: BT_TEST,
     note: "FUNCTION, not a const: the cut clause's marker-gap deadline — 1.25× the tick interval from getHeartbeatIntervalMs, 15 s floor, TASK_HEARTBEAT_CUT_GAP_MS override.",
+  },
+  {
+    name: "DEFAULT_CPU_STALL_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 1_800_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#928 (C) — the shipped CPU-stall bound of the `tool-dead` clause: 30 min of flat CPU, admitted ONLY for a tool that has DEMONSTRATED CPU work this round (`cpu_advanced`) and is silent past S. The EFFECTIVE bound is resolved by getCpuStallMs (env override, 60 s floor, 0 = OFF). Calibrated to cover a tool that burned CPU and is now blocked on I/O, without re-creating the #363/#489 kill-productive-agents class.",
+  },
+  {
+    name: "getCpuStallMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE `tool-dead` CPU-stall bound (C) — max(60 s, TASK_CPU_STALL_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_CPU_STALL_MS so a launcher typo cannot silently disarm a kill path. Registered separately from the literal for the same reason as its siblings: without it the env path, its 60 s floor and its off switch are invisible to the registry.",
+  },
+  {
+    name: "DEFAULT_PROGRESS_AGE_MS",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: "= 2_700_000;",
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "#5195 (X) — the shipped bound of the `no-progress` clause, and the ONLY bound in the family keyed on PROGRESS rather than liveness: 45 min with no COMPLETED unit of work (`tool_end`) or content-grounded child progress (`progress=1`) while no tool is in flight. Deliberately NOT load-scaled and NOT latched — a bound that WIDENS is how the class this clause catches (`#363` hard cap 2h→6h, `ea22897` making S per-dispatch) escaped every other clause. The EFFECTIVE bound is resolved by getProgressAgeMs (env override; 0 = OFF; floored at the REPORTING CADENCE, `max(60 s, 3 x the heartbeat interval)`, because the parent can only see progress when the child reports it). 45 min is the repo's own declared ceiling for the child's retry/hang window (`HANG_WINDOW_CEILING_MS = 2700000` in scripts/check-cost-config.sh:198; docs/ops/cost-config-policy.md:102-103 derives the real 43.0 min window and requires it <= that ceiling) — set BELOW it, X would pre-empt a chattering retrying child's own bounded visible recovery. Still ~8x below the 6h hard-cap backstop.",
+  },
+  {
+    name: "getProgressAgeMs",
+    owners: ["extensions/builtin-tools/index.ts"],
+    value: null,
+    axis: "kill",
+    guardedBy: BT_TEST,
+    note: "FUNCTION, not a const: the EFFECTIVE `no-progress` bound (X) — max(reporting-cadence floor, TASK_PROGRESS_AGE_MS) when the override is a positive finite number; the VALUE 0 disables the clause outright; blank/whitespace/negative/non-finite fall back to DEFAULT_PROGRESS_AGE_MS, so a launcher typo cannot silently disarm the one clause that bounds the content-free-loop class. The floor is the REPORTING CADENCE — `max(60 s, 3 x the effective heartbeat interval)` — NOT a bare 60 s: the parent can only see progress when the child reports it, so a bound below the cadence fires before the evidence it waits for and would cut a genuinely progressing content-only child (TASK_PROGRESS_AGE_MS=60000 with a 300 s interval is the worked case; caught in review). Registered separately from the literal for the same reason as its siblings: otherwise the env path, its floor and its off switch are invisible to the registry.",
   },
 ];
 

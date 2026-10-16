@@ -1,0 +1,32 @@
+### GREEN — apply.sh to that pristine tree
+
+pi-patches apply — pi-coding-agent 0.85.1 / pi-ai 0.85.1
+  manifest: /Users/danielospina/Documents/GitHub/agent-infra/.worktrees/fix/1214-pi-clamp-output-floor/scripts/pi-patches/manifests/0.85.1/manifest.json
+  pi root:  /tmp/pi-fake-full
+  + b1-clamp-floor-esm
+  + b2-clamp-floor-bundle-http
+  + b3-clamp-floor-bundle-bedrock
+  + c1-recovery-field-esm
+  + c2-recovery-reset-user-esm
+  + c3-recovery-reset-success-esm
+  + c4-recovery-cap-esm
+  + c5-recovery-increment-esm
+  + c6-recovery-field-bundle
+  + c7-recovery-reset-user-bundle
+  + c8-recovery-reset-success-bundle
+  + c9-recovery-cap-bundle
+  + c10-recovery-increment-bundle
+✅ applied to 5 file(s); backups in /Users/danielospina/.pi/agent/state/pi-patches/backup-0.85.1-3ebf32a0
+✅ verified: clamp floor behaviour holds in BOTH the bundled runtime and the pi-ai ESM
+
+   ⚠ EXPIRY: this patch is pinned to pi-coding-agent/pi-ai 0.85.1. Any upgrade reverts it
+     and apply.mjs will refuse LOUDLY (exit 3) until the manifest is re-derived.
+apply EXIT=0
+
+### --check after apply (idempotent)
+✅ all replacements present — the fix is in place
+check EXIT=0
+
+### applying again writes nothing
+     and apply.mjs will refuse LOUDLY (exit 3) until the manifest is re-derived.
+EXIT=0

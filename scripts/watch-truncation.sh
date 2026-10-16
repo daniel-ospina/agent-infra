@@ -15,11 +15,18 @@
 #   A) re-read volume OR LLM call count per compacting session > 2× the
 #      regenerated Aug baseline over any 3 consecutive days, OR
 #   B) ≥1 stopReason:"length" record in the window
-#   → REVERT TO 1M. The rollback commit updates the guard's threshold
-#     (scripts/check-cost-config.sh) in the SAME commit. COST_CLAMP_OVERRIDE=1
-#     is the in-window escape. Owner: the weekly report reader (this exit 1 +
-#     the printed procedure is the escalation — the instrument does NOT
-#     auto-revert; a revert is a deliberate committed change).
+#   → REVERT TO 1M. The rollback commit moves the WHOLE geometry in the SAME
+#     commit — the deepseek `contextWindow` in `models.json`, the guard's
+#     `CLAMP` (scripts/check-cost-config.sh), and the regime floor in BOTH
+#     instruments (scripts/fleet-cost-report.sh's `FLEET_REGIME_TB:-<n>` default
+#     and this file's `REGIME_TB_FLOOR` band constant) — leaving `reserveTokens`
+#     at the reviewed 16384. The printed procedure below states the same list.
+#     The guard reads both floors BY EXECUTION (`--print-regime-floor`, #1342),
+#     so the bucket LABEL is display text and needs no coordination.
+#     `COST_CLAMP_OVERRIDE=1` covers the models.json clamp class only, not the
+#     geometry and not the retry/hang contract. Owner: the weekly report reader
+#     (this exit 1 + the printed procedure is the escalation — the instrument
+#     does NOT auto-revert; a revert is a deliberate committed change).
 #
 # Note on the length leg (expected week-1 behavior): the clamp DOES produce
 # mid-turn overruns in the real fleet — measured under the 400K clamp (91
@@ -31,6 +38,30 @@
 # The report prints the event context distribution so the owner can triage
 # small-window vs clamp-regime records before executing the rollback.
 #
+# REGIME HISTORY (withdrawal, 2026-09-21). The #1213/#1226 300K→700K re-clamp
+# was WITHDRAWN — the floor fix it was sequenced behind is deployed
+# (`MIN_USABLE_MAX_TOKENS = 1024`, pi-patch #1214(b): never clamp below a
+# usable output budget), which closes the one-token silent-death mechanism the
+# wider window was bought for, at a recurring ~+20% fleet model spend. The
+# retired 700K regime gets a distinct LEGACY bucket — from its trigger
+# (650,000 = 700,000 − 50,000) up to the shared 1M-drift floor at 900,000 — so
+# a record from that era is neither read as current geometry nor excluded as
+# small-window, the mirror of how #1226 kept the 300K era visible on the way
+# up. Against this box's corpus that bucket is EMPTY: the era's session
+# files (2026-09-18..21) carry no stopReason:"length" records (measured
+# 2026-09-21), which is the
+# honest reading of a regime that did not truncate, not a missing mechanism.
+# Any such record still COUNTS toward the literal pre-commitment above
+# (≥1 length record → revert to 1M): that trigger is
+# owner-owned, and narrowing its firing surface in code is an owner decision,
+# not this change's. The triage note therefore names the band a firing record
+# came from, which is the discriminator. NOTE the trigger has already fired
+# once (188 records — the corpus scan behind the re-clamp, recorded in §7 of
+# cost-config-policy.md) and the
+# owner's response to it
+# was the 700K re-clamp and then this withdrawal: the floor fix, not a wider
+# window, is what closes that class.
+#
 # Regenerated Aug baseline (fixed parser, #373): 8 pre-clamp compacting
 # sessions — calls mean 1867, re-read volume mean 1,969,341 tokens. Trigger =
 # > 2× baseline (3734 calls / 3,938,682 tokens) per compacting session,
@@ -38,6 +69,7 @@
 #
 # Usage:
 #   watch-truncation.sh [--days N] [--sessions-dir DIR] [--dry-run]
+#   watch-truncation.sh --print-regime-floor   print the resolved clamp-regime floor
 #   Exit 0 clean · 1 TRIGGERED (rollback procedure printed) · 2 usage
 #
 # Env seams (tests + tuning):
@@ -58,6 +90,25 @@ BASE_REREAD="${WATCH_BASELINE_REREAD:-1969341}"
 FACTOR="${WATCH_2X_FACTOR:-2}"
 DRY_RUN=0
 SINCE=""
+PRINT_REGIME_FLOOR=0
+
+# ── the clamp regime's band (single source of truth) ────────────────────────
+# The length triage below buckets by these, and `--print-regime-floor` reports
+# the FLOOR from these SAME frozen variables — so the value a consumer reads
+# (#1342) is the value the triage applies, by construction, and no consumer has
+# to parse this file's assignment text or anchor on the owner-facing bucket
+# LABEL. The label is display text; the band is the contract.
+#   FLOOR       = the shipped 300K-clamp compaction trigger (300,000 − 16,384)
+#   ERA_CEIL    = the WITHDRAWN (#1213/#1226) 700K era's own trigger (700,000 − 50,000)
+#   DRIFT_FLOOR = the shared 1M-drift floor that bounds the legacy bucket
+REGIME_TB_FLOOR=283616
+REGIME_TB_ERA_CEIL=650000
+REGIME_TB_DRIFT_FLOOR=900000
+# Frozen ONCE, before anything reads them: `--print-regime-floor` reports the
+# FLOOR from these and the triage below buckets from these, so freezing is what
+# makes the answer and the behaviour the SAME by construction — a later
+# assignment cannot diverge them (#1088's lesson, applied here, #1342).
+readonly REGIME_TB_FLOOR REGIME_TB_ERA_CEIL REGIME_TB_DRIFT_FLOOR
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -65,7 +116,8 @@ while [[ $# -gt 0 ]]; do
         --since) SINCE="${2:-}"; shift 2 ;;
         --sessions-dir) SESSIONS_DIR="${2:-}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
-        *) echo "usage: $0 [--days N] [--sessions-dir DIR] [--dry-run]" >&2; exit 2 ;;
+        --print-regime-floor) PRINT_REGIME_FLOOR=1; shift ;;
+        *) echo "usage: $0 [--days N] [--sessions-dir DIR] [--dry-run] [--print-regime-floor]" >&2; exit 2 ;;
     esac
 done
 
@@ -81,6 +133,70 @@ if [ -n "$SINCE" ]; then
         echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
         exit 2
     fi
+fi
+
+# The band must be coherent before ANY use. An empty/inverted band can never
+# place a record in the current regime, so certifying its floor would certify a
+# regime nothing can reach — fail closed, and do it here (not in a consumer, and
+# not only in the print path) so a normal run is caught the same way.
+# The length bound is REQUIRED, not decoration: `[ N -ge M ]` ERRORS (rc=2) on
+# a value above bash's int64 range, and because that test runs as an `if`
+# CONDITION `set -e` does not fire — the failed comparison is read as FALSE,
+# i.e. as a COHERENT band, silently disarming the inverted-band refusal below.
+# (The pre-#1342 guard bounded its capture at 15 digits for that exact reason;
+# the bound has to move here with the check.) 16 `?` = any literal of length >= 16.
+case "$REGIME_TB_FLOOR" in
+    ''|*[!0-9]*) echo "ERROR: the clamp-regime band floor must be a plain integer (got '$REGIME_TB_FLOOR')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime band floor is outside the representable integer range (got '$REGIME_TB_FLOOR') — bash cannot compare it, so the inverted-band refusal would be silently disarmed" >&2; exit 2 ;;
+esac
+case "$REGIME_TB_ERA_CEIL" in
+    ''|*[!0-9]*) echo "ERROR: the clamp-regime band ceiling must be a plain integer (got '$REGIME_TB_ERA_CEIL')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime band ceiling is outside the representable integer range (got '$REGIME_TB_ERA_CEIL') — bash cannot compare it, so the inverted-band refusal would be silently disarmed" >&2; exit 2 ;;
+esac
+# DRIFT_FLOOR is the band's THIRD constant and was left unvalidated by #1342's
+# first pass: it is interpolated into the triage as `int()` and bounds the
+# legacy bucket above, so a non-integer makes the heredoc raise — rc=1, which is
+# this instrument's documented "TRIGGERED (rollback procedure printed)" code, so
+# a typo would be reported to the weekly driver as a rollback trigger with no
+# procedure printed — and an out-of-int64 literal disarms the comparisons below
+# for the same reason the bound is required on the pair above. Validate it with
+# the others, before ANY use (the print path short-circuits the triage, so
+# validating only at the heredoc would leave `--print-regime-floor` certifying a
+# floor for a band this instrument cannot actually run).
+case "$REGIME_TB_DRIFT_FLOOR" in
+    ''|*[!0-9]*) echo "ERROR: the clamp-regime drift floor must be a plain integer (got '$REGIME_TB_DRIFT_FLOOR')" >&2; exit 2 ;;
+    ????????????????*) echo "ERROR: the clamp-regime drift floor is outside the representable integer range (got '$REGIME_TB_DRIFT_FLOOR') — bash cannot compare it, so the band coherence refusal would be silently disarmed" >&2; exit 2 ;;
+esac
+if [ "$REGIME_TB_FLOOR" -ge "$REGIME_TB_ERA_CEIL" ]; then
+    echo "ERROR: the clamp-regime band is empty or inverted (floor $REGIME_TB_FLOOR >= ceiling $REGIME_TB_ERA_CEIL) — the triage cannot band a record into the current regime" >&2
+    exit 2
+fi
+# A drift floor STRADDLED by the current bucket (floor < drift < ceiling) is
+# incoherent, and it is NOT the `ceiling >= drift` shape a plain ordering rule
+# would reject: the triage tests the current bucket FIRST, so every record at or
+# above the 1M-drift floor but below the ceiling is attributed to the CURRENT
+# clamp regime — 1M-era records counted as this clamp's overruns, exactly the
+# mis-triage this gate exists to prevent. (The documented 1M revert is
+# legitimately `ceiling >= drift` — floor 983616 > drift 900000 — so rejecting
+# `ceiling >= drift` would false-block the pre-committed rollback; the hazard is
+# the drift floor being straddled, not the legacy bucket being empty.)
+if [ "$REGIME_TB_FLOOR" -lt "$REGIME_TB_DRIFT_FLOOR" ] && [ "$REGIME_TB_DRIFT_FLOOR" -lt "$REGIME_TB_ERA_CEIL" ]; then
+    echo "ERROR: the clamp-regime band straddles the 1M-drift floor (floor $REGIME_TB_FLOOR < drift $REGIME_TB_DRIFT_FLOOR < ceiling $REGIME_TB_ERA_CEIL) — records at/above the drift floor would be attributed to the current clamp regime" >&2
+    exit 2
+fi
+
+# ── --print-regime-floor: report the FLOOR and exit ────────────────────────
+# The cost-config guard calls this rather than parsing this file's assignment
+# text (#1342, repeating the #1088 review's rule for `$CAP_MS`). Reporting the
+# SAME frozen variable the triage buckets with is what makes the answer and the
+# behaviour agree by construction; the owner-facing bucket LABEL is display
+# text and is deliberately NOT part of this contract, so a relabel can no
+# longer make the floor unreadable. Side-effect free and dependency-free by
+# construction — it runs before the shared-parser and sessions-dir checks, so
+# it works in a fixture root and in CI where neither exists.
+if [ "$PRINT_REGIME_FLOOR" -eq 1 ]; then
+    printf '%s\n' "$REGIME_TB_FLOOR"
+    exit 0
 fi
 
 [ -x "$SPM_SH" ] || { echo "ERROR: shared parser not found: $SPM_SH" >&2; exit 2; }
@@ -147,12 +263,15 @@ for line in sys.stdin:
     exit 2
 fi
 
-python3 - "$SUMMARY_JSONL" "$BASE_CALLS" "$BASE_REREAD" "$FACTOR" <<'PYEOF'
+python3 - "$SUMMARY_JSONL" "$BASE_CALLS" "$BASE_REREAD" "$FACTOR" \
+         "$REGIME_TB_FLOOR" "$REGIME_TB_ERA_CEIL" "$REGIME_TB_DRIFT_FLOOR" <<'PYEOF'
 import json, sys, collections
 
 raw = sys.argv[1]
 base_calls, base_reread = float(sys.argv[2]), float(sys.argv[3])
 factor = float(sys.argv[4])
+# The band, from the SAME frozen variables `--print-regime-floor` reports.
+regime_floor, era_ceil, drift_floor = int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7])
 rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
 rows = [r for r in rows if not r.get("error")]
 
@@ -176,13 +295,25 @@ for r in rows:
         tb = max(r["max_ctx"], r["max_tokensBefore"])
         # shipped 300K-clamp band: floor = the clamp's compaction trigger
         # 283,616 (= 300,000 − 16,384 reserveTokens; the same dial #570
-        # applied to fleet-cost-report's regime floor). A length stop in the
-        # 283.6–300K band IS a 300K-clamp session — it must NOT fall to
+        # applied to fleet-cost-report's regime floor). A length stop AT OR
+        # ABOVE the trigger IS a clamp session — it must NOT fall to
         # small-window (which would tell the owner to exclude a clamp-era
-        # record from the revert decision). Pre-clamp legacy/200K-transient
-        # sessions (~196–205K) stay below the floor.
-        bucket = "300K-clamp(283.6-300K)" if 283616 <= tb < 900000 else \
-                 ("1M-era(≥900K)" if tb >= 900000 else f"small-window(<{tb:,})")
+        # record from the revert decision); pre-clamp legacy/200K-transient
+        # sessions (~196–205K) stay below the floor. The band runs up to the
+        # next era's floor, and the label names that true band because this
+        # label is the owner-facing discriminator: a record sitting well above
+        # ~300K inside it is an EARLIER clamp era's (e.g. the 400K records the
+        # header describes), not this clamp's own mid-turn overrun — the
+        # current geometry's tight band is ~283.6–300K.
+        # The WITHDRAWN (#1213/#1226) 700K era gets its own LEGACY bucket,
+        # floor = its own compaction trigger 650,000 (= 700,000 − 50,000),
+        # running up to the shared 1M-drift floor at 900,000. Its label names
+        # that same true band, for the same reason: a record in this bucket is
+        # neither current geometry nor small-window. (Empty against this box's
+        # corpus — see the header.)
+        bucket = f"300K-clamp({regime_floor/1000:.1f}-{era_ceil/1000:.0f}K)" if regime_floor <= tb < era_ceil else \
+                 (f"700K-clamp-era({era_ceil/1000:.0f}-{drift_floor/1000:.0f}K)" if era_ceil <= tb < drift_floor else \
+                  (f"1M-era(≥{drift_floor/1000:.0f}K)" if tb >= drift_floor else f"small-window(<{tb:,})"))
         len_ctx_buckets[bucket] += gl
 
 # B) volume/calls leg: per-compacting-session means vs 2× baseline over any
@@ -247,14 +378,33 @@ print("")
 print("Pre-committed procedure (policy §7 — the weekly report reader is the owner):")
 print("  1. Revert the clamp: models.json contextWindow 300000 → 1000000 for every")
 print("     deepseek-served id (and models-store.json checkedAt bump, defense-in-depth).")
-print("  2. Update the guard threshold scripts/check-cost-config.sh in the SAME commit")
-print("     (the revert must not leave the drift guard asserting ≤300K).")
-print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the guard for the rollback run;")
+print("  2. Move the WHOLE geometry in the SAME commit (#1316): the guard's CLAMP and")
+print("     the regime floor in BOTH instruments — fleet-cost-report.sh's")
+print("     FLEET_REGIME_TB:-<n> default and this file's REGIME_TB_FLOOR band constant.")
+print("     settings.json's reserveTokens STAYS at the reviewed 16384: the 1M geometry")
+print("     only needs the window, the guard clamp and the two floors to move, and moving")
+print("     the reserve is the inflation the #1227 directive forbids (if it ever moves")
+print("     legitimately, the guard's REVIEWED_RESERVE moves with it in the same commit).")
+print("     Move REGIME_TB_FLOOR and REGIME_TB_ERA_CEIL together; the guard reads the")
+print("     floor by EXECUTION (#1342), so the bucket label is display text only.")
+print("     Flipping only CLAMP trips a settings-class block that COST_CLAMP_OVERRIDE=1")
+print("     does NOT silence, so make the guard green BEFORE the revert commit.")
+print("  3. Window: COST_CLAMP_OVERRIDE=1 silences the CLAMP block for the rollback run;")
 print("     it never enables a live 1M session past the window.")
 print("  4. Re-clamping to 300K afterwards requires re-approval (policy §7).")
 print("")
 print("Owner triage (this run): length records at the 300K-clamp regime are the")
 print("predicted C8 mid-turn-overrun class; records in small-window sessions are")
-print("not clamp-related — exclude them from the revert decision.")
+print("not clamp-related — exclude them from the revert decision. The 300K-clamp")
+print("bucket spans the trigger up to the withdrawn era's floor, so a record")
+print("sitting well above ~300K is an EARLIER clamp era's, not this clamp's — the")
+print("current geometry's own band is ~283.6–300K.")
+print("")
+print("Records bucketed 700K-clamp-era(650-900K) sit at or above the WITHDRAWN")
+print("700K regime's compaction trigger and below the 1M-drift floor. They still")
+print("count toward this trigger (it is owner-owned and this instrument does not")
+print("narrow it), but they are NOT evidence about the restored 300K clamp. When")
+print("every record this run carries that bucket, no current-geometry truncation")
+print("was observed; the firing records age out of the window and stop counting.")
 sys.exit(1)
 PYEOF

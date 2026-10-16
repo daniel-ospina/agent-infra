@@ -3,11 +3,12 @@ import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { relative, resolve, isAbsolute, join, dirname, basename, extname } from "node:path";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, realpathSync, statSync, lstatSync, readlinkSync, openSync, closeSync, writeSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { register } from "../shared/health.js";
 import { appendJsonl } from "../shared/audit-log.js";
 import { isPrintMode, argvAllowsTask } from "../shared/print-mode.js";
+import { redactCommand } from "../shared/redact-command.js";
 // #966: the command parsers are ONE copy shared with review-enforcer, in
 // extensions/shared/ — the two extensions carried private copies that silently
 // drifted (and asserted opposite answers for the same input). Kept in shared/
@@ -31,6 +32,7 @@ import {
   makeGitSubCtx,
   subtractCommitArm,
   subtractPushArm,
+  resolveTrustedBase,
   SUBTRACT_SKIP_REASONS,
   type SubBundle,
   type SubAudit,
@@ -308,7 +310,15 @@ export function bridgeRoots(): string[] {
   const bridge = readBridge();
   if (!bridge || bridge.status !== "PASS") return [];
   const roots = new Set<string>();
-  for (const vf of bridge.verified_files) {
+  // readBridge() guarantees `verified_files` is an ARRAY; this guards the
+  // per-entry SHAPE. An entry that is not an object with a string path (a
+  // hand-edited/corrupt bridge) used to throw here, rejecting the
+  // session_start handler — so bridge recovery AND the init reset block were
+  // skipped and the gate wedged on spurious blocks until the file was cleared
+  // (the same "a verified change cannot be committed" symptom this PR fixes).
+  // The merge path already guards this exact shape; mirror it here.
+  for (const vf of (Array.isArray(bridge.verified_files) ? bridge.verified_files : [])) {
+    if (!vf || typeof vf.path !== "string") continue;
     const parsed = parseCompoundKey(vf.path);
     if (parsed) roots.add(parsed.root);
   }
@@ -331,7 +341,8 @@ function recoveryOnlyRoot(root: string): string {
   if (picked === null) return root;
   console.log(
     `[verification-gate] ↔ #3255: no verified entries for ${normalizeWorktreeRoot(root)}; ` +
-      `adopting ${picked} (same repo, has verified entries) as the git-op root`,
+      `recovering entries recorded for ${picked} (same repo) — the git-op root is NOT adopted: ` +
+      `the command's own cwd stays authoritative, and a root mismatch is diagnosed separately`,
   );
   return picked;
 }
@@ -355,6 +366,83 @@ function diagnoseRootMismatch(root: string): void {
       `${siblings.join(", ")} (same repo). Those are different trees, so hashes cannot be compared — ` +
       `re-run the op from the verified tree (cd into it) or re-dispatch verification for ${norm} (#3255).`,
   );
+}
+
+// ── #1225/#1573 P0: the bridge is a SHARED, MULTI-ROOT registry ──────────
+// `writeBridge` used to publish a whole-file SNAPSHOT of the writer's own
+// registry, so any concurrent lane's write erased every other root's entries
+// (#1225 measured three consecutive silent losses). A parent's verified entries
+// were then gone before its task child read them, and the child blocked a
+// change that had already been verified — the P0 this fix closes. Writers now
+// MERGE by compound key and publish with an atomic rename (a reader never sees
+// a torn file). Concurrent writers serialize on an O_EXCL pidfile lock; the
+// holder holds for <1 ms, and a lock timeout degrades to an unlocked merge,
+// which is fail-closed (a lost merge means re-verification, never an allow).
+const BRIDGE_LOCK_WAIT_MS = 500;
+const BRIDGE_LOCK_STALE_MS = 10_000;
+
+export function acquireBridgeLock(): (() => void) | null {
+  const lockFile = `${bridgePath()}.lock`;
+  const deadline = Date.now() + BRIDGE_LOCK_WAIT_MS;
+  for (;;) {
+    // The deadline is checked at the TOP of EVERY iteration, so no branch can
+    // spin past it. A persistent EEXIST whose target is not a readable lock
+    // file (a directory, a dangling symlink, an unreadable path) used to hit
+    // `catch { continue }` below — skipping the only deadline check and
+    // busy-looping forever at ~100% CPU inside the tool_call hook that called
+    // writeBridge, instead of the bounded degrade the constants claim.
+    if (Date.now() >= deadline) return null; // degrade unlocked; merge is fail-closed
+    try {
+      const fd = openSync(lockFile, "wx", 0o600);
+      writeSync(fd, String(process.pid));
+      closeSync(fd);
+      return () => {
+        try {
+          // ownership check before unlink — a stale-reclaim cycle must not
+          // delete a lock a THIRD process now holds. `isFile()` first: reading
+          // a non-regular path (a FIFO/socket) would block forever.
+          if (lstatSync(lockFile).isFile() && readFileSync(lockFile, "utf-8").trim() === String(process.pid)) {
+            unlinkSync(lockFile);
+          }
+        } catch { /* already released */ }
+      };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return null; // read-only dir — degrade unlocked
+      // Stale-lock self-heal: dead holder PID, or age past the threshold. The
+      // lock is read ONLY after an `isFile()` check: a FIFO/socket/device at
+      // this path BLOCKS inside open(2) on read, and a synchronous block cannot
+      // be bounded by the deadline at the top of the loop — it would wedge the
+      // tool_call hook that called writeBridge, forever. `lstatSync` does not
+      // block, so every non-regular shape is handled as "not a lock we can
+      // take" rather than read.
+      let holderText: string | null = null;
+      try {
+        holderText = lstatSync(lockFile).isFile() ? readFileSync(lockFile, "utf-8").trim() : null;
+      } catch { holderText = null; }
+      if (holderText === null) {
+        // Not a regular lock file (directory / FIFO / socket / dangling
+        // symlink) or it vanished between the two calls. Reclaim it and retry;
+        // if it exists and cannot be removed it is not a lock we can ever
+        // take, so degrade unlocked NOW rather than spinning (a synchronous
+        // spin here wedges the hook too). The deadline at the top of the loop
+        // bounds every remaining path.
+        try { unlinkSync(lockFile); continue; } catch { /* not removable / already gone */ }
+        if (!existsSync(lockFile)) continue; // vanished between open and read — retry
+        return null; // exists but is not a removable regular lock — degrade unlocked
+      }
+      let stale = false;
+      const holder = Number(holderText);
+      if (Number.isInteger(holder) && holder > 0) {
+        try { process.kill(holder, 0); } catch { stale = true; } // ESRCH — holder is dead
+      } else {
+        stale = true; // empty/garbage lock (e.g. the legacy 0-byte file)
+      }
+      if (!stale) stale = Date.now() - statSync(lockFile).mtimeMs > BRIDGE_LOCK_STALE_MS;
+      if (stale) { try { unlinkSync(lockFile); } catch { /* raced */ } continue; }
+      const spinUntil = Date.now() + 10;
+      while (Date.now() < spinUntil) { /* brief spin — holders are sub-ms */ }
+    }
+  }
 }
 
 function writeBridge(projectRoot: string, files: string[]): void {
@@ -389,12 +477,65 @@ function writeBridge(projectRoot: string, files: string[]): void {
       console.error("[verification-gate] bridge write skipped — no files could be hashed");
       return;
     }
-    const payload = {
-      status: "PASS",
-      verified_files: verifiedFiles,
-      timestamp: new Date().toISOString(),
-    };
-    writeFileSync(bridgePath(), JSON.stringify(payload), { mode: 0o600 });
+    // #1225/#1573: MERGE into the shared registry — never overwrite it. The
+    // writer's OWN keys win (a re-verification updates in place); every
+    // foreign-root entry is preserved, so a concurrent lane cannot silently
+    // erase another root's verification. Preservation is security-neutral:
+    // recovery registers an entry only when its STORED hash still matches the
+    // file on disk under the committing root (match-or-drop, #190), so a
+    // preserved entry that no longer matches is inert (fail-closed). Entries
+    // whose root no longer exists, or whose file was deleted under a live
+    // root, are dropped — bounding the file to live worktrees and live files.
+    const release = acquireBridgeLock();
+    try {
+      const merged = new Map<string, VerifiedFile>();
+      const existing = readBridge();
+      if (existing && existing.status === "PASS" && Array.isArray(existing.verified_files)) {
+        const rootAlive = new Map<string, boolean>();
+        for (const vf of existing.verified_files) {
+          if (!vf || typeof vf.path !== "string" || typeof vf.hash !== "string") continue;
+          const parsed = parseCompoundKey(vf.path);
+          if (parsed) {
+            let alive = rootAlive.get(parsed.root);
+            if (alive === undefined) { alive = existsSync(parsed.root); rootAlive.set(parsed.root, alive); }
+            if (!alive) continue; // dead worktree — prune
+            // Prune files that no longer exist under a LIVE root. A merge never
+            // rewrites the file down to the writer's own registry the way the
+            // old snapshot did, so nothing else would ever remove these — they
+            // would accumulate without bound in the machine-global bridge, and
+            // every git op whose mtime changed re-parses and scans every entry.
+            // Presence must be tested WITHOUT following the link: the gate's
+            // own #1092 file rule hashes a symlink's LINK bytes and needs no
+            // existing target, so a verified DANGLING symlink is legitimate.
+            // `existsSync` follows the link, reads such a symlink as absent,
+            // and would prune the entry — re-creating the #1225/#1573 loss on
+            // the next foreign write, for the #1092 path class.
+            let present = false;
+            try { lstatSync(resolve(parsed.root, parsed.path)); present = true; } catch { present = false; }
+            if (!present) continue;
+          }
+          merged.set(vf.path, vf);
+        }
+      }
+      for (const vf of verifiedFiles) merged.set(vf.path, vf); // writer's own keys win
+      const payload = {
+        status: "PASS",
+        verified_files: Array.from(merged.values()),
+        timestamp: new Date().toISOString(),
+      };
+      // Atomic publish: a concurrent reader sees either the old file or the new
+      // one, never a truncated JSON body (which would read as no bridge).
+      const tmp = `${bridgePath()}.tmp-${process.pid}-${Date.now()}`;
+      try {
+        writeFileSync(tmp, JSON.stringify(payload), { mode: 0o600 });
+        renameSync(tmp, bridgePath());
+      } catch (e) {
+        try { unlinkSync(tmp); } catch { /* nothing to clean */ }
+        throw e;
+      }
+    } finally {
+      if (release) release();
+    }
   } catch (e) {
     console.error("[verification-gate] bridge write failed:", (e as Error).message);
   }
@@ -404,7 +545,18 @@ function readBridge(): { status: string; verified_files: VerifiedFile[] } | null
   try {
     if (!existsSync(bridgePath())) return null;
     const raw = readFileSync(bridgePath(), "utf-8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    // Normalise the SHAPE at the one read boundary, so NO consumer has to
+    // defend against a hand-edited/corrupt bridge. A non-array
+    // `verified_files` used to make `for (const vf of ...)` throw inside the
+    // session_start handler, skipping bridge recovery AND the init reset block
+    // and wedging the gate on spurious blocks until the file was cleared —
+    // the same "a verified change cannot be committed" symptom this PR fixes.
+    // Entries that are not objects with a string path are skipped by each
+    // consumer; this only guarantees the CONTAINER is iterable.
+    if (!Array.isArray(parsed.verified_files)) parsed.verified_files = [];
+    return parsed;
   } catch {
     return null;
   }
@@ -451,7 +603,7 @@ function recoverBridgeForRoot(normRoot: string): number {
   for (const vf of bridge.verified_files) {
     try {
       const parsed = parseCompoundKey(vf.path);
-      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert
+      if (!parsed || parsed.root !== normRoot) continue; // foreign root — inert (#37/#190 root isolation)
       // #190 review: containment — an out-of-root rel (../) is inert against
       // the block check (git names are repo-relative) but hashFile would read
       // outside the root; drop such keys before hashing.
@@ -866,14 +1018,10 @@ function isCrossRepo(cwdRepo: string | null, explicitRepo: string | null): boole
   return !!explicitRepoN && !!cwdRepoN && explicitRepoN !== cwdRepoN;
 }
 
-// Redact credentials from a command before it hits the audit log (the audit
-// files are world-readable — an inlined GH_TOKEN=… must never persist).
-function redactCommand(command: string): string {
-  return command
-    .replace(/\b(?:GH|GITHUB)_TOKEN=\S+/gi, "***")
-    .replace(/ghp_[A-Za-z0-9]+/g, "ghp_***")
-    .replace(/github_pat_[A-Za-z0-9_]+/g, "github_pat_***");
-}
+// Redaction moved to the shared seam when `review-enforcer` began writing the same
+// `command` field into the same JSONL stream (#1492) — one helper, so the two gates'
+// redaction cannot drift (#966). The rule it enforces: the audit files are
+// world-readable, so an inlined `GH_TOKEN=…` must never persist.
 
 // #472: shared gate_skip audit — field shape identical to the #204 merge-scope
 // skip (:1105) so all skip surfaces stay audit-synced (#60).
@@ -890,7 +1038,15 @@ const MERGE_SCOPE_DECISION_REASONS = [
 const GATE_SKIP_REASONS = [
   "push_range_empty",
   "delete_push_no_content",
+  // #7526: every routed candidate is a `D` row (or a per-arm deletion
+  // exclusion emptied them) — nothing has post-commit content to hash.
+  "deletion_only_no_content",
   "content_shape_exempt",
+  // #3716 — a push whose remote-tracking ref is no longer an ancestor of the
+  // pushed tip rewrites history: the scope moves to the branch's own diff
+  // against the integration base, and the DISCARDED commits are reported here
+  // (never by widening the verify set).
+  "non_fast_forward_push",
   ...MERGE_SCOPE_DECISION_REASONS,
   ...SUBTRACT_SKIP_REASONS,
 ] as const;
@@ -2023,8 +2179,11 @@ export function commandRunsCommit(command: string): boolean {
 // ANY probe failure → resolvePushRangeScope returns null → the caller's
 // status-quo staged scope (runStagedScope). NEVER error→[] (the
 // runBranchScope catch→clean-empty fail-open precedent is the
-// cautionary inversion). An empty RESOLVED range is audited push_range_empty
-// and allowed (an up-to-date push ships nothing).
+// cautionary inversion). An empty RESOLVED range is allowed (an up-to-date push
+// ships nothing) and audited push_range_empty — EXCEPT when it is a
+// history-rewriting push's narrowed range (#3716), which is audited
+// non_fast_forward_push instead: the ref being REPLACED makes "up to date" the
+// wrong statement about the push even when the content is identical.
 
 // src/dst are PLAIN ref names (no colon), validated by regex; colon = the
 // refspec had an explicit `:` (src:dst split) vs the bare same-name form — the
@@ -2151,9 +2310,18 @@ export function resolvePushTier(trackingExists: boolean, baseMainExists: boolean
 }
 
 // PURE argv builder — baseRef is the FULLY RESOLVED base ref (never DWIM);
-// src is the resolved local ref (refs/heads/<x> or HEAD). Tier A = 2-dot
+// src is the fully resolved source: a local ref (refs/heads/<x> or HEAD), or —
+// on the #3716 history-rewrite path — the narrowed source OID (40- or 64-hex,
+// per GIT_OID; NOT always 40 as an earlier version of this comment said)
+// (`narrowedSrc`), because a rebased branch's local ref name is exactly what the
+// narrowing exists to avoid re-diffing. Tier A = 2-dot
 // (space form — the remote branch also LOSES remote-side-only files on a
-// diverged/force push); tier B = 3-dot first-push base. Injection safety:
+// diverged/force push); tier B = 3-dot first-push base. The two forms are NOT
+// an A/B property of the branch: #3716 makes a history-rewriting push call this
+// with "B" against the INTEGRATION base (a rebased branch's tracking ref still
+// points at the pre-rebase tip, where the 2-dot range is the base delta, not
+// the branch's change) — the caller, never this function, owns that choice.
+// Injection safety:
 // every value that reaches the argv is whitelist-validated before it is
 // interpolated — classifier tokens by PUSH_REFNAME/remote regex, and
 // git-state-derived values (checked-out branch name, config remote) by the
@@ -2192,6 +2360,185 @@ function symbolicRefShort(cwd: string): string | null {
   return v === null || v === "" ? null : v;
 }
 
+// Repo-scope-only config read (#1491). The declaration must be the PER-CLONE
+// operator assertion, but `git config --get` reads the MERGED scope — local +
+// `--global` + `--system` + `GIT_CONFIG_*` env + `-c`. A machine-global declaration
+// then activates the narrowing in EVERY clone on the box, with NO per-clone action
+// at all — the exact #1491 fail-open, reproduced (a review finding at head
+// 36a25d0). `--local` reads only the SHARED repository config: a linked worktree
+// shares that file REGARDLESS of `extensions.worktreeConfig` (which affects
+// `--worktree`, not `--local`), so a per-worktree declaration is invisible to this
+// gate and cannot activate it. `include.path`/`includeIf` are not followed by
+// `--local` (only `--includes` follows them).
+//
+// DECLARED RESIDUAL (not closable by any config-scope read): a machine-global
+// `init.templateDir` — or the ambient `GIT_TEMPLATE_DIR` env — makes git COPY a
+// `config` file into every freshly cloned/initialised repo's `.git/config`, so a
+// `--local` read can pick up a seed the operator did not set in that clone. That
+// requires control of the machine-global config/env (the same trust boundary as
+// `GIT_CONFIG_GLOBAL`), and the key genuinely lands in `.git/config` where no read
+// can distinguish it from an operator's own. Other `gitConfigGet` callers keep the
+// merged read — branch-upstream configs are legitimately inherited.
+//
+// ⛔ TRUST BOUNDARY (declared, per the #1491 decision): the declaration IS the
+// operator's own assertion, and `.git/config` is written by the operator. A gated
+// actor that rewrites its OWN `vgate.integrationRef` (or `branch.<cur>.merge`) — or
+// deletes the working-tree tripwire — can therefore assert a wrong base; that is
+// the accepted model, NOT a gate inference, and F3/#1491 closes the INFERENCE
+// vector, not a lying operator. Binding the declaration to an out-of-band
+// attestation the actor cannot rewrite is a larger design change that reopens the
+// decision — recorded as an owner option, not adopted here.
+function gitConfigGetLocal(cwd: string, key: string): string | null {
+  const v = gitProbe(cwd, `config --local --get ${key}`);
+  return v === null || v === "" ? null : v;
+}
+
+// SHA-1 (40 hex) or SHA-256 (64 hex) object id. The shape a value must have
+// before `isAncestorOrEqual` or the `rev-list --count` probe interpolates it into
+// an execSync string — the same whitelist-before-interpolation invariant as
+// PUSH_REFNAME (execSync runs /bin/sh -c; nothing here sets shell:false).
+// `resolveCommitOid`'s `rev-parse` probe is the exception to "OIDs only": it
+// interpolates a PUSH_REFNAME-validated ref NAME and then validates the RESULT
+// against GIT_OID, so a name never reaches the ancestry probes.
+const GIT_OID = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
+
+// #1491 — the integration ref must be DECLARED, never inferred from a ref NAME.
+// The cycle-2 guard (`INTEGRATION_BASE_REF`) matched `refs/remotes/origin/(main|
+// master)`, which selects a NAME, not a ROLE. Two measured fail-opens followed
+// (agent-infra #1491): in a fork-as-`origin` layout the name matches the FORK's
+// `main`, so content the push LANDS on the canonical remote is omitted; and in a
+// `origin/HEAD -> master` repo a legacy `origin/main` matches while the
+// integration branch is `master`. `resolveTrustedBase` also prefers a branch's
+// DECLARED upstream naming another branch (#3398, for the subtraction arm, where
+// guards (0)-(5) neutralise it) — a TOPIC base, which the narrowing has no guard
+// for. No predicate on local ref names closes both vectors AND keeps scenario 87
+// (push to `fork`, base must stay `origin/main`): which remote is canonical is
+// carried only by an operator assertion.
+//
+// ⛔ THE ASSERTION MUST BE PER-CLONE. A checked-in `.vgate/integration-ref`
+// cannot carry it: the file is a shared, clone-relative NAME, so a fork clone
+// inherits `refs/remotes/origin/main` where `origin` is the FORK — honoring it
+// alone reproduces the fail-open one level up (the owner's stated "one outcome
+// this must not have"). Activation therefore requires the per-clone git-config
+// `vgate.integrationRef` (read `--local` ONLY — see `gitConfigGetLocal`: the
+// merged scope let a MACHINE-GLOBAL key activate every clone, a reproduced
+// fail-open); the checked-in file is an AGREEMENT TRIPWIRE — it must declare
+// exactly ONE meaningful line equal to the config, and any disagreement, extra
+// line, or present-but-unreadable file is refused. A MISSING config returns null
+// ⇒ NO narrowing (fail closed — a missing declaration must never produce a
+// narrowing).
+//
+// `cwd` is the git root of the gated op (the caller resolves it), but
+// `resolveGitRoot` is applied again for robustness when a subdirectory is passed.
+function readDeclaredIntegrationRefFile(cwd: string): { present: boolean; ref: string | null } {
+  const p = join(resolveGitRoot(cwd), ".vgate", "integration-ref");
+  // ⛔ PRESENCE is decided by lstat, NEVER by readFileSync's errno. A checked-in
+  // DANGLING SYMLINK (git mode 120000) is REPO-CARRIED content but `readFileSync`
+  // throws ENOENT — the exact errno for "no file" — so a tracked symlink could
+  // neutralise the tripwire and let the config activate. Only an lstat ENOENT is
+  // genuinely absent; any existing path is present.
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(p);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") return { present: true, ref: null };
+    // The entry itself is absent. But an INTERMEDIATE component can still be a
+    // repo-carried DANGLING SYMLINK (a committed `.vgate` symlink to a missing
+    // directory), which makes this path read as ENOENT exactly like a missing
+    // file — the same bypass class as a dangling FILE symlink. Refuse it.
+    try {
+      const d = lstatSync(dirname(p));
+      if (d.isSymbolicLink()) {
+        try {
+          statSync(dirname(p));
+        } catch {
+          return { present: true, ref: null };
+        }
+      }
+    } catch {
+      /* `.vgate` absent too → genuinely no tripwire (config alone activates) */
+    }
+    return { present: false, ref: null };
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      st = statSync(p); // follow: a symlink to a regular file is readable
+    } catch {
+      return { present: true, ref: null }; // DANGLING symlink → present-but-unreadable, refuse
+    }
+  }
+  // A non-regular file (directory/EISDIR, FIFO — readFileSync would BLOCK
+  // unbounded on a FIFO — socket, device) is present-but-unreadable: refuse.
+  if (!st.isFile()) return { present: true, ref: null };
+  let raw: string;
+  try {
+    raw = readFileSync(p, "utf-8");
+  } catch {
+    return { present: true, ref: null }; // EACCES/EIO — present but unreadable → refuse
+  }
+  const lines: string[] = [];
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (t === "" || t.startsWith("#")) continue;
+    lines.push(t);
+    // A declaration is exactly ONE meaningful line. A second meaningful line is
+    // malformed (and a decoy: a first line agreeing with the config while a later
+    // line names another ref must not read as "agrees") — refuse.
+    if (lines.length > 1) return { present: true, ref: null };
+  }
+  if (lines.length === 0) return { present: true, ref: null }; // present but empty/comment-only
+  return { present: true, ref: PUSH_REFNAME.test(lines[0]) ? lines[0] : null };
+}
+
+export function resolveDeclaredIntegrationRef(cwd: string): string | null {
+  const cfgRaw = gitConfigGetLocal(cwd, "vgate.integrationRef");
+  const cfg = cfgRaw !== null && PUSH_REFNAME.test(cfgRaw) ? cfgRaw : null;
+  if (cfg === null) return null; // no per-clone assertion ⇒ no narrowing
+  const file = readDeclaredIntegrationRefFile(cwd);
+  if (file.present && file.ref !== cfg) return null; // shared decl disagrees ⇒ fail closed
+  return cfg;
+}
+
+// Pin a ref to its commit OID ONCE (#3716, verification follow-up). The narrowing
+// proof and the range diff MUST be about the SAME commits: `merge-base
+// --is-ancestor` and `git diff` each re-resolve whatever name they are handed, so
+// a background `git fetch` that advances the name in the probe→diff window makes
+// proof (1) true of one commit while the range is taken against another — and the
+// range then omits paths that differ from the CURRENT base TIP, which is exactly
+// the #3398 trust proof (1) exists to guarantee. This is the invariant the #755
+// subtraction already keeps (`makeSubBundle` pins T once: "a concurrent
+// update-ref cannot tear it"); the narrowing keeps it too.
+// Export is for the unit pin (tests import from ./index.js, like resolvePushTier).
+// null = unprovable → the caller keeps its fail-closed (pre-#3716) path.
+export function resolveCommitOid(cwd: string, ref: string): string | null {
+  if (!PUSH_REFNAME.test(ref)) return null;
+  const out = gitProbe(cwd, `rev-parse --verify --quiet ${ref}^{commit}`);
+  if (out === null) return null;
+  const oid = (out.split("\n")[0] ?? "").trim();
+  return GIT_OID.test(oid) ? oid : null;
+}
+
+// Tri-state `git merge-base --is-ancestor` probe (#3716). ⛔ OIDs ONLY: this
+// function interpolates its arguments into a shell string and the #3716 caller
+// pins them with `resolveCommitOid`; a bare refname must never reach it (a name is
+// re-resolved per command, which is the tear #3716 closes). Exit 0 = true (an
+// ancestor-or-equal), exit 1 = an EXPLICIT NEGATIVE (not an ancestor — a valid
+// answer, never collapsed into the failure sentinel), anything else
+// (128/signal/spawn) = null = UNPROVABLE. The null must stay distinct from
+// `false`: the rewrite switch acts only on the explicit negative, so a probe
+// failure keeps the pre-existing (wider) scope — fail-closed.
+export function isAncestorOrEqual(cwd: string, a: string, b: string): boolean | null {
+  if (!GIT_OID.test(a) || !GIT_OID.test(b)) return null;
+  try {
+    execSync(`git merge-base --is-ancestor ${a} ${b}`, { cwd, timeout: 5000, stdio: "ignore" });
+    return true;
+  } catch (e) {
+    const rc = (e as { status?: unknown } | null)?.status;
+    if (rc === 1) return false;
+    return null;
+  }
+}
+
 // Refname/remote validation for GIT-STATE-DERIVED values before they reach an
 // execSync string. execSync runs /bin/sh -c (NO shell:false anywhere in this
 // file), so ANY interpolated value must pass a strict whitelist: git refnames
@@ -2205,7 +2552,7 @@ function symbolicRefShort(cwd: string): string | null {
 // branch name is rejected by the whitelist even though neither carries shell
 // metachars → bare pushes over parked WIP keep the staged check (status-quo,
 // pre-#487 behavior).
-export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBundle | null): DiffScope | null {
+export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBundle | null, subDisabled = false): DiffScope | null {
   const parsed = parsePushRefSpecs(command);
   if (!parsed.eligible) return null; // commit/gh/unmappable/wrapper/no_push — zero subprocess on bare commits
   // Bare push (no refspecs): derive remote + dst + src from the branch config
@@ -2236,7 +2583,24 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
   // Multi-refspec union: files dedup, renameOldPaths dedup, clean = AND over
   // the refspec parses (mixed-union rule).
   const union: DiffScope = { files: [], renameOldPaths: [], clean: true };
+  // #7526: the union of per-refspec LIVE files (`files` minus that refspec's
+  // `deleted`). The rebuild below excludes a deletion from the result only when
+  // no refspec contributes the path live — see `combineScopes` for the rule and
+  // the P0/P1 it settles.
+  const unionLiveFiles: string[] = [];
   let sawTierA = false;
+  // #3716 — op-level provenance for the empty-range audit below: a rewrite push
+  // whose narrowed range is empty is NOT an up-to-date push, and must not be
+  // reported as one.
+  let sawRewroteHistory = false;
+  // #3716 — DEFERRED rewrite audit. `logGateSkip` must not run inside the
+  // per-refspec loop: a later refspec can still `return null` (tier C / a
+  // throw / an unresolvable src), which discards the whole union and sends the
+  // caller to the STAGED scope — an audit line written before that point would
+  // attest a base-scoped narrowing the op never used. Emitted only once the
+  // union has resolved (see `emitPendingRewrites` below), so the line can never
+  // outlive the resolution it describes.
+  const pendingRewrites: Array<Record<string, unknown>> = [];
   for (const rs of refspecs) {
     let { src, dst } = rs;
     // src = HEAD special-case — NO-COLON ONLY (a positional `HEAD` pushes to
@@ -2300,16 +2664,111 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     const baseMainExists = refExists(cwd, baseMain);
     const tier = resolvePushTier(trackingExists, baseMainExists);
     if (tier === "C") return null; // whole-command rule: ANY tier C → staged
-    const baseRef = tier === "A" ? tracking : baseMain;
-    if (tier === "A") sawTierA = true;
+    // ── #3716 — a HISTORY-REWRITING push must not be scoped by the stale ref ──
+    // The tracking ref earns its place as tier A's base because it says what the
+    // remote branch currently holds, so the 2-dot range is "what this push
+    // changes". That premise BREAKS the moment the branch is rebased after being
+    // pushed: the ref still points at the PRE-rebase tip, which sits on the OLD
+    // base, so the range becomes the whole base delta (629 files in the field)
+    // instead of the branch's own diff (3) — and the loop cannot converge,
+    // because each re-dispatch can only remove the files the verifier was
+    // actually given (632 → 629).
+    // The branch's real diff is `git diff <base>...<src>` — exactly what the
+    // first-push (tier B) path already computes — so a rewrite push borrows that
+    // command against the branch's integration base.
+    // ⛔ An explicit DECLARATION plus TWO explicit proofs are required, and all
+    // are FAIL-CLOSED. The declaration is the first precondition (the base must
+    // EQUAL the declared integration ref — see `resolveDeclaredIntegrationRef`);
+    // the two proofs below are the second and third. Any other
+    // outcome (including a null/unprovable probe) leaves the push on its
+    // pre-#3716 path: this change can only ever take the narrowing on proof, so
+    // it never silently changes what an unprovable push is measured against.
+    //   (1) the integration base IS an ancestor-or-equal of the pushed tip.
+    //       ⛔ Load-bearing, and NOT implied by (2): it makes merge-base(base,
+    //       src) == base, so `git diff base...src` ≡ `git diff base src` and
+    //       every path the range OMITS is byte-identical to the base TIP's
+    //       content — the trusted integration content (#3398). Without it a
+    //       branch that is merely BEHIND or based on a sibling narrows to
+    //       `base...src`, which for a behind branch is EMPTY — reporting a
+    //       content-REVERTING force-push as an up-to-date no-op (measured:
+    //       2-dot = `M base.txt`, 3-dot = empty). That is a fail-OPEN, and it
+    //       is why this probe is required rather than merely conservative.
+    //   (2) the remote-tracking ref is NOT an ancestor (git exit 1, an explicit
+    //       negative — never a null). That is the rewrite proof itself: on an
+    //       ordinary fast-forward push the tracking ref IS an ancestor and the
+    //       narrow 2-dot increment is kept, unchanged.
+    // The signal that motivated the tracking ref — a force-push DISCARDS
+    // commits — is kept, but as the separate, explicitly-reported condition the
+    // issue asks for: an audit line, never an expansion of the verify set.
+    let baseRef = tier === "A" ? tracking : baseMain;
+    let rewroteHistory = false;
+    // Pinned OIDs for the RANGE — set only on the rewrite path; `undefined` keeps
+    // the pre-#3716 command byte-identical.
+    let narrowedBase: string | undefined;
+    let narrowedSrc: string | undefined;
+    // ⛔ #3716 — the kill switch must cover the NARROWING, not only the #755
+    // subtraction. `ELDATO_VGATE_NO_SUBTRACT` is documented (01-preflight) as the
+    // scope-WIDENING escape — "restores the previous (larger) scope … it can cost
+    // time, never coverage" — so a narrowing that survives it breaks that contract
+    // and removes an operator's only escape from a misbehaving narrowing. Skipped ⇒
+    // the pre-#3716 tier-A 2-dot scope, the same as any other unprovable outcome.
+    if (tier === "A" && !subDisabled) {
+      // ⛔ ONE base rule (#3398 + #1491): the base must be the ref the operator
+      // DECLARED as the integration ref, OID-pinned — never the push remote's
+      // `main` (a push remote says where content GOES, not what was integrated;
+      // trusting a fork's `main` let fork-only unverified content be omitted —
+      // review F1 on #1106) and never a ref NAME, which is re-resolved per
+      // command and can be retargeted between the proof and the range (the tear
+      // #3716 closes).
+      // ⛔ DECLARED, never inferred from a name — see `resolveDeclaredIntegrationRef`
+      // above for the two measured fail-opens (#1491) a name predicate cannot
+      // close. `trustedRef === declaredRef` is the whole guard: a base that is
+      // not the declared ref (a fork's `main`, a legacy `main`, a topic upstream)
+      // keeps the wider pre-#3716 scope.
+      const trusted = resolveTrustedBase(cwd);
+      const declaredRef = resolveDeclaredIntegrationRef(cwd);
+      const srcOid = resolveCommitOid(cwd, srcRef);
+      const trackingOid = resolveCommitOid(cwd, tracking);
+      const baseOid = trusted !== null && GIT_OID.test(trusted.oid) ? trusted.oid : null;
+      const trustedRef = trusted?.ref ?? null;
+      if (declaredRef !== null && trustedRef === declaredRef && baseOid !== null
+          && srcOid !== null && trackingOid !== null
+          && isAncestorOrEqual(cwd, baseOid, srcOid) === true
+          && isAncestorOrEqual(cwd, trackingOid, srcOid) === false) {
+        rewroteHistory = true;
+        sawRewroteHistory = true;
+        narrowedBase = baseOid;
+        narrowedSrc = srcOid;
+        const discardedRaw = gitProbe(cwd, `rev-list --count ${srcOid}..${trackingOid}`);
+        const discardedParsed = discardedRaw === null ? Number.NaN : Number.parseInt(discardedRaw, 10);
+        pendingRewrites.push({
+          branch: dst,
+          trackingRef: tracking,
+          baseRef: declaredRef,
+          baseOid,
+          trackingOid,
+          discardedCommits: Number.isFinite(discardedParsed) ? discardedParsed : null,
+        });
+      }
+    }
+    // `tier` in the push_range_empty audit names the RANGE FORM, so a rewrite
+    // push (which used the 3-dot base command) must not claim tier A.
+    if (tier === "A" && !rewroteHistory) sawTierA = true;
     // 2-dot (A) / 3-dot (B) `--name-status -z` diff. The builder emits the
     // FULL `git diff …` argv (unit-pinned) — run it directly (NOT through
     // gitProbe, which would double the `git` prefix). ANY throw → null
     // (staged) — NEVER error→[] (the computeBranchDiff catch→[] fail-open
     // precedent inverted). No trim: -z rows are NUL-delimited raw path bytes.
+    // #3716: a rewrite push reuses the tier-B command (`base...` 3-dot) while
+    // `tier` still carries the A label — the diff FORM must follow the base
+    // that was actually chosen, never the tracking ref that was rejected.
     let diffOut: string | null = null;
     try {
-      diffOut = execSync(buildPushRangeDiffCommand(tier, baseRef, srcRef, true), {
+      // #3716: the RANGE uses the SAME pinned OIDs the proof used (a name here
+      // would re-resolve and could differ from the commit the proof was about).
+      // OIDs were re-validated against GIT_OID at pin time and also match the
+      // builder's PUSH_REFNAME whitelist.
+      diffOut = execSync(buildPushRangeDiffCommand(rewroteHistory ? "B" : tier, narrowedBase ?? baseRef, narrowedSrc ?? srcRef, true), {
         cwd, encoding: "utf-8", timeout: 5000, maxBuffer: 64 * 1024 * 1024,
       });
     } catch {
@@ -2328,13 +2787,31 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
       srcRef: srcRef ?? undefined,
       trackingRef: tracking,
     });
+    // #7526: `files` unions the refspecs' files PLAINLY — the deletion exclusion
+    // must NOT be subtracted here, or `applyScopeGate` (fed the rebuilt `files`
+    // below) stops seeing a deleted non-exempt path and the content-shape
+    // exemption widens (#7526 P1). The exclusion rides on the rebuilt `deleted`
+    // instead, filtered to paths no refspec contributes live: origin/A..A
+    // deletes `f.ts` while origin/B..B modifies it ⇒ `f.ts` stays a candidate
+    // (the #7526 P0).
     union.files.push(...subbed.files);
     union.renameOldPaths.push(...subbed.renameOldPaths);
     union.clean = union.clean && subbed.clean;
+    if (subbed.deleted !== undefined) {
+      union.deleted = [...(union.deleted ?? []), ...subbed.deleted];
+    }
+    unionLiveFiles.push(...verificationCandidates(subbed.files, subbed.deleted));
     if (subbed.subtractions !== undefined) {
       union.subtractions = [...(union.subtractions ?? []), ...subbed.subtractions];
     }
   }
+  // #3716 — the rewrite audit is emitted HERE, once the union has resolved:
+  // every path below returns a scope, so a `non_fast_forward_push` line now
+  // describes a push the gate actually scoped, never a probe an op abandoned
+  // (see `pendingRewrites`). One line per rewriting refspec.
+  const emitPendingRewrites = (): void => {
+    for (const r of pendingRewrites) logGateSkip("non_fast_forward_push", command, cwd, r);
+  };
   if (union.files.length === 0 && union.renameOldPaths.length === 0 && union.clean) {
     // #755: suppress push_range_empty when the emptiness was CAUSED by
     // subtraction — the single emitted line is then the handler's richer
@@ -2349,6 +2826,14 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // `subtractions` is ABSENT (not []) on the ordinary no-subtraction push,
     // so the `?? 0` is load-bearing — a bare `.length` throws on the common path.
     const subtractedSomething = (union.subtractions?.length ?? 0) > 0;
+    // #3716 — the same suppression rule for a rewrite push: its range can be
+    // EMPTY (the pushed tip's tree IS the integration base, e.g. a branch reset
+    // onto origin/main), yet the push genuinely REWRITES the remote branch and
+    // discards commits. Emitting push_range_empty here would report a
+    // history-rewriting force-push as an up-to-date no-op; the op's
+    // non_fast_forward_push audit line(s) are then emitted once the union
+    // resolves (see emitPendingRewrites below — same shape as the subtraction
+    // suppression).
     // Up-to-date push ships nothing — audited INSIDE the resolver so the
     // caller's shared silent empty-allow never hides the range decision.
     // Note: with multi-refspec commands the tier payload is "A" iff ANY
@@ -2365,15 +2850,22 @@ export function resolvePushRangeScope(command: string, cwd: string, sub?: SubBun
     // same trust class (the gate never saw remote-side-only files — identical
     // to computeBranchDiff's origin/main staleness); the pull --rebase
     // pre-push ceremony (01-preflight) refreshes it.
-    if (!subtractedSomething) logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    if (!subtractedSomething && !sawRewroteHistory) logGateSkip("push_range_empty", command, cwd, { tier: sawTierA ? "A" : "B" });
+    emitPendingRewrites();
     return { files: [], renameOldPaths: [], clean: true, ...(subtractedSomething ? { subtractions: union.subtractions } : {}) };
   }
   // Fresh object ⇒ any field not explicitly rebuilt is dropped. `subtractions`
-  // is therefore carried explicitly and null-safely.
+  // and the #7526 `deleted` projection are therefore carried explicitly and
+  // null-safely. `deleted` is the union of the refspecs' deletions MINUS the
+  // paths any refspec contributes live (absent, never `[]`, when it is empty).
+  const unionLive = new Set(unionLiveFiles);
+  const deleted = Array.from(new Set(union.deleted ?? [])).filter((p) => !unionLive.has(p));
+  emitPendingRewrites();
   return {
     files: Array.from(new Set(union.files)),
     renameOldPaths: Array.from(new Set(union.renameOldPaths)),
     clean: union.clean,
+    ...(deleted.length > 0 ? { deleted } : {}),
     ...(union.subtractions !== undefined && union.subtractions.length > 0
       ? { subtractions: union.subtractions }
       : {}),
@@ -2402,6 +2894,20 @@ export interface DiffScope {
    *  nothing was subtracted. `combineScopes` concatenates it and reads nothing
    *  else, so `DiffScope`-shaped literals without the key stay valid. */
   subtractions?: SubAudit[];
+  /** #7526: paths whose row letter is `D` — the verify path's DELETION
+   *  exclusion. A `D` row has no post-commit content, so "verify this path"
+   *  has no referent: the verify path subtracts this set from `files` before
+   *  hashing (a deletion-only change therefore verifies nothing and is
+   *  allowed). This is a SEPARATE projection, NOT a filter of the parser's
+   *  faithful output — `files` still carries every `D` path (the G1 pin
+   *  requires it). ABSENT (never `[]`) when nothing was deleted, so the
+   *  whole-object `deepEqual` pins on `parseDiffNameStatus...` are unchanged.
+   *  A COMBINED scope (`combineScopes`, the push union) keeps `files` as the
+   *  PLAIN union (so `applyScopeGate` still sees every `D` path) and carries
+   *  only the deletions NO arm/refspec contributes as a live file — subtracting
+   *  the union globally would let one arm's `D` erase another arm's live path
+   *  (the #7526 P0). */
+  deleted?: string[];
 }
 
 // Pure `--name-status -z` parser. Row grammar (byte-exact, verified against
@@ -2421,9 +2927,12 @@ export interface DiffScope {
 // semantics (documented residual, #559 plan §1); only a NUL-stream anomaly is
 // newly fail-closed.
 export function parseDiffNameStatus(output: string): DiffScope {
-  // Thin wrapper — the seven G1 full-object deepEqual pins compare `.scope`, so
-  // splitting the parser must not change the returned object's shape.
-  return parseDiffNameStatusDetailed(output).scope;
+  // Thin wrapper — the G1 full-object deepEqual pins compare the WHOLE returned
+  // object, so this wrapper keeps its exact pre-#7526 shape: the #7526 `deleted`
+  // projection is a DETAILED-parse extra and is dropped here. Splitting the
+  // parser must never change this object's shape.
+  const { deleted: _deleted, ...scope } = parseDiffNameStatusDetailed(output).scope;
+  return scope;
 }
 
 /** #755 — the same parse, plus the per-path STATUS map the eligibility rule
@@ -2488,7 +2997,18 @@ export function parseDiffNameStatusDetailed(output: string): {
       i++;
     }
   }
-  return { scope: { files, renameOldPaths, clean }, statuses };
+  // #7526: the deletion projection, derived from the SAME status map the
+  // subtraction rule reads (never re-derived from the raw stream — a second
+  // parse could drift). Keyed off the map, so a repeated path is reported once
+  // and an anomaly's partial map yields a partial (never fabricated) set; the
+  // parse-block runs first, so a partial set is never consulted.
+  const deleted = [...statuses.entries()].filter(([, letter]) => letter === "D").map(([path]) => path);
+  return {
+    scope: deleted.length > 0
+      ? { files, renameOldPaths, clean, deleted }
+      : { files, renameOldPaths, clean },
+    statuses,
+  };
 }
 
 function execDiffStatusZ(cwd: string, cmd: string): string | null {
@@ -2505,10 +3025,43 @@ function execDiffStatusZ(cwd: string, cmd: string): string | null {
 // clean AND over the members). Pure + exported (unit-pinned — the mixed arm's
 // combination rule is otherwise comment-only).
 export function combineScopes(a: DiffScope, b: DiffScope): DiffScope {
+  // #7526: `files` is the PLAIN union of the arms' `files` — deliberately NOT
+  // pre-filtered by each arm's `deleted`. `applyScopeGate` (the content-shape
+  // exemption and the rename-source conjunction) consumes this set and must see
+  // every path, including `D` rows, exactly as a single-arm scope does. Dropping
+  // a deleted path HERE widens the exemption: a `D src/app.ts` (non-exempt code)
+  // + `A docs/code.md` change would present only the exempt path and route
+  // `exempt-allow` instead of `verify` — code moved into a docs-shaped path ships
+  // unverified (#7526 P1, introduced by subtracting per arm in 532ee59).
+  //
+  // The deletion exclusion is instead carried on the result's `deleted`, and
+  // ONLY for paths that no arm contributes as a LIVE file:
+  //   deleted_combined = (a.deleted ∪ b.deleted) \\ (live(a) ∪ live(b))
+  // where live(x) = x.files \\ x.deleted. A path may be excluded from
+  // verification only if EVERY arm that lists it in `files` also lists it in
+  // `deleted`; if any arm contributes it live, it must stay a candidate (the
+  // #7526 P0: `D f.ts` on one arm + `A f.ts` on another must still verify).
+  // Subtraction is then safe at the consumer, because no arm contributes the
+  // path as live content.
+  //
+  // `renameOldPaths` is deliberately NOT treated this way: it is an auxiliary
+  // R/C-SOURCE set consumed by the shape-exemption CONJUNCTION, not a projection
+  // subtracted from `files`, and one path carries one row letter — a `D` path can
+  // never be an R/C source — so unioning it unchanged is the existing (and
+  // correct) semantics.
+  const live = new Set([
+    ...verificationCandidates(a.files, a.deleted),
+    ...verificationCandidates(b.files, b.deleted),
+  ]);
+  const deleted = Array.from(new Set([...(a.deleted ?? []), ...(b.deleted ?? [])]))
+    .filter((p) => !live.has(p));
   const core: DiffScope = {
     files: Array.from(new Set([...a.files, ...b.files])),
     renameOldPaths: Array.from(new Set([...a.renameOldPaths, ...b.renameOldPaths])),
     clean: a.clean && b.clean,
+    // Absence-preserving (never `[]`) — the G4 whole-object literals carry no
+    // `deleted`, mirroring the `subtractions` contract.
+    ...(deleted.length > 0 ? { deleted } : {}),
   };
   // #755: concatenate the per-arm subtraction audits, null-safely AND
   // absence-preservingly — `[...a.subtractions, ...]` would throw
@@ -2759,6 +3312,33 @@ export function routeScopeGate(gate: ScopeGateDecision, files: string[]): ScopeG
     case "verify":
       return { action: "verify", files };
   }
+}
+
+/** #7526 — the verify path's candidate set: the routed `files` MINUS the
+ *  scope's `deleted` projection. A `D` row has no post-commit content, so
+ *  there is nothing for a verifier to hash; asking for one would make the gate's
+ *  cost scale with the number of files a change REMOVES (the report: 2,259
+ *  untracked vendored files → 2,259 "unverified" entries). A deletion-only
+ *  change filters to EMPTY — nothing to verify, so the caller allows it via the
+ *  same empty-allow posture as a genuinely empty diff.
+ *
+ *  This is the DECISION point, deliberately downstream of `applyScopeGate`:
+ *  the parser and the gate's parse-block / empty / exemption / rename-source
+ *  routing still see every path, and `A`/`M`/`R`/`T`/`U`/`X`/`B` pass through
+ *  untouched. Pure + exported so the decision is unit-pinned — a regression
+ *  cannot silently re-add a deleted path to the candidate set. `combineScopes`
+ *  and the push union also call it to compute an arm's LIVE files (that arm's
+ *  `files` minus its `deleted`), which is what lets them keep `files` a plain
+ *  union while still excluding a path every arm deleted.
+ *
+ *  Note: for a plain staged deletion (`git rm`) the worktree path is already
+ *  absent, so the loop's #920 ENOENT skip reached the same outcome; this
+ *  exclusion is what also covers the UNTRACK case (`git rm --cached`), where
+ *  the file is still on disk but no longer committed. */
+export function verificationCandidates(files: string[], deleted: readonly string[] | undefined): string[] {
+  if (deleted === undefined || deleted.length === 0) return files;
+  const deletedSet = new Set(deleted);
+  return files.filter((f) => !deletedSet.has(f));
 }
 
 /**
@@ -3516,8 +4096,15 @@ export default function (pi: ExtensionAPI) {
       scope = combineScopes(runStagedScope(cwd, sub), namedWt);
     } else {
       // #487 T1: a content push (no git commit anywhere in the command) verifies
-      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot) or
-      // the first-push base (tier B, 3-dot) — never the whole index, so another
+      // the PUSHED RANGE — HEAD vs the remote-tracking ref (tier A, 2-dot)
+      // UNLESS the #3716 narrowing applies, in which case it is the branch's diff
+      // against its integration base (3-dot: tier B / the first push, and a
+      // history-rewriting push). The narrowing applies only when BOTH proofs
+      // hold — the tracking ref is NOT an ancestor-or-equal of the pushed tip AND
+      // the integration base IS one. Every other outcome keeps the 2-dot scope,
+      // including the case where the tracking ref is NOT an ancestor and the base
+      // is not one either (a behind or sibling base) — that is the fail-closed
+      // direction, pinned by e2e scenario 85 — never the whole index, so another
       // session's parked WIP in the index cannot false-block `git push origin
       // main` of already-committed HEAD. Commit-time behavior is UNCHANGED:
       // commit-bearing commands resolve null fast inside (classifier, zero
@@ -3527,7 +4114,9 @@ export default function (pi: ExtensionAPI) {
       // (scenario 44 legs 2-3), commit/gh presence (the P0 backstop,
       // wrapper-inclusive), no usable base (tier C), any git failure — NEVER []
       // on error (the computeBranchDiff catch→[] fail-open
-      // precedent). An empty RESOLVED range is audited push_range_empty inside.
+      // precedent). An empty RESOLVED range is audited push_range_empty inside —
+      // unless it is a #3716 rewrite's narrowed range, which is audited
+      // non_fast_forward_push (the ref is replaced even when the content matches).
       // #755 — the `??` operand serves TWO different commands, and they need
       // DIFFERENT bundles:
       //   • a PUSH command: `resolvePushRangeScope` handles it; the operand fires
@@ -3540,7 +4129,7 @@ export default function (pi: ExtensionAPI) {
       // `parsePushRefSpecs` is a pure classifier (zero subprocess), so asking it
       // here costs nothing.
       const pushAttempt = parsePushRefSpecs(command).eligible;
-      const pushScope = resolvePushRangeScope(command, cwd, pushAttempt ? sub : null);
+      const pushScope = resolvePushRangeScope(command, cwd, pushAttempt ? sub : null, subDisabled);
       scope = pushScope ?? runStagedScope(cwd, pushAttempt ? null : sub);
     }
 
@@ -3642,9 +4231,27 @@ export default function (pi: ExtensionAPI) {
 
     // verify path — renameOldPaths never reach verify/hash/naming (consumed
     // only by the gate); changedFiles stays the new-path projection.
-    const changedFiles = route.files;
+    //
+    // #7526: DELETED paths are subtracted HERE — the DECISION point — never in
+    // the parser (`files` must remain the faithful projection; the G1 pin
+    // requires a `D` path to stay in it) and never in the parse-block / empty /
+    // exemption routing above (all of which still see every path). A `D` row has
+    // no post-commit content: an untracked file is no longer committed, so
+    // requiring a verifier hash for it has no referent. A deletion-only change
+    // filters to empty and is allowed exactly like the empty-allow route —
+    // nothing to verify.
+    const changedFiles = verificationCandidates(route.files, scope.deleted);
     if (changedFiles.length === 0) {
-      // (unreachable — empty-allow handled above; defensive)
+      // #7526: reachable when EVERY candidate is deleted (deletion-only
+      // change) — nothing to verify, allow. (Also the defensive empty case for
+      // the verify route: empty-allow was handled above.)
+      // Audited like the sibling allow classes (`delete_push_no_content`,
+      // `content_shape_exempt`): a non-empty routed set that filters to empty
+      // was a deletion-only skip — never a silent allow. The defensive
+      // empty-route case (`route.files` already empty) emits nothing.
+      if (route.files.length > 0) {
+        logGateSkip("deletion_only_no_content", command, cwd, { files: route.files });
+      }
       return undefined;
     }
 

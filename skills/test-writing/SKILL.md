@@ -133,11 +133,11 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 ### Step 3.5 — Test Review (Mandatory Synchronous Gate)
 
-**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage+surface, journey-alignment, and test-quality.
+**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 2 merged reviewers by concern — A (correctness + discriminating power) and B (coverage + surface + journey alignment) — plus C (e2e + reproducibility) when the change touches e2e surfaces.
 
-**Dispatch (multi-file, single invocation).** `TEST DIFF` and `SABOTAGE EVIDENCE` are REQUIRED fields — reviewer 1's discriminating-power check is decidable only from them, and omitting them makes that check fire blind. **What goes in `SABOTAGE EVIDENCE` depends on which path you are on, and on the TDD path below it is expected to be empty:**
+**Dispatch (multi-file, single invocation).** `TEST DIFF` and `SABOTAGE EVIDENCE` are REQUIRED fields — Reviewer A's pass 1 discriminating-power check is decidable only from them, and omitting them makes that check fire blind. **What goes in `SABOTAGE EVIDENCE` depends on which path you are on, and on the TDD path below it is expected to be empty:**
 
-- **(a) TDD path** — the test was written before the implementation, so this gate runs *before* Step 4 (run the test) and Step 5 (implement the fix). There is no fix to revert yet, so `"none supplied"` is the correct and expected value here; reviewer 1's fallback branch governs, and that is not a gap.
+- **(a) TDD path** — the test was written before the implementation, so this gate runs *before* Step 4 (run the test) and Step 5 (implement the fix). There is no fix to revert yet, so `"none supplied"` is the correct and expected value here; Reviewer A's pass 1 fallback branch governs, and that is not a gap.
 - **(b) Pin added to an existing suite** (the fix already exists — the regression case, and the one #820 is about) — perform the Step 4 sabotage procedure **now**, before dispatching, and paste the observed failure. Do not leave this empty: on this path an empty field is exactly the vacuous-pin condition the check exists to catch.
 - If a batch mixes both, fill in (b)'s evidence and say so; do not leave the field blank because part of the batch is TDD-authored.
 ```
@@ -149,9 +149,9 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 **Cap protocol (test-review's 10-cycle cap, not 3):**
 - CAPPED + only P1/P2 issues → **WARN** — proceed to Green phase. Document remaining issues.
 - CAPPED + any P0 issue → **escalate to human gate.** Do NOT proceed. Present issues for decision.
-- CLEAN (all 4 reviewers return NO ISSUES FOUND) → proceed to Green phase.
+- CLEAN (Reviewer A's combined verdict is `REVIEWER A VERDICT: CLEAN` — both its ordered passes clean — and Reviewer B's combined verdict is `REVIEWER B VERDICT: CLEAN` — every part it ran clean — plus Reviewer C when it fires returning `NO ISSUES FOUND`) → proceed to Green phase.
 
-**Wrong-layer P0 escalation:** If Reviewer #2 flags "SQL business logic tested with TS mocks (should be pgTAP)":
+**Wrong-layer P0 escalation:** If Reviewer B's part 1 flags "SQL business logic tested with TS mocks (should be pgTAP)":
 1. Escalate to implementer with pgTAP guidance: file path convention (`supabase/tests/`), assertion patterns, link to test-writing pgTAP-specific checks (#8-10)
 2. Implementer writes pgTAP test → re-run test-review for that surface only
 3. Max 2 re-review attempts. Still P0 after 2 → human gate.
@@ -159,6 +159,55 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 **Sub-agent failure:** If `task` sub-agent crashes or times out → retry 2x with exponential backoff (1s, 2s). Still failing → escalate to human.
 
 **Surface map pre-check:** If no surface map exists for these test files AND files touch DB/API/auth boundaries → WARN "no surface map — test-review runs without layer assignment context."
+
+### Step 3.8 — Isolated checkouts — never copy the repo (#1141)
+
+When a test must run against a ref other than your current checkout (verifying a
+branch, reproducing on `main`, mutation-probing a file), get the checkout from a
+worktree — never a copy:
+
+```bash
+bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> \
+  [--paths <dir,file> | --full] -- <test-command...>
+```
+
+`run` shares the object store (no second `.git`) and **removes the worktree on
+EXIT/INT/TERM/HUP**, so a failing or killed test still leaves nothing behind.
+`--paths` is a sparse checkout (a few KB) — use it when the test only reads some
+paths. `--full` is the whole tracked tree.
+
+**BANNED for scratch checkouts:** `git clone`, `cp -R`, `cp -r`, `cp -a`, `rsync`
+of the repo, `git archive | tar -x` into a temp dir. If you create a worktree by
+hand, the trap is mandatory and MUST re-raise the status (a trap that does not
+`exit` swallows the signal and the script keeps running):
+
+```bash
+REPO=<repo>; D="$REPO/.worktrees/scratch-$$"
+git -C "$REPO" worktree add --detach "$D" <ref>
+GD="$(sed -n 's/^gitdir: //p' "$D/.git" 2>/dev/null)"
+trap 'rc=$?; rm -rf "${D:-/nonexistent}" 2>/dev/null || true; if [ ! -e "${D:-/nonexistent}" ]; then git -C "$REPO" worktree remove --force "${D:-/nonexistent}" 2>/dev/null || true; case "${GD:-}" in /*/.git/worktrees/*) rm -rf "$GD";; esac; else echo "leftover ${D:-?} - record KEPT so list shows it" >&2; fi; exit $rc' EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM
+```
+
+The trap removes the TREE first and only then deregisters: `git worktree remove --force`
+drops the record even when it FAILS to delete the directory, so deregistering first would
+leave a surviving checkout invisible to `list`, to a second `clean <path>` and to the
+reaper (#1141).
+The record removal is TARGETED: a bare `git worktree prune` deregisters every
+record whose directory is not currently stat-able (unmounted volume, permission
+blip, stale network mount), so it can silently destroy an unrelated sibling
+worktree's checkout while its files sit on disk. Remove your own record — the
+trap above reads its own `gitdir:` line — never prune the whole repo.
+
+Before reporting done, `bash scripts/scratch-worktree.sh list --repo <repo> --root <the root you used>` must not show a
+scratch worktree of YOURS. Clean only your own path (`scratch-worktree.sh clean
+<path>`). A bare `clean --all` refuses to sweep (it cannot see a holder whose argv
+does not name the path, so it would delete a sibling's in-flight probe);
+`clean --all --force-all` is the deliberate sibling sweep — do not run it while
+sibling sessions are running.
+The check is ROOT-SCOPED (`$SCRATCH_WORKTREE_ROOT`, else `/tmp`), so a bare `list` is
+a false PASS for a worktree created under another root.
+
 
 ### Step 4 — Green Phase (Run Test, Verify It Fails)
 

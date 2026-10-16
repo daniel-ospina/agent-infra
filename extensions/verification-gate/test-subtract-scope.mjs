@@ -134,7 +134,7 @@ check(
 check(
   "the scope-resolution site discriminates the push attempt from the commit fallback",
   /parsePushRefSpecs\(command\)\.eligible/.test(index) &&
-    /resolvePushRangeScope\(command, cwd, pushAttempt \? sub : null\)/.test(index)
+    /resolvePushRangeScope\(command, cwd, pushAttempt \? sub : null, subDisabled\)/.test(index)
 );
 // (c) The emit site must not be anchored inside the push branch.
 check(

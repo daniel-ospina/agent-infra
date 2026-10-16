@@ -1,0 +1,18 @@
+### mangled refusal — a tree that is NEITHER pristine NOR patched
+### (one file carries a divergent edit inside the anchor region: the worst case)
+
+
+╔══════════════════════════════════════════════════════════════════════════════
+║  ⛔  PI PATCH FAILED — THE CLAMP DEATH FIX IS NOT IN PLACE
+╚══════════════════════════════════════════════════════════════════════════════
+   c6-recovery-field-bundle (dist/bundle/chunks/chunk-JVUZSMYM.js): the anchor is absent AND the patched form is absent.
+   The tree is neither pristine nor patched — this file has been modified by something else.
+   expected one of: _autoCompactionAbortController=void 0;_overflowRecoveryAttempt=0;
+   NOTHING WAS WRITTEN — no file in this tree has been touched. Restore from backup, or re-derive the manifest.
+
+EXIT=2
+
+### NOTHING WAS WRITTEN — the whole tree hashes identically before and after:
+before: 2092b692add84ef5a789cb808b58b700fd6bfc86
+after:  2092b692add84ef5a789cb808b58b700fd6bfc86
+same:   YES

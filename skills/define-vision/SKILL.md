@@ -47,7 +47,7 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<domain>"
 
 **Interpretation:**
 - **Existing vision Points found:** Summarize prior worldview claims. What did we believe about the market? What competitors did we track? Use these to validate or challenge the current environmental scan.
-- **"tortoise unavailable":** Skip — memory system offline.
+- **`status: "not_configured"`** (no usable `TORTOISE_API_KEY` — never set up, or the key was rejected with HTTP 401/403) or **`status: "tortoise_unavailable"`** (the store was unreachable): skip — memory is not available here.
 - **Zero results:** First vision cycle for this domain. Note and proceed.
 
 ### 5. Competitor Research
@@ -55,7 +55,7 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<domain>"
 #### 5a. Broad Scan — Multi-Angle Search
 **Cast a wide net before deep-diving.** Search for partial overlaps, not just direct competitors. Searching only for our own category framing misses players building toward the same problem from different angles.
 
-Dispatch parallel research sub-agents, each searching a different framing:
+Dispatch parallel research sub-agents, each searching a different framing. **They share one Perplexity key — stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound (at most 2 concurrent `web_search` calls; a wider fan-out 429s and truncates the batch).**
 
 | Search Framing | Rationale |
 |----------------|-----------|
@@ -170,7 +170,7 @@ node scripts/tortoise-memory.mjs write-points \
 - Environmental assumptions (medium confidence — market shifts can invalidate these)
 - The guiding question as context for all vision Points
 
-**Graceful degradation:** If `tortoise unavailable` → skip with note.
+**Graceful degradation:** If `status` is `not_configured` or `tortoise_unavailable` → skip with note.
 
 ### 13. Human Approval Gate
 The vision options MUST be reviewed by S5 (human). S5 selects the option. The skill documents the selection. This is an algedonic boundary — vision defines WHERE the system goes. An agent cannot decide that alone.
