@@ -438,6 +438,24 @@ async function main() {
     ok(rules.some(r => r.mode === "nudge" && r.patterns.some(p => p.test("tortoise_search"))), "broad nudge rule missing");
   });
 
+  await test("#6131 — the operator-taking generic verbs are HARD-armed, not left to the nudge rule", () => {
+    // SKILL.md's Hard Gate claims BOTH `update(<operator_id>, …)` and
+    // `delete(<operator_id>)` MUST go through the skill, and before #6131 the
+    // prose list and this manifest's hard list were 1:1 (7 ops each). The two
+    // generic verbs matched only the broad `tortoise_` NUDGE rule, so a lane
+    // could relabel or delete an operator edge — the exact mutation the skill
+    // exists to guard — without the skill ever being read. A nudge is not a
+    // gate: it escalates only after repeated bypasses.
+    const rules = MANIFEST_RULES["how-to-use-tortoise"] ?? [];
+    const hard = rules.filter(r => r.mode === "hard").flatMap(r => r.patterns);
+    for (const verb of ["tortoise_update", "tortoise_delete"]) {
+      ok(
+        hard.some(p => p.test(`mcp__tortoise__${verb}`)),
+        `${verb} must be armed by a HARD rule — the nudge rule is not a gate`,
+      );
+    }
+  });
+
   await test("banner reports the count and the rule count; a failed load never prints ✅", () => {
     const healthy = manifestBanner(MANIFEST_LOAD, MANIFEST_PATH);
     ok(healthy.includes("enforcing 4 skill gates from manifest"), healthy);
@@ -546,6 +564,23 @@ async function main() {
     await pi.fire("tool_call", { toolName: "read", input: { path: "/tmp/evil/skills/commit-workflow/SKILL.md" } });
     equal((await pi.fire("tool_call", COMMIT))?.block, true, "a forged path must not satisfy the gate");
     deepEqual(persistedNames(reads), []);
+  });
+
+  await test("#6131 — the operator-taking verbs hard-block until the skill is read, then clear", async () => {
+    const { pi } = await newSession();
+    for (const verb of ["tortoise_update", "tortoise_delete"]) {
+      const res = await pi.fire("tool_call", { toolName: `mcp__tortoise__${verb}`, input: {} });
+      ok(res && res.block === true, `${verb} must be blocked while how-to-use-tortoise is unread`);
+      ok(String(res.reason).includes("how-to-use-tortoise"), String(res.reason));
+    }
+    await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, "skills", "how-to-use-tortoise", "SKILL.md") } });
+    for (const verb of ["tortoise_update", "tortoise_delete"]) {
+      equal(
+        (await pi.fire("tool_call", { toolName: `mcp__tortoise__${verb}`, input: {} }))?.block,
+        undefined,
+        `${verb} must clear once the skill is read`,
+      );
+    }
   });
 
   await test("T11 — a nudge rule never hard-blocks (the manifest is armed, so this is now live)", async () => {
