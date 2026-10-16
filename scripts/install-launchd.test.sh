@@ -35,6 +35,15 @@
 
 set -euo pipefail
 
+# #1863 F10 (completed) — HERMETIC ENV: clear TORTOISE_REPO for the WHOLE suite, not only inside
+# `run_installer`. The helper already exports it empty, but several sections invoke the installer
+# DIRECTLY (`bash "$INSTALLER" …`) with a partial env list, so an ambient `TORTOISE_REPO` (the
+# orchestrator box sets it) leaked in: the two `{{TORTOISE_REPO}}`-gated jobs then resolved against a
+# checkout this fixture never created, and section 8 aborted on the installer's non-zero exit. It also
+# broke F14's DERIVED bootstrap count, which recomputes from the fixture HOME and `$INFRA_ROOT/../tortoise`
+# but reads the env candidate as EMPTY. Sections that need it set do so explicitly (and override this).
+export TORTOISE_REPO=""
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
