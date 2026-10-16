@@ -5407,6 +5407,13 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         "PATH=/tmp/real:/usr/bin; export PATH; A=gh; B=pr; C=merge; D=--admin; gh issue comment 5; osascript -e \"do shell script \\\"$A $B $C 9 $D\\\"\"",
         "PATH=/tmp/real:/usr/bin; export PATH; A=gh; B=pr; C=merge; D=--admin; gh issue comment 5; ssh localhost \"$A $B $C 9 $D\"",
         "PATH=/tmp/real:/usr/bin; export PATH; S=gh; P=pr; M=merge; V=--admin; gh issue comment 5; . <(echo \"$S $P $M 9 $V\")",
+        // …and the two halves of shape 18, the regression the positional rewrite itself
+        // introduced: `-c` is gh's `--comment` AND the shell's run-this-program flag, so the
+        // value exemption let an ASSEMBLED program through it — and an assignment prefix
+        // (`Z=ok $R`) carries `=` while putting the next word in COMMAND position, letting the
+        // RUNNER WORD be exempted as a value. Any assembled merge lands here.
+        "V=--admin; PATH=/tmp/real:/usr/bin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V; gh issue comment 5 --body ok",
+        "V=--admin; Z=ok R=sh CMD=gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V; PATH=/tmp/real:/usr/bin; $R -c \"$CMD\"; gh issue comment 5 --body ok",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5479,7 +5486,7 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh api /repos/o/r --method POST --input $(mktemp)", // a construct where a VALUE belongs
     "gh run view 123 --log",
     'gh pr create --title="admin $(date)" --body-file "$(mktemp)"', // the `--flag=value` spelling
-    'gh pr view 4 --json body -q "$(cat q)"',
+    'gh pr view 4 --json body --jq "$(cat q)"',
     "gh pr revert 1234 --title 'Revert admin RBAC' --body $(cat msg.md)",
   ]) {
     ok(readsNonMergeGhCall(cmd), `a readable non-merge gh call defers: ${cmd}`);
@@ -5534,6 +5541,14 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     // neither needs a runner to be recognised.
     "printf '%s %s %s 9 %s' \"$C\" \"$P\" \"$M\" \"$V\" | make -f -",
     ". <(echo \"$C $P $M 9 $V\")",
+    // …and shape 18: a value flag that is ALSO an execute flag, and an assignment prefix that
+    // is not a value at all (`--jq` is the unambiguous spelling of the same intent).
+    "sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V",
+    "Z=ok R=sh; $R -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V",
+    // …and the ASSIGNMENT-PREFIX half on its own, with nothing else to refuse it: a decoy
+    // supplies the read and only the command-position conjunct keeps the runner word from
+    // being exempted as a `=`-bearing value.
+    "gh pr view 1; Z=ok $R",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }

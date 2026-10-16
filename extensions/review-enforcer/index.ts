@@ -724,17 +724,19 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
 ]);
 
 /**
- * The flags whose next word is a VALUE. The positive read's boundary is POSITIONAL: the only
- * place a construct-bearing token may sit in a command this layer stands down for is where a
- * value belongs (`gh pr create --title x --body-file "$(mktemp)"`). Anywhere else it may be an
- * executable, a verb, a command string, or a program handed to a runner — and the text cannot
- * tell which, which is why the read must fail.
+ * The LONG flags whose next word is a VALUE. Only unambiguous long spellings are here: a
+ * short flag is also some other tool's EXECUTE flag — `-c` is gh's `--comment` AND the
+ * shell's "run this program" flag, and an exemption keyed on it let
+ * `sh -c gh$'\x20'pr$'\x20'merge$'\x20'999$'\x20'$V` stand the text layer down (adversarial
+ * review, shape 18). Since the list can only ever be an approximation, every entry must fail
+ * in the refusal direction — which is why the ambiguous shorts (`-c`, `-f`, `-e`-likes) are
+ * gone and `-q` is spelled `--jq`.
  */
 const VALUE_POSITION_FLAGS = new Set([
-  "--body", "-b", "--body-file", "-F", "--subject", "-t", "--title", "-T", "--author-email",
-  "--match-head-commit", "-f", "--field", "--raw-field", "--input", "--method", "-X",
-  "--message", "-m", "--notes", "--comment", "-c", "--label", "-l", "--add-label",
-  "--remove-label", "--assignee", "-a", "--reviewer", "-r", "--search", "--query", "-q",
+  "--body", "--body-file", "--subject", "--title", "--author-email", "--match-head-commit",
+  "--field", "--raw-field", "--input", "--method", "--message", "--notes", "--comment",
+  "--label", "--add-label", "--remove-label", "--assignee", "--reviewer", "--search",
+  "--query", "--jq", "--template",
 ]);
 
 /**
@@ -777,7 +779,12 @@ export function readsNonMergeGhCall(command: string): boolean {
     // `prevWord.includes("=")` covers the `--flag=value` spelling, where the VALUE's opening
     // word carries the `=` (`--title="admin $(x)"`). The TOKEN itself carrying `=` is NOT an
     // exemption: `X=$(date) gh issue comment 5` is an assignment whose value runs a command.
-    const inValuePosition = VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=");
+    // And a value position must not be a COMMAND position: an assignment prefix (`Z=ok $R`)
+    // puts the next word in command position while carrying `=`, which let a runner word be
+    // exempted as a value (adversarial review, shape 18, second half).
+    const inValuePosition =
+      (VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=")) &&
+      !isCommandPositionAt(scan, i);
     if (!inValuePosition) return false; // a `$`-bearing token where a value does not belong
   }
   let seen = false;
