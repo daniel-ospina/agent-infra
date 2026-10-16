@@ -20,9 +20,11 @@ rc=$?
 if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 fi
-# ⛔ Exit with the FIXER's status, explicitly. This script used to end on `bash "$O/fix-one.sh"`,
-# so `$?` was the fixer's. The reporting line above became the last command and inverted the status:
-# 1 on a clean success, 0 on the load refusal it exists to REPORT (a wrapper doing
-# `adopt-fix.sh … && next` then took the wrong branch, and the code said the opposite of the log).
-# `exit "$rc"` restores the contract rather than relying on the last command's status (#1720 review).
+# ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
+# `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with
+# a false condition and no `else` returns 0 — measured: `if [ "$rc" = "75" ]; then echo x; fi`
+# returns 0 for BOTH `rc=0` and `rc=75`. So the reporting line, made the last command, would have
+# reported the load refusal it exists to NAME as a SUCCESS: a wrapper doing `adopt-fix.sh … && next`
+# then takes the wrong branch and the exit code says the opposite of the log (#1720 review).
+# `exit "$rc"` restores the contract rather than relying on the last command's status.
 exit "$rc"

@@ -14,9 +14,13 @@
 #     and gates its four DECISION sites with them. Folding those into this file is a separate
 #     change with its own review.
 #   * `install.sh` renders MAX_LOAD into the plist; it does not source this file.
-#   ⇒ the shipped `pi -p` invokers on this tree are exactly {merge-one.sh, spawn-gate.sh}, and
-#     spawn-gate.test.sh asserts that set as an EQUALITY — a fourth launch path added tomorrow
-#     fails that suite loudly instead of drifting in ungated.
+#   ⇒ in THIS DIRECTORY the shipped `pi -p` invokers are exactly {merge-one.sh, spawn-gate.sh}, and
+#     while `scripts/` as a whole also contains {cloud-cell-bringup.sh, retired/refix.sh,
+#     retired/watch-one.sh}. spawn-gate.test.sh asserts BOTH sets as EQUALITIES — a fourth launch
+#     path added tomorrow fails that suite loudly instead of drifting in ungated — because a
+#     directory-scoped census silently says nothing about the tree outside it. (cloud-cell-bringup.sh
+#     is a 120 s provider reachability probe, not a lane dispatch, and is NOT load-gated: a named,
+#     asserted residual.)
 #
 # Why this file exists (agent-infra#1720): the gate used to be a one-liner inside orch-loop.sh plus
 # a copy-pasted `run_agent()` in three workers, and only the controller's decision sites consulted
@@ -57,27 +61,38 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # be absent entirely (Debian's procps does not ship it any more) and `hw.ncpu` is a macOS key
 # regardless, so the old `|| echo 4` silently pinned _NCPU=4 and MAX_LOAD=40 for EVERY cell (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
-# Coerce immediately before the ONLY reads. A non-numeric _NCPU already breaks `$(( _NCPU * 10 ))`,
-# and MAX_LOAD is supplied by the launchd plist: a typo there would OPEN the gate rather than close
-# it, because `[ -lt ]` on a non-number is FALSE and a false test in the gate chain allows dispatch.
-# ⛔ A 0-VALUED PROBE IS A FAILED PROBE, NOT "NO CORES" (P1, review round 2026-10-15). `10 * 0` is 0,
-# `[ "$l" -lt 0 ]` is ALWAYS FALSE, and `is_num 0` is TRUE — so a probe that returns 0 passes every
-# guard below and CLOSES the gate permanently: the box dispatches nothing, forever, and the failure
-# is silent. orch-loop.sh and install.sh carry the identical line for the same reason.
-# `10#` forces base 10 so a value with a leading zero is not re-read as octal.
-is_num "${_NCPU:-}"     || _NCPU=4
-[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
-MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-# ⛔ THE FALLBACK MUST BE A TRUE DEFAULT, NOT A RE-DERIVATION (P1, same round). A magnitude guard
-# that falls back to `_NCPU * 10` is a NO-OP in the case it exists for: an out-of-range value that
-# came FROM the core probe (a bogus 19-digit `hw.ncpu`, or a 10-digit MAX_LOAD derived from a
-# 9-digit one) re-derives to the same garbage. A 19-digit ceiling passes `is_num`, then ERRORS every
-# `[ -lt ]` below — and an errored test is false, so the gate OPENS, which is the one failure mode a
-# load gate must never have. Only the final fallback, the literal 40, is genuinely out of range.
-# `is_limit` = is_num AND at most 9 digits, the same predicate orch-loop.sh/fix-one.sh apply. It must
-# NOT reject 0: install.sh also validates plist limits through it, where 0 is legal, and `MAX_LOAD=0`
-# deliberately means "spawn nothing" (`[ 0 -lt 0 ]` is false).
+# `is_limit` = is_num AND at most 9 digits. It must NOT reject 0: install.sh validates plist limits
+# through it, where 0 is legal, and `MAX_LOAD=0` deliberately means "spawn nothing" (`[ 0 -lt 0 ]`
+# is false).
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+# ⛔ `_NCPU` IS GUARDED BY `is_limit`, NOT `is_num`, AND THE REASON IS A WRAP — not a bad comparison
+# (P1, review round 2026-10-15). A 19-digit-but-below-2^63 probe does NOT error anywhere: it reaches
+# `$(( 10#$_NCPU * 10 ))`, WRAPS, and yields a small, plausible ceiling that every later guard then
+# ACCEPTS. Measured before this fix: a probe of 1844674407470955161 gave MAX_LOAD=999999994 on a
+# 10-core box — the gate is INERT and every worker launches onto a saturated machine, silently. The
+# other wrap direction is the permanent stop: 2^63 wraps to 0, `is_limit 0` is true, and
+# `[ "$l" -lt 0 ]` is always false, so the gate CLOSES and the box dispatches nothing, for ever.
+# orch-loop.sh:83 and install.sh:45 guard the SAME derivative with `is_limit` for exactly this, and
+# README §7.1 records the wrap as already corrected on canonical — so `is_num` here would REGRESS a
+# canonical hardening.
+# ⛔ THE COMPARISON ITSELF DOES NOT FAIL OPEN — the opposite. `can_spawn` returns `[ -lt ]`'s status
+# and every caller tests `if ! can_spawn …`, so an ERRORED comparison is non-zero, `!` makes the
+# branch TRUE, and the spawn is REFUSED. Measured: `can_spawn 5` with `MAX_LOAD=abc` returns 2 and
+# the caller refuses. So the coercion below defends against the WRAP, the 0-valued probe and the
+# 19-digit ceiling — NOT against an open gate, which this shape cannot produce. A reader who takes
+# the older rationale ("`[` on a non-number is FALSE and FALSE allows dispatch") at face value will
+# mis-reason about which tamper this defends; it is wrong for this one-comparison polarity.
+is_limit "${_NCPU:-}"   || _NCPU=4
+# A 0-VALUED PROBE IS A FAILED PROBE, NOT "NO CORES": `10 * 0` is 0, `is_limit 0` is true, and
+# `[ "$l" -lt 0 ]` is always false — so a 0 probe passes every guard and CLOSES the gate for ever.
+# orch-loop.sh:85 and install.sh:47 carry the identical line.
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
+# `10#` forces base 10 so a value with a leading zero is not re-read as octal.
+MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+# ⛔ THE FALLBACK MUST BE A TRUE DEFAULT, NOT A RE-DERIVATION. A magnitude guard that falls back to
+# `_NCPU * 10` is a NO-OP in the case it exists for: an out-of-range value that came FROM the core
+# probe re-derives to the same garbage. The first guard repairs a 10-digit MAX_LOAD derived from a
+# 9-digit `_NCPU`; only the literal 40 is genuinely out of range, so it is the final fallback.
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 

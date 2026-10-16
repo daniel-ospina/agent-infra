@@ -54,8 +54,11 @@
 #                            refused fixer REFUNDS the attempt the controller booked (or three
 #                            refusals park a PR no fixer ever touched).
 #   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
-#   Tests: spawn-gate.test.sh — 42 checks, 40 of which go RED on the pre-port tree (measured; the 2
-#   survivors are the port-independent POSITIVE CONTROL and the CI-wiring equality).
+#   Tests: spawn-gate.test.sh — 47 checks, 45 of which go RED on the pre-port tree (measured; the 2
+#   survivors are the port-independent POSITIVE CONTROL and the CI-wiring equality). Seven MUTATION
+#   rows each revert ONE fix and go red on that check, so each is pinned rather than merely exercised:
+#   AGENT_STARTED from rc; _NCPU is_num (the wrap); the literal-40 fallback; chain-merge's exit;
+#   the fixcount refund; an out-of-directory `"$PI_BIN" -p` invoker; an in-directory `pi  -p` one.
 #   FOUR deliberate DEPARTURES from the tortoise original, all named in-file:
 #     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
 #        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).
@@ -71,6 +74,18 @@
 #        and `is_limit` (is_num AND at most 9 digits) with a LITERAL-40 final fallback — a magnitude
 #        guard that re-derives from the same _NCPU is a no-op in the case it exists for. fix-one.sh's
 #        refund also uses the imported is_num rather than a second, weaker inline `case`.
+#        ⛔ AND `_NCPU` MUST BE GUARDED BY `is_limit`, NOT `is_num` (P1, round 2). An absurd-but-
+#        numeric 19-digit core probe does not ERROR anywhere: it reaches `$(( 10#$_NCPU * 10 ))`,
+#        WRAPS, and yields a small, in-range ceiling that every later guard ACCEPTS. Measured:
+#        hw.ncpu=1844674407470955161 -> MAX_LOAD=999999994 on a 10-core box, i.e. the gate is INERT
+#        and every worker launches onto a saturated machine, silently. `is_num` there would REGRESS a
+#        canonical hardening that orch-loop.sh:83 and install.sh:45 already carry and that README §7.1
+#        records as corrected; the port now matches them.
+#        ⛔ AND THE COMPARISON DOES NOT FAIL OPEN — the opposite (round-2 doc-claim fix). `can_spawn`
+#        returns `[ -lt ]`'s status and every caller tests `if ! can_spawn …`, so an ERRORED comparison
+#        is non-zero, `!` makes the branch TRUE, and the spawn is REFUSED (measured: rc=2, refuse).
+#        The file's older rationale ("`[` on a non-number is FALSE and FALSE allows dispatch") is
+#        wrong for this one-comparison polarity and has been removed rather than left to mislead.
 #     D4 `chain-merge.sh` ends with `exit "$rc"`, which the tortoise original does NOT have — its
 #        last command is a reporting `echo`, so `$?` is echo's 0 on a refused reviewer (75) and on a
 #        crashed chain (1) alike. The port ADDS the exit; adopt-fix.sh already had it.
@@ -96,6 +111,13 @@
 #     this port; the correct fix is a mechanism change to the wall-limit contract (kill the process
 #     group, or track and kill the sleep's own pid), which is its own review. NOTE, not filed: the
 #     honest consequence is a few idle processes, which does not clear category-B admission.
+#   scripts/cloud-cell-bringup.sh — invokes `pi -p` with NO load gate (0 hits for MAX_LOAD/spawn-gate).
+#     A 120 s provider REACHABILITY probe, not a lane dispatch, so it is not routed through
+#     run_agent() here; it is instead asserted BY NAME in the suite's tree-wide census, so a new
+#     ungated invoker under scripts/ fails that check. Stated limit: a static census cannot resolve a
+#     command whose name AND flags are both assembled at runtime — that is the runtime run_agent
+#     contract's job. The census reads the index via `git ls-files --cached --others`, so an UNTRACKED
+#     new invoker is visible at the moment it is added, and it fails CLOSED outside a git work tree.
 #
 # ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
 # `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and

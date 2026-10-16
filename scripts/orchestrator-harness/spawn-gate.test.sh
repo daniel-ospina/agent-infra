@@ -55,22 +55,57 @@ done
 # "run_agent" would pass on a file that defines it and never calls it, so this counts the actual
 # INVOCATION and asserts the SET rather than a total: a new launch path fails here until it is
 # routed through the helper, and porting the remaining caller is an explicit, visible edit.
-# The test suites are excluded — they are not launch paths, and this file's own grep pattern would
-# otherwise match itself.
-PI_FILES=""
-for f in "$HERE"/*.sh; do
-  b="$(basename "$f")"
-  case "$b" in selftest.sh|*.test.sh) continue ;; esac
-  grep -q 'pi -p ' "$f" && PI_FILES="$PI_FILES $b"
-done
-PI_FILES="${PI_FILES# }"
+#
+# ⛔ TWO SCOPES, BOTH ASSERTED, AND A TOKEN PATTERN RATHER THAN A LITERAL (P2, review round
+# 2026-10-15). A census built from `$HERE/*.sh` with `grep 'pi -p '` says nothing about the rest of
+# the tree and misses every other spelling: `scripts/cloud-cell-bringup.sh` was an ungated invoker
+# the check could not see while it claimed to speak for the tree, and `"$PI_BIN" -p`, `pi  -p`,
+# a tab, and `pi --print` are all invisible to the literal. So: census the WHOLE tracked scripts/
+# tree, match the command TOKEN, and pin both sets as equalities. `retired/` is excluded — retired
+# scripts cannot be dispatched — and named here so the exclusion is visible rather than silent.
+scan_pi() { # scan_pi <root-relative-prefix>  → space-separated repo-relative paths
+  # ⛔ THE DETECTOR KEYS ON THE FLAG SEQUENCE, NOT ONLY ON THE COMMAND NAME (P2, review round
+  # 2026-10-15). A bare `pi` token misses an invocation whose binary is in a variable —
+  # `PI_BIN="${PI_BIN:-pi}"; "$PI_BIN" -p --no-session …` — which IS a real launch path, so the
+  # pattern also matches the flag pair ONLY a print-mode invocation carries (`-p --no-session` /
+  # `-p --provider`). LIMIT, stated rather than hidden: a static census cannot resolve a command
+  # whose name AND flags are both assembled at runtime; that case is covered by the runtime
+  # contract (everything must route through run_agent), not by a grep.
+  local p found="" MATCH_PI
+  MATCH_PI='(^|[^[:alnum:]_])pi[[:space:]]+(-p|--print)([[:space:]]|$)|-p[[:space:]]+--(no-session|provider)'
+  while IFS= read -r p; do
+    case "$p" in */retired/*|*.test.sh|*/selftest.sh) continue ;; esac
+    grep -qE "$MATCH_PI" "$ROOT/$p" 2>/dev/null || continue
+    found="$found $p"
+  # --others --exclude-standard: a launch path is a NEW file first and a tracked one later, so a
+  # census over `ls-files` alone cannot see it at the moment it is added — which is the only moment
+  # it matters (P2, review round 2026-10-15: an untracked `"$PI_BIN" -p` invoker was invisible).
+  done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$1")
+  printf '%s' "${found# }"
+}
+# The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
+# "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
+# which is the right direction for a guard whose job is "no ungated launch path exists".
+ROOT="$(cd "$HERE/../.." && pwd)"
 # merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
 # is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
 # pi-invoker — or a regression in either of these two — fails it.
 EXPECTED_PI="merge-one.sh spawn-gate.sh"
-[ "$PI_FILES" = "$EXPECTED_PI" ]; rc=$?
-[ "$rc" -eq 0 ] || echo "      pi-invokers found: [${PI_FILES:-<none>}]"
-ck "the shipped pi-invokers are exactly [$EXPECTED_PI]" $rc
+got_pi="$(scan_pi 'scripts/orchestrator-harness/*.sh' | sed "s#scripts/orchestrator-harness/##g")"
+[ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
+[ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
+ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" $rc
+
+# ... and the WIDER tree, because a directory-scoped census cannot see outside itself. This one
+# caught a real gap: `scripts/cloud-cell-bringup.sh` invokes `pi -p` with no load gate at all. It is
+# a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
+# is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
+# anywhere under scripts/ fails this check instead of arriving unannounced.
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+got_tree="$(scan_pi 'scripts/*.sh' 'scripts/*/*.sh' 'scripts/*/*/*.sh')"
+[ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
+[ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
+ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -99,7 +134,11 @@ else
 fi
 
 # ── 4) MAX_LOAD coercion: a bad plist value must CLOSE the gate, not open it ─────
-# `[ -ge ]` on a non-number is FALSE, and a false test in the gate chain ALLOWS dispatch — so a
+# `[ -lt ]` on a non-number ERRORS, and `can_spawn` returns that status — but every caller tests
+# `if ! can_spawn …`, so the error makes the branch TRUE and the spawn is REFUSED (fail-CLOSED,
+# measured). So this coercion is not about an open gate: it is about the WRAP below, a 0-valued
+# probe, and a 19-digit ceiling. The older rationale ("a false test in the gate chain ALLOWS") is
+# wrong for this polarity and is deliberately NOT repeated here.
 # typo in the plist would remove the back-pressure. Leading zeros are the subtle half: `$(( ))`
 # parses base 0, so `08` reaches `[ "$L" -ge "08" ]`, which ERRORS (also false => OPEN). The
 # magnitude is the third: a 19-digit MAX_LOAD passes a digits-only test and errors every `[ -ge ]`.
@@ -121,13 +160,24 @@ ck "the derived MAX_LOAD is 10 x the PORTABLE core count (got '${got:-<none>}', 
 # bad: a 19-digit probe passes `is_num`, ERRORS every `[ -lt ]` (an errored test is false), and
 # OPENS the gate. Both were live defects in this file. `sysctl` is the only seam that drives the
 # REAL probe expression, so it is faked here and removed after.
-for probe in 0 abc "" 99999999999999999999; do
+for probe in 0 abc "" 999999999 1844674407470955161 9223372036854775807 99999999999999999999; do
   printf '#!/bin/sh\n[ "$1" = "-n" ] && [ "$2" = "hw.ncpu" ] && { echo "%s"; exit 0; }\nexit 1\n' "$probe" > "$TMP/bin/sysctl"
   chmod +x "$TMP/bin/sysctl"
   got="$(env -u MAX_LOAD PATH="$TMP/bin:$PATH" bash -c '. "$1"; printf "%s" "$MAX_LOAD"' _ "$GATE" 2>/dev/null)"
-  case "$got" in ''|*[!0-9]*|0) rc=1 ;; *) [ "${#got}" -le 9 ] && rc=0 || rc=1 ;; esac
-  ck "a core probe of '$probe' can neither 0-CLOSE nor 19-digit-OPEN the gate (MAX_LOAD=${got:-<empty>})" $rc
+  # ⛔ THE ASSERTION IS EXACT, NOT A DIGIT-COUNT (P1, review round 2026-10-15, second pass). An
+  # earlier version only required a non-zero value of at most 9 digits — and a WRAPPED 19-digit
+  # probe yields 999999994, which satisfies every one of those properties while making the gate
+  # INERT. A garbage probe must fall back to the DOCUMENTED DEFAULT, so that is what is asserted.
+  [ "$got" = "40" ]; rc=$?
+  ck "a core probe of '$probe' falls back to the default ceiling 40 (got MAX_LOAD=${got:-<empty>})" $rc
 done
+# ... and the fallback must not have REPLACED the derivation: a plausible probe still yields 10 x it.
+# Without this pair, hardcoding the default would satisfy the loop above.
+printf '#!/bin/sh\n[ "$1" = "-n" ] && [ "$2" = "hw.ncpu" ] && { echo 8; exit 0; }\nexit 1\n' > "$TMP/bin/sysctl"
+got="$(env -u MAX_LOAD PATH="$TMP/bin:$PATH" bash -c '. "$1"; printf "%s" "$MAX_LOAD"' _ "$GATE" 2>/dev/null)"
+[ "$got" = "80" ]; rc=$?
+ck "a plausible core probe of 8 still DERIVES 10 x it — the fallback did not become the value (got '${got:-<none>}')" $rc
+rm -f "$TMP/bin/sysctl"
 rm -f "$TMP/bin/sysctl"
 # ... and the repair must not swallow the operator's DELIBERATE "spawn nothing": MAX_LOAD=0 is
 # legal (`[ 0 -lt 0 ]` is false), and conflating it with a failed probe would stop a box that was
@@ -247,15 +297,25 @@ got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" bash -c '
 ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<none>}')" $rc
 # ... and pi's 0-255 namespace cannot be mistaken for a refusal, so AGENT_STARTED (not the exit
 # code) is what the callers act on.
-got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" bash -c '
+# ⛔ THE STUB MUST ACTUALLY EXIT 75 (P1, review round 2026-10-15). The first version of this
+# check passed the LABEL "agent that itself exits 75" to the ONE stub `pi`, which exits 0 — so
+# the check held whatever the code did. Proven vacuous by mutation: replacing the pre-launch
+# `AGENT_STARTED=1` with a post-`wait` derivation from `rc == AGENT_LOAD_REFUSED` left the suite
+# at 42 passed, 0 failed. Under that mutation a real `pi` that exits 75 makes fix-one.sh REFUND a
+# booked attempt and SKIP the merge-chain re-run for a fixer that actually ran, so this must
+# assert BOTH the status and the flag against a stub that really exits 75.
+mkdir -p "$TMP/bin75"
+printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
+chmod +x "$TMP/bin75/pi"
+got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" bash -c '
   . "$1"
   load1() { printf "0"; }
   MAX_LOAD=10
-  run_agent 5 "$2" "$3" "agent that itself exits 75" >/dev/null 2>&1
-  printf "started=%s" "$AGENT_STARTED"
+  run_agent 1 "$2" "$3" "pi that exits 75 itself" >/dev/null 2>&1
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
 ' _ "$GATE" "$TMP/log3" "$PROMPT" 2>/dev/null)"
-[ "$got" = "started=1" ]; rc=$?
-ck "AGENT_STARTED distinguishes a real refusal from a pi that exits 75 itself ('${got:-<none>}')" $rc
+[ "$got" = "rc=75 started=1" ]; rc=$?
+ck "a pi that itself exits 75 is reported STARTED, not as a load refusal (want rc=75 started=1, got '${got:-<none>}')" $rc
 
 # ── 9) the PORTED CALLERS: a refusal must not consume a fixer attempt ───────────
 # The headline behavioural claim of this port is fix-one.sh's REFUND. orch-loop.sh books the attempt
