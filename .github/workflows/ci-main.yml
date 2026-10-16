@@ -144,7 +144,8 @@ jobs:
         npx tsx extensions/loop-enforcer/tier-config-parity.test.ts || failures=$((failures+1))
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
-        # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
+        # Zero-dep: the predicate comes from the shared zero-dep copy
+        # (extensions/shared/tool-call-event.ts, #1330), not the pi package.
         echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
         # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in

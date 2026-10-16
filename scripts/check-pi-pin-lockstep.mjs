@@ -1195,7 +1195,7 @@ test("pinFindings flags a drifted pin (positive control for (h))", () => {
 // Guard the whole stamp SET, not a phrase. A per-file phrase pattern was tried first and missed 2 of
 // the 5 pi stamps (frontmatter-validate's "probe pi X" and ci-main's "devDep pinned X") — the same
 // silent-staleness class this guard exists to close. So: every `<major>.<minor>.<patch>` literal on a
-// line that NAMES PI of these four hand-synced surfaces must be PI_VERSION_PIN or a listed non-pi
+// line that NAMES PI of these hand-synced surfaces must be PI_VERSION_PIN or a listed non-pi
 // dependency version.
 //
 // #675 P1-4 — the sweep is scoped to stamp context and the per-surface assertion is a FLOOR, not an
@@ -1217,6 +1217,12 @@ const MIRROR_FILES = [
   "extensions/custom-provider-qwen/index.ts",
   "scripts/frontmatter-validate.mjs",
   ".github/workflows/ci-main.yml",
+  // #1330 — the shared copy of pi's `isToolCallEventType` for the zero-dep
+  // extensions. Its stamp names the version the predicate was verified against,
+  // so a PI_VERSION_PIN bump REDs here until the copy is re-verified against the
+  // new pi — the per-PR half of the drift lock (the behavioural half is the SDK
+  // parity assertion in extensions/verification-gate/index.test.ts).
+  "extensions/shared/tool-call-event.ts",
 ];
 // Non-pi dependency versions legitimately quoted in a surface (so they are not
 // mistaken for stamps). Adding an entry here is a deliberate, reviewed act.
@@ -1232,7 +1238,7 @@ const ALLOWED_NON_PI = {
 // "A probe of the 3.11.4 runtime is pending.", or "// Runner image parity: 22.11.0" all reddened the
 // suite — the same incident class as #485 T2 (issue #779, which reddened main twice on 2026-09-10).
 // Moving the stamp marker to the pi token itself is the fix: none of those prose lines names pi, while
-// every real stamp line on all four surfaces does (the ci-main.yml stamp comments were reworded to
+// every real stamp line on every mirror surface does (the ci-main.yml stamp comments were reworded to
 // name pi, which is what they are stamping). A stamp line reworded to drop the pi token falls out of
 // coverage and trips the per-surface floor below, loudly, instead of silently weakening the guard.
 const PI_STAMP_MARKER_RE = /\bpi\b/i;
@@ -1247,6 +1253,7 @@ const STAMP_FLOORS = {
   "extensions/custom-provider-qwen/index.ts": 1,
   "scripts/frontmatter-validate.mjs": 3,
   ".github/workflows/ci-main.yml": 2,
+  "extensions/shared/tool-call-event.ts": 1,
 };
 
 /** Version literals in stamp context on one surface, minus its allowlisted non-pi versions. */

@@ -332,8 +332,9 @@ jobs:
         # and health-check called it loaded. #1322 — read identity was keyed by a
         # path prefix pi never serves, so a skill read through
         # `~/.pi/agent/skills/...` never cleared its own gate. Zero-dep by
-        # construction (the pi SDK import is TYPE-only and its predicate is
-        # inlined), so it MUST run in THIS job, which performs no `npm ci`. The
+        # construction (the pi SDK import is TYPE-only; the predicate comes from
+        # the zero-dep shared copy, extensions/shared/tool-call-event.ts, #1330),
+        # so it MUST run in THIS job, which performs no `npm ci`. The
         # deployed layout is reproduced in temp farms via
         # `tsx --preserve-symlinks` — whose `__dirname` semantics the fixture
         # asserts as a PRECONDITION before trusting any verdict — and through real

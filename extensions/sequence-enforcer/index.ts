@@ -48,6 +48,11 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unl
 import { resolve, join, dirname } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
+// #1330 — ONE copy of pi's `isToolCallEventType`, shared with skill-enforcer (it
+// was previously inlined in BOTH files, because both suites run in CI with ZERO
+// node_modules). The shared module carries the pi version stamp and the SDK
+// parity pin; a local copy here would be the #1330 drift again.
+import { isToolCallEventType } from "../shared/tool-call-event.js";
 // #1419: the kill switch has ONE home. It used to be defined here and
 // referenced-but-never-imported in loop-enforcer, where every write raised
 // `ReferenceError` into a swallowed catch — the documented escape was inert.
@@ -59,16 +64,9 @@ import {
   sessionEscapeStatus,
 } from "../shared/kill-switch.js";
 
-// #357 (Task 1): inline copy of pi's `isToolCallEventType` — the suite runs in
-// CI with ZERO node_modules (zero-dep route), so the runtime value import from
-// @earendil-works/pi-coding-agent was replaced. Verified against the pi dist:
-//   dist/core/extensions/types.js:45 `return event.toolName === toolName`
-//   (pi-node v22.23.2-darwin-arm64 @earendil-works/pi-coding-agent). Drift guard:
-//   if a pi upgrade changes this predicate, catch it in Task 13's audit window
-//   (the only place the dep IS available) — the suite exercises only this copy.
-function isToolCallEventType(toolName: string, event: unknown): boolean {
-  return (event as { toolName?: unknown })?.toolName === toolName;
-}
+// #1330 — the tool-call predicate now lives in ../shared/tool-call-event.js
+// (imported at the top). It was inlined here and in skill-enforcer; two
+// independent copies is exactly the drift that module removes.
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
 function _getEnv(name: string): string | undefined {

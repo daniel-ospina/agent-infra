@@ -18,6 +18,12 @@ import { fileURLToPath } from "node:url";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
 import * as sharedParse from "../shared/git-command-parse.js";
+// #1330: pi's REAL predicate and the shared one-copy replacement. The parity
+// assertion in the drift-pin section below is the only gate that compares the
+// shared copy against the SDK it mirrors — it fails if a pi upgrade changes the
+// event shape, which would silently turn every skill/sequence gate into a no-op.
+import { isToolCallEventType as piIsToolCallEventType } from "@earendil-works/pi-coding-agent";
+import { isToolCallEventType as sharedIsToolCallEventType } from "../shared/tool-call-event.js";
 
 let passed = 0;
 let failed = 0;
@@ -545,6 +551,68 @@ test("neither extension declares a local copy of the command parsers (#966)", ()
       ok(!declaresHelper(src, helper), `${name} must not declare a local ${helper} (#966: one copy only)`);
     }
   }
+});
+
+// ── Drift-pin: shared tool-call predicate vs the pi SDK (#1330) ──
+//
+// `extensions/shared/tool-call-event.ts` is the ONE copy of pi's
+// `isToolCallEventType` for the two extensions whose gate suites run on a bare
+// checkout (skill-enforcer, sequence-enforcer). If a pi upgrade changes the
+// event shape, that copy — and the inlines it replaced — stops matching, every
+// gate branch is skipped, and the extension still reports `✅ Loaded`. This
+// suite is SDK-bearing (ci-main runs it after `npm ci` in this package), so it
+// is the one place the copy can be compared against the real export.
+
+section("drift-pin — shared tool-call predicate (#1330)");
+
+test("the shared isToolCallEventType agrees with pi's real export on the event matrix", () => {
+  // pi's export reads `event.toolName` unguarded and throws on a null event;
+  // the shared copy is its null-safe totalization (handlers can see an absent
+  // event during teardown). `piTotal` applies the SAME totalization to pi, so
+  // every row is a real comparison rather than a skipped one.
+  const piTotal = (toolName: string, event: unknown): boolean => {
+    try {
+      return piIsToolCallEventType(toolName, event as never);
+    } catch {
+      return false;
+    }
+  };
+  const matrix: Array<[string, unknown]> = [
+    ["bash", { toolName: "bash", toolCallId: "t1", input: { command: "ls" } }],
+    ["bash", { toolName: "read", input: {} }],
+    ["read", { toolName: "read", input: { path: "x" } }],
+    ["task", { toolName: "task", input: {} }],
+    ["", { toolName: "" }],
+    ["bash", {}],
+    ["bash", { toolName: "" }],
+    ["bash", { toolName: 42 }],
+    ["bash", { name: "bash" }],
+    // A nested tool-name shape (the exact "the name moves" upgrade #1330
+    // worries about) must MATCH pi's answer — both false today. If pi moves the
+    // name inward, this row (and the top-level rows) diverge and the pin REDs.
+    ["bash", { tool: { name: "bash" } }],
+    ["bash", null],
+    ["bash", undefined],
+  ];
+  for (const [toolName, event] of matrix) {
+    equal(
+      sharedIsToolCallEventType(toolName, event),
+      piTotal(toolName, event),
+      `divergence for tool ${JSON.stringify(toolName)} / event ${JSON.stringify(event)} — ` +
+        "pi's predicate changed shape; re-verify extensions/shared/tool-call-event.ts " +
+        "and every caller before bumping PI_VERSION_PIN",
+    );
+  }
+});
+
+test("the null-safety of the shared copy is a deliberate superset, not a shape mismatch", () => {
+  // Pinned explicitly so the divergence from pi's throwing export can never be
+  // introduced accidentally (a copy that started returning true for a missing
+  // event would pass every gate vacuously).
+  equal(sharedIsToolCallEventType("bash", null), false, "a null event is not a bash tool call");
+  equal(sharedIsToolCallEventType("bash", undefined), false, "an undefined event is not a bash tool call");
+  equal(sharedIsToolCallEventType("bash", {}), false, "an event with no toolName is not a bash tool call");
+  equal(sharedIsToolCallEventType("bash", { toolName: "bash" }), true, "a matching top-level toolName IS a bash tool call");
 });
 
 // ── Module load regression ───────────────────────────

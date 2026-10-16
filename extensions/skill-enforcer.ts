@@ -23,18 +23,12 @@ import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
-
-// Inline copy of pi's `isToolCallEventType` (#1321). pi's extension loader
-// resolves the runtime package from its own bundled module table, but a suite
-// running on a bare checkout has no node_modules — and this extension's gate
-// suite must run there. The predicate is one line in pi
-// (dist/core/extensions/types.js: `return event.toolName === toolName`) and the
-// same inline is already shipped by extensions/sequence-enforcer/index.ts:59.
-// Drift guard: if a pi upgrade changes the predicate, the parity pin belongs in
-// an SDK-bearing suite (#966) — tracked with the shared-helper extraction.
-function isToolCallEventType(toolName: string, event: unknown): boolean {
-  return (event as { toolName?: unknown })?.toolName === toolName;
-}
+// #1330 — ONE copy of pi's `isToolCallEventType`, shared with sequence-enforcer.
+// It was inlined here because this gate suite runs on a bare checkout with no
+// node_modules; the earlier per-file inline drifted independently and an inline
+// that stops matching silently turns every gate into a no-op. The copy carries
+// the pi version stamp + the SDK parity pin that make a pi upgrade deliberate.
+import { isToolCallEventType } from "./shared/tool-call-event.js";
 
 // ── Real module location ────────────────────────────
 // See the DEPLOYED LAYOUT note at the top of this file. The try/catch keeps a
