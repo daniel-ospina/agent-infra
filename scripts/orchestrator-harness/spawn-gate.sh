@@ -145,7 +145,7 @@ is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=1024
 # constant, ignorable one. The failure mode is the same as the MAX_LOAD rule below — "the fallback
 # must be a true default, NOT a re-derivation": a floor whose derived band cannot be expressed in
 # this file's own range is out of range FOR THIS FILE'S PURPOSE and is repaired as one. The widest
-# floor that still admits an in-range band is 249999999 (4x it is 999999999).
+# floor that still admits an in-range band is 249999999 (4x it is 999999996).
 [ "${DISK_MIN_FREE_MB:-0}" -le 249999999 ] || DISK_MIN_FREE_MB=1024
 # The WARNING BAND — a device that fills SILENTLY is the defect, so the cell says so while it can
 # still act. 4x the floor is `cloud-cell-supervisor.sh`'s `check` warning band; that file's
@@ -232,10 +232,11 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting) or
 # AGENT_LOAD_REFUSED (75, which clears when the box quietens). The code selects the REMEDY.
 # ⛔ THE SIGNAL THAT NO AGENT RAN IS `AGENT_STARTED=0`, NOT EITHER CODE (review round 2, P2).
-# AGENT_STARTED is set before both gates and only cleared on a real spawn, so it cannot be produced by
-# a refusal and is not shared with `pi`'s own exit statuses; a caller that keys on 75 alone will
-# mis-read a disk refusal, and a caller that keys on the exit status alone will mis-read a `pi` that
-# exited 75 for its own reason. That is why the early contract here named only the load gate, and
+# AGENT_STARTED is 0 at function entry — BEFORE either gate — and is set to 1 only once both gates have
+# passed and `pi` has actually been launched. A refusal therefore always leaves it 0 (that is exactly
+# what makes it the no-agent signal), and it is not shared with `pi`'s own exit statuses; a caller that
+# keys on 75 alone will mis-read a disk refusal, and a caller that keys on the exit status alone will
+# mis-read a `pi` that exited 75 for its own reason. That is why the early contract here named only the load gate, and
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
 # merge-one.sh records a `needsfix-<PR>-<head>` marker for the latter. Recording one for a load
 # refusal would authorise a fixer for a review that never happened, burn a MAX_FIX_TRIES attempt and

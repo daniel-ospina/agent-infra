@@ -409,8 +409,9 @@ ok "plist valid"
 # (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
 # reason (#1764): it is sourced by both, and a $O copy without it holds the resolver the daemon
 # needs to know what the target repo actually requires. spawn-gate.sh is the SAME class again
-# (review round 2, P2): it is sourced by lane.sh, fix-one.sh and orch-loop.sh, and it CARRIES the
-# gate codes those callers branch on — a $O copy left behind at a pre-#1765 revision is a caller
+# (review round 2, P2): it is sourced by lane.sh and fix-one.sh — orch-loop.sh deliberately does NOT
+# source it (see its own header; it keeps a private can_spawn for its decision sites) — and it CARRIES
+# the gate codes those two callers branch on. A $O copy left behind at a pre-#1765 revision is a caller
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""

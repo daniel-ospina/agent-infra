@@ -133,8 +133,8 @@
 #     THIS change, but the file is held by PR #1730/#1812 — FILED as a follow-up issue rather than
 #     fixed here. install.sh's DRIFTED list — the other half of the same gap — is RESOLVED (review
 #     round 2, #1828): #1769 merged, and the list's own rule is that a SOURCED file belongs in it, so
-#     spawn-gate.sh (sourced by lane.sh, fix-one.sh and orch-loop.sh) is now in it and a stale helper
-#     is REPORTED. The callers are additionally tolerant of one (see the refusal-code note below), but
+#     spawn-gate.sh (sourced by lane.sh and fix-one.sh; orch-loop.sh does NOT source it) is now in it
+#     and a stale helper is REPORTED. The callers are additionally tolerant of one (see the refusal-code note below), but
 #     surviving a stale helper silently is not the same as detecting it.
 #   selftest.sh:866 — the "ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH" guard enumerates
 #     the is_num copies and asserts a count; spawn-gate.sh is a new copy it does not enumerate, so
