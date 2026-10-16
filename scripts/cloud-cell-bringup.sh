@@ -37,6 +37,21 @@
 #      the file is a credential on the VM's disk until it is deleted — and deleting it on the
 #      success branch alone left a push-capable token behind on every failed/aborted bring-up
 #      (agent-infra#1718). Its lifetime is bounded by an EXIT trap; see SECRET LIFETIME below.
+#
+#  (5) THE OPERATIONAL LAYER IS NOT ON THE CELL (agent-infra#1723).  Measured 2026-10-15 on the
+#      live cell pi-lane-1 / vm-efa6cc8fdb974e61b5c054acf41d8846: $CELL_HOME/.pi/agent held only
+#      models.json, auth.json, .ai-review-gate-key, reviews/, state/, audit/ and shims/ — no
+#      scripts/ (the directory did not exist), no extensions/, no skills/, no AGENTS.md, no
+#      settings.json. So a cell lane ran with NO review-enforcer, verification-gate,
+#      main-worktree-guard, search-guard or audit-logger — not the same guards as a laptop lane —
+#      and its merge path died rc=127 on the missing $HOME/.pi/agent/scripts/record-review.sh,
+#      the exact path merge-one.sh:240 executes.
+#      FIX: install it BY CONSTRUCTION — pi-bootstrap/cell-install.sh, run from the --check path
+#      below, from an agent-infra checkout that is already on the cell. That path VERIFIES first
+#      and installs only when the read-back refuses, so a re-run on a provisioned cell costs a
+#      read-back rather than a re-copy. A cell that cannot receive the layer is REFUSED rather
+#      than certified: a green `CELL READY` over an unguarded cell is the false PASS this whole
+#      script exists to remove.
 
 set -uo pipefail
 
@@ -331,6 +346,93 @@ check_dispatch() {
   ok "dispatch provisioning pre-flight passed"
 }
 
+# ── the operational layer (agent-infra#1723) ─────────────────────────────────────
+# WHY, in one line: without this, a cell lane runs with no review-enforcer, no
+# verification-gate, no main-worktree-guard, no search-guard, no audit-logger and no skills,
+# and its merge path dies rc=127 on the missing scripts/record-review.sh — the exact path
+# merge-one.sh:240 executes. See the header's (4).
+#
+# FATAL, not best-effort, and deliberately unlike check_dispatch above: the supervisor's
+# cmd_check tests NEITHER record-review.sh NOR lib/diff-normalize.py — the first is
+# agent-infra#1717 (orchestrator-harness/README.md §7.5, "Still open"), the second is read
+# from cmd_check itself (cloud-cell-supervisor.sh:234-345, no reference to either file) —
+# and nothing else installs any of the other 22 declared farm files. So if this step is
+# skipped, nothing else ever installs the guards. (A "CELL CAN RUN A CONTROLLER" from
+# cloud-cell-supervisor.sh start is therefore NOT evidence that the layer is present: it
+# reads a cell that never received it.) A "CELL READY" over an unguarded cell is exactly the
+# false PASS this repo keeps removing, and the remedy is one env var
+# (`INFRA_ROOT=<checkout>`) — so refuse.
+check_operational_layer() {
+  local cand root="" installer os_release self_root trusted=0
+  # A cell keeps its agent-infra checkout in any of a few places (this script is normally
+  # pushed STANDALONE, so its own directory proves nothing — and neither does its parent, which
+  # for a bare `bash cloud-cell-bringup.sh` is whatever directory it was run from, e.g. /tmp).
+  # ONLY $INFRA_ROOT is an unconditional declaration by the operator. Every other candidate,
+  # INCLUDING this script's own parent, must be owned by this user: the cell's HOME is a fixed
+  # path under a world-writable /tmp (/tmp/cell-home), and this step RUNS the installer it
+  # finds, with the cell's keys.env already exported — so a checkout-shaped tree planted at any
+  # of those paths would both choose and execute the code.
+  #
+  # Bound, stated rather than implied: the check is on the candidate ROOT's owner. It does not
+  # inspect the mode of the subdirectories on the way to pi-bootstrap/cell-install.sh, so a
+  # root we own but whose pi-bootstrap/ is group/other-writable would still let another local
+  # uid drop an installer in it. That requires a second local uid on the cell — the cell's home
+  # is created for the single account that runs it — and it is why two accounts must never
+  # share a cell.
+  self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  for cand in "${INFRA_ROOT:-}" "$self_root" \
+              "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" \
+              "$CELL_HOME/agent-infra"; do
+    [ -n "$cand" ] || continue
+    [ -f "$cand/pi-bootstrap/cell-install.sh" ] || continue
+    trusted=1
+    case "$cand" in
+      "${INFRA_ROOT:-}") ;;
+      *) [ -O "$cand" ] || trusted=0 ;;
+    esac
+    if [ "$trusted" -eq 1 ]; then root="$cand"; break; fi
+    say "  refusing $cand: checkout-shaped but not owned by $(id -un) — pass INFRA_ROOT=<checkout> to use it deliberately"
+  done
+  if [ -z "$root" ]; then
+    die "no agent-infra checkout on this cell (looked at \$INFRA_ROOT, $self_root, \$AGENT_INFRA_PATH, \${HARNESS}/.., $CELL_HOME/agent-infra).
+       The operational layer (guards, skills, the merge-path record-review.sh) cannot be installed,
+       so this cell would run unguarded with a rc=127 merge path. Clone agent-infra onto the cell
+       and re-run:  INFRA_ROOT=<checkout> bash $0 --check"
+  fi
+  installer="$root/pi-bootstrap/cell-install.sh"
+  # VERIFY FIRST: a re-run against a cell that already carries the layer is a READ-BACK (the
+  # installer's --verify writes nothing, so it cannot repair anything either), and only a cell
+  # that is missing the layer — or behind the checkout — pays for an install. Both halves are the
+  # installer's own decisions; this function re-implements neither.
+  # The exit status is captured from the COMMAND, never from a `| sed` pipeline — a decoration
+  # that swallows a failure is how a false PASS gets minted. The install's output is indented so
+  # the layer's own failures never read as bring-up chatter.
+  local out rc=0
+  out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --verify 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root"
+    rc=0
+    out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+  else
+    # The read-back is quiet: the installer's mode banner and its verdict line. The banner is
+    # what keeps the FAST path observable — a `--check` that silently re-copied instead would
+    # print no mode at all, and cloud-cell-bringup.test.sh asserts on exactly that. (The verdict
+    # is printed indented by the installer's own `say`, so do not anchor these patterns.)
+    printf '%s\n' "$out" | grep -E 'mode=--verify|LAYER VERIFIED' | sed 's/^/    /'
+  fi
+  if [ "$rc" -ne 0 ]; then
+    die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
+  fi
+  ok "operational layer present and verified ($CELL_HOME/.pi/agent)"
+  # A cell is Linux. Say which one, because the layer's own selection is surface-aware (no
+  # cmux desktop app, no launchd) and a reviewer reading a cell log should see the surface.
+  if [ -r /etc/os-release ]; then
+    os_release="$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-unknown}")"
+    ok "cell surface: ${os_release:-unknown} (Linux — cmux-session.ts and launchd are not installed)"
+  fi
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -343,12 +445,13 @@ main() {
       check_gh
       check_repo
       check_dispatch
+      check_operational_layer
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of
       # it. The EXIT trap covers every other exit path; this makes the banner's own path fail-closed
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

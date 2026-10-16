@@ -43,6 +43,7 @@ import hook, {
   skillFileFor,
   resolveManifestPath,
   _setSkillReadsFileForTest,
+  _setManifestForTest,
 } from "./skill-enforcer.js";
 
 const REPO_ROOT = resolve(__dirname, "..");
@@ -656,7 +657,88 @@ async function main() {
     equal((await pi.fire("tool_call", COMMIT))?.block, true);
   });
 
-  section("F. static pins (regression guards, not behaviour)");
+  section("F. #1328 — a `hard` rule fires on EVERY tool, not only bash / `mcp__*`");
+  // A fixture manifest installed through the module's test seam, so the REAL
+  // manifest (section B) is untouched after each leg. The pattern names BUILTIN
+  // tools: before #1328 the line was accepted, counted as armed by the banner,
+  // and could never fire — the only handler that sees a builtin tool name is the
+  // nudge handler, and it skips `mode === "hard"`.
+  const HARD_FIXTURE: Record<string, Array<{ patterns: RegExp[]; mode: "hard" | "nudge"; message?: string }>> = {
+    "commit-workflow": [
+      { patterns: [/^write$/, /^edit$/], mode: "hard", message: "Read commit-workflow first." },
+    ],
+  };
+
+  await test("#1328 — a `hard` rule naming a builtin tool BLOCKS it until the skill is read", async () => {
+    _setManifestForTest(HARD_FIXTURE);
+    try {
+      const { pi } = await newSession();
+      const res = await pi.fire("tool_call", { toolName: "write", input: { path: "x.ts" } });
+      ok(res?.block === true, "a hard rule naming `write` must block the write tool");
+      ok(String(res.reason).includes("commit-workflow"), String(res.reason));
+    } finally { _setManifestForTest(null); }
+  });
+
+  await test("#1328 — it fires on the named tool only, and the gate clears after the skill is read", async () => {
+    _setManifestForTest(HARD_FIXTURE);
+    try {
+      const { pi } = await newSession();
+      equal((await pi.fire("tool_call", { toolName: "edit", input: { path: "x.ts" } }))?.block, true, "`edit` is named by the rule");
+      // An unnamed tool is untouched: the gate is the PATTERN, not a blanket
+      // block on every builtin tool.
+      equal((await pi.fire("tool_call", { toolName: "grep", input: { pattern: "x" } }))?.block, undefined, "an unnamed tool must not block");
+      await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, "skills", "commit-workflow", "SKILL.md") } });
+      equal((await pi.fire("tool_call", { toolName: "write", input: { path: "x.ts" } }))?.block, undefined, "reading the skill must clear the builtin-tool gate");
+    } finally { _setManifestForTest(null); }
+  });
+
+  await test("#1328 — the write/edit prerequisite branch no longer swallows the manifest hard gate", async () => {
+    _setManifestForTest(HARD_FIXTURE);
+    try {
+      const { pi } = await newSession();
+      await pi.fire("tool_call", { toolName: "read", input: { path: join(REPO_ROOT, "skills", "writing-plans", "SKILL.md") } });
+      // The prerequisite chain is armed now. Bypassing IT must not bypass a
+      // manifest `hard` rule naming the same tool.
+      const res = await pi.fire("tool_call", { toolName: "write", input: { path: "x.ts", confirm: "prereq:writing-plans" } });
+      ok(res?.block === true, "bypassing the prerequisite must not bypass the manifest hard rule");
+      ok(String(res.reason).includes("commit-workflow"), String(res.reason));
+    } finally { _setManifestForTest(null); }
+  });
+
+  await test("#1328 — the shipped manifest's hard rules reach no builtin tool (behaviour-neutral)", async () => {
+    const { pi } = await newSession();
+    for (const ev of [
+      { toolName: "read", input: { path: "/etc/hostname" } },
+      { toolName: "grep", input: { pattern: "x" } },
+      { toolName: "find", input: { pattern: "x" } },
+      { toolName: "web_search", input: { query: "x" } },
+      { toolName: "todo_write", input: {} },
+      { toolName: "task", input: {} },
+    ]) {
+      equal((await pi.fire("tool_call", ev))?.block, undefined, `${ev.toolName} must not be blocked by the shipped manifest`);
+    }
+  });
+
+  await test("#1328 — a `hard` rule reaching for the gate-satisfaction tool is REFUSED at load, not armed", async () => {
+    const p = join(tmpDir("se-read-gate-"), "m.txt");
+    // `read` is how a skill gate is satisfied. Arming it would gate the
+    // documented remedy for every unread gate, so the line must be refused
+    // loudly and dropped — never counted as armed.
+    writeFileSync(p, "alpha # ^read$ # hard # gate the remedy\n");
+    const load = loadManifest(p);
+    equal(load.ok, false, "a hard rule reaching for `read` must make the load not-ok");
+    equal(load.rules.alpha, undefined, "the refused rule must not be armed");
+    ok(/satisfied with/.test(load.warnings.join("\n")), `expected a refusal naming the satisfaction tool, got ${load.warnings.join("|")}`);
+    // The refusal is scoped to `hard`: a NUDGE rule for the same tool is fine.
+    writeFileSync(p, "alpha # ^read$ # nudge # remind, do not gate\n");
+    equal(loadManifest(p).ok, true, "a nudge rule for `read` must still be accepted");
+    // A hard rule that only OVERLAPS the reserved tool via a broad alternation
+    // is refused too — partial enforcement is the silent downgrade #1321 banned.
+    writeFileSync(p, "alpha # write|read # hard # gated remedy\n");
+    ok(!loadManifest(p).ok, "a hard alternation that includes `read` must be refused, not partially armed");
+  });
+
+  section("G. static pins (regression guards, not behaviour)");
   const SOURCE = readFileSync(join(REPO_ROOT, "extensions", "skill-enforcer.ts"), "utf-8");
   await test("the SDK is imported for TYPES only — the module loads with zero node_modules", () => {
     ok(!/^\s*import\s+(?!type\b)[^;\n]*@earendil-works/m.test(SOURCE), "a runtime SDK import would break the bare-checkout suite");
@@ -668,7 +750,7 @@ async function main() {
     equal(hits.length, 1, `expected exactly one SKILLS_PREFIX key construction (the display fallback), got ${hits.length}`);
   });
 
-  section("G. symlink-farm integration — T1/T8 (#1321, the deployed layout)");
+  section("H. symlink-farm integration — T1/T8 (#1321, the deployed layout)");
   const realReadsBefore = existsSync(REAL_READS_FILE) ? readFileSync(REAL_READS_FILE, "utf-8") : null;
   const farm = makeFarm("symlink");
   const run = runDriver(farm.driver, childEnv({ NODE_OPTIONS: "--preserve-symlinks" }));
