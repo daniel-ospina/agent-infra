@@ -724,19 +724,18 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
 ]);
 
 /**
- * Words that RUN A STRING this command could assemble at runtime — the shells, the
- * command-string introducers, and the interpreters whose `-c`/`-e` argument is a program.
- *
- * This is a STRUCTURAL property, not another blinding spelling: a command carrying BOTH a
- * construct-bearing token AND one of these can hand a shell a program the text cannot read,
- * so a positive read cannot be trusted. Shape 15 was exactly that: `S=gh; P=pr; M=merge;
- * V=--admin; echo "$S $P $M 999 $V" | sh` names no merge anywhere (it assembles one), so the
- * read — through a decoy — said yes and BOTH layers were skipped. Adding the interpreters the
- * reviewer used (python/perl/…) is deliberate: each is the same bypass through a different
- * runner, and every word here can only turn a read into a refusal.
+ * The flags whose next word is a VALUE. The positive read's boundary is POSITIONAL: the only
+ * place a construct-bearing token may sit in a command this layer stands down for is where a
+ * value belongs (`gh pr create --title x --body-file "$(mktemp)"`). Anywhere else it may be an
+ * executable, a verb, a command string, or a program handed to a runner — and the text cannot
+ * tell which, which is why the read must fail.
  */
-const STRING_EXECUTOR =
-  /^(sh|bash|zsh|dash|ksh|eval|trap|coproc|xargs|source|python|python3|perl|ruby|node|php|awk)$/;
+const VALUE_POSITION_FLAGS = new Set([
+  "--body", "-b", "--body-file", "-F", "--subject", "-t", "--title", "-T", "--author-email",
+  "--match-head-commit", "-f", "--field", "--raw-field", "--input", "--method", "-X",
+  "--message", "-m", "--notes", "--comment", "-c", "--label", "-l", "--add-label",
+  "--remove-label", "--assignee", "-a", "--reviewer", "-r", "--search", "--query", "-q",
+]);
 
 /**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
@@ -760,36 +759,27 @@ const STRING_EXECUTOR =
  */
 export function readsNonMergeGhCall(command: string): boolean {
   const scan = scanTokens(command);
-  // A POSITIVE READ MUST NOT COEXIST WITH A HIDDEN EXECUTION. A decoy readable `gh …`
-  // elsewhere in the command satisfied the read while the real merge spelled its own words
-  // away (`echo gh issue comment 5; V=--admin; C=gh; P=pr; M=merge; $C $P $M 999 $V`) —
-  // measured as a live bypass of BOTH layers, with the argv layer discarded by the command
-  // itself. So a construct-bearing token fails the read when it is
-  //   - a path to a `gh` (`/tmp/x/gh`, `$P/g''h`), or
-  //   - followed immediately by `pr`/`merge` (`$C pr merge`, `$P$'r' merge`), or
-  //   - in COMMAND position, where an executable word lives (`$C $P $M 999 $V`, and the
-  //     assignment compound that blinded this layer to a quoted `S='gh pr merge 9 $V'`).
-  // Each test can only turn a read into a refusal, which is the direction this is allowed
-  // to be wrong in — and without all three, a decoy buys a hidden merge its deference.
+  // NO CONSTRUCT OUTSIDE A VALUE POSITION — the mechanism-level boundary, and the reason this
+  // no longer grows a list. Seven review rounds each found a new way for a command to RUN
+  // something the text cannot read: a construct in a verb position, a spliced or quoted
+  // introducer, `trap`/`coproc`, a program assembled at runtime and piped to a shell, and then
+  // the runners the executor list did not carry (`make -f -`, `osascript -e`, `. <(...)`).
+  // Every fix was another spelling, so each round produced the next bypass. The property that
+  // converges is POSITIONAL: a construct may sit only where a VALUE belongs. Anywhere else it
+  // can be an executable word, a verb, a whole command string, or a program handed to a runner
+  // the text never names — indistinguishable, so the read fails and this layer keeps the gate.
   for (let i = 0; i < scan.tokens.length; i++) {
     const tok = scan.tokens[i];
     const w = shellWord(tok);
     if (w !== "gh" && /(^|\/)gh$/.test(w)) return false; // `/tmp/x/gh`, `$P/g''h`
     if (!CONSTRUCT.test(tok)) continue;
-    const next = shellWord(scan.tokens[i + 1]);
-    if (next === "pr" || next === "merge") return false; // `$C pr merge`, `$P$'r' merge`
-    if (isCommandPositionAt(scan, i)) return false; // an executable word may be spelled away
+    const prevWord = shellWord(scan.tokens[i - 1] ?? "");
+    // `prevWord.includes("=")` covers the `--flag=value` spelling, where the VALUE's opening
+    // word carries the `=` (`--title="admin $(x)"`). The TOKEN itself carrying `=` is NOT an
+    // exemption: `X=$(date) gh issue comment 5` is an assignment whose value runs a command.
+    const inValuePosition = VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=");
+    if (!inValuePosition) return false; // a `$`-bearing token where a value does not belong
   }
-  // AND NO RUNTIME-ASSEMBLED PROGRAM. A command that carries a construct and one of the
-  // string executors can hand a shell a program the text never names, so the read cannot be
-  // trusted at all — that is a property of the command, not a spelling to enumerate.
-  let hasConstruct = false;
-  let hasExecutor = false;
-  for (const tok of scan.tokens) {
-    if (CONSTRUCT.test(tok)) hasConstruct = true;
-    if (STRING_EXECUTOR.test(shellWord(tok))) hasExecutor = true;
-  }
-  if (hasConstruct && hasExecutor) return false;
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {
     if (shellWord(scan.tokens[i]) !== "gh") continue;

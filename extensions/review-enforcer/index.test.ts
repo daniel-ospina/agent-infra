@@ -5396,9 +5396,17 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         "gh api /repos/o/r; export PATH=/usr/bin; G=gh; P=pr; M=merge; V='--admin'; trap \"$G $P $M 999 $V\" EXIT",
         // …and with the program ASSEMBLED AT RUNTIME and piped to a shell: the merge is
         // readable NOWHERE in the text (it is built from four assignments), so the decoy was
-        // the only thing the read saw. Closed by the structural rule: a command that carries
-        // a construct AND a string executor is out of the text's reach (shape 15).
+        // the only thing the read saw (shape 15).
         "gh pr view 1; export PATH=/usr/bin; S=gh; P=pr; M=merge; V=--admin; echo \"$S $P $M 999 $V\" | sh",
+        // …and the SAME assembly handed to a runner that is not a shell at all — the shapes
+        // that made the executor LIST the defect rather than the fix (shapes 16-17): the
+        // list could only ever be as complete as the reviewer's imagination, and each round
+        // it was not. They close now because the boundary is POSITIONAL: the construct is not
+        // where a value belongs, whatever is going to run it.
+        "PATH=/tmp/real:/usr/bin; export PATH; S=gh; P=pr; M=merge; V=--admin; gh issue comment 5; printf 'x:\n\t%s %s %s 9 %s\n' \"$S\" \"$P\" \"$M\" \"$V\" | make -f -",
+        "PATH=/tmp/real:/usr/bin; export PATH; A=gh; B=pr; C=merge; D=--admin; gh issue comment 5; osascript -e \"do shell script \\\"$A $B $C 9 $D\\\"\"",
+        "PATH=/tmp/real:/usr/bin; export PATH; A=gh; B=pr; C=merge; D=--admin; gh issue comment 5; ssh localhost \"$A $B $C 9 $D\"",
+        "PATH=/tmp/real:/usr/bin; export PATH; S=gh; P=pr; M=merge; V=--admin; gh issue comment 5; . <(echo \"$S $P $M 9 $V\")",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5468,15 +5476,24 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
   // shape it cannot read fails CLOSED (the caller keeps the gate) instead of open.
   for (const cmd of [
     'gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"', // the #1775 false positive
-    'gh issue comment 1 --body "the admin gate ran $(date)"',
-    "gh api /repos/o/r --method POST $(mktemp)",
+    "gh api /repos/o/r --method POST --input $(mktemp)", // a construct where a VALUE belongs
     "gh run view 123 --log",
-    "gh pr view 4 --json body $(mktemp)",
+    'gh pr create --title="admin $(date)" --body-file "$(mktemp)"', // the `--flag=value` spelling
+    'gh pr view 4 --json body -q "$(cat q)"',
     "gh pr revert 1234 --title 'Revert admin RBAC' --body $(cat msg.md)",
   ]) {
     ok(readsNonMergeGhCall(cmd), `a readable non-merge gh call defers: ${cmd}`);
   }
   for (const cmd of [
+    // The ACCEPTED OVER-BLOCK, pinned so it is a decision and not an oversight: a construct
+    // in an argument that is NOT opened by a value flag — a bare positional, or inside a
+    // body's own text — is refused. The text cannot tell a body's `$(…)` from a program, and
+    // the alternative (walking back to any value flag in the command) hands the attacker
+    // `--title x` to prepend, which re-opens the verb-position hole. Only commands that ALSO
+    // carry the word `admin` reach this branch at all; the session-level override is escape.
+    "gh api /repos/o/r --method POST $(mktemp)",
+    "gh pr view 4 --json body $(mktemp)",
+    'gh issue comment 1 --body "the admin gate ran $(date)"',
     "gh pr merge 999 $V", // a merge is not a positive read
     "gh --hostname github.com $X 999 $'--admin'", // a global flag hides the subcommand
     "gh {pr,merge} 999 $V", // a brace hides the group
@@ -5512,6 +5529,11 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     "gh pr view 1; echo \"$C $P $M 999 $V\" | sh", // …with a decoy, so only the rule refuses
     "python3 -c \"$C $P $M 999 $V\"", // …the same, through a non-shell runner
     "gh pr view 1; echo \"$C $P $M 999 $V\" | python3", // …and where ONLY the runner word identifies it
+    // …and the two shapes that made the executor list the defect (16-17): a runner the list
+    // did not carry, and `.` where the list had `source`. The boundary is POSITIONAL now, so
+    // neither needs a runner to be recognised.
+    "printf '%s %s %s 9 %s' \"$C\" \"$P\" \"$M\" \"$V\" | make -f -",
+    ". <(echo \"$C $P $M 9 $V\")",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }
