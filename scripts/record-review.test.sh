@@ -394,16 +394,19 @@ refs_for() { # <repo> <text> — prints one "repo#num" per line
     ) 2>/dev/null || true
 }
 
-# #1012 r2/r3 GitHub-parity seam: closing_issue_refs with the WORD-BOUNDARY-
-# ANCHORED CLOSING_KW (no positional REFCTX prefix, but `\b`-anchored exactly
-# as the tier guard passes it). The #513 tier guard unions this scan with the
-# positional one, so a mid-sentence ref GitHub will auto-close still binds —
-# while prose that merely CONTAINS the class ("prefix", "discloses") does not.
+# #1012 r2/r3, #1336 GitHub-parity seam: closing_issue_refs with the
+# BOUNDARY-ANCHORED CLOSING_KW (no positional REFCTX prefix; the boundary is
+# CLOSING_KW_BOUNDARY, composed exactly as the tier guard passes it). The #513
+# tier guard unions this scan with the positional one, so a mid-sentence ref
+# GitHub will auto-close still binds — while prose that merely CONTAINS the
+# class ("prefix", "discloses") does not. Since #1336 the boundary also admits
+# an emphasis OPENING `_`, so a mid-sentence `_closes #N_` (which GitHub DOES
+# close) binds too.
 refs_for_any() { # <repo> <text> — boundary-anchored keyword-class scan
     local repo="$1" text="$2"
     (
         export REPO="$repo"
-        bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2" "\b$CLOSING_KW"' _ "$RECORD" "$text"
+        bash -c 'source "$1" >/dev/null 2>&1 || exit 1; closing_issue_refs "$2" "${CLOSING_KW_BOUNDARY}${CLOSING_KW}"' _ "$RECORD" "$text"
     ) 2>/dev/null || true
 }
 
@@ -692,8 +695,8 @@ OUT="$(refs_for_any "daniel-ospina/agent-infra" "This also closes #42")"
 assert_contains "$OUT" "#42" "parser: parity scan resolves a mid-sentence closing ref (GitHub parity)"
 OUT="$(refs_for_any "daniel-ospina/agent-infra" "a sentence about refs #42")"
 [ -z "$OUT" ] && ok "parser: parity scan still ignores the trace class" || bad "parser: parity scan must not match trace keywords (got: $OUT)"
-# #1012 r3 — the parity scan is WORD-BOUNDARY-anchored because the keyword class
-# is a SUFFIX of ordinary English words. Unanchored, these three bodies were
+# #1012 r3 — the parity scan is BOUNDARY-anchored because the keyword class is
+# a SUFFIX of ordinary English words. Unanchored, these three bodies were
 # read as `fix #42` / `closes #42` / `resolved #42`, triggering a label fetch
 # and a false `exit 4` refusal on a non-micro issue. RED pre-fix.
 OUT="$(refs_for_any "daniel-ospina/agent-infra" "The prefix #42 is unrelated.")"
@@ -702,22 +705,39 @@ OUT="$(refs_for_any "daniel-ospina/agent-infra" "This discloses #42 but does not
 [ -z "$OUT" ] && ok "parser: parity scan ignores 'discloses #42' (word boundary)" || bad "parser: parity scan must ignore 'discloses #42' (got: $OUT)"
 OUT="$(refs_for_any "daniel-ospina/agent-infra" "Unresolved #42 remains open.")"
 [ -z "$OUT" ] && ok "parser: parity scan ignores 'unresolved #42' (word boundary)" || bad "parser: parity scan must ignore 'unresolved #42' (got: $OUT)"
+# #1336 — the boundary is NOT a bare `\b`: GitHub CLOSES an emphasis-wrapped
+# `_Closes #N_` (measured against GitHub's own closingIssuesReferences on scratch
+# repo `ai-gate-semantics-test` PR #13), so the parity scan must resolve it —
+# otherwise a mid-sentence underscore-emphasis closure records clean-micro with
+# the tier guard silent. RED pre-#1336.
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "_Closes #42_")"
+assert_contains "$OUT" "#42" "parser: parity scan resolves underscore-emphasis '_Closes #N_' (#1336)"
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "__Closes #42__")"
+assert_contains "$OUT" "#42" "parser: parity scan resolves '__Closes #N__' (#1336)"
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "This also _closes #42_ in passing")"
+assert_contains "$OUT" "#42" "parser: parity scan resolves a MID-SENTENCE '_closes #N_' (#1336)"
+# ...and the mirror control: an INTRA-WORD underscore is not an emphasis
+# opener, and GitHub does NOT close `foo_closes #42` — a fix that widened the
+# class to `[^[:alnum:]]` would invent a ref here and FALSE-refuse.
+OUT="$(refs_for_any "daniel-ospina/agent-infra" "This is a foo_closes #42 reference.")"
+[ -z "$OUT" ] && ok "parser: parity scan ignores 'foo_closes #42' (intra-word underscore)" || bad "parser: parity scan must ignore 'foo_closes #42' (got: $OUT)"
 
 # 8.12 repo-less clean-micro → arm (c) fail-open (no repo to tier-bind).
 run_record_verdict clean-micro "" 424316
 [ "$RECORD_RC" = "0" ] && ok "repo-less clean-micro fails open (rc 0)" || bad "repo-less clean-micro (rc=$RECORD_RC)"
 assert_contains "$RECORD_ERR" "UNVERIFIED" "repo-less clean-micro warns the tier is unverified"
 
-# 8.13 cross-script byte-identity pin (#1012 r2) — the REFCTX positional prefix
-# and the CLOSING_KW keyword class MUST be byte-identical between
-# check-pipeline-compliance.sh and record-review.sh: that equality is the
-# stated justification for anchoring both parsers with the same rule, yet
-# nothing asserted it, so a one-sided edit could silently desynchronize the two
-# gates. Extract the constant lines (in file order) and compare them.
-A_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$SCRIPT_DIR/check-pipeline-compliance.sh" || true)"
-B_CONST="$(grep -E '^(REFCTX|CLOSING_KW)=' "$RECORD" || true)"
-[ -n "$A_CONST" ] && [ -n "$B_CONST" ] || bad "cross-script pin: REFCTX/CLOSING_KW lines missing from a script (extraction is vacuous)"
-assert_eq "$A_CONST" "$B_CONST" "cross-script byte-identity: REFCTX + CLOSING_KW lines identical"
+# 8.13 cross-script byte-identity pin (#1012 r2, extended #1336) — the REFCTX
+# positional prefix, the CLOSING_KW keyword class AND the CLOSING_KW_BOUNDARY
+# parity wrapper MUST be byte-identical between check-pipeline-compliance.sh and
+# record-review.sh: that equality is the stated justification for anchoring both
+# parsers with the same rule, yet nothing asserted it, so a one-sided edit could
+# silently desynchronize the two gates. Extract the constant lines (in file
+# order) and compare them.
+A_CONST="$(grep -E '^(REFCTX|CLOSING_KW|CLOSING_KW_BOUNDARY)=' "$SCRIPT_DIR/check-pipeline-compliance.sh" || true)"
+B_CONST="$(grep -E '^(REFCTX|CLOSING_KW|CLOSING_KW_BOUNDARY)=' "$RECORD" || true)"
+[ -n "$A_CONST" ] && [ -n "$B_CONST" ] || bad "cross-script pin: REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY lines missing from a script (extraction is vacuous)"
+assert_eq "$A_CONST" "$B_CONST" "cross-script byte-identity: REFCTX + CLOSING_KW + CLOSING_KW_BOUNDARY lines identical"
 
 # 8.14 FALSE-REFUSAL guard on the parity scan (#1012 r3). The parity scan is
 # WORD-BOUNDARY-anchored. Unanchored, the keyword class matches INSIDE English
@@ -742,6 +762,32 @@ STUB_BODY='This discloses #424341 but does not close it.' run_record_verdict cle
 [ "$RECORD_RC" = "0" ] && ok "false-refusal: 'discloses #N' is not a closing ref (rc 0)" || bad "false-refusal: 'discloses #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
 STUB_BODY='Unresolved #424342 remains open.' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424342 "$SHA"
 [ "$RECORD_RC" = "0" ] && ok "false-refusal: 'unresolved #N' is not a closing ref (rc 0)" || bad "false-refusal: 'unresolved #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+unset STUB_LABELS_DIR STUB_LABELS
+rm -rf "$T/labels"
+
+# 8.15 (#1336) — the #513 tier guard must BIND a mid-sentence underscore-emphasis
+# closing keyword. GitHub CLOSES `_closes #N_` (measured: scratch repo
+# `ai-gate-semantics-test` PR #13 vs its GraphQL closingIssuesReferences), and
+# the POSITIONAL scan cannot see it (not line-leading), so before #1336 the
+# parity scan's `\b` was the only candidate — and `\b` does not fire after `_`
+# (`_` is a word character), so a non-micro issue could be recorded clean-micro
+# with the guard silent. RED pre-fix (rc 0, record written); GREEN post-fix
+# (rc 4, no record).
+mkdir -p "$T/labels"
+printf 'complexity:standard\n' > "$T/labels/424350"
+printf 'complexity:standard\n' > "$T/labels/424351"
+export STUB_LABELS_DIR="$T/labels"
+export STUB_LABELS=""
+STUB_BODY='This also _closes #424350_ in passing' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424350 "$SHA"
+[ "$RECORD_RC" = "4" ] && ok "#1336: mid-sentence '_closes #N_' refuses a non-micro ref (rc 4)" || bad "#1336: mid-sentence '_closes #N_' must refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ ! -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424350.json" ] && ok "#1336: underscore-emphasis refusal wrote no record" || bad "#1336: refusal must write no record"
+# Negative control, and it is the whole point of `[^[:alnum:]_]` over
+# `[^[:alnum:]]`: an INTRA-WORD underscore is not an emphasis opener and GitHub
+# does NOT close `foo_closes #N`, so the guard must PROCEED (arm (c)). A fix that
+# widened the class by deleting `_` from the non-word set would false-refuse.
+STUB_BODY='This is a foo_closes #424351 reference' run_record_verdict clean-micro "daniel-ospina/agent-infra" 424351 "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "#1336: intra-word 'foo_closes #N' is not a closing ref (rc 0)" || bad "#1336: 'foo_closes #N' must not refuse (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$RECORD_ERR" "no same-repo closing-issue ref" "#1336: 'foo_closes #N' reached arm (c), not a tier bind"
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
