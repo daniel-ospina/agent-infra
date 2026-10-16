@@ -96,11 +96,24 @@
 #                                                  command up to a statement separator (so a
 #                                                  producer in the PREVIOUS command cannot vouch
 #                                                  for this one)
+#       a QUOTED or ESCAPED WRAPPER WORD             `"command" -p grep …`, `\command -p grep …`,
+#                                                  `"env" -i grep …` — the wrapper walk read
+#                                                  RAW text, so the quoting never matched the
+#                                                  WRAPWORDS list
+#       a brace or parenthesis INSIDE a wrapper      `env -u "x(y" -- grep …`, `env -u x} -- grep
+#        OPTION ARGUMENT                             …` — the walk broke on `(`/`)`/`{`/`}`; only a
+#                                                  statement separator may end it
 #       an UNQUOTED BRACED VARIABLE among its         `/usr/bin/grep -E "a|b" ${y} f | grep -q p` —
 #        arguments                                   `${y}` opens no `{ …; }` group, so its `}`
 #                                                  landed in the group-depth-0 branch and CLEARED
 #                                                  the writer; parameter expansions are counted
 #                                                  (`pb`) so the two braces match each other
+#       a `}` that closes NEITHER a group NOR a      `grep -E "a|b" shard{1,2}.txt | grep -q p`,
+#        parameter                                    `grep -E "a|b" f{,} | grep -q p`,
+#                                                  `grep -E "a|b" } f | grep -q p` — bash treats
+#                                                  that `}` as an ordinary word character; it is
+#                                                  now left ACTIVE rather than clearing the
+#                                                  writer (over-block, not a false clean)
 #       a producer INSIDE a WRAPPER BODY            `eval "grep -vE \"x|y\" f | grep -q needle"`,
 #                                                  `env -S "grep -vE x|y f" | grep -q needle` —
 #                                                  and its SINGLE-quoted spelling
@@ -147,7 +160,9 @@
 #     position in which the flag is a substitution, carries no quiet flag in the TEXT. With the
 #     variable unset the command reads all its input; with it set to a quiet flag the writer dies.
 #     A static reader cannot decide that, and treating every unresolvable option token as a
-#     candidate would trade this narrow miss for a wide false block. Recorded, not closed.
+#     candidate would trade this narrow miss for a wide false block. Recorded, not closed. The
+#     same holds for a COMMAND WORD computed by a substitution (`… | $(printf grep) -q p`) or held
+#     in a variable — resolving it means RUNNING it, which is not a text predicate.
 #
 # WHAT IS SCANNED, AND WHERE THIS GUARD HAS TO RUN
 # ------------------------------------------------
@@ -1142,11 +1157,23 @@ HITS="$(
             while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
             if (pw < 1) break
             ph = pw
-            while (ph >= 1 && CH[ph] !~ /[ \t;&|({})]/) ph--
+            # A token boundary is ` \t;&|` and NOTHING else. `(`, `)`, `{` and `}` are ORDINARY
+            # CHARACTERS inside a word, so breaking on them ended the walk before the wrapper was
+            # reached when one appeared in a wrapper OPTION ARGUMENT (`env -u "x(y" -- grep …`,
+            # `env -u x} -- grep …`) — reported CLEAN at rc 141 (#864 review). Only a statement
+            # separator stops the walk, so a producer in the PREVIOUS command cannot vouch for this
+            # one.
+            while (ph >= 1 && CH[ph] !~ /[ \t;&|]/) ph--
             pto = substr(s, ph + 1, pw - ph)
+            # A QUOTED or ESCAPED wrapper word (`"env" -i grep`, `\env -i grep`) is still that
+            # command, and this walk reads RAW text, so its quoting is stripped before the match —
+            # the same allowance `writer_at` already makes for the producer word itself. Comparing
+            # `"env"` and `\env` against the WRAPWORDS list failed and reported CLEAN at rc 141
+            # (#864 review).
+            gsub(/["\\\047]/, "", pto)
             sub(/.*\//, "", pto)
             if (pto ~ "^(" WRAPWORDS ")$") { ok = 1; break }
-            if (ph < 1 || CH[ph] ~ /[;&|({})]/) break
+            if (ph < 1 || CH[ph] ~ /[;&|]/) break
             pw = ph - 1
           }
           if (!ok) return 0
@@ -1240,21 +1267,26 @@ HITS="$(
             continue
           }
           # `{ ...; }` groups: a `;` inside the group does not take the writer off the pipe, and the
-          # closing brace does not either — the GROUP stdout is the pipe. A `}` with no group open
-          # is conservative and clears the writer. `${x}` is NOT a group: its `{` follows a `$`, so
-          # it opens none — and its `}` must close none either, or it lands in the `br == 0` branch
-          # and CLEARS THE WRITER: `/usr/bin/grep -E "a|b" ${y} f | grep -q p` was reported CLEAN at
-          # rc 141 by an unquoted braced variable among the producer arguments (#864 review). PB
-          # counts parameter expansions, so the two braces are matched to each other.
+          # closing brace does not either — the GROUP stdout is the pipe. `${x}` is NOT a group: its
+          # `{` follows a `$`, so it opens none — and its `}` must close none either, or it lands in
+          # the `br == 0` branch and CLEARS THE WRITER: `/usr/bin/grep -E "a|b" ${y} f | grep -q p`
+          # was reported CLEAN at rc 141 by an unquoted braced variable among the producer arguments
+          # (#864 review). PB counts parameter expansions, so the two braces are matched to each
+          # other.
           if (c == "{") {
             if (i > 1 && CH[i - 1] == "$") pb++
             else if (i == 1 || CH[i - 1] ~ /[ \t;&|(]/) br++
             continue
           }
           if (c == "}") {
+            # A `}` that closes neither a counted `{ …; }` group nor a counted `${…}` parameter is
+            # not a group close at all: bash treats it as an ORDINARY WORD CHARACTER there (brace
+            # expansion `f{1,2}.txt`, `f{,}`, an argument that is a bare `}`, and a second `}` after
+            # `${y}`). Clearing the writer on it took the producer off the pipe and reported CLEAN
+            # at rc 141 (#864 review). It now stays conservative in the OTHER direction: an
+            # unmatched `}` leaves the writer ACTIVE, which can only over-block.
             if (pb > 0) pb--
             else if (br > 0) br--
-            else active = 0
             continue
           }
           if (c == ";") { if (br == 0) active = 0; continue }
