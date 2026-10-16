@@ -10,25 +10,16 @@
 // #1321 fail-open. `realpathSync(__filename)` recovers the real module location
 // under jiti AND Node's native loader; use MODULE_DIR/REPO_DIR, never `__dirname`.
 //
-// ── ONE SUBJECT PER CALL; EVERY `hard` RULE IS EVALUATED (#1328) ──────────
-// The blocking gate picks its match SUBJECT by CHANNEL: a bash call is judged
-// on its command text, every other call — `mcp__*` and builtin/extension tools
-// alike — on its tool name. It used to be two channel-specific branches (an
-// `mcp__*` branch, then a bash-only branch), so a `hard` rule naming any other
-// tool was accepted, counted as armed by the banner, and could never fire: an
-// inert enforcer, the same class as #1321's empty manifest. Every `tool_call`
-// maps to exactly one subject, so a `hard` rule is now unreachable only when
-// its pattern matches neither a command nor a tool name — a pattern defect,
-// not a channel defect. (The `nudge` × {bash, `mcp__*`} cell of the same matrix
-// is still dead and is tracked separately in #1820.)
-//
-// ⚠️ EXCEPTION — `read` IS NEVER A SUBJECT. Reading `<skill>/SKILL.md` is the
-// only documented way to clear ANY gate, so a manifest rule must never block the
-// `read` tool: a pattern that merely contains "read" (`git read-tree`) would
-// otherwise make every gate in the manifest unsatisfiable at once. `read` calls
-// therefore stay ungated, and `loadManifest` reports such a rule LOUDLY (the
-// issue's own option b, applied where it is decidable) so it is never silently
-// inert — which is the #1328 class this change closes.
+// ── A RULE'S SUBJECT, AND IT MUST BE ONE WE ENFORCE (#1328) ────────────────
+// A manifest rule is a pattern plus a mode. The pattern is matched against a
+// SUBJECT: the text of a `bash` command, or a tool NAME. The block branch once
+// covered bash and `mcp__*` ONLY, so a `hard` rule naming any other tool was
+// accepted, counted as armed by the banner, and could never fire — the nudge
+// handler is the only one that sees those tools and it skips `hard`. The
+// subject is now computed for EVERY tool, so a hard rule fires on whatever
+// channel its pattern names. `read` is the tool a skill gate is SATISFIED with,
+// so a hard rule that reaches for it is refused at load (loud, `ok=false`)
+// rather than armed as a blocker of its own remedy.
 //
 // ── READ IDENTITY IS A NAME, NOT A PATH FRAGMENT (#1322) ──────────────────
 // pi serves skills from `~/.pi/agent/skills/<name>/SKILL.md` (real dirs);
@@ -332,6 +323,15 @@ export function resolveManifestPath(
   return { path: sibling, source: "module" };
 }
 
+/**
+ * The tools by which a skill gate is SATISFIED (#1328). `read` is the only
+ * in-band remedy the block reason advertises, so it is deliberately OUTSIDE the
+ * hard-rule subject: a hard rule matching it would gate the documented way out
+ * of every unread gate. `loadManifest` REFUSES such a rule loudly instead of
+ * arming a channel the extension will not enforce.
+ */
+export const GATE_SATISFACTION_TOOLS: readonly string[] = ["read"];
+
 export interface ManifestRule {
   patterns: RegExp[];
   mode: "hard" | "nudge";
@@ -409,16 +409,20 @@ export function loadManifest(path: string): ManifestLoad {
       }
     }
     if (patterns.length === 0) continue;
-    // ── `read` is the REMEDY, never a subject (#1328) ─────────────────────
-    // The blocking gate skips the `read` tool (see the header), because reading
-    // the SKILL.md is how every gate is cleared. A `hard` pattern that also
-    // matches "read" would otherwise make EVERY gate in this manifest
-    // unsatisfiable at once, so it is reported here instead of passing as a
-    // healthy, armed rule — the same "declared but silent" class as #1328.
-    if (modeField === "hard" && patterns.some((p) => p.test("read"))) {
-      warnings.push(
-        `${path}:${lineNo} — entry "${skillName}" is a \`hard\` rule whose pattern also matches the \`read\` tool, which is never blocked (reading the SKILL.md is the remedy for every gate); the rule does NOT apply to \`read\` calls`,
-      );
+    // #1328 — a `hard` rule must gate a channel the extension actually
+    // enforces. Its subject is a bash command or a tool NAME, but `read` is the
+    // tool a gate is SATISFIED with: arming it would block the documented
+    // remedy for every unread gate. Refuse it loudly rather than accept it as
+    // armed and leave it inert-on-that-channel (or deadlocking).
+    if (modeField === "hard") {
+      const reserved = GATE_SATISFACTION_TOOLS.filter((t) => patterns.some((p) => p.test(t)));
+      if (reserved.length > 0) {
+        defects += 1;
+        warnings.push(
+          `${path}:${lineNo} — entry "${skillName}" is a HARD rule whose pattern matches ${reserved.map((t) => `"${t}"`).join(", ")}, the tool a skill gate is satisfied with. Gating it would block the remedy for every unread gate, so it is NOT enforced; narrow the pattern to the tools/commands it means to cover.`,
+        );
+        continue;
+      }
     }
     const rule: ManifestRule = {
       patterns,
@@ -438,8 +442,16 @@ export function loadManifest(path: string): ManifestLoad {
 }
 
 export const MANIFEST_LOAD = loadManifest(MANIFEST_PATH);
-const MANIFEST = MANIFEST_LOAD.rules;
+// `let`, not `const`, only so a suite can install a fixture manifest through
+// `_setManifestForTest` (the handlers close over this binding). MANIFEST_RULES
+// keeps the REAL load, which is what the manifest assertions read.
+let MANIFEST: Record<string, ManifestRule[]> = MANIFEST_LOAD.rules;
 export const MANIFEST_RULES = MANIFEST;
+
+/** Test seam: install a fixture manifest (or null to restore the real load). */
+export function _setManifestForTest(rules: Record<string, ManifestRule[]> | null): void {
+  MANIFEST = rules ?? MANIFEST_LOAD.rules;
+}
 
 /** Unique skills (the gate count the issue's Target names) and total rules. */
 export function manifestCounts(load: ManifestLoad = MANIFEST_LOAD): { skills: number; rules: number } {
@@ -617,7 +629,7 @@ export default function (pi: ExtensionAPI) {
         const input = (event.input as Record<string, unknown>) ?? {};
         if (input.confirm === `prereq:${skillName}`) {
           console.log(`[skill-enforcer] 🔓 Prerequisite bypassed: ${skillName}`);
-          return undefined;
+          continue;
         }
         const reason = [
           `⛔ Pipeline gate — ${skillName}/SKILL.md was read but no dispatched workflow`,
@@ -627,13 +639,22 @@ export default function (pi: ExtensionAPI) {
         console.log(`[skill-enforcer] 🚫 Prerequisite block: ${skillName} → ${toolName}`);
         return { block: true, reason };
       }
-      return undefined;
+      // Fall through to the manifest hard-rule gate (#1328): `write`/`edit` are
+      // tools like any other, and a hard rule naming one must fire.
     }
 
-    let cmd = "";
-    if (isToolCallEventType("bash", event)) {
-      cmd = String((event.input as any)?.command ?? "");
-    }
+    // ── The rule SUBJECT (#1328) ────────────────────────────────────────────
+    // See the header. Every tool yields a subject, so a `hard` rule fires on
+    // the channel its pattern names, not only on bash / `mcp__*`. `read` is the
+    // gate-satisfaction tool and is not a subject; loadManifest refuses a hard
+    // rule that reaches for it.
+    const isBash = isToolCallEventType("bash", event);
+    const subject = isBash
+      ? String((event.input as any)?.command ?? "")
+      : GATE_SATISFACTION_TOOLS.includes(toolName)
+        ? ""
+        : String(toolName);
+    if (!subject) return undefined;
 
     // Match only `hard` rules: a nudge rule must NEVER hard-block (#1321 — the
     // broad `tortoise_` catch-all would otherwise block every read-only
@@ -651,24 +672,11 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
-    // ── ONE SUBJECT PER CALL, EVERY `hard` RULE EVALUATED (#1328) ──────────
-    // See the header note. The channel discriminator is the tool name: a bash
-    // call is judged on its command text, any other tool on its own name, so a
-    // `hard` rule naming a builtin or extension tool now blocks instead of
-    // being accepted-and-inert. `read` is the remedy for every gate and is
-    // never a subject (header, #1328).
-    if (toolName === "read") return undefined;
-    const isBash = isToolCallEventType("bash", event);
-    const subject = isBash ? cmd : toolName;
-    if (!subject) return undefined;
-
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(subject) && !readFiles.has(skillName)) {
-            return blockReason(skillName, rule, isBash ? skillName : toolName);
-          }
+          if (p.test(subject) && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
         }
       }
     }
@@ -683,16 +691,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const toolName = (event as any).toolName ?? "";
-    // Skip bash and MCP: the blocking handler above owns those two channels.
-    // ⚠️ That handler skips `mode !== "hard"` rules, so a NUDGE rule whose
-    // pattern targets a bash command or an `mcp__*` tool is evaluated by
-    // NEITHER handler and can never fire — the shipped
-    // `how-to-use-tortoise # tortoise_ # nudge` broad catch-all is one (measured
-    // 2026-10-14: 5 consecutive `mcp__tortoise__tortoise_search` calls produce no
-    // block, no reminder, no injection, no nudge log). Not fixed here: closing
-    // it would newly apply nudge escalation — a block at the 3rd call — to
-    // read-only MCP queries, which #1321's T11 required must not block. Filed as
-    // #1820; the decision, not the mechanism, is missing.
+    // Skip bash and MCP: the blocking handler above owns EVERY `hard` rule
+    // (#1328), though a `nudge` rule for a bash command or an `mcp__*` tool is
+    // still inert — filed as #1820, which needs a decision before it can fire.
     if (toolName === "bash" || toolName.startsWith("mcp__")) return undefined;
     if (!toolName) return undefined;
 
