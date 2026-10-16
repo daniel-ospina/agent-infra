@@ -93,11 +93,11 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
     # and no-marker pins are real. A /rerun POST pipes NO stdin, so the read is
     # skipped for it — consuming stdin unconditionally would clobber the PATCH
     # capture with an empty body and, on an inherited terminal, block forever.
-    if printf '%s' "$*" | grep -qF -- "/rerun"; then
+    if grep -qF -- "/rerun" <<<"$*"; then
         if [ "${STUB_RERUN_FAIL:-0}" = "1" ]; then exit 1; fi
         exit 0
     fi
-    if printf '%s' "$*" | grep -qF -- "-X PATCH"; then
+    if grep -qF -- "-X PATCH" <<<"$*"; then
         if [ "${STUB_PATCH_FAIL:-0}" = "1" ]; then exit 1; fi
     fi
     # PATCH body — capture stdin to whichever sink the test asked for, else swallow.
@@ -2999,7 +2999,7 @@ fi
 #       SIGNED form (sig=…), not on the marker text. RED pre-fix: MARKER_PRESENT
 #       was set from a text-only grep, so the unsigned body re-ran the job.
 UNSIGNED_BODY="$(printf '%s' "$SEED_BODY" | sed 's/ sig=[0-9a-f]\{64\}$//')"
-if [ "$UNSIGNED_BODY" != "$SEED_BODY" ] && ! printf '%s' "$UNSIGNED_BODY" | grep -q ' sig='; then
+if [ "$UNSIGNED_BODY" != "$SEED_BODY" ] && ! grep -q ' sig=' <<<"$UNSIGNED_BODY"; then
     ok "14.13 the unsigned-marker fixture dropped the signature (prerequisite)"
 else
     bad "14.13 the unsigned-marker fixture dropped the signature (prerequisite)"
