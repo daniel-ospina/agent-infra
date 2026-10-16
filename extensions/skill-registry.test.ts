@@ -55,6 +55,7 @@ import hook, {
   isLinkedWorktree,
   projectRoot,
   runSync,
+  staleRemedy,
 } from "./skill-registry.js";
 
 const REPO_ROOT = resolve(__dirname, "..");
@@ -208,6 +209,11 @@ await test("a symlinked skill dir is followed; a BROKEN link is skipped, not fat
 
   const found = enumerateSkills(root);
   deepEqual(found.skills.map((s) => s.name), ["aliased"]);
+  // `SkillSource.dir` documents "symlinks resolved", and the invariant is
+  // load-bearing: collectSources compares it against the farm's real path to
+  // skip a source that IS the farm, so an unresolved alias would defeat that
+  // guard while still enumerating and linking.
+  strictEqual(found.skills[0].dir, realpathSync(real));
   deepEqual(found.errors, []);
 });
 
@@ -401,6 +407,31 @@ await test("NEGATIVE CONTROL: a dangling link that matches NO source is not touc
   strictEqual(readlinkSync(join(farm, "unrelated")), orphan);
 });
 
+await test("NEGATIVE CONTROL: a farm link whose target CANNOT BE STATTED is left alone, never re-pointed", () => {
+  // `existsSync` returns false for ANY stat failure, so an unreadable target used
+  // to be indistinguishable from a gone one: the entry was unlinked and
+  // re-pointed at this extension's source (a rule-2 violation on a link this
+  // extension did not create) and then counted in `repaired` — a false report of
+  // a repair. A symlink LOOP reproduces the non-ENOENT error deterministically;
+  // EACCES on a non-traversable ancestor and EPERM under macOS TCC reach the same
+  // branch but cannot be fixture-proven under a root runner.
+  const project = tmpDir("sr-unstatable-");
+  const src = writeSkill(project, ["skills"], "alpha");
+  const farm = join(tmpDir("sr-unstatablefarm-"), "skills");
+  mkdirSync(farm, { recursive: true });
+  const loop = join(farm, "alpha");
+  symlinkSync(loop, loop, "dir"); // self-referential → statSync throws ELOOP
+
+  const r = runSync({ farm, projectRoot: project, moduleRoot: project });
+  deepEqual(r.repaired, [], "an unreadable entry is NOT a repair");
+  deepEqual(r.linked, [], "and it must not be linked either");
+  strictEqual(r.ok, false, "an entry that cannot be read is never a pass");
+  equal(r.errors.length, 1);
+  ok(r.errors[0].includes("cannot tell whether"), r.errors[0]);
+  strictEqual(readlinkSync(loop), loop, "the entry must be exactly as it was found");
+  strictEqual(readlinkSync(loop) === realpathSync(src), false, "and never re-pointed at our source");
+});
+
 await test("a plain FILE where a skill belongs is a conflict — reported, never replaced", () => {
   const project = tmpDir("sr-conflict-");
   writeSkill(project, ["skills"], "alpha");
@@ -412,6 +443,24 @@ await test("a plain FILE where a skill belongs is a conflict — reported, never
   deepEqual(r.conflicts, ["alpha"]);
   deepEqual(r.linked, []);
   strictEqual(readFileSync(join(farm, "alpha"), "utf-8"), "I am a file");
+});
+
+await test("a handler-level CONFLICT is WARNED about — the only signal that a name was skipped", async () => {
+  // `runSync`'s struct is asserted above, but the branch that carries that fact
+  // to a human lives in `reportSync`. Deleting the whole warn block leaves every
+  // struct assertion green, so the report is driven here through the handler.
+  const project = tmpDir("sr-conflictmsg-");
+  writeSkill(project, ["skills"], "alpha");
+  const farm = join(tmpDir("sr-conflictmsgfarm-"), "skills");
+  mkdirSync(farm, { recursive: true });
+  writeFileSync(join(farm, "alpha"), "I am a file");
+
+  const out = await fireHandler(farm, project, project);
+  deepEqual(out.logs, [], "a skipped name is not a success");
+  equal(out.warns.length, 1);
+  ok(out.warns[0].includes("alpha"), out.warns[0]);
+  ok(out.warns[0].includes("left alone"), out.warns[0]);
+  deepEqual(out.errors, []);
 });
 
 // ── delegated (symlinked) farm ───────────────────────────────────────────────
@@ -517,6 +566,24 @@ await test("the handler prints a success line ONLY when it changed something", a
   deepEqual(second, { logs: [], warns: [], errors: [] });
 });
 
+await test("a REPAIR is reported in the success line — a repair-only run must not read as 'linked 0'", async () => {
+  // The `repaired` clause of the success line has no other coverage: test 24's
+  // second run is idempotent, so dropping the clause made a run that fixed a
+  // dangling link print "linked 0 of N source skill(s)" and nothing else.
+  const project = tmpDir("sr-repairmsg-");
+  const src = writeSkill(project, ["skills"], "alpha");
+  const farm = join(tmpDir("sr-repairmsgfarm-"), "skills");
+  mkdirSync(farm, { recursive: true });
+  symlinkSync(join(tmpDir("sr-moved3-"), "old"), join(farm, "alpha"), "dir");
+
+  const out = await fireHandler(farm, project, project);
+  equal(out.logs.length, 1);
+  ok(out.logs[0].includes("repaired 1"), out.logs[0]);
+  ok(out.logs[0].includes("linked 0"), out.logs[0]);
+  strictEqual(readlinkSync(join(farm, "alpha")), realpathSync(src));
+  deepEqual(out.errors, []);
+});
+
 // ── staleness + failures are surfaced (indicators 2 and 3) ───────────────────
 section("staleness and failure reporting (indicators 2 and 3)");
 
@@ -538,6 +605,25 @@ await test("a stale farm copy is named, with a remedy that EXISTS on this machin
   deepEqual(out.errors, []);
 });
 
+await test("NEGATIVE CONTROL: the stale remedy never names a path that does not exist", () => {
+  // The stale branch fires in setup.sh's COPY layout, where the extension's own
+  // root is `~/.pi/agent` and holds no `sync.sh`. Naming `<root>/sync.sh`
+  // unconditionally sent the operator to a file that cannot be there — and the
+  // leg above could not see it, because the suite always loads the module from a
+  // real repo root, where the path happens to exist.
+  const withSync = tmpDir("sr-remedy-");
+  writeFileSync(join(withSync, "sync.sh"), "#!/bin/sh\n");
+  ok(staleRemedy(withSync).includes(`"${join(withSync, "sync.sh")}"`), staleRemedy(withSync));
+
+  const withoutSync = tmpDir("sr-remedy2-");
+  const text = staleRemedy(withoutSync);
+  strictEqual(text.includes(join(withoutSync, "sync.sh")), false, text);
+  ok(text.includes("sync.sh"), `the remedy still has to say what to run: ${text}`);
+  for (const quoted of text.match(/"[^"]+"/g) ?? []) {
+    ok(existsSync(quoted.slice(1, -1)), `the remedy names a path that does not exist: ${quoted}`);
+  }
+});
+
 await test("a delegated farm names the skills pi cannot see", async () => {
   const project = tmpDir("sr-deleghandler-");
   writeSkill(project, ["skills"], "absent");
@@ -550,6 +636,27 @@ await test("a delegated farm names the skills pi cannot see", async () => {
   ok(out.warns[0].includes("absent"), out.warns[0]);
   ok(out.warns[0].includes(realpathSync(delegated)), out.warns[0]);
   deepEqual(out.logs, []);
+});
+
+await test("NEGATIVE CONTROL: a delegated farm does NOT call a pi PROJECT skill invisible", async () => {
+  // `.pi/skills` is one of pi's own default locations — its loader adds
+  // `<cwd>/.pi/skills` as a "project" source — so a delegated farm does not make
+  // such a skill less visible to pi, and naming it "NOT visible … because the
+  // farm is a symlink" states a false cause. A shape the farm genuinely cannot
+  // reach must STILL be reported: the control is on the message, not the field.
+  const project = tmpDir("sr-delegnative-");
+  writeSkill(project, [".pi", "skills"], "proj-native");
+  writeSkill(project, ["skills"], "delegated-absent");
+  // Deliberately EMPTY: `delegated-absent` is genuinely unreachable through the
+  // farm, so the control has a positive to assert alongside the skipped name.
+  const delegated = tmpDir("sr-delegnativereal-");
+  const farmLink = join(tmpDir("sr-delegnativefarm-"), "skills");
+  symlinkSync(delegated, farmLink, "dir");
+
+  const out = await fireHandler(farmLink, project, project);
+  equal(out.warns.length, 1);
+  strictEqual(out.warns[0].includes("proj-native"), false, `a project skill pi reads directly must not be reported invisible: ${out.warns[0]}`);
+  ok(out.warns[0].includes("delegated-absent"), out.warns[0]);
 });
 
 await test("a failure is an ERROR line and never a success line", async () => {
@@ -603,6 +710,52 @@ await test("the handler can never crash session startup (hostile paths)", async 
   }
 });
 
+await test("the SESSION_START guard is real: a report that THROWS is reported, not propagated", async () => {
+  // Every filesystem failure is absorbed inside `runSync`, so no hostile path
+  // reaches the handler's own try/catch — delete the guard and the suite stayed
+  // green. It has to be forced through the seam to pin the guard itself.
+  _setSyncOptionsForTest({
+    get farm(): string {
+      throw new Error("boom");
+    },
+  } as never);
+  const pi = fakePi();
+  hook(pi as never);
+  try {
+    const out = await withConsole(async () => {
+      await pi.fire("session_start"); // must RESOLVE, never reject
+    });
+    deepEqual(out.logs, []);
+    equal(out.errors.length, 1);
+    ok(out.errors[0].includes("skill farm sync failed"), out.errors[0]);
+    ok(out.errors[0].includes("boom"), out.errors[0]);
+  } finally {
+    _setSyncOptionsForTest(null);
+  }
+});
+
+await test("projectRoot is the git TOPLEVEL of a subdirectory, not the subdirectory", () => {
+  // The only leg for `projectRoot` asserted the NON-repo fallback, so replacing
+  // the whole git call with `return resolve(cwd)` left the suite green — and with
+  // it, a session started in a subdirectory would silently find no skills.
+  const main = tmpDir("sr-toplevel-");
+  git(main, ["init", "-q"]);
+  git(main, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"]);
+  const sub = join(main, "deep", "dir");
+  mkdirSync(sub, { recursive: true });
+  strictEqual(realpathSync(projectRoot(sub)), realpathSync(main));
+  // …and the behaviour that matters end to end: the default project root finds
+  // the project's skills when the session cwd is a subdirectory.
+  writeSkill(main, ["skills"], "found-from-subdir");
+  const farm = join(tmpDir("sr-toplevelfarm-"), "skills");
+  // A module root with NO skills, so the project root derived from `cwd` is the
+  // only possible source — otherwise an explicitly-passed root would mask the
+  // mutation this leg exists to catch.
+  const moduleRoot = tmpDir("sr-toplevelmodule-");
+  const r = runSync({ farm, cwd: sub, moduleRoot });
+  deepEqual(r.linked, ["found-from-subdir"]);
+});
+
 // ── the warning #1323 was filed for ──────────────────────────────────────────
 section("source of the warning (indicator 1)");
 
@@ -639,9 +792,13 @@ await test("the module carries no Python generator and no env-var path fallback"
 // ── real-repo smoke + module surface ─────────────────────────────────────────
 section("smoke tests on this checkout");
 
-await test("the module resolves its own repo by REALPATH, not by `__dirname` (#1321 discipline)", () => {
-  strictEqual(MODULE_DIR, realpathSync(MODULE_DIR));
-  strictEqual(REPO_DIR, resolve(__dirname, ".."));
+// The REALPATH discipline is pinned by the T8/T1 leg BELOW — loading this module
+// through a symlink is the only shape in which `__dirname` and
+// `realpathSync(__filename)` can differ, so asserting the identity HERE was
+// vacuous (both implementations agree on the ordinary load path). This leg is
+// named for what it actually pins.
+await test("loaded from this checkout, the module's repo root is this checkout and its surfaces exist", () => {
+  ok(REPO_DIR === resolve(MODULE_DIR, ".."), `${REPO_DIR} must be the parent of ${MODULE_DIR}`);
   ok(existsSync(join(REPO_DIR, "skills")), `${REPO_DIR}/skills must exist`);
   ok(existsSync(join(REPO_DIR, "extensions", "skill-registry.ts")));
   strictEqual(defaultFarmDir("/home/x"), "/home/x/.pi/agent/skills");

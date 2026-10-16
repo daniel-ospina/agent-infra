@@ -113,7 +113,8 @@ export interface SyncReport {
   repaired: string[];
   /** Names the farm holds as a real copy that DIFFERS from its source. */
   stale: string[];
-  /** Names not visible to pi because the farm is a symlink (delegated layout). */
+  /** Names pi cannot reach through the farm's target and is not already reading
+   *  as a project skill (delegated layout, rule 3). */
   missing: string[];
   /** Names occupied by a non-directory in the farm — left alone, reported. */
   conflicts: string[];
@@ -422,7 +423,18 @@ export function runSync(opts: SyncOptions = {}): SyncReport {
 
   // ── delegated farm: report, never write (contract rule 3) ──────────────────
   if (report.farm.mode === "symlink") {
+    // A source pi reads DIRECTLY is not made invisible by a delegated farm. The
+    // project's own `.pi/skills` is one of pi's two default locations (its
+    // loader adds `<cwd>/.pi/skills` as a "project" source) and this module
+    // enumerates that shape on purpose — so naming such a source "NOT visible to
+    // pi BECAUSE the farm is a symlink" states a false cause and prints a
+    // permanent false alarm in the delegated layout. Under-reported when the
+    // session cwd is a SUBdirectory of the project root (pi's project dir is
+    // `<cwd>/.pi/skills`; this module's is `<toplevel>/.pi/skills`): withholding a
+    // warning whose stated cause cannot be honored is the safe direction.
+    const piProjectSkills = resolve(project, ".pi", "skills");
     for (const src of report.sources) {
+      if (src.root === piProjectSkills) continue;
       if (!existsSync(join(report.farm.realPath, src.name, SKILL_ENTRY))) {
         report.missing.push(src.name);
       }
@@ -477,8 +489,30 @@ export function runSync(opts: SyncOptions = {}): SyncReport {
     }
     if (entryKind === "symlink") {
       // A LIVE link belongs to whoever made it (setup.sh's farm, an installer):
-      // leave it alone. Only a link whose target is gone is repaired.
-      if (existsSync(target)) continue;
+      // leave it alone. Only a link whose target is GONE is repaired — and
+      // "gone" must be read from the ERROR CODE, not from `existsSync`: that
+      // returns false for ANY stat failure, so EACCES/EPERM on an ancestor is
+      // indistinguishable from ENOENT. Treating it as dangling unlinked a LIVE
+      // foreign link and re-pointed it at this extension's source (the rule-2
+      // violation) and then counted the name in `repaired`, reporting a repair
+      // of a link that was never dangling. EACCES is not exotic: setup.sh
+      // records exactly this under macOS TCC, and an unmounted volume or a
+      // non-traversable ancestor reaches the same branch.
+      let dangling = false;
+      try {
+        statSync(target);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR") {
+          dangling = true;
+        } else {
+          report.errors.push(
+            `cannot tell whether the farm entry ${target} is live (${message(err)}) — left alone, NOT re-pointed`,
+          );
+          continue;
+        }
+      }
+      if (!dangling) continue;
       try {
         unlinkSync(target);
       } catch (err) {
@@ -500,6 +534,21 @@ export function runSync(opts: SyncOptions = {}): SyncReport {
   return report;
 }
 
+/**
+ * The remedy clause for a stale-copy warning. The stale branch fires exactly in
+ * setup.sh's COPY layout, where this extension is a real file under
+ * `~/.pi/agent` — so its own root holds no `sync.sh`. The remedy is therefore
+ * chosen by what EXISTS, never by where the source happens to be installed:
+ * advertising `<root>/sync.sh` unconditionally sent the operator to a file that
+ * cannot be there on the one layout this warning is about.
+ */
+export function staleRemedy(repoDir: string): string {
+  const syncSh = join(repoDir, "sync.sh");
+  return existsSync(syncSh)
+    ? `refresh with "${syncSh}"`
+    : `refresh by running sync.sh from an agent-infra checkout (this extension is installed as a COPY, so its own root — ${repoDir} — holds no sync.sh)`;
+}
+
 function list(names: string[]): string {
   if (names.length <= LIST_CAP) return names.join(", ");
   return `${names.slice(0, LIST_CAP).join(", ")} (+${names.length - LIST_CAP} more)`;
@@ -515,7 +564,7 @@ export function reportSync(report: SyncReport): void {
   }
   if (report.stale.length > 0) {
     console.warn(
-      `[skill-registry] ⚠️  ${report.stale.length} skill(s) in ${report.farm.path} are STALE COPIES of their source: ${list(report.stale)} — refresh with "${join(REPO_DIR, "sync.sh")}"`,
+      `[skill-registry] ⚠️  ${report.stale.length} skill(s) in ${report.farm.path} are STALE COPIES of their source: ${list(report.stale)} — ${staleRemedy(REPO_DIR)}`,
     );
   }
   if (report.missing.length > 0) {
