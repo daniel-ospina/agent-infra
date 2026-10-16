@@ -117,6 +117,13 @@
 #
 #   --install (default)  install the layer, then VERIFY it; non-zero if either fails.
 #   --verify             check an already-installed layer against the checkout; no writes.
+#                        It compares CONTENT, not existence: the farmed scripts, the extensions
+#                        (files byte-compared, directories file-by-file), the config set,
+#                        settings.json's keys, and every `skills/*/SKILL.md` — and it refuses
+#                        (non-zero) when a comparison cannot be made IN FULL. That matters beyond
+#                        this script: cloud-cell-bringup.sh --check runs `--verify` BEFORE it
+#                        installs, so this read-back is what decides whether a cell's existing
+#                        layer is REPAIRED or CERTIFIED.
 #   --help               print this header.
 #
 #   ENV  CELL_HOME    the cell home (default /tmp/cell-home; the cell's real HOME)
@@ -185,6 +192,9 @@ TOOLS_ALLOWED_NAMES=( fd rg fd.exe rg.exe )
 # legitimate growth while a collapse is loud.
 MIN_FARM_FILES=20
 MIN_SHIP_LIST=10
+# 124 SKILL.md files ship today; the floor exists to catch a TRUNCATED READING (a walk that found
+# almost nothing) rather than to track the tree's growth.
+MIN_SKILL_FILES=80
 
 # ── locating the checkout to install FROM ────────────────────────────────────
 # A candidate "is a checkout" only if it carries BOTH files this script reads: the farm
@@ -749,8 +759,43 @@ verify_layer() {
     say "verified $seen_dep extension(s) that declare runtime deps"
   fi
 
-  [ -d "$DEST/skills" ] && [ -n "$(ls -A "$DEST/skills" 2>/dev/null)" ] \
-    || fail "skills/ is missing or empty"
+  # skills/. The install is a `cp -R` of the whole tree, so the read-back compares the SET and the
+  # CONTENT: every SKILL.md the checkout has must be on the cell, byte for byte. What this check
+  # used to be — `[ -d ]` plus a non-empty `ls` — refuses an absent tree but CERTIFIES a partial
+  # one, and a cell that lost most of its skills is exactly that shape. It was invisible until
+  # `--check` began verifying BEFORE it installs: with a read-back that weak, a cell holding 1 of
+  # 124 skills passed verify, took the fast path, and was certified without the repair the install
+  # path would have performed.
+  if [ ! -d "$DEST/skills" ]; then
+    fail "skills/ is missing"
+  else
+    local ssrc srel sdst nskills=0 skill_fails=0 slink
+    while IFS= read -r ssrc; do
+      [ -n "$ssrc" ] || continue
+      srel="${ssrc#"$INFRA_ROOT"/skills/}"
+      nskills=$((nskills + 1))
+      sdst="$DEST/skills/$srel"
+      if [ ! -f "$sdst" ]; then
+        fail "SKILL MISSING: skills/$srel is not on the cell"
+        skill_fails=$((skill_fails + 1))
+      elif ! cmp -s "$ssrc" "$sdst"; then
+        fail "SKILL CONTENT DIFFERS from the checkout: skills/$srel (a stale or hand-edited copy)"
+        skill_fails=$((skill_fails + 1))
+      fi
+    done < <(find -H "$INFRA_ROOT/skills" -name SKILL.md -type f 2>/dev/null)
+    if [ "$nskills" -lt "$MIN_SKILL_FILES" ]; then
+      fail "skills/ holds only $nskills SKILL.md file(s) in the checkout (floor: $MIN_SKILL_FILES) — verify would be checking a truncated list"
+      skill_fails=$((skill_fails + 1))
+    fi
+    # A symlinked entry under skills/ installs as a LINK (cp -R copies it as one), so the cell's
+    # skill would point outside the cell and `find` would not descend into it to compare anything.
+    slink="$(find -H "$INFRA_ROOT/skills" -type l 2>/dev/null | head -3)"
+    if [ -n "$slink" ]; then
+      fail "skills/ ships a SYMLINK ($slink) — the install copies it as a link, so verify cannot vouch for the skill it points at"
+      skill_fails=$((skill_fails + 1))
+    fi
+    [ "$skill_fails" -ne 0 ] || say "verified $nskills SKILL.md file(s) against the checkout"
+  fi
   # The config set. These five were installed blind and never read back, so a checkout
   # missing one produced a cell that verified clean with no sub-agent definitions at all —
   # pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch
@@ -787,7 +832,10 @@ verify_layer() {
       esac
     fi
   done
-  [ -f "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing (a cell lane gets no global rules)"
+  # `-f` alone certified an EMPTY AGENTS.md — "no global rules" reported as verified. A cell-local
+  # AGENTS.md is legitimate (the install writes one only when it is absent), so this checks that
+  # there is something in it, not that it matches the checkout.
+  [ -s "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing or empty (a cell lane gets no global rules)"
   [ -f "$DEST/settings.json" ] || fail "settings.json is missing"
   # settings.json is MERGED, so it can never be byte-compared — but every key the checkout
   # declares must still be present and equal on the cell (the merge is source-wins, per key,

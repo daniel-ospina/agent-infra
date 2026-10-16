@@ -415,10 +415,11 @@ check_operational_layer() {
     out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
     printf '%s\n' "$out" | sed 's/^/    /'
   else
-    # The read-back is quiet: its mode banner, any failure line, and its verdict. The banner is
+    # The read-back is quiet: the installer's mode banner and its verdict line. The banner is
     # what keeps the FAST path observable — a `--check` that silently re-copied instead would
-    # print no mode at all, and cloud-cell-bringup.test.sh asserts on exactly that.
-    printf '%s\n' "$out" | grep -E '(^cell-install — mode|^LAYER VERIFIED|^FAIL:)' | sed 's/^/    /'
+    # print no mode at all, and cloud-cell-bringup.test.sh asserts on exactly that. (The verdict
+    # is printed indented by the installer's own `say`, so do not anchor these patterns.)
+    printf '%s\n' "$out" | grep -E 'mode=--verify|LAYER VERIFIED' | sed 's/^/    /'
   fi
   if [ "$rc" -ne 0 ]; then
     die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
