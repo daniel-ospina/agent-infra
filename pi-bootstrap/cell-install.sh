@@ -216,7 +216,9 @@ resolve_infra_root() {
   # replaced by another uid if its PARENT is writable by that uid, and if $CELL_HOME itself is
   # writable by another user then the cell's whole HOME — auth.json, .ai-review-gate-key,
   # settings.json — is attacker-writable and nothing this layer installs is safe. That
-  # precondition is the VM's (a single-tenant cell), and it is stated, not assumed.
+  # precondition is the VM's (a single-tenant cell), and it is stated, not assumed. The same
+  # bound applies one level down: a subdirectory of a root we own that is group/other-writable
+  # is not detected either, and a second local uid could swap a shipped file inside it.
   local refused=""
   for cand in "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra"; do
     [ -n "$cand" ] || continue
@@ -608,16 +610,29 @@ GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-g
 # tools/fleet/), so a file that exists only on the cell is not a failure. A two-way `diff -rq`
 # refused such a cell and the installer could not repair it — a false block, not a finding.
 # A MISSING or EDITED shipped file still fails: that is drift.
+#
+# The list is enumerated with `find -H`, so a SOURCE whose own final path component is a
+# symlink to a directory (an operator's symlinked checkout, or a fixture that links the real
+# extension dirs in) is followed — `find` without -H descends into nothing there and the tree
+# would read as empty. `cp -R` on the install side already resolved that case, so verify has to
+# agree with install about the same input.
+#
+# Returns 1 on drift, 2 when the source tree yields NOTHING to compare (an emptied checkout
+# must not read as a match), and 3 when the tree could not be READ in full: `find`'s status is
+# checked, because a partial list would compare a subset of the files and certify the rest
+# unseen — a false PASS in a tree whose every file is later executed.
 shipped_content_matches() {
-  local src="$1" dst="$2" f rel n=0
+  local src="$1" dst="$2" f rel n=0 files
+  [ -d "$src" ] || return 2
+  [ -r "$src" ] || return 3
+  files="$(find -H "$src" -type f 2>/dev/null)" || return 3
   while IFS= read -r f; do
+    [ -n "$f" ] || continue
     rel="${f#"$src"/}"
     case "$rel" in node_modules/*) continue ;; esac
     cmp -s "$f" "$dst/$rel" || return 1
     n=$((n + 1))
-  done < <(find "$src" -type f 2>/dev/null)
-  # A source tree that ships NOTHING cannot be compared, and must not read as a match: a
-  # zero-file extension directory passed the one-directional check in silence.
+  done <<<"$files"
   [ "$n" -gt 0 ] || return 2
   return 0
 }
@@ -680,6 +695,7 @@ verify_layer() {
       case $? in
         0) ;;
         2) fail "extension $base ships NO files in the checkout ($esrc) — verify cannot vouch for an empty tree" ;;
+        3) fail "extension $base could not be READ in the checkout ($esrc) — refusing to certify a comparison over a partial file list" ;;
         *) fail "extension CONTENT DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)" ;;
       esac
     fi
@@ -730,7 +746,7 @@ verify_layer() {
     elif [ -f "$csrc" ]; then
       # SHAPE first: a cell whose `agents` is a FILE where the checkout has a directory used to
       # fall through every branch of this chain and be certified (the extension loop has had
-      # this check; the config loop did not — the third branch-asymmetry this PR has caught).
+      # this check; the config loop did not).
       if [ ! -f "$cdst" ]; then
         fail "config artifact SHAPE CHANGED: $cfg is a file in the checkout and not one on the cell"
       else
@@ -744,6 +760,7 @@ verify_layer() {
       case $? in
         0) ;;
         2) fail "config artifact $cfg ships NO files in the checkout ($csrc) — verify cannot vouch for an empty tree" ;;
+        3) fail "config artifact $cfg could not be READ in the checkout ($csrc) — refusing to certify a comparison over a partial file list" ;;
         *) fail "config artifact CONTENT DIFFERS from the checkout: $cfg (a hand-edited or stale cell copy)" ;;
       esac
     fi

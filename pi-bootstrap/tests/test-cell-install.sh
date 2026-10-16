@@ -394,6 +394,15 @@ rc=$?
 [ "$rc" -eq 1 ] && grep -q "config artifact SHAPE CHANGED: agents" "$LOG" \
   && ok "--verify refuses a config artifact whose SHAPE changed (a file where the checkout has a directory)" \
   || fail "--verify CERTIFIED a cell whose agents/ is a file"
+# ... and the mirror shape: a FILE artifact made a DIRECTORY on the cell (the arm the split
+# `[ -f "$csrc" ]` / `[ ! -f "$cdst" ]` branch covers — otherwise unpinned).
+rm -f "$DEST/coding-rules.md" && mkdir -p "$DEST/coding-rules.md"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "config artifact SHAPE CHANGED: coding-rules.md" "$LOG" \
+  && ok "--verify refuses a config artifact whose SHAPE changed the other way (a directory where the checkout has a file)" \
+  || fail "--verify CERTIFIED a cell whose coding-rules.md is a directory"
+rm -rf "$DEST/coding-rules.md" && cp "$ROOT/pi-bootstrap/pi-config/coding-rules.md" "$DEST/coding-rules.md"
 # ... and the INSTALL side must COUNT that copy failure, not merely muffle the success line.
 run_install
 rc=$?
@@ -402,8 +411,13 @@ rc=$?
   || fail "an install over a wrong-shaped dest exited $rc without recording the copy failure"
 rm -f "$DEST/agents"
 run_install >/dev/null 2>&1
-# A shipped extension directory that carries NO files cannot be compared, and must not read as
-# a match (`find` returns nothing, so the one-directional check used to pass on an empty tree).
+# A shipped directory that carries NO files cannot be compared, and must not read as a match
+# (`find` returns nothing, so the one-directional check used to pass over an empty tree). The
+# fixture links the OTHER extension dirs in as symlinks, which is what pins the second half of
+# this control: `find` must FOLLOW a symlinked source dir (`-H`) — without it every one of those
+# siblings reports the same "ships NO files" text, so the count and the two named messages below
+# are the assertion. A fixture of all-empty dirs would prove only that the refusal exists; it
+# could not tell an empty tree from a symlinked one, and the false BLOCK would read as a pass.
 EMPTY_EXT="$TMP/empty-ext-checkout"
 mkdir -p "$EMPTY_EXT/extensions" "$EMPTY_EXT/pi-bootstrap/pi-config"
 for d in scripts skills templates tools manifest.json; do ln -s "$ROOT/$d" "$EMPTY_EXT/$d"; done
@@ -413,14 +427,45 @@ for d in "$ROOT"/extensions/*; do
   b="$(basename "$d")"; [ "$b" = review-enforcer ] && continue
   ln -s "$d" "$EMPTY_EXT/extensions/$b"
 done
-mkdir -p "$EMPTY_EXT/extensions/review-enforcer"   # exists, ships NO files
+mkdir -p "$EMPTY_EXT/extensions/review-enforcer"               # exists, ships NO files
+rm -rf "$EMPTY_EXT/pi-bootstrap/pi-config/agents"               # and a config dir that ships NO files
+mkdir -p "$EMPTY_EXT/pi-bootstrap/pi-config/agents"
 out="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
-[ "$?" -eq 1 ] && grep -q "ships NO files in the checkout" <<<"$out" \
-  && ok "an extension directory that ships NO files is refused, not certified on an empty tree" \
-  || fail "a zero-file extension directory was certified as the layer"
+rc=$?
+if [ "$rc" -ne 1 ]; then
+  fail "a zero-file extension directory was certified as the layer (rc=$rc)"
+else
+  empties="$(grep -c 'ships NO files in the checkout' <<<"$out")"
+  if [ "$empties" = "2" ]; then
+    ok "exactly the two zero-file source trees are refused (the 29 symlinked siblings verify CLEAN — find follows a symlinked source)"
+  else
+    fail "$empties zero-file refusals for a fixture holding 2 of them — an empty tree and a symlinked tree are not being told apart"
+  fi
+  grep -q 'extension review-enforcer ships NO files in the checkout' <<<"$out" \
+    && ok "an extension directory that ships NO files is refused, not certified on an empty tree" \
+    || fail "the refusal did not name the empty extension (review-enforcer)"
+  grep -q 'config artifact agents ships NO files in the checkout' <<<"$out" \
+    && ok "a config artifact that ships NO files is refused (the config loop's arm, not just the extension loop's)" \
+    || fail "the config loop certified a zero-file agents/ source"
+fi
+# A source tree that cannot be READ in FULL must not be certified over the part find managed to
+# reach: `find` exits non-zero and prints a PARTIAL list, and the old form discarded that status
+# (`done < <(find … 2>/dev/null)`) so the comparison silently covered a subset and vouched for
+# the rest unseen — in a tree whose every file is later executed.
+if [ "$(id -u)" = "0" ]; then
+  ok "skipped the unreadable-subtree pin: running as root, where chmod 000 does not block a read"
+else
+  rm -rf "$EMPTY_EXT/pi-bootstrap/pi-config/agents"
+  cp -R "$ROOT/pi-bootstrap/pi-config/agents" "$EMPTY_EXT/pi-bootstrap/pi-config/agents"
+  mkdir -p "$EMPTY_EXT/pi-bootstrap/pi-config/agents/.unreadable"
+  chmod 000 "$EMPTY_EXT/pi-bootstrap/pi-config/agents/.unreadable"
+  out2="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
+  chmod 700 "$EMPTY_EXT/pi-bootstrap/pi-config/agents/.unreadable" 2>/dev/null
+  grep -q 'config artifact agents could not be READ in the checkout' <<<"$out2" \
+    && ok "a source tree that cannot be read in full is REFUSED, not certified over a partial file list" \
+    || fail "an unreadable subtree produced a certified comparison over the files find could reach"
+fi
 rm -rf "$EMPTY_EXT" "$TMP/emptyext-home"
-# The config set used to be installed blind and never read back: a checkout missing
-# pi-config/agents produced a certified cell whose lane could dispatch no sub-agent.
 rm -rf "$DEST/agents"
 run_verify
 rc=$?

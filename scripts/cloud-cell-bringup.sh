@@ -224,6 +224,13 @@ check_operational_layer() {
   # path under a world-writable /tmp (/tmp/cell-home), and this step RUNS the installer it
   # finds, with the cell's keys.env already exported — so a checkout-shaped tree planted at any
   # of those paths would both choose and execute the code.
+  #
+  # Bound, stated rather than implied: the check is on the candidate ROOT's owner. It does not
+  # inspect the mode of the subdirectories on the way to pi-bootstrap/cell-install.sh, so a
+  # root we own but whose pi-bootstrap/ is group/other-writable would still let another local
+  # uid drop an installer in it. That requires a second local uid on the cell — the cell's home
+  # is created for the single account that runs it — and it is why two accounts must never
+  # share a cell.
   self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
   for cand in "${INFRA_ROOT:-}" "$self_root" \
               "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" \
