@@ -537,11 +537,11 @@ while read -r N; do
     exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
-  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer only
-  # emits `ALSO INCOMPLETE` beside COLLISION/INCOMPLETE, but `resolve_preflight` prefers the repo's
-  # OWN copy, so a vendored producer could pair it with CLEAN and reproduce the healthy-looking
-  # reading this pass exists to refuse (#1853 review). LANDED is exempt: the producer's contract
-  # makes a terminal signal decisive over an incomplete one.
+  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer pairs
+  # `ALSO INCOMPLETE` with COLLISION, INCOMPLETE and LANDED but never with CLEAN, and `resolve_preflight`
+  # prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and reproduce the
+  # healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt: the
+  # producer's contract makes a terminal signal decisive over an incomplete one.
   degraded=0
   grep -q 'ALSO INCOMPLETE' <<<"$PRE" && degraded=1
   case "$V" in
