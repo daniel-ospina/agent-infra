@@ -53,16 +53,34 @@ strong, and this tool encodes the difference rather than treating them alike:
 
 THE DECISION LADDER (order is the safety property)
 --------------------------------------------------
-Each step is a return; nothing later can override an earlier verdict:
+Each step is a return; nothing later can override an earlier verdict. The order
+below IS the order `decide()` implements:
 
-    0. the STORE is unreadable                 -> UNKNOWN   (fail closed)
-    1. a live pi rooted in the worktree        -> PREDECESSOR-LIVE
+    0. a live pi rooted in the worktree        -> PREDECESSOR-LIVE
+       (a live pid is POSITIVE evidence: it proves an owner whether or not the
+       store can be read, so it outranks the store and reports LIVE, not UNKNOWN
+       -- both refuse the dispatch)
+    1. the STORE is unreadable                 -> UNKNOWN   (fail closed)
     2. any lane record on the worktree that is
        not `dead` (running-quiet/wedged/idle/unknown) -> PREDECESSOR-LIVE
     3. recent cmux activity for the worktree   -> PREDECESSOR-LIVE
-    4. both authoritative reads were readable,
+    4. the process read could not be completed -> UNKNOWN   (fail closed)
+    5. both authoritative reads were readable,
        and neither produced a live witness     -> PREDECESSOR-GONE
-    5. otherwise (a read could not be taken)   -> UNKNOWN   (fail closed)
+
+A READ IS COMPLETE, OR IT IS NOT A READING. `readable` is not "the command
+returned": it means every pid we asked about was ANSWERED. The two ways a read
+can fail to cover the list are different facts and only one of them is evidence:
+
+  * a pid the reader could not stat/read (`lsof` exit 1 with a partial output,
+    `EACCES`/`EPERM` on `/proc/<pid>/cwd` under `hidepid`, `EINVAL` on a
+    non-symlink) -> the read was REFUSED -> UNKNOWN. Scoring a partial read as a
+    complete one is how a live predecessor owned by another uid reads as "no
+    agent in this worktree" and the tool emits the #1317 failure it exists to
+    prevent. **Absence of an answer is never evidence of absence.**
+  * a pid that is provably GONE (`ENOENT`, the pid exited between `pgrep` and
+    the read) -> that IS an answer: it holds no worktree. This is why the
+    `/proc` fallback can complete a partial `lsof` read rather than abstaining.
 
 LIVE beats GONE at every step, and UNKNOWN is not a weaker GONE: a reading we
 could not take is never a predecessor we proved absent. That is the same
@@ -79,7 +97,12 @@ EXIT CODES
     0  PREDECESSOR-GONE   — dispatch a successor: the proof says the unit is free
     3  PREDECESSOR-LIVE   — do NOT dispatch a successor; nudge the live lane or wait
     4  UNKNOWN            — could not verify; fail closed, do not dispatch
-    2  usage / environment error (unreadable working directory, bad argument)
+    2  usage / environment error — NOTHING was decided: a bad/missing argument, an
+       `--emit` that could not be written, or a `--worktree` that is not a
+       readable directory. A target that does not exist is never reported GONE --
+       "there is no directory here" and "I proved no predecessor holds it" are
+       different facts, and a dispatcher switching on the exit code must be able
+       to tell them apart.
 
 USAGE
 -----
@@ -95,6 +118,12 @@ Env seams (tests + tuning; production uses the defaults):
     SUCCESSOR_PGREP_BIN   pgrep binary (default: pgrep on PATH)
     SUCCESSOR_LSOF_BIN    lsof binary (default: lsof on PATH; /proc fallback)
     SUCCESSOR_CMUX_BIN    cmux binary (default: cmux on PATH)
+    SUCCESSOR_PROC_ROOT   the procfs root for the cwd fallback (default: /proc)
+
+The proof block NAMES the readers it used (`readers: pgrep=… lsof=… …`) for the
+same reason every read is stated: an inherited `SUCCESSOR_LSOF_BIN`/`--store`
+changes what was read, so the artifact must not read as if the default tool had
+made the reading.
     LANE_LIVENESS_PS_REAL the real ps for the shared one-read-per-pass cache
     PI_PID_IDENTITY_LIB   probe CLI (default: liveness.lib_path())
 """
@@ -134,6 +163,12 @@ UNKNOWN = "UNKNOWN"
 # interacting with that lane recently enough that displacing it is wrong.
 DEFAULT_RECENT_S = 900
 
+# The kernel's spelling for a cwd whose directory has been unlinked. See `_real`.
+DELETED_SUFFIX = " (deleted)"
+
+# procfs root for the cwd fallback (a test seam: the suite drives a fake root).
+DEFAULT_PROC_ROOT = "/proc"
+
 
 def _real(path: str) -> str:
     """One normalisation for every path compared here.
@@ -145,7 +180,15 @@ def _real(path: str) -> str:
     predecessor — the exact false absence this tool exists to prevent.
     """
     try:
-        return os.path.realpath(os.path.normpath(os.path.expanduser(path)))
+        s = os.path.expanduser(path)
+        # Linux spells a cwd whose directory has been UNLINKED as
+        # "/path/to/dir (deleted)" (`/proc/<pid>/cwd`). That is the same
+        # directory as `/path/to/dir`; comparing the two spellings apart would
+        # report a live predecessor in a removed worktree as GONE -- the #1317
+        # failure. Strip the kernel's suffix (and only that suffix) first.
+        if s.endswith(DELETED_SUFFIX):
+            s = s[: -len(DELETED_SUFFIX)]
+        return os.path.realpath(os.path.normpath(s))
     except Exception:
         return path
 
@@ -175,7 +218,8 @@ def pi_pids(pgrep_bin: str) -> Tuple[List[str], bool]:
     return [p for p in out.split() if p.isdigit()], True
 
 
-def pi_cwds(pids: Sequence[str], lsof_bin: str, proc_root: str = "/proc") -> Tuple[Dict[str, str], bool]:
+def pi_cwds(pids: Sequence[str], lsof_bin: str,
+            proc_root: str = DEFAULT_PROC_ROOT) -> Tuple[Dict[str, str], bool]:
     """``({pid: cwd}, readable)`` for the given pids.
 
     ``lsof -a -d cwd -Fn`` in ONE call is the fleet's existing mechanic
@@ -196,10 +240,24 @@ def pi_cwds(pids: Sequence[str], lsof_bin: str, proc_root: str = "/proc") -> Tup
             elif line.startswith("n") and cur:
                 m[cur] = line[1:]
                 cur = None
-        # lsof printed something for live pids -> that IS the reading. A
-        # non-zero exit with output is a PARTIAL read (lsof exits 1 when one pid
-        # could not be stat'ed); the cwds it did print are still true.
+        # A reading is COMPLETE only when every pid we asked about is answered.
+        # lsof exits 1 when it cannot stat a pid (another uid's process, or a pid
+        # that exited mid-read) and simply OMITS it. The cwds it did print are
+        # true, but an omission is not an answer: the old `if m: return m, True`
+        # scored a REFUSED read as a complete one, so a live pi lsof could not
+        # stat read as "no agent in this worktree" -> PREDECESSOR-GONE. That is
+        # the #1317 failure, reached through the read side.
         if m:
+            if set(m) == set(pids):
+                return m, True
+            # Ask the /proc fallback for exactly the pids lsof did not answer.
+            # `ok` means it ANSWERED all of them: each is either mapped in `rest`
+            # or `ENOENT` (proven gone), so the merged read is COMPLETE. A refusal
+            # (EACCES/EINVAL) makes the whole read unusable.
+            rest, ok = _proc_cwds([p for p in pids if p not in m], proc_root)
+            if not ok:
+                return {}, False
+            m.update(rest)
             return m, True
         # It printed nothing — fall through to the /proc fallback, and if that
         # does not exist either, the caller abstains. That is the difference
@@ -209,24 +267,48 @@ def pi_cwds(pids: Sequence[str], lsof_bin: str, proc_root: str = "/proc") -> Tup
 
 
 def _proc_cwds(pids: Sequence[str], proc_root: str) -> Tuple[Dict[str, str], bool]:
-    """Linux fallback: ``/proc/<pid>/cwd`` is a symlink to the process cwd."""
+    """Linux fallback: ``/proc/<pid>/cwd`` is a symlink to the process cwd.
+
+    The two failure modes here must NOT be conflated, and the old
+    ``except OSError: continue`` did exactly that:
+
+      * ``ENOENT`` — the pid is GONE. An answer: it holds no worktree.
+      * any other ``OSError`` — ``EACCES``/``EPERM`` (another uid's process under
+        ``hidepid``) or ``EINVAL`` (a non-symlink): the read was REFUSED. That is
+        NOT evidence of absence, and silently skipping it made a live
+        predecessor read as GONE while the caller still reported
+        ``readable=True``. Refuse the whole read so ``decide`` abstains.
+
+    The return contract the caller relies on: ``ok=True`` means EVERY pid in
+    ``pids`` was ANSWERED — mapped in the returned dict, or proven gone by
+    ``ENOENT``. That is what lets a partial ``lsof`` be completed by this
+    fallback instead of abstaining: an omitted pid that /proc does not know is a
+    pid that is genuinely gone, not a gap in the reading.
+    """
     if not os.path.isdir(proc_root):
         return {}, False
     m: Dict[str, str] = {}
     for pid in pids:
         try:
             m[pid] = os.readlink(os.path.join(proc_root, pid, "cwd"))
+        except FileNotFoundError:
+            continue          # proven gone — an answer, not a gap in the read
         except OSError:
-            continue
+            return {}, False  # refused — never evidence of absence
     return m, True
 
 
-def live_pids_in_worktree(target: str, pgrep_bin: str, lsof_bin: str) -> Tuple[List[int], bool]:
-    """``(pids, readable)`` — live pi processes whose cwd IS ``target``."""
+def live_pids_in_worktree(target: str, pgrep_bin: str, lsof_bin: str,
+                          proc_root: str = DEFAULT_PROC_ROOT) -> Tuple[List[int], bool]:
+    """``(pids, readable)`` — live pi processes whose cwd IS ``target``.
+
+    ``readable`` is False unless EVERY live pid was answered (see `pi_cwds`): a
+    partial read must abstain, never conclude that no process holds the worktree.
+    """
     pids, ok = pi_pids(pgrep_bin)
     if not ok:
         return [], False
-    cwds, ok = pi_cwds(pids, lsof_bin)
+    cwds, ok = pi_cwds(pids, lsof_bin, proc_root)
     if not ok:
         return [], False
     hits = [int(p) for p, cwd in cwds.items() if _real(cwd) == target]
@@ -405,7 +487,8 @@ def _iso(now_s: float) -> str:
 def render_block(target: str, now_s: float, verdict: str, why: List[str],
                  process_pids: List[int], process_readable: bool,
                  lanes: List[dict], store_readable: bool, cmux_readable: bool,
-                 cmux_activity: List[dict], recent_s: float) -> str:
+                 cmux_activity: List[dict], recent_s: float,
+                 readers: Optional[Dict[str, str]] = None) -> str:
     """The proof block a dispatch file must carry (#1317)."""
     lines = [
         "--- successor-preflight (#1317) ---",
@@ -414,6 +497,12 @@ def render_block(target: str, now_s: float, verdict: str, why: List[str],
         "read-at: %s" % _iso(now_s),
         "why: %s" % " ".join(why),
     ]
+    if readers:
+        # Name the READERS, not just the reading: an inherited env seam (or a
+        # non-default flag) changes what was read, and the proof is worthless if
+        # it reads as though the default tool had answered.
+        lines.append("readers: %s" % " ".join(
+            "%s=%s" % (k, readers[k]) for k in sorted(readers)))
     if not process_readable:
         labels = "process-read: UNREADABLE (pgrep/lsof could not answer)"
     elif process_pids:
@@ -476,6 +565,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     ap.add_argument("--pgrep-bin", default=os.environ.get("SUCCESSOR_PGREP_BIN", "pgrep"))
     ap.add_argument("--lsof-bin", default=os.environ.get("SUCCESSOR_LSOF_BIN", "lsof"))
     ap.add_argument("--cmux-bin", default=os.environ.get("SUCCESSOR_CMUX_BIN", "cmux"))
+    ap.add_argument("--proc-root", default=os.environ.get("SUCCESSOR_PROC_ROOT", DEFAULT_PROC_ROOT),
+                    help="procfs root for the cwd fallback (default %s)" % DEFAULT_PROC_ROOT)
     return ap.parse_args(argv)
 
 
@@ -485,13 +576,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("successor-preflight: --worktree is required", file=sys.stderr)
         return 2
     target = _real(ns.worktree)
+    # NOTHING WAS DECIDED if the target is not a readable directory. A path that
+    # does not exist is not a predecessor proven gone: reporting GONE (exit 0)
+    # for it makes "no such directory" indistinguishable from a proof, inside the
+    # artifact that exists to make exactly that distinction. Documented as exit 2
+    # ("nothing was decided").
+    if not os.path.isdir(target):
+        print("successor-preflight: --worktree %s is not a readable directory — "
+              "nothing was decided, do not dispatch on this reading" % ns.worktree,
+              file=sys.stderr)
+        return 2
     now_s = ns.now if ns.now is not None else datetime.datetime.now().timestamp()
     now_ms = int(now_s * 1000)
 
     lane_liveness.install_ps_cache()   # one `ps` read per pass, as the report uses
 
     process_pids, process_readable = live_pids_in_worktree(
-        target, ns.pgrep_bin, ns.lsof_bin)
+        target, ns.pgrep_bin, ns.lsof_bin, ns.proc_root)
     lanes, store_readable = lanes_on_worktree(
         ns.store, ns.sessions_dir, ns.task_sessions, ns.cmux_state, target, now_ms)
     cmux_rows, cmux_readable = read_cmux(ns.cmux_bin)
@@ -500,12 +601,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     verdict, why = decide(process_pids, process_readable, lanes, store_readable,
                           cmux_rows, cmux_activity)
 
+    readers = {
+        "pgrep": ns.pgrep_bin,
+        "lsof": ns.lsof_bin,
+        "cmux": ns.cmux_bin,
+        "proc-root": ns.proc_root,
+        "store": ns.store,
+    }
+
     if ns.json:
         print(json.dumps({
             "verdict": verdict,
             "target_worktree": target,
             "read_at": _iso(now_s),
             "why": why,
+            "readers": readers,
             "process_readable": process_readable,
             "live_pids": process_pids,
             "store_readable": store_readable,
@@ -517,12 +627,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         print(render_block(target, now_s, verdict, why, process_pids, process_readable,
                            lanes, store_readable, cmux_readable, cmux_activity,
-                           ns.recent_s), end="")
+                           ns.recent_s, readers), end="")
 
     if ns.emit:
         block = render_block(target, now_s, verdict, why, process_pids, process_readable,
                              lanes, store_readable, cmux_readable, cmux_activity,
-                             ns.recent_s)
+                             ns.recent_s, readers)
         try:
             with open(ns.emit, "a", encoding="utf-8") as fh:
                 fh.write("\n" + block)

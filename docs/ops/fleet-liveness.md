@@ -458,7 +458,7 @@ and put the proof block in the dispatch file. Its exit code is the dispatch deci
 | 0 | `PREDECESSOR-GONE` | dispatch the successor — the unit is free |
 | 3 | `PREDECESSOR-LIVE` | do **not** dispatch a successor; **nudge the live lane, or wait** |
 | 4 | `UNKNOWN` | could not verify — fail closed, do not dispatch |
-| 2 | usage / environment error | nothing was decided |
+| 2 | usage / environment error | **nothing was decided** — a bad argument, an `--emit` that could not be written, or a `--worktree` that is not a readable directory. A target that does not exist is **never** reported `GONE`: *"there is no directory here"* and *"I proved no predecessor holds it"* are different facts, and a dispatcher switching on the exit code must be able to tell them apart |
 
 **Why the proof goes in the dispatch file.** The incident's defect was not a wrong reading — there
 was **no reading**. A brief that carries `verdict: PREDECESSOR-LIVE` and its `read-at` timestamp lets
@@ -493,6 +493,26 @@ consume. A local re-implementation of "is the lane alive" is the exact defect #1
 remove. The preflight adds only the **worktree-scoped question** (which lanes/processes are rooted
 *here*) and the decision ladder.
 
+⛔ **A read is complete, or it is not a reading.** `readable` does not mean "the command returned" —
+it means **every pid we asked about was answered**. The two ways a read can fail to cover the list
+are different facts, and only one of them is evidence:
+
+- a pid the reader could not stat/read — `lsof` exits `1` and **omits** it (another uid's process);
+  `EACCES`/`EPERM` on `/proc/<pid>/cwd` under `hidepid`; `EINVAL` on a non-symlink — is a
+  **refused** read → `UNKNOWN`;
+- a pid that is provably **gone** (`ENOENT`: it exited between `pgrep` and the read) **is** an
+  answer — it holds no worktree — which is why the `/proc` fallback can *complete* a partial `lsof`
+  read rather than abstaining.
+
+**Absence of an answer is never evidence of absence.** Scoring a partial read as a complete one is
+how a live predecessor owned by another uid reads as *"no agent in this worktree"* and the tool
+emits the very `PREDECESSOR-GONE` the incident is about.
+
+**The proof names its readers.** The block carries `readers: pgrep=… lsof=… cmux=… proc-root=…
+store=…`, because an inherited `SUCCESSOR_LSOF_BIN` or a non-default `--store` changes what was read
+— and a proof that reads as though the default tool had answered is exactly the *"was assumed gone"*
+shape this section exists to eliminate.
+
 ### 9.2 The decision ladder — order is the safety property
 
 Each step is a return; nothing later can override an earlier verdict:
@@ -502,7 +522,7 @@ Each step is a return; nothing later can override an earlier verdict:
 1. the lane store is unreadable                              -> UNKNOWN
 2. any lane record on the worktree that is not `dead`        -> PREDECESSOR-LIVE
 3. recent cmux activity on the worktree                      -> PREDECESSOR-LIVE
-4. the process read could not be taken                       -> UNKNOWN
+4. the process read could not be COMPLETED                    -> UNKNOWN
 5. both authoritative reads ran and found no live witness    -> PREDECESSOR-GONE
 ```
 
@@ -549,7 +569,11 @@ Run the pinned suites after any change to the preflight (the red control proves 
 without its fix):
 
 ```bash
-python3 tools/fleet/successor_preflight.test.py               # 13 legs
-python3 tools/fleet/successor_preflight.test.py --red-control # 9 mutations, each must go RED
+python3 tools/fleet/successor_preflight.test.py               # 21 legs
+python3 tools/fleet/successor_preflight.test.py --red-control # 13 mutations, each must go RED
 python3 tools/fleet/liveness.test.py                          # the predicate it consumes
 ```
+
+The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc` fallback is
+exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
+`cwd`) and the one that is a real answer (a pid that is gone).

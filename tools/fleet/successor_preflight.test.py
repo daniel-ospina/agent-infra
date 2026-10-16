@@ -12,7 +12,7 @@ exercises, and the red controls prove each leg can go red.
     python3 tools/fleet/successor_preflight.test.py
     python3 tools/fleet/successor_preflight.test.py --red-control
 
-RED CONTROL — nine mutations, each run against the leg that must catch it (a
+RED CONTROL — thirteen mutations, each run against the leg that must catch it (a
 mutation the suite does not catch is reported as a suite FAILURE):
 
   * drop the live-process check        -> LIVE-PROCESS red
@@ -24,14 +24,21 @@ mutation the suite does not catch is reported as a suite FAILURE):
   * ignore the cmux recency window     -> CMUX-WINDOW red
   * read cmux cwd without matching it  -> OTHER-WORKTREE red
   * drop the shared liveness predicate (call every lane `dead`) -> LIVE-LANE red
+  * accept a partial cwd read as complete -> PARTIAL-CWD-READ red
+  * an unreadable cwd read becomes an omitted one -> PROC-READ-REFUSED red
+  * drop the unlinked-cwd normalisation -> DELETED-CWD red
+  * report a nonexistent worktree as GONE -> NO-WORKTREE red
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
 ``pgrep``/``lsof``/``cmux``/``ps``/``date`` are hermetic shims, so nothing touches
-the real fleet, the real store, the network, or the process table.
+the real fleet, the real store, the network, or the process table. The procfs is
+hermetic too (a fake ``--proc-root``), so the ``/proc`` fallback is actually
+exercised and no leg's verdict can depend on the host's ``/proc``.
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 import shutil
@@ -170,6 +177,16 @@ class Fixture:
                  cmux_rows=None, cmux_readable=True):
         self.dir = tempfile.mkdtemp(prefix="succ-pre-test-")
         self.worktree = worktree
+        # The target MUST exist: a nonexistent --worktree is now an environment
+        # error (exit 2, nothing decided), never a GONE proof. The old fixture
+        # never created it, which is exactly how that gap went unnoticed.
+        os.makedirs(worktree, exist_ok=True)
+        # The procfs is ALWAYS hermetic, so (a) the /proc fallback is reachable in
+        # the suite at all — the old suite let every leg answer through the lsof
+        # shim, so the fallback was never executed — and (b) no leg's verdict can
+        # depend on the host's real /proc.
+        self.proc = os.path.join(self.dir, "proc")
+        os.makedirs(self.proc, exist_ok=True)
 
         sessions = {}
         for sid, ws, rec in lanes:
@@ -230,6 +247,24 @@ class Fixture:
         os.chmod(path, 0o755)
         return path
 
+    def proc_cwd(self, pid, value, kind="symlink"):
+        """Plant `<proc>/<pid>/cwd`.
+
+        ``symlink`` is the readable shape. ``file`` is the REFUSED shape: the
+        path exists but is not a symlink, so ``os.readlink`` raises ``EINVAL``
+        (an ``OSError`` that is not ``FileNotFoundError``) — the same class as an
+        ``EACCES`` under ``hidepid``, and deterministic regardless of the uid the
+        suite runs as (a chmod-based fixture would pass under root).
+        """
+        d = os.path.join(self.proc, str(pid))
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "cwd")
+        if kind == "symlink":
+            os.symlink(value, p)
+        else:
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write(value)
+
     def close(self):
         shutil.rmtree(self.dir, ignore_errors=True)
 
@@ -245,6 +280,7 @@ def run_preflight(fx, *args, module=None):
            "--pgrep-bin", fx.pgrep,
            "--lsof-bin", fx.lsof,
            "--cmux-bin", fx.cmux,
+           "--proc-root", fx.proc,
            "--now", str(NOW_S)]
     cmd.extend(args)
     env = dict(os.environ)
@@ -515,6 +551,178 @@ def t_json(module):
         fx.close()
 
 
+@test("PROC-FALLBACK")
+def t_proc_fallback(module):
+    """The /proc fallback (no lsof) must be EXERCISED, not assumed.
+
+    Until this leg every fixture answered through the lsof shim, so `_proc_cwds`
+    was never reached by a test — and it is the only reader when lsof is absent,
+    i.e. the whole fail-closed contract rests on code no leg ran.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-procfb-wt")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 pids=[PID_OTHER], cmux_rows=[])
+    fx.proc_cwd(PID_OTHER, wt)
+    try:
+        rc, out = run_preflight(fx, "--lsof-bin", os.path.join(fx.dir, "no-lsof"),
+                                module=module)
+        assert_eq(rc, 3, "rc 3 = the /proc fallback found the live pi")
+        assert_in("live-pi-cwd:%d" % PID_OTHER, out, "the /proc-read cwd is the witness")
+    finally:
+        fx.close()
+
+
+@test("PROC-READ-REFUSED")
+def t_proc_refused(module):
+    """A REFUSED cwd read is UNKNOWN, never GONE.
+
+    The P1 both cycle-1 reviewers reproduced: `except OSError: continue` scored
+    `EACCES`/`EPERM` (another uid, `hidepid`) and `EINVAL` (non-symlink) as "the
+    pid is not here", so a live predecessor whose cwd could not be read was
+    reported GONE while the read claimed to be complete.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-procref-wt")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 pids=[PID_OTHER], cmux_rows=[])
+    fx.proc_cwd(PID_OTHER, wt, kind="file")   # readlink -> EINVAL: refused
+    try:
+        rc, out = run_preflight(fx, "--lsof-bin", os.path.join(fx.dir, "no-lsof"),
+                                module=module)
+        assert_eq(rc, 4, "rc 4 = a refused read is not evidence of absence")
+        assert_in("verdict: UNKNOWN", out, "verdict is UNKNOWN")
+        assert_in("process-read-unreadable", out, "the refused read is named")
+    finally:
+        fx.close()
+
+
+@test("PARTIAL-CWD-READ")
+def t_partial_cwd(module):
+    """A partial cwd read must abstain, and an `ENOENT` pid is an ANSWER.
+
+    lsof exits 1 and OMITS a pid it could not stat. The old `if m: return m,
+    True` accepted that partial map as the complete reading, so a live pi it
+    could not stat read as "not in this worktree" -> GONE.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-partial-wt")
+    other = os.path.join(tempfile.gettempdir(), "succ-partial-other")
+    lanes = [(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))]
+    # Case 1 — the omitted pid's cwd is REFUSED by /proc: the read is unusable.
+    fx = Fixture(worktree=wt, lanes=lanes, pids=[PID_LIVE, PID_OTHER],
+                 cwd_map={PID_OTHER: other}, cmux_rows=[])
+    fx.proc_cwd(PID_LIVE, wt, kind="file")
+    try:
+        rc, out = run_preflight(fx, module=module)
+        assert_eq(rc, 4, "rc 4 = a partial read that cannot be completed abstains")
+        assert_in("verdict: UNKNOWN", out, "verdict is UNKNOWN")
+    finally:
+        fx.close()
+    # Case 2 — the omitted pid is provably GONE (/proc has no entry for it): that
+    # IS an answer, so the merged read completes and GONE is still provable.
+    fx2 = Fixture(worktree=wt, lanes=lanes, pids=[PID_LIVE, PID_OTHER],
+                  cwd_map={PID_OTHER: other}, cmux_rows=[])
+    try:
+        rc, out = run_preflight(fx2, module=module)
+        assert_eq(rc, 0, "rc 0 = the omitted pid is gone, so the read is complete")
+        assert_in("no live pi rooted in this worktree", out, "the absence is stated")
+    finally:
+        fx2.close()
+
+
+@test("DELETED-CWD")
+def t_deleted_cwd(module):
+    """A cwd the kernel spells `/path (deleted)` is the SAME worktree.
+
+    `/proc/<pid>/cwd` appends ` (deleted)` once the directory is unlinked, so a
+    worktree removed under a running lane normalised to a different string and
+    its live predecessor read as GONE.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-deleted-wt")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 pids=[PID_OTHER], cwd_map={PID_OTHER: wt + " (deleted)"},
+                 cmux_rows=[])
+    try:
+        rc, out = run_preflight(fx, module=module)
+        assert_eq(rc, 3, "rc 3 = the unlinked spelling still names this worktree")
+        assert_in("live-pi-cwd:%d" % PID_OTHER, out, "the live pid is the witness")
+    finally:
+        fx.close()
+
+
+@test("NO-WORKTREE")
+def t_no_worktree(module):
+    """A --worktree that is not a readable directory is exit 2, never GONE.
+
+    "There is no directory here" and "I proved no predecessor holds it" are
+    different facts, and a dispatcher switching on the documented exit code must
+    be able to tell them apart. The docstring promised exit 2 for an unreadable
+    working directory while the code returned a GONE proof.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-nodir-wt")
+    fx = Fixture(worktree=wt, lanes=[], cmux_rows=[])
+    ghost = os.path.join(fx.dir, "does-not-exist", "nope")
+    try:
+        rc, out = run_preflight(fx, "--worktree", ghost, module=module)
+        assert_eq(rc, 2, "rc 2 = nothing was decided")
+        assert_in("not a readable directory", out, "the environment error is named")
+        assert_not_in("PREDECESSOR-GONE", out, "a missing target is never a GONE proof")
+    finally:
+        fx.close()
+
+
+@test("EMIT-FAIL")
+def t_emit_fail(module):
+    """A failed --emit is exit 2 — the proof could not be attached."""
+    wt = os.path.join(tempfile.gettempdir(), "succ-emitfail-wt")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 cmux_rows=[])
+    try:
+        rc, out = run_preflight(fx, "--emit", fx.dir, module=module)
+        assert_eq(rc, 2, "rc 2 = the proof could not be written")
+        assert_in("cannot emit to", out, "the emit failure is named")
+    finally:
+        fx.close()
+
+
+@test("CMUX-EPOCHS")
+def t_cmux_epochs(module):
+    """An ISO-8601 stamp and an epoch-MILLIS stamp are both read as recency.
+
+    Every other fixture uses epoch seconds, so the `_epoch` string and the
+    millis branch were never reached — and real cmux data is where an ISO or
+    millis stamp would come from.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-epochs-wt")
+    iso = _dt.datetime.fromtimestamp(NOW_S - 60, _dt.timezone.utc) \
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 cmux_rows=[{"id": WS, "current_directory": wt,
+                             "latest_submitted_at": iso},
+                            {"id": WS2, "current_directory": wt,
+                             "updated_at": (NOW_S - 30) * 1000}])
+    try:
+        rc, out = run_preflight(fx, module=module)
+        assert_eq(rc, 3, "rc 3 = recent inbound activity blocks the successor")
+        assert_in("recent-cmux-inbound:11111111,22222222", out,
+                  "both the ISO row and the millis row are recent")
+    finally:
+        fx.close()
+
+
+@test("CMUX-UPDATED-ONLY")
+def t_cmux_updated_only(module):
+    """The workspace record's own `updated_at` alone is enough to block."""
+    wt = os.path.join(tempfile.gettempdir(), "succ-updonly-wt")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 cmux_rows=[{"id": WS, "current_directory": wt,
+                             "updated_at": NOW_S - 30}])
+    try:
+        rc, out = run_preflight(fx, module=module)
+        assert_eq(rc, 3, "rc 3 = a recently written workspace record blocks")
+        assert_in("recent-cmux-inbound:11111111", out, "the row is the witness")
+    finally:
+        fx.close()
+
+
 # ── red control ──────────────────────────────────────────────────────────
 MUTATIONS = [
     ("drop the live-process check", "LIVE-PROCESS",
@@ -533,8 +741,8 @@ MUTATIONS = [
      "    if not process_readable:\n        # The worktree read could not be taken; lanes alone cannot prove absence\n        # of a process whose record the store never had.\n        return UNKNOWN, [\"process-read-unreadable\"]\n",
      "    pass\n"),
     ("drop the realpath normalisation", "REALPATH",
-     "    try:\n        return os.path.realpath(os.path.normpath(os.path.expanduser(path)))\n    except Exception:\n        return path\n",
-     "    return path\n"),
+     "        return os.path.realpath(os.path.normpath(s))\n",
+     "        return s\n"),
     ("ignore the cmux recency window", "CMUX-WINDOW",
      "            \"recent\": bool(newest is not None and (now_s - newest) <= recent_s),\n",
      "            \"recent\": bool(newest is not None),\n"),
@@ -544,6 +752,18 @@ MUTATIONS = [
     ("call every lane dead (drop the shared predicate)", "LIVE-LANE",
      "            \"state\": verdict.state,\n",
      "            \"state\": \"dead\",\n"),
+    ("accept a partial cwd read as complete", "PARTIAL-CWD-READ",
+     "        if m:\n            if set(m) == set(pids):\n                return m, True\n",
+     "        if m:\n            if True:\n                return m, True\n"),
+    ("an unreadable cwd read becomes an omitted one", "PROC-READ-REFUSED",
+     "        except FileNotFoundError:\n            continue          # proven gone — an answer, not a gap in the read\n        except OSError:\n            return {}, False  # refused — never evidence of absence\n",
+     "        except OSError:\n            continue\n"),
+    ("drop the unlinked-cwd normalisation", "DELETED-CWD",
+     "        if s.endswith(DELETED_SUFFIX):\n            s = s[: -len(DELETED_SUFFIX)]\n",
+     "        if False:\n            s = s[: -len(DELETED_SUFFIX)]\n"),
+    ("report a nonexistent worktree as GONE", "NO-WORKTREE",
+     "    if not os.path.isdir(target):\n",
+     "    if False:\n"),
 ]
 
 

@@ -338,6 +338,12 @@ jobs:
         # without their cwd, call every lane dead) must each turn their paired
         # leg RED. Unwired in CI a suite is inert by never running, so this is
         # how the preflight is actually executed on every PR.
+        # VISIBLE, not merge-blocking: `pipeline-compliance` is the repo's only
+        # required check (#646), and there is NO post-merge backstop for this
+        # suite today — ci-main.yml's script-validate job runs bash shards only
+        # (no python3.12 step), so a red here is a signal, not a block (the
+        # successor reuses lane_liveness.verdict_for, whose library IS exercised
+        # post-merge by the reaper's own suite).
         run: python3.12 tools/fleet/successor_preflight.test.py
       - name: Successor-preflight mutation evidence (#1317, zero-dep)
         # The suite above is only a pin if it can FAIL. A mutation whose paired
