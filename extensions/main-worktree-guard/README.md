@@ -346,6 +346,121 @@ not-checked-out-anywhere semantics:
    marker (the documented prompt contract); the CAP stays active under the
    marker (D3 — the marker never re-enables hub writes).
 
+### The clean-hub sync allowance is EFFECT-shaped, not verb-shaped (#1144)
+
+When the hub is **clean and on its baseline branch**, the destructive-git block
+admits one narrow class of ops without a hatch: the session's OWN branch syncs.
+That allowance is decided on the operation's **effect**, never its verb.
+
+Live 2026-09-17: `git rebase origin/main` on the SHARED tortoise hub's `main`
+moved that branch (rewriting the local tip onto `origin/main`) under **11 live
+sessions** with **no hatch** — while the comparable `git reset --hard
+origin/main` was refused and demanded `AGENT_ALLOW_MAIN_EDITS=1`. The allowance
+fired because it matched the VERB (`merge`/`pull`/`rebase`) whenever
+`currentBranch === baselineBranch`. A verb list cannot be repaired by
+lengthening it: the enforcement is a string scan, so both its false-positive
+surface (prose that only DESCRIBES a verb) and its false-negative surface (a
+spelling it does not enumerate) are functions of TEXT, not of EFFECT.
+
+The sync arm now requires ALL of (see `shared/branch-ownership.mjs` →
+`syncEffectAllowed` + `classify-git.mjs` → `syncEffectOf`):
+
+| Condition | Meaning |
+|---|---|
+| `scopeOwnRepo` | the op acts on the repo the session's **baseline was recorded in** — a `-C`/cwd hop into another repo's hub cannot borrow this session's allowance (the comment said "agent-infra main"; the behaviour was any repo's `main`) |
+| `treeClean` | the shared checkout has no uncommitted work at the moment of the decision |
+| `onlyGitInvocation` | the sync op is the command's ONLY git invocation — the classifier assigns one verdict from one verb while the parsed effect describes the FIRST sync op, so `git pull --ff-only && git rebase origin/main` looks fast-forward while carrying a rewrite |
+| `ffOnly` | the op carries `--ff-only` (last-wins across `--ff`/`--no-ff`/`--ff-only`): the only sync effect that cannot move the baseline tip backwards or rewrite a commit |
+| not `rebaseEffect` | `rebase`, `pull --rebase`, `pull -r` REPLACE the tip instead of advancing it |
+| not `leavesDirty` | no `--squash` / `--no-commit` staged state left in the shared tree |
+| not `unverifiable` | every option-shaped token is a KNOWN one — an abbreviated long option (`--mess`) or an optional-argument one (`--gpg-sign`) can silently swallow or free an `--ff-only`, so unlisted shapes fail closed |
+
+Absent or partial evidence fails **closed** — a caller that supplies no effect
+record cannot satisfy the sync arm at all. `git pull --ff-only` and `git merge
+--ff-only` remain permitted without a hatch (the allowance's genuine purpose);
+everything else needs a worktree or the human hatch, and the refusal message
+**names the permitted fast-forward forms** instead of pointing only at the
+hatch.
+
+**`onlyGitInvocation` and the sanctioned recovery one-liner (agent vs.
+terminal).** The documented recovery `cd <repo> && git checkout main && git pull
+--ff-only` is a COMPOUND, so it is admitted only where the compound is the
+sanctioned form: from a **human terminal** (the guard never intercepts a
+terminal) and in the **disordered hub**, where M4's recovery allowlist admits it
+before the sync arm is consulted. On a **clean hub** M4 is inactive and
+`onlyGitInvocation` refuses the compound — an agent there runs the sync on its
+own (`git pull --ff-only`), which is exactly what the refusal message says. This
+is a deliberate safe direction: the effect record describes the first sync op,
+so a compound needs per-invocation proof that the first cut did not carry.
+
+Two consequences of "effect, not verb" that the first cut missed (found by the
+second review cycle) are worth stating, because they are the same rule applied
+one level down:
+
+- **Worktree exemptions are per-INVOCATION.** `git -C <worktree> status && git
+  reset --hard origin/main` used to inherit the leading segment's worktree
+  exemption while the `reset` ran at the shell cwd — the `-C` binds only the
+  segment it precedes — and so moved the shared hub. The exemption now holds
+  only when EVERY git invocation in the command resolves inside a worktree.
+- **A carve-out may not close a compound command it does not describe.** The M3
+  return-to-original carve-out (#376) returned early for the whole command, so
+  `git checkout main && git reset --hard origin/main` ran with its blessing. It
+  now closes the command only when every OTHER invocation is read-only — where
+  "read-only" includes a refspec-less `git fetch`, which cannot write
+  `refs/heads/*`, and is decided **per argument** for verbs with a read-only
+  FORM and a mutating form (`worktree list` is a query, `worktree add` is not;
+  bare `tag`/`stash list` are queries, `tag <name>`/bare `stash` are not), so
+  the ordinary `git checkout main && git worktree list` ceremony is not
+  false-blocked.
+- **The carve-out's OWN invocation is exempt by IDENTITY, never by verb.** A
+  blanket "the branch-state family is read-only" test admits an INDEPENDENT
+  later mutation of that family, because index.ts returns from the whole handler
+  at the first `reBaseline` and the sibling is never seen by the M3 loop:
+  `git checkout main && git switch -f feat/x` moved the shared hub off main, and
+  `… && update-ref refs/heads/main HEAD` / `… && branch -M main stolen` moved
+  the baseline ref, all with the sanctioned return's blessing. `stateCarveOutClean`
+  now exempts `stateInv` itself (the invocation decideM3 sanctioned) and judges
+  each other invocation on its own arguments; bare `branch` (list) and
+  `symbolic-ref <name>` (query) stay read-only, while every later
+  `checkout`/`switch`, any `update-ref`, a ref-writing `symbolic-ref`, and every
+  `branch` mutation are not.
+
+A second adversarial review cycle then found the same two rules **incompletely
+closed**, and they are enforced here rather than deferred:
+
+- **The option-value model is only as good as its table, so unenumerated shapes
+  fail closed.** `git pull -o --ff-only origin main` read `--ff-only` as a live
+  flag while real git consumed it as `-o`'s (`--server-option`) VALUE and
+  performed a non-fast-forward pull (probe rc 0, merge commit, branch moved).
+  `-o` is now modelled as an arg-taker, and — the general rule — any single-dash
+  short-cluster letter that is neither a known arg-taker nor a known boolean
+  makes the proof **unverifiable**, mirroring the long-option design. The
+  short/long asymmetry self-heals as a consequence: `-p` is refused exactly as
+  `--prune` is, because neither is allowlisted.
+- **A hidden shell payload contributes NO invocation, so every "this is the
+  whole command" claim is unprovable while it runs.** `git pull --ff-only &&
+  eval "git rebase origin/main"` walked to exactly one invocation (the pull), so
+  the sync arm trusted the pull's fast-forward record for a command that rewrites
+  the branch immediately after; and `git -C <worktree> status && eval "git reset
+  --hard origin/main"` looked wholly worktree-scoped, so the legacy arm's
+  per-invocation worktree exemption laundered a reset of the SHARED hub.
+  `hiddenStateSubst` (`eval`, `$(…)`, backticks, piped-stdin shells, heredocs —
+  the hub gate's hardened shape set) now forces `syncOnlyInvocation` false and
+  the worktree exemption false: absent/partial evidence fails closed.
+
+A third fresh-context adversarial review cycle found the same hidden-payload
+rule **incompletely closed one consumer over**, and it is enforced here rather
+than deferred:
+
+- **The M3 carve-out is the THIRD consumer of "the invocation list is the whole
+  command".** A hidden payload contributes no invocation, so the visible list
+  still looked clean and the carve-out closed the command even while the
+  classifier's own verdict was `block:reset` — `git checkout main && eval "git
+  reset --hard origin/main"` (and the own-baseline rename arm, and the `$(…)`
+  twin) reached the shared hub through the sanctioned return. `stateCarveOutClean`
+  now requires `!hiddenStateSubst`, exactly as `syncOnlyInvocation` and the
+  worktree exemption do: absent/partial evidence fails closed.
+
 **Why WIP preservation:** the 2026-08-18 incident left 38 commits on `pr1467`
 in the hub. `git push origin <checked-out-branch>` is the ONE allowed push so
 a stranded lane's work never silently dies before recovery.
@@ -357,7 +472,11 @@ sanctioned recovery ops above are allowed directly), but **cannot resume
 feature work in the hub**. Only `AGENT_ALLOW_MAIN_EDITS=1` (env, set at
 session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
-touched only by humans and is unaffected.
+touched only by humans and is unaffected — a human terminal is never
+intercepted, and inside the disordered hub M4's recovery allowlist admits the
+compound. (An AGENT on a CLEAN hub has no M4 active and must run the sync on its
+own: the #1144 effect arm refuses the compound because its effect evidence
+covers only the first sync op. See "The clean-hub sync allowance" above.)
 
 **Scope (#347/#618/#621):** M4 fires only when the session cwd IS the hub's main checkout
 and the hub is off-main/dirty. Worktree sessions are exempt from the M4 git-verb gates (they are isolated

@@ -1306,9 +1306,10 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
 
 /**
  * Ownership allowance (agent-infra main, own baseline branch):
- *   merge/pull/rebase → current branch == baseline branch suffices (the
- *     mutation only ever advances the session's OWN branch; syncSource
- *     presence is not required — bare `git pull` pulls the own upstream).
+ *   merge/pull/rebase → #1144: EFFECT-gated, never verb-gated. The sync arm
+ *     fires only when the caller supplies an `effect` record proving the
+ *     operation is a PROVABLE FAST-FORWARD on the session's OWN repo with a
+ *     clean shared tree — see syncEffectAllowed below.
  *   push / force-push / push-delete → EVERY named target == baseline branch
  *     (all-targets semantics — a multi-refspec `git push origin feat/1 other/2`
  *     must never slip a foreign target past the gate; symmetric with the
@@ -1322,14 +1323,92 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
  *     so a pid-owned local delete is collision-free). Remote pushes/deletes of
  *     owned branches stay baseline-only.
  */
-export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource, ownedBranches }) {
+/**
+ * #1144 — the EFFECT-shaped predicate for the sync arm of the allowance.
+ *
+ * Live 2026-09-17: `classifyGitCommandDetailed("git rebase origin/main")`
+ * correctly returned `block:rebase` (it sits in LEGACY_BLOCK beside `reset`),
+ * but the guard consulted THIS allowance FIRST, and the allowance returned
+ * true for `opKind:"rebase"` whenever `currentBranch === baselineBranch`. A
+ * `reset --hard` that moved the SHARED tortoise hub's `main` was refused and
+ * demanded AGENT_ALLOW_MAIN_EDITS=1; a `rebase` that moved the SAME branch
+ * under 11 live sessions cost nothing. The defect is the allowance's SHAPE —
+ * it matched a verb — not its existence: it is the same allowance the
+ * `using-git-worktrees` skill relies on for agent-side `git pull --ff-only`.
+ *
+ * A verb list cannot be repaired by lengthening it. Enforcement is a string
+ * scan, so both its false-positive surface (prose that DESCRIBES a verb) and
+ * its false-negative surface (any spelling it does not enumerate) are
+ * functions of TEXT, not of EFFECT. The predicate therefore asks about the
+ * effect only:
+ *
+ *   scopeOwnRepo   — the operation acts on the repo the session's baseline was
+ *                    recorded in. Without this the allowance is repo-agnostic:
+ *                    its own comment says "agent-infra main" while it fired for
+ *                    ANY repo's `main`, so a `-C`/cwd hop into another repo's
+ *                    hub could borrow this session's allowance.
+ *   treeClean      — the shared checkout has no uncommitted work at the moment
+ *                    of the decision, so there is nothing to destroy.
+ *   onlyGitInvocation — the sync invocation is the command's ONLY git
+ *                    invocation. The classifier assigns ONE verdict from ONE
+ *                    verb while the parsed record describes the first sync op,
+ *                    so `git pull --ff-only && git rebase origin/main` looks
+ *                    fast-forward while carrying a rewrite. Nothing else may
+ *                    run between the live-state read and the operation.
+ *   leavesDirty    — false: the operation must not leave staged/index state
+ *                    behind in the shared tree (`--squash` / `--no-commit`).
+ *   ffOnly         — true: the only sync effect that CANNOT move the baseline
+ *                    tip backwards or rewrite a commit. A non-fast-forward
+ *                    integration on a SHARED branch mints a merge commit no
+ *                    other session expects, and `git pull` resolves through
+ *                    `pull.rebase` / `branch.<name>.rebase`, so a bare `pull`
+ *                    is NOT provably fast-forward. Fail closed: a bare
+ *                    spelling needs the narrowest admitted form or the hatch.
+ *   rebaseEffect   — false: this operation can REPLACE the tip instead of
+ *                    advancing it (`rebase`, `pull --rebase`, `pull -r`).
+ *   unverifiable   — false: the lexical proof actually holds. A `--`
+ *                    terminator (`git merge -- --ff-only` merges a REF named
+ *                    --ff-only) or an unresolvable expansion (`$(echo --no-ff)`
+ *                    flips the effective flag after this read) means the
+ *                    proof cannot be made, so the op fails closed. A VALUE
+ *                    token is not an option either: `git merge -m --ff-only
+ *                    origin/main` sets the merge MESSAGE and merges NON-ff.
+ *
+ * Absent or partial evidence → false (fail closed). The anti-bypass property
+ * is structural: a caller that supplies no `effect` record cannot satisfy the
+ * sync arm at all, so no verb can reach the allowance without effect evidence.
+ *
+ * The fast-forward forms whose effect is safe are named in the refusal
+ * message (`pull --ff-only`, `merge --ff-only`) instead of pointing only at
+ * the human hatch.
+ *
+ * @param {{parsedEffect?: {verb?: string, ffOnly?: boolean, rebaseEffect?: boolean, leavesDirty?: boolean, unverifiable?: boolean}|null, onlyGitInvocation?: boolean, scopeOwnRepo?: boolean, treeClean?: boolean}|null} effect
+ * @returns {boolean}
+ */
+export function syncEffectAllowed(effect) {
+  if (!effect || typeof effect !== "object") return false;
+  const p = effect.parsedEffect;
+  if (!p || typeof p !== "object") return false;
+  return effect.scopeOwnRepo === true
+    && effect.treeClean === true
+    && effect.onlyGitInvocation === true
+    && p.leavesDirty !== true
+    && p.unverifiable !== true
+    && p.ffOnly === true
+    && p.rebaseEffect !== true;
+}
+
+export function ownershipAllowed({ opKind, currentBranch, baselineBranch, targets, syncSource, ownedBranches, effect }) {
   if (!baselineBranch) return false;
   if (currentBranch !== baselineBranch) return false;
   switch (opKind) {
     case "merge":
     case "pull":
     case "rebase":
-      return true;
+      // #1144: effect-gated. `syncSource` is deliberately NOT consulted —
+      // what matters is the operation's effect on the baseline tip, not the
+      // locality of the ref it integrates.
+      return syncEffectAllowed(effect);
     case "push":
     case "force-push":
     case "push-delete":
