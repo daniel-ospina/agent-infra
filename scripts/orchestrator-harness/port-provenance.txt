@@ -62,6 +62,10 @@
 #   removed; chain-merge hardcoding 75; the fixcount refund; an out-of-directory `"$PI_BIN" -p`
 #   invoker; an in-directory `pi  -p` one; a NEAR-REVERSED flag order (`pi --no-session -p`); the
 #   missing-helper guard neutered to `|| true`; and `elapsed` set to the literal `garbage`.
+#   FIVE FURTHER CENSUS SPELLINGS were added after round 4, each verified to go RED: a LINE-CONTINUED
+#   `pi -p \` + newline (which the round-3 same-line pattern had REGRESSED out of the round-2
+#   detector's reach), a Python argv-list launcher and a Node one (both invisible to a
+#   shell-whitespace boundary), and both earlier spellings re-checked so neither fix traded a class.
 #   FOUR deliberate DEPARTURES from the tortoise original, all named in-file:
 #     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
 #        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).

@@ -87,18 +87,25 @@ scan_pi() { # scan_pi <root-relative-prefix>  → space-separated repo-relative 
   # whose name AND flags are both assembled at runtime; that case is covered by the runtime
   # contract (everything must route through run_agent), not by a grep.
   local p found="" MATCH_PI
-  MATCH_PI='((^|[[:space:]])-p([[:space:]]|$)|(^|[[:space:]])--print([[:space:]]|$)).*--no-session|--no-session.*((^|[[:space:]])-p([[:space:]]|$)|(^|[[:space:]])--print([[:space:]]|$))'
-  # ⛔ ORDER-INSENSITIVE AND MULTI-LANGUAGE (P2, review round 2026-10-15, second pass). The first
-  # detector required `pi` IMMEDIATELY followed by `-p`, so `pi --no-session -p …` — both tokens
-  # literal, only the order changed — was invisible; and it globbed `*.sh` while the tree ships
-  # `.py`/`.mjs` launchers. This keys on the flag PAIR, which is specific to a print-mode agent
-  # invocation and cannot be reordered away. STATED LIMIT: an invocation that omits `--no-session`
-  # (the harness convention requires it), or one whose command name AND flags are both assembled at
-  # runtime, is outside a static census — that residue is the runtime `run_agent` contract's job.
+  MATCH_PI='((^|[^[:alnum:]_-])-p([^[:alnum:]_-]|$)|(^|[^[:alnum:]_-])--print([^[:alnum:]_-]|$)).*--no-session|--no-session.*((^|[^[:alnum:]_-])-p([^[:alnum:]_-]|$)|(^|[^[:alnum:]_-])--print([^[:alnum:]_-]|$))'
+  # ⛔ ORDER-INSENSITIVE, MULTI-LANGUAGE, AND LINE-CONTINUATION-SAFE. Three rounds shaped this,
+  # and each round's fix broke something the previous one caught — so all three failure modes are
+  # recorded here rather than in a commit message:
+  #   • round 2 keyed on `pi` IMMEDIATELY followed by `-p`, so `pi --no-session -p …` — both tokens
+  #     literal, only the order changed — was invisible, and it globbed `*.sh` only.
+  #   • round 3 fixed that with a same-LINE flag pair, and REGRESSED the continuation case that
+  #     round 2's pattern had caught: `grep -E` is line-based, so `pi -p \` + newline + `--no-session`
+  #     presents one token per line. Hence the `awk` join at the match below.
+  #   • and the boundary must not assume SHELL whitespace: an idiomatic Python/JS launcher passes
+  #     argv as a LIST, so `-p` is delimited by a quote or a comma — the multi-language arm was
+  #     inert for exactly the files it was widened to cover.
+  # STATED LIMIT: an invocation that omits `--no-session` (the harness convention requires it), or
+  # one whose command name AND flags are both assembled at runtime, is outside a static census —
+  # that residue is the runtime `run_agent` contract's job, not a grep's.
   while IFS= read -r p; do
     case "$p" in */retired/*|*/testdata/*|*.test.*|*/selftest.sh) continue ;; esac
     case "$p" in *.sh|*.py|*.mjs|*.js|*.ts) ;; *) continue ;; esac
-    grep -qE "$MATCH_PI" "$ROOT/$p" 2>/dev/null || continue
+    awk '{ if (sub(/\\$/,"")) printf "%s", $0; else print $0 }' "$ROOT/$p" 2>/dev/null | grep -qE "$MATCH_PI" || continue
     found="$found $p"
   # --others --exclude-standard: a launch path is a NEW file first and a tracked one later, so a
   # census over `ls-files` alone cannot see it at the moment it is added — which is the only moment
