@@ -106,6 +106,16 @@
 # `-d` is required to succeed on the branch's own evidence, or the branch stays
 # put and is reported as failed.
 #
+# ⛔ `-D` IS GUARDED BY A COMPARE-AND-SWAP, exactly as the remote leg guards its
+# delete with `--force-with-lease`. The `merged` gate proves the tip equalled the
+# PR's headRefOid at CLASSIFICATION time; `-D` re-checks NOTHING by itself, so a
+# commit landing between classification and delete would be force-deleted even
+# though the new tip was never proven merged (the local leg's data-loss window —
+# F10). So `-D` runs ONLY when the branch's CURRENT tip still equals the
+# classified tip; a tip that moved is reported (`moved`, old → new), counted, and
+# the sweep exits non-zero. `-d` needs no such guard: git itself refuses when the
+# tip is not merged, so it can never force-delete.
+#
 # Deletion mechanics (remote): the classification reads
 # refs/remotes/origin/<br>, but the destructive action targets origin's REAL
 # refs/heads/<br>, so before each delete THREE things are proved, and the delete
@@ -1471,7 +1481,9 @@ run_local_scope() {
             keep_localonly=$((keep_localonly + 1)); keep_total=$((keep_total + 1)); continue
         fi
 
-        delete_list="${delete_list}${cls}"$'\t'"$br"$'\n'
+        # Third column: the classified TIP. `merged` force-delete (`-D`) uses it
+        # as the compare-and-swap expected value; `-d` never needs it.
+        delete_list="${delete_list}${cls}"$'\t'"$br"$'\t'"$sha"$'\n'
         sel_total=$((sel_total + 1))
         case "$cls" in
             merged)    sel_merged=$((sel_merged + 1)) ;;
@@ -1488,7 +1500,7 @@ run_local_scope() {
     if [ "$sel_total" -eq 0 ]; then
         echo "  (none)"
     else
-        while IFS=$'\t' read -r cls br; do
+        while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
             printf '  delete %-10s %s\n' "$cls" "$br"
         done <<<"$delete_list"
@@ -1496,11 +1508,14 @@ run_local_scope() {
     echo ""
 
     # ── EXECUTE or DRY-RUN ────────────────────────────────────────
-    local deleted=0 failed=0
+    local deleted=0 failed=0 moved=0
     if [ "$EXECUTE" = true ] && [ "$sel_total" -gt 0 ]; then
         echo "── EXECUTE: deleting $sel_total stale local branch(es) ──"
         echo ""
-        while IFS=$'\t' read -r cls br; do
+        # Columns: cls<TAB>br<TAB>sha. `sha` is the tip the classified gate
+        # PROVED (for `merged`, the PR's headRefOid it equalled). It is the
+        # compare-and-swap expected value for `-D` below.
+        while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
             # ⛔ `--` before the ref: without it a branch whose name begins with
             # `-` (`-x`, `--version`) is parsed by git as an OPTION, the delete
@@ -1509,13 +1524,31 @@ run_local_scope() {
             if git branch -d -- "$br" >/dev/null 2>&1; then
                 printf '  deleted %-10s %s\n' "$cls" "$br"
                 deleted=$((deleted + 1))
-            elif [ "$cls" = "merged" ] && git branch -D -- "$br" >/dev/null 2>&1; then
-                # Squash-merged AND unmoved: the classification already proved
-                # the local tip IS the revision the PR merged (it equalled
-                # headRefOid), so `-d` refuses only because the squash commit is
-                # not an ancestor of main. `-D` is correct ONLY here.
-                printf '  deleted %-10s %s (via -D: squash-merged PR)\n' "$cls" "$br"
-                deleted=$((deleted + 1))
+            elif [ "$cls" = "merged" ]; then
+                # ⛔ COMPARE-AND-SWAP (F10): `-D` is force-delete, and the
+                # `merged` gate proved the tip only at CLASSIFICATION time. Read
+                # the branch's CURRENT tip and force-delete ONLY if it is still
+                # the revision the gate proved. This is the local analogue of the
+                # remote leg's `--force-with-lease`: without it, a commit landing
+                # between classification and delete is destroyed (and `-D` drops
+                # the reflog too, so recovery is `git fsck --lost-found` only).
+                local cur_tip=""
+                cur_tip="$(git rev-parse -q --verify "refs/heads/$br" 2>/dev/null || true)"
+                if [ "$cur_tip" != "$sha" ]; then
+                    printf '  moved   %-10s %s (tip advanced %s -> %s; -D refused)\n' \
+                        "$cls" "$br" "$sha" "${cur_tip:-<deleted>}"
+                    moved=$((moved + 1))
+                elif git branch -D -- "$br" >/dev/null 2>&1; then
+                    # Squash-merged AND unmoved: the classification already proved
+                    # the local tip IS the revision the PR merged (it equalled
+                    # headRefOid), so `-d` refuses only because the squash commit
+                    # is not an ancestor of main. `-D` is correct ONLY here.
+                    printf '  deleted %-10s %s (via -D: squash-merged PR)\n' "$cls" "$br"
+                    deleted=$((deleted + 1))
+                else
+                    printf '  failed  %-10s %s (-D refused; tip unchanged)\n' "$cls" "$br"
+                    failed=$((failed + 1))
+                fi
             else
                 printf '  failed  %-10s %s (git branch -d refused; -D not allowed for this class)\n' "$cls" "$br"
                 failed=$((failed + 1))
@@ -1527,7 +1560,7 @@ run_local_scope() {
         echo "To delete: bash scripts/cleanup-stale-branches.sh --scope local --execute"
         echo ""
         echo "Deletion commands that would run (-D fallback only for a merged branch that -d will refuse):"
-        while IFS=$'\t' read -r cls br; do
+        while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
             # ⛔ Build the command ONCE, as an array, and PRINT it through
             # `quote_argv` — the SAME primitive the remote plan uses. A local
@@ -1551,30 +1584,54 @@ run_local_scope() {
             # path's `git branch -d` SUCCEEDS and `-D` never runs; the extra
             # printed line then ran `git branch -D -- m-anc` → `error: branch
             # 'm-anc' not found`, and under `set -e` that aborted the rest of the
-            # paste — an UNDER-reap. So follow the SAME predicate the outcome
-            # follows: is the tip an ancestor of main? Ancestor → `-d` succeeds,
-            # print NO fallback; not-an-ancestor → print the fallback, through
-            # the SAME `quote_argv`, annotated OUTSIDE the quoted argv.
+            # paste — an UNDER-reap. So predict the SAME test the outcome will
+            # apply: is the tip an ancestor of the ref `-d` compares against?
+            # Ancestor → `-d` succeeds, print NO fallback; not-an-ancestor →
+            # print the fallback, through the SAME `quote_argv`, annotated
+            # OUTSIDE the quoted argv.
+            # ⛔ AND IT MUST PREDICT THE SAME REF `-d` WILL TEST (F11). `git
+            # branch -d` tests the branch's UPSTREAM when it has one, and only
+            # falls back to HEAD otherwise — NOT `origin/main`. Predicating on
+            # `origin/main` mispredicted in BOTH directions: with a merge-commit
+            # branch and HEAD off main it printed only `-d` while execute ran
+            # `-D` (UNDER-describes), and with a branch tracking origin it printed
+            # a spurious `-D` while execute ran only `-d` (OVER-describes). So
+            # resolve the comparison ref as `<br>@{upstream}` when configured,
+            # else HEAD, and test ancestry against EXACTLY that.
             if [ "$cls" = "merged" ]; then
-                local dry_needs_force=0 dry_reason=""
-                if [ "$main_ref_ok" = 1 ]; then
-                    local dry_tip=""
-                    if dry_tip="$(git rev-parse --verify -q "refs/heads/$br" 2>/dev/null)" \
-                        && git merge-base --is-ancestor "$dry_tip" "origin/$MAIN_BRANCH" 2>/dev/null; then
+                local dry_needs_force=0 dry_reason="" dry_tip="" dry_cmp_ref=""
+                dry_tip="$(git rev-parse --verify -q "refs/heads/$br" 2>/dev/null || true)"
+                if [ -z "$dry_tip" ]; then
+                    # Tip unresolvable at plan time: conservative (over-describe).
+                    dry_needs_force=1
+                    dry_reason="(fallback if -d refuses; tip unresolvable)"
+                elif [ "$dry_tip" != "$sha" ]; then
+                    # Tip MOVED since classification: the execute gate's
+                    # compare-and-swap will REFUSE `-D`, so the plan must not
+                    # advertise one (F10).
+                    dry_needs_force=0
+                else
+                    # `git branch -d` compares against the branch's configured
+                    # upstream if it has one, else HEAD. `--symbolic-full-name`
+                    # resolves that name; a failure means no upstream, so HEAD is
+                    # the ref `-d` will use.
+                    if dry_cmp_ref="$(git rev-parse --abbrev-ref --symbolic-full-name "$br@{upstream}" 2>/dev/null)"; then
+                        :
+                    else
+                        dry_cmp_ref="HEAD"
+                    fi
+                    if git rev-parse --verify -q "$dry_cmp_ref" >/dev/null 2>&1 \
+                        && git merge-base --is-ancestor "$dry_tip" "$dry_cmp_ref" 2>/dev/null; then
                         dry_needs_force=0
                     else
+                        # Either the comparison ref does not resolve, or the tip
+                        # is not merged into it: print the fallback. The
+                        # conservative arm (over-describe) is kept for the
+                        # unresolvable case; the annotation says certainty is not
+                        # established rather than implying it.
                         dry_needs_force=1
                         dry_reason="(fallback if -d refuses)"
                     fi
-                else
-                    # origin/$MAIN_BRANCH does not resolve, so ancestry cannot be
-                    # tested here. Choose the CONSERVATIVE (over-describing)
-                    # direction — PRINT the fallback — because that keeps the plan
-                    # a strict SUPERSET of execution and never under-describes it;
-                    # the annotation says the certainty is not established rather
-                    # than implying it.
-                    dry_needs_force=1
-                    dry_reason="(fallback if -d refuses; ancestry unverified: origin/$MAIN_BRANCH does not resolve)"
                 fi
                 if [ "$dry_needs_force" = 1 ]; then
                     local local_cmd_force=(git branch -D -- "$br")
@@ -1608,6 +1665,9 @@ run_local_scope() {
     if [ "$EXECUTE" = true ]; then
         echo "  Deleted:   $deleted"
         echo "  Failed:    $failed"
+        if [ "$moved" -gt 0 ]; then
+            echo "  Moved:     $moved (tip moved before delete; not force-deleted)"
+        fi
     else
         echo "  Deleted:   0 (dry-run)"
         echo "  Failed:    0 (dry-run)"
@@ -1623,8 +1683,14 @@ run_local_scope() {
     # the branch is still there, so it is recoverable, but the sweep lied about
     # completing). Fail the pass whenever a selected branch was left behind; the
     # per-branch lines remain so the operator sees WHICH one.
-    if [ "$EXECUTE" = true ] && [ "$failed" -gt 0 ]; then
-        echo "ERROR: $failed local branch delete(s) FAILED: a selected branch was not reaped." >&2
+    if [ "$EXECUTE" = true ] && { [ "$failed" -gt 0 ] || [ "$moved" -gt 0 ]; }; then
+        if [ "$moved" -gt 0 ]; then
+            echo "ERROR: $moved local branch(es) MOVED under the sweep: the classified tip was no longer current," >&2
+            echo "ERROR: so the force-delete was REFUSED (a moved tip is never proven merged)." >&2
+        fi
+        if [ "$failed" -gt 0 ]; then
+            echo "ERROR: $failed local branch delete(s) FAILED: a selected branch was not reaped." >&2
+        fi
         echo "ERROR: The exit status means 'everything selected was reaped', so the sweep does NOT report success." >&2
         return 1
     fi

@@ -2648,6 +2648,229 @@ fi
 
 cd "$REPO"
 echo ""
+echo "== 36. the local -D fallback is COMPARE-AND-SWAP guarded — a tip that MOVED is not force-deleted (F10) =="
+# The `merged` gate proves tip == headRefOid at CLASSIFICATION time. `-D` then
+# re-checked NOTHING, so a commit landing between classification and delete was
+# force-deleted even though the new tip was never proven merged (and `-D` drops
+# the reflog too). This fixture races the tip: a git wrapper advances
+# refs/heads/sq from B to R (a child of B) at sq's own `branch -d`, exactly the
+# window the remote leg closes with --force-with-lease.
+F10R_ORIGIN="$FIX/f10r-origin.git"
+F10R_REPO="$FIX/f10r-repo"
+new_repo "$F10R_REPO" "$F10R_ORIGIN"
+cd "$F10R_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F10R_SCRIPT="$F10R_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f10r.txt; git add f10r.txt; old_commit "init"; git push -q origin main
+# sq: squash-shaped (tip NOT an ancestor of main), no upstream, MERGED PR.
+git checkout -q -b sq main
+echo sq > sq.txt; git add sq.txt; old_commit "sq-content"
+F10R_B="$(git rev-parse HEAD)"
+git checkout -q main
+# ok-sq: the SAME shape but never raced — the positive control proving -D still
+# reaps a normal squash merge.
+git checkout -q -b ok-sq main
+echo ok > oksq.txt; git add oksq.txt; old_commit "ok-sq-content"
+F10R_OK="$(git rev-parse HEAD)"
+git checkout -q main
+# R: a child of B reachable ONLY from sq. Without the CAS guard, `-D` destroys
+# the only ref to R and `git branch -D` drops the reflog with it.
+F10R_TREE="$(git rev-parse "$F10R_B^{tree}")"
+F10R_R="$(GIT_AUTHOR_DATE="2020-01-02T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-02T00:00:00 +0000" \
+    git commit-tree "$F10R_TREE" -p "$F10R_B" -m "post-classification commit")"
+F10R_PR_MAP="$FIX/f10r-pr-map.json"
+cat > "$F10R_PR_MAP" <<JSON
+[
+  {"headRefName":"sq","state":"MERGED","headRefOid":"$F10R_B","baseRefName":"main"},
+  {"headRefName":"ok-sq","state":"MERGED","headRefOid":"$F10R_OK","baseRefName":"main"}
+]
+JSON
+F10R_REAL_GIT="$(command -v git)"
+F10R_WRAP="$FIX/f10r-wrap"
+F10R_SENT="$FIX/f10r-advanced.sentinel"
+rm -f "$F10R_SENT"
+mkdir -p "$F10R_WRAP"
+cat > "$F10R_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F10): when the sweep deletes `sq`, advance refs/heads/sq from the
+# classified tip B to the child R BEFORE the real `git branch -d` runs — the
+# "commit lands between classification and delete" race. The advance happens
+# once (sentinel) and only for the `sq` target; every other call delegates.
+REAL_GIT="${F10R_REAL_GIT:?F10R_REAL_GIT unset}"
+if [ "$1" = "branch" ]; then
+    for _a in "$@"; do
+        if [ "$_a" = "${F10R_BRANCH:?F10R_BRANCH unset}" ]; then
+            if [ ! -e "${F10R_SENTINEL:?F10R_SENTINEL unset}" ]; then
+                : >"$F10R_SENTINEL"
+                "$REAL_GIT" update-ref "refs/heads/${F10R_BRANCH}" "${F10R_R_SHA:?F10R_R_SHA unset}"
+            fi
+        fi
+    done
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F10R_WRAP/git"
+run_script env PATH="$F10R_WRAP:$PATH" F10R_REAL_GIT="$F10R_REAL_GIT" \
+    F10R_BRANCH="sq" F10R_R_SHA="$F10R_R" F10R_SENTINEL="$F10R_SENT" \
+    bash "$F10R_SCRIPT" --repo "$F10R_REPO" --scope local --execute --pr-map-file "$F10R_PR_MAP"
+# Non-zero: a moved tip was NOT reaped, so the sweep must not claim success.
+assert_eq "$RC" "1" "a tip that moves under the sweep exits non-zero (F10)"
+assert_match "$OUT" '^  moved +merged +sq ' "the advanced branch is reported as moved (F10)"
+assert_contains "$OUT" "tip advanced $F10R_B -> $F10R_R" "the move names the old and new oids (F10)"
+assert_contains "$OUT" "Moved:     1" "the moved branch is counted in the summary (F10)"
+assert_no_match "$OUT" '^  deleted +merged +sq ' "the moved branch is NOT reported deleted (F10)"
+if [ "$(git -C "$F10R_REPO" rev-parse -q --verify refs/heads/sq || echo GONE)" = "$F10R_R" ]; then
+    ok "the ADVANCED branch SURVIVES at the new tip R (no data loss) (F10)"
+else
+    bad "the advanced branch was deleted or moved — DATA LOSS (F10)"
+fi
+# Positive control: the un-raced squash branch is still reaped through -D.
+assert_branch_absent ok-sq "the normal squash branch is still reaped via -D (F10)"
+assert_contains "$OUT" "via -D: squash-merged PR" "the normal squash -D path is unchanged (F10)"
+
+cd "$REPO"
+echo ""
+echo "== 37. the local plan ⇄ execute parity holds for BOTH refs git branch -d tests (F11) =="
+# `git branch -d` tests the branch's UPSTREAM when it has one, else HEAD — never
+# `origin/main`. The pre-F11 predictor tested `origin/main`, which mispredicted
+# BOTH ways: (A) a merge-commit branch with HEAD off main printed only `-d`
+# while execute ran `-D` (UNDER-describes); (B) a branch tracking origin printed
+# a spurious `-D` while execute ran only `-d` (OVER-describes). Each shape gets
+# its own fixture, and each asserts plan ⇄ execute parity under the SAME
+# NUL-delimited argv comparison section 29d uses. Restore the origin/main-only
+# predicate and the `cmp` below goes RED in the corresponding fixture.
+F11_WRAP="$FIX/f11-wrap"
+F11_REAL_GIT="$(command -v git)"
+mkdir -p "$F11_WRAP"
+cat > "$F11_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F11): dumps the `git branch` argv as NUL-delimited records in
+# `print` mode; otherwise appends them to GIT_WRAP_LOG and delegates to the real
+# git, so the execute path really deletes.
+REAL_GIT="${F11_REAL_GIT:?F11_REAL_GIT unset}"
+if [ "$1" = "branch" ]; then
+    if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+        printf '%s\000' "$@"
+        printf '\000'
+        exit 0
+    fi
+    {
+        printf '%s\000' "$@"
+        printf '\000'
+    } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F11_WRAP/git"
+
+# ── (A) HEAD is NOT main: a merge-commit-merged branch needs -D, and the plan
+#        must say so (the pre-F11 plan printed only -d here).
+F11A_ORIGIN="$FIX/f11a-origin.git"
+F11A_REPO="$FIX/f11a-repo"
+new_repo "$F11A_REPO" "$F11A_ORIGIN"
+cd "$F11A_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F11A_SCRIPT="$F11A_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f11a.txt; git add f11a.txt; old_commit "init"; git push -q origin main
+F11A_BASE="$(git rev-parse main)"
+git checkout -q -b m-anc main
+echo ma > ma.txt; git add ma.txt; old_commit "m-anc-content"
+F11A_MANC="$(git rev-parse HEAD)"
+git checkout -q main
+git merge -q --no-ff -m "merge m-anc" m-anc
+git push -q origin main
+# HEAD to an OLD commit that does NOT contain m-anc. `-d` tests HEAD, so it will
+# REFUSE and execute will need `-D`; the plan must predict that.
+git checkout -q -b detour "$F11A_BASE"
+if git merge-base --is-ancestor "$F11A_MANC" HEAD 2>/dev/null; then
+    bad "F11A fixture: HEAD contains m-anc — -d would not refuse (shape wrong) (F11)"
+else
+    ok "F11A fixture: HEAD does not contain m-anc, so -d refuses and -D is required (F11)"
+fi
+F11A_MAP="$FIX/f11a-pr-map.json"
+cat > "$F11A_MAP" <<JSON
+[
+  {"headRefName":"m-anc","state":"MERGED","headRefOid":"$F11A_MANC","baseRefName":"main"}
+]
+JSON
+run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
+    bash "$F11A_SCRIPT" --repo "$F11A_REPO" --scope local --pr-map-file "$F11A_MAP"
+F11A_PLAN_OUT="$OUT"
+assert_eq "$RC" "0" "F11A: dry-run exits 0"
+assert_contains "$F11A_PLAN_OUT" 'git branch -d -- m-anc   # class=merged' "F11A: the plan prints the -d command (F11)"
+assert_contains "$F11A_PLAN_OUT" 'git branch -D -- m-anc   # class=merged (fallback if -d refuses)' "F11A: the plan prints the -D fallback because -d will test HEAD, not origin/main (F11)"
+F11A_PLAN="$FIX/f11a-plan.bin"; : > "$F11A_PLAN"
+while IFS= read -r _f11a_line; do
+    [ -n "$_f11a_line" ] || continue
+    PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
+        bash -c 'eval "$1"' _ "$_f11a_line" >>"$F11A_PLAN" || true
+done <<<"$(grep '^  git branch -[dD] --' <<<"$F11A_PLAN_OUT" || true)"
+F11A_EXEC="$FIX/f11a-exec.bin"; : > "$F11A_EXEC"
+run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11A_EXEC" \
+    bash "$F11A_SCRIPT" --repo "$F11A_REPO" --scope local --execute --pr-map-file "$F11A_MAP"
+assert_eq "$RC" "0" "F11A: --execute exits 0"
+if [ -s "$F11A_PLAN" ] && cmp -s "$F11A_PLAN" "$F11A_EXEC"; then
+    ok "F11A: plan ⇄ execute argv parity with HEAD off main (merge-commit needs -D) (F11)"
+else
+    bad "F11A: plan ⇄ execute argv DIVERGE with HEAD off main (F11)"
+    echo "    plan argv:"; od -c "$F11A_PLAN" | head -n 6
+    echo "    exec argv:"; od -c "$F11A_EXEC" | head -n 6
+fi
+assert_branch_absent m-anc "F11A: the merge-commit branch is reaped via -D (F11)"
+
+# ── (B) the branch tracks origin: `-d` tests the UPSTREAM, so the plan must NOT
+#        print a spurious -D (the pre-F11 plan did).
+F11B_ORIGIN="$FIX/f11b-origin.git"
+F11B_REPO="$FIX/f11b-repo"
+new_repo "$F11B_REPO" "$F11B_ORIGIN"
+cd "$F11B_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F11B_SCRIPT="$F11B_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f11b.txt; git add f11b.txt; old_commit "init"; git push -q origin main
+git checkout -q -b sq main
+echo sq > sq.txt; git add sq.txt; old_commit "sq-content"
+F11B_SQ="$(git rev-parse HEAD)"
+git push -q -u origin sq
+git checkout -q main
+# origin/main does NOT contain sq's tip; `-d` tests origin/sq (== the tip) and
+# SUCCEEDS, so execute never runs -D.
+F11B_MAP="$FIX/f11b-pr-map.json"
+cat > "$F11B_MAP" <<JSON
+[
+  {"headRefName":"sq","state":"MERGED","headRefOid":"$F11B_SQ","baseRefName":"main"}
+]
+JSON
+run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
+    bash "$F11B_SCRIPT" --repo "$F11B_REPO" --scope local --pr-map-file "$F11B_MAP"
+F11B_PLAN_OUT="$OUT"
+assert_eq "$RC" "0" "F11B: dry-run exits 0"
+assert_contains "$F11B_PLAN_OUT" 'git branch -d -- sq   # class=merged' "F11B: the plan prints the -d command (F11)"
+assert_not_contains "$F11B_PLAN_OUT" 'git branch -D -- sq' "F11B: the plan prints NO spurious -D for an upstream-comparison branch (F11)"
+F11B_PLAN="$FIX/f11b-plan.bin"; : > "$F11B_PLAN"
+while IFS= read -r _f11b_line; do
+    [ -n "$_f11b_line" ] || continue
+    PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
+        bash -c 'eval "$1"' _ "$_f11b_line" >>"$F11B_PLAN" || true
+done <<<"$(grep '^  git branch -[dD] --' <<<"$F11B_PLAN_OUT" || true)"
+F11B_EXEC="$FIX/f11b-exec.bin"; : > "$F11B_EXEC"
+run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11B_EXEC" \
+    bash "$F11B_SCRIPT" --repo "$F11B_REPO" --scope local --execute --pr-map-file "$F11B_MAP"
+assert_eq "$RC" "0" "F11B: --execute exits 0"
+if [ -s "$F11B_PLAN" ] && cmp -s "$F11B_PLAN" "$F11B_EXEC"; then
+    ok "F11B: plan ⇄ execute argv parity with an upstream comparison ref (F11)"
+else
+    bad "F11B: plan ⇄ execute argv DIVERGE with an upstream comparison ref (F11)"
+    echo "    plan argv:"; od -c "$F11B_PLAN" | head -n 6
+    echo "    exec argv:"; od -c "$F11B_EXEC" | head -n 6
+fi
+assert_branch_absent sq "F11B: the upstream-tracking squash branch is reaped via -d (F11)"
+
+cd "$REPO"
+echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
