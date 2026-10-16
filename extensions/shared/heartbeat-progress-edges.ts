@@ -736,6 +736,44 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "retention",
     guardedBy: NONE,
   },
+  // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
+  //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
+  //   #1552). They classify a lane as idle / free capacity; they are liveness
+  //   thresholds, not kill switches, so they answer to the heartbeat axis. The
+  //   reverse scan found all four the moment the file landed — registered here
+  //   rather than exempted, because each IS a real liveness bound.
+  {
+    name: "IDLE_MIN",
+    owners: ["scripts/orchestrator-heartbeat.sh"],
+    value: "=9",
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: "minutes since last output ABOVE which a lane with no spinner is classified finished/idle. Paired with STALE_MIN (the same age WITH a spinner ⇒ wedge suspect). Both are classifier thresholds; nothing is killed.",
+  },
+  {
+    name: "CAP_IDLE_MIN",
+    owners: ["scripts/orchestrator-heartbeat.sh"],
+    value: "=20",
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: "the free-capacity bound: a lane idle at least this long, and with no live child pi, is offered as FREE CAPACITY. Deliberately above IDLE_MIN (the classifier's measured 9 m false positive); a dead pane is excluded by a separate live-process probe, not by this value.",
+  },
+  {
+    name: "SCAN_MAX_AGE_S",
+    owners: ["scripts/orchestrator-heartbeat.sh"],
+    value: "${SCAN_MAX_AGE_S:-10800}",
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: "the ask-scan cache's absolute freshness ceiling (3 h): a stamp older than this is never trusted, so the ~7-9 min scan re-runs. The reuse window SCAN_INTERVAL_S (45 min) sits below it; both are env-overridable.",
+  },
+  {
+    name: "ASK_AGE",
+    owners: ["scripts/orchestrator-heartbeat.sh"],
+    value: null,
+    axis: "heartbeat",
+    guardedBy: NONE,
+    note: "DERIVED at runtime: now − the cache stamp, compared against SCAN_INTERVAL_S to decide cache reuse. Registered (not value-pinned) so the reuse decision's age input is in the vocabulary.",
+  },
   // — hygiene axis (idle reapers that are NOT agent-stall detectors) —
   {
     name: "DEFAULT_IDLE_TIMEOUT_MS",

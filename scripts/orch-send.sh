@@ -49,7 +49,7 @@ read_footer() {
 FOOT=""
 for _try in 1 2 3 4; do
   FOOT="$(read_footer)"
-  printf '%s' "$FOOT" | grep -qE "$ALLOW_RE" && break
+  grep -qE "$ALLOW_RE" <<<"$FOOT" && break
   sleep 6
 done
 
@@ -57,7 +57,7 @@ REPO=""
 _via_map=""
 _via_live=""
 
-if printf '%s' "$FOOT" | grep -qE "$ALLOW_RE"; then
+if grep -qE "$ALLOW_RE" <<<"$FOOT"; then
   REPO="$(printf '%s' "$FOOT" | grep -oE "$ALLOW_RE" | head -1)"
   # Orchestrator self-check: its footer carries this session's unique spend + RSS signature.
   case "$FOOT" in

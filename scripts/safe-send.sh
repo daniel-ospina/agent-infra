@@ -62,7 +62,7 @@ if [ -n "$PSCREEN" ]; then
   case "$PLAST" in
     *"%/300k"*|*"• high"*|*"• low"*|*"• medium"*) : ;;
     *)
-      if [ "$MODE" != "--force" ] || printf '%s' "$PLAST" | grep -qE '(%|\$|#)[[:space:]]*$'; then
+      if [ "$MODE" != "--force" ] || grep -qE '(%|\$|#)[[:space:]]*$' <<<"$PLAST"; then
         echo "REFUSED [$LABEL] $WS — NO pi IN THIS PANE (last line: $(printf '%s' "$PLAST" | tail -c 70))."
         echo "         A send here would be typed into a BARE LOGIN SHELL and EXECUTED."
         echo "         Relaunch the lane first (ORCHESTRATION-BOARD 72). --force does NOT override this."

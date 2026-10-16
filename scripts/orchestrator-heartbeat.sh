@@ -116,7 +116,7 @@ if [ "$DRY" != "1" ] && [ -s "$ASK_CACHE" ] && [ -s "$ASK_CACHE_TS" ]; then
   case "$ASK_TS" in *[!0-9]*|"") ASK_TS=0 ;; esac
   ASK_AGE=$(( $(date +%s) - ASK_TS ))
   if [ "$ASK_AGE" -ge 0 ] && [ "$ASK_AGE" -lt "$SCAN_INTERVAL_S" ]; then
-    if ASK_ALL=$(cat "$ASK_CACHE" 2>/dev/null) && printf '%s' "$ASK_ALL" | grep -q '^ASK '; then
+    if ASK_ALL=$(cat "$ASK_CACHE" 2>/dev/null) && grep -q '^ASK ' <<<"$ASK_ALL"; then
       ASK_FROM_CACHE=1
       log "ask| scan REUSED (cache ${ASK_AGE}s old < ${SCAN_INTERVAL_S}s)"
     else
@@ -127,7 +127,7 @@ fi
 if [ "$ASK_FROM_CACHE" != "1" ]; then
   ASK_ALL=$(/usr/bin/python3 "$SCRIPTS/ask-owner.py" --scan $([ "$DRY" = "1" ] && printf -- '--dry-run') 2>&1)
   # Cache only a USABLE result — never cache a failure, or the failure becomes sticky for 45 min.
-  if printf '%s' "$ASK_ALL" | grep -q '^ASK '; then
+  if grep -q '^ASK ' <<<"$ASK_ALL"; then
     printf '%s' "$ASK_ALL" > "$ASK_CACHE.$$"  && mv "$ASK_CACHE.$$" "$ASK_CACHE"
     date +%s                > "$ASK_CACHE_TS.$$" && mv "$ASK_CACHE_TS.$$" "$ASK_CACHE_TS"
   fi
@@ -658,7 +658,7 @@ if [ "${N_TRIAGE:-0}" -gt 0 ]; then
     for _e in $(printf '%s' "$CAP" | tr '|' '\n'); do
       _nm=$(printf '%s' "$_e" | sed -E 's/\([0-9.]+m?\)[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
       [ -z "$_nm" ] && continue
-      if printf '%s\n' "$_WIPN" | grep -qxF "$_nm"; then
+      if grep -qxF "$_nm" <<<"$_WIPN"; then
         log "DO-DEDUPE: $_nm is WIP-IDLE (unfinished work) -- dropped from READY; CONTINUE it, never hand it a new task"
       else
         _NEWCAP2="${_NEWCAP2}${_NEWCAP2:+ | }$(printf '%s' "$_e" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -686,7 +686,7 @@ if [ "${N_TRIAGE:-0}" -gt 0 ]; then
       for _e in $(printf '%s' "$CAPW" | tr '|' '\n'); do
         _nm=$(printf '%s' "$_e" | sed -E 's/\([0-9.]+m?\)[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
         [ -z "$_nm" ] && continue
-        if printf '%s\n' "$_TRIAGED" | grep -qxF "$_nm"; then
+        if grep -qxF "$_nm" <<<"$_TRIAGED"; then
           log "DO-DEDUPE: $_nm carries a triage class -- dropped from WIP (action class outranks mechanical)"
         else
           _NEWWIP="${_NEWWIP}${_NEWWIP:+ | }$(printf '%s' "$_e" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -714,7 +714,7 @@ if [ "${N_TRIAGE:-0}" -gt 0 ]; then
     for _e in $(printf '%s' "$CAP" | tr '|' '\n'); do
       _nm=$(printf '%s' "$_e" | sed -E 's/\([0-9.]+\)[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
       [ -z "$_nm" ] && continue
-      if printf '%s\n' "$_DEADN" | grep -qxF "$_nm"; then
+      if grep -qxF "$_nm" <<<"$_DEADN"; then
         log "CAPACITY DROP dead lane offered as free: $_nm (no live pi) -- NOT dispatchable"
       else
         _NEWCAP="${_NEWCAP}${_NEWCAP:+ | }$(printf '%s' "$_e" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
@@ -744,7 +744,7 @@ fi
       for _e in $(printf '%s' "$_cur" | tr '|' '\n'); do
         _nm=$(printf '%s' "$_e" | sed -E 's/\[[0-9A-Fa-f]*\][[:space:]]*$//; s/\([0-9.]+m?\)[[:space:]]*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
         [ -z "$_nm" ] && continue
-        if printf '%s\n' "$_BUSYN" | grep -qxF "$_nm"; then
+        if grep -qxF "$_nm" <<<"$_BUSYN"; then
           log "DO-DEDUPE: $_nm is BUSY (already nudged) -- dropped from $_v"
         else
           _keep="${_keep}${_keep:+ | }$(printf '%s' "$_e" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
