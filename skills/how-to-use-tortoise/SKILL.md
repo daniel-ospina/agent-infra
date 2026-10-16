@@ -137,10 +137,11 @@ even unrated it already clamps to `10.0` and a best rating gains nothing
 (weakening still lands — `16.0 × 0.5 = 8.0`).
 
 > **Do not confuse these with source credibility tiers.** A **Point's** Beta
-> prior — how much we trust the claim itself — comes from its sources'
-> `sourceKind` (T0–T4), not from the `credibility` kwarg. That kwarg is a
-> validated *label*, not a strength: it adds one weak evidence body, the same
-> for every ladder word, and does not select the tier prior. The annotation
+> prior — how much we trust the claim itself — comes from its sources' tier
+> (`credibilityTier` when set, otherwise the tier implied by `sourceKind`,
+> T0–T4), not from the `credibility` kwarg. That kwarg is a validated *label*,
+> not a strength: it adds one weak evidence body, the same for every ladder
+> word, and does not select the tier prior. The annotation
 > dimensions grade an **Operator's** weight — how much this connection
 > contributes. They are separate systems: a T0 source on a heavily-biased
 > connection is still a heavily-biased connection.
