@@ -145,13 +145,16 @@ def capacity() -> dict:
     cfg.update(os.environ)
 
     def _limit(key, default):
-        try:
-            n = int(str(cfg.get(key)).strip())
-        except Exception:
+        # ⛔ MATCH orch-loop.sh's is_num/is_limit EXACTLY: `0`, or a non-zero-leading
+        # run of at most 9 digits. Do NOT use bare int(): it accepts `010`, `1_000`,
+        # `+12` and ` 12`, all of which the loop's guards REJECT and coerce to the
+        # default -- so int() would let pr-doctor read 10/1000/12/12 where the loop
+        # runs 3, a fail-open divergence on the documented env-override path.
+        raw = cfg.get(key)
+        s = "" if raw is None else str(raw)
+        if not re.fullmatch(r"0|[1-9][0-9]{0,8}", s):
             return default
-        # Same range guard the loop applies: a non-number or an absurd value must fall back,
-        # never open the gate it configures (a `[ -ge ]` on a non-number is FALSE).
-        return n if 0 <= n <= 999_999_999 else default
+        return int(s)
 
     return {"max_fix": _limit("MAX_FIX", DEFAULT_MAX_FIX),
             "max_review": _limit("MAX_REVIEW", DEFAULT_MAX_REVIEW)}

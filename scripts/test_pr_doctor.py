@@ -97,11 +97,29 @@ def test_capacity_falls_back_to_the_loop_defaults(monkeypatch):
     assert pr.capacity() == {"max_fix": _default("MAX_FIX"), "max_review": _default("MAX_REVIEW")}
 
 
-@pytest.mark.parametrize("bad", ["nope", "", "-1", "9999999999"])
+@pytest.mark.parametrize("bad", ["nope", "", "-1", "9999999999",
+                                      "010", "08", "1_000", "+12", " 12"])
 def test_capacity_rejects_a_bad_value_and_uses_the_default(monkeypatch, bad):
     monkeypatch.setenv("MAX_FIX", bad)
     monkeypatch.setenv("MAX_REVIEW", "4")
     assert pr.capacity()["max_fix"] == pr.DEFAULT_MAX_FIX
+
+
+def test_orch_plist_path_is_pinned_to_install_sh_label():
+    """The ONE home must not silently evaporate if the launchd label is renamed.
+
+    `install.sh` owns the label; if it changes and pr-doctor's literal does not, `capacity()`
+    reads a nonexistent file and falls back to 3/4 -- the exact regression this change removes --
+    with the suite still green. Pin pr-doctor's literal to the installer's own `LABEL=`.
+    (Read the source literal: the autouse fixture stubs the runtime path.)
+    """
+    src = (_REPO / "scripts" / "pr-doctor.py").read_text()
+    lm = re.search(r'ORCH_PLIST = os\.path\.join\(HOME, "Library", "LaunchAgents", "([^"]+)"\)', src)
+    assert lm, "pr-doctor.py no longer builds ORCH_PLIST from a literal plist name"
+    inst = (_REPO / "scripts" / "orchestrator-harness" / "install.sh").read_text()
+    im = re.search(r'^LABEL="([^"]+)"', inst, re.M)
+    assert im, "install.sh no longer assigns LABEL with a quoted value"
+    assert lm.group(1) == im.group(1) + ".plist"
 
 
 # ── 2. the cap is consumed per class, and a stale row does not consume it ─────────────────
