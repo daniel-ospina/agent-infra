@@ -295,11 +295,52 @@ fi
 # executes $DEST/scripts/ci_runner_gate.sh, so farming it is what makes the REPO
 # copy the copy that runs — without it a box keeps executing a hand-copied
 # duplicate (a merged fix never reaches it) and a second box has no fallback gate.
+#
+# #1552 — the LAPTOP-ONLY lane-orchestration layer joins this farm. Each of the 27 entries
+# below existed on exactly ONE disk (~/.pi/agent/scripts) and in no repo file, so a repair to the
+# fleet's own dispatch guard could not go through the gate that guard exists to protect
+# (measured: a fix for a broken gate was applied in place, unreviewed and unreproducible on a
+# rebuilt machine — the remedy for a broken gate was itself ungated). They farm FLAT for the same
+# reason as the rest of this list: the layer resolves its siblings as `$SCRIPTS/<name>` at
+# $DEST/scripts/, which is this farm's destination.
+#
+# ⚠️ PARTIAL BY CONSTRUCTION — declared here, not left to be discovered. The VERSIONED half of the
+# SAME layer (`lane-status.py`, `lane-actions.py`, `lane-watchdog.py`, `objective.py`,
+# `heartbeat-loop.sh`, `cadence-nudge.sh`, `publish-live-workspaces.py`) is present in scripts/ but
+# is in NO farm list, so a box rebuilt from this file gets the farmed CONSUMERS (the 27 below plus
+# the 10 pre-existing) WITHOUT those seven PRODUCERS.
+# Adding them is not a list-only edit and is deliberately out of #1552's scope, because the copies
+# have drifted — measured AT THIS COMMIT, one-directionally:
+#   * `lane-status.py` — the DESTINATION is ahead (repo 1993 lines / live 2005; the live copy
+#     carries the #1777 abstention text, in flight). Farming the repo copy would OVERWRITE the
+#     running classifier with an older one — the fail-dangerous overwrite #1553's review named.
+#   * the other six (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `heartbeat-loop.sh`,
+#     `cadence-nudge.sh`, `publish-live-workspaces.py`) are byte-identical repo↔live at this commit,
+#     so none carries a hazard of its own today. They are listed as a SET because the seven must be
+#     farmed together, once `lane-status.py`'s live bytes land. (`cadence-nudge.sh` was repo-ahead
+#     422 / live 409 when this comment was first drafted and has since been synced — the numbers
+#     above are true as of THIS commit, and a stale number in a comment is the exact failure this
+#     PR exists to make reviewable.)
+# So the closure is a declared residual of #1552 (see its residual comment), and the repo↔deployed
+# identity instrument that would report it continuously is #1760/#1759's — not this list's.
+# The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
+# TWO of them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
+# (a non-zero exit is read as "screened, not stalled"; see the filed #1797) and
+# `state/lane-triage.py` (`2>/dev/null || log "NOTE triage unavailable"`). The third,
+# `state/queues/claim.py`, is NOT in that class: its read fails LOUDLY — `claim_next()` raises
+# `QueueReadError` and the caller prints `READ-FAILED <lane>: … withholding this lane (NOT read as
+# empty)` — while its RELEASE paths (`free`/`done`) do ignore their result. None of the three is in
+# any farm list.
+# ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
+# `sed -n 's/^fleet_srcs=(\(.*\))$/\1/p'`, so a wrapped array reads as EMPTY and that gate's
+# membership assertion goes RED. (Loud, not silent — do not describe it as vacuous.)
+# Tests are not farmed (the farm contract above): scripts/test_objective.py and
+# scripts/test_turn_classify_state.py land in the repo and stay there.
 # #1787 adds cleanup-stale-branches.sh: the daily com.tortoise.branch-reaper job
 # runs the FARMED copy through the shared launcher with an explicit --repo, and
 # install-launchd.sh's broken-target guard refuses the whole install when the
 # farmed script is absent.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py probe-one.py queue-dispatch.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
