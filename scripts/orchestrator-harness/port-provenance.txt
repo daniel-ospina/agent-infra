@@ -54,7 +54,10 @@
 #                            refused fixer REFUNDS the attempt the controller booked (or three
 #                            refusals park a PR no fixer ever touched).
 #   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
-#   Tests: spawn-gate.test.sh — 53 checks, 49 of which go RED on the pre-port tree (measured; the 4
+#   Tests: spawn-gate.test.sh — 53 checks at the PORT, 80 after the disk gate (#1765) and 89 after
+#   review round 2 (+9: the stale-helper refund, the worktree-volume assertion, the in-range warn-band
+#   invariant and the CI-wiring/population pair). 49 of the ORIGINAL 53 go RED on the pre-port tree
+#   (measured; the 4
 #   survivors are port-independent: the POSITIVE CONTROL, the two 0-STATUS arms — 0 was always
 #   returned, the defect was about non-zero codes — and the CI-wiring equality). ELEVEN mutation rows
 #   each revert ONE fix and go red on that check, so each is pinned rather than merely exercised:
@@ -127,12 +130,16 @@
 #     spawn-gate.sh, which lane.sh/fix-one.sh now HARD-REQUIRE (they `exit 78` without it). So a
 #     stale/empty $O passes `check` and then every lane and fixer refuses to run: the checker reports
 #     "CELL CAN RUN A CONTROLLER" over a cell that cannot. CATEGORY A (a false PASS) and caused by
-#     THIS change, but the file is held by PR #1769/#1730 — FILED as a follow-up issue rather than
-#     fixed here. install.sh's DRIFTED list is the other half of the same gap (also held).
+#     THIS change, but the file is held by PR #1730/#1812 — FILED as a follow-up issue rather than
+#     fixed here. install.sh's DRIFTED list — the other half of the same gap — is RESOLVED (review
+#     round 2, #1828): #1769 merged, and the list's own rule is that a SOURCED file belongs in it, so
+#     spawn-gate.sh (sourced by lane.sh, fix-one.sh and orch-loop.sh) is now in it and a stale helper
+#     is REPORTED. The callers are additionally tolerant of one (see the refusal-code note below), but
+#     surviving a stale helper silently is not the same as detecting it.
 #   selftest.sh:866 — the "ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH" guard enumerates
 #     the is_num copies and asserts a count; spawn-gate.sh is a new copy it does not enumerate, so
 #     the guard now undercounts silently (it still passes). Needs the new file added to its list.
-#     Held by #1769/#1730.
+#     Held by #1730/#1812 (#1769 merged as a5fa100).
 #   The watchdog subshell in every run_agent() copy (`( sleep $t; kill … ) &` then `kill $w`) ORPHANS
 #     its `sleep` on the success path — up to 40 minutes of a parked process per agent run, in all
 #     FOUR copies (three here, one being ported from tortoise). PRE-EXISTING and NOT introduced by
@@ -152,8 +159,10 @@
 #
 # ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
 # `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and
-# `scripts/run-bash-shards.sh` are all being edited by open PR #1769 and/or PR #1730, so this pass
-# was not permitted to touch them. What remains, precisely:
+# `scripts/run-bash-shards.sh` were all being edited by open PR #1769 and/or PR #1730, so the port
+# pass did not touch them. #1769 has since MERGED (a5fa100); the live holders are #1730 and #1812, and
+# review round 2 (#1828) landed the two halves whose holders had cleared (marked DONE below). What
+# remains, precisely:
 #   merge-one.sh  #8589 the reviewer's own DETACHED checkout (and DROP the AGENT_ALLOW_MAIN_EDITS
 #                 export — prompt-only containment is what #8484 measured failing)
 #                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
@@ -166,7 +175,8 @@
 #                 without the orch-loop half, fix-one.sh cannot tell the ai-review-gate arm (which
 #                 deletes the marker) from the CI-red arm (which never touches it), and restoring
 #                 the marker there would INVENT a findings record — refund_bailed_fixer's own note.
-#   install.sh    #8521 register spawn-gate.sh in the DRIFTED list (PR #1769 edits this exact line)
+#   install.sh    #8521 register spawn-gate.sh in the DRIFTED list — DONE (review round 2, #1828);
+#                 #1769 merged, so the line PR #1769 was editing was free.
 #                 #8468 render P0_BYPASS_MERGE_PRIORITY
 #   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key. Held back WITH install.sh on
 #                 purpose: the template and its renderer must gain the placeholder together or the
@@ -182,7 +192,10 @@
 #     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
 #     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
 #     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
-#     suite — IS held, so this half is blocked at the CI wiring even once it is written.
+#     suite — was DONE in review round 2 (#1828): spawn-gate.test.sh is now a registered shard, and
+#     the suite's §12 residual therefore fires IN CI instead of only under a local invocation (the
+#     inert-enforcer shape a prior review on PR #1807 had falsified). #1730/#1812 still insert their
+#     own shard line in a different region of the same file, so the two do not overlap.
 # The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
 # `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
 # on tortoise main, so it is queued for porting above rather than excluded.

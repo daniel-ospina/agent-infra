@@ -412,14 +412,51 @@ ck "the rig's pi stub is EXPORTED into the callers' environment (a function beat
 # these checks exercise the gate and the refund, not the claim machinery (which has its own suite).
 fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 > "$RIG/argv7"; }
 
-fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+# ⛔ EVERY LOAD/SUCCESS ARM BELOW PINS DISK_MIN_FREE_MB=1, AND IT IS NOT COSMETIC (review round 2, P1).
+# The disk gate runs FIRST, so without this the arms are decided by THIS HOST's free space: on a box
+# with less than the shipped 1024 MiB floor — the exact state this PR exists for — each of them gets
+# AGENT_DISK_REFUSED=77 instead of the 75/0 it asserts, and six "load-gate regressions" are reported
+# that are not regressions. `drive()` above neutralises the disk gate for the same reason and says so;
+# the arms that drive the real CALLERS must do it too. Only the arm that INTENDS a disk refusal varies
+# the floor (it sets DISK_MIN_FREE_MB=9999999).
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "1" ]; }; rc=$?
 ck "fix-one.sh --argv (CONTROLLER) on a refused load exits 75 and REFUNDS fixcount 2->1 (rc=$frc, fixcount=${got:-<gone>})" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a refused fixer starts no agent and does NOT re-run the merge chain" $rc
+# ⛔ THE LOAD DIRECTION IS NAMED TOO (review round 2, P2). The disk arm below asserts the disk wording
+# is present; on its own that is satisfied by a caller which prints the DISK wording for EVERY refusal,
+# and that caller would send an operator to reclaim disk on a box whose only problem is load. Both
+# directions have to be pinned, or the pair proves nothing about the naming.
+grep -q 'fixer NOT started (load gate' "$RO/logs/fix-7.log"; rc=$?
+ck "fix-one.sh NAMES the load gate on a load refusal — the disk wording is not universal" $rc
+
+# ⛔ A STALE $O HELPER MUST NOT TURN A REFUSAL INTO A LOST ATTEMPT (review round 2, P1 — REPRODUCED).
+# The daemon executes `$O/<script>` and $O is seeded file by file, so a NEW caller can run against a
+# PRE-#1765 helper that defines AGENT_LOAD_REFUSED but NOT AGENT_DISK_REFUSED. Under `set -u` the
+# caller's `[ "$ar" = "$AGENT_DISK_REFUSED" ]` then aborts BEFORE its refund — measured on the
+# pre-fix tree: `bash: AGENT_DISK_REFUSED: unbound variable`, rc=1, fixcount left at 2 (no refund).
+# The fixture is derived FROM THE SHIPPED HELPER (only the constant's definition is removed), so it
+# tracks the file under test instead of re-implementing a pre-fix helper by hand.
+mkdir -p "$RIG/stale"
+cp "$HERE/fix-one.sh" "$RIG/stale/"
+sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
+    -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
+    "$HERE/spawn-gate.sh" > "$RIG/stale/spawn-gate.sh"
+# The transformation is ASSERTED, not assumed: if the helper stops matching those patterns the sed
+# yields an UNCHANGED file and the arm below would pass for the wrong reason.
+grep -q 'AGENT_DISK_REFUSED=' "$RIG/stale/spawn-gate.sh"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and the stale-helper fixture really carries no AGENT_DISK_REFUSED (the sed transformed it)" $rc
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$RIG/stale/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; src_=$?
+sgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
+{ [ "$src_" -eq 75 ] && [ "$sgot" = "1" ]; }; rc=$?
+ck "a STALE helper still REFUNDS a load refusal: rc=75, fixcount 2->1 (rc=$src_, fixcount=${sgot:-<gone>})" $rc
 
 # ... and the DISK refusal through the SAME caller (#1765). 77, refunded the same way — and, the
 # point of the arm, it must NAME the disk gate. The two refusals demand OPPOSITE remedies (wait for
@@ -440,7 +477,7 @@ ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $r
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
 printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 got="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
 { [ "$frc" -eq 75 ] && [ "$got" = "2" ]; }; rc=$?
@@ -452,10 +489,27 @@ ck "fix-one.sh (MANUAL/positional) refunds nothing — fixcount stays 2 (rc=$frc
 # `sleep` reparented (a disclosed, pre-existing defect), so the default 2400 would park a 40-minute
 # process per suite run. A small limit bounds the leak to seconds without changing what is proven.
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+rows_d0=0; [ -s "$RO/state/disk.tsv" ] && rows_d0="$(wc -l < "$RO/state/disk.tsv" | tr -d ' ')"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 { [ "$frc" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: gate open -> the fixer RUNS and the merge chain IS re-run (rc=$frc)" $rc
+# ⛔ THE ALLOWED RUN MUST RECORD ITS READING TOO (review round 2, P2). run_agent writes disk.tsv "for
+# ALLOWED runs too — a series that only records refusals cannot answer 'how close did we get'"
+# (spawn-gate.sh). Only the REFUSAL row was asserted, so moving that write inside the refusal branch
+# would leave the series refusal-only and this suite still green — the documented contract silently
+# gone. Assert the series GROWS by one on an allowed spawn, as the walltime checks do.
+rows_d1=0; [ -s "$RO/state/disk.tsv" ] && rows_d1="$(wc -l < "$RO/state/disk.tsv" | tr -d ' ')"
+[ "$rows_d1" = "$(( rows_d0 + 1 ))" ]; rc=$?
+ck "an ALLOWED run appends its own disk.tsv row, not only a refusal ($rows_d1 vs $rows_d0 before)" $rc
+# ⛔ AND IT RECORDS THE VOLUME THE AGENT ACTUALLY OCCUPIES (review round 2, P2 — the fix for a real
+# mis-measurement). fix-one.sh does `cd "$REPO"`, so the gate's `:-$PWD` default would be the MAIN
+# CHECKOUT while the fixer works in $WT; it now passes `DISK_GATE_PATH="$WT"` explicitly. The ledger
+# is where that is observable: the disk arms set DISK_GATE_PATH themselves, so without this assertion
+# the explicit path could be dropped from fix-one.sh and every other check here would still pass.
+dp="$(tail -1 "$RO/state/disk.tsv" 2>/dev/null | cut -f5)"
+[ "$dp" = "$RREPO/.worktrees/fix-7" ]; rc=$?
+ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path='${dp:-<none>}')" $rc
 
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
 # adopt-fix.sh and chain-merge.sh are report-then-`echo` scripts: their LAST command used to be a
@@ -480,15 +534,19 @@ for want in 0 1 75; do
   [ "$crc" -eq "$want" ]; rc=$?
   ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
 done
-printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
 [ "$arc" -eq 75 ]; rc=$?
 ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo's 0 (rc=$arc)" $rc
+# ... and the LOAD wording is named here too: the disk arm below must not be satisfiable by a wrapper
+# that reports the DISK remedy for a load refusal (review round 2, P2).
+grep -q 'fixer NOT started (load gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the load gate on a load refusal" $rc
 # ... and the SUCCESS arm too: a constant-75 wrapper would pass the line above and report every
 # successful adopt as a refusal.
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
 { [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
 ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
@@ -508,11 +566,13 @@ ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
 
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.
-: > "$PI_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+: > "$PI_LOG"; : > "$RO/logs/lane-9999.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
     bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc=$?
 { [ "$lrc" -eq 75 ] && [ ! -s "$PI_LOG" ] && [ -s "$RO/logs/prompt-9999.txt" ]; }; rc=$?
 ck "lane.sh on a refused load exits 75, writes the prompt, and NEVER spawns (rc=$lrc)" $rc
+grep -q 'load gate refused' "$RO/logs/lane-9999.log"; rc=$?
+ck "lane.sh NAMES the load gate on a load refusal" $rc
 # The DISK arm: 77 propagates out of lane.sh, and the refusal line NAMES the disk gate. lane.sh is
 # what opens a PR, so a lane refused here consumed nothing — but an operator told "load gate" would
 # re-dispatch into the same full filesystem for ever.
@@ -597,6 +657,22 @@ band="$(DISK_MIN_FREE_MB=100 DISK_WARN_FREE_MB=1 bash -c '
   printf "%s %s %s warn=%s" "$a" "$b" "$c" "$DISK_WARN_FREE_MB"' _ "$GATE")"
 [ "$band" = "allow warn warn warn=200" ]; rc=$?
 ck "AT the floor the gate ALLOWS and still WARNS — an empty band is not a warning ($band)" $rc
+# ⛔ THE BAND MUST STAY INSIDE THE FILE'S OWN RANGE (review round 2, P2). `is_limit` accepts 9 digits,
+# so it accepts floor=999999999 — but the band is 4x the floor, and 4 x 999999999 is 3999999996: TEN
+# digits, out of range by the very predicate that guards a PROVIDED warn. Every later guard ACCEPTS
+# it (it IS `> floor`), so the "an out-of-range value is repaired" contract above was false, and the
+# band sat above every real device — `disk_low` returns true on EVERY spawn, i.e. a PERMANENT warning
+# instead of a signal. Assert the INVARIANT, not the one value: whatever the operator sets, the band
+# is within the limit AND strictly above the floor. (Pre-fix this prints
+# `out-of-range warn=3999999996 (len=10)`; the shape is §4's MAX_LOAD fallback, which already falls
+# back to the default on a derivation that produces 10+ digits.)
+over="$(DISK_MIN_FREE_MB=999999999 bash -c '
+  . "$1"
+  len="${#DISK_WARN_FREE_MB}"
+  if [ "$len" -le 9 ] && [ "$DISK_WARN_FREE_MB" -gt "$DISK_MIN_FREE_MB" ]; then echo ok;
+  else echo "out-of-range warn=$DISK_WARN_FREE_MB (len=$len) floor=$DISK_MIN_FREE_MB"; fi' _ "$GATE")"
+[ "$over" = "ok" ]; rc=$?
+ck "a floor at the top of is_limit is repaired so the band stays IN RANGE and strictly above it ($over)" $rc
 # ⛔ A DISK REFUSAL MUST OUTRANK A LOAD REFUSAL (review round 1, P1). With the load gate first, a
 # saturated box with a full filesystem reported ONLY the load refusal — sending the operator to wait
 # for load to fall, a remedy that cannot free a filesystem. Both are true at once, so the
@@ -669,22 +745,39 @@ ck "an UNREADABLE probe fails OPEN — an unanswerable probe is not evidence of 
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not silently permissive" $rc
 
-# ── 12) a suite nothing RUNS is not a gate ──────────────────────────────────────
-# This file is not yet a registered CI shard: scripts/run-bash-shards.sh is held by concurrent lanes
-# (PR #1769/#1730), so the entry cannot be added from here. The problem is SILENCE — a suite that is
-# present but unwired gets forgotten. So the residual is asserted as an EQUALITY: exactly one
-# orchestrator-harness suite is unwired, and it is this one. Wiring it turns this red until it is
-# moved to the empty-want arm; adding a SECOND unwired suite turns it red too.
+# ── 12) a suite nothing RUNS is not a gate ──────────────────────────────
+# ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that
+# stood here said `scripts/run-bash-shards.sh` was "held by concurrent lanes (PR #1769/#1730), so the
+# entry cannot be added from here". #1769 is MERGED (a5fa100, an ancestor of this head) — and, more to
+# the point, the equality that sentence justified COULD NEVER FIRE, because nothing ran the suite.
+# That is the inert-enforcer shape a prior review on PR #1807 had already falsified: "the assertion
+# cannot fire, so the residual can go quiet — indefinitely". The entry is now in the shard list, so a
+# regression in ANY check above fails `bash-suites` on every PR; UN-wiring it is a visible diff in the
+# shard list, which is where that decision belongs.
+# The check below still asserts the SUITE POPULATION, because the failure it guards is SILENCE. Two
+# harness suites are deliberately NOT in the shard list — README §suites records both as "Not part of
+# the loop" (they drive the claim CAS against a live origin from throwaway clones, i.e. they need a
+# network remote): test-claims.sh and test-crossbox.sh. Any OTHER unwired suite turns this red.
+# ⛔ AND THE POPULATION IS ENUMERATED BY BOTH GLOBS (review round 2, P2). A `*.test.sh`-only glob
+# cannot see `test-claims.sh`/`test-crossbox.sh` at all, so the previous EQUALITY reported green while
+# its own sentence ("the only unwired suite is this one") was FALSE on the tree it ran on — a false
+# PASS in the one guard whose job is to notice an unwired suite.
 SHARDS="$(cd "$HERE/.." && pwd)/run-bash-shards.sh"
+# ...and THIS suite's own entry is asserted first: the population check below is executed by the very
+# suite it speaks about, so a run that reaches here proves the entry is present. (The lane reads
+# `run-bash-shards.sh --list`; this is the run-time half.)
+grep -q 'spawn-gate.test.sh' "$SHARDS"; rc=$?
+ck "this suite IS listed in run-bash-shards.sh — its checks run in CI, not only on a local invocation" $rc
 unwired=""
-for f in "$HERE"/*.test.sh; do
+for f in "$HERE"/*.test.sh "$HERE"/test-*.sh; do
+  [ -f "$f" ] || continue
   b="$(basename "$f")"
   grep -q "$b" "$SHARDS" 2>/dev/null || unwired="$unwired $b"
 done
 unwired="${unwired# }"
-[ "$unwired" = "spawn-gate.test.sh" ]; rc=$?
+[ "$unwired" = "test-claims.sh test-crossbox.sh" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      unwired suites: [${unwired:-<none>}]"
-ck "the only orchestrator-harness suite NOT wired into run-bash-shards.sh is this one [$unwired]" $rc
+ck "the orchestrator-harness suites NOT wired into run-bash-shards.sh are exactly the two documented non-loop ones [$unwired]" $rc
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

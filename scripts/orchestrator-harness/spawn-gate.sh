@@ -136,6 +136,17 @@ is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=1024
 # A 0 floor would make `[ "$mb" -ge 0 ]` true for every reading — a gate that can never refuse,
 # i.e. the no-op gate this whole file is written against. Same shape as the `_NCPU` zero guard above.
 [ "${DISK_MIN_FREE_MB:-0}" -ge 1 ] || DISK_MIN_FREE_MB=1024
+# ⛔ AND THE FLOOR MUST LEAVE THE BAND HEADROOM (review round 2, P2). `is_limit` accepts 9 digits, so
+# it accepts `DISK_MIN_FREE_MB=999999999` — but the band is 4x the floor, and 4 x 999999999 is
+# 3999999996: TEN digits, i.e. OUT OF RANGE by the very predicate that guards a PROVIDED warn. Every
+# later guard ACCEPTS it (it is `> floor`), so the "repairs an out-of-range value at SOURCE time"
+# claim above would be false, and the band would sit above every real device — `disk_low` then returns
+# true on EVERY spawn, turning the "a device that fills SILENTLY is the defect" warning into a
+# constant, ignorable one. The failure mode is the same as the MAX_LOAD rule below — "the fallback
+# must be a true default, NOT a re-derivation": a floor whose derived band cannot be expressed in
+# this file's own range is out of range FOR THIS FILE'S PURPOSE and is repaired as one. The widest
+# floor that still admits an in-range band is 249999999 (4x it is 999999999).
+[ "${DISK_MIN_FREE_MB:-0}" -le 249999999 ] || DISK_MIN_FREE_MB=1024
 # The WARNING BAND — a device that fills SILENTLY is the defect, so the cell says so while it can
 # still act. 4x the floor is `cloud-cell-supervisor.sh`'s `check` warning band; that file's
 # UNATTENDED prune trigger is narrower (2x, `cmd_start`), and the two are not interchangeable.
@@ -217,8 +228,15 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # subshell that kills it after N seconds. The stale-worker reaper in orch-loop.sh is the second line
 # of defence.
 #
-# Gated: above MAX_LOAD it does not start the agent at all and returns AGENT_LOAD_REFUSED. That code
-# is the caller's signal that NO AGENT RAN — distinct from "the agent ran and failed", because
+# Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
+# AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting) or
+# AGENT_LOAD_REFUSED (75, which clears when the box quietens). The code selects the REMEDY.
+# ⛔ THE SIGNAL THAT NO AGENT RAN IS `AGENT_STARTED=0`, NOT EITHER CODE (review round 2, P2).
+# AGENT_STARTED is set before both gates and only cleared on a real spawn, so it cannot be produced by
+# a refusal and is not shared with `pi`'s own exit statuses; a caller that keys on 75 alone will
+# mis-read a disk refusal, and a caller that keys on the exit status alone will mis-read a `pi` that
+# exited 75 for its own reason. That is why the early contract here named only the load gate, and
+# after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
 # merge-one.sh records a `needsfix-<PR>-<head>` marker for the latter. Recording one for a load
 # refusal would authorise a fixer for a review that never happened, burn a MAX_FIX_TRIES attempt and
 # eventually park the PR (the same failure class as agent-infra#1716).
@@ -247,10 +265,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # caller-side naming exists to remove. A disk refusal never clears on its own; a load refusal does.
   # Both are true at once, so the un-clearable one has to be the one reported.
   #
-  # DISK_GATE_PATH names the volume; the default is the caller's cwd, which for both ported callers
-  # is the worktree the agent will run in — exactly where `uv sync` writes its venv and where the
-  # ENOSPC of 2026-10-15 landed. On a cell the harness's own `$O` and the worktree share /dev/root,
-  # so one reading covers both; the override exists for a box that splits them.
+  # DISK_GATE_PATH names the volume; the default is the caller's OWN CWD — and that is deliberately
+  # not claimed to be the agent's worktree (review round 2, P2: the earlier comment said it was, and
+  # for fix-one.sh it is not). lane.sh is launched with its cwd inside the worktree, so its default is
+  # right; fix-one.sh does `cd "$REPO"` and only NAMES the worktree in the agent's prompt, so it
+  # passes the volume explicitly (`DISK_GATE_PATH="$WT"`) instead of silently measuring the main
+  # checkout — which is the whole point, because `uv sync` writes its venv in the WORKTREE and that is
+  # where the ENOSPC of 2026-10-15 landed. On a cell `$O`, `$REPO` and the worktree share /dev/root,
+  # so one reading covers both; the override exists for a box that splits them, and it must be GIVEN
+  # there rather than assumed.
   local dfree dpath
   dpath="${DISK_GATE_PATH:-$PWD}"
   dfree="$(disk_free_mb "$dpath")"

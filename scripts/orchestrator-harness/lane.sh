@@ -62,7 +62,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
   # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
   # on a full filesystem waits for a remedy that cannot arrive.
-  if [ "$rc" = "$AGENT_DISK_REFUSED" ]; then
+  # ⛔ TOLERANT REFERENCE (review round 2, P2). `$O` is seeded file by file, so a NEW lane.sh can run
+  # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
+  # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
+  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
+  if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   else
     echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"

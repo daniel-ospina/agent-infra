@@ -174,7 +174,14 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
-run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ THE VOLUME IS THE WORKTREE, AND IT MUST BE PASSED EXPLICITLY (review round 2, P2). This script
+# does `cd "$REPO"` (above) and only NAMES the worktree inside the agent's prompt, so `$PWD` here is
+# the MAIN CHECKOUT — the gate's `DISK_GATE_PATH:-$PWD` default would measure a directory the agent
+# never writes to. That is latent on a cell ($WT lives under $REPO/.worktrees, one volume) and real on
+# a box that splits them: a healthy main checkout would let the fixer start onto a full worktree
+# volume, which is the precise "cannot name the volume that actually fills" failure #1765 exists to
+# remove. `uv sync` writes the venv in $WT, so $WT is the reading that matters.
+DISK_GATE_PATH="$WT" run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
 # ⛔ THE GATE'S OWN CODE, captured immediately. It is the ONLY thing that distinguishes the two
 # refusals below, and `$?` read after any later command would be that command's status (§7.4).
 ar=$?
@@ -191,7 +198,17 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # clears on its own — no amount of waiting frees a filesystem. Naming a disk refusal "load gate"
   # sends the operator to wait for an event that cannot fix it, which is the instrument false
   # positive this file's callers exist to avoid.
-  if [ "$ar" = "$AGENT_DISK_REFUSED" ]; then
+  # ⛔ TOLERANT REFERENCE, AND THE REASON IS A REAL SKEW (review round 2, P2 — REPRODUCED). The daemon
+  # executes `$O/<script>` and $O is seeded file by file (cloud-cell-supervisor.sh's seed_and_stamp),
+  # so a NEW caller can run against an OLD `$O/spawn-gate.sh` — the pre-#1765 helper defines
+  # AGENT_LOAD_REFUSED but NOT AGENT_DISK_REFUSED. Under `set -u` that reference aborts HERE, BEFORE
+  # the refund below: measured `bash: AGENT_DISK_REFUSED: unbound variable`, rc=1, fixcount unchanged —
+  # three such refusals park a PR "needs a human" having never run a fixer, exactly the
+  # agent-infra#1720 failure the refund exists to prevent. The default is CORRECT, not merely safe: a
+  # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
+  # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
+  # survived.
+  if [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
