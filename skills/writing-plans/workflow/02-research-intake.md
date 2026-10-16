@@ -74,7 +74,7 @@ Optional 4th call when warranted:
 **Hard rules:**
 
 - **Multi-call != multi-question single call.** A single perplexity call with three questions packed in is ONE call from the model's perspective — one synthesis biased by one framing. Use **separate invocations** of `mcp__seo-intelligence__perplexity_research`, one per framing.
-- **Parallel-safe.** The 3+ calls per bucket are independent and SHOULD be issued in parallel (multiple tool calls in one message).
+- **Bounded concurrency, not an unbounded fan-out.** The 3+ calls per bucket are independent, but Perplexity rate-limits concurrent calls — HTTP 429 `request_rate_limit_exceeded` (the `research` skill's Step 3 measures 1-2 of 4-5 concurrent calls surviving; sequential calls succeed). Issue **at most 2 in flight** (2-wide or sequential), retry a 429'd call serially with a short backoff, and carry the `attempted / returned` counts into the bucket write-up — a truncated batch must not read as complete. **This does not repeal the rule above:** batching framings into one call is still forbidden; the fix is the fan-out width, never the call count. **If a call still 429s after that serial retry, the Fallback below governs — PAUSE and ask the user with the completed-call count; never auto-select (b) or (c).**
 - **Cite the framing in the synthesized output.** When writing into `### Pattern Research`, label which framing produced which conclusion ("Canonical: X. Competitor variance: Y. Known pitfall: Z.").
 - **Per-bucket call count is a floor, not a ceiling.**
 

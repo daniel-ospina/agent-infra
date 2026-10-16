@@ -113,7 +113,7 @@ git commit -m "feat: add specific feature"
 
 | Mistake | Fix |
 |---------|-----|
-| Batching all 3+ framings into one perplexity call to save latency | Single batched call = one synthesis biased by one framing. Issue **separate** invocations per framing; parallel-safe |
+| Batching all 3+ framings into one perplexity call to save latency | Single batched call = one synthesis biased by one framing. Issue **separate** invocations per framing, but **at most 2 in flight** (a wider fan-out 429s and truncates the batch — `research` Step 3 / `02-research-intake.md`), and report `attempted / returned` |
 | Silently skipping the gate when perplexity 401/402/429s | PAUSE and ask the user. Default to option (a) — never auto-pick (b) or (c) |
 | Skipping the gate because the design seems clear | A clear approach is not a reason to skip |
 | Re-firing the gate for libraries already verified upstream | Cite the prior finding — don't re-research what's already triangulated |
