@@ -351,10 +351,21 @@ cmd_check() {
 
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
-# non-directory `$O` (or a read-only one, or a full disk) let the run finish with `checked 0; backlog
-# now` at rc 0 having persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits
-# RUNNING with `lanes: 0` — the merge-only shape this change exists to remove (#1853 review).
+# state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
+# persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
+# — the merge-only shape this change exists to remove (#1853 review).
 mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O"; exit "$EXIT_TRANSIENT"; }
+# ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
+# directory, where every write below fails. Those failures are invisible in exactly the way that
+# matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
+# stale pool, and the pass reports `checked N; backlog now M` at rc 0 having persisted nothing. A probe
+# write at entry makes it ONE named refusal instead (#1853 review). A write failure that only BEGINS
+# mid-run (a disk that fills afterwards) is still absorbed by the loop's appends — a declared residual.
+if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
+  echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
+  exit "$EXIT_TRANSIENT"
+fi
+rm -f "$O/.write-probe"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 gh_env_verdict || exit $?
@@ -537,6 +548,10 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
 # inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
 # pipeline's subshell, so the parent sees it.
+# ⛔ AND AN UNWRITTEN POOL IS NOT AN EMPTY ONE. The test for that is the redirect's STATUS, not the
+# FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
+# redirect failed, and the stale pool was then read as this run's backlog — `checked N; backlog now M`
+# at rc 0 over a run that persisted nothing (#1853 review).
 rm -f "$O/.pool-err"
 {
   gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
@@ -545,12 +560,10 @@ rm -f "$O/.pool-err"
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err" || echo "P1-severe" >> "$O/.pool-err"
   gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err" || echo "P2-moderate" >> "$O/.pool-err"
-} | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
-
-# ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE. A present-but-EMPTY `.pool` is a legitimate answer (no
-# unassigned P0/P1/P2), so the test is on the FILE, not on its contents: if the redirect did not even
-# create it, the pool was never persisted and everything below reads a backlog that does not exist.
-[ -f "$O/.pool" ] || { echo "[refresh] ABORT: $O is not writable — the candidate pool was not written"; exit "$EXIT_TRANSIENT"; }
+} | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool" || {
+  echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
+  exit "$EXIT_TRANSIENT"
+}
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
 # WHICH host would come back, and a marker only a human can clear must not be latched on a guess.

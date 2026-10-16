@@ -524,6 +524,32 @@ case "$OUT" in
   *) ok "unwritable \$O: no \"checked N; backlog now 0\" over a state dir that was never written" ;;
 esac
 
+# The shape a FILE-existence test cannot see: `mkdir -p` SUCCEEDS on an existing read-only directory,
+# and a STALE `.pool` from the previous run then satisfies `[ -f "$O/.pool" ]` — so the pass read the
+# stale pool, reported `checked N; backlog now M` at rc 0, and persisted nothing (the writes to
+# checked.txt / candidates.txt failed silently). Only a WRITE can tell a writable dir from a present
+# one (#1853 review).
+echo; echo "── a READ-ONLY state dir with a stale pool is refused, not reported as a backlog ──"
+mk_case readonly-o
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 77\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+RF_PATH="$D/bin:$PATH" rf "$D" refresh               # a first, healthy run, so the stale state is real
+printf '99\n' > "$D/o/.pool"                         # a STALE pool the next run must not inherit
+chmod -R a-w "$D/o"
+rf "$D" refresh
+chmod -R u+w "$D/o" 2>/dev/null || true              # so the case's temp dir can be cleaned up
+[ "$RC" -eq 1 ] && ok "read-only \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "read-only \$O: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"not WRITABLE"*) ok "read-only \$O: the abort says the state dir is not writable" ;;
+  *) bad "read-only \$O: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"backlog now 1"*|*"+#99"*) bad "read-only \$O: read the STALE pool as this run's backlog — output: $OUT" ;;
+  *) ok "read-only \$O: the stale pool is not reported as this run's backlog" ;;
+esac
+
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
 # cmd_check and cloud-cell-bringup.sh's check_gh (which its check_dispatch calls) each ALREADY run
 # `gh auth status` themselves (under $CELL_HOME), and orchestrator-harness's selftest pins exactly
