@@ -3076,6 +3076,147 @@ assert_not_contains "$OUT" 'class=merged (fallback if -d refuses)' "F14: the unr
 
 cd "$REPO"
 echo ""
+echo "== 40. an EMPTY classified tip refuses the force-delete; update-ref -d never gets an empty old value (F15) =="
+# `git update-ref -d <ref> <old>` refuses unless the ref's current value equals
+# <old> — but an EMPTY <old> disables that comparison and deletes
+# UNCONDITIONALLY. `$sha` comes from the classification's `%(objectname)` field,
+# and the delete-time pre-check that would otherwise reject an empty value is —
+# by the script's own comment — NOT the safety mechanism. The shipped parsers
+# make an empty tip UNREACHABLE through the merged gate: the PR map's
+# `merged_ok_lookup` is `br:<oid>`, and `read` with IFS=TAB collapses an empty
+# `<oid>` so its `baseRefName` field shifts away — the branch lands off-base and
+# is kept. That construction is exactly why the guard must not DEPEND on it. To
+# exercise the guard, the condition is FORCED on a COPY of the script (never the
+# worktree file): one injected line empties the classified tip for the target
+# branch AFTER the gate has classified it, simulating the field-shift the
+# classification comment itself warns about. A git wrapper also answers the
+# delete-time pre-check with nothing, so the atomic swap is reached. `f15-ok` is
+# the positive control: the same shape with a resolvable tip must still be reaped
+# by the atomic swap.
+F15_ORIGIN="$FIX/f15-origin.git"
+F15_REPO="$FIX/f15-repo"
+new_repo "$F15_REPO" "$F15_ORIGIN"
+cd "$F15_REPO"
+echo base > f15.txt; git add f15.txt; old_commit "init"; git push -q origin main
+F15_MAIN_SHA="$(git rev-parse main)"
+F15_TREE="$(git rev-parse "$F15_MAIN_SHA^{tree}")"
+F15_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F15_TREE" -p "$F15_MAIN_SHA" -m "f15-squash")"
+git update-ref refs/heads/f15-empty "$F15_SHA"
+git update-ref refs/heads/f15-ok "$F15_SHA"
+F15_MAP="$FIX/f15-pr-map.json"
+cat > "$F15_MAP" <<JSON
+[
+  {"headRefName":"f15-empty","state":"MERGED","headRefOid":"$F15_SHA","baseRefName":"main"},
+  {"headRefName":"f15-ok","state":"MERGED","headRefOid":"$F15_SHA","baseRefName":"main"}
+]
+JSON
+# The forced-condition copy. `index()` is a LITERAL substring match — the anchor
+# carries regex metacharacters (`${`, `}`) that a regex would misread.
+F15_DOC="$FIX/f15-doc"
+mkdir -p "$F15_DOC"
+awk -v inj='        if [ "$br" = "$F15_FORCE_EMPTY_TIP" ]; then sha=""; fi' '
+    index($0, "delete_list=\"${delete_list}${cls}\"") > 0 { print inj }
+    { print }
+' "$SCRIPT" > "$F15_DOC/cleanup-stale-branches.sh"
+if bash -n "$F15_DOC/cleanup-stale-branches.sh"; then
+    ok "F15: the forced-condition copy is syntactically valid"
+else
+    bad "F15: the forced-condition copy is syntactically invalid"
+fi
+F15_REAL_GIT="$(command -v git)"
+F15_WRAP="$FIX/f15-wrap"
+mkdir -p "$F15_WRAP"
+cat > "$F15_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F15): answer the plan/delete-time pre-check for the target branch
+# with nothing (the ref appears unresolvable), so the atomic swap is reached.
+# Every other call delegates to the real git.
+REAL_GIT="${F15_REAL_GIT:?F15_REAL_GIT unset}"
+BR="${F15_BRANCH:?F15_BRANCH unset}"
+if [ "$1" = "rev-parse" ]; then
+    for _a in "$@"; do
+        if [ "$_a" = "refs/heads/$BR" ]; then
+            exit 1
+        fi
+    done
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F15_WRAP/git"
+# Dry run: the plan must NOT advertise a fallback whose old value is empty —
+# pasting it would be an unconditional delete, and execution refuses that swap.
+run_script env PATH="$F15_WRAP:$PATH" F15_REAL_GIT="$F15_REAL_GIT" F15_BRANCH="f15-empty" \
+    F15_FORCE_EMPTY_TIP="f15-empty" \
+    bash "$F15_DOC/cleanup-stale-branches.sh" --repo "$F15_REPO" --scope local --pr-map-file "$F15_MAP"
+assert_eq "$RC" "0" "F15: the dry-run pass still exits 0"
+assert_contains "$OUT" 'git branch -d -- f15-empty   # class=merged' "F15: the -d plan line is still printed"
+assert_not_contains "$OUT" 'git update-ref -d refs/heads/f15-empty' \
+    "F15: NO fallback is advertised when the CLASSIFIED tip is empty (an empty old value deletes unconditionally) (F15)"
+assert_contains "$OUT" 'git update-ref -d refs/heads/f15-ok' \
+    "F15: the normal fallback IS still advertised for a RESOLVABLE tip (no under-advertisement) (F15)"
+# Execute: the empty-tip swap must be REFUSED and the branch must survive.
+run_script env PATH="$F15_WRAP:$PATH" F15_REAL_GIT="$F15_REAL_GIT" F15_BRANCH="f15-empty" \
+    F15_FORCE_EMPTY_TIP="f15-empty" \
+    bash "$F15_DOC/cleanup-stale-branches.sh" --repo "$F15_REPO" --scope local --execute --pr-map-file "$F15_MAP"
+assert_eq "$RC" "1" "F15: an empty classified tip fails the sweep (non-zero) (F15)"
+assert_match "$OUT" '^  failed +merged +f15-empty ' "F15: the empty-tip branch is reported FAILED, never deleted (F15)"
+assert_no_match "$OUT" '^  deleted +merged +f15-empty ' "F15: the empty-tip branch is NOT reported deleted (F15)"
+if git -C "$F15_REPO" rev-parse -q --verify refs/heads/f15-empty >/dev/null 2>&1; then
+    ok "F15: the branch SURVIVES (no unconditional update-ref -d with an empty old value) (F15)"
+else
+    bad "F15: the branch was DELETED via an empty old value — the invariant was not local to the swap (F15)"
+fi
+assert_branch_absent f15-ok "F15: the positive control (a RESOLVABLE tip) is still reaped through the atomic swap"
+assert_contains "$OUT" "via update-ref -d: squash-merged PR" "F15: the normal force-delete path is unchanged"
+
+cd "$REPO"
+echo ""
+echo "== 41. a successful force-delete ALSO removes branch.<b>.* config, matching git branch -D (F16) =="
+# `git branch -D` removes the `branch.<b>.*` section; `git update-ref -d` does
+# not, so pre-fix a later branch created under the same name inherited a stale
+# upstream that this sweep's own `-d` and its plan prediction then consulted.
+# `f16-nocfg` has NO such section: removing a missing section must not fail the
+# run (git branch -D is equally silent when there is nothing to remove).
+F16_ORIGIN="$FIX/f16-origin.git"
+F16_REPO="$FIX/f16-repo"
+new_repo "$F16_REPO" "$F16_ORIGIN"
+cd "$F16_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F16_SCRIPT="$F16_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f16.txt; git add f16.txt; old_commit "init"; git push -q origin main
+F16_MAIN_SHA="$(git rev-parse main)"
+F16_TREE="$(git rev-parse "$F16_MAIN_SHA^{tree}")"
+F16_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F16_TREE" -p "$F16_MAIN_SHA" -m "f16-squash")"
+git update-ref refs/heads/f16-cfg "$F16_SHA"
+git update-ref refs/heads/f16-nocfg "$F16_SHA"
+# the stale upstream the pre-fix path left behind (update-ref -d does not touch it);
+# no `.merge`, so the branch has no complete upstream and `-d` compares against HEAD.
+git config branch.f16-cfg.remote origin
+F16_MAP="$FIX/f16-pr-map.json"
+cat > "$F16_MAP" <<JSON
+[
+  {"headRefName":"f16-cfg","state":"MERGED","headRefOid":"$F16_SHA","baseRefName":"main"},
+  {"headRefName":"f16-nocfg","state":"MERGED","headRefOid":"$F16_SHA","baseRefName":"main"}
+]
+JSON
+assert_eq "$(git config --get branch.f16-cfg.remote || echo ABSENT)" "origin" \
+    "F16: the fixture starts with branch.f16-cfg.remote configured"
+run_script bash "$F16_SCRIPT" --repo "$F16_REPO" --scope local --execute --pr-map-file "$F16_MAP"
+assert_eq "$RC" "0" "F16: the execute pass succeeds (a missing config section is not an error)"
+assert_branch_absent f16-cfg "F16: the configured branch is force-deleted"
+assert_branch_absent f16-nocfg "F16: the unconfigured branch is force-deleted"
+assert_eq "$(git config --get branch.f16-cfg.remote || echo ABSENT)" "ABSENT" \
+    "F16: branch.f16-cfg.remote is REMOVED (parity with git branch -D)"
+assert_contains "$OUT" "Deleted:   2" "F16: both branches are counted deleted"
+assert_contains "$OUT" "Failed:    0" "F16: no branch is reported failed"
+
+cd "$REPO"
+echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

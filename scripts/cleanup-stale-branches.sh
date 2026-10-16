@@ -125,14 +125,23 @@
 # guard: git itself refuses when the tip is not merged, so it cannot force-delete.
 #
 # ⛔ `update-ref -d` is NOT `git branch -D`, so the delete path does NOT inherit
-# `-D`'s two refusals. (1) It does NOT refuse a CHECKED-OUT branch (`-D` does;
-# verified: `update-ref -d` removes the checked-out branch and leaves HEAD
+# `-D`'s CHECKED-OUT refusal. It does NOT refuse a CHECKED-OUT branch (`-D`
+# does; verified: `update-ref -d` removes the checked-out branch and leaves HEAD
 # dangling), so the delete path re-enumerates the worktrees immediately before
 # the swap and refuses on its own — the classification's `worktree:` keep rule is
-# not relied on across the window. (2) It DOES remove `logs/refs/heads/<br>`
-# exactly as `-D` does, but it does NOT remove the `branch.<br>.*` config section
-# `-D` cleans up; that orphan is left deliberately (it is only read while the
-# branch exists) and no path here reaches `-D`'s cleanup.
+# not relied on across the window. In every other respect the path now matches
+# `-D`: it removes `logs/refs/heads/<br>` itself, and after a SUCCESSFUL swap it
+# removes the `branch.<br>.*` config section too (F16), so a branch recreated
+# with the same name does not inherit a stale upstream.
+#
+# ⛔ AN EMPTY `<old>` IS AN UNCONDITIONAL DELETE (F15). `git update-ref -d <ref>
+# <old>` compares and refuses — but ONLY when <old> is non-empty: with an empty
+# <old> git performs NO comparison and removes the ref unconditionally (verified
+# on git 2.50.1: rc=0, ref gone). The compare-and-swap argument above therefore
+# assumes a non-empty classified tip. `$sha` comes from the classification's
+# `%(objectname)` field, and the pre-check that would otherwise reject an empty
+# value is — by its own comment above — NOT the safety mechanism, so the guard
+# lives WITH the swap and refuses the force-delete when `$sha` is empty.
 #
 # Deletion mechanics (remote): the classification reads
 # refs/remotes/origin/<br>, but the destructive action targets origin's REAL
@@ -1605,19 +1614,46 @@ run_local_scope() {
                             failed=$((failed + 1))
                             continue ;;
                     esac
+                    # ⛔ AN EMPTY `$sha` TURNS THE SWAP INTO AN UNCONDITIONAL
+                    # DELETE (F15). `git update-ref -d <ref> <old>` refuses
+                    # unless the ref's current value equals <old> — but with an
+                    # EMPTY <old> git does NO comparison at all and removes the
+                    # ref (verified on git 2.50.1: rc=0, ref deleted). Nothing
+                    # here guarantees `$sha` is non-empty: it comes from the
+                    # classification's `%(objectname)` field, and the pre-check
+                    # above is — by its own comment — NOT the safety mechanism.
+                    # The invariant must be LOCAL to the swap, so refuse the
+                    # force-delete whenever the classified tip is empty rather
+                    # than hand git an old value that disables the comparison.
+                    # Reported `failed` (never `deleted`), so the sweep exits
+                    # non-zero.
+                    if [ -z "$sha" ]; then
+                        printf '  failed  %-10s %s (classified tip was UNRESOLVABLE; refused an unconditional update-ref -d)\n' "$cls" "$br"
+                        failed=$((failed + 1))
+                        continue
+                    fi
                     # (b) `git update-ref -d` DOES remove logs/refs/heads/<br>
-                    # exactly as `git branch -D` does (verified). It does NOT
-                    # remove the `branch.<br>.*` config section that `-D` also
-                    # cleans up, and no path here reaches that cleanup: the
-                    # orphaned section is harmless (only read while the branch
-                    # exists) and is left deliberately. `update-ref -d` is NOT
-                    # `git branch -D`; do not assume parity.
+                    # exactly as `git branch -D` does (verified), and after a
+                    # SUCCESSFUL swap the `branch.<br>.*` config section is
+                    # removed below (F16) — so the two agree on config as well as
+                    # on the reflog. The ONE residual difference is that `-d`
+                    # does not refuse a CHECKED-OUT branch, which the worktree
+                    # guard above handles explicitly.
                     if git update-ref -d "refs/heads/$br" "$sha" >/dev/null 2>&1; then
                         # Squash-merged AND unmoved: the classification already
                         # proved the local tip IS the revision the PR merged (it
                         # equalled headRefOid), so `-d` refused only because the
                         # squash commit is not an ancestor of main. The atomic
                         # old-value check is correct ONLY here.
+                        #
+                        # (F16) `git branch -D` also drops the `branch.<br>.*`
+                        # config section; `update-ref -d` does not. Remove it so
+                        # a branch later recreated under the same name does not
+                        # inherit a stale upstream that this sweep's own `-d`
+                        # and its plan prediction would then consult. A MISSING
+                        # section must not fail the run — `git branch -D` is
+                        # equally silent when there is nothing to remove.
+                        git config --remove-section "branch.$br" >/dev/null 2>&1 || true
                         printf '  deleted %-10s %s (via update-ref -d: squash-merged PR)\n' "$cls" "$br"
                         deleted=$((deleted + 1))
                     else
@@ -1707,6 +1743,12 @@ run_local_scope() {
                     #     reappeared at exactly <sha>. Suppressing the line would
                     #     risk UNDER-advertising a delete execution may still
                     #     perform in that case.
+                    # ⛔ EXCEPT when the CLASSIFIED tip itself is empty (F15).
+                    # An empty <old> makes `update-ref -d` delete UNCONDITIONALLY,
+                    # so pasting the advertised line would be a force-delete that
+                    # is safe by NOTHING — and execution now refuses exactly that
+                    # swap, so the plan must not advertise it either (the
+                    # `[ -n "$sha" ]` on the print below).
                     dry_needs_force=1
                     dry_reason="(fallback only if the tip is still $sha when this runs; tip unresolvable at plan time — the atomic update-ref -d refuses any other tip)"
                 elif [ "$dry_tip" != "$sha" ]; then
@@ -1736,7 +1778,7 @@ run_local_scope() {
                         dry_reason="(fallback if -d refuses)"
                     fi
                 fi
-                if [ "$dry_needs_force" = 1 ]; then
+                if [ "$dry_needs_force" = 1 ] && [ -n "$sha" ]; then
                     # ⛔ The fallback is the SAME atomically-checked swap the
                     # execute path runs (`git update-ref -d <ref> <old>`), not
                     # `git branch -D`: evaluating the printed line re-parses to
