@@ -140,6 +140,10 @@ ln -s "$FIX/hub-alias/extensions/builtin-tools" "$FARM649/alias-tool"
 ( cd "$FARM649" && ln -s ../hub/extensions/builtin-tools rel-tool )     # RELATIVE target into the hub
 ln -s "$HUB/extensions/redirect" "$FARM649/redirect-tool"              # parent=hub_ext, final escapes
 ln -s "$FIX/foreign/extensions/links-into-hub" "$FARM649/indirect-tool" # parent=foreign, final enters
+# A trailing slash on the TARGET must not defeat resolution: `test -L a/` is false
+# even when `a` is a symlink, so both directions regress if the slash is not stripped.
+ln -s "$HUB/extensions/redirect/" "$FARM649/redirect-slash"
+ln -s "$FIX/foreign/extensions/links-into-hub/" "$FARM649/indirect-slash"
 # The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
 # intended (anchor-safe) deployment, not the #649 defect.
 out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
@@ -154,7 +158,9 @@ assert_contains "$out" "$FARM649/alias-tool -> $FIX/hub-alias/extensions/builtin
 assert_contains "$out" "$FARM649/rel-tool -> " "a RELATIVE target that resolves into the hub is named"
 assert_contains "$out" "farm649/../hub/extensions/builtin-tools" "…and its relative target is shown"
 assert_contains "$out" "$FARM649/indirect-tool -> $FIX/foreign/extensions/links-into-hub" "a link whose FINAL component resolves INTO the hub is named (pre-fix: silently missed)"
+assert_contains "$out" "$FARM649/indirect-slash -> $FIX/foreign/extensions/links-into-hub/" "a TRAILING-SLASH target that resolves INTO the hub is still named"
 assert_not_contains "$out" "redirect-tool" "a link whose FINAL component escapes the hub is not named (pre-fix: mis-attributed)"
+assert_not_contains "$out" "redirect-slash" "a TRAILING-SLASH target that escapes the hub is still not named"
 assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
 git -C "$HUB" checkout -q main
 rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias"

@@ -307,6 +307,7 @@ extensions_farm_root() { printf '%s\n' "${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent
 
 # physical_path <path> — the fully-resolved physical path: every symlink followed
 # (final component AND every directory on the way) and every component canonicalized.
+# A trailing slash is normalized off first (see below) — it is what makes `-L` lie.
 # Portable on purpose: BSD/macOS `readlink` has no `-f`, and this repo's operators are
 # on macOS (the #649 evidence is a /Users path), so the walk is explicit. Bounded at
 # 40 hops, so a symlink cycle prints the best resolution it reached rather than looping;
@@ -314,6 +315,12 @@ extensions_farm_root() { printf '%s\n' "${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent
 # the caller's `set -e` command substitution cannot be tripped).
 physical_path() { # $1=path
   local p="$1" hop=0 base dir final
+  # A TRAILING SLASH must come off FIRST: `test -L a/` is FALSE even when `a` is a
+  # symlink (POSIX resolves the slash as a directory reference), so the walk below
+  # would skip the final component, `dirname`/`basename` would then split `a/`
+  # lexically, and the caller would treat the symlink as an ordinary child — the
+  # exact mis-attribution / silent-miss the walk exists to prevent. Keep a bare "/".
+  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
   while [ -L "$p" ] && [ "$hop" -lt 40 ]; do
     base="$(readlink "$p" 2>/dev/null)" || break
     case "$base" in
