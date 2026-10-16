@@ -17,6 +17,64 @@ set -u
 OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
+
+# ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
+# WHY THIS LIVES HERE AND NOT ONLY IN cloud-cell-bringup.sh. Bring-up already names this as friction
+# #1 (`cmux vm exec` runs as user `cmux` with HOME=/home/ubuntu, which is NOT created on the image,
+# so anything that writes $HOME dies) and repairs it — inside its OWN process. A repair in bring-up's
+# process cannot cross a process boundary, and the controller is not always started by bring-up: the
+# REFRESH is what actually runs the pre-flight, and nothing made its environment usable.
+#
+# MEASURED 2026-10-16 on the live cmux cells — the SAME tool, the same cwd, the same issue, with
+# ONLY $HOME differing (issue #1328, daniel-ospina/agent-infra):
+#   HOME=/home/ubuntu   -> VERDICT: COLLISION (exit 1) — "a peer owns it, retry next pass"
+#                          ... ALSO INCOMPLETE: 3 surface(s) could not be queried
+#   HOME=/tmp/cell-home -> VERDICT: LANDED (exit 4) — the authoritative answer
+# gh keeps its credentials in $HOME/.config/gh, so under the image's HOME every gh surface of the
+# pre-flight fails (`gh auth status` there answers "not logged in"). The danger is not that the tool
+# refuses: a COLLISION is a perfectly ordinary answer to the caller, so a broken environment does not
+# read as breakage — it reads as a busy queue. Measured the same day: the cell whose keys.env
+# carries NO `HOME=` logged 309 collisions and ZERO clean verdicts, its `candidates.txt` stayed
+# empty and orch-loop reported RUNNING with `lanes: 0`; the ONLY cell queueing candidates was the
+# one whose keys.env carries an operator's HAND-WRITTEN `HOME=`/`UV_CACHE_DIR=`. That is the
+# fix-that-never-ran shape.
+#
+# The repair is applied at the point of use and is a NO-OP wherever $HOME is already a writable
+# directory (every laptop, and every cell whose controller the supervisor started). It cannot move a
+# working home; it only replaces an unusable one.
+CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
+usable_home() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
+# $1 = --create. Runs at LOAD, before anything else: the interpreter probe, uv's cache and the
+# pre-flight all resolve through $HOME. TWO candidates — the caller's $HOME, then $CELL_HOME (the
+# home bring-up provisions and the credentials live in) — and only an ABSOLUTE, existing, writable
+# directory is eligible. Only $CELL_HOME is ever created, and the repo, the scout worktree and the
+# venv are never touched (which is what `--check`'s read-only promise is about);
+# cloud-cell-bringup.sh's --check path creates the same home. $O's parent is deliberately NOT a
+# candidate: it is the same directory on a real cell, and on a hand-run with $O pointed elsewhere it
+# would silently adopt a home that holds no credentials.
+resolve_home() {
+  local create="${1:-}" cand old="${HOME:-<unset>}"
+  for cand in "${HOME:-}" "$CELL_HOME"; do
+    [ -n "$cand" ] || continue
+    case "$cand" in /*) ;; *) continue ;; esac
+    if [ "$cand" = "$CELL_HOME" ] && [ "$create" = --create ] && ! usable_home "$cand"; then
+      mkdir -p "$cand" 2>/dev/null || true
+    fi
+    usable_home "$cand" || continue
+    [ "$cand" = "$old" ] && return 0
+    HOME="$cand"; export HOME
+    # uv's cache default is $HOME/.cache/uv, which is why an unusable HOME makes `uv sync` die on
+    # its cache before it can fail on anything real. Point it at the same writable home; an
+    # explicit operator value is kept.
+    : "${UV_CACHE_DIR:=$cand/.cache/uv}"; export UV_CACHE_DIR
+    echo "[refresh] HOME=$old is not a writable directory — using HOME=$HOME UV_CACHE_DIR=$UV_CACHE_DIR (cloud-cell-bringup.sh friction #1)"
+    return 0
+  done
+  return 1
+}
+resolve_home --create \
+  || echo "[refresh] WARN: neither \$HOME ('${HOME:-<unset>}') nor CELL_HOME ('$CELL_HOME') is a writable directory — the pre-flight's gh surfaces will be unreadable and its verdicts degraded"
+
 O="${O:-$HOME/orchestrator}"
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
@@ -139,9 +197,43 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
   return 1
 }
 
+# ── gh must be able to AUTHENTICATE, or the pre-flight's verdicts are degraded fiction ─────────
+# WHY. Every surface of tools/collision_preflight.py is gh-backed (issue metadata, open PRs, the
+# assignee/holder surfaces). With an unauthenticated gh the tool does NOT refuse — it answers from
+# whatever it can still read, which is how a LANDED issue came back as a COLLISION (measured
+# 2026-10-16, #1328: `VERDICT: COLLISION ... ALSO INCOMPLETE: 3 surface(s) could not be queried`
+# under HOME=/home/ubuntu, `VERDICT: LANDED` under HOME=/tmp/cell-home). The caller cannot tell that
+# answer apart from a real collision, so an environment failure becomes "a peer owns it, retry next
+# pass" on every candidate, forever. This check turns it back into ONE named provisioning failure.
+# Its exit code is the PERMANENT one (3): the remedy needs a human or a credential, not a retry —
+# which is exactly what orch-loop.sh's `.refresh-blocked` marker and `status` are for.
+# `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
+gh_env_verdict() {
+  local out
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — every surface of the collision pre-flight is gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  if ! out="$(gh auth status 2>&1)"; then
+    echo "[refresh] NOT PROVISIONABLE: gh is NOT authenticated in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+    printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  return 0
+}
+
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
 cmd_check() {
   local scout tool_dir
+  # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
+  # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and BOTH
+  # of them already run `gh auth status` themselves (under $CELL_HOME) — and orchestrator-harness's
+  # selftest pins that each of them invokes gh EXACTLY once, so a second call from here would
+  # redden an owned suite. More importantly it is the WRONG LAYER: those checks run in the
+  # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
+  # process that actually runs it — which is the divergence this whole change exists for, and which
+  # no operator-side check can see. The run path below is the one that judges it.
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
@@ -189,6 +281,9 @@ cmd_check() {
 
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 mkdir -p "$O"
+# The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
+# that cannot read GitHub refuses in a second instead of after minutes of network work.
+gh_env_verdict || exit "$EXIT_NOT_PROVISIONABLE"
 
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
@@ -369,6 +464,9 @@ touch "$O/checked.txt" "$O/candidates.txt"
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 
 n=0
+# `usable` counts the verdicts the pre-flight actually produced (CLEAN or COLLISION; an INCOMPLETE
+# run is not a verdict — see the property assertion after the loop).
+usable=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -405,15 +503,31 @@ while read -r N; do
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
   case "$V" in
     CLEAN)
+      usable=$((usable + 1))
       echo "$N" >> "$O/checked.txt"
       echo "$N" >> "$O/candidates.txt"
       echo "[refresh] +#$N CLEAN -> backlog" ;;
     COLLISION)
+      usable=$((usable + 1))
       echo "[refresh] =#$N collision — a peer owns it, retried next pass" ;;
     *)
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ⛔ ASSERT THE PROPERTY, NOT THE PLUMBING. "checked N; backlog now 0" over a non-empty pool is the
+# reading the fleet has been stuck in: it looks like a healthy empty queue, and each `?no verdict`
+# line is a per-candidate MASK of one environment failure (measured 2026-10-16: two cells whose
+# keys.env carried no HOME logged 98 and 113 of them, and both had an empty backlog). If the
+# pre-flight produced no usable verdict for ANY candidate, this pass judged nothing and must say so
+# rather than report an empty backlog as a result.
+# The TRANSIENT code, deliberately: the gh precondition above already refused PERMANENTLY (rc=3,
+# with the reason) when the environment could not authenticate, so no-usable-verdict from a passing
+# environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
+# retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
+if [ "$n" -gt 0 ] && [ "$usable" -eq 0 ]; then
+  echo "[refresh] ABORT: none of the $n candidate(s) in the pool produced a usable verdict (CLEAN or COLLISION) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
+  exit "$EXIT_TRANSIENT"
+fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog
 # by issue number, which is what put 238 P2s ahead of 20 P0s (#8465) — the same defect as the pool

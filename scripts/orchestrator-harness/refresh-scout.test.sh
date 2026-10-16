@@ -106,6 +106,52 @@ exit 3
 SH
   chmod +x "$1"
 }
+# mk_home_tool <path> — a pre-flight stand-in that answers CLEAN and RECORDS the HOME it ran under
+# ($HOMELOG). "Which home did the pre-flight actually see?" is a property of the environment, and a
+# suite that only inspects the script's own text cannot answer it.
+mk_home_tool() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os
+if os.environ.get("HOMELOG"):
+    with open(os.environ["HOMELOG"], "a") as fh:
+        fh.write("%s\n" % os.environ.get("HOME", ""))
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1"
+}
+# mk_gh_noauth <case-dir> — a `gh` that answers the pool queries but is NOT authenticated. The
+# pre-flight's surfaces are all gh-backed, so this is the environment the live cells actually had
+# (measured 2026-10-16: `gh auth status` fails under HOME=/home/ubuntu and succeeds under
+# HOME=/tmp/cell-home, on the same cell).
+mk_gh_noauth() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") echo "To get started with GitHub CLI, please run: gh auth login" >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_degraded_tool <path> — what the REAL pre-flight answers when its gh surfaces are unreadable:
+# `VERDICT: COLLISION` (measured on the cells — a LANDED issue came back as a COLLISION under
+# HOME=/home/ubuntu). The caller cannot tell that apart from a real collision, which is the whole
+# reason an unreadable environment has to be refused BEFORE the tool is asked. Records argv.
+mk_degraded_tool() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+if os.environ.get("TOOL_LOG"):
+    with open(os.environ["TOOL_LOG"], "a") as fh:
+        fh.write("%s|%s\n" % (os.getcwd(), " ".join(sys.argv[1:])))
+print("VERDICT: COLLISION")
+PY
+  chmod +x "$1"
+}
 
 # ── 1) a repo with NO pyproject.toml must PROCEED, not abort (the measured defect) ──────────────
 # Tortoise's tool is resolved through the fallback, and the venv step is skipped because it is
@@ -191,6 +237,139 @@ case "$OUT" in
 esac
 [ ! -s "$D/o/candidates.txt" ] && ok "pre-flight exits 3: nothing is queued" \
                               || bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+
+# ── 1d) THE PRE-FLIGHT'S ENVIRONMENT IS A PRECONDITION, NOT A PER-CANDIDATE RESULT ─────────────
+# The measured defect (2026-10-16, live cells). `cloud-cell-bringup.sh` documents friction #1
+# (`cmux vm exec` runs as user `cmux` with HOME=/home/ubuntu, which is NOT created on the image) and
+# repairs it IN ITS OWN PROCESS — a repair that cannot cross a process boundary, in a cell whose
+# controller is not always started by bring-up. The refresh is what actually runs the pre-flight, so
+# the repair belongs here too. Two failures are pinned below, each of which the pre-fix script
+# absorbs silently:
+#   (1) an UNUSABLE HOME  -> gh is unauthenticated there ($HOME/.config/gh), so the tool answers from
+#                            partial evidence: measured on the cells, `VERDICT: COLLISION` ("a peer
+#                            owns it") for an issue whose true verdict was `LANDED`. A collision is
+#                            an ordinary answer, so the cell logs 309 collisions, ZERO clean verdicts,
+#                            an empty backlog and `lanes: 0` — for ever, while reporting RUNNING.
+#   (2) gh NOT AUTHENTICATED -> the same degradation, one layer in.
+# Both cases fail on the PRE-FIX code for the right reason: it runs the tool anyway and reports an
+# empty backlog as a healthy result.
+echo; echo "── an unusable HOME is repaired by the refresh itself (the pre-flight's real precondition) ──"
+mk_case home-unusable
+mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh HOME="$D/no-such-home" CELL_HOME="$D/cellhome" HOMELOG="$D/homelog"
+[ "$RC" -eq 0 ] && ok "unusable HOME: the refresh still proceeds (rc=0)" \
+                || bad "unusable HOME: rc=$RC — output: $OUT"
+case "$OUT" in
+  *"is not a writable directory"*) ok "unusable HOME: the substitution is NAMED, not silent" ;;
+  *) bad "unusable HOME: no substitution reported — output: $OUT" ;;
+esac
+[ -d "$D/cellhome" ] && ok "unusable HOME: the cell home was created (self-heal)" \
+                     || bad "unusable HOME: the cell home was never created"
+[ "$(cat "$D/homelog" 2>/dev/null)" = "$D/cellhome" ] \
+  && ok "unusable HOME: the pre-flight RAN under the writable home (HOME=$D/cellhome)" \
+  || bad "unusable HOME: the pre-flight ran under '$(cat "$D/homelog" 2>/dev/null)' — a verdict from an unusable HOME is the defect"
+
+# The other direction, so the repair cannot silently move a HOME that works: a writable HOME is used
+# VERBATIM and no substitution is reported.
+echo; echo "── a writable HOME is used verbatim (the repair is a no-op on a normal box) ──"
+mk_case home-ok
+mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh HOMELOG="$D/homelog"
+[ "$(cat "$D/homelog" 2>/dev/null)" = "$D/home" ] \
+  && ok "writable HOME: the caller's HOME reached the tool unchanged" \
+  || bad "writable HOME: the tool saw '$(cat "$D/homelog" 2>/dev/null)' instead of $D/home"
+case "$OUT" in
+  *"is not a writable directory"*) bad "writable HOME: a working HOME was reported as unusable" ;;
+  *) ok "writable HOME: no substitution line" ;;
+esac
+
+echo; echo "── an unauthenticated gh REFUSES the pass instead of degrading every candidate ──"
+mk_case gh-noauth
+mk_degraded_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+rf "$D" refresh TOOL_LOG="$D/tool-log"
+# The MEASURED symptom is not a crash: an unreadable environment makes every candidate read as
+# "a peer owns it", which is an ordinary answer. Pre-fix this case exits 0 having queued nothing and
+# having logged a COLLISION for #42 — indistinguishable from a busy queue on a healthy cell.
+case "$OUT" in
+  *"collision — a peer owns it"*) bad "gh unauthenticated: a DEGRADED collision was reported as a real verdict" ;;
+  *) ok "gh unauthenticated: no degraded collision is passed off as a real verdict" ;;
+esac
+[ "$RC" -eq 3 ] && ok "gh unauthenticated: rc=3 (PERMANENT — a marker, not a silent 0)" \
+               || bad "gh unauthenticated: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "gh unauthenticated: the refusal is LOUD and named" ;;
+  *) bad "gh unauthenticated: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"HOME=$D/home"*) ok "gh unauthenticated: the refusal names the HOME the pre-flight would use" ;;
+  *) bad "gh unauthenticated: the refusal does not name HOME — output: $OUT" ;;
+esac
+[ ! -e "$D/tool-log" ] && ok "gh unauthenticated: refused BEFORE spending on the pre-flight" \
+                       || bad "gh unauthenticated: the pre-flight ran anyway — $(cat "$D/tool-log" 2>/dev/null)"
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "gh unauthenticated: still reported a healthy empty backlog" ;;
+  *) ok "gh unauthenticated: no \"checked N; backlog now 0\" over an unjudged pool" ;;
+esac
+[ ! -s "$D/o/candidates.txt" ] && ok "gh unauthenticated: nothing is queued" \
+                              || bad "gh unauthenticated: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+
+# `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
+# cmd_check and cloud-cell-bringup.sh's check_dispatch each ALREADY run `gh auth status` themselves
+# (under $CELL_HOME), and orchestrator-harness's selftest pins that each of them invokes gh exactly
+# once — so a probe here would redden an owned suite AND ask the question in the wrong layer: those
+# checks run in the OPERATOR's shell, while the pre-flight inherits the HOME of whatever process
+# actually started the controller. The run path is the enforcement point. This case pins that
+# `--check` did not quietly acquire a second gh call or a new refusal.
+echo; echo "── --check keeps its own verdict (the gh precondition belongs to the RUN path) ──"
+mk_case gh-noauth-check
+mk_tool "$D/tort/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "--check: still answers its own question (rc=0) — the gh precondition is the run path's" \
+               || bad "--check: rc=$RC — the operator-side gate must not acquire a second gh probe (selftest pins one gh call each)"
+
+# ── 1e) ASSERT THE PROPERTY: A PASS THAT JUDGED NOTHING MUST SAY SO ──────────────────────────────
+# `checked N; backlog now 0` over a non-empty pool is the reading the fleet has been stuck in — it
+# looks like a healthy empty queue, and each `?no verdict` line is a per-candidate MASK of one
+# environment failure. The assertion is the TRANSIENT code on purpose: a permanent environment
+# failure has already refused above with the reason, so reaching here is a per-cycle anomaly that
+# the next cycle should retry (orch-loop.sh logs `FAILED rc=1`). The second half of the case is the
+# false-block guard: an EMPTY pool is a legitimate answer and must still exit 0.
+echo; echo "── a pass that judged NOTHING does not report an empty backlog ──"
+mk_case no-usable-verdict
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+raise SystemExit(2)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "no usable verdict: the pass is NOT reported as success (rc=$RC)" \
+               || bad "no usable verdict: rc=0 — an unjudged pool was reported as a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "no usable verdict: the abort names what happened" ;;
+  *) bad "no usable verdict: no explanation of the pass — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "no usable verdict: still printed \"checked N; backlog now 0\"" ;;
+  *) ok "no usable verdict: the false empty-backlog report is suppressed" ;;
+esac
+[ ! -s "$D/o/candidates.txt" ] && ok "no usable verdict: nothing is queued" \
+                              || bad "no usable verdict: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+# ...and the same script with an EMPTY pool must still exit 0 (the assertion is not a blanket refusal).
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "no usable verdict: an EMPTY pool still exits 0 (no false block)" \
+               || bad "no usable verdict: false block on an empty pool — rc=$RC — output: $OUT"
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
 # Structural, not textual: the stub tool records its cwd and argv, and the candidate it cleared must
