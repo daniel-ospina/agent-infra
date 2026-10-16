@@ -742,6 +742,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   //   thresholds, not kill switches, so they answer to the heartbeat axis. The
   //   reverse scan found all four the moment the file landed — registered here
   //   rather than exempted, because each IS a real liveness bound.
+  //   DISCLOSED, not silently skipped: the same file's `STALE_MIN` (12 m),
+  //   `MIN_GAP_MIN` (4 m), `PULSE_MIN` (5 m) and `SCAN_INTERVAL_S` (2700 s) carry no
+  //   family token, so the name scan cannot see them and neither scan direction can go
+  //   red on them — the coverage limit documented at `OUT_OF_FAMILY_TERMS`. They are
+  //   named here because each IS a bound in this file, and a reader who trusts the
+  //   registry to hold every bound in it should know it does not. They are NOT added to
+  //   `OUT_OF_FAMILY_TERMS`: that list's invariant is that every name in it is also a
+  //   registry entry.
   {
     name: "IDLE_MIN",
     owners: ["scripts/orchestrator-heartbeat.sh"],
@@ -756,7 +764,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "=20",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: "the free-capacity bound: a lane idle at least this long, and with no live child pi, is offered as FREE CAPACITY. Deliberately above IDLE_MIN (the classifier's measured 9 m false positive); a dead pane is excluded by a separate live-process probe, not by this value.",
+    note: "the FREE-CAPACITY eligibility bound, in MINUTES: a lane must be stale at least this long before it is a candidate for the free list (a lane merely BETWEEN steps is the measured false positive the clause's 9 m sibling is meant to avoid). Eligibility is not an offer — a candidate with no live child pi is then DROPPED, never offered, because a dead pane still carries its last session file and would otherwise read as idle-forever. Deliberately above IDLE_MIN.",
   },
   {
     name: "SCAN_MAX_AGE_S",
@@ -764,7 +772,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${SCAN_MAX_AGE_S:-10800}",
     axis: "heartbeat",
     guardedBy: NONE,
-    note: "the ask-scan cache's absolute freshness ceiling (3 h): a stamp older than this is never trusted, so the ~7-9 min scan re-runs. The reuse window SCAN_INTERVAL_S (45 min) sits below it; both are env-overridable.",
+    note: "the ask-scan cache's DECLARED absolute freshness ceiling (3 h), the outer bound of the reuse window SCAN_INTERVAL_S (45 min); both are env-overridable. ⚠️ Declared, not read: the only comparison the script performs is `ASK_AGE < SCAN_INTERVAL_S`, and with the shipped defaults that subsumes this value, so a stamp older than 3 h does re-run the scan — by way of the reuse window, not by reading this one. Registering it keeps the declared ceiling in the vocabulary; nothing expands it (filed as a separate defect rather than silently relied on).",
   },
   {
     name: "ASK_AGE",

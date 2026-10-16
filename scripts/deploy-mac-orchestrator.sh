@@ -39,6 +39,21 @@ inflight() { tmux ls 2>/dev/null | grep -cE '^(merge|fix)-'; }
 # fixtures of a PEER LANE's test that was running at that moment. An unscoped kill would have taken
 # out a peer lane's test. A destructive verb must be scoped to its own target.
 controller_pids() { pgrep -f "[b]ash $O/orch-loop\.sh" 2>/dev/null; }
+# The runtime names its OWN controller: orch-loop.sh writes its $$ into $O/.orch.lock (acq(), with
+# noclobber) and a second launch EXITS immediately while that pid is alive. So the lock is the
+# authoritative, SINGULAR handle on this runtime's controller, whereas a `pgrep` POPULATION is
+# merely a sample of the box — and this box carries peer lanes' fixtures (measured 2026-10-15: a
+# transient `bash $O/orch-loop.sh` appeared inside the scope between the pre-check and the stop,
+# because a peer fixture launched the real path and exited at once on the lock).
+# Prints the pid only when the lock names a LIVE process that really is this runtime's controller.
+lock_pid() { # -> pid on stdout, empty when there is no usable lock
+  local p
+  p="$(tr -dc '0-9' < "$O/.orch.lock" 2>/dev/null)"
+  [ -n "$p" ] || return 0
+  kill -0 "$p" 2>/dev/null || return 0
+  ps -o command= -p "$p" 2>/dev/null | grep -q "bash $O/orch-loop\.sh" || return 0
+  printf '%s\n' "$p"
+}
 # Atomic install: temp file in the SAME directory, then rename (new inode). A running bash keeps
 # reading its old inode, so a swap can never be read half-old/half-new — the property that makes
 # phase A and phase B safe at ANY time, in-flight work or not.
@@ -108,13 +123,39 @@ fi
 install_file "$H/orch-loop.sh" "$O/orch-loop.sh"
 log "phase B: orch-loop.sh replaced (atomic rename; inode now $(ls -i "$O/orch-loop.sh" | awk '{print $1}'))"
 
-PIDS="$(controller_pids)"
-log "stopping controller pid(s): $(echo $PIDS | tr '\n' ' ')"
-[ -n "$PIDS" ] && kill $PIDS 2>/dev/null || true
-for _ in $(seq 1 15); do sleep 1; [ -z "$(controller_pids)" ] && break; done
-[ -n "$(controller_pids)" ] && { pkill -f '[o]rch-loop\.sh' 2>/dev/null || true; sleep 2; }
+OLDPID="$(lock_pid)"
+if [ -n "$OLDPID" ]; then
+  log "stopping the controller the runtime itself names: pid $OLDPID (from $O/.orch.lock)"
+  kill "$OLDPID" 2>/dev/null || true
+  for _ in $(seq 1 15); do sleep 1; kill -0 "$OLDPID" 2>/dev/null || break; done
+  # Fallback is the SAME scoped pid — never a bare `pkill -f '[o]rch-loop\.sh'`. bash runs a trap
+  # only AFTER the current foreground command returns, so a TERM sent while the loop is inside a
+  # slow call is handled late; that lateness must not become a licence to signal unrelated procs.
+  if kill -0 "$OLDPID" 2>/dev/null; then
+    log "fallback: TERM did not clear pid $OLDPID within 15s — KILLing that scoped pid only"
+    kill -9 "$OLDPID" 2>/dev/null || true
+    sleep 2
+  fi
+else
+  # No usable lock. Fall back to the scoped population — and refuse an AMBIGUOUS one: a scope that
+  # matches more than one process is not a scope we may signal. Measured 2026-10-15: an unscoped
+  # `pkill -f '[o]rch-loop\.sh'` matches a peer lane's live test fixture running `bash
+  # ./orch-loop.sh` from a temp dir, so it would kill a peer's test mid-run. Killing a controller
+  # is cheap; killing someone else's work is not. If the target is ambiguous: report, do not reap.
+  PIDS="$(controller_pids)"
+  NPIDS="$(printf '%s\n' "$PIDS" | grep -c .)"
+  log "no usable lock — scoped pgrep matched [$NPIDS]: $(echo $PIDS | tr '\n' ' ')"
+  if [ "$NPIDS" -gt 1 ]; then
+    log "FATAL: $NPIDS processes match the controller scope and no lock names one — refusing to signal an ambiguous target"
+    pgrep -fl "[b]ash $O/orch-loop\.sh" | cut -c1-140
+    rm -rf "$STAGE"; exit 1
+  fi
+  [ -n "$PIDS" ] && kill $PIDS 2>/dev/null || true
+  for _ in $(seq 1 15); do sleep 1; [ -z "$(controller_pids)" ] && break; done
+  [ -n "$(controller_pids)" ] && { kill -9 $(controller_pids) 2>/dev/null || true; sleep 2; }
+fi
 rm -f "$O/.orch.lock"
-log "controller stopped ($(controller_pids | wc -l | tr -d ' ') remaining)"
+log "controller stopped"
 
 # Relaunch with the SAME command the live controller was started with (captured from
 # ps at deploy time): cd $HOME, fixed PATH, nohup into logs/nohup.out.
@@ -124,14 +165,24 @@ PATH="/Users/danielospina/.local/bin:/Users/danielospina/.local/share/pi-node/cu
 sleep 8
 
 N="$(controller_pids | wc -l | tr -d ' ')"
-log "after: $N controller pid(s)"
-if [ "$N" != "1" ]; then
-  log "FATAL: expected exactly 1 controller, found $N"
-  pgrep -fl '[o]rch-loop\.sh' | cut -c1-140
+P="$(lock_pid)"
+log "after: $N scoped match(es); the lock names: ${P:-none} (old=${OLDPID:-none})"
+# The identity that decides is the LOCK, not the population: orch-loop.sh's acq() makes the lock
+# singular by construction (a second launch EXITS on it), while a peer fixture launching the real
+# path shows up in the population for milliseconds. So: fail when the lock is absent or still names
+# the OLD pid; merely NAME any extra scoped match, and never signal it.
+if [ -z "$P" ]; then
+  log "FATAL: no controller holds $O/.orch.lock after the restart"
+  pgrep -fl "[b]ash $O/orch-loop\.sh" | cut -c1-140
   rm -rf "$STAGE"; exit 1
 fi
-P="$(controller_pids | head -1)"
-log "VERIFIED: controller pid=$P running $O/orch-loop.sh"
+if [ "$P" = "${OLDPID:-}" ]; then
+  log "FATAL: the lock still names the OLD pid $P — the restart did not take"
+  rm -rf "$STAGE"; exit 1
+fi
+EXTRA="$(controller_pids | grep -vx "$P" | tr '\n' ' ')"
+[ -n "${EXTRA// /}" ] && log "WARN: the scope also names [$EXTRA] — not signalled (a second launch exits on the lock; treat as a peer fixture)"
+log "VERIFIED: controller pid=$P (new inode) holds $O/.orch.lock and runs $O/orch-loop.sh"
 log "  registry wiring in the live loop: $(grep -c 'refs/claims' "$O/orch-loop.sh") ref(s)"
 log "  claims.sh present: $([ -f "$O/claims.sh" ] && echo yes || echo NO)"
 log "  snapshot path: $O/state/claims-snapshot"
