@@ -16,7 +16,7 @@
 # copied_at=2026-10-13T10:50:00Z            (the instant the relocation copy was taken)
 # main_tip_at_copy=0e060082f                (tortoise main at that instant)
 # copied_from=eda7df136                     (newest commit touching this path at that instant)
-# ported_through=26f6c9488                  (the post-copy commits are all ported; see README)
+# ported_through_pass1=26f6c9488            (PASS 1 — historical; the canonical sync point is at the foot)
 #
 # Post-copy commits ported, in order:
 #   8fe1e7b13  #8437           core-derived load ceiling, MIN_MEM_FREE_MB, REPO default, res_line()
@@ -27,12 +27,13 @@
 #   45dd16cc8  agent-infra#1705  a failed PR listing is not an empty one
 #   26f6c9488  agent-infra#1702  portable load/swap/memory/mtime probes (Linux cell)
 #
-# NOT ported, deliberately: tortoise's open branch `fix/8468-closure-linkage` (severity-ordered
-# pool, `.prio`-keyed P0 bypass, `merged-not-closed.sh`, `Closes`-not-`Refs` lane brief). It is
-# unmerged work still under review; porting it would give it a second home. The removal PR must
-# either wait for it to merge or port it.
+# ⚠️ HISTORICAL (PASS 1, 2026-10-13) — NOT ported then, deliberately: tortoise's then-open branch
+# `fix/8468-closure-linkage` (severity-ordered pool, `.prio`-keyed P0 bypass, `merged-not-closed.sh`,
+# `Closes`-not-`Refs` lane brief). That branch has since MERGED as 9b249f418, and
+# `merged-not-closed.sh` + the `Closes`-not-`Refs` lane brief ARE ported in the THIRD PASS below.
+# The `.prio` P0 bypass is STILL unported — see the residual list at the foot of this file.
 #
-# ported_through=45dd16cc8
+# ported_through_pass2=45dd16cc8            (PASS 2 — historical; superseded by the canonical line at the foot)
 # repinned_at=2026-10-13T20:23:38Z
 #
 # ══ 2026-10-15 — SECOND drift pass: the source moved 8 commits past the pin ══════════════════════
@@ -110,7 +111,10 @@
 #     D4 `chain-merge.sh` ends with `exit "$rc"`, which the tortoise original does NOT have — its
 #        last command is a reporting `echo`, so `$?` was echo's 0 whatever happened. The port ADDS the
 #        exit; adopt-fix.sh already had it.
-#        ⚠️ WHAT THIS DOES NOT YET DELIVER (review round 3): `merge-one.sh` ITSELF still ends on a
+#        ⛔ SUPERSEDED BY THE THIRD PASS (2026-10-16): `merge-one.sh` now SOURCES spawn-gate.sh and
+#        carries the `AGENT_STARTED` / `exit 75` arm (see the third-pass section below), so the
+#        paragraph that follows describes the PASS-2 tree only and must not be read as current.
+#        ⚠️ WHAT THIS DID NOT DELIVER AT PASS 2 (review round 3): `merge-one.sh` ITSELF still ends on a
 #        reporting `echo` and has NO `exit 75`/`AGENT_STARTED` (0 hits), so on the paths that reach its
 #        end — a reviewer that FAILED, and a clean pass — it returns 0. Its early guards DO exit
 #        1/2/3/4 and those propagate now; the 75 arm fires only when the BLOCKED #8521 half lands in
@@ -150,68 +154,153 @@
 #     contract's job. The census reads the index via `git ls-files --cached --others`, so an UNTRACKED
 #     new invoker is visible at the moment it is added, and it fails CLOSED outside a git work tree.
 #
-# ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
-# `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and
-# `scripts/run-bash-shards.sh` are all being edited by open PR #1769 and/or PR #1730, so this pass
-# was not permitted to touch them. What remains, precisely:
-#   merge-one.sh  #8589 the reviewer's own DETACHED checkout (and DROP the AGENT_ALLOW_MAIN_EDITS
-#                 export — prompt-only containment is what #8484 measured failing)
-#                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
-#                 #8521 host spawn-gate.sh; it is the last of the three duplicate `pi` call sites
-#   orch-loop.sh  #8521 source the helper; `can_spawn "$L"` at the four decision sites
-#                 #8469 `p0_merge_priority_override` + the `.prio` tier map it reads
-#                 #8521 stop `rm -f needsfix-<PR>-<HEAD>` at DISPATCH. That delete sits UPSTREAM of
-#                 the load gate, so a refused fixer loses the reviewer's findings. It is also why
-#                 the 5th argv line (`HEAD`) and fix-one.sh's marker-consume are NOT ported here:
-#                 without the orch-loop half, fix-one.sh cannot tell the ai-review-gate arm (which
-#                 deletes the marker) from the CI-red arm (which never touches it), and restoring
-#                 the marker there would INVENT a findings record — refund_bailed_fixer's own note.
-#   install.sh    #8521 register spawn-gate.sh in the DRIFTED list (PR #1769 edits this exact line)
-#                 #8468 render P0_BYPASS_MERGE_PRIORITY
-#   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key. Held back WITH install.sh on
-#                 purpose: the template and its renderer must gain the placeholder together or the
-#                 placeholder-parity check reddens and the daemon gets a literal placeholder.
-#   README.md     the §4 / §5.3 / §7.1b prose for all of the above
-#   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
-#                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
-#                 shipped helper while still reporting green.
-# ⛔ ── NOT DONE, AND NOT BLOCKED: no lane holds these files ────────────────────────────────────
-#   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
-#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). NOTHING holds these
-#     two files, so this is scope this pass did not reach — not a refusal. Of the 8 post-pin commits,
-#     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
-#     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
-#     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
-#     suite — IS held, so this half is blocked at the CI wiring even once it is written.
-# The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
-# `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
-# on tortoise main, so it is queued for porting above rather than excluded.
+# ══ THIRD PASS — 2026-10-16: the pin was STALE, and the two held files landed ═════════════════════
 #
-# ⛔ DO NOT `--repin` UNTIL THE ABOVE LANDS. The pin below still names the LAST reconciliation that
-# was COMPLETE for every file; re-pinning now would assert these as reconciled and turn the guard
-# green over a source that has moved — the stale-flag false pass this file exists to prevent.
+# ⛔ WHAT WAS WRONG. `pinned_tip` sat at e20de606b (2026-10-13T20:17) while the prose
+# `ported_through` already named ef59f6d6f — the pin was an ANCESTOR of what the prose claimed was
+# ported, so `check-port-drift.sh` compared tortoise against a sync point that predated work already
+# in this tree and reported it as DRIFT. Measured at the start of this pass: 15 files drifting —
+# THIRTEEN `tortoise moved past the revision this copy was reconciled with` (README.md, adopt-fix.sh,
+# chain-merge.sh, fix-one.sh, install.sh, lane.sh, launchd.plist.template, merge-one.sh, orch-loop.sh,
+# refresh-candidates.sh, retired/refix.sh, retired/watch-one.sh, selftest.sh) and TWO `in tortoise but
+# not in the pinned sync point`, including
+#   DRIFT: …/spawn-gate.sh — in tortoise but not in the pinned sync point (port it, then re-pin)
+# over a file that IS in this tree (ported by f95148c, PR #1807). That is the one check that must be
+# trustworthy at the moment the tortoise copy is deleted, so a pin that reports ported work as
+# unported is the stale-flag FALSE PASS this file exists to prevent — in the exact instrument whose
+# job is to be believed.
+#
+# ⛔ THE PIN HAS NO IN-REPO CONSUMER OTHER THAN check-port-drift.sh, and that check reads ONLY the
+# blob hashes below — never these prose fields. They are for the human who has to decide whether the
+# tortoise copy can be deleted. They are therefore RECONCILED here: ONE canonical `ported_through=`
+# at the foot of this file, the two earlier values renamed `ported_through_pass1=` /
+# `ported_through_pass2=` and marked historical. ⚠️ The `--repin` header directly above the marker is the
+# machine pin, and a SECOND `--repin` ACCUMULATES it (the awk keeps everything above the marker and
+# then appends a fresh header) — read the LAST pinned_tip in the file, and remember that
+# `check-port-drift.sh` reads NO pinned_* line at all: the blob hashes are the only machine-read
+# field.
+#
+# ── THIS PASS PORTED (tortoise → agent-infra) ──────────────────────────────────────────────────
+#   merge-one.sh   #8589 (10563490a) the reviewer's own DETACHED checkout: `review_sandbox()`,
+#                  `sandbox_record()`, `drop_sandbox_record()`, `review_cleanup()` in the EXIT trap,
+#                  `review_sandbox` created OUTSIDE the repo, the ref-move detector (`ref_shas` /
+#                  `mover_of`), the load gate consulted BEFORE provisioning, the `refs/pull/<N>/head`
+#                  fetch and the unknown-head PARK; the AGENT_ALLOW_MAIN_EDITS export DROPPED and the
+#                  variable UNSET (fix-one.sh still exports it — it runs merge-one.sh as a child).
+#                  #8612 (f5823a6a4) `verdict_kind()` / `apply_verdict_marker()` — a verdict-LESS run
+#                  authorises NO fixer and the reviewer prompt forbids the venv hunt.
+#                  #8521 (80db43882) hosts `spawn-gate.sh`, sourced AFTER the PATH export (D1): the
+#                  last of the three duplicate `pi` call sites is gone and its local run_agent()
+#                  deleted — the helper's carries the #1709 telemetry AND the gate.
+#   merged-not-closed.sh (NEW)  #8469 9b249f418 — the ONLY commit that has ever touched this file on
+#                  tortoise main (`git log origin/main -- …/merged-not-closed.sh` lists it alone).
+#                  e5354e1a4/#8565, 9eb19478a/#8629 and 0a215d088/#8645 touch refresh-candidates.sh and
+#                  README/selftest, NOT this file. ONE deliberate departure: the default repo is `$OR` (this harness's own
+#                  owner/repo) else daniel-ospina/agent-infra — the tortoise original hardcodes
+#                  daniel-ospina/tortoise, which is the wrong default in the relocated copy.
+#   lane.sh        ⛔ NOT ported here: the #8469 closure wording (`Closes #N` required, a bare
+#                  `Refs #N` no longer offered for finished work, the partial naming its unmet
+#                  indicator on its own line) is the other half of the same defect, but `lane.sh` is
+#                  held by a concurrent lane and is EXCLUDED from this pass — see STILL NOT
+#                  RECONCILED below.
+#   spawn-gate.sh  HEADER CORRECTED. Its "WHAT THIS FILE DOES NOT YET COVER" block still claimed
+#                  merge-one.sh carried its own UNGATED run_agent() and that this directory's
+#                  pi-invokers were {merge-one.sh, spawn-gate.sh}. Both became false with this port,
+#                  and spawn-gate.test.sh's census (now `[spawn-gate.sh]`) contradicted the file's own
+#                  header — updated rather than left to mislead.
+#   selftest.sh    §15 now extracts run_agent() from spawn-gate.sh (the ledger's own instruction —
+#                  with the private copy gone, leaving it pointed at merge-one.sh would have silently
+#                  stopped covering the shipped helper while still reporting green). A NEW §21 DRIVES
+#                  the ported sandbox against a real throwaway repo: the checkout is OUTSIDE the
+#                  reviewed repo and DETACHED (a commit there moves no branch), a mutation never
+#                  reaches the reviewed tree, the dangling-record recovery provisions again instead
+#                  of bricking the head, a sibling lane's record survives review_cleanup (the
+#                  banned-repo-wide-prune witness), mover_of names the ref that actually moved, the
+#                  verdict_kind/apply_verdict_marker dispatch authorises a fixer ONLY for a real
+#                  ISSUES verdict, and the shipped reviewer_prompt forbids the #8602 venv hunt. The
+#                  §4/§20 claim extractions now carry review_cleanup, so their drivers no longer
+#                  fail for a reason unrelated to what they test.
+#                  spawn-gate.test.sh's two censuses, its sources-after-PATH-export loop, its
+#                  no-private-run_agent loop AND its driven missing-helper refusal loop now include
+#                  merge-one.sh, so the new state is ASSERTED, not merely performed.
+#   Evidence: `bash selftest.sh` → 394 passed, 0 failed (was 364; +30 from §21). §21 is non-vacuous:
+#   the dangling-record recovery is the witness that caught a ONE-CHARACTER transcription slip in
+#   `drop_sandbox_record` (the basename alternative transcribed with a stray `/`), which made the
+#   fallback unmatchable and re-bricked the head — RED on the extracted helper before the fix,
+#   GREEN after.
+#   `bash spawn-gate.test.sh` → the census that read
+#   `[merge-one.sh spawn-gate.sh]` now reads `[spawn-gate.sh]`, the tree-wide census loses
+#   merge-one.sh, and `merge-one.sh sources the helper AFTER its PATH export (line 50 > 48)` and
+#   `merge-one.sh no longer defines its own run_agent()` are new and PASS. (That suite has a
+#   PRE-EXISTING red + hang at HEAD on a box whose real `gh`/`pi` sit in /opt/homebrew/bin: the
+#   scripts PREPEND that dir to PATH, so the rig's stubs are shadowed — it is unchanged by this
+#   pass and is not claimed clean here.) ⚠️ BECAUSE OF THAT SHADOWING, THE FULL SUITE WAS NOT RUN
+#   HERE: its positive controls spawn a REAL `pi`. The four affected assertions above were
+#   re-verified IN ISOLATION instead (census, tree census, source-line ordering, no private
+#   run_agent), together with the driven missing-helper refusal for all three callers (exit 78 +
+#   FATAL). That is a narrower claim than "the suite passes" and is the claim actually earned.
+#
+# ⛔ ── STILL NOT RECONCILED — the tortoise copy IS STILL REQUIRED ──────────────────────────────
+# The pin below asserts "the tortoise harness has not MOVED since this reconciliation", NOT "the two
+# trees are byte-identical". This directory is the home and is EXPECTED to diverge; these remain
+# genuinely unported, and the follow-up PR that deletes the tortoise copy must wait for them:
+#   orch-loop.sh  #8521 source spawn-gate.sh and gate the four DECISION sites with `can_spawn "$L"`
+#                 (agent-infra today defines its own is_num/is_limit/can_spawn);
+#                 #8469 `p0_merge_priority_override()` + the `.prio` tier map it reads;
+#                 #8521 stop deleting `needsfix-<PR>-<HEAD>` at DISPATCH (that delete sits UPSTREAM of
+#                 the load gate, so a refused fixer loses the reviewer's findings — and it is why the
+#                 fifth argv line (`HEAD`) and fix-one.sh's marker-consume are not ported either).
+#   refresh-candidates.sh  agent-infra's copy is a REWRITE (cell provisioning, agent-infra#1736/#1748)
+#                 and is NOT a port target. Tortoise's post-pin hunks here are #8469's `.prio` writer
+#                 (which DEPENDS on the orch-loop consumer above) plus #8565/#8629/#8645, which are
+#                 tortoise `tools/collision_preflight.py` behaviour — agent-infra does not carry that
+#                 tool (it resolves a tortoise checkout to run it), so those are DROP-NOT-APPLICABLE.
+#   install.sh    BLOCKED BY A CONCURRENT LANE (do not edit it here). Its DRIFTED list lacks BOTH
+#                 `spawn-gate.sh` (a pass-2 residual) and `merged-not-closed.sh` (this pass), so both
+#                 are copied to $O by the `$HERE/*.sh` loop but NOT checked for drift; and #8468's
+#                 `P0_BYPASS_MERGE_PRIORITY` render is unported.
+#   launchd.plist.template  #8468's `P0_BYPASS_MERGE_PRIORITY` key — held back WITH install.sh on
+#                 purpose: template and renderer must gain the placeholder together or the
+#                 placeholder-parity check reddens and the daemon gets a literal placeholder.
+#   README.md     the §4 / §5.3 / §7.1b prose for all of the above.
+#   tests/        tortoise drives the SHIPPED scripts with a recording stub `gh` in
+#                 `tests/test_orchestrator_harness.py` (#8469/#8612). agent-infra carries no such
+#                 file, so §21 in selftest.sh is the ONLY guard on the ported sandbox/verdict helpers
+#                 here. Porting the pytest harness is its own change (it needs a pytest leg in
+#                 agent-infra's CI to be worth anything).
+#   (scripts/run-bash-shards.sh is tortoise CI wiring; agent-infra has no such shard runner.)
+#
+# ── CANONICAL SYNC POINT ──────────────────────────────────────────────────────────────────────
+# ported_through=0a215d088                  (newest tortoise commit touching this path — verified:
+#                                            `git log origin/main -- operations/orchestrator-harness/`
+#                                            lists it first. origin/main itself is 2173bf333, a docs
+#                                            commit that does not touch the harness, so the pin's
+#                                            pinned_tip names a tip whose HARNESS CONTENT is
+#                                            0a215d088's.)
 #
 # pinned_ref=origin/main
-# pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)
-# pinned_at=2026-10-13T20:24:13Z
+# pinned_tip=2173bf333e91f25b0bc7f8c2d7ab9f7197c540cf   (2026-10-16T01:04:24-05:00)
+# pinned_at=2026-10-16T06:54:55Z
 #
 # --- BEGIN PINNED FILES ---
 # <git-blob-sha1>  <path relative to the tortoise repo root>
-9e42109f9dae84a3cfaf0dbdfa8c9c3edc50767d  operations/orchestrator-harness/README.md
-8c8e7c88ca671e8a3dc5506e618017fcbeea0b5a  operations/orchestrator-harness/adopt-fix.sh
-87129f269e349bcd39c929af300170789553a66d  operations/orchestrator-harness/chain-merge.sh
+707de8752a47e48cd05d4f9a8294a335670be176  operations/orchestrator-harness/README.md
+a98069485abd5926dc2d1e97e82a8d0d82091328  operations/orchestrator-harness/adopt-fix.sh
+2f1c49881ba71781f3eb442ed54d5f2baf9067dd  operations/orchestrator-harness/chain-merge.sh
 e5b7dcd132da59547734d513799347d3d61bac76  operations/orchestrator-harness/dispatch-merge.sh
-2d99ef2ef632301a4c027b898f4d46a2f707445e  operations/orchestrator-harness/fix-one.sh
-d14135e04c40753178cae86f7204dc3ce74485f8  operations/orchestrator-harness/install.sh
-dfae891a90d47b2a3321e84bfc8bcece4589b897  operations/orchestrator-harness/lane.sh
-da72f18a645b74512d6548bcb918b11689746de7  operations/orchestrator-harness/launchd.plist.template
-d3852aa791344c6b6bc4fc7810a38fa78763450b  operations/orchestrator-harness/merge-one.sh
-90f4e352f9e8d29a0e1748b4c0aa1b567a58cec6  operations/orchestrator-harness/orch-loop.sh
-873da7697e7383566e0da72b463203621302d448  operations/orchestrator-harness/refresh-candidates.sh
+2bd39fcac2d999f4a59b74a2cd228b6caae6aaae  operations/orchestrator-harness/fix-one.sh
+de2ce83a26f2b42543faa5514c8770d0312bbab1  operations/orchestrator-harness/install.sh
+03400e8ddad3c39c034a02625cc1a0244d063567  operations/orchestrator-harness/lane.sh
+36e03c9fa00aa21a19f4a13f1d0c6d9bbefd4053  operations/orchestrator-harness/launchd.plist.template
+2f7a8cd66dc378c701e7b8523ab531e0921654d7  operations/orchestrator-harness/merge-one.sh
+b2f9d3af756f6bfe495c688d4a75a404176856a1  operations/orchestrator-harness/merged-not-closed.sh
+a1ffab3db7745dc14bef1fef18c22bb62c2923b4  operations/orchestrator-harness/orch-loop.sh
+facc9a1d0db847fe7f6c05e4fa614ba3d605ccb7  operations/orchestrator-harness/refresh-candidates.sh
 c40f3d7b54299ff677996267efc2b6156480ca81  operations/orchestrator-harness/retired/auto-loop.sh
 de3d7718e0ec1200f373d6c215f6b26b854b8294  operations/orchestrator-harness/retired/dispatch.sh
 dc382e0ba8a8e14e3055cd0c4cad83d2ca32a535  operations/orchestrator-harness/retired/do-merge.sh
-1f62f65f3ec0c97f64299148ef8e68b0497524d9  operations/orchestrator-harness/retired/refix.sh
+b7a6a0b4e374bdcdcb6606f87f914c7edd0ac8b1  operations/orchestrator-harness/retired/refix.sh
 f3c568004d5ffd973784409a7f87a9b1b9df24de  operations/orchestrator-harness/retired/sweep.sh
-0baf97fe8ec16cf7919899654284eb0741b48e13  operations/orchestrator-harness/retired/watch-one.sh
-c7e1fcee5ee36080dc04d2615154eb199dcbec69  operations/orchestrator-harness/selftest.sh
+faaa23e3e639b911a2ba25e9618249fa0999c323  operations/orchestrator-harness/retired/watch-one.sh
+04174f50a87eaec7a5ac6a739fd9b7620f811801  operations/orchestrator-harness/selftest.sh
+f7af791979834149d16fb1769e8f3b68eb36b3d9  operations/orchestrator-harness/spawn-gate.sh

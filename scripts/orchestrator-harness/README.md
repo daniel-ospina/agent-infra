@@ -73,13 +73,13 @@ doc_status: draft
 >    added checks that are RED on the pre-fix tree (16 for #1702 alone), so a reverted port fails the
 >    suite rather than merely looking different.
 >
-> ⚠️ **The follow-up has a second obligation the sha list never covered.** tortoise's **open**
-> branch `fix/8468-closure-linkage` also rewrites this directory (severity-ordered pool, a
-> `.prio`-keyed P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs`
-> lane brief). It is **not** on `main`, so it is deliberately not ported here — it is still under
-> review, and porting it would create a second home for work that has not landed. The live box is
-> already running an earlier revision of it. Either that branch merges first, or the removal PR
-> must port it; removing the directory while it is open orphans it.
+> ⚠️ **The follow-up has a second obligation the sha list never covered.** tortoise's
+> `fix/8468-closure-linkage` branch rewrote this directory (severity-ordered pool, a `.prio`-keyed
+> P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs` lane brief).
+> It has since MERGED (9b249f418). `merged-not-closed.sh` is ported here (third pass, 2026-10-16);
+> the `Closes`-not-`Refs` lane brief, the `.prio` P0 bypass and the `orch-loop.sh` merge-priority
+> override are **not** — every remaining file is tracked in `port-provenance.txt`.
+> **The tortoise copy is still required and must not be deleted yet.**
 >
 > ⚠️ **This port is faithful EXCEPT for a declared set of fail-open / false-PASS fixes.** These are
 > agent-infra's, not tortoise's — a later diff between the two trees WILL show them, and they must not
@@ -741,10 +741,10 @@ These are kept as a record because each one is a *failure mode of the design*, n
   commits merged on tortoise `main` after the copy was taken (2026-10-13 10:50Z, `eda7df136`); all
   seven are ported here, listed in the provenance note at the top. `port-provenance.txt` pins every
   file's tortoise blob hash at that sync point and `check-port-drift.sh` fails if the tortoise tree
-  moves again. ⚠️ Still open, and not fixable from here: tortoise's **unmerged**
-  `fix/8468-closure-linkage` branch rewrites this same directory (P0 bypass, `.prio`,
-  `merged-not-closed.sh`, lane brief). The removal PR must either wait for it to merge or port it —
-  deleting the directory while that branch is open orphans that work.
+  moves again. ⚠️ Its pin was STALE from 2026-10-13 to 2026-10-16 — it sat at `e20de606b`, an
+  ancestor of the prose `ported_through`, so the check reported already-ported files (e.g.
+  `spawn-gate.sh`) as drift. Re-pinned in the third pass; `port-provenance.txt` records the
+  residuals that are still unported and why **the tortoise copy must not be deleted yet**.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
