@@ -32,8 +32,14 @@
  *   - a credential WORD in a leaf name must be a WHOLE segment, a camelCase SUFFIX, or a
  *     camelCase PREFIX compound whose following words are also credential vocabulary:
  *     `clientSecret`/`secret_key`/`dbPassword`/`credentials` AND
- *     `secretKey`/`secretAccessKey`/`passwordHash` are collected, while
- *     `secretary`/`credentialsFile`/`passwordPolicy`/`secretariatOffice` are NOT.
+ *     `secretKey`/`secretAccessKey`/`passwordHash`/`secretPassphrase` are collected, while
+ *     `secretary`/`credentialsFile`/`passwordPolicy`/`secretariatOffice` are NOT; and
+ *   - the redaction LABEL is POSITION-INDEPENDENT of the store's contents (`store#N`): a
+ *     secret that appears ONLY as a config KEY — never as a collected value — must not be
+ *     re-emitted in the marker or the warning (the old pin was vacuous: its key secret was
+ *     also a collected value, so it was scrubbed for the wrong reason); and
+ *   - a configured store that EXISTS but cannot be read or parsed FAILS CLOSED (the exact
+ *     detector is incomplete), naming the store — it used to be dropped silently.
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -95,6 +101,16 @@ const SECRET_VALUE_VALUE = "secretvaluevalue00000019";
 const PASSWORD_HASH_VALUE = "passwordhashvalue0000020";
 const PASSWORD_VALUE_VALUE = "passwordvaluevalue00021";
 const CREDENTIAL_ID_VALUE = "credentialidvalue0000022";
+// Review round 10 / backlog-land review: the label embedded the traversal PATH, so a
+// secret used ONLY as a config KEY (never a collected value) was re-emitted in the
+// marker and the warning; `secretPassphrase` was dropped by the round-8 anchoring; a
+// camelCase `privateKey`/`signingKey` store leaf was emitted verbatim (the env collector
+// caught `JWT_SIGNING_KEY`); and an unreadable/unparseable store silently removed its
+// secrets from the exact-value detector.
+const KEY_ONLY_SECRET = "keyonlyconfigsecret0000030";
+const SECRET_PASSPHRASE_VALUE = "secretpassphrasevalue000031";
+const PRIVATE_KEY_VALUE = "privatekeymaterialvalue0032";
+const SIGNING_KEY_VALUE = "signingkeymaterialvalue0033";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -126,6 +142,9 @@ writeFileSync(
   JSON.stringify({
     public_key: PUBLIC_KEY_MATERIAL,
     ssh_public_key: SSH_PUBLIC_KEY_MATERIAL,
+    // The camelCase spelling of public material must stay exempt from the new
+    // `(private|signing)key$` alternative (review round 10).
+    publicKey: PUBLIC_KEY_MATERIAL,
     // Ordinary camelCase/key-suffix data that a naive `key$` would redact as a secret.
     sortKey: "ordinary-sort-key-value00001",
     monkey: "ordinary-data-not-secret0001",
@@ -163,7 +182,14 @@ writeFileSync(
 // secret it had just redacted.
 writeFileSync(
   join(AGENT, "auth-config.json"),
-  JSON.stringify({ auths: { [CONFIG_SECRET]: { password: AUTH_CONFIG_LEAF_SECRET } } }),
+  JSON.stringify({
+    auths: {
+      // KEY_ONLY: appears ONLY as a key, never as a value anywhere — the case the old pin
+      // missed because its key secret was also apiKey's collected value.
+      [KEY_ONLY_SECRET]: { password: AUTH_CONFIG_LEAF_SECRET },
+      [CONFIG_SECRET]: { password: AUTH_CONFIG_LEAF_SECRET },
+    },
+  }),
 );
 // Review round 8, finding 2: ordinary STRING-valued leaves whose name merely CONTAINS a
 // credential word were collected as secrets and rewritten out of tool results.
@@ -199,6 +225,11 @@ writeFileSync(
     passwordHash: PASSWORD_HASH_VALUE,
     passwordValue: PASSWORD_VALUE_VALUE,
     credentialId: CREDENTIAL_ID_VALUE,
+    // Review round 10: `passphrase` is credential vocabulary, and a camelCase
+    // `privateKey`/`signingKey` is private key material / a private signing secret.
+    secretPassphrase: SECRET_PASSPHRASE_VALUE,
+    privateKey: PRIVATE_KEY_VALUE,
+    signingKey: SIGNING_KEY_VALUE,
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
@@ -384,6 +415,11 @@ async function main(): Promise<void> {
       await run({ toolName: "x", content: [{ type: "text", text: `ssh_public_key=${SSH_PUBLIC_KEY_MATERIAL}` }] }),
       undefined,
     );
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `publicKey=${PUBLIC_KEY_MATERIAL}` }] }),
+      undefined,
+      "camelCase public material must not be collected by the private/signing widening",
+    );
   });
 
   await test("ordinary camelCase `*Key` data is NOT collected (over-redaction guard)", async () => {
@@ -426,10 +462,14 @@ async function main(): Promise<void> {
 
   await test("the marker label does not double its store prefix", async () => {
     const out = await run({ toolName: "bash", content: [{ type: "text", text: `key=${CONFIG_SECRET}` }] });
+    ok(out, "patch expected");
+    // The label is POSITION-INDEPENDENT of the store's contents: `store#N`, never
+    // `store:path` (review round 10 — the path could carry a key-only secret).
     ok(
-      out && JSON.stringify(out).includes("[REDACTED:tortoise-config:apiKey]"),
-      "the label is store:path, not store:store.path",
+      JSON.stringify(out).includes("[REDACTED:tortoise-config#"),
+      "the label is store#N",
     );
+    ok(!JSON.stringify(out).includes("[REDACTED:tortoise-config:"), "the label must not embed a path");
   });
 
   // ── review round 7: path matcher (both directions) + env veto + `__proto__` ──
@@ -488,6 +528,10 @@ async function main(): Promise<void> {
     ok(out, "the leaf secret under a secret-named KEY must still be redacted");
     ok(!JSON.stringify(out).includes(AUTH_CONFIG_LEAF_SECRET), "the leaf secret must not survive");
     ok(
+      !JSON.stringify(out).includes(KEY_ONLY_SECRET),
+      "a KEY-ONLY secret (never a collected VALUE) must not be re-emitted in the marker or the warning",
+    );
+    ok(
       !JSON.stringify(out).includes(CONFIG_SECRET),
       "the secret in KEY position must not be re-emitted in the marker or the warning",
     );
@@ -530,10 +574,55 @@ async function main(): Promise<void> {
       ["passwordHash", PASSWORD_HASH_VALUE],
       ["passwordValue", PASSWORD_VALUE_VALUE],
       ["credentialId", CREDENTIAL_ID_VALUE],
+      ["secretPassphrase", SECRET_PASSPHRASE_VALUE],
     ] as const) {
       const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
       ok(out && !JSON.stringify(out).includes(value), `${leaf} must be collected (was emitted verbatim)`);
     }
+  });
+
+  await test("camelCase `privateKey`/`signingKey` store leaves ARE collected (env/store asymmetry)", async () => {
+    for (const [leaf, value] of [
+      ["privateKey", PRIVATE_KEY_VALUE],
+      ["signingKey", SIGNING_KEY_VALUE],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
+      ok(out && !JSON.stringify(out).includes(value), `${leaf} must be collected (was emitted verbatim)`);
+    }
+  });
+
+  // ── review round 10: an unreadable store must fail closed, not silently vanish ──
+  await test("a store that EXISTS but cannot be parsed fails closed and names the store", async () => {
+    const badHome = mkdtempSync(join(tmpdir(), "secret-redactor-bad-"));
+    const badAgent = join(badHome, ".pi", "agent");
+    mkdirSync(badAgent, { recursive: true });
+    // A declared fleet store that exists but is not valid JSON. Pre-fix its values were
+    // dropped from the exact detector with no warning; a result then passed through.
+    writeFileSync(join(badAgent, "tortoise-config.json"), "{ this is not json");
+    const savedHome = process.env.HOME;
+    let badHandler: ((event: unknown) => unknown) | undefined;
+    try {
+      process.env.HOME = badHome;
+      // A FRESH module instance (query-bust): its AGENT_DIR is the bad HOME, because the
+      // suite's own instance already captured HOME at load time.
+      const mod = (await import("./index.js?degraded-store")) as { default: (pi: unknown) => void };
+      mod.default({
+        on: (name: string, fn: (event: unknown) => unknown) => {
+          if (name === "tool_result") badHandler = fn;
+        },
+      });
+    } finally {
+      process.env.HOME = savedHome;
+    }
+    const out = await Promise.resolve(badHandler!({ toolName: "read", content: [{ type: "text", text: "hello" }] }));
+    ok(out, "an incomplete exact detector must not pass a result through (it used to be silent)");
+    equal((out as { isError?: boolean }).isError, true, "the withheld result is an error");
+    ok(
+      JSON.stringify(out).includes("tortoise-config"),
+      "the message NAMES the unreadable store so the degradation is not silent",
+    );
+    ok(JSON.stringify(out).toLowerCase().includes("withheld"), "the message explains the state");
+    rmSync(badHome, { recursive: true, force: true });
   });
 
   // ── negatives: no over-redaction, no touch when clean ──────────────────────
