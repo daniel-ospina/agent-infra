@@ -2157,6 +2157,24 @@ printf '%s\n' '#!/usr/bin/env bash' 'env -u ${x:-a;b} -i grep -E "a|b" f | grep 
 printf '%s\n' '#!/usr/bin/env bash' 'env -u `echo a;b` -i grep -E "a|b" f | grep -q bar'       > "$E/scripts/btsep.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a|b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substpipe.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a&b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substamp.sh"
+# The FIFTH review round closed the last spelling gap in the producer WORD: an ANSI-C quoted span
+# DECODES its escapes, so `prin$'\164'f` IS printf and not the raw characters. A decoder is
+# required, not a skip. The same round fixed two defects in this lane's OWN previous commit: the
+# `printf -v` carve-out keyed on the raw width 6 rather than the word, so it DROPPED a split `grep`
+# whose raw width is also 6 (`gre''p -v`), and `<(` was missing from the quote-map openers, so a
+# separator inside a process substitution in a wrapper option argument stopped the wrapper walk.
+# Each was measured at rc 141 under `pipefail` on a >64 KiB payload with the match on line 1
+# against 0 for the capture-then-classify form, and each was CLEAN before this fix (#864 review).
+printf '%s\n' '#!/usr/bin/env bash' "prin\$'\\164'f '%s' \"\$T\" | grep -q bar"      > "$E/scripts/ansioctal.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\157' \"\$T\" | grep -q bar"            > "$E/scripts/ansioctalecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x70' -E \"a|b\" f | grep -q bar"      > "$E/scripts/ansihex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ec\$'\\150'\"o\" \"\$T\" | grep -q bar"       > "$E/scripts/ansisplice.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\u006f' \"\$T\" | grep -q bar"          > "$E/scripts/ansiuni.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\U0000006f' \"\$T\" | grep -q bar"      > "$E/scripts/ansiuni8.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\147rep' -E \"a|b\" f | grep -q bar"        > "$E/scripts/ansilead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -i \$'\\147rep' -E \"a|b\" f | grep -q bar" > "$E/scripts/ansiwrap.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre''p -v zzz \"\$P\" | grep -q bar"          > "$E/scripts/splitgv.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u <(echo a;b) -i grep -E "a|b" f | grep -q bar'   > "$E/scripts/procsubstopt.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2195,6 +2213,20 @@ else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
 fi
+# 13a2. The ANSI-C DECODER pins, asserted separately so a decoder regression names itself instead
+#       of hiding inside the aggregate above. Note `word == "printf"`, not a raw width: the same
+#       change is what keeps the `printf -v` carve-out alive for a SPLIT printf word, which 13b
+#       pins on the clean side.
+if [ "$rc" -eq 1 ] && grep -q 'ansioctal\.sh' "$OUT" && grep -q 'ansioctalecho\.sh' "$OUT" \
+   && grep -q 'ansihex\.sh' "$OUT" && grep -q 'ansisplice\.sh' "$OUT" \
+   && grep -q 'ansiuni\.sh' "$OUT" && grep -q 'ansiuni8\.sh' "$OUT" \
+   && grep -q 'ansilead\.sh' "$OUT" && grep -q 'ansiwrap\.sh' "$OUT" \
+   && grep -q 'splitgv\.sh' "$OUT" && grep -q 'procsubstopt\.sh' "$OUT"; then
+  pass "an ANSI-C quoted producer word is DECODED (octal, hex, unicode u/U, spliced, word-initial, wrapper-prefixed) and the split grep -v / process-substitution-option residual is closed"
+else
+  fail "an ANSI-C escaped producer word was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
 #      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
 #      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
@@ -2203,9 +2235,11 @@ E="$TMP/f13b"; mkdir -p "$E/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'out="$(grep -vxF -f list f || true)"' 'case "$out" in *needle*) : ;; esac' > "$E/scripts/fixed.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -q needle <<<"$(grep -v x f || true)"'                                > "$E/scripts/herestring.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f | grep needle'                                                > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print''f -v VAR \"%s\" \"a|b\" | grep -q p"                             > "$E/scripts/printfvsplit.sh"
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\164' -e \"a|b\" f | grep -q p"                                   > "$E/scripts/ansiprefixarg.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 0 ]; then
-  pass "the capture-then-case fix, a grep producer into a here-string, and a non-quiet consumer all pass (exit 0)"
+  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C argument to a non-producer, and a non-quiet consumer all pass (exit 0)"
 else
   fail "false positive on a safe grep-producer form (exit $rc):"
   sed -n '1,10p' "$OUT"

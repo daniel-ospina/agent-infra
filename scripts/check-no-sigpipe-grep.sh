@@ -151,9 +151,35 @@
 #                                                  that state is now SAVED ON CAPTURE ENTRY and
 #                                                  RESTORED ON ITS CLOSER (a subshell `( … )` is
 #                                                  not restored: it passes its stdout on)
+#       an ANSI-C QUOTED producer word whose      `prin$'\164'f …`, `ech$'\157' …`,
+#        ESCAPES ARE DECODED                         `gre$'\x70' …`, `ec$'\150'"o" …`,
+#                                                  `ech$'\u006f' …`, `ech$'\U0000006f' …`,
+#                                                  `$'\147rep' -E …`, and the same inside a
+#                                                  wrapper (`env -i $'\147rep' …`) — the word was
+#                                                  assembled with quoting removed, but an ANSI-C
+#                                                  span DECODES its escapes, so the raw characters
+#                                                  are not the word (`$'\147'` is `g`); the
+#                                                  assembly now decodes octal, `\xHH`, `\uHHHH`,
+#                                                  `\UHHHHHHHH` and the C single-character escapes,
+#                                                  and takes an unknown escape literally, exactly as
+#                                                  the shell does
+#       a `<(` in a wrapper OPTION ARGUMENT          `env -u <(echo a;b) -i grep …` — the quote map
+#                                                  (QI) knew `${…}`, `$(…)` and backticks but not
+#                                                  the process-substitution opener, so a separator
+#                                                  inside it ended the wrapper walk
+#       a SPLIT word for the `printf -v` CARVE-OUT   `gre''p -v …` (a `grep` PRODUCER, flagged) and
+#        (a defect this lane introduced and fixed)    `print''f -v …` (still the carve-out, not
+#                                                  flagged) — the carve-out keyed on the RAW WORD
+#                                                  WIDTH, and an assembled word of the same raw
+#                                                  width matched it, so the split `grep -v`
+#                                                  producer was dropped; it now keys on the
+#                                                  ASSEMBLED WORD (`word == "printf"`), which is
+#                                                  what the carve-out means
 #     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
 #     regression; the widening closes them. The class stays open-ended in exactly the way the
 #     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
+#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (and 13a2 for the ANSI-C decoder,
+#     which is asserted separately so a decoder regression names itself).
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
 #     into grep is seen through — `env`, `nice`, `command`, `time`, `sudo`, `stdbuf`, `exec`,
@@ -1108,9 +1134,34 @@ HITS="$(
       # variable, not to stdout, so it cannot SIGPIPE, and a writer that is an ARGUMENT to another
       # command is not a writer either (in `foo -e echo -e "a|b" f | grep -q p` the pipeline
       # carries foo output, and the `echo` is an option argument, not a command).
-      # KEEP IN STEP WITH WRITERRE (see the note at its definition): the ladder below is the
+      # KEEP IN STEP WITH WRITERRE (see the note at its definition): the assembly below is the
       # only producer list scan_idiom consults.
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok, word, c, qq, n) {
+      # The numeric value of the digits in `s` in `base`: the ANSI-C escape decoder below needs it
+      # and this awk has no strtonum.
+      function numval(s, base,   i, c, d, v) {
+        v = 0
+        for (i = 1; i <= length(s); i++) {
+          c = tolower(substr(s, i, 1))
+          d = index("0123456789abcdef", c) - 1
+          if (d < 0 || d >= base) break
+          v = v * base + d
+        }
+        return v
+      }
+      # The character the C escape letter `ch` stands for, so a `$'...'` span is decoded the way
+      # the shell decodes it (`\n` is a newline, `\t` a tab). An unknown escape is itself.
+      function ctrl_char(ch) {
+        if (ch == "a") return sprintf("%c", 7)
+        if (ch == "b") return sprintf("%c", 8)
+        if (ch == "e" || ch == "E") return sprintf("%c", 27)
+        if (ch == "f") return sprintf("%c", 12)
+        if (ch == "n") return sprintf("%c", 10)
+        if (ch == "r") return sprintf("%c", 13)
+        if (ch == "t") return sprintf("%c", 9)
+        if (ch == "v") return sprintf("%c", 11)
+        return ch
+      }
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok, word, c, n, an, mx, hs) {
         w = 0
         # The command word is ASSEMBLED one literal character at a time with shell quoting and
         # escaping REMOVED, so a producer whose LETTERS are separated by quote runs or backslashes
@@ -1119,13 +1170,39 @@ HITS="$(
         # character ladder could only see the contiguous form, and BOTH matchers were blind to the
         # split ones — every one of them CLEAN at rc 141 (#864 review). The first-character test
         # keeps this O(1) for the common case; the assembly is bounded by the longest producer word.
-        if (CH[i] != "e" && CH[i] != "p" && CH[i] != "g") return 0
-        word = ""; j = i; n = 0
+        if (CH[i] != "e" && CH[i] != "p" && CH[i] != "g" \
+            && !(CH[i] == "$" && CH[i + 1] == "\047")) return 0
+        word = ""; j = i; n = 0; an = 0
         while (j <= CHN && n < 7) {
           c = CH[j]
-          if (c == "$" && (CH[j + 1] == "\047" || CH[j + 1] == "\"")) { j += 2; continue }
+          if (c == "$" && CH[j + 1] == "\047") { an = 1; j += 2; continue }
+          if (c == "$" && CH[j + 1] == "\"") { an = 0; j += 2; continue }
+          if (c == "\\" && an) {
+            # Inside an ANSI-C quoted span the shell DECODES the escape, so the word is the value
+            # and not the two raw characters: `prin$'\164'f` is `printf`, `gre$'\x70'` is `grep`,
+            # `$'\147rep'` is `grep`. All of them were CLEAN at rc 141 (#864 review). An escape
+            # this decoder does not know is taken literally, which is what the shell does with an
+            # unknown escape too.
+            j++
+            if (j > CHN) break
+            if (CH[j] == "x" || CH[j] == "u" || CH[j] == "U") {
+              mx = (CH[j] == "x") ? 2 : ((CH[j] == "u") ? 4 : 8)
+              j++; hs = ""
+              while (j <= CHN && length(hs) < mx && CH[j] ~ /[0-9A-Fa-f]/) { hs = hs CH[j]; j++ }
+              if (hs == "") c = "x"
+              else c = sprintf("%c", numval(hs, 16))
+            } else if (CH[j] ~ /[0-7]/) {
+              hs = ""
+              while (j <= CHN && length(hs) < 3 && CH[j] ~ /[0-7]/) { hs = hs CH[j]; j++ }
+              c = sprintf("%c", numval(hs, 8))
+            } else {
+              c = ctrl_char(CH[j]); j++
+            }
+            word = word c; n++
+            continue
+          }
           if (c == "\\") { j++; if (j > CHN) break; c = CH[j] }
-          else if (c == "\047" || c == "\"") { j++; continue }
+          else if (c == "\047" || c == "\"") { if (c == "\047") an = 0; j++; continue }
           else if (c ~ /[ \t;&|()<>`{}]/) break
           word = word c; j++; n++
         }
@@ -1161,7 +1238,7 @@ HITS="$(
         # A quote or a backslash DIRECTLY after the word is its own quoting (`"grep"`, `'grep'`),
         # not the start of another word: `grepx` must stay rejected, `grep"` must not.
         if (nxt != "" && nxt !~ /[ \t"\047\\]/) return 0
-        if (w == 6 && substr(s, i + w, 10) ~ /^[ \t]+-v/) return 0
+        if (w != 0 && word == "printf" && substr(s, i + w, 10) ~ /^[ \t]+-v/) return 0
         j = i - 1
         while (j >= 1 && (CH[j] == " " || CH[j] == "\t")) j--
         k = j
@@ -1256,7 +1333,13 @@ HITS="$(
             if (c == q) { q = ""; ansi = 0 }
             continue
           }
-          if (c == "$" && CH[i + 1] == "\047") { q = "\047"; ansi = 1; i++; continue }
+          if (c == "$" && CH[i + 1] == "\047") {
+            # The word can OPEN with the ANSI-C span (`$'\147rep'` IS grep), so test it at the
+            # DOLLAR: this branch is about to consume both characters and enter the quoted region,
+            # which would leave the escape the word depends on BEHIND the entry point.
+            w = writer_at(s, i); if (w && scan_from(i + w)) return 1
+            q = "\047"; ansi = 1; i++; continue
+          }
           if (c == "\\") { esc = 1; continue }
           if (c == "\"" || c == "\047") { q = c; ansi = 0; continue }
           # GROUPING. A `( ... )` SUBSHELL passes its stdout on, so a writer inside it keeps the
@@ -1474,6 +1557,7 @@ HITS="$(
             if (CH[i] == "`") { QI[i] = 1; btt = 1; continue }
             if (CH[i] == "$" && CH[i + 1] == "{") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
             if (CH[i] == "$" && CH[i + 1] == "(") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
+            if (CH[i] == "<" && CH[i + 1] == "(") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
             if (CH[i] == "\\") { QI[i] = 1; if (i < CHN) { i++; QI[i] = 1 }; continue }
             if (CH[i] == "$" && CH[i + 1] == "\047") { QI[i] = 1; i++; QI[i] = 1; qq = 3; continue }
             if (CH[i] == "$" && CH[i + 1] == "\"") { QI[i] = 1; i++; QI[i] = 1; qq = 2; continue }
