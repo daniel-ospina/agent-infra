@@ -897,6 +897,30 @@ run_remote_scope() {
     fi
     echo ""
 
+    # ⛔ RESOLVE THE MERGE BASE BEFORE CLASSIFYING AGAINST IT. `git branch -r
+    # --merged "origin/$MAIN_BRANCH"` exits non-zero with NO output when that ref
+    # does not resolve; the `|| true` this loop used to carry hid the status, the
+    # candidate list stayed EMPTY, and the pass printed "No stale merged branches
+    # found" and exited 0. That is under-deletion, but it is a FALSE PASS: a
+    # scheduler reading only the status concludes the estate is clean while every
+    # stale merged branch is still on the remote. This is exactly the "an
+    # unreadable map is not an empty one" rule the LOCAL scope already enforces
+    # with `main_ref_ok` — and here the classification IS the delete list, so an
+    # unresolvable base must REFUSE, not silently select nothing. (A narrowed
+    # positive refspec — `clone --single-branch --branch <other>`, `git remote
+    # set-branches` — leaves exactly this state: the fetch exits 0 and
+    # refs/remotes/origin/$MAIN_BRANCH is never created.)
+    local merged_list=""
+    if ! merged_list="$(git branch -r --merged "origin/$MAIN_BRANCH" 2>/dev/null)"; then
+        echo "ERROR: origin/$MAIN_BRANCH does not resolve, so no branch can be shown to be" >&2
+        echo "ERROR: merged into main. 'git branch -r --merged origin/$MAIN_BRANCH' fails with" >&2
+        echo "ERROR: no output in that state, which reads as 'nothing is stale' — an unreadable" >&2
+        echo "ERROR: merge base is NOT an empty selection. Refusing the remote sweep; fetch" >&2
+        echo "ERROR: refs/remotes/origin/$MAIN_BRANCH (a narrowed remote.origin.fetch refspec is the" >&2
+        echo "ERROR: usual cause) and re-run." >&2
+        return 1
+    fi
+
     # ── Find stale merged branches ────────────────────────────────
     # Strategy:
     #   1. git branch -r --merged origin/main → all remote branches merged into main
@@ -963,7 +987,7 @@ run_remote_scope() {
             TRACKING_OID="$(git rev-parse --verify -q "refs/remotes/$branch" 2>/dev/null || true)"
             STALE_BRANCHES+=("$branch"$'\t'"$COMMIT_DATE_HR"$'\t'"$TRACKING_OID")
         fi
-    done < <(git branch -r --merged "origin/$MAIN_BRANCH" 2>/dev/null || true)
+    done <<<"$merged_list"
 
     # ⛔ DELETE ORDER: longest local branch first. `git push --delete --
     # refs/heads/foo` fails with "dst refspec refs/heads/foo matches more than
@@ -1516,6 +1540,21 @@ run_local_scope() {
             # quoted argv: it is informational and must not become an argument.
             local local_cmd=(git branch -d -- "$br")
             printf '  %s   # class=%s\n' "$(quote_argv "${local_cmd[@]}")" "$cls"
+            # ⛔ THE `-D` FALLBACK IS PART OF THE PLAN FOR `merged`, and omitting
+            # it made the printed plan a LIE for the very class the merged gate
+            # exists to reap. The execute path tries `-d` and then `-D` for a
+            # squash-merged branch whose tip is not an ancestor of main — so the
+            # plan said `git branch -d -- sq` and pasting it made git refuse ("not
+            # fully merged") while `--execute` silently force-deleted it. Render
+            # the SAME two commands the execute loop runs, through the SAME
+            # `quote_argv`, so the plan stays a faithful, paste-safe description.
+            # `-D` remains confined to `merged` — no other class gets a second
+            # line, and `-d` is still printed FIRST (the fallback, not the primary).
+            if [ "$cls" = "merged" ]; then
+                local local_cmd_force=(git branch -D -- "$br")
+                printf '  %s   # class=%s (fallback if -d refuses)\n' \
+                    "$(quote_argv "${local_cmd_force[@]}")" "$cls"
+            fi
         done <<<"$delete_list"
         echo ""
     else

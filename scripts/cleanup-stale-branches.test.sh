@@ -1433,6 +1433,55 @@ fi
 
 cd "$REPO"
 echo ""
+echo "== 19b. remote scope REFUSES when origin/main cannot resolve (F8) =="
+# `git branch -r --merged "origin/$MAIN_BRANCH"` exits NON-ZERO with NO output
+# when that ref does not resolve. The old loop carried `|| true`, so the status
+# was swallowed, the candidate list was EMPTY, and the pass printed
+# `✅ No stale merged branches found` and exited 0 — a FALSE PASS over an estate
+# that still holds a stale merged branch. A `--single-branch --branch foo` clone
+# leaves exactly that state: `git fetch origin --prune` exits 0 and
+# refs/remotes/origin/main is NEVER created, while origin's `foo` IS merged and
+# stale. This is the "an unreadable map is not an empty one" rule the LOCAL
+# scope already enforces with `main_ref_ok`; the remote scope must refuse too.
+F8_ORIGIN="$FIX/f8-origin.git"
+F8_SEED="$FIX/f8-seed"
+F8_CLONE="$FIX/f8-clone"
+new_repo "$F8_SEED" "$F8_ORIGIN"
+cd "$F8_SEED"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F8_SCRIPT="$F8_SEED/scripts/cleanup-stale-branches.sh"
+echo base > f8.txt; git add f8.txt; old_commit "init"; git push -q origin main
+# foo — merged into main and STALE, so it WOULD be a candidate if origin/main resolved.
+git checkout -q -b foo main
+echo foo > foo.txt; git add foo.txt; old_commit "foo"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+# The single-branch clone: remote.origin.fetch omits refs/heads/main entirely.
+git clone -q --single-branch --branch foo "$F8_ORIGIN" "$F8_CLONE"
+if git -C "$F8_CLONE" rev-parse --verify -q refs/remotes/origin/main >/dev/null 2>&1; then
+    bad "F8 fixture: refs/remotes/origin/main resolved — the fixture no longer exercises the defect (F8)"
+else
+    ok "F8 fixture: refs/remotes/origin/main does NOT resolve after a 0-exit fetch (F8)"
+fi
+if git -C "$F8_CLONE" rev-parse --verify -q refs/remotes/origin/foo >/dev/null 2>&1; then
+    ok "F8 fixture: refs/remotes/origin/foo resolves (origin's merged+stale foo is present) (F8)"
+else
+    bad "F8 fixture: refs/remotes/origin/foo is missing (F8)"
+fi
+run_script bash "$F8_SCRIPT" --repo "$F8_CLONE" --scope remote
+assert_eq "$RC" "1" "an unresolvable origin/main REFUSES the remote scope (F8)"
+assert_contains "$OUT" "origin/main does not resolve" "the refusal names the unresolved ref (F8)"
+assert_not_contains "$OUT" "No stale merged branches found" "the false 'nothing is stale' success line is NOT printed (F8)"
+# And the same state must refuse the remote leg under --execute as well.
+run_script bash "$F8_SCRIPT" --repo "$F8_CLONE" --scope remote --execute
+assert_eq "$RC" "1" "an unresolvable origin/main REFUSES --execute too (F8)"
+assert_not_contains "$OUT" "✅ deleted" "nothing is deleted against an unresolvable merge base (F8)"
+
+cd "$REPO"
+echo ""
 echo "== 20. a FAILED fetch REFUSES the remote sweep even under CLEANUP_BRANCH_LOG (R3-2) =="
 # `git fetch origin --prune --quiet` in the remote scope was bare and relied on
 # `set -e`. The opt-in report log wraps the whole pass in `set +e` (so PIPESTATUS
@@ -2126,6 +2175,32 @@ F6_NAMES=('pwn$(id)end' 'p|pe' "s'qzz" 'q"xx')
 for _f6n in "${F6_NAMES[@]}"; do
     git update-ref "refs/heads/$_f6n" "$F6_MAIN_SHA"
 done
+# ⛔ AND one `merged`-class name whose tip is NOT an ancestor of main. This is
+# the ONLY shape that reaches the `-D` fallback (`git branch -d` refuses a
+# squash-merged tip), and therefore the only shape that can expose the plan/
+# execute divergence: the plan printed just `git branch -d`, while `--execute`
+# silently fell back to `git branch -D`, so pasting the plan refused and the
+# branch was never reaped. Built with plumbing (commit-tree + update-ref) so no
+# working-tree operation runs. The tree is main's, so the commit is distinct and
+# unreachable from main.
+F6_TREE="$(git rev-parse "$F6_MAIN_SHA^{tree}")"
+F6_MERGED_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F6_TREE" -p "$F6_MAIN_SHA" -m "f6-merged")"
+git update-ref refs/heads/f6-merged "$F6_MERGED_SHA"
+if git merge-base --is-ancestor "$F6_MERGED_SHA" main 2>/dev/null; then
+    bad "F6 fixture: the merged tip IS an ancestor of main — the -D fallback is unreachable (F6/F7)"
+else
+    ok "F6 fixture: the merged tip is NOT an ancestor of main (the -D fallback is reachable) (F6/F7)"
+fi
+# The PR map backing it: MERGED, base main, headRefOid == the tip. The four
+# special names stay absent, so they remain `redundant` and take only `-d`.
+F6_PR_MAP="$FIX/f6-pr-map.json"
+cat > "$F6_PR_MAP" <<JSON
+[
+  {"headRefName":"f6-merged","state":"MERGED","headRefOid":"$F6_MERGED_SHA","baseRefName":"main"}
+]
+JSON
 F6_REAL_GIT="$(command -v git)"
 F6_WRAP="$FIX/f6-wrap"
 mkdir -p "$F6_WRAP"
@@ -2150,10 +2225,15 @@ exec "$REAL_GIT" "$@"
 WRAP
 chmod +x "$F6_WRAP/git"
 
-run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$PR_MAP_OTHER"
+run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$F6_PR_MAP"
 assert_eq "$RC" "0" "local paste-safety fixture: dry-run exits 0 (F6)"
-F6_PLAN_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
-assert_eq "$F6_PLAN_COUNT" "4" "the local plan prints one paste-safe command per special-named branch (F6)"
+# One `-d` per selected branch, PLUS the `-D` fallback for the `merged` class.
+# Counted separately so the test also pins that `-D` stays CONFINED to `merged`.
+F6_PLAN_D_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
+F6_PLAN_FORCE_COUNT="$(grep -c '^  git branch -D --' <<<"$OUT" || true)"
+assert_eq "$F6_PLAN_D_COUNT" "5" "the local plan prints one -d command per selected branch (4 redundant + 1 merged) (F6)"
+assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the -D fallback for the merged class ONLY (F6/F7)"
+assert_contains "$OUT" 'git branch -D -- f6-merged' 'the merged class actually prints its -D fallback (F6/F7)'
 assert_contains "$OUT" '# class=redundant' 'the class annotation is still printed (F6)'
 
 # Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
@@ -2165,13 +2245,13 @@ while IFS= read -r _f6_line; do
     [ -n "$_f6_line" ] || continue
     PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f6_line" >>"$F6_PLAN_ARGV" || true
-done <<<"$(grep '^  git branch -d --' <<<"$OUT" || true)"
+done <<<"$(grep '^  git branch -[dD] --' <<<"$OUT" || true)"
 
 # The execute path logs the SAME encoding from its real `git branch` invocations.
 F6_EXEC_ARGV="$FIX/f6-exec.bin"
 : > "$F6_EXEC_ARGV"
 run_script env PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_LOG="$F6_EXEC_ARGV" \
-    bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --execute --pr-map-file "$PR_MAP_OTHER"
+    bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --execute --pr-map-file "$F6_PR_MAP"
 assert_eq "$RC" "0" "local paste-safety fixture: --execute exits 0 (F6)"
 if [ -s "$F6_PLAN_ARGV" ] && cmp -s "$F6_PLAN_ARGV" "$F6_EXEC_ARGV"; then
     ok "evaluating the LOCAL printed plan yields EXACTLY the executed argv (no \$(id) fired) (F6)"
