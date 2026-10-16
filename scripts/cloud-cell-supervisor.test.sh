@@ -86,6 +86,15 @@ make_ai_repo() {
   for w in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
+  # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
+  # checkout without the pair makes `start` die "the harness checkout must be a full agent-infra
+  # checkout" BEFORE the probe under test ever runs (they are needed by §7's `start` and by §9's
+  # `start`/`apply` arms). Carry them here, exactly where a real checkout has them, so each fixture
+  # stays a CELL and not a partial copy that only the newest refusal can reach.
+  printf '#!/bin/bash\nexit 0\n' > "$AI/scripts/record-review.sh"
+  mkdir -p "$AI/scripts/lib"
+  printf '#!/usr/bin/env python3\n' > "$AI/scripts/lib/diff-normalize.py"
   git -C "$AI" add -A
   git -C "$AI" commit -q -m base
   git -C "$AI" branch -M main
@@ -101,6 +110,21 @@ sup() {
              HARNESS_REPO="$AI" HARNESS_FETCH=0 \
              bash "$SUP" "$1" 2>&1)"
   SUP_RC=$?
+}
+
+# `cmd_check` probes `git`/`python3`/`pi` on PATH (#1717), so a fixture has to satisfy that probe —
+# but stubbing a tool the FIXTURE ITSELF needs SHADOWS the real one, and the probe under test then
+# reads the stub instead of reality: a `git` stub makes the provenance gate's `rev-parse` return
+# empty, so a healthy harness reads as unverifiable and §7/§8/§9 assert against the WRONG refusal (or
+# die in `harness_apply` with "cannot pin a harness to verify against"). Stub the GAPS the host
+# leaves (the ubuntu CI runner installs no `pi`), never the tools.
+stub_missing() { # <bin dir> <tool>…
+  local d="$1"; shift
+  local t
+  mkdir -p "$d"
+  for t in "$@"; do
+    command -v "$t" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$d/$t"; chmod +x "$d/$t"; }
+  done
 }
 
 # A temp HOME and a state dir per case, so no case can see another's O.
@@ -195,9 +219,14 @@ esac
 # toolchain is stubbed so the check is hermetic (the real `pi` is not installed on the runner).
 say_case "cloud-cell-bringup.sh --check with a top-level exit in keys.env"
 STUB="$T/stub"; mkdir -p "$STUB"
-for c in git gh node python3 uv tmux pi docker; do
+# `gh`/`tmux`/`node`/`uv`/`pi`/`docker` MUST be stubs — the suite is offline and the real tmux server
+# must never be touched — but `git`/`python3` are stubbed only on the hosts that LACK them. An `exit 0`
+# `git` answers nothing, and shadowing the real one is the exact trap that cost §7/§8 two review rounds
+# (see `stub_missing`): the next assertion added here would inherit a git that cannot resolve a ref.
+for c in gh node uv tmux pi docker; do
   printf '#!/bin/sh\nexit 0\n' > "$STUB/$c"; chmod +x "$STUB/$c"
 done
+stub_missing "$STUB" git python3
 printf '#!/bin/sh\nprintf 200\n' > "$STUB/curl"   # check_network reads %{http_code} on stdout
 chmod +x "$STUB/curl"
 mkdir -p "$T/bringup-home"
@@ -271,11 +300,15 @@ printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # cell without it — or without its declared sibling `lib/diff-normalize.py` (the recorder resolves the
 # normalizer as its OWN sibling). So the fixture must carry the PAIR one directory up from the
 # harness, exactly where recorder_src()/recorder_lib_src() look, or every §7 case dies before the
-# session launch. The `pi` stub is the new runtime-dependency probe: the CI runner installs none, so
-# a fixture that leans on the host PATH reddens on the runner only (agent-infra#1348/#1369 class).
+# session launch. The `pi` stub is the new runtime-dependency probe: the ubuntu CI runner installs
+# none, so a fixture that leans on the host PATH reddens on the runner only (#1348/#1369 class).
+# ⛔ GAPS ONLY (see `stub_missing`): `git` must stay REAL, because the provenance gate's `rev-parse`
+# and `harness_apply`'s ref resolution READ its output — an `exit 0` stub prints nothing, so a
+# healthy fixture harness reads as UNVERIFIABLE and every §7 `start` dies "cannot resolve origin/main
+# … cannot pin a harness to verify against" instead of exercising key delivery.
 printf '#!/bin/bash\nexit 0\n' > "$W/record-review.sh"; chmod +x "$W/record-review.sh"
 mkdir -p "$W/lib"; printf '#!/usr/bin/env python3\n' > "$W/lib/diff-normalize.py"
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$W/bin/$c"; chmod +x "$W/bin/$c"; done
+stub_missing "$W/bin" pi
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
 cat > "$W/harness/orch-loop.sh" <<EOF
@@ -532,7 +565,7 @@ chmod +x "$F/home/.pi/agent/scripts/record-review.sh"
 printf '#!/usr/bin/env python3\n' > "$F/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf '#!/bin/bash\nexit 0\n' > "$F/record-review.sh"; chmod +x "$F/record-review.sh"
 mkdir -p "$F/lib"; printf '#!/usr/bin/env python3\n' > "$F/lib/diff-normalize.py"
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$F/bin/$c"; chmod +x "$F/bin/$c"; done
+stub_missing "$F/bin" pi
 # Stand-in for refresh-candidates.sh --check: echoes the REPO/O it was handed (so a probe run
 # against the wrong repo cannot pass silently) and exits with $PROBE_RC.
 cat > "$F/harness/refresh-candidates.sh" <<'SH'
@@ -631,6 +664,18 @@ for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chai
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$P/bin/gh"; chmod +x "$P/bin/gh"
+# #1717: `check` refuses a cell whose $CELL_HOME lacks the record step (and its declared sibling),
+# so seed the pair exactly where the shipped `start` lays it down. Without this every §9 arm that
+# EXPECTS a green verdict is decided by the MISSING RECORDER rather than by the provenance/disk probe
+# it means to exercise — a rule, not a count: a figure here re-stales the moment an arm is added, the
+# same reason the record-dep suite's header states its labelling rule instead of a total.
+mkdir -p "$P/home/.pi/agent/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$P/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$P/home/.pi/agent/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$P/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi`, which the ubuntu CI runner does not install. GAPS
+# ONLY (see `stub_missing`): `git` must stay REAL here — the provenance arms below read its output.
+stub_missing "$P/bin" pi
 # A tmux double so `start` is exercised without ever creating a real session: has-session is false
 # until new-session "starts" one — exactly the sequence cmd_start checks after its sleep.
 cat > "$P/bin/tmux" <<'SH'

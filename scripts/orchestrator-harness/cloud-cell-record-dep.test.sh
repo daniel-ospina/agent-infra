@@ -54,7 +54,7 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
 # The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
 # under test are trivial `exit 0` stubs.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname env sed grep chmod head tail awk seq sleep diff stat touch true false"
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -90,7 +90,15 @@ case "$1" in
 esac
 SH
   chmod +x "$d/tmux"
-  for b in git python3 pi; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
+  # ⛔ git is REAL and SYMLINKED, never an `exit 0` stub: `cmd_check`'s provenance probe and
+  # `harness_apply`'s ref resolution both READ its output, and a stub prints nothing — every healthy
+  # tree then reads as UNVERIFIABLE ("cannot resolve origin/main … cannot pin a harness to verify
+  # against"), so the whole cell is refused before the recorder probe this suite exists for is ever
+  # reached — and the recorder assertions pass for the wrong reason (or fail loudly).
+  # python3/pi stay `exit 0` stubs: nothing below reads their OUTPUT, only their presence, and §4
+  # removes each in turn to pin the "missing on PATH" refusal.
+  p="$(command -v git 2>/dev/null)" && ln -sf "$p" "$d/git"
+  for b in python3 pi; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
   return 0
 }
 
@@ -98,14 +106,35 @@ SH
 CELL="$TMP/cell"
 CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"; CELL_HARNESS="$CELL/harness"
 CELL_STUBS="$CELL/stubs"
-mkdir -p "$CELL_HOME" "$CELL_REPO/.git" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
+mkdir -p "$CELL_HOME" "$CELL_REPO" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
 # cmd_check also judges DISPATCH PROVISIONING (agent-infra#1736): the target repo must carry its
 # own tools/collision_preflight.py (or resolve a tortoise checkout), else the whole cell is refused
 # as MERGE-ONLY before the recorder assertions below are ever reached — which would make them pass
 # for the wrong reason. Give the fixture its own tool so every recorder assertion is decided by the
 # recorder probe it names, not by an earlier refusal.
 mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/tools/collision_preflight.py"
+# ⛔ With a REAL git on the stub PATH the two trees the supervisor interrogates must BE git trees:
+# `cmd_check` asks `git -C $REPO rev-parse --git-dir` (an empty `.git` DIRECTORY is not a checkout —
+# it dies "$REPO is not a git checkout" before the recorder probe), and the provenance half asks the
+# HARNESS for `HEAD^{commit}` plus `status --porcelain` (a plain directory answers neither, so the
+# harness reads as `untracked` and DRIFT refuses the cell). Both are built here, hermetically: a
+# commit each, and a LOCAL `refs/remotes/origin/main` on the harness so HARNESS_REL is `current` with
+# no network and no reference to the operator's checkout. HARNESS_REPO is a fixture path (set in
+# cell_check/cell_start) precisely so no probe can reach the real one.
+git -C "$CELL_REPO" init -q
+# ⛔ `commit.gpgsign=false` is not decoration: a host with `commit.gpgsign = true` in its global
+# config makes this commit die (`gpg failed to sign the data`), the `update-ref` below then fails
+# (`HEAD: not a valid SHA1`), `classify_harness` reads `unknown`, and EVERY `cell_check` is refused —
+# the whole suite reddens on a dev box while staying green on CI, the mirror of the #1348/#1369
+# runner-only class this fixture exists to close. Measured: 78 passed / 17 failed under a
+# `gpgsign = true` global config before this line. Every other fixture in this repo
+# (`ai_init_repo`/`make_ai_repo`, selftest's `$HFIX`) sets it for the same reason.
+git -C "$CELL_REPO" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q --allow-empty -m base
 cp "$HERE"/*.sh "$CELL_HARNESS/"
+git -C "$CELL_HARNESS" init -q
+git -C "$CELL_HARNESS" add -A
+git -C "$CELL_HARNESS" -c user.email=t@t -c user.name=t -c commit.gpgsign=false commit -q -m "fixture harness"
+git -C "$CELL_HARNESS" update-ref refs/remotes/origin/main HEAD
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"
@@ -123,6 +152,7 @@ cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's st
   env -u SCOPE -u AI_REVIEW_GATE_KEY \
     PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
     O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
+    HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     "$BASH_BIN" "$SUP" check 2>&1
 }
 cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that records the session
@@ -130,6 +160,7 @@ cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that 
   env -u AI_REVIEW_GATE_KEY SCOPE=own \
     PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
     REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
+    HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     "$BASH_BIN" "$SUP" start 2>&1
 }
 certified() { case "$1" in *'CELL CAN RUN A CONTROLLER'*) return 0 ;; *) return 1 ;; esac; }
@@ -506,8 +537,11 @@ case "$reason" in *'could not resolve'*'head'*) rc=0 ;; *) rc=1; note "reason=$r
 ck "the refusal names the unresolvable head" $rc
 case "$reason" in *"rm -f '$MRG/o/state/parked-$PR' '$MRG/o/state/parkreason-$PR'"*) rc=0 ;; *) rc=1; note "reason=$reason";; esac
 ck "the unresolvable-head reason names the way out" $rc
-# …and a head that is present but NOT a 40-char lower-hex sha is the same refusal (the shape
-# record-review.sh:649 enforces), not a review that can never be recorded.
+# …and a head that is present but NOT a 40-char lower-hex sha is the same refusal (the
+# `head_sha must be a full 40-char hex sha` refusal in record-review.sh — cited by SYMBOL, not by
+# line: a line number in a comment re-stales on the next unrelated edit, and five of the citations
+# this test added had already drifted before they were committed), not a review that can never be
+# recorded.
 out="$(FAKE_HEAD_OVERRIDE='deadbeef' run_merge)"; rc=$?
 [ "$rc" -ne 0 ] && [ "$(pi_calls)" = "0" ] && rc=0 || { rc=1; note "rc=$rc pi calls=$(pi_calls)"; }
 ck "a non-40-hex head is refused before the paid review" $rc
@@ -679,7 +713,8 @@ ck "non-vacuity: a successful record writes no park" $rc
 ck "non-vacuity: exactly one review is run on the happy path" $rc
 
 # 9b) COVERAGE — the marker the signer emits in PRODUCTION carries `diff=<64hex>`
-# (`record-review.sh:2150`), and no other case drives that shape through the guard: `mkrecorder_posts`
+# (record-review.sh's `MARKER="review recorded: …"` construction — again cited by symbol, not by
+# line), and no other case drives that shape through the guard: `mkrecorder_posts`
 # posts the legacy no-`diff=` form. A later tightening of the pattern that breaks the diff-bearing
 # line would otherwise stay green here while every honest merge parked in production. It is the `.*`
 # between the head and `sig=` that admits both forms — this pins it.

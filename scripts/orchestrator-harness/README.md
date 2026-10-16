@@ -228,9 +228,13 @@ the fact: the PR body names the comment it was signed against.
 a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
 with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
 `~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
-table is *not* a refusal: a missing `AI_REVIEW_GATE_KEY` is a **warning** (a keyless cell can run a
-controller but cannot merge), and `tools/collision_preflight.py` and the `.worktrees/` gitignore are
-not probed by `check` at all.
+table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
+still runs a controller and is still a **MERGE ACTOR** (`gh pr merge --auto` does not go through the
+key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it just cannot complete a
+*signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
+`tools/collision_preflight.py` is not probed *by name* — but the #1736 dispatch-provisioning probe
+(`refresh-candidates.sh --check`) refuses a repo that resolves no copy of it, so `check` does refuse
+that cell in effect.
 Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
 fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
 `git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does
@@ -692,11 +696,11 @@ These are kept as a record because each one is a *failure mode of the design*, n
 
 | Defect | Impact | Fix |
 |---|---|---|
-| **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` skipped the `*)` arm that writes the fixer marker, so nothing was recorded and nothing was parked: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. A later push changes the head and re-arms the PR by construction |
+| **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` skipped the `*)` arm that writes the fixer marker, so nothing was recorded and nothing was parked: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a **controller** park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. ⚠️ **Residual:** `merge-one.sh`'s own rail cap writes `state/parked-<PR>` directly and no `parkreason-<PR>`; that site `exit 0`s before the exit-5 refusal can print a reason, so it cannot itself misreport — but a human reading `state/parkreason-<PR>` beside a newer marker still can. A later push changes the head and re-arms the PR by construction |
 
 ### 7.5 Still open, deliberately not fixed here
 
-> **Seven entries that were here are now FIXED** and have been removed from this list: the
+> **Eight entries that were here are now FIXED** and have been removed from this list: the
 > fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519), `checked.txt`
 > written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the returning INT/TERM
 > trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516), the controller's
@@ -704,7 +708,8 @@ These are kept as a record because each one is a *failure mode of the design*, n
 > `orch-loop.sh` (agent-infra#1714, tortoise#8518), this directory being older than its source
 > (agent-infra#1712 — see the provenance note at the top of this file), and
 > `cloud-cell-bringup.sh` deleting the pushed gh token only on the success branch
-> (agent-infra#1718 — fixed in this branch, independent of the #1712 port).
+> (agent-infra#1718 — fixed in this branch, independent of the #1712 port), and
+> `cmd_check` never testing `record-review.sh` (agent-infra#1717 — see §7.4b).
 
 - **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
   sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn

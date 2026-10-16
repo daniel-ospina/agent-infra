@@ -1404,11 +1404,15 @@ chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
-# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the CI runner `pi` is not
-# installed, so every fixture that reaches that probe must stub it instead of leaning on the host
-# PATH — otherwise the suite reddens on the runner only (the #1348/#1369 lane-split class). git and
-# python3 are stubbed too so the probe is hermetic rather than host-dependent.
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; done
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
+# not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
+# fixture that reaches the probe must stub it instead of leaning on the host PATH — otherwise the
+# suite reddens on the runner only (the #1348/#1369 lane-split class).
+# ⛔ Stub the GAPS ONLY — stubbing a tool the fixture itself needs SHADOWS the real one, and the
+# provenance gate then reads the stub: `git -C "$HARNESS_REPO" rev-parse` returns EMPTY, the harness
+# classifies as `unknown`, and cmd_check refuses with "Cannot-verify is never a pass" — so every
+# case below would assert against a DRIFT refusal instead of the verdict under test.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; }; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1549,8 +1553,10 @@ chmod +x "$TMP/tm/record-review.sh"
 # #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
 mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
-# …and the runtime-dependency probe needs `pi` (absent on the CI runner) and the other two, stubbed.
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; done
+# …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
+# for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
+# and turns a current harness into an unverifiable one.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
