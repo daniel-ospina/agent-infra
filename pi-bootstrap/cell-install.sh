@@ -505,9 +505,10 @@ install_config() {
       cfg_fail=1
       continue
     fi
-    # A copy that FAILS must be COUNTED, not merely silence the success line below: the dest
-    # can be a file where the checkout has a directory (`mkdir -p` then fails), and a silent
-    # skip would report the config set as installed while only the success line was suppressed.
+    # A copy that FAILS must be COUNTED: `copy_repo_path` returns non-zero when the destination
+    # cannot take what the checkout has (a file where the source is a directory, say), and the
+    # read-back below is what a lane actually gets vouched for — a copy that failed and was not
+    # counted would leave this path reporting success.
     copy_repo_path "$rel" || { fail "could not install $rel (a dest that is not the same shape as the source?)"; cfg_fail=1; }
   done
   # The step's own narrative may not contradict its FAIL line: an unconditional `say` here
