@@ -126,9 +126,20 @@ git -C "$HUB" checkout -q main
 # branch code, and a merged fix is not live — the FAIL must name it.
 mkdir -p "$HUB/extensions/builtin-tools"
 FARM649="$FIX/farm649"
-mkdir -p "$FARM649" "$FIX/foreign/extensions"
+mkdir -p "$FARM649" "$FIX/foreign/extensions/other"
 ln -s "$HUB/extensions/builtin-tools" "$FARM649/builtin-tools"
-ln -s "$FIX/foreign/extensions/other" "$FARM649/other-tool"   # a DIFFERENT checkout
+ln -s "$FIX/foreign/extensions/other" "$FARM649/other-tool"   # a DIFFERENT checkout (a real dir)
+# #649 resolution classes. A link is this hub's only when its FULLY-RESOLVED target is
+# a child of <hub>/extensions: the pre-fix form compared only the target's PARENT, so
+# it mis-attributed a link whose final component escapes the hub and silently missed one
+# whose final component resolves back INTO it. Both directions are fixtured below.
+ln -s "$FIX/foreign/extensions/other" "$HUB/extensions/redirect"        # hub entry that escapes to other/
+ln -s "$HUB/extensions/builtin-tools" "$FIX/foreign/extensions/links-into-hub"
+ln -s "$HUB" "$FIX/hub-alias"                                           # symlinked spelling of the hub
+ln -s "$FIX/hub-alias/extensions/builtin-tools" "$FARM649/alias-tool"
+( cd "$FARM649" && ln -s ../hub/extensions/builtin-tools rel-tool )     # RELATIVE target into the hub
+ln -s "$HUB/extensions/redirect" "$FARM649/redirect-tool"              # parent=hub_ext, final escapes
+ln -s "$FIX/foreign/extensions/links-into-hub" "$FARM649/indirect-tool" # parent=foreign, final enters
 # The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
 # intended (anchor-safe) deployment, not the #649 defect.
 out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
@@ -138,10 +149,15 @@ out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 |
 assert_eq "$rc" 1 "off-main + live symlink farm → exit 1"
 assert_contains "$out" "HUB_DISORDER=off_main" "off-main farm link still reports off_main"
 assert_contains "$out" "#649" "off-main farm link prints the live-runtime consequence"
-assert_contains "$out" "~/.pi/agent/extensions/builtin-tools -> $HUB/extensions/builtin-tools" "names the farmed entry and its target"
-assert_not_contains "$out" "$FIX/foreign/extensions/other" "a link into ANOTHER checkout is not named"
+assert_contains "$out" "$FARM649/builtin-tools -> $HUB/extensions/builtin-tools" "names the farmed entry and its target"
+assert_contains "$out" "$FARM649/alias-tool -> $FIX/hub-alias/extensions/builtin-tools" "a link through a symlinked spelling of the hub is named"
+assert_contains "$out" "$FARM649/rel-tool -> " "a RELATIVE target that resolves into the hub is named"
+assert_contains "$out" "farm649/../hub/extensions/builtin-tools" "…and its relative target is shown"
+assert_contains "$out" "$FARM649/indirect-tool -> $FIX/foreign/extensions/links-into-hub" "a link whose FINAL component resolves INTO the hub is named (pre-fix: silently missed)"
+assert_not_contains "$out" "redirect-tool" "a link whose FINAL component escapes the hub is not named (pre-fix: mis-attributed)"
+assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
 git -C "$HUB" checkout -q main
-rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign"
+rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias"
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────
 WT="$HUB/.worktrees/wt-test"

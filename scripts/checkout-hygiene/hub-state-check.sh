@@ -238,11 +238,13 @@ recovery_guide() {
     local ext_links
     ext_links="$(live_extension_links "$repo")"
     if [[ -n "$ext_links" ]]; then
+      local farm_root
+      farm_root="$(extensions_farm_root)"
       lines+=("")
       lines+=("#649 — the live pi extension farm symlinks into THIS checkout, so every")
       lines+=("running session executes its WORKING TREE, not the commit on main:")
       while IFS=$'\t' read -r n tgt; do
-        lines+=("  ~/.pi/agent/extensions/$n -> $tgt")
+        lines+=("  $farm_root/$n -> $tgt")
       done <<<"$ext_links"
       lines+=("Until this checkout is back on main at a commit containing them, merged fixes")
       lines+=("are NOT live and unmerged branch code is what runs. Return it to main (above).")
@@ -291,9 +293,47 @@ recovery_guide() {
 #
 # PI_EXTENSIONS_DIR overrides the farm root (the pi-config-extensions suite's
 # fixture contract); the default is the machine-local farm.
+#
+# The comparison resolves the target PHYSICALLY — every component, INCLUDING the
+# final one. An earlier form compared only the target's parent directory, which
+# made this both mis-attribute and miss links once a checkout's `extensions/<name>`
+# is itself a symlink (both reproduced — the declared adversarial classes (a)/(b)):
+#   (a) `farm/tricky -> hub/extensions/redirect` where `redirect -> other/...`
+#       was announced as THIS hub's (and, under --gh-report, published to an issue);
+#   (b) `farm/indirect -> other/extensions/link-to-hub`, whose final component
+#       resolves INTO the hub, was silently omitted — the exact state #649 exists
+#       to name.
+extensions_farm_root() { printf '%s\n' "${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"; }
+
+# physical_path <path> — the fully-resolved physical path: every symlink followed
+# (final component AND every directory on the way) and every component canonicalized.
+# Portable on purpose: BSD/macOS `readlink` has no `-f`, and this repo's operators are
+# on macOS (the #649 evidence is a /Users path), so the walk is explicit. Bounded at
+# 40 hops, so a symlink cycle prints the best resolution it reached rather than looping;
+# a path it cannot fully resolve is printed as-is (never dropped, and always exit 0, so
+# the caller's `set -e` command substitution cannot be tripped).
+physical_path() { # $1=path
+  local p="$1" hop=0 base dir final
+  while [ -L "$p" ] && [ "$hop" -lt 40 ]; do
+    base="$(readlink "$p" 2>/dev/null)" || break
+    case "$base" in
+      /*) p="$base" ;;
+      *)  p="$(dirname "$p")/$base" ;;
+    esac
+    hop=$((hop + 1))
+  done
+  dir="$(dirname "$p")"; final="$(basename "$p")"
+  if [ -d "$dir" ]; then
+    printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$final"
+  else
+    printf '%s\n' "$p"
+  fi
+}
+
 live_extension_links() { # $1=hub
-  local hub="$1" farm="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
-  local e base target tdir real hub_ext
+  local hub="$1" farm
+  farm="$(extensions_farm_root)"
+  local e base target real hub_ext
   [ -d "$farm" ] || return 0
   hub_ext="$( (cd "$hub/extensions" 2>/dev/null && pwd -P) || printf '%s' "$hub/extensions" )"
   for e in "$farm"/*; do
@@ -301,22 +341,20 @@ live_extension_links() { # $1=hub
     base="$(basename "$e")"
     target="$(readlink "$e" 2>/dev/null || true)"
     [ -n "$target" ] || continue
-    # Resolve a RELATIVE link target against the link's own directory, then
-    # canonicalize the target's parent so a symlinked spelling of the hub (macOS
-    # /tmp -> /private/tmp) still matches. The entry itself is carried raw — it
-    # is what the operator must repoint.
+    # Resolve a RELATIVE link target against the link's own (physical) directory,
+    # then resolve the target PHYSICALLY before comparing. The entry and its raw
+    # target are carried as they are — the entry is what the operator must repoint.
     case "$target" in
       /*) ;;
-      *)  tdir="$( (cd "$(dirname "$e")" 2>/dev/null && pwd -P) || printf '%s' "$(dirname "$e")" )"
-          target="$tdir/$target" ;;
+      *)  target="$(physical_path "$(dirname "$e")")/$target" ;;
     esac
-    tdir="$(dirname "$target")"
-    real="$( (cd "$tdir" 2>/dev/null && pwd -P) )" || real="$tdir"
-    if [ "$real" = "$hub_ext" ]; then printf '%s\t%s\n' "$base" "$target"; fi
+    real="$(physical_path "$target")"
+    if [ "$(dirname "$real")" = "$hub_ext" ]; then printf '%s\t%s\n' "$base" "$target"; fi
   done
-  # ALWAYS 0: the caller runs under `set -e` and a non-matching last entry (the
-  # `[ … ]` test) would otherwise make the command substitution fail and abort
-  # the whole check before the guide is printed — a silent guide loss.
+  # ALWAYS 0: the caller runs under `set -e` and reads this through a command
+  # substitution, where a non-zero helper aborts the whole check before the guide is
+  # printed — a silent guide loss. The `if …; fi` tail already returns 0; this makes
+  # the contract explicit so a future arm cannot break it by accident.
   return 0
 }
 
