@@ -672,6 +672,55 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "reap",
     guardedBy: NONE,
   },
+  // — reap axis: the ORPHAN reaper (scripts/pi-reap-orphans.sh, #1862). The
+  //   reverse scan found all five the moment the reaper was versioned, exactly as
+  //   it did for the heartbeat bounds in #1552. Registered rather than exempted:
+  //   each IS a real liveness bound governing whether a candidate may be
+  //   signalled. The two properties the issue requires live here and in the
+  //   ancestry gate: an ACTIVE CPU advance (never a PARKED test, cf. #1343) on an
+  //   AGE FLOOR, and a POSITIVE human-ancestry refusal.
+  {
+    name: "REAP_ORPHAN_SAMPLE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_SAMPLE_SECONDS:-3}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_SAMPLE_SECONDS="$2"'],
+    note: "the two-`ps`-snapshot window the CPU-time delta is measured over; the second assignment is the `--sample-seconds` CLI override",
+  },
+  {
+    name: "REAP_ORPHAN_MIN_ELAPSED_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_MIN_ELAPSED_SECONDS:-60}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_MIN_ELAPSED_SECONDS="$2"'],
+    note: "the AGE FLOOR: a process younger than this is never signalled (the leak class outlives its harness by minutes, and a fresh reparented child is still being set up). Active-CPU advance is the other half of the pair — a PARKED process is never a candidate (#1343).",
+  },
+  {
+    name: "REAP_ORPHAN_TERM_GRACE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_TERM_GRACE_SECONDS:-5}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "post-SIGTERM settle grace before the re-probe escalates to SIGKILL; a death that cannot be re-verified counts as STILL ALIVE",
+  },
+  {
+    name: "REAP_ORPHAN_BUDGET_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_BUDGET_SECONDS:-300}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "the pass wall-clock budget: classification stops and DEFERS the remainder rather than holding the host it exists to unload",
+  },
+  {
+    name: "REAP_ORPHAN_LOCK_STALE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_LOCK_STALE_SECONDS:-1800}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "how old a reaper lock must be before a DEAD owner's lock is broken; a LIVE owner holds it outright whatever the directory age",
+  },
   {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
