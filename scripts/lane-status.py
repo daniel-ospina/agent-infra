@@ -6,9 +6,10 @@ Signals combined (owner, 2026-09-25):
                      whether a lane that HAS a session file is writing (the spinner
                      animates while wedged), and the CPU-time delta below outranks
                      it. Because it probes a session file it cannot see a lane that
-                     leaves none — an orchestrator lane runs `pi -p --no-session`, so
-                     it writes no session file and is absent from every population
-                     built from the session store or the cmux hook store (#1777).
+                     leaves none — an orchestrator lane runs pi in print mode with
+                     sessions disabled, so it writes no session file and is absent from
+                     every population built from the session store or the cmux hook
+                     store (#1777).
                      Never read its absence as "nobody is on it" — the holder-authored
                      existence datum is the `refs/claims/<pr>-<sha12>` ref namespace
                      written by `scripts/orchestrator-harness/claims.sh`; the fleet's
@@ -116,12 +117,12 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 # ⛔ WHAT ACTUAL LIVENESS USES: the lane's SESSION JSONL mtime/size (`stale`/`grew`, above). That is
 # OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal
 # DERIVED FROM A LANE'S OWN SESSION FILE (the CPU-time delta, below, outranks it). It is not the only
-# record of a lane: an orchestrator lane (`pi -p --no-session`) has no session file at all, so a `grep`
-# for its branch over the session store comes back empty while it is live and committing (#1777,
-# 2026-10-15). Absence here is not freedom — the holder-authored existence datum is the
-# `refs/claims/<pr>-<sha12>` ref namespace (#1777 tracks binding it into the fleet's read set), and
-# `tools/fleet/liveness.py` stays the ONE verdict function (per #1178). The stores and their readers
-# are named in the module docstring above.
+# record of a lane: an orchestrator lane runs pi in print mode with sessions disabled, so it has no
+# session file at all, and a `grep` for its branch over the session store comes back empty while it is
+# live and committing (#1777, 2026-10-15). Absence here is not freedom — the holder-authored existence
+# datum is the `refs/claims/<pr>-<sha12>` ref namespace (#1777 tracks binding it into the fleet's read
+# set), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178). The stores and their
+# readers are named in the module docstring above.
 # Inbound-recency is reported BESIDE it, never in place of it.
 #
 # ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts
