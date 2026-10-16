@@ -180,7 +180,18 @@
 #                                                `\x{`) is EMPTY, and an escape the C table does
 #                                                not know KEEPS ITS BACKSLASH (`\q`, `\;`, `\8`),
 #                                                where dropping it manufactured live punctuation
-#                                                out of data.
+#                                                out of data. TWO PLACES THE DECODE ITSELF COULD
+#                                                SWALLOW A PRODUCER, both closed and pinned: a
+#                                                brace-hex scan must STOP AT THE SPAN CLOSING QUOTE
+#                                                (an unterminated `\x{` ran on to the next `}` on
+#                                                the line, taking the quote and the PIPE with it,
+#                                                so the line decoded to a fraction of itself), and
+#                                                the decode must run at EVERY ENTRY POINT, not
+#                                                only on the top-level line, because a span inside
+#                                                a quoted wrapper BODY is decoded by the INNER
+#                                                shell and not by the outer one (the level-0
+#                                                backslash removal no longer reaches inside a
+#                                                span either).
 #       a `<(` in a wrapper OPTION ARGUMENT          `env -u <(echo a;b) -i grep …` — the quote map
 #                                                  (QI) knew `${…}`, `$(…)` and backticks but not
 #                                                  the process-substitution opener, so a separator
@@ -211,7 +222,7 @@
 #     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
 #     regression; the widening closes them. The class stays open-ended in exactly the way the
 #     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
-#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (13a2, 13a3 and 13a4 assert the
+#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (13a2, 13a3, 13a4 and 13a5 assert the
 #     ANSI-C decode separately, so a decoder regression names itself).
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
@@ -1194,6 +1205,9 @@ HITS="$(
         if (ch == "t") return sprintf("%c", 9)
         if (ch == "v") return sprintf("%c", 11)
         if (ch == "?") return "?"
+        if (ch == "\\") return "\\"
+        if (ch == "\047") return "\047"
+        if (ch == "\"") return "\""
         # "" for an escape the C table does not know, so the caller can KEEP THE BACKSLASH the way
         # the shell does (see the escape rules in ansi_decode).
         return ""
@@ -1254,13 +1268,19 @@ HITS="$(
               # unterminated `\x{` are all EMPTY. Copying those verbatim is what hid
               # `print` + `\x{}` + `f` (which IS printf) from this guard (#864 review).
               i += 2; hb = ""; bad = 0
-              while (i <= n && substr(s, i, 1) != "}") {
+              # The brace scan STOPS AT THE SPAN CLOSING QUOTE: a `}` may never come, and running
+              # past the quote swallowed the REST OF THE LINE — the pipe included — so
+              # `print$'\x{'f '%s' "$T" | grep -q bar` decoded to `print` and reported CLEAN at
+              # rc 141 (#864 review). An unterminated brace-hex yields NOTHING, as bash does.
+              while (i <= n && substr(s, i, 1) != "}" && substr(s, i, 1) != "\047") {
                 if (bad || substr(s, i, 1) !~ /[0-9A-Fa-f]/) bad = 1
                 else hb = hb substr(s, i, 1)
                 i++
               }
-              if (i <= n) i++
-              if (!bad && hb != "") word = word sprintf("%c", numval(hb, 16))
+              if (i <= n && substr(s, i, 1) == "}") {
+                i++
+                if (!bad && hb != "") word = word sprintf("%c", numval(hb, 16))
+              }
               continue
             }
             if (c == "x" || c == "u" || c == "U") {
@@ -1597,7 +1617,7 @@ HITS="$(
         for (QK = 1; QK <= QN; QK++) if (QB[QK] == b) return
         QN++; QB[QN] = b
       }
-      function bodies_of(s,   i, c, q, ansi, beg, end, body, nb, j, g) {
+      function bodies_of(s,   i, c, q, ansi, beg, end, body, nb, j, k, g) {
         for (i = 1; i <= CHN; i++) {
           c = CH[i]
           if (q == "") {
@@ -1613,10 +1633,24 @@ HITS="$(
           end = i
           body = substr(s, beg, end - beg)
           q = ""; ansi = 0
-          # The inner shell has already removed the level-0 backslashes here; dropping them all
-          # is the coarse approximation body_quiet makes too, and the matchers still decide.
-          nb = body
-          gsub(/\\/, "", nb)
+          # The inner shell has already removed the level-0 backslashes here, and dropping them ALL
+          # is the coarse approximation body_quiet makes too — EXCEPT inside an ANSI-C span, whose
+          # backslashes are escapes the INNER shell decodes: stripping them turned `gre$'\x70'` into
+          # `gre$'x70'` and a producer inside a wrapper BODY went CLEAN (#864 review). Those spans
+          # are copied through untouched.
+          nb = ""; j = 1
+          while (j <= length(body)) {
+            c = substr(body, j, 1)
+            if (c == "$" && substr(body, j + 1, 1) == "\047") {
+              k = j + 2
+              while (k <= length(body) && substr(body, k, 1) != "\047") k++
+              nb = nb substr(body, j, k - j + 1)
+              j = k + 1
+              continue
+            }
+            if (c != "\\") nb = nb c
+            j++
+          }
           if (index(nb, "|") > 0 && nb ~ WRITERRE "[ \t]") body_enqueue(nb)
           # The wrapper whose BODY is the producer and whose stdout is piped straight on:
           # `env -S "grep -vE x|y f" | grep -q needle`. Only the FIRST command of a resolved
@@ -1633,7 +1667,15 @@ HITS="$(
         return 0
       }
       # The two original matchers in one place; also rebuilds CH for the body walk of the caller.
-      function matchers(s,   i, qq, sdd, btt) {
+      function matchers(s,   i, qq, sdd, btt, d) {
+        # THE DECODE LIVES HERE, not at the top-level caller, so EVERY entry point gets it: the raw
+        # line, a wrapper BODY, and a body nested in a body. Putting it only at the top level left a
+        # span inside a quoted wrapper body reported CLEAN, where the INNER shell decodes it and the
+        # outer one does not — a regression against the per-site revision (#864 review).
+        # The decoded text goes through THESE SAME matchers, never a third predicate, and the
+        # recursion is depth-1 because the emitted text carries no live ANSI-C span.
+        d = ansi_decode(s)
+        if (d != s && matchers(d)) return 1
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
@@ -1695,17 +1737,8 @@ HITS="$(
         CURLINE = s
         return (raw_idiom(s) || scan_idiom(s))
       }
-      function is_idiom(s,   k, d) {
+      function is_idiom(s,   k) {
         delete QB; QN = 0
-        # The line AS THE SHELL SEES IT, when it carries an ANSI-C span, is run through the SAME
-        # matchers — not a third predicate — so a spelled-out producer word is decided by the
-        # unchanged rules (see ansi_decode). Order matters: bodies_of reads the global CH that the
-        # matchers call before it built, so each bodies_of stays adjacent to its own matchers call.
-        d = ansi_decode(s)
-        if (d != s) {
-          if (matchers(d)) return 1
-          if (bodies_of(d)) return 1
-        }
         if (matchers(s)) return 1
         if (bodies_of(s)) return 1
         # Drain the queue breadth-first. Every enqueued body is strictly shorter than the line

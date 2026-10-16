@@ -2198,6 +2198,11 @@ printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x70' -E \$'a\\x7cb' f | grep -q bar
 printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{}'f '%s' \"\$T\" | grep -q bar"       > "$E/scripts/emptyescape.sh"
 printf '%s\n' '#!/usr/bin/env bash' "x=\$'\\x7c' ; grep -E \"a|b\" f | grep -q p"       > "$E/scripts/semispanassign.sh"
 printf '%s\n' '#!/usr/bin/env bash' "\$'\\x65cho' \"\$T\" | grep -q p"                   > "$E/scripts/leadhexecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{'f '%s' \"\$T\" | grep -q bar"         > "$E/scripts/untermbrace.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{ZZ}'f '%s' \"\$T\" | grep -q bar"      > "$E/scripts/badbracehex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "eval \"gre\$'\\x70' -E 'a|b' f | grep -q bar\""    > "$E/scripts/bodyspan.sh"
+printf '%s\n' '#!/usr/bin/env bash' "bash -c \"set -o pipefail; gre\$'\\x70' -E 'a|b' f | grep -q bar\"" > "$E/scripts/bodybashc.sh"
+printf '%s\n' '#!/usr/bin/env bash' "eval \"printf '%s' \\\"\\\$T\\\" | gre\$'\\x70' -q bar\"" > "$E/scripts/bodyconsspan.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2272,6 +2277,23 @@ if [ "$rc" -eq 1 ] && grep -q 'spanpipearg\.sh' "$OUT" && grep -q 'emptyescape\.
   pass "a decoded span keeps its WORD boundary (a spanned data pipe, an empty brace-hex, a spanned separator before a real producer, a word-initial hex echo)"
 else
   fail "a decoded span hid a producer (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a5. TWO WAYS THE DECODE ITSELF CAN SWALLOW A PRODUCER. (a) A brace-hex scan must stop at the
+#       SPAN closing quote — an unterminated `\x{` used to run to the next `}` on the line, taking
+#       the closing quote and the PIPE with it, so the line decoded to a fraction of itself. (b) The
+#       decode runs at EVERY entry point, not only on the top-level line, because a span inside a
+#       quoted wrapper BODY is decoded by the INNER shell and not by the outer one. The level-0
+#       backslash removal no longer reaches inside a span either (it turned `gre$'\x70'` into
+#       `gre$'x70'`). Each was measured at rc 141 under `pipefail` against 0 for the
+#       capture-then-classify form, and the body spellings were flagged by the per-site revision and
+#       CLEAN here before this fix.
+if [ "$rc" -eq 1 ] && grep -q 'untermbrace\.sh' "$OUT" && grep -q 'badbracehex\.sh' "$OUT" \
+   && grep -q 'bodyspan\.sh' "$OUT" && grep -q 'bodybashc\.sh' "$OUT" \
+   && grep -q 'bodyconsspan\.sh' "$OUT"; then
+  pass "the decode stops at the span quote and runs at EVERY entry point (an unterminated brace-hex, a malformed one, and a spanned producer or consumer inside a wrapper body)"
+else
+  fail "the decode swallowed a producer (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
 fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
