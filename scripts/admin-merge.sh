@@ -5340,8 +5340,11 @@ main() {
   # the unreadable arm below: that arm prints "could not READ the state of PR #…", which for
   # a refusal would name the wrong cause (a GitHub blip) for a caller's bad bound, and would
   # attribute a claim about reality to a read that never ran. `poll_merge_artifact` returns
-  # NON-ZERO exactly on a refusal, so the status separates the two cases here. (The rail's
-  # own knob is validated at startup, so this is the only refusal reachable from step 0a.)
+  # NON-ZERO exactly on a refusal, so the status separates the two cases here. Both of the
+  # door's refusals are excluded TODAY — the knob by `validate_timing_knobs` at startup, the
+  # override by this call's literal `1` — so the arm below is DEFENSIVE rather than live: it
+  # exists so that a future caller passing a COMPUTED override cannot have a bad bound
+  # re-narrated as a GitHub read failure.
   # shellcheck disable=SC2086
   if ! poll_merge_artifact "$PR" 1; then
     say_err "admin-merge: ✗ the already-merged pre-check could not run — its attempts override was REFUSED (above)."

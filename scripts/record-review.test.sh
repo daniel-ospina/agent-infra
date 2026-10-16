@@ -3192,8 +3192,8 @@ else
     bad "15.6 the evidence ref was dropped from the identity — the predicate cannot tell two attestations apart"
 fi
 
-# 15.7 RUNNER-LEVEL: the SAME head with a DIFFERENT artifact still REWRITES (review
-#      finding). §15.1-§15.3 pin the equal-identity no-op and §15.5/§15.6 pin the predicate
+# 15.7 RUNNER-LEVEL: the SAME head with a DIFFERENT artifact still REWRITES. §15.1-§15.3
+#      pin the equal-identity no-op and §15.5/§15.6 pin the predicate
 #      DIRECTLY — but neither drives the shipped script through the guard's ELSE arm, so a
 #      guard weakened to compare only `head_sha` would leave every vector above green while
 #      silently SWALLOWING a re-record of a different artifact at the same head, which is
