@@ -2020,9 +2020,9 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the eight fixtures below. NON-VACUOUS: all eight are reported CLEAN by
-#        #841's guard (`git show HEAD:scripts/check-no-sigpipe-grep.sh`), so this whole block
-#        fails before the widening.
+#   13a  DETECTION — the twenty-two fixtures below. NON-VACUOUS: all twenty-two are reported
+#        CLEAN by #841's guard (`git show HEAD:scripts/check-no-sigpipe-grep.sh`), so this whole
+#        block fails before the widening.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2060,6 +2060,20 @@ printf '%s\n' '#!/usr/bin/env bash' '"grep" -E "a|b" f | grep -q bar'           
 printf '%s\n' '#!/usr/bin/env bash' '\grep -E "a|b" f | grep -q bar'             > "$E/scripts/escapedword.sh"
 printf '%s\n' '#!/usr/bin/env bash' '$HOME/bin/grep -E "a|b" f | grep -q bar'     > "$E/scripts/varpath.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head -2) f | grep -q bar' > "$E/scripts/procsubst.sh"
+# The spellings that reach the SAME false clean THROUGH a MULTI-TOKEN prefix, each measured at
+# rc 141 on the same payload: a wrapper two or more tokens back because its option has a
+# SEPARATED ARGUMENT (`env -u FOO -i grep`, `env -u FOO -- grep`) or because it carries several
+# options (`stdbuf -i0 -o0 grep`) — a one-token lookback lands on the option or on its argument
+# and never reaches the wrapper; a QUOTED `env -S` BODY carrying a data pipe, where restarting at
+# the body close re-opened quoting so the outer pipe was never charged; and an unquoted BRACED
+# VARIABLE among the producer arguments, whose `}` a group-depth-0 test read as a group close and
+# so cleared the writer. Each was reported CLEAN before this round (review of #864).
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -i grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'stdbuf -i0 -o0 grep -E "a|b" f | grep -q bar' > "$E/scripts/multiopt2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -- grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt3.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -S 'grep -E \"a|b\" f' | grep -q bar"     > "$E/scripts/envbody.sh"
+printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" ${y} f | grep -q bar'  > "$E/scripts/vararg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head) ${y} f | grep -q bar' > "$E/scripts/procsubstvar.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2068,8 +2082,11 @@ if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" 
    && grep -q 'wrapbypath\.sh' "$OUT" && grep -q 'stagedbypath\.sh' "$OUT" \
    && grep -q 'substbypath\.sh' "$OUT" && grep -q 'wrapopt\.sh' "$OUT" \
    && grep -q 'quotedword\.sh' "$OUT" && grep -q 'escapedword\.sh' "$OUT" \
-   && grep -q 'varpath\.sh' "$OUT" && grep -q 'procsubst\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution conjunctions)"
+   && grep -q 'varpath\.sh' "$OUT" && grep -q 'procsubst\.sh' "$OUT" \
+   && grep -q 'multiopt\.sh' "$OUT" && grep -q 'multiopt2\.sh' "$OUT" \
+   && grep -q 'multiopt3\.sh' "$OUT" && grep -q 'envbody\.sh' "$OUT" \
+   && grep -q 'vararg\.sh' "$OUT" && grep -q 'procsubstvar\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"

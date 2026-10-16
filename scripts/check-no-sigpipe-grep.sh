@@ -1035,7 +1035,7 @@ HITS="$(
       # carries foo output, and the `echo` is an option argument, not a command).
       # KEEP IN STEP WITH WRITERRE (see the note at its definition): the ladder below is the
       # only producer list scan_idiom consults.
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto) {
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok) {
         w = 0
         # Character comparisons against the pre-split array: `substr(s, i, 6)` per index over a long
         # line is O(n) PER CALL in this awk and made the walk quadratic (27 s for a 1 MB line).
@@ -1090,12 +1090,27 @@ HITS="$(
           # belongs to env, and `grep` is the operand whose stdout owns the pipe. The case this test
           # exists for is a writer that is an OPTION ARGUMENT of another command (`foo -e echo -e
           # …`), and there no wrapper precedes the option, so it stays rejected.
+          #
+          # Walk back over EVERY token of the simple command — options, the SEPARATED ARGUMENT of an
+          # option (`env -u FOO -i grep`, `stdbuf -i0 -o0 grep`) and `--` — and accept the word if ANY
+          # of them names a wrapper. One token back is not enough: it lands on the separated argument
+          # (`FOO`) or on an earlier option (`-i0`), the wrapper is never reached, and the line was
+          # reported CLEAN at rc 141 (#864 review). The walk stops at a statement separator, so a
+          # producer in the PREVIOUS command cannot vouch for this one.
           pw = k - 1
-          while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
-          ph = pw
-          while (ph >= 1 && CH[ph] !~ /[ \t;&|({]/) ph--
-          pto = substr(s, ph + 1, pw - ph)
-          if (pto !~ "^(" WRAPWORDS ")$" && pto !~ "/" WRAPWORDS "$") return 0
+          ok = 0
+          while (pw >= 1) {
+            while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
+            if (pw < 1) break
+            ph = pw
+            while (ph >= 1 && CH[ph] !~ /[ \t;&|({})]/) ph--
+            pto = substr(s, ph + 1, pw - ph)
+            sub(/.*\//, "", pto)
+            if (pto ~ "^(" WRAPWORDS ")$") { ok = 1; break }
+            if (ph < 1 || CH[ph] ~ /[;&|({})]/) break
+            pw = ph - 1
+          }
+          if (!ok) return 0
         }
         # A QUOTE-CLOSED word (`"grep"`, `'grep'`) carries its own quoting: report the length
         # INCLUDING the closing quote, so the caller restarts OUTSIDE it. Restarting ON the closing
@@ -1115,8 +1130,8 @@ HITS="$(
       # — and that is the ONLY reason a per-line scan budget existed. A budget can be spent two
       # ways, scan less (a false clean) or refuse a verdict, so removing the rescan removes the need
       # for it rather than choosing which failure to accept.
-      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pd, ad, bt, d, inside) {
-        q = ""; ansi = 0; esc = 0; active = 0; br = 0; pd = 0; ad = 0; bt = 0
+      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pb, pd, ad, bt, d, inside) {
+        q = ""; ansi = 0; esc = 0; active = 0; br = 0; pb = 0; pd = 0; ad = 0; bt = 0
         # Nothing to find on a line with no pipe at all, and this is the common case for the
         # many-writers pathology (`echo ` repeated): without it every writer drove a walk.
         if (index(s, "|") == 0) return 0
@@ -1130,6 +1145,13 @@ HITS="$(
             # A writer inside the quoted region: scan it in its OWN quoting context (see scan_from).
             w = writer_at(s, i)
             if (w && scan_from(i + w)) return 1
+            # ...and keep it as the active writer for the ENCLOSING context too. A wrapper BODY is a
+            # quoted region holding the command whose stdout owns the outer pipe, and the apostrophes
+            # in this comment had to be removed because the awk program is ONE SHELL WORD: an
+            # apostrophe anywhere in it ends the quoting and breaks the whole script. Restarting at
+            # the body closing quote re-opened quoting, so the outer pipe was never charged and the
+            # line was CLEAN at rc 141 (#864 review).
+            if (w) { active = 1; ad = pd }
             if ((q == "\"" || ansi) && c == "\\") { esc = 1; continue }
             if (c == q) { q = ""; ansi = 0 }
             continue
@@ -1165,10 +1187,22 @@ HITS="$(
           }
           # `{ ...; }` groups: a `;` inside the group does not take the writer off the pipe, and the
           # closing brace does not either — the GROUP stdout is the pipe. A `}` with no group open
-          # is conservative and clears the writer. `${x}` does not open one: its `{` follows a `$`,
-          # not a command boundary.
-          if (c == "{") { if (i == 1 || CH[i - 1] ~ /[ \t;&|(]/) br++; continue }
-          if (c == "}") { if (br > 0) br--; else active = 0; continue }
+          # is conservative and clears the writer. `${x}` is NOT a group: its `{` follows a `$`, so
+          # it opens none — and its `}` must close none either, or it lands in the `br == 0` branch
+          # and CLEARS THE WRITER: `/usr/bin/grep -E "a|b" ${y} f | grep -q p` was reported CLEAN at
+          # rc 141 by an unquoted braced variable among the producer arguments (#864 review). PB
+          # counts parameter expansions, so the two braces are matched to each other.
+          if (c == "{") {
+            if (i > 1 && CH[i - 1] == "$") pb++
+            else if (i == 1 || CH[i - 1] ~ /[ \t;&|(]/) br++
+            continue
+          }
+          if (c == "}") {
+            if (pb > 0) pb--
+            else if (br > 0) br--
+            else active = 0
+            continue
+          }
           if (c == ";") { if (br == 0) active = 0; continue }
           # `&&` ends the command; a bare `&` backgrounds the writer, so its stdout is not this
           # pipe. `2>&1` is NOT that case: there the `&` is preceded by `>`.
@@ -1212,6 +1246,13 @@ HITS="$(
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
+        # Nothing to find on a line with NO pipe at all, and this is the common case for the
+        # many-producers pathology: `raw_idiom` bridges `[^|]*[|]` from EVERY producer word and
+        # rescans the rest of the line looking for the `|` that is not there, so the cost is
+        # quadratic in the line length. `grep` appears far more often in shell text than printf or
+        # echo, so widening WRITERRE extended a latent hazard into a reachable one (measured 37.6 s
+        # on a 256 KB single-line fixture, 0.04 s through this fast path) (#864 review).
+        if (index(s, "|") == 0) return 0
         CHN = length(s); delete CH; split(s, CH, "")
         # The LINE is kept as a global too, because a wrapper body must be read WHOLE from it (TOK is
         # capped) - see body_text.
