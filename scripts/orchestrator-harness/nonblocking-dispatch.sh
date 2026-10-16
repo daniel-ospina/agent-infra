@@ -46,8 +46,13 @@ fi
 case "${T:-}" in ''|*[!0-9]*) echo "nonblocking-dispatch.sh: timeout '$T' is not a positive integer" >&2; exit 2 ;; esac
 
 O="${O:-$HOME/orchestrator}"; D="$O/bg"; mkdir -p "$D" "$O/state"
-# Same resolution as lane.sh/fix-one.sh: the helper must be found beside THIS script (or at $O), or
-# nothing runs — an unresolved helper must never degrade into "the worker ran".
+# ⛔ PATH FIRST, then source — this part IS lane.sh/fix-one.sh's rule. spawn-gate.sh derives `_NCPU`
+# at SOURCE time (sysctl/nproc/getconf), so sourcing it under a cell's pre-export PATH pins
+# `_NCPU=4` / `MAX_LOAD=40` for every cell (agent-infra#1702). The two siblings carry the same ⛔.
+export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# The RESOLUTION, though, mirrors merge-one.sh's repo-authority.sh — NOT lane.sh/fix-one.sh, which
+# source only `$SELF/spawn-gate.sh` and never consult `$O`. Prefer the daemon's copy at `$O`, fall
+# back to the copy beside THIS script; an unresolved helper must never degrade into "the worker ran".
 if [ -f "$O/spawn-gate.sh" ]; then . "$O/spawn-gate.sh"; HARNESS="$O"
 else
   HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -61,7 +66,6 @@ command -v run_agent >/dev/null 2>&1 \
 [ -f "$PROMPT" ] || { echo "nonblocking-dispatch.sh: no prompt file $PROMPT" >&2; exit 2; }
 
 LOG="$D/$NAME.log"; RC="$D/$NAME.rc"; PIDF="$D/$NAME.pid"; STAMP="$D/$NAME.started"
-export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # The worker is a fleet lane in every respect except that nobody waits for it: the local review/VGATE
 # gates are bypassed so the PARENT owns the review ceremony, and no MCP servers are started.
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
