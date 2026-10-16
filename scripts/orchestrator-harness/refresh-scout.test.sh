@@ -550,6 +550,36 @@ case "$OUT" in
   *) ok "read-only \$O: the stale pool is not reported as this run's backlog" ;;
 esac
 
+# ── a CLEAN issue is not SUPPRESSED when its queue entry cannot be written ────────────────────
+# `checked.txt` is the permanent suppression — reclaimed only for numbers that reached
+# `dispatched.txt` — so writing it before the queue entry made a failed queue append an unrecoverable
+# loss: the issue is never pre-flighted again, is never queued, and the pass still logs
+# `+#N CLEAN -> backlog` and exits 0. Measured with `candidates.txt` unwritable: two consecutive
+# passes reported success and the pre-flight ran once, ever (#1853 review). Every state write is now
+# checked, and the recoverable one lands FIRST.
+echo; echo "── a CLEAN issue is not suppressed when it was never queued ──"
+mk_case queue-unwritable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "queue unwritable: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"cannot queue #42"*) ok "queue unwritable: the abort names the write that failed AND the issue" ;;
+  *) bad "queue unwritable: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"+#42"*) bad "queue unwritable: logged a queue entry that never landed" ;;
+  *) ok "queue unwritable: no \"+#42 CLEAN -> backlog\" over an issue it did not queue" ;;
+esac
+if grep -qx 42 "$D/o/checked.txt" 2>/dev/null; then
+  bad "queue unwritable: #42 was SUPPRESSED although it was never queued — it can never be dispatched again"
+else
+  ok "queue unwritable: #42 is NOT suppressed, so the next pass retries it"
+fi
+
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
 # cmd_check and cloud-cell-bringup.sh's check_gh (which its check_dispatch calls) each ALREADY run
 # `gh auth status` themselves (under $CELL_HOME), and orchestrator-harness's selftest pins exactly

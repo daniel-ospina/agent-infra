@@ -479,6 +479,10 @@ if ! gh pr list --repo "$OR" --state all --limit 500 --json headRefName --jq '.[
   rm -f "$O/.pr_brs"
   echo "[refresh] WARN: PR listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
 fi
+# ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
+# discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
+# carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line stays
+# exactly `python3 - "$O" <<'PY'` because selftest.sh extracts the heredoc body by anchoring on it.
 python3 - "$O" <<'PY'
 import os, re, subprocess, sys
 O = sys.argv[1]
@@ -526,6 +530,11 @@ if reaped:
             fh.write("\n".join(kept) + ("\n" if kept else ""))
     print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
 PY
+reap_rc=$?
+if [ "$reap_rc" -ne 0 ]; then
+  echo "[refresh] ABORT: the reap pass failed — refusing to carry on over a half-rewritten blacklist (#1736)"
+  exit "$EXIT_TRANSIENT"
+fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 
 touch "$O/checked.txt" "$O/candidates.txt"
@@ -647,9 +656,25 @@ while read -r N; do
       if [ "$degraded" -eq 1 ]; then
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
+        # ⛔ EVERY STATE WRITE IS CHECKED, AND THE PERMANENT ONE GOES LAST. `checked.txt` is what makes
+        # an issue invisible to LATER passes — it is reclaimed only for numbers that reached
+        # `dispatched.txt` — so writing it BEFORE the queue entry made a failed append to
+        # `candidates.txt` an unrecoverable loss: the issue is never pre-flighted again, never queued,
+        # and the pass still logged `+#N CLEAN -> backlog` and exited 0. Measured (#1853 review): with
+        # `candidates.txt` unwritable, the pre-flight ran ONCE, ever, and two consecutive passes
+        # reported success. The recoverable write lands FIRST, so a failure there leaves the issue
+        # retryable; the log line and `usable` follow BOTH writes, so neither can overstate the queue.
+        # (Inlined rather than a helper: selftest.sh extracts this loop body and runs it standalone,
+        # so anything it calls must live inside the extraction.)
+        if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
+          echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+          exit "${EXIT_TRANSIENT:-1}"
+        fi
+        if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
+          echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
+          exit "${EXIT_TRANSIENT:-1}"
+        fi
         usable=$((usable + 1))
-        echo "$N" >> "$O/checked.txt"
-        echo "$N" >> "$O/candidates.txt"
         echo "[refresh] +#$N CLEAN -> backlog"
       fi ;;
     COLLISION)
@@ -724,5 +749,15 @@ fi
 # trade: `mv` swaps the inode, so the target's mode is replaced by the temp's umask-derived one,
 # whereas the old `sort -o` preserved it. The file holds only public issue numbers and its mode is
 # never set deliberately, so 644 is not a property anything depends on.
-awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" && mv "$O/.cand" "$O/candidates.txt"
+# ⛔ The final rewrite is CHECKED too: `&&` only stopped the `mv`, so a failed rewrite left the OLD
+# `candidates.txt` in place and the line below then reported a backlog count from a file THIS pass
+# never produced — the same absorbed-write shape as the queue append above (#1853 review).
+awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" || {
+  echo "[refresh] ABORT: cannot rewrite the deduped backlog into $O/.cand (#1736)"
+  exit "$EXIT_TRANSIENT"
+}
+mv "$O/.cand" "$O/candidates.txt" || {
+  echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
+  exit "$EXIT_TRANSIENT"
+}
 echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
