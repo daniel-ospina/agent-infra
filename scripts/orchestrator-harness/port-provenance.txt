@@ -35,6 +35,71 @@
 # ported_through=45dd16cc8
 # repinned_at=2026-10-13T20:23:38Z
 #
+# ══ 2026-10-15 — SECOND drift pass: the source moved 8 commits past the pin ══════════════════════
+#
+# Measured against tortoise `origin/main` = 8cc17435a (2026-10-15T18:45:53-05:00):
+#   git -C "$TORTOISE" log --oneline e20de606be10fc9fda96729b6cfd6277ac3ad1ec..origin/main \
+#     -- operations/orchestrator-harness/
+# → 8 commits, +2073/−212 across 15 files; `check-port-drift.sh` names 15 files in drift.
+# The per-file ledger for this pass — EVERY file in either tree with a verdict and the evidence for
+# it (PORT / DROP-SUPERSEDED / DROP-WORSE / ALREADY-EQUAL / CANONICAL-ONLY) — is in the PR body that
+# carries this change.
+#
+# POST-PIN COMMITS: ef59f6d6f #8518 · 80db43882 #8521 · 9b249f418 #8469 · e5354e1a4 #8565 ·
+# 10563490a #8589 · f5823a6a4 #8612 · 9eb19478a #8629 · 0a215d088 #8645
+#
+# ── PORTED in this pass (the files no concurrent lane holds) ────────────────────────────────────
+#   spawn-gate.sh (NEW)      #8521 — the ONE load gate and the ONE `pi` invocation.
+#   lane.sh  fix-one.sh      #8521 — host the helper; a refusal (75) is not a failed agent, and a
+#                            refused fixer REFUNDS the attempt the controller booked (or three
+#                            refusals park a PR no fixer ever touched).
+#   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
+#   Tests: spawn-gate.test.sh — 27 checks, of which 25 go RED on the pre-port tree (recorded).
+#   Two deliberate DEPARTURES from the tortoise original, both named in-file: the helper is sourced
+#   AFTER the caller's PATH export (tortoise sources it before, which pins _NCPU=4 / MAX_LOAD=40 at
+#   source time on every cell — #1702), and run_agent() keeps agent-infra's #1709 wall-time telemetry
+#   (`elapsed=`, walltime.tsv) which the tortoise copy never had.
+#
+# ── DROPPED: canonical is already ahead ─────────────────────────────────────────────────────────
+#   #8518 allow-list polarity — canonical has it byte-equivalent at orch-loop.sh:770-832 and
+#   fix-one.sh:148-160, so ef59f6d6f's classifier hunk is DROP-SUPERSEDED.
+#
+# ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
+# `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and
+# `scripts/run-bash-shards.sh` are all being edited by open PR #1769 and/or PR #1730, so this pass
+# was not permitted to touch them. What remains, precisely:
+#   merge-one.sh  #8589 the reviewer's own DETACHED checkout (and DROP the AGENT_ALLOW_MAIN_EDITS
+#                 export — prompt-only containment is what #8484 measured failing)
+#                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
+#                 #8521 host spawn-gate.sh; it is the last of the three duplicate `pi` call sites
+#   orch-loop.sh  #8521 source the helper; `can_spawn "$L"` at the four decision sites
+#                 #8469 `p0_merge_priority_override` + the `.prio` tier map it reads
+#                 #8521 stop `rm -f needsfix-<PR>-<HEAD>` at DISPATCH. That delete sits UPSTREAM of
+#                 the load gate, so a refused fixer loses the reviewer's findings. It is also why
+#                 the 5th argv line (`HEAD`) and fix-one.sh's marker-consume are NOT ported here:
+#                 without the orch-loop half, fix-one.sh cannot tell the ai-review-gate arm (which
+#                 deletes the marker) from the CI-red arm (which never touches it), and restoring
+#                 the marker there would INVENT a findings record — refund_bailed_fixer's own note.
+#   install.sh    #8521 register spawn-gate.sh in the DRIFTED list (PR #1769 edits this exact line)
+#                 #8468 render P0_BYPASS_MERGE_PRIORITY
+#   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key. Held back WITH install.sh on
+#                 purpose: the template and its renderer must gain the placeholder together or the
+#                 placeholder-parity check reddens and the daemon gets a literal placeholder.
+#   README.md     the §4 / §5.3 / §7.1b prose for all of the above
+#   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
+#                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
+#                 shipped helper while still reporting green.
+#   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
+#                 reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX) — plus
+#                 `run-bash-shards.sh` to run its suite.
+# The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
+# `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
+# on tortoise main, so it is queued for porting above rather than excluded.
+#
+# ⛔ DO NOT `--repin` UNTIL THE ABOVE LANDS. The pin below still names the LAST reconciliation that
+# was COMPLETE for every file; re-pinning now would assert these as reconciled and turn the guard
+# green over a source that has moved — the stale-flag false pass this file exists to prevent.
+#
 # pinned_ref=origin/main
 # pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)
 # pinned_at=2026-10-13T20:24:13Z

@@ -8,8 +8,11 @@ if [ "${1:-}" = "--argv" ]; then
   [ -f "$ARGV" ] || { echo "[fix] missing argv file: $ARGV" >&2; exit 1; }
   { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
   rm -f "$ARGV"
+  # Only a CONTROLLER dispatch books an attempt in fixcount-<PR>. See the refund in the load-refusal
+  # path below: a manual run must not decrement a counter it never incremented.
+  CTRL=1
 else
-  REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+  REPO="$1"; OR="$2"; PR="$3"; BR="$4"; CTRL=0
 fi
 case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
 # Guard-before-use for env tunables (same P1 class as merge-one.sh): FIX_TIMEOUT feeds ARITHMETIC
@@ -31,37 +34,20 @@ KIND=fixer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# The wall-clock limit AND the load gate both live in the shared helper, so this script has no
+# `pi` invocation of its own to forget to gate (agent-infra#1720). NB: L above is a LOG PATH, not a
+# load reading — the gate takes its reading as an argument for exactly that reason.
+# Fail LOUD if the helper is missing: an unsourced helper leaves `run_agent` undefined, and that must
+# never degrade into "the fixer ran" — see README §9 on syncing $O.
+# ⛔ SOURCED AFTER THE PATH EXPORT: spawn-gate.sh derives `_NCPU` at SOURCE time, so sourcing it
+# under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
 
-# Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
-# model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
-# silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
-# agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
-# reaper in orch-loop.sh is the second line of defence.
-run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
-  start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
-  pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
-  wait "$pid" 2>/dev/null; rc=$?
-  kill "$w" 2>/dev/null
-  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
-  # fixer wall-time — the load-bearing number for fleet capacity (it was unmeasured).
-  elapsed=$(( $(date +%s) - start ))
-  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
-  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
-  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
-  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
-  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
-  mkdir -p "$O/state"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
-  return "$rc"
-}
 # locate the branch's worktree
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
@@ -188,7 +174,33 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
-run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt"
+run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AGENT_STARTED (set by run_agent) is the authority, NOT the exit code: `pi` shares the 0–255
+# status namespace, so a pi that exited 75 for its own reason must not be read as a load refusal —
+# that would silently skip the merge-chain re-run below (#1720 advisory).
+if [ "$AGENT_STARTED" = "0" ]; then
+  # Nothing was fixed, so re-running the merge chain would be a fresh-context review of an
+  # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
+  # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
+  echo "[fix $PR] fixer NOT started (load gate) — merge chain NOT re-run" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ]; then
+    # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when
+    # it CREATES the session, which is UPSTREAM of the gate inside run_agent(); this worker is the
+    # only party that knows no agent ran. Without the refund, three refusals reach MAX_FIX_TRIES and
+    # the PR is PARKED "needs a human" having never had a single fixer run (agent-infra#1720). A
+    # manual (positional) run booked nothing, so it must refund nothing.
+    CF="$O/state/fixcount-$PR"
+    if [ -f "$CF" ]; then
+      NF="$(cat "$CF" 2>/dev/null || echo 0)"
+      case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
+      if [ "$NF" -gt 0 ]; then
+        echo $((NF - 1)) > "$CF"
+        echo "[fix $PR] load refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
+      fi
+    fi
+  fi
+  exit "$AGENT_LOAD_REFUSED"
+fi
 echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
 # Release BEFORE the merge chain. If the fixer pushed, merge-one.sh claims the NEW head. If it did
 # NOT push, the SAME head is still claimed by us and merge-one.sh would refuse it as "another box
