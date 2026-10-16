@@ -32,6 +32,29 @@ export SHA   # MUST be exported: merge-one.sh runs `set -u`, and the stub functi
 # suite stops writing to the production `refs/claims/*` namespace the live fleet uses.
 CLAIM_NS="${CLAIM_NS:-refs/claims-verify-$$}"; export CLAIM_NS
 CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CACHE_NS
+# ⛔ THE DISK FLOOR IS PINNED OFF, for the same reason the two FIX_TIMEOUT pins exist (review round 1,
+# P2). These arms drive the REAL fix-one.sh, which now sources spawn-gate.sh — so on a cell whose
+# filesystem is below the 500MB floor, EVERY arm in this file would exit 77 and the suite would report
+# its own SUBJECT as broken, on exactly the box the gate was written for. It is exported (not a
+# per-call prefix) because the arms reach fix-one.sh through `exec env`, which starts from this env.
+# 1 is the documented neutralizer: a legal, tiny floor that no real filesystem is below.
+DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
+# ⛔ AND SO IS THE LOAD CEILING, FOR THE SAME REASON (verification round, P1). NO arm in this file
+# asserts a LOAD refusal (0 hits for MAX_LOAD outside this block), so the shipped load gate is a pure
+# CONFOUNDER here: every arm that expects the fixer to run instead gets AGENT_LOAD_REFUSED, and the
+# suite reports its own SUBJECT as broken on a box where nothing is wrong with it. Reproduced at load
+# ~130 against a default MAX_LOAD of 100: the affected arms' fixer exits `75` (= AGENT_LOAD_REFUSED)
+# and the suite goes red; with the confounder held constant the same file is fully green, and the
+# merge-base commit reproduces the identical failures. The deterministic observable is that `exit=75`.
+# ⛔ PASS/FAIL TOTALS ARE DELIBERATELY NOT RECORDED HERE: this file takes some of its assertions on a
+# branch, so a run executes a variable number of them and a count written here could not be
+# re-measured — the shape that goes stale and then misleads.
+# ⛔ THE VALUE IS NOT AT `is_limit`'s CEILING ON PURPOSE. `is_limit` accepts at most 9 digits, so
+# `MAX_LOAD=999999999` sat EXACTLY on it: one more digit is rejected and silently REPAIRED back to
+# `_NCPU*10` (= 100 here) — quietly re-arming the very confounder this pin removes, in a diff that
+# would look like a no-op. `999999` is six digits, so three further digits still fit and the fourth
+# breaches: real margin, and unmistakably not a ceiling anyone mistook for a device limit.
+MAX_LOAD=999999; export MAX_LOAD
 REF="$CLAIM_NS/777777-${SHA:0:12}"
 REF2="$CLAIM_NS/888888-${SHA:0:12}"
 FIXREF="$CLAIM_NS/666666-${SHA:0:12}"
