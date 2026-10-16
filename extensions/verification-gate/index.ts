@@ -3469,8 +3469,11 @@ export function normalizeRegistryPath(projectRoot: string, filePath: string): st
 //   hash — the verifier is the authority. A stale lastBlockedFiles list (the
 //   previous block in the session may have covered different files) must not
 //   drop the update.
-// - #5673: brand-new paths are still scoped to the blocked diff, so a
-//   full-repo-scan response can't mark arbitrary files as verified.
+// - #5673: brand-new paths are still scoped to this root's merge scope — the
+//   recorded blocked set UNION the current staged diff (#1660) — so a
+//   full-repo-scan response can't mark arbitrary files as verified. The scope
+//   argument is therefore `mergeScope`, not a blocked diff alone, even though
+//   the parameter keeps the historical name.
 export function mergeVerifiedFiles(
   verifiedSet: Map<string, string>,
   blockAttempts: Map<string, number>,
