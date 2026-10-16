@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, session-liveness, pid-identity, lane-liveness, pi-idle-repl-reaper-policy
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy
 ---
 
 # Fleet session liveness (#1178)
@@ -434,3 +434,122 @@ This doc's value is being **true**. Claims are labelled by how they were establi
 **Not claimed here:** anything about how the reaper decides to kill (see
 `docs/ops/pi-idle-repl-reaper-policy.md`), the merge rail's wait bound (#1167, a different
 target), or the compaction clamp (#1213 / #1214 / #1215).
+
+---
+
+## 9. Successor dispatch must carry a liveness proof (#1317)
+
+Everything above answers *"is this lane alive?"* for a lane you already know about. This section
+answers the dispatch-time question that the 2026-09-21 incident turned on: **may a successor lane be
+sent to this worktree?**
+
+**The rule.** A dispatch that says *"the predecessor is gone / is out of context"* is a **state
+assertion**, and it must carry the reading that shows it. Before a successor is written, run:
+
+```bash
+python3 tools/fleet/successor_preflight.py --worktree <the successor's worktree> \
+    --emit "$O/logs/prompt-<N>.txt"      # appends the proof to the dispatch file
+```
+
+and put the proof block in the dispatch file. Its exit code is the dispatch decision:
+
+| exit | verdict | action |
+|---|---|---|
+| 0 | `PREDECESSOR-GONE` | dispatch the successor — the unit is free |
+| 3 | `PREDECESSOR-LIVE` | do **not** dispatch a successor; **nudge the live lane, or wait** |
+| 4 | `UNKNOWN` | could not verify — fail closed, do not dispatch |
+| 2 | usage / environment error | nothing was decided |
+
+**Why the proof goes in the dispatch file.** The incident's defect was not a wrong reading — there
+was **no reading**. A brief that carries `verdict: PREDECESSOR-LIVE` and its `read-at` timestamp lets
+a later reader (and the successor itself) tell *"the predecessor is gone"* from *"the predecessor was
+assumed gone"*. `--emit` **appends**, so the proof sits beside the brief it justifies and re-running
+never rewrites history.
+
+### 9.1 The three reads, and which two decide
+
+The issue proposed two inexpensive reads plus a cmux reading. They are not equally strong, and the
+tool encodes the difference rather than treating them alike:
+
+| # | read | weight |
+|---|---|---|
+| 1 | a live `pi` whose **cwd is the target worktree** (`pgrep -x pi` + `lsof -a -d cwd -Fn`, `/proc/<pid>/cwd` on Linux) | **authoritative** — a `pi` rooted in the worktree is its owner, whether it is mid-tool or at a prompt (*idle is not available*) |
+| 2 | every **lane record** whose `cwd` is the worktree, verdicted by the ONE predicate (§1–§4: `liveness.gather` + `liveness.evaluate`) | **authoritative** — catches a predecessor whose transcript stopped growing (a record outlives its process) |
+| 3 | the cmux workspace's `latest_submitted_at` / `updated_at` | **corroborating only** — see below |
+
+⛔ **Read 3 is `INBOUND` activity, not liveness.** `scripts/lane-status.py` states this in
+`_inbound_message`: `latest_submitted_at` is what someone *sent* the lane, and it *"is not evidence
+of liveness and must never be read as such"*. The preflight therefore uses it in the **safe**
+direction only — recent activity is a *sufficiency* signal for "do not dispatch a successor" (the
+issue's intent), never a reason to call a predecessor alive against reads 1 and 2. Its
+**unavailability never decides the verdict alone**: on a box where the `cmux` CLI is unreachable
+(launchd: *"Access denied — only processes started inside cmux can connect"*) a gate that required
+it could never open, which is the no-op-gate class this fleet has already paid for. An unreadable
+cmux is stated in the proof (`cmux: unread (corroborating only …)`); it does not force `UNKNOWN`.
+
+**No second liveness rule.** The preflight imports `lane_liveness` and calls
+`lane_liveness.verdict_for` — the same predicate the scheduled report and the kill-path reaper
+consume. A local re-implementation of "is the lane alive" is the exact defect #1178 exists to
+remove. The preflight adds only the **worktree-scoped question** (which lanes/processes are rooted
+*here*) and the decision ladder.
+
+### 9.2 The decision ladder — order is the safety property
+
+Each step is a return; nothing later can override an earlier verdict:
+
+```
+0. a live pi rooted in the worktree                          -> PREDECESSOR-LIVE
+1. the lane store is unreadable                              -> UNKNOWN
+2. any lane record on the worktree that is not `dead`        -> PREDECESSOR-LIVE
+3. recent cmux activity on the worktree                      -> PREDECESSOR-LIVE
+4. the process read could not be taken                       -> UNKNOWN
+5. both authoritative reads ran and found no live witness    -> PREDECESSOR-GONE
+```
+
+**LIVE beats GONE at every step, and `UNKNOWN` is not a weaker `GONE`** — a reading we could not take
+is never a predecessor we proved absent. This is the same direction the kill path already runs on
+(*"no proof ⇒ not idle ⇒ never kill"*, `pi-idle-repl-reaper-policy.md`), applied to dispatch. The
+failure directions are deliberately asymmetric:
+
+- a false `PREDECESSOR-GONE` puts a **second lane on a live unit** — the #1317 incident;
+- a false `PREDECESSOR-LIVE` **delays** a dispatch, and the proof block says why — friction a human
+  can read past.
+
+⛔ **No open-workspace filter.** The scheduled report drops closed cmux panes from its population so
+a retired workspace is not reported on. The preflight does **not** use that filter to shrink the set
+of lanes it will refuse for: a lane record for this worktree that is not provably `dead` blocks the
+dispatch whether or not cmux still lists the pane. Over-blocking is friction; under-blocking is the
+incident.
+
+### 9.3 What is NOT wired, stated plainly
+
+There is no automated successor-dispatch hook point today: a successor is dispatched by an
+orchestrator session writing a brief, not by a script. `successor_preflight.py` therefore ships
+**standalone + documented**, exactly like `scripts/check-handoff-size.sh`
+(`session-lifecycle-contract.md` §2) — the check is the enforcement, the rule is this section.
+
+The neighbourhood was checked before leaving it unwired: `dispatch-merge.sh` starts a lane and a
+chain for an issue but its `tmux new-session -s lane-<N>` already refuses a duplicate session name;
+`scripts/orch-send.sh` dispatches to a **live** lane (its guards are about the *target*), not to a
+successor; and `scripts/queue-dispatch.py` feeds idle lanes. None of them is the successor path.
+The ported `scripts/orchestrator-harness/` is held by concurrent lanes and pinned to a tortoise sync
+point (`port-provenance.txt`), so wiring a new hard gate into it is a separate change with its own
+review.
+
+⚠️ **The existing PR-rail idempotence check would NOT have caught the incident.** `scripts/pr-loop.py`
+skips a PR whose lane id still appears in `cmux list-workspaces` output — but in the incident the
+predecessor's workspace `D77AC55C` **did** exist (it had a submitted message at 22:01:58Z). Workspace
+*presence* is not worktree *occupancy*; the worktree-scoped process read is the missing piece.
+
+The lane store path defaults to the fleet's canonical `~/.cmuxterm/pi-hook-sessions.json` (#1178) and
+is overridable with `--store` (as are the sessions, task-session and cmux-state roots); a dispatcher
+on a non-standard home names them explicitly, and an unreadable store is `UNKNOWN` — never `GONE`.
+
+Run the pinned suites after any change to the preflight (the red control proves each leg fails
+without its fix):
+
+```bash
+python3 tools/fleet/successor_preflight.test.py               # 13 legs
+python3 tools/fleet/successor_preflight.test.py --red-control # 9 mutations, each must go RED
+python3 tools/fleet/liveness.test.py                          # the predicate it consumes
+```

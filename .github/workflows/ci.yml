@@ -322,6 +322,29 @@ jobs:
         # catch it. python3 + bash only; its own step so one
         # verdict cannot suppress the other (same rule as every suite here).
         run: python3.12 tools/fleet/lane_liveness.test.py
+      - name: Successor-preflight suite (#1317, zero-dep)
+        # #1317 — a successor lane was dispatched to a unit whose predecessor was
+        # live and mid-review, on a state assertion ("out of context") nobody had
+        # read from an artifact. `tools/fleet/successor_preflight.py` proves the
+        # predecessor GONE before a dispatch is written, and appends the proof to
+        # the dispatch file. Zero-dep by construction: a standalone script that
+        # drives the tool as a subprocess against temp fixtures with hermetic
+        # pgrep/lsof/cmux/ps/date shims, and reuses the #1178 predicate
+        # (lane_liveness.verdict_for) rather than re-deriving liveness. Its own
+        # step, and it carries a RED control: nine mutations of the shipped file
+        # (drop the live-process check / the live-lane check / the recent-cmux
+        # check, turn an unreadable store or process read into GONE, drop the
+        # realpath normalisation, ignore the cmux recency window, match cmux rows
+        # without their cwd, call every lane dead) must each turn their paired
+        # leg RED. Unwired in CI a suite is inert by never running, so this is
+        # how the preflight is actually executed on every PR.
+        run: python3.12 tools/fleet/successor_preflight.test.py
+      - name: Successor-preflight mutation evidence (#1317, zero-dep)
+        # The suite above is only a pin if it can FAIL. A mutation whose paired
+        # leg still passes is reported as a suite failure. Its own step, not a
+        # second command in the step above — sequencing would suppress one
+        # verdict when the other fails (the same rule as every suite here).
+        run: python3.12 tools/fleet/successor_preflight.test.py --red-control
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
       - name: Kill-switch / session-escape suite (#1419)
