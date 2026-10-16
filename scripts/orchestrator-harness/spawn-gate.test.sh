@@ -414,7 +414,7 @@ fix_argv() { printf '%s\n%s\n%s\nwork\n' "$RREPO" "daniel-ospina/agent-infra" 7 
 
 # ⛔ EVERY LOAD/SUCCESS ARM BELOW PINS DISK_MIN_FREE_MB=1, AND IT IS NOT COSMETIC (review round 2, P1).
 # The disk gate runs FIRST, so without this the arms are decided by THIS HOST's free space: on a box
-# with less than the shipped 1024 MiB floor — the exact state this PR exists for — each of them gets
+# with less than the shipped 500 MiB floor — the exact state this PR exists for — each of them gets
 # AGENT_DISK_REFUSED=77 instead of the 75/0 it asserts, and six "load-gate regressions" are reported
 # that are not regressions. `drive()` above neutralises the disk gate for the same reason and says so;
 # the arms that drive the real CALLERS must do it too. Only the arm that INTENDS a disk refusal varies
@@ -659,10 +659,11 @@ ck "a 0 floor is REPAIRED, not honoured — a gate that can never refuse is not 
 sup="$(sed -n 's/^MIN_FREE_MB="\${MIN_FREE_MB:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/../cloud-cell-supervisor.sh" 2>/dev/null | head -1)"
 # ⛔ AND THE DEFAULT MUST BE PROBED WITH THE VARIABLE **UNSET** (verification round, P1 — this check
 # was FAIL-OPEN as first written). Driving `DISK_MIN_FREE_MB=0` exercises the REPAIR constants, NOT
-# the default on the assignment line: patching ONLY that line `500` -> `600` left the whole suite at
-# `94 passed, 0 failed` while the live default was 600 against the supervisor's 500 — the exact drift
-# the pin exists to catch, in the direction that matters. `env -u` removes the variable from a
-# caller's environment too, so the probe reads the shipped default and nothing else.
+# the default on the assignment line: patching ONLY that line `500` -> `600` left the whole suite
+# GREEN while the live default was 600 against the supervisor's 500 — the exact drift the pin exists to
+# catch, in the direction that matters. `env -u` removes the variable from a caller's environment too,
+# so the probe reads the shipped default and nothing else. (The pre-fix count is deliberately NOT
+# recorded: it is not re-measurable from this tree without reverting the check below.)
 dfl="$(env -u DISK_MIN_FREE_MB bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
 if [ -n "$sup" ] && [ "$dfl" = "$sup" ]; then rc=0; else rc=1; fi
 ck "the DEFAULT (unset) floor EQUALS the supervisor's MIN_FREE_MB ($dfl vs ${sup:-<unreadable>}) — a higher one is a false PASS, not a safer gate" $rc
@@ -697,6 +698,30 @@ band="$(DISK_MIN_FREE_MB=100 DISK_WARN_FREE_MB=1 bash -c '
   printf "%s %s %s warn=%s" "$a" "$b" "$c" "$DISK_WARN_FREE_MB"' _ "$GATE")"
 [ "$band" = "allow warn warn warn=200" ]; rc=$?
 ck "AT the floor the gate ALLOWS and still WARNS — an empty band is not a warning ($band)" $rc
+# ⛔ ONE READER FOR "IS THIS A NUMBER" (review round, P3). The announcement and the predicates must
+# classify a reading IDENTICALLY, or the WARN reports a different verdict than the one it is
+# announcing — and the divergence was a fail-OPEN, not a cosmetic one: `is_num` rejects a LEADING ZERO
+# where the predicates' comparison accepts `0100` as 100, and because the WARN branch RETURNS before
+# `disk_ok` runs, such a reading was ALLOWED where the previous form REFUSED it. Driven end to end
+# through the shipped run_agent below — unreachable from the shipped probe, which is exactly why it
+# needs a pin: the seam is reachable by any redeclared probe, and this suite redeclares one itself.
+: > "$LOG"; : > "$PI_LOG"
+lz="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=500 bash -c '
+    . "$1"
+    disk_free_mb() { printf "%s" "0100"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "leading-zero probe" >/dev/null 2>&1
+    printf "rc=%s started=%s warned=%s" "$?" "$AGENT_STARTED" \
+      "$(grep -c "could not read free space" "$LOG")"' _ "$GATE" "$LOG" "$PROMPT")"
+[ "$lz" = "rc=77 started=0 warned=0" ]; rc=$?
+ck "a LEADING-ZERO reading is REFUSED like any other below-floor number ($lz) — an announcer that disagrees is a fail-open" $rc
+# ... and the divergence is REAL, not hypothetical: `is_num` — the classifier this file uses for
+# `_NCPU`/`MAX_LOAD`/`DISK_MIN_FREE_MB` — rejects that same string. Pinning it here says WHY the
+# announcer needs its own reader rather than reusing `is_num`, and fails if someone "tidies" it back.
+div="$(bash -c '. "$1"; is_num "0100" && echo agree || echo diverge' _ "$GATE")"
+[ "$div" = "diverge" ]; rc=$?
+ck "...and \`is_num\` really does NOT agree on it ($div), which is why the two readers cannot be shared" $rc
 # ⛔ THE BAND MUST STAY INSIDE THE FILE'S OWN RANGE (review round 2, P2). `is_limit` accepts 9 digits,
 # so it accepts floor=999999999 — but the band is 4x the floor, and 4 x 999999999 is 3999999996: TEN
 # digits, out of range by the very predicate that guards a PROVIDED warn. Every later guard ACCEPTS

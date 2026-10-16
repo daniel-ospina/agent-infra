@@ -141,8 +141,14 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 # as this file's own unreadable-`df` divergence. The alternative place to close it is that file's
 # floor, and that is the stronger place; it is held by concurrent lanes, so the DEFAULT is aligned
 # here instead. A deployment wanting a higher dispatch floor sets DISK_MIN_FREE_MB explicitly, and
-# then the two differ BY DECLARATION instead of by accident. `spawn-gate.test.sh` pins the EQUALITY
-# against that file's own line, so raising one of the two alone reddens it.
+# then the two differ BY DECLARATION instead of by accident. ⚠️ THE BAND IS CLOSED IN BOTH DIRECTIONS
+# FOR THE DEFAULTS ONLY (review round, P3): `MIN_FREE_MB` is itself a documented tunable, so setting
+# it LOWER than this floor re-opens the band from the other side (supervisor 100 / gate 500 → `check`
+# healthy, spawns refused 77). The durable fix is to bind the gate to `MIN_FREE_MB` when
+# `DISK_MIN_FREE_MB` is unset — or to have `cloud-cell-supervisor.sh` refuse a floor below this one —
+# and both of those touch a file held by concurrent lanes, so it is recorded as a residual rather than
+# settled here. `spawn-gate.test.sh` pins the EQUALITY of the DEFAULTS against that file's own line, so
+# raising one of the two alone reddens it.
 DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-500}"
 is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=500
 # A 0 floor would make `[ "$mb" -ge 0 ]` true for every reading — a gate that can never refuse,
@@ -188,12 +194,25 @@ disk_free_mb() { # disk_free_mb <path>
   df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d\n", $4 / 1024}'
 }
 
+# disk_readable <free-mb> — the ONE definition of "we actually got a number", shared by the three
+# consumers below. It is `case`-shaped rather than `is_num`-shaped ON PURPOSE (review round, P3):
+# `is_num` deliberately REJECTS a leading zero, because its other callers feed `$(( ))` where `08` is
+# an invalid octal — but the comparison here parses `0100` as 100 without error. Using `is_num` for the
+# announcement while the predicates used `case` made ONE reading "unreadable" to the WARN and "100MB"
+# to the verdict the WARN is announcing, and it was a fail-OPEN: measured through the shipped
+# run_agent, a `0100` reading at floor 500 REFUSED (77) under the `case` form and ALLOWED under the
+# `is_num` form. Unreachable from the shipped probe (`printf "%d"` never emits a leading zero) and
+# exactly the kind of divergence this file's "ONE predicate" rule exists to stop.
+disk_readable() { # disk_readable <free-mb>
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+}
+
 # disk_ok <free-mb> — the ONE disk predicate, and the gate's polarity in one place.
 # An empty or NON-NUMERIC reading is unreadable, not zero: it returns ALLOWED (the documented
 # fail-open). A readable reading is compared against the floor.
 disk_ok() { # disk_ok <free-mb>
   local mb="${1:-}"
-  case "$mb" in ''|*[!0-9]*) return 0 ;; esac
+  disk_readable "$mb" || return 0
   [ "$mb" -ge "$DISK_MIN_FREE_MB" ]
 }
 
@@ -201,7 +220,7 @@ disk_ok() { # disk_ok <free-mb>
 # polarity as disk_ok: a reading we cannot take is not evidence that the disk is low.
 disk_low() { # disk_low <free-mb>
   local mb="${1:-}"
-  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  disk_readable "$mb" || return 1
   [ "$mb" -lt "$DISK_WARN_FREE_MB" ]
 }
 
@@ -311,12 +330,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # silent fail-open is how a typo'd DISK_GATE_PATH — or a missing `df` — disarms the gate invisibly.
   # The reading is not a refusal, so this is a WARN; the distinction matters, because the agent is
   # still allowed to start.
-  # ⛔ AND "UNREADABLE" IS THE PREDICATE'S OWN DEFINITION, NOT `-z` (review round 1, P2). `disk_ok`
-  # and `disk_low` both classify an EMPTY **or NON-NUMERIC** reading as unreadable and fail open on
-  # it; testing `-z` here meant a NON-EMPTY but non-numeric reading — the shape the OFMT bug above
-  # produces — was silently permissive while this comment claimed it was loud. The two must agree, or
-  # the same reading is "unreadable" to the predicates and "just fine" to the operator.
-  if ! is_num "$dfree"; then
+  # ⛔ AND "UNREADABLE" IS THE PREDICATES' OWN DEFINITION, NOT A SECOND ONE (review round, P2).
+  # `disk_ok` and `disk_low` classify an EMPTY or NON-NUMERIC reading as unreadable and fail open on
+  # it; announcing with `-z` meant a NON-EMPTY but non-numeric reading — the shape the OFMT bug above
+  # produces — was silently permissive while this comment claimed it was loud. Announcing with
+  # `is_num` was still a SECOND definition, and a divergent one: `is_num` rejects `0100` where the
+  # predicates accept it, so the same reading was "unreadable" here and "100MB" to the verdict being
+  # announced. Both now call `disk_readable`, so agreement is structural rather than maintained.
+  if ! disk_readable "$dfree"; then
     echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
   elif ! disk_ok "$dfree"; then
     echo "[disk-gate] REFUSED $label: only ${dfree}MB free on $dpath < disk_min_free_mb=$DISK_MIN_FREE_MB — no agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) and the controller re-dispatches" >> "$log"
