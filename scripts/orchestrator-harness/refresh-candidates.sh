@@ -205,8 +205,8 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 # the assignee/holder surfaces — are gh-backed. The three it reads from git (local branches, remote
 # branches, local worktrees) are NOT a substitute: all three are BLOCKING — a ref naming the issue
 # forces a COLLISION — and the local-branch surface's terminal lookup is itself a gh call whose
-# failure deliberately KEEPS the ref blocking (fail-closed). With an
-# unauthenticated gh the tool does NOT refuse — it answers from whatever it can still read, which is
+# failure deliberately KEEPS the ref blocking (fail-closed). With an unauthenticated gh the tool does
+# NOT refuse — it answers from whatever it can still read, which is
 # how a LANDED issue came back as a COLLISION (measured 2026-10-16, #1328: `VERDICT: COLLISION ...
 # ALSO INCOMPLETE: 3 surface(s) could not be queried` under HOME=/home/ubuntu, `VERDICT: LANDED`
 # under HOME=/tmp/cell-home). The caller cannot tell that answer apart from a real collision, so an
@@ -216,51 +216,47 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 # stored for the host, or a credential the API has REJECTED with a 401. Everything else is TRANSIENT
 # (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker that only a human
 # can clear (#1853 review).
-# `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
-# The host to probe is the host the PRE-FLIGHT's own gh calls resolve, and it is READ, not guessed.
-# Those calls pass a host-LESS repo slug (`--repo .`, whose remote host `_remote_slug` strips), so gh
-# picks the host itself: `GH_HOST` if set, else github.com when gh is configured for it, else the
-# configured host (measured on gh 2.97.0). `$OR`'s prefix does NOT select it, so consulting that here
-# would probe a host the pre-flight never contacts. The host cannot be named by OMISSION either: an
-# UNSCOPED `gh auth status` fails when any UNRELATED configured host has a problem, while `--hostname`
-# names exactly one. `gh auth status --json hosts` exposes the configured set machine-readably, so no
-# prose is parsed and no external `jq` is needed (gh embeds its own).
-gh_default_host() {
-  local host
-  if [ -n "${GH_HOST:-}" ]; then printf '%s\n' "$GH_HOST"; return 0; fi
-  host="$(gh auth status --json hosts --jq '(.hosts // {}) as $h
-    | if ($h | length) == 0 or ($h | has("github.com")) then "github.com"
-      elif ([$h | to_entries[] | select(.value[0].active == true) | .key] | length) > 0
-        then ([$h | to_entries[] | select(.value[0].active == true) | .key] | first)
-      else ([$h | to_entries[] | .key] | first) end' 2>/dev/null)"
-  case "$host" in '' | null) host="github.com" ;; esac
-  printf '%s\n' "$host"
-}
+# `gh auth token` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
+# ⛔ ASK gh WHICH HOST IT WILL USE — DO NOT MODEL IT. The pre-flight's own calls pass a host-LESS
+# repo slug (`--repo .`, whose remote host `_remote_slug` strips), so the host is gh's choice — and
+# gh's rule (`GH_HOST`, else the ONE configured host, else github.com) CANNOT be reproduced from its
+# JSON view. `gh auth status --json hosts` reports the KNOWN hosts, which ADD a github.com entry
+# synthesised from GH_TOKEN/GITHUB_TOKEN, and it cannot show a configured github.com whose token an
+# env token shadows: the two are byte-identical there. Every attempt to derive the host from that
+# JSON named the WRONG host in some configuration — a two-GHES config (gh uses github.com, the JSON
+# suggests the enterprise host, so the probe reported TRANSIENT for ever and never named the real
+# cause) and a GHES config with GH_TOKEN set (gh uses the enterprise host, the JSON suggests
+# github.com, so a bad credential LATCHED the permanent marker naming the wrong host) — both measured
+# against gh 2.97.0 (#1853 review). So NO host is named here at all: `gh auth token` and `gh api`
+# resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
+# host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
 
-# 0 = gh can authenticate for host $1; 1 = TRANSIENT; 3 = PERMANENT (with the reason printed).
-gh_probe_host() {
-  local host="$1" out
+# 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
+gh_probe_env() {
+  local terr err
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ONE call captures both the status and the output.
-  out="$(gh auth status --hostname "$host" 2>&1)" && return 0
-  # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. `gh auth status` cannot tell a
-  # transport fault from a rejected credential — measured on gh 2.97.0: behind a DEAD PROXY a pure
-  # network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is invalid." as a
-  # revoked one, so any text match on "invalid"/"expired"/"authenticat" classifies an outage as a
-  # credential failure and latches the permanent marker a human must clear (#1853 review).
-  # `gh auth token` is an OFFLINE lookup of the stored credential (hosts.yml / the keyring) — it never
-  # touches the network, so its exit status is cause-independent. The token itself is never printed:
-  # stdout goes to /dev/null.
-  if ! gh auth token --hostname "$host" >/dev/null 2>&1; then
-    echo "[refresh] NOT PROVISIONABLE: no gh credential is STORED for $host in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
-    printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
+  # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
+  # status` cannot tell a transport fault from a rejected credential — measured on gh 2.97.0: behind a
+  # DEAD PROXY a pure network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is
+  # invalid." as a revoked one — so any text match on "invalid"/"expired"/"authenticat" classifies an
+  # outage as a credential failure and latches the permanent marker a human must clear (#1853 review).
+  # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
+  # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
+  # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
+  if ! terr="$(gh auth token 2>&1 >/dev/null)"; then
+    echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+    printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # A credential IS stored but could not be validated. Is it REJECTED, or merely UNREACHABLE? Only
+  # VALIDATION is the same call the pre-flight's gh-backed surfaces make, with no host named. A
+  # credential that is STORED and DOES answer is usable, so this is also where the probe can SUCCEED.
+  err="$(gh api rate_limit 2>&1)" && return 0
+  # A credential IS stored, but the call did not answer. Is it REJECTED, or merely UNREACHABLE? Only
   # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
   # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
   # enforcement, a missing scope, an IP-allowlist block, a suspended account, or a SECONDARY rate
@@ -272,24 +268,22 @@ gh_probe_host() {
   # status.
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
-  if grep -q 'HTTP 401' <<<"$(gh api --hostname "$host" rate_limit 2>&1)"; then
-    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for $host is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
-    printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  if grep -q 'HTTP 401' <<<"$err"; then
+    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for the host gh is configured for is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] TRANSIENT: a gh credential is stored for $host but could not be validated and the API is NOT answering with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
-  printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  echo "[refresh] TRANSIENT: a gh credential is stored for the host gh is configured for but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
+  printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
   return "$EXIT_TRANSIENT"
 }
 
 gh_env_verdict() {
-  local rc
   # The probe covers the host the pre-flight's own host-LESS calls resolve. The harness's POOL
   # LISTING is a different call — it names `$OR` directly — and it is guarded where it runs: an
   # unreadable listing must not be read as an empty one (see `.pool` in cmd_run).
-  gh_probe_host "$(gh_default_host)"; rc=$?
-  return "$rc"
+  gh_probe_env
 }
 
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
@@ -298,8 +292,9 @@ cmd_check() {
   # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
   # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and each of
   # those already performs ONE `gh auth status` itself — the supervisor's in cmd_check, the bringup's
-  # in check_gh (which check_dispatch calls). orchestrator-harness's selftest pins exactly one such
-  # call under `$CELL_HOME` for each of them, so a second `gh auth status` from here would redden an
+  # in check_gh, which bringup's own `--check` arm runs immediately before check_dispatch (both are
+  # listed in its main()). orchestrator-harness's selftest pins exactly one such call under
+  # `$CELL_HOME` for each of them, so a second `gh auth status` from here would redden an
   # owned suite. More importantly it is the WRONG LAYER:
   # those checks run in the
   # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
@@ -355,7 +350,11 @@ cmd_check() {
 }
 
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
-mkdir -p "$O"
+# ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
+# non-directory `$O` (or a read-only one, or a full disk) let the run finish with `checked 0; backlog
+# now` at rc 0 having persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits
+# RUNNING with `lanes: 0` — the merge-only shape this change exists to remove (#1853 review).
+mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O"; exit "$EXIT_TRANSIENT"; }
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 gh_env_verdict || exit $?
@@ -537,6 +536,11 @@ touch "$O/checked.txt" "$O/candidates.txt"
   gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>/dev/null
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
+
+# ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE. A present-but-EMPTY `.pool` is a legitimate answer (no
+# unassigned P0/P1/P2), so the test is on the FILE, not on its contents: if the redirect did not even
+# create it, the pool was never persisted and everything below reads a backlog that does not exist.
+[ -f "$O/.pool" ] || { echo "[refresh] ABORT: $O is not writable — the candidate pool was not written"; exit "$EXIT_TRANSIENT"; }
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY POOL — the same rule the open-issue listing above enforces.
 # The three queries above run inside a group whose status this pipeline DISCARDS, and each hides its

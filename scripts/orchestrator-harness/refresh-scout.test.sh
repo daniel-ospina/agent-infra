@@ -58,7 +58,8 @@ rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV \
+  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
+          -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
           HOME="$dir/home" PATH="$paths" REPO="$dir/repo" O="$dir/o" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -389,45 +390,51 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
 esac
 
 # ── the host is READ from gh, never hardcoded ───────────────────────────────────────
-# The pre-flight hands gh a host-LESS slug, so gh resolves the host itself and the probe has to name
-# THAT host. A hardcoded `github.com` asked about the wrong host on a cell whose gh is configured for
-# an enterprise host, and the refusal it produced was PERMANENT — a marker only a human can clear, on
-# an environment that could dispatch perfectly well (#1853 review). This stub's gh is configured for
-# an enterprise host ONLY, so the pre-fix probe asks github.com, finds no credential, and latches.
-echo; echo "── the probe names the host gh RESOLVES, not a hardcoded github.com ──"
+# The pre-flight hands gh a host-LESS repo slug, so gh chooses the host, and the ONLY faithful probe
+# is one that names none either. A stub is exactly the right instrument here: this one resolves the
+# host the way gh does (GH_HOST, else the ONE configured host, else github.com — measured on gh
+# 2.97.0) from the case's own hosts.yml, and refuses any call that names a different one. So the case
+# fails the moment the script assumes a host: with a GHES-only config the pre-fix `--hostname
+# github.com` finds no credential and latches the PERMANENT marker on an environment that can dispatch
+# perfectly well (#1853 review). Reported already once: a `--json hosts`-derived host named the WRONG
+# host for a two-GHES config and for a GHES config with GH_TOKEN set.
+echo; echo "── the probe lets gh choose the host, rather than assuming github.com ──"
 mk_case ghes-host
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mkdir -p "$D/home/.config/gh"
+printf 'ghe.example.com:\n    oauth_token: x\n    user: n\n' > "$D/home/.config/gh/hosts.yml"
 cat > "$D/bin/gh" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "$GH_LOG"
-case "$1 $2" in
-  "auth status")
-    case "$*" in
-      # What `--json hosts` + gh's EMBEDDED `--jq` prints for this configuration: the one host gh is
-      # configured for. The stub answers with the RESOLVED value, because the assertion is about
-      # which host the probe asks for — a stub that printed raw JSON could not be told apart from a
-      # parse that silently failed and fell back to github.com.
-      *"--json hosts"*) printf 'ghe.example.com\n'; exit 0 ;;
-      *"--hostname ghe.example.com"*) exit 0 ;;
-    esac
-    printf 'To get started with GitHub CLI, please run: gh auth login\n' >&2; exit 1 ;;
-  "auth token") case "$*" in *"--hostname ghe.example.com"*) exit 0 ;; esac; exit 1 ;;
+# This stub's own model of gh's default host: GH_HOST, else the ONE configured host, else github.com.
+CFG="${GH_CONFIG_DIR:-$HOME/.config/gh}/hosts.yml"
+HOST="${GH_HOST:-}"
+if [ -z "$HOST" ]; then
+  n=$(grep -cE '^[^[:space:]#][^:]*:' "$CFG" 2>/dev/null || true)
+  if [ "${n:-0}" = 1 ]; then HOST=$(grep -E '^[^[:space:]#][^:]*:' "$CFG" | head -1 | tr -d ':')
+  else HOST=github.com; fi
+fi
+# A call that NAMES a host must name the one gh resolves. (The shipped script must name none at all;
+# this arm exists so the pre-fix `--hostname github.com` is refused here rather than silently accepted.)
+case "$*" in
+  *"--hostname "*) named="${*##*--hostname }"; named="${named%% *}"
+    if [ "$named" != "$HOST" ]; then printf 'no oauth token found for %s\n' "$named" >&2; exit 1; fi ;;
 esac
+# Only the configured enterprise host is authenticated in this case.
+[ "$HOST" = github.com ] && { printf 'no oauth token found for github.com\n' >&2; exit 1; }
+printf '{"resources":{}}\n'
 exit 0
 SH
 chmod +x "$D/bin/gh"
 rf "$D" refresh GH_LOG="$D/gh-log"
 [ "$RC" -eq 0 ] && ok "GHES host: a cell gh is configured for an enterprise host is NOT refused" \
-               || bad "GHES host: rc=$RC (want 0) — the probe asked about the wrong host — output: $OUT"
-grep -q 'auth status --json hosts' "$D/gh-log" 2>/dev/null \
-  && ok "GHES host: the host was READ from gh's machine-readable surface, not parsed out of prose" \
-  || bad "GHES host: gh was never asked for its configured hosts — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
-grep -q -- '--hostname ghe.example.com' "$D/gh-log" 2>/dev/null \
-  && ok "GHES host: the probe named the host gh reports" \
-  || bad "GHES host: ghe.example.com was never probed — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
-grep -q -- '--hostname github.com' "$D/gh-log" 2>/dev/null \
-  && bad "GHES host: probed a hardcoded github.com" \
-  || ok "GHES host: no hardcoded github.com probe"
+               || bad "GHES host: rc=$RC (want 0) — the probe assumed a host — output: $OUT"
+grep -q -- '--hostname' "$D/gh-log" 2>/dev/null \
+  && bad "GHES host: the probe NAMED a host — gh must choose it — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'" \
+  || ok "GHES host: no host is named — gh resolves it, so the probe cannot disagree with the pre-flight"
+grep -q 'auth token' "$D/gh-log" 2>/dev/null \
+  && ok "GHES host: the credential question is asked of gh" \
+  || bad "GHES host: gh was never asked for a credential — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
 
 # ── an unreadable pool listing is NOT an empty backlog ───────────────────────────────────────────
 # The three pool queries run in a group whose status the pipeline discards, and each hides its reason
@@ -442,9 +449,10 @@ mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 cat > "$D/bin/gh" <<'SH'
 #!/bin/bash
 case "$*" in
-  "auth status"*) exit 0 ;;
+  "auth token"*) exit 0 ;; # a credential IS stored
   "issue list"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
 esac
+printf '{"resources":{}}\n'
 exit 0
 SH
 chmod +x "$D/bin/gh"
@@ -458,6 +466,28 @@ esac
 case "$OUT" in
   *"checked 0; backlog now"*) bad "unreadable pool: still reported a healthy empty backlog" ;;
   *) ok "unreadable pool: no \"checked N; backlog now 0\" over an unreadable pool" ;;
+esac
+
+# ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
+# `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
+# `checked 0; backlog now` at rc 0 having persisted NOTHING: no marker for orch-loop, no candidates, a
+# cell RUNNING with `lanes: 0`. That is the merge-only shape this change exists to remove, so it must
+# refuse loudly rather than report a healthy empty queue (#1853 review).
+echo; echo "── an unwritable state dir is refused, not absorbed ──"
+mk_case unwritable-o
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#' > "$D/state-file" # a REGULAR FILE where $O must be a directory
+OUT="$(env -u GH_HOST -u CELL_HOME HOME="$D/home" PATH="$D/bin:$PATH" REPO="$D/repo" \
+        O="$D/state-file" bash "$REFRESH" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok "unwritable \$O: rc=1 (TRANSIENT — loud, and no permanent marker)" \
+               || bad "unwritable \$O: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"cannot create the state directory"*) ok "unwritable \$O: the abort names the state directory" ;;
+  *) bad "unwritable \$O: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked 0; backlog now"*) bad "unwritable \$O: still reported a healthy empty backlog" ;;
+  *) ok "unwritable \$O: no \"checked N; backlog now 0\" over a state dir that was never written" ;;
 esac
 
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
