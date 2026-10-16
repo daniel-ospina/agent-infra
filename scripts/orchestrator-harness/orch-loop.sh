@@ -1422,6 +1422,10 @@ PY
       # Capture rc: 3 is refresh-candidates.sh's NOT_PROVISIONABLE code — permanent, so retrying
       # cannot help; record it and stop re-spawning. Any OTHER non-zero is transient (network, a
       # failed listing) and IS retried next cycle.
+      # ⛔ BOUND THE EVIDENCE TO THIS RUN. $LOG is append-only and never rotated, so a bare
+      # `grep NOT PROVISIONABLE "$LOG"` would quote a PREVIOUS cycle's refusal as this block's
+      # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
+      log_mark="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"; [ -n "$log_mark" ] || log_mark=0
       ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
@@ -1433,9 +1437,9 @@ PY
           {
             echo "MERGE-ONLY: dispatch provisioning is BLOCKED — no implementation lane will be dispatched until this is fixed."
             echo "Reason and evidence (the refresh's own refusal, verbatim):"
-            grep 'NOT PROVISIONABLE' "$LOG" 2>/dev/null | tail -3 | sed 's/^/  /'
+            tail -n +"$((log_mark + 1))" "$LOG" 2>/dev/null | grep 'NOT PROVISIONABLE' | tail -3 | sed 's/^/  /'
             echo "Those lines name the failing link; the knobs are TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), a vendored tools/collision_preflight.py in the repo, SCOUT_PY=<a Python >= 3.12>, or a writable, gh-authenticated HOME."
-            echo "After fixing it, delete this file (or re-run 'check', which clears it)."
+            echo "After fixing it, delete this file and re-run 'check' to confirm."
           } > "$O/.refresh-blocked"
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"

@@ -39,9 +39,12 @@ SC="$REPO/.worktrees/dispatch-scout"
 # one whose keys.env carries an operator's HAND-WRITTEN `HOME=`/`UV_CACHE_DIR=`. That is the
 # fix-that-never-ran shape.
 #
-# The repair is applied at the point of use and is a NO-OP wherever $HOME is already a writable
-# directory (every laptop, and every cell whose controller the supervisor started). It cannot move a
-# working home; it only replaces an unusable one.
+# WRITABLE is the definition of usable HERE, and it is the harness's own precondition, not a choice
+# made in this function: cloud-cell-supervisor.sh and cloud-cell-bringup.sh both die on a non-writable
+# home, and `$O` defaults to `$HOME/orchestrator`, which this script writes. The repair is a NO-OP
+# wherever $HOME is already a writable directory (every laptop, and every cell whose controller the
+# supervisor started); a home that is absent, not a directory, or not writable is off-spec for this
+# harness and is replaced.
 CELL_HOME="${CELL_HOME:-/tmp/cell-home}"
 usable_home() { [ -n "${1:-}" ] && [ -d "$1" ] && [ -w "$1" ]; }
 # $1 = --create. Runs at LOAD, before anything else: the interpreter probe, uv's cache and the
@@ -198,29 +201,46 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 }
 
 # ── gh must be able to AUTHENTICATE, or the pre-flight's verdicts are degraded fiction ─────────
-# WHY. Every surface of tools/collision_preflight.py is gh-backed (issue metadata, open PRs, the
-# assignee/holder surfaces). With an unauthenticated gh the tool does NOT refuse — it answers from
-# whatever it can still read, which is how a LANDED issue came back as a COLLISION (measured
-# 2026-10-16, #1328: `VERDICT: COLLISION ... ALSO INCOMPLETE: 3 surface(s) could not be queried`
-# under HOME=/home/ubuntu, `VERDICT: LANDED` under HOME=/tmp/cell-home). The caller cannot tell that
-# answer apart from a real collision, so an environment failure becomes "a peer owns it, retry next
-# pass" on every candidate, forever. This check turns it back into ONE named provisioning failure.
-# Its exit code is the PERMANENT one (3): the remedy needs a human or a credential, not a retry —
-# which is exactly what orch-loop.sh's `.refresh-blocked` marker and `status` are for.
+# WHY. The surfaces of tools/collision_preflight.py that DECIDE a verdict — issue metadata, open PRs,
+# the assignee/holder surfaces — are gh-backed (its three git-backed surfaces — local branches,
+# remote branches, worktrees — answer without gh and cannot make a collision). With an
+# unauthenticated gh the tool does NOT refuse — it answers from whatever it can still read, which is
+# how a LANDED issue came back as a COLLISION (measured 2026-10-16, #1328: `VERDICT: COLLISION ...
+# ALSO INCOMPLETE: 3 surface(s) could not be queried` under HOME=/home/ubuntu, `VERDICT: LANDED`
+# under HOME=/tmp/cell-home). The caller cannot tell that answer apart from a real collision, so an
+# environment failure becomes "a peer owns it, retry next pass" on every candidate, forever. This
+# check turns it back into ONE named provisioning failure.
+# ⛔ PERMANENT (3) IS RESERVED FOR A CREDENTIAL FAILURE, whose remedy needs a human. The probe is
+# scoped to the host the pre-flight queries, retried once, and a failure that does NOT name a
+# credential problem is returned TRANSIENT (1) — a network/API fault must not latch the permanent
+# `.refresh-blocked` marker that only a human can clear (#1853 review).
 # `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
 gh_env_verdict() {
-  local out
+  local out attempt
   if ! command -v gh >/dev/null 2>&1; then
-    echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — every surface of the collision pre-flight is gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
+    echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  if ! out="$(gh auth status 2>&1)"; then
-    echo "[refresh] NOT PROVISIONABLE: gh is NOT authenticated in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+  # ⛔ SCOPE THE PROBE TO THE HOST THE PRE-FLIGHT QUERIES. `gh auth status` exits non-zero if an
+  # account on ANY configured host has a problem, so a stale second host (an enterprise entry in
+  # hosts.yml) would refuse a cell whose github.com credential is perfectly good (#1853 review).
+  for attempt in 1 2; do
+    if out="$(gh auth status --hostname "${GH_HOST:-github.com}" 2>&1)"; then return 0; fi
+    # ONE retry: the exit status alone cannot separate a transport failure from a credential
+    # failure — the classification below is what separates them.
+    [ "$attempt" -eq 1 ] && sleep "${GH_AUTH_RETRY_SLEEP:-1}"
+  done
+  # A credential failure NAMES itself; a network/API fault does not. Default to TRANSIENT: a wrong
+  # TRANSIENT costs one retry, a wrong PERMANENT latches the MERGE-ONLY marker (#1853 review).
+  if ! printf '%s\n' "$out" | grep -qiE 'not logged|gh auth login|invalid|expired|bad credentials|authenticat'; then
+    echo "[refresh] TRANSIENT: gh auth status failed in the environment the pre-flight runs in (HOME=$HOME) without naming a credential problem — treating it as a network/API fault, retried next cycle (#1736)"
     printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
-    return "$EXIT_NOT_PROVISIONABLE"
+    return "$EXIT_TRANSIENT"
   fi
-  return 0
+  echo "[refresh] NOT PROVISIONABLE: gh is NOT authenticated in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+  printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
+  return "$EXIT_NOT_PROVISIONABLE"
 }
 
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
@@ -229,8 +249,9 @@ cmd_check() {
   # ⛔ The gh precondition is DELIBERATELY NOT judged here. `--check` is what
   # cloud-cell-supervisor.sh's cmd_check and cloud-cell-bringup.sh's check_dispatch run, and BOTH
   # of them already run `gh auth status` themselves (under $CELL_HOME) — and orchestrator-harness's
-  # selftest pins that each of them invokes gh EXACTLY once, so a second call from here would
-  # redden an owned suite. More importantly it is the WRONG LAYER: those checks run in the
+  # selftest pins exactly one `gh auth status` call under `$CELL_HOME` for each of them, so a second
+  # `gh auth status` from here would redden an owned suite. More importantly it is the WRONG LAYER:
+  # those checks run in the
   # operator's shell with HOME=$CELL_HOME forced, while the pre-flight inherits the HOME of the
   # process that actually runs it — which is the divergence this whole change exists for, and which
   # no operator-side check can see. The run path below is the one that judges it.
@@ -283,7 +304,7 @@ if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 mkdir -p "$O"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
-gh_env_verdict || exit "$EXIT_NOT_PROVISIONABLE"
+gh_env_verdict || exit $?
 
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
@@ -464,9 +485,15 @@ touch "$O/checked.txt" "$O/candidates.txt"
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 
 n=0
-# `usable` counts the verdicts the pre-flight actually produced (CLEAN or COLLISION; an INCOMPLETE
-# run is not a verdict — see the property assertion after the loop).
+# `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,
+# and LANDED. NOT counted: an INCOMPLETE run, a DEGRADED `COLLISION ... ALSO INCOMPLETE` (the tool
+# answering from partial evidence — the broken-environment fingerprint this gate exists to catch),
+# and a run that emitted no VERDICT at all. See the property assertion after the loop.
 usable=0
+# `judged` counts the candidates the pre-flight ACTUALLY RAN — `n` counts the slots the loop
+# ATTEMPTED, because it is incremented before the LIMIT break. The abort and the final report use
+# `judged`, so neither over-states the pass by one (#1853 review).
+judged=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -480,6 +507,7 @@ while read -r N; do
   # work lands). checked.txt is therefore written ONLY on the verdict that terminates the issue —
   # CLEAN, which is queued. Everything else is left unchecked, so the next pass re-attempts it.
   # (agent-infra#1716)
+  judged=$((judged + 1))
   PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
@@ -500,7 +528,7 @@ while read -r N; do
     echo "[refresh]   fix: make the interpreter runnable (the tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR) or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
     exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
-  V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION).*/\1/')"
+  V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
   case "$V" in
     CLEAN)
       usable=$((usable + 1))
@@ -508,12 +536,35 @@ while read -r N; do
       echo "$N" >> "$O/candidates.txt"
       echo "[refresh] +#$N CLEAN -> backlog" ;;
     COLLISION)
+      # ⛔ A COLLISION that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict: the tool
+      # could not read every surface and defaulted to the conservative one. Measured 2026-10-16
+      # (#1328): an issue whose true verdict was LANDED came back as `VERDICT: COLLISION ... ALSO
+      # INCOMPLETE: 3 surface(s) could not be queried`. Counting it as usable would let a broken
+      # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
+      # refuse (#1853 review).
+      if grep -q 'ALSO INCOMPLETE' <<<"$PRE"; then
+        echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
+      else
+        usable=$((usable + 1))
+        echo "[refresh] =#$N collision — a peer owns it, retried next pass"
+      fi ;;
+    LANDED)
+      # Terminal and REAL: the issue was closed between the pool listing and the pre-flight, so it
+      # has left the pool by itself. Counted as a usable verdict — otherwise a pass of LANDEDs is
+      # reported as "judged NOTHING" — but never queued and never written to checked.txt (#1853
+      # review; the canonical consumer's LANDED arm).
       usable=$((usable + 1))
-      echo "[refresh] =#$N collision — a peer owns it, retried next pass" ;;
+      echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
+    INCOMPLETE)
+      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
     *)
       echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
   esac
 done < "$O/.pool"
+# ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
+# persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
+# prints and M > 0 — `COLLISION` counts as usable, so that class is invisible here. It is
+# agent-infra#1729 and stays OPEN; this assertion covers the empty-backlog reading only.
 # ⛔ ASSERT THE PROPERTY, NOT THE PLUMBING. "checked N; backlog now 0" over a non-empty pool is the
 # reading the fleet has been stuck in: it looks like a healthy empty queue, and each `?no verdict`
 # line is a per-candidate MASK of one environment failure (measured 2026-10-16: two cells whose
@@ -524,8 +575,8 @@ done < "$O/.pool"
 # with the reason) when the environment could not authenticate, so no-usable-verdict from a passing
 # environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
 # retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
-if [ "$n" -gt 0 ] && [ "$usable" -eq 0 ]; then
-  echo "[refresh] ABORT: none of the $n candidate(s) in the pool produced a usable verdict (CLEAN or COLLISION) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
+if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
+  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
   exit "$EXIT_TRANSIENT"
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
@@ -549,4 +600,4 @@ fi
 # whereas the old `sort -o` preserved it. The file holds only public issue numbers and its mode is
 # never set deliberately, so 644 is not a property anything depends on.
 awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" && mv "$O/.cand" "$O/candidates.txt"
-echo "[refresh] checked $n; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
+echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"

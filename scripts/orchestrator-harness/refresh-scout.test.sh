@@ -320,8 +320,9 @@ esac
 
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
 # cmd_check and cloud-cell-bringup.sh's check_dispatch each ALREADY run `gh auth status` themselves
-# (under $CELL_HOME), and orchestrator-harness's selftest pins that each of them invokes gh exactly
-# once — so a probe here would redden an owned suite AND ask the question in the wrong layer: those
+# (under $CELL_HOME), and orchestrator-harness's selftest pins exactly one `gh auth status` call
+# under `$CELL_HOME` for each of them — so a second `gh auth status` from here would redden an owned
+# suite AND ask the question in the wrong layer: those
 # checks run in the OPERATOR's shell, while the pre-flight inherits the HOME of whatever process
 # actually started the controller. The run path is the enforcement point. This case pins that
 # `--check` did not quietly acquire a second gh call or a new refusal.
@@ -370,6 +371,91 @@ chmod +x "$D/bin/gh"
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "no usable verdict: an EMPTY pool still exits 0 (no false block)" \
                || bad "no usable verdict: false block on an empty pool — rc=$RC — output: $OUT"
+
+# ── 1f) LANDED IS A USABLE VERDICT (agent-infra#1853 review P1) ─────────────────────────────────
+# The tool's fourth verdict is `VERDICT: LANDED (exit 4)` — an issue closed between the pool listing
+# and the pre-flight. The parser matched only CLEAN|COLLISION, so a LANDED fell into the `*)` arm, was
+# not counted by `usable`, and a pass of LANDEDs then tripped the "judged NOTHING" abort (rc=1). A
+# LANDED is terminal and real, so it must count as a usable verdict — while never being queued.
+mk_case landed-usable
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: LANDED (exit 4) — the issue's own state is CLOSED")
+raise SystemExit(4)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "LANDED: a pass of LANDEDs exits 0 (not the rc=1 abort)" \
+               || bad "LANDED: rc=$RC (want 0 — LANDED must count as usable) — output: $OUT"
+case "$OUT" in
+  *"judged NOTHING"*) bad "LANDED: the abort fired on a usable LANDED verdict" ;;
+  *) ok "LANDED: no \"judged NOTHING\" abort" ;;
+esac
+case "$OUT" in
+  *"LANDED"*) ok "LANDED: the verdict is reported" ;;
+  *) bad "LANDED: the verdict was not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "LANDED: a landed issue was queued (it must not enter candidates.txt)" ;;
+  *) ok "LANDED: a landed issue is NOT queued" ;;
+esac
+
+# ── 1g) A DEGRADED COLLISION IS NOT A VERDICT (agent-infra#1853 review P2, #1328) ───────────────
+# Measured on the live cells: an issue whose true verdict was LANDED came back as
+# `VERDICT: COLLISION ... ALSO INCOMPLETE: 3 surface(s) could not be queried`. Counting that as usable
+# would let a broken environment report a healthy `checked N; backlog now 0` — the exact reading this
+# gate exists to refuse. Degraded collisions must NOT count, so the pass must abort (rc=1) instead.
+mk_case degraded-collision
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
+print("ALSO INCOMPLETE: 3 surface(s) could not be queried")
+raise SystemExit(1)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
+               || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "degraded COLLISION: still reported a healthy empty backlog" ;;
+  *) ok "degraded COLLISION: no \"checked N; backlog now 0\" over a degraded answer" ;;
+esac
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the degradation is NAMED" ;;
+  *) bad "degraded COLLISION: the degradation is not reported — output: $OUT" ;;
+esac
+[ ! -s "$D/o/candidates.txt" ] && ok "degraded COLLISION: nothing is queued" \
+                              || bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+
+# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# `gh auth status` hits the network, so a transport failure must not latch the MERGE-ONLY marker that
+# only a human can clear. A failure whose output does NOT name a credential problem is TRANSIENT (rc=1)
+# and retried next cycle; only a credential failure is PERMANENT (rc=3).
+mk_case gh-transient
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status") echo "error connecting to api.github.com: dial tcp: i/o timeout" >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh GH_AUTH_RETRY_SLEEP=0
+[ "$RC" -eq 1 ] && ok "gh network fault: rc=1 (TRANSIENT — not the permanent 3)" \
+               || bad "gh network fault: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) bad "gh network fault: a transport failure was called NOT PROVISIONABLE" ;;
+  *) ok "gh network fault: not reported as NOT PROVISIONABLE" ;;
+esac
+[ ! -e "$D/o/.refresh-blocked" ] && ok "gh network fault: the permanent marker path was NOT written" \
+                                 || bad "gh network fault: a permanent marker was written — $(cat "$D/o/.refresh-blocked" 2>/dev/null)"
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
 # Structural, not textual: the stub tool records its cwd and argv, and the candidate it cleared must
