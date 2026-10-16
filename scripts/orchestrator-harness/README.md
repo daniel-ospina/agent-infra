@@ -233,9 +233,11 @@ this script reports: it cannot tell you the work succeeded.
 PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
 never handed to the chain is unreviewed code by default.
 
-⚠️ `install.sh` copies every `*.sh` into `$O`, but its drift comparison lists the loop scripts
-explicitly, so this one is copied and *not* compared against the running copy. Run it from the
-harness directory, or re-copy it after editing.
+⚠️ `install.sh` does **not** copy it. The script only syntax-checks every `*.sh`, and its drift
+comparison lists the loop scripts **explicitly** (it does not include this one), so a stale copy here
+is never reported and `install.sh` prints no `cp` for it. What puts this file in `$O` is the manual
+copy in §4 — `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness
+directory, and re-run that `cp` after editing this script.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that

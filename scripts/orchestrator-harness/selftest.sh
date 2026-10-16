@@ -2754,21 +2754,48 @@ echo
 # the prompt text is command substitution at prompt-build time. An earlier draft of this fix would
 # have run `uv sync` and spliced its output into the reviewer prompt, and erased the literal
 # `UNVERIFIED` — and `bash -n` does NOT catch it (the script is syntactically valid; the bug is what
-# the shell DOES with it). So these checks EXPAND the shipped heredocs with every command name that
-# appears inside a backtick span backed by a tripwire stub, and the last check is a NON-VACUITY
-# control: the same rig against a deliberately unescaped heredoc must fire.
+# the shell DOES with it).
+#
+# TWO checks, because each is blind to a class the other covers (agent-infra#1835 review, P2: with
+# only the execution check, a bare `git add -A` PASSED here while git really ran, because `git` had
+# never been added to the stub list):
+#   (1) TEXTUAL and NAME-BLIND — in each prompt heredoc, count backticks against backslash-escaped
+#       backticks; a bare one makes them differ. This also covers a command that CANNOT be stubbed
+#       (`-maxdepth` -> "command not found"): it executes, erases prompt text, and an execution-only
+#       rig sees an EMPTY tripwire.
+#   (2) EXECUTION — expand each shipped heredoc with a stub for every command its backtick spans
+#       name, so a bare backtick's command writes to a tripwire file. This exercises the real
+#       expansion path, and catches a command whose output happens to equal the literal it replaced.
+# The last blocks are NON-VACUITY controls: the execution rig against a deliberately unescaped
+# heredoc (a STUBBED command, and the `git` class that passed before this fix), and the textual
+# check against a name no stub can intercept. A rig that cannot fire proves nothing.
 NB="$TMP/nb"; mkdir -p "$NB/bin" "$NB/repo/.venv/bin" "$NB/o/logs"
 : > "$NB/trip"
-for c in uv find rg du mdfind ls UNVERIFIED; do
+# The population is every first-word that appears in a backtick span of the three prompts — the
+# spans name uv/find/rg/du/mdfind/ls/UNVERIFIED/git/python — plus `gh` (used on plain command lines,
+# not in spans, but advertised in the PR body) and `TORTOISE_TEST_CARVE_OUT` (the env-assignment
+# prefix the body names). Over-stubbing cannot false-fire: a stub is only written when that name is
+# actually looked up on PATH. `git` and `python` were MISSING before this review, and both are live.
+for c in uv find rg du mdfind ls UNVERIFIED git gh python TORTOISE_TEST_CARVE_OUT; do
   printf '#!/bin/bash\nprintf "%%s\\n" "%s" >> "%s"\nexit 0\n' "$c" "$NB/trip" > "$NB/bin/$c"
   chmod +x "$NB/bin/$c"
 done
 printf '#!/bin/bash\nprintf "%%s\\n" ".venv/bin/python" >> "%s"\nexit 0\n' "$NB/trip" > "$NB/repo/.venv/bin/python"
 chmod +x "$NB/repo/.venv/bin/python"
+# Extracts a script's FIRST prompt heredoc verbatim: the opening `cat > ... <<EOF`, the body, `EOF`.
+nb_extract() { # nb_extract <script> <out-file>
+  awk '/^cat > .*<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$2"
+}
+nb_ticks_escaped() { # nb_ticks_escaped <script> -> 0 iff EVERY backtick in its heredoc is escaped
+  nb_extract "$1" "$NB/snip.sh"
+  [ -s "$NB/snip.sh" ] || return 1
+  set -- $(awk '{n+=gsub(/`/,"&"); m+=gsub(/\\`/,"&")} END{printf "%d %d\n", n+0, m+0}' "$NB/snip.sh")
+  [ "${1:-0}" -gt 0 ] && [ "${1:-0}" -eq "${2:-0}" ]
+}
 # Expands the script's first prompt heredoc the way a real run does: SOURCED into a shell carrying
 # the same variables (the shipped scripts use unexported $L/$O/$N in the heredoc target).
 nb_expand() { # nb_expand <script>
-  awk '/^cat > .*<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$NB/snip.sh"
+  nb_extract "$1" "$NB/snip.sh"
   [ -s "$NB/snip.sh" ] || return 1
   ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
     O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
@@ -2795,8 +2822,13 @@ ck "fix-one.sh's prompt keeps its test command AND forbids searching for an inte
 [ -s "$NB/trip" ] && rc=1 || rc=0
 [ "$rc" -eq 0 ] || { echo "      a stub EXECUTED at prompt-build time: $(sort -u "$NB/trip" | tr '\n' ' ')"; }
 ck "no command inside the three prompts' backtick spans ran at prompt-build time (unescaped backtick)" $rc
-# NON-VACUITY: the identical rig on a deliberately unescaped heredoc MUST fire, or the check above
-# proves nothing (a rig that can never fire is the "test that cannot fail" class).
+rc=0
+for f in "$MERGE" "$HERE/lane.sh" "$HERE/fix-one.sh"; do
+  nb_ticks_escaped "$f" || { rc=1; echo "      $(basename "$f"): a BARE backtick in the prompt heredoc — command substitution at prompt-build time"; }
+done
+ck "every backtick in the three prompt heredocs is ESCAPED (name-blind — covers commands no stub can intercept)" $rc
+# NON-VACUITY (execution): the identical rig on a deliberately unescaped heredoc MUST fire, or the
+# check above proves nothing (a rig that can never fire is the "test that cannot fail" class).
 : > "$NB/trip"
 cat > "$NB/neg.sh" <<'NEG'
 cat > "$NEGOUT" <<EOF
@@ -2806,6 +2838,23 @@ NEG
 NEGOUT="$NB/neg.out" NEGPATH="$NB/bin" bash -c 'set +u; PATH="$NEGPATH:$PATH"; NEGOUT="$NEGOUT"; . "$1"' _ "$NB/neg.sh" >/dev/null 2>&1
 { [ -s "$NB/trip" ] && ! grep -qF 'UNVERIFIED' "$NB/neg.out"; }; rc=$?
 ck "non-vacuity: the same rig FIRES on a bare-backtick heredoc and ERASES the literal" $rc
+# NON-VACUITY (`git`): the class the review found PASSING — a bare span whose command ran for real
+# because `git` was never stubbed. The stub must now record it.
+: > "$NB/trip"
+cat > "$NB/neg-git.sh" <<'NEG'
+cat > "$NEGOUT" <<EOF
+Stage specific files; never `git add -A`.
+EOF
+NEG
+NEGOUT="$NB/neg-git.out" NEGPATH="$NB/bin" bash -c 'set +u; PATH="$NEGPATH:$PATH"; NEGOUT="$NEGOUT"; . "$1"' _ "$NB/neg-git.sh" >/dev/null 2>&1
+{ [ -s "$NB/trip" ] && grep -qxF 'git' "$NB/trip"; }; rc=$?
+ck "non-vacuity: the tripwire FIRES on a bare \`git\` span (the class that passed before this fix)" $rc
+# NON-VACUITY (textual): `-maxdepth` is not a command and cannot be stubbed, so the execution rig
+# is blind to it — but unescaped it erases prompt text. Mutate the REAL merge-one.sh prompt and the
+# name-blind census must go unequal.
+sed 's/\\`-maxdepth\\`/`-maxdepth`/' "$MERGE" > "$NB/mut-merge.sh"
+nb_ticks_escaped "$NB/mut-merge.sh" && rc=1 || rc=0
+ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub can intercept" $rc
 
 echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
