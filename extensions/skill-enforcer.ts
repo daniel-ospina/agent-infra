@@ -10,6 +10,17 @@
 // #1321 fail-open. `realpathSync(__filename)` recovers the real module location
 // under jiti AND Node's native loader; use MODULE_DIR/REPO_DIR, never `__dirname`.
 //
+// ── A RULE'S SUBJECT, AND IT MUST BE ONE WE ENFORCE (#1328) ────────────────
+// A manifest rule is a pattern plus a mode. The pattern is matched against a
+// SUBJECT: the text of a `bash` command, or a tool NAME. The block branch once
+// covered bash and `mcp__*` ONLY, so a `hard` rule naming any other tool was
+// accepted, counted as armed by the banner, and could never fire — the nudge
+// handler is the only one that sees those tools and it skips `hard`. The
+// subject is now computed for EVERY tool, so a hard rule fires on whatever
+// channel its pattern names. `read` is the tool a skill gate is SATISFIED with,
+// so a hard rule that reaches for it is refused at load (loud, `ok=false`)
+// rather than armed as a blocker of its own remedy.
+//
 // ── READ IDENTITY IS A NAME, NOT A PATH FRAGMENT (#1322) ──────────────────
 // pi serves skills from `~/.pi/agent/skills/<name>/SKILL.md` (real dirs);
 // consumer repos keep them at `operations/skills/` or `.agents/skills/`;
@@ -312,6 +323,15 @@ export function resolveManifestPath(
   return { path: sibling, source: "module" };
 }
 
+/**
+ * The tools by which a skill gate is SATISFIED (#1328). `read` is the only
+ * in-band remedy the block reason advertises, so it is deliberately OUTSIDE the
+ * hard-rule subject: a hard rule matching it would gate the documented way out
+ * of every unread gate. `loadManifest` REFUSES such a rule loudly instead of
+ * arming a channel the extension will not enforce.
+ */
+export const GATE_SATISFACTION_TOOLS: readonly string[] = ["read"];
+
 export interface ManifestRule {
   patterns: RegExp[];
   mode: "hard" | "nudge";
@@ -389,6 +409,21 @@ export function loadManifest(path: string): ManifestLoad {
       }
     }
     if (patterns.length === 0) continue;
+    // #1328 — a `hard` rule must gate a channel the extension actually
+    // enforces. Its subject is a bash command or a tool NAME, but `read` is the
+    // tool a gate is SATISFIED with: arming it would block the documented
+    // remedy for every unread gate. Refuse it loudly rather than accept it as
+    // armed and leave it inert-on-that-channel (or deadlocking).
+    if (modeField === "hard") {
+      const reserved = GATE_SATISFACTION_TOOLS.filter((t) => patterns.some((p) => p.test(t)));
+      if (reserved.length > 0) {
+        defects += 1;
+        warnings.push(
+          `${path}:${lineNo} — entry "${skillName}" is a HARD rule whose pattern matches ${reserved.map((t) => `"${t}"`).join(", ")}, the tool a skill gate is satisfied with. Gating it would block the remedy for every unread gate, so it is NOT enforced; narrow the pattern to the tools/commands it means to cover.`,
+        );
+        continue;
+      }
+    }
     const rule: ManifestRule = {
       patterns,
       mode: modeField,
@@ -407,8 +442,16 @@ export function loadManifest(path: string): ManifestLoad {
 }
 
 export const MANIFEST_LOAD = loadManifest(MANIFEST_PATH);
-const MANIFEST = MANIFEST_LOAD.rules;
+// `let`, not `const`, only so a suite can install a fixture manifest through
+// `_setManifestForTest` (the handlers close over this binding). MANIFEST_RULES
+// keeps the REAL load, which is what the manifest assertions read.
+let MANIFEST: Record<string, ManifestRule[]> = MANIFEST_LOAD.rules;
 export const MANIFEST_RULES = MANIFEST;
+
+/** Test seam: install a fixture manifest (or null to restore the real load). */
+export function _setManifestForTest(rules: Record<string, ManifestRule[]> | null): void {
+  MANIFEST = rules ?? MANIFEST_LOAD.rules;
+}
 
 /** Unique skills (the gate count the issue's Target names) and total rules. */
 export function manifestCounts(load: ManifestLoad = MANIFEST_LOAD): { skills: number; rules: number } {
@@ -586,7 +629,7 @@ export default function (pi: ExtensionAPI) {
         const input = (event.input as Record<string, unknown>) ?? {};
         if (input.confirm === `prereq:${skillName}`) {
           console.log(`[skill-enforcer] 🔓 Prerequisite bypassed: ${skillName}`);
-          return undefined;
+          continue;
         }
         const reason = [
           `⛔ Pipeline gate — ${skillName}/SKILL.md was read but no dispatched workflow`,
@@ -596,13 +639,22 @@ export default function (pi: ExtensionAPI) {
         console.log(`[skill-enforcer] 🚫 Prerequisite block: ${skillName} → ${toolName}`);
         return { block: true, reason };
       }
-      return undefined;
+      // Fall through to the manifest hard-rule gate (#1328): `write`/`edit` are
+      // tools like any other, and a hard rule naming one must fire.
     }
 
-    let cmd = "";
-    if (isToolCallEventType("bash", event)) {
-      cmd = String((event.input as any)?.command ?? "");
-    }
+    // ── The rule SUBJECT (#1328) ────────────────────────────────────────────
+    // See the header. Every tool yields a subject, so a `hard` rule fires on
+    // the channel its pattern names, not only on bash / `mcp__*`. `read` is the
+    // gate-satisfaction tool and is not a subject; loadManifest refuses a hard
+    // rule that reaches for it.
+    const isBash = isToolCallEventType("bash", event);
+    const subject = isBash
+      ? String((event.input as any)?.command ?? "")
+      : GATE_SATISFACTION_TOOLS.includes(toolName)
+        ? ""
+        : String(toolName);
+    if (!subject) return undefined;
 
     // Match only `hard` rules: a nudge rule must NEVER hard-block (#1321 — the
     // broad `tortoise_` catch-all would otherwise block every read-only
@@ -620,28 +672,11 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
-    // Check MCP tool calls
-    const mcpTool = (event as any).toolName ?? "";
-    if (mcpTool.startsWith("mcp__")) {
-      for (const [skillName, rules] of Object.entries(MANIFEST)) {
-        for (const rule of rules) {
-          if (rule.mode !== "hard") continue;
-          for (const p of rule.patterns) {
-            if (p.test(mcpTool) && !readFiles.has(skillName)) return blockReason(skillName, rule, mcpTool);
-          }
-        }
-      }
-      return undefined;
-    }
-
-    // Check bash commands
-    if (!cmd) return undefined;
-
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(cmd) && !readFiles.has(skillName)) return blockReason(skillName, rule, skillName);
+          if (p.test(subject) && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
         }
       }
     }
@@ -656,7 +691,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const toolName = (event as any).toolName ?? "";
-    // Skip bash and MCP — already handled by the blocking handler above
+    // Skip bash and MCP: the blocking handler above owns EVERY `hard` rule
+    // (#1328), though a `nudge` rule for a bash command or an `mcp__*` tool is
+    // still inert — filed as #1820, which needs a decision before it can fire.
     if (toolName === "bash" || toolName.startsWith("mcp__")) return undefined;
     if (!toolName) return undefined;
 
