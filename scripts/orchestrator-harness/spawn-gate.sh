@@ -9,7 +9,9 @@
 #   * `merge-one.sh` still carries its OWN copy of `run_agent()` with NO gate. That is the
 #     `chain-<N>` first-review path for every own-lane PR — and the one path the controller
 #     deliberately stands down for, because the chain holds the claim — plus fix-one.sh's
-#     re-review. It is held by concurrent lanes (PR #1769 / #1730), so it is BLOCKED, not declined.
+#     re-review. #1769 MERGED on 2026-10-16 without closing it; it is held by the still-open
+#     #1730 / #1812, so it is BLOCKED, not declined — and it is UNGATED today, which means the disk
+#     gate below does NOT reach it.
 #   * `orch-loop.sh` does NOT source this file: it defines its own `is_num`/`is_limit`/`can_spawn`
 #     and gates its four DECISION sites with them. Folding those into this file is a separate
 #     change with its own review.
@@ -131,11 +133,21 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 # not a defence against an operator who deliberately exports DISK_MIN_FREE_MB=1 (a legal, tiny floor)
 # or who re-assigns the variable AFTER sourcing this file; they defend the shipped callers, which set
 # neither.
-DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-1024}"
-is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=1024
+# ⛔ THE DEFAULT IS 500 ON PURPOSE: IT IS `cloud-cell-supervisor.sh`'s `MIN_FREE_MB`, AND ANY HIGHER
+# VALUE HERE IS A FALSE PASS RATHER THAN A SAFER GATE (review round 1, P1). That file's `cmd_check`
+# answers "can this cell run a controller?" against its own 500MB floor, so a floor above it opens a
+# band where `check` prints `CELL CAN RUN A CONTROLLER` while every lane spawn is refused 77 — an
+# instrument reporting healthy about a cell that can do no work, which is the same false-PASS shape
+# as this file's own unreadable-`df` divergence. The alternative place to close it is that file's
+# floor, and that is the stronger place; it is held by concurrent lanes, so the DEFAULT is aligned
+# here instead. A deployment wanting a higher dispatch floor sets DISK_MIN_FREE_MB explicitly, and
+# then the two differ BY DECLARATION instead of by accident. `spawn-gate.test.sh` pins the EQUALITY
+# against that file's own line, so raising one of the two alone reddens it.
+DISK_MIN_FREE_MB="${DISK_MIN_FREE_MB:-500}"
+is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=500
 # A 0 floor would make `[ "$mb" -ge 0 ]` true for every reading — a gate that can never refuse,
 # i.e. the no-op gate this whole file is written against. Same shape as the `_NCPU` zero guard above.
-[ "${DISK_MIN_FREE_MB:-0}" -ge 1 ] || DISK_MIN_FREE_MB=1024
+[ "${DISK_MIN_FREE_MB:-0}" -ge 1 ] || DISK_MIN_FREE_MB=500
 # ⛔ AND THE FLOOR MUST LEAVE THE BAND HEADROOM (review round 2, P2). `is_limit` accepts 9 digits, so
 # it accepts `DISK_MIN_FREE_MB=999999999` — but the band is 4x the floor, and 4 x 999999999 is
 # 3999999996: TEN digits, i.e. OUT OF RANGE by the very predicate that guards a PROVIDED warn. Every
@@ -146,7 +158,7 @@ is_limit "${DISK_MIN_FREE_MB:-}" || DISK_MIN_FREE_MB=1024
 # must be a true default, NOT a re-derivation": a floor whose derived band cannot be expressed in
 # this file's own range is out of range FOR THIS FILE'S PURPOSE and is repaired as one. The widest
 # floor that still admits an in-range band is 249999999 (4x it is 999999999).
-[ "${DISK_MIN_FREE_MB:-0}" -le 249999999 ] || DISK_MIN_FREE_MB=1024
+[ "${DISK_MIN_FREE_MB:-0}" -le 249999999 ] || DISK_MIN_FREE_MB=500
 # The WARNING BAND — a device that fills SILENTLY is the defect, so the cell says so while it can
 # still act. 4x the floor is `cloud-cell-supervisor.sh`'s `check` warning band; that file's
 # UNATTENDED prune trigger is narrower (2x, `cmd_start`), and the two are not interchangeable.
@@ -165,8 +177,15 @@ is_limit "${DISK_WARN_FREE_MB:-}" || DISK_WARN_FREE_MB=$(( 10#$DISK_MIN_FREE_MB 
 # the conversion is `/1024` — and the column is VALIDATED (`$4 ~ /^[0-9]+$/`) rather than trusted: a
 # locale- or column-shifted `df` would otherwise hand back a string that `[ -lt ]` errors on, and an
 # errored comparison is not a measurement.
+# ⛔ `printf "%d"`, NEVER `print int(...)` (review round 1, P2). `int()` renders through awk's OFMT,
+# so on mawk — the default `awk` on Debian/Ubuntu, i.e. ON THE CELL — an integral value at or above
+# 2^31 prints in SCIENTIFIC notation (`2.14748e+09`). That is not a number to any consumer here:
+# `[ -lt ]` errors on it, `disk_ok` reads the error as "garbage" and ALLOWS, so the gate fails OPEN
+# on a full-enough disk — the exact silent-permissive class this change exists to remove. Unreachable
+# on today's disks (needs 2 PiB free), and precisely the kind of thing that is only ever found late.
+# `orch-loop.sh`'s sibling probe already uses `printf "%d"`; this is the pair being made to match.
 disk_free_mb() { # disk_free_mb <path>
-  df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {print int($4 / 1024)}'
+  df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d\n", $4 / 1024}'
 }
 
 # disk_ok <free-mb> — the ONE disk predicate, and the gate's polarity in one place.
@@ -291,7 +310,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # silent fail-open is how a typo'd DISK_GATE_PATH — or a missing `df` — disarms the gate invisibly.
   # The reading is not a refusal, so this is a WARN; the distinction matters, because the agent is
   # still allowed to start.
-  if [ -z "$dfree" ]; then
+  # ⛔ AND "UNREADABLE" IS THE PREDICATE'S OWN DEFINITION, NOT `-z` (review round 1, P2). `disk_ok`
+  # and `disk_low` both classify an EMPTY **or NON-NUMERIC** reading as unreadable and fail open on
+  # it; testing `-z` here meant a NON-EMPTY but non-numeric reading — the shape the OFMT bug above
+  # produces — was silently permissive while this comment claimed it was loud. The two must agree, or
+  # the same reading is "unreadable" to the predicates and "just fine" to the operator.
+  if ! is_num "$dfree"; then
     echo "[disk-gate] WARN $label: could not read free space on $dpath — the disk floor CANNOT be enforced for this spawn. Check DISK_GATE_PATH, PATH and that 'df' works. Failing OPEN by design." >> "$log"
   elif ! disk_ok "$dfree"; then
     echo "[disk-gate] REFUSED $label: only ${dfree}MB free on $dpath < disk_min_free_mb=$DISK_MIN_FREE_MB — no agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) and the controller re-dispatches" >> "$log"

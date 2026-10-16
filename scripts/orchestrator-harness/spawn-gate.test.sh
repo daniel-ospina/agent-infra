@@ -508,7 +508,17 @@ ck "an ALLOWED run appends its own disk.tsv row, not only a refusal ($rows_d1 vs
 # is where that is observable: the disk arms set DISK_GATE_PATH themselves, so without this assertion
 # the explicit path could be dropped from fix-one.sh and every other check here would still pass.
 dp="$(tail -1 "$RO/state/disk.tsv" 2>/dev/null | cut -f5)"
-[ "$dp" = "$RREPO/.worktrees/fix-7" ]; rc=$?
+# ⛔ COMPARED BY PHYSICAL PATH, NOT BY STRING (macOS portability — this check was RED on every macOS
+# box while GREEN on the Linux cell, i.e. it could not be reproduced where it was written). The two
+# sides are produced by DIFFERENT tools with different ideas of the same directory: `$WT` comes from
+# `git worktree list --porcelain`, which prints the REALPATH (`/private/var/folders/...`), while
+# `$RREPO` is built from `mktemp -d`, which returns the logical form (`/var/folders/...`) — and on
+# macOS `/var` IS a symlink into `/private/var`. So the raw comparison asserted a property about
+# `$TMPDIR`'s spelling rather than the one it exists to assert. `pwd -P` on BOTH sides asks the real
+# question: "are these the same DIRECTORY?". The mismatch is still red (a realpath is unique), so
+# nothing is loosened — only the false red goes away.
+dp_p="$(cd "$dp" 2>/dev/null && pwd -P)"; wt_p="$(cd "$RREPO/.worktrees/fix-7" 2>/dev/null && pwd -P)"
+[ -n "$dp_p" ] && [ "$dp_p" = "$wt_p" ]; rc=$?
 ck "the fixer's disk reading is the WORKTREE volume, not the main checkout (path='${dp:-<none>}')" $rc
 
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
@@ -637,8 +647,38 @@ ck "disk_ok: unreadable ALLOWS, one below the floor REFUSES, AT the floor allows
 
 # A 0 floor is a NO-OP GATE: `[ "$mb" -ge 0 ]` is true for every reading, so it could never refuse.
 zf="$(DISK_MIN_FREE_MB=0 bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
-[ "$zf" = "1024" ]; rc=$?
+[ "$zf" = "500" ]; rc=$?
 ck "a 0 floor is REPAIRED, not honoured — a gate that can never refuse is not a gate (got '$zf')" $rc
+# ⛔ AND THE REPAIRED DEFAULT MUST EQUAL `cloud-cell-supervisor.sh`'s OWN FLOOR (review round 1, P1).
+# That file's `cmd_check` answers "can this cell run a controller?" against `MIN_FREE_MB`, INDEPENDENTLY
+# of this gate. A DISPATCH floor above it opens a band — [supervisor floor, dispatch floor) — where
+# `check` prints `CELL CAN RUN A CONTROLLER` and every lane spawn is then refused 77: an instrument
+# reporting healthy about a cell that can do no work, i.e. a FALSE PASS, which is why "a higher floor
+# is safer" is the wrong instinct here. Pin the EQUALITY against that file's own line rather than
+# against the literal 500, so raising ONE of the two alone reddens this instead of drifting silently.
+sup="$(sed -n 's/^MIN_FREE_MB="\${MIN_FREE_MB:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/../cloud-cell-supervisor.sh" 2>/dev/null | head -1)"
+# ⛔ AND THE DEFAULT MUST BE PROBED WITH THE VARIABLE **UNSET** (verification round, P1 — this check
+# was FAIL-OPEN as first written). Driving `DISK_MIN_FREE_MB=0` exercises the REPAIR constants, NOT
+# the default on the assignment line: patching ONLY that line `500` -> `600` left the whole suite at
+# `94 passed, 0 failed` while the live default was 600 against the supervisor's 500 — the exact drift
+# the pin exists to catch, in the direction that matters. `env -u` removes the variable from a
+# caller's environment too, so the probe reads the shipped default and nothing else.
+dfl="$(env -u DISK_MIN_FREE_MB bash -c '. "$1"; printf "%s" "$DISK_MIN_FREE_MB"' _ "$GATE")"
+if [ -n "$sup" ] && [ "$dfl" = "$sup" ]; then rc=0; else rc=1; fi
+ck "the DEFAULT (unset) floor EQUALS the supervisor's MIN_FREE_MB ($dfl vs ${sup:-<unreadable>}) — a higher one is a false PASS, not a safer gate" $rc
+if [ -n "$sup" ] && [ "$zf" = "$sup" ]; then rc=0; else rc=1; fi
+ck "...and the REPAIRED floor (DISK_MIN_FREE_MB=0) equals it too ($zf) — the fallback is not a second, drifting default" $rc
+# ⛔ THE FREE-SPACE CONVERSION MUST NOT GO THROUGH `print int(...)` (review round 1, P2). `int()`
+# renders through awk's OFMT, so on mawk — the default `awk` on Debian/Ubuntu, i.e. ON THE CELL — an
+# integral value at or above 2^31 prints as `2.14748e+09`: not a number to `[ -lt ]` (errors), which
+# `disk_ok` reads as garbage and ALLOWS, i.e. the gate FAILS OPEN on a nearly-full disk. Pinned BY
+# NAME because the failure is awk-implementation-specific and this box has no mawk to drive — the same
+# shape as the `export -f` mechanism pin in §11. ⚠️ Stated limit: a source-shaped check cannot see a
+# conversion that is assembled at runtime; the behavioural half is the integer contract on
+# `disk_free_mb` above, and `orch-loop.sh`'s sibling probe uses the identical idiom.
+grep -qF 'printf "%d\n", $4 / 1024' "$GATE" && ! grep -qF 'print int($4 / 1024)' "$GATE"; rc=$?
+ck "free-space MB is converted with printf %d, NOT print int() — int() prints 2.14748e+09 on mawk, which fails the gate OPEN" $rc
+
 # A warn band BELOW the floor can never fire (the refusal wins first), which would silently degrade
 # "warn before it is full" into "no warning at all".
 wb="$(DISK_MIN_FREE_MB=500 DISK_WARN_FREE_MB=1 bash -c '. "$1"; printf "%s" "$DISK_WARN_FREE_MB"' _ "$GATE")"
@@ -744,6 +784,26 @@ res="$(drive_disk "$TMP/no-such-path-$$" 9999999)"
 ck "an UNREADABLE probe fails OPEN — an unanswerable probe is not evidence of a full disk ($res)" $rc
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and an unreadable probe is ANNOUNCED, so a misconfigured path is not silently permissive" $rc
+
+# ⛔ A NON-EMPTY BUT NON-NUMERIC READING IS "UNREADABLE" TOO, AND MUST BE ANNOUNCED (review round 1,
+# P2). `disk_ok`/`disk_low` BOTH classify a non-numeric reading as unreadable and fail open on it, but
+# the announcement tested `-z` — so the reading the predicates call "unreadable" was the one reading
+# the operator was never told about, and the comment above claimed the opposite. That is the shape the
+# OFMT bug in `disk_free_mb` produces (`2.14748e+09`), i.e. the two defects compound: the probe hands
+# back a non-number and the WARN that exists for it stays silent. Driven by REPLACING the probe after
+# it is sourced — the only non-numeric shape reachable once the conversion is `printf "%d"`.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=9999999 bash -c '
+    . "$1"
+    disk_free_mb() { printf "%s" "9.7e+15"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "non-numeric probe" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT")"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim that the disk is full ($res)" $rc
+grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
+ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unreadable, so the log must agree" $rc
 
 # ── 12) a suite nothing RUNS is not a gate ──────────────────────────────
 # ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that
