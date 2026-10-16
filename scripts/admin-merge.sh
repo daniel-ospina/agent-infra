@@ -509,6 +509,16 @@
 #   ADMIN_MERGE_GH                       the gh command (default: `gh`)
 #   ADMIN_MERGE_FAILURE_SET_SH           the parser (default: ./ci-failure-set.sh)
 #   ADMIN_MERGE_POLL_INTERVAL            seconds between re-run polls (default 10)
+#   ADMIN_MERGE_SELF_EDIT_WAIT           bound (seconds, default 300) on the wait
+#                                         for the run generation the rail's OWN
+#                                         `[3/4] record` body PATCH created
+#                                         (#1417). 0 disables the wait, which
+#                                         restores the pre-#1417 refusal
+#                                         exactly. The guard legs are small
+#                                         (measured ~1 min end to end); on
+#                                         timeout the runs are still pending and
+#                                         §1b refuses as before, so this knob
+#                                         can only remove a FALSE refusal.
 #   ADMIN_MERGE_GREEN_RUNS               recent SUCCESSFUL runs sampled per shard
 #                                         for the healthy duration (default 5)
 #   ADMIN_MERGE_REPRO_CMD                the #3715 base-reproduction command
@@ -584,6 +594,11 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
+# SELF_EDIT_WAIT — the bound on the #1417 wait for the rail's own body-edit run
+# generation. A POLICY bound, not a derived one (the two guard legs are small and
+# fixed, unlike a test lane's per-shard spread). See settle_self_edit_generation.
+SELF_EDIT_WAIT="${ADMIN_MERGE_SELF_EDIT_WAIT:-300}"
+
 # ── THE HEAD READ'S RETRY BUDGET (#1690) ────────────────────────────────
 # Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
 # exactly like POLL_INTERVAL — NOT inline in `resolve_head`, which is how the first
@@ -686,6 +701,29 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 # fail". Dropping such a run here would let a lane look as though it never ran the
 # shard at all.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
+
+# The GUARD projection (#1417), used ONLY by settle_self_edit_generation: the
+# completion state plus the workflow's NORMALIZED DISPLAY NAME — the signal that
+# identifies the rail's own body-edit generation on the runs surface.
+#
+# ⛔ `event` IS DELIBERATELY NOT PROJECTED (review, PR #1640). A workflow RUN's
+# `event` field is the WEBHOOK EVENT NAME (`pull_request`, `pull_request_target`,
+# `push`, …) — never the pull_request ACTIVITY TYPE (`edited`), which lives in the
+# webhook payload and is not exposed on the run object at all. The first version
+# of this fix classified on `event == edited`; that value cannot occur, so `self_n`
+# was always 0 and the wait was dead code in production. The activity is also not
+# what is needed: a `synchronize` run and an `edited` run of one workflow share a
+# single `event` value, so no comparison on it can separate them.
+#
+# The workflow name is matched, not the file name, because
+# `gh run list --json workflowName` returns the DISPLAY name and the file name is
+# not on that surface. Normalizing to `[a-z0-9]` IN JQ is also the fail-open
+# hardening: `ci-failure-set.sh:255` base64-encodes a raw `workflowName` because a
+# newline in a workflow `name:` splits the projection, and this projection makes
+# that impossible structurally — the field cannot contain TAB or NEWLINE, so it
+# can never shift a later column. It carries no `headSha`: the listing is already
+# `--commit`-scoped, so the field would be redundant.
+LANE_RUN_GUARD_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.databaseId)\t\((.workflowName // "") | ascii_downcase | gsub("[^a-z0-9]"; ""))"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
@@ -1221,6 +1259,27 @@ validate_timing_knobs() {
     say_err "   (max ${POLL_INTERVAL_MAX}s). 'all digits' is not enough: a value 'sleep' cannot take fails"
     say_err "   on EVERY poll, so the wait becomes a tight BUSY SPIN of gh calls instead of a paced"
     say_err "   poll — and an interval beyond an hour paces nothing."
+  fi
+  # #1417's wait bound. Same two-stage discipline as POLL_INTERVAL: a non-numeric
+  # value makes the bound comparison ERROR (test returns 2, the body is SKIPPED),
+  # and a skipped check inside a wait loop is exactly the fail-open this rail
+  # refuses elsewhere. 0 stays LEGAL and means "do not wait" — the test seam, and
+  # the pre-#1417 behaviour.
+  if counter_has_leading_zero "$SELF_EDIT_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the bound comparison reads it as"
+    say_err "   DECIMAL. Write it without the leading zero (e.g. '300', not '0300')."
+  elif ! counter_is_number "$SELF_EDIT_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — the wait bound must be"
+    say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: it disables the wait)."
+  elif counter_exceeds_max "$SELF_EDIT_WAIT" "$POLL_INTERVAL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — beyond the usable range"
+    say_err "   (max ${POLL_INTERVAL_MAX}s). The other timing knobs are bounded only by the ARITHMETIC"
+    say_err "   maximum ${TIMING_KNOB_MAX}s; this one is a POLICY bound, because a typo such as 300000"
+    say_err "   would otherwise hold the merge rail for days."
   fi
   if counter_has_leading_zero "$HEAD_ATTEMPTS"; then
     bad=1
@@ -3147,6 +3206,202 @@ pending_run_id() {
       ${args[@]+"${args[@]}"} \
       --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null || true)
   return 0
+}
+
+# ── THE RAIL'S OWN BODY-EDIT RUN GENERATION (#1417) ─────────────────────────
+#
+# THE MEASURED DEFECT (agent-infra#1417, comment 6057991604; reproduced on
+# #1495 @ 1f92b609 and #1633 @ 8e8b7cbb). The rail's four steps are:
+#   [2/4] verify  — waits for the head's CHECK-RUNS to be terminal (atomic-land),
+#   [3/4] record  — `record-review.sh` PATCHes the review marker into the PR BODY,
+#   [4/4] land    — admin-merge, whose §1b reads the WORKFLOW RUNS surface.
+# The body PATCH is an `edited` pull_request activity, and exactly TWO
+# NON-code-measuring workflows declare that trigger:
+#   * `pipeline-compliance` — #513's verdict binding, deliberately re-run so a
+#     forged `verdict=...` marker cannot ride a stale green check;
+#   * `workflow-lock`.
+# So [3/4] creates two fresh runs 11-87s AFTER [2/4] returned — a generation [2/4]
+# could not have seen on ANY surface, which is why polling the runs surface in
+# [2/4] does not close this. [4/4] then refused with `run still in_progress`
+# against the rail's own work, costing a whole extra rail round ([2/4] is bounded
+# at 5400s).
+#
+# ⛔ THIS IS NOT AN EXCLUSION, AND IT MUST NEVER BECOME ONE. The generation is
+# WAITED FOR, and the WHOLE surface is then RE-READ (main, the #1417 loop) so the
+# guard runs enter the SAME failure-set comparison as every other run. A guard
+# run that FAILS — `pipeline-compliance` whose entire #513 purpose is to be able
+# to fail here — is therefore in the re-read failing set and BLOCKS. What is
+# deferred is only the §1b refusal on an UNFINISHED run set; no failure is ever
+# ignored.
+#
+# ⛔ WHY THE WORKFLOW NAME, AND NOT `event == edited` (review, PR #1640). The
+# first version classified a run as "ours" only when `gh run list --json event`
+# was the literal `edited`. That value does not exist on the runs surface: a
+# run's `event` is the WEBHOOK EVENT NAME (`pull_request`, `pull_request_target`,
+# `push`, …), never the activity type (`edited`), which lives in the webhook
+# payload and is not exposed on the run object at all. `self_n` was therefore
+# always 0 and the wait was dead code — `event` cannot carry this distinction,
+# and a corrected spelling would not help either, because a `synchronize` (push)
+# and an `edited` run of one workflow report the SAME event value.
+#
+# The guard WORKFLOW NAME is the signal that does exist. Over-matching is
+# harmless by construction: a matched run is only WAITED FOR and then
+# re-evaluated, never dropped, so a name that is not really a guard leg costs the
+# wait and nothing else — and waiting for a guard run started by a push is
+# correct, not a hazard.
+#
+# ⛔ COMPLETENESS IS PART OF THE PREDICATE (review P1, PR #1640). "The pending set
+# is a subset of ours" has no completeness test, and an ABSENT leg is not a
+# foreign leg. The two guard legs come from two DIFFERENT workflows created with
+# an 11-87s spread, so leg A can finish before leg B exists; a subset-only
+# predicate then sees an empty pending set and SETTLES — a merge the pre-#1417
+# rail refused. The wait therefore settles only after it has observed AT LEAST
+# ONE RUN FOR EVERY known guard workflow at this head — pending OR already
+# terminal, because an already-green leg proves the workflow ran and an ABSENT
+# one does not; a partial generation keeps waiting (to $SELF_EDIT_WAIT) for the
+# missing leg rather than settling.
+#
+# A TERMINAL LEG SATISFIES COMPLETENESS (review P2, PR #1640). A leg that
+# finished before the first probe read is still an observed leg; requiring that
+# it was seen PENDING made the predicate unsatisfiable for that shape, so the
+# probe ran to $SELF_EDIT_WAIT and returned 1 — the pre-#1417 refusal #1417
+# exists to remove.
+#
+# FAILURE POLARITY. Every unreadable path here (a failed listing, a nonexistent
+# field, an empty selection) leaves the parser's `pending` counter untouched, so
+# §1b refuses exactly as it did before this change. The wait can only remove a
+# FALSE refusal; it can never produce a merge on its own.
+
+# The NON-code-measuring guard workflows whose PR triggers declare `edited`, and
+# whose runs a body PATCH therefore creates. Keys are the NORMALIZED display
+# names (lowercase, [a-z0-9] only) that LANE_RUN_GUARD_JQ emits — the real names
+# are prose (`Pipeline Compliance`, `Workflow lock (base-branch checker)`) and
+# either casing/spacing may change. Adding a guard workflow means adding its key
+# here; guard_generation_complete then waits for it too.
+GUARD_WORKFLOW_KEYS="pipelinecompliance workflowlock"
+
+# guard_workflow_key <normalized-workflow-name> — print the matching known guard
+# key, or return 1. Matched by SUBSTRING so a suffix (`… (fork)`) still matches:
+# over-matching is harmless (see the set description above). Under-matching falls
+# through to the unchanged §1b refusal.
+guard_workflow_key() {
+  local norm="${1:-}" k
+  for k in $GUARD_WORKFLOW_KEYS; do
+    case "$norm" in *"$k"*) printf '%s' "$k"; return 0 ;; esac
+  done
+  return 1
+}
+
+# guard_generation_complete <seen-key-list> — TRUE when EVERY known guard
+# workflow has been observed AT THIS HEAD at least once — pending OR already
+# terminal (a green leg still proves the workflow ran; see the block comment).
+# The list is space-delimited with a leading AND trailing space, so the `case`
+# glob cannot match a key that is merely a prefix of a longer one.
+guard_generation_complete() {
+  local seen="${1:- }" k
+  for k in $GUARD_WORKFLOW_KEYS; do
+    case "$seen" in *" $k "*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# settle_self_edit_generation <head> — hold the rail until the run generation
+# its OWN `[3/4]` body edit created has finished, so §1b's re-read sees it.
+#
+# Return 0 ONLY when this head's unfinished set was EXACTLY that generation, EVERY
+# known guard workflow was observed at this head — pending or terminal
+# (completeness — see the block comment) — and it has now completed (so the caller
+# re-reads the surface).
+# Return 1 in every other case — a pending run that is NOT ours, nothing pending
+# at all, an unreadable listing, a partial generation at the bound, or the
+# generation still pending at $SELF_EDIT_WAIT — and the caller then falls through
+# to the UNCHANGED §1b refusal on the surface the parser already read. There is no
+# third state and no "proceed anyway".
+settle_self_edit_generation() {
+  local head="$1"
+  # A disabled/absent bound is the pre-#1417 behaviour, byte for byte.
+  counter_is_positive "$SELF_EDIT_WAIT" || return 1
+  local args=()
+  [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+  # The SAME lane scope §1b's parser was invoked with: a guard run outside the
+  # watched lane can never make §1b refuse, so waiting for it would be gratuitous
+  # (and a guard run INSIDE it is exactly the set this exists for).
+  if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    args+=(--workflow "$WORKFLOW")
+  fi
+  local waited=0 step saw=0 status conclusion id key gk self_n foreign_n missing
+  local seen_keys=" "
+  while :; do
+    self_n=0; foreign_n=0
+    # shellcheck disable=SC2086
+    while IFS=$'\t' read -r status conclusion id key; do
+      [ -n "$status" ] || continue
+      # ⛔ CLASSIFY BEFORE THE COMPLETED SKIP (review P2, PR #1640). A guard leg
+      # that is ALREADY TERMINAL is still an observed leg at this head, so it is
+      # recorded and satisfies completeness; it just does not count as pending.
+      # Only a leg never seen at this head is unobserved, and that alone keeps
+      # the wait going. (Recording only PENDING legs made the predicate
+      # unsatisfiable when one guard leg finished before the first read — the
+      # probe then ran to the bound and produced the pre-#1417 refusal.)
+      if gk="$(guard_workflow_key "$key")"; then
+        case "$seen_keys" in *" $gk "*) ;; *) seen_keys="$seen_keys$gk " ;; esac
+        [ "$status" = "completed" ] && continue
+        self_n=$((self_n + 1))
+      else
+        [ "$status" = "completed" ] && continue
+        foreign_n=$((foreign_n + 1))
+      fi
+    done < <($GH run list --commit "$head" --limit 100 \
+        ${args[@]+"${args[@]}"} \
+        --json databaseId,status,conclusion,workflowName --jq "$LANE_RUN_GUARD_JQ" 2>/dev/null || true)
+    # SOMETHING THAT IS NOT OURS IS PENDING. The §1b refusal owns the decision on
+    # the surface the parser read, and this function must not paper over it.
+    if [ "$foreign_n" -ne 0 ]; then
+      say_err "admin-merge: · the head's unfinished set is NOT only the rail's own body-edit run generation — $foreign_n run(s) belong to the lane's own CI; §1b's lane-terminal precondition decides (unchanged)."
+      return 1
+    fi
+    if [ "$self_n" -eq 0 ]; then
+      # Nothing unfinished right now. Only a SETTLED, COMPLETE generation earns
+      # the re-read; an empty FIRST read is an unreadable or absent surface and
+      # fails closed; and a PARTIAL generation (a leg not yet created) keeps
+      # waiting below instead of settling on a subset — an absent leg is not a
+      # foreign leg, so a subset-only predicate would merge inside the window the
+      # pre-#1417 rail refused (review P1, PR #1640).
+      if [ "$saw" -eq 1 ] && guard_generation_complete "$seen_keys"; then
+        return 0
+      fi
+      if [ "$saw" -eq 0 ]; then
+        return 1
+      fi
+    fi
+    if [ "$waited" -ge "$SELF_EDIT_WAIT" ]; then
+      if [ "$self_n" -gt 0 ]; then
+        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL pending after ${SELF_EDIT_WAIT}s ($self_n run(s)) — §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
+      else
+        missing=""
+        for k in $GUARD_WORKFLOW_KEYS; do
+          case "$seen_keys" in *" $k "*) ;; *) missing="$missing ${k}" ;; esac
+        done
+        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL incomplete after ${SELF_EDIT_WAIT}s — not every guard workflow was ever observed at this head (never seen:${missing:- none}); §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
+      fi
+      return 1
+    fi
+    saw=1
+    if [ "$self_n" -gt 0 ]; then
+      info "admin-merge: … the rail's own body-edit run generation (#1417) is still pending ($self_n run(s)); waiting instead of discarding the round (${waited}s of ${SELF_EDIT_WAIT}s)"
+    else
+      info "admin-merge: … the rail's own body-edit run generation (#1417) settled for the leg(s) seen so far, but not every guard workflow has been observed yet; waiting for the remaining leg(s) instead of settling (${waited}s of ${SELF_EDIT_WAIT}s)"
+    fi
+    # CLAMP THE SLEEP TO THE REMAINING BUDGET (review P2, PR #1640). The bound is
+    # documented in SECONDS; an unbounded `sleep $POLL_INTERVAL` lets a legal
+    # ADMIN_MERGE_POLL_INTERVAL=3600 overshoot a 300s bound by an hour. Fail-closed
+    # (it only waits longer), but it contradicts the knob's own documentation.
+    step="$POLL_INTERVAL"
+    [ "$step" -gt 0 ] 2>/dev/null || step=1
+    [ "$step" -gt $((SELF_EDIT_WAIT - waited)) ] && step=$((SELF_EDIT_WAIT - waited))
+    [ "$step" -gt 0 ] && sleep "$step"
+    waited=$((waited + step))
+  done
 }
 
 # run_exemption_decision <pr-rows> <main-rates> <main-sigs> <rotation> <prefix>
@@ -5114,33 +5369,67 @@ main() {
   # Selected by COMMIT, not by PR: the analyzed set must be provably the SHA the
   # evidence marker names. `--pr` would re-resolve the head internally, so a push
   # between the two resolutions could analyze one SHA and certify another (#P1).
-  local pr_status=0
-  # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
-  # FAILED tokens it names are the ONLY source of the attribution half, and they
-  # must reach the posted evidence. They are re-emitted verbatim below, so nothing
-  # that used to be visible on stderr is silenced.
-  run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
-    --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
-    > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
-  [ -s "$TMP/pr-drops.err" ] && cat "$TMP/pr-drops.err" >&2
-  if [ "$pr_status" -ne 0 ]; then
-    say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
-    say_err "   Refusing to certify a comparison computed over an unreadable set."
-    exit 1
-  fi
-  # The id set the evidence and the re-run loop use, derived from the ROWS the
-  # decision consumes, so the two can never disagree about which ids exist.
-  cut -f1 "$TMP/pr-rows.txt" 2>/dev/null | sort -u > "$TMP/pr-fails.txt"
+  #
+  # #1417 — THE ANALYSIS IS RE-RUN, ONCE, WHEN THE ONLY THING UNFINISHED IS THE
+  # RAIL'S OWN BODY-EDIT GENERATION. `[3/4] record` PATCHes the review marker
+  # into the PR body (an `edited` activity), which re-triggers exactly the two
+  # NON-code-measuring guard workflows (`pipeline-compliance` — #513's verdict
+  # binding — and `workflow-lock`), creating two fresh runs 11-87s AFTER `[2/4]
+  # verify` certified the head. MEASURED on #1495 and #1633: `[4/4]` refused with
+  # `run still in_progress` against its own work, costing a whole extra rail
+  # round. The generation is WAITED FOR and the surface RE-READ, so a guard run
+  # that FAILS enters the failing set and blocks exactly as before — this
+  # defers a refusal on an unfinished run set, never a failure.
+  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0
+  # The last diagnostics block emitted, so the #1417 re-read pass does not
+  # DOUBLE-EMIT byte-identical parser diagnostics (review P2, PR #1640). The
+  # `pr-drops.err` FILE is left intact — the attribution half reads it later.
+  local pr_drops_emitted=""
+  while :; do
+    pr_status=0
+    # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
+    # FAILED tokens it names are the ONLY source of the attribution half, and they
+    # must reach the posted evidence. They are re-emitted verbatim below, so nothing
+    # that used to be visible on stderr is silenced.
+    run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+      --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
+      > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
+    if [ -s "$TMP/pr-drops.err" ]; then
+      local pr_drops_cur
+      pr_drops_cur="$(cat "$TMP/pr-drops.err")"
+      if [ "$pr_drops_cur" != "$pr_drops_emitted" ]; then
+        printf '%s\n' "$pr_drops_cur" >&2
+        pr_drops_emitted="$pr_drops_cur"
+      fi
+    fi
+    if [ "$pr_status" -ne 0 ]; then
+      say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
+      say_err "   Refusing to certify a comparison computed over an unreadable set."
+      exit 1
+    fi
+    # The id set the evidence and the re-run loop use, derived from the ROWS the
+    # decision consumes, so the two can never disagree about which ids exist.
+    cut -f1 "$TMP/pr-rows.txt" 2>/dev/null | sort -u > "$TMP/pr-fails.txt"
 
-  # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────────
-  # `examined=0` is NOT the signal — a green lane legitimately has no failing
-  # runs. The signal is `tested=0` (no run actually exercised this revision) or
-  # `pending>0` (something has not finished). Either way an empty failing set
-  # proves nothing, so the rail must not read it as "no unique failures".
-  local pr_completed pr_tested pr_pending
-  pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
-  pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
-  pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+    # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────
+    # `examined=0` is NOT the signal — a green lane legitimately has no failing
+    # runs. The signal is `tested=0` (no run actually exercised this revision) or
+    # `pending>0` (something has not finished). Either way an empty failing set
+    # proves nothing, so the rail must not read it as "no unique failures".
+    pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
+    pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
+    pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+
+    # #1417: defer ONLY the rail's own body-edit generation, and re-verify the
+    # surface ONCE. A NEGATIVE test is deliberate: `pending` that is 0 (nothing
+    # unfinished) and `pending` that is UNREADABLE ('n/a') both leave the loop
+    # immediately, and the unreadable one is refused by §1b below — the loop
+    # never waits on a counter it could not read.
+    if ! counter_is_positive "$pr_pending"; then break; fi
+    if [ "$pr_self_edit_retry" -eq 1 ]; then break; fi
+    settle_self_edit_generation "$head" || break
+    pr_self_edit_retry=1
+  done
 
   # "Not proven finished" is not "finished": `! counter_is_zero` blocks on an
   # UNREADABLE `pending` too, not only on a positive one. A bare `-gt 0` skipped
