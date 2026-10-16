@@ -117,10 +117,17 @@ without a human in the loop:
 - **Back-pressure:** every cycle is gated on load average and swap, so the box throttles
   itself instead of thrashing. Above `MERGE_PRIORITY_AT` **unowned** open PRs (25) — open PRs
   nothing is currently working, derived from the loop's own worker sessions, cross-box claims and
-  reviewer-findings markers — the balance shifts to **draining**: new lanes stop being dispatched
-  and the reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`), because a merge backlog
-  means the scarce capacity belongs to review and merge, not to opening more PRs. Counting TOTAL
-  open PRs instead capped the fleet on a healthy queue (#see the tuning table).
+  unconsumed reviewer-findings markers — the balance shifts to **draining**: new lanes stop being
+  dispatched and the reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`), because a
+  merge backlog means the scarce capacity belongs to review and merge, not to opening more PRs.
+  Counting TOTAL open PRs instead capped the fleet on a busy queue: a PR mid-review, mid-fix,
+  mid-merge — or held by a claim on another box — read as congestion. Measured 2026-10-16, two live
+  cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
+  59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
+  ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
+  lease is *data, not liveness* (a remote pid cannot be probed), so an abandoned-but-unexpired
+  claim reads as owned until the lease expires. The residuals and their direction are recorded on
+  `pr_owned()` in `orch-loop.sh`.
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
@@ -198,6 +205,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
 | `state/last-open-n` | the last SUCCESSFUL open-PR count; reused only when positive if a later count fails — a failure never reads as 0 |
+| `state/last-open-prs` | the `number:headOid` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`). Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
 

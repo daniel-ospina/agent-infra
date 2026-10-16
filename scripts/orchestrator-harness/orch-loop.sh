@@ -90,12 +90,17 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
-# merging takes priority and new lanes stop being dispatched. 10 was measured to CAP THE FLEET:
-# two live cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32,
-# 59-86% CPU idle, 13.9 GB RAM free (2026-10-16) — because TOTAL open PRs were counted, and 17 of
-# those 20 were BEHIND/DIRTY, i.e. already being worked. Raised to 25 (owner ruling: "we should have
-# something more like 10 PRs who are not being processed"); the instrument, not the number, is the
-# real fix. MERGE_PRIORITY_AT also raises the reviewer AND fixer budgets in drain mode.
+# merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
+# open count, so a PR mid-review, mid-fix, mid-merge — or held by a claim on another box — read as
+# congestion. Measured 2026-10-16: two live cells logged `merge-priority (20 open PRs — draining)`
+# at `lanes=1` of a configured 32 with 59-86% CPU idle and 13.9 GB RAM free, while 17 of those 20
+# PRs carried a merge state of BEHIND/DIRTY. ⛔ Merge state is NOT an ownership signal (pr_owned
+# reads worker sessions, claims and markers only), so that measurement does not by itself show those
+# 17 were being worked — and the cells' own `workers=0` shows no LOCAL worker held them (only a
+# cross-box claim could have). What it does show is that the gate was counting the wrong thing:
+# raising the number alone would still cap a cell whose whole queue is owned.
+# Raised to 25 (owner ruling: "we should have something more like 10 PRs who are not being
+# processed"). MERGE_PRIORITY_AT also raises the reviewer AND fixer budgets in drain mode.
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
@@ -591,8 +596,10 @@ sweep_defer_until() {
 }
 # END sweep-quota
 
-# Count of open PRs. This one number drives THREE decisions — scope (BROAD drain vs OWN), the
-# reviewer budget (review_slots), and the merge-priority gate (mp_reason) — so a FAILED count must
+# Count of open PRs. This number drives the SCOPE decision (BROAD drain vs OWN) and the sticky
+# fallback, and its `number:headOid` rows feed the ownership scan (unowned_pr_count -> pr_owned)
+# whose result is what the reviewer budget (review_slots), the fixer budget (fix_slots) and the
+# merge-priority gate (mp_reason) actually consume. So a FAILED count must
 # never be readable as "the queue is empty". The pre-fix line was
 #   OPEN_N="$(gh pr list … 2>/dev/null)"; : "${OPEN_N:=0}"
 # which discarded rc AND stderr, then coerced the empty result to 0: on 2026-10-12 a single
@@ -672,34 +679,52 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
 # `pr_owned` reuses the SAME signals the sweep's own skip arms already consult —
 # `sess "fix-$PR" || sess "merge-$PR" || claim_live "$PR" "$HEAD_N"` — plus the reviewer-findings
 # record (`needsfix-<PR>-<head>`, written by merge-one.sh when a reviewer reports real issues and
-# DELETED at fixer spawn). No second source of truth is invented for ownership: the loop's own
-# per-PR state IS the answer, and every marker consulted here is one the spawn paths already keep.
+# deleted once the fixer that consumes it is spawned). No second source of truth is invented for
+# ownership: the loop's own per-PR state IS the answer, and every marker consulted here is one the
+# spawn paths already keep.
 #
-# ⚠️ Known residual, stated rather than hidden: a PR PARKED at MAX_FIX_TRIES keeps its needsfix
-# marker, so it reads as owned here. That is the wanted direction — the harness has declared it
-# needs a HUMAN, and letting a permanently-stuck PR inflate `unowned` would latch the dispatch gate
-# shut forever (the "stale flag that records a past state" failure). Revisit if parks ever become a
-# large share of the queue.
+# ⚠️ Two residuals, stated rather than hidden. Both make a PR read as OWNED when nothing is working
+# it, i.e. they UNDER-count `unowned` and hold the gate more open than the queue warrants — the
+# deliberate direction for a fleet whose problem was capping itself, and each is bounded:
+#   1. A PR PARKED at MAX_FIX_TRIES keeps its current-head marker, so it reads as owned. Wanted: the
+#      harness has declared it needs a HUMAN, and letting a permanently-stuck PR inflate `unowned`
+#      would latch the dispatch gate shut forever (the "stale flag that records a past state"
+#      failure). Revisit if parks ever become a large share of the queue.
+#   2. A cross-box claim is a DECLARED WINDOW, NOT LIVENESS — claims.sh is explicit ("LEASE = DATA,
+#      NOT LIVENESS": git refs have no TTL and a remote pid cannot be probed), which is why the
+#      lease is the accepted signal (#1709) and why an abandoned-but-unexpired claim reads as owned
+#      here. The bound is the lease, not the process.
 pr_owned() { # <pr> <head-sha> -> 0 when something is currently working this PR
-  local pr="$1" sha="${2:-}" m
+  local pr="$1" sha="${2:-}"
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
   # ⛔ `if …; then return 0; fi`, NEVER `… || … || … || return 0`: the `||` chain returns 0 only when
   # EVERY test was FALSE, so a short-circuit on the FIRST true test falls THROUGH to the findings
-  # loop and the function returns 1 — an OWNED PR read as unowned and an idle one as owned.
+  # test below and the function returns 1 — an OWNED PR read as unowned and an idle one as owned.
   if wsess "fix-$pr" || wsess "merge-$pr" || claim_live "$pr" "$sha"; then return 0; fi
-  # A reviewer reported real issues at some head and the fixer has not been spawned yet (the spawn
-  # DELETES this marker), so its presence is a recorded in-flight step. Matched on the PR alone:
-  # the loop's own head lives in the sweep, and a marker for ANY head is an unconsumed hand-off.
-  for m in "$O"/state/needsfix-"$pr"-*; do
-    [ -e "$m" ] && return 0
-  done
+  # A reviewer reported real issues at some head and the fixer that consumes that record has not
+  # been spawned yet, so its presence is a recorded in-flight step.
+  # ⛔ HEAD-KEYED, like every other reader of this marker (the ai-review arm tests
+  # `needsfix-$PR-$HEAD_N`): a marker for a SUPERSEDED head is a hand-off nothing will consume, and
+  # the PR-wide glob (`needsfix-<pr>-*`) read one as owned FOREVER — only the ai-review arm deletes
+  # a marker at all, so a stale one is never cleaned up and its PR was permanently under-counted in
+  # `unowned`. Measured: with only `needsfix-7-<old-sha>` present, `pr_owned 7 <new-sha>` returned 0.
+  if [ -n "$sha" ] && [ -f "$O/state/needsfix-$pr-$sha" ]; then return 0; fi
   return 1
 }
 
 # How many OPEN PRs nothing is currently working. <open_prs>
 unowned_pr_count() {
-  local n="${1:-0}" list tok pr sha owned=0 u
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  local n="${1:-}" list tok pr sha owned=0 u
+  # ⛔ A malformed count must FAIL CLOSED, and failing closed here means EMIT NOTHING — never a
+  # number. The first draft coerced it to 0, which is the most permissive value the gate can be
+  # handed AND a perfectly valid one, so the caller's guard could not see it and the gate OPENED on
+  # a count that was never read (measured). An empty result falls through to the caller's total-open
+  # fallback, the conservative direction.
+  # ⛔ `is_num`, NOT a `case … [0-9]` digit test: the case pattern ACCEPTS a leading zero, which
+  # `$(( ))` then parses in BASE 0 — `08` made the arithmetic below ERROR, `u` came out empty, the
+  # caller substituted its own `08`, and `[ 08 -gt 25 ]` read 8 and OPENED the gate. is_num rejects
+  # leading zeros (and everything non-numeric) on purpose.
+  is_num "$n" || return 1
   list="$(cat "$O/state/last-open-prs" 2>/dev/null || true)"
   # No rows => assume NOTHING is owned, i.e. the whole count is unowned. That is the CONSERVATIVE
   # direction: more unowned CLOSES the dispatch gate. Assuming they were owned would OPEN it on a
@@ -713,7 +738,11 @@ unowned_pr_count() {
   done
   # An owned count ABOVE the listing's (a race between the two reads) collapses to 0, never to a
   # negative that `[ -gt ]` would read as "not over the threshold".
-  u=$(( n - owned ))
+  # `10#` is belt-and-braces, NOT independently test-covered: `is_num` above already rejects the
+  # leading zero this would normalise (mutation-tested — removing it leaves the suite green). It
+  # stays for consistency with every other arithmetic read of a tunable in this file, so the
+  # function is correct even if the guard is ever loosened.
+  u=$(( 10#$n - owned ))
   [ "$u" -lt 0 ] && u=0
   echo "$u"
 }
@@ -729,21 +758,10 @@ while true; do
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
   # FAILED counts are 'unknown', never 0 — see open_pr_count() above.
   OPEN_N="$(open_pr_count)"
-  # Merge priority counts what is UNOWNED, not what is open: a PR that is mid-review, mid-fix,
-  # mid-merge, or held by a claim on another box is healthy queue depth, not a reason to stop
-  # opening work (see pr_owned/unowned_pr_count). Snapshot the worker sessions ONCE for the scan.
-  wsess_snapshot
-  UPN="$(unowned_pr_count "$OPEN_N")"
-  # ⛔ A malformed count must not OPEN the gate. `[ … -gt … ]` on a non-number ERRORS (rc 2) and an
-  # errored test is FALSE — the gate chain then allows dispatch. Fall back to the TOTAL open count
-  # (the conservative direction: more unowned => drain), and if even that is unusable, to one above
-  # the threshold. Both arms fail CLOSED.
-  case "${UPN:-}" in ''|*[!0-9]*) UPN="${OPEN_N:-}" ;; esac
-  case "${UPN:-}" in ''|*[!0-9]*) UPN=$(( 10#${MERGE_PRIORITY_AT:-25} + 1 )) ;; esac
-  # Give reviewers AND fixers extra headroom above the backlog threshold (and section 2 stops
-  # dispatching new lanes). Below it, run a mix. Tune with MERGE_PRIORITY_AT.
-  MR="$(review_slots "$UPN")"
-  MF="$(fix_slots "$UPN")"
+  # NOTE: the merge-priority gate's own inputs — the unowned count and the reviewer/fixer budgets —
+  # are derived BELOW, right after the cross-box claim snapshot is refreshed. pr_owned() reads that
+  # snapshot (via claim_live), so running the scan HERE read the PREVIOUS cycle's file: the same
+  # predicate gave the gate and the sweep different answers for the same PR within one cycle.
   # Scope: >10 open PRs -> BROAD (help drain everyone's). Our OWN patterns are always included
   # even while drafts, because a draft is invisible to the checks below and nothing else would
   # ever ready it — our lanes' own drafts used to stall red forever (#8219, #8085).
@@ -958,6 +976,29 @@ while true; do
       ( claim_prune >> "$LOG" 2>&1 ) &
     fi
   fi
+
+  # ── ownership: the merge-priority gate's input ──────────────────────────────
+  # Merge priority counts what is UNOWNED, not what is open: a PR that is mid-review, mid-fix,
+  # mid-merge, or held by a claim on another box is healthy queue depth, not a reason to stop
+  # opening work (see pr_owned/unowned_pr_count). Snapshot the worker sessions ONCE for the scan.
+  # ⛔ ORDER IS LOAD-BEARING: this must run AFTER the claim snapshot refresh above (pr_owned reads
+  # it) and BEFORE every use of UPN/MR/MF (section 2's spawn sites and the dispatch gate).
+  wsess_snapshot
+  UPN="$(unowned_pr_count "$OPEN_N")"
+  # ⛔ A malformed count must not OPEN the gate. `[ … -gt … ]` on a non-number ERRORS (rc 2) and an
+  # errored test is FALSE — the gate chain then allows dispatch. Fall back to the TOTAL open count
+  # (the conservative direction: more unowned => drain), and if even that is unusable, to one above
+  # the threshold. Both arms fail CLOSED — and they are the ONLY fallback there is, now that
+  # unowned_pr_count emits nothing rather than a number on a malformed argument.
+  # ⛔ `is_num`, NOT a `case … [0-9]` digit test: the case pattern accepts a leading zero, which
+  # `[ … -gt … ]` reads as DECIMAL (`08` = 8), so `08` slipped through the guard and the gate
+  # OPENED on a count that was never valid.
+  is_num "${UPN:-}" || UPN="${OPEN_N:-}"
+  is_num "${UPN:-}" || UPN=$(( 10#${MERGE_PRIORITY_AT:-25} + 1 ))
+  # Give reviewers AND fixers extra headroom above the backlog threshold (and section 2 stops
+  # dispatching new lanes). Below it, run a mix. Tune with MERGE_PRIORITY_AT.
+  MR="$(review_slots "$UPN")"
+  MF="$(fix_slots "$UPN")"
   printf '%s\n' "${SWEEP_LIST:-}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT; do
     [ -z "${PR:-}" ] && continue

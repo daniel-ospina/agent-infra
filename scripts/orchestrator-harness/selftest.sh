@@ -1207,12 +1207,17 @@ SH
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=15 bash "$OC/drive.sh" )"
   [ "$_mp" = "16" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=15 produced '$_mp' (expected 16)"; }
   ck "an above-default MERGE_PRIORITY_AT (15) falls back to 16, above the tunable" $rc
-  # (b4) a leading-zero tunable must be read as DECIMAL: `[ … -ge 10 ]` parses base 10 but `$(( … ))`
-  # parses base 0, in which `010` is octal 8 — so the guard ratified "ten" and the arithmetic
-  # returned 9, landing in OWN, the same unsafe direction the tunable-keyed fallback was fixed for.
+  # (b4) UNIT coverage of open_pr_count's base-10 normalisation, reached only with the tunable guard
+  # BYPASSED — which is exactly what this driver does (it sources is_num + open_pr_count, not the
+  # loop's is_limit coercion). ⚠️ In the SHIPPED loop the guard runs FIRST: is_num rejects leading
+  # zeros, so `MERGE_PRIORITY_AT=010` is coerced to the default (25) and the real fallback is 26 —
+  # asserted directly above. Do not read this case as shipped-loop behaviour.
+  # What it covers: `[ … -ge 10 ]` parses base 10 but `$(( … ))` parses base 0, where `010` is octal
+  # 8 — so the guard ratifies "ten" and an un-normalised arithmetic would return 9, landing in OWN,
+  # the same unsafe direction the tunable-keyed fallback was fixed for. The `10#` keeps it at 11.
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=010 bash "$OC/drive.sh" )"
   [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=010 produced '$_mp' (expected 11)"; }
-  ck "a leading-zero MERGE_PRIORITY_AT (010) is decimal 10, falls back to 11" $rc
+  ck "unit (guard bypassed): a raw leading-zero tunable 010 normalises to base 10 (11), not octal 8 (9)" $rc
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=notanum bash "$OC/drive.sh" )"
   [ "$_mp" = "26" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 26)"; }
   ck "a non-numeric MERGE_PRIORITY_AT falls back to 26 without aborting" $rc
