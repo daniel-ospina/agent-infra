@@ -3140,6 +3140,93 @@ fi
 
 
 echo ""
+echo "── 15. #1709 rec 7: the same head twice is the SAME record ──────────"
+# `record-review.sh` runs AT-LEAST-ONCE (a crash, a paused worker that resumes,
+# or a second box sweeping the same PR re-executes the same record). The side
+# effect must therefore be idempotent: recording the SAME review for the SAME
+# head twice must produce the SAME artifact. The PR-body MARKER already satisfied
+# this — its text is a pure function of pr/verdict/sha/diff/repo and the append is
+# a whole-string `grep -qF` — but the RECORD FILE did not: every run re-stamped
+# `reviewed_at` from the wall clock and rewrote the file, so a duplicate MUTATED
+# the attestation. That is corruption, not waste: `reviewed_at` is the audit
+# trail's ONLY join from a merge-gate pass to the review that authorised it
+# (extensions/review-enforcer `logMergeGateDecision`), and it must not move
+# because a paused worker resumed. The head sha is the idempotency key.
+PR_IDEM=424800
+IDEM_PATH="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-$PR_IDEM.json"
+rm -f "$IDEM_PATH"
+run_record_diff "$PR_IDEM" "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "15.1 first record succeeds" || bad "15.1 first record (rc=$RECORD_RC)"
+IDEM_1="$(cat "$IDEM_PATH" 2>/dev/null || true)"
+# A ≥1s gap: `reviewed_at` has SECOND resolution, so a shorter gap could produce
+# the same stamp by luck and the equality asserted below would hold for a reason
+# that is not the guard.
+sleep 1
+run_record_diff "$PR_IDEM" "$SHA" "PR body" "$D_F"
+[ "$RECORD_RC" = "0" ] && ok "15.2 the duplicate execution succeeds" || bad "15.2 duplicate execution (rc=$RECORD_RC)"
+IDEM_2="$(cat "$IDEM_PATH" 2>/dev/null || true)"
+if [ -n "$IDEM_1" ] && [ "$IDEM_1" = "$IDEM_2" ]; then
+    ok "15.3 same head twice → BYTE-IDENTICAL record (reviewed_at preserved)"
+else
+    bad "15.3 a duplicate execution rewrote the record: 1=$IDEM_1 2=$IDEM_2"
+fi
+assert_contains "$RECORD_ERR" "#1709 rec 7 idempotent" "15.4 the no-op is named on stderr, not silent"
+
+# 15.5-15.6 the IDENTITY predicate directly: only the VOLATILE fields
+#        (`reviewed_at`, the carry provenance) are dropped — the deterministic
+#        fields, and in particular the EVIDENCE ref, ARE the identity, so a
+#        different artifact is a different attestation and must still rewrite.
+idem_ident() { bash -c 'source "$1" >/dev/null 2>&1 || exit 1; record_identity "$2"' _ "$RECORD" "$1"; }
+printf '{"pr":1,"head_sha":"S","diff_sha256":"D","mint":"fresh","evidence":"comment:1","verdict":"clean","repo":"r","reviewed_at":"2026-01-01T00:00:00Z"}\n' > "$T/idem-a.json"
+printf '{"pr":1,"head_sha":"S","diff_sha256":"D","mint":"carried","carried_from":"H","carried_at":"2026-01-02T00:00:00Z","evidence":"comment:1","verdict":"clean","repo":"r","reviewed_at":"2025-01-01T00:00:00Z"}\n' > "$T/idem-b.json"
+printf '{"pr":1,"head_sha":"S","diff_sha256":"D","mint":"fresh","evidence":"comment:2","verdict":"clean","repo":"r","reviewed_at":"2026-01-01T00:00:00Z"}\n' > "$T/idem-c.json"
+if [ "$(idem_ident "$T/idem-a.json")" = "$(idem_ident "$T/idem-b.json")" ]; then
+    ok "15.5 a fresh and a carried record at one head share an identity (volatile provenance dropped)"
+else
+    bad "15.5 the carry provenance was treated as identity — a duplicate carry would churn the record"
+fi
+if [ "$(idem_ident "$T/idem-a.json")" != "$(idem_ident "$T/idem-c.json")" ]; then
+    ok "15.6 a DIFFERENT evidence ref is a different attestation (it still rewrites)"
+else
+    bad "15.6 the evidence ref was dropped from the identity — a re-record on new evidence would be swallowed"
+fi
+
+# 15.7 MUTATION PIN — the guard is what makes 15.3 true. A copy with the
+#      idempotency guard disarmed MUST rewrite the record on the second run
+#      (reviewed_at moves), proving 15.3 is load-bearing rather than green by
+#      accident.
+mkdir -p "$T/mut-idem/lib"
+cp "$SCRIPT_DIR/lib/diff-normalize.py" "$T/mut-idem/lib/diff-normalize.py"
+python3 - "$RECORD" "$T/mut-idem/record-review.sh" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+text = open(src).read()
+old = 'if [ -f "$FILE" ] && [ "$(record_identity "$FILE")" = "$(record_identity "$TMP")" ]; then'
+new = 'if false; then   # MUTATION (#1709 rec 7): the idempotency guard disarmed'
+assert old in text, "mutation anchor not found"
+open(dst, "w").write(text.replace(old, new))
+PY
+if cmp -s "$T/mut-idem/record-review.sh" "$RECORD"; then
+    bad "15.7 mutation: the mutant copy is IDENTICAL to the script"
+else
+    ok "15.7 mutation: the mutant copy differs from the script"
+fi
+PR_IDEM_M=424801
+IDEM_M_PATH="$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-$PR_IDEM_M.json"
+rm -f "$IDEM_M_PATH"
+run_record_diff_with "$T/mut-idem/record-review.sh" "$PR_IDEM_M" "$SHA" "PR body" "$D_F"
+IDEM_M1="$(cat "$IDEM_M_PATH" 2>/dev/null || true)"
+sleep 1
+run_record_diff_with "$T/mut-idem/record-review.sh" "$PR_IDEM_M" "$SHA" "PR body" "$D_F"
+IDEM_M2="$(cat "$IDEM_M_PATH" 2>/dev/null || true)"
+if [ -n "$IDEM_M1" ] && [ "$IDEM_M1" != "$IDEM_M2" ]; then
+    ok "15.7 MUTATION: without the guard the duplicate REWRITES the record — 15.3 is load-bearing"
+else
+    bad "15.7 mutation: the guardless copy still produced an identical record — 15.3 does not test the guard"
+fi
+
+
+echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 SUMMARY_PRINTED=1   # the sentinel: only from here may the EXIT trap pass an exit status through
