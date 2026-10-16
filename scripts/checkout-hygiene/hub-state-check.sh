@@ -288,8 +288,9 @@ recovery_guide() {
 # runtime executes the TARGET CHECKOUT'S WORKING TREE. On an off-main hub that is
 # unreviewed branch code, and a merged fix is not live until the checkout returns
 # to a commit containing it (#649). Emits `entry<TAB>target` per link that
-# resolves into $1/extensions/; prints nothing when the farm is absent, is
-# materialized as real copies, or points at another checkout.
+# resolves to a DIRECT CHILD of $1/extensions/ (a link to a grandchild or to the
+# extensions dir itself is not this hub's farm entry); prints nothing when the farm
+# is absent, is materialized as real copies, or points at another checkout.
 #
 # PI_EXTENSIONS_DIR overrides the farm root (the pi-config-extensions suite's
 # fixture contract); the default is the machine-local farm.
@@ -341,10 +342,16 @@ physical_path() { # $1=path
   # extensions dir and the hub root as this hub's children, and dropping a link
   # that really does land on one. Only an unresolved/non-directory final component
   # falls back to parent+final (a dangling target is still reported).
+  #
+  # `cd -P` is load-bearing: plain `cd` is LOGICAL, so a `..` that FOLLOWS a symlink
+  # is collapsed lexically rather than physically (`link/..` where `link -> other/x`
+  # becomes the link's own directory, not `other`). `readlink -f` collapses it
+  # physically, and so must this — otherwise a `..`-mid target is mis-graded in both
+  # directions (reproduced). `pwd -P` after `cd -P` is redundant but harmless.
   if [ -d "$p" ]; then
-    printf '%s\n' "$(cd "$p" && pwd -P)"
+    printf '%s\n' "$(cd -P "$p" && pwd -P)"
   elif [ -d "$dir" ]; then
-    printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$final"
+    printf '%s/%s\n' "$(cd -P "$dir" && pwd -P)" "$final"
   else
     printf '%s\n' "$p"
   fi

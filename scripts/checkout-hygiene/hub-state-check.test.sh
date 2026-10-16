@@ -158,6 +158,13 @@ ln -s "$HUB/extensions/hop-in" "$FARM649/inter-in"
 ln -s "$HUB/extensions/." "$FARM649/dot-tool"
 ln -s "$HUB/extensions/.." "$FARM649/dotdot-tool"
 ln -s "$HUB/extensions/builtin-tools/." "$FARM649/subdot-tool"
+# `..` AFTER a symlink must resolve PHYSICALLY (readlink -f semantics), not be
+# collapsed lexically: `linkin/..` is the hub's extensions dir (linkin -> its `sub`),
+# while `redirect/..` is the FOREIGN extensions dir.
+mkdir -p "$HUB/extensions/sub" "$FIX/mid/builtin-tools" "$FIX/foreign/extensions/builtin-tools"
+ln -s "$HUB/extensions/sub" "$FIX/mid/linkin"
+ln -s "$FIX/mid/linkin/../builtin-tools" "$FARM649/mid-in"
+ln -s "$HUB/extensions/redirect/../builtin-tools" "$FARM649/mid-out"
 # The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
 # intended (anchor-safe) deployment, not the #649 defect.
 out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
@@ -180,9 +187,11 @@ assert_not_contains "$out" "inter-esc" "an INTERMEDIATE hop with a trailing slas
 assert_contains "$out" "$FARM649/subdot-tool -> $HUB/extensions/builtin-tools/." "a target whose final component is '.' INSIDE the hub is named"
 assert_not_contains "$out" "$FARM649/dot-tool" "a target ending '/.' (the extensions dir itself) is not named as this hub's child"
 assert_not_contains "$out" "$FARM649/dotdot-tool" "a target ending '/..' (the hub root) is not named as this hub's child"
+assert_contains "$out" "$FARM649/mid-in -> $FIX/mid/linkin/../builtin-tools" "a '..' AFTER a symlink that resolves INTO the hub is named"
+assert_not_contains "$out" "$FARM649/mid-out" "a '..' AFTER a symlink that resolves OUT of the hub is not named"
 assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
 git -C "$HUB" checkout -q main
-rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias"
+rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias" "$FIX/mid"
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────
 WT="$HUB/.worktrees/wt-test"
