@@ -5419,6 +5419,11 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // model knew only `NAME=`, not `NAME+=`/`NAME[i]=`, and the previous word's `=`
         // laundered the command word into a value exemption.
         "PATH=/tmp/real:/usr/bin CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge CMD+=' ' CMD+=999 CMD+=' ' V+=--admin CMD+=$V;A+=ok $CMD;gh api /repos/o/r --body admin",
+        // …and shape 20: the QUOTED spelling of an assignment prefix. The value clause read the
+        // dequoted word while the command-position model read the raw token, so `"X=1"` was a
+        // value to one and not a command position to the other — a command string after it was
+        // exempted (`eval "X=1" $'<payload>'` reached the real gh as `pr merge 999 --admin`).
+        "gh pr view 1; eval \"X=1\" $'Z'",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5558,6 +5563,10 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     // which the command-position model did not recognise (`NAME+=`, `NAME[i]=`).
     "gh pr view 1; A+=ok $CMD",
     "gh pr view 1; A[0]=ok $CMD",
+    // …and shape 20: the same laundering with the assignment prefix QUOTED, which the two
+    // clauses read differently (dequoted for the value test, raw for the position test).
+    "gh pr view 1; eval \"X=1\" $'Z'",
+    "gh pr view 1; \"X=1\" $(true)",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }

@@ -646,12 +646,13 @@ function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
     // (cycle-4 review P0-1).
     /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
     // An assignment prefix (`FOO=bar`, and bash's APPEND/ARRAY forms `FOO+=bar`, `FOO[0]=bar`)
-    // or a reserved word (`if`, `while`, ...) all put the next word in command position. The
-    // `+=`/`[i]=` forms were missing, so a construct in a genuine command position was
-    // laundered into a value when the previous word carried `=` (adversarial review, shape
-    // 19: `A+=ok $CMD` runs `$CMD`, and `CMD+=gh CMD+=pr …` assembles the whole merge with no
-    // readable gh/pr/merge token anywhere).
-    /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(prev) ||
+    // or a reserved word (`if`, `while`, ...) all put the next word in command position. This
+    // test reads the DEQUOTED word (`prevWord`), like the value clause that consults it: with
+    // the raw token, a QUOTED `"X=1"` counted as a value for the exemption and as "not an
+    // assignment" here, so a command string after it was exempted (`eval "X=1" $'<payload>'`
+    // reached the real gh as `pr merge 999 --admin` — adversarial review, shape 20). The two
+    // clauses read the same word or they can disagree about the same token.
+    /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(prevWord) ||
     /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prevWord)
   );
 }
