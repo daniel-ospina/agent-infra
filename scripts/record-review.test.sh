@@ -88,11 +88,18 @@ mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${GH_STUB_LOG:?}"
-if [ "$1" = "api" ] && [ "$2" = "-X" ]; then
+if [ "$1" = "api" ] && [ "$2" = "-X" ] \
+   && { grep -qF -- "/rerun" <<<"$*" || grep -qF -- "-X PATCH" <<<"$*"; }; then
     # PATCH body / job rerun POST. #633: fail either on demand so the fail-soft
     # and no-marker pins are real. A /rerun POST pipes NO stdin, so the read is
     # skipped for it — consuming stdin unconditionally would clobber the PATCH
     # capture with an empty body and, on an inherited terminal, block forever.
+    # ⛔ NOT every `-X` call: `gh api -X GET <url> -f …` is a READ (the #633
+    # check-runs transport) and must fall through to the routing below. Gating
+    # this branch on `$2 = -X` alone mis-routed it here, where it swallowed the
+    # capture file with an empty stdin read — which silently BLANKED the recorded
+    # marker and made every diff= assertion fail. The branch now names its two
+    # mutating callers (PATCH, /rerun) instead of assuming `-X` means write.
     if grep -qF -- "/rerun" <<<"$*"; then
         if [ "${STUB_RERUN_FAIL:-0}" = "1" ]; then exit 1; fi
         exit 0
@@ -619,7 +626,11 @@ STUB_BODY="Fixes https://GITHUB.com/Daniel-Ospina/Agent-Infra/issues/424316" run
 unset STUB_LABELS_DIR STUB_LABELS
 rm -rf "$T/labels"
 
-# 8.10 clean verdict: ZERO extra gh calls (no labels query in the log).
+# 8.10 clean verdict: no gh LABELS call (#513/#568). The clean path now makes
+#      exactly ONE other gh call — the bounded `commits/<sha>/check-runs` GET
+#      the #633 stale-run remediation reads — so the claim is scoped to the
+#      labels query, which is what this pin greps for. The pre-fix comment
+#      ("ZERO extra gh calls") stopped being true with #633; corrected here.
 run_record "daniel-ospina/agent-infra" 424315
 if grep -q "labels" "$LOG"; then
     bad "clean verdict adds no gh labels call"
@@ -2794,6 +2805,8 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         # The runner passes the caller's gate key through so a vector can unset
         # it (the suite exports a deterministic key at the top).
         export AI_REVIEW_GATE_KEY="${AI_REVIEW_GATE_KEY-}"
+        # The check-name override is passed through for the same reason.
+        export AI_REVIEW_GATE_CHECK_NAME="${AI_REVIEW_GATE_CHECK_NAME-}"
         [ -n "${STUB_HEAD_SHA:-}" ] && export STUB_HEAD_SHA
         rc=0
         bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
@@ -2992,6 +3005,15 @@ if GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[]' "$T/bin/gh" api "repos/x/y/commits/$
 else
     bad "14.12c the stub serves the explicit -X GET form"
 fi
+# 14.12d the RECORDER's actual argv order (`-X GET` BEFORE the URL) must be a
+#       READ, not the stub's PATCH/rerun capture branch. That branch keyed on
+#       `$2 = -X` alone, so the check-runs read fell into it, consumed an empty
+#       stdin into STUB_CAPTURE, and BLANKED the recorded marker — every diff=
+#       assertion failed while the check-runs pins still passed. RED pre-fix:
+#       the call returns empty stdout (the capture branch prints nothing).
+TLOG="$T/transport.log"
+GOT_14_12D="$(GH_STUB_LOG="$TLOG" STUB_CHECK_RUNS='[{"name":"x"}]' "$T/bin/gh" api -X GET "repos/x/y/commits/$SHA/check-runs" -f check_name=x -f per_page=100 </dev/null 2>/dev/null)"
+assert_contains "$GOT_14_12D" '"check_runs"' "14.12d the stub treats the recorder's -X GET (before the URL) as a READ"
 
 # 14.13 THE SIGNED-MARKER GATE (review finding 3). With NO gate key the recorder
 #       posts an UNSIGNED marker, which the gate is guaranteed to reject — so a
@@ -3011,6 +3033,63 @@ if grep -qF -- "actions/jobs/601/rerun" "$LOG"; then
     bad "14.13 an UNSIGNED marker does not fire the rerun (guaranteed-red churn) (log: $(cat "$LOG"))"
 else
     ok "14.13 an UNSIGNED marker does not fire the rerun (guaranteed-red churn)"
+fi
+
+# 14.14 THE ALLOW-LIST POLARITY (review finding 1). The repo mandate (AGENTS.md
+#       §"Reading verification state" step 4, implemented by target_head_red in
+#       this same file) is: only success/neutral/skipped are green and
+#       cancelled/stale are non-red; EVERY OTHER conclusion is RED — including
+#       one GitHub has not documented and a null one. A CLOSED red-list
+#       (failure/cancelled/timed_out/action_required) read an unrecognised or
+#       null conclusion as "not red AND not suspicious": no rerun and no
+#       warning — the silent no-op #633 exists to close. RED pre-fix: `notice`
+#       and `null` both left NEWEST_RED_ID empty with nothing on stderr.
+STUB_BODY="PR body" run_record_633 424332 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"notice","id":610}]'
+if grep -qF -- "actions/jobs/610/rerun" "$LOG"; then
+    ok "14.14 an UNDOCUMENTED conclusion (notice) is RED and re-runs the job"
+else
+    bad "14.14 an undocumented conclusion was silently treated as non-red (log: $(cat "$LOG"); err=$RECORD_ERR)"
+fi
+# 14.14b a NULL conclusion on a completed run is RED too (the #1353 fail-open,
+#       one level down) — and must warn/remediate, never read as nothing-to-do.
+STUB_BODY="PR body" run_record_633 424333 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":null,"id":611}]'
+grep -qF -- "actions/jobs/611/rerun" "$LOG" && ok "14.14b a NULL conclusion on the newest completed run is RED" || bad "14.14b a null conclusion was silently treated as non-red (log: $(cat "$LOG"))"
+# 14.14c the named NON-RED conclusions stay non-red — no churn. `cancelled` is
+#        non-red per the repo rule (the pre-fix closed list had it RED).
+STUB_BODY="PR body" run_record_633 424334 "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"cancelled","id":612}]'
+if grep -qF -- "actions/jobs/" "$LOG"; then
+    bad "14.14c cancelled is non-red — no rerun (log: $(cat "$LOG"))"
+else
+    ok "14.14c cancelled is non-red — no rerun"
+fi
+# 14.14d an unrecognised STATUS with a NULL conclusion is RED (in-flight is the
+#        named set only) — the same decision target_head_red makes.
+STUB_BODY="PR body" run_record_633 424335 "$SHA" \
+    '[{"name":"ai-review-gate","status":"something_new","conclusion":null,"id":613}]'
+grep -qF -- "actions/jobs/613/rerun" "$LOG" && ok "14.14d an unknown status with a NULL conclusion is RED" || bad "14.14d an unknown status read as pending/non-red (log: $(cat "$LOG"))"
+
+# 14.15 THE CHECK-NAME OVERRIDE (review finding 2). A check-run NAME is an
+#       arbitrary string; interior whitespace is MEANINGFUL and must survive the
+#       override read. `tr -d '[:space:]'` (copied from the HMAC-key read)
+#       deleted it, so the documented AI_REVIEW_GATE_CHECK_NAME override silently
+#       mismatched any renamed check containing a space (`python-ci / test` is a
+#       real name on this fleet): server filter matched nothing, local name
+#       filter matched nothing, remediation never fired. RED pre-fix: GATE_CHECK
+#       became `python-ci/test`. Only leading/trailing padding is still trimmed.
+STUB_BODY="PR body" AI_REVIEW_GATE_CHECK_NAME="  python-ci / test  " run_record_633 424336 "$SHA" \
+    '[{"name":"python-ci / test","status":"completed","conclusion":"failure","id":614}]'
+if grep -qF -- "actions/jobs/614/rerun" "$LOG"; then
+    ok "14.15 an override with interior whitespace is preserved and re-runs the job"
+else
+    bad "14.15 interior whitespace in AI_REVIEW_GATE_CHECK_NAME was mangled (log: $(cat "$LOG"); err=$RECORD_ERR)"
+fi
+if grep -qF -- "check_name=python-ci / test" "$LOG"; then
+    ok "14.15 padding trimmed, interior whitespace intact in the query"
+else
+    bad "14.15 check-name normalization mangled the name (log: $(cat "$LOG"))"
 fi
 
 

@@ -2211,8 +2211,9 @@ ${MISSING}"
   # run's conclusion (PATCH /check-runs/{id} → 403, GitHub-App-only) nor
   # re-request it (POST /check-runs/{id}/rerequest → 404 for Actions runs),
   # but CAN re-run the Actions job (POST /actions/jobs/{id}/rerun — verified
-  # #633). So when the head's newest gate run is completed AND red, re-run it
-  # here: the re-run re-reads the PR body live, so with the signed marker
+  # #633). So when the head's newest gate run is NOT in flight AND red (the
+  # allow-list polarity, below), re-run it here: the re-run re-reads the PR
+  # body live, so with the signed marker
   # present it replaces the stale red attempt with a fresh run (for GitHub
   # Actions the check-run id IS the job id). A newer SUCCESS for the name is
   # the normal green end-state (no rerun — would just churn Actions jobs); a
@@ -2220,7 +2221,9 @@ ${MISSING}"
   # state is unresolvable by design and a rerun in the PR's concurrency group
   # could cancel the real head's in-flight gate run). The gate's check-run
   # name is repo-specific — override AI_REVIEW_GATE_CHECK_NAME for consumers
-  # that renamed their required check. Best-effort — NEVER fails the record.
+  # that renamed their required check. A check-run NAME is an arbitrary
+  # string: only leading/trailing padding is trimmed, INTERIOR whitespace is
+  # preserved (review finding 2). Best-effort — NEVER fails the record.
   #
   # GATED ON THE **SIGNED** MARKER (#633 review finding 3): `MARKER` carries
   # ` sig=<hmac>` iff a key signed it. An UNSIGNED marker (no
@@ -2232,9 +2235,13 @@ ${MISSING}"
     MARKER_PRESENT=1
   fi
   if [ "$MARKER_PRESENT" = "1" ] && [ "$FORCE_STALE" -ne 1 ]; then
-    # Normalize like the GATE_KEY read: a file/env override may carry stray
-    # whitespace that would silently zero out the name match.
-    GATE_CHECK="$(printf '%s' "${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}" | tr -d '[:space:]')"
+    # Trim only LEADING/TRAILING padding (#633 review finding 2). A check-run
+    # NAME is an arbitrary string, and `tr -d '[:space:]'` — correct for the
+    # HMAC key it was copied from — also deletes INTERIOR whitespace, silently
+    # zeroing every name that contains it (`python-ci / test` is a real name on
+    # this fleet). Interior whitespace is meaningful and must survive.
+    GATE_CHECK="${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}"
+    GATE_CHECK="$(printf '%s' "$GATE_CHECK" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     : "${GATE_CHECK:=ai-review-gate}"
     NEWEST_RED_ID=""
     # ⛔ THE TRANSPORT IS THE WHOLE BUG THIS FIX EXISTS FOR (#633 review
@@ -2243,31 +2250,44 @@ ${MISSING}"
     # parameterized call with no `-X GET` answers `404 Not Found`. That made
     # the `if` below FALSE on every production invocation, left NEWEST_RED_ID
     # empty, and turned the rerun into dead code while printing a false
-    # "gh/API failure" warning. Parameters therefore go in the QUERY STRING,
-    # exactly as the sibling readers do (target_head_red above,
-    # admin-merge.sh, atomic-land.sh, objective.py). The suite's gh stub models
-    # the method now, so a regression reddens it instead of passing silently.
+    # "gh/API failure" warning. So the read carries an EXPLICIT `-X GET`; the
+    # suite's gh stub models the method now, so a regression reddens it instead
+    # of passing silently. Parameters go through `-f` (NOT a hand-built query
+    # string) so gh PERCENT-ENCODES them: `check_name` is an arbitrary string,
+    # and a name with interior whitespace makes a raw query string malformed
+    # (measured: a literal space in the URL → PROTOCOL_ERROR, while
+    # `-X GET -f check_name='python-ci / test'` answers 200 — finding 2).
     # The commit check-runs payload is read RAW so a query failure is
     # distinguishable from "no red run" (the #405 convention: a transient
     # API failure must warn loudly and skip, never read as nothing-to-do).
     # The server-side check_name filter keeps the payload to the gate's own
     # runs (a commit can carry >100 check runs across a big CI matrix — an
     # unfiltered page could push the true newest gate run out of view).
-    if GATE_JSON="$(command gh api "repos/$REPO/commits/$SHA/check-runs?check_name=$GATE_CHECK&per_page=100&filter=all" 2>/dev/null)"; then
-      # Newest run for the gate check name across ALL statuses; remediate only
-      # when that newest run is COMPLETED and red (failure/cancelled/
-      # timed_out/action_required — success/skipped/neutral satisfy the
-      # required check). Demanding the newest run be completed is also the
-      # livelock guard: a queued/in_progress run (a rerun the remediation
-      # itself fired, or the `edited` run a fresh PATCH just started) is
-      # already re-evaluating the body, and re-running the older completed
+    if GATE_JSON="$(command gh api -X GET "repos/$REPO/commits/$SHA/check-runs" -f check_name="$GATE_CHECK" -f per_page=100 -f filter=all 2>/dev/null)"; then
+      # Newest run for the gate check name across ALL statuses, then judge it
+      # by the repo's ALLOW-LIST POLARITY (#633 review finding 1; AGENTS.md
+      # §"Reading verification state" step 4, and the same predicate
+      # target_head_red above already uses). Only success/neutral/skipped are
+      # green and cancelled/stale are non-red; EVERY OTHER conclusion is RED —
+      # including one GitHub has not documented and a null one. A closed
+      # red-list (failure/cancelled/timed_out/action_required) read an
+      # unrecognised or null conclusion as "not red AND not suspicious" — no
+      # rerun and no warning, the silent no-op #633 exists to close.
+      #
+      # "In flight" is the NAMED set only. A queued/in_progress run (a rerun
+      # the remediation itself fired, or the `edited` run a fresh PATCH just
+      # started) is already re-evaluating the body, and re-running the older
       # red behind it would start a second job whose per-PR cancel-in-progress
-      # cancels the in-flight fresh run — forever. The local name filter is a
-      # belt over the server filter, and $gate arrives via --arg — no
-      # jq-program interpolation.
+      # cancels the in-flight fresh run — forever. An unrecognised STATUS is
+      # NOT in that set: it falls through to the conclusion, and a null
+      # conclusion is RED, exactly as target_head_red decides it (gating on
+      # "no conclusion" is the #1353 fail-open). `select(. != null)` keeps an
+      # empty gate-name match from minting a literal `null` id. The local name
+      # filter is a belt over the server filter, and $gate arrives via --arg —
+      # no jq-program interpolation.
       if ! NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
         | jq -r --arg gate "$GATE_CHECK" \
-          '[.check_runs[] | select(.name == $gate)] | sort_by(.id) | reverse | .[0] | select(.status == "completed") | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out" or .conclusion == "action_required") | .id' \
+          '[.check_runs[] | select(.name == $gate)] | sort_by(.id) | reverse | .[0] | select(. != null) | select(.status != "queued" and .status != "in_progress" and .status != "waiting" and .status != "requested" and .status != "pending") | select((.conclusion // "") as $c | ($c != "success" and $c != "neutral" and $c != "skipped" and $c != "cancelled" and $c != "stale")) | .id' \
       )"; then
         # A gh-200 whose body fails the jq stage is its own failure class
         # (payload shape change, broken jq) — warn loudly, never read as
