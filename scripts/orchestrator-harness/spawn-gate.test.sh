@@ -35,7 +35,7 @@ ck "spawn-gate.sh exists and parses" $rc
 # A `run_agent` that a caller never received is worse than none: an unset function is a 127 at the
 # SPAWN SITE, not a load-time error, so a caller must FAIL LOUD when the helper is absent rather
 # than carry on ungated. Assert the guard, not merely the source line.
-for f in lane.sh fix-one.sh; do
+for f in lane.sh merge-one.sh fix-one.sh; do
   grep -q '\. "\$SELF/spawn-gate.sh" ||' "$HERE/$f"; rc=$?
   ck "$f refuses to run when spawn-gate.sh is missing (fail loud, not 127 at the spawn)" $rc
 done
@@ -45,7 +45,7 @@ done
 # `run_agent` undefined and a 127 at the SPAWN SITE — would ship green. So drive it: copy each caller
 # into a scratch dir with NO helper beside it and require the loud, non-zero refusal.
 NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
-cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
+cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$HERE/merge-one.sh" "$NX/"
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
 # A here-string, NOT `printf | grep -q`: `grep -q` exits on first match, `printf` takes SIGPIPE, and
 # under `pipefail` the pipeline returns 141 — so the idiom reads as "no match" ON A MATCH, which is
@@ -57,11 +57,16 @@ ck "lane.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven,
 out="$( ( cd "$NX" && O="$NX/O" bash "$NX/fix-one.sh" "$NX" daniel-ospina/agent-infra 7 work ) 2>&1 )"; nrc=$?
 { [ "$nrc" -eq 78 ] && grep -q 'FATAL' <<<"$out"; }; rc=$?
 ck "fix-one.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
+# merge-one.sh takes FOUR positional args too, and its PR-numeric guard fires (exit 1) before the
+# source line if PR is non-numeric — so pass a valid argv and require the SOURCE-LINE refusal.
+out="$( ( cd "$NX" && O="$NX/O" bash "$NX/merge-one.sh" "$NX" daniel-ospina/agent-infra 7 work ) 2>&1 )"; nrc=$?
+{ [ "$nrc" -eq 78 ] && grep -q 'FATAL' <<<"$out"; }; rc=$?
+ck "merge-one.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
 
 # ⛔ SOURCED AFTER `export PATH`. spawn-gate.sh resolves `_NCPU` at SOURCE time through
 # sysctl/nproc/getconf, so a caller that sources it above its PATH export pins _NCPU=4 and
 # MAX_LOAD=40 on every cell — the #1702 failure the portable probe exists to prevent.
-for f in lane.sh fix-one.sh; do
+for f in lane.sh merge-one.sh fix-one.sh; do
   src="$(grep -n 'spawn-gate.sh"' "$HERE/$f" | head -1 | cut -d: -f1)"
   pexp="$(grep -n '^export PATH=' "$HERE/$f" | head -1 | cut -d: -f1)"
   if [ -n "$src" ] && [ -n "$pexp" ] && [ "$src" -gt "$pexp" ]; then rc=0; else rc=1; fi
@@ -119,10 +124,11 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
 # "Search"), and if it fails the set comes back empty and the EQUALITY below goes RED — fail-closed,
 # which is the right direction for a guard whose job is "no ungated launch path exists".
 ROOT="$(cd "$HERE/../.." && pwd)"
-# merge-one.sh is NOT ported here: it is owned by a concurrent lane (PR #1769/#1730). The assertion
-# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
-# pi-invoker — or a regression in either of these two — fails it.
-EXPECTED_PI="merge-one.sh spawn-gate.sh"
+# merge-one.sh NOW hosts the helper too: the last of the three duplicate `pi` call sites is routed
+# through spawn-gate.sh (agent-infra#1720), so it no longer invokes the model itself. The assertion
+# is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a SECOND
+# pi-invoker — or a regression that re-adds one to a caller — fails it.
+EXPECTED_PI="spawn-gate.sh"
 got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
@@ -133,14 +139,14 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # a 120 s provider REACHABILITY probe rather than a lane dispatch (see the harness README §6), so it
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
-EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
+EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/spawn-gate.sh"
 got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
 ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
-for f in lane.sh fix-one.sh; do
+for f in lane.sh merge-one.sh fix-one.sh; do
   if grep -qE '^run_agent\(\)' "$HERE/$f"; then rc=1; else rc=0; fi
   ck "$f no longer defines its own run_agent() (one copy, in the helper)" $rc
 done
