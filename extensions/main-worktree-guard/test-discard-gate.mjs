@@ -1044,17 +1044,32 @@ async function partB() {
     // A nested script that RUNS an expanded path (B13's last case).
     const outerExp = join(wt, "outer-1228.sh");
     write(outerExp, "bash ./undo-1228*.sh\n");
+    // A nested script that PIPES an expanded producer into a shell one level in
+    // (the pipe-inside-a-wrapper case review cycle 1 found still open).
+    const outerPipeExp = join(wt, "outer-pipe-1228.sh");
+    write(outerPipeExp, "bash -c 'cat ./undo-1228*.sh | bash'\n");
+    // A file whose CONTENT becomes a `-c` payload via `$(cat …)`.
+    const producerExp = join(wt, "producer-1228.sh");
+    write(producerExp, "cat ./undo-1228*.sh | bash\n");
+    // A nested script whose own BODY is a bare pipeline (the line-ending case
+    // that defeated the consumer test before the producer scan trimmed it).
+    const outerBarePipeExp = join(wt, "outer-bare-pipe-1228.sh");
+    write(outerBarePipeExp, "cat ./undo-1228*.sh | bash\n");
+    // A script named BY a `-c` / `eval` payload whose own body runs an expanded
+    // path (the payload-text check cannot see inside the named file).
+    const outerGlobPayload = join(wt, "outer-glob-payload-1228.sh");
+    write(outerGlobPayload, "bash ./undo-1228*.sh\n");
     const blockReason1228 = (r) => String(r?.reason ?? "");
     const exp1228 = [
       ["control: literal `bash ./undo-1228.sh`", "bash ./undo-1228.sh", /#709/],
       ["control: literal `cat undo-1228.sh | bash`", "cat undo-1228.sh | bash", /#709/],
-      ["glob `bash ./undo-1228*.sh`", "bash ./undo-1228*.sh", /expanded by the shell at runtime/],
-      ["char-class `bash ./undo-1228-[g]lob.sh`", "bash ./undo-1228-[g]lob.sh", /expanded by the shell at runtime/],
-      ["brace `bash ./undo-1228{-glob,}.sh`", "bash ./undo-1228{-glob,}.sh", /expanded by the shell at runtime/],
-      ["tilde `bash ~/undo-1228.sh`", "bash ~/undo-1228.sh", /expanded by the shell at runtime/],
-      ["extglob via `bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'` (the reachable form)", "bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'", /expanded by the shell at runtime/],
-      ["direct `./undo-1228*.sh`", "./undo-1228*.sh", /expanded by the shell at runtime/],
-      ["direct `~/undo-1228.sh`", "~/undo-1228.sh", /expanded by the shell at runtime/],
+      ["glob `bash ./undo-1228*.sh`", "bash ./undo-1228*.sh", /not statically resolvable/],
+      ["char-class `bash ./undo-1228-[g]lob.sh`", "bash ./undo-1228-[g]lob.sh", /not statically resolvable/],
+      ["brace `bash ./undo-1228{-glob,}.sh`", "bash ./undo-1228{-glob,}.sh", /not statically resolvable/],
+      ["tilde `bash ~/undo-1228.sh`", "bash ~/undo-1228.sh", /not statically resolvable/],
+      ["extglob via `bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'` (the reachable form)", "bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'", /not statically resolvable/],
+      ["direct `./undo-1228*.sh`", "./undo-1228*.sh", /not statically resolvable/],
+      ["direct `~/undo-1228.sh`", "~/undo-1228.sh", /not statically resolvable/],
       ["direct static relative `sub-1228/undo.sh` (executable, previously unread)", "sub-1228/undo.sh", /#709/],
       ["pipe glob `cat ./undo-1228*.sh | bash`", "cat ./undo-1228*.sh | bash", /piped producer/],
       ["pipe char-class `cat ./undo-1228-[g]lob.sh | bash`", "cat ./undo-1228-[g]lob.sh | bash", /piped producer/],
@@ -1062,10 +1077,27 @@ async function partB() {
       // #1228 — the SAME expanded path behind the indirection wrappers the
       // walk also reads (`-c` payload, `eval` payload, nested script). These
       // are ordinary agent shapes; each was a one-level-in fail-open.
-      ["interpreter `-c` payload `bash -c 'bash ./undo-1228*.sh'`", "bash -c 'bash ./undo-1228*.sh'", /expanded by the shell at runtime/],
-      ["interpreter `-c` payload `sh -c 'source ./undo-1228*.sh'`", "sh -c 'source ./undo-1228*.sh'", /expanded by the shell at runtime/],
-      ["`eval` payload `eval 'bash ./undo-1228*.sh'`", "eval 'bash ./undo-1228*.sh'", /expanded by the shell at runtime/],
-      ["nested script runs an expanded path (`bash ./outer-1228.sh`)", "bash ./outer-1228.sh", /expanded by the shell at runtime/],
+      ["interpreter `-c` payload `bash -c 'bash ./undo-1228*.sh'`", "bash -c 'bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["interpreter `-c` payload `sh -c 'source ./undo-1228*.sh'`", "sh -c 'source ./undo-1228*.sh'", /not statically resolvable/],
+      ["`eval` payload `eval 'bash ./undo-1228*.sh'`", "eval 'bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["nested script runs an expanded path (`bash ./outer-1228.sh`)", "bash ./outer-1228.sh", /not statically resolvable/],
+      // #1228 review cycle 1 — the piped-producer form is ALSO reachable one
+      // level in. The first cut checked it only at the TOP level, so
+      // `bash -c 'cat ./undo*.sh | bash'` (and the `eval` / nested-script
+      // equivalents) still ALLOWED while destroying the tree. Each row below
+      // was reproduced as ALLOW+destroy on the pre-fix head.
+      ["bare `?` glob `bash ./undo-1228?.sh`", "bash ./undo-1228?.sh", /not statically resolvable/],
+      ["pipe glob inside `-c` payload `bash -c 'cat ./undo-1228*.sh | bash'`", "bash -c 'cat ./undo-1228*.sh | bash'", /piped producer/],
+      ["pipe char-class inside `-c` payload `sh -c 'cat ./undo-1228-[g]lob.sh | bash'`", "sh -c 'cat ./undo-1228-[g]lob.sh | bash'", /piped producer/],
+      ["pipe variable inside `-c` payload `bash -c 'F=./undo-1228.sh; cat $F | bash'`", "bash -c 'F=./undo-1228.sh; cat $F | bash'", /piped producer/],
+      ["pipe tilde inside `eval` payload `eval 'cat ~/undo-1228.sh | bash'`", "eval 'cat ~/undo-1228.sh | bash'", /piped producer/],
+      ["nested script pipes an expanded path (`bash ./outer-pipe-1228.sh`)", "bash ./outer-pipe-1228.sh", /piped producer/],
+      ["nested script BODY is a bare pipe (`bash ./outer-bare-pipe-1228.sh`)", "bash ./outer-bare-pipe-1228.sh", /piped producer/],
+      ["variable-resolved `-c` payload `S='cat ./undo-1228*.sh | bash'; bash -c \"$S\"`", "S='cat ./undo-1228*.sh | bash'; bash -c \"$S\"", /piped producer/],
+      ["`$(cat FILE)` payload whose file pipes an expanded path", "bash -c \"$(cat ./producer-1228.sh)\"", /piped producer/],
+      ["variable-resolved `eval` payload `P='cat ./undo-1228*.sh | bash'; eval \"$P\"`", "P='cat ./undo-1228*.sh | bash'; eval \"$P\"", /piped producer/],
+      ["nested script named by a `-c` payload (`bash -c 'bash ./outer-glob-payload-1228.sh'`)", "bash -c 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
+      ["nested script named by an `eval` payload (`eval 'bash ./outer-glob-payload-1228.sh'`)", "eval 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
     ];
     for (const [why, cmd, reasonRe] of exp1228) {
       write(join(wt, "dirty.txt"), "MUTANT\n");
@@ -1089,8 +1121,35 @@ async function partB() {
     // allowed (the arm must not fail closed on every pipe into a shell).
     expectTrue("B13: `printf 'hello\\n' | bash` ALLOWED (no expansion, no discard)",
       allowed(await bash("printf 'hello\\n' | bash", wt)), "was blocked");
+    // Regression control (review cycle-1 P2): the extglob raw-word scan must
+    // NOT refuse a non-script command whose ARGUMENT carries an extglob
+    // operator. All three were ALLOWED before #1228 and were blocked by its
+    // first cut, which scanned every word of every command.
+    for (const cmd of ["git add src/@(a|b).ts", "rg -n 'foo' src/@(a|b).ts", "find . -path '*/@(a|b)/*'", "python3 -c \"print(1/2*(3+4))\"", "node -e 'const x=a/b*(c)'", "awk 'BEGIN{print 1/2*(3)}' f"]) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      expectTrue(`B13: non-script extglob/arith argument ALLOWED — ${cmd}`, allowed(await bash(cmd, wt)), "was blocked");
+    }
+    // The refusal must name the OBSERVED text and HEDGE the runtime expansion:
+    // a QUOTED metachar path is not expanded by the shell, so asserting "is
+    // expanded by the shell at runtime" is a claim the guard cannot observe
+    // (#1229/#1210). Pins the reworded reason.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const quotedGlob = await bash("bash './undo-1228*.sh'", wt);
+    expectTrue("B13: quoted metachar path BLOCKED with a HEDGED reason (no unobserved expansion claim)",
+      blocked(quotedGlob) && /not statically resolvable/.test(blockReason1228(quotedGlob)) &&
+        !/is expanded by the shell at runtime/.test(blockReason1228(quotedGlob)),
+      `reason=${JSON.stringify(blockReason1228(quotedGlob)).slice(0, 240)}`);
+    // Documented fail-closed cost (review cycle-1 P3): the piped-producer arm
+    // cannot tell a producer token that names the piped FILE from one that names
+    // a PATTERN argument, so `grep '<glob-regex>' file | bash` is refused.
+    // Narrowing it to path-like tokens would REOPEN the measured
+    // `cat undo-[12].sh | bash` bypass (no `/` in the token), so the over-block
+    // stands. Pinned here so it is a recorded cost, not a silent one.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13: `grep -n 'foo*' file | bash` BLOCKED (documented producer-token over-block)",
+      blocked(await bash("grep -n 'foo*' file | bash", wt)), "was allowed");
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
-    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp]) rmSync(f, { force: true });
+    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp, outerPipeExp, producerExp, outerBarePipeExp, outerGlobPayload]) rmSync(f, { force: true });
 
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
