@@ -304,12 +304,18 @@ salvage() {
       "??")
         # #854: `.worktrees/` is the isolated-worktree CONTAINER, not work
         # product. It is untracked exactly when it is not gitignored (the state
-        # this script already warns about), and a collapsed porcelain record
-        # names the whole directory — so it is never captured (a copy would
-        # carry sibling sessions' uncommitted trees, and the push would publish
-        # them) and the cleanup pass refuses it by the same rule.
+        # this script already warns about), so it is never captured (a copy
+        # would carry sibling sessions' uncommitted trees, and the push would
+        # publish them) and the cleanup pass refuses it by the same rule.
+        # MATCH EVERY FORM THE PATH CAN ARRIVE IN: this loop reads porcelain
+        # with `--untracked-files=all`, so a sibling worktree arrives as
+        # `.worktrees/<name>/` — NEVER as bare `.worktrees/`. An exact-path
+        # match therefore misses it and the capture pass copies the sibling
+        # worktree (git records it as an embedded repo / gitlink) onto the
+        # salvage branch. `.worktrees/*` also covers `.worktrees/` (`*` may be
+        # empty), so the container form stays matched.
         case "$rest" in
-          .worktrees|.worktrees/)
+          .worktrees|.worktrees/*)
             echo "   ⏭  .worktrees/ (isolated-worktree container — not captured): add '.worktrees/' to $MAIN_REPO/.gitignore" >&2
             skipped_junk=$((skipped_junk + 1)); continue
             ;;
@@ -442,13 +448,18 @@ salvage() {
         esac
         # #854: `.worktrees/` is the container of every ISOLATED worktree in
         # this repo. It appears as untracked exactly when `.worktrees/` is NOT
-        # gitignored — the state this script already warns about — and the
-        # collapsed porcelain record is the whole DIRECTORY, so `rm -rf` would
-        # take every sibling session's live worktree (and everything
+        # gitignored — the state this script already warns about — and `rm -rf`
+        # would take every sibling session's live worktree (and everything
         # uncommitted in it) with it, naming no worktree at all. That is not a
         # cleanup, it is the loss this pass exists to make impossible.
+        # MATCH EVERY FORM: this loop reads porcelain WITHOUT an explicit
+        # `--untracked-files`, so the user's `status.showUntrackedFiles=all`
+        # config decides the shape — under it a sibling arrives as
+        # `.worktrees/<name>/` and an exact-path match lets `rm -rf` delete the
+        # live worktree. `.worktrees/*` covers `.worktrees/` (`*` may be
+        # empty), so the collapsed form stays matched too.
         case "$rest" in
-          .worktrees|.worktrees/)
+          .worktrees|.worktrees/*)
             echo "   ⛔ NOT removed: $rest is the isolated-worktree container — add '.worktrees/' to $MAIN_REPO/.gitignore (a sibling worktree's uncommitted work lives in it)" >&2
             UNCLEANED_PATHS+=("$rest"); uncleaned=$((uncleaned + 1)); continue
             ;;

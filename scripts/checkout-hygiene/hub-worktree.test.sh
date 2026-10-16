@@ -197,16 +197,22 @@ case "$out" in *"hub cleanup REVERSED"*) bad "#854: clean hub emitted a reversal
 
 # ── 6c. #854: the untracked sweep must NOT take `.worktrees/` ──────────
 # `.worktrees/` appears as an untracked DIRECTORY whenever it is not
-# gitignored, and the collapsed porcelain record names the container, not the
-# worktree — so an unguarded `rm -rf` destroys every sibling session's live
+# gitignored, so an unguarded `rm -rf` destroys every sibling session's live
 # worktree, and the paths are never named. Pin the guard with a sibling
 # worktree holding an uncommitted edit.
+# `status.showUntrackedFiles=all` is set deliberately: it is the user config
+# under which the sweep's porcelain arrives as `.worktrees/<name>/` instead of
+# the collapsed `.worktrees/`, so a guard matching only the container path
+# fails OPEN and deletes the sibling worktree (and, on the capture side,
+# publishes it to the salvage branch as an embedded-repo gitlink). Both guards
+# must match every form the path can arrive in.
 REPO854B="$REAL_FIX/repo854b"
 ORIGIN854B="$REAL_FIX/origin854b.git"
 git init -q --bare -b main "$ORIGIN854B"
 git init -q -b main "$REPO854B"
 git -C "$REPO854B" config user.email t@t
 git -C "$REPO854B" config user.name t
+git -C "$REPO854B" config status.showUntrackedFiles all
 echo a > "$REPO854B/a.txt"
 git -C "$REPO854B" add . && git -C "$REPO854B" commit -qm init
 git -C "$REPO854B" remote add origin "$ORIGIN854B"
@@ -219,6 +225,15 @@ assert_eq "$rc" 1 "#854: a hub whose .worktrees is not gitignored does NOT repor
 assert_contains "$out" "is the isolated-worktree container" "#854: the refusal names the .worktrees container"
 if [ -e "$REPO854B/.worktrees/sibling/a.txt" ]; then ok "#854: the sibling worktree SURVIVED the sweep"; else bad "#854: the sibling worktree was DELETED"; fi
 grep -q "sibling-uncommitted" "$REPO854B/.worktrees/sibling/a.txt" 2>/dev/null && ok "#854: the sibling's uncommitted edit survived" || bad "#854: the sibling's uncommitted edit was destroyed"
+# The capture pass must not put the container on the salvage branch either:
+# with `--untracked-files=all` the pre-existing sibling arrives as
+# `.worktrees/sibling/`, and copying it makes git record an embedded-repo
+# gitlink on the branch the PR is opened from.
+if git -C "$ORIGIN854B" ls-tree -r --name-only feat/salvage-854b 2>/dev/null | grep -q '^\.worktrees'; then
+  bad "#854: the salvage branch CAPTURED the .worktrees container (sibling worktree)"
+else
+  ok "#854: the salvage branch carries no .worktrees path"
+fi
 
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
