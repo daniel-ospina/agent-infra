@@ -216,7 +216,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T23 with 30 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T24 with 31 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -277,7 +277,11 @@ verdict.
    live**. Instead `gather` falls back to `tool_from_jsonl`, which derives the in-flight tool from
    the transcript this module **already reads** for its turn boundary: an assistant message carrying
    tool calls with no `toolResult` after it **is** a tool in flight, and its entry timestamp dates
-   the call. Positive control over the **300 most recently modified** lane transcripts: **31–37
+   the call. The one OPEN shape that is NOT in flight is a `length`-truncated message: pi FAILS
+   its calls (`failToolCallsFromTruncatedMessage`, all 78 measured results `isError: true`), so
+   the derivation abstains there and the lane keeps the honest `wedged` verdict rather than being
+   held quiet to the 4 h backstop by a phantom tool (#5389 review P2). Positive control over the
+   **300 most recently modified** lane transcripts: **31–37
    carried a derivable in-flight tool** across repeated runs (`bash` and `task` dominate; `write`
    and `subagent` appear occasionally) where the record path supplies nothing. The corpus is live
    and written to continuously, so the exact integer moves run to run — the durable claim is the
@@ -402,7 +406,7 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 23 tests
+python3 tools/fleet/liveness.test.py               # 24 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```

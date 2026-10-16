@@ -144,6 +144,7 @@ __all__ = [
     "Evidence",
     "Verdict",
     "CALL_DISCARDING_STOP_REASONS",
+    "CALL_FAILED_STOP_REASONS",
     "TERMINAL_STOP_REASONS",
     "tool_stall_ms",
     "cpu_attributable",
@@ -199,6 +200,19 @@ NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
 # still-running turn read `turn-ended` — the #1254 fail-open shape, aimed at
 # the classifier itself.
 CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})
+# #5389 review (cycle 4, P2): the stop reasons under which pi FAILS a truncated
+# message's tool calls instead of executing them. `length` is OPEN — the loop
+# continues and awaits the turn's next step (see the measurement above) — but it
+# is NOT in flight: all 78 measured results after a `length`+calls message carry
+# `isError: true` ("Tool call ... was not executed"). Openness and in-flight-ness
+# are DIFFERENT conditions for this shape, so the transcript-derived veto must
+# abstain: a phantom tool would hold the lane `running-quiet/tool-in-flight` to
+# the 4 h AGE backstop where the watchdog's zero-tool `stream-stall` cuts at S,
+# i.e. the classifier standing quiet where the watchdog cut (the fail-open
+# divergence docs/ops/fleet-liveness.md §6 forbids). Do NOT fold this into
+# `CALL_DISCARDING_STOP_REASONS`: `length` leaves the turn OPEN (T18 pins that),
+# and only the VETO abstains.
+CALL_FAILED_STOP_REASONS = frozenset({"length"})
 # #1272: the stop reasons on a CALL-FREE message under which pi ENDS the turn.
 # `stop` and `length` end a completed turn; `error` and `aborted` END THE AGENT
 # RUN outright — pi's loop returns before any tool batch
@@ -1124,7 +1138,10 @@ def tool_from_jsonl(
     Returns None — never a zeroed Tool — when the tail shows no in-flight tool:
     a ``None`` veto and an empty one are different claims, and manufacturing the
     empty one would assert "no tool is running" from a transcript this parser
-    simply could not read.
+    simply could not read. A ``length``-truncated message is one such shape on
+    the OTHER side of the boundary: it is OPEN (pi continues the turn) but its
+    calls were FAILED, not executed, so it asserts no tool either — see
+    ``CALL_FAILED_STOP_REASONS`` (#5389 review, cycle 4, P2).
     """
     if not path:
         return None
@@ -1146,6 +1163,13 @@ def tool_from_jsonl(
     # in-flight tool (`turn_from_entry` decides the same way, so the veto and
     # the boundary cannot disagree about whether this message is open).
     if msg.get("stopReason") in CALL_DISCARDING_STOP_REASONS:
+        return None
+    # #5389 review (cycle 4, P2): `length` FAILS the truncated message's calls
+    # (`failToolCallsFromTruncatedMessage`) while the turn stays OPEN. The veto
+    # is about a tool EXECUTING, and no call here is — asserting one would
+    # suppress the honest `wedged` verdict for a lane pi hung on immediately
+    # after truncating.
+    if msg.get("stopReason") in CALL_FAILED_STOP_REASONS:
         return None
     # The transcript's OWN mtime, read once and used for BOTH bounds below. It
     # is a genuine lower bound on the call's age: the file is written at or

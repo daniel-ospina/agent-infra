@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty-three tests with thirty paired mutations: every mutation re-
+Twenty-four tests with thirty-one paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the twenty-three (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the twenty-four (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,7 +17,7 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 23 tests, green
+    python3 tools/fleet/liveness.test.py                # the 24 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -1197,6 +1197,80 @@ def t23_false_cut_reproduced():
         shutil.rmtree(d, ignore_errors=True)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# T24 — #5389 review (cycle 4, P2). A `length`-truncated assistant message
+# carrying tool calls is an OPEN turn whose calls pi has ALREADY FAILED
+# (`failToolCallsFromTruncatedMessage`; all 78 measured results after a
+# `length`+calls message carry `isError: true`, "Tool call ... was not
+# executed"). OPEN and IN FLIGHT are different conditions for this shape: the
+# turn is open, but no tool is running. The transcript-derived veto must not
+# manufacture one from the truncated message, or the lane stands quiet
+# (`running-quiet/tool-in-flight`, held to the 4 h age backstop) where the
+# watchdog's zero-tool `stream-stall` cut at S = 20 min — the fail-open
+# divergence `docs/ops/fleet-liveness.md` §6 forbids. T18 pins the OPEN half;
+# this pins the veto half, so the two can never be conflated again.
+# ═══════════════════════════════════════════════════════════════════
+@test("T24 a `length`-truncated call is OPEN but NOT in flight: no phantom tool veto (#5389 P2)")
+def t24_length_truncated_call_is_not_a_tool():
+    d = tempfile.mkdtemp(prefix="liv-length-")
+    try:
+        path = os.path.join(d, "session.jsonl")
+        frozen = NOW_MS - 21 * M  # past S=20min, inside the 4h backstop
+
+        def real(role, ts_ms, **msg):
+            base = {"role": role}
+            base.update(msg)
+            return {"type": "message", "id": "e", "parentId": None,
+                    "timestamp": _iso(ts_ms), "message": base}
+
+        # pi's `length` truncation FAILS the message's calls; the turn continues.
+        write_entries = [real("assistant", frozen, stopReason="length",
+                             content=[{"type": "toolCall", "name": "bash",
+                                       "id": "call_LEN"}])]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in write_entries) + "\n")
+        os.utime(path, (frozen / 1000.0, frozen / 1000.0))
+
+        # (a) The turn boundary still reads OPEN, exactly as T18 pins it.
+        turn = liv.turn_from_jsonl(path)
+        check(turn is not None and turn.stalled is True
+              and turn.reason == "turn-open:pending-tool-call",
+              "a `length`+calls turn is still OPEN; got %s" % turn)
+
+        # (b) ... but NO tool is in flight: pi failed the calls, so the veto
+        #     abstains rather than manufacturing a tool from the truncation.
+        check(liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M) is None,
+              "a `length`-FAILED call is not an in-flight tool; the veto must not "
+              "manufacture one from a truncated message")
+
+        # (c) End to end: a frozen, fenced, OPEN length-truncated lane is WEDGED
+        #     at S (the watchdog's zero-tool `stream-stall`), never held quiet to
+        #     the 4h backstop by a phantom veto.
+        tool = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        e = ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=turn,
+               tool=tool)
+        v = liv.evaluate(e)
+        check(v.state == "wedged" and v.reason == "turn-open:pending-tool-call",
+              "a phantom veto must not suppress the honest `wedged` verdict; got %s/%s"
+              % (v.state, v.reason))
+        check("call_LEN" in v.detail,
+              "the wedged row names the open (failed) call; got %r" % v.detail)
+
+        # (d) The sibling case is unchanged: `toolUse` IS in flight (T23's
+        #     shape), so this test cannot pass by disabling the derivation.
+        write_entries = [real("assistant", frozen, stopReason="toolUse",
+                             content=[{"type": "toolCall", "name": "bash",
+                                       "id": "call_FLY"}])]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in write_entries) + "\n")
+        os.utime(path, (frozen / 1000.0, frozen / 1000.0))
+        flying = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        check(flying is not None and flying.tools_in_flight == 1,
+              "a `toolUse` call is still derived as in flight; got %s" % flying)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -1425,6 +1499,14 @@ MUTATIONS = [
         '        tool = None\n',
         "the #5389 (a) wiring is removed: no store record carries the fields (0 of 1011), so the "
         "veto is dead again and a lane inside one long read reads `wedged`",
+    ),
+    Mutation(
+        "T24", "module",
+        '    if msg.get("stopReason") in CALL_FAILED_STOP_REASONS:\n        return None\n',
+        '',
+        "a `length`-truncated message's calls are treated as still in flight, so the veto "
+        "manufactures a tool pi already FAILED and the lane stands quiet past S where the "
+        "watchdog's zero-tool `stream-stall` cut (#5389 review P2)",
     ),
 ]
 
