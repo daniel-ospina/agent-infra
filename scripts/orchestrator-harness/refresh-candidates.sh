@@ -528,13 +528,23 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and every worker the harness ran was a P2 (#8465). The tier is a RANK, not a label.
 # Dedupe on the NUMBER, keeping the lowest tier: the sort already put an issue's best tier first, so
 # `!seen[$2]++` drops the later, weaker duplicate rather than letting one issue occupy two slots.
+# ⛔ EACH QUERY RECORDS ITS OWN FAILURE, so a partial listing is detected too. Depending on the
+# pipeline's status cannot work — the group reports only its LAST command's, and `pipefail` would not
+# fix it — and a re-read of the listing is NOT the same question: this pipeline's queries carry
+# `--label` and a `--jq`, so a failure confined to those succeeds on a plain re-read. Measured: a
+# broken `--jq` fails the pool query while `gh issue list … --json number` still exits 0, and one
+# failing tier with another returning rows leaves `.pool` NON-EMPTY — so an emptiness test never fires
+# and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
+# inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
+# pipeline's subshell, so the parent sees it.
+rm -f "$O/.pool-err"
 {
   gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>/dev/null
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err" || echo "P0-blocker" >> "$O/.pool-err"
   gh issue list --repo "$OR" --state open --limit 200 --label P1-severe --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>/dev/null
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err" || echo "P1-severe" >> "$O/.pool-err"
   gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>/dev/null
+    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err" || echo "P2-moderate" >> "$O/.pool-err"
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 
 # ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE. A present-but-EMPTY `.pool` is a legitimate answer (no
@@ -542,19 +552,15 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # create it, the pool was never persisted and everything below reads a backlog that does not exist.
 [ -f "$O/.pool" ] || { echo "[refresh] ABORT: $O is not writable — the candidate pool was not written"; exit "$EXIT_TRANSIENT"; }
 
-# ⛔ AN UNREADABLE POOL IS NOT AN EMPTY POOL — the same rule the open-issue listing above enforces.
-# The three queries above run inside a group whose status this pipeline DISCARDS, and each hides its
-# own reason behind `2>/dev/null`, so a listing that fails comes out as `checked 0; backlog now 0` at
-# rc 0 — the merge-only cell this whole gate exists to catch, certified by the gate itself (#1853
-# review). The probe above names only the host a host-LESS call resolves, while this listing names
-# `$OR` directly, so a host-qualified `$OR` is exactly the case the probe cannot cover. Re-read the
-# listing directly, so an empty pool is only believed when `$OR` is actually readable. TRANSIENT on
-# purpose: this says nothing about WHICH host failed, and a marker only a human can clear must not be
-# latched on a guess.
-if [ ! -s "$O/.pool" ] && ! gh issue list --repo "$OR" --state open --limit 1 --json number >/dev/null 2>&1; then
-  echo "[refresh] ABORT: $OR could not be READ, so an empty candidate pool is not an empty backlog — the pool listing above failed silently (#1736)"
+# ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
+# WHICH host would come back, and a marker only a human can clear must not be latched on a guess.
+if [ -s "$O/.pool-err" ]; then
+  echo "[refresh] ABORT: the candidate pool listing FAILED for $(grep -oE 'P[012]-[a-z]+' "$O/.pool-err" | tr '\n' ' ')— a partial pool is not a backlog (#1736)"
+  sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
+  rm -f "$O/.pool-err"
   exit "$EXIT_TRANSIENT"
 fi
+rm -f "$O/.pool-err"
 
 n=0
 # `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,

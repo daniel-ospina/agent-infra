@@ -437,12 +437,11 @@ grep -q 'auth token' "$D/gh-log" 2>/dev/null \
   || bad "GHES host: gh was never asked for a credential — '$(tr '\n' ' ' < "$D/gh-log" 2>/dev/null)'"
 
 # ── an unreadable pool listing is NOT an empty backlog ───────────────────────────────────────────
-# The three pool queries run in a group whose status the pipeline discards, and each hides its reason
-# behind `2>/dev/null` — so a listing that fails (a host-qualified `$OR` on a host with no credential
-# is the case the host probe above cannot name) reached the summary as `checked 0; backlog now 0` at
-# rc 0: a merge-only cell reporting a healthy empty queue (#1853 review). It must abort LOUDLY and
-# TRANSIENTLY: nothing here knows which host failed, so it must not latch the marker only a human can
-# clear.
+# Each pool query records its OWN failure, so the abort fires whether the pool came out empty or NOT.
+# The partial case below is the one a mere emptiness test misses: one tier's query fails while another
+# returns rows, leaving a non-empty pool that silently drops a whole priority tier — the #8465
+# priority inversion. Both shapes must abort LOUDLY and TRANSIENTLY: nothing here knows which host
+# would come back, and a marker only a human can clear must not be latched on a guess (#1853 review).
 echo; echo "── an unreadable pool listing is not an empty backlog ──"
 mk_case pool-unreadable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -460,12 +459,47 @@ rf "$D" refresh
 [ "$RC" -eq 1 ] && ok "unreadable pool: rc=1 (TRANSIENT — the ambiguous case never latches the permanent marker)" \
                || bad "unreadable pool: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
-  *"could not be READ"*) ok "unreadable pool: the abort is LOUD and says the listing failed" ;;
+  *"candidate pool listing FAILED"*) ok "unreadable pool: the abort is LOUD and says the listing failed" ;;
   *) bad "unreadable pool: no refusal — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"P0-blocker"*) ok "unreadable pool: the abort names WHICH tier could not be read" ;;
+  *) bad "unreadable pool: the abort does not name the tier — output: $OUT" ;;
 esac
 case "$OUT" in
   *"checked 0; backlog now"*) bad "unreadable pool: still reported a healthy empty backlog" ;;
   *) ok "unreadable pool: no \"checked N; backlog now 0\" over an unreadable pool" ;;
+esac
+
+# The PARTIAL shape: `.pool` is NON-EMPTY, so an emptiness test cannot see it.
+echo; echo "── a PARTIALLY read pool is not a backlog (one tier failed, another returned rows) ──"
+mk_case pool-partial
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token"*) exit 0 ;;
+  "issue list"*)
+    case "$*" in
+      *"--label P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
+      *"--label P1-severe"*) printf '1 4242\n' ;;
+    esac
+    exit 0 ;;
+esac
+printf '{"resources":{}}\n'
+exit 0
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "partial pool: rc=1 (TRANSIENT — a missing tier is not a short backlog)" \
+               || bad "partial pool: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"P0-blocker"*) ok "partial pool: the abort names the tier that failed" ;;
+  *) bad "partial pool: the abort does not name the failing tier — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"backlog now 1"*|*"+#4242"*) bad "partial pool: acted on a pool it could not read — output: $OUT" ;;
+  *) ok "partial pool: the readable tier's issue is NOT queued as if the pool were complete" ;;
 esac
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
