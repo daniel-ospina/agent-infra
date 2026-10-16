@@ -5414,6 +5414,11 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // RUNNER WORD be exempted as a value. Any assembled merge lands here.
         "V=--admin; PATH=/tmp/real:/usr/bin; sh -c gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V; gh issue comment 5 --body ok",
         "V=--admin; Z=ok R=sh CMD=gh$'\\x20'pr$'\\x20'merge$'\\x20'999$'\\x20'$V; PATH=/tmp/real:/usr/bin; $R -c \"$CMD\"; gh issue comment 5 --body ok",
+        // …and shape 19: the whole merge ASSEMBLED with bash's APPEND assignment and run from
+        // one, so no `gh`/`pr`/`merge`/`--admin` token ever appears — the command-position
+        // model knew only `NAME=`, not `NAME+=`/`NAME[i]=`, and the previous word's `=`
+        // laundered the command word into a value exemption.
+        "PATH=/tmp/real:/usr/bin CMD+=gh CMD+=' ' CMD+=pr CMD+=' ' CMD+=merge CMD+=' ' CMD+=999 CMD+=' ' V+=--admin CMD+=$V;A+=ok $CMD;gh api /repos/o/r --body admin",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5549,6 +5554,10 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     // supplies the read and only the command-position conjunct keeps the runner word from
     // being exempted as a `=`-bearing value.
     "gh pr view 1; Z=ok $R",
+    // …and shape 19: the same laundering through bash's APPEND and ARRAY assignment forms,
+    // which the command-position model did not recognise (`NAME+=`, `NAME[i]=`).
+    "gh pr view 1; A+=ok $CMD",
+    "gh pr view 1; A[0]=ok $CMD",
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }

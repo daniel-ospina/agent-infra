@@ -645,7 +645,13 @@ function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
     // and `-c` let `2>/dev/null "gh" pr merge 1 --admin` skip BOTH gates
     // (cycle-4 review P0-1).
     /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
-    /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
+    // An assignment prefix (`FOO=bar`, and bash's APPEND/ARRAY forms `FOO+=bar`, `FOO[0]=bar`)
+    // or a reserved word (`if`, `while`, ...) all put the next word in command position. The
+    // `+=`/`[i]=` forms were missing, so a construct in a genuine command position was
+    // laundered into a value when the previous word carried `=` (adversarial review, shape
+    // 19: `A+=ok $CMD` runs `$CMD`, and `CMD+=gh CMD+=pr …` assembles the whole merge with no
+    // readable gh/pr/merge token anywhere).
+    /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(prev) ||
     /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prevWord)
   );
 }
