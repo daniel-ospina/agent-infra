@@ -1395,6 +1395,40 @@ PY
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
+      # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
+      # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
+      # both arrive here. The claim IS the lock — pushing a root commit to `refs/claims/issue-<N>`
+      # is an atomic CAS, so exactly one box wins and the loser is told which owner holds it.
+      #
+      # ⛔ CLAIMED HERE, NOT IN dispatch-merge.sh, so the bookkeeping stays honest: a REFUSED issue
+      # is not appended to `dispatched.txt` and not put in `.batch`, so it stays in `candidates.txt`
+      # and is simply re-attempted next cycle — no blacklist for the reaper to undo, and no lane, no
+      # worktree and no chain spawned for work another box already owns.
+      #
+      # ⛔ BOTH REFUSALS STOP THE DISPATCH — INCLUDING THE INFRA ONE (rc=2). claims.sh fails OPEN on
+      # an unreachable remote for a PR claim, because refusing there costs one merge; here the safe
+      # reading is the opposite: an UNREADABLE registry is not evidence of freedom, and dispatching
+      # on it is the exact duplicate this issue exists to remove. The cost is bounded — the same
+      # outage fails the pre-flight's `gh` surfaces, so the cell is already stalled — and it is the
+      # polarity `claim_issue_preflight` takes on the read side.
+      #
+      # ⚠️ NO KILL-SWITCH. An ambient env var that turns this off is the "disable a gate by ambient
+      # env" shape (a bypass), so the fallback below is only for a registry that is genuinely not
+      # provisioned, and it says so in the log every time it is used.
+      if [ -f "$O/claims.sh" ] && declare -f claim_issue_acquire >/dev/null 2>&1; then
+        if claim_issue_acquire "" "$ISS"; then
+          # The commit this box pushed, for the FENCED release. Written only on a successful acquire,
+          # so a refusal can never leave a release path pointing at someone else's claim.
+          claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
+            || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
+        else
+          echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
+          continue
+        fi
+      else
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh (or it predates the issue key) — dispatching WITHOUT a cross-box claim" >> "$LOG"
+      fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$O/candidates.txt"
     if [ -s "$O/.batch" ]; then
