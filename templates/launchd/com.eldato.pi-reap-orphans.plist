@@ -13,8 +13,11 @@
          cheap HINT, never the test — the ancestry gate decides), a cwd that
          resolves to a DELETED directory (never "unreadable" — that
          is a different state and PRESERVES), CPU-time advancing by at least
-         REAP_ORPHAN_MIN_CPU_CENTISECONDS across the sample window, our uid, and
-         an elapsed floor. It signals SIGTERM, waits a grace period, then
+         REAP_ORPHAN_MIN_CPU_CENTISECONDS across the sample window, our uid, an
+         elapsed floor, and a start identity that still matches the one recorded
+         at snapshot B immediately before each signal (a mismatch, an unreadable
+         read, or no recorded identity PRESERVEs the candidate — never signalled).
+         It signals SIGTERM, waits a grace period, then
          SIGKILL, and treats an unevaluable post-signal probe as STILL ALIVE
          (never a false "REAPED").
          Scoped to SCRATCH cwd roots by default (/tmp, /private/tmp, $TMPDIR,

@@ -38,6 +38,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
+INFRA_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 PASS=0
 FAIL=0
@@ -387,7 +388,17 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "9" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate + pi-reap-orphans)"
+# #1863 F14: the two {{TORTOISE_REPO}}-gated jobs install IFF a tortoise checkout
+# resolves, and resolve_env AUTO-DETECTS one (env, ~/Documents/GitHub/tortoise,
+# INFRA_ROOT/../tortoise, ~/tortoise) even when TORTOISE_REPO is cleared. On a
+# box with a sibling checkout the count is 11, not 9, so the expectation is
+# DERIVED from this checkout + the fixture HOME rather than hard-coded. It stays
+# meaningful: a dropped base job (or an extra non-gated one) still moves the count.
+FIXTURE_TORTOISE=0
+for cand in "$HOME1/Documents/GitHub/tortoise" "$INFRA_ROOT/../tortoise" "$HOME1/tortoise"; do
+    if [ -d "$cand" ] && [ -d "$cand/.git" ]; then FIXTURE_TORTOISE=1; break; fi
+done
+assert_eq "$BOOTSTRAP_COUNT1" "$((9 + 2 * FIXTURE_TORTOISE))" "fresh install bootstraps every active job (9 base + the 2 {{TORTOISE_REPO}}-gated jobs when a tortoise checkout resolves)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

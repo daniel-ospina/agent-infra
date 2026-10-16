@@ -50,8 +50,10 @@
 #   flags / env validation   O20  (--help, unknown arg, bad numbers)
 #   verbose vs summary       O21  (non-verbose still reports exact counts)
 #   real reproduction        R1   (--repro only)
-#   identity binding (F11)   O27  (identity changed/unknown => PRESERVE, no
-#                                  signal; a stable identity still reaps)
+#   identity binding (F11/F12) O27 (snapshot-B identity table captured BEFORE lsof;
+#                                  a changed/absent identity => PRESERVE, no signal;
+#                                  a stable identity still reaps; F13 histogram
+#                                  and counters agree on the downgraded path)
 
 set -uo pipefail
 
@@ -95,14 +97,23 @@ cat >"$T/bin/ps" <<'SHIM'
 # IDENTITY probe: `ps -o lstart= -p PID`. Answered from FAKE_IDENT_SEQ (a
 # `|`-separated walk — lstart contains COLONS in its time field, so `:` cannot be
 # the delimiter; past the end the LAST value repeats) so a fixture can make a
-# pid's start identity CHANGE between classification and signal — the #1863 F11
-# regression. The literal token __EMPTY__ models an unevaluable read. This branch
-# runs BEFORE the snapshot walk so identity probes never consume a fixture table.
-# With no FAKE_IDENT_SEQ set the identity is STABLE, which is what the
-# pre-existing apply fixtures rely on.
+# pid's start identity CHANGE between snapshot B and the signal — the #1863 F11
+# regression. The literal token __EMPTY__ models an unevaluable read.
+# The SNAPSHOT-B IDENTITY TABLE (`ps -axo pid=,lstart=`, #1863 F12) is a distinct
+# call shape answered from FAKE_IDENT_TABLE (a fixture file of `pid lstart` rows)
+# or, when unset, synthesized from every pid in the fixture sequence with a STABLE
+# identity — which is what the pre-existing apply fixtures rely on. Both branches
+# run BEFORE the snapshot walk, so identity probes never consume a fixture table.
 for a in "$@"; do
     case "$a" in
-        *lstart*)
+        'pid=,lstart=')
+            if [ -n "${FAKE_IDENT_TABLE:-}" ]; then cat "$FAKE_IDENT_TABLE"; exit 0; fi
+            IFS=':' read -r -a ifiles <<<"${FAKE_PS_SEQ:-}"
+            for f in "${ifiles[@]}"; do
+                [ -f "$f" ] && awk '$1 ~ /^[0-9]+$/ { print $1, "Wed Oct 15 10:04:03 2025" }' "$f"
+            done | sort -u
+            exit 0 ;;
+        'lstart=')
             idx=0
             if [ -n "${FAKE_IDENT_COUNTER:-}" ]; then
                 idx="$(cat "$FAKE_IDENT_COUNTER" 2>/dev/null || printf 0)"
@@ -216,6 +227,9 @@ RUN_LOG=""
 RUN_KILL=""
 # Identity walk for the F11 fixtures; empty => the shim's STABLE default.
 RUN_IDENT_SEQ=""
+# Snapshot-B identity TABLE override (#1863 F12); empty => the shim synthesizes a
+# STABLE identity for every pid in the fixture sequence.
+RUN_IDENT_TABLE=""
 run_reaper() {
     local label="$1" ps_seq="$2" lsof_table="$3"; shift 3
     # These MUST be set OUTSIDE the command substitution below: assignments made
@@ -230,6 +244,7 @@ run_reaper() {
     out="$(
         FAKE_PS_SEQ="$ps_seq" FAKE_PS_COUNTER="$T/$label.counter" \
         FAKE_IDENT_SEQ="${RUN_IDENT_SEQ:-}" FAKE_IDENT_COUNTER="$T/$label.identcounter" \
+        FAKE_IDENT_TABLE="${RUN_IDENT_TABLE:-}" \
         FAKE_LSOF_TABLE="$lsof_table" FAKE_KILL_LOG="$RUN_KILL" \
         PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
         REAP_ORPHAN_STATE_DIR="$T/$label.state" REAP_ORPHAN_LOG="$RUN_LOG" \
@@ -679,49 +694,71 @@ else
     bad "O26 the mutation did not apply (human_anchor not rewritten) — the proof is void"
 fi
 
-# ── O27: the signal is bound to process identity (#1863 F11) ───────────
+# ── O27: the signal is bound to process identity (#1863 F11/F12) ───────
 # The observation→signal window spans the whole lsof pass, so a pid REUSED
-# between classification and signal must never be signalled. A pid whose start
-# identity changed (or could not be read) is PRESERVEd; a stable identity must
-# still reap, so the binding cannot disable the tool.
+# between snapshot B and the signal must never be signalled. The expected
+# identity is the one captured from snapshot B (BEFORE lsof); a fresh read
+# immediately before each signal must still match it. A pid whose identity
+# changed, or whose snapshot-B identity was never recorded, is PRESERVEd; a
+# stable identity must still reap, so the binding cannot disable the tool.
 echo "— O27: identity binding — a reused/changed pid is PRESERVED, never signalled —"
 DEADCWD27="$CWD_ROOT/gone27"; mkdir -p "$DEADCWD27"
 L27="$(lsof_fixture ls27 "$ORPH:$DEADCWD27")"
 rmdir "$DEADCWD27"
 IDENT_S="Wed Oct 15 10:04:03 2025"
 IDENT_C="Wed Oct 15 11:22:44 2025"
+# Snapshot-B identity table fixture (#1863 F12): one `pid identity` line.
+ident_table() { # <name> <pid> <identity>
+    printf '%s %s\n' "$2" "$3" >"$T/$1.ident"
+    printf '%s' "$T/$1.ident"
+}
 
 # O27a: STABLE identity still reaps (the binding must not disable the tool).
-RUN_IDENT_SEQ="$IDENT_S|$IDENT_S"
+RUN_IDENT_TABLE="$(ident_table o27a "$ORPH" "$IDENT_S")"
 OUT="$(run_reaper o27a "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
-RUN_IDENT_SEQ=""
+RUN_IDENT_TABLE=""
 assert_contains "$(kills o27a)" "-TERM $ORPH" "O27a a STABLE identity is still signalled (the binding does not disable the reap)"
 assert_contains "$OUT" "REAPED" "O27a ... and the reap completes"
 assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O27a ... exit 0"
 
-# O27b: identity changes before SIGTERM -> PRESERVE, NO signal at all.
-RUN_IDENT_SEQ="$IDENT_S|$IDENT_C"
+# O27b: identity changes before SIGTERM -> PRESERVE, NO signal at all, and
+# exactly ONE final reason — the histogram must NOT also carry `reapable` (F13).
+RUN_IDENT_TABLE="$(ident_table o27b "$ORPH" "$IDENT_S")"
+RUN_IDENT_SEQ="$IDENT_C"
 OUT="$(run_reaper o27b "$A:$B:$GONE" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
-RUN_IDENT_SEQ=""
+RUN_IDENT_TABLE=""; RUN_IDENT_SEQ=""
 assert_contains "$OUT" "identity-changed" "O27b a pid whose identity changed before SIGTERM is PRESERVED (reason named)"
 assert_nofile "$T/o27b.kills" "O27b ... and NO signal is delivered"
 assert_contains "$OUT" "reaped=0" "O27b ... nothing is reported reaped"
+assert_contains "$OUT" "reapable=0" "O27b ... and the summary counts ZERO reapable"
+# F13: the histogram and the counters must AGREE. `preserved` counts every
+# preserved row (the idle-daemon fixture is `cpu-idle` too), so compare the
+# histogram total to it rather than pinning a single row.
+PRESERVED_SUM="$(sed -n 's/.*preserved=\([0-9]*\).*/\1/p' <<<"$OUT")"
+HIST_SUM="$(awk '/^preserve reasons/{f=1;next} f && /^ +[0-9]+ +/{s+=$1} END{print s+0}' <<<"$OUT")"
+assert_eq "$HIST_SUM" "$PRESERVED_SUM" "O27b ... with the histogram total equal to preserved=N (counters agree)"
+assert_eq "$(grep -cE '^ +1 +identity-changed$' <<<"$OUT")" "1" "O27b the histogram records identity-changed EXACTLY once (F13)"
+assert_eq "$(grep -cE '^ +[0-9]+ +reapable$' <<<"$OUT")" "0" "O27b ... and carries NO stale reapable row (F13)"
 
-# O27c: identity changes before the SIGKILL escalation -> no SIGKILL.
+# O27c: identity changes before the SIGKILL escalation -> no SIGKILL, one reason.
 STILL27="$(fake_ps psStill27 "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
                             "$(ps_row_line $ORPH 1 "$MY_UID" '0:01.00' '00:05:00' /bin/sh-spin)")"
-RUN_IDENT_SEQ="$IDENT_S|$IDENT_S|$IDENT_C"
+RUN_IDENT_TABLE="$(ident_table o27c "$ORPH" "$IDENT_S")"
+RUN_IDENT_SEQ="$IDENT_S|$IDENT_C"
 OUT="$(run_reaper o27c "$A:$B:$STILL27" "$L27" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
-RUN_IDENT_SEQ=""
+RUN_IDENT_TABLE=""; RUN_IDENT_SEQ=""
 assert_contains "$(kills o27c)" "-TERM $ORPH" "O27c SIGTERM was delivered to the VERIFIED process"
 assert_absent "$(kills o27c)" "-KILL" "O27c ... but a pid that changed before escalation is NEVER KILLed"
 assert_contains "$OUT" "identity-changed" "O27c ... and the escalation preserve is reported"
+assert_eq "$(grep -cE '^ +[0-9]+ +reapable$' <<<"$OUT")" "0" "O27c the histogram carries no reapable row for the downgraded candidate (F13)"
 
-# O27d: an unevaluable identity read is not a licence to signal.
-RUN_IDENT_SEQ="__EMPTY__|$IDENT_S"
+# O27d: a pid with NO recorded snapshot-B identity is not a licence to signal.
+# The table is NON-EMPTY (pid 1 only) so a global probe remains valid while the
+# orphan is genuinely absent from it.
+RUN_IDENT_TABLE="$(ident_table o27d 1 "$IDENT_S")"
 OUT="$(run_reaper o27d "$A:$B:$GONE" "$L27" --apply --verbose --min-elapsed-seconds 1 --sample-seconds 0)"
-RUN_IDENT_SEQ=""
-assert_contains "$OUT" "reason=identity-unknown" "O27d an unreadable start identity is PRESERVED (fail-closed)"
+RUN_IDENT_TABLE=""
+assert_contains "$OUT" "reason=identity-unknown" "O27d an unrecorded start identity is PRESERVED (fail-closed)"
 assert_nofile "$T/o27d.kills" "O27d ... and NO signal is delivered"
 
 echo ""
