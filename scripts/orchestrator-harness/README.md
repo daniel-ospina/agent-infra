@@ -347,7 +347,14 @@ bash scripts/orchestrator-harness/install.sh
 
 # 4. Start it when you mean to
 launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+```
 
+Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
+(agent-infra#1745; see §9). Run `install.sh` from the agent-infra checkout as shown — if the source
+is not a git repo the record reads `UNKNOWN` and `check-deployed-drift.sh` exits 2 rather than
+passing, which is the intended fail-closed behaviour and not an install failure.
+
+```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
@@ -727,6 +734,66 @@ agent-infra#1709's headline finding is that duplicate execution is unavoidable a
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
+### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
+
+`refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
+issue at all: `claim_ref <pr> <sha>` has no sha to address, `claim_live()` returns 1 on an empty
+one, and the whole registry was therefore **bypassed for issue dispatch**. That is the longest
+exposure the fleet has, because it is the *whole working period of a lane before its first push*:
+the pre-flight's own surfaces are immutable history (open/closed PRs, `gh` assignee) plus
+**per-machine** git state (`git worktree list`, local branches), and `refresh-candidates.sh` selects
+issues where `(.assignees|length)==0` while **nothing assigns on dispatch** — so every box reads
+every issue as free. Measured 2026-10-16: two cells were pointed at `daniel-ospina/tortoise`, whose
+pool held six P0 blockers with no PR for any of them.
+
+The extension is a **key, not a mechanism**: `refs/claims/issue-<N>` uses the same CAS (a ref push),
+the same lease-as-data commit, the same `--force-with-lease` fencing and the same `claim_prune`
+reap. The decisions that are not obvious:
+
+- **The key is `issue-<N>`, and the box id stays in the commit's `owner=` field.** `issue-<N>-<box>`
+  was rejected deliberately: a per-box key is not a CAS — two boxes mint two distinct refs and both
+  pushes succeed, so the ref can only be *read*, never *won*, and the pre-flight read alone cannot
+  close the gap (it runs **before** the claim, so both boxes can read CLEAN and then both claim).
+  `issue-<N>` is also idempotent for the same work, and its `issue-` prefix is disjoint from the PR
+  key `<N>-<sha12>`, so a PR claim for the same number neither blocks nor is blocked.
+- **The ref's home is the TARGET repo's origin** (`CLAIM_REPO`, i.e. the repo whose issue number is
+  claimed) — never the harness repo. Every would-be dispatcher of that issue already resolves
+  `$REPO`/`--repo` to it, so it is the one namespace all of them read; a claim pushed into
+  agent-infra would be invisible to a peer dispatching tortoise, which is exactly the collision that
+  was measured.
+- **Claimed by `orch-loop.sh` when it forms its dispatch batch**, not by `dispatch-merge.sh`: a
+  refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
+  `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
+  worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
+  every exit path** (clean merge, failed merge, and the 90-minute "no PR appeared" timeout) through
+  a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
+  which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
+  normal path, so the lease only runs its full length when the box is gone.
+- **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
+  `claim_issue_preflight` after a clean tool verdict: a live claim is a **COLLISION** (left
+  unchecked, so a window is re-attempted when it closes), an **unreadable** registry is
+  **INCOMPLETE** and is never queued, and a registry that **cannot answer** (an older `$O/claims.sh`
+  with no issue functions — the drift `install.sh` reports) is INCOMPLETE too. This is the opposite
+  polarity from the PR claim's fail-open, on purpose: refusing a merge on a network blip costs one
+  merge, while certifying a free issue costs duplicated work on two boxes. The one limit is stated
+  rather than hidden — a box where `claims.sh` is **not installed** falls through to the
+  pre-registry behaviour **loudly**; `install.sh` seeds `$O/claims.sh`, and making a missing file
+  refuse would turn such a box merge-only, a bigger and less reversible failure.
+
+Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
+under `set -u`, so a caller with no commit to fence on aborted with
+`line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
+leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+
+`test-claims.sh` (I1–I9) pins the issue key against live origin from two throwaway clones, including
+the **non-vacuity case for this defect**: A claims an issue with **no branch, no PR and no push of
+anything but the claim ref**, and B's pre-flight read must not be CLEAN — a test that only passes
+after a push does not test it. Measured: 35 of those assertions fail on the pre-change
+`claims.sh` (`CLAIMS_SH=<old copy> bash test-claims.sh`). `refresh-scout.test.sh` drives the
+**shipped** refresh step and the **shipped** dispatch block against a real local origin for the
+collision, unreachable, absent and stale-registry verdicts, plus the fenced release on the chain's
+exit path (14 assertions fail on the pre-change scripts).
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,
@@ -920,6 +987,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
+| `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
 `nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
@@ -928,6 +997,34 @@ Neither is part of the loop.
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
 same idea and are no longer invoked; they are included for the record, not for use.
+
+### Which harness commit is this box running? (agent-infra#1745)
+
+On the deployed laptop box the question had **no answer**: the daemon executes `$O/<script>` and
+`~/orchestrator` is not a git checkout at all (`git rev-parse --show-toplevel` → `fatal: not a git
+repository`). `install.sh` now records the source identity into `$O/.agent-infra-stamp.json` — the
+SAME cell-shaped record `cloud-cell-supervisor.sh` writes on a cmux cell, so there is one stamp
+concept, not two. `commit` names the source tree, `payloadSha256` covers the `*.sh` the daemon
+actually executes (the commit cannot see a post-install hand edit to `$O`; the hash cannot say
+whether the commit is on the repo's line), and `agentInfraDirty` says whether that source tree was
+clean when it was copied. The answer is a file read, not a `git` call.
+
+```bash
+sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json"
+```
+
+`check-deployed-drift.sh` answers the next question — does the deployed `$O` actually match the repo?
+
+```bash
+./check-deployed-drift.sh            # 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify)
+```
+
+⛔ **`UNKNOWN` is never a pass.** A missing record, an unreadable one, `commit: UNKNOWN` (the source
+was not a checkout), or an unresolvable ref exits **2**, not 0. That is the rule #1790 measured on
+the cells: `check` printed `CELL CAN RUN A CONTROLLER` over a tree that was not on `main`'s line,
+and over a copy whose bytes matched `main` but which carried no git identity. The laptop is the
+same class with a worse starting point — no record at all — so its absence fails the check loudly
+instead of reading as healthy.
 
 **Portability edits applied to every shipped script.** Three per-box constants became
 overridable with this box's values as defaults (the launchd `PATH` is no longer one of them —

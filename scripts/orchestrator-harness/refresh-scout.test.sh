@@ -48,6 +48,33 @@ mk_case() {
   # `gh` succeeds and lists NOTHING: the reaper then sees a readable, empty answer (which it is
   # entitled to reap against) and the pool comes out empty unless a case stubs otherwise.
   printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
+  # ── a REAL git repo with a REAL (local, bare) origin, and the running registry (agent-infra#1850) ─
+  # The pre-flight now reads `refs/claims/*` from the TARGET repo's origin before it certifies an
+  # issue CLEAN, so the sandbox has to be a repo with an origin or every case would take the
+  # "registry not installed" fallback and the gate below would never be exercised. The origin is a
+  # bare dir in the sandbox: real git semantics (refs, fetch, ls-remote exit codes) and no network.
+  # `$D/o/claims.sh` is the RUNNING copy — install.sh seeds it into $O — so the gate reads the same
+  # file the daemon would.
+  git init -q --bare "$D/origin.git"
+  git init -q "$D/repo"
+  git -C "$D/repo" remote add origin "$D/origin.git"
+  cp "$HERE/claims.sh" "$D/o/claims.sh"
+}
+# mk_issue_claim <dir> <issue> <lease-seconds-from-now> — push a live issue claim to the sandbox
+# origin, minted by the SHIPPED claims.sh (so the sandbox cannot drift from the real claim format).
+# ⛔ NOT `CLAIM_REPO=… . claims.sh`: a variable assignment PREFIXING the `.` builtin is a TEMPORARY
+# environment for that one command and bash RESTORES the variable afterwards, so the functions the
+# sourced file defined see CLAIM_REPO UNSET — `_git` then dies with `CLAIM_REPO: unbound variable`
+# under `set -u`, `_claim_commit` returns empty (its stderr is swallowed), and an empty commit in a
+# `"$c:refs/…"` refspec is a DELETE, not a create. Assign in a SEPARATE statement.
+mk_issue_claim() {
+  local d="$1" n="$2" ttl="$3" c
+  c="$( cd "$d/repo" || exit 1
+        CLAIM_REPO="$d/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+        . "$HERE/claims.sh"
+        _claim_commit peerbox "$(( $(date +%s) + ttl ))" )"
+  [ -n "$c" ] || return 1
+  git -C "$d/repo" push -q origin "$c:refs/claims/issue-$n"
 }
 # rf <dir> <refresh|check> [KEY=VAL ...] — runs the SHIPPED script hermetically; $OUT/$RC.
 # RF_PATH overrides the constructed PATH for the one case that must have no `uv` on it. The ambient
@@ -1110,6 +1137,287 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
 else
   bad "orch-loop: could not extract the refresh block"
+fi
+
+# ── 8) the pre-flight CONSULTS THE ISSUE-CLAIM REGISTRY, and fails CLOSED (#1850) ──────────────
+# The defect this section exists for: the pre-flight tool enumerates immutable history (PRs,
+# branches, worktrees, assignee) — and branches/worktrees are PER-MACHINE, so a PEER's lane is
+# invisible until it first pushes. Nothing assigns the issue on dispatch, so both boxes read CLEAN
+# and both dispatch. The registry read is the surface that closes it, and these cases drive the
+# SHIPPED refresh with a REAL claim ref on a REAL (local) origin.
+#
+# NON-VACUITY, MEASURED: on the pre-change refresh-candidates.sh all three cases fail — (a) and (b)
+# because the candidate IS queued (nothing reads the registry), (c) because the warning line does not
+# exist. Reproduce against the pre-change tree by checking out the base revision of the script.
+mk_gh_one_issue() {   # <dir> — a `gh` stub that puts issue 42 in the pool
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+
+# (a) A LIVE claim from another box: the issue is a COLLISION, not CLEAN. It must not be queued
+#     (nothing is dispatched on a guess) and must NOT be blacklisted (a claim is a window, not a
+#     verdict), so the next pass re-attempts it.
+mk_case claim-collision
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+mk_issue_claim "$D" 42 600 || bad "claim-collision: could not seed the peer's issue claim"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "claim-collision: #42 was QUEUED although a peer holds the issue claim — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+  *) ok "claim-collision: a peer's LIVE issue claim keeps #42 OUT of the backlog" ;;
+esac
+case "$OUT" in
+  *"COLLISION (cross-box issue claim)"*) ok "claim-collision: the verdict NAMES the cross-box claim (not the tool's own surface)" ;;
+  *) bad "claim-collision: the collision is not attributed to the claim registry — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *42*) bad "claim-collision: #42 was BLACKLISTED — a transient claim must be re-attempted, not suppressed" ;;
+  *) ok "claim-collision: #42 is left UNCHECKED for the next pass" ;;
+esac
+
+# (b) The registry is UNREACHABLE (origin removed): INCOMPLETE — never CLEAN. A registry outage must
+#     not become a duplicate dispatch, so nothing is queued and nothing is blacklisted either.
+mk_case claim-unreachable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+git -C "$D/repo" remote set-url origin "$D/no-such-origin-anywhere.git"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "claim-unreachable: #42 was queued on an UNREADABLE registry — a false CLEAN" ;;
+  *) ok "claim-unreachable: an unreadable registry queues NOTHING (INCOMPLETE, never CLEAN)" ;;
+esac
+case "$OUT" in
+  *"INCOMPLETE"*) ok "claim-unreachable: the refusal is named INCOMPLETE" ;;
+  *) bad "claim-unreachable: no INCOMPLETE verdict — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *42*) bad "claim-unreachable: #42 was blacklisted on an unreadable registry" ;;
+  *) ok "claim-unreachable: #42 is left unchecked, so an outage does not consume an issue" ;;
+esac
+
+# (c) The registry is NOT INSTALLED: the documented FALLBACK. The candidate IS queued (a missing FILE
+#     is not an unreachable registry — refusing here would make the box merge-only), and the box says
+#     so every time. This pins the limit the code comment states, so it cannot go quiet.
+mk_case claim-absent
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+rf "$D" refresh CLAIMS_SH="$D/no-registry-here.sh"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "claim-absent: a candidate is still queued (the fallback is not a false block)" ;;
+  *) bad "claim-absent: nothing was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"no claim registry at"*"cross-box issue-claim check is OFF"*) ok "claim-absent: the missing registry is ANNOUNCED (never silent)" ;;
+  *) bad "claim-absent: the missing registry is silent — output: $OUT" ;;
+esac
+
+# (e) A REGISTRY THAT CANNOT ANSWER THE QUESTION IS NOT EVIDENCE OF FREEDOM. `$O/claims.sh` exists
+#     but predates the issue key (install.sh reports that drift; the daemon executes the $O copy), so
+#     the reader has nothing to call. Calling the missing function would return 127 — a value the
+#     CLEAN arm's `case` would read as neither 1 nor 2 and therefore QUEUE. It must read INCOMPLETE.
+#     The stub is written explicitly (rather than taken from git) so the case cannot silently become
+#     "the current file" on a branch where the functions exist. ⛔ It must stay free of any
+#     `git … "$@"` delegation shape: an unresolved git VERB is what the checkout guard fails closed
+#     on (`unverifiable-verb`), and it refused to run this suite when the stub carried one.
+mk_case claim-stale-registry
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+printf '# a registry that predates the issue key: sourceable, no claim_issue_* functions\nCLAIM_TTL=1800\n' > "$D/o/claims.sh"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "claim-stale-registry: #42 was queued by a registry that cannot answer the issue-claim question" ;;
+  *) ok "claim-stale-registry: a registry that cannot answer queues NOTHING (INCOMPLETE)" ;;
+esac
+case "$OUT" in
+  *"predates the issue-claim reader"*) ok "claim-stale-registry: the refusal NAMES the stale registry" ;;
+  *) bad "claim-stale-registry: the reason is not named — output: $OUT" ;;
+esac
+
+# (f) And the CLEAN path still works WITH the registry installed and NO claim: the gate must not be a
+#     blanket refusal. (Case 2 above already covers this shape, but it now runs with a real origin and
+#     the registry present — this makes the "no claim => CLEAN" half explicit.)
+mk_case claim-free
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_one_issue "$D"
+rf "$D" refresh
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "claim-free: with the registry readable and no claim, #42 IS queued (no false block)" ;;
+  *) bad "claim-free: #42 was not queued although nothing holds it — output: $OUT" ;;
+esac
+
+# ── 9) orch-loop.sh's DISPATCH claims the issue, and a REFUSED claim does not dispatch ───────
+# The registry read above only stops a PEER from QUEUEING the issue; the claim itself is taken when
+# the controller forms its batch, and that CAS is what makes two simultaneous boxes safe (both can
+# read CLEAN before either claims). The shipped batch block is extracted VERBATIM and driven against
+# a real local origin with a real claims.sh, so the assertion is about the shipped code, not a
+# re-implementation.
+awk '/if \[ -z/ && /GATE_WHY/ {f=1} f{print} f&&/^    done < /{exit}' \
+  "$LOOP" > "$T/dispatchblock.sh"
+printf '\nfi\n' >> "$T/dispatchblock.sh"
+if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
+  ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
+  # db <sandbox> — run the shipped block with $O/candidates.txt = 42 and $BATCH=1. The registry is
+  # the SHIPPED claims.sh, sourced from $O with CLAIM_REPO set exactly as the loop's own cycle does
+  # (sourcing it here is what makes `declare -f claim_issue_acquire` true, as it is in the daemon).
+  db() {
+    local d="$1"
+    ( O="$d/o" LOG="$d/log" BATCH=1 OR="acme/widget" REPO="$d/repo" GATE_WHY="" \
+      bash -c 'CLAIM_REPO="$REPO"; . "$O/claims.sh"; . "$1"' _ "$T/dispatchblock.sh" ) >/dev/null 2>&1
+  }
+  # (i) NO claim exists: the issue is claimed, recorded in .batch/dispatched.txt, and the commit this
+  #     box pushed is written to state/issueclaim-42 for chain-merge.sh's FENCED release.
+  DB1="$T/db-ok"; mkdir -p "$DB1/o/state" "$DB1/repo"
+  git init -q --bare "$DB1/origin.git"; git init -q "$DB1/repo"
+  git -C "$DB1/repo" remote add origin "$DB1/origin.git"
+  cp "$HERE/claims.sh" "$DB1/o/claims.sh"
+  printf '42\n' > "$DB1/o/candidates.txt"; : > "$DB1/o/dispatched.txt"
+  db "$DB1"
+  case "$(tr '\n' ' ' < "$DB1/o/.batch" 2>/dev/null)" in
+    *42*) ok "orch-loop dispatch: the issue IS batched once it holds the claim" ;;
+    *) bad "orch-loop dispatch: nothing was batched — log: $(cat "$DB1/log" 2>/dev/null)" ;;
+  esac
+  case "$(tr '\n' ' ' < "$DB1/o/dispatched.txt" 2>/dev/null)" in
+    *42*) ok "orch-loop dispatch: the cleared issue is recorded in dispatched.txt" ;;
+    *) bad "orch-loop dispatch: dispatched.txt was not written" ;;
+  esac
+  [ -s "$DB1/o/state/issueclaim-42" ] && ok "orch-loop dispatch: the claimed commit is recorded for the fenced release" \
+                                      || bad "orch-loop dispatch: state/issueclaim-42 is missing (no fenced release possible)"
+  one_left="$(git -C "$DB1/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
+  [ "$one_left" = "1" ] && ok "orch-loop dispatch: the claim ref IS on origin (one box can now see it)" \
+                         || bad "orch-loop dispatch: expected 1 claim ref on origin, found $one_left"
+  # (ii) a PEER already holds it: NOT batched, NOT in dispatched.txt (so the issue stays in
+  #      candidates.txt for the next cycle), and no lane can be spawned for work another box owns.
+  DB2="$T/db-held"; mkdir -p "$DB2/o/state" "$DB2/repo"
+  git init -q --bare "$DB2/origin.git"; git init -q "$DB2/repo"
+  git -C "$DB2/repo" remote add origin "$DB2/origin.git"
+  cp "$HERE/claims.sh" "$DB2/o/claims.sh"
+  mk_issue_claim "$DB2" 42 600 || bad "orch-loop dispatch: could not seed the peer's claim"
+  printf '42\n' > "$DB2/o/candidates.txt"; : > "$DB2/o/dispatched.txt"
+  db "$DB2"
+  case "$(tr '\n' ' ' < "$DB2/o/.batch" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: a HELD issue was batched anyway" ;;
+    *) ok "orch-loop dispatch: a claim held by a peer leaves the issue OUT of the batch" ;;
+  esac
+  case "$(tr '\n' ' ' < "$DB2/o/dispatched.txt" 2>/dev/null)" in
+    *42*) bad "orch-loop dispatch: a HELD issue was blacklisted in dispatched.txt" ;;
+    *) ok "orch-loop dispatch: a held issue is NOT blacklisted (it returns next cycle)" ;;
+  esac
+  [ ! -e "$DB2/o/state/issueclaim-42" ] && ok "orch-loop dispatch: no release record was written for a refused claim" \
+                                        || bad "orch-loop dispatch: a release record exists for a claim this box never took"
+else
+  bad "orch-loop: could not extract the dispatch block carrying claim_issue_acquire"
+fi
+
+# ── 10) chain-merge.sh releases the issue claim on EVERY exit path, and the release is FENCED ────
+# Kept OUT of the block above on purpose: nested there, a failure to extract the DISPATCH block
+# silently SKIPPED these assertions — coverage that disappears exactly when something else broke is
+# not coverage. Both blocks now fail independently.
+# The shipped function is extracted (not re-implemented) and driven directly; the 90-minute PR wait
+# that follows it in the real script is not part of it.
+awk '/^release_issue_claim\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$HERE/chain-merge.sh" > "$T/release.sh"
+if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
+    ok "chain-merge: the issue-claim release is extractable from the shipped script"
+    RL1="$T/rl-ok"; mkdir -p "$RL1/o/state" "$RL1/repo"
+    git init -q --bare "$RL1/origin.git"; git init -q "$RL1/repo"
+    git -C "$RL1/repo" remote add origin "$RL1/origin.git"
+    cp "$HERE/claims.sh" "$RL1/o/claims.sh"
+    # The box's own claim, minted and pushed the way orch-loop.sh does it; its commit is the fence.
+    # (Separate assignments, NOT a prefix on `.` — see mk_issue_claim's note.)
+    own="$( cd "$RL1/repo" || exit 1
+            CLAIM_REPO="$RL1/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+            . "$HERE/claims.sh"
+            _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
+    [ -n "$own" ] || bad "chain-merge: could not mint the box's own issue claim"
+    git -C "$RL1/repo" push -q origin "$own:refs/claims/issue-42"
+    printf '%s\n' "$own" > "$RL1/o/state/issueclaim-42"
+    # ⛔ Separate ASSIGNMENTS, not a variable prefix on `.` — a prefix is a temporary environment for
+    # that one command and bash RESTORES it afterwards, so the extracted function would read O/N/REPO
+    # UNSET and abort under `set -u` (measured: the release silently did nothing). claims.sh is
+    # sourced first because the record/fence convention (`claim_issue_release_record`) lives THERE,
+    # not in this function — one implementation, one writer convention (see its comment).
+    ( O="$RL1/o"; LOG="$RL1/o/log"; N=42; REPO="$RL1/repo"; CLAIM_REPO="$RL1/repo"
+      export O LOG N REPO CLAIM_REPO
+      . "$RL1/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    rl_left="$(git -C "$RL1/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
+    [ "$rl_left" = "0" ] && ok "chain-merge: the issue claim IS released on the exit path" \
+                          || bad "chain-merge: the issue claim survived the release ($rl_left refs)"
+    [ ! -e "$RL1/o/state/issueclaim-42" ] && ok "chain-merge: the release record is cleaned up" \
+                                          || bad "chain-merge: the release record was left behind"
+    # FENCING: a peer reclaimed the ref (its commit is the tip); OUR stale record must not delete it.
+    RL2="$T/rl-stale"; mkdir -p "$RL2/o/state" "$RL2/repo"
+    git init -q --bare "$RL2/origin.git"; git init -q "$RL2/repo"
+    git -C "$RL2/repo" remote add origin "$RL2/origin.git"
+    cp "$HERE/claims.sh" "$RL2/o/claims.sh"
+    stale="$( cd "$RL2/repo" || exit 1
+              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit selfbox "$(( $(date +%s) - 5 ))" )"
+    peerc="$( cd "$RL2/repo" || exit 1
+              CLAIM_REPO="$RL2/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+              . "$HERE/claims.sh"
+              _claim_commit peerbox "$(( $(date +%s) + 600 ))" )"
+    [ -n "$peerc" ] || bad "chain-merge: could not mint the peer's claim for the fencing case"
+    git -C "$RL2/repo" push -q origin "$peerc:refs/claims/issue-42"
+    printf '%s\n' "$stale" > "$RL2/o/state/issueclaim-42"
+    ( O="$RL2/o"; LOG="$RL2/o/log"; N=42; REPO="$RL2/repo"; CLAIM_REPO="$RL2/repo"
+      export O LOG N REPO CLAIM_REPO
+      . "$RL2/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    after_stale="$(git -C "$RL2/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
+    [ "$after_stale" = "$peerc" ] && ok "chain-merge: a STALE holder cannot delete the WINNER's issue claim (fenced)" \
+                                   || bad "chain-merge: the fenced release deleted a peer's claim (${after_stale:-<gone>} vs $peerc)"
+else
+    bad "chain-merge: could not extract release_issue_claim from the shipped script"
+fi
+
+# ── 11) dispatch-merge.sh releases the claim on the NO-CHAIN path (#1850) ─────────────────────
+# The worktree could not be created, so no lane and no chain are spawned — and `chain-merge.sh`'s
+# EXIT trap, the NORMAL release path, never runs. Nothing else would ever release the claim, so a
+# single failed `git worktree add` would hold a FREE issue across every box for the whole lease
+# (CLAIM_ISSUE_TTL, 3h) while the reaper returned the issue to a pool every box then reads as
+# another box's live claim. The shipped helper is extracted and driven directly.
+awk '/^release_issue_claim_unspawned\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$HERE/dispatch-merge.sh" > "$T/unspawned.sh"
+if [ -s "$T/unspawned.sh" ] && grep -q 'claim_issue_release_record' "$T/unspawned.sh"; then
+  ok "dispatch-merge: the no-chain release helper is extractable from the shipped script"
+  NS="$T/ns"; mkdir -p "$NS/o/state" "$NS/repo"
+  git init -q --bare "$NS/origin.git"; git init -q "$NS/repo"
+  git -C "$NS/repo" remote add origin "$NS/origin.git"
+  cp "$HERE/claims.sh" "$NS/o/claims.sh"
+  nsown="$( cd "$NS/repo" || exit 1
+             CLAIM_REPO="$NS/repo"; CLAIM_OWNER_ID=selfbox; export CLAIM_REPO CLAIM_OWNER_ID
+             . "$HERE/claims.sh"
+             _claim_commit selfbox "$(( $(date +%s) + 600 ))" )"
+  git -C "$NS/repo" push -q origin "$nsown:refs/claims/issue-77"
+  printf '%s\n' "$nsown" > "$NS/o/state/issueclaim-77"
+  ( O="$NS/o"; REPO="$NS/repo"; CLAIM_REPO="$NS/repo"; export O REPO CLAIM_REPO
+    . "$NS/o/claims.sh"; . "$T/unspawned.sh"; release_issue_claim_unspawned 77 ) >/dev/null 2>&1
+  ns_left="$(git -C "$NS/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
+  [ "$ns_left" = "0" ] && ok "dispatch-merge: the no-chain path RELEASES the issue claim" \
+                       || bad "dispatch-merge: the issue claim survived the no-chain path ($ns_left refs)"
+  [ ! -e "$NS/o/state/issueclaim-77" ] && ok "dispatch-merge: the release record is consumed" \
+                                       || bad "dispatch-merge: the release record was left behind"
+  # An EMPTY record must delete NOTHING: it cannot fence, and an unfenced delete would remove a
+  # peer's claim, which is the one thing the fence exists to prevent.
+  NS2="$T/ns-empty"; mkdir -p "$NS2/o/state" "$NS2/repo"
+  git init -q --bare "$NS2/origin.git"; git init -q "$NS2/repo"
+  git -C "$NS2/repo" remote add origin "$NS2/origin.git"
+  cp "$HERE/claims.sh" "$NS2/o/claims.sh"
+  peer2="$( cd "$NS2/repo" || exit 1
+            CLAIM_REPO="$NS2/repo"; CLAIM_OWNER_ID=peerbox; export CLAIM_REPO CLAIM_OWNER_ID
+            . "$HERE/claims.sh"
+            _claim_commit peerbox "$(( $(date +%s) + 600 ))" )"
+  git -C "$NS2/repo" push -q origin "$peer2:refs/claims/issue-78"
+  : > "$NS2/o/state/issueclaim-78"
+  ( O="$NS2/o"; REPO="$NS2/repo"; CLAIM_REPO="$NS2/repo"; export O REPO CLAIM_REPO
+    . "$NS2/o/claims.sh"; . "$T/unspawned.sh"; release_issue_claim_unspawned 78 ) >/dev/null 2>&1
+  keep="$(git -C "$NS2/repo" ls-remote origin refs/claims/issue-78 | awk '{print $1}')"
+  [ "$keep" = "$peer2" ] && ok "dispatch-merge: an EMPTY record cannot delete a peer's claim (no unfenced delete)" \
+                         || bad "dispatch-merge: an empty record deleted or changed the claim (${keep:-<gone>} vs $peer2)"
+else
+  bad "dispatch-merge: could not extract release_issue_claim_unspawned from the shipped script"
 fi
 
 echo

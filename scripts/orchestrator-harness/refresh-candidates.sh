@@ -286,6 +286,54 @@ gh_env_verdict() {
   gh_probe_env
 }
 
+# ── the cross-box ISSUE claim: a BLOCKING pre-flight surface (agent-infra#1850) ────────────────
+# The pre-flight tool (`tools/collision_preflight.py`) enumerates its own surfaces out of immutable
+# history — open PRs, branches, worktrees, the assignee — and `git worktree list`/local branches are
+# PER-MACHINE BY CONSTRUCTION, so a peer's work is invisible until it first pushes. A lane's whole
+# working period is exactly that window, and NOTHING assigns the issue on dispatch
+# (`refresh-candidates.sh`'s pool selects `(.assignees|length)==0`), so every box reads every issue
+# as free. That is the 2026-10-16 collision: two cells dispatched the same tortoise issues.
+#
+# The registry that closes the window is `refs/claims/*` (claims.sh) — a ref push is an atomic CAS,
+# it is durable, and it is already read cross-box. So the pre-flight step consults it HERE: this
+# script is what certifies an issue as dispatchable, so it is the only place the read can make the
+# verdict WRONG (the tool is a tortoise product and reads no claim refs; a claim nobody reads is not
+# a claim). The ref's HOME is the TARGET repo's origin — that is `$SC`, the scout worktree, which
+# shares `$REPO`'s origin — because every would-be dispatcher of that issue resolves `$REPO` to it.
+#
+# ⛔ FAIL-CLOSED, AND ONLY HERE. `claim_issue_preflight` returns 2 (INCOMPLETE) when the registry
+# cannot be READ, and an INCOMPLETE is never a CLEAN: a registry outage must not become a duplicate
+# dispatch. That polarity is the OPPOSITE of claims.sh's acquisition path, which fails OPEN on an
+# infra error so a network blip does not block a merge — the two are deliberate, and the cost of
+# being wrong differs: refusing costs one PR's merge, certifying a free issue costs duplicated work
+# on two boxes.
+#
+# ⚠️ STATED LIMIT: a box where the registry is NOT INSTALLED does not queue nothing — it falls
+# through to the pre-registry behaviour, loudly. `install.sh` seeds `claims.sh` into `$O` (it is in
+# the drift list precisely because the daemon executes it), so a deployed cell has it; a box without
+# it cannot take the claim either, and refusing to queue on a missing FILE would make every such box
+# merge-only — a bigger, less reversible failure than the state being removed. Missing is reported;
+# unreadable is refused.
+issue_claim_verdict() { # <issue> -> 0 CLEAN / 1 COLLISION / 2 INCOMPLETE; the reason in CLAIM_RESULT
+  local csh="${CLAIMS_SH:-$O/claims.sh}"
+  if [ ! -f "$csh" ]; then
+    CLAIM_RESULT="the claim registry ($csh) is NOT INSTALLED — INCOMPLETE, never CLEAN"
+    return 2
+  fi
+  # CLAIM_REPO = the scout worktree: a checkout of the TARGET repo, whose origin is the ref's home.
+  CLAIM_REPO="${SC:-$PWD}"
+  # shellcheck source=/dev/null
+  . "$csh" || { CLAIM_RESULT="$csh failed to source — INCOMPLETE, never CLEAN"; return 2; }
+  # ⛔ A REGISTRY THAT CANNOT ANSWER IS NOT EVIDENCE OF FREEDOM. An older `claims.sh` in $O (drift:
+  # install.sh reports it, and the daemon executes the $O copy) has no `claim_issue_preflight`, and
+  # calling the missing function returns 127 — which the CLEAN arm's `case` would read as neither 1
+  # nor 2, and therefore QUEUE the issue. A stale flag that records a past state must not become a
+  # duplicate dispatch, so a registry that cannot answer counts as INCOMPLETE.
+  declare -f claim_issue_preflight >/dev/null 2>&1 \
+    || { CLAIM_RESULT="$csh predates the issue-claim reader — INCOMPLETE, never CLEAN"; return 2; }
+  claim_issue_preflight "$1"
+}
+
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
 cmd_check() {
   local scout tool_dir
@@ -656,29 +704,55 @@ while read -r N; do
       # Measured 2026-10-16 (#1328): an issue whose true verdict was LANDED came back degraded.
       # Counting a degraded answer as usable would let a broken environment report a healthy
       # `checked N; backlog now 0` — the reading this pass exists to refuse (#1853 review).
+      # A DEGRADED pre-flight short-circuits BEFORE the claim read: the verdict is not trustworthy,
+      # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
-        # ⛔ EVERY STATE WRITE IS CHECKED, AND THE PERMANENT ONE GOES LAST. `checked.txt` is what makes
-        # an issue invisible to LATER passes — it is reclaimed only for numbers that reached
-        # `dispatched.txt` — so writing it BEFORE the queue entry made a failed append to
-        # `candidates.txt` an unrecoverable loss: the issue is never pre-flighted again, never queued,
-        # and the pass still logged `+#N CLEAN -> backlog` and exited 0. Measured (#1853 review): with
-        # `candidates.txt` unwritable, the pre-flight ran ONCE, ever, and two consecutive passes
-        # reported success. The recoverable write lands FIRST, so a failure there leaves the issue
-        # retryable; the log line and `usable` follow BOTH writes, so neither can overstate the queue.
-        # (Inlined rather than a helper: selftest.sh extracts this loop body and runs it standalone,
-        # so anything it calls must live inside the extraction.)
-        if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
-          echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
-          exit "${EXIT_TRANSIENT:-1}"
+        # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
+        # The tool above reads only immutable history and per-machine git state, so it reports CLEAN
+        # for an issue a PEER started ten seconds ago and has not pushed yet. Read the registry
+        # before certifying: an issue claim is a claim on the WORK, and it exists before the first
+        # push. `$CLAIMS_SH` may be unset here (the loop body is extracted and driven on its own by
+        # the regression suite), hence `${CLAIMS_SH:-$O/claims.sh}` rather than a bare expansion.
+        ICR=0
+        if [ -f "${CLAIMS_SH:-$O/claims.sh}" ]; then
+          # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
+          # condition's status surviving into the else branch.
+          issue_claim_verdict "$N"; ICR=$?
+        else
+          echo "[refresh] ⚠️ #$N: no claim registry at ${CLAIMS_SH:-$O/claims.sh} — the cross-box issue-claim check is OFF on this box (install.sh seeds claims.sh into \$O)"
         fi
-        if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
-          echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
-          exit "${EXIT_TRANSIENT:-1}"
-        fi
-        usable=$((usable + 1))
-        echo "[refresh] +#$N CLEAN -> backlog"
+        case "$ICR" in
+          1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
+             # a claim is a window, not a verdict (the peer's work lands).
+             echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
+          2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
+             # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
+             echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
+          *)
+            # ⛔ EVERY STATE WRITE IS CHECKED, AND THE PERMANENT ONE GOES LAST. `checked.txt` is what
+            # makes an issue invisible to LATER passes — it is reclaimed only for numbers that reached
+            # `dispatched.txt` — so writing it BEFORE the queue entry made a failed append to
+            # `candidates.txt` an unrecoverable loss: the issue is never pre-flighted again, never
+            # queued, and the pass still logged `+#N CLEAN -> backlog` and exited 0. Measured (#1853
+            # review): with `candidates.txt` unwritable, the pre-flight ran ONCE, ever, and two
+            # consecutive passes reported success. The recoverable write lands FIRST, so a failure
+            # there leaves the issue retryable; the log line and `usable` follow BOTH writes, so
+            # neither can overstate the queue. (Inlined rather than a helper: selftest.sh extracts
+            # this loop body and runs it standalone, so anything it calls must live inside the
+            # extraction.)
+            if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
+              echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              exit "${EXIT_TRANSIENT:-1}"
+            fi
+            if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
+              echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
+              exit "${EXIT_TRANSIENT:-1}"
+            fi
+            usable=$((usable + 1))
+            echo "[refresh] +#$N CLEAN -> backlog" ;;
+        esac
       fi ;;
     COLLISION)
       # ⛔ A COLLISION that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict: the tool

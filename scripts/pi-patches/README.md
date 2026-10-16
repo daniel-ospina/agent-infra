@@ -142,12 +142,19 @@ the needles** must not read as applied. And it carries a direct unit table over 
 every fragment of the marker classifies NOT code-shaped, every real code needle classifies
 code-shaped — so the non-vacuity predicate is falsifiable rather than merely asserted.
 
-That second shape is why `apply.mjs` decides "already applied" on the entry's **own replacement
-payload present verbatim** (`next.includes(entry.replace)`), not on scattered `verifyPresent`
-substrings. A substring test answers "does this text appear anywhere?", and a comment that merely
-quotes the needles satisfies it over a tree whose fix code is gone. `verifyPresent` is kept for the
-diagnostics — the "neither pristine nor patched" refusal names the expected needles — but it is no
-longer the *proof* that the fix is installed.
+That second shape is why `apply.mjs` decides "already applied" on the entry's **own patched region
+present verbatim with its positional context** — `preContext + replace + postContext` — and never on
+scattered `verifyPresent` substrings or on the bare payload. A substring test answers "does this
+text appear anywhere?", and a comment that merely quotes the needles satisfies it over a tree whose
+fix code is gone; a bare-payload test is the *same* existential question, so a payload retained
+VERBATIM but NEUTRALISED — quoted into an inert string literal or comment by a partial revert —
+satisfied it over a tree whose patched region was gone, and `--check` exited 0 (#1341).
+`make-manifest.mjs` now records, per entry, the text that surrounds the payload in the correctly
+patched file (clamped so it never reaches into another entry's patched region, which would refuse a
+valid *partially* patched tree), making the proof positional: a payload pasted elsewhere is refused,
+an in-place patched region passes. `verifyPresent` is kept for the diagnostics — the "neither
+pristine nor patched" refusal names the expected needles — but it is not the *proof* that the fix is
+installed.
 
 The change is proved by `tests/verify-summarization-budget-floor.mjs`, which is hermetic: it builds
 a pristine tree and a patched tree in a temp dir (a copy of the installed `dist/` plus a symlinked
@@ -348,7 +355,7 @@ scripts/pi-patches/apply.sh`; the version pin is re-checked, so a mismatch still
 | Situation | Behaviour | Exit |
 |---|---|---|
 | anchor present | replaces it, backing up the original first | 0 |
-| anchor absent, the entry's replacement payload present verbatim | reports `already applied` (idempotent) | 0 |
+| anchor absent, the entry's patched region present verbatim (`preContext + replace + postContext`, #1341) | reports `already applied` (idempotent) | 0 |
 | anchor absent, patched form absent | **refuses** and writes nothing at all — the tree is left byte-identical, because the refusal is found in pass 1 | 2 |
 | `manifests/` directory missing | **refuses** and names it a broken checkout, rather than reporting "0 version directories" | 2 |
 | several version directories present | **selects the one whose `writtenAgainst` pin matches the installed version** — the normal post-upgrade state, not an error | 0 / 1 |
@@ -548,12 +555,17 @@ trees. It builds its own trees and never modifies the installed one.
     there is deliberate follow-up work, tracked as agent-infra **#1340** — the manifest's `find` must
     include the enclosing function signature, because the inline options expression occurs **twice**
     in the chunk and a bare expression anchor is (correctly) refused as ambiguous.
-14. **`apply.mjs`'s "already applied" test is payload-verbatim-anywhere, so a neutralised copy reads
-    as applied.** The test is `next.includes(entry.replace)`: it answers "is this payload string
-    present?", not "is the fix in force?". A tree that retains the payload verbatim inside an inert
-    literal — a string, a `/* … */` block, a dead branch — therefore reads as applied over a tree
-    with no working fix, and `--check` exits 0. It is strictly better than the scattered-substring
-    test it replaced (which a comment quoting the needles satisfied), and it is the best signal
-    available without executing the tree, so it is **kept** — but it is a heuristic, not proof, and
-    the `apply.sh` table's "anchor absent, the entry's replacement payload present verbatim →
-    already applied" row inherits that limit. Tracked as agent-infra **#1341**.
+14. **CLOSED (#1341) — `apply.mjs`'s "already applied" test was payload-verbatim-anywhere, so a
+    neutralised copy read as applied.** The old test was `next.includes(entry.replace)`: it answered
+    "is this payload present?", not "is the fix in force?", so a tree that retained the payload
+    verbatim inside an inert literal — a string, a `/* … */` block, a dead branch — read as applied
+    over a tree with no working fix and `--check` exited 0. It was strictly better than the
+    scattered-substring test it replaced (which a comment quoting the needles satisfied), but it was
+    a heuristic, not proof. The proof is now **positional**: `make-manifest.mjs` records the
+    `preContext` and `postContext` that surround each payload in the correctly patched file, and
+    `apply.mjs` requires the payload WITH that context, so a payload pasted elsewhere is refused.
+    Both evidence suites build the shape for every entry they cover — the payload appended verbatim
+    inside an inert `String.raw` template literal, block comment or line comment, with the patched
+    region neutralised and the pristine anchor absent, and the file asserted to still parse — and
+    require `--check` to refuse it. Recorded here rather than deleted because the failure mode is the
+    one to keep in view the next time this check is "simplified".

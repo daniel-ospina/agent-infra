@@ -2,8 +2,20 @@
 """lane-status — multi-signal lane health. No single signal is definitive.
 
 Signals combined (owner, 2026-09-25):
-  1. SESSION file  — mtime/size DELTA over a sample window. The only reliable
-                     liveness signal: the spinner animates while wedged.
+  1. SESSION file  — mtime/size DELTA over a sample window. A FILE probe: it says
+                     whether a lane that HAS a session file is writing (the spinner
+                     animates while wedged), and the CPU-time delta below outranks
+                     it. Because it probes a session file it cannot see a lane that
+                     leaves none — an orchestrator lane runs pi in print mode with
+                     sessions disabled, so it writes no session file and is absent from
+                     every population built from the session store or the cmux hook
+                     store (#1777).
+                     Never read its absence as "nobody is on it" — the holder-authored
+                     existence datum is the `refs/claims/<pr>-<sha12>` ref namespace
+                     written by `scripts/orchestrator-harness/claims.sh`; the fleet's
+                     readers of those stores include `tools/fleet/liveness.py`,
+                     `tools/fleet/lane_liveness.py`, `tools/fleet/fleet-health.py` and
+                     `tools/fleet/map-sessions.py`.
   2. TRANSCRIPT    — the last 1-3 messages: tells WIP from DONE, which a
                      spinner cannot.
   3. UI            — the 'Working' indicator from cmux.
@@ -103,7 +115,14 @@ CHILD_SUPPRESSED = ACTION_VERDICTS   # back-compat alias; the set is no longer c
 #      submitted 0.03h earlier, and acting on that would have interrupted live work.
 #
 # ⛔ WHAT ACTUAL LIVENESS USES: the lane's SESSION JSONL mtime/size (`stale`/`grew`, above). That is
-# OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal.
+# OUTPUT -- it advances when the lane works and stops when it stalls -- and it stays the primary signal
+# DERIVED FROM A LANE'S OWN SESSION FILE (the CPU-time delta, below, outranks it). It is not the only
+# record of a lane: an orchestrator lane runs pi in print mode with sessions disabled, so it has no
+# session file at all, and a `grep` for its branch over the session store comes back empty while it is
+# live and committing (#1777, 2026-10-15). Absence here is not freedom — the holder-authored existence
+# datum is the `refs/claims/<pr>-<sha12>` ref namespace (#1777 tracks binding it into the fleet's read
+# set), and `tools/fleet/liveness.py` stays the ONE verdict function (per #1178). The stores and their
+# readers are named in the module docstring above.
 # Inbound-recency is reported BESIDE it, never in place of it.
 #
 # ⛔ AND IT MUST NOT VETO THE SERIOUS VERDICTS. A fresh inbound is not proof of life, so it discounts

@@ -460,6 +460,65 @@ for (const entry of entries) {
 	}
 	problems.push(`${entry.id}: anchor matched ${count} times in ${entry.file} (expected exactly 1)`);
 }
+
+// ---- the positional proof context (#1341) --------------------------------------------------
+// `text.includes(entry.replace)` is an EXISTENTIAL test: it answers "does this payload appear
+// anywhere?", so a payload retained VERBATIM but NEUTRALISED — a partial revert that quotes it
+// into an inert string or comment while the marker gate is gone — satisfies it over a tree whose
+// patched region is ABSENT. `apply.mjs` then reported the entry as "already applied" and exited 0:
+// a false PASS. The proof must be POSITIONAL. Record, for each entry, the text that immediately
+// SURROUNDS the payload in the correctly patched file (`preContext` + `replace` + `postContext`),
+// so an in-place patched region carries it and a payload pasted elsewhere does not.
+//
+// The window is taken from the PATCHED text (it must be the text that actually sits around the
+// region once every entry in the file is applied) and CLAMPED so it never reaches into another
+// entry's patched region: `apply.mjs` proves an already-applied entry BEFORE the later entries in
+// the same file are applied, so a window that crossed one would contain text a later patch rewrites
+// and would refuse a perfectly valid, partially patched tree. Several entries in this set are
+// adjacent — e3's `function summarizationMaxTokens` begins one newline after b1's closing brace —
+// so the clamp is load-bearing, not defensive.
+const CONTEXT_CHARS = 64; // per side, before clamping to the unpatched neighbourhood
+const MIN_CONTEXT_CHARS = 16; // below this the positional proof is too weak to be worth carrying
+const byFile = new Map();
+for (const entry of entries) {
+	if (!byFile.has(entry.file)) byFile.set(entry.file, []);
+	byFile.get(entry.file).push(entry);
+}
+for (const [file, list] of byFile) {
+	if (!existsSync(join(PI_ROOT, file))) continue;
+	let text = readFileSync(join(PI_ROOT, file), "utf8");
+	// Apply only the anchors still present: on an already-patched tree the file is already at its
+	// final shape, and re-applying a `find` that is gone would corrupt it.
+	for (const entry of list) if (text.includes(entry.find)) text = text.replace(entry.find, entry.replace);
+	const spans = [];
+	for (const entry of list) {
+		const at = text.indexOf(entry.replace);
+		if (at === -1 || text.indexOf(entry.replace, at + 1) !== -1) {
+			problems.push(
+				`${entry.id}: the patched payload is ${at === -1 ? "ABSENT" : "NOT UNIQUE"} in the fully patched ${file}, so no positional context can be derived for it`,
+			);
+			continue;
+		}
+		spans.push({ entry, start: at, end: at + entry.replace.length });
+	}
+	for (const span of spans) {
+		const { entry, start, end } = span;
+		const prevEnd = spans
+			.filter((s) => s !== span && s.end <= start)
+			.reduce((m, s) => Math.max(m, s.end), 0);
+		const nextStart = spans
+			.filter((s) => s !== span && s.start >= end)
+			.reduce((m, s) => Math.min(m, s.start), text.length);
+		entry.preContext = text.slice(Math.max(prevEnd, start - CONTEXT_CHARS), start);
+		entry.postContext = text.slice(end, Math.min(nextStart, end + CONTEXT_CHARS));
+		const total = entry.preContext.length + entry.postContext.length;
+		if (total < MIN_CONTEXT_CHARS) {
+			problems.push(
+				`${entry.id}: only ${total} characters of unpatched context surround its payload in ${file} (need ${MIN_CONTEXT_CHARS}) — the region cannot be proved positionally`,
+			);
+		}
+	}
+}
 if (problems.length > 0) {
 	console.error("FATAL: the installed pi tree does not match this patch set — refusing to emit a manifest.");
 	for (const p of problems) console.error(`  - ${p}`);
@@ -467,7 +526,7 @@ if (problems.length > 0) {
 }
 
 const manifest = {
-	schema: 1,
+	schema: 2, // v2 adds the required `preContext`/`postContext` positional proof (#1341)
 	issue: "#1214, #1263, #1316",
 	writtenAgainst: { "pi-coding-agent": CODING_VERSION, "pi-ai": AI_VERSION },
 	note:
