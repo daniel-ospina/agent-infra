@@ -24,9 +24,17 @@ SHA=deadbeefcafebabe0123456789abcdef01234567
 export SHA   # MUST be exported: merge-one.sh runs `set -u`, and the stub function is evaluated
              # in THAT shell — an unexported SHA makes `echo "$SHA"` fail and HEAD come back empty,
              # which silently skips the whole claim block and looks like a passing test.
-REF="refs/claims/777777-${SHA:0:12}"
-REF2="refs/claims/888888-${SHA:0:12}"
-FIXREF="refs/claims/666666-${SHA:0:12}"
+# ⛔ PER-RUN CLAIM NAMESPACE (review round 7 — REPRODUCED: two concurrent runs of this suite gave
+# 27/2 and 23/6). The refs live on the REAL origin and the names were FIXED, so two runs raced —
+# each deleted or overwrote the other's refs and a run interleaved with a reviewer's run failed on
+# refs another run had removed. claims.sh already scopes EVERYTHING by CLAIM_NS/CLAIM_CACHE_NS, so
+# the suite takes its own $$-scoped namespaces: concurrent runs cannot see each other, and the
+# suite stops writing to the production `refs/claims/*` namespace the live fleet uses.
+CLAIM_NS="${CLAIM_NS:-refs/claims-verify-$$}"; export CLAIM_NS
+CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CACHE_NS
+REF="$CLAIM_NS/777777-${SHA:0:12}"
+REF2="$CLAIM_NS/888888-${SHA:0:12}"
+FIXREF="$CLAIM_NS/666666-${SHA:0:12}"
 
 # A = the repo merge-one.sh claims against; O = the running-copy dir it reads claims.sh from.
 A="/tmp/xb-crossbox-repo.$$"
@@ -52,6 +60,16 @@ cleanup_remote() {
     cur="$(git -C "$A" ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
     [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null
   done
+  # …then sweep anything ELSE left in THIS run's own namespace (a name we did not enumerate, or a
+  # ref a failed step created). Bounded to the run's own $$-scoped namespace, so it can never touch
+  # a concurrent run's refs — the reason the namespace exists (see UNIQ below).
+  local ns_ref all
+  all="$(git -C "$A" ls-remote origin "${CLAIM_NS}/*" 2>/dev/null | awk '{print $2}')"
+  for ns_ref in $all; do
+    [ -n "$ns_ref" ] || continue
+    cur="$(git -C "$A" ls-remote origin "$ns_ref" 2>/dev/null | awk '{print $1}')"
+    [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ns_ref:$cur" origin ":$ns_ref" 2>/dev/null
+  done
   return 0
 }
 cleanup_all() { trap - EXIT INT TERM; cleanup_remote; rm -rf "$A" "$O" 2>/dev/null; }
@@ -65,6 +83,16 @@ gh() {
     *headRefOid*) echo "$SHA" ;;
     *"pr checks"*) echo "[]" ;;
     *--comments*) echo "stub: no reviewer comment" ;;
+    # required_status_checks (agent-infra#1764): merge-one resolves the repo's merge contract
+    # from branch protection; the mock must ANSWER it or the (correct) authority-unknown refusal
+    # exits 5 before the claim flow the suite drives. It emulates the POST-jq shape (one bare
+    # context per line, as `--jq '.contexts[]'` prints) and carries the gate, so the suite keeps
+    # exercising the gate-mode flow it was written for.
+    *required_status_checks*)
+      case "$*" in
+        *'.contexts[]'*) printf 'ai-review-gate\n' ;;
+        *)               printf '{"contexts":["ai-review-gate"]}' ;;
+      esac ;;
     *) echo "fake-gh unhandled: $*" >&2; return 1 ;;
   esac
 }
@@ -84,7 +112,7 @@ clear_ref() { # <ref>
 
 echo "=== step 0: clear any holder so A starts from a free ref ==="
 clear_ref "$REF"; clear_ref "$REF2"
-echo "  refs/claims/* on origin: $(git -C "$A" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
+echo "  ${CLAIM_NS}/* on origin: $(git -C "$A" ls-remote origin "${CLAIM_NS}/*" | wc -l | tr -d ' ')"
 
 echo
 echo "=== step 1: run the REAL merge-one.sh from this directory — expect ACQUIRED ==="
@@ -266,7 +294,25 @@ t="$(trap -p EXIT INT TERM)"
 for s in EXIT INT TERM; do
   # bash 3.2 prints SIGINT/SIGTERM, later bashes print INT/TERM — a substring match covers both.
   # here-string, not a pipe — `printf … | grep -q` takes SIGPIPE under pipefail (#841).
-  grep -q "$s" <<<"$t" && ok "trap registered for $s" || bad "no trap for $s"
+  if grep -q "$s" <<<"$t"; then
+    ok "trap registered for $s"
+  elif [ "$s" = INT ] && [ -z "$(trap -p INT)" ] && grep -qE "^trap 'exit 130' INT$" "$0"; then
+    # ⚠️ NOT a defect in this script (review round 7, diagnosed live; round 8, P3). POSIX puts SIGINT
+    # (and SIGQUIT) at IGNORE in a `&` background job, and bash REFUSES to trap a signal inherited as
+    # ignored — so `trap 'exit 130' INT` above is a no-op for a backgrounded run and this assertion
+    # can never be met there. Foreground (CI, selftest.sh) it holds.
+    # ⛔ LINE-ANCHORED, and that is load-bearing: an UNANCHORED `grep -F` matched this very
+    # condition line and the comment above it, so deleting the registration left the pin GREEN —
+    # the exact regression it names (round-9 review, P3: the first fix was itself vacuous).
+    # with SIGINT refused, `trap -p INT` prints EMPTY — byte-for-byte the same as "the trap line was
+    # deleted", which is precisely the regression this pin names (measured round 8: backgrounded
+    # refusal `[]`, no-trap `[]`, foreground `trap -- 'exit 130' SIGINT`). Skipping on the empty read
+    # ALONE made this pin unfalsifiable; requiring the source line makes deleting it go red even in a
+    # backgrounded run, so the pin can now fail on the thing it names.
+    echo "  ⊘ trap for INT: SKIPPED dynamically (SIGINT was IGNORED on entry — POSIX ignores INT in a \`&\` job and bash cannot trap an ignored signal), but the registration IS present in $0"
+  else
+    bad "no trap for $s"
+  fi
 done
 
 echo

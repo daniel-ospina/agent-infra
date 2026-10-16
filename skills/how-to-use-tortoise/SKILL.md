@@ -44,12 +44,28 @@ The write operations appear once in this skill (by operation name). Invoke them 
 | Invalidate point | `tortoise_invalidate` | `sdk.supersede(old, new, transfer_edges=False)` |
 | Delete point | `tortoise_delete_point` | `sdk.delete_point(id)` |
 | Update point | `tortoise_update_point` | `sdk.update_point(id, **props)` |
+| **Edit an operator edge** (relabel) | `tortoise_update` | `sdk.update(<operator_id>, label=…)` |
+| **Remove an operator edge** | `tortoise_delete` | `sdk.delete(<operator_id>)` |
 | Compute confidence | `tortoise_compute_confidence` | `sdk.compute_confidence(anchors=…)` |
 | Check structure | `tortoise_check_structure` | `sdk.check_structure()` |
 
+> **An operator IS a Point.** Operators carry `is_operator=true` on a `:Point` node, so they take
+> the *generic* verbs above — `sdk.update(<operator_id>, label=…)` relabels an operator edge in
+> place and `sdk.delete(<operator_id>)` removes it. `operator_action`'s refusal (`"must be
+> 'mitigate' or 'annotate'"`) is **not** the whole operator vocabulary; that action set exists only
+> for the two operations needing a reason or epistemic dimensions.
+>
+> One asymmetry worth knowing before you choose a verb: **relabelling does not validate.**
+> `create_operator(label=…)` returns a structured `undeclared_relation` warning when the predicate
+> is neither a **core operator label** — `IMPL`/`NAND` (Edge Types) plus the ONTOLOGY §8 semantics
+> vocabulary (`hasPart`, `addresses`, `supports`, `refutes`, `causes`, `dependsOn`, …) — nor one an
+> installed pack declares. `update(<operator_id>, label=…)` performs **no declaredness check** and
+> stores the label silently. Take valid predicates from `list_relations()` for the pack-declared
+> leg, **or from that core set**.
+
 ## Hard Gate
 
-**Any graph write** (create_point, create_operator, mitigate_operator, supersede_point, delete_point, annotate_point, invalidate_point) **MUST** go through this skill. Bypassing it risks:
+**Any graph write** (create_point, create_operator, mitigate_operator, supersede_point, delete_point, annotate_point, invalidate_point, and the operator-taking `update(<operator_id>, …)` / `delete(<operator_id>)`) **MUST** go through this skill. Bypassing it risks:
 - EP weights nuked by batch-connected mitigations
 - Orphaned NAND edges with no cleanup
 - Superseded operators with active edges still propagating
@@ -78,6 +94,73 @@ Never use <0.10 (negligible) or >0.50 (would invert the claim — use NAND inste
 Formula: `w_eff = w × (1 − strength)` — the mitigation is a graded
 DAMPENER, never a refutation (a mitigated NAND stays a contradiction, only
 weaker).
+
+## Annotation Dimensions — the Other Weight Mechanism
+
+A second, independent lever scales an operator's weight: the four **annotation
+dimensions** on every IMPL/NAND edge. Mitigation only ever *damps* an operator
+(0.10–0.50); annotation *bands* it — it can make a well-rated operator count for
+**more** as well as less. Use mitigation when the connection is weaker than it
+looks, and annotation when the connection's quality is known and should be graded.
+
+| Dimension | Reads as | Direction |
+|---|---|---|
+| `bias` | How one-sided the source's stake is (hidden agenda) | **Inverted** — high bias reads WORSE |
+| `precision` | How sharply the claim is defined | High reads BETTER |
+| `consistency` | How stable this relevance is across contexts | High reads BETTER |
+| `directness` | How directly the evidence bears on the claim | High reads BETTER |
+
+Each is a number in `0.0–1.0`. Set all four together:
+`tortoise_annotate_operator` (hosted) /
+`sdk.annotate_operator(id, bias, precision, consistency, directness)` (self-hosted).
+
+```
+q      = mean(1 − bias, precision, consistency, directness)
+factor = 2 ** (2q − 1)          # 0.5 (worst) … 1.0 (neutral) … 2.0 (best)
+```
+
+| Rating | Factor |
+|---|---|
+| **no rating at all, or all four at 0.5** | **exactly 1.0** |
+| worst possible (bias 1.0, others 0.0) | 0.5 |
+| best possible (bias 0.0, others 1.0) | 2.0 |
+| only `precision` at 1.0, the rest unrated | 1.189 |
+
+Four rules that decide how to use it:
+
+- **Unrated is exactly neutral, and neutral is the default.** Leave the
+  dimensions alone unless you have a reason. Rating is a deliberate act —
+  never set them as a by-product of writing something else.
+- **Averaged, not multiplied.** Rating one dimension well never penalises the
+  others, and a partial rating moves the factor only as far as that
+  dimension justifies. A rating of 0.9 across the board reads BETTER than
+  unrated, not worse.
+- **Symmetric — for every rating that halves a weight there is one that
+  doubles it.** Do not use these to express disagreement; that is NAND's job.
+  Use them to say "this reasoning is stronger, or weaker, than an unrated
+  connection".
+- **A rating does not require a source.** These dimensions grade how much a
+  connection contributes, so they apply as much to a reasoning link you built
+  yourself as to one backed by external evidence. Grade the connection;
+  provenance belongs on the point, in `credibility` / `sourceKind`.
+
+On a **NAND** the top of the band is partly absorbed: `NAND_BASE_WEIGHT` is
+8.0 and the final clamp is `[0.1, 10.0]`, so `8.0 × 2.0 = 16.0` clamps to
+`10.0`. Strengthening is fully effective on IMPL and only partly on a
+**top-level** NAND. It is **not effective at all** on a NAND whose target is
+itself an operator: that NAND's base doubles to 16.0 *before* the rating, so
+even unrated it already clamps to `10.0` and a best rating gains nothing
+(weakening still lands — `16.0 × 0.5 = 8.0`).
+
+> **Do not confuse these with source credibility tiers.** A **Point's** Beta
+> prior — how much we trust the claim itself — comes from its sources' tier
+> (`credibilityTier` when set, otherwise the tier implied by `sourceKind`,
+> T0–T4), not from the `credibility` kwarg. That kwarg is a validated *label*,
+> not a strength: it adds one weak evidence body, the same for every ladder
+> word, and does not select the tier prior. The annotation
+> dimensions grade an **Operator's** weight — how much this connection
+> contributes. They are separate systems: a T0 source on a heavily-biased
+> connection is still a heavily-biased connection.
 
 ## The Critical Semantic: Truth vs Weight
 
@@ -115,6 +198,8 @@ Challenge received:
 ├─ Claim is FACTUALLY WRONG? → NAND the Point directly (truth attack)
 ├─ Claim is TRUE but OVERSTATED? → mitigate_operator on the edge (relevance attack, 0.10–0.50)
 ├─ Claim is TRUE but IRRELEVANT to what it's connected to? → NAND the operator (relevance attack)
+├─ Claim is TRUE, the link holds, but its QUALITY is known and should be graded?
+│    → annotate_operator on the edge (grades its weight, 0.5–2.0; leave unset = exactly neutral)
 └─ Option is a BAD FIT for a criterion? → NAND/mitigate the operator between them, never the option or criterion points
 ```
 
@@ -590,7 +675,7 @@ and terminal statuses too). The sanctioned promotion routes:
 - `promotion_policy="auto"` opts into #131 parity (source auto-promotion on
   first edge write) — the migration path from the old default.
 
-The response carries `warnings` (never fatal) — see the ELEVEN-key table.
+The response carries `warnings` (never fatal) — see the TWELVE-key table.
 
 ## Idempotent resubmission
 
@@ -614,9 +699,24 @@ by the retry (content+kind fallback scan), never duplicated.
 
 | Connection | Route | Result |
 |---|---|---|
-| Plain `operator: IMPL/NAND` | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
+| Plain `operator: IMPL/NAND` — **any endpoint is a plain `:Point`** | Operator point | `{"operator_id", "deduped"}` |
+| Plain `operator: IMPL/NAND` — **both endpoints non-Point** (e.g. `Object↔Object`) | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
 | `mitigation` / `reify: true` | Operator point | `{"operator_id", "deduped"}` |
 | `relation` | Structural edge | `{"relation", "from", "to", "deduped"}` |
+
+⛔ **Point↔Point relations are operator-mediated** (owner ruling 2026-10-13, tortoise #8499) — an
+operator-less edge carries no operator node, so it can be neither mitigated nor annotated, and it
+cannot carry the epistemic weighting a Point's relations claim. (Durability was the ruling's
+original third argument — plain direct edges were journaled but never replayed, so `rebuild_all`
+lost them — but #8499 landed the `DirectEdgeCreated` replay fold, so they survive a rebuild now
+too; the ruling does not rest on that argument any more.) The direct shape is reserved for
+`Object↔Object`, where no epistemic weighting is claimed. Write `reify: true` to say the operator
+route explicitly; a plain spelling that gets re-routed is reported as the `point_mediated_route`
+warning. Note `ingest`'s connection contract admits only plain `:Point` endpoints today (sole
+carve-out: an `Event` on the operator route), so in practice every plain `IMPL`/`NAND` in a bundle
+is operator-mediated and returns the bare operator-id string — the `{direct_edge, from, to}`
+descriptor is what `create_direct_edge` returns for an `Object↔Object` pair, while `create_edge`
+writes a *relation* edge (`{relation, from, to}`) instead.
 
 Multi-item `to` on a plain IMPL/NAND connection: use `reify:true` /
 mitigation (the operator route) or split into singular connections.
@@ -631,7 +731,7 @@ mitigation (the operator route) or split into singular connections.
   rejections — migrate via `reify:true` ×2 (the operator route preserves
   both labels).
 
-## Warnings — the ELEVEN keys (closed set)
+## Warnings — the TWELVE keys (closed set)
 
 `warnings` entries are key-prefixed strings. A key outside this table is a
 divergence — report it:
@@ -640,7 +740,8 @@ divergence — report it:
 · `mitigation_drift_duplicate` · `nfc_straddle_duplicate` ·
 `mitigation_strength_change` · `partial_operator_residue` ·
 `operator_absorb_completed` · `label_dropped_resubmit` ·
-`direction_dropped_resubmit` · `direction_changed_resubmit`
+`direction_dropped_resubmit` · `direction_changed_resubmit` ·
+`point_mediated_route`
 
 ## Query-back verification (J8 exit state)
 

@@ -61,7 +61,7 @@ Routes an epic through the full 6-stage fractal planning pipeline. Each stage in
 
 > **Hooks:** Test-Design Gate fires between Scope and Plan; Capstone Verification Gate fires between Decompose and Verify. Both are mandatory stage hooks — see Gates below.
 
-**Reflect** — session capture runs at session quit via `reflect-hook.ts`: writes a durable local JSONL record (~/.tortoise/session-events/) and POSTs to the hosted tortoise `/v1/sessions` endpoint when `TORTOISE_API_KEY` is set (AAR postmortem + friction data). Cross-cutting: fires at epic completion, project close, and session quit.
+**Reflect** — session capture runs at session quit via `reflect-hook.ts`: writes a durable local JSONL record (~/.tortoise/session-events/) and POSTs to the hosted tortoise `/v1/sessions` endpoint only when hosted capture is explicitly opted in (`"cloud": true` in `~/.pi/agent/tortoise-config.json`) AND a key is present (#803; a key alone never enables egress). A repo can opt out with `<repo>/.pi/tortoise-capture.json` `{"cloud": false}` or `TORTOISE_CAPTURE_CLOUD=0`. Cross-cutting: fires at epic completion, project close, and session quit.
 
 ## Human Gates
 

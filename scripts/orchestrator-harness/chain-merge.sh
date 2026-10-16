@@ -18,4 +18,23 @@ if [ -z "${PR:-}" ] || [ "$PR" = "null" ]; then
 fi
 echo "[chain $N] PR #$PR found — starting merge chain $(date)" >> "$LOG"
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
+rc=$?
+# A load refusal (75) is not a failure of the work: nothing ran and nothing was consumed. Name it
+# HERE, in the log the operator reads for this chain — the reviewer's own line is inside
+# merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
+echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
+if [ "$rc" = "75" ]; then
+  echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
+fi
 echo "[chain $N] done $(date)" >> "$LOG"
+# ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
+# above, so `$?` was the STATUS OF `echo` — always 0 — and a caller doing `chain-merge.sh … && next`
+# took the success branch whatever happened.
+# ⚠️ WHAT THIS DOES NOT YET FIX (review round 2026-10-15): `merge-one.sh` ITSELF still ends on a
+# reporting `echo` and contains no `exit 75` / `AGENT_STARTED` (0 hits), so on the paths that reach
+# its end — a reviewer that FAILED, and a clean pass — it returns 0, and the refusal branch BELOW is
+# FORWARD-LOOKING. Its early guards do exit 1/2/3/4, and those propagate now; the 75 will propagate
+# once the blocked `#8521` half lands in merge-one.sh (PR #1769/#1730 hold that file). Until then the
+# reporting lines stay truthful about a refusal while the EXIT CODE cannot distinguish a refused
+# reviewer from a successful one. Recorded in port-provenance.txt as a residual, not claimed as done.
+exit "$rc"

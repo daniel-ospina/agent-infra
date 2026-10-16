@@ -144,6 +144,7 @@ __all__ = [
     "Evidence",
     "Verdict",
     "CALL_DISCARDING_STOP_REASONS",
+    "CALL_FAILED_STOP_REASONS",
     "TERMINAL_STOP_REASONS",
     "tool_stall_ms",
     "cpu_attributable",
@@ -199,6 +200,19 @@ NON_TERMINAL_STOP_REASONS = frozenset({"toolUse"})
 # still-running turn read `turn-ended` — the #1254 fail-open shape, aimed at
 # the classifier itself.
 CALL_DISCARDING_STOP_REASONS = frozenset({"error", "aborted"})
+# #5389 review (cycle 4, P2): the stop reasons under which pi FAILS a truncated
+# message's tool calls instead of executing them. `length` is OPEN — the loop
+# continues and awaits the turn's next step (see the measurement above) — but it
+# is NOT in flight: all 78 measured results after a `length`+calls message carry
+# `isError: true` ("Tool call ... was not executed"). Openness and in-flight-ness
+# are DIFFERENT conditions for this shape, so the transcript-derived veto must
+# abstain: a phantom tool would hold the lane `running-quiet/tool-in-flight` to
+# the 4 h AGE backstop where the watchdog's zero-tool `stream-stall` cuts at S,
+# i.e. the classifier standing quiet where the watchdog cut (the fail-open
+# divergence docs/ops/fleet-liveness.md §6 forbids). Do NOT fold this into
+# `CALL_DISCARDING_STOP_REASONS`: `length` leaves the turn OPEN (T18 pins that),
+# and only the VETO abstains.
+CALL_FAILED_STOP_REASONS = frozenset({"length"})
 # #1272: the stop reasons on a CALL-FREE message under which pi ENDS the turn.
 # `stop` and `length` end a completed turn; `error` and `aborted` END THE AGENT
 # RUN outright — pi's loop returns before any tool batch
@@ -307,9 +321,16 @@ class Tool:
     ``cpu_advanced`` / ``cpu_stall_ms`` are the ALREADY-COMPUTED tick fields
     (builtin-tools/index.ts:2274-2275, task-heartbeat.ts:226) — this module does
     NOT re-derive CPU attribution.
+
+    ``call_label`` is the transcript's own label for the open call
+    (``bash(call_00_…)``). It is EVIDENCE, not a verdict input: the
+    ``tool-in-flight`` row names the unwritten call so a reader can tell *which*
+    step is holding the lane, exactly as the ``wedged`` row does (#5389 review
+    cycle 1 P1 — the two rows must not disagree about what the tail shows).
     """
 
     name: str = ""
+    call_label: str = ""
     tools_in_flight: int = 0
     tool_updates: bool = False
     silence_age_ms: Optional[int] = None
@@ -493,7 +514,7 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
         ``effToolAge > streamStallMs`` (:3058, 20 min). 30 min binds only when the
         CPU-stall and tool-age clocks start together.
       * ``"progressing"``, ``"unknown"``, or a non-attributable tool kind — the
-        AGE backstop, ``tool-stall`` (index.ts:3065-3073, kill at :3072): ``toolStallMs`` (4h
+        AGE backstop, ``tool-stall`` (index.ts:3091-3096, kill at :3095): ``toolStallMs`` (4h
         at the 6h cap) while the turn is ACTIVE, and
         ``min(toolStallMs, heartbeatTimeoutMs)`` (30 min) when it is NOT. The
         turn-inactive branch is the one v4 missed, and missing it is the
@@ -544,7 +565,7 @@ def tool_veto_expired(tool: Optional[Tool]) -> bool:
     # `"progressing"`, `"unknown"`, a non-attributable tool kind, and a
     # `no-progress` shape whose clause is not yet due ALL reach the watchdog's
     # AGE backstop, and that is the faithful mirror: the watchdog's `tool-stall`
-    # clause (index.ts:3065-3073, kill at :3072) has NO CPU or progress conjunct —
+    # clause (index.ts:3091-3096, kill at :3095) has NO CPU or progress conjunct —
     # `effToolAge > bound` alone — so it cuts a tool whose CPU is STILL ADVANCING
     # once the age backstop is passed. Progress evidence buys a reprieve from
     # `tool-silence`/`tool-dead` (S = 20 min), never an exemption from the
@@ -662,8 +683,14 @@ def evaluate(ev: Evidence) -> Verdict:
     if ev.tool is not None and ev.tool.tools_in_flight > 0 and not tool_veto_expired(ev.tool):
         # Quiet is never a stall: the tool veto holds until the watchdog's own
         # per-shape bound (T9, C5) — and never for a legitimately CPU-flat
-        # nested `task` (T11, C8).
-        return Verdict("running-quiet", "tool-in-flight", holder_pid=holder.pid)
+        # nested `task` (T11, C8). The detail names the UNWRITTEN call the veto
+        # is holding on (#5389 review cycle 1 P1): a report row that says only
+        # `tool-in-flight` cannot distinguish the bash it is waiting on, and the
+        # markdown-escape leg of the delivery suite needs the same
+        # transcript-derived value the `wedged` row renders.
+        held = ev.tool.call_label or ev.tool.name
+        return Verdict("running-quiet", "tool-in-flight", holder_pid=holder.pid,
+                       detail=("in-flight %s" % held) if held else "")
 
     # (4) The bounded input-consumption veto. It gates `idle`/`wedged` ONLY —
     #     `dead` was decided above and NO record can veto it (C9, T10).
@@ -859,16 +886,25 @@ def jsonl_state(path: Optional[str], now_ms: int, window_ms: int = STREAM_STALL_
 
 
 # ── the turn boundary (#1254) ─────────────────────────────────────────────
-def _tool_call_labels(msg: dict) -> List[str]:
-    """``["bash(call_00_…)", …]`` for an assistant message's toolCall items."""
+def _tool_call_items(msg: dict) -> List[dict]:
+    """The ``toolCall`` content items of an assistant message, in message order."""
+    return [item for item in (msg.get("content") or [])
+            if isinstance(item, dict) and item.get("type") == "toolCall"]
+
+
+def _tool_call_labels_from(calls: Sequence[dict]) -> List[str]:
+    """``["bash(call_00_…)", …]`` for a list of ``toolCall`` items."""
     labels: List[str] = []
-    for item in msg.get("content") or []:
-        if not isinstance(item, dict) or item.get("type") != "toolCall":
-            continue
+    for item in calls:
         name = str(item.get("name") or "?")
         cid = str(item.get("id") or "")
         labels.append("%s(%s)" % (name, cid) if cid else name)
     return labels
+
+
+def _tool_call_labels(msg: dict) -> List[str]:
+    """``["bash(call_00_…)", …]`` for an assistant message's toolCall items."""
+    return _tool_call_labels_from(_tool_call_items(msg))
 
 
 def turn_from_entry(entry) -> Turn:
@@ -941,23 +977,57 @@ def turn_from_entry(entry) -> Turn:
     return Turn(False, "no-turn-yet")
 
 
-def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
-    """The last message-bearing entry AND the file's actual last entry.
+def _tail_needs_widening(messages: List[dict]) -> bool:
+    """Whether the tail window is too small for BOTH tail readers.
+
+    The turn boundary needs only the newest message-bearing entry. The derived
+    tool needs MORE: pi runs one assistant message's tool calls in PARALLEL by
+    default (`executeToolCallsParallel`), writing each result as it lands, so a
+    partially-completed batch leaves a `toolResult` as the newest message entry
+    and the assistant message that ISSUED the remaining call one or more entries
+    behind it. A window whose newest message is a `toolResult` with no
+    call-carrying assistant message before it cannot see that in-flight sibling —
+    widen, or abstain rather than deny a tool that is demonstrably running
+    (#5389 review P1).
+    """
+    if not messages:
+        return True
+    msg = messages[-1].get("message")
+    if not isinstance(msg, dict) or msg.get("role") != "toolResult":
+        return False
+    for entry in messages[:-1]:
+        m = entry.get("message")
+        if (isinstance(m, dict) and m.get("role") == "assistant"
+                and _tool_call_items(m)):
+            return False
+    return True
+
+
+def _tail_message_entries(path: str, limit_bytes: int = TURN_TAIL_BYTES):
+    """The message-bearing entries in the transcript's bounded tail, in order.
+
+    Returns ``(messages, last_entry, size)``: ``messages`` in CHRONOLOGICAL
+    order (newest LAST), ``last_entry`` the file's actual last parseable entry
+    (a non-message trailer such as a `compaction` is reported here, never inside
+    ``messages``), and ``size`` (0 when the file cannot be stat'd).
+
+    ``_last_message_entry`` is the ``messages[-1]`` view of this; the
+    derived-tool reader needs the whole list so it can find the assistant
+    message that issued a trailing `toolResult`'s calls (see
+    ``_tail_needs_widening``).
 
     Read BACKWARDS from EOF — the last turn boundary is always at the end, so a
     bounded read suffices and the file is never read whole. Every pass reaches
-    EOF, so the first parseable line it meets is the file's LAST entry. Returns
-    ``(message_entry, last_entry, size)``: ``message_entry`` is ``None`` when no
-    message-bearing entry was found in the window (or the file could not be
-    read); ``last_entry`` is ``None`` only when the window held no parseable
-    entry at all. The caller abstains, it never guesses.
+    EOF, so the first parseable line it meets is the file's LAST entry. The
+    window grows (x4, capped) while it holds no message-bearing entry or a
+    trailing result whose owner it cannot see. ``([], None, size)`` on a read
+    failure: the caller abstains, it never guesses.
     """
     try:
         size = os.path.getsize(path)
     except OSError:
-        return None, None, 0
+        return [], None, 0
     window = limit_bytes
-    last_entry = None
     while True:
         read = min(size, window)
         start = size - read
@@ -967,12 +1037,13 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
                     fh.seek(start)
                 blob = fh.read(read)
         except OSError:
-            return None, None, size
+            return [], None, size
         lines = blob.split(b"\n")
         if start:
             # The read began mid-entry: the first line is a partial record.
             lines = lines[1:]
-        for raw in reversed(lines):
+        entries: List[dict] = []
+        for raw in lines:
             raw = raw.strip()
             if not raw:
                 continue
@@ -980,14 +1051,31 @@ def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
                 entry = json.loads(raw.decode("utf-8", "replace"))
             except (ValueError, UnicodeDecodeError):
                 continue
-            if last_entry is None:
-                last_entry = entry
-            msg = entry.get("message") if isinstance(entry, dict) else None
-            if isinstance(msg, dict) and msg.get("role") in TURN_MESSAGE_ROLES:
-                return entry, last_entry, size
+            entries.append(entry)
+        last_entry = entries[-1] if entries else None
+        messages = [e for e in entries
+                    if isinstance(e, dict)
+                    and isinstance(e.get("message"), dict)
+                    and e["message"].get("role") in TURN_MESSAGE_ROLES]
         if start == 0 or window >= TURN_TAIL_CAP_BYTES:
-            return None, last_entry, size
+            return messages, last_entry, size
+        if not _tail_needs_widening(messages):
+            return messages, last_entry, size
         window = min(window * 4, TURN_TAIL_CAP_BYTES)
+
+
+def _last_message_entry(path: str, limit_bytes: int = TURN_TAIL_BYTES):
+    """The last message-bearing entry AND the file's actual last entry.
+
+    The ``messages[-1]`` view of :func:`_tail_message_entries`; see it for the
+    reverse read, the window-growth rule and the abstention semantics. Returns
+    ``(message_entry, last_entry, size)``: ``message_entry`` is ``None`` when no
+    message-bearing entry was found in the window (or the file could not be
+    read); ``last_entry`` is ``None`` only when the window held no parseable
+    entry at all. The caller abstains, it never guesses.
+    """
+    messages, last_entry, size = _tail_message_entries(path, limit_bytes)
+    return (messages[-1] if messages else None), last_entry, size
 
 
 def turn_from_jsonl(path: Optional[str]) -> Optional[Turn]:
@@ -1052,6 +1140,37 @@ def _iso_ms(stamp) -> Optional[int]:
     return int(parsed.timestamp() * 1000)
 
 
+def _unanswered_calls(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
+    """The owning assistant entry and the calls no `toolResult` has answered.
+
+    ``messages`` is a transcript tail in chronological order (newest last). pi
+    runs one assistant message's calls in PARALLEL, so a partially-completed
+    batch leaves results after the message that issued them; the owning message
+    is the nearest assistant carrying tool calls. Returns ``(None, [])`` when no
+    such message is in the window — the caller abstains, never guesses.
+    """
+    owner_idx = None
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i].get("message")
+        if (isinstance(m, dict) and m.get("role") == "assistant"
+                and _tool_call_items(m)):
+            owner_idx = i
+            break
+    if owner_idx is None:
+        return None, []
+    owner = messages[owner_idx]
+    answered = set()
+    for later in messages[owner_idx + 1:]:
+        m = later.get("message")
+        if isinstance(m, dict) and m.get("role") == "toolResult":
+            cid = m.get("toolCallId")
+            if cid:
+                answered.add(str(cid))
+    calls = [c for c in _tool_call_items(owner.get("message"))
+             if str(c.get("id") or "") not in answered]
+    return owner, calls
+
+
 def tool_from_jsonl(
     path: Optional[str],
     now_ms: int,
@@ -1100,25 +1219,61 @@ def tool_from_jsonl(
     than the 30 min one (a lane whose transcript shows an unanswered call is by
     definition not resting).
 
+    The derived age is bounded from TWO sources, not one. The transcript's own
+    mtime is a genuine lower bound on the call's age (the file is written at or
+    after the call), so ``min(started, mtime)`` covers both shapes an entry
+    stamp alone cannot: an UNREADABLE stamp (age would be unknown → an unknown
+    age never expires) and a FUTURE-dated stamp from a writer host on a bad
+    clock (a bare ``now - started`` clamps to 0 and STAYS 0 → the 4 h backstop
+    is never reached). Both are the permanent veto T9 forbids (#5389 review F2).
+
     Returns None — never a zeroed Tool — when the tail shows no in-flight tool:
     a ``None`` veto and an empty one are different claims, and manufacturing the
     empty one would assert "no tool is running" from a transcript this parser
-    simply could not read.
+    simply could not read. A ``length``-truncated message is one such shape on
+    the OTHER side of the boundary: it is OPEN (pi continues the turn) but its
+    calls were FAILED, not executed, so it asserts no tool either — see
+    ``CALL_FAILED_STOP_REASONS`` (#5389 review, cycle 4, P2).
+
+    The tail is read as a SET, not as a single entry. pi runs one assistant
+    message's tool calls in PARALLEL by default (`executeToolCallsParallel`; no
+    builtin tool opts into `executionMode: "sequential"`) and writes each result
+    as it lands, so a partially-completed batch leaves a sibling's `toolResult`
+    newest with the still-unanswered call behind it. Deciding from the newest
+    entry alone would deny a tool that is demonstrably in flight and read the
+    lane `wedged` where the watchdog's own progress-blind `tool-stall` backstop
+    still applies; this reader walks back to the owning assistant message and
+    keeps only the calls no result has answered (#5389 review P1).
     """
     if not path:
         return None
-    entry, last_entry, _size = _last_message_entry(path)
+    messages, last_entry, _size = _tail_message_entries(path)
     # Mirror turn_from_jsonl: a compaction trailer decides neither disposition.
     if (last_entry is not None and isinstance(last_entry, dict)
             and last_entry.get("type") == "compaction"):
         return None
-    if not isinstance(entry, dict):
+    if not messages:
         return None
+    entry = messages[-1]
     msg = entry.get("message")
-    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+    if not isinstance(msg, dict):
         return None
-    calls = [item for item in (msg.get("content") or [])
-             if isinstance(item, dict) and item.get("type") == "toolCall"]
+    if msg.get("role") == "assistant":
+        calls = _tool_call_items(msg)
+    elif msg.get("role") == "toolResult":
+        # #5389 review P1 — a PARALLEL batch. The newest message is a sibling's
+        # result; the call it does not answer is still in flight, so derive the
+        # veto from the owning assistant message instead of denying it. Only
+        # calls with NO `toolResult` after them are in flight — a fully-answered
+        # batch asserts nothing and the turn boundary's
+        # `turn-open:awaiting-assistant` (the assistant reply is what is missing)
+        # decides alone.
+        owner, calls = _unanswered_calls(messages)
+        if owner is None:
+            return None
+        entry, msg = owner, owner.get("message")
+    else:
+        return None
     if not calls:
         return None
     # A call-carrying message whose stop reason DISCARDS its calls is not an
@@ -1126,6 +1281,20 @@ def tool_from_jsonl(
     # the boundary cannot disagree about whether this message is open).
     if msg.get("stopReason") in CALL_DISCARDING_STOP_REASONS:
         return None
+    # #5389 review (cycle 4, P2): `length` FAILS the truncated message's calls
+    # (`failToolCallsFromTruncatedMessage`) while the turn stays OPEN. The veto
+    # is about a tool EXECUTING, and no call here is — asserting one would
+    # suppress the honest `wedged` verdict for a lane pi hung on immediately
+    # after truncating.
+    if msg.get("stopReason") in CALL_FAILED_STOP_REASONS:
+        return None
+    # The transcript's OWN mtime, read once and used for BOTH bounds below. It
+    # is a genuine lower bound on the call's age: the file is written at or
+    # after the call, so the call is at least as old as the file.
+    try:
+        mtime_ms = int(os.stat(path).st_mtime * 1000)
+    except OSError:
+        mtime_ms = None
     started = _iso_ms(entry.get("timestamp"))
     if started is None:
         # #5389 review P1: an UNREADABLE entry stamp must not leave the age
@@ -1135,12 +1304,9 @@ def tool_from_jsonl(
         # veto PERMANENT: the lane would read `running-quiet/tool-in-flight`
         # forever and `idle` would become unreachable, which is the one outcome
         # T9 forbids. Fall back to the transcript's OWN mtime: it is a genuine
-        # measurement, it UNDERSTATES the call's age (the file is written at or
-        # after the call), and it grows without bound while the file is frozen,
-        # so the veto still expires.
-        try:
-            started = int(os.stat(path).st_mtime * 1000)
-        except OSError:
+        # measurement and it grows without bound while the file is frozen, so
+        # the veto still expires.
+        if mtime_ms is None:
             # Cannot date the call from ANY source. Do NOT return a Tool here:
             # `_exceeds(None, bound)` is False, so an unmeasurable age makes the
             # veto PERMANENT (T9 forbids it — and that is the defect the previous
@@ -1150,9 +1316,21 @@ def tool_from_jsonl(
             # `evaluate` names that `jsonl-age-unknown` — an ABSTENTION reached
             # after the (now absent) veto, never `wedged`. (#5389 review, cycle 3.)
             return None
+        started = mtime_ms
+    elif mtime_ms is not None:
+        # #5389 review F2: a FUTURE-dated entry stamp (a writer host with a
+        # wrong clock — a VM booting on a bad RTC before NTP corrects it) makes
+        # `now - started` clamp to 0 and STAY 0 while the stamp is ahead of the
+        # clock, so the 4 h AGE backstop is never reached and the veto is
+        # PERMANENT (`idle` unreachable) — the same outcome T9 forbids by
+        # another route. `min` takes the EARLIER timestamp, which never reports
+        # the call as younger than it is, so the veto can only expire no earlier
+        # than the call's true age allows.
+        started = min(started, mtime_ms)
     age = max(0, now_ms - started)
     return Tool(
         name=str(calls[0].get("name") or ""),
+        call_label=", ".join(_tool_call_labels_from(calls)),
         tools_in_flight=len(calls),
         tool_updates=False,
         silence_age_ms=silence_age_ms,

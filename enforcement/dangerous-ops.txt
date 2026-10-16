@@ -8,7 +8,7 @@ using-git-worktrees # git worktree add|git worktree remove # hard # Raw worktree
 
 supabase # supabase|migration|RLS|apply_migration_safe|pg_ # hard # Use supabase/SKILL.md for all Supabase operations. Unsafe migrations can cause data loss.
 
-how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation.
+how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator|tortoise_update|tortoise_delete # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation. The generic update/delete take the Point arm for operators too, so the SKILL.md Hard Gate names them; arming them here keeps the prose list and this manifest 1:1 (issue 6131).
 
 commit-workflow # gh pr review|gh pr approve # hard # Use commit-workflow/SKILL.md for PR review operations.
 

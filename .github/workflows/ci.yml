@@ -292,7 +292,7 @@ jobs:
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
         # The suite above is only a pin if it can FAIL. `--mutations`
-        # reintroduces each of the 29 defects into a TEMP copy of the module (or
+        # reintroduces each of the 33 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
         # subprocess — a mutation whose paired test still passes is reported as
         # a suite failure. Its own step, not a second command in the step above:
@@ -380,6 +380,21 @@ jobs:
         # non-numeric field, and an already-healthy payload must all be left
         # BYTE-IDENTICAL — the guard must never rewrite a good request.
         run: npx tsx extensions/clamp-output-floor.test.ts
+
+      - name: Secret-echo-guard suite (#5109 — the transcript-leak control)
+        # #5109 — a live API key was persisted in plaintext into session
+        # transcripts (60/576 files, still growing) because every reading tool
+        # returns the value and the result is written verbatim. This extension
+        # redacts registered secrets from `content` AND `details` in the
+        # `tool_result` hook, before persistence. Zero-dep by construction: the
+        # extension imports the pi package as a TYPE only (erased by tsx) and
+        # node stdlib otherwise, so it runs in THIS job (the job that performs no
+        # `npm ci`); every sink is driven through the NODE_ENV=test hook seam, so
+        # it never touches the real ~/.pi and never reads a real secret.
+        # Negative pins are first-class: ordinary output must be returned BY
+        # REFERENCE (handler answers `undefined`) and record nothing, a sub-floor
+        # value must not be redacted, and no sink may carry a redacted value.
+        run: npx tsx extensions/secret-echo-guard.test.ts
 
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
@@ -524,6 +539,38 @@ jobs:
         # RED on the defect, GREEN under a behaviour-identical reformat. Zero-dep
         # (`node:*` only), no `npm ci`, ~4s.
         run: node --test scripts/tortoise-memory.test.mjs
+      - name: version-stamp drift check — scripts/check-version-stamp.test.mjs (#1760)
+        # A check nothing runs is the inert gate #1760 exists to remove, so its suite is wired here.
+        # The SUITE is wired rather than the checker: the suite builds its own git fixtures (a real
+        # repo, a stamped surface, an off-main-line branch), so it is independent of whether the
+        # runner's surface set is stamped — while the checker itself, with no surfaces present,
+        # deliberately refuses (exit 2, "an empty set is not a pass") rather than reporting green.
+        # That refusal is the behaviour, so wiring the checker here would be red for the wrong reason.
+        # Zero-dep (`node:*` only), no `npm ci`.
+        run: node --test scripts/check-version-stamp.test.mjs
+      - name: cmux-session snapshot pin — extensions/cmux-session.test.ts (#1138)
+        # Same shape as the step above, one layer down: a suite that pins a
+        # version-controlled snapshot, wired nowhere, so it enforced nothing.
+        # extensions/cmux-session.ts is a bootstrap SNAPSHOT of a file cmux
+        # upgrades IN PLACE on the farm (~/.pi/agent/extensions/cmux-session.ts),
+        # so the snapshot can silently fall behind with nothing in main saying so
+        # — measured: main carried the v2 snapshot (55,408 B) while the farm ran
+        # v4 (74,220 B, sha256 35764c49…), and that delta was in no ref at all.
+        # HONEST SCOPE: the literals live in the same commit as the file, so this
+        # cannot observe the FARM advancing — cmux upgrading the live file leaves
+        # this repo holding the previous payload with a green suite. What it
+        # catches is an unrecorded swap of the committed snapshot (the v2-in-main
+        # shape #1138 describes). The farm-advance residual is named on #1138.
+        # The step is what makes the pins BITE. Against the old v2 blob THREE
+        # tests fail (the handler test — v2 registers no `agent_start` — plus both
+        # pins; 1 passed, 3 failed, exit 1); against a v4 payload carrying a
+        # line-1-preserving edit the payload assertion alone goes red (3 passed,
+        # 1 failed, exit 1) — the false PASS a marker literal cannot see, which is
+        # #1760's payload-hash decision applied to this snapshot.
+        # Zero-dep by construction (the pi package is a TYPE-only import, erased
+        # by tsx; node stdlib otherwise), so it runs in THIS job, which performs
+        # no `npm ci`.
+        run: npx tsx extensions/cmux-session.test.ts
       - name: Literal-path fence (no swarm abspath in skills/extensions/scripts)
         # Task 4 acceptance, CI-enforced: FAIL on a match. docs/ is excluded
         # (provenance).

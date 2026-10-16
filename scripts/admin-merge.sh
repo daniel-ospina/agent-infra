@@ -339,20 +339,28 @@
 #                        Jobs API call, and an unbounded window turns a
 #                        correctness knob into a cost one. A non-numeric or
 #                        non-positive N is refused before any CI work.
-#                        For the LANE-COVERAGE gate the window counts MEASUREMENTS,
-#                        never raw positions (#4844): a push burst that cancels its
-#                        own predecessors leaves terminal-but-unmeasured
-#                        (`completed/cancelled`) runs, which used to fill the window
-#                        and push the last measured run out of it — refusing every
-#                        merge on a condition unrelated to the PR. The gate widens
-#                        the raw listing past those runs (doubling, bounded by 200)
-#                        while a window has yielded no executed shard at all, and
-#                        stops once N runs that FINISHED a measurement are consulted.
-#                        So N is the widening's STOPPING RULE, not a bound on
-#                        what one pass reads or on the call budget: a widened pass
-#                        reads its whole listing (at most 200 lane runs per side,
-#                        one Jobs-API call each), and the posted evidence says when
-#                        the reference came from a wider window than N.
+#                        For the LANE-COVERAGE gate the raw listing WIDENS while the
+#                        window has yielded no shard in the parity FAMILY at all
+#                        (doubling, bounded by 200). That is what makes a push burst
+#                        harmless (#4844): each push CANCELS its predecessor, leaving
+#                        terminal-but-unmeasured (`completed/cancelled`) runs that
+#                        used to fill the window and push the last measured run out
+#                        of it, refusing every merge on a condition unrelated to the
+#                        PR. Such a run is still CONSULTED — it may have executed
+#                        shards before it was cancelled, and skipping it would SHRINK
+#                        the reference — but it cannot end the search. N is the
+#                        STARTING WIDTH, not a stopping rule (#7734): the widening
+#                        stops on a family match, on the history being exhausted, or
+#                        at the 200-run bound — never merely because N runs finished
+#                        a measurement, since under --any-workflow those runs can be
+#                        non-code ones that carry no shard (measured: tortoise main
+#                        carried 2 distinct executed job names in a 10-run window and
+#                        3 in a 20-run one, none named `test*`, where 40 runs wide
+#                        carried 17). So N is not a bound on what one pass reads or on
+#                        the call budget: a widened pass reads its whole listing (at
+#                        most 200 lane runs per side, one Jobs-API call each), and the
+#                        posted evidence says when the reference came from a wider
+#                        window than N.
 #   --workflow <f>       the TEST lane both sides are read from (default
 #                        `python-ci.yml`). NOT cosmetic: an unfiltered main
 #                        window is dominated by cron/watchdog lanes and can
@@ -428,7 +436,10 @@
 #                        explicit value is a CEILING instead: an operator's cap,
 #                        not a claim about the run. See wait_for_run.
 #   --no-rerun           skip the flake re-run classification (a non-empty
-#                        unique set then blocks immediately)
+#                        unique set then blocks immediately). NOTE: the #3715
+#                        base reproduction still runs — it is a baseline
+#                        MEASUREMENT, not the PR's flake re-run, and it can
+#                        still clear a failure main's table has no row for.
 #   --print-bounds [<run-id>]
 #                        print the re-run bound + per-shard table + source. With NO
 #                        run id there is nothing to derive from, so this prints the
@@ -487,14 +498,36 @@
 #   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
 #   systematic collision. The rail reads `isDraft` BEFORE any CI work and
 #   refuses with that specific reason (tell the caller to `gh pr ready`) — never
-#   a generic merge failure after the evidence marker.
+#   a generic merge failure after the evidence marker. ⛔ AN UNREADABLE `isDraft`
+#   READ IS A THIRD OUTCOME, NOT `false` (#1750): a failed read used to return
+#   the empty string and be read as "not a draft", so the rail PROCEEDED past
+#   this refusal. It now refuses by name via `require_draft` with its own
+#   machine-readable tag (`[draft_unreadable]`), which the genuine-draft refusal
+#   does NOT carry.
 #
 # Env seams (tests only):
 #   ADMIN_MERGE_GH                       the gh command (default: `gh`)
 #   ADMIN_MERGE_FAILURE_SET_SH           the parser (default: ./ci-failure-set.sh)
 #   ADMIN_MERGE_POLL_INTERVAL            seconds between re-run polls (default 10)
+#   ADMIN_MERGE_SELF_EDIT_WAIT           bound (seconds, default 300) on the wait
+#                                         for the run generation the rail's OWN
+#                                         `[3/4] record` body PATCH created
+#                                         (#1417). 0 disables the wait, which
+#                                         restores the pre-#1417 refusal
+#                                         exactly. The guard legs are small
+#                                         (measured ~1 min end to end); on
+#                                         timeout the runs are still pending and
+#                                         §1b refuses as before, so this knob
+#                                         can only remove a FALSE refusal.
 #   ADMIN_MERGE_GREEN_RUNS               recent SUCCESSFUL runs sampled per shard
 #                                         for the healthy duration (default 5)
+#   ADMIN_MERGE_REPRO_CMD                the #3715 base-reproduction command
+#                                         (reads refused nodeids on STDIN, writes a
+#                                         pytest-shaped capture on stdout). Unset =
+#                                         a pristine base worktree + `uv run pytest`.
+#   ADMIN_MERGE_REPRO_TIMEOUT            the reproduction's mandatory alarm bound in
+#                                         seconds (default 900; a positive integer —
+#                                         anything else is refused)
 #   ADMIN_MERGE_RERUN_FLOOR              per-shard bound FLOOR (default 1200). A
 #                                         floor only ever RAISES the bound, so it
 #                                         cannot cause the false block the flat
@@ -543,6 +576,13 @@ set -uo pipefail
 
 # File-scope so the EXIT trap can read it after `main` returns (P1-2).
 TMP=""
+# The stderr-capture file for the two READ PROBES (`resolve_head` / `resolve_draft`).
+# File-scope for the same reason as `TMP`: a process-group signal (a terminal Ctrl-C) can
+# kill the subshell between create and `rm`, and only the EXIT trap can then clean it. ONE
+# global for both, because the two readers never run concurrently — the head read completes
+# before the draft probe starts. Empty until a read creates it, so the trap's `rm -f` is a
+# no-op on the paths that never read (#1750 review).
+READ_ERRTMP=""
 
 GH="${ADMIN_MERGE_GH:-gh}"
 # The jobs-JSON parse and the ISO-8601 age both need a real JSON/timestamp
@@ -554,6 +594,11 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CFS="${ADMIN_MERGE_FAILURE_SET_SH:-$SELF_DIR/ci-failure-set.sh}"
 EXEMPTION_PY="$SELF_DIR/ci_exemption.py"
 POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
+# SELF_EDIT_WAIT — the bound on the #1417 wait for the rail's own body-edit run
+# generation. A POLICY bound, not a derived one (the two guard legs are small and
+# fixed, unlike a test lane's per-shard spread). See settle_self_edit_generation.
+SELF_EDIT_WAIT="${ADMIN_MERGE_SELF_EDIT_WAIT:-300}"
+
 # ── THE HEAD READ'S RETRY BUDGET (#1690) ────────────────────────────────
 # Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
 # exactly like POLL_INTERVAL — NOT inline in `resolve_head`, which is how the first
@@ -581,6 +626,17 @@ POLL_INTERVAL="${ADMIN_MERGE_POLL_INTERVAL:-10}"
 # default costs the suite no wall-clock time.
 HEAD_ATTEMPTS="${ADMIN_MERGE_HEAD_ATTEMPTS:-5}"
 HEAD_READ_SLEEP="${ADMIN_MERGE_HEAD_READ_SLEEP:-2}"
+# ── THE MERGE-ARTIFACT READ'S RETRY BUDGET (#1298) ──────────────────────
+# Hoisted here so `validate_timing_knobs` can refuse a bad value BY NAME at startup,
+# exactly like HEAD_ATTEMPTS — and NOT inline in the reader, which is how
+# `ADMIN_MERGE_HEAD_ATTEMPTS=08` reached a loop and printed
+# `[head_unreadable] — could not READ the head (0 attempts)` on a run where ZERO
+# reads were attempted (#1690 review round 4). `poll_merge_artifact` is the SAME
+# shape: a `for ((attempt = 1; attempt <= attempts; attempt++))` whose bound is
+# supplied by an operator env var, so `08` is invalid OCTAL there and the loop body
+# never executes. Validation therefore has to happen BEFORE any arithmetic consumes
+# it, on the startup path AND on a sourced path (see `merge_art_knobs_ok`).
+VERIFY_ATTEMPTS="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
 
 # ── THE RE-RUN BOUND IS DERIVED PER SHARD, AT RAIL RUNTIME ──────────────
 # There is deliberately NO GLOBAL CONSTANT. B4's population falsifies one:
@@ -645,6 +701,29 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 # fail". Dropping such a run here would let a lane look as though it never ran the
 # shard at all.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
+
+# The GUARD projection (#1417), used ONLY by settle_self_edit_generation: the
+# completion state plus the workflow's NORMALIZED DISPLAY NAME — the signal that
+# identifies the rail's own body-edit generation on the runs surface.
+#
+# ⛔ `event` IS DELIBERATELY NOT PROJECTED (review, PR #1640). A workflow RUN's
+# `event` field is the WEBHOOK EVENT NAME (`pull_request`, `pull_request_target`,
+# `push`, …) — never the pull_request ACTIVITY TYPE (`edited`), which lives in the
+# webhook payload and is not exposed on the run object at all. The first version
+# of this fix classified on `event == edited`; that value cannot occur, so `self_n`
+# was always 0 and the wait was dead code in production. The activity is also not
+# what is needed: a `synchronize` run and an `edited` run of one workflow share a
+# single `event` value, so no comparison on it can separate them.
+#
+# The workflow name is matched, not the file name, because
+# `gh run list --json workflowName` returns the DISPLAY name and the file name is
+# not on that surface. Normalizing to `[a-z0-9]` IN JQ is also the fail-open
+# hardening: `ci-failure-set.sh:255` base64-encodes a raw `workflowName` because a
+# newline in a workflow `name:` splits the projection, and this projection makes
+# that impossible structurally — the field cannot contain TAB or NEWLINE, so it
+# can never shift a later column. It carries no `headSha`: the listing is already
+# `--commit`-scoped, so the field would be redundant.
+LANE_RUN_GUARD_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.databaseId)\t\((.workflowName // "") | ascii_downcase | gsub("[^a-z0-9]"; ""))"'
 
 usage() { awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"; }
 say_err() { printf '%s\n' "$*" >&2; }
@@ -904,6 +983,17 @@ refresh_pr_branch() {
 # while the artifact (state=MERGED) was never observed. Two copies of a retraction
 # body would drift, and the drift would be invisible in exactly the situation it
 # exists for.
+#
+# ⛔ A RETRACTION IS A CLAIM, SO IT MAY ONLY BE POSTED ON EVIDENCE THAT SUPPORTS ONE
+# (#1298). "the merge did NOT happen" is a statement about the REPOSITORY, and the
+# ONLY thing that licenses it is a read of the repository that says so — a state of
+# `OPEN`/`CLOSED` from `poll_merge_artifact`. A non-zero `gh pr merge` exit does NOT
+# license it (that is a lost read, ambiguous about the mutation by definition), and
+# neither does an unreadable artifact read: this comment is durable and cannot be
+# un-posted, so a retraction posted over an UNKNOWN state annotates a possibly-MERGED
+# PR forever. Callers must branch on `MERGE_ART_VERDICT` and call this function ONLY
+# on `not_merged`. There is no third caller to write here — the undeterminable case
+# posts NOTHING and says exactly that on stderr.
 write_merge_retraction() {
   local pr="$1" head="$2" reason="$3" detail="$4" label="$5"
   {
@@ -1170,6 +1260,27 @@ validate_timing_knobs() {
     say_err "   on EVERY poll, so the wait becomes a tight BUSY SPIN of gh calls instead of a paced"
     say_err "   poll — and an interval beyond an hour paces nothing."
   fi
+  # #1417's wait bound. Same two-stage discipline as POLL_INTERVAL: a non-numeric
+  # value makes the bound comparison ERROR (test returns 2, the body is SKIPPED),
+  # and a skipped check inside a wait loop is exactly the fail-open this rail
+  # refuses elsewhere. 0 stays LEGAL and means "do not wait" — the test seam, and
+  # the pre-#1417 behaviour.
+  if counter_has_leading_zero "$SELF_EDIT_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the bound comparison reads it as"
+    say_err "   DECIMAL. Write it without the leading zero (e.g. '300', not '0300')."
+  elif ! counter_is_number "$SELF_EDIT_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — the wait bound must be"
+    say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: it disables the wait)."
+  elif counter_exceeds_max "$SELF_EDIT_WAIT" "$POLL_INTERVAL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_SELF_EDIT_WAIT='${SELF_EDIT_WAIT}' — beyond the usable range"
+    say_err "   (max ${POLL_INTERVAL_MAX}s). The other timing knobs are bounded only by the ARITHMETIC"
+    say_err "   maximum ${TIMING_KNOB_MAX}s; this one is a POLICY bound, because a typo such as 300000"
+    say_err "   would otherwise hold the merge rail for days."
+  fi
   if counter_has_leading_zero "$HEAD_ATTEMPTS"; then
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_ATTEMPTS='${HEAD_ATTEMPTS}' — a LEADING ZERO is"
@@ -1199,6 +1310,28 @@ validate_timing_knobs() {
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_HEAD_READ_SLEEP='${HEAD_READ_SLEEP}' — beyond the usable"
     say_err "   range (max ${TIMING_KNOB_MAX}s)."
+  fi
+  # The merge-artifact read's bound is the SAME class as the head read's (#1298), and
+  # it was the last knob still carrying a bare `case … attempts=6` default: an
+  # all-digit value with a LEADING ZERO passes that guard and is invalid octal to bash
+  # ARITHMETIC, so the loop body never ran and the rail printed
+  # `[merge_unreadable] — could NOT be READ (08 attempt(s))` — a claim about the
+  # instrument on a run where the instrument never ran. Refuse it BY NAME instead.
+  if counter_has_leading_zero "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL, so '08' is not 8 but an ERROR that aborts"
+    say_err "   the merge-artifact read's loop body. The rail would then report that it could not read"
+    say_err "   whether PR merged while attempting ZERO reads. Write it without the leading zero."
+  elif ! counter_is_positive "$VERIFY_ATTEMPTS"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — the merge-artifact"
+    say_err "   read's retry budget must be a POSITIVE integer: a non-numeric value errors the loop's"
+    say_err "   arithmetic, and a non-positive one attempts no read at all."
+  elif counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX})."
   fi
   # Not a timing knob, but the same startup-refusal discipline and the same
   # reason: an unrecognised value must not silently behave like a recognised one.
@@ -1248,6 +1381,28 @@ refuse_bad_head_knobs() {
   return 1
 }
 
+# ── THE MERGE-ARTIFACT READ'S KNOB INVARIANT BELONGS TO THE READ (#1298) ─
+# Same reason as `head_read_knobs_ok` (#1690 review rounds 4-5): `validate_timing_knobs`
+# runs only inside `main()`, so ANY path that SOURCES the rail bypasses it — and this
+# read OWNS the arithmetic that consumes the knob, so it is where the invariant has to
+# hold. It REJECTS rather than defaulting: the pre-refactor inline `case …) attempts=6`
+# silently turned a typo into a different budget, and (measured, #1690 review round 4)
+# a leading-zero value left the loop body never running while the refusal still printed
+# an attempt count.
+merge_art_knobs_ok() {
+  counter_is_positive "$VERIFY_ATTEMPTS" \
+    && ! counter_has_leading_zero "$VERIFY_ATTEMPTS" \
+    && ! counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"
+}
+
+# refuse_bad_merge_art_knobs -> 1 (having said why) when the bound is unusable.
+refuse_bad_merge_art_knobs() {
+  say_err "admin-merge: ✗ refusing a bad merge-artifact knob (ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}')"
+  say_err "   — refusing to report on whether the PR merged with a retry budget that is not a validated"
+  say_err "   positive integer without a leading zero (max ${TIMING_KNOB_MAX}). Fix the value and re-run."
+  return 1
+}
+
 resolve_head() {
   local pr="$1"; shift
   # ⛔ BEFORE ANY ARITHMETIC (#1690 review round 5). This is the function that evaluates the
@@ -1279,7 +1434,27 @@ resolve_head() {
   # because `resolve_head` must still print NOTHING on failure — the value channel
   # stays empty and the diagnostic travels on its own channel.
   HEAD_READ_DIAG=""
-  errtmp="${TMPDIR:-/tmp}/admin-merge-head.$$.err"
+  # ⛔ THE ERR FILE IS CREATED WITH `mktemp`, NOT A PREDICTABLE PATH (#1750 review). The name
+  # used to be `${TMPDIR:-/tmp}/admin-merge-head.$$.err`, and `2>"$path"` FOLLOWS a symlink
+  # — so with `TMPDIR` unset (cron/launchd/`env -i`) the `${TMPDIR:-/tmp}` fallback is a
+  # world-writable /tmp, and a same-box attacker who can predict the PID could have the rail
+  # truncate any file the operator can write (CWE-377/CWE-59). MEASURED: on this box `TMPDIR`
+  # is a mode-0700 per-user directory, and the abuse cases were fail-CLOSED (the redirect
+  # failed and the read refused) — so this is a truncation primitive under an unset `TMPDIR`,
+  # never a fail-open. `mktemp` uses O_EXCL, so the name cannot pre-exist as anyone else's
+  # symlink. A total `mktemp` failure (no writable temp dir) leaves the path empty, the
+  # redirect then fails, and the read refuses — fail-closed, the direction this change is
+  # about.
+  #
+  # ⛔ AND THE FILE MUST BE THE PARENT'S (#1750 review). These resolvers run inside command
+  # substitutions at the real call sites, so a `mktemp` performed here would put the path in
+  # a SUBSHELL that the EXIT trap — which runs in `main`, the parent — can never see; a
+  # Ctrl-C between create and `rm` would then leak an unpredictably-named file, a small
+  # regression against the #1690 trap. `main` creates ONE such file up front, in the parent,
+  # and the sourced path (the unit suite, the rail suite's `sed '$d'` loader, which have no
+  # `main`) falls back to creating its own here.
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-head.XXXXXX" 2>/dev/null)"
   # ⛔ THE RETRY BUDGET IS A VALIDATED STARTUP KNOB, NOT AN INLINE `case` (#1690 review).
   # `HEAD_ATTEMPTS` / `HEAD_READ_SLEEP` are checked by `validate_timing_knobs` before any
   # CI work, with the rail's own primitives (leading-zero, positive, range) — see their
@@ -1384,15 +1559,286 @@ require_head() {
   return 1
 }
 
-# resolve_draft <pr> → the PR's `isDraft` flag (`true`/`false`). `commit-workflow`
-# opens drafts on purpose, and `gh pr merge` refuses a draft with "Pull Request is
-# still a draft" — so the rail probes this BEFORE any CI work and refuses early
-# with THAT reason, rather than surfacing it late as a generic merge failure once
-# the head-bound evidence marker has already been posted.
+# resolve_draft <pr> → the PR's `isDraft` flag on stdout: EXACTLY `true` or `false`.
+# `commit-workflow` opens drafts on purpose, and `gh pr merge` refuses a draft with
+# "Pull Request is still a draft" — so the rail probes this BEFORE any CI work and
+# refuses early with THAT reason, rather than surfacing it late as a generic merge
+# failure once the head-bound evidence marker has already been posted.
+#
+# ⛔ A FAILED READ MUST BE ABLE TO FAIL (#1750). This was a bare
+# `$GH pr view … --jq .isDraft 2>/dev/null`, and its only caller ASSIGNED the output
+# and discarded the status. A failed read then returned the EMPTY STRING, and the
+# caller's `[ "$is_draft" = "true" ]` read that as "not a draft" and PROCEEDED — past
+# the early refusal this probe exists to make. Same root as #1690 ("a read that failed
+# is rendered as a value"), opposite side of the falsifier: #1690 was a false REFUSAL,
+# this was a false PERMISSION. Fail-open is the worse direction, so this one is the
+# strict shape.
+#
+# The shape follows #1690's landed answer, and each clause is load-bearing:
+#   * VALIDATE THE WHOLE VALUE. `isDraft` is a BOOLEAN, so it has exactly two readings.
+#     Anything that is not `true` or `false` — empty, `yes`, a multi-line read — is
+#     UNREADABLE, never `false`. A `case` on the whole value rejects an embedded newline
+#     by construction, so no pipe is needed (the `writer | grep` shape is banned
+#     repo-wide, #841: under `set -uo pipefail` a writer killed by SIGPIPE makes the
+#     pipeline non-zero, which would classify a VALID value as unreadable).
+#   * ON ANY UNUSABLE READ, PRINT NOTHING AND RETURN NON-ZERO, so no caller can mistake
+#     the absence for a value.
+#   * THE READ'S OWN WORDS TRAVEL ON A SEPARATE CHANNEL (a global, not the value
+#     channel), so the refusal can tell a transient blip from a permanent cause instead
+#     of prescribing a remedy that cannot help. `resolve_draft` is called DIRECTLY by
+#     `require_draft`, never through a command substitution, so the global is not lost to
+#     a subshell — the same trap #1690's review found with `HEAD_READ_DIAG`.
+# ⛔ Callers must use `require_draft` below, never this directly: the whole defect was a
+# caller that could not tell "empty" from "the PR is not a draft".
 resolve_draft() {
   local pr="$1"; shift
+  local out rc errtmp err
+  DRAFT_READ_DIAG=""
+  # The same O_EXCL creation, and the same parent-owns-the-file rule, as the head read above
+  # (#1750 review); the two probes never run concurrently and share the one file.
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-draft.XXXXXX" 2>/dev/null)"
   # shellcheck disable=SC2086
-  $GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>/dev/null
+  out="$($GH pr view "$pr" "$@" --json isDraft --jq .isDraft 2>"$errtmp")" && rc=0 || rc=$?
+  err="$(tail -n 1 "$errtmp" 2>/dev/null)"
+  [ -n "$err" ] && DRAFT_READ_DIAG="${err:0:200}"
+  rm -f "$errtmp"
+  [ "$rc" -eq 0 ] || return 1
+  case "$out" in
+    true | false) printf '%s\n' "$out"; return 0 ;;
+  esac
+  return 1
+}
+
+# ── THE ONE DOOR FOR THE DRAFT PROBE (#1750) ───────────────────────────────────
+# ⛔ THERE IS EXACTLY ONE REASON TO READ `isDraft`, SO THERE IS EXACTLY ONE PLACE THAT
+# FAILS TO. The discrimination between "the instrument could not answer" and "this PR is
+# a draft" lives HERE, once — a caller that gets a value has a KNOWN-GOOD boolean.
+#
+# ⛔ THE TWO REFUSALS ARE DIFFERENT SPEECH ACTS AND MUST NOT SHARE A MESSAGE.
+#   * an UNREADABLE draft flag is NOT a claim about the PR — it says the instrument could
+#     not answer, and the remedy is to retry the rail;
+#   * "the PR IS A DRAFT" IS a claim about the PR — it voids the merge, and the remedy is
+#     `gh pr ready`.
+# Rendering the first as the second is bad; rendering it as NOTHING AT ALL — which is what
+# the bare read did — is #1750, and it is the failure this door exists to make impossible.
+require_draft() {
+  local pr="$1"; shift
+  if resolve_draft "$pr" "$@"; then
+    return 0
+  fi
+  # ⛔ A MACHINE-READABLE TOKEN, NOT JUST PROSE — the answer #1690 reached for the head
+  # read. `[draft_unreadable]` is the tag the genuine draft refusal does NOT carry, so
+  # `grep -F '[draft_unreadable]'` answers "could the instrument read the draft flag?"
+  # without depending on how the sentence is worded. The refusal deliberately does NOT
+  # contain the phrase "is a DRAFT" or the remedy `gh pr ready`, so a log scraper matching
+  # the GENUINE draft refusal cannot match this one by phrasing either.
+  say_err "admin-merge: ✗ BLOCK [draft_unreadable] — could not READ the isDraft flag of PR #$pr."
+  say_err "   This is NOT a claim about the PR, and NOT a CI-failure verdict: the read"
+  say_err "   failed, or returned something other than exactly 'true' or 'false'."
+  say_err "   Nothing was merged and no evidence was posted."
+  # ⛔ A REFUSAL MUST NOT PRESCRIBE A REMEDY IT CANNOT KNOW APPLIES (#1690 review, whose
+  # finding applies verbatim here). "Re-run the rail" is right for a transient blip and
+  # useless for a permanent cause; without the read's own words the two are the same
+  # refusal. Quoted when there is one; the absence is STATED rather than papered over.
+  if [ -n "${DRAFT_READ_DIAG:-}" ]; then
+    say_err "   the read reported: ${DRAFT_READ_DIAG}"
+    say_err "   Re-run the rail if that looks transient; if it repeats, the cause above is"
+    say_err "   probably not transient — check credentials, --repo, and the PR number."
+  else
+    say_err "   the read produced no diagnostic (gh exited 0 with an unusable value, or wrote"
+    say_err "   nothing to stderr). Re-run the rail."
+  fi
+  return 1
+}
+
+# ── THE ONE DOOR FOR READING THE MERGE ARTIFACT (#1298) ────────────────────────
+#
+# `gh pr merge`'s EXIT STATUS is a statement about the SEND. The PR's STATE is the
+# statement about the ARTIFACT. The two disagree in BOTH directions, and each
+# direction costs something real:
+#
+#   * exit 0 while the PR is still OPEN — a queued `--auto`, or a merge not yet
+#     reflected. The success marker then stands over an unmerged PR (#1359).
+#   * exit NON-ZERO while the PR is MERGED — GitHub PROCESSED the merge and the
+#     RESPONSE READ failed (a network timeout; tortoise #4413 shows the exact
+#     `Post "https://api.github.com/graphql": read tcp …: operation timed out`).
+#     A lost answer to a MUTATION is ambiguous BY DEFINITION about whether the
+#     mutation ran, so the exit status CANNOT tell a refused merge from an
+#     answered-and-lost one. The rail rendered the second as "the merge did NOT
+#     happen" and posted a durable retraction over a MERGED PR (#1298).
+#
+# BOTH arms therefore ask THE REPOSITORY, through THIS function, and neither infers
+# the artifact from the exit status. One door, for the same reason `require_head`
+# and `require_draft` are one door: two copies of "did it happen?" drift, and the
+# drift is invisible in exactly the situation the guard exists for.
+#
+# ⛔ THE OUTCOMES ARE THREE, NOT TWO. A read that FAILED is not a claim about the
+#    PR, so it is rendered as neither "merged" nor "not merged". Rendering a failed
+#    read as the second is #1298; #1690 fixed the same shape one arm over, and the
+#    rule it established applies verbatim to the highest-consequence instance.
+#
+# Nothing travels on stdout — the verdict and the observation travel in the globals
+# below, so no caller can read the empty stream as a value (the #1690/#1750 shape):
+#   MERGE_ART_VERDICT    merged | not_merged | unreadable
+#   MERGE_ART_STATE      the observed state, or `<unreadable>`
+#   MERGE_ART_MERGED_AT  the observed mergedAt, or `<unreadable>`
+#   MERGE_ART_ATTEMPTS   the bound actually used (formatted into the callers' messages), or
+#                        `0` on the one path that reads nothing: a refused knob
+#   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
+#                        bounded line), empty when that attempt wrote none — never an
+#                        earlier attempt's text
+poll_merge_artifact() {
+  local pr="$1"
+  MERGE_ART_VERDICT="unreadable"
+  MERGE_ART_STATE="<unreadable>"
+  MERGE_ART_MERGED_AT="<unreadable>"
+  # ⛔ EVERY EXIT PATH SETS EVERY GLOBAL (#1298 review). The knob refusal below returns
+  # BEFORE the loop, so leaving this unset made the callers' `(${MERGE_ART_ATTEMPTS}
+  # attempt(s))` an unbound-variable ABORT under `set -u` — the rail would die with a
+  # shell error instead of printing the refusal it had just composed. `0` is also the
+  # TRUE count on that path (zero reads ran), which is the distinction #1690 was about.
+  MERGE_ART_ATTEMPTS="0"
+  MERGE_ART_DIAG=""
+  local attempts="$VERIFY_ATTEMPTS"
+  # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
+  # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
+  # different budget for a typo) and — measured — a leading-zero value reached this
+  # arithmetic site, where `attempt <= 08` errors and the loop body NEVER RUNS: the rail
+  # then prints `[merge_unreadable] … (08 attempt(s))` on a run where ZERO reads were
+  # attempted, which is #1690's symptom one arm over. The STARTUP path refuses the same
+  # three classes BY NAME before any CI work, through `validate_timing_knobs`' own inline
+  # checks (which can name WHICH class was bad, as its per-cause messages do); this helper
+  # exists for the paths that never reach it, because ANY path that SOURCES the rail
+  # bypasses `main` — and that is where the arithmetic lives.
+  merge_art_knobs_ok || { refuse_bad_merge_art_knobs; return 1; }
+  MERGE_ART_ATTEMPTS="$attempts"
+  local attempt=0 rc=0 observed="" state_part="" rest="" err=""
+  local errtmp outtmp
+  # The same O_EXCL creation and the same parent-owns-the-file rule as the head and
+  # draft reads (#1690/#1750 review): the file is `mktemp`-generated, read from the
+  # file-scope `READ_ERRTMP` so the EXIT trap can remove it, and created here only on
+  # a path with no `main` (the suites that source the rail).
+  errtmp="${READ_ERRTMP:-}"
+  [ -n "$errtmp" ] || errtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art.XXXXXX" 2>/dev/null)"
+  # ⛔ THE READ IS CAPTURED TO A FILE, NOT STRAIGHT INTO A VARIABLE (#1298 review). A bash
+  # string CANNOT hold a NUL byte: `$(...)` deletes NULs silently, with no error and no
+  # warning, so a producer emitting `MER<NUL>GED` would be read as `MERGED` — a value
+  # GitHub did not say, rendered as a MERGE, which is the one direction that cannot be
+  # walked back (the evidence marker is standing and no retraction is posted). GitHub's
+  # `state` is an enum and cannot carry a NUL, so this was LATENT — but this guard must not
+  # rest on the producer's output shape, which is the same reason the `sed`-over-JSON
+  # projection above was rejected. The file is inside the per-run `$TMP` when there is one
+  # (so the EXIT trap removes it wholesale) and `mktemp`-generated otherwise, exactly like
+  # `errtmp` — never a FIXED name, which two concurrent runs would share.
+  outtmp="${TMP:+$TMP/merge-art.out}"
+  [ -n "$outtmp" ] || outtmp="$(mktemp "${TMPDIR:-/tmp}/admin-merge-art-out.XXXXXX" 2>/dev/null)"
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over the
+    # whole JSON takes the LAST `"state"` anywhere in the output, so a nested or
+    # repeated object could be read as the merge state while the TOP-LEVEL state said
+    # OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json state,mergedAt` emits
+    # only those two keys, so it was not reachable today, but this guard's correctness
+    # must not rest on the producer's output shape). `--jq` reads the TOP-LEVEL fields:
+    # one tab-separated `<state>\t<mergedAt>`, mergedAt sentineled because it is null
+    # for an unmerged PR.
+    # shellcheck disable=SC2086
+    if $GH pr view "$pr" ${repo_args[@]+"${repo_args[@]}"} \
+        --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' \
+        >"$outtmp" 2>"$errtmp"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    # ⛔ THE WHOLE VALUE, NOT A LINE OF IT (#1690's review, applied to this read). The
+    # version this replaces took `head -1` and `${x%%$'\t'*}`, which are an ANY-FIRST-LINE
+    # test and an ANY-SEPARATOR test: a read that answered the projection AND a trailing
+    # junk line passed the first, and the mergedAt half could itself carry a tab. `@tsv`
+    # emits exactly ONE line with exactly ONE separator, so anything else — an INTERNAL
+    # newline, a second separator, a value that is not the projection — is UNREADABLE by
+    # construction. A `case` on the whole value needs no pipe, so the `writer | grep -q`
+    # idiom banned repo-wide (#841) is not reintroduced either — and that matters here:
+    # under `set -uo pipefail` a SIGPIPE-killed writer makes the pipeline non-zero, which
+    # would classify a VALID read as unreadable.
+    #
+    # ⛔ WHAT THIS DOES *NOT* RE-DERIVE, stated rather than implied: `$(...)` strips ALL
+    # trailing newlines, so a value whose extra lines are all BLANK past the first (and
+    # gh's own output ends in one newline, which is why the raw byte count cannot simply
+    # be `lines == 1`) is read as the single line it reduces to. That cannot change a
+    # verdict — a token still has to be exactly `MERGED`/`OPEN`/`CLOSED` — so it is a
+    # narrower guard, not a fail-open, and it is left deliberately (see the PR's limits).
+    #
+    # ⛔ AND A NUL IS TESTED AT THE BYTE LEVEL, because no bash string can carry one. The
+    # read above is a FILE, so the test is exact: `tr -d '\000'` applied to the file equals
+    # the file IFF it held no NUL. A missing or unreadable file makes `cmp` exit 2, which is
+    # not "equal", so this test fails CLOSED (unreadable) rather than open.
+    #
+    # ⛔ AND THE VALUE IS BOUNDED, because the two parameter EXPANSIONS below
+    # (`${observed%%$'\t'*}` and `${observed#*$'\t'}`) are what is O(n²) in the value's
+    # length — measured on this box: 80 KB ≈ 7 s and ≈ 18 s for the two expansions, 160 KB
+    # ≈ 25 s and ≈ 58 s — so a producer emitting a large body HANGED the rail instead of
+    # answering it. (The `case` tests themselves are linear; the cost is in the removals.)
+    # The projection is a fixed, tiny shape (real `gh` output for these two fields is 28
+    # bytes), so a generous 4 KiB ceiling costs nothing real and keeps those expansions from
+    # ever seeing an oversized value.
+    state_part=""; rest=""
+    if [ "$rc" -eq 0 ] && [ "$(wc -c < "$outtmp")" -le 4096 ] \
+       && cmp -s "$outtmp" <(tr -d '\000' < "$outtmp"); then
+      observed="$(cat "$outtmp")"
+      case "$observed" in
+        *$'\n'*)       : ;;                  # more than one line: not the projection
+        *$'\t'*$'\t'*) : ;;                  # more than one separator: not the projection
+        *$'\t'*)       state_part="${observed%%$'\t'*}"
+                       rest="${observed#*$'\t'}" ;;
+      esac
+    fi
+    # ⛔ THE ANSWER IS AN ALLOW-LIST, NOT "ANYTHING THAT IS NOT MERGED". GitHub reports a
+    # PR state as exactly one of MERGED / OPEN / CLOSED, and only MERGED means the merge
+    # happened. ANY other value — empty, a state GitHub has not documented, a mis-shaped
+    # read — is UNREADABLE, never `not_merged`, so a garbage read cannot manufacture a
+    # retraction. This is the polarity the merge rail's own check-run reader adopted
+    # ("EVERY OTHER CONCLUSION IS RED — including one GitHub has not documented yet, and
+    # a null one"): an unnamed value must never fall through a gap.
+    case "$state_part" in
+      MERGED)      MERGE_ART_STATE="MERGED"
+                   MERGE_ART_MERGED_AT="${rest:-<unreadable>}" ;;
+      OPEN|CLOSED) MERGE_ART_STATE="$state_part"
+                   MERGE_ART_MERGED_AT="${rest:-<unreadable>}" ;;
+      *)           MERGE_ART_STATE="<unreadable>"
+                   MERGE_ART_MERGED_AT="<unreadable>" ;;
+    esac
+    # ⛔ THE DIAGNOSTIC BELONGS TO THE ATTEMPT THAT DECIDED (#1298 review). This kept the
+    # last NON-EMPTY stderr, so when the deciding attempt wrote none — a real `gh` shape:
+    # exit 0 with a non-projected answer and empty stderr — the callers printed an EARLIER
+    # attempt's transient error as "the state read reported: …". That names the wrong cause
+    # (a timeout, remedy: re-run) for a different one (the producer's shape changed), and it
+    # is the one thing that separates a blip from a config error. Assigning unconditionally
+    # lets the callers' `if [ -n … ]` / else-arm tell the truth about the deciding read.
+    #
+    # ⛔ THE LAST *NON-BLANK* LINE, not the last line (#1298 delta review): a multiline error
+    # ending in a blank line — `boom\n\n` — made `tail -n 1` return the EMPTY string, so a
+    # real message was reported as "produced no diagnostic". `awk` keeps the last line that
+    # has content and ignores the padding, with no pipe to SIGPIPE.
+    err="$(awk 'NF { last = $0 } END { print last }' "$errtmp" 2>/dev/null)"
+    MERGE_ART_DIAG="${err:0:200}"
+    if [ "$MERGE_ART_STATE" = "MERGED" ]; then
+      break
+    fi
+    # A well-formed read that is NOT merged keeps polling: the merge may still be
+    # landing (#1359). Only the LAST attempt's observation decides the verdict, so a
+    # readable OPEN followed by an unreadable final attempt is UNREADABLE — the state at
+    # the END is unknown, and an earlier observation cannot stand in for it.
+    [ "$attempt" -ge "$attempts" ] && break
+    sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
+  done
+  rm -f "$errtmp" "$outtmp"
+  case "$MERGE_ART_STATE" in
+    MERGED)      MERGE_ART_VERDICT="merged" ;;
+    OPEN|CLOSED) MERGE_ART_VERDICT="not_merged" ;;
+    *)           MERGE_ART_VERDICT="unreadable"
+                 MERGE_ART_STATE="<unreadable>"
+                 MERGE_ART_MERGED_AT="<unreadable>" ;;
+  esac
 }
 
 # resolve_base_ref <pr> → the PR's TARGET branch (`baseRefName`). The base branch's
@@ -1518,6 +1964,14 @@ run_failure_set() {
 # `--print-bounds <run-id>` argument without swallowing the next flag.
 is_run_id() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 
+# is_full_sha — a pinned 40-hex commit OID, and NOT a branch/tag ref name. Used
+# by the #3715 base reproduction: a REF resolved locally can be stale, and a
+# stale base must never certify a failure as pre-existing.
+is_full_sha() {
+  case "${1:-}" in ''|*[!0-9a-f]*) return 1 ;; esac
+  [ "${#1}" -eq 40 ]
+}
+
 # fail_safe_rerun_timeout <reason> — install the fail-safe and say WHY, loudly.
 # NEVER small: the whole defect this replaces was a bound that was too tight.
 fail_safe_rerun_timeout() {
@@ -1594,16 +2048,15 @@ GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
 #     fail-open (a shard present only in an older run vanished from the
 #     reference), so there is no independent sampling cap any more — instead the
 #     window itself is BOUNDED and validated (--main-runs, $MAIN_RUNS_MAX).
-#     The window counts MEASUREMENTS, not raw positions (#4844): a run that did not
-#     finish a measurement does not SPEND the window. A push burst cancels its own
-#     predecessors, and a cancelled run is `completed` — terminal, but measured
-#     nothing; charging the window for it pushed the last usable reference out of
-#     a window the operator asked for. It is still CONSULTED (a cancelled run may
-#     have executed shards before it was cancelled, and dropping those would SHRINK
-#     the reference — the #1319 fail-open). When a window yields no executed shard
-#     at all the listing widens past those runs (bounded by $MAIN_RUNS_MAX), and the
-#     evidence SAYS SO — a reference drawn from a wider window than requested is
-#     disclosed, never implied. DECLARED RESIDUAL: a run still IN FLIGHT is not
+#     A run that did not finish a measurement must not END the search (#4844). A
+#     push burst cancels its own predecessors, and a cancelled run is `completed` —
+#     terminal, but measured nothing; charging the operator's window for it pushed
+#     the last usable reference out of a window they asked for. It is still
+#     CONSULTED (a cancelled run may have executed shards before it was cancelled,
+#     and dropping those would SHRINK the reference — the #1319 fail-open), and the
+#     listing widens while the window holds no shard in the parity FAMILY
+#     (bounded by $MAIN_RUNS_MAX). The evidence SAYS SO — a reference drawn from a
+#     wider window than requested is disclosed, never implied. DECLARED RESIDUAL: a run still IN FLIGHT is not
 #     consulted, so a shard such a run has ALREADY executed is unobserved until it
 #     concludes. Consulting a still-changing job list instead would make main's
 #     mid-flight lane block every merge — the failure this change removes.
@@ -1688,6 +2141,32 @@ lane_count() {
   local n
   n="$(grep -c '[^[:space:]]' "$1" 2>/dev/null)"
   printf '%s' "${n:-0}"
+}
+
+# lane_job_sample <all-names-file> [<max>] — a bounded, ` | `-separated rendering
+# of the executed job names a lane window carried. This is what lets a family
+# refusal NAME the names it saw (#7734): the COUNT alone cannot distinguish "the
+# shards are named differently" (remedy: ADMIN_MERGE_LANE_JOB_PREFIX) from "the
+# window held no run of a code lane at all" (remedy: name the lane with
+# --workflow), and a refusal that cannot be acted on is the defect this exists to
+# remove. The separator is ` | ` and NOT a comma because a GitHub job NAME may
+# contain one — this repo's own vocabulary includes `test (a, docker)`, which a
+# comma-joined sample would render as two names. Bounded because a wide window
+# can carry dozens of names and the refusal is read by a human; the overflow is
+# COUNTED rather than dropped silently. Prints nothing for an empty set, never a
+# blank line (the empty-stream rule that `lane_count` and `lane_shards` obey).
+lane_job_sample() {
+  local f="$1" max="${2:-12}" total="" sample=""
+  [ -f "$f" ] || return 0
+  total="$(sort -u "$f" 2>/dev/null | grep -c '[^[:space:]]' || true)"; total="${total:-0}"
+  [ "$total" -gt 0 ] || return 0
+  sample="$(sort -u "$f" | grep '[^[:space:]]' | head -n "$max" \
+    | awk 'BEGIN{ORS=""} {if (n++) printf " | "; printf "%s", $0}')"
+  if [ "$total" -gt "$max" ]; then
+    printf '%s (+%s more)' "$sample" "$((total - max))"
+  else
+    printf '%s' "$sample"
+  fi
 }
 
 # lane_shards <run-id> <all-names-out> — the TEST shards this run EXECUTED, one
@@ -1776,21 +2255,23 @@ for n in sorted(names):
 # questions and the gate needs both (#4844):
 #
 #   lane_run_in_flight — is this run still RUNNING? Only a NAMED in-flight
-#     spelling counts (see the allow-list note below). An in-flight run cannot
-#     spend the window and is not consulted — its job list is still changing, so
-#     the lane's shard set is not settled (the declared residual above).
+#     spelling counts (see the allow-list note below). An in-flight run is NOT
+#     CONSULTED — its job list is still changing, so the lane's shard set is not
+#     settled (the declared residual above) — and it is counted, so a refusal can
+#     say how much of the window was mid-run.
 #
 #   lane_run_measured — did this run FINISH a measurement? A `completed` run may
 #     still be `cancelled`, `skipped`, `stale`, `neutral` or `startup_failure`;
 #     those measured nothing, and a push burst leaves a window FULL of them (each
-#     push cancels its predecessor, and a cancelled run is `completed`). This is
-#     what spends the operator's `--main-runs` window. It is the parser's own
-#     vocabulary (`success|failure|timed_out` credit `tested`), not a new one.
+#     push cancels its predecessor, and a cancelled run is `completed`). It is
+#     the parser's own vocabulary (`success|failure|timed_out` credit `tested`),
+#     not a new one — and since #7734 it is a DIAGNOSTIC only: it is reported in
+#     the refusal, and it no longer stops the widening.
 #
-# CONSULTING and SPENDING are therefore separate: a cancelled run is still
-# consulted (it may have executed shards before it was cancelled, and dropping
-# those would SHRINK the reference — the #1319 fail-open), but it does not spend
-# the window.
+# CONSULTING is therefore governed by the in-flight allow-list ALONE: a cancelled
+# or otherwise unmeasured run is still consulted (it may have executed shards
+# before it was cancelled, and dropping those would SHRINK the reference — the
+# #1319 fail-open).
 #
 # A NON-FINISHED RUN IS TRUSTED TO BE IN FLIGHT ONLY FOR A NAMED SPELLING. The
 # polarity is an ALLOW-list, the same one the check-run surface uses (#1353: as a
@@ -1818,7 +2299,7 @@ lane_run_measured() {
 # full is the fail-open this gate prevents. No name is written for an empty
 # shard set.
 #
-# #4844 — the window is spent on MEASUREMENTS, not on raw positions.
+# #4844 — a terminal run that MEASURED NOTHING must not end the search.
 #
 #   * The id guard failed the WHOLE side for a line whose run could not be
 #     addressed — including a run that had not finished. Refusing on a
@@ -1832,22 +2313,54 @@ lane_run_measured() {
 #     predecessor, leaving `completed/cancelled` runs that are terminal but
 #     MEASURED NOTHING — filled it and pushed the last usable reference OUT of
 #     it. The gate then refused every PR, naming a shard family when the missing
-#     thing was the reference. Now a run spends the window only if it FINISHED a
-#     measurement; when a window yields no executed shard at all the listing
-#     WIDENS (doubling, bounded by $MAIN_RUNS_MAX) until one appears, the history
-#     is exhausted, or the bound is reached. The ordinary path is unchanged —
-#     widening happens only where the old code refused.
+#     thing was the reference. Now the listing WIDENS (doubling, bounded by
+#     $MAIN_RUNS_MAX) while the window has yielded no FAMILY shard, so such a run
+#     cannot end the search, and the loop stops on a family match, on the history
+#     being exhausted, or at the bound. CONSULTATION is a SEPARATE question and
+#     `lane_run_in_flight` is its ONLY filter: a terminal-but-unmeasured run is
+#     still fully consulted (it may have executed shards before it was cancelled,
+#     and skipping it would SHRINK the reference). The ordinary path is unchanged
+#     — widening happens only where the old code refused.
+#
+#   * ⛔ `--main-runs` IS THE STARTING WIDTH, NOT THE STOPPING RULE, AND ONLY THREE
+#     CONDITIONS STOP THE WIDENING (#7734). `--main-runs` USED to stop it too:
+#     the loop broke as soon as `$limit` runs that had FINISHED A MEASUREMENT
+#     were counted. Under `--any-workflow` that counter is not a statement about
+#     the LANE at all — an `issue_comment` run of a reporting workflow is
+#     `completed/success`, so it SPENT the budget while contributing no test
+#     shard. Measured on the target repo (tortoise main, `--any-workflow`, the
+#     rail's default `--main-runs 10`): the 10-run window carried 2 distinct
+#     executed job names and the widened 20-run window 3, NONE of them `test*`,
+#     so the widening stopped on the spent budget with the family still EMPTY and
+#     refused with "the shard FAMILY selects nothing on main"; the SAME listing
+#     read 40 runs wide carried 36 distinct names, 17 of them `test*`. The code
+#     lane was one doubling away the whole time, and the refusal's remedy
+#     (`ADMIN_MERGE_LANE_JOB_PREFIX`) could never have reached it. The loop now
+#     stops ONLY on a family match, on the history being exhausted, or at
+#     $MAIN_RUNS_MAX. The direction is fail-safe, and NOT because a wider window
+#     is unconditionally stricter — the two sides differ, so say which. MAIN's
+#     reference can only GROW, so the demanded set grows: strictly stricter. The
+#     PR side's set grows too, which SHRINKS the reported gap (the looser
+#     direction) — sound only because every run consulted on that side carries
+#     THIS head's sha, so every name added was genuinely executed by the head in
+#     question; the certificate's claim ("PR ⊆ main" is not the claim — "main's
+#     shards ⊆ the PR's executed set" is) becomes more true, never less.
 #
 # The Jobs-API cost does NOT track the operator's window on the widening path,
-# and that is a deliberate trade. `--main-runs` is the widening's STOPPING RULE
-# (it widens while fewer than $limit runs that FINISHED a measurement have been
-# counted), not a bound on what one pass reads: a widened pass consults its whole
-# listing, so both the runs read and the measured runs counted can exceed $limit —
-# bounded by $MAIN_RUNS_MAX per side, which is the call budget, because every
-# CONSULTED run costs one job-list read. Reading each one is the only way to learn
-# that a terminal run measured nothing — refusing instead is the bug this fixes
-# (#4844). The LANE_SET_* globals report what the window actually held, so a
-# refusal can name the condition it found rather than a neighbouring one.
+# and that is a deliberate trade. A widened pass consults its whole listing, so
+# the runs read CAN exceed $limit — and so can the measured runs counted — bounded
+# by $MAIN_RUNS_MAX per side, which is the call budget, because every CONSULTED run
+# costs one job-list read. Dropping the budget break means the widening is no
+# longer stopped by the measurement count, so a window FULL of measuring,
+# non-family runs continues to the bound — or to the end of the history, whichever
+# comes first. That is not a new ceiling: an operator who passed `--main-runs 200`
+# already pays it, and the all-non-measuring path already reached it under the old
+# code (#4844's `vacuouswidenbound` pinned `--limit 200` before this change). It is
+# paid only where the REQUESTED window carried no family shard — the same path on
+# which the old code could refuse with a remedy the operator could not act on. The
+# LANE_SET_* globals report what the window actually held — including a bounded
+# SAMPLE of the executed job names, so a refusal can NAME what it saw instead of
+# only what it did not (#7734).
 lane_shard_set() {
   local flag="$1" value="$2" limit="$3" out="$4"
   local listing="$TMP/lane-runs.tmp" shards="$TMP/lane-shards.tmp"
@@ -1859,6 +2372,7 @@ lane_shard_set() {
   : > "$allnames"
   LANE_SET_LISTED=0; LANE_SET_WINDOW="$limit"; LANE_SET_CONSULTED=0
   LANE_SET_MEASURED=0; LANE_SET_NONMEASURING=0; LANE_SET_JOBS=0
+  LANE_SET_JOB_SAMPLE=""; LANE_SET_EMPTY_STOP=""
   while :; do
     if ! lane_run_ids "$flag" "$value" "$raw" > "$listing"; then
       say_err "admin-merge: ✗ could not list the lane runs for $flag $value — lane coverage unverifiable"
@@ -1892,9 +2406,9 @@ lane_shard_set() {
         return 1
       fi
       if lane_run_in_flight "$status"; then
-        # In flight: not read at all (the declared residual above), and it cannot
-        # spend the window. Counted so the refusal can say how much of the window
-        # was mid-run rather than implying the lane was empty.
+        # In flight: not read at all (the declared residual above). Counted so the
+        # refusal can say how much of the window was mid-run rather than implying
+        # the lane was empty.
         nonmeas=$((nonmeas + 1))
         continue
       fi
@@ -1923,14 +2437,14 @@ lane_shard_set() {
     [ "$listed" -lt "$raw" ] && LANE_SET_WINDOW="$listed"
     LANE_SET_CONSULTED="$consulted_n"; LANE_SET_MEASURED="$measured"
     LANE_SET_NONMEASURING="$nonmeas"
-    # Widen ONLY while the window has produced no executed shard AT ALL: an empty
-    # reference is the one condition more runs can repair. Stop once the
-    # operator's window is spent on runs that FINISHED a measurement, once the
-    # history is exhausted, or at the policy bound.
+    # Widen while the window has produced no FAMILY shard: an empty reference is
+    # the one condition more runs can repair. The three stops below are the ONLY
+    # ones — see the `--main-runs` bullet above `lane_shard_set` for why the
+    # `measured >= limit` budget break that used to sit among them is gone, and
+    # for why dropping it is fail-safe rather than permissive (#7734).
     [ -s "$out" ] && break
-    [ "$measured" -ge "$limit" ] && break
-    [ "$listed" -lt "$raw" ] && break
-    [ "$raw" -ge "$MAIN_RUNS_MAX" ] && break
+    [ "$listed" -lt "$raw" ] && { LANE_SET_EMPTY_STOP="history"; break; }
+    [ "$raw" -ge "$MAIN_RUNS_MAX" ] && { LANE_SET_EMPTY_STOP="bound"; break; }
     raw=$((raw * 2))
     [ "$raw" -gt "$MAIN_RUNS_MAX" ] && raw="$MAIN_RUNS_MAX"
   done
@@ -1939,6 +2453,11 @@ lane_shard_set() {
   # double-counted and not dropped).
   LANE_SET_JOBS="$(sort -u "$allnames" 2>/dev/null | grep -c '[^[:space:]]' || true)"
   LANE_SET_JOBS="${LANE_SET_JOBS:-0}"
+  # A bounded SAMPLE of those names, rendered for the refusal (#7734). The count
+  # alone cannot tell "this lane's shards are named differently" from "no run of a
+  # code lane was in the window at all", and those two have opposite remedies —
+  # so the refusal NAMES what it saw. Read BEFORE the accumulator is removed.
+  LANE_SET_JOB_SAMPLE="$(lane_job_sample "$allnames")"
   rm -f "$allnames"
   # Drop any blank line before the union: a single blank entry would be counted
   # as a shard by `wc -l` and would match the empty pattern under `grep -xF`.
@@ -2280,6 +2799,24 @@ lane_parity_check() {
   local main_consulted="$LANE_SET_CONSULTED" main_nonmeas="$LANE_SET_NONMEASURING"
   local main_measured="$LANE_SET_MEASURED"
   local main_jobs="$LANE_SET_JOBS"
+  # #7734: WHY the widening stopped, and WHAT the window actually carried. Both
+  # belong in the refusal — the count alone cannot be acted on, and "the family
+  # is named differently" versus "no code-lane run was in this window" have
+  # opposite remedies.
+  local main_job_sample="$LANE_SET_JOB_SAMPLE" main_empty_stop="$LANE_SET_EMPTY_STOP"
+  local main_stop_note=""
+  case "$main_empty_stop" in
+    history) main_stop_note="and the LANE's run history was read IN FULL (the listing returned fewer runs than were asked for) without finding one" ;;
+    bound)
+      # `--main-runs` may BE the bound, in which case no widening happened and a
+      # note claiming one would be false — so the two cases are stated apart.
+      if [ "$main_window" -gt "$MAIN_RUNS" ]; then
+        main_stop_note="and the listing was widened to the policy bound of ${MAIN_RUNS_MAX} runs and STILL selected nothing"
+      else
+        main_stop_note="and the listing was read at the policy bound of ${MAIN_RUNS_MAX} runs — the requested width WAS the bound, so nothing was widened — and STILL selected nothing"
+      fi ;;
+    *)       main_stop_note="and no run in that window executed a job in the family" ;;
+  esac
   LANE_PARITY_MAIN_WINDOW="$main_window"
   # Decide on NAMES, never on file size (see lane_count).
   if [ "$(lane_count "$TMP/lane-main.txt")" -eq 0 ]; then
@@ -2299,9 +2836,9 @@ lane_parity_check() {
     # read is STATED either way, because "widened past --main-runs" is a fact the
     # operator must be able to audit.
     if [ "$main_jobs" -eq 0 ]; then
-      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
+      LANE_PARITY_REASON="main's lane window yielded NO EXECUTED job — ${main_consulted} completed run(s) consulted (${main_measured} a finished measurement, $((main_consulted - main_measured)) that measured nothing) out of ${main_listed} listed over a ${main_window}-run window, ${main_nonmeas} of the listed runs not yet finished, ${main_stop_note}. An EXECUTED job is one whose conclusion is success, failure or timed_out, so either the completed runs hold no readable job list (purged, zero-job, or not yet served — check the lane selector: --workflow, or --any-workflow for a trigger-split repo) or none of the jobs they list carries one (skipped, cancelled, neutral, stale, …). Either way the REFERENCE is what is missing and the shard family '${LANE_JOB_PREFIX}*' selected nothing, so this is NOT a coverage gap in this PR"
     else
-      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX"
+      LANE_PARITY_REASON="main's lane runs executed ${main_jobs} distinct job name(s) across a ${main_window}-run window (${main_consulted} completed run(s) consulted, ${main_measured} a finished measurement, ${main_nonmeas} non-completed), ${main_stop_note}, but NONE is named '${LANE_JOB_PREFIX}*' — so the shard FAMILY selects nothing on main. The executed job name(s) this window DID carry were: ${main_job_sample:-(none)}. If this lane's test shards are named differently, set ADMIN_MERGE_LANE_JOB_PREFIX to the prefix they use — the family is a PREFIX match, so ADMIN_MERGE_LANE_JOB_PREFIX=unit selects a shard named 'unit (a)'. If instead NONE of the names above is a test shard, then no run of a CODE lane READ in this window executed one — its shards were skipped, cancelled, neutral, stale or otherwise not executed here, or the lane is not in the window at all — and the fix is to NAME the lane whose test shards run on BOTH push and pull_request: --workflow <file>. --any-workflow widens the reference to EVERY workflow on main — event-driven ones (issue_comment, schedule, issues) that run no test included — which is how a window fills with non-code runs (tortoise #7734)"
     fi
     return 2
   fi
@@ -2669,6 +3206,202 @@ pending_run_id() {
       ${args[@]+"${args[@]}"} \
       --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null || true)
   return 0
+}
+
+# ── THE RAIL'S OWN BODY-EDIT RUN GENERATION (#1417) ─────────────────────────
+#
+# THE MEASURED DEFECT (agent-infra#1417, comment 6057991604; reproduced on
+# #1495 @ 1f92b609 and #1633 @ 8e8b7cbb). The rail's four steps are:
+#   [2/4] verify  — waits for the head's CHECK-RUNS to be terminal (atomic-land),
+#   [3/4] record  — `record-review.sh` PATCHes the review marker into the PR BODY,
+#   [4/4] land    — admin-merge, whose §1b reads the WORKFLOW RUNS surface.
+# The body PATCH is an `edited` pull_request activity, and exactly TWO
+# NON-code-measuring workflows declare that trigger:
+#   * `pipeline-compliance` — #513's verdict binding, deliberately re-run so a
+#     forged `verdict=...` marker cannot ride a stale green check;
+#   * `workflow-lock`.
+# So [3/4] creates two fresh runs 11-87s AFTER [2/4] returned — a generation [2/4]
+# could not have seen on ANY surface, which is why polling the runs surface in
+# [2/4] does not close this. [4/4] then refused with `run still in_progress`
+# against the rail's own work, costing a whole extra rail round ([2/4] is bounded
+# at 5400s).
+#
+# ⛔ THIS IS NOT AN EXCLUSION, AND IT MUST NEVER BECOME ONE. The generation is
+# WAITED FOR, and the WHOLE surface is then RE-READ (main, the #1417 loop) so the
+# guard runs enter the SAME failure-set comparison as every other run. A guard
+# run that FAILS — `pipeline-compliance` whose entire #513 purpose is to be able
+# to fail here — is therefore in the re-read failing set and BLOCKS. What is
+# deferred is only the §1b refusal on an UNFINISHED run set; no failure is ever
+# ignored.
+#
+# ⛔ WHY THE WORKFLOW NAME, AND NOT `event == edited` (review, PR #1640). The
+# first version classified a run as "ours" only when `gh run list --json event`
+# was the literal `edited`. That value does not exist on the runs surface: a
+# run's `event` is the WEBHOOK EVENT NAME (`pull_request`, `pull_request_target`,
+# `push`, …), never the activity type (`edited`), which lives in the webhook
+# payload and is not exposed on the run object at all. `self_n` was therefore
+# always 0 and the wait was dead code — `event` cannot carry this distinction,
+# and a corrected spelling would not help either, because a `synchronize` (push)
+# and an `edited` run of one workflow report the SAME event value.
+#
+# The guard WORKFLOW NAME is the signal that does exist. Over-matching is
+# harmless by construction: a matched run is only WAITED FOR and then
+# re-evaluated, never dropped, so a name that is not really a guard leg costs the
+# wait and nothing else — and waiting for a guard run started by a push is
+# correct, not a hazard.
+#
+# ⛔ COMPLETENESS IS PART OF THE PREDICATE (review P1, PR #1640). "The pending set
+# is a subset of ours" has no completeness test, and an ABSENT leg is not a
+# foreign leg. The two guard legs come from two DIFFERENT workflows created with
+# an 11-87s spread, so leg A can finish before leg B exists; a subset-only
+# predicate then sees an empty pending set and SETTLES — a merge the pre-#1417
+# rail refused. The wait therefore settles only after it has observed AT LEAST
+# ONE RUN FOR EVERY known guard workflow at this head — pending OR already
+# terminal, because an already-green leg proves the workflow ran and an ABSENT
+# one does not; a partial generation keeps waiting (to $SELF_EDIT_WAIT) for the
+# missing leg rather than settling.
+#
+# A TERMINAL LEG SATISFIES COMPLETENESS (review P2, PR #1640). A leg that
+# finished before the first probe read is still an observed leg; requiring that
+# it was seen PENDING made the predicate unsatisfiable for that shape, so the
+# probe ran to $SELF_EDIT_WAIT and returned 1 — the pre-#1417 refusal #1417
+# exists to remove.
+#
+# FAILURE POLARITY. Every unreadable path here (a failed listing, a nonexistent
+# field, an empty selection) leaves the parser's `pending` counter untouched, so
+# §1b refuses exactly as it did before this change. The wait can only remove a
+# FALSE refusal; it can never produce a merge on its own.
+
+# The NON-code-measuring guard workflows whose PR triggers declare `edited`, and
+# whose runs a body PATCH therefore creates. Keys are the NORMALIZED display
+# names (lowercase, [a-z0-9] only) that LANE_RUN_GUARD_JQ emits — the real names
+# are prose (`Pipeline Compliance`, `Workflow lock (base-branch checker)`) and
+# either casing/spacing may change. Adding a guard workflow means adding its key
+# here; guard_generation_complete then waits for it too.
+GUARD_WORKFLOW_KEYS="pipelinecompliance workflowlock"
+
+# guard_workflow_key <normalized-workflow-name> — print the matching known guard
+# key, or return 1. Matched by SUBSTRING so a suffix (`… (fork)`) still matches:
+# over-matching is harmless (see the set description above). Under-matching falls
+# through to the unchanged §1b refusal.
+guard_workflow_key() {
+  local norm="${1:-}" k
+  for k in $GUARD_WORKFLOW_KEYS; do
+    case "$norm" in *"$k"*) printf '%s' "$k"; return 0 ;; esac
+  done
+  return 1
+}
+
+# guard_generation_complete <seen-key-list> — TRUE when EVERY known guard
+# workflow has been observed AT THIS HEAD at least once — pending OR already
+# terminal (a green leg still proves the workflow ran; see the block comment).
+# The list is space-delimited with a leading AND trailing space, so the `case`
+# glob cannot match a key that is merely a prefix of a longer one.
+guard_generation_complete() {
+  local seen="${1:- }" k
+  for k in $GUARD_WORKFLOW_KEYS; do
+    case "$seen" in *" $k "*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+# settle_self_edit_generation <head> — hold the rail until the run generation
+# its OWN `[3/4]` body edit created has finished, so §1b's re-read sees it.
+#
+# Return 0 ONLY when this head's unfinished set was EXACTLY that generation, EVERY
+# known guard workflow was observed at this head — pending or terminal
+# (completeness — see the block comment) — and it has now completed (so the caller
+# re-reads the surface).
+# Return 1 in every other case — a pending run that is NOT ours, nothing pending
+# at all, an unreadable listing, a partial generation at the bound, or the
+# generation still pending at $SELF_EDIT_WAIT — and the caller then falls through
+# to the UNCHANGED §1b refusal on the surface the parser already read. There is no
+# third state and no "proceed anyway".
+settle_self_edit_generation() {
+  local head="$1"
+  # A disabled/absent bound is the pre-#1417 behaviour, byte for byte.
+  counter_is_positive "$SELF_EDIT_WAIT" || return 1
+  local args=()
+  [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
+  # The SAME lane scope §1b's parser was invoked with: a guard run outside the
+  # watched lane can never make §1b refuse, so waiting for it would be gratuitous
+  # (and a guard run INSIDE it is exactly the set this exists for).
+  if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
+    args+=(--workflow "$WORKFLOW")
+  fi
+  local waited=0 step saw=0 status conclusion id key gk self_n foreign_n missing
+  local seen_keys=" "
+  while :; do
+    self_n=0; foreign_n=0
+    # shellcheck disable=SC2086
+    while IFS=$'\t' read -r status conclusion id key; do
+      [ -n "$status" ] || continue
+      # ⛔ CLASSIFY BEFORE THE COMPLETED SKIP (review P2, PR #1640). A guard leg
+      # that is ALREADY TERMINAL is still an observed leg at this head, so it is
+      # recorded and satisfies completeness; it just does not count as pending.
+      # Only a leg never seen at this head is unobserved, and that alone keeps
+      # the wait going. (Recording only PENDING legs made the predicate
+      # unsatisfiable when one guard leg finished before the first read — the
+      # probe then ran to the bound and produced the pre-#1417 refusal.)
+      if gk="$(guard_workflow_key "$key")"; then
+        case "$seen_keys" in *" $gk "*) ;; *) seen_keys="$seen_keys$gk " ;; esac
+        [ "$status" = "completed" ] && continue
+        self_n=$((self_n + 1))
+      else
+        [ "$status" = "completed" ] && continue
+        foreign_n=$((foreign_n + 1))
+      fi
+    done < <($GH run list --commit "$head" --limit 100 \
+        ${args[@]+"${args[@]}"} \
+        --json databaseId,status,conclusion,workflowName --jq "$LANE_RUN_GUARD_JQ" 2>/dev/null || true)
+    # SOMETHING THAT IS NOT OURS IS PENDING. The §1b refusal owns the decision on
+    # the surface the parser read, and this function must not paper over it.
+    if [ "$foreign_n" -ne 0 ]; then
+      say_err "admin-merge: · the head's unfinished set is NOT only the rail's own body-edit run generation — $foreign_n run(s) belong to the lane's own CI; §1b's lane-terminal precondition decides (unchanged)."
+      return 1
+    fi
+    if [ "$self_n" -eq 0 ]; then
+      # Nothing unfinished right now. Only a SETTLED, COMPLETE generation earns
+      # the re-read; an empty FIRST read is an unreadable or absent surface and
+      # fails closed; and a PARTIAL generation (a leg not yet created) keeps
+      # waiting below instead of settling on a subset — an absent leg is not a
+      # foreign leg, so a subset-only predicate would merge inside the window the
+      # pre-#1417 rail refused (review P1, PR #1640).
+      if [ "$saw" -eq 1 ] && guard_generation_complete "$seen_keys"; then
+        return 0
+      fi
+      if [ "$saw" -eq 0 ]; then
+        return 1
+      fi
+    fi
+    if [ "$waited" -ge "$SELF_EDIT_WAIT" ]; then
+      if [ "$self_n" -gt 0 ]; then
+        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL pending after ${SELF_EDIT_WAIT}s ($self_n run(s)) — §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
+      else
+        missing=""
+        for k in $GUARD_WORKFLOW_KEYS; do
+          case "$seen_keys" in *" $k "*) ;; *) missing="$missing ${k}" ;; esac
+        done
+        say_err "admin-merge: ✗ the rail's own body-edit run generation is STILL incomplete after ${SELF_EDIT_WAIT}s — not every guard workflow was ever observed at this head (never seen:${missing:- none}); §1b refuses exactly as before; raise ADMIN_MERGE_SELF_EDIT_WAIT or re-run the rail."
+      fi
+      return 1
+    fi
+    saw=1
+    if [ "$self_n" -gt 0 ]; then
+      info "admin-merge: … the rail's own body-edit run generation (#1417) is still pending ($self_n run(s)); waiting instead of discarding the round (${waited}s of ${SELF_EDIT_WAIT}s)"
+    else
+      info "admin-merge: … the rail's own body-edit run generation (#1417) settled for the leg(s) seen so far, but not every guard workflow has been observed yet; waiting for the remaining leg(s) instead of settling (${waited}s of ${SELF_EDIT_WAIT}s)"
+    fi
+    # CLAMP THE SLEEP TO THE REMAINING BUDGET (review P2, PR #1640). The bound is
+    # documented in SECONDS; an unbounded `sleep $POLL_INTERVAL` lets a legal
+    # ADMIN_MERGE_POLL_INTERVAL=3600 overshoot a 300s bound by an hour. Fail-closed
+    # (it only waits longer), but it contradicts the knob's own documentation.
+    step="$POLL_INTERVAL"
+    [ "$step" -gt 0 ] 2>/dev/null || step=1
+    [ "$step" -gt $((SELF_EDIT_WAIT - waited)) ] && step=$((SELF_EDIT_WAIT - waited))
+    [ "$step" -gt 0 ] && sleep "$step"
+    waited=$((waited + step))
+  done
 }
 
 # run_exemption_decision <pr-rows> <main-rates> <main-sigs> <rotation> <prefix>
@@ -3680,7 +4413,7 @@ build_evidence() {
   local head="$1" main_prov="$2" pr_count="$3" main_count="$4"
   local unique_raw="$5" flake_line="$6" analyzed="$7" lane="$8"
   local pr_fails="$9" main_fails="${10}" final_unique_raw="${11:-}" exempt_raw="${12:-}"
-  local unattr_tokens="${13:-}" unattr_count="${14:-0}"
+  local unattr_tokens="${13:-}" unattr_count="${14:-0}" repro_raw="${15:-}" repro_count="${16:-0}"
 
   printf '<!-- admin-merge-safety: %s -->\n' "$head"
   printf 'PR head: %s\n' "$head"
@@ -3703,7 +4436,17 @@ build_evidence() {
   # reaches this point with a zero residual, so every failure the PR carries IS
   # exempt-with-evidence, and recording the set is what lets a reviewer reach
   # `blocked: 0` from the comment instead of taking it on faith.
-  evidence_list "the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)" \
+  # THE HEADING MUST NOT OVERCLAIM (#3715 review). When the base reproduction
+  # cleared an id, that id was neither EXEMPTed by the decision nor measured on
+  # main — it was cleared by a local re-run on the base, and the summary must say
+  # so rather than folding it into "all EXEMPT" (the evidence comment is the
+  # audit artifact, so a claim that contradicts its own `Reproduction on base:`
+  # line is a defect in the record).
+  local exempt_heading="the $pr_count failure(s) this PR carries — all EXEMPT (id measured on main with a matching signature; rate compared where the PR sample was measurable)"
+  if counter_is_positive "$repro_count"; then
+    exempt_heading="the $pr_count failure(s) this PR carries — EXEMPT by the decision, or CLEARED as reproduced on the base (the $repro_count cleared id(s) had no main-side measurement of their own); rate compared where the PR sample was measurable"
+  fi
+  evidence_list "$exempt_heading" \
     "$(cat "$pr_fails")" "(none — this PR carries no failure of its own)"
   evidence_list "main baseline: $main_count pre-existing failure(s), for comparison" \
     "$(cat "$main_fails")" "(none)"
@@ -3720,8 +4463,24 @@ build_evidence() {
     evidence_list 'residual BEFORE the flake re-run — reclassified as flaky, NOT new failures' \
       "$unique_raw" "(none)"
   fi
+  # ⛔ THE PLACEHOLDER MUST NOT CONTRADICT THE BLOCK ABOVE IT (#3715 review). The
+  # EXEMPT heading was already made conditional on `repro_count`; this body was
+  # not, so a run whose residual was cleared by the base reproduction printed
+  # "empty — the decision exempts every failure this PR carries" directly under
+  # "(none — no failure was exempted)" and directly under its own `Reproduction
+  # on base:` line. A cleared id was NOT exempted; the body is chosen from the
+  # same count as the heading, so the two claims cannot disagree.
+  local final_empty="(empty — the decision exempts every failure this PR carries)"
+  if counter_is_positive "$repro_count"; then
+    final_empty="(empty — the decision exempted nothing here; the $repro_count cleared id(s) were reproduced on the base, and every other failure is exempt by the decision)"
+  fi
   evidence_list 'final residual (the exemption decision: BLOCKED ∪ UNATTRIBUTABLE) — must be empty' \
-    "$final_unique_raw" "(empty — the decision exempts every failure this PR carries)"
+    "$final_unique_raw" "$final_empty"
+  # THE BASE REPRODUCTION (#3715) — stated ALWAYS, so a reader can tell "no failure
+  # was refused" from "failures were refused and reproduced on the base". A
+  # reproduction that cleared a failure is the one thing that lets a merge proceed
+  # over a non-empty decision residual, so it is never silent.
+  printf '%s\n' "$repro_raw"
   # THE ATTRIBUTION HALF (#1353) — one line per merge, ALWAYS, so a CLIPPED set is
   # never mistaken for a measured zero and a COMPLETE set is stated rather than
   # assumed. The count itself is in the analysed block above; this is the tokens.
@@ -3751,6 +4510,271 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
+# ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
+#
+# THE DEFECT. `main-rates.txt` is a FAILURE-ONLY projection over the last N runs
+# of the lane on main. A failure that is genuinely pre-existing on main can be
+# absent from it for three different reasons, and the decision cannot tell them
+# apart:
+#
+#   (a) main ran the test in the EVALUATED SHAPE and it PASSED   -> an absent row
+#       is real evidence of novelty (the PR broke it);
+#   (b) main ran the test in a DIFFERENT shape and it passed/failed (this repo's
+#       tier-2 PR legs run `TORTOISE_TEST_CARVE_OUT=1` embedded, while main's
+#       push legs run the same files against docker — a same-nodeid row from the
+#       other shape must never decide this one);
+#   (c) main NEVER RAN the test (the selector is diff-gated, the leg ran nowhere,
+#       the file was not in the shard) -> absence is NOT evidence of anything.
+#
+# (b) is the fail-open direction: a docker failure of X on main would EXEMPT an
+# embedded failure of X in the PR, because the union is keyed on the bare
+# nodeid. (c) is the false-BLOCK direction the issue is filed about: the rail
+# attributes to the PR a failure it could not have caused, because the baseline
+# never measured it. Both are the SAME defect — the comparison's key carries no
+# shape — and no amount of set arithmetic can separate them, because the missing
+# information is a MEASUREMENT, not a membership.
+#
+# THE REPAIR, and why it is the baseline's construction rather than a waiver:
+# when the decision would BLOCK, the rail CONSTRUCTS the missing measurement by
+# running the refused nodeids on a pristine worktree of the BASE (origin/main).
+# A failure the base reproduces is one the base's code ALREADY fails in THIS
+# lane's AMBIENT shape — a MEASUREMENT the failure-only baseline did not carry.
+# It is NOT proof the PR is innocent (see the declared residue below); it is the
+# missing observation, and it is strictly stronger than a set-membership test.
+# THE QUESTION IT ANSWERS is a direction ("reproduce the residual set on
+# origin/main"). What it establishes
+# is REPRODUCED-ON-THE-BASE versus NOT — a MEASUREMENT, strictly stronger than
+# any set-membership test. It does NOT establish case (a) versus case (c) (see
+# the declared residue below): a base run cannot tell "main ran this shape and it
+# passed" from "main never ran it".
+#
+# THE MEASUREMENT SHAPE (a DECLARED RESIDUE, and it is NOT one-directional).
+# The reproduction runs in the AMBIENT test environment the rail inherits — it
+# does not re-create CI's per-leg shape (e.g. this repo's tier-2 PR legs run the
+# fast halves embedded while main's push legs run them against docker). The
+# residue therefore has TWO directions, and only the first is fail-closed:
+#   * a failure SHAPE-SPECIFIC to the evaluated lane may not reproduce here, so
+#     the rail blocks exactly as before (fail closed, harmless); but
+#   * an ambient failure main's own leg does NOT see (a missing service, an env
+#     var, an order dependence) CAN reproduce on the base and clear an id whose
+#     main-side leg is in fact GREEN — the fail-OPEN direction. Case (a) above
+#     ("main ran it in this shape and it passed") and case (c) ("main never ran
+#     it") are indistinguishable from a failure-only baseline, so this repair
+#     cannot separate them and does not pretend to: closing (a)-versus-(c) needs
+#     CI's own per-leg shape, not a local run.
+# Two things bound the blast radius, and BOTH are load-bearing:
+#   * an id is clearable only if the decision could not MEASURE it — no row for
+#     the ID, and no row for its FILE (see `repro_candidates`); a MEASURED value
+#     is never overridable by a local run; and
+#   * only ids the base ITSELF reports FAILED *and that were actually candidates*
+#     are cleared — the clearable set is `candidates ∩ reproduced`, never the
+#     base's whole failing set, so a runner/parser that volunteers an id outside
+#     its argv clears nothing.
+# It is stated here rather than smoothed over because a residue that is only
+# fail-closed in one direction must not read as "cannot fail open".
+#
+# IT IS NOT A WAIVER AND NOT AN EXCEPTION:
+#   * it runs only on a residual the decision ALREADY REFUSED — it can never
+#     widen an exemption the decision granted;
+#   * CANDIDATES ARE THE MEASUREMENT GAP ONLY, AT BOTH LEVELS. An id whose row IS
+#     in main's rate table was MEASURED by the decision — a rate regression
+#     (#3756: main 1/8 vs PR 8/8), a signature mismatch, or a sample below
+#     min_runs — and is NOT a candidate. Neither is an id whose FILE main's
+#     baseline measured (a sibling failure in the same file): the rail's own
+#     `attribute_residual` calls that MEASURED-ABSENT, "not present on main",
+#     which is evidence of novelty. Only the absence of ANY measurement of the
+#     file is the missing measurement this constructs. AND EVERY NON-NODEID
+#     CLASS IS NEVER A CANDIDATE, because a base run cannot speak to what it
+#     asserts: an UNATTRIBUTABLE id (a class red across runs under a MOVING id —
+#     "cannot be attributed to this PR", and therefore never a merge), a
+#     guard-step identity (no local runner), and the other non-nodeid families a
+#     local pytest cannot execute (`collect-error::<file>` #6798,
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131 — passed as argv
+#     they make pytest exit 4 having run NOTHING). `repro_scope` then
+#     `repro_candidates` are the one place that decision is made, and the cleared
+#     set is its intersection with the base's own failures (`intersect_sets`,
+#     below);
+#   * it runs the exact NODEIDS as argv, never their whole files — that bounds
+#     WHICH TESTS RUN on the base (an unrelated failure in the same file is never
+#     executed), while `intersect_sets` separately bounds WHAT MAY BE CLEARED, so
+#     a capture that NAMES an id outside its argv still clears nothing;
+#   * only nodeids the BASE ITSELF reports FAILED are cleared, and a nodeid whose
+#     reproduction cannot be parsed stays in the residual (fail-closed);
+#   * a base that cannot be materialised / a lane with no runnable runner / an
+#     invalid bound clears NOTHING and the rail blocks exactly as before — an
+#     unrun reproduction is never read as "pre-existing";
+#   * guard-step identities are NOT reproduced (they have no local runner) and
+#     always remain in the residual.
+#
+# The worktree is a throwaway under $TMP and is always removed.
+#
+# Env seams (tests / operator):
+#   ADMIN_MERGE_REPRO_CMD   the reproduction command, run with the residual
+#                           nodeids on stdin and its pytest-shaped output on
+#                           stdout. When set, no worktree is created and the
+#                           command runs in $PWD — this is the harness seam, in
+#                           the same spirit as ADMIN_MERGE_GH / CI_FAILURE_SET_GH.
+#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900). The bound is MANDATORY
+#                           and VALIDATED (positive integer): a value perl's
+#                           `alarm` cannot numify cancels the timer, and a
+#                           hanging suite must become "not reproduced" (a
+#                           block), never an unbounded merge-time stall.
+#
+# RETURN: 0 = ran (the capture was read; `$out` may be empty) · 1 = could not
+# run, so the caller clears NOTHING. "Found nothing" is NEVER reported as
+# "could not run".
+reproduce_residual_on_base() {
+  local residual="$1" out="$2" base="${3:-}"
+  : > "$out"
+  # RETURN CONTRACT — the caller reports on it, so conflating the two outcomes is
+  # itself a defect (#3715 review): 0 = the reproduction RAN (its capture was
+  # read; `$out` may legitimately be empty) · 1 = it COULD NOT RUN (no base OID,
+  # no worktree, no runner, no usable bound) — clear NOTHING. "ran and found
+  # nothing" must never be reported as "could not run".
+  [ -s "$residual" ] || return 1
+  # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
+  # P2). The parser's other non-nodeid identities — `collect-error::<file>`
+  # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131) — are
+  # real residual rows but they name no pytest nodeid. Handed to the runner as
+  # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
+  # directory not found`), so a residual that mixes a collection error with real
+  # nodeids aborted the whole base run and cleared nothing — the false block this
+  # repair exists to remove, with no diagnostic naming the cause. (`repro_scope`
+  # already filters them from the candidate set; this is the function's own
+  # guard, so the contract holds for any caller.)
+  local nodeids
+  nodeids="$(grep -v -e '^guard-step::' -e '^collect-error::' -e '^watchdog-kill::' -e '^job-unreadable::' "$residual" 2>/dev/null || true)"
+  [ -n "$nodeids" ] || return 1
+
+  # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
+  # PREDICATES. `perl alarm` numifies its argument, so `alarm "abc"` is
+  # `alarm 0` (the timer is CANCELED) and the runner becomes unbounded; and the
+  # same is true of a LEADING-ZERO spelling (`alarm 00` == `alarm 0`) or a value
+  # past the integer range (`alarm` errors, and the bound is never armed).
+  # Reusing `counter_is_positive` / `counter_has_leading_zero` /
+  # `counter_exceeds_max` is deliberate: every other timing knob in this rail is
+  # validated by exactly these three, and a hand-rolled `case` here is how the
+  # leading-zero and out-of-range holes reappear.
+  local timeout_s="${ADMIN_MERGE_REPRO_TIMEOUT:-900}"
+  if counter_has_leading_zero "$timeout_s" \
+     || ! counter_is_positive "$timeout_s" \
+     || counter_exceeds_max "$timeout_s" "$TIMING_KNOB_MAX"; then
+    say_err "admin-merge: (reproduction) refusing ADMIN_MERGE_REPRO_TIMEOUT='$timeout_s' — a POSITIVE"
+    say_err "   integer (no leading zero, within the usable range) is required: perl's alarm numifies"
+    say_err "   its argument, so a non-integer, a leading-zero spelling, or an out-of-range value"
+    say_err "   CANCELS or never arms the bound and the base run would be UNBOUNDED. Nothing"
+    say_err "   reproduced; the refusal stands (fail closed)."
+    return 1
+  fi
+  # The bound is enforced by `perl alarm` (macOS ships no `timeout`). Without perl
+  # there is NO bound, and starting an unbounded merge-time suite is exactly what
+  # this function must never do.
+  if ! command -v perl >/dev/null 2>&1; then
+    say_err "admin-merge: (reproduction) no 'perl' for the mandatory alarm bound — nothing"
+    say_err "   reproduced; the refusal stands (fail closed)."
+    return 1
+  fi
+
+  # THE REQUESTED SET IS THE NODEIDS, passed to the runner as ARGV (the seam also
+  # gets them on stdin). Running the exact nodeids — never their whole files —
+  # bounds the base's OWN output to the ids under test, so an unrelated failure
+  # in the same file can never be read as a reproduced one. Built BEFORE the
+  # worktree exists so an empty request can never leave one behind (#3715 review).
+  local -a nodeid_arr=() n
+  while IFS= read -r n; do [ -n "$n" ] && nodeid_arr+=("$n"); done <<< "$nodeids"
+  [ "${#nodeid_arr[@]}" -gt 0 ] || return 1
+
+  local work="$TMP/repro-base"
+  rm -rf "$work"; mkdir -p "$work" || return 1
+
+  local cmd_dir="$PWD" used_worktree=0
+  if [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+    # PRODUCTION PATH: a pristine base worktree. No base ref, not a git repo, or a
+    # worktree that cannot be created -> clear NOTHING (fail closed).
+    [ -n "$base" ] || return 1
+    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+    if ! git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+      say_err "admin-merge: (reproduction) could not materialise the base '$base' as a worktree — the"
+      say_err "   residual is NOT reproduced and the rail blocks as before (fail closed)."
+      return 1
+    fi
+    cmd_dir="$work/tree"; used_worktree=1
+  fi
+
+  local -a runner
+  if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+    runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
+  elif command -v uv >/dev/null 2>&1 && [ -f "$cmd_dir/uv.lock" ]; then
+    runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
+  else
+    say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
+    say_err "   — the residual is NOT reproduced and the rail blocks as before (fail closed)."
+    [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
+    return 1
+  fi
+  local raw="$work/repro.raw" run_rc=0
+  (
+    cd "$cmd_dir" || exit 1
+    printf '%s\n' "$nodeids" > "$work/nodeids.txt"
+    perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
+  ) > "$raw" 2> "$work/repro.err" || run_rc=$?
+  [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
+
+  # The reproduced set, through the CANONICAL parser so the shapes cannot drift.
+  # `ids` exits non-zero ONLY when the capture could not be READ (an empty id set
+  # is a legitimate 0), so a non-zero here is "could not run", not "found none".
+  local reproduced
+  reproduced="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$raw" 2>/dev/null)" || return 1
+  # ⛔ A RUNNER THAT DID NOT RUN IS NOT A RAN-AND-FOUND-NOTHING MEASUREMENT
+  # (#3715 review, P2). The subshell's status was DISCARDED, so a crash, a
+  # missing dependency, an argv the runner refused, or a suite KILLED at the
+  # mandatory `perl alarm` bound all left an empty capture; `ids` reads that as a
+  # legitimate empty set (exit 0), and the rail reported "NO refused failure
+  # reproduced there" — a POSITIVE measurement that the base passed tests it
+  # never executed, contradicted by the runner's own unread `$work/repro.err`.
+  # The STATUS ALONE is not the test: pytest exits 1 when tests FAIL, which is a
+  # successful measurement. The evidence is the CAPTURE — a runner that ran and
+  # found failures names them, one that could not run names none — so BOTH
+  # together are the predicate: non-zero status AND no recovered id is "could not
+  # run" (fail closed), while a non-zero status WITH recovered ids is a
+  # measurement. 142 is SIGALRM (128+14): the bound killed it.
+  if [ "$run_rc" -ne 0 ] && [ -z "$reproduced" ]; then
+    if [ "$run_rc" -eq 142 ]; then
+      say_err "admin-merge: (reproduction) the base runner was KILLED by the ${timeout_s}s bound"
+      say_err "   (SIGALRM) before it reported anything — that is a run that could NOT run, never a"
+      say_err "   measurement that the base does not fail these tests."
+    else
+      say_err "admin-merge: (reproduction) the base runner exited $run_rc with NO recovered failure id"
+      say_err "   — a crash, a missing dependency, or an argv the runner refused, NOT a run that found"
+      say_err "   nothing. 'ran and found nothing' must never be reported as 'could not run', and this"
+      say_err "   inverse is the same defect."
+    fi
+    local diag=""
+    if [ -s "$work/repro.err" ]; then
+      diag="$(tail -n 3 "$work/repro.err" 2>/dev/null)"
+      say_err "   runner stderr (last 3 lines):"
+      printf '%s\n' "$diag" | sed 's/^/      /' >&2
+    fi
+    say_err "   Nothing reproduced; the refusal stands (fail closed)."
+    return 1
+  fi
+  # THE CAPTURE IS INTERSECTED WITH WHAT WAS ACTUALLY ASKED FOR (#3715 review,
+  # P0). `ids --log` recovers nodeid-shaped tokens from ANYWHERE in the capture
+  # and the test seam can echo whatever it likes, so the base's raw output may
+  # name an id outside its argv — including a MEASURED one. Subtracting that from
+  # the residual would override a measured verdict, which is the #3756 fail-open
+  # the candidate set exists to stop. `$residual` IS the candidate set, so the
+  # intersection belongs here, and it goes through the ONE comparison
+  # implementation (never a second subtraction, never `comm -12`).
+  if [ -n "$reproduced" ]; then
+    printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
+    intersect_sets "$work/reproduced.all" "$residual" "$out" "$work/rep-outside.txt" || {
+      : > "$out"; return 1
+    }
+  fi
+  return 0
+}
+
 # attribute_residual <residual-file> <main-fails-file> — name WHY each residual
 # failure is not in main's baseline. This IMPROVES the diagnosis of a refusal;
 # it must never NARROW the refusal. Every caller blocks on a non-empty residual
@@ -3758,6 +4782,15 @@ build_evidence() {
 # (B1 asked for lane-matched attribution sufficient to CERTIFY; the answer is
 # no — a gate cannot adjudicate causation, and accepting it once lets the next
 # genuinely-new failure in that file ride the same argument).
+#
+# #3715 — A LABEL IS NOT A MEASUREMENT, AND THIS RULE IS ABOUT LABELS. The
+# paragraph above refuses to CERTIFY from an ATTRIBUTION LABEL, i.e. an
+# inference drawn from file proximity. The base reproduction is a different
+# thing in kind, not a softer label: it RUNS the refused nodeids on the base and
+# clears only an id the base itself reports FAILED — and only when main's rate
+# table carries NO row for it, so a MEASURED verdict (including #3756's rate
+# regression) is never overridden. "Both labels block" still holds: nothing
+# here clears, and no label may be read as a waiver.
 #
 # The UNIT is the failure's own grouping: a pytest nodeid groups by FILE (before
 # the first `::`), a guard-step identity (#4469, `guard-step::<step>::<shape>`)
@@ -3787,38 +4820,157 @@ build_evidence() {
 #       (B1: CI's docker lane reproduces ZERO occurrences of the embedded lane's
 #       redislite/GRAPH.COPY race while the embedded lane reproduces it — the old
 #       wording asserted uniqueness with nothing to compare against.)
+# main_measured_files <mainfails> — the FILES main's failure-only baseline
+# actually MEASURED, i.e. a real test failure in the file (or a guard-step
+# identity for it). A sibling failure in the file is proof main's lane RAN it and
+# did not show THIS id red — MEASURED-ABSENT — which the rail must keep distinct
+# from NOT-MEASURABLE.
+#
+# A `collect-error::<file>` is deliberately NOT in this set, and that is the whole
+# reason this function is not `main_baseline_units`: pytest could not COLLECT the
+# file, so NO test in it ran and main's baseline says NOTHING about the file's
+# tests. It is a unit the rail can NAME, not a measurement it can rely on.
+# Conflating the two makes the base reproduction refuse an id the base itself
+# reproduces as FAILED — the false block #3715 exists to remove (a real
+# regression when this set was widened; caught in review).
+main_measured_files() {
+  local mainfails="$1"
+  [ -s "$mainfails" ] || return 0
+  {
+    sed '/^guard-step::/d; s/::.*//' "$mainfails"
+    sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+  } | sort -u
+}
+
+# main_baseline_units <mainfails> — the UNIT each of main's baseline rows is
+# keyed by, for MATCHING a residual and for PRINTING it. Wider than
+# `main_measured_files` by exactly the rows that name no test: `collect-error::`
+# groups by FILE (#6798 — a different file on main must not read as a
+# pre-existing failure in the same unit) and an environmental kill groups by the
+# MECHANISM. Read by `attribute_residual` (the rail's WORDS); deliberately NOT
+# read by `repro_candidates` (its CLEARANCE), because a unit is not a
+# measurement. The two coincide for every id that names a test, which is why one
+# function looked sufficient.
+main_baseline_units() {
+  local mainfails="$1"
+  [ -s "$mainfails" ] || return 0
+  {
+    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
+    sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
+    sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
+    sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
+    # #7131: the unit is the JOB SLUG. Without this arm the generic `s/::.*//`
+    # above is suppressed for the family and a main baseline red on a DIFFERENT
+    # job would read as pre-existing in this one.
+    sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
+  } | sort -u
+}
+
+# failure_file_key <id> — the FILE (or, for an environmental kill, the
+# MECHANISM) an id is grouped by. ONE derivation, because BOTH readers of
+# `main_measured_files` must group an id identically or the rail's words and its
+# clearance drift apart (the helper's own contract): `repro_candidates` decides
+# what a base reproduction may clear, `attribute_residual` decides what the rail
+# PRINTS. #6798: a `collect-error::` id is keyed by its FILE — a different file
+# on main must not read as a pre-existing failure in the same unit — and an
+# environmental kill carries no file, so it is keyed by the mechanism.
+failure_file_key() {
+  case "$1" in
+    guard-step::*::*) local f="${1#guard-step::}"; printf '%s\n' "${f%%::*}" ;;
+    collect-error::*) printf '%s\n' "${1#collect-error::}" ;;
+    watchdog-kill::*) printf '%s\n' "watchdog-kill" ;;
+    # #7131: an unreadable job's unit is the JOB SLUG — the key asserts only "a
+    # job with this slug failed", so a different job on main must not read as a
+    # pre-existing failure in this one. Without this arm the generic default
+    # would collapse every job onto the literal `job-unreadable`.
+    job-unreadable::*) printf '%s\n' "${1#job-unreadable::}" ;;
+    *) printf '%s\n' "${1%%::*}" ;;
+  esac
+}
+
+# intersect_sets <a> <b> <out> <scratch> — a ∩ b, as `a − (a − b)`, through the
+# ONE shared comparison. `comm -12` is forbidden in this file for the same reason
+# `comm -23` is (the parity invariant): a second set implementation is drift.
+# Returns 1 if either subtraction could not run — the caller clears NOTHING.
+intersect_sets() {
+  local a="$1" b="$2" out="$3" scratch="$4"
+  run_failure_set --diff "$a" "$b" > "$scratch" 2>/dev/null || return 1
+  run_failure_set --diff "$a" "$scratch" > "$out" 2>/dev/null || return 1
+  return 0
+}
+
+# repro_scope <residual> <unattributable> <out> <scratch> — the ids a base run
+# could even SPEAK TO: the residual minus UNATTRIBUTABLE identities, minus
+# guard-step identities, and minus the other NON-NODEID families. All are
+# excluded on doctrine, not on evidence:
+#   * UNATTRIBUTABLE is "a class red across runs under a MOVING id — the identity
+#     provably will not be the same next run, so it cannot be attributed to this
+#     PR". Reproducing ONE of the moving ids on the base says nothing about the
+#     class, and the class is never a merge (`detect_rotating_identity`, E5).
+#   * a guard-step identity has no local pytest runner, so it cannot be
+#     reproduced and must always remain in the residual.
+#   * the other non-nodeid identities (`collect-error::<file>` #6798,
+#     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131) also name no
+#     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
+#     NOTHING, so they are not candidates either — they are units the rail can
+#     NAME, never measurements a local run can clear (#3715 review, P2).
+# Return contract: 0 = computed (out may be empty) · 1 = could not compute.
+repro_scope() {
+  local residual="$1" unattrib="$2" out="$3" scratch="$4" nid
+  if [ -s "$unattrib" ]; then
+    run_failure_set --diff "$residual" "$unattrib" > "$scratch" 2>/dev/null || return 1
+  else
+    cp "$residual" "$scratch" || return 1
+  fi
+  : > "$out"
+  while IFS= read -r nid; do
+    [ -n "$nid" ] || continue
+    case "$nid" in
+      guard-step::*|collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
+    esac
+    printf '%s\n' "$nid" >> "$out"
+  done < "$scratch"
+  return 0
+}
+
+# repro_candidates <scoped> <mainfails> <out> <idlevel> <mainfiles> — the ids the
+# base reproduction may legitimately clear: the ones the decision could not
+# MEASURE. TWO levels, and both are the rail's own doctrine:
+#   * ID level — no row in main's rate table (the decision's `mr is None`).
+#   * FILE level — main's baseline carries no measurement of the id's FILE, so
+#     absence is not evidence of novelty. An id whose file main DID measure (a
+#     sibling failure in main-fails) is MEASURED-ABSENT: `attribute_residual`
+#     names that "measured on this lane, not present on main" — evidence of
+#     novelty — and a local base run must never clear it (#3715 review, P0).
+# `scoped` is `repro_scope`'s output. Return contract: 0 = computed (out may be
+# empty) · 1 = could not compute.
+repro_candidates() {
+  local scoped="$1" mainfails="$2" out="$3" idlevel="$4" mainfiles="$5" nid file
+  run_failure_set --diff "$scoped" "$mainfails" > "$idlevel" 2>/dev/null || return 1
+  : > "$out"
+  [ -s "$idlevel" ] || return 0
+  main_measured_files "$mainfails" > "$mainfiles"
+  while IFS= read -r nid; do
+    [ -n "$nid" ] || continue
+    file="$(failure_file_key "$nid")"
+    if [ -s "$mainfiles" ] && grep -qxF -- "$file" "$mainfiles" 2>/dev/null; then
+      continue
+    fi
+    printf '%s\n' "$nid" >> "$out"
+  done < "$idlevel"
+  return 0
+}
+
 attribute_residual() {
   local residual="$1" mainfails="$2" nodeid file main_files=""
-  if [ -s "$mainfails" ]; then
-    main_files="$(
-      sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; s/::.*//' "$mainfails"
-      sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
-      sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
-      sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
-      # #7131: the unit is the JOB SLUG. Without this arm the generic `s/::.*//`
-      # above is suppressed for the family and a main baseline red on a DIFFERENT
-      # job would read as pre-existing in this one.
-      sed -n 's/^job-unreadable::\(.*\)$/\1/p' "$mainfails"
-    )"
-    main_files="$(printf '%s\n' "$main_files" | sort -u)"
-  fi
+  # main's side is kept: the file set is the WIDE one (main's #6798 families),
+  # because this function MATCHES a residual id to the unit main's baseline
+  # names. Its own inline block is now `main_baseline_units`, so the two readers
+  # of a shared key derivation cannot drift — see `failure_file_key`.
+  main_files="$(main_baseline_units "$mainfails")"
   while IFS= read -r nodeid; do
     [ -n "$nodeid" ] || continue
-    case "$nodeid" in
-      guard-step::*::*) file="${nodeid#guard-step::}"; file="${file%%::*}" ;;
-      # #6798: group by FILE — the id is file-keyed, so a different file on main
-      # must NOT read as a pre-existing failure in the same unit.
-      collect-error::*) file="${nodeid#collect-error::}" ;;
-      # #6798: an environmental kill has no file; group by the mechanism.
-      watchdog-kill::*) file="watchdog-kill" ;;
-      # #7131: the fallback's unit is the JOB SLUG — the key asserts only "a job
-      # with this slug failed", so a different job on main must not read as a
-      # pre-existing failure in this one. (a)-(d) above pin the same rule for the
-      # other non-nodeid families; this arm exists because the generic default
-      # would collapse every job onto the literal `job-unreadable`.
-      job-unreadable::*) file="${nodeid#job-unreadable::}" ;;
-      *) file="${nodeid%%::*}" ;;
-    esac
+    file="$(failure_file_key "$nodeid")"
     if [ -n "$main_files" ] && grep -qxF -- "$file" <<<"$main_files"; then
       printf '   %s\n      -> measured on this lane, not present on main\n' "$nodeid"
     else
@@ -4096,12 +5248,20 @@ main() {
   # ran (729 stale `admin-merge.*` directories, 21 MB, on the reviewing machine).
   # Assign the FILE-SCOPE `TMP` declared below and expand it at trap-set time.
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge.XXXXXX")"
+  # ⛔ THE READ PROBES' STDERR FILE IS CREATED HERE, IN THE PARENT (#1750 review). The reads
+  # run inside command substitutions, so a `mktemp` performed THERE would put the path in a
+  # subshell that this trap cannot see — and the trap is the only thing that removes the file
+  # after a process-group signal. `mktemp` (O_EXCL) is still what makes the name
+  # unpredictable, so the truncation primitive the predictable name allowed is gone; this line
+  # is what keeps the trap able to clean up after it.
+  READ_ERRTMP="$(mktemp "${TMPDIR:-/tmp}/admin-merge-read.XXXXXX" 2>/dev/null)"
   # ⛔ THE READ'S OWN TEMP FILE IS IN THE EXIT TRAP (#1690 review). `resolve_head` removes it on
   # both normal exits, but a process-group signal (what a terminal Ctrl-C actually delivers)
   # kills the subshell before its `rm` runs, and the file leaks. SIGKILL can still leak it —
-  # nothing can trap that — so this narrows the window rather than closing it to zero, and the
-  # name is PID-scoped so a leak is one file per killed run, not a shared collision.
-  trap 'rm -rf "${TMP:-}"; rm -f "${TMPDIR:-/tmp}/admin-merge-head.$$.err"' EXIT
+  # nothing can trap that — so this narrows the window rather than closing it to zero. The path
+  # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
+  # the file the reads actually created instead of naming a predictable path (#1750 review).
+  trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
 
   local head
   # shellcheck disable=SC2086
@@ -4121,8 +5281,15 @@ main() {
   # posted. The rail does NOT silently ready the PR: a draft is a deliberate
   # review checkpoint, and clearing it is the author's act, not the rail's.
   local is_draft
+  # ⛔ READ THROUGH THE DOOR, AND PROPAGATE ITS FAILURE (#1750). The bare read here was
+  # the defect: a failed read yielded "", and the comparison below read that as "not a
+  # draft" and let the rail proceed. `require_draft` prints the value ONLY when it is
+  # exactly `true`/`false`, so `|| exit 1` is what makes an unreadable probe refuse
+  # instead of becoming a permission. It is deliberately NOT defended by a second
+  # emptiness check here: the guarantee lives in the door, once, and a defence at the
+  # one site that already refuses is how the @1690 fix inverted its own invariant.
   # shellcheck disable=SC2086
-  is_draft="$(resolve_draft "$PR" ${repo_args[@]+"${repo_args[@]}"})"
+  is_draft="$(require_draft "$PR" ${repo_args[@]+"${repo_args[@]}"})" || exit 1
   if [ "$is_draft" = "true" ]; then
     say_err "admin-merge: ✗ BLOCK — PR #$PR is a DRAFT, and gh refuses to merge a draft"
     say_err "   (\"Pull Request is still a draft\"). This is NOT a CI-failure verdict and NOT"
@@ -4202,33 +5369,67 @@ main() {
   # Selected by COMMIT, not by PR: the analyzed set must be provably the SHA the
   # evidence marker names. `--pr` would re-resolve the head internally, so a push
   # between the two resolutions could analyze one SHA and certify another (#P1).
-  local pr_status=0
-  # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
-  # FAILED tokens it names are the ONLY source of the attribution half, and they
-  # must reach the posted evidence. They are re-emitted verbatim below, so nothing
-  # that used to be visible on stderr is silenced.
-  run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
-    --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
-    > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
-  [ -s "$TMP/pr-drops.err" ] && cat "$TMP/pr-drops.err" >&2
-  if [ "$pr_status" -ne 0 ]; then
-    say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
-    say_err "   Refusing to certify a comparison computed over an unreadable set."
-    exit 1
-  fi
-  # The id set the evidence and the re-run loop use, derived from the ROWS the
-  # decision consumes, so the two can never disagree about which ids exist.
-  cut -f1 "$TMP/pr-rows.txt" 2>/dev/null | sort -u > "$TMP/pr-fails.txt"
+  #
+  # #1417 — THE ANALYSIS IS RE-RUN, ONCE, WHEN THE ONLY THING UNFINISHED IS THE
+  # RAIL'S OWN BODY-EDIT GENERATION. `[3/4] record` PATCHes the review marker
+  # into the PR body (an `edited` activity), which re-triggers exactly the two
+  # NON-code-measuring guard workflows (`pipeline-compliance` — #513's verdict
+  # binding — and `workflow-lock`), creating two fresh runs 11-87s AFTER `[2/4]
+  # verify` certified the head. MEASURED on #1495 and #1633: `[4/4]` refused with
+  # `run still in_progress` against its own work, costing a whole extra rail
+  # round. The generation is WAITED FOR and the surface RE-READ, so a guard run
+  # that FAILS enters the failing set and blocks exactly as before — this
+  # defers a refusal on an unfinished run set, never a failure.
+  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0
+  # The last diagnostics block emitted, so the #1417 re-read pass does not
+  # DOUBLE-EMIT byte-identical parser diagnostics (review P2, PR #1640). The
+  # `pr-drops.err` FILE is left intact — the attribution half reads it later.
+  local pr_drops_emitted=""
+  while :; do
+    pr_status=0
+    # THE PARSER'S DIAGNOSTICS ARE CAPTURED, NOT INHERITED (#1353): the dropped
+    # FAILED tokens it names are the ONLY source of the attribution half, and they
+    # must reach the posted evidence. They are re-emitted verbatim below, so nothing
+    # that used to be visible on stderr is silenced.
+    run_failure_set --commit-rows "$head" ${repo_args[@]+"${repo_args[@]}"} ${wf_args[@]+"${wf_args[@]}"} \
+      --provenance "$TMP/pr-runs.txt" --runs-report "$TMP/pr-report.txt" --per-run "$TMP/pr-per-run.txt" \
+      > "$TMP/pr-rows.txt" 2> "$TMP/pr-drops.err" || pr_status=$?
+    if [ -s "$TMP/pr-drops.err" ]; then
+      local pr_drops_cur
+      pr_drops_cur="$(cat "$TMP/pr-drops.err")"
+      if [ "$pr_drops_cur" != "$pr_drops_emitted" ]; then
+        printf '%s\n' "$pr_drops_cur" >&2
+        pr_drops_emitted="$pr_drops_cur"
+      fi
+    fi
+    if [ "$pr_status" -ne 0 ]; then
+      say_err "admin-merge: ✗ BLOCK — could not extract the PR's failing set (parser exit $pr_status)."
+      say_err "   Refusing to certify a comparison computed over an unreadable set."
+      exit 1
+    fi
+    # The id set the evidence and the re-run loop use, derived from the ROWS the
+    # decision consumes, so the two can never disagree about which ids exist.
+    cut -f1 "$TMP/pr-rows.txt" 2>/dev/null | sort -u > "$TMP/pr-fails.txt"
 
-  # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────────
-  # `examined=0` is NOT the signal — a green lane legitimately has no failing
-  # runs. The signal is `tested=0` (no run actually exercised this revision) or
-  # `pending>0` (something has not finished). Either way an empty failing set
-  # proves nothing, so the rail must not read it as "no unique failures".
-  local pr_completed pr_tested pr_pending
-  pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
-  pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
-  pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+    # ── 1b. THE HEAD MUST HAVE BEEN TESTED (review P0 #3) ────────────────
+    # `examined=0` is NOT the signal — a green lane legitimately has no failing
+    # runs. The signal is `tested=0` (no run actually exercised this revision) or
+    # `pending>0` (something has not finished). Either way an empty failing set
+    # proves nothing, so the rail must not read it as "no unique failures".
+    pr_completed="$(report_value "$TMP/pr-report.txt" completed)"
+    pr_tested="$(report_value "$TMP/pr-report.txt" tested)"
+    pr_pending="$(report_value "$TMP/pr-report.txt" pending)"
+
+    # #1417: defer ONLY the rail's own body-edit generation, and re-verify the
+    # surface ONCE. A NEGATIVE test is deliberate: `pending` that is 0 (nothing
+    # unfinished) and `pending` that is UNREADABLE ('n/a') both leave the loop
+    # immediately, and the unreadable one is refused by §1b below — the loop
+    # never waits on a counter it could not read.
+    if ! counter_is_positive "$pr_pending"; then break; fi
+    if [ "$pr_self_edit_retry" -eq 1 ]; then break; fi
+    settle_self_edit_generation "$head" || break
+    pr_self_edit_retry=1
+  done
 
   # "Not proven finished" is not "finished": `! counter_is_zero` blocks on an
   # UNREADABLE `pending` too, not only on a positive one. A bare `-gt 0` skipped
@@ -4694,14 +5895,113 @@ main() {
   local unique_before
   unique_before="$(count_lines "$TMP/unique.txt")"
 
+  # ── 3b. THE MISSING MEASUREMENT (#3715) ──────────────────────────────────
+  # The decision has refused this residual because main's lane carries no
+  # measurement of it (or too thin a one). Absence is NOT evidence of novelty:
+  # main may never have run the test in the evaluated shape at all. Before the
+  # rail attributes them to this PR, it CONSTRUCTS the missing measurement by
+  # running the residual nodeids on a pristine worktree of the BASE. A failure
+  # the base itself reproduces is pre-existing by construction and is cleared
+  # from the residual; anything the base does NOT reproduce stays refused. See
+  # `reproduce_residual_on_base` for why this is the baseline's construction and
+  # not a waiver. A reproduction that cannot run clears NOTHING (fail closed).
+  #
+  # `--dry-run` MUTATES NOTHING, so it must not run the base suite either: the
+  # reproduction materialises a worktree and executes tests, and a documented
+  # no-op that runs a suite is the same defect the CI-re-run guard below closes.
+  local repro_line="Reproduction on base: not attempted (the decision blocked nothing)"
+  local repro_base="${BASE_SHA:-$base_ref}"
+  local repro_n=0
+  if [ "$unique_before" -gt 0 ] && [ "${DRY_RUN:-0}" -eq 0 ]; then
+    # THE CANDIDATES ARE ONLY THE MEASUREMENT GAP (#3715 review, P1). The
+    # residual is BLOCKED ∪ UNATTRIBUTABLE, and BLOCKED is not one class: the
+    # decision also blocks a MEASURED verdict — a rate regression (#3756:
+    # main 1/8 vs PR 8/8), a signature mismatch, or a sample below min_runs. A
+    # single ambient run on the base must never override a MEASURED verdict; the
+    # missing measurement this constructs is exactly the case where main's rate
+    # table carries NO row for the id. `main-fails.txt` IS that table's id column
+    # (step 2). An id WITH a row stays refused no matter what the base does.
+    local cand="$TMP/repro-candidates.txt"
+    if ! repro_scope "$TMP/unique.txt" "$TMP/unique.unattributable" \
+         "$TMP/repro-scope.txt" "$TMP/repro-nonattr.txt" \
+       || ! repro_candidates "$TMP/repro-scope.txt" "$TMP/main-fails.txt" "$cand" \
+         "$TMP/repro-idlevel.txt" "$TMP/main-files.txt"; then
+      repro_line="Reproduction on base: attempted on base $repro_base; the candidate set could not be computed through the shared parser — the refusal stands (fail closed)"
+    elif [ ! -s "$cand" ]; then
+      # THREE ways the candidate set is empty, and they are DIFFERENT claims:
+      # nothing is left after the UNATTRIBUTABLE/guard-step exclusion, or every id
+      # carries a main-side measurement, or every id's FILE is measured on main
+      # (MEASURED-ABSENT). Naming the wrong one would be a false report.
+      if [ ! -s "$TMP/repro-scope.txt" ]; then
+        repro_line="Reproduction on base: attempted on base $repro_base; every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step — a reproduction can never clear these — or names no test a local run could execute (a collection error, a watchdog kill, an unreadable job) — the refusal stands"
+      elif [ ! -s "$TMP/repro-idlevel.txt" ]; then
+        repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to carries a main-side measurement, so there is no missing measurement to construct — the refusal stands"
+      else
+        repro_line="Reproduction on base: attempted on base $repro_base; every failure a reproduction could speak to sits in a FILE main's baseline measured (MEASURED-ABSENT), which is evidence of novelty — the refusal stands"
+      fi
+    elif ! is_full_sha "$repro_base"; then
+      # A REF NAME is not a pinned base. `check_surface_probe` falls back to the
+      # REF when the commits API cannot resolve a SHA, and `git worktree add main`
+      # would then resolve the LOCAL ref — a stale, redder main would clear
+      # failures that are not pre-existing on the real base.
+      repro_line="Reproduction on base: attempted on base '$repro_base'; the base is not a pinned commit OID, so nothing was reproduced — the refusal stands (fail closed)"
+    elif reproduce_residual_on_base "$cand" "$TMP/reproduced.txt" "$repro_base"; then
+      # The subtractions are the SHARED comparison (`ci-failure-set.sh --diff`,
+      # the one `comm -23` in the rail) — a second implementation here is exactly
+      # the drift the parity invariant exists to stop. A `--diff` that cannot run
+      # clears NOTHING and the refusal stands (fail closed).
+      cp "$TMP/unique.txt" "$TMP/unique.before"
+      if run_failure_set --diff "$TMP/unique.txt" "$TMP/reproduced.txt" > "$TMP/unique.filtered" 2>/dev/null; then
+        # THE CLEARED SET IS THE ACTUAL DIFFERENCE — the ids that left the
+        # residual — never the base's whole failing set (which may include ids
+        # that were never refused). Printed and counted from this one source.
+        run_failure_set --diff "$TMP/unique.before" "$TMP/unique.filtered" > "$TMP/repro-cleared.txt" 2>/dev/null \
+          || : > "$TMP/repro-cleared.txt"
+        repro_n="$(count_lines "$TMP/repro-cleared.txt")"
+        if [ "$repro_n" -gt 0 ]; then
+          mv "$TMP/unique.filtered" "$TMP/unique.txt"
+          unique_before="$(count_lines "$TMP/unique.txt")"
+          repro_line="Reproduction on base: $repro_n of the refused failure(s) REPRODUCE on base $repro_base in this AMBIENT lane shape — cleared as pre-existing there. NOTE: a failure-only baseline cannot separate 'main ran this shape and passed' from 'main never ran it', so this is a measurement of the base in THIS shape, not proof that the PR is innocent"
+          info "admin-merge: ↩︎ $repro_n refused failure(s) reproduce on the BASE $repro_base in this AMBIENT shape — cleared (a measurement of the base here, not proof the PR is innocent)"
+          sed 's/^/   pre-existing: /' "$TMP/repro-cleared.txt" >&2
+        else
+          repro_line="Reproduction on base: attempted on base $repro_base; NO refused failure reproduced there — the refusal stands"
+        fi
+      else
+        repro_line="Reproduction on base: attempted on base $repro_base; the reproduction could not be compared through the shared parser — the refusal stands (fail closed)"
+      fi
+    else
+      repro_line="Reproduction on base: attempted on base $repro_base; the reproduction could not RUN — the refusal stands (fail closed)"
+    fi
+  fi
+
   local flake_line="Flake classification: none needed (nothing blocked before the re-run)"
   local rerun_residual=0
 
-  if [ "$unique_before" -gt 0 ]; then
-    info "admin-merge: $unique_before failure(s) are blocked by the decision — re-run classification:"
-    sed 's/^/   /' "$TMP/unique.txt"
+  # THE RE-RUN IS FORCED WHENEVER THE BASE CLEARED ANYTHING (#3715 review, P1).
+  # The re-run is the ONLY mechanism that collects the SECOND sample the E5
+  # rotation rule needs (`detect_rotating_identity` needs >= 2 samples), and a
+  # reproduction that clears the WHOLE residual would otherwise skip it — letting
+  # a single-sample MOVING identity be cleared by the base, which is the
+  # exempt-and-silent direction on the one class that may never merge. The second
+  # sample is taken BEFORE the merge decision, so a rotation that appears on retry
+  # still blocks.
+  if [ "$unique_before" -gt 0 ] || [ "${repro_n:-0}" -gt 0 ]; then
+    if [ "$unique_before" -gt 0 ]; then
+      info "admin-merge: $unique_before failure(s) are blocked by the decision — re-run classification:"
+      sed 's/^/   /' "$TMP/unique.txt"
+    else
+      info "admin-merge: the base reproduction cleared $repro_n failure(s); re-running to collect a SECOND"
+      info "admin-merge:   sample (the E5 rotation rule needs two) before deciding to merge:"
+    fi
     if [ "$NO_RERUN" -eq 1 ]; then
-      say_err "admin-merge: ✗ BLOCK — failures are blocked by the decision and --no-rerun given. No merge."
+      if [ "$unique_before" -gt 0 ]; then
+        say_err "admin-merge: ✗ BLOCK — failures are blocked by the decision and --no-rerun given. No merge."
+      else
+        say_err "admin-merge: ✗ BLOCK — the base reproduction cleared the residual, but --no-rerun denies"
+        say_err "   the E5 second sample the re-run would take. No merge."
+      fi
+      say_err "   $repro_line"
       # §37 (main): WHY each residual could not be attributed to this PR — the
       # FILE-level diagnosis. Complementary to the decision's id-level reason
       # lines below, not a replacement: the decision says WHAT it decided and on
@@ -4714,9 +6014,11 @@ main() {
     # the DRY_RUN branch would make a documented no-op re-run a caller's CI
     # (review P2, cycle 2). Report the decision instead of performing it.
     if [ "$DRY_RUN" -eq 1 ]; then
+      info "admin-merge: (dry-run) a real run would CONSTRUCT the missing main-side measurement (run"
+      info "admin-merge: (dry-run)   the residual on a pristine base worktree, #3715) before this point."
       info "admin-merge: (dry-run) a real run would re-run the failing job(s) of this head once and re-classify them."
-      info "admin-merge: (dry-run) --dry-run performs no CI re-run, posts no comment and merges nothing."
-      info "admin-merge: (dry-run) decision: BLOCK unless the residual clears on retry. No merge."
+      info "admin-merge: (dry-run) --dry-run performs no base run, no CI re-run, posts no comment and merges nothing."
+      info "admin-merge: (dry-run) decision: BLOCK unless the residual clears on the base or on retry. No merge."
       exit 0
     fi
     # Re-run every failing run of the PR head ONCE. A test that passes on retry
@@ -4802,10 +6104,33 @@ main() {
       exit 1
     fi
     residual_of "$TMP/unique2" "$TMP/unique2.txt"
+    # The base reproduction applies to the POST-rerun residual too (and only
+    # ever REMOVES ids the base itself reported FAILED): a failure cleared
+    # before the re-run must not reappear as "survived the re-run". SAME shared
+    # comparison as 3b — a failing `--diff` clears NOTHING (fail closed).
+    if [ -s "$TMP/reproduced.txt" ] \
+       && run_failure_set --diff "$TMP/unique2.txt" "$TMP/reproduced.txt" > "$TMP/unique2.filtered" 2>/dev/null; then
+      mv "$TMP/unique2.filtered" "$TMP/unique2.txt"
+      # PRESENTATION ONLY: the decision's reason lines for the ids that remain.
+      # A cleared id's reason line must not be printed under a refusal it is no
+      # longer part of. `reproduced.txt` is sorted-unique; a cleared BLOCK line
+      # is `<prefix><nodeid>  <reason>` (ci_exemption.py's render), so the nodeid
+      # is field 1 after the `BLOCK : ` prefix and the two-space reason gap.
+      awk 'NR==FNR { rep[$0]=1; next }
+           { key=$0; sub(/^BLOCK[[:space:]]*:[[:space:]]*/, "", key); sub(/  .*/, "", key);
+             if (!(key in rep)) print }' \
+        "$TMP/reproduced.txt" "$TMP/unique2.lines" > "$TMP/unique2.lines.filtered" 2>/dev/null \
+        && mv "$TMP/unique2.lines.filtered" "$TMP/unique2.lines"
+    fi
     rerun_residual="$(count_lines "$TMP/unique2.txt")"
 
     if [ "$rerun_residual" -gt 0 ]; then
       say_err "admin-merge: ✗ BLOCK — $rerun_residual failure(s) SURVIVED the re-run:"
+      # THE REPRODUCTION'S OUTCOME IS REPORTED ON EVERY REFUSAL (#3715 review):
+      # an operator must be able to tell "the base did not reproduce it" from
+      # "the reproduction could not run" / "could not be compared" — the
+      # refusal is the same either way, but the reason is not.
+      say_err "   $repro_line"
       # §33 (#1147): the REASON, not just the node id. An UNATTRIBUTABLE id (a rotating identity,
       # or one ABSENT from main's failure set) is created with `blocked=True`, so its
       # verdict line is a `BLOCK` line whose reason names the class — and a refusal
@@ -4827,8 +6152,15 @@ main() {
       exit 1
     fi
     cp "$TMP/pr-fails2.txt" "$TMP/pr-fails.txt"
-    flake_line="Flake classification: $unique_before residual re-ran → all passed on retry (flaky, not new)"
-    info "admin-merge: ✅ all $unique_before residual failure(s) passed on retry — flaky, not new"
+    if [ "$unique_before" -gt 0 ]; then
+      flake_line="Flake classification: $unique_before residual re-ran → all passed on retry (flaky, not new)"
+      info "admin-merge: ✅ all $unique_before residual failure(s) passed on retry — flaky, not new"
+    else
+      # The residual was cleared by the BASE, not by a flake: the retry was taken
+      # only for the E5 second sample, and nothing survived it.
+      flake_line="Flake classification: the base reproduction cleared $repro_n failure(s); the re-run's second sample survived none (no E5 rotation observed)"
+      info "admin-merge: ✅ the re-run's second sample survived nothing — merging on the reproduced-on-base clearance"
+    fi
   fi
 
   # ── 4. THE HEAD IS RE-RESOLVED IMMEDIATELY BEFORE THE EVIDENCE (review P1) ─
@@ -5227,7 +6559,7 @@ $attribution_line"
       # a WIDENED body (tests/admin-merge) — the source-line check alone cannot
       # catch a suffix added to the line's VALUE.
       if [ "${LANE_PARITY_MAIN_WINDOW:-0}" -gt "$MAIN_RUNS" ]; then
-        parity_window_note="   reference window: main's lane reference was widened past non-measuring runs to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested window yielded no executed shard"
+        parity_window_note="   reference window: main's lane reference was widened to a ${LANE_PARITY_MAIN_WINDOW}-run window (from the requested ${MAIN_RUNS}) because the requested ${MAIN_RUNS}-run window carried no shard in the parity family '${LANE_JOB_PREFIX}*'"
       fi
     fi
     # ── THE #6928 FORGIVENESS LINE, ON THE CERTIFICATE ──────────────────────
@@ -5349,7 +6681,7 @@ ${parity_forgiven_note}"
   build_evidence "$head" "$TMP/main-runs.txt" "$pr_count" "$main_count" \
     "$(cat "$TMP/unique.txt")" "$flake_line" "$analyzed" "$lane" \
     "$TMP/pr-fails.txt" "$TMP/main-fails.txt" "$(cat "$final_unique")" \
-    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" > "$TMP/evidence.md"
+    "$(cat "$final_exempt" 2>/dev/null || true)" "$unattr_tokens" "$unattr_total" "$repro_line" "$repro_n" > "$TMP/evidence.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     info "admin-merge: --dry-run — evidence that WOULD be posted:"
@@ -5395,79 +6727,138 @@ ${parity_forgiven_note}"
   # local inference, because a wrong "merged" is the one error that cannot be
   # walked back (the evidence comment is already standing).
   local merge_state="" merge_merged_at=""
+  # ⛔ `gh pr merge` EXITING NON-ZERO IS NOT EVIDENCE THAT IT DID NOT MERGE (#1298).
+  # A mutation whose RESPONSE READ failed is ambiguous by definition about whether the
+  # mutation ran, and the exit status cannot resolve it. Both arms below therefore ask
+  # the REPOSITORY through `poll_merge_artifact`, which answers with THREE outcomes —
+  # merged / not_merged / unreadable — and NEITHER arm infers the artifact from the send.
+  local merge_response_lost=0
   if [ "$merge_status" -eq 0 ]; then
-    local attempt=0 attempts="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
-    # A non-numeric bound would make `[ "$attempt" -ge "$attempts" ]` exit 2 on
-    # every pass, so the poll would never terminate — a HANG, not a refusal. So
-    # would a bound at or above the integer ceiling (all digits, so the guard below
-    # cannot see it: `-ge` can never be satisfied and `[` starts erroring past
-    # int64 — adversarial cycle 2, reproduced). Ten digits is already far beyond any
-    # sane bound, so anything longer falls back to the default.
-    case "$attempts" in ''|*[!0-9]*|??????????*) attempts=6 ;; esac
-    while : ; do
-      local observed state_tab
-      # ASK FOR EXACTLY WHAT WE MEAN and let the producer project it. A `sed` over
-      # the whole JSON takes the LAST `"state"` anywhere in the output, so a nested
-      # or repeated object could be read as the merge state while the TOP-LEVEL
-      # state said OPEN (adversarial cycle 1 — LATENT: real `gh pr view --json
-      # state,mergedAt` emits only those two keys, so it was not reachable today, but
-      # this guard's correctness must not rest on the producer's output shape).
-      # `--jq` reads the TOP-LEVEL fields: one tab-separated `<state>\t<mergedAt>`,
-      # with mergedAt sentineled because it is null for an unmerged PR.
-      observed="$($GH pr view "$PR" ${repo_args[@]+"${repo_args[@]}"} --json state,mergedAt --jq '[.state, (.mergedAt // "-")] | @tsv' 2>/dev/null || true)"
-      state_tab="$(printf '%s' "$observed" | head -1)"
-      # THE SEPARATOR IS REQUIRED. `${x%%$'\t'*}` returns the WHOLE STRING when
-      # there is no TAB, so a producer that ignores `--jq` and answers a bare
-      # `MERGED` would set merge_state=MERGED with mergedAt never observed, and the
-      # break below would fire on the first pass — an assertion of MERGED with no
-      # observation of the artifact, which is the one thing this guard exists to
-      # prevent (adversarial cycle 2, reproduced). The absence of the separator is
-      # the absence of the response: unreadable, and therefore a REFUSAL.
-      case "$state_tab" in
-        *$'\t'*) merge_state="${state_tab%%$'\t'*}"
-                  merge_merged_at="${state_tab#*$'\t'}"
-                  [ -n "$merge_merged_at" ] || merge_merged_at="<unreadable>" ;;
-        *)        merge_state="<unreadable>"
-                  merge_merged_at="<unreadable>" ;;
-      esac
-      [ "$merge_state" = "MERGED" ] && break
-      attempt=$((attempt + 1))
-      [ "$attempt" -ge "$attempts" ] && break
-      sleep "${ADMIN_MERGE_VERIFY_POLL:-2}"
-    done
-    if [ "$merge_state" != "MERGED" ]; then
+    # ── THE ARTIFACT, NOT THE SEND (#1359) ───────────────────────────────────
+    # `gh pr merge` exiting 0 is a SEND. It is not the artifact. `--auto` enqueues a
+    # merge and exits 0 while the PR is still OPEN (and MERGE_ARGS is CALLER-supplied,
+    # so `-- --auto` reaches this line); an enqueued or asynchronously-completed merge
+    # can also lag the command's return. Either way the next line asserts a fact about
+    # the REPOSITORY, so the repository is what gets read — through the ONE read door,
+    # bounded, because a genuine merge can take a moment to be reflected and a wrong
+    # "merged" is the one error that cannot be walked back (the evidence comment is
+    # already standing).
+    poll_merge_artifact "$PR"
+    merge_state="$MERGE_ART_STATE"
+    merge_merged_at="$MERGE_ART_MERGED_AT"
+    if [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
       say_err "⛔ admin-merge: FAILED — gh pr merge reported SUCCESS (exit 0), but PR #$PR is NOT merged."
-      say_err "   The API reports state=${merge_state:-<unreadable>} mergedAt=${merge_merged_at:-<unreadable>} after $attempts attempt(s)."
+      say_err "   The API reports state=$merge_state mergedAt=$merge_merged_at after ${MERGE_ART_ATTEMPTS} attempt(s)."
       say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
       say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
       say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. A QUEUED merge is"
       say_err "   not a merge: the rail certifies the ARTIFACT, not the command's exit code. If you"
       say_err "   passed '--auto' through MERGE_ARGS, that is the cause."
       write_merge_retraction "$PR" "$head" \
-        "gh pr merge exited 0, but the API does not report this PR as MERGED (state=${merge_state:-<unreadable>}, mergedAt=${merge_merged_at:-<unreadable>}) after $attempts attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
+        "gh pr merge exited 0, but the API reports this PR as state=$merge_state (mergedAt=$merge_merged_at) after ${MERGE_ART_ATTEMPTS} attempt(s). A merge that is still QUEUED (for example one requested with '--auto') is not a merge that happened." \
         "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    fi
+    # ⛔ THE RETRACTION GATE IS AN ALLOW-LIST, MATCHING ITS SIBLING ARM (#1298 review).
+    # This arm used to retract on `verdict != merged` — a DENY-LIST, so ANY verdict that
+    # was neither `merged` nor the explicitly-caught `unreadable` would fall through to a
+    # DURABLE retraction asserting "the merge did NOT happen" on a state nobody read as
+    # refused. `not_merged` is now the only licensed retraction, and everything else —
+    # today only `unreadable`, tomorrow any verdict this read grows — lands here and
+    # claims NEITHER outcome. The polarity is the rule `poll_merge_artifact` states: an
+    # unnamed value must never fall through a gap into a claim about the repository.
+    if [ "$MERGE_ART_VERDICT" != "merged" ]; then
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge reported SUCCESS (exit 0), but the"
+      say_err "   state of PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does"
+      say_err "   NOT know whether it merged."
+      say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did."
+      say_err "   Nothing is retracted and no claim about the PR is made — a retraction posted over"
+      say_err "   an UNKNOWN state is the worst of the three outcomes (#1298)."
+      say_err "   THE SUCCESS MARKER MAY BE STANDING OVER AN UNKNOWN STATE. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'."
+      if [ -n "${MERGE_ART_DIAG:-}" ]; then
+        say_err "   the state read reported: ${MERGE_ART_DIAG}"
+      else
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
+      fi
+      say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
       exit 1
     fi
   fi
 
   if [ "$merge_status" -ne 0 ]; then
-    say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
-    say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
-    say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
-    say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. The merge it was"
-    say_err "   posted to authorize FAILED, so PR #$PR is NOT merged."
-    if [ -s "$TMP/merge.err" ]; then
-      say_err "   gh pr merge said:"
-      sed 's/^/      /' "$TMP/merge.err" >&2
+    # ── A READ THAT FAILED IS NOT A VALUE (#1298, the #1690 rule, one arm over) ──
+    # `gh pr merge` exited non-zero. That may be a REFUSAL (a draft, a moved head, a
+    # permissions error) — or it may be a merge GitHub PERFORMED whose RESPONSE the
+    # client never read (a timeout; tortoise #4413 is the measured case). Both produce
+    # the SAME non-zero status, so the status decides NOTHING about the repository, and
+    # the rail asks the repository before it says anything about reality.
+    poll_merge_artifact "$PR"
+    merge_state="$MERGE_ART_STATE"
+    merge_merged_at="$MERGE_ART_MERGED_AT"
+    if [ "$MERGE_ART_VERDICT" = "merged" ]; then
+      # ⛔ THE MERGE HAPPENED. `gh pr merge` exited non-zero and the PR is MERGED — the
+      # two facts are INDEPENDENT, and the artifact decides. Reporting this as "did NOT
+      # happen" is #1298: the rail's loudest statement would be false, and a DURABLE
+      # retraction would annotate a MERGED PR forever. NO RETRACTION IS POSTED — there
+      # is nothing to correct: the marker's own claim ("the evidence comment was
+      # posted") is true and stays true.
+      #
+      # ⛔ THE MARKER ASSERTS ONLY WHAT WAS OBSERVED (#1298 review, io-contract).
+      # `[merge_response_lost]` names the CLASS this fix exists for, but a non-zero exit
+      # plus MERGED is also consistent with a refusal that coincided with a merged PR
+      # (gh answering "already merged", or another actor landing it). So the emitted
+      # lines state the OBSERVATIONS and point at the only evidence of the CAUSE — the
+      # command's own output — rather than asserting a networking incident.
+      merge_response_lost="$merge_status"
+      merge_status=0    # fall through to the landed-commit read and the success line
+    elif [ "$MERGE_ART_VERDICT" = "not_merged" ]; then
+      say_err "⛔ admin-merge: FAILED — the merge of PR #$PR did NOT happen (gh pr merge exit $merge_status)."
+      say_err "   This is the ARTIFACT, not the exit status: the API reports state=$merge_state after"
+      say_err "   ${MERGE_ART_ATTEMPTS} attempt(s), so the PR really is unmerged."
+      say_err "   THE SUCCESS MARKER IS STANDING OVER AN UNMERGED PR. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'. The merge it was"
+      say_err "   posted to authorize FAILED, so PR #$PR is NOT merged."
+      if [ -s "$TMP/merge.err" ]; then
+        say_err "   gh pr merge said:"
+        sed 's/^/      /' "$TMP/merge.err" >&2
+      fi
+      if [ -s "$TMP/merge.out" ]; then
+        say_err "   gh pr merge stdout:"
+        sed 's/^/      /' "$TMP/merge.out" >&2
+      fi
+      write_merge_retraction "$PR" "$head" \
+        "\`gh pr merge\` exited $merge_status after that marker was posted, and the API reports state=$merge_state — so this retraction rests on the ARTIFACT read after the failure, not on the exit status alone." \
+        "$TMP/merge.err" "gh pr merge said:"
+      exit 1
+    else
+      say_err "⛔ admin-merge: BLOCK [merge_unreadable] — gh pr merge exited $merge_status and the state of"
+      say_err "   PR #$PR could NOT be READ (${MERGE_ART_ATTEMPTS} attempt(s)), so the rail does NOT know"
+      say_err "   whether the merge happened."
+      say_err "   This is NOT a claim that the merge did not happen, and NOT a claim that it did. A"
+      say_err "   non-zero exit means the RESPONSE could not be read, and a lost answer to a mutation"
+      say_err "   is ambiguous BY DEFINITION about whether the mutation ran — so NOTHING is retracted"
+      say_err "   and no claim about the PR is made (#1298; a retraction posted over an UNKNOWN state"
+      say_err "   is the worst of the three outcomes)."
+      say_err "   THE SUCCESS MARKER MAY BE STANDING OVER AN UNKNOWN STATE. Read"
+      say_err "     ✅ head-bound evidence posted (marker: admin-merge-safety: $head)"
+      say_err "   as 'the EVIDENCE COMMENT was posted' — NOT as 'the PR merged'."
+      if [ -s "$TMP/merge.err" ]; then
+        say_err "   gh pr merge said:"
+        sed 's/^/      /' "$TMP/merge.err" >&2
+      fi
+      if [ -n "${MERGE_ART_DIAG:-}" ]; then
+        say_err "   the state read reported: ${MERGE_ART_DIAG}"
+      else
+        say_err "   the state read wrote no non-blank message — the read either answered with"
+        say_err "   something other than the projection, or failed without saying why."
+      fi
+      say_err "   Determine the state and re-run: gh pr view $PR ${REPO:+--repo $REPO} --json state,mergedAt"
+      exit 1
     fi
-    if [ -s "$TMP/merge.out" ]; then
-      say_err "   gh pr merge stdout:"
-      sed 's/^/      /' "$TMP/merge.out" >&2
-    fi
-    write_merge_retraction "$PR" "$head" \
-      "\`gh pr merge\` exited $merge_status after that marker was posted." \
-      "$TMP/merge.err" "gh pr merge said:"
-    exit 1
   fi
   # THE SHA THAT LANDED, NOT THE SHA WE SENT (#7504). `$head` is the BRANCH head, and
   # under the DEFAULT `--squash` (see the MERGE_ARGS note above) the commit that lands
@@ -5511,6 +6902,28 @@ ${parity_forgiven_note}"
       info "admin-merge: ✅ merged PR #$PR at $landed_sha (state=$merge_state confirmed via the API; branch head was ${head:0:12}…)"
       ;;
   esac
+  # ── THE LOST RESPONSE IS DISCLOSED, NOT ERASED (#1298) ────────────────────
+  # When the merge happened DESPITE a non-zero exit, the success above is the truth
+  # and this line is the rest of it: the exit status was unreadable, and the merge was
+  # established by re-reading the ARTIFACT. It is machine-distinguishable from the
+  # ordinary success (a consumer must not have to parse the prose), and it is stated on
+  # the SAME run as the success line rather than in a comment somebody has to find.
+  if [ "$merge_response_lost" -ne 0 ]; then
+    info "admin-merge: ⚠️  [merge_response_lost] gh pr merge exited ${merge_response_lost} while the API reports"
+    info "   state=$merge_state — the merge DID happen, decided by the ARTIFACT and not by the exit status."
+    info "   The non-zero exit is NOT read as a refused merge: no retraction was posted, and the evidence"
+    info "   marker still stands over a MERGED PR. This marker asserts only what was OBSERVED (a non-zero"
+    info "   exit and a MERGED state); the command's own output below is the only evidence of WHY it was"
+    info "   non-zero — a lost response is the case this fix exists for, not the only one it admits."
+    # ⛔ THE READ'S OWN WORDS, ON THE DIAGNOSTIC CHANNEL (#1690 review, round 4: a refusal
+    # that cannot say WHAT it measured can only prescribe "re-run it"). Discarding this is
+    # how a transient timeout and a permanent cause became the same sentence — and it is the
+    # one thing that tells an operator whether the lost response was a blip or a config error.
+    if [ -s "$TMP/merge.err" ]; then
+      say_err "   gh pr merge said:"
+      sed 's/^/      /' "$TMP/merge.err" >&2
+    fi
+  fi
 }
 
 # ⛔ ENTRY-POINT GUARD (#1690): the read path must be REACHABLE FROM A TEST.

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty-three tests with twenty-nine paired mutations: every mutation re-
+Twenty-four tests with thirty-three paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of the twenty-three (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of the twenty-four (#1254) pin the TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,7 +17,7 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 23 tests, green
+    python3 tools/fleet/liveness.test.py                # the 24 tests, green
     python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
@@ -970,6 +970,44 @@ def t21_tool_from_jsonl():
         check(liv.tool_from_jsonl(path, NOW_MS) is None,
               "a matching toolResult means nothing is in flight")
 
+        # (b2) #5389 review P1 — a PARALLEL batch, PARTIALLY complete. pi runs
+        #      one assistant message's calls in parallel by default and writes
+        #      each result as it lands, so the newest entry can be a SIBLING's
+        #      `toolResult` while another call from the SAME message has not
+        #      returned. The veto must come from the owning assistant message,
+        #      be aged from WHEN THE CALLS WERE ISSUED, and cover only the call
+        #      no result has answered.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"},
+                          {"type": "toolCall", "name": "write", "id": "call_B"}]),
+            real("toolResult", started + 1000, toolName="bash", toolCallId="call_A",
+                 content=[{"type": "text", "text": "done"}]),
+        ])
+        sib = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        check(sib is not None and sib.tools_in_flight == 1 and sib.name == "write",
+              "the UNANSWERED sibling call is the in-flight tool; got %s" % sib)
+        check(sib.tool_age_ms == 21 * M,
+              "the age is the owning assistant message's age, not the result's; got %s"
+              % sib.tool_age_ms)
+        check(sib.call_label == "write(call_B)",
+              "the veto names only the unanswered sibling; got %r" % sib.call_label)
+
+        # (b3) ... and once a parallel batch has FULLY returned, nothing is in
+        #      flight: the boundary's `turn-open:awaiting-assistant` is what is
+        #      open, and no veto may hold the lane quiet on a completed batch.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"},
+                          {"type": "toolCall", "name": "write", "id": "call_B"}]),
+            real("toolResult", started + 1000, toolName="bash", toolCallId="call_A",
+                 content=[{"type": "text", "text": "done"}]),
+            real("toolResult", started + 2000, toolName="write", toolCallId="call_B",
+                 content=[{"type": "text", "text": "done"}]),
+        ])
+        check(liv.tool_from_jsonl(path, NOW_MS) is None,
+              "a fully-answered parallel batch asserts no in-flight tool")
+
         # (c) a call the stop reason DISCARDS is not in flight either — the veto
         #     and the turn boundary must not disagree about openness.
         write([real("assistant", started, stopReason="error",
@@ -1034,6 +1072,26 @@ def t21_tool_from_jsonl():
               "the fixture must actually reach the mtime fallback; got %d stat(s)" % len(attempts))
         check(undatable is None,
               "an undateable call must assert NO veto (an unmeasurable age would be FOREVER)")
+
+        # (h) #5389 review F2: a FUTURE-dated entry stamp must not pin the age at
+        #     0 forever. A writer host with a wrong clock (a VM booting on a bad
+        #     RTC before NTP corrects it) stamps the entry ahead of the
+        #     classifier's clock; a bare `now - started` clamps to 0 and STAYS 0,
+        #     so the 4h AGE backstop is never reached and the veto is PERMANENT —
+        #     `idle` becomes unreachable (T9: never forever). The transcript's own
+        #     mtime is a genuine LOWER bound on the call's age (the file is written
+        #     at or after the call), so it bounds the age from the other side too.
+        write([real("assistant", NOW_MS + 10 * H, stopReason="toolUse",
+                    content=[{"type": "toolCall", "name": "bash", "id": "call_A"}])])
+        os.utime(path, ((NOW_MS - 5 * H) / 1000.0,) * 2)
+        future = liv.tool_from_jsonl(path, NOW_MS)
+        check(future is not None and future.tool_age_ms is not None,
+              "a future-stamped in-flight call is still a tool")
+        check(future.tool_age_ms >= 5 * H - 2000,
+              "a future stamp is bounded by the transcript's own mtime, never 0; got %s"
+              % future.tool_age_ms)
+        check(liv.tool_veto_expired(future) is True,
+              "and past the 4h backstop it EXPIRES — a future stamp is not a permanent veto (T9)")
 
         # (f) no file / an empty file is an ABSTENTION, never a tool.
         check(liv.tool_from_jsonl(None, NOW_MS) is None, "no path -> no assertion")
@@ -1160,6 +1218,11 @@ def t23_false_cut_reproduced():
         v = liv.evaluate(e)
         check(v.state == "running-quiet" and v.reason == "tool-in-flight",
               "a lane inside one long read is quiet, never wedged; got %s/%s" % (v.state, v.reason))
+        # The row must name the UNWRITTEN call the veto holds on — the same
+        # evidence the `wedged` row renders — or the report cannot say which
+        # step it is waiting for (#5389 review cycle 1 P1).
+        check("call_A" in v.detail,
+              "the tool-in-flight verdict names the in-flight call; got %r" % v.detail)
 
         # THE CONTROL: strip the derived tool (today's wiring, 0 of 1011 records)
         # and the same evidence reads `wedged`. Without this the test could pass
@@ -1168,6 +1231,80 @@ def t23_false_cut_reproduced():
         check(v_no_tool.state == "wedged",
               "control: with NO tool the same evidence IS wedged; got %s/%s"
               % (v_no_tool.state, v_no_tool.reason))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# T24 — #5389 review (cycle 4, P2). A `length`-truncated assistant message
+# carrying tool calls is an OPEN turn whose calls pi has ALREADY FAILED
+# (`failToolCallsFromTruncatedMessage`; all 78 measured results after a
+# `length`+calls message carry `isError: true`, "Tool call ... was not
+# executed"). OPEN and IN FLIGHT are different conditions for this shape: the
+# turn is open, but no tool is running. The transcript-derived veto must not
+# manufacture one from the truncated message, or the lane stands quiet
+# (`running-quiet/tool-in-flight`, held to the 4 h age backstop) where the
+# watchdog's zero-tool `stream-stall` cut at S = 20 min — the fail-open
+# divergence `docs/ops/fleet-liveness.md` §6 forbids. T18 pins the OPEN half;
+# this pins the veto half, so the two can never be conflated again.
+# ═══════════════════════════════════════════════════════════════════
+@test("T24 a `length`-truncated call is OPEN but NOT in flight: no phantom tool veto (#5389 P2)")
+def t24_length_truncated_call_is_not_a_tool():
+    d = tempfile.mkdtemp(prefix="liv-length-")
+    try:
+        path = os.path.join(d, "session.jsonl")
+        frozen = NOW_MS - 21 * M  # past S=20min, inside the 4h backstop
+
+        def real(role, ts_ms, **msg):
+            base = {"role": role}
+            base.update(msg)
+            return {"type": "message", "id": "e", "parentId": None,
+                    "timestamp": _iso(ts_ms), "message": base}
+
+        # pi's `length` truncation FAILS the message's calls; the turn continues.
+        write_entries = [real("assistant", frozen, stopReason="length",
+                             content=[{"type": "toolCall", "name": "bash",
+                                       "id": "call_LEN"}])]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in write_entries) + "\n")
+        os.utime(path, (frozen / 1000.0, frozen / 1000.0))
+
+        # (a) The turn boundary still reads OPEN, exactly as T18 pins it.
+        turn = liv.turn_from_jsonl(path)
+        check(turn is not None and turn.stalled is True
+              and turn.reason == "turn-open:pending-tool-call",
+              "a `length`+calls turn is still OPEN; got %s" % turn)
+
+        # (b) ... but NO tool is in flight: pi failed the calls, so the veto
+        #     abstains rather than manufacturing a tool from the truncation.
+        check(liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M) is None,
+              "a `length`-FAILED call is not an in-flight tool; the veto must not "
+              "manufacture one from a truncated message")
+
+        # (c) End to end: a frozen, fenced, OPEN length-truncated lane is WEDGED
+        #     at S (the watchdog's zero-tool `stream-stall`), never held quiet to
+        #     the 4h backstop by a phantom veto.
+        tool = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        e = ev(candidates=[C(1, "holder")], jsonl_age_ms=21 * M, jsonl_turn=turn,
+               tool=tool)
+        v = liv.evaluate(e)
+        check(v.state == "wedged" and v.reason == "turn-open:pending-tool-call",
+              "a phantom veto must not suppress the honest `wedged` verdict; got %s/%s"
+              % (v.state, v.reason))
+        check("call_LEN" in v.detail,
+              "the wedged row names the open (failed) call; got %r" % v.detail)
+
+        # (d) The sibling case is unchanged: `toolUse` IS in flight (T23's
+        #     shape), so this test cannot pass by disabling the derivation.
+        write_entries = [real("assistant", frozen, stopReason="toolUse",
+                             content=[{"type": "toolCall", "name": "bash",
+                                       "id": "call_FLY"}])]
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(json.dumps(e) for e in write_entries) + "\n")
+        os.utime(path, (frozen / 1000.0, frozen / 1000.0))
+        flying = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        check(flying is not None and flying.tools_in_flight == 1,
+              "a `toolUse` call is still derived as in flight; got %s" % flying)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1344,9 +1481,10 @@ MUTATIONS = [
     ),
     Mutation(
         "T15", "module",
-        '        for raw in reversed(lines):',
-        '        for raw in lines:',
-        "the tail scan runs forward, so an ancient boundary decides instead of the last (#1254)",
+        '    return (messages[-1] if messages else None), last_entry, size',
+        '    return (messages[0] if messages else None), last_entry, size',
+        "the tail reader keeps the OLDEST message-bearing entry instead of the newest, so an "
+        "ancient boundary decides instead of the last (#1254)",
     ),
     Mutation(
         "T20", "module",
@@ -1387,11 +1525,43 @@ MUTATIONS = [
         "unreachable (T9; #5389 review, cycles 1 and 3)",
     ),
     Mutation(
+        "T21", "module",
+        '        started = min(started, mtime_ms)\n',
+        '        started = max(started, mtime_ms)\n',
+        "a FUTURE-dated entry stamp is no longer bounded by the transcript's own mtime, so "
+        "`now - started` clamps to 0 and STAYS 0 — the 4h age backstop is never reached and "
+        "the veto is PERMANENT (T9; #5389 review F2)",
+    ),
+    Mutation(
         "T23", "module",
         '        tool = tool_from_jsonl(sfile, now, silence_age_ms=age)\n',
         '        tool = None\n',
         "the #5389 (a) wiring is removed: no store record carries the fields (0 of 1011), so the "
         "veto is dead again and a lane inside one long read reads `wedged`",
+    ),
+    Mutation(
+        "T21", "module",
+        '    elif msg.get("role") == "toolResult":\n',
+        '    elif False:\n',
+        "the parallel-batch walk-back is disabled, so a sibling's `toolResult` as the newest "
+        "entry denies a call that is still in flight — the lane reads `wedged` where the "
+        "watchdog's own `tool-stall` backstop still applies (#5389 review P1)",
+    ),
+    Mutation(
+        "T21", "module",
+        '    calls = [c for c in _tool_call_items(owner.get("message"))\n'
+        '             if str(c.get("id") or "") not in answered]\n',
+        '    calls = _tool_call_items(owner.get("message"))\n',
+        "the answered set is ignored, so a RETURNED sibling is read as still in flight — a "
+        "fully-answered parallel batch would hold the lane quiet (#5389 review P1)",
+    ),
+    Mutation(
+        "T24", "module",
+        '    if msg.get("stopReason") in CALL_FAILED_STOP_REASONS:\n        return None\n',
+        '',
+        "a `length`-truncated message's calls are treated as still in flight, so the veto "
+        "manufactures a tool pi already FAILED and the lane stands quiet past S where the "
+        "watchdog's zero-tool `stream-stall` cut (#5389 review P2)",
     ),
 ]
 

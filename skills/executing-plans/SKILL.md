@@ -372,7 +372,7 @@ Run the detection algorithm from [Third-Party Dependency Detection](#third-party
 
 #### Sub-step 1.5b — Perplexity Verification
 
-For each unfamiliar dep, fire 2 separate `web_search` calls (can be issued in parallel across all deps):
+For each unfamiliar dep, fire 2 separate `web_search` calls. **Keep at most 2 `web_search` calls in flight across ALL deps** — that is the rung-2 concurrency bound from the `research` skill's Step 3 (Perplexity returns HTTP 429 to a wider fan-out and the batch is silently truncated). Stagger the deps instead of firing 2-per-dep at once, retry a 429'd call serially with a short backoff, and report `attempted / returned` if any call is lost:
 
 1. **API verification call** — "What is the current API for [package]? How do you import and use it? Show the most common usage patterns for the latest stable version."
 2. **Pitfalls call** — "What are common pitfalls, breaking changes, deprecations, or migration notes for [package]? What should developers watch out for?"
