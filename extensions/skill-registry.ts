@@ -54,6 +54,27 @@
 //    of a source skill (setup.sh's copy layout) and the copy differs from the
 //    source, the skill is named together with the remedy — otherwise drift is
 //    invisible until setup.sh happens to run again.
+// 7. DECLARED TRUST BOUNDARY. A project root's skill NAMES become MACHINE-GLOBAL
+//    links: opening a repo that carries `<repo>/.agents/skills/<n>/SKILL.md`
+//    makes `<n>` loadable in every later session, in every repo, until that
+//    symlink is removed. That is the price of indicator 4 — a consumer's
+//    `operations/skills/` exists nowhere else, and it MUST become visible to pi
+//    (pi's own discovery is `~/.pi/agent/skills` + `<cwd>/.pi/skills` only). It
+//    is also the trust the previous generator granted. Narrowing the roots to
+//    the module repo alone would make this module equivalent to `setup.sh`, and
+//    that is a DECISION, not a bug fix — so it is declared, and pinned by a test,
+//    instead of being changed quietly. What is NOT granted: nothing pre-existing
+//    is overwritten or removed (rule 2), so the blast radius is "new names pi can
+//    see", never "an existing entry changed".
+// 8. AN ABSENT INPUT IS SILENT, BY CHOICE. A repo with no skills is normal, and a
+//    warning there is exactly the noise indicator 1 exists to remove. So a
+//    zero-source run reports NOTHING and does not create a farm. The one path
+//    where that silence can hide a real gap: a session whose MODULE root is also
+//    a linked worktree (a lane whose extension resolves through its own
+//    checkout) — rule 4 skips both roots, nothing links and nothing prints. It is
+//    narrow (the fleet's module root is the main checkout) and declared here
+//    rather than papered over with a warning that would fire in every no-skills
+//    repo. An input that exists but is UNUSABLE is a different case and is loud.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execFileSync } from "node:child_process";

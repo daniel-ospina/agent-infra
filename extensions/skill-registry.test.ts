@@ -536,6 +536,36 @@ await test("NEGATIVE CONTROL: with no sources, the handler prints NOTHING at all
   strictEqual(existsSync(farm), false, "an empty source set must not even create a farm");
 });
 
+await test("DECLARED SILENCE: an ABSENT input is quiet by choice — including the both-roots-worktree path", async () => {
+  // Contract rule 8. The second half is the ONE path where that choice can hide
+  // a real gap: a lane whose extension resolves through its own checkout, so the
+  // MODULE root is a linked worktree too and rule 4 skips both roots. Pinned, so
+  // the silence is a decision rather than an accident — and so a future change to
+  // it is a visible diff rather than a silent behaviour change.
+  const { main, linked } = mainCheckout();
+  writeSkill(main, ["skills"], "only-in-the-main-checkout");
+  const farm = join(tmpDir("sr-silentfarm-"), "skills");
+  const out = await fireHandler(farm, linked, linked);
+  deepEqual(out, { logs: [], warns: [], errors: [] });
+  const report = runSync({ farm, projectRoot: linked, moduleRoot: linked });
+  strictEqual(report.ok, true); // nothing is broken; there is simply nothing to do
+  deepEqual(report.sources, []);
+});
+
+await test("DECLARED TRADE: a project root's skill NAMES become machine-global links", () => {
+  // Contract rule 7 — the trust boundary indicator 4 buys. Pinned deliberately:
+  // narrowing the roots is a decision about visibility, not a bug fix, so the
+  // behaviour must be changed on purpose (with a diff here) and never by drift.
+  const project = tmpDir("sr-trust-");
+  const src = writeSkill(project, [".agents", "skills"], "from-an-opened-repo");
+  const emptyModule = tmpDir("sr-trust-module-");
+  const farm = join(tmpDir("sr-trust-farm-"), "skills");
+  const r = runSync({ farm, projectRoot: project, moduleRoot: emptyModule });
+  strictEqual(r.ok, true);
+  deepEqual(r.linked, ["from-an-opened-repo"]);
+  strictEqual(readlinkSync(join(farm, "from-an-opened-repo")), realpathSync(src));
+});
+
 await test("the report's `ok` is true ONLY when no error was recorded", () => {
   const project = tmpDir("sr-ok-");
   writeSkill(project, ["skills"], "alpha");

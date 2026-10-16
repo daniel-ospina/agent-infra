@@ -105,8 +105,19 @@ asserting a **missing generator** is surfaced (non-silent)". This change removes
 the generator concept entirely, so the target is met by its generalisation — the
 equivalent missing/unusable **input** (an unreadable source root, an unusable
 farm, a dangling farm link) is a `❌` and `ok=false`, and the empty-input path is
-pinned to print nothing rather than a success. That is a deliberate re-derivation
-of the target, not a claim of literal compliance.
+pinned to print nothing rather than a success.
+
+**And the one place the old silence is preserved ON PURPOSE (rule 8).** A repo
+with **no skills at all** returns `ok: true`, prints nothing and does not create a
+farm — measured: `{"ok":true,"errors":[],"sources":0,"farmMode":"missing","output":[]}`.
+That is the same shape as the old `{}` → `return`, kept deliberately: a warning
+per session in every skills-free repo is exactly the noise indicator 1 exists to
+remove. It is a choice, not an oversight, and it is pinned by a test
+(`DECLARED SILENCE`). The one path where that choice can hide a real gap is a
+session whose **module** root is *also* a linked worktree (a lane whose extension
+resolves through its own checkout): rule 4 skips both roots, so nothing links and
+nothing prints. Narrow — the fleet's module root is the main checkout — and
+declared rather than papered over.
 
 ## `### Adversarial Threat Surface`
 
@@ -127,9 +138,21 @@ are declared rather than chased.
 | A8 | Sandbox leak | a linked worktree root | contributes no sources; the machine farm is not pointed at a teardown-able path | `LINKED WORKTREE guard` |
 | A9 | Dangling links | a link whose target is gone | repaired **only** when the name matches a source | `dangling link ... repaired` + its negative control |
 | A10 | Deployed layout (#1321 mechanism) | module loaded through a farm symlink under `--preserve-symlinks` | `REPO_DIR` is the REAL repo; the project's skills still link | `T8/T1` farm-child leg with a loader precondition |
+| A11 | **Trust boundary (declared, not closed)** | a repo the agent merely OPENS carries `.agents/skills/<n>/SKILL.md` | that name becomes a machine-global link and pi loads it in every later session in every repo | `DECLARED TRADE` — pinned as behaviour, so narrowing the roots must be a decision, never drift |
 
 **Explicitly out of scope (declared, not chased):**
 
+- **The A11 trust boundary is NOT closed.** A project root's skill names become
+  machine-global links. That is the price of indicator 4 (a consumer's
+  `operations/skills/` exists nowhere else and must be visible to pi) and it is
+  the trust the previous generator granted. Narrowing the roots to the module
+  repo alone would make this module equivalent to `setup.sh` — a **decision**, not
+  a bug fix. What is bounded: nothing pre-existing is overwritten or removed
+  (rule 2), so the blast radius is "new names pi can see", never "an existing
+  entry changed".
+- **An absent input is silent by choice** (rule 8; see the target-2 mapping
+  above), including the both-roots-worktree path where that silence could hide a
+  real gap.
 - **A worktree with a BROKEN `git`** is classified as a main checkout (the
   conservative default), so its skills could be linked. The guard's purpose is
   to avoid dangling links; failing closed here would drop a real repo instead.
@@ -159,11 +182,18 @@ are declared rather than chased.
 
 ```
 $ npx tsx extensions/skill-registry.test.ts
-✅ 34 passed, 0 failed
+✅ 37 passed, 0 failed
+
+$ # same suite in a REAL MAIN checkout (the shape CI uses; the leg must not
+$ # depend on the ambient checkout shape)
+$ git clone --branch feat/1323-tm --depth 1 <repo> /tmp/main-clone && cd /tmp/main-clone
+$ npx tsx extensions/skill-registry.test.ts
+✅ 37 passed, 0 failed
 
 $ bash scripts/check-pi-config-extensions.sh
 ✅ pi-config/extensions = symlink farm into extensions/ (32 entries)
 ✅ manifest.json files.extensions.entries ↔ extensions/ tree parity holds
+✅ All pi-config extension-farm parity gate tests passed
 exit 0
 
 $ node scripts/check-pi-pin-lockstep.mjs
