@@ -68,11 +68,21 @@
 # because git WILL refuse on them; a refusal is reported, never swallowed.
 #   `--force` is never passed and `git branch -D` is never called.
 #
-# DISK-SAVINGS HONESTY: per-worktree `.venv`s are hardlinked to the uv cache,
-# so `du` over-reports them (measured: 84 GB `du` delta vs 22 GB actually
-# freed). This script therefore NEVER calls `du` and NEVER claims a byte
-# saving. The real, deliverable win is FILE COUNT — the amplification that
-# produced the 10-18 minute repo-wide searches.
+# DISK-SAVINGS HONESTY: there is NO single apparent-to-real ratio, because the gap
+# is a SHARING property of the filesystem, not of worktrees. Measured 2026-10-16
+# (#1851), three regimes: (a) APFS with the uv cache on the SAME volume shares
+# blocks by copy-on-write (`clonefile`) — one venv `du` 22.0 MB vs a `df` used
+# delta of +0.6 MB, nlink=1 throughout, and a `--link-mode=hardlink` control at
+# nlink=2 proving the flag is honoured; (b) hardlinks into the cache (nlink>1)
+# make a venv`s marginal cost the CACHE`s — `du` 5,704 MB vs 186 MB actually
+# released on a Linux cell; (c) neither (Linux/overlayfs, a cache on another
+# mount, `--link-mode=copy`) leaves the venv REAL — 75 worktrees at `du`
+# 5,647 MiB vs `df` 5.90 GB released, ratio 1.004. So this script NEVER calls
+# `du` and NEVER claims a byte saving: a `du` figure is an upper bound whose
+# error is machine-specific and unmeasured. The real, portable win is FILE
+# COUNT — the amplification that produced the 10-18 minute repo-wide searches.
+# Real bytes are measured per machine, on the machine that removes, by
+# scripts/worktree-disk-probe.sh (a `df` used delta), never inferred from `du`.
 #
 # BOUNDEDNESS (a reaper that hangs the fleet is worse than no reaper):
 #   * enumeration is `git worktree list --porcelain [-z]` (admin files only) —
@@ -1240,8 +1250,12 @@ run() {
     cwd_probe_load
 
     say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
-    say "note: no byte-savings figure is reported — per-worktree .venv dirs are hardlinked to the uv cache"
-    say "      (measured 84 GB du delta vs 22 GB actual). The deliverable win is FILE COUNT."
+    say "note: no byte-savings figure is reported — a per-worktree .venv shares blocks with the uv"
+    say "      cache on SOME machines (APFS clonefile, or a hardlink) and is REAL on others"
+    say "      (Linux/overlayfs, a cache on another volume — measured 2026-10-16: du 22.0 MB vs df"
+    say "      +0.6 MB when cloned; du 5,647 MiB vs df 5.90 GB real, ratio 1.004). The deliverable"
+    say "      win is FILE COUNT. Real bytes are measured per machine, never inferred from du:"
+    say "      bash scripts/worktree-disk-probe.sh --help   (#1851)"
     say ""
 
     local elapsed=0 crumb verdict reason detail rc
