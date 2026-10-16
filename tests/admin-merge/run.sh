@@ -2474,8 +2474,9 @@ grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no
 # site the FAILURE ARM IS SKIPPED — a FAIL-OPEN enforcer that reports green on a regressed rail).
 # That is the precise failure these four scenarios exist to prevent, so shipping it inside them
 # would have been the joke telling itself. The repo's own `check-no-sigpipe-grep.sh` cannot see it
-# (it scans `scripts .husky pi-bootstrap` and its predicate is builtin-writer-into-quiet-grep, not
-# `grep | grep -q`). Capture-independent, per-line, pipe-free:
+# HERE — because this file is outside its scan set (`scripts .husky pi-bootstrap`), NOT because of
+# its predicate: since #864 that predicate recognises a `grep` producer too, so `grep | grep -q`
+# is exactly what it would flag if `tests/` were scanned. Capture-independent, per-line, pipe-free:
 post_read_call_made() {
   local l
   while IFS= read -r l; do

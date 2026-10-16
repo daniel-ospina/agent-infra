@@ -13,7 +13,12 @@ for N in "$@"; do
   # Issue numbers come from the GitHub API via candidates.txt; never let one reach a shell string.
   case "${N:-}" in ''|*[!0-9]*) echo "#$N: SKIPPED (non-numeric issue id)"; continue ;; esac
   WT="tm-$N"; BR="feat/$N-tm"
-  if ! git worktree list | grep -q "/$WT "; then
+  # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative
+  # under `pipefail` would send this lane down the `worktree add` path, fail on the
+  # existing worktree, and silently SKIP the issue (#864).
+  wt_registered=0
+  case "$(git worktree list 2>/dev/null || true)" in *"/$WT "*) wt_registered=1 ;; esac
+  if [ "$wt_registered" -eq 0 ]; then
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; continue; }
   fi

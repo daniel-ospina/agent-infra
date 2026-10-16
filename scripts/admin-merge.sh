@@ -2323,10 +2323,21 @@ lane_shard_set() {
 # workflow LIFECYCLE job? A family whose every member is bookkeeping measured no
 # test, so certifying on it is certifying on nothing (cycle-2 P1).
 lane_has_test_shard() {
-  local f="$1"
+  local f="$1" remaining=""
   [ -s "$f" ] || return 1
   printf '%s\n' "$LANE_LIFECYCLE_JOBS" > "$TMP/lane-lifecycle.txt"
-  grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" | grep -q '[^[:space:]]'
+  # NO PIPE. A quiet grep downstream of any still-writing producer is the SIGPIPE
+  # false-negative class of #864, not only the builtin-writer form of #841: grep exits
+  # at its FIRST match, the upstream grep takes SIGPIPE (141), and under `pipefail`
+  # that status wins — so this function answers "no test shard" for a set that HAS
+  # one and the lane-parity check certifies on nothing. Capture first, then classify in
+  # the SHELL: a `case` needs no second process at all — there is no pipe to lose a
+  # status to, which is the same remedy the head/verdict resolvers above use.
+  remaining="$(grep -vxF -f "$TMP/lane-lifecycle.txt" "$f" || true)"
+  case "$remaining" in
+    *[![:space:]]*) return 0 ;;
+  esac
+  return 1
 }
 
 # ── #6928: A SHARD THE DIFF SELECTOR *DECLINED* IS NOT A COVERAGE GAP ─────

@@ -40,12 +40,49 @@
 #
 # SCOPE — WHAT THIS GUARD DOES NOT COVER (deliberate)
 # ---------------------------------------------------
-# It matches the BUILTIN writers `printf`/`echo` only, because that is the set where the
-# fix is mechanical and universal. The same false negative is reachable with ANY producer
-# (`git … | grep -q`, `docker … | grep -q`, a function's output) — see the data-loss sites
-# fixed in `scripts/stale-worktrees.sh`/`scripts/cleanup-worktree.sh` (#863) and the
-# follow-up issue for broadening this guard. Do not read a green run as "no SIGPIPE risk
-# exists anywhere"; read it as "the builtin-writer idiom is gone".
+# It matches the builtin writers `printf`/`echo`, PLUS a `grep` as producer, because those are
+# the sets where a recognised producer word is unambiguous in the TEXT. The `grep` producer was
+# added by #864: the failure mechanism is `pipefail` + the quiet grep's early exit, NOT the
+# identity of the writer, and `grep -vxF … | grep -q …` is a real gate site (`lane_has_test_shard`
+# in the rail, and the test-teardown check) that #841's builtin-only predicate could not see. The
+# same false negative is reachable with ANY producer (`git … | grep -q`, `docker … | grep -q`, a
+# function's output) — see the data-loss sites fixed in
+# `scripts/stale-worktrees.sh`/`scripts/cleanup-worktree.sh` (#863). Do not read a green run as
+# "no SIGPIPE risk exists anywhere"; read it as "the recognised producer idioms are gone".
+# Broadening the recognised producer set further is #864's open design question: ANY other
+# producer is a false CLEAN until it is listed here.
+#
+#     PRODUCER-SIDE OVER-BLOCK, ACCEPTED AND PINNED (tests/sigpipe-grep/run.sh 13d). A producer
+#     that writes NOTHING, or writes only once it has read everything (`grep -q`, `grep -c`),
+#     cannot itself take the signal, so flagging it is a SHAPE flag and not a live false negative.
+#     It is still flagged: the pipeline cannot carry that producer's status either, no live
+#     occurrence of the shape exists on this tree, and writing a "does this producer write?"
+#     model into a TEXT matcher is the unbounded direction #1645 documents round after round.
+#     Over-block is friction and is visible; a missed producer is a silent false CLEAN.
+#
+#     PRODUCER-SIDE OVER-BLOCK FROM THE SUBSTRING CLASS, ALSO EXTENDED BY #864. raw_idiom is
+#     deliberately not anchored (see its own note below), so the WORD `grep` anywhere before a
+#     pipe counts as a producer: `ls a/grep | grep -q x`, `sed -n "/grep/p" f | grep -q x` and
+#     `git log --grep=x | grep -q y` are all flagged although the producer is not grep. Reproduced
+#     on fixtures (no live occurrence exists on this tree — the guard runs clean), and all are
+#     recoverable through the exceptions file; the alternative (anchoring raw_idiom) regressed
+#     quoted/escaped/backticked writers from flagged to CLEAN.
+#
+#     RESIDUALS — PRODUCER SPELLINGS THE WIDENING STILL MISSES (measured, filed, NOT chased).
+#     All four need the SAME conjunction — a producer word `writer_at` rejects AND a `|` inside
+#     the producer's own argument that defeats raw_idiom's `[^|]*` bridge — and all four are
+#     CLEAN before and after #864, so none is a regression; the widening is strictly better on
+#     each. They are open-ended in exactly the way the wrapper allowlist is (#1645), and they
+#     are recorded on #864 rather than half-modelled here:
+#       a wrapper whose OPTION precedes the word   `env -i grep`, `command -p grep`,
+#                                                  `stdbuf -oL grep`, `sudo -E grep`
+#                                                  (`tokn ~ /^-/` rejects the word — the same
+#                                                  test that keeps `foo -e echo` unflagged)
+#       a QUOTED or ESCAPED producer word           `"grep" -E "a|b" f | grep -q p`, `\grep …`
+#       a $-rooted path                             `$HOME/bin/grep -E "a|b" f | grep -q p`
+#       a PROCESS SUBSTITUTION in its argument       `grep -f <(cat list | head -2) f | grep -q p`
+#     Measured: each returns rc 141 under `pipefail` on a >64 KiB payload with the match on line
+#     1, and the capture-then-case form returns 0.
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
 #     into grep is seen through — `env`, `nice`, `command`, `time`, `sudo`, `stdbuf`, `exec`,
@@ -53,6 +90,11 @@
 #     completed by construction, so any OTHER wrapper is a false CLEAN. Adding a member is a
 #     one-line change in GREPRE (both matchers) plus the prefix set in is_grep_cmd, plus a pin in
 #     tests/sigpipe-grep/run.sh; nothing else about the guard is wrapper-specific.
+#   · ADDING A PRODUCER WORD IS NOT A ONE-LINE CHANGE — IT TAKES THREE. WRITERRE (read by
+#     raw_idiom), the character ladder in writer_at (scan_idiom), and a pin in
+#     tests/sigpipe-grep/run.sh. A word added to only one of the two matchers is a producer the
+#     other cannot see — a false CLEAN, the failure this guard exists to prevent. The by-path
+#     fixtures in tests/sigpipe-grep/run.sh 13a pin the class that this gap produced.
 #   · TWO-STAGE PRODUCERS ARE OUT OF SCOPE. A writer piped through an intermediary (`cat`, `tee`,
 #     `sort`) and then into a quiet grep does eventually kill the writer, because the intermediary
 #     dies when grep exits — but the writer is piped into the INTERMEDIARY, not into grep, and this
@@ -512,6 +554,20 @@ HITS="$(
         # matchers previously reported it clean because neither admitted a prefix. Defined ONCE so
         # the two matchers cannot drift apart on which forms they recognise.
         GREPRE = "(([A-Za-z0-9._~+-]*/)*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*|env|nice|command|time|sudo|stdbuf|exec|eval|nohup|setsid|timeout|busybox|sh|bash|dash|zsh|ksh)[ \t]+)*([A-Za-z0-9._~+-]*/)*"
+        # The PRODUCER words whose stdout, piped into a quiet grep, is the class this guard
+        # bans. `grep` joined the set in #864: the mechanism is `pipefail` plus the early
+        # exit of a quiet grep, so a `grep` upstream takes the signal exactly as the builtin
+        # writers do.
+        # ⛔ THE PRODUCER SET LIVES IN TWO PLACES AND BOTH MUST CHANGE TOGETHER —
+        #     this regex (read by raw_idiom only) and the character ladder in writer_at().
+        #     writer_at is hand-written because substr() per index made the walk quadratic
+        #     (27 s for a 1 MB line), and a WORD here with no branch there is a producer that
+        #     scan_idiom — the authoritative walk — cannot see, i.e. exactly the false CLEAN
+        #     the union of the two matchers exists to eliminate. Unlike GREPRE (single use),
+        #     WRITERRE cannot be single-sourced at an acceptable cost.
+        # NOTE: this program is a SINGLE-QUOTED shell word, so an apostrophe in any of these
+        # comment lines would terminate it and break the whole script — keep them apostrophe-free.
+        WRITERRE = "(printf|echo|grep)"
       }
       # The QUOTED BODY of a shell-out wrapper is a command in its own right and inherits the
       # wrapper stdin: `printf x | sh -c "grep -q p"` and `printf x | eval "grep -q p"` both pipe
@@ -780,7 +836,7 @@ HITS="$(
         off = 0
         while (off < length(s)) {
           rest = substr(s, off + 1)
-          if (!match(rest, "(printf|echo)[^|]*[|][ \t]*" GREPRE "grep[ \t]+"))
+          if (!match(rest, WRITERRE "[^|]*[|][ \t]*" GREPRE "grep[ \t]+"))
             return 0
           pos = off + RSTART
           # An offset, not a slice: the walk is bounded by the grep COMMAND it is reading, never by
@@ -965,11 +1021,14 @@ HITS="$(
         }
         return 0
       }
-      # Is there a writer word at `i`, and how long is it? A writer is a `printf`/`echo` at a command
-      # boundary whose next character ends the word; `printf -v NAME` writes to a shell variable, not
-      # to stdout, so it cannot SIGPIPE, and a writer that is an ARGUMENT to another command is not a
-      # writer either (in `grep -e echo -e "a|b" f | grep -q p` the pipeline carries grep output).
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn) {
+      # Is there a writer word at `i`, and how long is it? A writer is a `printf`/`echo`/`grep` at a
+      # command boundary whose next character ends the word; `printf -v NAME` writes to a shell
+      # variable, not to stdout, so it cannot SIGPIPE, and a writer that is an ARGUMENT to another
+      # command is not a writer either (in `foo -e echo -e "a|b" f | grep -q p` the pipeline
+      # carries foo output, and the `echo` is an option argument, not a command).
+      # KEEP IN STEP WITH WRITERRE (see the note at its definition): the ladder below is the
+      # only producer list scan_idiom consults.
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q) {
         w = 0
         # Character comparisons against the pre-split array: `substr(s, i, 6)` per index over a long
         # line is O(n) PER CALL in this awk and made the walk quadratic (27 s for a 1 MB line).
@@ -977,10 +1036,32 @@ HITS="$(
           if (CH[i + 1] == "c" && CH[i + 2] == "h" && CH[i + 3] == "o") w = 4
         } else if (CH[i] == "p") {
           if (CH[i + 1] == "r" && CH[i + 2] == "i" && CH[i + 3] == "n" && CH[i + 4] == "t" && CH[i + 5] == "f") w = 6
+        } else if (CH[i] == "g") {
+          # A `grep` as the PRODUCER (#864). The mechanism is `pipefail` plus the early
+          # exit of a downstream quiet grep, so a grep upstream takes the signal exactly as a
+          # builtin writer does. No quietness model here: a producer that writes nothing
+          # (`grep -q`) is flagged as a SHAPE, which is the documented over-block (see the
+          # SCOPE header). (Apostrophe-free: this awk program is a single-quoted shell word.)
+          if (CH[i + 1] == "r" && CH[i + 2] == "e" && CH[i + 3] == "p") w = 4
         }
         if (w == 0) return 0
         # A backtick starts a command substitution, so a writer right after one is a writer.
         prev = (i == 1) ? " " : CH[i - 1]
+        # A PATH-PREFIXED command word is the SAME command, and the producer side must accept
+        # the path the consumer side already accepts (GREPRE carries ([A-Za-z0-9._~+-]*/)*):
+        # without this, `/usr/bin/grep -E "a|b" f | grep -q p` was seen by NEITHER matcher —
+        # raw_idiom cannot cross the quoted pipe, and scan_idiom rejected the path — and that
+        # shape is a measured false CLEAN at rc 141 (#864 review). The walk runs only when the
+        # word is preceded by `/`, so the common case pays nothing.
+        if (prev == "/") {
+          p = i - 1
+          while (p >= 1 && CH[p] == "/") {
+            q = p - 1
+            while (q >= 1 && CH[q] ~ /[A-Za-z0-9._~+-]/) q--
+            p = q
+          }
+          prev = (p < 1) ? " " : CH[p]
+        }
         if (prev !~ /[ \t;&|({`]/) return 0
         nxt = CH[i + w]
         if (nxt != "" && nxt !~ /[ \t]/) return 0
@@ -1249,18 +1330,23 @@ if [ -n "$warns" ]; then
 fi
 
 if [ -n "$fails" ]; then
-  echo "❌ SIGPIPE false-negative idiom (printf/echo piped into a quiet grep under pipefail) — #841:" >&2
+  echo "❌ SIGPIPE false-negative idiom (a recognised producer piped into a quiet grep under pipefail) — #841/#864:" >&2
   printf '%s' "$fails" >&2
   printf '%s\n' "$HITS" | sed '/^$/d' | sed 's/^/     /' >&2
   echo "" >&2
-  echo "Fix: invert to a here-string, e.g." >&2
+  echo "Fix: drop the pipe. A builtin writer inverts to a here-string; any other producer" >&2
+  echo "(e.g. a non-quiet grep) CAPTURES first and tests in the shell — a case needs no pipe:" >&2
   echo "  BAD   printf '%s' \"\$TEXT\" piped into grep -q 'PATTERN'" >&2
   echo "  GOOD  grep -q 'PATTERN' <<<\"\$TEXT\"" >&2
-  echo "(bash-only; every flag still applies. See the header of this script for the windows of failure," >&2
-  echo " and for the POSIX-sh variant that .husky/ hooks need.)" >&2
+  echo "  BAD   grep -vxF -f list f piped into grep -q '[^[:space:]]'" >&2
+  echo "  GOOD  out=\"\$(grep -vxF -f list f || true)\"; case \"\$out\" in *[![:space:]]*) … ;; esac" >&2
+  echo 'If the producer itself is quiet or counts (grep -q, grep -c) it writes nothing to the' >&2
+  echo "pipe at all — the PIPE is the bug: drop it and test the source directly, do not capture it." >&2
+  echo "(bash-only for the here-string form; every grep flag still applies. See the header of this" >&2
+  echo " script for the windows of failure and for the POSIX-sh variant that .husky/ hooks need.)" >&2
   exit 1
 fi
 
-echo "✅ no builtin-writer SIGPIPE false-negative idiom in ${SCAN_DIRS[*]} (scanned $FILE_COUNT file(s) under $ROOT)"
-echo "   NOTE: scope is printf/echo only — any other producer piped into a quiet grep has the same failure mode."
+echo "✅ no recognised-producer SIGPIPE false-negative idiom in ${SCAN_DIRS[*]} (scanned $FILE_COUNT file(s) under $ROOT)"
+echo "   NOTE: producers recognised are printf|echo|grep — any OTHER producer piped into a quiet grep has the same failure mode (#864)."
 exit 0

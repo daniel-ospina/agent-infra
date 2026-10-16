@@ -9,7 +9,11 @@ mkdir -p "$O/logs"
 cd "$REPO" || exit 1
 git fetch origin "$BR" --quiet 2>/dev/null || true
 WT=".worktrees/adopt-$PR"
-if ! git worktree list | grep -q "/$WT "; then
+# Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
+# `pipefail` would re-run `worktree add` over an existing worktree and abort (#864).
+wt_registered=0
+case "$(git worktree list 2>/dev/null || true)" in *"/$WT "*) wt_registered=1 ;; esac
+if [ "$wt_registered" -eq 0 ]; then
   git worktree add "$WT" "$BR" >/dev/null 2>&1 || { echo "[adopt-fix $PR] worktree add failed for $BR" | tee -a "$O/logs/adopt-$PR.log"; exit 1; }
 fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log"

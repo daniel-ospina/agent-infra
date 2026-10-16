@@ -2081,8 +2081,10 @@ $big_filler"
   # glossed: the repo-wide guard's matcher is narrower than the pin deleted
   # here. It requires `grep` immediately after the pipe (so a post-pipe env
   # prefix — `printf … | LC_ALL=C grep -q x` — is a MISS), knows only the
-  # `printf`/`echo` producers (so a `cat file | grep -q x` is a MISS; its header
-  # scopes non-builtin producers out deliberately), and looks for the quiet flag
+  # `printf`/`echo`/`grep` producers (so a `cat file | grep -q x` is a MISS; its header
+  # scopes other producers out deliberately — `grep` joined the set in #864, because the
+  # failure is `pipefail` plus the quiet grep early exit, not the writer identity), and looks
+  # for the quiet flag
   # before the pattern (so `grep x -q` is a MISS). No live occurrence of those
   # three spellings exists on this head, so nothing regresses today — the gap is
   # tracked in issue #877, together with the fact that run.sh has no separated

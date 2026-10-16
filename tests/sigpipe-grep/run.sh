@@ -62,6 +62,16 @@
 #      where /dev/full exists — both GNU/Linux. The count is therefore platform-dependent; read it
 #      from the suite's own summary line rather than pinning a number here.
 #
+#  12be. a shell option between `-c` and its command string is not read as the body.
+#  13. NON-BUILTIN PRODUCER (#864). The guard matches `printf`/`echo` PLUS a `grep`: the failure
+#      is `pipefail` + the quiet grep early exit, not the producer identity. 13a pins DETECTION
+#      (bare, via an intermediary, by path, with an env prefix, with a data pipe in the
+#      producer's own argument, continued, in a substitution, and the by-path-plus-data-pipe
+#      CONJUNCTION) and is the only sub-section that fails on the un-widened guard; 13b is an
+#      over-block CONTROL (safe forms: capture-then-case, here-string, non-quiet consumer);
+#      13c is a NON-VACUITY pin that the idiom really does lose the match on a >64 KiB payload;
+#      13d pins the ACCEPTED over-block (a producer that writes nothing) so it stays deliberate.
+#
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
 # in order to prove it is detected — see SCAN_DIRS in the guard).
@@ -1359,7 +1369,7 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 #      first grep's output; charging that pipe to `echo`, or to a path-like token after a `;`,
 #      flags lines the old matcher left clean — a new false block.
 E="$TMP/f12p"; mkdir -p "$E/scripts"
-printf '%s\n' '#!/usr/bin/env bash' 'grep -e echo -e "OK|FAIL" "$f" | grep -q FAIL' > "$E/scripts/argwriter.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'foo -e echo -e "OK|FAIL" "$f" | grep -q FAIL' > "$E/scripts/argwriter.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'printf x | foo;/bin/grep -q p' > "$E/scripts/pathsep.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 0 ] \
@@ -2001,6 +2011,108 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
   && grep -q 'ex\.sh' "$OUT" && ! grep -q 'ecat\.sh' "$OUT" && ! grep -q 'nobody\.sh' "$OUT" \
   && pass "a shell option between -c and its command string is not mistaken for the body" \
   || fail "an option was consumed as the shell command string (exit $rc)"
+
+echo ""
+echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
+# #841's guard matched the builtin writers only, so the same false negative with a `grep`
+# producer (`grep -v … | grep -q …`) sat outside it: measured on a 1.4 MB multi-line payload
+# with the match on line 1, the idiom returns 141 under `pipefail` and the downstream `-q`
+# never reports the match.
+#
+# WHAT EACH SUB-SECTION PINS (they are not interchangeable):
+#   13a  DETECTION — the eight fixtures below. NON-VACUOUS: all eight are reported CLEAN by
+#        #841's guard (`git show HEAD:scripts/check-no-sigpipe-grep.sh`), so this whole block
+#        fails before the widening.
+#   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
+#        one; it does not detect the widening, it detects an over-broad version of it.
+#   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
+#        lose the match), not the matcher.
+#   13d  ACCEPTED OVER-BLOCK — the producer that writes nothing. Documented, not accidental.
+E="$TMP/f13"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f | grep -q "[^[:space:]]"'  > "$E/scripts/plain.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | grep -vE "#" | grep -q needle'   > "$E/scripts/staged.sh"
+printf '%s\n' '#!/usr/bin/env bash' '/bin/grep -v foo f | command grep -qx bar'     > "$E/scripts/aliased.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'LC_ALL=C grep -v foo f | LC_ALL=C grep -q bar' > "$E/scripts/prefixed.sh"
+# The classes the DECLARED threat surface for this change requires: the producer's own
+# argument carrying a literal `|` (which a single-line regex bridge cannot cross), a producer
+# split from its pipe by a line continuation, a producer inside a wrapper body, and a producer
+# in command substitution. Each is an attacker-shaped spelling of the ONE bypass under test —
+# "get a grep producer past the matcher" — so each is a pin, not a nicety.
+printf '%s\n' '#!/usr/bin/env bash' 'grep "a|b" f | grep -q bar'                  > "$E/scripts/quotepipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f \' '  | grep -q bar'            > "$E/scripts/continued.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(grep -v foo f | grep -q bar)'               > "$E/scripts/subst.sh"
+# COMPOSED fixtures. The blind spots of the two matchers MEET where a path-qualified producer
+# also carries a data pipe in its own argument: raw_idiom's `[^|]*` bridge cannot cross that
+# pipe, and scan_idiom's boundary test rejected the path — so the conjunction was reported
+# CLEAN at rc 141 while every single-dimension fixture above was flagged (review of #864).
+# These three are that conjunction, and each FAILS on the widening without the path handling.
+printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" f | grep -q bar'      > "$E/scripts/bypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env /usr/bin/grep -E "a|b" f | grep -q bar'  > "$E/scripts/wrapbypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | /usr/bin/grep -E "a|b" | grep -q needle' > "$E/scripts/stagedbypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(/usr/bin/grep -E "a|b" f | grep -q bar)' > "$E/scripts/substbypath.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
+   && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
+   && grep -q 'quotepipe\.sh' "$OUT" && grep -q 'continued\.sh' "$OUT" \
+   && grep -q 'subst\.sh' "$OUT" && grep -q 'bypath\.sh' "$OUT" \
+   && grep -q 'wrapbypath\.sh' "$OUT" && grep -q 'stagedbypath\.sh' "$OUT" \
+   && grep -q 'substbypath\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, via an intermediary, by path, wrapper-prefixed, with a data pipe in the producer's own argument, continued, in a substitution, and the by-path-plus-data-pipe conjunction)"
+else
+  fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,16p' "$OUT"
+fi
+# 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
+#      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
+#      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
+#      over-broad version of the widening.
+E="$TMP/f13b"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'out="$(grep -vxF -f list f || true)"' 'case "$out" in *needle*) : ;; esac' > "$E/scripts/fixed.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q needle <<<"$(grep -v x f || true)"'                                > "$E/scripts/herestring.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f | grep needle'                                                > "$E/scripts/notquiet.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 0 ]; then
+  pass "the capture-then-case fix, a grep producer into a here-string, and a non-quiet consumer all pass (exit 0)"
+else
+  fail "false positive on a safe grep-producer form (exit $rc):"
+  sed -n '1,10p' "$OUT"
+fi
+# 13c. NON-VACUITY for the grep producer: the class is REAL, not merely a shape. No guard is
+#      invoked here — the two shell functions below ARE the measurement. On a >64 KiB multi-line
+#      payload with the match on line 1, the piped idiom returns NON-ZERO while the
+#      capture-then-case form returns 0, and the two MUST differ (a small payload lets the
+#      producer finish before grep exits, and the pin would then pass for the wrong reason).
+BIGF="$TMP/f13-big.txt"
+{ printf 'MARKER needle\n'; i=0; while [ "$i" -lt 40000 ]; do printf 'padding line %d of a big payload\n' "$i"; i=$((i + 1)); done; } > "$BIGF"
+note "payload: $(wc -c <"$BIGF" | tr -d ' ') bytes, multi-line, match on line 1"
+grep_old() { ( set -o pipefail; grep -vxF -f /dev/null "$BIGF" | grep -q needle ) 2>/dev/null; }
+grep_new() { ( set -o pipefail; out="$(grep -vxF -f /dev/null "$BIGF" || true)"; case "$out" in *needle*) return 0 ;; esac; return 1 ) 2>/dev/null; }
+grep_old; g_old=$?
+grep_new; g_new=$?
+note "grep-producer idiom rc=$g_old   capture-then-case rc=$g_new"
+if [ "$g_new" -eq 0 ] && [ "$g_old" -ne 0 ]; then
+  pass "the grep-producer idiom LOSES the match (rc $g_old) while the pipe-free form finds it (rc 0)"
+else
+  fail "the grep-producer class did not reproduce (old=$g_old new=$g_new) — the pin would be vacuous"
+fi
+# 13d. ACCEPTED OVER-BLOCK, PINNED SO IT IS DELIBERATE. A producer that writes NOTHING to the
+#      pipe cannot itself take the signal, so flagging it is a SHAPE flag, not a live false
+#      negative — and the guard flags it anyway (see the SCOPE header). It is pinned here so
+#      that narrowing it later is a CONSCIOUS change with a failing test, not a silent edit.
+#      The rc is measured alongside, so the test itself records that this shape is NOT the
+#      mechanism: a quiet producer never reproduces the 141 that 13c measures.
+E="$TMP/f13d"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q foo f | grep -q bar' > "$E/scripts/quietproducer.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -c foo f | grep -q bar' > "$E/scripts/countproducer.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+( set -o pipefail; grep -q needle "$BIGF" | grep -q needle ) 2>/dev/null; q_rc=$?
+note "quiet-producer idiom rc=$q_rc (never 141 — it writes nothing to the pipe)"
+if [ "$rc" -eq 1 ] && grep -q 'quietproducer\.sh' "$OUT" && grep -q 'countproducer\.sh' "$OUT" \
+   && [ "$q_rc" -ne 141 ]; then
+  pass "a producer that writes NOTHING is flagged as a documented SHAPE, and its rc is not 141 (over-block is deliberate, not the mechanism)"
+else
+  fail "the accepted over-block changed (guard rc=$rc, quiet-producer rc=$q_rc) — was the predicate narrowed? Then move this pin to a clean-form assertion and update the SCOPE header"
+fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then

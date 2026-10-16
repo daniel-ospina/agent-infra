@@ -2308,7 +2308,10 @@ out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
 SBT="$(mk_sb)"; run_inst "$SBT" MAX_LANES=4x >/dev/null
-ls "$SBT/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+# Capture, then classify in the SHELL — never `ls … | grep -q`, whose false negative under
+# `pipefail` would report GREEN on a regression (this assertion pins the ABSENCE of a temp plist)
+# — the #864 class, and the guard does not scan this file's directory tree for it.
+case "$(ls "$SBT/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a rejected render leaves no temp plist behind (the render is not atomic by accident)" $rc
 # ⛔ The cases above fail BEFORE the render or AFTER it completes, so neither drives the window
 # BETWEEN `RENDER=` and the `mv`. The render runs under `set -euo pipefail`, so a template read that
@@ -2338,7 +2341,7 @@ ck "the unreadable-template fixture is in place (a swallowed cp must be loud, no
 # negative this repo bans (`scripts/check-no-sigpipe-grep.sh`, #841).
 grep -q 'Permission denied' <<<"$out" && rc=0 || { rc=1; echo "      the run did not fail AT THE RENDER: '$out'"; }
 ck "the unreadable-template case failed at the render, not at an earlier guard that also names it" $rc
-ls "$SBR/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+case "$(ls "$SBR/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a render that ABORTS mid-flight leaves no orphan temp plist (the path rm -f alone misses)" $rc
 chmod 644 "$HDR/launchd.plist.template"
 # ⛔ ATOMICITY ITSELF is untested by the three cases above: they all fail BEFORE the render, so a
