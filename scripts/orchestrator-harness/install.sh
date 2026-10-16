@@ -510,7 +510,46 @@ prov_dirty() {
 }
 
 write_provenance() {
-  local commit rel dirty_word payload tmp drc
+  local commit rel dirty_word payload tmp drc _depf _depb dep_why
+  # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
+  # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
+  # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
+  # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
+  # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
+  # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
+  # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
+  # FIELD, so the record itself cannot be read as "this commit describes these bytes".
+  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
+  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # differ while this field still said `true` — so the record read "this commit describes these bytes"
+  # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
+  # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a
+  # surface `check-deployed-drift.sh` refused.
+  # ⛔ BOTH DIRECTIONS. `check-deployed-drift.sh`'s byte half also fails a `$O/*.sh` the repo does not
+  # ship ("a hand-placed or retired script", its own words), so a one-way `$HERE -> $O` comparison
+  # still blessed a hand-edited deployment the check refused — the same gap one step narrower
+  # (also reproduced in review).
+  #
+  # The list of what differed is built HERE, not read from `$DRIFTED`: that variable is computed
+  # OUTSIDE this block (install.sh's daemon-script loop), so it is EMPTY in exactly this field's own
+  # case — a mismatch in a script outside the daemon list — and UNSET when the block is extracted and
+  # sourced on its own, which under `set -u` made the warning below die with "DRIFTED: unbound
+  # variable" (both measured in review; the second was audible in the shipped suite's stderr).
+  # `dep_why` is declared in this function's `local` at the top; do NOT re-declare it here.
+  dep_why=""
+  for _depf in "$HERE"/*.sh; do
+    _depb="${_depf##*/}"
+    { [ -f "$O/$_depb" ] && cmp -s "$_depf" "$O/$_depb"; } || dep_why="$dep_why ${_depb}(differs-or-missing)"
+  done
+  for _depf in "$O"/*.sh; do
+    _depb="${_depf##*/}"
+    [ -f "$HERE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
+  done
+  local dep_match=true
+  # An `if`, not `[ … ] && …`: the bare AND-OR list's status is 1 in the normal (in-sync) case, and a
+  # future reader should not have to re-derive whether `set -e` tolerates that shape.
+  if [ -n "$dep_why" ]; then dep_match=false; fi
   prov_classify
   commit="${PROV_COMMIT:-}"; [ -n "$commit" ] || commit=UNKNOWN
   rel="${PROV_REL:-unknown}"
@@ -536,6 +575,7 @@ write_provenance() {
   "refCommit": "${PROV_REFCOMMIT:-UNKNOWN}",
   "relation": "$rel",
   "agentInfraDirty": $dirty_word,
+  "deployedMatchesSource": $dep_match,
   "payloadSha256": "$payload",
   "recordedAt": "$(date -u +%FT%TZ)"
 }
@@ -552,6 +592,10 @@ STAMPEOF
   fi
   if [ "$dirty_word" = true ]; then
     warn "the source tree at $HERE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
+  fi
+  if [ "$dep_match" = false ]; then
+    warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
+    warn "  the record names $commit, but the box is not running those bytes — cp '$HERE'/*.sh '$O'/"
   fi
   return 0
 }

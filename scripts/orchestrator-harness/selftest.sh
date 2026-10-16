@@ -2826,6 +2826,10 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     PG="git -C $PW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
     printf 'loop v1\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
+    # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
+    # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
+    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
     prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
@@ -2839,6 +2843,31 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     ck "the stamp classifies the source as current at the ref" $rc
     grep -qE '"payloadSha256": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "the stamp records a payload hash over \$O/*.sh" $rc
+    # #1837 review (P2): `install.sh` NEVER copies — the operator syncs `$O` — so the source commit
+    # and the deployed bytes can genuinely disagree. Without a field saying so, the record reads as
+    # "this commit describes these bytes" while the box runs other ones. Declared as a field, not
+    # inferred from `relation` (which is git ancestry of the SOURCE, not a statement about `$O`).
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp says whether the deployed copy matches the source (in-sync: true)" $rc
+    # `$O` that differs from the source: install.sh NEVER copies (`$O` is synced by the operator), so
+    # an install run from a newer checkout can stamp a commit over bytes from an older one. Tampered
+    # file is `check-port-drift.sh` — deliberately one NOT in install.sh's `DRIFTED` list, so this
+    # assertion is RED if the field is derived from that subset instead of from the whole surface.
+    printf 'tampered\n' > "$PO/check-port-drift.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "a \$O that differs from the source in a NON-DRIFTED script records deployedMatchesSource: false" $rc
+    deploy; prov
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
+    # The OTHER direction, which a one-way `$HERE -> $O` comparison would miss: a hand-placed
+    # `$O/*.sh` the repo does not ship is DRIFT to check-deployed-drift.sh, so the stamp must not
+    # call that deployment a match either.
+    printf 'hand-placed\n' > "$PO/legacy-probe.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "an extra \$O/*.sh the repo does not ship records deployedMatchesSource: false" $rc
+    deploy; prov
     dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
     ck "check-deployed-drift: a matching deployment exits 0" $rc
     # a DIRTY source: its recorded commit cannot describe the deployed bytes
@@ -2935,6 +2964,13 @@ if [ -f "$HERE/report.sh" ]; then
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
+  # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+  # "08: value too great for base" at the `FROM=` line and then died at the first use of `$FROM`
+  # ("FROM: unbound variable", rc=1), stopping the report partway. It must clamp to the 12h
+  # default instead.
+  rout08="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 08 2>&1)"; rrc08=$?
+  [ "$rrc08" -eq 0 ] && case "$rout08" in *"orchestrator report"*"12h"*) rc=0;; *) rc=1;; esac || rc=1
+  ck "report.sh clamps a leading-zero HOURS arg instead of dying in the arithmetic" $rc
   case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
   ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
   case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac

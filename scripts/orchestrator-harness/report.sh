@@ -14,7 +14,12 @@
 # the tortoise checkout this box drains; override it for any other target.
 set -u
 H="${1:-12}"
-case "$H" in ''|*[!0-9]*) H=12 ;; esac
+# ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+# "08: value too great for base" at the `FROM=` line below and then died at the first use of `$FROM`
+# with "FROM: unbound variable", rc=1 — the report stopped partway. (Pre-existing; found by the same
+# review that added the identical arm to the heartbeat guard, and closed here because this is the
+# file being changed rather than filed as a peer.)
+case "$H" in ''|*[!0-9]*|0[0-9]*) H=12 ;; esac
 O="${O:-$HOME/orchestrator}"
 REPO="${REPO:-$HOME/eldato/tortoise}"
 NOW=$(date +%s); FROM=$(( NOW - H * 3600 ))
@@ -36,8 +41,22 @@ echo
 echo "── controller ──────────────────────────────────────────────"
 if command -v launchctl >/dev/null 2>&1; then
   pid=$(launchctl list 2>/dev/null | awk '/orchestrator/{print $1}')
+  # ⛔ `launchctl list` prints `-` in the PID column for a job that is LOADED but NOT RUNNING, so
+  # `[ -n "$pid" ]` alone read a stopped job as UP (measured: a job loaded with no process printed
+  # `UP (pid -)   heartbeat age: 92167609s`). `-` must fall through to the NOT RUNNING branch.
+  [ "${pid:-}" = "-" ] && pid=""
   if [ -n "${pid:-}" ]; then
     hb=$(cat "$O/heartbeat" 2>/dev/null || echo 0)
+    # ⛔ A non-numeric heartbeat is FATAL here, not cosmetic: `$(( NOW - abc ))` recurses into the
+    # VARIABLE `abc`, and under `set -u` that is "abc: unbound variable" — so the whole report
+    # aborted mid-way (everything after `── controller ──`: merges, wall-time, claims, queue health)
+    # and the script still exited 0. Measured with `heartbeat` = `abc`: 3 lines of stdout, rc=0.
+    # Validate exactly as the sibling paths already validate their numeric reads.
+    # ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`, so `heartbeat=08` fails the expansion
+    # with "value too great for base" and the status line is dropped silently — the same silent-drop
+    # class this guard was added for. (The `case "$H"` guard at the top of this file had the
+    # identical gap; it is closed there too.)
+    case "$hb" in ''|*[!0-9]*|0[0-9]*) hb=0 ;; esac
     echo "  UP (pid $pid)   heartbeat age: $(( NOW - hb ))s"
   else
     echo "  ⚠️  NOT RUNNING (no launchd job)"
@@ -57,7 +76,15 @@ echo "  backlog: $queued candidates queued   dispatched-to-date: $dispatched"
 if [ -f "$O/.agent-infra-stamp.json" ]; then
   hc=$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)
   hr=$(sed -n 's/.*"relation"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" | head -1)
+  # The source commit does NOT describe the deployed bytes when install.sh recorded a mismatch
+  # (`deployedMatchesSource: false` — `$O` was synced from a different revision than the checkout
+  # install.sh ran from). Printing `[current]` alone would headline a commit the box is not running.
+  dm=$(sed -n 's/.*"deployedMatchesSource"[[:space:]]*:[[:space:]]*\([^,}]*\).*/\1/p' "$O/.agent-infra-stamp.json" | tr -d ' "' | head -1)
   echo "  harness: ${hc:-UNKNOWN} [${hr:-unknown}]"
+  if [ "$dm" = false ]; then
+    echo "  ⚠️  the DEPLOYED copy at \$O differs from the recorded source commit — this box is NOT running those bytes"
+    echo "      re-sync and re-record: cp '<checkout>/scripts/orchestrator-harness'/*.sh \"\$O\"/ && O=\"\$O\" bash <checkout>/scripts/orchestrator-harness/install.sh"
+  fi
 else
   echo "  harness: UNKNOWN (no $O/.agent-infra-stamp.json — run install.sh to record it)"
 fi
