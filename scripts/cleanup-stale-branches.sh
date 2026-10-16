@@ -343,7 +343,12 @@ require_value() {
 # permits them), and a hand-built `--force-with-lease="...$branch..."` echo lets
 # those run as commands when pasted. `%q` is bash's own re-input-safe quoting, so
 # the round-trip is the shell's property, not a hand-kept escaping table. The
-# printer and the execute path consume the SAME array, so they cannot diverge.
+# printer and the execute path consume the SAME array for every line the plan
+# prints AS A COMMAND, so those cannot diverge. The LOCAL plan’s force-delete
+# fallback is deliberately NOT one of them: it is printed as a COMMENT (F17),
+# because printing it as a second command made the plan advertise two commands
+# where execution runs one, and a verbatim paste under `set -e` aborted on the
+# first (see the plan block below).
 quote_argv() {
     local _qa_sep="" _qa_arg _qa_q
     for _qa_arg in "$@"; do
@@ -1699,8 +1704,9 @@ run_local_scope() {
             # quoted argv: it is informational and must not become an argument.
             local local_cmd=(git branch -d -- "$br")
             printf '  %s   # class=%s\n' "$(quote_argv "${local_cmd[@]}")" "$cls"
-            # ⛔ THE FORCE-DELETE FALLBACK IS PART OF THE PLAN FOR `merged` —
-            # BUT ONLY WHEN `-d` WILL ACTUALLY REFUSE (F9). Omitting it entirely
+            # ⛔ THE FORCE-DELETE FALLBACK IS ADVERTISED IN THE PLAN FOR
+            # `merged` — BUT ONLY WHEN `-d` WILL ACTUALLY REFUSE (F9), AND AS A
+            # COMMENT, NEVER AS A SECOND COMMAND (F17). Omitting it entirely
             # made the plan a LIE for a squash-merged branch (the execute path
             # silently fell back). Printing it UNCONDITIONALLY made the plan a
             # strict SUPERSET for a branch merged with a MERGE COMMIT (or
@@ -1713,8 +1719,8 @@ run_local_scope() {
             # aborted the rest of the paste — an UNDER-reap. So predict the SAME
             # test the outcome will apply: is the tip an ancestor of the ref `-d`
             # compares against? Ancestor → `-d` succeeds, print NO fallback;
-            # not-an-ancestor → print the fallback, through the SAME
-            # `quote_argv`, annotated OUTSIDE the quoted argv.
+            # not-an-ancestor → print the fallback as a COMMENT, through the
+            # SAME `quote_argv`, annotated OUTSIDE the quoted argv.
             # ⛔ AND IT MUST PREDICT THE SAME REF `-d` WILL TEST (F11). `git
             # branch -d` tests the branch's UPSTREAM when it has one, and only
             # falls back to HEAD otherwise — NOT `origin/main`. Predicating on
@@ -1730,9 +1736,9 @@ run_local_scope() {
                 dry_tip="$(git rev-parse --verify -q "refs/heads/$br" 2>/dev/null || true)"
                 if [ -z "$dry_tip" ]; then
                     # ⛔ Tip unresolvable at plan time (F14). The fallback is
-                    # printed CONDITIONALLY-annotated, not suppressed, and NOT
-                    # with the unqualified "(fallback if -d refuses)" used when
-                    # the tip IS resolvable:
+                    # advertised as a COMMENT with a CONDITIONAL annotation, not
+                    # suppressed, and NOT with the unqualified
+                    # "(fallback if -d refuses)" used when the tip IS resolvable:
                     #   * `update-ref -d <ref> <old>` refuses unless the ref is
                     #     still exactly the classified tip, so pasting it can
                     #     never force-delete anything — the command is safe by
@@ -1750,7 +1756,7 @@ run_local_scope() {
                     # swap, so the plan must not advertise it either (the
                     # `[ -n "$sha" ]` on the print below).
                     dry_needs_force=1
-                    dry_reason="(fallback only if the tip is still $sha when this runs; tip unresolvable at plan time — the atomic update-ref -d refuses any other tip)"
+                    dry_reason="only if the tip is still $sha when this runs (tip unresolvable at plan time), --execute runs:"
                 elif [ "$dry_tip" != "$sha" ]; then
                     # Tip MOVED since classification: the execute gate's
                     # compare-and-swap will REFUSE the fallback, so the plan must
@@ -1775,19 +1781,34 @@ run_local_scope() {
                         # annotation says certainty was not established rather
                         # than implying it.
                         dry_needs_force=1
-                        dry_reason="(fallback if -d refuses)"
+                        dry_reason="if that refuses (squash-merged), --execute runs:"
                     fi
                 fi
                 if [ "$dry_needs_force" = 1 ] && [ -n "$sha" ]; then
-                    # ⛔ The fallback is the SAME atomically-checked swap the
-                    # execute path runs (`git update-ref -d <ref> <old>`), not
-                    # `git branch -D`: evaluating the printed line re-parses to
-                    # the executed argv (the F6/F11 parity tests), and its
-                    # old-value argument makes the paste safe on its own — git
-                    # refuses and deletes nothing once the tip has moved.
+                    # ⛔ THE FALLBACK IS PRINTED AS A COMMENT, NEVER AS A SECOND
+                    # COMMAND (F17). It IS the SAME atomically-checked swap the
+                    # execute path runs (`git update-ref -d <ref> <old>`), and
+                    # its old-value argument makes the pasted command safe on its
+                    # own — git refuses and deletes nothing once the tip has
+                    # moved. But for a SQUASH-merged branch — the only shape this
+                    # fallback exists for, because a squash tip is not an
+                    # ancestor of main — the `-d` line above REFUSES. Printing
+                    # the fallback as a SECOND executable line therefore made the
+                    # plan advertise TWO commands where execution runs ONE, and a
+                    # verbatim paste under `set -e` ran the failing `-d` first and
+                    # ABORTED, reaping nothing. A comment cannot abort a paste,
+                    # and it cannot be pasted into running something execution
+                    # would refuse: a `git branch -d -- b || git update-ref -d …`
+                    # one-liner would run the fallback for a branch that became
+                    # CHECKED OUT and dangle HEAD, whereas the execute path’s
+                    # worktree guard refuses that. So `-d` is the executable part
+                    # and the fallback is information, rendered through the SAME
+                    # `quote_argv` (it re-parses to the executed argv) with the
+                    # conditional reason preserved.
                     local local_cmd_force=(git update-ref -d "refs/heads/$br" "$sha")
-                    printf '  %s   # class=%s %s\n' \
-                        "$(quote_argv "${local_cmd_force[@]}")" "$cls" "$dry_reason"
+                    printf '  #   %s\n' "$dry_reason"
+                    printf '  #   %s   [tip must still be %s; checked-out branches are refused]\n' \
+                        "$(quote_argv "${local_cmd_force[@]}")" "$sha"
                 fi
             fi
         done <<<"$delete_list"

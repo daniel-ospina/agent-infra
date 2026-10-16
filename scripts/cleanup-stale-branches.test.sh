@@ -2229,9 +2229,13 @@ F6_WRAP="$FIX/f6-wrap"
 mkdir -p "$F6_WRAP"
 cat > "$F6_WRAP/git" <<'WRAP'
 #!/usr/bin/env bash
-# Test double: intercept `git branch`. In `print` mode it dumps the argv (the
-# paste-evaluation side); otherwise it appends the argv to GIT_WRAP_LOG and then
-# delegates to the real git, so the execute path really deletes.
+# Test double: intercept `git branch` and `git update-ref`. In `print` mode it
+# dumps the argv (the paste-evaluation side); otherwise it appends the argv to
+# GIT_WRAP_LOG (branch) or GIT_WRAP_REF_LOG (update-ref) and then delegates to
+# the real git, so the execute path really deletes. The two logs are SEPARATE
+# (F17): the plan prints only the `-d` line as a COMMAND and describes the
+# force-delete fallback as a COMMENT, so plan ⇄ execute parity is over the `-d`
+# surface, while GIT_WRAP_REF_LOG still captures the executed atomic swap.
 REAL_GIT="${F6_REAL_GIT:?F6_REAL_GIT unset}"
 case "$1" in
     branch|update-ref)
@@ -2240,10 +2244,15 @@ case "$1" in
             printf '\000'
             exit 0
         fi
+        if [ "$1" = "update-ref" ] && [ -n "${GIT_WRAP_REF_LOG:-}" ]; then
+            LOG="$GIT_WRAP_REF_LOG"
+        else
+            LOG="${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        fi
         {
             printf '%s\000' "$@"
             printf '\000'
-        } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        } >>"$LOG"
         ;;
 esac
 exec "$REAL_GIT" "$@"
@@ -2251,16 +2260,22 @@ WRAP
 chmod +x "$F6_WRAP/git"
 
 run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$F6_PR_MAP"
+F6_PLAN_OUT="$OUT"
 assert_eq "$RC" "0" "local paste-safety fixture: dry-run exits 0 (F6)"
-# One `-d` per selected branch, PLUS the force-delete fallback for the SQUASH
-# `merged` shape ONLY. Counted separately so the test also pins that the
-# force-delete stays CONFINED to `merged` and to the shape that needs it (F9),
-# and (F12) that its primitive is the atomic `git update-ref -d`.
+# One `-d` per selected branch; the force-delete fallback for the SQUASH
+# `merged` shape is advertised as a COMMENT only (F17). Counted separately so the
+# test also pins that the force-delete stays CONFINED to `merged` and to the
+# shape that needs it (F9), and (F12) that its primitive is the atomic
+# `git update-ref -d`.
 F6_PLAN_D_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
+F6_PLAN_EXEC_LINES="$(grep -c '^  git ' <<<"$OUT" || true)"
 F6_PLAN_FORCE_COUNT="$(grep -c '^  git update-ref -d ' <<<"$OUT" || true)"
+F6_PLAN_FORCE_CMT="$(grep -c '^  #   git update-ref -d refs/heads/f6-merged' <<<"$OUT" || true)"
 assert_eq "$F6_PLAN_D_COUNT" "6" "the local plan prints one -d command per selected branch (4 redundant + 2 merged) (F6)"
-assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the force-delete fallback for the SQUASH merged class ONLY (F6/F7/F9)"
-assert_contains "$OUT" 'git update-ref -d refs/heads/f6-merged' 'the squash merged class actually prints its force-delete fallback (F6/F7)'
+assert_eq "$F6_PLAN_EXEC_LINES" "6" "the plan has EXACTLY ONE executable line per selected branch; the fallback is not a command (F17)"
+assert_eq "$F6_PLAN_FORCE_COUNT" "0" "the plan prints NO executable update-ref line (the squash fallback is not a command) (F17)"
+assert_eq "$F6_PLAN_FORCE_CMT" "1" "the plan prints the squash force-delete fallback as a COMMENT (F17)"
+assert_contains "$OUT" 'git update-ref -d refs/heads/f6-merged' 'the squash merged class actually advertises its force-delete fallback (F6/F7)'
 assert_contains "$OUT" '# class=redundant' 'the class annotation is still printed (F6)'
 # ⛔ F9: the MERGE-COMMIT-merged shape takes EXACTLY ONE command (`-d`) — `-d`
 # succeeds, so a printed `-D` would be a command execution never runs. Assert
@@ -2270,29 +2285,36 @@ F6_PLAN_MANC_FORCE="$(grep -c '^  git update-ref -d refs/heads/f6-manc' <<<"$OUT
 assert_eq "$F6_PLAN_MANC_D" "1" "the merge-commit-merged shape prints exactly one -d command (F9)"
 assert_eq "$F6_PLAN_MANC_FORCE" "0" "the merge-commit-merged shape prints NO force-delete fallback (F9)"
 assert_contains "$OUT" 'git branch -d -- f6-merged   # class=merged' 'the squash shape still prints its -d command (F9)'
-assert_match "$OUT" '^  git update-ref -d refs/heads/f6-merged [0-9a-f]+   # class=merged \(fallback if -d refuses\)$' 'the squash shape prints its force-delete fallback through the atomic primitive (F9/F12)'
+assert_match "$OUT" '^  #   git update-ref -d refs/heads/f6-merged [0-9a-f]+   \[tip must still be [0-9a-f]+; checked-out branches are refused\]$' 'the squash shape advertises the atomic fallback as a COMMENT with the tip pin (F9/F12/F17)'
+assert_contains "$OUT" 'if that refuses (squash-merged), --execute runs:' 'the comment names the squash-merged refusal that motivates the fallback (F17)'
 
-# Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
-# NUL-delimited records (a ref name cannot contain NUL, so the encoding is exact).
-# The trailing `# class=...` is a shell COMMENT; eval ignores it.
+# Evaluate each printed EXECUTABLE plan line with `git` stubbed to an argv
+# dumper, writing NUL-delimited records (a ref name cannot contain NUL, so the
+# encoding is exact). The trailing `# class=...` is a shell COMMENT; eval ignores
+# it. The force-delete fallback is a COMMENT line (F17) and so is deliberately
+# NOT evaluated here: the plan's executable surface is the `-d` line.
 F6_PLAN_ARGV="$FIX/f6-plan.bin"
 : > "$F6_PLAN_ARGV"
 while IFS= read -r _f6_line; do
     [ -n "$_f6_line" ] || continue
     PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f6_line" >>"$F6_PLAN_ARGV" || true
-done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$OUT" || true)"
+done <<<"$(grep -E '^  git branch -[dD] --' <<<"$OUT" || true)"
 
-# The execute path logs the SAME encoding from its real `git branch` invocations.
+# The execute path logs the SAME encoding from its real `git branch` invocations;
+# the atomic swap is captured separately (F17).
 F6_EXEC_ARGV="$FIX/f6-exec.bin"
+F6_EXEC_REF_ARGV="$FIX/f6-exec-ref.bin"
 : > "$F6_EXEC_ARGV"
+: > "$F6_EXEC_REF_ARGV"
 run_script env PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_LOG="$F6_EXEC_ARGV" \
+    GIT_WRAP_REF_LOG="$F6_EXEC_REF_ARGV" \
     bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --execute --pr-map-file "$F6_PR_MAP"
 assert_eq "$RC" "0" "local paste-safety fixture: --execute exits 0 (F6)"
 if [ -s "$F6_PLAN_ARGV" ] && cmp -s "$F6_PLAN_ARGV" "$F6_EXEC_ARGV"; then
-    ok "evaluating the LOCAL printed plan yields EXACTLY the executed argv (no \$(id) fired) (F6)"
+    ok "evaluating the LOCAL printed plan's -d lines yields EXACTLY the executed -d argv (no \$(id) fired) (F6/F17)"
 else
-    bad "the LOCAL printed plan does NOT re-parse to the executed argv (F6)"
+    bad "the LOCAL printed plan's -d lines do NOT re-parse to the executed -d argv (F6/F17)"
     echo "    plan argv:"
     od -c "$F6_PLAN_ARGV" | head -n 8
     echo "    exec argv:"
@@ -2316,12 +2338,121 @@ F6_EXEC_MERGED_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^f6-merged$' || tr
 assert_eq "$F6_PLAN_MERGED_N" "1" "the plan's NUL argv names f6-merged once through -d (squash shape) (F9)"
 assert_eq "$F6_EXEC_MERGED_N" "1" "the execute path's NUL argv names f6-merged once through -d (squash shape) (F9)"
 # ⛔ F12: the squash shape's force-delete is the ATOMIC `git update-ref -d`, whose
-# old-value argument is the classified tip — pinned on BOTH the printed plan and
-# the executed argv, so an edit back to `git branch -D` goes RED here.
-F6_PLAN_REF_N="$(tr '\0' '\n' < "$F6_PLAN_ARGV" | grep -c '^refs/heads/f6-merged$' || true)"
-F6_EXEC_REF_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^refs/heads/f6-merged$' || true)"
-assert_eq "$F6_PLAN_REF_N" "1" "the plan's NUL argv passes the ref to update-ref -d (squash shape) (F12)"
-assert_eq "$F6_EXEC_REF_N" "1" "the execute path's NUL argv passes the ref to update-ref -d (squash shape) (F12)"
+# old-value argument is the classified tip. Since it is advertised as a COMMENT
+# (F17), the plan side is pinned on the comment text and the EXECUTED argv is
+# pinned on the separate ref log — so an edit back to `git branch -D` goes RED.
+F6_PLAN_REF_CMT="$(grep -c '^  #   git update-ref -d refs/heads/f6-merged ' <<<"$F6_PLAN_OUT" || true)"
+assert_eq "$F6_PLAN_REF_CMT" "1" "the plan's fallback COMMENT passes the ref to update-ref -d (squash shape) (F12/F17)"
+assert_contains "$F6_PLAN_OUT" "[tip must still be $F6_MERGED_SHA; checked-out branches are refused]" 'the fallback COMMENT pins the classified tip (F12)'
+F6_EXEC_REF_N="$(tr '\0' '\n' < "$F6_EXEC_REF_ARGV" | grep -c '^refs/heads/f6-merged$' || true)"
+F6_EXEC_REF_TIP_N="$(tr '\0' '\n' < "$F6_EXEC_REF_ARGV" | grep -c "^$F6_MERGED_SHA$" || true)"
+assert_eq "$F6_EXEC_REF_N" "1" "the execute path passes the ref to update-ref -d exactly once (squash shape) (F12)"
+assert_eq "$F6_EXEC_REF_TIP_N" "1" "the execute path's update-ref -d carries the classified tip as the old value (F12)"
+
+# ⛔ F17: a VERBATIM PASTE of the printed local plan under `set -e` must not abort
+# PART-WAY. For a SQUASH-merged branch the `-d` line REFUSES, so the plan used to
+# carry the force-delete fallback as a SECOND executable line — two commands
+# advertised where execution runs one — and a paste ran the failing `-d` first
+# and stopped before the fallback, reaping nothing. The fallback is now a
+# COMMENT, so the plan's executable surface is exactly the `-d` line and the
+# paste attempts every command the plan advertised.
+#
+# F17_ADVERTISED is the plan's executable argv (print-mode evaluation of the
+# `^  git ` lines); F17_PASTED is what the VERBATIM paste actually attempts
+# under `set -e`. They must be EQUAL. If the fallback is ever printed as a
+# command again, the plan advertises TWO argv records while the paste attempts
+# ONE, and the `cmp` below goes RED.
+F17_ORIGIN="$FIX/f17-origin.git"
+F17_REPO="$FIX/f17-repo"
+new_repo "$F17_REPO" "$F17_ORIGIN"
+cd "$F17_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F17_SCRIPT="$F17_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f17.txt; git add f17.txt; old_commit "init"; git push -q origin main
+F17_MAIN_SHA="$(git rev-parse main)"
+F17_TREE="$(git rev-parse "$F17_MAIN_SHA^{tree}")"
+F17_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F17_TREE" -p "$F17_MAIN_SHA" -m "f17-squash")"
+git update-ref refs/heads/f17-merged "$F17_SHA"
+if git merge-base --is-ancestor "$F17_SHA" main 2>/dev/null; then
+    bad "F17 fixture: the squash tip IS an ancestor of main — -d would succeed and no fallback is printed (F17)"
+else
+    ok "F17 fixture: the squash tip is NOT an ancestor of main (the fallback is reachable) (F17)"
+fi
+F17_MAP="$FIX/f17-pr-map.json"
+cat > "$F17_MAP" <<JSON
+[
+  {"headRefName":"f17-merged","state":"MERGED","headRefOid":"$F17_SHA","baseRefName":"main"}
+]
+JSON
+F17_REAL_GIT="$(command -v git)"
+F17_WRAP="$FIX/f17-wrap"
+mkdir -p "$F17_WRAP"
+cat > "$F17_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F17): dumps/records `git branch` and `git update-ref` argv as
+# NUL-delimited records. `print` mode dumps; otherwise the paste's real run is
+# recorded BEFORE delegating, so the failing `-d` is still captured.
+REAL_GIT="${F17_REAL_GIT:?F17_REAL_GIT unset}"
+case "$1" in
+    branch|update-ref)
+        if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+            printf '%s\000' "$@"
+            printf '\000'
+            exit 0
+        fi
+        {
+            printf '%s\000' "$@"
+            printf '\000'
+        } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        ;;
+esac
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F17_WRAP/git"
+run_script bash "$F17_SCRIPT" --repo "$F17_REPO" --scope local --pr-map-file "$F17_MAP"
+F17_PLAN_OUT="$OUT"
+assert_eq "$RC" "0" "F17: the squash-only dry-run exits 0"
+assert_eq "$(grep -c '^  git ' <<<"$F17_PLAN_OUT" || true)" "1" "F17: the plan has exactly ONE executable line (the -d command)"
+assert_eq "$(grep -c '^  git update-ref -d ' <<<"$F17_PLAN_OUT" || true)" "0" "F17: the plan has NO executable update-ref line (the fallback is a comment)"
+assert_eq "$(grep -c '^  #   git update-ref -d refs/heads/f17-merged ' <<<"$F17_PLAN_OUT" || true)" "1" "F17: the plan carries the fallback as a COMMENT"
+# The plan's advertised executable argv (print-mode evaluation).
+F17_ADVERTISED="$FIX/f17-advertised.bin"; : > "$F17_ADVERTISED"
+while IFS= read -r _f17_line; do
+    [ -n "$_f17_line" ] || continue
+    PATH="$F17_WRAP:$PATH" F17_REAL_GIT="$F17_REAL_GIT" GIT_WRAP_MODE=print \
+        bash -c 'eval "$1"' _ "$_f17_line" >>"$F17_ADVERTISED" || true
+done <<<"$(grep -E '^  git ' <<<"$F17_PLAN_OUT" || true)"
+# The VERBATIM paste: every line under the plan header, run under `set -e`.
+F17_PASTE_SCRIPT="$FIX/f17-paste.sh"
+{
+    printf '#!/usr/bin/env bash\nset -e\n'
+    awk '/^Deletion commands that would run/ { grab=1; next } grab && /^$/ { exit } grab { print }' <<<"$F17_PLAN_OUT"
+} > "$F17_PASTE_SCRIPT"
+assert_contains "$(cat "$F17_PASTE_SCRIPT")" '#   git update-ref -d refs/heads/f17-merged' "F17: the pasted block carries the fallback as a COMMENT"
+assert_eq "$([ -s "$F17_ADVERTISED" ] && echo nonempty || echo empty)" "nonempty" "F17: the plan advertises at least one executable command"
+F17_PASTED="$FIX/f17-pasted.bin"; : > "$F17_PASTED"
+cd "$F17_REPO"
+run_script env PATH="$F17_WRAP:$PATH" F17_REAL_GIT="$F17_REAL_GIT" GIT_WRAP_LOG="$F17_PASTED" \
+    bash "$F17_PASTE_SCRIPT"
+F17_PASTE_RC="$RC"
+cd "$REPO"
+if cmp -s "$F17_ADVERTISED" "$F17_PASTED"; then
+    ok "F17: the verbatim paste attempts EXACTLY the executable commands the plan advertises (no part-way abort) (F17)"
+else
+    bad "F17: the verbatim paste did NOT attempt every advertised command — it aborted part-way (F17)"
+    echo "    advertised argv:"; od -c "$F17_ADVERTISED" | head -n 6
+    echo "    pasted argv:"; od -c "$F17_PASTED" | head -n 6
+fi
+assert_eq "$F17_PASTE_RC" "1" "F17: the paste's rc is 1 — the -d refusal is the documented outcome, not a silent success"
+assert_not_contains "$(tr '\0' '\n' < "$F17_PASTED")" 'update-ref' "F17: the paste never runs the force-delete fallback (a comment cannot be pasted into doing something execution would refuse)"
+if git -C "$F17_REPO" rev-parse -q --verify refs/heads/f17-merged >/dev/null 2>&1; then
+    ok "F17: the branch SURVIVES the paste (-d refused the squash tip; the fallback was not run)"
+else
+    bad "F17: the branch was DELETED by the paste — the fallback ran despite `set -e`"
+fi
 
 cd "$REPO"
 echo ""
@@ -2848,10 +2979,10 @@ cat > "$F11_WRAP/git" <<'WRAP'
 #!/usr/bin/env bash
 # Test double (F11): dumps the `git branch` / `git update-ref` argv as
 # NUL-delimited records in `print` mode; otherwise appends them to GIT_WRAP_LOG
-# and delegates to the real git, so the execute path really deletes. `update-ref`
-# is intercepted too (F12): the squash force-delete is part of the plan ⇄
-# execute argv surface, so leaving it out would make the parity comparison
-# vacuous for that shape.
+# (branch) or GIT_WRAP_REF_LOG (update-ref) and delegates to the real git, so the
+# execute path really deletes. The two logs are SEPARATE (F17): the plan prints
+# only the `-d` line as a COMMAND and describes the squash force-delete fallback
+# as a COMMENT, so plan ⇄ execute parity is over the `-d` surface.
 REAL_GIT="${F11_REAL_GIT:?F11_REAL_GIT unset}"
 case "$1" in
     branch|update-ref)
@@ -2860,10 +2991,15 @@ case "$1" in
             printf '\000'
             exit 0
         fi
+        if [ "$1" = "update-ref" ] && [ -n "${GIT_WRAP_REF_LOG:-}" ]; then
+            LOG="$GIT_WRAP_REF_LOG"
+        else
+            LOG="${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        fi
         {
             printf '%s\000' "$@"
             printf '\000'
-        } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        } >>"$LOG"
         ;;
 esac
 exec "$REAL_GIT" "$@"
@@ -2906,24 +3042,29 @@ run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE
 F11A_PLAN_OUT="$OUT"
 assert_eq "$RC" "0" "F11A: dry-run exits 0"
 assert_contains "$F11A_PLAN_OUT" 'git branch -d -- m-anc   # class=merged' "F11A: the plan prints the -d command (F11)"
-assert_match "$F11A_PLAN_OUT" '^  git update-ref -d refs/heads/m-anc [0-9a-f]+   # class=merged \(fallback if -d refuses\)$' "F11A: the plan prints the force-delete fallback because -d will test HEAD, not origin/main (F11)"
+assert_match "$F11A_PLAN_OUT" '^  #   git update-ref -d refs/heads/m-anc [0-9a-f]+   \[tip must still be [0-9a-f]+; checked-out branches are refused\]$' "F11A: the plan advertises the force-delete fallback as a COMMENT because -d will test HEAD, not origin/main (F11/F17)"
+assert_contains "$F11A_PLAN_OUT" 'if that refuses (squash-merged), --execute runs:' "F11A: the fallback COMMENT names the squash-merged refusal (F17)"
+assert_eq "$(grep -c '^  git ' <<<"$F11A_PLAN_OUT" || true)" "1" "F11A: the plan has exactly ONE executable line (the fallback is a comment) (F17)"
 F11A_PLAN="$FIX/f11a-plan.bin"; : > "$F11A_PLAN"
 while IFS= read -r _f11a_line; do
     [ -n "$_f11a_line" ] || continue
     PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f11a_line" >>"$F11A_PLAN" || true
-done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$F11A_PLAN_OUT" || true)"
+done <<<"$(grep -E '^  git branch -[dD] --' <<<"$F11A_PLAN_OUT" || true)"
 F11A_EXEC="$FIX/f11a-exec.bin"; : > "$F11A_EXEC"
+F11A_EXEC_REF="$FIX/f11a-exec-ref.bin"; : > "$F11A_EXEC_REF"
 run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11A_EXEC" \
+    GIT_WRAP_REF_LOG="$F11A_EXEC_REF" \
     bash "$F11A_SCRIPT" --repo "$F11A_REPO" --scope local --execute --pr-map-file "$F11A_MAP"
 assert_eq "$RC" "0" "F11A: --execute exits 0"
 if [ -s "$F11A_PLAN" ] && cmp -s "$F11A_PLAN" "$F11A_EXEC"; then
-    ok "F11A: plan ⇄ execute argv parity with HEAD off main (merge-commit needs -D) (F11)"
+    ok "F11A: plan ⇄ execute -d argv parity with HEAD off main (merge-commit needs the fallback) (F11/F17)"
 else
-    bad "F11A: plan ⇄ execute argv DIVERGE with HEAD off main (F11)"
+    bad "F11A: plan ⇄ execute -d argv DIVERGE with HEAD off main (F11/F17)"
     echo "    plan argv:"; od -c "$F11A_PLAN" | head -n 6
     echo "    exec argv:"; od -c "$F11A_EXEC" | head -n 6
 fi
+assert_contains "$(tr '\0' '\n' < "$F11A_EXEC_REF")" 'refs/heads/m-anc' "F11A: execute ran the atomic update-ref -d fallback for m-anc (F11)"
 assert_branch_absent m-anc "F11A: the merge-commit branch is reaped via the force-delete fallback (F11)"
 
 # ── (B) the branch tracks origin: `-d` tests the UPSTREAM, so the plan must NOT
@@ -2955,23 +3096,27 @@ F11B_PLAN_OUT="$OUT"
 assert_eq "$RC" "0" "F11B: dry-run exits 0"
 assert_contains "$F11B_PLAN_OUT" 'git branch -d -- sq   # class=merged' "F11B: the plan prints the -d command (F11)"
 assert_not_contains "$F11B_PLAN_OUT" 'git update-ref -d refs/heads/sq' "F11B: the plan prints NO spurious force-delete for an upstream-comparison branch (F11)"
+assert_eq "$(grep -c '^  git ' <<<"$F11B_PLAN_OUT" || true)" "1" "F11B: the plan has exactly ONE executable line (F17)"
 F11B_PLAN="$FIX/f11b-plan.bin"; : > "$F11B_PLAN"
 while IFS= read -r _f11b_line; do
     [ -n "$_f11b_line" ] || continue
     PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f11b_line" >>"$F11B_PLAN" || true
-done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$F11B_PLAN_OUT" || true)"
+done <<<"$(grep -E '^  git branch -[dD] --' <<<"$F11B_PLAN_OUT" || true)"
 F11B_EXEC="$FIX/f11b-exec.bin"; : > "$F11B_EXEC"
+F11B_EXEC_REF="$FIX/f11b-exec-ref.bin"; : > "$F11B_EXEC_REF"
 run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11B_EXEC" \
+    GIT_WRAP_REF_LOG="$F11B_EXEC_REF" \
     bash "$F11B_SCRIPT" --repo "$F11B_REPO" --scope local --execute --pr-map-file "$F11B_MAP"
 assert_eq "$RC" "0" "F11B: --execute exits 0"
 if [ -s "$F11B_PLAN" ] && cmp -s "$F11B_PLAN" "$F11B_EXEC"; then
-    ok "F11B: plan ⇄ execute argv parity with an upstream comparison ref (F11)"
+    ok "F11B: plan ⇄ execute -d argv parity with an upstream comparison ref (F11/F17)"
 else
-    bad "F11B: plan ⇄ execute argv DIVERGE with an upstream comparison ref (F11)"
+    bad "F11B: plan ⇄ execute -d argv DIVERGE with an upstream comparison ref (F11/F17)"
     echo "    plan argv:"; od -c "$F11B_PLAN" | head -n 6
     echo "    exec argv:"; od -c "$F11B_EXEC" | head -n 6
 fi
+assert_eq "$([ -s "$F11B_EXEC_REF" ] && echo nonempty || echo empty)" "empty" "F11B: execute ran NO atomic fallback for an upstream-comparison branch (F11)"
 assert_branch_absent sq "F11B: the upstream-tracking squash branch is reaped via -d (F11)"
 
 cd "$REPO"
