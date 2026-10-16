@@ -2,7 +2,7 @@
 title: "#1328 — skill-enforcer: a `hard` manifest rule for a non-bash, non-MCP tool is silently inert"
 type: engineering
 domain: platform
-doc_status: implemented
+doc_status: live
 created: 2026-10-16
 subjects.team: organisation-design-team
 aboutSubjects: organisation-design-team
@@ -75,11 +75,25 @@ tool name.
 2. **`read` is never a subject.** Reading `<skill>/SKILL.md` is the only documented remedy for
    any gate, so a manifest rule must never block the `read` tool: a pattern that merely
    contains `read` (`git read-tree`, `spread`) would otherwise make **every** gate in the
-   manifest unsatisfiable at once. `loadManifest` reports such a rule **loudly** as a warning
-   (not a defect — the rule stays armed for its other subjects), which is the issue's option
-   (b) applied precisely where it is decidable, so the rule is never *silently* inert.
+   manifest unsatisfiable at once. A `hard` rule whose pattern reaches `read` is therefore
+   **refused at load**: `loadManifest` reports it loudly, sets `ok=false` and DROPS the rule,
+   rather than arming a gate the extension will not fire. That is the issue's option (b)
+   applied precisely where it is decidable, so the line is never *silently* inert. The whole
+   rule is dropped, never partially armed: a broad alternation such as
+   `git read-tree|read` is refused rather than silently downgraded to its non-`read` half,
+   which is the silent downgrade #1321 banned. (A `nudge` rule for the same tool is still
+   accepted — it can only remind — and the shipped manifest raises no refusal at all.)
 3. **`mode` is still honoured in the unified loop** — `nudge` rules never hard-block
    (#1321/T11), pinned by a regression control.
+4. **`write`/`edit` reach the subject loop.** The prerequisite branch used to end in a bare
+   `return undefined;` *before* the manifest loop, so a `hard` rule naming `write` or `edit`
+   was still accepted-and-inert. Measured on the pre-merge head `675216b91`, against this
+   PR's own module, with fixture `hard` rules `^web_search$` and `^write$`:
+   `{"webSearchBlocked":true,"writeBlocked":false,"manifestOk":true}` — `web_search`
+   blocked, `write` did not, while the banner counted both as armed. The branch now falls
+   through to the subject loop, and a `prereq:<skill>` confirm bypass `continue`s instead of
+   returning: bypassing the prerequisite must not bypass a manifest `hard` rule naming the
+   same tool.
 
 ## Threat surface (adversarial domain)
 
@@ -88,8 +102,9 @@ tool name.
 | T1 | `hard` × builtin tool (the issue) | manifest rule `builtin-skill # web_search # hard` | **blocks**, and clears once `skills/builtin-skill/SKILL.md` is read | copy-farm gate driver (RED on `HEAD`: `blocked:false`) |
 | T2 | `hard` × bash / `mcp__*` (controls) | `git commit`, `mcp__svc__do_thing` | still block, with the right skill named | same farm |
 | T3 | `nudge` × builtin | `nudge-skill # web_search # nudge` | never blocks; rule still loaded (`1 rule`) | same farm |
-| T4 | Remedy-tool collision | `git-skill # git read-tree\|read # hard` | `read` is **not** blocked; the bash leg still blocks; the collision is warned on **stderr** | same farm (RED on `HEAD`: `warnings: []`) |
-| T5 | False block introduced by channel completion | all 16 fleet tool names vs the **real** manifest | none blocks; no warning | copy-farm gate driver over `enforcement/dangerous-ops.txt` |
+| T4 | Remedy-tool collision | `git-skill # git read-tree\|read # hard` | `read` is **not** blocked; the colliding rule is **refused at load** (`ok=false`, dropped, reported on stderr) rather than warned-but-armed; a `nudge` rule for `read` is still accepted | same farm |
+| T5 | False block introduced by channel completion | all 16 fleet tool names vs the **real** manifest | none blocks; no warning, no refusal | copy-farm gate driver over `enforcement/dangerous-ops.txt` |
+| T6 | `hard` × `write`/`edit` (the early-return gap) | `commit-workflow # ^write$ # hard` | **blocks** `write`; an unnamed tool does not; reading the SKILL.md clears it; `confirm="prereq:…"` does not bypass it | `extensions/skill-enforcer.test.ts` section F |
 
 ## Residuals (declared, not chased)
 
@@ -99,8 +114,9 @@ tool name.
   #1321's declared T11 requires must not block. That is a decision (may a nudge escalate on
   a read-only MCP query?), not a mechanism, so it is filed with the measurement. The false
   comment has been corrected in place next to the early return.
-- **A `hard` rule naming `read` remains inert, by design and loudly** (warning above). The
-  alternative — arming it — is the unavertible deadlock described in (2).
+- **A `hard` rule whose pattern reaches `read` is refused at load** (dropped, `ok=false`,
+  loudly). The alternatives are worse: arming it is the unavertible deadlock described in
+  (2), and arming it only for its non-`read` subjects is a silent partial enforcement.
 - **`NUDGE_MESSAGES` carries `research` / `debug-workflow` entries that no manifest rule
   names**, so those tailored messages are unused (the generic fallback text is used
   instead). Dead config text, nothing lost; not filed (category B, no named consequence).
@@ -109,8 +125,8 @@ tool name.
 
 | Command | Result |
 |---|---|
-| `npx tsx extensions/skill-enforcer.test.ts` | **49 passed, 0 failed** |
-| `SE_TEST_MODULE_SRC=<HEAD module> npx tsx extensions/skill-enforcer.test.ts` | **46 passed, 3 failed** — the two new legs, with the expected RED evidence (`web_search blocked:false`; `warnings: []`) plus T1's `MODULE_DIR` assertion, which fails only because the seam feeds the module in from `/tmp` (a property of the seam, red on `main` too — it is not a regression) |
+| `npx tsx extensions/skill-enforcer.test.ts` (merged head) | **50 passed, 0 failed** |
+| the same suite on the pre-fix module | RED: the new legs report `web_search blocked:false` and `writeBlocked:false`, with the manifest still `ok:true` — the accepted-and-inert half |
 | `bash scripts/ci/enforce-protocol-table.sh` | PASS (manifest → skills, 4 checked) |
 | `bash scripts/ci/tests/enforce-protocol-table.test.sh` | ALL FIXTURES PASS |
 | `node scripts/check-skill-lint.test.mjs` | 160 passed, 0 failed |
