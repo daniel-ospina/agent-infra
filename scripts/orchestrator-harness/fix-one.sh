@@ -154,6 +154,10 @@ done
 # capture the reviewer's findings (the latest code-review comment on the PR)
 gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 
+# ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test bullet
+# below. The fixer's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for
+# an interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
+# agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$L-fixer.txt" <<EOF
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
@@ -168,7 +172,7 @@ If the branch is behind \`origin/main\`, integrate it first (\`git fetch origin 
 Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirements:
 - Make the fix at the stated location, and add/adjust tests so they genuinely FAIL on the pre-fix code (prove non-vacuity where you can).
 - Register any new test file in \`config/ci-surfaces.yml\` (correct surface) — verify with \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python tools/ci_selection.py --integrity\`.
-- Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite.
+- Run the targeted tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\` (plus the sibling suites the review names). Never run the whole suite. Your worktree has its own \`.venv\` — use THAT one. ⛔ Never search the filesystem for an interpreter: no \`find\`/\`rg\`/\`du\` outside this worktree (a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result). If \`.venv\` is genuinely missing here, run \`uv sync --extra embeddings --extra parity\` once.
 - Stage specific files (never \`git add -A\`); commit with \`git commit -F <message-file>\`; push: \`git push origin $BR\`.
 - Do NOT merge. Do NOT amend already-pushed commits — add a new commit.
 
