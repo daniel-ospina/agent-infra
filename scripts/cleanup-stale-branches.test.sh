@@ -3764,6 +3764,164 @@ else
     bad "F24: the over-long-date local branch was deleted despite the refusal — the local guard did not fire"
 fi
 
+echo ""
+echo "== 46. F25: the commit-date family is bounded by the NORMALISED NUMERIC VALUE, never the raw string =="
+# `git log --format='%ct'` (the REMOTE scope's read) prints a timestamp VERBATIM,
+# so a commit object can carry `0000000009` or `0000000000000009` — the SAME
+# numeric value (9), spelled with a different digit count. Bounding the RAW
+# STRING split that one root into two OPPOSITE failures:
+#   * `0000000009` (10 characters) PASSED the 15-character bound, and then
+#     `date -r 0000000009` FAILED on macOS (it parses the argument as a DATE, not
+#     as seconds, and there is no `date -d` fallback here). Under `set -e` that
+#     assignment aborted the whole remote sweep with a raw `date` usage message,
+#     rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the pass runs
+#     `set +e`, so the same value printed the branch with an EMPTY date instead.
+#   * `0000000000000009` (16 characters, numeric 9) was FALSELY refused as
+#     "outside bash's integer range", although `[ 0000000000000009 -lt 100 ]` is 0
+#     on bash 3.2.57.
+# The shared helper now strips leading zeros BEFORE the bound, and the remote
+# `date` call re-reads the digits as base 10 (`$((10#$v))`), so a zero-padded
+# value can never reach `date` as a date string. This section pins the WHOLE
+# family: it calls the SHARED helper directly for the value classes, then drives
+# BOTH scopes end-to-end with REAL zero-padded commit objects. `git for-each-ref`
+# (the local scope's read) NORMALISES the value, so the LOCAL half pins
+# ACCEPTANCE; the REMOTE half pins that `date` is never handed the raw string.
+F25_HELPER="$FIX/f25-helper.sh"
+sed -n '/^validate_commit_date()/,/^}/p' "$SCRIPT" > "$F25_HELPER"
+if grep -qF 'value="${value#' "$F25_HELPER"; then
+    ok "F25: the SHARED validate_commit_date was extracted from the script under test"
+else
+    bad "F25: could not extract validate_commit_date from the script — the unit half cannot run"
+fi
+f25_helper() { # $1 = the value the shared helper is asked to rule on
+    run_script bash -c 'source "$1"; validate_commit_date "f25-helper" "$2"' _ "$F25_HELPER" "$1"
+}
+
+# ── REFUSED: empty, whitespace, non-numeric ───────────────────────
+f25_helper ""
+assert_eq "$RC" "1" "F25: an EMPTY commit date is REFUSED"
+assert_contains "$OUT" "could not read the commit date of f25-helper" "F25: the empty-value refusal NAMES the ref"
+f25_helper " "
+assert_eq "$RC" "1" "F25: a WHITESPACE commit date is REFUSED"
+f25_helper "abc"
+assert_eq "$RC" "1" "F25: a NON-NUMERIC commit date is REFUSED"
+f25_helper "12x"
+assert_eq "$RC" "1" "F25: a partially-numeric commit date is REFUSED"
+
+# ── REFUSED: genuinely over the file's 15-digit bound ─────────────
+f25_helper "9223372036854775808"
+assert_eq "$RC" "1" "F25: 2^63 is REFUSED as over-range"
+assert_contains "$OUT" "outside bash's integer range" "F25: the over-range refusal says WHY"
+f25_helper "9999999999999999"
+assert_eq "$RC" "1" "F25: a 16-digit over-range value is REFUSED"
+f25_helper "1000000000000000"
+assert_eq "$RC" "1" "F25: 10^15 (16 digits) is REFUSED"
+
+# ── ACCEPTED: zero-padded values, judged by NUMERIC VALUE ─────────
+# These are the assertions that go RED if the leading-zero strip is removed:
+# without it, every value longer than 15 raw characters is refused here, and
+# `0000000009` reaches `date` as a date string in the remote half below.
+f25_helper "0000000009"
+assert_eq "$RC" "0" "F25: 0000000009 (numeric 9) is ACCEPTED"
+f25_helper "0000000000000009"
+assert_eq "$RC" "0" "F25: 0000000000000009 (16 characters, numeric 9) is ACCEPTED — the RAW length is not the bound"
+f25_helper "0000000000000000000000000009"
+assert_eq "$RC" "0" "F25: any number of leading zeros normalises to the same value (26 characters accepted)"
+f25_helper "0000000000"
+assert_eq "$RC" "0" "F25: an all-zero value normalises to 0 and is ACCEPTED"
+f25_helper "0"
+assert_eq "$RC" "0" "F25: epoch 0 is ACCEPTED (it is STALE, not unreadable)"
+f25_helper "012"
+assert_eq "$RC" "0" "F25: the leading-zero short value 012 is ACCEPTED"
+f25_helper "999999999999999"
+assert_eq "$RC" "0" "F25: the 15-digit maximum is still ACCEPTED"
+f25_helper "1577836800"
+assert_eq "$RC" "0" "F25: a normal 10-digit date is ACCEPTED"
+
+# ── REMOTE scope end-to-end: real zero-padded %ct objects ─────────
+F25_ORIGIN="$FIX/f25-origin.git"
+F25_REPO="$FIX/f25-repo"
+new_repo "$F25_REPO" "$F25_ORIGIN"
+cd "$F25_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F25_SCRIPT="$F25_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f25.txt; git add f25.txt; old_commit "init"; git push -q origin main
+F25_PARENT="$(git rev-parse main)"
+F25_TREE="$(git rev-parse "$F25_PARENT^{tree}")"
+# Chain the synthetic commits, so EVERY one of them is an ancestor of main's
+# tip and `git branch -r --merged origin/main` lists each as its own ref.
+# ⛔ NOT called inside `$( )`: a command substitution runs the function in a
+# SUBSHELL, so the `F25_PARENT` chaining update would be discarded and every
+# commit would become a sibling of the base — merged into main, but NOT
+# ancestors of it, so `--merged` would list none of them.
+f25_synth() { # $1 = branch name, $2 = RAW committer timestamp -> sets $F25_OID
+    F25_OID="$(printf 'tree %s\nparent %s\nauthor A <a@b> %s +0000\ncommitter A <a@b> %s +0000\n\nf25 %s\n' \
+        "$F25_TREE" "$F25_PARENT" "$2" "$2" "$1" \
+        | git hash-object -t commit -w --stdin --literally)"
+    F25_PARENT="$F25_OID"
+}
+F25_OID=""
+f25_synth f25-zpad10 0000000009;      F25_ZPAD10="$F25_OID"
+f25_synth f25-zpad16 0000000000000009; F25_ZPAD16="$F25_OID"
+f25_synth f25-zlead 012;               F25_ZLEAD="$F25_OID"
+f25_synth f25-epoch 0;                 F25_EPOCH="$F25_OID"
+f25_synth f25-fresh 2000000000;        F25_FRESH="$F25_OID"
+git update-ref refs/heads/main "$F25_FRESH"
+git update-ref refs/heads/f25-zpad10 "$F25_ZPAD10"
+git update-ref refs/heads/f25-zpad16 "$F25_ZPAD16"
+git update-ref refs/heads/f25-zlead "$F25_ZLEAD"
+git update-ref refs/heads/f25-epoch "$F25_EPOCH"
+git update-ref refs/heads/f25-fresh "$F25_FRESH"
+git push -q --force origin main f25-zpad10 f25-zpad16 f25-zlead f25-epoch f25-fresh
+# Fixture proof: `git log` prints the timestamp VERBATIM (the guard's input),
+# while `git for-each-ref` normalises it (the local scope's input).
+assert_eq "$(git log --no-color -1 --format='%ct' refs/remotes/origin/f25-zpad10)" "0000000009" "F25 fixture: git log prints 0000000009 verbatim (the remote guard's input)"
+assert_eq "$(git log --no-color -1 --format='%ct' refs/remotes/origin/f25-zpad16)" "0000000000000009" "F25 fixture: git log prints the 16-character zero-padded value verbatim"
+assert_eq "$(git for-each-ref --no-color --format='%(committerdate:unix)' refs/heads/f25-zpad16)" "9" "F25 fixture: git for-each-ref normalises the same value to 9 (the local scope's input)"
+
+run_script bash "$F25_SCRIPT" --repo "$F25_REPO" --scope remote
+assert_eq "$RC" "0" "F25 remote: the zero-padded family does NOT abort the sweep (no raw-date abort, no refusal)"
+assert_not_contains "$OUT" "illegal option" "F25 remote: no raw 'date' usage message (the abort F25 closes)"
+assert_not_contains "$OUT" "usage: date" "F25 remote: no raw 'date' usage message (Linux shape)"
+assert_not_contains "$OUT" "could not read the commit date" "F25 remote: a zero-padded date is NOT treated as unreadable"
+assert_no_match "$OUT" 'last commit: *$' "F25 remote: no candidate is printed with an EMPTY date"
+assert_contains "$OUT" "Found 4 stale merged branch(es)" "F25 remote: all four stale zero-padded/epoch candidates are SELECTED (none silently dropped)"
+assert_match "$OUT" 'origin/f25-zpad10 +last commit: [0-9]{4}-[0-9]{2}-[0-9]{2}' "F25 remote: 0000000009 is evaluated and rendered as its NUMERIC date"
+assert_match "$OUT" 'origin/f25-zpad16 +last commit: [0-9]{4}-[0-9]{2}-[0-9]{2}' "F25 remote: the 16-character zero-padded value is rendered as a date, not refused"
+assert_contains "$OUT" "origin/f25-zlead" "F25 remote: the leading-zero short value 012 is selected"
+assert_contains "$OUT" "origin/f25-epoch" "F25 remote: epoch 0 is still stale and selected"
+assert_not_contains "$OUT" "origin/f25-fresh" "F25 remote: the large legitimate FRESH date is NOT selected"
+
+run_script bash "$F25_SCRIPT" --repo "$F25_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F25 remote --execute: exits 0 over the zero-padded family"
+for _f25b in f25-zpad10 f25-zpad16 f25-zlead f25-epoch; do
+    if [ "$(git -C "$F25_ORIGIN" rev-parse -q --verify "refs/heads/$_f25b" || echo GONE)" = "GONE" ]; then
+        ok "F25 remote: stale $_f25b WAS deleted (accepted, evaluated, reaped)"
+    else
+        bad "F25 remote: stale $_f25b SURVIVED the execute sweep — it was silently dropped"
+    fi
+done
+unset _f25b
+assert_eq "$(git -C "$F25_ORIGIN" rev-parse -q --verify refs/heads/f25-fresh || echo GONE)" "$F25_FRESH" "F25 remote: the FRESH branch SURVIVES --execute"
+
+# ── LOCAL scope end-to-end: the SAME zero-padded commit date ──────
+# Nothing on the local path reads `date` (its plan prints no date), but the
+# SHARED helper is on it — so this pins that the local sweep ACCEPTS a
+# zero-padded committer date instead of falsely refusing the whole run, and
+# evaluates it as its numeric value (for-each-ref normalised it to 9).
+git update-ref refs/heads/f25-local-zpad "$F25_ZPAD16"
+F25_MAP="$FIX/f25-pr-map.json"
+cat > "$F25_MAP" <<JSON
+[
+  {"headRefName":"f25-local-zpad","state":"MERGED","headRefOid":"$F25_ZPAD16","baseRefName":"main"}
+]
+JSON
+run_script bash "$F25_SCRIPT" --repo "$F25_REPO" --scope local --pr-map-file "$F25_MAP" --execute
+assert_eq "$RC" "0" "F25 local: a zero-padded committer date does NOT refuse the local sweep (rc=0)"
+assert_not_contains "$OUT" "outside bash's integer range" "F25 local: the 16-character zero-padded value is NOT refused as over-range"
+assert_branch_absent f25-local-zpad "F25 local: the zero-padded local branch IS treated as stale and reaped"
+
 cd "$REPO"
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

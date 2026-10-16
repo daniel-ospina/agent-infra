@@ -702,10 +702,10 @@ is_member() {
     return 1
 }
 
-# ── Shared: commit-date validation (F18/F22/F24) ──────────────────
+# ── Shared: commit-date validation (F18/F22/F24/F25) ──────────────
 # validate_commit_date <ref> <value> — return 0 (printing nothing) for a value
 # this sweep can compare with $CUTOFF_EPOCH, and return 1 with a diagnostic on
-# stderr NAMING <ref> for an EMPTY, NON-NUMERIC or OVER-LONG value.
+# stderr NAMING <ref> for an EMPTY, NON-NUMERIC or OVER-RANGE value.
 #
 # ⛔ ONE implementation, called by BOTH the remote and the local scope. The two
 # scopes each grew their own copy of this check and then DRIFTED: the remote
@@ -718,12 +718,29 @@ is_member() {
 # see). F18, F22 and F24 are the same defect at the two call sites; the single
 # helper is what keeps them from diverging a third time.
 #
-# ⛔ 15 DIGITS is the file's own bound — the same one `--cutoff`, `--pr-limit`
-# and CLEANUP_BRANCH_LOG_MAX_BYTES are validated with: a value matching ^[0-9]+$
-# can still exceed bash's integer range, and the digit count is tested BEFORE any
-# arithmetic, so the overflow is never reached. A genuine all-digit date
-# (including epoch 0, which IS stale) passes and is evaluated normally by the
-# caller — this helper rules on READABILITY, never on staleness.
+# ⛔ THE BOUND IS ON THE NORMALISED NUMERIC VALUE, NEVER ON THE RAW STRING (F25).
+# `git log --format='%ct'` prints a timestamp VERBATIM, so a commit object can
+# carry `0000000009` or `0000000000000009` — the SAME numeric value (9) spelled
+# with a different digit count. Bounding the raw string split that one root into
+# two OPPOSITE failures:
+#   * `0000000009` (10 raw characters) PASSED the bound, and then
+#     `date -r 0000000009` FAILED on macOS — it parses that argument as a DATE,
+#     not as seconds, and macOS has no `date -d` fallback — so under `set -e`
+#     the assignment aborted the whole remote sweep with a raw `date` usage
+#     message, rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the pass
+#     runs `set +e`, so the same value instead printed the branch with an EMPTY
+#     date.
+#   * `0000000000000009` (16 raw characters, numeric value 9) was FALSELY refused
+#     as "outside bash's integer range", although `[ 0000000000000009 -lt 100 ]`
+#     is 0 on bash 3.2.57.
+# Leading zeros are therefore stripped BEFORE the bound is tested. 15 DIGITS is
+# the file's own bound — the same one `--cutoff`, `--pr-limit` and
+# CLEANUP_BRANCH_LOG_MAX_BYTES are validated with — and it is now tested on the
+# value every later arithmetic and `date` call actually sees. A genuine all-digit
+# date with ANY number of leading zeros (including epoch 0, which IS stale) is
+# ACCEPTED and evaluated normally by the caller — this helper rules on
+# READABILITY, never on staleness. It REFUSES exactly an EMPTY, a NON-NUMERIC, or
+# a genuinely OVER-15-DIGIT numeric value.
 validate_commit_date() {
     local ref="$1" value="${2:-}"
     case "$value" in
@@ -734,6 +751,16 @@ validate_commit_date() {
             return 1
             ;;
     esac
+    # ⛔ F25: strip the leading zeros so the bound tests the VALUE, not its
+    # spelling. `%%[!0]*` removes the longest suffix whose FIRST character is a
+    # non-zero digit — that suffix starts at the first non-zero digit — so the
+    # prefix it leaves behind is EXACTLY the leading zeros. An all-zero value has
+    # no such suffix, so it normalises to the empty string and is mapped to `0`.
+    # The expansion is quoted, so the pattern is never globbed against the
+    # filesystem, and it cannot fail under `set -e`/`set -u` on bash 3.2.57
+    # (the non-numeric case above already guaranteed a non-empty all-digit value).
+    value="${value#"${value%%[!0]*}"}"
+    [ -n "$value" ] || value=0
     if [ "${#value}" -gt 15 ]; then
         echo "ERROR: the commit date of $ref ($value) is outside bash's integer range, so it" >&2
         echo "ERROR: cannot be compared with the cutoff. Refusing the sweep rather than letting" >&2
@@ -1125,7 +1152,14 @@ run_remote_scope() {
         # back with `IFS=$'\t' read`, as the local scope already does.
         if [ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]; then
             local COMMIT_DATE_HR
-            COMMIT_DATE_HR="$(date -r "$COMMIT_DATE" '+%Y-%m-%d' 2>/dev/null || date -d "@$COMMIT_DATE" '+%Y-%m-%d')"
+            # ⛔ F25: `date -r` reads its argument as a DATE STRING on macOS, so a
+            # zero-padded `%ct` such as `0000000009` is rejected (`illegal option
+            # -- d`, no `date -d` on macOS) and, under `set -e`, aborted the whole
+            # remote sweep with rc=1 before any plan was printed. `$((10#$...))`
+            # re-reads the digit string as base 10, so `date` ALWAYS receives plain
+            # seconds — the helper above already bounded the normalised value to
+            # ≤15 digits, so this arithmetic cannot overflow.
+            COMMIT_DATE_HR="$(date -r "$((10#$COMMIT_DATE))" '+%Y-%m-%d' 2>/dev/null || date -d "@$((10#$COMMIT_DATE))" '+%Y-%m-%d')"
             # ⛔ `git branch -r --merged` lists EVERY remote's tracking refs, but
             # deletion is ALWAYS `git push origin --delete ${branch#origin/}`. For
             # a non-origin ref that prefix-strip removes nothing, so the premise
