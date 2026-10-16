@@ -62,10 +62,15 @@
 #   removed; chain-merge hardcoding 75; the fixcount refund; an out-of-directory `"$PI_BIN" -p`
 #   invoker; an in-directory `pi  -p` one; a NEAR-REVERSED flag order (`pi --no-session -p`); the
 #   missing-helper guard neutered to `|| true`; and `elapsed` set to the literal `garbage`.
-#   FIVE FURTHER CENSUS SPELLINGS were added after round 4, each verified to go RED: a LINE-CONTINUED
-#   `pi -p \` + newline (which the round-3 same-line pattern had REGRESSED out of the round-2
-#   detector's reach), a Python argv-list launcher and a Node one (both invisible to a
-#   shell-whitespace boundary), and both earlier spellings re-checked so neither fix traded a class.
+#   NINE FURTHER CENSUS SPELLINGS were added across rounds 4-5, each verified to go RED: a
+#   LINE-CONTINUED `pi -p \` + newline (which the round-3 same-line pattern had REGRESSED out of the
+#   round-2 detector's reach), a Python argv-list launcher, a Node one, a MULTI-LINE argv list
+#   (Python list and a bash array -- both invisible to any adjacency-based pattern), an extensionless
+#   launcher and a `.cjs` one (both skipped by an extension allow-list the tree's own files prove is
+#   wrong), and the round-2/round-3 spellings re-checked so no fix traded a class for another.
+#   The census is therefore ADJACENCY-FREE: print-mode flag as a TOKEN + `--no-session` anywhere, with
+#   an EXCLUSION list of non-launcher paths instead of an extension allow-list. Stated limits: an
+#   invocation that omits `--no-session`, or one whose name AND flags are both assembled at runtime.
 #   FOUR deliberate DEPARTURES from the tortoise original, all named in-file:
 #     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
 #        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).

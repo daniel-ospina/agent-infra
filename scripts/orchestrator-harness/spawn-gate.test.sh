@@ -78,39 +78,32 @@ done
 # a tab, and `pi --print` are all invisible to the literal. So: census the WHOLE tracked scripts/
 # tree, match the command TOKEN, and pin both sets as equalities. `retired/` is excluded — retired
 # scripts cannot be dispatched — and named here so the exclusion is visible rather than silent.
-scan_pi() { # scan_pi <root-relative-prefix>  → space-separated repo-relative paths
-  # ⛔ THE DETECTOR KEYS ON THE FLAG SEQUENCE, NOT ONLY ON THE COMMAND NAME (P2, review round
-  # 2026-10-15). A bare `pi` token misses an invocation whose binary is in a variable —
-  # `PI_BIN="${PI_BIN:-pi}"; "$PI_BIN" -p --no-session …` — which IS a real launch path, so the
-  # pattern also matches the flag pair ONLY a print-mode invocation carries (`-p --no-session` /
-  # `-p --provider`). LIMIT, stated rather than hidden: a static census cannot resolve a command
-  # whose name AND flags are both assembled at runtime; that case is covered by the runtime
-  # contract (everything must route through run_agent), not by a grep.
-  local p found="" MATCH_PI
-  MATCH_PI='((^|[^[:alnum:]_-])-p([^[:alnum:]_-]|$)|(^|[^[:alnum:]_-])--print([^[:alnum:]_-]|$)).*--no-session|--no-session.*((^|[^[:alnum:]_-])-p([^[:alnum:]_-]|$)|(^|[^[:alnum:]_-])--print([^[:alnum:]_-]|$))'
-  # ⛔ ORDER-INSENSITIVE, MULTI-LANGUAGE, AND LINE-CONTINUATION-SAFE. Three rounds shaped this,
-  # and each round's fix broke something the previous one caught — so all three failure modes are
-  # recorded here rather than in a commit message:
-  #   • round 2 keyed on `pi` IMMEDIATELY followed by `-p`, so `pi --no-session -p …` — both tokens
-  #     literal, only the order changed — was invisible, and it globbed `*.sh` only.
-  #   • round 3 fixed that with a same-LINE flag pair, and REGRESSED the continuation case that
-  #     round 2's pattern had caught: `grep -E` is line-based, so `pi -p \` + newline + `--no-session`
-  #     presents one token per line. Hence the `awk` join at the match below.
-  #   • and the boundary must not assume SHELL whitespace: an idiomatic Python/JS launcher passes
-  #     argv as a LIST, so `-p` is delimited by a quote or a comma — the multi-language arm was
-  #     inert for exactly the files it was widened to cover.
-  # STATED LIMIT: an invocation that omits `--no-session` (the harness convention requires it), or
-  # one whose command name AND flags are both assembled at runtime, is outside a static census —
-  # that residue is the runtime `run_agent` contract's job, not a grep's.
+scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
+  # ⛔ THE CENSUS IS ADJACENCY-FREE, AND THAT IS THE POINT. Four review rounds went into this one
+  # predicate, so the history lives here rather than in commit messages:
+  #   • round 2 keyed on `pi` IMMEDIATELY followed by `-p` → blind to `pi --no-session -p`.
+  #   • round 3 switched to a same-LINE flag pair → REGRESSED the line-continuation case that
+  #     round 2 had caught: `grep -E` is line-based, so `pi -p \` + newline + `--no-session`
+  #     presents one token per line.
+  #   • round 4 made the boundary delimiter-agnostic but kept ADJACENCY and a `*.sh|*.py|*.mjs|…`
+  #     allow-list → still blind to a multi-line argv LIST (an idiomatic Python/JS launcher) and to
+  #     `.cjs` / extensionless launchers, which this tree already ships.
+  # So the test is the TOKEN PAIR, not their proximity: a file is an invoker if it carries a
+  # print-mode flag as a TOKEN and `--no-session` ANYWHERE. No line joining, no flag order, and an
+  # EXCLUSION list of non-launcher paths rather than an extension allow-list (a new extension cannot
+  # silently drop a launch path out of the census).
+  # STATED LIMIT: an invocation that omits `--no-session` (the harness convention requires it), or one
+  # whose command name AND flags are both assembled at runtime, is outside a static census — that
+  # residue is the runtime `run_agent` contract's job, not a grep's.
+  local p found="" FLAG
+  FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
-    case "$p" in */retired/*|*/testdata/*|*.test.*|*/selftest.sh) continue ;; esac
-    case "$p" in *.sh|*.py|*.mjs|*.js|*.ts) ;; *) continue ;; esac
-    awk '{ if (sub(/\\$/,"")) printf "%s", $0; else print $0 }' "$ROOT/$p" 2>/dev/null | grep -qE "$MATCH_PI" || continue
+    case "$p" in
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env) continue ;; esac
+    grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
+    grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
-  # --others --exclude-standard: a launch path is a NEW file first and a tracked one later, so a
-  # census over `ls-files` alone cannot see it at the moment it is added — which is the only moment
-  # it matters (P2, review round 2026-10-15: an untracked `"$PI_BIN" -p` invoker was invisible).
-  done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$1")
+  done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard "$@")
   printf '%s' "${found# }"
 }
 # The censuses need a git work tree: `git ls-files` is the index-bounded primitive (per AGENTS.md
