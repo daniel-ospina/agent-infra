@@ -142,6 +142,28 @@ function git(cwd: string, args: string[]) {
   if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed in ${cwd}: ${r.stderr}`);
   return r.stdout.trim();
 }
+/**
+ * Is `dir` a LINKED worktree? Probed with git DIRECTLY — deliberately NOT via
+ * the module's own `isLinkedWorktree`, so an expectation built on this answer is
+ * never a mirror of the code it grades. `--git-dir` is this checkout's gitdir
+ * and `--git-common-dir` the shared one: they differ exactly for a linked
+ * worktree. An unreadable answer is "main checkout", matching the module's own
+ * conservative default.
+ */
+function gitIsLinkedWorktree(dir: string): boolean {
+  const r = spawnSync("git", ["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], {
+    cwd: dir,
+    encoding: "utf-8",
+  });
+  if (r.status !== 0) return false;
+  const [gitDir, commonDir] = r.stdout
+    .trim()
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (!gitDir || !commonDir) return false;
+  return realpathSync(gitDir) !== realpathSync(commonDir);
+}
 /** A real main checkout (and optionally a linked worktree off it). */
 function mainCheckout(): { main: string; linked: string } {
   const main = tmpDir("sr-main-");
@@ -218,6 +240,21 @@ await test("LINKED WORKTREE guard: a lane's sandbox root contributes no sources"
   const collected = collectSources({ projectRoot: linked, moduleRoot: main, farm: join(tmpDir("sr-f-"), "skills") });
   deepEqual(collected.sources.map((s) => s.name), ["from-main"]);
   deepEqual(collected.skippedRoots, [linked]);
+});
+
+await test("REGRESSION: a MAIN checkout module root still CONTRIBUTES — only a worktree is skipped", () => {
+  // The rule the CI failure exposed: the worktree guard SKIPS a sandbox, it does
+  // not disable the module root. Asserted deterministically (both roots are
+  // fixtures) because the ambient checkout shape must never decide this leg: a
+  // lane runs in a linked worktree and CI checks out a main checkout, so a leg
+  // that reads `REPO_ROOT` can only ever exercise one of the two shapes.
+  const { main: moduleRoot } = mainCheckout();
+  const { main: project } = mainCheckout();
+  writeSkill(moduleRoot, ["skills"], "from-module-main");
+  writeSkill(project, ["skills"], "from-project");
+  const collected = collectSources({ projectRoot: project, moduleRoot, farm: join(tmpDir("sr-f-"), "skills") });
+  deepEqual(collected.sources.map((s) => s.name).sort(), ["from-module-main", "from-project"]);
+  deepEqual(collected.skippedRoots, []);
 });
 
 await test("SELF-LINK guard: a root whose `skills/` IS the farm contributes nothing", () => {
@@ -709,7 +746,18 @@ await test("T8/T1 — a farm-symlinked module still resolves the REAL repo, and 
   strictEqual(json.loadError, null, `module failed to load: ${json.loadError}`);
   strictEqual(realpathSync(json.MODULE_DIR), realpathSync(join(REPO_ROOT, "extensions")));
   strictEqual(realpathSync(json.REPO_DIR), realpathSync(REPO_ROOT));
-  deepEqual(json.linked, ["linked-from-farm"]);
+  // The REAL repo root contributes its skills ONLY when it is a MAIN checkout —
+  // contract rule 4 skips a linked worktree (the #1214b guard). The expectation
+  // is therefore DERIVED from the checkout shape (probed with git, above) rather
+  // than assumed: assuming a worktree is what made this leg green in every lane
+  // and red on the first CI run (`33 passed, 1 failed`, the fixture's skill
+  // linked PLUS the repo's). Derived, not mirrored: the module root's own names
+  // come from `enumerateSkills`, so a drop of either root fails this leg.
+  const repoNames = gitIsLinkedWorktree(REPO_ROOT)
+    ? []
+    : enumerateSkills(REPO_ROOT).skills.map((s) => s.name);
+  ok(json.linked.includes("linked-from-farm"), "the PROJECT's skill must link");
+  deepEqual(json.linked, [...new Set([...repoNames, "linked-from-farm"])].sort());
   equal(json.logs.length, 1);
 });
 
