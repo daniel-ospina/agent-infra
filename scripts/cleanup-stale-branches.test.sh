@@ -271,6 +271,17 @@ assert_eq "$RC" "1" "an EMPTY PR-map file is refused (exit 1)"
 assert_contains "$OUT" "PR map is EMPTY" "empty file → emptiness named"
 assert_not_contains "$OUT" "── SELECTED" "empty file → nothing classified"
 
+# F5: the refusal must cover WHITESPACE-ONLY input, not just a zero-byte file.
+# The guard is now a `case` glob (bash 3.2's `${var//[[:space:]]/}` hangs on a
+# real ~88 KB gh payload); this pins the SEMANTICS it replaces: a file of only
+# spaces/tabs/newlines is refused exactly like an empty one, before any shape
+# check runs.
+printf '   \n\t \n\n' > "$FIX/pr-whitespace-only.json"
+run_script bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$FIX/pr-whitespace-only.json"
+assert_eq "$RC" "1" "a WHITESPACE-ONLY PR-map file is refused (F5)"
+assert_contains "$OUT" "PR map is EMPTY" "whitespace-only file → emptiness named (F5)"
+assert_not_contains "$OUT" "── SELECTED" "whitespace-only file → nothing classified (F5)"
+
 printf '{}\n' > "$FIX/pr-object.json"
 run_script bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$FIX/pr-object.json"
 assert_eq "$RC" "1" "{} is refused (not silently an empty keep-set)"
@@ -327,6 +338,66 @@ assert_contains "$OUT" "PR map refused" "malformed JSON → refusal"
 
 run_script bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$FIX/pr-map-missing-file.json"
 assert_eq "$RC" "1" "a missing map FILE is refused"
+
+# F5: a REAL gh payload is parsed, never hung. On macOS's /bin/bash 3.2.57 the
+# old guard `[ -z "${src//[[:space:]]/}" ]` is SUPERLINEAR: an ~88 KB
+# whitespace-heavy gh payload never returns (>30 s and climbing), so the LOCAL
+# scope neither classified nor failed closed. This builds a >=80 KB
+# pretty-printed map in the `gh pr list --json ...` shape and requires the run to
+# COMPLETE (bounded wall clock — macOS has no `timeout`) and to CLASSIFY with the
+# fixture's own PR entries still applied. Mutation proof: restore
+# `${src//[[:space:]]/}` and this run exceeds the bound and is killed.
+F5BIG_MAP="$FIX/f5-big-map.json"
+{
+    printf '[\n'
+    jq -c '.[]' "$PR_MAP" | while IFS= read -r _f5_obj; do
+        printf '  %s,\n' "$_f5_obj"
+    done
+    _f5_i=0
+    while [ "$_f5_i" -lt 900 ]; do
+        printf '  {\n    "headRefName": "filler/branch-%04d",\n    "state": "CLOSED",\n    "headRefOid": "%040d",\n    "baseRefName": "main"\n  },\n' "$_f5_i" "$_f5_i"
+        _f5_i=$((_f5_i + 1))
+    done
+    printf '  {"headRefName":"filler/final","state":"CLOSED","headRefOid":"%040d","baseRefName":"main"}\n' 0
+    printf ']\n'
+} > "$F5BIG_MAP"
+F5BIG_BYTES="$(wc -c < "$F5BIG_MAP" | tr -d ' ')"
+if [ "$F5BIG_BYTES" -ge 81920 ]; then
+    ok "F5 fixture is >=80 KB of whitespace-heavy JSON ($F5BIG_BYTES bytes)"
+else
+    bad "F5 fixture is too small to reproduce the hang ($F5BIG_BYTES bytes, want >=81920)"
+fi
+# Background-and-poll: macOS has no `timeout`. The fixed run is near-instant; a
+# 60 s bound is generous and still catches the superlinear hang.
+F5BIG_BOUND=60
+F5BIG_START=$SECONDS
+set +e
+bash "$LOCAL_SCRIPT" --scope local --pr-map-file "$F5BIG_MAP" >"$FIX/f5-big.out" 2>&1 &
+F5BIG_PID=$!
+F5BIG_WAITED=0
+while kill -0 "$F5BIG_PID" 2>/dev/null; do
+    sleep 1
+    F5BIG_WAITED=$((F5BIG_WAITED + 1))
+    if [ "$F5BIG_WAITED" -ge "$F5BIG_BOUND" ]; then
+        kill -9 "$F5BIG_PID" 2>/dev/null || true
+        break
+    fi
+done
+wait "$F5BIG_PID" 2>/dev/null
+F5BIG_RC=$?
+set -e
+F5BIG_ELAPSED=$((SECONDS - F5BIG_START))
+F5BIG_OUT="$(cat "$FIX/f5-big.out" 2>/dev/null || true)"
+assert_eq "$F5BIG_RC" "0" "a >=80 KB whitespace-heavy PR map is PARSED and exits 0 (F5)"
+assert_contains "$F5BIG_OUT" "Classified" "the large map reached local classification (F5)"
+assert_contains "$F5BIG_OUT" "── Summary ──" "the large map ran the whole local pass to the summary (F5)"
+assert_match "$F5BIG_OUT" '^  delete +merged +feat/merged-one$' 'the large map still applies its own MERGED entry (F5)'
+assert_match "$F5BIG_OUT" '^  keep +open-pr +open-pr-one$' 'the large map still applies its own OPEN-PR entry (F5)'
+if [ "$F5BIG_ELAPSED" -lt "$F5BIG_BOUND" ]; then
+    ok "the large map completed in ${F5BIG_ELAPSED}s (< ${F5BIG_BOUND}s bound) (F5)"
+else
+    bad "the large map did not complete within ${F5BIG_BOUND}s — the guard hangs (F5)"
+fi
 
 echo ""
 echo "== 4. local scope dry-run: classification =="
@@ -782,7 +853,13 @@ echo ""
 echo "== 9. local scope --execute: deletion mechanics =="
 
 run_script bash "$LOCAL_SCRIPT" --scope local --execute --pr-map-file "$PR_MAP"
-assert_eq "$RC" "0" "execute exits 0 (a per-branch failure is reported, not fatal)"
+# F1: a per-branch failure is REPORTED and must ALSO make the pass non-zero —
+# `--help` states the status means "everything selected was reaped", so
+# `Failed: 1` with rc=0 was a sweep that reported success while a selected branch
+# was left behind. Mutation proof: restore `return 0` at the end of
+# run_local_scope and this assertion goes red (`RC` becomes 0).
+assert_eq "$RC" "1" "execute exits NON-ZERO when a selected branch was not reaped (F1)"
+assert_contains "$OUT" "1 local branch delete(s) FAILED" "the non-zero exit names the failed-delete count (F1)"
 assert_match "$OUT" '^  deleted +merged +feat/merged-one' 'merged branch deleted (via the -D fallback)'
 assert_contains "$OUT" "via -D: squash-merged PR" 'the -D fallback is named in the output'
 assert_match "$OUT" '^  deleted +redundant +redundant-one' 'redundant branch deleted'
@@ -1082,7 +1159,7 @@ run_script bash "$F8_SCRIPT" --scope local --pr-map-file "$PR_MAP_OTHER"
 assert_eq "$RC" "0" "dash-named fixture: dry-run exits 0 (Finding 8)"
 assert_match "$OUT" '^  delete +redundant +-x$' 'a branch named -x is SELECTED as redundant (Finding 8)'
 assert_match "$OUT" '^  delete +redundant +--version$' 'a branch named --version is SELECTED as redundant (Finding 8)'
-assert_contains "$OUT" 'git branch -d -- "-x"' 'the dry-run echo mirrors the -- guard (Finding 8)'
+assert_contains "$OUT" 'git branch -d -- -x   # class=redundant' 'the dry-run echo mirrors the -- guard, annotation outside the argv (Finding 8)'
 run_script bash "$F8_SCRIPT" --scope local --execute --pr-map-file "$PR_MAP_OTHER"
 assert_eq "$RC" "0" "dash-named fixture: --execute exits 0 (Finding 8)"
 assert_match "$OUT" '^  deleted +redundant +-x' 'a branch named -x is actually DELETED (Finding 8)'
@@ -1111,8 +1188,8 @@ git push -q origin refs/heads/-x:refs/heads/-x
 git push -q origin refs/heads/--version:refs/heads/--version
 run_script bash "$F10_SCRIPT" --scope remote
 assert_eq "$RC" "0" "dash-named remote fixture: dry-run exits 0 (F5)"
-assert_contains "$OUT" "--force-with-lease=\"refs/heads/-x:$F10_MAIN_SHA\" -- \"refs/heads/-x\"" 'the dry-run echo mirrors the -- guard and the lease for -x (F5/F1)'
-assert_contains "$OUT" "--force-with-lease=\"refs/heads/--version:$F10_MAIN_SHA\" -- \"refs/heads/--version\"" 'the dry-run echo mirrors the -- guard and the lease for --version (F5/F1)'
+assert_contains "$OUT" "--force-with-lease=refs/heads/-x:$F10_MAIN_SHA -- refs/heads/-x" 'the dry-run echo mirrors the -- guard and the lease for -x (F5/F2)'
+assert_contains "$OUT" "--force-with-lease=refs/heads/--version:$F10_MAIN_SHA -- refs/heads/--version" 'the dry-run echo mirrors the -- guard and the lease for --version (F5/F2)'
 run_script bash "$F10_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "dash-named remote fixture: --execute exits 0 (F5)"
 if [ -z "$(git ls-remote origin 'refs/heads/-x' 2>/dev/null)" ]; then
@@ -1174,7 +1251,13 @@ assert_match "$OUT" '^  keep +non-origin-remote +upstream/foo$' 'the non-origin 
 # `git push origin --delete "upstream/foo"`. Assert on the deletion PLAN instead:
 # origin must never be told to delete a ref whose `--merged` premise was
 # evaluated on another remote. RED whenever the origin confinement is reverted.
-assert_no_match "$OUT" '--delete -- "refs/heads/upstream/foo"' 'the deletion plan never targets the non-origin ref through origin (Finding 1)'
+# F3: the previous assertion here (`assert_no_match "$OUT" '--delete -- "refs/heads/upstream/foo"'`)
+# was permanently VACUOUS once the plan started emitting the lease: the literal
+# `--delete -- "` can never occur in any line the plan prints. Guard the SAME
+# defect with a lease-aware negative that genuinely tracks the fix — RED when the
+# `origin/*` confinement is reverted (the plan would then lease
+# refs/heads/upstream/foo through origin).
+assert_no_match "$OUT" 'force-with-lease=refs/heads/upstream/foo:' 'the deletion plan never leases the non-origin ref through origin (Finding 1)'
 
 run_script bash "$F1_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "non-origin fixture: remote --execute exits 0 (Finding 1)"
@@ -1264,7 +1347,10 @@ assert_eq "$RC" "1" "a negative refspec refuses the remote dry-run too (F1)"
 # the dry-run returns before ever reaching, so it could not fail in either
 # direction. Assert on the dry-run's DELETE PLAN instead, which the pre-fix
 # dry-run DOES print and which is therefore inversion-sensitive.
-assert_no_match "$OUT" '--delete -- "refs/heads/foo"' 'the dry-run plans no deletion behind the refspec (F1)'
+# F3: the `--delete -- "refs/heads/foo"` form can no longer occur (the plan is
+# always leased), so that negative was unfalsifiable. Lease-aware replacement:
+# RED if the negative-refspec refusal is removed and the plan leases refs/heads/foo.
+assert_no_match "$OUT" 'force-with-lease=refs/heads/foo:' 'the dry-run plans no leased deletion behind the refspec (F1)'
 
 echo ""
 echo "== 19. remote scope VERIFIES the target before deleting — a NARROWED POSITIVE refspec (R3-1) =="
@@ -1484,8 +1570,11 @@ git rev-parse --verify -q refs/heads/foo >/dev/null
 R33_FOO_OID="$(git -C "$R33_ORIGIN" rev-parse refs/heads/foo)"
 run_script bash "$R33_SCRIPT" --scope remote
 assert_eq "$RC" "0" "pipe-named fixture: dry-run exits 0 (R3-3)"
-assert_match "$OUT" '--delete --force-with-lease="refs/heads/foo[|]bar:[0-9a-f]+" -- "refs/heads/foo[|]bar"' 'the dry-run plan targets foo|bar with the lease, not a truncated foo (R3-3/F1)'
-assert_no_match "$OUT" '--delete -- "refs/heads/foo"$' 'the dry-run plan does NOT target plain foo (R3-3)'
+assert_match "$OUT" '--delete --force-with-lease=refs/heads/foo\\[|]bar:[0-9a-f]+ -- refs/heads/foo\\[|]bar' 'the dry-run plan targets foo|bar with the lease, not a truncated foo (R3-3/F2)'
+# F3: `--delete -- "refs/heads/foo"$` can never occur under the leased form, so it
+# was unfalsifiable. The lease-aware negative is RED if the truncation returns
+# (the plan would lease plain refs/heads/foo).
+assert_no_match "$OUT" 'force-with-lease=refs/heads/foo:' 'the dry-run plan does NOT lease plain foo (R3-3)'
 run_script bash "$R33_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "pipe-named fixture: --execute exits 0 (R3-3)"
 if [ -z "$(git ls-remote origin 'refs/heads/foo|bar' 2>/dev/null)" ]; then
@@ -1672,8 +1761,8 @@ done
 unset _r
 run_script bash "$P3_SCRIPT" --scope remote
 assert_eq "$RC" "0" "qualified-ref fixture: dry-run exits 0 (F2)"
-assert_contains "$OUT" "--force-with-lease=\"refs/heads/@:$P3_SHA\" -- \"refs/heads/@\"" 'the plan targets the QUALIFIED ref for @ with the lease (F2/F1)'
-assert_contains "$OUT" "--force-with-lease=\"refs/heads/refs/heads/foo:$P3_SHA\" -- \"refs/heads/refs/heads/foo\"" 'the plan targets the QUALIFIED nested ref with the lease (F2/F1)'
+assert_contains "$OUT" "--force-with-lease=refs/heads/@:$P3_SHA -- refs/heads/@" 'the plan targets the QUALIFIED ref for @ with the lease (F2)'
+assert_contains "$OUT" "--force-with-lease=refs/heads/refs/heads/foo:$P3_SHA -- refs/heads/refs/heads/foo" 'the plan targets the QUALIFIED nested ref with the lease (F2)'
 run_script bash "$P3_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "qualified-ref fixture: --execute exits 0 (F2)"
 for _r in 'refs/heads/@' 'refs/heads/foo' 'refs/heads/refs/heads/foo'; do
@@ -1835,7 +1924,7 @@ fi
 # would be re-rewritten at push time).
 run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote
 assert_eq "$RC" "0" "chained-rewrite fixture: dry-run exits 0 (R5-1)"
-assert_contains "$OUT" "git push origin --delete --force-with-lease=\"refs/heads/chain-doomed:$R51_A_OID\" -- \"refs/heads/chain-doomed\"" 'the dry-run plan deletes through origin WITH the lease, not the resolved URL (R5-1/F1)'
+assert_contains "$OUT" "git push origin --delete --force-with-lease=refs/heads/chain-doomed:$R51_A_OID -- refs/heads/chain-doomed" 'the dry-run plan deletes through origin WITH the lease, not the resolved URL (R5-1/F2)'
 assert_not_contains "$OUT" "$R51_B" 'the dry-run plan does NOT echo the resolved URL as the push target (R5-1)'
 run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote --execute
 assert_eq "$RC" "0" "chained-rewrite fixture: --execute exits 0 (R5-1)"
@@ -1886,7 +1975,7 @@ if [ -n "$DRY_CMD" ]; then
 else
     bad "command-parity fixture: the dry-run printed no delete command (F1)"
 fi
-assert_contains "$DRY_CMD" "--force-with-lease=\"refs/heads/plan-match:$F1C_OID\"" 'the dry-run command carries the classified-oid lease (F1)'
+assert_contains "$DRY_CMD" "--force-with-lease=refs/heads/plan-match:$F1C_OID" 'the dry-run command carries the classified-oid lease (F1)'
 
 # GIT_TRACE=1 makes git print `trace: built-in: git push <argv...>`. The script
 # captures the push's own stderr (2>&1) and re-prints it, so the trace lands in OUT.
@@ -1898,8 +1987,9 @@ if [ -n "$TRACE_CMD" ]; then
 else
     bad "command-parity fixture: GIT_TRACE did not expose the executed push argv (F1)"
 fi
-# Normalise only the copy-paste shell quotes the dry-run echo adds; the command
-# string (every FLAG and operand) must otherwise be identical.
+# The plan is now shell-quoted only where the shell needs it, so removing `"`
+# is a no-op for the plain `plan-match` name; the command string (every FLAG and
+# operand) must be identical to what git executed.
 DRY_CMD_PLAIN="${DRY_CMD//\"/}"
 TRACE_CMD_PLAIN="${TRACE_CMD#*built-in: }"
 if [ -n "$TRACE_CMD_PLAIN" ] && [ "$TRACE_CMD_PLAIN" = "$DRY_CMD_PLAIN" ]; then
@@ -1907,6 +1997,195 @@ if [ -n "$TRACE_CMD_PLAIN" ] && [ "$TRACE_CMD_PLAIN" = "$DRY_CMD_PLAIN" ]; then
 else
     bad "the dry-run plan and the executed command DIFFER (F1): plan='$DRY_CMD_PLAIN' exec='$TRACE_CMD_PLAIN'"
 fi
+
+echo ""
+echo "== 29c. the dry-run plan is PASTE-SAFE for legal special ref names (F2) =="
+# A git ref name may legally contain `$()`, a double quote, a single quote, a
+# backtick or `|` (`git check-ref-format` accepts them). The old plan echoed
+# `--force-with-lease="refs/heads/$local_branch:$oid"`, so pasting the printed
+# line ran `$(id)` as a COMMAND and mangled a `"`-bearing name into a different
+# refspec. The plan is now built as ONE array and rendered through `quote_argv`,
+# so evaluating the printed line must re-parse to EXACTLY the argv the execute
+# path runs. This asserts that round-trip byte-for-byte (NUL-delimited argv), not
+# merely that a lease substring appears. Names are chosen with DISTINCT lengths
+# so the length-descending delete order is total and the two streams are
+# comparable without a sort.
+F2_ORIGIN="$FIX/f2-origin.git"
+F2_REPO="$FIX/f2-repo"
+new_repo "$F2_REPO" "$F2_ORIGIN"
+cd "$F2_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F2_SCRIPT="$F2_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f2.txt; git add f2.txt; old_commit "init"; git push -q origin main
+# Legal special ref names: `$()` (11), backtick (9), single quote (5), double
+# quote (4). A SPACE is NOT a legal ref name (check-ref-format rejects it), so it
+# cannot enter this path — the quoting primitive's space handling is asserted
+# separately below.
+F2_NAMES=('pwn$(id)end' 'back`tick' "s'qzz" 'q"xx')
+for _n in "${F2_NAMES[@]}"; do
+    git checkout -q -b "$_n" main
+    git push -q -u origin "$_n"
+    git checkout -q main
+done
+F2_REAL_GIT="$(command -v git)"
+F2_WRAP="$FIX/f2-wrap"
+mkdir -p "$F2_WRAP"
+cat > "$F2_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: intercept `git push`. In `print` mode it dumps the argv (the
+# paste-evaluation side); otherwise it appends the argv to GIT_WRAP_LOG and then
+# delegates to the real git, so the execute path really deletes.
+REAL_GIT="${F2_REAL_GIT:?F2_REAL_GIT unset}"
+if [ "$1" = "push" ]; then
+    if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+        printf '%s\000' "$@"
+        printf '\000'
+        exit 0
+    fi
+    {
+        printf '%s\000' "$@"
+        printf '\000'
+    } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F2_WRAP/git"
+
+run_script bash "$F2_SCRIPT" --repo "$F2_REPO" --scope remote
+assert_eq "$RC" "0" "paste-safety fixture: dry-run exits 0 (F2)"
+F2_PLAN_COUNT="$(grep -c '^  git push origin --delete' <<<"$OUT" || true)"
+assert_eq "$F2_PLAN_COUNT" "4" "the plan prints one paste-safe command per special-named ref (F2)"
+
+# Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
+# NUL-delimited records (a ref name cannot contain NUL, so the encoding is exact).
+F2_PLAN_ARGV="$FIX/f2-plan.bin"
+: > "$F2_PLAN_ARGV"
+while IFS= read -r _f2_line; do
+    [ -n "$_f2_line" ] || continue
+    PATH="$F2_WRAP:$PATH" F2_REAL_GIT="$F2_REAL_GIT" GIT_WRAP_MODE=print \
+        bash -c 'eval "$1"' _ "$_f2_line" >>"$F2_PLAN_ARGV"
+done <<<"$(grep '^  git push origin --delete' <<<"$OUT" || true)"
+
+# The execute path logs the SAME encoding from its real `git push` invocations.
+F2_EXEC_ARGV="$FIX/f2-exec.bin"
+: > "$F2_EXEC_ARGV"
+run_script env PATH="$F2_WRAP:$PATH" F2_REAL_GIT="$F2_REAL_GIT" GIT_WRAP_LOG="$F2_EXEC_ARGV" \
+    bash "$F2_SCRIPT" --repo "$F2_REPO" --scope remote --execute
+assert_eq "$RC" "0" "paste-safety fixture: --execute exits 0 (F2)"
+if [ -s "$F2_PLAN_ARGV" ] && cmp -s "$F2_PLAN_ARGV" "$F2_EXEC_ARGV"; then
+    ok "evaluating the printed plan yields EXACTLY the executed argv (no \$(id) fired) (F2)"
+else
+    bad "the printed plan does NOT re-parse to the executed argv (F2)"
+    echo "    plan argv:"
+    od -c "$F2_PLAN_ARGV" | head -n 8
+    echo "    exec argv:"
+    od -c "$F2_EXEC_ARGV" | head -n 8
+fi
+
+# The quoting primitive must also keep a SPACE inside ONE argv element, even
+# though no legal ref name can carry one (check-ref-format rejects it), so this
+# cannot be exercised end-to-end. Source the SHIPPED function — not a copy — and
+# round-trip the argument.
+F2_QUOTE_FN="$FIX/f2-quote.sh"
+sed -n '/^quote_argv() {/,/^}/p' "$SCRIPT" > "$F2_QUOTE_FN"
+if [ -s "$F2_QUOTE_FN" ]; then
+    # shellcheck disable=SC1090
+    . "$F2_QUOTE_FN"
+    F2_SPACE_LINE="$(quote_argv git push --delete '--force-with-lease=refs/heads/a b:deadbeef' -- 'refs/heads/a b')"
+    F2_SPACE_ARGS="$(F2_SPACE_LINE="$F2_SPACE_LINE" bash -c 'git() { printf "[%s]" "$@"; }; eval "$F2_SPACE_LINE"')"
+    assert_eq "$F2_SPACE_ARGS" "[push][--delete][--force-with-lease=refs/heads/a b:deadbeef][--][refs/heads/a b]" "quote_argv keeps a space inside ONE argv element (F2)"
+else
+    bad "could not extract quote_argv from the script (F2)"
+fi
+
+echo ""
+echo "== 29d. the LOCAL dry-run plan is PASTE-SAFE for legal special branch names (F6) =="
+# The SAME defect F2 fixed for the remote `git push` plan existed in the LOCAL
+# plan: `printf '  git branch -d -- "%s"'` echoes the branch name inside double
+# quotes, and a git ref name may LEGALLY contain `$(...)`, `"`, a single quote or
+# `|` (`git check-ref-format` accepts them). Pasting
+# `git branch -d -- "pwn$(id)end"` runs `$(id)` as a COMMAND and a `"`-bearing
+# name re-parses into a different argument. The local plan is now built as ONE
+# array and rendered through the SAME `quote_argv`, so evaluating the printed
+# line must re-parse to EXACTLY the argv the execute path runs. The
+# `# class=<cls>` annotation must stay OUTSIDE that argv.
+F6_ORIGIN="$FIX/f6-origin.git"
+F6_REPO="$FIX/f6-repo"
+new_repo "$F6_REPO" "$F6_ORIGIN"
+cd "$F6_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F6_SCRIPT="$F6_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f6.txt; git add f6.txt; old_commit "init"; git push -q origin main
+F6_MAIN_SHA="$(git rev-parse main)"
+# `$(id)` (11), `|` (4), single quote (5), double quote (4): all legal ref-name
+# characters, all at main's tip so each is classed `redundant` (`-d` succeeds,
+# no `-D`). Created with plumbing (update-ref) so no working-tree operation runs.
+F6_NAMES=('pwn$(id)end' 'p|pe' "s'qzz" 'q"xx')
+for _f6n in "${F6_NAMES[@]}"; do
+    git update-ref "refs/heads/$_f6n" "$F6_MAIN_SHA"
+done
+F6_REAL_GIT="$(command -v git)"
+F6_WRAP="$FIX/f6-wrap"
+mkdir -p "$F6_WRAP"
+cat > "$F6_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: intercept `git branch`. In `print` mode it dumps the argv (the
+# paste-evaluation side); otherwise it appends the argv to GIT_WRAP_LOG and then
+# delegates to the real git, so the execute path really deletes.
+REAL_GIT="${F6_REAL_GIT:?F6_REAL_GIT unset}"
+if [ "$1" = "branch" ]; then
+    if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+        printf '%s\000' "$@"
+        printf '\000'
+        exit 0
+    fi
+    {
+        printf '%s\000' "$@"
+        printf '\000'
+    } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F6_WRAP/git"
+
+run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "local paste-safety fixture: dry-run exits 0 (F6)"
+F6_PLAN_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
+assert_eq "$F6_PLAN_COUNT" "4" "the local plan prints one paste-safe command per special-named branch (F6)"
+assert_contains "$OUT" '# class=redundant' 'the class annotation is still printed (F6)'
+
+# Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
+# NUL-delimited records (a ref name cannot contain NUL, so the encoding is exact).
+# The trailing `# class=...` is a shell COMMENT; eval ignores it.
+F6_PLAN_ARGV="$FIX/f6-plan.bin"
+: > "$F6_PLAN_ARGV"
+while IFS= read -r _f6_line; do
+    [ -n "$_f6_line" ] || continue
+    PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_MODE=print \
+        bash -c 'eval "$1"' _ "$_f6_line" >>"$F6_PLAN_ARGV" || true
+done <<<"$(grep '^  git branch -d --' <<<"$OUT" || true)"
+
+# The execute path logs the SAME encoding from its real `git branch` invocations.
+F6_EXEC_ARGV="$FIX/f6-exec.bin"
+: > "$F6_EXEC_ARGV"
+run_script env PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_LOG="$F6_EXEC_ARGV" \
+    bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --execute --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "0" "local paste-safety fixture: --execute exits 0 (F6)"
+if [ -s "$F6_PLAN_ARGV" ] && cmp -s "$F6_PLAN_ARGV" "$F6_EXEC_ARGV"; then
+    ok "evaluating the LOCAL printed plan yields EXACTLY the executed argv (no \$(id) fired) (F6)"
+else
+    bad "the LOCAL printed plan does NOT re-parse to the executed argv (F6)"
+    echo "    plan argv:"
+    od -c "$F6_PLAN_ARGV" | head -n 8
+    echo "    exec argv:"
+    od -c "$F6_EXEC_ARGV" | head -n 8
+fi
+# The annotation must NOT have entered the argv: every executed argv is exactly
+# `branch -d -- <name>`. A stray `# class=...` argument would add a 5th element.
+F6_BAD_ELEM="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c 'class=' || true)"
+assert_eq "$F6_BAD_ELEM" "0" "the class annotation stays OUTSIDE the quoted argv (F6)"
 
 cd "$REPO"
 echo ""

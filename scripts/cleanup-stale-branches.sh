@@ -299,6 +299,24 @@ require_value() {
     fi
 }
 
+# quote_argv <arg>... — render an argv as ONE shell line that a human can paste
+# and have the shell re-parse to EXACTLY that argv. The dry-run plan is printed
+# for copy-paste, so the printed text is a SHELL line, not a mere display: a ref
+# name may legally contain `"`, `$()`, a backtick or `|` (`git check-ref-format`
+# permits them), and a hand-built `--force-with-lease="...$branch..."` echo lets
+# those run as commands when pasted. `%q` is bash's own re-input-safe quoting, so
+# the round-trip is the shell's property, not a hand-kept escaping table. The
+# printer and the execute path consume the SAME array, so they cannot diverge.
+quote_argv() {
+    local _qa_sep="" _qa_arg _qa_q
+    for _qa_arg in "$@"; do
+        printf -v _qa_q '%q' "$_qa_arg"
+        printf '%s%s' "$_qa_sep" "$_qa_q"
+        _qa_sep=" "
+    done
+    printf '\n'
+}
+
 # ── Parse args ────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -558,10 +576,22 @@ load_pr_map() {
     # `printf '' | jq` reads no document, prints nothing and exits 0, so an
     # empty payload would silently become an empty keep-set — the OPEN-PR rule
     # disabled without a word.
-    if [ -z "${src//[[:space:]]/}" ]; then
-        echo "PR map is EMPTY — refusing: an empty map is not an empty PR rule" >&2
-        return 1
-    fi
+    #
+    # ⛔ The test is a `case` GLOB, never `[ -z "${src//[[:space:]]/}" ]`. On
+    # macOS's /bin/bash 3.2.57 the pattern substitution is SUPERLINEAR in the
+    # input: a real `gh pr list` payload (~88 KB) does not return in >30 s, so
+    # the whole LOCAL scope stops here — it neither classifies nor fails closed.
+    # The glob answers the same question in O(n) and matches exactly the same
+    # set (POSIX `[:space:]`: space, tab, newline, CR, FF, VT). A NUL cannot
+    # reach here (command substitution strips it), so "empty or whitespace-only"
+    # is complete.
+    case "$src" in
+        *[![:space:]]*) ;;
+        *)
+            echo "PR map is EMPTY — refusing: an empty map is not an empty PR rule" >&2
+            return 1
+            ;;
+    esac
 
     # ── fail closed on the SHAPE ──────────────────────────────────
     # `{}` is the trap this catches: `jq` iterates an empty OBJECT to zero
@@ -991,17 +1021,26 @@ run_remote_scope() {
         echo "Deletion commands that would run:"
         for entry in "${STALE_BRANCHES[@]}"; do
             branch="${entry%%$'\t'*}"
-            # ⛔ Decode the classified oid the SAME way the execute loop does, and
-            # print the LEASED form. The `--force-with-lease` clause IS the safety
-            # mechanism: it sends the classified oid through the SAME resolution
-            # as the delete, so a pushInsteadOf/pushurl divergence is refused by
-            # the receiving repository instead of deleting unconditionally. An
-            # operator who copies a plan that omits it runs exactly the unguarded
-            # delete the lease was added to prevent. Keep this string in lockstep
-            # with the execute path below (the F1 test asserts they are the same).
+            # ⛔ Build the command ONCE, as an array, and PRINT it through
+            # `quote_argv`. The dry-run exists to tell the operator what
+            # `--execute` WOULD run, so the printed form and the executed argv
+            # must be the SAME array — two hand-kept copies drift, and the
+            # printed copy is the one a human pastes into a shell. `%q` quoting
+            # in `quote_argv` makes pasting re-parse to exactly this argv even
+            # when the ref name carries `"`, `$()`, a backtick or `|` (all legal
+            # in a git ref name); the raw `--force-with-lease="...$branch..."`
+            # echo let those run as commands on paste.
+            # ⛔ The decoded oid is the SAME one the execute loop leases, and the
+            # `--force-with-lease` clause IS the safety mechanism: it sends the
+            # classified oid through the SAME resolution as the delete, so a
+            # pushInsteadOf/pushurl divergence is refused by the receiving
+            # repository instead of deleting unconditionally.
             local tracking_oid="${entry##*$'\t'}"
             local local_branch="${branch#origin/}"
-            echo "  git push origin --delete --force-with-lease=\"refs/heads/$local_branch:$tracking_oid\" -- \"refs/heads/$local_branch\""
+            local cmd=(git push origin --delete \
+                "--force-with-lease=refs/heads/$local_branch:$tracking_oid" \
+                -- "refs/heads/$local_branch")
+            printf '  %s\n' "$(quote_argv "${cmd[@]}")"
         done
         return 0
     fi
@@ -1090,10 +1129,13 @@ run_remote_scope() {
         # exactly the oid this sweep classified. An unresolvable classified oid
         # leaves the lease's expected value EMPTY, and git then requires the ref
         # not to exist — a refusal, never an unguarded delete (fail-closed).
+        # ⛔ The delete runs the SAME array the dry-run plan prints (built just
+        # below), so the printed plan and the executed argv cannot diverge.
         local push_out="" push_rc=0
-        push_out="$(git push origin --delete \
-            --force-with-lease="refs/heads/$local_branch:$tracking_oid" \
-            -- "refs/heads/$local_branch" 2>&1)" || push_rc=$?
+        local cmd=(git push origin --delete \
+            "--force-with-lease=refs/heads/$local_branch:$tracking_oid" \
+            -- "refs/heads/$local_branch")
+        push_out="$("${cmd[@]}" 2>&1)" || push_rc=$?
         if [ "$push_rc" -eq 0 ]; then
             if [ -n "$push_out" ]; then printf '%s\n' "$push_out"; fi
             echo "    ✅ deleted"
@@ -1463,7 +1505,17 @@ run_local_scope() {
         echo "Deletion commands that would run (-D fallback only for the merged class):"
         while IFS=$'\t' read -r cls br; do
             [ -n "$cls" ] || continue
-            printf '  git branch -d -- "%s"   # class=%s\n' "$br" "$cls"
+            # ⛔ Build the command ONCE, as an array, and PRINT it through
+            # `quote_argv` — the SAME primitive the remote plan uses. A local
+            # branch name may legally contain `"`, `$()`, a backtick or `|`
+            # (`git check-ref-format` permits them), so the old hand-built
+            # `git branch -d -- "%s"` echo ran `$(id)` as a COMMAND and mangled
+            # a `"`-bearing name when the operator pasted it. `%q` quoting makes
+            # evaluating the printed line re-parse to exactly the argv the
+            # execute path runs. The `# class=<cls>` annotation stays OUTSIDE the
+            # quoted argv: it is informational and must not become an argument.
+            local local_cmd=(git branch -d -- "$br")
+            printf '  %s   # class=%s\n' "$(quote_argv "${local_cmd[@]}")" "$cls"
         done <<<"$delete_list"
         echo ""
     else
@@ -1496,6 +1548,20 @@ run_local_scope() {
     fi
     echo "  Kept:      $keep_total (worktree: $keep_worktree, main: $keep_main, open-pr: $keep_openpr, not-stale: $keep_notstale, merged-tip-moved: $keep_tipmoved, merged-base-not-main: $keep_offbase, non-origin-upstream: $keep_nonorigin, localonly: $keep_localonly)"
     echo ""
+
+    # ⛔ The `Failed:` count is not decorative. `--help` promises the exit status
+    # means "everything selected was reaped", and the status is the ONLY signal a
+    # scheduler reads. A per-branch `git branch -d` that legitimately refuses was
+    # reported and then discarded by `return 0`, so `--scope both` could report
+    # success while a selected local branch was never reaped (under-deletion —
+    # the branch is still there, so it is recoverable, but the sweep lied about
+    # completing). Fail the pass whenever a selected branch was left behind; the
+    # per-branch lines remain so the operator sees WHICH one.
+    if [ "$EXECUTE" = true ] && [ "$failed" -gt 0 ]; then
+        echo "ERROR: $failed local branch delete(s) FAILED: a selected branch was not reaped." >&2
+        echo "ERROR: The exit status means 'everything selected was reaped', so the sweep does NOT report success." >&2
+        return 1
+    fi
 
     return 0
 }
