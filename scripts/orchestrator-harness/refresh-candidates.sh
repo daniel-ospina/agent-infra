@@ -202,45 +202,52 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 
 # ── gh must be able to AUTHENTICATE, or the pre-flight's verdicts are degraded fiction ─────────
 # WHY. The surfaces of tools/collision_preflight.py that DECIDE a verdict — issue metadata, open PRs,
-# the assignee/holder surfaces — are gh-backed (its three git-backed surfaces — local branches,
-# remote branches, worktrees — answer without gh and cannot make a collision). With an
+# the assignee/holder surfaces — are gh-backed. The three it reads from git (local branches, remote
+# branches, local worktrees) are NOT a substitute: all three are BLOCKING — a ref naming the issue
+# forces a COLLISION — and the local-branch surface's terminal lookup is itself a gh call whose
+# failure deliberately KEEPS the ref blocking (fail-closed). With an
 # unauthenticated gh the tool does NOT refuse — it answers from whatever it can still read, which is
 # how a LANDED issue came back as a COLLISION (measured 2026-10-16, #1328: `VERDICT: COLLISION ...
 # ALSO INCOMPLETE: 3 surface(s) could not be queried` under HOME=/home/ubuntu, `VERDICT: LANDED`
 # under HOME=/tmp/cell-home). The caller cannot tell that answer apart from a real collision, so an
 # environment failure becomes "a peer owns it, retry next pass" on every candidate, forever. This
 # check turns it back into ONE named provisioning failure.
-# ⛔ PERMANENT (3) IS RESERVED FOR A CREDENTIAL FAILURE, whose remedy needs a human. The probe is
-# scoped to the host the pre-flight queries, retried once, and a failure that does NOT name a
-# credential problem is returned TRANSIENT (1) — a network/API fault must not latch the permanent
-# `.refresh-blocked` marker that only a human can clear (#1853 review).
+# ⛔ PERMANENT (3) IS RESERVED FOR A MISSING CREDENTIAL, whose remedy needs a human; everything else
+# is TRANSIENT (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker
+# that only a human can clear (#1853 review).
 # `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
 gh_env_verdict() {
-  local out attempt
+  local host="${GH_HOST:-github.com}" out
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ⛔ SCOPE THE PROBE TO THE HOST THE PRE-FLIGHT QUERIES. `gh auth status` exits non-zero if an
-  # account on ANY configured host has a problem, so a stale second host (an enterprise entry in
-  # hosts.yml) would refuse a cell whose github.com credential is perfectly good (#1853 review).
-  for attempt in 1 2; do
-    if out="$(gh auth status --hostname "${GH_HOST:-github.com}" 2>&1)"; then return 0; fi
-    # ONE retry: the exit status alone cannot separate a transport failure from a credential
-    # failure — the classification below is what separates them.
-    [ "$attempt" -eq 1 ] && sleep "${GH_AUTH_RETRY_SLEEP:-1}"
-  done
-  # A credential failure NAMES itself; a network/API fault does not. Default to TRANSIENT: a wrong
-  # TRANSIENT costs one retry, a wrong PERMANENT latches the MERGE-ONLY marker (#1853 review).
-  if ! printf '%s\n' "$out" | grep -qiE 'not logged|gh auth login|invalid|expired|bad credentials|authenticat'; then
-    echo "[refresh] TRANSIENT: gh auth status failed in the environment the pre-flight runs in (HOME=$HOME) without naming a credential problem — treating it as a network/API fault, retried next cycle (#1736)"
+  # ⛔ SCOPE THE PROBE TO THE HOST THE PRE-FLIGHT QUERIES: `gh auth status` exits non-zero if an
+  # account on ANY configured host has a problem, so an unrelated stale host would refuse a cell
+  # whose github.com credential is fine (#1853 review). ONE call captures both status and output.
+  out="$(gh auth status --hostname "$host" 2>&1)" && return 0
+  # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. `gh auth status` cannot tell a
+  # transport fault from a rejected credential — measured on gh 2.97.0: behind a dead proxy a PURE
+  # network fault still prints "The token in ~/.config/gh/hosts.yml is invalid.", so ANY text match
+  # on "invalid"/"expired"/"authenticat" classifies an outage as a credential failure and latches the
+  # permanent marker a human must clear (#1853 review). `gh auth token` is an OFFLINE lookup of the
+  # stored credential (hosts.yml / the keyring) — it never touches the network, so its exit status is
+  # cause-independent. The token itself is never printed: stdout goes to /dev/null.
+  #   no stored credential -> PERMANENT: this IS the broken-HOME defect (#1328), and retrying cannot
+  #                           conjure a credential.
+  #   a stored credential  -> TRANSIENT: an outage and a stale token are indistinguishable here, and
+  #                           the safe direction is to retry — a pass that judges nothing then aborts
+  #                           rc=1 loudly every cycle, while a wrong PERMANENT stops dispatch until a
+  #                           human intervenes.
+  if ! gh auth token --hostname "$host" >/dev/null 2>&1; then
+    echo "[refresh] NOT PROVISIONABLE: no gh credential is STORED for $host in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
     printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    return "$EXIT_TRANSIENT"
+    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
+    return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] NOT PROVISIONABLE: gh is NOT authenticated in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+  echo "[refresh] TRANSIENT: a gh credential IS stored for $host but could not be validated in the environment the pre-flight runs in (HOME=$HOME) — an outage and a stale token are indistinguishable here, so this is retried next cycle rather than latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-  echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
-  return "$EXIT_NOT_PROVISIONABLE"
+  return "$EXIT_TRANSIENT"
 }
 
 # ── --check: the read-only provisioning verdict ───────────────────────────────────────────────
@@ -494,6 +501,7 @@ usable=0
 # ATTEMPTED, because it is incremented before the LIMIT break. The abort and the final report use
 # `judged`, so neither over-states the pass by one (#1853 review).
 judged=0
+degraded=0
 while read -r N; do
   [ -z "${N:-}" ] && continue
   grep -qx "$N" "$O/checked.txt" 2>/dev/null && continue
@@ -529,12 +537,28 @@ while read -r N; do
     exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
+  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer only
+  # emits `ALSO INCOMPLETE` beside COLLISION/INCOMPLETE, but `resolve_preflight` prefers the repo's
+  # OWN copy, so a vendored producer could pair it with CLEAN and reproduce the healthy-looking
+  # reading this pass exists to refuse (#1853 review). LANDED is exempt: the producer's contract
+  # makes a terminal signal decisive over an incomplete one.
+  degraded=0
+  grep -q 'ALSO INCOMPLETE' <<<"$PRE" && degraded=1
   case "$V" in
     CLEAN)
-      usable=$((usable + 1))
-      echo "$N" >> "$O/checked.txt"
-      echo "$N" >> "$O/candidates.txt"
-      echo "[refresh] +#$N CLEAN -> backlog" ;;
+      # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
+      # not read every surface and would have used the conservative verdict had it been able to.
+      # Measured 2026-10-16 (#1328): an issue whose true verdict was LANDED came back degraded.
+      # Counting a degraded answer as usable would let a broken environment report a healthy
+      # `checked N; backlog now 0` — the reading this pass exists to refuse (#1853 review).
+      if [ "$degraded" -eq 1 ]; then
+        echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
+      else
+        usable=$((usable + 1))
+        echo "$N" >> "$O/checked.txt"
+        echo "$N" >> "$O/candidates.txt"
+        echo "[refresh] +#$N CLEAN -> backlog"
+      fi ;;
     COLLISION)
       # ⛔ A COLLISION that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict: the tool
       # could not read every surface and defaulted to the conservative one. Measured 2026-10-16
@@ -542,7 +566,7 @@ while read -r N; do
       # INCOMPLETE: 3 surface(s) could not be queried`. Counting it as usable would let a broken
       # environment report a healthy `checked N; backlog now 0` — the reading this pass exists to
       # refuse (#1853 review).
-      if grep -q 'ALSO INCOMPLETE' <<<"$PRE"; then
+      if [ "$degraded" -eq 1 ]; then
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1))
@@ -553,6 +577,9 @@ while read -r N; do
       # has left the pool by itself. Counted as a usable verdict — otherwise a pass of LANDEDs is
       # reported as "judged NOTHING" — but never queued and never written to checked.txt (#1853
       # review; the canonical consumer's LANDED arm).
+      # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:258-280, #8560/#8625 —
+      # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
+      # port-provenance.txt:208, NOT DONE).
       usable=$((usable + 1))
       echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
     INCOMPLETE)

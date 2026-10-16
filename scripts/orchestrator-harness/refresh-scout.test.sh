@@ -130,6 +130,32 @@ mk_gh_noauth() {
 #!/bin/bash
 case "$1 $2" in
   "auth status") echo "To get started with GitHub CLI, please run: gh auth login" >&2; exit 1 ;;
+  "auth token") echo "no oauth token found for github.com" >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_gh_stale_token <case-dir> — a gh with a STORED-BUT-UNVALIDATABLE credential: `auth status`
+# exits 1 with the REAL output gh 2.97.0 prints behind a dead proxy (measured: `HTTPS_PROXY=
+# http://127.0.0.1:1 gh auth status --hostname github.com` → "The token in ~/.config/gh/hosts.yml is
+# invalid."), while `auth token` — an OFFLINE lookup of the stored credential — succeeds. It is a
+# stored-but-unvalidatable credential, NOT a network stub: the whole point is that its prose is
+# exactly what an outage prints, so a text-match discriminator cannot tell them apart and the
+# presence of a stored credential is the only cause-independent signal.
+mk_gh_stale_token() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status")
+    cat >&2 <<'EOM'
+  X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
+  - Active account: true
+  - The token in ~/.config/gh/hosts.yml is invalid.
+EOM
+    exit 1 ;;
+  "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
 esac
 case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
 exit 0
@@ -387,6 +413,10 @@ PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
 chmod +x "$D/bin/gh"
+# A sentinel makes the "not queued" assertion DISCRIMINATING: an empty candidates.txt is equally
+# consistent with "nothing was queued" and "the backlog was clobbered", and it is empty on the
+# pre-fix revision too. Seeding 99 proves #42 was neither added nor the file rewritten away.
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "LANDED: a pass of LANDEDs exits 0 (not the rc=1 abort)" \
                || bad "LANDED: rc=$RC (want 0 — LANDED must count as usable) — output: $OUT"
@@ -400,7 +430,8 @@ case "$OUT" in
 esac
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "LANDED: a landed issue was queued (it must not enter candidates.txt)" ;;
-  *) ok "LANDED: a landed issue is NOT queued" ;;
+  *99*) ok "LANDED: a landed issue is NOT queued (seed 99 intact, #42 absent)" ;;
+  *) bad "LANDED: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 
 # ── 1g) A DEGRADED COLLISION IS NOT A VERDICT (agent-infra#1853 review P2, #1328) ───────────────
@@ -419,6 +450,9 @@ PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
 chmod +x "$D/bin/gh"
+# A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
+# file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
 [ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
                || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
@@ -430,32 +464,45 @@ case "$OUT" in
   *"DEGRADED"*) ok "degraded COLLISION: the degradation is NAMED" ;;
   *) bad "degraded COLLISION: the degradation is not reported — output: $OUT" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "degraded COLLISION: nothing is queued" \
-                              || bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "degraded COLLISION: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
-# `gh auth status` hits the network, so a transport failure must not latch the MERGE-ONLY marker that
-# only a human can clear. A failure whose output does NOT name a credential problem is TRANSIENT (rc=1)
-# and retried next cycle; only a credential failure is PERMANENT (rc=3).
-mk_case gh-transient
+# The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
+# behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
+# token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as
+# a credential failure — while `gh auth token` (an OFFLINE lookup of the stored credential) succeeds.
+# The stub below reproduces that exact prose, so this case FAILS on any text-matching discriminator.
+mk_case gh-stale-token
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
-#!/bin/bash
-case "$1 $2" in
-  "auth status") echo "error connecting to api.github.com: dial tcp: i/o timeout" >&2; exit 1 ;;
-esac
-exit 0
-SH
-chmod +x "$D/bin/gh"
-rf "$D" refresh GH_AUTH_RETRY_SLEEP=0
-[ "$RC" -eq 1 ] && ok "gh network fault: rc=1 (TRANSIENT — not the permanent 3)" \
-               || bad "gh network fault: rc=$RC (want 1) — output: $OUT"
+mk_gh_stale_token "$D"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "stale token: rc=1 (TRANSIENT — not the permanent 3)" \
+               || bad "stale token: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
-  *"NOT PROVISIONABLE"*) bad "gh network fault: a transport failure was called NOT PROVISIONABLE" ;;
-  *) ok "gh network fault: not reported as NOT PROVISIONABLE" ;;
+  *"TRANSIENT"*) ok "stale token: reported TRANSIENT (a stored credential is not a missing one)" ;;
+  *) bad "stale token: no TRANSIENT verdict — output: $OUT" ;;
 esac
-[ ! -e "$D/o/.refresh-blocked" ] && ok "gh network fault: the permanent marker path was NOT written" \
-                                 || bad "gh network fault: a permanent marker was written — $(cat "$D/o/.refresh-blocked" 2>/dev/null)"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) bad "stale token: the outage-shaped prose was called NOT PROVISIONABLE" ;;
+  *) ok "stale token: not reported as NOT PROVISIONABLE" ;;
+esac
+
+# The other arm: NO credential is STORED (both `auth status` and the offline `auth token` fail) —
+# the broken-HOME defect (#1328), which retrying cannot fix, so it is PERMANENT (rc=3).
+mk_case gh-no-stored-token
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_noauth "$D"
+rf "$D" refresh
+[ "$RC" -eq 3 ] && ok "no stored credential: rc=3 (PERMANENT — retrying cannot conjure one)" \
+               || bad "no stored credential: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "no stored credential: the refusal is LOUD and named" ;;
+  *) bad "no stored credential: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
 # Structural, not textual: the stub tool records its cwd and argv, and the candidate it cleared must
@@ -709,6 +756,23 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   after="$(wc -c < "$BL2/invoked" | tr -d ' ')"
   [ "$before" != "$after" ] && ok "orch-loop: a transient failure IS retried next cycle" \
                             || bad "orch-loop: a transient failure was not retried"
+  # (c) BOUND THE MARKER'S EVIDENCE TO THE CURRENT RUN (agent-infra#1853 review P2). $LOG is
+  # append-only and never rotated, so a bare `grep 'NOT PROVISIONABLE' "$LOG"` would quote a
+  # PREVIOUS cycle's refusal as this run's reason — presenting a cause that no longer fired. The
+  # marker must quote the CURRENT run's line only. Stubs write NOTHING to the log on the pre-fix
+  # code, so the evidence region is empty and only `[ -s marker ]` is ever asserted; the stale seed
+  # below makes the bound TESTABLE — on the unbounded grep it appears in the marker.
+  BL3="$T/block3"; mkdir -p "$BL3"; : > "$BL3/candidates.txt"
+  printf '[refresh] NOT PROVISIONABLE: STALE PREVIOUS CYCLE REFUSAL\n' > "$BL3/log"
+  printf '#!/bin/bash\necho "[refresh] NOT PROVISIONABLE: CURRENT CYCLE REFUSAL" >> "%s/log"\nexit 3\n' "$BL3" > "$BL3/refresh-candidates.sh"
+  chmod +x "$BL3/refresh-candidates.sh"
+  O="$BL3" LOG="$BL3/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  grep -q 'CURRENT CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
+    && ok "orch-loop: the marker quotes the CURRENT run's refusal" \
+    || bad "orch-loop: the marker does not quote the current refusal — $(cat "$BL3/.refresh-blocked" 2>/dev/null)"
+  grep -q 'STALE PREVIOUS CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
+    && bad "orch-loop: the marker quoted a PREVIOUS cycle's refusal as this run's reason" \
+    || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
 else
   bad "orch-loop: could not extract the refresh block"
 fi

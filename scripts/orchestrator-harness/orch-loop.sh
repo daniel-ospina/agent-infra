@@ -1425,7 +1425,7 @@ PY
       # ⛔ BOUND THE EVIDENCE TO THIS RUN. $LOG is append-only and never rotated, so a bare
       # `grep NOT PROVISIONABLE "$LOG"` would quote a PREVIOUS cycle's refusal as this block's
       # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
-      log_mark="$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')"; [ -n "$log_mark" ] || log_mark=0
+      log_mark="$(awk 'END{print NR}' "$LOG" 2>/dev/null)"; [ -n "$log_mark" ] || log_mark=0
       ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
@@ -1439,7 +1439,7 @@ PY
             echo "Reason and evidence (the refresh's own refusal, verbatim):"
             tail -n +"$((log_mark + 1))" "$LOG" 2>/dev/null | grep 'NOT PROVISIONABLE' | tail -3 | sed 's/^/  /'
             echo "Those lines name the failing link; the knobs are TORTOISE_REPO=<a tortoise checkout> in keys.env (the controller session re-sources it; an ambient export does not reach a pre-existing tmux server), a vendored tools/collision_preflight.py in the repo, SCOUT_PY=<a Python >= 3.12>, or a writable, gh-authenticated HOME."
-            echo "After fixing it, delete this file and re-run 'check' to confirm."
+            echo "After fixing it, delete this file. The refresh re-writes it, with the current reason, if the cause persists."
           } > "$O/.refresh-blocked"
         elif [ "$rc" -ne 0 ]; then
           echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
