@@ -1,6 +1,7 @@
 /**
  * git-command-parse.ts — THE single copy of the git/gh command-parsing helpers
- * shared by `verification-gate` and `review-enforcer` (#966).
+ * shared by `verification-gate`, `review-enforcer` and `skill-enforcer` (#966,
+ * #1329).
  *
  * ── WHY THIS MODULE EXISTS ───────────────────────────────────────────────
  * Both extensions used to carry private copies of `extractCdPath`,
@@ -198,6 +199,139 @@ function maskQuoted(command: string): string {
   let out = "";
   for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : " ";
   return out;
+}
+
+// ── command spellings for text gates (#1329) ─────────────────────────────
+// A TEXT gate — skill-enforcer's dangerous-ops manifest — matches a regex
+// against the bash command string, so a spelling that separates the command
+// word from its verb defeats it. MEASURED against the armed manifest
+// (enforcement/dangerous-ops.txt) on 2026-10-14:
+//
+//   BLOCKED (the literal pattern is still contiguous):
+//     `/usr/bin/git commit`, `command git commit`, `env FOO=1 git commit`,
+//     `sudo git commit`, `bash -c 'git commit'`, `xargs git commit`
+//   ALLOWED (the pattern is split, or the verb is indirect):
+//     `git -C <dir> commit`, `git --no-pager commit`, `git -c k=v commit`,
+//     `git -C <dir> stash pop`, `gh -R <owner/name> pr create`,
+//     `g=commit; git $g -m x`, `gc` after `alias gc='git commit'`,
+//     `eval "$CMD"`, `sh -c "git -C <dir> commit"`,
+//     `git com"mit"`, `git comm\it`, `git \` ⏎ `commit`
+//
+// The `git -C <dir>` form is the one that matters in practice: it is how this
+// fleet commits in a LINKED WORKTREE, so a cooperating agent produces it without
+// intending anything. `commandSpellings` closes that class — see its doc.
+//
+// Note the direction of the two lists: EVERY remaining evasion requires INDIRECTION
+// (a variable, an alias, a nested interpreter, or a splice) — the literal text of a
+// git command is caught wherever it appears, including inside quotes.
+
+/**
+ * Git's global options whose value is the NEXT word (as opposed to a flag, or a
+ * value carried by `--opt=value`). Incompleteness is a RECALL cost, never a
+ * false block: an option missing here is treated as valueless, so its value
+ * survives into the spelling and the spelling simply does not match — the raw
+ * command is still tried. Over-listing would be the dangerous direction (it
+ * would eat the verb), which is why the table carries only options whose
+ * separate-value form is real.
+ */
+const GIT_GLOBAL_VALUE_FLAGS = new Set([
+  "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
+  "--exec-path", "--attr-source", "--super-prefix", "--list-cmds",
+]);
+/** `gh`'s global flags that take a value. `-R`/`--repo` is the one that appears
+ * in real merge/create invocations (`gh -R owner/name pr merge 7` — the same
+ * spelling #931/#993 pinned for `extractRepoFlag`). */
+const GH_GLOBAL_VALUE_FLAGS = new Set(["-R", "--repo"]);
+
+interface CommandWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+/**
+ * Quote-aware WORD boundaries over the raw command. A quoted region (and any
+ * whitespace inside it) belongs to ONE word, so a QUOTED mention never presents
+ * `git` as a command word; unquoted shell separators end a word, so
+ * `cd /a&&git -C /b commit` still exposes `git` as its own word. Reuses
+ * `unquotedMask`, this module's single quote model.
+ */
+function commandWords(command: string): CommandWord[] {
+  const mask = unquotedMask(command);
+  const isBoundary = (c: string) =>
+    c === ";" || c === "&" || c === "|" || c === "(" || c === ")" ||
+    c === "{" || c === "}" || c === "`" || c === ">" || c === "<" || c === "\n" || c === "\r";
+  const words: CommandWord[] = [];
+  let i = 0;
+  while (i < command.length) {
+    if (mask[i] && (/\s/.test(command[i]) || isBoundary(command[i]))) { i++; continue; }
+    const start = i;
+    while (i < command.length && !(mask[i] && (/\s/.test(command[i]) || isBoundary(command[i])))) i++;
+    words.push({ text: command.slice(start, i), start, end: i });
+  }
+  return words;
+}
+
+/**
+ * Spans to DELETE from a command: for each `git`/`gh` command word, everything
+ * from the END of that word through the last of the global options that follow
+ * it. A value-taking option consumes the word after it too (`-C <dir>`, `-R
+ * <owner/name>`); a `--opt=value` token carries its own value; `--` ends option
+ * parsing; anything else that is not `-`-prefixed ends the run. Only the
+ * option run is removed — the rest of the command is left byte-for-byte.
+ */
+function gitGhGlobalOptionRuns(command: string): Array<[number, number]> {
+  const words = commandWords(command);
+  const runs: Array<[number, number]> = [];
+  for (let i = 0; i < words.length; i++) {
+    const valueFlags =
+      words[i].text === "git" ? GIT_GLOBAL_VALUE_FLAGS :
+      words[i].text === "gh" ? GH_GLOBAL_VALUE_FLAGS : null;
+    if (valueFlags === null) continue;
+    let j = i + 1;
+    let end = words[i].end;
+    while (j < words.length) {
+      const w = words[j].text;
+      if (!w.startsWith("-") || w === "-") break;
+      end = words[j].end;
+      j++;
+      if (w === "--") break; // end-of-options marker; the next word is not an option
+      if (w.includes("=")) continue; // `--opt=value` is self-contained
+      if (valueFlags.has(w) && j < words.length) { end = words[j].end; j++; }
+    }
+    if (end > words[i].end) { runs.push([words[i].end, end]); i = j - 1; }
+  }
+  return runs;
+}
+
+/**
+ * Every spelling of `command` a text gate should try: the command itself, and
+ * — when a git/gh invocation carries GLOBAL options — the same command with
+ * those option runs removed, so `git -C <dir> commit` reads like `git commit`.
+ *
+ * Two load-bearing properties:
+ *   1. NOTHING IS FABRICATED. Every returned string is the input with spans
+ *      DELETED, so it is a subsequence of the input (pinned in the suite).
+ *   2. MATCHING CAN ONLY ADD. The raw command is always returned FIRST, so a
+ *      caller that ORs across the spellings can never lose a hit it had before.
+ *      The only new hits are commands that really do run `git <verb>` with
+ *      options in front of the verb.
+ *
+ * This is NOT a shell interpreter and does not pretend to be one: variable
+ * indirection, alias/function invocation, `eval`, quote/escape splicing inside
+ * the verb, and arbitrary nesting are all left open, deliberately and visibly.
+ * The adopter-facing statement of that boundary is the header of
+ * `enforcement/dangerous-ops.txt` (#1329).
+ */
+export function commandSpellings(command: string): string[] {
+  if (!command) return [command];
+  const runs = gitGhGlobalOptionRuns(command);
+  if (runs.length === 0) return [command];
+  let out = "";
+  let cursor = 0;
+  for (const [start, end] of runs) { out += command.slice(cursor, start); cursor = end; }
+  out += command.slice(cursor);
+  return out === command ? [command] : [command, out];
 }
 
 // ── PR number ────────────────────────────────────────────────────────────

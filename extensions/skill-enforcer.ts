@@ -16,6 +16,22 @@
 // agent-infra at `skills/`. Keying `readFiles` by a path built from ONE prefix
 // meant a read through the path pi actually advertises never registered. The
 // key is now the canonical skill NAME, resolved only from a trusted root.
+//
+// ── THIS GATE IS A COMPLIANCE GATE, NOT A SECURITY BOUNDARY (#1329) ────────
+// The bash branch matches a regex against the command TEXT. That catches the
+// spellings the manifest lists, and (since #1329) also the canonical spelling
+// with a git/gh invocation's GLOBAL options removed — `git -C <dir> commit`,
+// `git --no-pager commit`, `gh -R <owner/name> pr create` — which were
+// measured ALLOWED before, `git -C <dir>` being how this fleet commits in a
+// linked worktree. It does NOT stop an agent that INTENDS to evade it:
+// variable indirection (`g=commit; git $g …`), an alias/function invocation, an
+// `eval` of a variable, quote/escape splicing inside the verb, and arbitrary
+// nesting all bypass every rule. (The LITERAL text of a git command IS matched
+// wherever it appears — `eval 'git commit'` and `echo 'git commit'` are caught —
+// so every remaining evasion needs indirection.) The
+// adopter-facing statement of that boundary — what is closed, what is not, and
+// the sanctioned bypasses — lives in the manifest header
+// (`enforcement/dangerous-ops.txt`), where the rules are read.
 
 import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
@@ -23,6 +39,7 @@ import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
+import { commandSpellings } from "./shared/git-command-parse.js";
 
 // Inline copy of pi's `isToolCallEventType` (#1321). pi's extension loader
 // resolves the runtime package from its own bundled module table, but a suite
@@ -512,6 +529,19 @@ function logNudgeEvent(type: "fired" | "complied" | "bypassed" | "blocked", skil
   console.log(`[skill-enforcer] 📊 ${event}`);
 }
 
+/**
+ * #1329 — match a rule against every SPELLING of the command the shared parser
+ * derives (raw first, then a git/gh invocation with its GLOBAL options removed).
+ * The derivation only DELETES option runs, so this can only ADD a block: a rule
+ * that matched the raw command still matches, and the raw command is always
+ * tried first. See `commandSpellings` (shared/git-command-parse.ts) for the two
+ * load-bearing properties, and the `enforcement/dangerous-ops.txt` header for
+ * what this deliberately does not close.
+ */
+export function commandMatches(pattern: RegExp, spellings: string[]): boolean {
+  return spellings.some((spelling) => pattern.test(spelling));
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, _ctx) => {
     readFiles.clear();
@@ -637,11 +667,15 @@ export default function (pi: ExtensionAPI) {
     // Check bash commands
     if (!cmd) return undefined;
 
+    // #1329: the raw command AND the option-normalised spelling (computed once
+    // per call — the same list is tried by every rule).
+    const spellings = commandSpellings(cmd);
+
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(cmd) && !readFiles.has(skillName)) return blockReason(skillName, rule, skillName);
+          if (commandMatches(p, spellings) && !readFiles.has(skillName)) return blockReason(skillName, rule, skillName);
         }
       }
     }
