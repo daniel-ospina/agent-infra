@@ -656,6 +656,30 @@ async function main() {
     equal((await pi.fire("tool_call", COMMIT))?.block, true);
   });
 
+  // #1331: the persisted window is a bound on IDLENESS, not on the age of the
+  // read. This pins the mechanism the documentation now commits to
+  // (enforcement/dangerous-ops.txt header, AGENTS.md §Skill Reading Protocol):
+  // persistReadFiles() writes `readAt: now` for EVERY in-memory read — a
+  // restored one included — and runs at session_shutdown, so each session that
+  // restores an entry re-stamps it. Remove the re-stamp (drop the `now` write
+  // in favour of the persisted value) and this test fails: a read would then
+  // expire 24 h after it was taken, which is precisely the mis-statement the
+  // issue corrected.
+  await test("T13 — the 24 h window bounds IDLENESS: a restored read is re-stamped at session_shutdown (#1331)", async () => {
+    const { pi, reads } = await newSession();
+    const seeded = Date.now() - 23 * 60 * 60 * 1000; // inside the TTL → restores
+    writeFileSync(reads, JSON.stringify([{ file: "commit-workflow", readAt: seeded }]));
+    await pi.fire("session_start", {});
+    equal((await pi.fire("tool_call", COMMIT))?.block, undefined, "a 23 h-old persisted read must clear the gate (it is restored)");
+    const before = Date.now();
+    await pi.fire("session_shutdown", {});
+    const after = Date.now();
+    const [entry] = JSON.parse(readFileSync(reads, "utf-8")) as Array<{ file: string; readAt: number }>;
+    equal(entry.file, "commit-workflow");
+    ok(entry.readAt >= before && entry.readAt <= after, `session_shutdown must re-stamp the restored entry to now (seeded=${seeded}, persisted=${entry.readAt}, window=[${before},${after}])`);
+    ok(entry.readAt > seeded + 1000, "the persisted readAt must be strictly newer than the 23 h-old seed — the TTL must not measure the read's age");
+  });
+
   section("F. static pins (regression guards, not behaviour)");
   const SOURCE = readFileSync(join(REPO_ROOT, "extensions", "skill-enforcer.ts"), "utf-8");
   await test("the SDK is imported for TYPES only — the module loads with zero node_modules", () => {
