@@ -857,13 +857,17 @@ ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unr
 SHARDS="$(cd "$HERE/.." && pwd)/run-bash-shards.sh"
 # The runner's own answer. A failed or empty `--list` makes every assertion below fail (fail-closed).
 LIST="$(bash "$SHARDS" --list 2>/dev/null)"
-printf '%s\n' "$LIST" | grep -qx 'scripts/orchestrator-harness/spawn-gate.test.sh'; rc=$?
+# ⛔ HERE-STRINGS, NOT `printf … | grep -q` (#841): with `pipefail` set, `grep -q` exits on its first
+# match, the writer takes SIGPIPE, and the PIPELINE's status becomes 141 — so `rc=$?` records a SIGPIPE
+# instead of the match. `scripts/check-no-sigpipe-grep.sh` flags the idiom by SHAPE and gates CI on it,
+# so the form is what matters here, whatever the payload happens to be today.
+grep -qx 'scripts/orchestrator-harness/spawn-gate.test.sh' <<<"$LIST"; rc=$?
 ck "this suite IS EXECUTED by run-bash-shards.sh (--list), not merely named in its text" $rc
 unwired=""
 for f in "$HERE"/*.test.sh "$HERE"/test-*.sh "$HERE"/selftest.sh; do
   [ -f "$f" ] || continue
   b="$(basename "$f")"
-  printf '%s\n' "$LIST" | grep -q "/$b\$" || unwired="$unwired $b"
+  grep -q "/$b\$" <<<"$LIST" || unwired="$unwired $b"
 done
 unwired="${unwired# }"
 [ "$unwired" = "test-claims.sh test-crossbox.sh" ]; rc=$?
