@@ -334,7 +334,16 @@ physical_path() { # $1=path
     hop=$((hop + 1))
   done
   dir="$(dirname "$p")"; final="$(basename "$p")"
-  if [ -d "$dir" ]; then
+  # When the resolved path IS a directory, canonicalize IT (not just its parent):
+  # that collapses a `.`/`..` final component (`hub/extensions/.` is hub_ext,
+  # `hub/extensions/..` is the hub root, `hub/extensions/a/.` is `a`), which a
+  # lexical `dirname`/`basename` split gets wrong in BOTH directions — naming the
+  # extensions dir and the hub root as this hub's children, and dropping a link
+  # that really does land on one. Only an unresolved/non-directory final component
+  # falls back to parent+final (a dangling target is still reported).
+  if [ -d "$p" ]; then
+    printf '%s\n' "$(cd "$p" && pwd -P)"
+  elif [ -d "$dir" ]; then
     printf '%s/%s\n' "$(cd "$dir" && pwd -P)" "$final"
   else
     printf '%s\n' "$p"
