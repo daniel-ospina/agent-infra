@@ -189,7 +189,20 @@ function plantSkill(
   const file = join(dir, "SKILL.md");
   if (mode === "forged") writeFileSync(file, "anything at all\n");
   else if (mode === "copy") copyFileSync(canonical, file);
-  else linkSync(canonical, file);
+  else {
+    try {
+      linkSync(canonical, file);
+    } catch (err) {
+      // A hard link is the documented consumer layout (scripts/link-skills.sh),
+      // but it cannot cross filesystems: where `tmpdir()` is its own mount the
+      // link is EXDEV. Fall back to the byte-identical copy — the SAME
+      // acceptance property via the other identity branch (the inode branch is
+      // separately exercised by the dir-symlink legs, where `statSync` follows
+      // to the canonical inode). Anything other than EXDEV is a real error.
+      if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err;
+      copyFileSync(canonical, file);
+    }
+  }
   return file;
 }
 
