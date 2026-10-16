@@ -390,7 +390,14 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # record-review.sh WITHOUT diff-normalize.py degrades the producer to the raw
 # pre-#1362 digest — no false accept, but every base-only update goes back to
 # refusing carry-forward. Farm them together.
-lib_srcs=(pid-identity.sh diff-normalize.py)
+#
+# #1187 adds a THIRD sibling: `orch-send.sh` (farmed above) resolves its
+# payload-integrity check as `$(dirname "${BASH_SOURCE[0]}")/lib/cmux_payload.py`.
+# Farming the sender WITHOUT the checker re-arms every orchestrator dispatch with
+# an EMPTY verdict, and orch-send.sh reports an empty verdict as SENT BUT NOT
+# VERIFIED (exit 6) — a fail-closed FALSE BLOCK on every lane order. Farm them
+# together.
+lib_srcs=(pid-identity.sh diff-normalize.py cmux_payload.py)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -422,9 +429,9 @@ for base in "${lib_srcs[@]}"; do
   fi
 done
 if [ "$lib_failed" -gt 0 ]; then
-  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py, #1178)" >&2
+  echo "    scripts lib farm: $lib_copied copied, $lib_failed FAILED/MISSING (pid-identity.sh + diff-normalize.py + cmux_payload.py, #1178)" >&2
 else
-  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py, #1178)"
+  echo "    scripts lib farm: $lib_copied copied (pid-identity.sh + diff-normalize.py + cmux_payload.py, #1178)"
 fi
 
 # Fleet-tools farm (#1178 unit 3): the scheduled lane-liveness report
