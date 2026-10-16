@@ -196,8 +196,8 @@ is_infra_checkout() {
 resolve_infra_root() {
   local cand
   # Order matters: an explicit INFRA_ROOT wins, then the checkout this script itself was
-  # shipped in (the strongest signal — it IS the checkout the installer came from), then the
-  # ambient/derived locations an operator or the supervisor may have exported.
+  # shipped in — the script IS a file inside that checkout, so whoever put it there already
+  # chose what runs; a writer at that path could replace this script outright.
   for cand in "${INFRA_ROOT:-}" "$SELF_DIR/.."; do
     [ -n "$cand" ] || continue
     if is_infra_checkout "$cand"; then
@@ -209,7 +209,14 @@ resolve_infra_root() {
   # cell's HOME is a fixed path under a world-writable /tmp (/tmp/cell-home), so a
   # checkout-shaped tree appearing there may have been planted by another local user — and
   # everything under it is installed and then EXECUTED by pi (merge-one.sh runs the farmed
-  # record-review.sh directly). The two declarations above are the operator's own.
+  # record-review.sh directly). The two paths above are the ones the operator chose to run
+  # from.
+  #
+  # The check is on the LEAF we resolved, which is sufficient here: a leaf can only be
+  # replaced by another uid if its PARENT is writable by that uid, and if $CELL_HOME itself is
+  # writable by another user then the cell's whole HOME — auth.json, .ai-review-gate-key,
+  # settings.json — is attacker-writable and nothing this layer installs is safe. That
+  # precondition is the VM's (a single-tenant cell), and it is stated, not assumed.
   local refused=""
   for cand in "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" "$CELL_HOME/agent-infra"; do
     [ -n "$cand" ] || continue
@@ -416,9 +423,10 @@ install_extensions() {
 #     extensions resolve floating ranges, so a compromised published version or any
 #     transitive dep could read the merge key and mint review markers for arbitrary code.
 #     --ignore-scripts is the control that blocks the READ; `env -i` removes the environment
-#     COPY, which is defence in depth, not the control — pi also writes the key to DISK
-#     ($HOME/.pi/agent/.ai-review-gate-key) and auth.json alongside it. Do not delete either
-#     flag believing the other covers it.
+#     COPY, which is defence in depth, not the control — the key is ALSO on disk at
+#     $HOME/.pi/agent/.ai-review-gate-key (written there by the OPERATOR, or pushed in
+#     keys.env; pi itself does not write it), with auth.json alongside it. Do not delete
+#     either flag believing the other covers it.
 #   * the allowlist keeps a cell behind a mirror or an HTTP proxy able to install at all: the
 #     previous invocation inherited the operator's npm configuration from keys.env, and
 #     `env -i` would otherwise drop it.
@@ -495,7 +503,10 @@ install_config() {
       cfg_fail=1
       continue
     fi
-    copy_repo_path "$rel" || cfg_fail=1
+    # A copy that FAILS must be COUNTED, not merely silence the success line below: the dest
+    # can be a file where the checkout has a directory (`mkdir -p` then fails), and the round-1
+    # form recorded that (`|| fail "could not install $rel"`).
+    copy_repo_path "$rel" || { fail "could not install $rel (a dest that is not the same shape as the source?)"; cfg_fail=1; }
   done
   # The step's own narrative may not contradict its FAIL line: an unconditional `say` here
   # used to print 'installed' straight after a recorded failure.
@@ -598,12 +609,16 @@ GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-g
 # refused such a cell and the installer could not repair it — a false block, not a finding.
 # A MISSING or EDITED shipped file still fails: that is drift.
 shipped_content_matches() {
-  local src="$1" dst="$2" f rel
+  local src="$1" dst="$2" f rel n=0
   while IFS= read -r f; do
     rel="${f#"$src"/}"
     case "$rel" in node_modules/*) continue ;; esac
     cmp -s "$f" "$dst/$rel" || return 1
+    n=$((n + 1))
   done < <(find "$src" -type f 2>/dev/null)
+  # A source tree that ships NOTHING cannot be compared, and must not read as a match: a
+  # zero-file extension directory passed the one-directional check in silence.
+  [ "$n" -gt 0 ] || return 2
   return 0
 }
 
@@ -660,8 +675,13 @@ verify_layer() {
         || fail "extension DIFFERS from the checkout: extensions/$base (a stale or hand-edited copy)"
     elif [ ! -d "$edst" ]; then
       fail "extension SHAPE CHANGED: extensions/$base is a directory in the checkout and not one on the cell"
-    elif ! shipped_content_matches "$esrc" "$edst"; then
-      fail "extension CONTENT DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)"
+    else
+      shipped_content_matches "$esrc" "$edst"
+      case $? in
+        0) ;;
+        2) fail "extension $base ships NO files in the checkout ($esrc) — verify cannot vouch for an empty tree" ;;
+        *) fail "extension CONTENT DIFFERS from the checkout: extensions/$base (a stale, truncated or hand-edited copy)" ;;
+      esac
     fi
   done <<<"$entries"
 
@@ -708,12 +728,24 @@ verify_layer() {
     elif [ ! -e "$csrc" ]; then
       fail "config artifact $cfg is not in the checkout ($csrc) — verify cannot vouch for it"
     elif [ -f "$csrc" ]; then
-      cmp -s "$csrc" "$cdst" \
-        || fail "config artifact DIFFERS from the checkout: $cfg (a hand-edited cell copy — re-apply it as a checkout change)"
-    elif [ -d "$cdst" ] && ! shipped_content_matches "$csrc" "$cdst"; then
-      fail "config artifact CONTENT DIFFERS from the checkout: $cfg (a hand-edited or stale cell copy)"
-    elif [ -d "$cdst" ] && [ -z "$(ls -A "$cdst" 2>/dev/null)" ]; then
-      fail "config artifact $cfg is EMPTY (pi resolves user-scope sub-agents from ~/.pi/agent/agents, so a lane could not dispatch a reviewer)"
+      # SHAPE first: a cell whose `agents` is a FILE where the checkout has a directory used to
+      # fall through every branch of this chain and be certified (the extension loop has had
+      # this check; the config loop did not — the third branch-asymmetry this PR has caught).
+      if [ ! -f "$cdst" ]; then
+        fail "config artifact SHAPE CHANGED: $cfg is a file in the checkout and not one on the cell"
+      else
+        cmp -s "$csrc" "$cdst" \
+          || fail "config artifact DIFFERS from the checkout: $cfg (a hand-edited cell copy — re-apply it as a checkout change)"
+      fi
+    elif [ ! -d "$cdst" ]; then
+      fail "config artifact SHAPE CHANGED: $cfg is a directory in the checkout and not one on the cell"
+    else
+      shipped_content_matches "$csrc" "$cdst"
+      case $? in
+        0) ;;
+        2) fail "config artifact $cfg ships NO files in the checkout ($csrc) — verify cannot vouch for an empty tree" ;;
+        *) fail "config artifact CONTENT DIFFERS from the checkout: $cfg (a hand-edited or stale cell copy)" ;;
+      esac
     fi
   done
   [ -f "$DEST/AGENTS.md" ] || fail "AGENTS.md is missing (a cell lane gets no global rules)"

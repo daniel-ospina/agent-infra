@@ -217,12 +217,13 @@ check_dispatch() {
 check_operational_layer() {
   local cand root="" installer os_release self_root trusted=0
   # A cell keeps its agent-infra checkout in any of a few places (this script is normally
-  # pushed STANDALONE, so its own directory proves nothing). Same candidates as
-  # cell-install.sh's own resolver. The FIRST TWO are the operator's own declarations; the
-  # AMBIENT ones must additionally be owned by this user, because the cell's HOME is a fixed
-  # path under a world-writable /tmp (/tmp/cell-home) — a checkout-shaped tree planted there
-  # by another local user would choose the installer this step then RUNS, with the cell's
-  # keys.env exported. Pass INFRA_ROOT explicitly to use such a path deliberately.
+  # pushed STANDALONE, so its own directory proves nothing — and neither does its parent, which
+  # for a bare `bash cloud-cell-bringup.sh` is whatever directory it was run from, e.g. /tmp).
+  # ONLY $INFRA_ROOT is an unconditional declaration by the operator. Every other candidate,
+  # INCLUDING this script's own parent, must be owned by this user: the cell's HOME is a fixed
+  # path under a world-writable /tmp (/tmp/cell-home), and this step RUNS the installer it
+  # finds, with the cell's keys.env already exported — so a checkout-shaped tree planted at any
+  # of those paths would both choose and execute the code.
   self_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
   for cand in "${INFRA_ROOT:-}" "$self_root" \
               "${AGENT_INFRA_PATH:-}" "${HARNESS:+$HARNESS/..}" \
@@ -231,7 +232,7 @@ check_operational_layer() {
     [ -f "$cand/pi-bootstrap/cell-install.sh" ] || continue
     trusted=1
     case "$cand" in
-      "${INFRA_ROOT:-}"|"$self_root") ;;
+      "${INFRA_ROOT:-}") ;;
       *) [ -O "$cand" ] || trusted=0 ;;
     esac
     if [ "$trusted" -eq 1 ]; then root="$cand"; break; fi

@@ -24,9 +24,8 @@
 #       (pi blocks every interactive boot on one, #1277), or an unlocatable checkout — and
 #       the tools/ migration removes a legacy tools/fleet/ farm;
 #   (f) an npm-less cell is refused rather than certified with a partial layer;
-#   (g) the npm child runs with an EMPTY environment (the cell's keys.env is exported into
-#       reach of this installer, so an inherited merge key would be readable by any
-#       dependency's lifecycle script) and with --ignore-scripts;
+#   (g) the npm child runs with a SCRUBBED environment — an allowlisted proxy/registry only,
+#       never the keys.env the cell exported — and with --ignore-scripts;
 #   (h) `--verify` refuses a hand-edited guard EXTENSION and a missing config artifact
 #       (agents/) — existence alone was certified before.
 #
@@ -65,13 +64,14 @@ cat > "$FAKEBIN/npm" <<EOF
 # create node_modules, because the artifact the installer's own --verify reads back is the
 # dependency tree npm would have produced.
 #
-# It also records one line per invocation: first the merge key it can SEE in its
-# environment, then its argv. The installer must call it with an EMPTY environment (a
-# package's lifecycle script inherits it otherwise) and with --ignore-scripts, so a
-# compromised dependency cannot execute at install time. The path is baked in because the
-# child deliberately gets no environment to pass one through.
+# It also records one line per invocation: the merge key and the npm registry it can SEE in
+# its environment, then its argv. The installer must call it with a SCRUBBED environment —
+# an allowlisted proxy/registry only (a package's lifecycle script inherits the rest
+# otherwise) — and with --ignore-scripts, so a compromised dependency cannot execute at
+# install time. The path is baked in because the child deliberately gets no environment to
+# pass one through.
 mkdir -p node_modules
-{ printf '%s\n' "\${AI_REVIEW_GATE_KEY-CELL_INSTALL_TEST_UNSET}"; printf '%s\n' "\$*"; } >> "$SPY"
+{ printf 'KEY=%s REG=%s\n' "\${AI_REVIEW_GATE_KEY-CELL_INSTALL_TEST_UNSET}" "\${npm_config_registry-CELL_INSTALL_TEST_NOREG}"; printf '%s\n' "\$*"; } >> "$SPY"
 exit 0
 EOF
 chmod +x "$FAKEBIN/npm"
@@ -226,15 +226,16 @@ else
   ok "\$DEST/tools/ is absent or empty (pi's startup scan stays quiet)"
 fi
 
-# (g) The npm child must see NO inherited secret and must not be allowed to run package
-# scripts. Proven by what the stub SAW, not by reading the installer's source.
+# (g) The npm child must see NO inherited secret, must keep the operator's registry
+# allowlist, and must not be allowed to run package scripts. Proven by what the stub SAW, not
+# by reading the installer's source.
 if [ ! -s "$SPY" ]; then
   fail "npm was never invoked — the dependency step is not running, so these assertions would be vacuous"
 else
   if grep -q "CELL-INSTALL-TEST-MERGE-KEY" "$SPY"; then
     fail "the npm child INHERITED AI_REVIEW_GATE_KEY — a dependency lifecycle script can read the merge authority"
   else
-    ok "npm runs with an EMPTY environment — the exported merge key never reaches a dependency"
+    ok "npm runs with a SCRUBBED environment — the exported merge key never reaches a dependency"
   fi
   noscripts="$(awk 'NR % 2 == 0 && $0 !~ /--ignore-scripts/' "$SPY" | wc -l | tr -d ' ')"
   [ "$noscripts" = "0" ] \
@@ -245,6 +246,18 @@ else
   [ "$n" = "$deps" ] \
     && ok "npm ran for exactly the $deps extension(s) that declare dependencies (install and verify agree)" \
     || fail "npm ran $n time(s) but $deps extension(s) declare dependencies — the two halves of the contract disagree"
+  # The allowlist is what keeps a mirrored or proxied cell able to install at all; without a
+  # pin, deleting it leaves this suite green.
+  : > "$SPY"
+  npm_config_registry="https://mirror.invalid/simple" run_install >/dev/null 2>&1
+  if grep -q "REG=https://mirror.invalid/simple" "$SPY"; then
+    ok "the npm child keeps the operator's registry (env -i does not strip the allowlist)"
+  else
+    fail "the npm child did NOT receive npm_config_registry — a mirrored cell could not install deps"
+  fi
+  grep -q "CELL-INSTALL-TEST-MERGE-KEY" "$SPY" \
+    && fail "the allowlisted run leaked the merge key" \
+    || ok "the allowlist carries the registry and nothing else of the operator's environment"
 fi
 
 # -------------------------------------------------------------------------
@@ -372,6 +385,40 @@ rc=$?
 [ "$rc" -eq 1 ] && grep -q "config artifact CONTENT DIFFERS from the checkout: agents" "$LOG" \
   && ok "--verify refuses a hand-edited config artifact (agents/ is read back, not just listed)" \
   || fail "--verify CERTIFIED a hand-edited agents/ definition"
+# The SHAPE branch: a cell whose `agents` is a FILE where the checkout has a directory used to
+# fall through every branch of the read-back chain and be certified (the extension loop has
+# had this check all along).
+rm -rf "$DEST/agents" && printf 'not a directory\n' > "$DEST/agents"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "config artifact SHAPE CHANGED: agents" "$LOG" \
+  && ok "--verify refuses a config artifact whose SHAPE changed (a file where the checkout has a directory)" \
+  || fail "--verify CERTIFIED a cell whose agents/ is a file"
+# ... and the INSTALL side must COUNT that copy failure, not merely muffle the success line.
+run_install
+rc=$?
+{ [ "$rc" -eq 1 ] && grep -q "could not install pi-bootstrap/pi-config/agents" "$LOG"; } \
+  && ok "a config copy that FAILS is counted as a failure (rc=$rc), not just a muffled success line" \
+  || fail "an install over a wrong-shaped dest exited $rc without recording the copy failure"
+rm -f "$DEST/agents"
+run_install >/dev/null 2>&1
+# A shipped extension directory that carries NO files cannot be compared, and must not read as
+# a match (`find` returns nothing, so the one-directional check used to pass on an empty tree).
+EMPTY_EXT="$TMP/empty-ext-checkout"
+mkdir -p "$EMPTY_EXT/extensions" "$EMPTY_EXT/pi-bootstrap/pi-config"
+for d in scripts skills templates tools manifest.json; do ln -s "$ROOT/$d" "$EMPTY_EXT/$d"; done
+ln -s "$ROOT/pi-bootstrap/setup.sh" "$EMPTY_EXT/pi-bootstrap/setup.sh"
+cp -R "$ROOT/pi-bootstrap/pi-config/." "$EMPTY_EXT/pi-bootstrap/pi-config/"
+for d in "$ROOT"/extensions/*; do
+  b="$(basename "$d")"; [ "$b" = review-enforcer ] && continue
+  ln -s "$d" "$EMPTY_EXT/extensions/$b"
+done
+mkdir -p "$EMPTY_EXT/extensions/review-enforcer"   # exists, ships NO files
+out="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
+[ "$?" -eq 1 ] && grep -q "ships NO files in the checkout" <<<"$out" \
+  && ok "an extension directory that ships NO files is refused, not certified on an empty tree" \
+  || fail "a zero-file extension directory was certified as the layer"
+rm -rf "$EMPTY_EXT" "$TMP/emptyext-home"
 # The config set used to be installed blind and never read back: a checkout missing
 # pi-config/agents produced a certified cell whose lane could dispatch no sub-agent.
 rm -rf "$DEST/agents"
