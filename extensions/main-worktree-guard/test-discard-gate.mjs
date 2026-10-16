@@ -1021,6 +1021,77 @@ async function partB() {
       allowed(bareTarget), `reason=${JSON.stringify(bareTarget?.reason ?? "").slice(0, 240)}`);
 
 
+    // ── B13 (#1228): the verdict must not depend on the TEXT SHAPE of a script
+    // path. A runtime-EXPANDED path (glob / tilde / brace / char-class, or a
+    // `$VAR` producer) names a script the shell will really run but the guard
+    // could never READ, so the discard inside it ran UNGATED. Same script, same
+    // discard, opposite verdict before this change — measured on the fixtures
+    // below. Every expansion form now fails closed, and the literal spelling
+    // stays gated exactly as before (the first two controls, and B6e/B6g).
+    const undoExp = join(wt, "undo-1228.sh");
+    const undoExpGlob = join(wt, "undo-1228-glob.sh");
+    const undoExpHome = join(home, "undo-1228.sh");
+    const undoExpSubDir = join(wt, "sub-1228");
+    mkdirSync(undoExpSubDir, { recursive: true });
+    const undoExpSub = join(undoExpSubDir, "undo.sh");
+    const undoCleanGlob = join(wt, "cleanonly-1228.sh");
+    write(undoExp, "git checkout -- dirty.txt\n");
+    write(undoExpGlob, "git checkout -- dirty.txt\n");
+    write(undoExpHome, "git checkout -- dirty.txt\n");
+    write(undoExpSub, "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${undoExpSub}`);
+    write(undoCleanGlob, "git checkout -- clean.txt\n");
+    // A nested script that RUNS an expanded path (B13's last case).
+    const outerExp = join(wt, "outer-1228.sh");
+    write(outerExp, "bash ./undo-1228*.sh\n");
+    const blockReason1228 = (r) => String(r?.reason ?? "");
+    const exp1228 = [
+      ["control: literal `bash ./undo-1228.sh`", "bash ./undo-1228.sh", /#709/],
+      ["control: literal `cat undo-1228.sh | bash`", "cat undo-1228.sh | bash", /#709/],
+      ["glob `bash ./undo-1228*.sh`", "bash ./undo-1228*.sh", /expanded by the shell at runtime/],
+      ["char-class `bash ./undo-1228-[g]lob.sh`", "bash ./undo-1228-[g]lob.sh", /expanded by the shell at runtime/],
+      ["brace `bash ./undo-1228{-glob,}.sh`", "bash ./undo-1228{-glob,}.sh", /expanded by the shell at runtime/],
+      ["tilde `bash ~/undo-1228.sh`", "bash ~/undo-1228.sh", /expanded by the shell at runtime/],
+      ["extglob via `bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'` (the reachable form)", "bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'", /expanded by the shell at runtime/],
+      ["direct `./undo-1228*.sh`", "./undo-1228*.sh", /expanded by the shell at runtime/],
+      ["direct `~/undo-1228.sh`", "~/undo-1228.sh", /expanded by the shell at runtime/],
+      ["direct static relative `sub-1228/undo.sh` (executable, previously unread)", "sub-1228/undo.sh", /#709/],
+      ["pipe glob `cat ./undo-1228*.sh | bash`", "cat ./undo-1228*.sh | bash", /piped producer/],
+      ["pipe char-class `cat ./undo-1228-[g]lob.sh | bash`", "cat ./undo-1228-[g]lob.sh | bash", /piped producer/],
+      ["pipe variable `F=./undo-1228.sh; cat $F | bash`", "F=./undo-1228.sh; cat $F | bash", /piped producer/],
+      // #1228 — the SAME expanded path behind the indirection wrappers the
+      // walk also reads (`-c` payload, `eval` payload, nested script). These
+      // are ordinary agent shapes; each was a one-level-in fail-open.
+      ["interpreter `-c` payload `bash -c 'bash ./undo-1228*.sh'`", "bash -c 'bash ./undo-1228*.sh'", /expanded by the shell at runtime/],
+      ["interpreter `-c` payload `sh -c 'source ./undo-1228*.sh'`", "sh -c 'source ./undo-1228*.sh'", /expanded by the shell at runtime/],
+      ["`eval` payload `eval 'bash ./undo-1228*.sh'`", "eval 'bash ./undo-1228*.sh'", /expanded by the shell at runtime/],
+      ["nested script runs an expanded path (`bash ./outer-1228.sh`)", "bash ./outer-1228.sh", /expanded by the shell at runtime/],
+    ];
+    for (const [why, cmd, reasonRe] of exp1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+      expectTrue(`B13: ${why} → reason names what was observed`,
+        reasonRe.test(blockReason1228(r)), `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
+    }
+    // Documented fail-closed COST, not a bug: an expansion-shaped path is
+    // refused WITHOUT reading it, so a glob that happens to match only a clean
+    // script blocks too. That is the accepted price of the fix — resolving
+    // globs would re-open a (globbing-semantics) mismatch between the guard's
+    // expansion and the shell's, which is the fail-open class #1228 closes.
+    // The reason must offer the literal-spelling remedy.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const cleanGlob = await bash("bash ./cleanonly-1228*.sh", wt);
+    expectTrue("B13: glob over a CLEAN script BLOCKED (documented fail-closed cost) and offers the literal remedy",
+      blocked(cleanGlob) && /pass the path literally/.test(blockReason1228(cleanGlob)),
+      `reason=${JSON.stringify(blockReason1228(cleanGlob)).slice(0, 240)}`);
+    // Negative control: a piped producer with no expansion and no discard stays
+    // allowed (the arm must not fail closed on every pipe into a shell).
+    expectTrue("B13: `printf 'hello\\n' | bash` ALLOWED (no expansion, no discard)",
+      allowed(await bash("printf 'hello\\n' | bash", wt)), "was blocked");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp]) rmSync(f, { force: true });
+
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
     process.env.AGENT_ALLOW_MAIN_EDITS = "1";
