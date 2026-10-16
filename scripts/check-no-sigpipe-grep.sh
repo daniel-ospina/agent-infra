@@ -68,21 +68,21 @@
 #     recoverable through the exceptions file; the alternative (anchoring raw_idiom) regressed
 #     quoted/escaped/backticked writers from flagged to CLEAN.
 #
-#     RESIDUALS — PRODUCER SPELLINGS THE WIDENING STILL MISSES (measured, filed, NOT chased).
-#     All four need the SAME conjunction — a producer word `writer_at` rejects AND a `|` inside
-#     the producer's own argument that defeats raw_idiom's `[^|]*` bridge — and all four are
-#     CLEAN before and after #864, so none is a regression; the widening is strictly better on
-#     each. They are open-ended in exactly the way the wrapper allowlist is (#1645), and they
-#     are recorded on #864 rather than half-modelled here:
+#     PRODUCER SPELLINGS THAT REACH THE SAME FALSE CLEAN, AND ARE NOW CLOSED. Each of these needed
+#     the SAME conjunction — a producer word the token walk had to resolve AND a `|` inside the
+#     producer's own argument that defeats raw_idiom's `[^|]*` bridge — and each was measured at rc
+#     141 under `pipefail` on a >64 KiB payload whose match is on line 1, against 0 for the
+#     capture-then-classify form. All are pinned in tests/sigpipe-grep/run.sh 13a:
 #       a wrapper whose OPTION precedes the word   `env -i grep`, `command -p grep`,
 #                                                  `stdbuf -oL grep`, `sudo -E grep`
-#                                                  (`tokn ~ /^-/` rejects the word — the same
-#                                                  test that keeps `foo -e echo` unflagged)
+#                                                  (the option belongs to the WRAPPER — the same
+#                                                  test keeps `foo -e echo` unflagged)
 #       a QUOTED or ESCAPED producer word           `"grep" -E "a|b" f | grep -q p`, `\grep …`
 #       a $-rooted path                             `$HOME/bin/grep -E "a|b" f | grep -q p`
 #       a PROCESS SUBSTITUTION in its argument       `grep -f <(cat list | head -2) f | grep -q p`
-#     Measured: each returns rc 141 under `pipefail` on a >64 KiB payload with the match on line
-#     1, and the capture-then-case form returns 0.
+#     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
+#     regression; the widening closes them. The class stays open-ended in exactly the way the
+#     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
 #     into grep is seen through — `env`, `nice`, `command`, `time`, `sudo`, `stdbuf`, `exec`,
@@ -553,7 +553,14 @@ HITS="$(
         # optional path. `printf x | LC_ALL=C grep -q p` IS the idiom (measured rc 141), and both
         # matchers previously reported it clean because neither admitted a prefix. Defined ONCE so
         # the two matchers cannot drift apart on which forms they recognise.
-        GREPRE = "(([A-Za-z0-9._~+-]*/)*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*|env|nice|command|time|sudo|stdbuf|exec|eval|nohup|setsid|timeout|busybox|sh|bash|dash|zsh|ksh)[ \t]+)*([A-Za-z0-9._~+-]*/)*"
+        # The WRAPPER words — a command that EXECS INTO the next one and passes stdin/stdout
+        # through. Named ONCE because two checks need the same list: the consumer prefix grammar
+        # (GREPRE, immediately below) and the producer prefix grammar in writer_at (an option
+        # before the command word belongs to the WRAPPER, not to some other command — without
+        # that test `env -i grep`, `command -p grep`, `stdbuf -oL grep` and `nice --adjustment=5
+        # grep` were reported CLEAN at rc 141; #864 review).
+        WRAPWORDS = "env|nice|command|time|sudo|stdbuf|exec|eval|nohup|setsid|timeout|busybox|sh|bash|dash|zsh|ksh"
+        GREPRE = "(([A-Za-z0-9._~+-]*/)*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*|" WRAPWORDS ")[ \t]+)*([A-Za-z0-9._~+-]*/)*"
         # The PRODUCER words whose stdout, piped into a quiet grep, is the class this guard
         # bans. `grep` joined the set in #864: the mechanism is `pipefail` plus the early
         # exit of a quiet grep, so a `grep` upstream takes the signal exactly as the builtin
@@ -1000,7 +1007,7 @@ HITS="$(
         q = ""; ansi = 0; esc = 0
         for (i = start; i <= CHN; i++) {
           c = CH[i]
-          if (esc) { esc = 0; continue }
+          if (esc) { esc = 0; w = writer_at(s, i); if (w && scan_from(i + w)) return 1; continue }
           if (q != "") {
             if ((q == "\"" || ansi) && c == "\\") { esc = 1; continue }
             if (c == q) { q = ""; ansi = 0 }
@@ -1028,7 +1035,7 @@ HITS="$(
       # carries foo output, and the `echo` is an option argument, not a command).
       # KEEP IN STEP WITH WRITERRE (see the note at its definition): the ladder below is the
       # only producer list scan_idiom consults.
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q) {
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto) {
         w = 0
         # Character comparisons against the pre-split array: `substr(s, i, 6)` per index over a long
         # line is O(n) PER CALL in this awk and made the walk quadratic (27 s for a 1 MB line).
@@ -1057,21 +1064,45 @@ HITS="$(
           p = i - 1
           while (p >= 1 && CH[p] == "/") {
             q = p - 1
-            while (q >= 1 && CH[q] ~ /[A-Za-z0-9._~+-]/) q--
+            while (q >= 1 && CH[q] ~ /[A-Za-z0-9._~+{}$-]/) q--
             p = q
           }
           prev = (p < 1) ? " " : CH[p]
         }
-        if (prev !~ /[ \t;&|({`]/) return 0
+        # A QUOTED or ESCAPED command word is the same command (the shell removes the quoting), and
+        # `raw_idiom` was deliberately left unanchored to keep exactly these spellings flagged — but
+        # a data pipe inside the producer argument defeats that matcher, so scan_idiom has to see
+        # them too, or the two blind spots meet: both were CLEAN at rc 141 (#864 review).
+        if (prev !~ /[ \t;&|({`"\\\047]/) return 0
         nxt = CH[i + w]
-        if (nxt != "" && nxt !~ /[ \t]/) return 0
+        # A quote or a backslash DIRECTLY after the word is its own quoting (`"grep"`, `'grep'`),
+        # not the start of another word: `grepx` must stay rejected, `grep"` must not.
+        if (nxt != "" && nxt !~ /[ \t"\047\\]/) return 0
         if (w == 6 && substr(s, i + w, 10) ~ /^[ \t]+-v/) return 0
         j = i - 1
         while (j >= 1 && (CH[j] == " " || CH[j] == "\t")) j--
         k = j
         while (k >= 1 && CH[k] !~ /[ \t;&|({]/) k--
         tokn = substr(s, k + 1, j - k)
-        if (tokn ~ /^-/) return 0
+        if (tokn ~ /^-/) {
+          # The preceding token is an OPTION — but an option belongs to the command BEFORE it, and a
+          # WRAPPER option does not stop the word being a command: in `env -i grep` the option
+          # belongs to env, and `grep` is the operand whose stdout owns the pipe. The case this test
+          # exists for is a writer that is an OPTION ARGUMENT of another command (`foo -e echo -e
+          # …`), and there no wrapper precedes the option, so it stays rejected.
+          pw = k - 1
+          while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
+          ph = pw
+          while (ph >= 1 && CH[ph] !~ /[ \t;&|({]/) ph--
+          pto = substr(s, ph + 1, pw - ph)
+          if (pto !~ "^(" WRAPWORDS ")$" && pto !~ "/" WRAPWORDS "$") return 0
+        }
+        # A QUOTE-CLOSED word (`"grep"`, `'grep'`) carries its own quoting: report the length
+        # INCLUDING the closing quote, so the caller restarts OUTSIDE it. Restarting ON the closing
+        # quote mis-pairs the rest of the line — `"grep" -E "a|b" f | grep -q p` reopened a quote at
+        # the closing one, re-paired `"a|b"` as unquoted, and charged the DATA pipe to the writer,
+        # reporting CLEAN at rc 141 (#864 review).
+        if ((prev == "\"" || prev == "\047") && nxt == prev) return w + 1
         return w
       }
       # Try EVERY writer at a command boundary — a line may hold more than one shell invocation,
@@ -1084,14 +1115,17 @@ HITS="$(
       # — and that is the ONLY reason a per-line scan budget existed. A budget can be spent two
       # ways, scan less (a false clean) or refuse a verdict, so removing the rescan removes the need
       # for it rather than choosing which failure to accept.
-      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pd, ad, bt) {
+      function scan_idiom(s,   i, c, q, ansi, esc, w, active, g, br, pd, ad, bt, d, inside) {
         q = ""; ansi = 0; esc = 0; active = 0; br = 0; pd = 0; ad = 0; bt = 0
         # Nothing to find on a line with no pipe at all, and this is the common case for the
         # many-writers pathology (`echo ` repeated): without it every writer drove a walk.
         if (index(s, "|") == 0) return 0
         for (i = 1; i <= CHN; i++) {
           c = CH[i]
-          if (esc) { esc = 0; continue }
+          # An ESCAPED command word is still that command (`\grep` runs grep), so the word after a
+          # backslash is tested too — otherwise `\grep -E "a|b" f | grep -q p` is CLEAN while the
+          # unescaped form is flagged (#864 review).
+          if (esc) { esc = 0; w = writer_at(s, i); if (w && scan_from(i + w)) return 1; continue }
           if (q != "") {
             # A writer inside the quoted region: scan it in its OWN quoting context (see scan_from).
             w = writer_at(s, i)
@@ -1111,7 +1145,13 @@ HITS="$(
           # captured. CS[d] marks the depth at which the output is captured; AD is the depth of the
           # writer that owns the pipe, and the closer only clears a writer inside the capture.
           if (c == "$" && CH[i + 1] == "(") { pd++; CS[pd] = 1; i++; continue }
-          if (c == "<" && CH[i + 1] == "(") { pd++; CS[pd] = 1; active = 0; i++; continue }
+          if (c == "<" && CH[i + 1] == "(") {
+            # `<(` is INPUT redirection: it feeds one ARGUMENT and does NOT move the stdout of the
+            # command it belongs to off the pipe. Clearing the writer here lost `grep -f <(cat
+            # list) f | grep -q p`, a measured 141 reported CLEAN (#864 review). `CS[pd]` still marks
+            # the depth as captured, so a writer INSIDE the substitution is cleared at its closer.
+            pd++; CS[pd] = 1; i++; continue
+          }
           if (c == "`") {
             if (bt == 0) { pd++; CS[pd] = 1; bt = 1 }
             else { if (ad >= pd) active = 0; pd--; bt = 0 }
@@ -1140,6 +1180,15 @@ HITS="$(
           if (c == "<" && CH[i + 1] == "(") { active = 0; continue }
           if (c == "|") {
             if (CH[i + 1] == "|") { active = 0; i++; continue }
+            # A pipe INSIDE a capture (`$( … )`, `<( … )`, backticks) belongs to the nested command,
+            # not to a writer outside it: `grep -f <(cat list | head -2) f | grep -q p` charged the
+            # INNER pipe to the outer grep, so the real pipe was never owned and the line was
+            # reported CLEAN at rc 141 (#864 review).
+            if (active) {
+              inside = 0
+              for (d = ad + 1; d <= pd; d++) if (CS[d]) { inside = 1; break }
+              if (inside) continue
+            }
             # The FIRST unquoted pipe after a writer takes its stdout. If the command that reads it
             # is not a quiet grep, nothing further along the line belongs to this writer:
             # `printf ... | sed ... | grep -q` is two stages down, not the adjacent-writer idiom

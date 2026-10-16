@@ -2050,17 +2050,29 @@ printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" f | grep -q bar'    
 printf '%s\n' '#!/usr/bin/env bash' 'env /usr/bin/grep -E "a|b" f | grep -q bar'  > "$E/scripts/wrapbypath.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | /usr/bin/grep -E "a|b" | grep -q needle' > "$E/scripts/stagedbypath.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'x=$(/usr/bin/grep -E "a|b" f | grep -q bar)' > "$E/scripts/substbypath.sh"
+# The prefix spellings that reach the SAME false clean, each measured at rc 141 on a >64 KiB
+# payload with the match on line 1: a WRAPPER option before the word (the option belongs to the
+# wrapper, not to another command), a QUOTED or ESCAPED word, a $-rooted path, and a PROCESS
+# SUBSTITUTION in the producer's own argument (which is INPUT redirection — it does not move the
+# stdout off the pipe). Each was CLEAN before this widening and is pinned so it stays flagged.
+printf '%s\n' '#!/usr/bin/env bash' 'env -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/wrapopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"grep" -E "a|b" f | grep -q bar'            > "$E/scripts/quotedword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '\grep -E "a|b" f | grep -q bar'             > "$E/scripts/escapedword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '$HOME/bin/grep -E "a|b" f | grep -q bar'     > "$E/scripts/varpath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head -2) f | grep -q bar' > "$E/scripts/procsubst.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
    && grep -q 'quotepipe\.sh' "$OUT" && grep -q 'continued\.sh' "$OUT" \
    && grep -q 'subst\.sh' "$OUT" && grep -q 'bypath\.sh' "$OUT" \
    && grep -q 'wrapbypath\.sh' "$OUT" && grep -q 'stagedbypath\.sh' "$OUT" \
-   && grep -q 'substbypath\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, via an intermediary, by path, wrapper-prefixed, with a data pipe in the producer's own argument, continued, in a substitution, and the by-path-plus-data-pipe conjunction)"
+   && grep -q 'substbypath\.sh' "$OUT" && grep -q 'wrapopt\.sh' "$OUT" \
+   && grep -q 'quotedword\.sh' "$OUT" && grep -q 'escapedword\.sh' "$OUT" \
+   && grep -q 'varpath\.sh' "$OUT" && grep -q 'procsubst\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
-  sed -n '1,16p' "$OUT"
+  sed -n '1,20p' "$OUT"
 fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
 #      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
