@@ -68,6 +68,14 @@
 #     recoverable through the exceptions file; the alternative (anchoring raw_idiom) regressed
 #     quoted/escaped/backticked writers from flagged to CLEAN.
 #
+#     PRODUCER-SIDE OVER-BLOCK FROM THE QUOTED-BODY CLASS (#864). The quoted-body pass reads any
+#     quoted region whose resolution begins with a producer word and which is piped straight on
+#     as a wrapper body (`env -S "printf x" | grep -q p`), because a text matcher cannot tell a
+#     wrapper body from an ordinary string argument: `foo "grep -vE a|b f" | grep -q c` is
+#     flagged although foo is the producer. Same polarity as the substring class — over-block is
+#     friction and visible, a missed producer is a silent false CLEAN — and no live occurrence of
+#     the shape exists on this tree (the guard runs clean).
+#
 #     PRODUCER SPELLINGS THAT REACH THE SAME FALSE CLEAN, AND ARE NOW CLOSED. Each of these needed
 #     the SAME conjunction — a producer word the token walk had to resolve AND a `|` inside the
 #     producer's own argument that defeats raw_idiom's `[^|]*` bridge — and each was measured at rc
@@ -80,6 +88,13 @@
 #       a QUOTED or ESCAPED producer word           `"grep" -E "a|b" f | grep -q p`, `\grep …`
 #       a $-rooted path                             `$HOME/bin/grep -E "a|b" f | grep -q p`
 #       a PROCESS SUBSTITUTION in its argument       `grep -f <(cat list | head -2) f | grep -q p`
+#       a producer INSIDE a WRAPPER BODY            `eval "grep -vE \"x|y\" f | grep -q needle"`,
+#                                                  `env -S "grep -vE x|y f" | grep -q needle` —
+#                                                  the producer own argument carries the data
+#                                                  pipe, so BOTH matchers miss it; the QUOTED-BODY
+#                                                  pass resolves the body (the inner shell removes
+#                                                  the level-0 escapes) and re-runs the same two
+#                                                  matchers on it, never a weaker third predicate
 #     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
 #     regression; the widening closes them. The class stays open-ended in exactly the way the
 #     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
@@ -1208,7 +1223,75 @@ HITS="$(
         }
         return 0
       }
-      function is_idiom(s) {
+      # THE WRAPPER-BODY PRODUCER (the fourth declared class in 13a).
+      # -------------------------------------------------------------
+      # The two matchers above BOTH miss the same conjunction: a `grep` producer whose own
+      # argument carries a literal `|`, inside a quoted body. raw_idiom cannot cross that data
+      # pipe with its `[^|]*` bridge, and scan_from abandons at the first pipe it meets because
+      # the level-0 backslash that escapes the inner quote is read as a level-1 escape, so the
+      # data pipe looks like a real break:
+      #     eval "grep -vE \"x|y\" f | grep -q needle"      # rc 141, reported CLEAN before this
+      #     env -S "grep -vE x|y f" | grep -q needle        # rc 141, reported CLEAN before this
+      # A body is a shell program in its own right, so the pass below RE-READS each quoted
+      # region the way the inner shell will. The inner shell removes the level-0 escape
+      # backslashes before it parses, so those are removed here too, and the resolved body is
+      # fed BACK THROUGH the two matchers above - it is not re-decided by a third, weaker
+      # predicate. That is what keeps this from over-blocking: a plain string that merely
+      # MENTIONS a pipe and a grep (an echo of a message, a `--status` option) is not an idiom,
+      # and the full matchers say so.
+      #
+      # The worklist is ITERATIVE, never recursive: a body can itself contain a body (an eval
+      # inside an eval), and recursing into `matchers` would clobber the global CH that the
+      # outer walk is mid-way through. `is_idiom` therefore drives a queue, and each entry is
+      # analysed only after the previous one has finished with CH.
+      #
+      # Only a body carrying BOTH a pipe and a producer word can hold the self-contained idiom,
+      # so the cheap filter keeps the queue (and the O(body count) re-scan) off the common
+      # clean line. The other shape - the body is the PRODUCER and the wrapper stdout is piped
+      # straight on - is decided directly on the line, with no queue entry.
+      function body_enqueue(b,   QK) {
+        # A quoted body often repeats (`"$a"` and `"$a"` on one line); the queue only needs
+        # the distinct strings, so skip a body already queued.
+        for (QK = 1; QK <= QN; QK++) if (QB[QK] == b) return
+        QN++; QB[QN] = b
+      }
+      function bodies_of(s,   i, c, q, ansi, beg, end, body, nb, j, g) {
+        for (i = 1; i <= CHN; i++) {
+          c = CH[i]
+          if (q == "") {
+            if (c == "$" && CH[i + 1] == "\047") { q = "\047"; ansi = 1; i++; beg = i + 1; continue }
+            if (c == "\"" || c == "\047") { q = c; ansi = 0; beg = i + 1; continue }
+            continue
+          }
+          # The quote flavours resolve escapes differently: a backslash escapes the next
+          # character inside double quotes and inside an ANSI-C dollar-single form, and is literal inside
+          # a plain single-quoted body.
+          if ((q == "\"" || ansi) && c == "\\") { i++; continue }
+          if (c != q) continue
+          end = i
+          body = substr(s, beg, end - beg)
+          q = ""; ansi = 0
+          # The inner shell has already removed the level-0 backslashes here; dropping them all
+          # is the coarse approximation body_quiet makes too, and the matchers still decide.
+          nb = body
+          gsub(/\\/, "", nb)
+          if (index(nb, "|") > 0 && nb ~ /(printf|echo|grep)[ \t]/) body_enqueue(nb)
+          # The wrapper whose BODY is the producer and whose stdout is piped straight on:
+          # `env -S "grep -vE x|y f" | grep -q needle`. Only the FIRST command of a resolved
+          # body can be the wrapper command, so the test is anchored at its start.
+          j = end + 1
+          while (j <= CHN && (CH[j] == " " || CH[j] == "\t")) j++
+          if (j <= CHN && CH[j] == "|" && CH[j + 1] != "|") {
+            if (nb ~ "^[ \t]*" GREPRE "(printf|echo|grep)([ \t]|$)") {
+              g = is_grep_cmd(j + 1)
+              if (g == -1 || (g && has_quiet(g))) return 1
+            }
+          }
+        }
+        return 0
+      }
+      # The two original matchers in one place; also rebuilds CH for the body walk of the caller.
+      function matchers(s) {
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
@@ -1216,7 +1299,22 @@ HITS="$(
         # The LINE is kept as a global too, because a wrapper body must be read WHOLE from it (TOK is
         # capped) - see body_text.
         CURLINE = s
-        return raw_idiom(s) || scan_idiom(s)
+        return (raw_idiom(s) || scan_idiom(s))
+      }
+      function is_idiom(s,   k) {
+        delete QB; QN = 0
+        if (matchers(s)) return 1
+        if (bodies_of(s)) return 1
+        # Drain the queue breadth-first. Every enqueued body is strictly shorter than the line
+        # that produced it, so the loop terminates; CH is rebuilt per entry and never clobbered
+        # mid-walk because no entry is analysed from inside the walk of another entry.
+        k = 1
+        while (k <= QN) {
+          if (matchers(QB[k])) return 1
+          if (bodies_of(QB[k])) return 1
+          k++
+        }
+        return 0
       }
       # a pure comment or blank line is documentation: it cannot execute, so it is skipped
       # (otherwise a script that merely DOCUMENTS the anti-pattern fails the build).
