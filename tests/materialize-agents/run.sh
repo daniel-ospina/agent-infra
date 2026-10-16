@@ -547,9 +547,24 @@ rule_scan() {  # <file> → one finding per line on stdout
   printf '%s' "$findings"
 }
 
-rule_fixture() {  # <name> ; fixture body on stdin → path on stdout
-  local f="$TMP/rule-$1.md"; cat > "$f"; printf '%s' "$f"
-}
+# Each fixture body is written with a TOP-LEVEL heredoc into `$TMP/rule-<name>.md`,
+# never with `$( … <<'EOF' … )`.
+#
+# ⛔ WHY (measured, #1681 review P1): bash 3.2.57 — `/bin/bash` on macOS, the
+# interpreter this fleet runs — mis-parses a QUOTED heredoc inside a command
+# substitution whose BODY contains an apostrophe. It swallows everything from
+# the apostrophe to the end of the chunk, so the file parses as
+# `bad substitution`, every later fixture is never written, and the R1/R2
+# controls below silently do not execute. The suite was GREEN in CI
+# (ubuntu/bash 5) and RED here — 44 checks instead of 58, one ❌ and a
+# `bad substitution` on stderr. A top-level heredoc is not a command
+# substitution, so the parse is identical on bash 3.2 and bash 5.
+#
+# Two apostrophe-free fixtures happened to parse; that is luck, not a rule, so
+# every fixture in this file uses the same shape.
+#
+# rule_fixture() (the old `cat`-on-stdin helper) is DELETED with this change:
+# its only call shape WAS the broken one, and leaving it would re-invite it.
 rule_expect() {  # <file> hits|clean <label>
   local f="$1" want="$2" label="$3" hits
   hits="$(rule_scan "$f")"
@@ -563,35 +578,35 @@ rule_expect() {  # <file> hits|clean <label>
 }
 
 # RED: the pre-fix uncertainty branch (commit 2341d76bd) — applies on uncertainty.
-rule_expect "$(rule_fixture red-unsure-apply <<'EOF'
+cat > "$TMP/rule-red-unsure-apply.md" <<'EOF'
 **The test to apply:** *has the owner approved the content of this exact change?* **Yes** → apply it,
 and do not ask again. **No, or the diff changed since approval** → it is a new decision and needs
 approving. **Unsure which diff was approved** → state the diff you believe is approved and apply
 that; this question is answered by *naming the diff*, never by stopping.
 EOF
-)" hits "pre-fix uncertainty branch resolves to applying"
+rule_expect "$TMP/rule-red-unsure-apply.md" hits "pre-fix uncertainty branch resolves to applying"
 
 # GREEN control: the post-fix uncertainty branch must NOT be flagged.
-rule_expect "$(rule_fixture green-unsure-confirm <<'EOF'
+cat > "$TMP/rule-green-unsure-confirm.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: argue it in the decision's own home, per the contradiction test below.
 
 approving. **Unsure which diff was approved** → **state that exact diff and ask for the one-line
 confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of
 your own reading of what was approved — and never merely wait in silence.
 EOF
-)" clean "post-fix uncertainty branch requires a confirmation"
+rule_expect "$TMP/rule-green-unsure-confirm.md" clean "post-fix uncertainty branch requires a confirmation"
 
 # RED, isolated to R1: the reworded false-PASS #1681's review reproduced — it keeps
 # the word 'confirm' while still directing the write, which the old deny-list missed
 # and the old polarity-blind `grep -qi confirm` accepted. The cross-reference is clean
 # so the assertion names the R1 arms.
-r1_reword_red="$(rule_fixture red-reworded-apply <<'EOF'
+cat > "$TMP/rule-red-reworded-apply.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 **Unsure which diff was approved** → apply the diff you believe was approved and confirm it
 afterwards in the same comment; the confirmation never gates the write.
 EOF
-)"
+r1_reword_red="$TMP/rule-red-reworded-apply.md"
 r1_reword_hits="$(rule_scan "$r1_reword_red")"
 if grep -q '^R1' <<<"$r1_reword_hits" && ! grep -q '^R2' <<<"$r1_reword_hits"; then
   pass "rule pin: reworded apply-on-uncertainty flagged by the R1 arms alone"
@@ -600,12 +615,12 @@ else
 
 # RED, isolated to R1's ASK arm: the branch negates the write but never ASKS for
 # the confirmation. Delete the ask conjunct and this case goes red.
-r1_ask_red="$(rule_fixture red-unsure-no-ask <<'EOF'
+cat > "$TMP/rule-red-unsure-no-ask.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 **Unsure which diff was approved** → never apply on your own reading; wait for the owner.
 EOF
-)"
+r1_ask_red="$TMP/rule-red-unsure-no-ask.md"
 r1_ask_hits="$(rule_scan "$r1_ask_red")"
 if grep -q 'does not ask for the one-line confirmation' <<<"$r1_ask_hits" \
    && ! grep -q 'carries no negation of the write' <<<"$r1_ask_hits"; then
@@ -616,12 +631,12 @@ else
 # RED, isolated to R1's NEGATION arm: the branch ASKS but still applies — exactly
 # the shape a bare `confirm` token used to satisfy. Delete the negation conjunct
 # and this case goes red.
-r1_neg_red="$(rule_fixture red-unsure-no-negation <<'EOF'
+cat > "$TMP/rule-red-unsure-no-negation.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 **Unsure which diff was approved** → ask for the one-line confirmation, then apply what you believe was approved.
 EOF
-)"
+r1_neg_red="$TMP/rule-red-unsure-no-negation.md"
 r1_neg_hits="$(rule_scan "$r1_neg_red")"
 if grep -q 'carries no negation of the write' <<<"$r1_neg_hits" \
    && ! grep -q 'does not ask for the one-line confirmation' <<<"$r1_neg_hits"; then
@@ -635,12 +650,12 @@ else
 # NON-apply verb is appended to it. #1681's fifth review reproduced exactly this
 # shape: the sweep reported only apply-family tokens, so `go ahead and make the
 # change anyway` re-instated the unauthorized-write path and passed clean.
-r1_verb_red="$(rule_fixture red-foreign-verb <<'EOF'
+cat > "$TMP/rule-red-foreign-verb.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 **Unsure which diff was approved** → **state that exact diff and ask for the one-line confirmation**; the *confirmation* is what authorizes the write, so never apply on the strength of your own reading of what was approved — but if the owner is slow, go ahead and make the change anyway, then note it.
 EOF
-)"
+r1_verb_red="$TMP/rule-red-foreign-verb.md"
 r1_verb_hits="$(rule_scan "$r1_verb_red")"
 if grep -q 'non-apply verb' <<<"$r1_verb_hits" \
    && ! grep -q 'does not ask' <<<"$r1_verb_hits" \
@@ -656,7 +671,7 @@ else
 # silent — but a NEIGHBOURING paragraph rewords the write back in. #1681's third
 # review reproduced exactly this end to end: the old paragraph-scoped R1 returned
 # clean on both shipped surfaces. The false-PASS sentence is used verbatim.
-r1_neighbour_red="$(rule_fixture red-neighbouring-apply <<'EOF'
+cat > "$TMP/rule-red-neighbouring-apply.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 ### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
@@ -674,7 +689,7 @@ confirmation can follow later.
 
 ---
 EOF
-)"
+r1_neighbour_red="$TMP/rule-red-neighbouring-apply.md"
 r1_neighbour_hits="$(rule_scan "$r1_neighbour_red")"
 if grep -q 'neighbouring paragraph' <<<"$r1_neighbour_hits" \
    && ! grep -q 'does not ask' <<<"$r1_neighbour_hits" \
@@ -701,7 +716,7 @@ r1_sweep_labels=(
   "neighbouring 'may APPLY' (case-sensitive scan)"
 )
 for i in "${!r1_sweep_rewords[@]}"; do
-  r1_sweep_red="$(rule_fixture "red-sweep-reword-$i" <<EOF
+cat > "$TMP/rule-red-sweep-reword-$i.md" <<EOF
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 ### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
@@ -717,7 +732,7 @@ ${r1_sweep_rewords[$i]}
 
 ---
 EOF
-)"
+  r1_sweep_red="$TMP/rule-red-sweep-reword-$i.md"
   r1_sweep_hits="$(rule_scan "$r1_sweep_red")"
   if grep -q 'neighbouring paragraph' <<<"$r1_sweep_hits" \
      && ! grep -q 'does not ask' <<<"$r1_sweep_hits" \
@@ -735,7 +750,7 @@ done
 # reproduced it end to end: a directive inserted immediately above the H3 left
 # both shipped surfaces reporting clean. The branch is the shipped (clean) one and
 # the cross-reference is clean, so only the sweep has anything to say.
-r1_above_red="$(rule_fixture red-paragraph-above-apply <<'EOF'
+cat > "$TMP/rule-red-paragraph-above-apply.md" <<'EOF'
 ## ⛔ HARD RULE: Process Problems Are Yours To Fix — Do Not Escalate Them
 
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
@@ -754,7 +769,7 @@ your own reading of what was approved — and never merely wait in silence.
 
 ---
 EOF
-)"
+r1_above_red="$TMP/rule-red-paragraph-above-apply.md"
 r1_above_hits="$(rule_scan "$r1_above_red")"
 if grep -q 'un-negated write directive' <<<"$r1_above_hits" \
    && ! grep -q 'does not ask' <<<"$r1_above_hits" \
@@ -772,7 +787,7 @@ else
 # it replaced, which swept the heading. Only the frozen heading clause may be
 # removed; anything appended to it is swept. The branch and cross-reference are
 # clean so only the sweep has anything to say.
-r1_heading_red="$(rule_fixture red-heading-apply <<'EOF'
+cat > "$TMP/rule-red-heading-apply.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 ### ⛔ An owner-APPROVED diff is yours to APPLY — if you are unsure, apply the diff you believe was approved
@@ -786,7 +801,7 @@ your own reading of what was approved — and never merely wait in silence.
 
 ---
 EOF
-)"
+r1_heading_red="$TMP/rule-red-heading-apply.md"
 r1_heading_hits="$(rule_scan "$r1_heading_red")"
 if grep -q 'un-negated write directive' <<<"$r1_heading_hits" \
    && ! grep -q 'does not ask' <<<"$r1_heading_hits" \
@@ -800,7 +815,7 @@ else
 # GREEN control for the sweep: the shipped subsection shape, clear of any
 # neighbouring write, must stay clean — a legitimate reword of the two
 # allow-listed apply clauses is the only thing this arm may false-flag.
-rule_expect "$(rule_fixture green-subsection-clean <<'EOF'
+cat > "$TMP/rule-green-subsection-clean.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: per the contradiction test below.
 
 ### ⛔ An owner-APPROVED diff is yours to APPLY — approval is not a keystroke
@@ -818,16 +833,16 @@ confirmation, never to a write.
 
 ---
 EOF
-)" clean "subsection with a clean neighbouring paragraph stays clean"
+rule_expect "$TMP/rule-green-subsection-clean.md" clean "subsection with a clean neighbouring paragraph stays clean"
 
 # RED for R2 specifically: the pre-fix cross-reference, with a clean uncertainty branch
 # so the R1 arm stays silent and the assertion names the R2 arm.
-r2_red="$(rule_fixture red-above-ref <<'EOF'
+cat > "$TMP/rule-red-above-ref.md" <<'EOF'
 Reversing a recorded decision is a **reopen**: argue it in the decision's own home, per the contradiction test above.
 
 **Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
-)"
+r2_red="$TMP/rule-red-above-ref.md"
 r2_hits="$(rule_scan "$r2_red")"
 if grep -q '^R2' <<<"$r2_hits" && ! grep -q '^R1' <<<"$r2_hits"; then
   pass "rule pin: cross-reference 'above' flagged by the R2 arm alone"
@@ -837,14 +852,14 @@ else
 # RED for R2's de-anchoring: the pre-fix cross-reference under a RENAMED section
 # heading. The old range was anchored to the exact H1, so this exact input used to
 # report clean (the arm was disabled by the rename).
-r2_rename_red="$(rule_fixture red-above-renamed-heading <<'EOF'
+cat > "$TMP/rule-red-above-renamed-heading.md" <<'EOF'
 ## ⛔ HARD RULE: Process Problems — Do Not Escalate Them
 
 Reversing a recorded decision is a **reopen**: per the contradiction test above.
 
 **Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
-)"
+r2_rename_red="$TMP/rule-red-above-renamed-heading.md"
 r2_rename_hits="$(rule_scan "$r2_rename_red")"
 if grep -q '^R2' <<<"$r2_rename_hits" && ! grep -q '^R1' <<<"$r2_rename_hits"; then
   pass "rule pin: R2 survives a section-heading rename"
@@ -852,22 +867,22 @@ else
   fail "rule pin: R2 disabled by a heading rename (got: $(head -1 <<<"$r2_rename_hits"))"; fi
 
 # RED for R2's fail-closed anchor: no cross-reference sentence at all.
-r2_missing_red="$(rule_fixture red-missing-ref <<'EOF'
+cat > "$TMP/rule-red-missing-ref.md" <<'EOF'
 **Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
-)"
+r2_missing_red="$TMP/rule-red-missing-ref.md"
 if grep -q 'R2: no' <<<"$(rule_scan "$r2_missing_red")"; then
   pass "rule pin: missing cross-reference fails closed"
 else
   fail "rule pin: missing cross-reference reported clean (fail-open)"; fi
 
 # GREEN: the post-fix reference direction must NOT be flagged.
-rule_expect "$(rule_fixture green-below-ref <<'EOF'
+cat > "$TMP/rule-green-below-ref.md" <<'EOF'
 Reversing a recorded decision is a **reopen**, per the contradiction test below.
 
 **Unsure which diff was approved** → state that exact diff and ask for the one-line confirmation; never apply on your own reading.
 EOF
-)" clean "cross-reference to the contradiction test says 'below'"
+rule_expect "$TMP/rule-green-below-ref.md" clean "cross-reference to the contradiction test says 'below'"
 
 # The shipped surfaces must be clean — the pin is not vacuous on the real file.
 for f in "$BASE" "$ROOT/AGENTS.md"; do
