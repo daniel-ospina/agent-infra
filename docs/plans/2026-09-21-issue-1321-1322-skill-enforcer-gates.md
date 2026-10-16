@@ -139,7 +139,7 @@ below gets a test.
 | T10 | Duplicate manifest lines | the *real* `enforcement/dangerous-ops.txt` (two lines per skill, two of them) | both lines' patterns survive with their own mode; `git commit` is armed | unit over the real manifest + positive control |
 | T11 | A **nudge** rule must never hard-block | `mcp__tortoise__tortoise_search`, `rg -n 'tortoise_' skills/` | neither blocks; the `hard` verb list still blocks a genuine `tortoise_create_point` | handler-driven fake-`pi` test |
 | T12 | Fixture hermeticity | ambient `PI_MODE=print`, `SKILL_ENFORCER_DISABLED=1`, `AGENT_INFRA_PATH` → another checkout | every child/in-process leg pins or clears those vars, so a control cannot pass vacuously | fixture-level precondition assertion in each leg |
-| T13 | Persisted-read entry | a hand-written `~/.pi/agent/skill-reads.json` naming a skill | narrowed: an entry restores only if it canonicalises to a name a trusted root actually holds a `SKILL.md` for. **Residual, not closed:** a valid name (or a read by a previous session) still satisfies a gate for ≤24 h — deliberate #7416 behaviour, pre-existing, filed as a follow-up | unit (seeded + forged file) |
+| T13 | Persisted-read entry | a hand-written `~/.pi/agent/skill-reads.json` naming a skill | narrowed: an entry restores only if it canonicalises to a name a trusted root actually holds a `SKILL.md` for. **Residual, not closed:** a valid name (or a read by a previous session) still satisfies a gate — the 24 h TTL is a bound on **idleness**, not on the age of the read (see the residual bullet) — deliberate #7416 behaviour, pre-existing, filed as a follow-up | unit (seeded + forged file) |
 
 **Explicitly out of scope** (declared, not chased, filed from cycle 1):
 
@@ -149,10 +149,26 @@ below gets a test.
   closing it needs a content hash / signed manifest-of-skills. Requirement 3 needs the
   `<repo>/skills/` shape to register, so tightening further would break the stated
   acceptance. Filed as a follow-up.
-- **T13 residual — persisted reads satisfy a gate for ≤24 h** (#7416 by design, pre-existing
-  before this change: the stored key was a path string and was equally forgeable). This
-  change *narrows* it (an entry must now name a skill a trusted root actually holds).
-  Reversing #7416 would reopen a recorded decision, so it is filed, not absorbed.
+- **T13 residual — persisted reads satisfy a gate, bounded by 24 h of IDLENESS** (eldato #7416 by
+  design, pre-existing before this change: the stored key was a path string and was equally
+  forgeable). This change *narrows* it (an entry must now name a skill a trusted root actually
+  holds). Reversing #7416 would reopen a recorded decision, so it is filed, not absorbed.
+  - **Re-measured 2026-10-16 (agent-infra #1331): the bound is on idleness, not on the read's age.**
+    `persistReadFiles()` writes `readAt: now` for **every** entry in `readFiles` — a restored entry
+    included — and it runs after each tracked read and at `session_shutdown`. So each session that
+    restores an entry re-stamps it: a skill read once keeps clearing its gate while a session starts
+    at least once every 24 h, and the entry is dropped only when 24 h pass with no session. Probe
+    (the shipped handlers, `_setSkillReadsFileForTest` seam): an entry seeded 23 h old clears an
+    armed gate at `session_start` and is re-stamped to `now` at `session_shutdown`. The row above
+    previously read "≤24 h"; that was the TTL's *restore* condition, not the entry's lifetime.
+  - **Documented and filed as agent-infra #1331** — the window is now stated at the gate-description
+    sites: the manifest header (`enforcement/dangerous-ops.txt`), the `skill-enforcer` persistence
+    comment, and `AGENTS.md` §Skill Reading Protocol. "Read this session" in a gate message means
+    "restored into this session".
+  - **OVERRIDES:** the common "explicit sign-off per session" default — a read from a previous
+    session clears the gate (re-stamped by each session that restores it), because re-read friction
+    after a reload was the larger cost (eldato #7416). Deleting or shortening the window would
+    silently reverse that decision; the route is a reopen.
 - **Gate applicability is by pattern spelling.** `git -C <path> commit` / `git --no-pager
   commit` do not match the manifest's plain alternation, so the git gate is not
   spelling-proof. The manifest is a stated scope boundary; residual, follow-up.

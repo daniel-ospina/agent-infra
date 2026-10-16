@@ -1,6 +1,21 @@
 # dangerous-ops.txt — manifest for skill-enforcer gate enforcement
 # Format: skillName # pattern # mode # optional_message
 # mode: hard (blocks until skill read) | nudge (reminds, escalates to block after threshold)
+#
+# What "read" means — read this before changing a mode or a pattern: a read recorded
+# by a PREVIOUS session satisfies a hard gate. `hard (blocks until skill read)` is
+# enforced against reads remembered in ~/.pi/agent/skill-reads.json, which
+# skill-enforcer restores at session_start (READ_PERSIST_TTL_MS = 24 h). The 24 h
+# bound is on IDLENESS, not on the age of the read: each tracked read and each
+# session_shutdown re-stamps every remembered read — restored ones included — so a
+# skill read once keeps clearing its gate while a session starts at least once every
+# 24 h. A restored read is announced once as "Restored N skill reads from previous
+# session". See AGENTS.md §Skill Reading Protocol for the agent-facing statement.
+#
+# OVERRIDES: the common "explicit sign-off per session" default — a read from a
+# previous session clears the gate, because re-read friction after a reload was the
+# larger cost (eldato #7416, agent-infra #1331). Do NOT delete the window to
+# "tighten" this: that silently reverses a recorded decision. The route is a reopen.
 
 commit-workflow # git commit|git push|git merge|git add|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
 
