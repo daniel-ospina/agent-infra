@@ -62,6 +62,18 @@
 #      where /dev/full exists — both GNU/Linux. The count is therefore platform-dependent; read it
 #      from the suite's own summary line rather than pinning a number here.
 #
+#  12be. a shell option between `-c` and its command string is not read as the body.
+#  13. NON-BUILTIN PRODUCER (#864). The guard matches `printf`/`echo` PLUS a `grep`: the failure
+#      is `pipefail` + the quiet grep early exit, not the producer identity. 13a pins DETECTION
+#      (bare, via an intermediary, by path, with an env prefix, with a data pipe in the
+#      producer's own argument, continued, in a substitution, the by-path-plus-data-pipe
+#      CONJUNCTION, the ANSI-C decode classes, and the `|&` pipe operator) and is the only
+#      sub-section that fails on the un-widened guard; 13b is an over-block CONTROL (safe forms:
+#      capture-then-case, here-string, non-quiet consumer); 13c is a NON-VACUITY pin that the
+#      idiom really does lose the match on a >64 KiB payload; 13d pins the ACCEPTED over-blocks
+#      (a producer that writes nothing, and a line that is DATA — a heredoc body or a multi-line
+#      quoted string) so they stay deliberate.
+#
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
 # in order to prove it is detected — see SCAN_DIRS in the guard).
@@ -1359,7 +1371,7 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 #      first grep's output; charging that pipe to `echo`, or to a path-like token after a `;`,
 #      flags lines the old matcher left clean — a new false block.
 E="$TMP/f12p"; mkdir -p "$E/scripts"
-printf '%s\n' '#!/usr/bin/env bash' 'grep -e echo -e "OK|FAIL" "$f" | grep -q FAIL' > "$E/scripts/argwriter.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'foo -e echo -e "OK|FAIL" "$f" | grep -q FAIL' > "$E/scripts/argwriter.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'printf x | foo;/bin/grep -q p' > "$E/scripts/pathsep.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 [ "$rc" -eq 0 ] \
@@ -2001,6 +2013,393 @@ rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
   && grep -q 'ex\.sh' "$OUT" && ! grep -q 'ecat\.sh' "$OUT" && ! grep -q 'nobody\.sh' "$OUT" \
   && pass "a shell option between -c and its command string is not mistaken for the body" \
   || fail "an option was consumed as the shell command string (exit $rc)"
+
+echo ""
+echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
+# #841's guard matched the builtin writers only, so the same false negative with a `grep`
+# producer (`grep -v … | grep -q …`) sat outside it: measured on a 1.4 MB multi-line payload
+# with the match on line 1, the idiom returns 141 under `pipefail` and the downstream `-q`
+# never reports the match.
+#
+# WHAT EACH SUB-SECTION PINS (they are not interchangeable):
+#   13a  DETECTION — the fixtures below. NON-VACUOUS: every fixture 13a writes is reported
+#        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
+#        (NOT `HEAD`, which by the time you read this is the widened guard and reports every one
+#        as a hit at rc 1) — so this whole block fails before the widening. 13a writes **93**
+#        detection fixtures: the AGGREGATE below asserts the **62** that 13a1 introduced, and
+#        13a2-13a5 assert the decoder/decode classes and 13a6 the `|&` operator separately, so a
+#        regression in any one of them names itself. Verified 2026 on the pre-change guard: rc 0
+#        on all 93, and the head guard rc 1 naming all 93.
+#   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
+#        one; it does not detect the widening, it detects an over-broad version of it.
+#   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
+#        lose the match), not the matcher.
+#   13d  ACCEPTED OVER-BLOCK — the producer that writes nothing. Documented, not accidental.
+E="$TMP/f13"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f | grep -q "[^[:space:]]"'  > "$E/scripts/plain.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | grep -vE "#" | grep -q needle'   > "$E/scripts/staged.sh"
+printf '%s\n' '#!/usr/bin/env bash' '/bin/grep -v foo f | command grep -qx bar'     > "$E/scripts/aliased.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'LC_ALL=C grep -v foo f | LC_ALL=C grep -q bar' > "$E/scripts/prefixed.sh"
+# The classes the DECLARED threat surface for this change requires: the producer's own
+# argument carrying a literal `|` (which a single-line regex bridge cannot cross), a producer
+# split from its pipe by a line continuation, a producer inside a wrapper body, and a producer
+# in command substitution. Each is an attacker-shaped spelling of the ONE bypass under test —
+# "get a grep producer past the matcher" — so each is a pin, not a nicety.
+printf '%s\n' '#!/usr/bin/env bash' 'grep "a|b" f | grep -q bar'                  > "$E/scripts/quotepipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f \' '  | grep -q bar'            > "$E/scripts/continued.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(grep -v foo f | grep -q bar)'               > "$E/scripts/subst.sh"
+# COMPOSED fixtures. The blind spots of the two matchers MEET where a path-qualified producer
+# also carries a data pipe in its own argument: raw_idiom's `[^|]*` bridge cannot cross that
+# pipe, and scan_idiom's boundary test rejected the path — so the conjunction was reported
+# CLEAN at rc 141 while every single-dimension fixture above was flagged (review of #864).
+# These four are that conjunction, and each FAILS on the widening without the path handling.
+printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" f | grep -q bar'      > "$E/scripts/bypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env /usr/bin/grep -E "a|b" f | grep -q bar'  > "$E/scripts/wrapbypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'head -n 5 f | /usr/bin/grep -E "a|b" | grep -q needle' > "$E/scripts/stagedbypath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'x=$(/usr/bin/grep -E "a|b" f | grep -q bar)' > "$E/scripts/substbypath.sh"
+# The prefix spellings that reach the SAME false clean, each measured at rc 141 on a >64 KiB
+# payload with the match on line 1: a WRAPPER option before the word (the option belongs to the
+# wrapper, not to another command), a QUOTED or ESCAPED word, a $-rooted path, and a PROCESS
+# SUBSTITUTION in the producer's own argument (which is INPUT redirection — it does not move the
+# stdout off the pipe). Each was CLEAN before this widening and is pinned so it stays flagged.
+printf '%s\n' '#!/usr/bin/env bash' 'env -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/wrapopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"grep" -E "a|b" f | grep -q bar'            > "$E/scripts/quotedword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '\grep -E "a|b" f | grep -q bar'             > "$E/scripts/escapedword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '$HOME/bin/grep -E "a|b" f | grep -q bar'     > "$E/scripts/varpath.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head -2) f | grep -q bar' > "$E/scripts/procsubst.sh"
+# The fourth declared class: a producer INSIDE a WRAPPER BODY, where the producer own argument
+# carries the data pipe of the quotepipe class. Both original matchers miss it — raw_idiom cannot
+# cross the data pipe, and scan_from reads the body level-0 escaped quote as a level-1 escape, so
+# the data pipe looks like a real break — and the quoted-body pass in the guard resolves the body
+# and hands it BACK to those matchers. Both measured rc 141 on a >64 KiB payload with the match on
+# line 1, and CLEAN on the pre-change guard.
+printf '%s\n' '#!/usr/bin/env bash' 'eval "grep -vE \"x|y\" f | grep -q needle"' > "$E/scripts/evalbody.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -S "grep -vE x|y f" | grep -q needle'    > "$E/scripts/envsbody.sh"
+# The NESTED-WRITER conjunction: the enclosing writer state is a single pair of globals, so a
+# writer INSIDE a capture overwrote it and a pipe inside the capture was judged against the INNER
+# writer — the enclosing writer ownership was gone by the time the capture closed and its real
+# pipe was never evaluated, so the line was CLEAN at rc 141 (#864 review). The enclosing state is
+# now saved and restored across the capture. The wrapper-body spellings carry the same shape
+# inside a body, so the quoted-body pass hands it back to the same matcher and the fix applies
+# there too. All five are CLEAN on the pre-change guard; the process-substitution and printf
+# forms measured rc 141 under `pipefail` on a >64 KiB payload with the match on line 1 (13c
+# measures the underlying idiom), and `sh -c` is the same shape for a shell that has `<(`.
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(grep -v x f | head) f | grep -q bar'        > "$E/scripts/nestedsubst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f $(grep -v x f | head -1) f | grep -q bar'     > "$E/scripts/nestedcmdsubst.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(printf x | head) f | grep -q bar'           > "$E/scripts/nestedprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'eval "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/evalnest.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'sh -c "grep -f <(grep -v x f | head) f | grep -q bar"' > "$E/scripts/shcnest.sh"
+# The spellings that reach the SAME false clean THROUGH a MULTI-TOKEN prefix, each measured at
+# rc 141 on the same payload: a wrapper two or more tokens back because its option has a
+# SEPARATED ARGUMENT (`env -u FOO -i grep`, `env -u FOO -- grep`) or because it carries several
+# options (`stdbuf -i0 -o0 grep`) — a one-token lookback lands on the option or on its argument
+# and never reaches the wrapper; a QUOTED `env -S` BODY carrying a data pipe (the single-quoted
+# spelling; `envsbody.sh` above is the double-quoted one), where restarting at the body close
+# re-opened quoting so the outer pipe was never charged; and an unquoted BRACED VARIABLE among
+# the producer arguments, whose `}` a group-depth-0 test read as a group close and so cleared the
+# writer. `envbody.sh` is the single-quoted spelling of the wrapper-body class the cloud lane's
+# quoted-body pass already closes, so it is duplicate coverage and NOT a false negative this
+# round produced; the rest were each reported CLEAN on the parent head (review of #864).
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -i grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'stdbuf -i0 -o0 grep -E "a|b" f | grep -q bar' > "$E/scripts/multiopt2.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u FOO -- grep -E "a|b" f | grep -q bar'  > "$E/scripts/multiopt3.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -S 'grep -E \"a|b\" f' | grep -q bar"     > "$E/scripts/envbody.sh"
+printf '%s\n' '#!/usr/bin/env bash' '/usr/bin/grep -E "a|b" ${y} f | grep -q bar'  > "$E/scripts/vararg.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -f <(cat list | head) ${y} f | grep -q bar' > "$E/scripts/procsubstvar.sh"
+# The SECOND review round over the widened matcher found three more classes, each measured at rc
+# 141 under `pipefail` on a >64 KiB payload with the match on line 1 against 0 for the
+# capture-then-classify form, and each CLEAN on the parent head before this fix (#864 review):
+#   - a `}` that closes NEITHER a counted `{ …; }` group nor a counted `${…}` parameter is not a
+#     group close at all — bash treats it as an ordinary word character (brace expansion, a bare
+#     `}` argument) — but clearing the writer on it took the producer off the pipe.
+#   - a QUOTED or ESCAPED WRAPPER WORD: the wrapper walk read raw text, so `"command"` and
+#     `\command` never matched the WRAPWORDS list.
+#   - a brace or parenthesis INSIDE a wrapper OPTION ARGUMENT ended the wrapping walk before the
+#     wrapper was reached (it broke on `(`/`)`/`{`/`}`; only a statement separator may end it).
+printf '%s\n' '#!/usr/bin/env bash' 'grep -E "a|b" shard{1,2}.txt | grep -q bar'      > "$E/scripts/braceexp.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -E "a|b" f{,} | grep -q bar'              > "$E/scripts/braceempty.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -E "a|b" x${y}} f | grep -q bar'          > "$E/scripts/braceclose.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -E "a|b" } f | grep -q bar'               > "$E/scripts/braceword.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"command" -p grep -E "a|b" f | grep -q bar'    > "$E/scripts/wrapquoted.sh"
+printf '%s\n' '#!/usr/bin/env bash' '\command -p grep -E "a|b" f | grep -q bar'     > "$E/scripts/wrapescaped.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"env" -i grep -E "a|b" f | grep -q bar'        > "$E/scripts/wrapquotedenv.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u "x(y" -- grep -E "a|b" f | grep -q bar' > "$E/scripts/wrapparen.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u x} -- grep -E "a|b" f | grep -q bar'    > "$E/scripts/wrapbrace.sh"
+# The THIRD review round found the same walk still breaking on a QUOTED or ESCAPED `;`/`&`/`|`
+# (data, not a statement separator) and still failing to strip the dollar from a dollar-quoted
+# wrapper word, plus one consumer-side case. Each was measured at rc 141 under `pipefail` on a
+# >64 KiB payload with the match on line 1 against 0 for the capture-then-classify form, and each
+# was CLEAN on the parent head (#864 review). The guard now carries a quote map so only a REAL
+# statement separator stops the wrapper walk.
+printf '%s\n' '#!/usr/bin/env bash' "env -u 'x;y' -i grep -E \"a|b\" f | grep -q bar"     > "$E/scripts/sepquoted.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u "x&y" -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/sepqamp.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u "x|y" -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/seppipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u x\;y -i grep -E "a|b" f | grep -q bar'          > "$E/scripts/sepescaped.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -u 'x;y' -- grep -E \"a|b\" f | grep -q bar"      > "$E/scripts/sepquoteddq.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'env' -i grep -E \"a|b\" f | grep -q bar"           > "$E/scripts/ansiwrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' "en\$'v' -i grep -E \"a|b\" f | grep -q bar"           > "$E/scripts/ansisplit.sh"
+printf '%s\n' '#!/usr/bin/env bash' '$'"\""'env'"\""' -i grep -E "a|b" f | grep -q bar'    > "$E/scripts/localewrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -u \$'x;y' -i grep -E \"a|b\" f | grep -q bar"    > "$E/scripts/ansiquotedsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' "/usr/bin/\$'env' -i grep -E \"a|b\" f | grep -q bar" > "$E/scripts/pathansiwrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f | $"command" -p grep -q needle'      > "$E/scripts/localecmd.sh"
+# The FOURTH review round found the same quoting-resolution gap ONE LEVEL DOWN — in the producer
+# WORD itself, where a fixed character ladder could see only a contiguous spelling — and in the
+# quote map, which did not model `${…}`/`$(…)`/backtick regions. Each was measured at rc 141 under
+# `pipefail` on a >64 KiB payload with the match on line 1 against 0 for the capture-then-classify
+# form, and each was CLEAN before this fix (#864 review). The word is now ASSEMBLED with quoting and
+# escaping removed, and a substitution region is opaque to the wrapper walk.
+printf '%s\n' '#!/usr/bin/env bash' "gre''p -E \"a|b\" f | grep -q bar"      > "$E/scripts/splitquotes.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'g\rep -E "a|b" f | grep -q bar'         > "$E/scripts/splitescape.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"gr"ep -E "a|b" f | grep -q bar'        > "$E/scripts/splitlead.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'gr"ep" -E "a|b" f | grep -q bar'        > "$E/scripts/splittrail.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'p' -E \"a|b\" f | grep -q bar"    > "$E/scripts/splitansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "grep\$'' -E \"a|b\" f | grep -q bar"    > "$E/scripts/splittail.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech''o \"a|b\" f | grep -q bar"         > "$E/scripts/splitecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print''f \"a|b\" f | grep -q bar"       > "$E/scripts/splitprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a;b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u ${x:-a;b} -i grep -E "a|b" f | grep -q bar'       > "$E/scripts/paramsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u `echo a;b` -i grep -E "a|b" f | grep -q bar'       > "$E/scripts/btsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a|b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substpipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a&b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substamp.sh"
+# The FIFTH review round closed the last spelling gap in the producer WORD: an ANSI-C quoted span
+# DECODES its escapes, so `prin$'\164'f` IS printf and not the raw characters. A decoder is
+# required, not a skip. The same round fixed two defects in this lane's OWN previous commit: the
+# `printf -v` carve-out keyed on the raw width 6 rather than the word, so it DROPPED a split `grep`
+# whose raw width is also 6 (`gre''p -v`), and `<(` was missing from the quote-map openers, so a
+# separator inside a process substitution in a wrapper option argument stopped the wrapper walk.
+# Each was measured at rc 141 under `pipefail` on a >64 KiB payload with the match on line 1
+# against 0 for the capture-then-classify form, and each was CLEAN before this fix (#864 review).
+printf '%s\n' '#!/usr/bin/env bash' "prin\$'\\164'f '%s' \"\$T\" | grep -q bar"      > "$E/scripts/ansioctal.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\157' \"\$T\" | grep -q bar"            > "$E/scripts/ansioctalecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x70' -E \"a|b\" f | grep -q bar"      > "$E/scripts/ansihex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ec\$'\\150'\"o\" \"\$T\" | grep -q bar"       > "$E/scripts/ansisplice.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\u006f' \"\$T\" | grep -q bar"          > "$E/scripts/ansiuni.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\U0000006f' \"\$T\" | grep -q bar"      > "$E/scripts/ansiuni8.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\147rep' -E \"a|b\" f | grep -q bar"        > "$E/scripts/ansilead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -i \$'\\147rep' -E \"a|b\" f | grep -q bar" > "$E/scripts/ansiwrap.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre''p -v zzz \"\$P\" | grep -q bar"          > "$E/scripts/splitgv.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u <(echo a;b) -i grep -E "a|b" f | grep -q bar'   > "$E/scripts/procsubstopt.sh"
+# The SIXTH round closed the spelling family STRUCTURALLY instead of adding spellings: the line is
+# decoded ONCE into the text the shell will run and the same two matchers run on it. These pins are
+# the three sides that per-site fixes kept missing — bash brace-hex (`\x{70}`), the escaped WRAPPER
+# word, and the CONSUMER word — each measured at rc 141 under `pipefail` on a >64 KiB payload with
+# the match on line 1 against 0 for the capture-then-classify form, and each CLEAN before this fix.
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x{70}' -E \"a|b\" f | grep -q bar"        > "$E/scripts/bracehex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x{67}rep' -E \"a|b\" f | grep -q bar"        > "$E/scripts/bracehexlead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech\$'\\x{6f}' \"\$T\" | grep -q bar"             > "$E/scripts/bracehexecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x65nv' -i grep -E \"a|b\" f | grep -q bar"   > "$E/scripts/escwrap.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | gre\$'\\x70' -q bar"        > "$E/scripts/consansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\147rep' -q bar"        > "$E/scripts/consansilead.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x2dq' bar"        > "$E/scripts/consansiflag.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\x65nv' -i grep -q bar" > "$E/scripts/consansiwrap.sh"
+# The decode must preserve the WORD BOUNDARY, not just the characters. A shell expansion yields one
+# word whose characters are DATA: emitting the value bare made a `$'a\x7cb'` argument read as a real
+# PIPELINE, so `gre$'\x70' -E $'a\x7cb' f | grep -q bar` — a genuine rc-141 false negative that the
+# per-site revision DID flag — went CLEAN. These pins hold the quoted emission and the escape rules
+# bash actually uses (a malformed brace-hex is EMPTY, an UNKNOWN escape KEEPS its backslash, and an
+# ESCAPED dollar is not ANSI-C quoting at all).
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x70' -E \$'a\\x7cb' f | grep -q bar"      > "$E/scripts/spanpipearg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{}'f '%s' \"\$T\" | grep -q bar"       > "$E/scripts/emptyescape.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x=\$'\\x7c' ; grep -E \"a|b\" f | grep -q p"       > "$E/scripts/semispanassign.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x65cho' \"\$T\" | grep -q p"                   > "$E/scripts/leadhexecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{'f '%s' \"\$T\" | grep -q bar"         > "$E/scripts/untermbrace.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{ZZ}'f '%s' \"\$T\" | grep -q bar"      > "$E/scripts/badbracehex.sh"
+printf '%s\n' '#!/usr/bin/env bash' "eval \"gre\$'\\x70' -E 'a|b' f | grep -q bar\""    > "$E/scripts/bodyspan.sh"
+printf '%s\n' '#!/usr/bin/env bash' "bash -c \"set -o pipefail; gre\$'\\x70' -E 'a|b' f | grep -q bar\"" > "$E/scripts/bodybashc.sh"
+printf '%s\n' '#!/usr/bin/env bash' "eval \"printf '%s' \\\"\\\$T\\\" | gre\$'\\x70' -q bar\"" > "$E/scripts/bodyconsspan.sh"
+# The `|&` PIPE OPERATOR (`cmd 2>&1 | grep`). The `&` belongs to the OPERATOR, not to a
+# backgrounding `&`, but an unquoted `&` is a separator to the token walk — so `is_grep_cmd`
+# was handed a `&` token and rejected it, the consumer word was never read, and the line was
+# CLEAN on the head before this fix (#864 review F1). Both producer sides are pinned: the
+# builtin and the `grep` producer.
+printf '%s\n' '#!/usr/bin/env bash' 'printf x |& grep -q p'                       > "$E/scripts/pipeampprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |& grep -q "[^[:space:]]"' > "$E/scripts/pipeampgrep.sh"
+# The SAME operator BROKEN ACROSS A NEWLINE. Bash accepts `| pipeline BAR_AND newline_list
+# pipeline`, so the operator can end a line. The continuation joiner had a bare `|` arm but no
+# `|&` arm, so `printf x |&` NEWLINE `grep -q p` was a silent false CLEAN while the backslash
+# spelling was flagged (#864 review F1). Both producer sides pinned.
+printf '%s\n' '#!/usr/bin/env bash' 'printf x |&' 'grep -q p'                       > "$E/scripts/pipeampnlprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |&' '  grep -q "[^[:space:]]"' > "$E/scripts/pipeampnlgrep.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
+   && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
+   && grep -q 'quotepipe\.sh' "$OUT" && grep -q 'continued\.sh' "$OUT" \
+   && grep -q 'subst\.sh' "$OUT" && grep -q 'bypath\.sh' "$OUT" \
+   && grep -q 'wrapbypath\.sh' "$OUT" && grep -q 'stagedbypath\.sh' "$OUT" \
+   && grep -q 'substbypath\.sh' "$OUT" && grep -q 'wrapopt\.sh' "$OUT" \
+   && grep -q 'quotedword\.sh' "$OUT" && grep -q 'escapedword\.sh' "$OUT" \
+   && grep -q 'varpath\.sh' "$OUT" && grep -q 'procsubst\.sh' "$OUT" \
+   && grep -q 'evalbody\.sh' "$OUT" && grep -q 'envsbody\.sh' "$OUT" \
+   && grep -q 'nestedsubst\.sh' "$OUT" && grep -q 'nestedcmdsubst\.sh' "$OUT" \
+   && grep -q 'nestedprintf\.sh' "$OUT" && grep -q 'evalnest\.sh' "$OUT" \
+   && grep -q 'shcnest\.sh' "$OUT" \
+   && grep -q 'multiopt\.sh' "$OUT" && grep -q 'multiopt2\.sh' "$OUT" \
+   && grep -q 'multiopt3\.sh' "$OUT" && grep -q 'envbody\.sh' "$OUT" \
+   && grep -q 'vararg\.sh' "$OUT" && grep -q 'procsubstvar\.sh' "$OUT" \
+   && grep -q 'braceexp\.sh' "$OUT" && grep -q 'braceempty\.sh' "$OUT" \
+   && grep -q 'braceclose\.sh' "$OUT" && grep -q 'braceword\.sh' "$OUT" \
+   && grep -q 'wrapquoted\.sh' "$OUT" && grep -q 'wrapescaped\.sh' "$OUT" \
+   && grep -q 'wrapquotedenv\.sh' "$OUT" && grep -q 'wrapparen\.sh' "$OUT" \
+   && grep -q 'wrapbrace\.sh' "$OUT" && grep -q 'sepquoted\.sh' "$OUT" \
+   && grep -q 'sepqamp\.sh' "$OUT" && grep -q 'seppipe\.sh' "$OUT" \
+   && grep -q 'sepescaped\.sh' "$OUT" && grep -q 'sepquoteddq\.sh' "$OUT" \
+   && grep -q 'ansiwrapper\.sh' "$OUT" && grep -q 'ansisplit\.sh' "$OUT" \
+   && grep -q 'localewrapper\.sh' "$OUT" && grep -q 'ansiquotedsep\.sh' "$OUT" \
+   && grep -q 'pathansiwrapper\.sh' "$OUT" && grep -q 'localecmd\.sh' "$OUT" \
+   && grep -q 'splitquotes\.sh' "$OUT" && grep -q 'splitescape\.sh' "$OUT" \
+   && grep -q 'splitlead\.sh' "$OUT" && grep -q 'splittrail\.sh' "$OUT" \
+   && grep -q 'splitansi\.sh' "$OUT" && grep -q 'splittail\.sh' "$OUT" \
+   && grep -q 'splitecho\.sh' "$OUT" && grep -q 'splitprintf\.sh' "$OUT" \
+   && grep -q 'substsep\.sh' "$OUT" && grep -q 'paramsep\.sh' "$OUT" \
+   && grep -q 'btsep\.sh' "$OUT" && grep -q 'substpipe\.sh' "$OUT" \
+   && grep -q 'substamp\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable / brace-expansion / quoted-or-dollar-quoted-wrapper / quoted-or-escaped-separator-in-option-argument / brace-in-option / split-producer-word / substitution-in-option-argument conjunctions)"
+else
+  fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a2. The ANSI-C DECODER pins, asserted separately so a decoder regression names itself instead
+#       of hiding inside the aggregate above. Note `word == "printf"`, not a raw width: the same
+#       change is what keeps the `printf -v` carve-out alive for a SPLIT printf word, which 13b
+#       pins on the clean side.
+if [ "$rc" -eq 1 ] && grep -q 'ansioctal\.sh' "$OUT" && grep -q 'ansioctalecho\.sh' "$OUT" \
+   && grep -q 'ansihex\.sh' "$OUT" && grep -q 'ansisplice\.sh' "$OUT" \
+   && grep -q 'ansiuni\.sh' "$OUT" && grep -q 'ansiuni8\.sh' "$OUT" \
+   && grep -q 'ansilead\.sh' "$OUT" && grep -q 'ansiwrap\.sh' "$OUT" \
+   && grep -q 'splitgv\.sh' "$OUT" && grep -q 'procsubstopt\.sh' "$OUT"; then
+  pass "an ANSI-C quoted producer word is DECODED (octal, hex, unicode u/U, spliced, word-initial, wrapper-prefixed) and the split grep -v / process-substitution-option residual is closed"
+else
+  fail "an ANSI-C escaped producer word was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a3. THE LINE-WIDE DECODE pins: bash brace-hex, the escaped WRAPPER word and the CONSUMER word.
+#       These three are why the fix is ONE decode rather than another per-site spelling: each is the
+#       SAME conjunction on a side the previous local fixes did not cover.
+if [ "$rc" -eq 1 ] && grep -q 'bracehex\.sh' "$OUT" && grep -q 'bracehexlead\.sh' "$OUT" \
+   && grep -q 'bracehexecho\.sh' "$OUT" && grep -q 'escwrap\.sh' "$OUT" \
+   && grep -q 'consansi\.sh' "$OUT" && grep -q 'consansilead\.sh' "$OUT" \
+   && grep -q 'consansiflag\.sh' "$OUT" && grep -q 'consansiwrap\.sh' "$OUT"; then
+  pass "a word spelled with an ANSI-C escape is DETECTED on all three sides of the pipe (producer, wrapper, consumer) and in bash brace-hex form"
+else
+  fail "an ANSI-C spelled word on a side the decode must cover was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a4. THE DECODE MUST NOT BREAK WHAT THE PER-SITE REVISION GOT RIGHT. A spanned DATA metacharacter
+#       in the producer's own argument used to be flagged (the data pipe inside a quoted argument is
+#       not a pipeline); a bare emission of the value turned it CLEAN, which is the regression these
+#       four pins hold shut. The escape rules are bash 3.2.57 measured: `\x{}` is EMPTY, `\q` is the
+#       two characters, an escaped dollar does not open an ANSI-C span.
+if [ "$rc" -eq 1 ] && grep -q 'spanpipearg\.sh' "$OUT" && grep -q 'emptyescape\.sh' "$OUT" \
+   && grep -q 'semispanassign\.sh' "$OUT" && grep -q 'leadhexecho\.sh' "$OUT"; then
+  pass "a decoded span keeps its WORD boundary (a spanned data pipe, an empty brace-hex, a spanned separator before a real producer, a word-initial hex echo)"
+else
+  fail "a decoded span hid a producer (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a5. TWO WAYS THE DECODE ITSELF CAN SWALLOW A PRODUCER. (a) A brace-hex scan must stop at the
+#       SPAN closing quote — an unterminated `\x{` used to run to the next `}` on the line, taking
+#       the closing quote and the PIPE with it, so the line decoded to a fraction of itself. (b) The
+#       decode runs at EVERY entry point, not only on the top-level line, because a span inside a
+#       quoted wrapper BODY is decoded by the INNER shell and not by the outer one. The level-0
+#       backslash removal no longer reaches inside a span either (it turned `gre$'\x70'` into
+#       `gre$'x70'`). Each was measured at rc 141 under `pipefail` against 0 for the
+#       capture-then-classify form, and the body spellings were flagged by the per-site revision and
+#       CLEAN here before this fix.
+if [ "$rc" -eq 1 ] && grep -q 'untermbrace\.sh' "$OUT" && grep -q 'badbracehex\.sh' "$OUT" \
+   && grep -q 'bodyspan\.sh' "$OUT" && grep -q 'bodybashc\.sh' "$OUT" \
+   && grep -q 'bodyconsspan\.sh' "$OUT"; then
+  pass "the decode stops at the span quote and runs at EVERY entry point (an unterminated brace-hex, a malformed one, and a spanned producer or consumer inside a wrapper body)"
+else
+  fail "the decode swallowed a producer (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13a6. THE `|&` PIPE OPERATOR (`cmd 2>&1 | grep`), asserted separately so an operator regression
+#       names itself instead of hiding inside the 62-fixture aggregate above. The `&` is part of
+#       the pipe, NOT a backgrounding separator, but an unquoted `&` is a separator to the token
+#       walk, so `is_grep_cmd` was handed a `&` token and rejected it: the consumer word after
+#       the operator was never read. Measured CLEAN at head `39e65457`, rc 141 under `pipefail`
+#       on a >64 KiB payload with the match on line 1, against 0 for the capture-then-classify
+#       form — the same mechanism 13c pins. `raw_idiom` was blind to it too, because its
+#       `[^|]*[|][ \t]*` bridge cannot cross the `&`; all three call sites now step over it.
+if [ "$rc" -eq 1 ] && grep -q 'pipeampprintf\.sh' "$OUT" && grep -q 'pipeampgrep\.sh' "$OUT" \
+   && grep -q 'pipeampnlprintf\.sh' "$OUT" && grep -q 'pipeampnlgrep\.sh' "$OUT"; then
+  pass "the \`|&\` pipe operator is DETECTED for a builtin producer and for a grep producer, on one line AND broken across a NEWLINE (the \`&\` is stepped over before the consumer word is read, and the continuation joiner keeps a trailing \`|&\`)"
+else
+  fail "a producer piped with \`|&\` was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
+# 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
+#      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
+#      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
+#      over-broad version of the widening.
+E="$TMP/f13b"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'out="$(grep -vxF -f list f || true)"' 'case "$out" in *needle*) : ;; esac' > "$E/scripts/fixed.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q needle <<<"$(grep -v x f || true)"'                                > "$E/scripts/herestring.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -v foo f | grep needle'                                                > "$E/scripts/notquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print''f -v VAR \"%s\" \"a|b\" | grep -q p"                             > "$E/scripts/printfvsplit.sh"
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\164' -e \"a|b\" f | grep -q p"                                   > "$E/scripts/ansiprefixarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x{74}' -e \"a|b\" f | grep -q p"                                 > "$E/scripts/bracehexarg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x76' bar"                                  > "$E/scripts/consansinonquiet.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x=\$'grep' ; echo ok"                                                        > "$E/scripts/mentionansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\\\$'\\x70' -E 'a|b' f | grep -q bar"                                   > "$E/scripts/escdollar.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\q'f '%s' \"\$T\" | grep -q bar"                                 > "$E/scripts/unknownescape.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+if [ "$rc" -eq 0 ]; then
+  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C or brace-hex argument to a non-producer, a decoded non-quiet consumer, a mention, an escaped dollar, an unknown escape, and a non-quiet consumer all pass (exit 0)"
+else
+  fail "false positive on a safe grep-producer form (exit $rc):"
+  sed -n '1,10p' "$OUT"
+fi
+# 13c. NON-VACUITY for the grep producer: the class is REAL, not merely a shape. No guard is
+#      invoked here — the two shell functions below ARE the measurement. On a >64 KiB multi-line
+#      payload with the match on line 1, the piped idiom returns NON-ZERO while the
+#      capture-then-case form returns 0, and the two MUST differ (a small payload lets the
+#      producer finish before grep exits, and the pin would then pass for the wrong reason).
+BIGF="$TMP/f13-big.txt"
+{ printf 'MARKER needle\n'; i=0; while [ "$i" -lt 40000 ]; do printf 'padding line %d of a big payload\n' "$i"; i=$((i + 1)); done; } > "$BIGF"
+note "payload: $(wc -c <"$BIGF" | tr -d ' ') bytes, multi-line, match on line 1"
+grep_old() { ( set -o pipefail; grep -vxF -f /dev/null "$BIGF" | grep -q needle ) 2>/dev/null; }
+grep_new() { ( set -o pipefail; out="$(grep -vxF -f /dev/null "$BIGF" || true)"; case "$out" in *needle*) return 0 ;; esac; return 1 ) 2>/dev/null; }
+grep_old; g_old=$?
+grep_new; g_new=$?
+note "grep-producer idiom rc=$g_old   capture-then-case rc=$g_new"
+if [ "$g_new" -eq 0 ] && [ "$g_old" -ne 0 ]; then
+  pass "the grep-producer idiom LOSES the match (rc $g_old) while the pipe-free form finds it (rc 0)"
+else
+  fail "the grep-producer class did not reproduce (old=$g_old new=$g_new) — the pin would be vacuous"
+fi
+# 13d. ACCEPTED OVER-BLOCK, PINNED SO IT IS DELIBERATE. A producer that writes NOTHING to the
+#      pipe cannot itself take the signal, so flagging it is a SHAPE flag, not a live false
+#      negative — and the guard flags it anyway (see the SCOPE header). It is pinned here so
+#      that narrowing it later is a CONSCIOUS change with a failing test, not a silent edit.
+#      The rc is measured alongside, so the test itself records that this shape is NOT the
+#      mechanism: a quiet producer never reproduces the 141 that 13c measures.
+E="$TMP/f13d"; mkdir -p "$E/scripts"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -q foo f | grep -q bar' > "$E/scripts/quietproducer.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -c foo f | grep -q bar' > "$E/scripts/countproducer.sh"
+# The DECODED-SPELLING over-block, pinned so it is a CONSCIOUS consequence rather than a surprise:
+# the decode makes the plain word visible, so a `grep` that is an ARGUMENT to another command is now
+# flagged through an escaped spelling as well — the same declared class as `ls a/grep | grep -q x`.
+# It is a SHAPE flag, not the mechanism: the pipeline carries the OTHER command's output.
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x67rep' -e \"a|b\" f | grep -q p" > "$E/scripts/argspanproducer.sh"
+# The DATA-REGION over-block, pinned so it is a CONSCIOUS consequence rather than a surprise: the
+# scan is LINE-oriented, so a line that is the DATA of a heredoc body, or the interior line of a
+# multi-line single-quoted string, is read as if it were a command. The idiom on it is flagged
+# although the shell never runs it. Same polarity as every accepted over-block here — friction,
+# visible, recoverable through the exceptions file — and no live occurrence exists on this tree.
+printf '%s\n' '#!/usr/bin/env bash' "cat <<'EOF'" 'grep foo bar | grep -q baz' 'EOF' > "$E/scripts/heredocdata.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x='line one" 'grep foo bar | grep -q baz' "line three'" > "$E/scripts/multiquotedata.sh"
+rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
+( set -o pipefail; grep -q needle "$BIGF" | grep -q needle ) 2>/dev/null; q_rc=$?
+note "quiet-producer idiom rc=$q_rc (never 141 — it writes nothing to the pipe)"
+if [ "$rc" -eq 1 ] && grep -q 'quietproducer\.sh' "$OUT" && grep -q 'countproducer\.sh' "$OUT" \
+   && grep -q 'argspanproducer\.sh' "$OUT" && grep -q 'heredocdata\.sh' "$OUT" \
+   && grep -q 'multiquotedata\.sh' "$OUT" \
+   && [ "$q_rc" -ne 141 ]; then
+  pass "a producer that writes NOTHING is flagged as a documented SHAPE, and a heredoc body / multi-line quoted string is flagged as a documented DATA-REGION over-block, and the quiet-producer rc is not 141 (over-block is deliberate, not the mechanism)"
+else
+  fail "the accepted over-block changed (guard rc=$rc, quiet-producer rc=$q_rc) — was the predicate narrowed? Then move this pin to a clean-form assertion and update the SCOPE header"
+fi
 
 echo ""
 if [ "$failures" -eq 0 ]; then
