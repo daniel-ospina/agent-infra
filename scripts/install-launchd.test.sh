@@ -106,7 +106,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -221,12 +221,14 @@ assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-sess
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
+assert_contains "$OUT" "pi-reap-orphans: installed + loaded" "pi-reap-orphans installed on fresh machine (#1142) — the reaper is SCHEDULED, not merely present"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
 REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist"
 PRUNE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-task-session-prune.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
+ORPHANS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
 assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "canary plist rendered PYTHON_BIN"
@@ -252,6 +254,22 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" 
 # and silently broaden the kill set on every host at the next sync.
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
+# #1142/#1862 — the orphan reaper is the artifact this issue restores. The
+# assertions below are what make the ACCEPTANCE falsifiable: asserting the file
+# EXISTS would pass on the pre-change state (the script survived only under
+# state/recovered-1161/), so the test must assert the job is SCHEDULED (the
+# rendered+installed plist, its interval, and the farmed path it execs) and that
+# a pass WRITES FRESH OUTPUT (section 15 runs the real script and reads the log).
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-reap-orphans.sh" "orphan reaper plist execs the FARMED script (launchd cannot read ~/Documents, #427)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "StartInterval" "orphan reaper job is interval-scheduled (#1862)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "<integer>3600</integer>" "orphan reaper runs hourly (StartInterval 3600)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "agent-infra-plist-version: 0.1.0" "orphan reaper template carries version marker"
+# #1142 acceptance: "dry-run by default". Arming is a manual, per-machine, owned
+# decision, so a later template edit flipping this to 0 must fail here — without
+# this assertion the flip would satisfy every other plist check and silently arm
+# an always-on killer on every host at the next sync.
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "REAP_ORPHAN_DRY_RUN" "orphan reaper plist carries REAP_ORPHAN_DRY_RUN env"
+assert_contains "$(grep -A1 'REAP_ORPHAN_DRY_RUN' "$ORPHANS_INSTALLED" | tail -1)" "<string>1</string>" "orphan reaper SHIPS DISARMED (REAP_ORPHAN_DRY_RUN=1, #1142)"
 # #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
 # path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
 assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"
@@ -363,7 +381,7 @@ assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired orac
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate)"
+assert_eq "$BOOTSTRAP_COUNT1" "9" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate + pi-reap-orphans)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
@@ -671,6 +689,66 @@ if [ -f "$BR_INSTALLED" ]; then
         || ok "no unresolved placeholders remain in the branch-reaper plist"
 else
     bad "branch-reaper installs when {{TORTOISE_REPO}} resolves"
+fi
+
+echo ""
+echo "── 15. The orphan reaper WRITES FRESH OUTPUT on a pass (#1862 acceptance) ──"
+# The acceptance is explicit: a test that only asserts the FILE exists proves
+# nothing (pre-change the script existed only under state/recovered-1161/).
+# Section 1 proves the job is SCHEDULED; this section proves a pass produces a
+# FRESH log, so "a plist that loads and never runs" — the defect #1862 exists to
+# fix — cannot pass this suite.
+ORPHAN_REAPER="$SCRIPT_DIR/pi-reap-orphans.sh"
+if [ -f "$ORPHAN_REAPER" ]; then
+    ok "the reaper is versioned in scripts/ (not only under a machine-local recovery dir)"
+    # Run the REAL script in the DEPLOYED shape: the plist sets only
+    # REAP_ORPHAN_DRY_RUN=1, so the state dir and log default to
+    # $HOME/.pi/agent/state/pi-reap-orphans.log. Assert on THAT path, not a
+    # test-only override — otherwise the test would prove a log the deployed
+    # job never writes.
+    ORPHAN_STATE="$HOME1/.pi/agent/state"; mkdir -p "$ORPHAN_STATE"
+    ORPHAN_LOG="$ORPHAN_STATE/pi-reap-orphans.log"; rm -f "$ORPHAN_LOG"
+    ORPHAN_START="$(date +%s)"
+    set +e
+    HOME="$HOME1" REAP_ORPHAN_DRY_RUN=1 REAP_ORPHAN_SAMPLE_SECONDS=0 \
+        REAP_ORPHAN_PS_TIMEOUT=10 REAP_ORPHAN_LSOF_TIMEOUT=10 \
+        REAP_ORPHAN_BUDGET_SECONDS=20 \
+        bash "$ORPHAN_REAPER" --dry-run --sample-seconds 0 >/dev/null 2>&1
+    ORPHAN_RC=$?
+    set -e
+    # 0 = full pass, 3 = fail-closed probe abort (e.g. no lsof on the runner).
+    # BOTH write the log; what must NEVER happen is a silent no-op.
+    case "$ORPHAN_RC" in
+        0|3) ok "a reaper pass exits cleanly (full dry-run pass, or a fail-closed probe abort)" ;;
+        *) bad "a reaper pass exits 0 or 3 (got $ORPHAN_RC)" ;;
+    esac
+    [ -s "$ORPHAN_LOG" ] && ok "the pass WROTE a fresh log (installed-but-inert cannot pass this)" \
+        || bad "the pass wrote no log at $ORPHAN_LOG"
+    # BSD `stat -f %m` and GNU `stat -c %Y`; on GNU `-f %m` means FILESYSTEM
+    # stats and prints a block report, so the flavour must be detected, never
+    # tried-then-fallback (the block report is non-numeric and blows up `[ -ge ]`).
+    case "$(uname -s 2>/dev/null)" in
+        Linux) LOG_MTIME="$(stat -c %Y "$ORPHAN_LOG" 2>/dev/null || echo 0)" ;;
+        *)     LOG_MTIME="$(stat -f %m "$ORPHAN_LOG" 2>/dev/null || echo 0)" ;;
+    esac
+    [ "$LOG_MTIME" -ge "$ORPHAN_START" ] && ok "the log is FRESH (mtime within this pass, not a stale artifact)" \
+        || bad "the log is stale (mtime $LOG_MTIME < start $ORPHAN_START)"
+    grep -qE 'MODE=dry-run|FAIL-CLOSED' "$ORPHAN_LOG" \
+        && ok "the log records the mode (MODE=dry-run) or names the fail-closed abort" \
+        || bad "the log does not name the pass (no MODE= / FAIL-CLOSED line)"
+    # The paired property #1862 requires: a dry pass signals NOTHING. Only
+    # assertable on a completed pass; a fail-closed abort has no footer and is
+    # itself a no-signal outcome (it exits before the classification loop).
+    if [ "$ORPHAN_RC" = 0 ]; then
+        assert_contains "$(cat "$ORPHAN_LOG")" "MODE=dry-run" \
+            "the deployed dry-run mode is recorded in the log (#1142 acceptance)"
+        assert_not_contains "$(cat "$ORPHAN_LOG")" "REAPED pid=" \
+            "the dry-run pass reaped NOTHING (the deployed default signals no one)"
+    else
+        ok "fail-closed probe abort: the pass exited before any signal could be sent"
+    fi
+else
+    bad "scripts/pi-reap-orphans.sh is MISSING — the reaper is not versioned (#1862)"
 fi
 
 echo ""

@@ -127,6 +127,7 @@ run_shard scripts/checkout-hygiene/hub-worktree.test.sh                    # #13
 run_shard scripts/install-launchd.test.sh                                  # #304 installer suite
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
+run_shard scripts/pi-reap-orphans.test.sh                                  # #1142 orphan reaper gates (deleted cwd + CPU advance + human ancestry; dry-run default)
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
 run_shard scripts/cleanup-stale-branches.test.sh                          # #1787 local-branch reaper gates (the squash-merge-aware three gates, dry-run default)
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
