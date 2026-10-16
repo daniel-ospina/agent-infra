@@ -861,10 +861,12 @@ pr_is_artifact_only() {
 #
 # WHY SOURCING IS SAFE. record-review.sh has a `[[ "${BASH_SOURCE[0]}" == "$0" ]]`
 # guarded main, so a `source` executes its top-level DEFINITIONS only (the
-# REFCTX/CLOSING_KW constants — byte-identical to this script's, a documented
-# cross-script contract pinned by record-review.test.sh §8.13 — and the
-# clean_low_* predicates, all declared ABOVE the guard). Sourcing therefore runs
-# no main, writes no record, and calls no gh.
+# REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY constants — byte-identical to this
+# script's, a documented cross-script contract pinned by record-review.test.sh
+# §8.13 — and the clean_low_* predicates, all declared ABOVE the guard).
+# Sourcing therefore runs no main, writes no record, and calls no gh. The
+# constants are RESTORED straight after the source: see the note on the restore
+# below for why "byte-identical" must not be relied on to make that harmless.
 #
 # The class admits PROSE and STYLESHEETS only — deliberately narrower than the
 # two other content-shape classes in this repo (pr_is_artifact_only above, and
@@ -877,6 +879,32 @@ pr_is_artifact_only() {
 # Resolution is a sibling of THIS script (the repo copy under review — never the
 # mutable ~/.pi/agent/scripts copy), so the class the gate enforces is the class
 # the PR's own tree declares.
+#
+# ⚠ THE TRUST LIMIT, STATED AT THE SOURCE (#1356 review round 2). Reading the
+# class from the PR's own tree makes that tree a TRUST INPUT: a PR that weakens
+# clean_low_path_ok — e.g. `case "$p" in extensions/mine.ts) return 0 ;; esac`
+# right here — suppresses the binding for its own path, and the SELF_TEST's real
+# arms do NOT catch it (its pass-6 fixture is extensions/example/sample.ts, so a
+# whitelist that leaves the fixture refused keeps the suite green). Weakening the
+# FIXTURE path instead IS caught (the real-script arm reddens), so only the
+# targeted form evades. That is not repairable by enumeration — no fixed canary
+# list can cover an arbitrary attacker path — and it is not #1356's defect to
+# fix: it is the structural class "the gate's inputs are not trusted, and it is
+# graded by a copy the PR controls", whose remedy (a pinned ref, a separate
+# checkout, or a checksum-pinned copy) is the OPEN DECISION on #713. What this
+# gate DOES do is refuse to let the trust input grow past the class it came for:
+# the three parser constants are restored below, so the source contributes
+# clean_low_* and nothing else. #713 carries this arm as evidence. Do not
+# restate this as "the shape is re-derived from the PR's diff" — that phrasing
+# hides the trust input and was a review finding on #1356.
+# Captured as ONE `declare -p` blob, NOT three assignments: record-review.test.sh
+# §8.13 greps EVERY line matching ^(REFCTX|CLOSING_KW|CLOSING_KW_BOUNDARY)= in
+# both files and compares the blocks, so a second assignment line here would
+# (correctly) read as a one-sided edit of the cross-script contract. A
+# `declare -p` blob is invisible to that grep, and the pin keeps its
+# "every matching line" strictness — which is what catches an OVERRIDING
+# assignment, the shape this restore defends against.
+GATE_PARSER_CONSTS="$(declare -p REFCTX CLOSING_KW CLOSING_KW_BOUNDARY)"
 RECORD_REVIEW_SH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/record-review.sh"
 CLEAN_LOW_CLASS_SOURCED="false"
 if [[ -f "$RECORD_REVIEW_SH" ]]; then
@@ -891,6 +919,22 @@ if [[ -f "$RECORD_REVIEW_SH" ]]; then
     echo "⚠️ #1356: could not source the Low content-shape class from $RECORD_REVIEW_SH — a verdict=clean-low marker will be refused (its shape is unverifiable)." >&2
   fi
 fi
+
+# ── The source must not REBIND this gate's own parser constants (#1356 r2) ────
+# record-review.sh declares REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY too (§8.13's
+# byte-identity contract), and `source` runs AFTER this file's own definitions —
+# so without this restore the PRODUCER's values win and this file's are dead
+# code. In agent-infra the two are byte-identical (§8.13 pins it), which is
+# exactly why the effect is INVISIBLE here and observable in a consumer repo that
+# ships the producer without §8.13 (WIRING OPTION 1 copies the two files, not the
+# test): a producer from a different revision would silently rebind check (a)'s
+# parser and the close-hazard scan from a file the PR controls. Restoring the
+# values captured before the `source` keeps the source's contribution to the
+# class this gate came for. This is NOT a second declaration of the contract — it
+# is this gate's OWN declaration re-asserted over a sibling's, so §8.13 still
+# holds the two equal. (`eval` of a `declare -p` blob built from this file's own
+# single-quoted literals is the exact round-trip; the values are never untrusted.)
+eval "$GATE_PARSER_CONSTS"
 
 # pr_is_clean_low_shaped <files-rows> — true iff the diff is PROVABLY in the Low
 # content-shape class, judged by the producer's OWN predicates: its row framing
@@ -2585,8 +2629,8 @@ $big_filler"
   # ── #1356: the check (c) clean-low content-shape binding, and the proof that
   # it is LOAD-BEARING. The binding's vectors live in the FAIL_ALL simulation
   # (passes 6–8) deliberately: a MUTANT of this script can then run them
-  # without re-entering this harness (FAIL_ALL contains none). Two subprocess
-  # runs pin the two halves:
+  # without re-entering this harness (FAIL_ALL contains none). THREE subprocess
+  # runs pin the halves:
   #   * the REAL script must report "pass 6: binding fired" and "pass 8: prose
   #     mention did NOT fire" (and "pass 7: control held" when the class is
   #     sourced) — this is what puts those vectors in front of CI at all,
@@ -2595,6 +2639,10 @@ $big_filler"
   #   * a MUTANT with pr_is_clean_low_shaped neutered to `return 0` must FAIL
   #     pass 6 ("binding did NOT fire") — proving the shared shape check is the
   #     clause that refuses the marker, not decoration.
+  #   * a copy of this script ALONE (no sibling producer) must refuse the same
+  #     vector with the NAMED class-unreadable message — the producer-ABSENT arm
+  #     (#1356 T4), which the `CLEAN_LOW_CLASS_SOURCED` branches below can only
+  #     reach by accident, so it is CONSTRUCTED here rather than waited for.
   # Without the producer the class cannot be shape-EXERCISED (no pass 7, no
   # mutation) — say so LOUDLY rather than reporting a green that tested
   # nothing. Pass 6 and pass 8 still run there: both are class-independent
@@ -2671,7 +2719,112 @@ $big_filler"
     fi
     rm -rf "$CL_MUT_DIR"
   fi
-  unset CL_SHA40 CL_MODERN CL_PROSE CL_MODERN_OK CL_PROSE_OK CL_LOG CL_RC CL_OK CL_MUT_DIR CL_MUT CL_MLOG CL_MRC 2>/dev/null || true
+  # ── #1356 T4 — the PRODUCER-ABSENT arm, CONSTRUCTED rather than waited for ──
+  # The absent branch above is taken only when record-review.sh happens to be
+  # missing from THIS checkout — which never happens in CI: agent-infra's own
+  # workflow hard-fails without the gate and always ships the producer in the
+  # same repo, and the consumer template fetches record-review.sh fail-closed
+  # (curl -f) before running the gate. A declared threat class whose arm is
+  # reachable only by accident is pinned by nothing (#991), so this vector
+  # BUILDS the absent environment: a copy of this script ALONE, no sibling
+  # producer. Two runs pin the two halves, as the mutation above does:
+  #   * the REAL script must refuse the code-bearing clean-low vector with the
+  #     NAMED class-unreadable message (pass 6, fail-closed), skip pass 7
+  #     LOUDLY, and still ignore the prose mention (pass 8) — the absent arm is
+  #     a refusal, never a silent green;
+  #   * a MUTANT of THAT copy with pr_is_clean_low_shaped neutered to `return 0`
+  #     must report "pass 6: binding did NOT fire" — proving the fail-closed
+  #     clause (not the fixture, not the marker regex) is what refuses it.
+  # The fixture asserts its own premise: if a producer were reachable there, the
+  # vector would silently exercise the PRESENT arm and prove nothing.
+  CL_ABS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1356-absent.XXXXXX")"
+  CL_ABS="$CL_ABS_DIR/check-pipeline-compliance.sh"
+  cp "$SELF_SRC" "$CL_ABS"
+  if [[ -e "$CL_ABS_DIR/record-review.sh" ]]; then
+    printf '❌ #1356 T4: fixture is not producer-absent (%s exists) — the vector would test the PRESENT arm\n' "$CL_ABS_DIR/record-review.sh" >&2
+    selffail=$((selffail + 1))
+  else
+    CL_ALOG="$CL_ABS_DIR/real.log"
+    CL_ARC=0
+    PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+      PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+      GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$CL_ABS" >"$CL_ALOG" 2>&1 || CL_ARC=$?
+    CL_AOK=1
+    grep -qF 'clean-low verdict marker, but the Low content-shape class could not be read' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 6: binding fired' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 7 SKIPPED (producer absent' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 8: prose mention did NOT fire' "$CL_ALOG" || CL_AOK=0
+    if [[ "$CL_AOK" == "1" ]]; then
+      printf '✅ #1356 T4: with the producer CONSTRUCTED-absent, the REAL gate refuses the clean-low marker with the NAMED class-unreadable message (pass 6, fail-closed), skips pass 7 loudly, and still ignores prose (pass 8)\n'
+    else
+      printf '❌ #1356 T4: the producer-absent run did not report the named fail-closed refusal (rc=%s)\n' "$CL_ARC" >&2
+      grep -E 'pass 6|pass 7|pass 8|could not be read' "$CL_ALOG" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    CL_AMUT="$CL_ABS_DIR/check-pipeline-compliance.mutant.sh"
+    # TWO layers refuse when the producer is absent, and BOTH must be neutered to
+    # reach a false PASS: the explicit NAMED clause in check (c), and
+    # pr_is_clean_low_shaped's own `CLEAN_LOW_CLASS_SOURCED == true || return 1`.
+    # That layering is the point — removing one layer changes the DIAGNOSIS (the
+    # remediation-bearing message) but not the verdict — so this mutant neuters
+    # both, proving the fail-closed POSTURE (not one particular line) is what
+    # refuses the marker. The second substitution is anchored on the refusal's
+    # own message text, which is unique to check (c) (the condition text alone
+    # occurs 3x in the file: the check (c) clause, its FAIL_ALL vector, and its
+    # SELF_TEST arm — a bare condition-anchored pattern neutralises the wrong
+    # ones).
+    perl -0pe '
+      s/pr_is_clean_low_shaped\(\) \{.*?\n\}/pr_is_clean_low_shaped() { return 0; }/s;
+      s/if \[\[ "\$CLEAN_LOW_CLASS_SOURCED" != "true" \]\]; then\n(\s*)fail c "clean-low verdict marker, but the Low content-shape class could not be read/if false; then\n${1}fail c "clean-low verdict marker, but the Low content-shape class could not be read/s;
+    ' "$SELF_SRC" > "$CL_AMUT" || true
+    if [[ ! -s "$CL_AMUT" ]] || cmp -s "$CL_AMUT" "$SELF_SRC" || ! bash -n "$CL_AMUT" 2>/dev/null \
+       || ! grep -q 'if false; then' "$CL_AMUT" || ! grep -q 'pr_is_clean_low_shaped() { return 0; }' "$CL_AMUT"; then
+      printf '❌ #1356 T4 mutation: could not neuter BOTH fail-closed layers in the absent fixture (reformatted?) — coverage is blind\n' >&2
+      selffail=$((selffail + 1))
+    else
+      CL_AMLOG="$CL_ABS_DIR/mutant.log"
+      CL_AMRC=0
+      PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+        PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+        GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$CL_AMUT" >"$CL_AMLOG" 2>&1 || CL_AMRC=$?
+      if grep -q 'pass 6: binding did NOT fire' "$CL_AMLOG"; then
+        printf '✅ #1356 T4 mutation is caught: with BOTH fail-closed layers neutered in the producer-ABSENT copy, the clean-low marker PASSES check (c) — so the fail-closed posture is load-bearing, and the named class-unreadable message is what layer 1 uniquely provides\n'
+      else
+        printf '❌ #1356 T4 mutation NOT caught (mutant rc=%s) — the absent arm is not what refuses the marker\n' "$CL_AMRC" >&2
+        grep -E 'pass 6' "$CL_AMLOG" >&2 || true
+        selffail=$((selffail + 1))
+      fi
+    fi
+    rm -rf "$CL_ABS_DIR"
+  fi
+
+  # ── #1356 T7 — the `source` must not REBIND this gate's own parser constants ──
+  # record-review.sh declares REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY too, and it is
+  # sourced AFTER this file declares them, so the producer's values would win.
+  # §8.13 pins the two copies byte-identical IN AGENT-INFRA — which is exactly why
+  # the defect is invisible here and LIVE in a consumer repo that ships the
+  # producer without that test (WIRING OPTION 1 copies the two files, not the
+  # test): a producer from another revision would silently rebind check (a)'s
+  # parser and the close-hazard scan. So assert the INVARIANT — the LIVE value
+  # equals THIS FILE's own declared line — rather than the producer's agreement,
+  # which the restore deliberately no longer depends on.
+  CL_C7_BAD=0
+  for CL_C7_C in REFCTX CLOSING_KW CLOSING_KW_BOUNDARY; do
+    CL_C7_OWN="$(grep -m1 "^${CL_C7_C}=" "$SELF_SRC" | sed -e "s/^${CL_C7_C}=//" -e "s/^'//" -e "s/'$//")"
+    if [[ -z "$CL_C7_OWN" || "${!CL_C7_C}" != "$CL_C7_OWN" ]]; then
+      printf "❌ #1356 T7: the sourced producer REBOUND this gate's own %s — the live value no longer matches this file's declaration, so a consumer repo without §8.13 parses check (a) and the close-hazard scan with a sibling's rule\n" "$CL_C7_C" >&2
+      CL_C7_BAD=$((CL_C7_BAD + 1))
+    fi
+  done
+  if [[ "$CL_C7_BAD" == "0" ]]; then
+    printf "✅ #1356 T7: the sourced producer did NOT rebind this gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY — the live values still match this file's declarations\n"
+  else
+    selffail=$((selffail + CL_C7_BAD))
+  fi
+  unset CL_C7_C CL_C7_OWN CL_C7_BAD 2>/dev/null || true
+
+  unset CL_SHA40 CL_MODERN CL_PROSE CL_MODERN_OK CL_PROSE_OK CL_LOG CL_RC CL_OK CL_MUT_DIR CL_MUT CL_MLOG CL_MRC \
+    CL_ABS_DIR CL_ABS CL_ALOG CL_ARC CL_AOK CL_AMUT CL_AMLOG CL_AMRC 2>/dev/null || true
 
   # ── #1611: the artifact class is DECLARED ONCE, and both user-facing
   # surfaces RENDER it from the declaration. #1409 added one regex alternative
@@ -2811,7 +2964,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation (#1356); resolve_issue_ref prefers closure."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure."
   exit 0
 fi
 
