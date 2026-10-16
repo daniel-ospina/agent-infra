@@ -2823,6 +2823,10 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     PG="git -C $PW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
     printf 'loop v1\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
+    # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
+    # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
+    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
     prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
@@ -2842,12 +2846,15 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     # inferred from `relation` (which is git ancestry of the SOURCE, not a statement about `$O`).
     grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "the stamp says whether the deployed copy matches the source (in-sync: true)" $rc
-    # `DRIFTED` is computed OUTSIDE the extracted provenance block (the block starts at its own
-    # marker), so the fixture supplies it — the same seam the real installer uses at module scope.
-    ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; DRIFTED="orch-loop.sh"; . "$TMP/prov-block.sh" )
-    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
-    ck "a DRIFTED \$O records deployedMatchesSource: false" $rc
+    # `$O` that differs from the source: install.sh NEVER copies (`$O` is synced by the operator), so
+    # an install run from a newer checkout can stamp a commit over bytes from an older one. Tampered
+    # file is `check-port-drift.sh` — deliberately one NOT in install.sh's `DRIFTED` list, so this
+    # assertion is RED if the field is derived from that subset instead of from the whole surface.
+    printf 'tampered\n' > "$PO/check-port-drift.sh"
     prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "a \$O that differs from the source in a NON-DRIFTED script records deployedMatchesSource: false" $rc
+    deploy; prov
     grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
     dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }

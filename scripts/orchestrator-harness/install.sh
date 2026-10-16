@@ -510,7 +510,7 @@ prov_dirty() {
 }
 
 write_provenance() {
-  local commit rel dirty_word payload tmp drc
+  local commit rel dirty_word payload tmp drc _depf _depb
   # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
   # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
   # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
@@ -520,7 +520,18 @@ write_provenance() {
   # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
   # FIELD, so the record itself cannot be read as "this commit describes these bytes".
   local dep_match
-  dep_match=true; [ -n "${DRIFTED:-}" ] && dep_match=false
+  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
+  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # differ while this field still said `true` — so the record read "this commit describes these bytes"
+  # about a `$O` the new check returns DRIFT/1 for. Reproduced in review (P2): a byte appended to
+  # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a
+  # surface `check-deployed-drift.sh` refused.
+  dep_match=true
+  for _depf in "$HERE"/*.sh; do
+    _depb="${_depf##*/}"
+    { [ -f "$O/$_depb" ] && cmp -s "$_depf" "$O/$_depb"; } || { dep_match=false; break; }
+  done
   prov_classify
   commit="${PROV_COMMIT:-}"; [ -n "$commit" ] || commit=UNKNOWN
   rel="${PROV_REL:-unknown}"
