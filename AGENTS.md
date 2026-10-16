@@ -27,6 +27,8 @@ If none of those apply: **keep going.** The user can interrupt if they disagree.
 
 **Auto-file rule:** When you encounter a bug, workflow gap, missed edge case, or improvement opportunity → file a GitHub issue immediately. Never ask "should I file an issue?" — just file it — **subject to the admission control in Product Over Process below** (category A always; category B only with a stated consequence; a product bug is filed as before).
 
+**⛔ Symptom check — before you file, find the ROOT.** Search the tracker for the same **root cause**, not the same words. If what you found is a **symptom of an existing issue**, add it **as a comment on that issue, with your evidence** — do **not** file a peer. **A peer issue is how one defect became 76** (the `derived = replay(journal)` class, measured 2026-09-25): 76 peer issues, one root, and **not one of the peers was visible to whoever fixes that root**. Filing is not the duty — **recording** is. **Your duty is to record the finding, not to own a new ticket.** **Filing a peer for a known root is a process defect, not diligence.**
+
 **Moving is not a license to build machinery.** "Keep going" means keep making progress on the **product** — not keep adding, fixing, auditing, or documenting *process*. If the only work in front of you is category B, that is a real reason to stop and say so — say it plainly rather than manufacturing more process to look busy.
 
 ---
@@ -365,9 +367,9 @@ Does **not** apply to: routine project file reads, git operations, local shell c
 
 ## File Pre-Existing Bugs
 
-When you encounter a **pre-existing bug** (not introduced by your current work), **file a GitHub issue for it.** Do not treat "out of scope" as a reason to skip. Known bugs carried silently forward accumulate into build rot.
+When you encounter a **pre-existing bug** (not introduced by your current work), **file a GitHub issue for it.** Do not treat "out of scope" as a reason to skip. Known bugs carried silently forward accumulate into build rot. **Unless the symptom check above shows it is a symptom of an existing issue** — then add your evidence as a comment on that issue instead; filing is the duty only when no root already exists.
 
-**Admission control applies to machinery findings — see Product Over Process.** Classify the *machinery* finding A or B *before* filing. **A** — file it, always. **B** — file it only with a stated consequence; if the honest answer is "nothing but time", do not file it. A pre-existing **product** bug is filed as before — the A/B test governs machinery, not the product.
+**Admission control applies to machinery findings — see Product Over Process.** Classify the *machinery* finding A or B *before* filing. **A** — file it, always (unless the symptom check above shows it is a symptom of an existing root). **B** — file it only with a stated consequence; if the honest answer is "nothing but time", do not file it. A pre-existing **product** bug is filed as before — **unless the symptom check above shows it is a symptom of an existing issue** — the A/B test governs machinery, not the product.
 
 ---
 
