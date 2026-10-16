@@ -305,8 +305,8 @@ check_producer_farm_declared() {
     floor_ok=0
   fi
   # SET BINDING (review H7) — the count floor above is blind to a COUNT-PRESERVING substitution, which
-  # is the shape `objective.py` was actually lost in. Compare the sorted names to the canonical set so
-  # the guard's SUBJECT is bound, not merely its size.
+  # is the shape a producer can actually be lost in (the shape the H7 probe exercises). Compare the
+  # sorted names to the canonical set so the guard's SUBJECT is bound, not merely its size.
   local actual_set canonical_set
   actual_set="$(printf '%s\n' $LANE_PRODUCERS | sort)"
   canonical_set="$(printf '%s\n' $LANE_PRODUCERS_CANONICAL | sort)"

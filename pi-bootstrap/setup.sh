@@ -334,8 +334,9 @@ fi
 # #1553 owns both: it declares `lane_root_srcs=(lane-status.py heartbeat-loop.sh)` and sources them
 # from `scripts/` once `lane-status.py`'s live bytes land. Until then the gap is declared, and
 # `pi-bootstrap/tests/test-setup-no-nesting.sh` names the two explicitly so it can never go quiet —
-# that check asserts EVERY member of the seven is declared in a farm array (`fleet_srcs` or #1553's
-# `lane_root_srcs`) and fails a producer that is in neither. The repo↔deployed identity instrument
+# that check asserts every one of the seven is ACCOUNTED FOR — declared in a farm array (`fleet_srcs`
+# or #1553's `lane_root_srcs`) or named as the two-file declared gap — and fails a producer that is in
+# neither array AND not so named. The repo↔deployed identity instrument
 # that would report drift continuously is #1760/#1759's — not this list's.
 # The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
 # TWO of them are read FAIL-SILENTLY and are therefore invisible when absent — `state/lane-confirm.py`
