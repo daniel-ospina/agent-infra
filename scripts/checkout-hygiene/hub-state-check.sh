@@ -40,6 +40,11 @@
 # `off_main` suppresses the staleness class: a stranded branch's own tip is not
 # the hub's freshness.
 #
+# #649: an off-main hub is MORE than a hygiene defect when pi's extension farm
+# symlinks into it — every session then executes the branch's working tree. The
+# check names those links (via PI_EXTENSIONS_DIR, default ~/.pi/agent/extensions)
+# and the consequence, so the FAIL is not read as cosmetic.
+#
 # #1313: before this, the verdict was on-main + clean ONLY, so a hub that was
 # arbitrarily behind or diverged reported PASS — a false PASS on exactly the
 # state that hides itself. Everything merged upstream is simply ABSENT from the
@@ -222,6 +227,27 @@ recovery_guide() {
       esac
     done <<<"$unlinked"
   fi
+  # #649 — APPENDIX, not a disorder class. When the checkout pi's extension farm
+  # symlinks into is OFF MAIN, name the live-runtime consequence: every pi session
+  # is executing this working tree, so unmerged branch code is what runs and a
+  # merged fix is NOT live. The remedy is the class above (return the checkout to
+  # main); this exists so the operator sees why that is urgent beyond hub hygiene.
+  # Only off-main is named: a farm materialized as real copies cannot track a
+  # branch at all, and a farm pointing at another checkout is not this hub's.
+  if [[ "$on_main" -eq 0 ]]; then
+    local ext_links
+    ext_links="$(live_extension_links "$repo")"
+    if [[ -n "$ext_links" ]]; then
+      lines+=("")
+      lines+=("#649 — the live pi extension farm symlinks into THIS checkout, so every")
+      lines+=("running session executes its WORKING TREE, not the commit on main:")
+      while IFS=$'\t' read -r n tgt; do
+        lines+=("  ~/.pi/agent/extensions/$n -> $tgt")
+      done <<<"$ext_links"
+      lines+=("Until this checkout is back on main at a commit containing them, merged fixes")
+      lines+=("are NOT live and unmerged branch code is what runs. Return it to main (above).")
+    fi
+  fi
   # #431: an EMPTY array expands to an unbound variable under `set -u` on bash 3.2, so a
   # guide that produced no lines would abort its caller instead of reporting. Every class
   # above appends, but this keeps a future arm from turning "no guidance" into a crash.
@@ -255,6 +281,45 @@ recovery_guide() {
 # registered worktree under the hub is covered, wherever it sits.
 #
 # `rec` is that record, so the printed repair is exact rather than a template.
+# #649 — live pi extension entries that are SYMLINKS into $1 (a hub checkout).
+# pi loads ~/.pi/agent/extensions/* at startup; when an entry is a symlink the
+# runtime executes the TARGET CHECKOUT'S WORKING TREE. On an off-main hub that is
+# unreviewed branch code, and a merged fix is not live until the checkout returns
+# to a commit containing it (#649). Emits `entry<TAB>target` per link that
+# resolves into $1/extensions/; prints nothing when the farm is absent, is
+# materialized as real copies, or points at another checkout.
+#
+# PI_EXTENSIONS_DIR overrides the farm root (the pi-config-extensions suite's
+# fixture contract); the default is the machine-local farm.
+live_extension_links() { # $1=hub
+  local hub="$1" farm="${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent/extensions}"
+  local e base target tdir real hub_ext
+  [ -d "$farm" ] || return 0
+  hub_ext="$( (cd "$hub/extensions" 2>/dev/null && pwd -P) || printf '%s' "$hub/extensions" )"
+  for e in "$farm"/*; do
+    [ -L "$e" ] || continue
+    base="$(basename "$e")"
+    target="$(readlink "$e" 2>/dev/null || true)"
+    [ -n "$target" ] || continue
+    # Resolve a RELATIVE link target against the link's own directory, then
+    # canonicalize the target's parent so a symlinked spelling of the hub (macOS
+    # /tmp -> /private/tmp) still matches. The entry itself is carried raw — it
+    # is what the operator must repoint.
+    case "$target" in
+      /*) ;;
+      *)  tdir="$( (cd "$(dirname "$e")" 2>/dev/null && pwd -P) || printf '%s' "$(dirname "$e")" )"
+          target="$tdir/$target" ;;
+    esac
+    tdir="$(dirname "$target")"
+    real="$( (cd "$tdir" 2>/dev/null && pwd -P) )" || real="$tdir"
+    if [ "$real" = "$hub_ext" ]; then printf '%s\t%s\n' "$base" "$target"; fi
+  done
+  # ALWAYS 0: the caller runs under `set -e` and a non-matching last entry (the
+  # `[ … ]` test) would otherwise make the command substitution fail and abort
+  # the whole check before the guide is printed — a silent guide loss.
+  return 0
+}
+
 unlinked_worktrees() { # $1=hub — emits `T<TAB><dir>` / `M<TAB>` then the record, two lines per entry
   local hub="$1" r dir raw out="" records mark bad=0 resolved="" up=0 nl=$'\n' tab=$'\t' 
   records="$(git -C "$hub" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || echo "$hub/.git")"

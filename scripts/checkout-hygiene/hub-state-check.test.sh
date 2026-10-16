@@ -53,6 +53,11 @@ assert_not_contains() { # <haystack> <needle> <label>
 FIX="$(mktemp -d)"
 trap 'rm -rf "$FIX"' EXIT
 
+# #649 — every case is hermetic about the live extension farm: the default points
+# at a path that does not exist, so the real ~/.pi/agent/extensions never
+# participates. Case 4b opts in explicitly.
+export PI_EXTENSIONS_DIR="$FIX/no-farm-649"
+
 # ── Fixture: two temp repos (one clean hub, one to disorder) ──────────────
 HUB="$FIX/hub"
 OTHER="$FIX/other"
@@ -112,7 +117,31 @@ assert_eq "$rc" 1 "off-main → exit 1"
 assert_contains "$out" "HUB_DISORDER=off_main" "off-main → HUB_DISORDER=off_main"
 assert_contains "$out" "git push origin feat/incident" "off-main FAIL prints the WIP-preservation push"
 assert_contains "$out" "git checkout main && git pull --ff-only" "off-main FAIL prints the return-to-main steps"
+assert_not_contains "$out" "#649" "off-main hub with no extension farm does not print the #649 appendix"
 git -C "$HUB" checkout -q main
+
+# ── 4b. #649: an off-main hub the live extension farm symlinks into ────────
+# The measured state: ~/.pi/agent/extensions/<e> -> <hub>/extensions/<e>, so
+# every session executes the hub's WORKING TREE. Off main that is unmerged
+# branch code, and a merged fix is not live — the FAIL must name it.
+mkdir -p "$HUB/extensions/builtin-tools"
+FARM649="$FIX/farm649"
+mkdir -p "$FARM649" "$FIX/foreign/extensions"
+ln -s "$HUB/extensions/builtin-tools" "$FARM649/builtin-tools"
+ln -s "$FIX/foreign/extensions/other" "$FARM649/other-tool"   # a DIFFERENT checkout
+# The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
+# intended (anchor-safe) deployment, not the #649 defect.
+out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_not_contains "$out" "#649" "ON-MAIN farm link does not print the #649 appendix"
+git -C "$HUB" checkout -qb feat/live-ext
+out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "off-main + live symlink farm → exit 1"
+assert_contains "$out" "HUB_DISORDER=off_main" "off-main farm link still reports off_main"
+assert_contains "$out" "#649" "off-main farm link prints the live-runtime consequence"
+assert_contains "$out" "~/.pi/agent/extensions/builtin-tools -> $HUB/extensions/builtin-tools" "names the farmed entry and its target"
+assert_not_contains "$out" "$FIX/foreign/extensions/other" "a link into ANOTHER checkout is not named"
+git -C "$HUB" checkout -q main
+rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign"
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────
 WT="$HUB/.worktrees/wt-test"
