@@ -212,40 +212,54 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
 # under HOME=/tmp/cell-home). The caller cannot tell that answer apart from a real collision, so an
 # environment failure becomes "a peer owns it, retry next pass" on every candidate, forever. This
 # check turns it back into ONE named provisioning failure.
-# ⛔ PERMANENT (3) IS RESERVED FOR A MISSING CREDENTIAL, whose remedy needs a human; everything else
-# is TRANSIENT (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker
-# that only a human can clear (#1853 review).
+# ⛔ PERMANENT (3) IS RESERVED FOR A CONDITION A RETRY CANNOT CHANGE — no `gh` on PATH, no credential
+# stored for the host, or a credential the API has REJECTED with a 401. Everything else is TRANSIENT
+# (1), so a network/API fault cannot latch the permanent `.refresh-blocked` marker that only a human
+# can clear (#1853 review).
 # `gh auth status` also recognises GH_TOKEN/GITHUB_TOKEN, so a token-in-env cell is not false-blocked.
 gh_env_verdict() {
-  local host="${GH_HOST:-github.com}" out
+  local host out
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ⛔ SCOPE THE PROBE TO THE HOST THE PRE-FLIGHT QUERIES: `gh auth status` exits non-zero if an
-  # account on ANY configured host has a problem, so an unrelated stale host would refuse a cell
-  # whose github.com credential is fine (#1853 review). ONE call captures both status and output.
+  # ⛔ THE PROBE MUST USE THE HOST THE PRE-FLIGHT QUERIES. The pre-flight passes `--repo owner/name`
+  # and lets gh infer the host from the remote, so a host-qualified $OR (a GHES cell) must drive the
+  # probe too — otherwise the probe validates github.com, finds no credential for it, and refuses a
+  # cell that would have worked (#1853 review). GH_HOST is the explicit override.
+  case "${OR%%/*}" in
+    *.*) host="${OR%%/*}" ;;
+    *) host="${GH_HOST:-github.com}" ;;
+  esac
+  # ONE call captures both the status and the output.
   out="$(gh auth status --hostname "$host" 2>&1)" && return 0
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. `gh auth status` cannot tell a
-  # transport fault from a rejected credential — measured on gh 2.97.0: behind a dead proxy a PURE
-  # network fault still prints "The token in ~/.config/gh/hosts.yml is invalid.", so ANY text match
-  # on "invalid"/"expired"/"authenticat" classifies an outage as a credential failure and latches the
-  # permanent marker a human must clear (#1853 review). `gh auth token` is an OFFLINE lookup of the
-  # stored credential (hosts.yml / the keyring) — it never touches the network, so its exit status is
-  # cause-independent. The token itself is never printed: stdout goes to /dev/null.
-  #   no stored credential -> PERMANENT: this IS the broken-HOME defect (#1328), and retrying cannot
-  #                           conjure a credential.
-  #   a stored credential  -> TRANSIENT: an outage and a stale token are indistinguishable here, and
-  #                           the safe direction is to retry — a pass that judges nothing then aborts
-  #                           rc=1 loudly every cycle, while a wrong PERMANENT stops dispatch until a
-  #                           human intervenes.
+  # transport fault from a rejected credential — measured on gh 2.97.0: behind a DEAD PROXY a pure
+  # network fault prints exactly the same "The token in ~/.config/gh/hosts.yml is invalid." as a
+  # revoked one, so any text match on "invalid"/"expired"/"authenticat" classifies an outage as a
+  # credential failure and latches the permanent marker a human must clear (#1853 review).
+  # `gh auth token` is an OFFLINE lookup of the stored credential (hosts.yml / the keyring) — it never
+  # touches the network, so its exit status is cause-independent. The token itself is never printed:
+  # stdout goes to /dev/null.
   if ! gh auth token --hostname "$host" >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: no gh credential is STORED for $host in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
     printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials, then re-run"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] TRANSIENT: a gh credential IS stored for $host but could not be validated in the environment the pre-flight runs in (HOME=$HOME) — an outage and a stale token are indistinguishable here, so this is retried next cycle rather than latching the permanent MERGE-ONLY marker (#1736)"
+  # A credential IS stored but could not be validated. Is it REJECTED, or merely UNREACHABLE? Only
+  # the API can say, and only a 401 is unambiguous: a 403 is rate limiting (transient by nature) and
+  # a transport failure carries no HTTP status at all. MEASURED on gh 2.97.0: a bogus stored token ->
+  # `gh: Bad credentials (HTTP 401)`; a dead proxy -> `proxyconnect tcp: … connection refused` with no
+  # status. A rejected credential is permanent because a retry cannot change it, and leaving it as a
+  # silent transient is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
+  if grep -q 'HTTP 401' <<<"$(gh api --hostname "$host" rate_limit 2>&1)"; then
+    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for $host is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+    echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
+    return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] TRANSIENT: a gh credential is stored for $host but could not be validated and the API is NOT answering with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$out" | sed -n '1,4p' | sed 's/^/[refresh]   /'
   return "$EXIT_TRANSIENT"
 }
@@ -537,13 +551,16 @@ while read -r N; do
     exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
-  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer pairs
-  # `ALSO INCOMPLETE` with COLLISION, INCOMPLETE and LANDED but never with CLEAN, and `resolve_preflight`
-  # prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and reproduce the
-  # healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt: the
-  # producer's contract makes a terminal signal decisive over an incomplete one.
+  # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer prints the
+  # `ALSO INCOMPLETE:` marker beside a COLLISION or a LANDED answer (an INCOMPLETE verdict IS the
+  # degraded reading and prints "N surface(s) could not be queried" with no marker), and
+  # `resolve_preflight` prefers the repo's OWN copy, so a VENDORED producer could pair it with CLEAN and
+  # reproduce the healthy-looking reading this pass exists to refuse (#1853 review). LANDED is exempt:
+  # the producer's contract makes a terminal signal decisive over an incomplete one.
   degraded=0
-  grep -q 'ALSO INCOMPLETE' <<<"$PRE" && degraded=1
+  # ⛔ ANCHORED, because the report echoes the candidate's own `title:` line: an unanchored search for
+  # this phrase would let an ISSUE TITLE set the flag and silently drop a genuine CLEAN (#1853 review).
+  grep -qE '^ *ALSO INCOMPLETE: ' <<<"$PRE" && degraded=1
   case "$V" in
     CLEAN)
       # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
@@ -577,7 +594,7 @@ while read -r N; do
       # has left the pool by itself. Counted as a usable verdict — otherwise a pass of LANDEDs is
       # reported as "judged NOTHING" — but never queued and never written to checked.txt (#1853
       # review; the canonical consumer's LANDED arm).
-      # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:258-280, #8560/#8625 —
+      # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:266-274, #8560/#8625 —
       # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
       # port-provenance.txt:208, NOT DONE).
       usable=$((usable + 1))
@@ -591,7 +608,12 @@ done < "$O/.pool"
 # ⛔ WHAT THIS DOES NOT COVER: the stall that leaves a HEALTHY-LOOKING NON-EMPTY backlog. A
 # persistently-colliding issue consumes the whole window while `checked N; backlog now M` still
 # prints and M > 0 — `COLLISION` counts as usable, so that class is invisible here. It is
-# agent-infra#1729 and stays OPEN; this assertion covers the empty-backlog reading only.
+# agent-infra#1729 and stays OPEN.
+# ⛔ ... and a MIXED pass: ONE usable verdict masks any number of `?no verdict` / DEGRADED candidates,
+# so `checked N; backlog now M` can still be printed over candidates the pre-flight could not judge.
+# An abort on any degraded candidate would be worse — it would discard a pass that DID find a CLEAN
+# candidate — so this limit is declared, not closed.
+# This assertion covers the ALL-candidates-unjudged empty-backlog reading only.
 # ⛔ ASSERT THE PROPERTY, NOT THE PLUMBING. "checked N; backlog now 0" over a non-empty pool is the
 # reading the fleet has been stuck in: it looks like a healthy empty queue, and each `?no verdict`
 # line is a per-candidate MASK of one environment failure (measured 2026-10-16: two cells whose

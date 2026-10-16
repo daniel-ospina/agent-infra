@@ -122,7 +122,9 @@ PY
   chmod +x "$1"
 }
 # mk_gh_noauth <case-dir> — a `gh` that answers the pool queries but is NOT authenticated. The
-# pre-flight's surfaces are all gh-backed, so this is the environment the live cells actually had
+# gh-backed ISSUE/PR surfaces DECIDE a verdict; the git-read branches/worktrees are BLOCKING (a ref
+# naming the issue forces a COLLISION) and the local-branch terminal lookup is itself a gh call that
+# fails closed — so an unauthenticated gh is the environment the live cells actually had
 # (measured 2026-10-16: `gh auth status` fails under HOME=/home/ubuntu and succeeds under
 # HOME=/tmp/cell-home, on the same cell).
 mk_gh_noauth() {
@@ -140,10 +142,10 @@ SH
 # mk_gh_stale_token <case-dir> — a gh with a STORED-BUT-UNVALIDATABLE credential: `auth status`
 # exits 1 with the REAL output gh 2.97.0 prints behind a dead proxy (measured: `HTTPS_PROXY=
 # http://127.0.0.1:1 gh auth status --hostname github.com` → "The token in ~/.config/gh/hosts.yml is
-# invalid."), while `auth token` — an OFFLINE lookup of the stored credential — succeeds. It is a
-# stored-but-unvalidatable credential, NOT a network stub: the whole point is that its prose is
-# exactly what an outage prints, so a text-match discriminator cannot tell them apart and the
-# presence of a stored credential is the only cause-independent signal.
+# invalid."), while `auth token` — an OFFLINE lookup of the stored credential — succeeds, and the API
+# call fails with the SAME transport error (no HTTP status). This is the TRANSIENT case: the prose is
+# exactly what a rejected credential prints, so a text-match discriminator cannot tell them apart —
+# only the API's own answer can, and an unreachable API answers with no status at all.
 mk_gh_stale_token() {
   cat > "$1/bin/gh" <<'SH'
 #!/bin/bash
@@ -156,6 +158,32 @@ case "$1 $2" in
 EOM
     exit 1 ;;
   "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
+  api\ *) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
+esac
+case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+exit 0
+SH
+  chmod +x "$1/bin/gh"
+}
+# mk_gh_rejected <case-dir> — a gh with a STORED-BUT-REJECTED credential: `auth status` exits 1 with
+# the SAME prose a dead proxy prints (so a prose matcher cannot tell them apart), `auth token` — an
+# OFFLINE lookup — SUCCEEDS, and the ONLY thing separating it from an outage is the API's own answer:
+# `gh api … rate_limit` prints `gh: Bad credentials (HTTP 401)` and exits 1 (measured on gh 2.97.0).
+# A rejected credential is permanent — a retry cannot change it — so it MUST latch the marker rather
+# than stay a silent transient, which is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
+mk_gh_rejected() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth status")
+    cat >&2 <<'EOM'
+  X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
+  - Active account: true
+  - The token in ~/.config/gh/hosts.yml is invalid.
+EOM
+    exit 1 ;;
+  "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
+  api\ *) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
 esac
 case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
 exit 0
@@ -225,6 +253,9 @@ esac
 mk_case old-python-run
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_old_python "$D/bin/oldpy"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING — an empty file cannot distinguish "nothing
+# was queued" from "the backlog was clobbered" (the pattern used by the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh SCOUT_PY="$D/bin/oldpy"
 [ "$RC" -eq 3 ] && ok "old interpreter (run): rc=3 (PERMANENT — a marker, not a silent 0)" \
                || bad "old interpreter (run): rc=$RC (want 3) — output: $OUT"
@@ -232,8 +263,11 @@ case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "old interpreter (run): the refusal is LOUD and named" ;;
   *) bad "old interpreter (run): no NOT PROVISIONABLE verdict — output: $OUT" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "old interpreter (run): nothing is queued" \
-                              || bad "old interpreter (run): queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "old interpreter (run): queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "old interpreter (run): nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "old interpreter (run): the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 1c) a pre-flight that REFUSES TO RUN is PERMANENT, not a per-issue "no verdict" (#1748 P1) ──
 # The tool's EXIT_USAGE (3) reports an unusable environment with NO `VERDICT` line. Absorbing that
@@ -254,6 +288,8 @@ case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
 exit 0
 SH
 chmod +x "$D/bin/gh"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
 [ "$RC" -eq 3 ] && ok "pre-flight exits 3 (no VERDICT): the refresh is PERMANENT rc=3, not a silent 0" \
                || bad "pre-flight exits 3: rc=$RC (want 3) — output: $OUT"
@@ -261,8 +297,11 @@ case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "pre-flight exits 3: the refusal is LOUD and named" ;;
   *) bad "pre-flight exits 3: no NOT PROVISIONABLE verdict — output: $OUT" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "pre-flight exits 3: nothing is queued" \
-                              || bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "pre-flight exits 3: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "pre-flight exits 3: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "pre-flight exits 3: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # ── 1d) THE PRE-FLIGHT'S ENVIRONMENT IS A PRECONDITION, NOT A PER-CANDIDATE RESULT ─────────────
 # The measured defect (2026-10-16, live cells). `cloud-cell-bringup.sh` documents friction #1
@@ -317,6 +356,8 @@ echo; echo "── an unauthenticated gh REFUSES the pass instead of degrading e
 mk_case gh-noauth
 mk_degraded_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_noauth "$D"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh TOOL_LOG="$D/tool-log"
 # The MEASURED symptom is not a crash: an unreadable environment makes every candidate read as
 # "a peer owns it", which is an ordinary answer. Pre-fix this case exits 0 having queued nothing and
@@ -341,8 +382,11 @@ case "$OUT" in
   *"checked "*"backlog now"*) bad "gh unauthenticated: still reported a healthy empty backlog" ;;
   *) ok "gh unauthenticated: no \"checked N; backlog now 0\" over an unjudged pool" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "gh unauthenticated: nothing is queued" \
-                              || bad "gh unauthenticated: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "gh unauthenticated: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "gh unauthenticated: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "gh unauthenticated: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 
 # `--check` is deliberately NOT where the gh precondition is judged. cloud-cell-supervisor.sh's
 # cmd_check and cloud-cell-bringup.sh's check_dispatch each ALREADY run `gh auth status` themselves
@@ -378,6 +422,8 @@ PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
 chmod +x "$D/bin/gh"
+# Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
+echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
 [ "$RC" -ne 0 ] && ok "no usable verdict: the pass is NOT reported as success (rc=$RC)" \
                || bad "no usable verdict: rc=0 — an unjudged pool was reported as a healthy empty backlog"
@@ -389,8 +435,11 @@ case "$OUT" in
   *"checked "*"backlog now"*) bad "no usable verdict: still printed \"checked N; backlog now 0\"" ;;
   *) ok "no usable verdict: the false empty-backlog report is suppressed" ;;
 esac
-[ ! -s "$D/o/candidates.txt" ] && ok "no usable verdict: nothing is queued" \
-                              || bad "no usable verdict: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "no usable verdict: queued candidates — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "no usable verdict: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "no usable verdict: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
 # ...and the same script with an EMPTY pool must still exit 0 (the assertion is not a blanket refusal).
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"
 chmod +x "$D/bin/gh"
@@ -444,7 +493,7 @@ mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
 print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
-print("ALSO INCOMPLETE: 3 surface(s) could not be queried")
+print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
@@ -502,6 +551,69 @@ rf "$D" refresh
 case "$OUT" in
   *"NOT PROVISIONABLE"*) ok "no stored credential: the refusal is LOUD and named" ;;
   *) bad "no stored credential: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+
+# ── 1i) A STORED-BUT-REJECTED CREDENTIAL IS PERMANENT (agent-infra#1853 review P1) ──────────────
+# The most common real credential failure: a stale/revoked token is STORED (`auth token` succeeds)
+# but the API REJECTS it (HTTP 401). Returning TRANSIENT for ever leaves no marker and no escalation
+# while the cell reports RUNNING with `lanes: 0` — the exact #1328/#1736 shape this PR removes. The
+# API layer is the only signal that separates a rejected credential from an unreachable one
+# (measured on gh 2.97.0: a bogus stored token prints `gh: Bad credentials (HTTP 401)`; a dead proxy
+# prints no HTTP status at all).
+mk_case gh-rejected
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rejected "$D"
+rf "$D" refresh
+[ "$RC" -eq 3 ] && ok "rejected credential: rc=3 (PERMANENT — a retry cannot change a 401)" \
+               || bad "rejected credential: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) ok "rejected credential: the refusal is LOUD and named" ;;
+  *) bad "rejected credential: no NOT PROVISIONABLE verdict — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"HTTP 401"*) ok "rejected credential: the refusal names the 401 (the discriminating signal)" ;;
+  *) bad "rejected credential: the refusal does not name the 401 — output: $OUT" ;;
+esac
+
+# ── 1j) A CLEAN THAT IS DEGRADED IS NOT A VERDICT (agent-infra#1853 review P2) ──────────────────
+# The canonical producer never pairs `ALSO INCOMPLETE` with CLEAN, but `resolve_preflight` prefers
+# the repo's OWN copy — so a VENDORED producer could, and a degraded CLEAN counted as usable would
+# let a broken environment queue an issue it could not actually judge. The guard must drop it.
+# ⛔ The report echoes the candidate's own `title:` line, so the marker match must be ANCHORED: an
+# unanchored search would let an issue TITLE containing the phrase set the flag.
+mk_case clean-degraded
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: CLEAN (exit 0) — the pre-flight could not query every surface")
+print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
+raise SystemExit(0)
+PY
+chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+chmod +x "$D/bin/gh"
+# A sentinel makes "nothing queued" DISCRIMINATING: an empty file cannot distinguish "the degraded
+# CLEAN was not queued" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 1 ] && ok "CLEAN is DEGRADED: the pass aborts TRANSIENT (rc=1) — no usable verdict" \
+               || bad "CLEAN is DEGRADED: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"CLEAN is DEGRADED"*) ok "CLEAN is DEGRADED: the degradation is NAMED" ;;
+  *) bad "CLEAN is DEGRADED: the degradation is not reported — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "CLEAN is DEGRADED: still reported a healthy backlog" ;;
+  *) ok "CLEAN is DEGRADED: no \"checked N; backlog now M\" over a degraded CLEAN" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "CLEAN is DEGRADED: the degraded CLEAN was queued — $(cat "$D/o/candidates.txt" 2>/dev/null)" ;;
+  *99*) ok "CLEAN is DEGRADED: not queued (seed 99 intact, #42 absent from candidates.txt)" ;;
+  *) bad "CLEAN is DEGRADED: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *42*) bad "CLEAN is DEGRADED: the degraded CLEAN was written to checked.txt (blacklisted)" ;;
+  *) ok "CLEAN is DEGRADED: not written to checked.txt (left unchecked for the next pass)" ;;
 esac
 
 # ── 2) the tool is resolved PER REPO: the repo's OWN copy wins, run from the scout with --repo . ─
