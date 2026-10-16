@@ -20,6 +20,10 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELD
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+# ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
+# below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
+# interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
+# agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$O/logs/prompt-$N.txt" <<EOF
 Autonomous engineering lane. You are ALREADY inside your own worktree (that is your cwd, on branch \`$BR\`). Do NOT create, switch, or remove worktrees, and NEVER touch the repo's main checkout.
 
@@ -31,7 +35,7 @@ The comment thread supersedes the body where they disagree. Several issues here 
 
 ## Setup (you are already in the worktree)
     uv sync --extra embeddings --extra parity        # tortoise: installs the canonical dev env
-Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras).
+Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras). If \`.venv\` is missing in YOUR worktree, run \`uv sync --extra embeddings --extra parity\` once — ⛔ never search the filesystem for an interpreter (no \`find\`/\`rg\`/\`du\` outside this worktree: a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result).
 
 ## Rules
 - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.
@@ -52,12 +56,24 @@ run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" 
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
 rc=$?
 echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
-# A gate refusal reports AGENT_LOAD_REFUSED (75); AGENT_STARTED is authoritative rather than the
-# exit code, because `pi` shares the 0–255 status namespace and could exit 75 itself (#1720).
+# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
+# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
+# exit 75 itself (#1720).
 if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
   # to the pool.
-  echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
+  # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
+  # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
+  # on a full filesystem waits for a remedy that cannot arrive.
+  # ⛔ TOLERANT REFERENCE (review round 2, P2). `$O` is seeded file by file, so a NEW lane.sh can run
+  # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
+  # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
+  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
+  if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
+    echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  else
+    echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
+  fi
 fi
 exit "$rc"

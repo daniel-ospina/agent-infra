@@ -21,14 +21,20 @@ set -euo pipefail
 
 # ── Stage guard FIRST: only enforce when AGENTS.md is staged. Must be the
 # first statement so normal commits pay one git call and nothing more.
-if ! git diff --cached --name-only -- AGENTS.md 2>/dev/null | grep -q .; then
+#
+# `[ -n … ]` on a capture, NOT `… | grep -q .`: a piped quiet grep takes SIGPIPE
+# under `pipefail` on a large staged name list, and a false negative here makes the
+# gate SKIP ITSELF — the bypass direction (#864).
+staged_agents="$(git diff --cached --name-only -- AGENTS.md 2>/dev/null || true)"
+if [ -z "$staged_agents" ]; then
   exit 0
 fi
 
 # ── Staged DELETION policy: a repo deliberately removing AGENTS.md (leaving
 # the materialization model) is a repo-owner decision, not a stub regression.
 # Allow it, but say so — never silently skip.
-if git diff --cached --name-only --diff-filter=D -- AGENTS.md 2>/dev/null | grep -q .; then
+deleted_agents="$(git diff --cached --name-only --diff-filter=D -- AGENTS.md 2>/dev/null || true)"
+if [ -n "$deleted_agents" ]; then
   echo "[agent-infra] ℹ️ AGENTS.md staged for DELETION — materialization gate skipped (repo-owner decision)."
   exit 0
 fi

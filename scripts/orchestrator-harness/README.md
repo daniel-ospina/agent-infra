@@ -115,9 +115,19 @@ without a human in the loop:
 - **Fan-out:** N simultaneous implementation lanes, each in its own git worktree.
 - **Fan-in:** a per-PR chain that reviews, records the review as a gate artifact, and merges.
 - **Back-pressure:** every cycle is gated on load average and swap, so the box throttles
-  itself instead of thrashing. Above `MERGE_PRIORITY_AT` open PRs (10) the balance shifts to
-  **draining**: new lanes stop being dispatched and reviewer headroom rises, because a merge
-  backlog means the scarce capacity belongs to review and merge, not to opening more PRs.
+  itself instead of thrashing. Above `MERGE_PRIORITY_AT` **unowned** open PRs (25) — open PRs
+  nothing is currently working, derived from the loop's own worker sessions, cross-box claims and
+  unconsumed reviewer-findings markers — the balance shifts to **draining**: new lanes stop being
+  dispatched and the reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`), because a
+  merge backlog means the scarce capacity belongs to review and merge, not to opening more PRs.
+  Counting TOTAL open PRs instead capped the fleet on a busy queue: a PR mid-review, mid-fix,
+  mid-merge — or held by a claim on another box — read as congestion. Measured 2026-10-16, two live
+  cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
+  59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
+  ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
+  lease is *data, not liveness* (a remote pid cannot be probed), so an abandoned-but-unexpired
+  claim reads as owned until the lease expires. The residuals and their direction are recorded on
+  `pr_owned()` in `orch-loop.sh`.
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
@@ -195,6 +205,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
 | `state/last-open-n` | the last SUCCESSFUL open-PR count; reused only when positive if a later count fails — a failure never reads as 0 |
+| `state/last-open-prs` | the `number:headOid` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`). Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
 | `logs/` | one log per worker: `lane-*.log`, `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6) |
 
@@ -206,6 +217,44 @@ rather than only diff hunks, and posts its verdict as a PR comment. That comment
 evidence the `record-review.sh` signature points at, so the merge gate is auditable after
 the fact: the PR body names the comment it was signed against.
 
+### Non-blocking dispatch — the orchestrator keeps its own time
+
+`nonblocking-dispatch.sh` launches a headless worker and **returns immediately**. It exists because
+the built-in `task`/`subagent` tools always block the caller (agent-infra#1662): an orchestrator that
+dispatches N workers pays `max(worker)` wall-clock and cannot react to anything until the slowest
+settles.
+
+It is deliberately thin. It carries **no agent invocation of its own** — it backgrounds
+`run_agent()` from `spawn-gate.sh`, so a background worker is load-gated exactly like `lane.sh` and
+`fix-one.sh`, gets the same wall-clock watchdog, and appends the same `state/walltime.tsv` row with
+`KIND=bg`. Routing it through the helper is also what keeps `spawn-gate.test.sh`'s invoker census an
+equality: a direct spawn here would be a fourth, ungated launch path.
+
+```bash
+bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed rc=N | lost
+```
+
+Status comes from the worker's own exit-status file plus a pid probe — **never `%CPU`**, which reads
+0 for a worker that is merely WAITING (`docs/ops/fleet-liveness.md`). "launched" is the only success
+this script reports: it cannot tell you the work succeeded.
+
+⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
+`task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
+PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
+never handed to the chain is unreviewed code by default.
+
+⚠️ `install.sh` does **not** copy it. The script only syntax-checks every `*.sh`, and its drift
+comparison lists the loop scripts **explicitly** (it does not include this one), so a stale copy here
+is never reported and `install.sh` prints no `cp` for it. What puts this file in `$O` is the manual
+copy in §4 — `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness
+directory, and re-run that `cp` after editing this script.
+
+⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
+as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
+merges it supersedes this script for `task`-based orchestrators; the harness keeps this one for its
+own `pi` workers, which do not go through `task`.
+
 ---
 
 ## 3. Prerequisites
@@ -216,12 +265,36 @@ the fact: the PR body names the comment it was signed against.
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
-| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there |
+| `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
+| `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
+| **the operational layer** (`~/.pi/agent/{scripts,extensions,skills,AGENTS.md,settings.json}`) | a lane is only as guarded as its `pi`; without the layer a box has **no review-enforcer, no verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no skills** | installed by `pi-bootstrap/cell-install.sh`, and on a cell it runs from `cloud-cell-bringup.sh --check`. Measured 2026-10-15 on a live cell: `scripts/` did not exist at all (24/24 declared farm files absent), and the merge path died `rc=127` on the missing `record-review.sh` (agent-infra#1723) |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
 | `.worktrees/` gitignored in the target repo | worktrees are created under it | `git check-ignore .worktrees` |
+
+**`cloud-cell-supervisor.sh check` vouches only for what it actually probes, and refuses to certify
+a cell missing any of them: `tmux`, an authenticated `gh`, `git`, `python3`, `pi`, a cloned repo
+with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty, executable
+`~/.pi/agent/scripts/record-review.sh` with its `lib/diff-normalize.py` sibling.** The rest of the
+table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
+still runs a controller and is still a **MERGE ACTOR** (`gh pr merge --auto` does not go through the
+key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it just cannot complete a
+*signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
+`tools/collision_preflight.py` is not a dependency `check` refuses on by that name: the only by-name
+read in `cloud-cell-supervisor.sh` itself is `repo_vendors_tool()`, which uses it solely to decide
+whether an operator's `TORTOISE_REPO` is relevant. The refusal is indirect but real — the #1736
+dispatch-provisioning probe (`refresh-candidates.sh --check`, which `cmd_check` runs) reads that same
+literal path and refuses a repo that resolves no copy of it — so `check` does refuse that cell in
+effect.
+Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency that is absent must
+fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
+`git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does
+in `install.sh`) — but the #1736 dispatch probe (`refresh-candidates.sh --check`, which `cmd_check`
+runs) refuses a `pyproject.toml` repo whose scout venv has to be built while `uv` does not resolve on
+`PATH`, so `uv` is fatal in effect there. And `start` provisions the record step from this checkout
+when the cell has none (agent-infra#1717).
 
 **Single-host assumption.** Everything is local: tmux sessions, worktrees, logs, the key.
 There is no scheduler, no queue service, no shared database. Two boxes running this against
@@ -231,6 +304,25 @@ work unless they coordinate (see §5, "broad mode").
 ---
 
 ## 4. Install
+
+**On a cmux cloud cell**, `scripts/cloud-cell-bringup.sh --check` provisions the toolchain,
+the network, the provider, `gh` auth/push, the target-repo clone, the dispatch pre-flight and
+**the operational layer** — that last one from the agent-infra checkout already on the cell via
+`pi-bootstrap/cell-install.sh`, and it REFUSES to print `CELL READY` if the layer cannot be
+installed. Two things a `CELL READY` does NOT speak for, and which the operator still owns:
+**`AI_REVIEW_GATE_KEY`** (push it in `keys.env`; what actually ENFORCES it is the
+`ai-review-gate` check on each PR — `cloud-cell-supervisor.sh check` only WARNS, and says so)
+and **`AGENT_INFRA_PATH`**, which the `AGENTS.md` this step
+installs declares as a prerequisite — nothing on the cell sets it (`session-checks` and
+`auto-sync` silently skip without it, and `sequence-enforcer` in gate mode reports an
+unpassable checkpoint), so export it in the cell session's environment. `cell-install.sh` copies
+the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), every extension in
+`manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
+the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
+`settings.json`; run it with `--verify` to check an existing cell with no writes.
+
+**On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
+checkout:
 
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
@@ -255,7 +347,14 @@ bash scripts/orchestrator-harness/install.sh
 
 # 4. Start it when you mean to
 launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+```
 
+Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
+(agent-infra#1745; see §9). Run `install.sh` from the agent-infra checkout as shown — if the source
+is not a git repo the record reads `UNKNOWN` and `check-deployed-drift.sh` exits 2 rather than
+passing, which is the intended fail-closed behaviour and not an install failure.
+
+```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
@@ -293,7 +392,7 @@ secret into a world-readable plist, and launchd inherits no shell environment �
 | `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
 | `MAX_LANES` | `4` | concurrent implementation lanes |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
-| `MERGE_PRIORITY_AT` | `10` | above this many open PRs, **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer headroom rises to `MAX_REVIEW+2` |
+| `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
 | `MIN_SWAP_FREE` | `600` | MB; with `MAX_LOAD` raised this and `MIN_MEM_FREE_MB` are the binding gates in practice |
@@ -635,6 +734,66 @@ agent-infra#1709's headline finding is that duplicate execution is unavoidable a
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier.
 
+### 7.2c ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
+
+`refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
+issue at all: `claim_ref <pr> <sha>` has no sha to address, `claim_live()` returns 1 on an empty
+one, and the whole registry was therefore **bypassed for issue dispatch**. That is the longest
+exposure the fleet has, because it is the *whole working period of a lane before its first push*:
+the pre-flight's own surfaces are immutable history (open/closed PRs, `gh` assignee) plus
+**per-machine** git state (`git worktree list`, local branches), and `refresh-candidates.sh` selects
+issues where `(.assignees|length)==0` while **nothing assigns on dispatch** — so every box reads
+every issue as free. Measured 2026-10-16: two cells were pointed at `daniel-ospina/tortoise`, whose
+pool held six P0 blockers with no PR for any of them.
+
+The extension is a **key, not a mechanism**: `refs/claims/issue-<N>` uses the same CAS (a ref push),
+the same lease-as-data commit, the same `--force-with-lease` fencing and the same `claim_prune`
+reap. The decisions that are not obvious:
+
+- **The key is `issue-<N>`, and the box id stays in the commit's `owner=` field.** `issue-<N>-<box>`
+  was rejected deliberately: a per-box key is not a CAS — two boxes mint two distinct refs and both
+  pushes succeed, so the ref can only be *read*, never *won*, and the pre-flight read alone cannot
+  close the gap (it runs **before** the claim, so both boxes can read CLEAN and then both claim).
+  `issue-<N>` is also idempotent for the same work, and its `issue-` prefix is disjoint from the PR
+  key `<N>-<sha12>`, so a PR claim for the same number neither blocks nor is blocked.
+- **The ref's home is the TARGET repo's origin** (`CLAIM_REPO`, i.e. the repo whose issue number is
+  claimed) — never the harness repo. Every would-be dispatcher of that issue already resolves
+  `$REPO`/`--repo` to it, so it is the one namespace all of them read; a claim pushed into
+  agent-infra would be invisible to a peer dispatching tortoise, which is exactly the collision that
+  was measured.
+- **Claimed by `orch-loop.sh` when it forms its dispatch batch**, not by `dispatch-merge.sh`: a
+  refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
+  `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
+  worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
+  every exit path** (clean merge, failed merge, and the 90-minute "no PR appeared" timeout) through
+  a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
+  which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
+  normal path, so the lease only runs its full length when the box is gone.
+- **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
+  `claim_issue_preflight` after a clean tool verdict: a live claim is a **COLLISION** (left
+  unchecked, so a window is re-attempted when it closes), an **unreadable** registry is
+  **INCOMPLETE** and is never queued, and a registry that **cannot answer** (an older `$O/claims.sh`
+  with no issue functions — the drift `install.sh` reports) is INCOMPLETE too. This is the opposite
+  polarity from the PR claim's fail-open, on purpose: refusing a merge on a network blip costs one
+  merge, while certifying a free issue costs duplicated work on two boxes. The one limit is stated
+  rather than hidden — a box where `claims.sh` is **not installed** falls through to the
+  pre-registry behaviour **loudly**; `install.sh` seeds `$O/claims.sh`, and making a missing file
+  refuse would turn such a box merge-only, a bigger and less reversible failure.
+
+Two incidental defects are fixed with it: `claim_release` read its third/fourth arguments **bare**
+under `set -u`, so a caller with no commit to fence on aborted with
+`line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
+leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+
+`test-claims.sh` (I1–I9) pins the issue key against live origin from two throwaway clones, including
+the **non-vacuity case for this defect**: A claims an issue with **no branch, no PR and no push of
+anything but the claim ref**, and B's pre-flight read must not be CLEAN — a test that only passes
+after a push does not test it. Measured: 35 of those assertions fail on the pre-change
+`claims.sh` (`CLAIMS_SH=<old copy> bash test-claims.sh`). `refresh-scout.test.sh` drives the
+**shipped** refresh step and the **shipped** dispatch block against a real local origin for the
+collision, unreachable, absent and stale-registry verdicts, plus the fenced release on the chain's
+exit path (14 assertions fail on the pre-change scripts).
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,
@@ -674,9 +833,15 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | **a hung worker held a concurrency slot for 9 hours** | `pi -p` has no timeout and the caps count **tmux sessions**, so a hung reviewer (or a runaway `find /` it spawned) permanently reduced merge throughput while the queue looked busy — three slots were dead weight overnight on 2026-10-12 | portable `run_agent()` wall-clock limit (bash `wait` + watchdog subshell, since macOS ships no `timeout`) plus a `reap_stale_workers()` sweep that kills any worker silent for `STALE_MIN` minutes |
 | **only `ai-review-gate` and `python-ci-gate` failures had a remediation path** | a PR red on any *other* required check (`docs`, `test-isolation`, `license-surface`, `legal-e2e`, `pricing-artifact`) was merely logged, so it sat red forever with **no worker at all**. Observed: #8278 carried two new `docs`-lint findings (MD056, an unescaped `\|` in a table row; MD046, fence style — fixed in `f15923b`) and #8193 a new `MD018` finding — both with zero workers for hours. ⛔ **And the name list was itself a tortoise constant (#1764):** on agent-infra a red `pipeline-compliance` matched none of those five, so the fix reappeared there | those checks now route to `fix-one.sh` too — but the arm is now **derived from the repo's own required set** (#1764), so a red required check routes on *any* repo (agent-infra's `pipeline-compliance` included) — capped and parkable like every other fix loop; and `fix-one.sh` fetches the failing check's **log** into the prompt, because it previously only ever read a reviewer comment — for a CI failure there may be no comment at all. ⚠️ **Known residual (agent-infra#1703):** that fetch reads the workflow RUN's `--log-failed` and `tail -80`, so a multi-failed-job run can hand the fixer the wrong job's log; tracked, not fixed here. |
 
+### 7.4b Defects found in the agent-infra#1700 review (fixed here)
+
+| Defect | Impact | Fix |
+|---|---|---|
+| **`cmd_check` never tested `record-review.sh`, and neither cell script provisioned it (agent-infra#1717)** | `merge-one.sh` executes `$HOME/.pi/agent/scripts/record-review.sh` to mint the signed marker, and a fresh cell has no such file. `cmd_check` printed `CELL CAN RUN A CONTROLLER` anyway (a false PASS on the only question that verdict answers), the cell ran a full fresh-context review — up to `REVIEW_TIMEOUT` = 1800 s, **paid** — and only then hit 127. The pre-fix `exit 3` left no terminal state at all — nothing was recorded and nothing was parked: it returns from the `CLEAN*)` arm, and the `*)` arm that writes the fixer marker is reached only for a non-CLEAN verdict, so the marker was never written on this path either way: the next cycle saw an unmarked `FAILED:ai-review-gate` and spawned another review, **one paid review per cycle, forever** | `cmd_check` probes the runtime dependencies the loop actually invokes — `git`, `python3`, `pi` (`uv` warns, matching `install.sh`) and the recorder path it reads from `$CELL_HOME` — and refuses to print the verdict without them; `start` provisions the recorder from the checkout. The record step is also checked **before** the paid review in `merge-one.sh`, and any of its failures (absent, empty, non-executable, non-regular-file, non-zero rc, an `rc=0` record that posted **no signed marker** into the PR body, or a CLEAN verdict that named no comment) writes the controller's own terminal `state/parked-<PR>` marker at the reviewed head plus a `state/parkreason-<PR>` naming why — and the worker itself refuses to re-review a head it has already parked, so the `chain-<N>`/`fix-<one.sh>` paths that never consult the controller cannot re-pay either. The controller's own park sites (`orch-loop.sh`, conflict/fix/CI caps) write the same `parkreason-<PR>` pair through `park_ctrl()`, so a **controller** park at a moved head never leaves the previous head's reason behind for the exit-5 refusal to misreport. ⚠️ **Residual:** `merge-one.sh`'s own rail cap writes `state/parked-<PR>` directly and no `parkreason-<PR>`; that site `exit 0`s before the exit-5 refusal can print a reason, so it cannot itself misreport — but a human reading `state/parkreason-<PR>` beside a newer marker still can. A later push changes the head and re-arms the PR by construction |
+
 ### 7.5 Still open, deliberately not fixed here
 
-> **Seven entries that were here are now FIXED** and have been removed from this list: the
+> **Eight entries that were here are now FIXED**; all but two have been removed from this list: the
 > fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519), `checked.txt`
 > written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the returning INT/TERM
 > trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516), the controller's
@@ -684,7 +849,12 @@ These are kept as a record because each one is a *failure mode of the design*, n
 > `orch-loop.sh` (agent-infra#1714, tortoise#8518), this directory being older than its source
 > (agent-infra#1712 — see the provenance note at the top of this file), and
 > `cloud-cell-bringup.sh` deleting the pushed gh token only on the success branch
-> (agent-infra#1718 — fixed in this branch, independent of the #1712 port).
+> (agent-infra#1718 — fixed in this branch, independent of the #1712 port), and
+> `cmd_check` never testing `record-review.sh` (agent-infra#1717 — fixed in this branch; see §7.4b).
+>
+> The two that keep a bullet below do so as the *record* of the failure mode, not as open defects:
+> agent-infra#1705 (the fail-open reaper) and agent-infra#1712 (this directory's provenance pin) —
+> both closed.
 
 - **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
   sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
@@ -748,10 +918,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
-- **`cmd_check` never tests `record-review.sh` (agent-infra#1717).** `merge-one.sh` calls it at
-  `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
-  prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
-  marker is written — one fresh review per cycle, forever, with no terminal state.
 - **`ci_runner_gate.sh` is versioned here but wired to nothing (agent-infra#1719).** No
   `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
   still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy
@@ -820,12 +986,45 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
+| `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
+| `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
-**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
+**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
+`nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
+Neither is part of the loop.
 
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
 same idea and are no longer invoked; they are included for the record, not for use.
+
+### Which harness commit is this box running? (agent-infra#1745)
+
+On the deployed laptop box the question had **no answer**: the daemon executes `$O/<script>` and
+`~/orchestrator` is not a git checkout at all (`git rev-parse --show-toplevel` → `fatal: not a git
+repository`). `install.sh` now records the source identity into `$O/.agent-infra-stamp.json` — the
+SAME cell-shaped record `cloud-cell-supervisor.sh` writes on a cmux cell, so there is one stamp
+concept, not two. `commit` names the source tree, `payloadSha256` covers the `*.sh` the daemon
+actually executes (the commit cannot see a post-install hand edit to `$O`; the hash cannot say
+whether the commit is on the repo's line), and `agentInfraDirty` says whether that source tree was
+clean when it was copied. The answer is a file read, not a `git` call.
+
+```bash
+sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json"
+```
+
+`check-deployed-drift.sh` answers the next question — does the deployed `$O` actually match the repo?
+
+```bash
+./check-deployed-drift.sh            # 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify)
+```
+
+⛔ **`UNKNOWN` is never a pass.** A missing record, an unreadable one, `commit: UNKNOWN` (the source
+was not a checkout), or an unresolvable ref exits **2**, not 0. That is the rule #1790 measured on
+the cells: `check` printed `CELL CAN RUN A CONTROLLER` over a tree that was not on `main`'s line,
+and over a copy whose bytes matched `main` but which carried no git identity. The laptop is the
+same class with a worse starting point — no record at all — so its absence fails the check loudly
+instead of reading as healthy.
 
 **Portability edits applied to every shipped script.** Three per-box constants became
 overridable with this box's values as defaults (the launchd `PATH` is no longer one of them —
@@ -840,7 +1039,7 @@ O="${O:-$HOME/orchestrator}"
 ```
 
 The shipped copies are **not** byte-identical to the ones running on the original box: they are
-those copies **plus every §7.4 fix**. `install.sh` compares the scripts it invokes — the nine loop
+those copies **plus every §7.4 fix** (and the §7.4b ones). `install.sh` compares the scripts it invokes — the nine loop
 scripts in §9 plus the manual `adopt-fix.sh` — against the running copies at `$O` and warns loudly
 on drift, because the daemon executes `$O/<script>` — a fix that only lands in this directory is not
 in effect. That set is the one `install.sh`'s drift loop lists; `selftest.sh` is shipped but not

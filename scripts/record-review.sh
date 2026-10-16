@@ -560,6 +560,43 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   return 0
 }
 
+# ── #1709 rec 7 — the record's IDENTITY, for idempotent same-head writes ──
+# `record-review.sh` runs at-least-once (a duplicate execution is possible under
+# crashes, pauses and cross-box dispatch), so its side effects must be idempotent:
+# running it twice for the SAME head must produce the SAME artifact, not a second
+# one. The PR-body MARKER already satisfies this — it is a function of
+# (pr, verdict, sha, diff, repo) and the append is guarded by a whole-string
+# `grep -qF` — but the RECORD FILE did not: every run re-stamped `reviewed_at`
+# from the wall clock and rewrote the file, so a duplicate execution MUTATED the
+# attestation. That is corruption, not waste: `reviewed_at` is the audit trail's
+# only join from a merge-gate pass to the review dispatch that authorised it
+# (extensions/review-enforcer logMergeGateDecision), and the mint time of a
+# reviewed head must not move because a paused worker resumed.
+#
+# The idempotency KEY is the head sha — the same content-addressing #1709 rec 1
+# applies to claims. Two records are the SAME attestation when their deterministic
+# identity matches: pr, head_sha, the diff/merge-base bindings, the evidence ref,
+# the verdict and the repo. The VOLATILE fields — `reviewed_at`, and the carry
+# provenance (`mint`, `carried_from`, `carried_at`) — are NOT identity: they are
+# what the duplicate would churn, and stripping them from BOTH sides lets a
+# carry and a fresh mint at the same head compare equal (a duplicate of either
+# is a no-op, which is exactly right: the head is already recorded).
+#
+# This is deliberately EXACT-string comparison over the canonicalized single-line
+# JSON, not a jq/python parse: the record is written by ONE printf with a fixed
+# field order, and a second parser here would be a second definition of the
+# record's shape. A malformed or foreign file simply fails to match, and the
+# write proceeds as before (fail-open on the GUARD, never on a safety property —
+# this only decides whether to rewrite an already-correct file).
+record_identity() { # <record-file> -> the record with its volatile fields removed
+  sed -E \
+    -e 's/,"reviewed_at":"[^"]*"//' \
+    -e 's/"mint":"[^"]*",//' \
+    -e 's/"carried_from":"[^"]*",//' \
+    -e 's/"carried_at":"[^"]*",//' \
+    "$1"
+}
+
 # ── main (guarded — executable when run, inert when sourced for tests) ────
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # ── #980: the second-model subsystem was removed ────────────────────────
@@ -2131,7 +2168,25 @@ else
   printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
-mv "$TMP" "$FILE"
+# ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
+# The record this run would write is already on disk with the SAME deterministic
+# identity (record_identity, above), so a duplicate execution is a NO-OP: do not
+# rewrite it. This is what keeps `reviewed_at` — the audit trail's only join to
+# the authorising dispatch — stable across a duplicate, and it makes the second
+# execution's result BYTE-IDENTICAL to the first's rather than merely equivalent.
+# The legacy-migration and evidence-post blocks below still run: they are already
+# idempotent, and skipping them would only make a duplicate STRAND the legacy key
+# (the failure this whole block exists to avoid) — the record file is the one
+# side effect that was not idempotent. ⛔ The no-op arm skips ONLY the write: the two
+# blocks below are UNCONDITIONAL and still run, which is what keeps a duplicate from
+# STRANDING the legacy key. That half is pinned by record-review.test.sh §15.8 (a
+# same-head duplicate with a legacy key present must still remove it).
+if [ -f "$FILE" ] && [ "$(record_identity "$FILE")" = "$(record_identity "$TMP")" ]; then
+  rm -f "$TMP"
+  echo "#1709 rec 7 idempotent: $REPO#$PR already records verdict=$VERDICT at head ${SHA:0:12}… with the same binding — record NOT rewritten (reviewed_at preserved)" >&2
+else
+  mv "$TMP" "$FILE"
+fi
 # Migration (#426): a legacy <pr>.json that belongs to THIS repo is
 # superseded by the qualified file — remove it so stale number-keyed copies
 # can't collide later. Discriminate "no repo field at all" from "unparseable":
