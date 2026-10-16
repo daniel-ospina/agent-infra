@@ -565,7 +565,7 @@ gh issue view $ISSUE_NUMBER --json labels --jq '.labels[].name' | grep -q '^scop
 
 ### Sub-Agent Dispatch
 
-Dispatch in parallel via `task`. All agents MUST invoke the `research` skill internally.
+Dispatch in parallel via `task`. All agents MUST invoke the `research` skill internally. **They share the machine's Perplexity key, so stagger the group: keep the aggregate concurrent rung-2 `web_search` count at 2** (`research` Step 3) — each agent obeying the bound individually is not enough.
 
 **Micro:** 1 sub-agent. **Standard:** 1 sub-agent. **Complex:** 2 sub-agents.
 

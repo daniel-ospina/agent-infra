@@ -60,6 +60,7 @@
 #
 # Usage:
 #   fleet-cost-report.sh [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR]
+#   fleet-cost-report.sh --print-regime-floor   print the resolved floor and exit
 #   Exit 0 clean · 1 escalation (a or b tripped) · 2 usage/environment error
 #
 # Env seams (tests + tuning):
@@ -81,14 +82,21 @@ SESSIONS_DIR="${PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
 WINDOW_DAYS="${FLEET_WINDOW_DAYS:-7}"
 CACHE_FLOOR="${FLEET_CACHE_FLOOR:-0.65}"
 REGIME_TB="${FLEET_REGIME_TB:-283616}"
+# Frozen ONCE, before anything reads it: `--print-regime-floor` reports this value
+# and the banding below interpolates this value, so freezing is what makes those
+# two the SAME by construction — a later assignment cannot make the answer
+# diverge from the behaviour (#1088's lesson, applied to this interface, #1342).
+readonly REGIME_TB
 SINCE=""
+PRINT_REGIME_FLOOR=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --days) WINDOW_DAYS="${2:-}"; shift 2 ;;
         --since) SINCE="${2:-}"; shift 2 ;;
         --sessions-dir) SESSIONS_DIR="${2:-}"; shift 2 ;;
-        *) echo "usage: $0 [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR]" >&2; exit 2 ;;
+        --print-regime-floor) PRINT_REGIME_FLOOR=1; shift ;;
+        *) echo "usage: $0 [--days N] [--since YYYY-MM-DD] [--sessions-dir DIR] [--print-regime-floor]" >&2; exit 2 ;;
     esac
 done
 
@@ -104,6 +112,26 @@ if [ -n "$SINCE" ]; then
         echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
         exit 2
     fi
+fi
+
+# ── the regime floor must be a plain integer before ANY use ─────────────
+# A bad value used to reach the Python heredoc's `float()` and die with a
+# traceback; a clean usage error is the fail-closed shape.
+case "$REGIME_TB" in
+    ''|*[!0-9]*) echo "ERROR: FLEET_REGIME_TB must be a plain integer (got '$REGIME_TB')" >&2; exit 2 ;;
+esac
+
+# ── --print-regime-floor: report the RESOLVED floor and exit ─────────────
+# The cost-config guard calls this rather than parsing this file's assignment
+# text (#1342, repeating the #1088 review's rule for `$CAP_MS`). The floor is
+# frozen from FLEET_REGIME_TB at the top, so this prints the exact value the
+# banding below applies — an ambient override or a later assignment cannot make
+# the answer differ from the behaviour. Side-effect free and dependency-free by
+# construction: it runs BEFORE the shared-parser and sessions-dir checks, so it
+# works in a fixture root and in CI where neither exists.
+if [ "$PRINT_REGIME_FLOOR" -eq 1 ]; then
+    printf '%s\n' "$REGIME_TB"
+    exit 0
 fi
 
 [ -x "$SPM_SH" ] || { echo "ERROR: shared parser not found: $SPM_SH" >&2; exit 2; }

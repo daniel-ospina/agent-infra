@@ -276,6 +276,8 @@ When the user selects "Research this first" for a question:
 2. Continue presenting remaining qualifying questions — the user can fire multiple "research this" items while answering other questions directly (true parallel workflow)
 3. When subagent results arrive, re-ask the original question with research context appended to the context line (**without** the "Research this first" option the second time)
 
+**Rate-limit bound:** these background subagents share the machine's Perplexity key, and several can be in flight at once — stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound (at most 2 concurrent `web_search` calls; a wider fan-out returns HTTP 429 and truncates the batch), and have each subagent report `attempted / returned`.
+
 ---
 
 ### Step 5 — Handle "skip all"

@@ -32,7 +32,18 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 # sysctl -n hw.ncpu is macOS-only: on a Linux cell sysctl may be absent entirely (Debian's procps
 # does not ship it any more — verified in debian:stable-slim) and hw.ncpu is a macOS key regardless,
 # so the fallback silently pinned _NCPU=4 for EVERY cell and MAX_LOAD=40 with it (#1702).
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ LEADING ZEROS ARE NOT NUMBERS HERE (P2, second review round, 2026-10-14). `''|*[!0-9]*`
+# ACCEPTED `08`, and `$(( ))` parses base 0 (a leading 0 means OCTAL; `08`/`09` are not octal).
+# On /bin/bash 3.2.57 — what the launchd plist invokes — the failed arithmetic ASSIGNMENT aborts
+# the rest of the enclosing block and resumes after it with status 0, silently. Inside `while true`
+# it is worse: the whole loop is discarded and the script exits 0 after one cycle. Two shipped
+# consequences: `CYC=08` reached `JIT=$(( CYC / 5 ))` and turned the controller into a
+# relaunch-per-cycle loop under KeepAlive, and a leading-zero timeout reached the lease arithmetic in
+# the merge/fix workers. Accept only `0` or `[1-9][0-9]*`.
+# NOTE this also tightens `is_limit` below (it delegates here), which is how CYC=08 is coerced to
+# 240 before any arithmetic sees it. `is_num` must stay otherwise generous: it also validates a
+# 10-digit epoch mtime, and a tighter DIGIT bound silently rejected every file as un-stat-able.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # A digit string is not enough for a TUNABLE: `[` errors at or above 2**63, and an errored test is
 # FALSE, which OPENS the very gate the value configures (MAX_LANES=99999999999999999999 passed the
 # class test, then `[ "$LANES" -ge "$MAX_LANES" ]` errored and the lane cap was gone). So the limits
@@ -51,11 +62,31 @@ _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESS
 #
 # It is `is_limit`, not `is_num`, because a non-number is only the FIRST way the gate opens: `[`
 # ERRORS at or above 2**63 ("integer expression expected"), so an absurd-but-numeric MAX_LOAD
-# slips past is_num and then aborts the gate chain — the same fail-open this block exists to
-# close. `_NCPU` keeps is_num: its source is `nproc` on this host, not the plist.
-is_num "${_NCPU:-}"      || _NCPU=4
+# slips past is_num and then aborts the gate chain — the same fail-open this block exists to close.
+# ⛔ `_NCPU` GETS THE SAME BOUND (P3, fourth review round, 2026-10-14), and the failure it prevents
+# is NOT the plist's: `_NCPU` is an OS probe (`sysctl`/`nproc`), so an absurd-but-numeric value
+# reaches `$(( 10#$_NCPU * 10 ))` and the magnitude WRAPS instead of erroring — and each wrapped
+# outcome is individually a VALID number, so no downstream guard can see it. Measured on
+# /bin/bash 3.2.57: 99999999999999999999 * 10 wraps to 3875820019684212726, and -- CORRECTED, fifth
+# review round 2026-10-14: that is 19 digits but still BELOW 2**63-1, so `[ -ge ]` does NOT error.
+# It just NEVER BINDS and the load gate OPENS SILENTLY (the same mechanism as the 9-digit product
+# two sentences below; the earlier comment wrongly said `[ -ge ]` ERRORS here). And
+# 9223372036854775808 (2**63) * 10 wraps to exactly **0**, which
+# `is_limit` ACCEPTS — and `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box
+# dispatches nothing, indefinitely. Bound the PROBE so neither wrap can be produced.
+# ⛔ AND MAX_LOAD NEEDS A TRUE DEFAULT, not a re-derivation (same round): the first fallback
+# recomputed from the SAME `_NCPU`, so it could not repair an out-of-range product — a 9-digit
+# _NCPU yields a 10-digit product (999999999 -> 9999999990), which is under 2**63 so `[ -ge ]` does
+# not error, it just never binds and the gate silently OPENS. The second guard falls back to the
+# documented default instead. (`MAX_LOAD` may still be set to 0 deliberately — install.sh allows 0
+# for every limit but CYC — so this bounds the DERIVATION, never a plist value that passes is_limit.)
+is_limit "${_NCPU:-}"    || _NCPU=4
+# A 0-valued probe is a FAILED probe, not "no cores": `10 * 0` is 0, `is_limit 0` is true, and
+# `[ "$L" -ge 0 ]` is always true, so the load gate CLOSES and the box dispatches nothing, forever.
+# install.sh carries the identical line (P3, fifth review round, 2026-10-14).
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
-is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 ))
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"   # above this many open PRs, drain before dispatching
@@ -65,7 +96,25 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
 CYC="${CYC:-240}"
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
+# The required-check list and the review authority are REPO-DEPENDENT inputs. This line used to
+# BE tortoise's branch-protection list, so a controller pointed at agent-infra named eight checks
+# that can never appear there, every PR read `FAILED:ai-review-gate`, and the merge queue could
+# not drain. They now live in repo-authority.sh, SOURCED here and by merge-one.sh so the two
+# cannot drift.
+# ⛔ REQ in the environment is an operator override and WINS. Capture it ONCE: the cycle below
+# overwrites REQ with the resolved value, so reading REQ as "the override" on the next cycle
+# would freeze the first cycle's answer (see REQ_OVERRIDE's note in repo-authority.sh).
+_HERE_RA="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+if [ -f "$O/repo-authority.sh" ]; then . "$O/repo-authority.sh"
+elif [ -f "$_HERE_RA/repo-authority.sh" ]; then . "$_HERE_RA/repo-authority.sh"
+else echo "orch-loop: FATAL repo-authority.sh not found (looked in $O and ${_HERE_RA:-<unresolved>}) — refusing to run without the per-repo merge contract" >&2; exit 78; fi
+# ⚠️ review round 3: a PRESENT but stale/partial repo-authority.sh sources cleanly and silently
+# yields REQ="" — which used to read as `rail`. The resolver must actually exist.
+command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority >/dev/null 2>&1 \
+  || { echo "orch-loop: FATAL repo-authority.sh at $O is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >&2; exit 78; }
+REQ_OVERRIDE="${REQ:-}"
+REQ=""
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
@@ -81,6 +130,17 @@ safe_ref() {
   case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac
   git -C "$REPO" check-ref-format --branch "$1" >/dev/null 2>&1
 }
+
+# shq <value> -> a POSIX-sh-safe single-quoted word.
+# ⛔ NOT `printf %q`. bash's %q emits `$'…'` for any byte outside [[:print:]], and `$'…'` is NOT a
+# quoting form in POSIX sh: on a Debian/Ubuntu cell `/bin/sh` is dash, so the quoting is LOST and
+# the remainder is re-parsed as COMMANDS. Measured 2026-10-15 (round-8 adversarial review, class
+# B6): the spawn line below carried a required-check name containing ESC and executed an injected
+# command on the merge host — `REQ=$'a\'\E;touch${IFS}/tmp/PWNED;#'`. `%q` is only safe where the
+# reader is bash (the macOS operator box), which is exactly why it went unnoticed.
+# Single-quoting with `'\''` escaping is POSIX and correct for EVERY byte (a newline included), so
+# it needs no character screen and cannot be defeated by a byte the screen forgot.
+shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # A non-numeric threshold makes `[ -le ]` ERROR -- which returns false, and a false test in the gate
 # chain OPENS the gate. So a typo in the plist env (MIN_MEM_FREE_MB=abc) would silently remove the very
 # back-pressure these gates exist to apply. Coerce to the documented default instead of failing open.
@@ -104,6 +164,19 @@ is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 is_limit "${BATCH:-}"             || BATCH=2
 is_limit "${CYC:-}"               || CYC=240
+# ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
+# is TRUE and install.sh's range loop explicitly allowed `0`, so `CYC=0` survived all the way to
+# `sleep $(( 10#0 - 0 + RANDOM % 1 ))` = `sleep 0` — the controller revisited every cycle with no
+# delay, hammering the GitHub API. The floor is a small 5s (not 240, which would silently replace a
+# deliberate small value); install.sh refuses < 5 at render time, so the two ends agree.
+[ "$CYC" -ge 5 ] || CYC=240
+# agent-infra#1762. SWEEP_MAX_AGE bounds how long a 304 may serve a cached "unchanged" listing (see
+# the sweep listing block for the measured reason the bound is required). SWEEP_MIN_REMAIN is the
+# x-ratelimit-remaining floor below which the NEXT sweep is deferred to the reset.
+SWEEP_MAX_AGE="${SWEEP_MAX_AGE:-600}"
+is_limit "${SWEEP_MAX_AGE:-}"      || SWEEP_MAX_AGE=600
+SWEEP_MIN_REMAIN="${SWEEP_MIN_REMAIN:-20}"
+is_limit "${SWEEP_MIN_REMAIN:-}"   || SWEEP_MIN_REMAIN=20
 
 # ── portable OS primitives ─────────────────────────────────────────────────────
 # This harness runs on macOS (the operator's box, launchd) AND on a Linux cell
@@ -193,12 +266,80 @@ esac
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
-claim_live() {
+claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box ref claim
   local f="$O/state/mergeclaim-$1.lock" p
-  [ -f "$f" ] || return 1
-  p="$(cat "$f" 2>/dev/null || echo 0)"
-  [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null && return 0
-  rm -f "$f"; return 1
+  if [ -f "$f" ]; then
+    p="$(cat "$f" 2>/dev/null || echo 0)"
+    if [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null; then return 0; fi
+    rm -f "$f"
+  fi
+  # Cross-box (agent-infra#1709 recs 1-3): a reviewer on ANOTHER box holds the claim as a git
+  # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
+  # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
+  # once at the top of this cycle, not from the network per PR.
+  local sha="${2:-}" ref until
+  [ -n "$sha" ] || return 1
+  [ -f "$O/state/claims-snapshot" ] || return 1
+  if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
+  until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
+  # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
+  # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
+  # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
+  # SECOND — 10 digits today). Without it the two readers DISAGREED about the same datum: the bare
+  # `[ "$now" -le "$until" ]` below ERRORS at or above 2**63 (rc=2, and an errored test is FALSE),
+  # so claim_live() reported a foreign full-width claim as DEAD while claim_acquire() correctly
+  # refused that head as live. The controller therefore reached the spawn branch EVERY cycle, the
+  # refused fixer wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker and
+  # `parked-<pr>` on the next cycle — so the cap never tripped and the PR was never parked: one
+  # refused spawn plus 1 GitHub call and 3 remote round trips per cycle, indefinitely, on a PR no
+  # box could work. The conservative direction is the same one claims.sh takes: treat it as LIVE.
+  #
+  # ⛔ AND ABSENT IS STILL NOT THE SAME AS UNPARSEABLE (P2, fifth review round, 2026-10-14). An entry
+  # MISSING from the snapshot means "no visible claim" -> NOT live. An entry whose lease reads `0`
+  # means "a claim EXISTS whose lease is unreadable", and claims.sh treats exactly that as LIVE
+  # (claim_acquire's `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via
+  # `[ "$until" != "0" ]`). A negative lease collapses to the same `0` — `_lease_of`'s `[0-9]*`
+  # cannot match a minus sign — and so does any other non-digit. Collapsing the sentinel into the
+  # absent case made these two readers DISAGREE on the one input class claims.sh documents as a
+  # sentinel, with the very same consequence described above (the controller re-spawns a fixer
+  # claim_acquire refuses; refund_bailed_fixer un-parks the PR every cycle, so the cap never trips).
+  # `-n` is checked FIRST because absent (not live) and unreadable (live) must never be merged; the
+  # non-digit test then covers the literal negative, which claim_prune also reads as "keep".
+  [ -n "${until:-}" ] || return 1
+  [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
+  [ -z "${until//[0-9]/}" ] || return 0
+  [ "$(date +%s)" -le "$until" ] && return 0
+  return 1
+}
+
+# refund_bailed_fixer <pr> <head-sha> <restore-findings: 0|1>
+# fix-one.sh writes $O/state/fixbail-<pr>-<head> when the cross-box CAS REFUSES it (another box
+# already owns this head). The controller books the attempt at SPAWN (fixcount+1) and, on the
+# reviewer-findings arm, DELETES the findings marker there — so a refusal, which does no work at all,
+# used to consume one of MAX_FIX_TRIES and destroy the record that a reviewer reported issues. Three
+# refusals PARK the PR as needs-a-human although no fixer ever ran (P2, second review round,
+# 2026-10-14). This refunds the attempt and restores the marker. `restore-findings` is 1 only on the
+# ai-review-gate arm, because that is the only arm that deletes the marker at spawn — the CI-red and
+# CONFLICTING arms never touch it, so restoring there would invent a findings record.
+refund_bailed_fixer() {
+  local pr="$1" head="$2" restore="${3:-0}" b f n
+  [ -n "${head:-}" ] || return 0
+  b="$O/state/fixbail-$pr-$head"
+  [ -f "$b" ] || return 0
+  rm -f "$b"
+  f="$O/state/fixcount-$pr"; n="$(cat "$f" 2>/dev/null || echo 0)"
+  is_num "$n" || n=0
+  [ "$n" -gt 0 ] && n=$(( n - 1 ))
+  echo "$n" > "$f"
+  if [ "$restore" = "1" ]; then
+    touch "$O/state/needsfix-$pr-$head"
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+  else
+    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
+  fi
+  # A bail is proof the cap was not really reached; drop any park so the next cycle retries.
+  rm -f "$O/state/parked-$pr"
+  return 0
 }
 
 # single-instance lock (atomic: noclobber create fails if the file exists)
@@ -295,8 +436,14 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…>
 # regression cannot hide behind a comment):
 #   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
 #   review_slots -> reviewer concurrency, with headroom once a backlog exists
-mp_reason() { # <open_prs> <lanes>
-  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ "${2:-0}" -ge 1 ]; then
+mp_reason() { # <open_prs> <lanes> <workers>
+  # The condition is "the box has review/merge work IN FLIGHT", not "a lane happens to be
+  # running". Measured 2026-10-13 (agent-infra#1709 item 4): the lanes-only form let dispatch
+  # through on 4/4 sampled blocks — e.g. `lanes=0 workers=8` with 27 open PRs, i.e. eight
+  # reviewers mid-flight on a box already saturated. That ADDS WIP to fixed throughput and
+  # lengthens cycle time (Little's Law), which is the opposite of draining.
+  # Total in-flight agents = lanes + workers; `workers` is the merge/fix session count.
+  if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ] && [ $(( ${2:-0} + ${3:-0} )) -ge 1 ]; then
     echo "merge-priority (${1} open PRs — draining before opening more)"
   fi
 }
@@ -334,6 +481,98 @@ res_line() {
 review_slots() { # <open_prs>
   if [ "${1:-0}" -gt "$MERGE_PRIORITY_AT" ]; then echo $(( 10#${MAX_REVIEW:-4} + 2 )); else echo "$MAX_REVIEW"; fi
 }
+
+# ── rate-limit-aware conditional listing (agent-infra#1762) ─────────────────────
+# The sweep re-listed every open PR every cycle and then read each one twice more, all over
+# GraphQL. That budget is 5,000 POINTS/hr per USER and is shared by every cell, lane and box acting
+# as the account, so two cells cross it; when it goes, EVERY `gh pr` call fails while
+# `gh api rate_limit` still reports `graphql 4933/5000`, and the sweep logs one
+# `nothing swept this cycle` line next to a healthy `[scope] open=N`. A cell that cannot list PRs
+# cannot merge, and it read as idle-but-fine.
+#
+# Two mechanisms from GitHub's own REST best-practice page replace that:
+#   * a CONDITIONAL listing — `If-None-Match: <etag>`; a 304 means the list is unchanged and GitHub
+#     does not charge a 304 to the primary rate limit, so the sweep's listing is free;
+#   * the RESPONSE HEADERS as the health signal — `x-ratelimit-remaining` / `-reset` / `Retry-After`
+#     — instead of polling `/rate_limit`, which the docs explicitly say not to trust and which was
+#     measured reporting 4933 remaining while every call failed (#1762). This governs the DEFERRAL
+#     DECISION only. The `[res]` line still prints a `/rate_limit` counter (`res_line`, advisory and
+#     deliberately not read for this decision) — do not read a healthy `gh_gql=` there as "the sweep
+#     can list PRs".
+# The listing moves to REST (`gh api`) because conditional requests are a REST feature — GraphQL has
+# no ETag — and `resources.core` is a SEPARATE 5,000/hr bucket from the GraphQL one the per-PR reads
+# below still spend. Those per-PR reads stay on GraphQL — moving them to REST is the issue's own
+# direction 1 / research item 4 and is NOT this PR — but a 304 SKIPS them for that cycle (an
+# identical list means an identical PR set). "Unchanged" therefore means "not moved to REST", never
+# "run every cycle": the skip is bounded by SWEEP_MAX_AGE, which drops `If-None-Match` once the
+# cached listing ages out.
+#
+# BEGIN sweep-quota (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
+# rl_header <name>: the value of one HTTP header in a raw `gh api --include` response, or empty.
+# Header NAMES are case-insensitive (HTTP/1.1) and the CRLF terminator is stripped. `--paginate -i`
+# repeats the header block once per page; the FIRST match (page 1) is returned, which is the page the
+# conditional header was sent on and therefore the one the deferral decision is about.
+rl_header() {
+  local want; want="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')"
+  tr -d '\r' | awk -v want="$want" '
+    {
+      c = index($0, ":")
+      if (c == 0) next
+      if (tolower(substr($0, 1, c - 1)) != want) next
+      v = substr($0, c + 1)
+      # Trim HTTP optional whitespace by character test, not a regex class: one-true-awk (the macOS
+      # default) does not reliably honour `\t` inside a bracket expression.
+      while (substr(v,1,1) == " " || substr(v,1,1) == "\t") v = substr(v, 2)
+      print v; exit
+    }'
+}
+# rl_status: the HTTP status of a raw `gh api --include` response ("HTTP/2.0 200 OK" on line 1).
+rl_status() {
+  awk 'NR == 1 { if (match($0, / [0-9][0-9][0-9]/)) { print substr($0, RSTART + 1, 3); exit } }'
+}
+# sweep_fail_kind <raw-response> <stderr> -> rate-limit | network | other.
+# A rate-limit failure and a network failure are NOT the same event: the first means the shared
+# budget is spent (wait for the reset, then retry), the second means the link (retry at once).
+# Reading them as one is what made a cell that cannot merge indistinguishable from an idle one.
+# A `304` never reaches here — the caller tests the status first.
+sweep_fail_kind() {
+  local raw="${1:-}" err="${2:-}"
+  # ⛔ NOT `HTTP 4(29|03)`. A bare 403 is how a PERMISSION/SCOPE failure arrives — an expired or
+  # under-scoped token, SSO, admin rights ("gh: Resource not accessible by integration (HTTP 403)")
+  # — and it carries no rate-limit header, because there was no rate limit. Matching 403 here
+  # classified such a failure as `rate-limit`, deferred the sweep for up to an hour, and logged
+  # `RATE-LIMITED ... CANNOT MERGE` over a stderr line that says otherwise: the same "instrument
+  # reports the opposite of the truth" defect this block exists to remove. A 429 is unambiguous; a 403
+  # must CORROBORATE the limit via a header or one of the named phrases, and otherwise falls through
+  # to `other`, where the real stderr reaches the operator.
+  if [ "$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-remaining')" = "0" ] \
+     || [ -n "$(printf '%s\n' "$raw" | rl_header 'retry-after')" ] \
+     || grep -qiE 'rate limit|abuse detection|secondary rate|HTTP 429' <<<"$err" ; then
+    echo rate-limit
+  elif grep -qiE 'timeout|timed out|TLS|tls:|dial|connection|no such host|network|EOF|reset by peer|refused' <<<"$err" ; then
+    echo network
+  else
+    echo other
+  fi
+}
+# sweep_defer_until <raw-response> -> epoch seconds to defer the sweep until.
+# Honours `Retry-After` (seconds) and `x-ratelimit-reset` (epoch), takes the LATER, and floors/ceils
+# it to [now+60, now+3600]: a missing or absurd reset must not become either a hot retry loop or a
+# multi-day stall.
+sweep_defer_until() {
+  local raw="${1:-}" now ra reset cand=0
+  now="$(date +%s)"
+  ra="$(printf '%s\n' "$raw" | rl_header 'retry-after')"
+  is_num "${ra:-}" || ra=""
+  reset="$(printf '%s\n' "$raw" | rl_header 'x-ratelimit-reset')"
+  is_num "${reset:-}" || reset=""
+  [ -n "$ra" ] && cand=$(( now + ra ))
+  if [ -n "$reset" ] && [ "$reset" -gt "$cand" ]; then cand="$reset"; fi
+  [ "$cand" -lt $(( now + 60 )) ]   && cand=$(( now + 60 ))
+  [ "$cand" -gt $(( now + 3600 )) ] && cand=$(( now + 3600 ))
+  printf '%s\n' "$cand"
+}
+# END sweep-quota
 
 # Count of open PRs. This one number drives THREE decisions — scope (BROAD drain vs OWN), the
 # reviewer budget (review_slots), and the merge-priority gate (mp_reason) — so a FAILED count must
@@ -438,18 +677,185 @@ while true; do
   fi
   echo "[scope] open=$OPEN_N -> $SCOPE_MODE ($SCOPE_WHY)" >> "$LOG"
   # END scope-select
+  # ── repo authority for THIS cycle (agent-infra#1764) ────────────────────────
+  # Resolved per cycle: branch protection can change while the controller runs. With REQ already set
+  # in the environment the RESOLVER costs no gh call (it short-circuits on REQ_OVERRIDE), but the
+  # authority-flip DETECTOR below does re-read branch protection on the cycles where an override is
+  # active (review round 7 — the earlier comment claimed zero gh calls and was wrong). The required
+  # set is the repo's declaration of what must gate a merge; the merge authority follows from it,
+  # so both are read from ONE home.
+  # ⛔ resolve_required_checks, NEVER `REQ="$(resolve_required_checks …)"`: the command substitution
+  # subshells the resolver, REQ_SOURCE cannot survive the assignment, and the ⚠️ fallback warning
+  # in the case below would never fire.
+  resolve_required_checks "$OR"
+  MERGE_AUTHORITY="$(merge_authority "$REQ")"
+  # ⚠️ review round 3: an EMPTY contract (a stale/partial repo-authority.sh yields REQ="") used
+  # to read as `rail` and silently reroute a gate repo — unknown refuses, exactly like fallback.
+  # ⛔ ALLOW-LIST POLARITY (round-11 review, P2). This was a DENY list — an empty REQ, `fallback`,
+  # or the literal `unknown` — so any OTHER value was treated as a KNOWN authority and the sweep
+  # acted on it. An authority the controller does not recognise is exactly as unknown as an
+  # unreadable one, so the test now names the two values it TRUSTS and treats everything else as
+  # unknown. (`merge_authority` prints only gate|rail|unknown today, so this is latent — but it was
+  # one new value away from the raw merge this whole change exists to prevent.)
+  if [ -z "${REQ:-}" ] \
+     || { [ "${MERGE_AUTHORITY:-}" != "gate" ] && [ "${MERGE_AUTHORITY:-}" != "rail" ]; } \
+     || [ "${REQ_SOURCE:-}" = "fallback" ]; then
+    AUTHORITY_UNKNOWN=1
+  else
+    AUTHORITY_UNKNOWN=0
+  fi
+  case "${REQ_SOURCE:-}" in
+    protection) echo "[req] $OR: required checks from branch protection: $REQ" >>"$LOG" ;;
+    env)        echo "[req] $OR: required checks from the REQ environment override: $REQ" >>"$LOG" ;;
+    fallback)
+      # ⚠️ review P2, round 1: the fallback set deliberately carries the review gate, which on a
+      # foreign repo reads FAILED — NOT PENDING — and the FAILED arm would then spawn a
+      # fresh-context reviewer per PR per cycle for as long as protection is unreadable. While
+      # the repo's own contract cannot be read, the SWEEP merges, auto-arms, and spawns nothing
+      # this cycle (AUTHORITY_UNKNOWN, honoured in the sweep below). Dispatch lanes are
+      # unaffected; and any merge worker invoked by another ingress (chain-merge, fix-one)
+      # refuses on ITS OWN unreadable read — see merge-one.sh's authority-unknown refusal.
+      echo "[req] ⚠️ $OR: branch protection UNREADABLE — the merge contract is UNKNOWN; the sweep merges, auto-arms, and spawns nothing this cycle (fail-closed, no burn loop; workers refuse on their own read)" >>"$LOG"
+      AUTHORITY_UNKNOWN=1 ;;
+    *)          echo "[req] $OR: resolver returned no source (REQ='${REQ:-}')" >>"$LOG" ;;
+  esac
+  # ⛔ round-11 review, P3: for an authority of `unknown` this line asserted the gate "is NOT
+  # required" — a determination the controller cannot make (unknown means it does not know). A
+  # three-way suffix, so the log never states a conclusion it did not reach.
+  case "$MERGE_AUTHORITY" in
+    gate) _gate_rel="IS required" ;;
+    rail) _gate_rel="is NOT required" ;;
+    *)    _gate_rel="is UNKNOWN (the contract could not be read — the sweep merges nothing this cycle)" ;;
+  esac
+  echo "[authority] $OR: merge authority=$MERGE_AUTHORITY (review gate '$REVIEW_GATE' $_gate_rel)" >>"$LOG"
+  # ⚠️ review rounds 4-6: REQ_OVERRIDE is a documented operator pin (README: "`REQ=…` in the cell
+  # env / keys.env overrides the read"), and REQ/REVIEW_GATE are read from the environment — which
+  # a cloud cell sources with `set -a`, so a stray export reaches here. An override that CHANGES
+  # the authority away from the repo's own declaration would silently re-enable the raw merge this
+  # whole change exists to prevent on a rail repo; a REVIEW_GATE override does the same AND moves
+  # the classifier's gate_ok onto a different name. The override still wins (it is how a contract
+  # is pinned during an outage), but the flip is never silent.
+  # ⛔ THE BASELINE IS THE DEFAULT GATE NAME, NOT `$REVIEW_GATE` (review round 6, P1). Computing
+  # `_own_auth` from the overridden name made the comparison `X vs X` — provably inert — while a
+  # `REVIEW_GATE` export flipped agent-infra to `gate` and issued a RAW `gh pr merge` with no log
+  # line at all. With REVIEW_GATE_DEFAULT the question actually asked is "what would this repo's
+  # own declaration say with no gate-name override?", which is the thing an override changes.
+  if [ "${REQ_SOURCE:-}" = "env" ] || [ "${REVIEW_GATE_SOURCE:-default}" = "env" ]; then
+    _own_auth="$(REVIEW_GATE="$REVIEW_GATE_DEFAULT" merge_authority "$(required_checks "$OR" 2>/dev/null || true)")"
+    if [ "$_own_auth" != "unknown" ] && [ "$_own_auth" != "$MERGE_AUTHORITY" ]; then
+      echo "[authority] ⚠️ $OR: an operator override CHANGES the merge authority away from this repo's own declaration ('$_own_auth' -> '$MERGE_AUTHORITY'; REQ='$REQ' REQ_SOURCE=${REQ_SOURCE:-?} REVIEW_GATE='$REVIEW_GATE' REVIEW_GATE_SOURCE=${REVIEW_GATE_SOURCE:-default}) — the override wins, but verify it is intended$([ "$MERGE_AUTHORITY" = gate ] && printf ' — GATE authority issues a RAW gh pr merge, which on a rail repo lands the PR on the required checks alone with no head-bound evidence')" >>"$LOG"
+    fi
+  fi
   # Same rule for the sweep listing: as a pipeline into `while read` with 2>/dev/null, a FAILED
   # listing yields ZERO iterations and prints NOTHING — the sweep silently does nothing for the
   # whole cycle. Capture it, check rc, log the failure, and feed the loop from the captured text.
-  if SWEEP_LIST="$(gh pr list --repo "$OR" --state open --limit 300 --json number,headRefName,isDraft \
-    --jq ".[]|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" 2>"$O/state/.sweep-err.$$")"; then
-    SWEEP_RC=0
-  else
-    SWEEP_RC=$?
+  # `gh pr list` cannot be made conditional — GraphQL has no ETag — so it is a REST `gh api` call
+  # whose `--jq` reshapes each REST row into the SAME `.number/.headRefName/.isDraft` triple the
+  # pre-fix jq consumed, leaving $SEL and every decision below it untouched. `--paginate` follows the
+  # `Link` header, so a repo with more than 100 open PRs is listed in full (the old `--limit 300`
+  # silently dropped anything past 300). See the sweep-quota block above for why the listing moved,
+  # and for the header helpers used here.
+  # BEGIN sweep-listing (sweep-quota.test.sh extracts this block verbatim — keep it self-contained)
+  NOW="$(date +%s)"
+  SWEEP_LIST=""
+  # Bound the DIGITS before any `[ … -gt … ]`. `[` ERRORS at or above 2**63 (the is_limit hazard this
+  # file documents at the top), and an ERRORING `[` short-circuits a `&&` clamp into NOT firing — so a
+  # 19-digit value would sail past the clamp. `is_num` is deliberately unbounded (it must accept a
+  # 10-digit epoch), so the length test is what supplies the bound. Doing this FIRST means every
+  # comparison below is on a value that cannot error.
+  DEFER_UNTIL="$(cat "$O/state/sweep-defer-until" 2>/dev/null || true)"; is_num "${DEFER_UNTIL:-}" || DEFER_UNTIL=0
+  [ "${#DEFER_UNTIL}" -le 10 ] || DEFER_UNTIL=0
+  LAST_FULL="$(cat "$O/state/sweep-stamp" 2>/dev/null || true)";       is_num "${LAST_FULL:-}"  || LAST_FULL=0
+  [ "${#LAST_FULL}" -le 10 ] || LAST_FULL=0
+  # Clamp on READ, not only on write. Both writers below go through sweep_defer_until (<= now+3600),
+  # so an implausible value can only arrive from a corrupt/truncated/hand-edited state file — but it
+  # is the one piece of new state whose corruption stops the fleet merging and is never left, so it
+  # degrades to a FULL sweep rather than a permanent stall.
+  [ "$DEFER_UNTIL" -gt $(( NOW + 3600 )) ] && DEFER_UNTIL=0
+  # A FUTURE stamp is worse than a stale one. The floor below reads `NOW - LAST_FULL`, so a stamp
+  # ahead of NOW yields a NEGATIVE age, which is always `< SWEEP_MAX_AGE`: `If-None-Match` is then
+  # sent forever, every cycle is a 304, the per-PR reads are skipped forever, and a green PR sits
+  # unmerged behind a cached "unchanged" PERMANENTLY — the exact failure this floor exists to
+  # prevent, and silent, because the log reports a future full sweep. Reachable from a corrupt or
+  # hand-edited state file, or a BACKWARD clock step (NTP correction, VM snapshot restore). A stamp
+  # is written as `$NOW`, so any value ahead of NOW is invalid by construction: degrade to a sweep.
+  [ "$LAST_FULL" -gt "$NOW" ] && LAST_FULL=0
+  ETAG="$(cat "$O/state/sweep-etag" 2>/dev/null || true)"
+  # `If-None-Match` is sent only while the cached listing is younger than SWEEP_MAX_AGE. The floor is
+  # REQUIRED, not belt-and-braces: a completed check run does NOT reliably change the listing's ETag
+  # (measured 2026-10-15 — PR #1335's checks completed 00:23:32 while its listing `updated_at` stayed
+  # 00:17:07), so a 304 means "no PUSH", never "nothing to merge". Without the floor a green PR
+  # could sit unmerged behind a cached "unchanged" forever — the same cell-cannot-merge-reads-as-idle
+  # failure this fix removes. Once the stamp ages out the header is dropped, forcing a 200 and a full
+  # sweep.
+  COND=()
+  if [ -n "$ETAG" ] && [ $(( NOW - LAST_FULL )) -lt "$SWEEP_MAX_AGE" ]; then
+    COND=(-H "If-None-Match: $ETAG")
   fi
-  SWEEP_ERR="$(tr '\n' ' ' < "$O/state/.sweep-err.$$" 2>/dev/null || true)"; rm -f "$O/state/.sweep-err.$$"
-  if [ "$SWEEP_RC" -ne 0 ]; then
-    echo "[sweep] PR listing FAILED rc=$SWEEP_RC (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
+  if [ "$DEFER_UNTIL" -gt "$NOW" ]; then
+    # A previous listing was refused for rate limiting. Calling again before the reset is exactly the
+    # hammering the docs warn about — and every call would fail until then. The reset (or
+    # Retry-After) is already recorded, so the sweep waits it out rather than burning attempts.
+    echo "[sweep] ⛔ RATE-LIMITED — sweep DEFERRED for another $(( (DEFER_UNTIL - NOW + 59) / 60 ))m (until $(date -d "@$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || date -r "$DEFER_UNTIL" '+%H:%M:%S' 2>/dev/null || echo "epoch $DEFER_UNTIL")). THIS CELL CANNOT MERGE, NOT IDLE." >> "$LOG"
+  else
+    if SWEEP_RAW="$(gh api --paginate -i ${COND[@]+"${COND[@]}"} --jq \
+        ".[]|{number,headRefName:.head.ref,isDraft:.draft}|select((.isDraft|not) or (.headRefName|test(\"-tm$|-cap$|^fix/\")))|$SEL|\"\(.number)\t\(.headRefName)\t\(.isDraft)\"" \
+        "repos/$OR/pulls?state=open&per_page=100" 2>"$O/state/.sweep-err.$$")"; then
+      SWEEP_RC=0
+    else
+      SWEEP_RC=$?
+    fi
+    SWEEP_ERR="$(tr '\n' ' ' < "$O/state/.sweep-err.$$" 2>/dev/null || true)"; rm -f "$O/state/.sweep-err.$$"
+    SWEEP_STATUS="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_status)"
+    RL_REMAIN="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'x-ratelimit-remaining')"
+    RL_RESET="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'x-ratelimit-reset')"
+    RL_AFTER="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'retry-after')"
+    if [ "$SWEEP_STATUS" = "304" ]; then
+      # Unchanged: GitHub does not charge a 304 to the primary rate limit, and the per-PR reads are
+      # skipped this cycle — an identical listing means an identical PR set. Bounded by SWEEP_MAX_AGE.
+      echo "[sweep] listing unchanged (304, etag sent) — no per-PR reads this cycle; next full sweep in <=$(( SWEEP_MAX_AGE - (NOW - LAST_FULL) ))s" >> "$LOG"
+    elif [ "$SWEEP_RC" -ne 0 ]; then
+      SWEEP_KIND="$(sweep_fail_kind "${SWEEP_RAW:-}" "$SWEEP_ERR")"
+      if [ "$SWEEP_KIND" = "rate-limit" ]; then
+        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
+        echo "[sweep] ⛔ RATE-LIMITED (HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC; remaining=${RL_REMAIN:-?} reset=${RL_RESET:-?} retry-after=${RL_AFTER:-?}) — sweep DEFERRED $(( (DEFER_UNTIL - NOW + 59) / 60 ))m. THIS CELL CANNOT MERGE, NOT IDLE. (${SWEEP_ERR:-no stderr})" >> "$LOG"
+      else
+        echo "[sweep] PR listing FAILED ($SWEEP_KIND, HTTP ${SWEEP_STATUS:-?} rc=$SWEEP_RC) (${SWEEP_ERR:-no stderr}) — nothing swept this cycle" >> "$LOG"
+      fi
+    else
+      # 200: refresh the validator and the age stamp, and surface a nearly-spent bucket. The low
+      # deferral is set HERE, before the NEXT call — gating after the listing would only stop
+      # requests the listing has already paid for.
+      SWEEP_ETAG_NEW="$(printf '%s\n' "${SWEEP_RAW:-}" | rl_header 'etag')"
+      [ -n "$SWEEP_ETAG_NEW" ] && printf '%s\n' "$SWEEP_ETAG_NEW" > "$O/state/sweep-etag"
+      printf '%s\n' "$NOW" > "$O/state/sweep-stamp"
+      rm -f "$O/state/sweep-defer-until"
+      SWEEP_LIST="$(printf '%s\n' "${SWEEP_RAW:-}" | awk -F"$(printf '\t')" 'NF==3 && $1 ~ /^[0-9]+$/')"
+      if is_num "${RL_REMAIN:-}" && [ "$RL_REMAIN" -le "$SWEEP_MIN_REMAIN" ]; then
+        DEFER_UNTIL="$(sweep_defer_until "${SWEEP_RAW:-}")"
+        printf '%s\n' "$DEFER_UNTIL" > "$O/state/sweep-defer-until"
+        echo "[sweep] ⚠️ rate limit low: x-ratelimit-remaining=$RL_REMAIN (<= $SWEEP_MIN_REMAIN) reset=${RL_RESET:-?} — next sweep deferred $(( (DEFER_UNTIL - NOW + 59) / 60 ))m" >> "$LOG"
+      fi
+    fi
+  fi
+  # END sweep-listing
+  # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
+  # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
+  # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
+  if [ -f "$O/claims.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$O/claims.sh"
+    # REQUIRED: this loop runs from launchd with cwd=$HOME. Without CLAIM_REPO every git call
+    # inside claims.sh targets a non-repo, the fetch fails silently and the snapshot is empty
+    # even with live claims — measured: 3 claims on origin, 0 snapshot lines.
+    CLAIM_REPO="$REPO"
+    claim_snapshot "$O/state/claims-snapshot"
+    # Expired refs are unbounded otherwise. Hourly, in the background, never blocking the sweep.
+    if [ -z "$(find "$O/state/.claims-pruned" -mmin -60 2>/dev/null)" ]; then
+      touch "$O/state/.claims-pruned"
+      ( claim_prune >> "$LOG" 2>&1 ) &
+    fi
   fi
   printf '%s\n' "${SWEEP_LIST:-}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT; do
@@ -469,15 +875,20 @@ while true; do
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
-    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | python3 -c "
+    # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
+    # spawns — the one action worse than doing nothing here would be acting on a contract this
+    # repo never declared (review P2, round 1).
+    [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue
+    V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 -c "
 import sys,json
+import os
 try: d=json.load(sys.stdin)
 except Exception: print('NOCHECKS'); raise SystemExit
 # The source is either the check-runs API shape (an object carrying a check_runs list) or the flat
 # list \`gh pr checks --json\` prints. Both normalise to one row list; anything else is unreadable.
 rows=d.get('check_runs') if isinstance(d,dict) else d
 if not isinstance(rows,list): print('NOCHECKS'); raise SystemExit
-want='$REQ'.split()
+want=(os.environ.get('REQ') or '').split()
 # ⛔ ALLOW-LISTS, NEVER A DENY-LIST (agent-infra#1714). A conclusion is NON-RED only if it is NAMED
 # here - the identical five spellings admin-merge.sh (NON_RED_CONC) and record-review.sh
 # (target_head_red) use, so the harness and the merge rail cannot disagree. 'not in the red set' is
@@ -515,17 +926,26 @@ for c in rows:
     prev=groups.get(k)
     if prev is None or cid>=prev[0]: groups[k]=(cid,status,concl)
 rank={'nonred':0,'pending':1,'red':2}
+# The repo's review-gate NAME is an INPUT (agent-infra#1764), not the literal 'ai-review-gate'.
+# It is read from the env the bash side passes in, with the same default repo-authority.sh uses.
+rgate=os.environ.get('REVIEW_GATE') or 'ai-review-gate'
 named={}
 gate=[]
 for k in groups:
     status=groups[k][1]; concl=groups[k][2]
     v='pending' if status in INFLIGHT else ('nonred' if concl in NONRED else 'red')
-    if k[1]=='ai-review-gate': gate.append((v,concl))
+    if k[1]==rgate: gate.append((v,concl))
     if k[1] not in named or rank[v]>rank[named[k[1]]]: named[k[1]]=v
-# ai-review-gate IS the merge authority, so it must be an explicit SUCCESS. SKIPPED/NEUTRAL there
-# means no signed review exists; reading that as satisfied would merge without evidence. This is
-# also why GREEN always carries at least one MEASURING success: a surface of nothing but
-# cancelled/stale/skipped/neutral rows can never read green - those are non-red, never green.
+# THE REVIEW GATE IS THE MERGE AUTHORITY **WHERE THE REPO REQUIRES IT**, so it must be an explicit
+# SUCCESS there. SKIPPED/NEUTRAL means no signed review exists; reading that as satisfied would
+# merge without evidence. This is also why GREEN always carries at least one MEASURING success: a
+# surface of nothing but cancelled/stale/skipped/neutral rows can never read green - those are
+# non-red, never green.
+# ⛔ SCOPED BY 'rgate in want', WHICH IS THE WHOLE POINT (#1764). On a repo whose protection does
+# not require the gate (agent-infra), the name is NOT in 'want' and the rule below never fires -
+# otherwise its ABSENCE forced RED and deadlocked the queue. The rule is NOT weakened: on tortoise
+# the gate IS required, so a missing/red/skipped gate still blocks exactly as before. The
+# fail-closed posture is unchanged and stays INSIDE the repo's own required set.
 gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
 # Read it in this order: RED if any required check is red (a completed red is final - nothing in
 # flight can un-fail it); otherwise NOT YET KNOWN while any is in flight or never reported;
@@ -533,7 +953,7 @@ gate_ok=len(gate)>0 and all(v=='nonred' and c=='success' for v,c in gate)
 # and NOCHECKS reaches neither the merge nor the fixer arm below.
 fail=[n for n in want if named.get(n)=='red']
 pend=[n for n in want if named.get(n)=='pending' or n not in named]
-if 'ai-review-gate' in want and not gate_ok and 'ai-review-gate' not in fail: fail.insert(0,'ai-review-gate')
+if rgate in want and not gate_ok and rgate not in fail: fail.insert(0,rgate)
 print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PENDING:'+','.join(pend) if pend else ('GREEN' if want else 'NOCHECKS'))))
 " 2>/dev/null)"
     # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
@@ -543,11 +963,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
       GREEN|PENDING:*)
         MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
+          # A bailed fixer must not have consumed an attempt here (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
-          case "$NFC" in ''|*[!0-9]*) NFC=0 ;; esac
+          is_num "$NFC" || NFC=0
           if [ "$NFC" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park):
+            # a park left by a previous head must be REFRESHED or the new head never parks.
+            # park_ctrl writes BOTH the marker and the #1717 reason, so the exit-5 log on the
+            # chain-<N>/fix-one.sh paths names WHY this head was parked. The LOG line stays
+            # novel-only (per head) so the log does not repeat.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
+            fi
+            park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -562,18 +992,100 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         fi ;;
     esac
     case "$V" in
-      GREEN)     gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG" ;;
-      PENDING:*) gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true; gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true ;;
+      GREEN)
+        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        if [ "$MERGE_AUTHORITY" = "rail" ]; then
+          # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
+          # authority is its own rail (scripts/admin-merge.sh), which computes head-bound evidence
+          # and merges. We NEVER call `gh pr merge` here: on this repo it would land the PR on the
+          # required checks alone, bypassing the rail — the bypass agent-infra's AGENTS.md forbids.
+          #
+          # IT RUNS IN A WORKER, NOT INLINE. MEASURED 2026-10-15: one rail run on a green
+          # agent-infra PR (#1763, all 22 checks non-red) takes ~27s even with --dry-run --no-rerun,
+          # and the rail's re-run path waits for a re-run to finish. Inline, a 30-PR drain is ~13
+          # minutes of a BLOCKED controller cycle with dispatch halted — the very starvation this
+          # issue is about. The worker is single-owner (merge-one.sh's local lock + cross-box claim)
+          # and slot- and load-gated like every other spawn.
+          if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
+            : # a rail worker already owns this PR
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            # ⚠️ carry the RESOLVED contract into the worker (review P2, round 1): the controller
+            # resolved REQ/REVIEW_GATE for THIS cycle, but a worker that re-resolves independently
+            # can disagree (e.g. an operator REVIEW_GATE the tmux server does not export) and merge
+            # under a different authority than the one that classified the PR. Passing the resolved
+            # set as the worker's REQ makes it the override — one resolution, one authority.
+            # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
+            # that as quoting, so the value would execute (round-8 adversarial review, B6).
+            if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
+            else
+              echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
+            fi
+          fi
+        elif [ "$MERGE_AUTHORITY" = "gate" ]; then
+          # ⛔ EXPLICIT `gate` ONLY (round-10 review, P2). This arm used to be a bare `else`, so
+          # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
+          # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
+          # happens only on an authority that NAMES the gate.
+          gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
+        else
+          echo "#$PR GREEN but the merge authority is '${MERGE_AUTHORITY:-<unset>}' — NO merge (fail-closed: only an explicit 'gate' or 'rail' authority may merge)" >>"$LOG"
+        fi ;;
+      PENDING:*)
+        gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
+        if [ "$MERGE_AUTHORITY" = "gate" ]; then
+          gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true
+        else
+          # RAIL MODE: `--auto` must NOT be armed. It merges the moment the REPO'S required checks
+          # pass, which on a rail-managed repo bypasses the rail entirely — the same bypass the
+          # GREEN arm avoids. Wait for the next cycle; once every required check is non-red the
+          # GREEN arm dispatches the rail.
+          echo "#$PR PENDING (rail mode: auto-merge deliberately NOT armed — arming it would bypass the rail)" >>"$LOG"
+        fi ;;
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
-        if grep -q ai-review-gate <<<"$V"; then
+        # Which red names are REQUIRED checks other than the review gate? Derived from the
+        # classifier's own output and from THIS repo's required set ($REQ) — never from a literal
+        # name list. The arm below used to name tortoise's five doc/CI checks, so a red
+        # `pipeline-compliance` on agent-infra matched NOTHING and the PR sat red with no worker at
+        # all: the same repo-dependent-constant defect as the required-check list (#1764).
+        # ⚠️ review P2, round 1: the pre-#1764 arm deliberately EXCLUDED python-ci-gate — the
+        # rerun block at the bottom of this case owns it, and routing a flaky CI lane into the
+        # code-pushing fixer is churn the rerun already handles. RERUN_RED names that one check
+        # (the same name the rerun block greps for); a repo that does not carry it is unaffected
+        # and every OTHER required red name still reaches the fixer — including agent-infra's
+        # pipeline-compliance, which the old literal arm could not match at all.
+        RERUN_RED="python-ci-gate"
+        CI_RED=""
+        _redifs="$IFS"; IFS=','; set -f
+        for _rn in ${V#FAILED:}; do
+          [ -n "$_rn" ] || continue
+          [ "$_rn" = "$REVIEW_GATE" ] && continue
+          [ "$_rn" = "$RERUN_RED" ] && continue
+          case " $REQ " in *" $_rn "*) CI_RED="$_rn"; break ;; esac
+        done
+        set +f; IFS="$_redifs"
+        # Whole-NAME gate test (review P2, round 2): `grep -qF` matched a SUBSTRING, so a
+        # REVIEW_GATE that is a substring of another red required check (compliance vs
+        # pipeline-compliance) misrouted that check into the review arm instead of the CI fixer
+        # that fetches its failing log — while merge_authority and CI_RED test whole names.
+        _gate_hit=0; _gifs="$IFS"; IFS=','; set -f
+        for _vn in ${V#FAILED:}; do
+          [ "$_vn" = "$REVIEW_GATE" ] && _gate_hit=1
+        done
+        set +f; IFS="$_gifs"
+        if [ "$_gate_hit" = "1" ]; then
+          # A bailed fixer must not have consumed an attempt, and this arm DELETED the findings
+          # marker at spawn — so restore it too (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 1
           # The claim file is written by merge-one.sh itself, so it also covers the chain-<N>
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
-          if claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+          if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
-            case "$NF" in ''|*[!0-9]*) NF=0 ;; esac
+            is_num "$NF" || NF=0
             # a reviewer already reported real issues AT THIS HEAD -> fix them and re-run the chain.
             # otherwise the gate is probably just missing evidence -> re-record (fresh review).
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
@@ -600,22 +1112,41 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              tmux new-session -d -s "merge-$PR" "bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
+              # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
+              # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
+              tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
                 && echo "#$PR re-record" >>"$LOG"
             fi
           fi
-        elif grep -qE 'docs|test-isolation|license-surface|legal-e2e|pricing-artifact' <<<"$V"; then
-          # A required check OTHER than the review gate or python CI is red — docs lint, a
-          # committed conflict marker, legal-e2e, test isolation. Nothing re-recorded or reran
-          # those, so such a PR sat red forever with no worker at all (observed: #8278 carried two
-          # docs-lint findings — MD056, an unescaped '|' in a table row, and MD046, fence style;
-          # #8193 a new MD018 finding; both had zero workers for hours). Route them to the fixer,
-          # which now also receives the failing CI log, capped like every other fix loop.
+        elif [ -n "$CI_RED" ]; then
+          # CI-red arm (agent-infra#1764: derived from the repo's required set, not a name list)
+          # A required check OTHER than the review gate is red — docs lint, a committed conflict
+          # marker, legal-e2e, test isolation, or agent-infra's `pipeline-compliance`. Nothing
+          # re-recorded or reran those, so such a PR sat red forever with no worker at all
+          # (observed: #8278 carried two docs-lint findings — MD056, an unescaped '|' in a table
+          # row, and MD046, fence style; #8193 a new MD018 finding; both had zero workers for
+          # hours). Route them to the fixer, which now also receives the failing CI log, capped
+          # like every other fix loop.
+          # ⛔ THE REFUND MUST PRECEDE THE READ (P2, third review round, 2026-10-14). The CONFLICTING
+          # arm above and the ai-review-gate arm below both read the count AFTER the refund; this arm
+          # read it BEFORE, so the decrement was immediately overwritten by `$NFC2 + 1` and the refund
+          # was a NO-OP here. fix-one.sh exits 0 — having done no work — when the cross-box CAS
+          # refuses it, so three no-op cross-box refusals still PARKED the PR as needs-a-human,
+          # exactly the defect the previous round claimed to close. Keep this ordering; selftest §15
+          # drives the shipped sequence and goes RED if the read moves back above the refund.
+          # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
+          # marker, so restore is 0 (P2, second review round).
+          refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
-          case "$NFC2" in ''|*[!0-9]*) NFC2=0 ;; esac
+          is_num "$NFC2" || NFC2=0
           if [ "$NFC2" -ge "${MAX_FIX_TRIES:-3}" ]; then
-            [ -f "$O/state/parked-$PR" ] || { park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"; echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"; }
-          elif claim_live "$PR" || sess "fix-$PR" || sess "merge-$PR"; then
+            # Unconditional park write (review P1, round 1, same class as merge-one's rail park).
+            # park_ctrl writes BOTH the marker and the #1717 reason; the LOG line stays novel-only.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "${HEAD_N:-}" ]; then
+              echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
+            fi
+            park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+          elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_FIX:-3}" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -649,6 +1180,11 @@ open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
   L="$(load1)"; LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
+  # live at this instant, so the dispatch block line below can distinguish "blocked while the box
+  # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
+  # not). Total in-flight agents = lanes + workers.
+  WORKERS="$(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-')"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on
@@ -678,7 +1214,7 @@ PY
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
-  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES")"
+  GATE_WHY="$(mp_reason "${OPEN_N:-0}" "$LANES" "$WORKERS")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
@@ -702,7 +1238,7 @@ PY
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     else echo "[dispatch] backlog empty" >> "$LOG"; fi
   else
-    echo "[dispatch] skipped ($GATE_WHY)" >> "$LOG"
+    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
   fi
   heartbeat
 
@@ -736,9 +1272,19 @@ PY
     fi
   fi
 
+  # agent-infra#1709 rec 4: JITTER. Three boxes on the same 240s cycle wake together — the
+  # classic thundering-herd trigger, and the sources name randomised expiry/backoff as the fix.
+  # Spread each box's wake-up by up to ±20% of the cycle. Cheap, and it matters more at 3 boxes
+  # than at 2: the claim CAS resolves the collision, but jitter means far fewer collisions to
+  # resolve at all.
+  JIT=$(( 10#${CYC} / 5 ))
   # `& wait`, not a bare sleep: bash runs a trap only AFTER the current foreground command
   # completes, so `sleep 240` deferred the stop for up to a whole cycle — measured 5.07s of a 6s
   # sleep, vs 0.09s with the background form. The lock is held either way, but "kill -TERM ends
   # the process" (agent-infra#1715's indicator) is then true in ~0.1s, not in four minutes.
-  sleep "$CYC" & wait $!
+  # ⛔ `10#` on BOTH arithmetic sites (P1, second review round, 2026-10-14): the predicate above
+  # coerces CYC=08 to 240, but this is defence in depth — this line is where a leading zero used to
+  # DISCARD the entire `while true` loop and exit 0 after one cycle (relaunch-per-cycle under
+  # KeepAlive). `10#${CYC}` reads it base 10 whatever the predicate did.
+  sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
 done

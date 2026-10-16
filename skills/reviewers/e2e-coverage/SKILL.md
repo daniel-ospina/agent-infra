@@ -20,6 +20,8 @@ Maps every high-level scenario from the epic's User Journeys to detailed E2E tes
 
 Dispatched by the fractal planning pipeline during the **Detailed E2E** substep when the epic's Architecture or UX complexity axis is rated medium or high.
 
+Consulted by **`test-review` Reviewer C** (when C fires on e2e surfaces) as a **supplementary reference** for the e2e-coverage concern — C's inline prompt is the specification, not this catalog, and C's required inputs (`TEST FILE` / `E2E SCENARIOS` / `SURFACE MAP`) differ from the plan-doc inputs below.
+
 ## Inputs Required
 
 - **Detailed E2E section** of the epic doc — the test scenario descriptions

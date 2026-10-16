@@ -144,6 +144,17 @@ bash "$SHIM" pr merge 123 --admin=false >/dev/null 2>&1; r4=$?
 [ "$r3" -eq 0 ] && pass "a NON-admin merge passes through" || fail "a plain \`--squash\` merge was blocked"
 [ "$r4" -eq 0 ] && pass "\`--admin=false\` is not a bypass (existing semantics preserved)" || fail "\`--admin=false\` was blocked"
 
+# The declared NEGATIVE class, at the layer that now decides it (#1776): a `gh` command
+# that merely MENTIONS `admin` — here with a construct in an unrelated argument — must
+# pass through with its argv intact. This is the argv of the command whose false block
+# opened #1776; the extension's own stand-down is pinned in its suite, and THIS is the
+# layer that then has to deliver an ordinary `gh pr create`.
+new_scen mention-negative
+bash "$SHIM" pr create --title "fix(admin-merge): x" --body "ask the admin" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q '^pr create --title fix(admin-merge): x --body ask the admin$' "$SCEN/calls" \
+  && pass "a mention of \`admin\` under a construct passes through, argv intact" \
+  || fail "the negative class was gated by the argv layer (rc=$rc): $(head -1 "$TMP/err")"
+
 # ── 5. the audited hatch still works ────────────────────────────────────────
 echo "== 5. the operator hatch is preserved, loudly =="
 new_scen override
@@ -535,6 +546,87 @@ for badnum in 0 01006 0001 9007199254740993 9999999999999999; do
     fail "a bare \`$badnum\` was not refused by the number rule (rc=$rc): $(head -1 "$TMP/err")"
   fi
 done
+
+# ── 12. the shapes around the deferral: what the TEXT layer hands over, and what it
+#        keeps for itself (#1776). The extension declines its GUESS on the admin-merge
+#        question whenever this shim is installed and executable (`ghShimWillEnforce`) —
+#        but only for a command it does not READ as a merge (`mergeVerbInText`), and a
+#        shape whose merge verb it reads keeps the fail-closed text-layer decision
+#        (pinned end-to-end in the extension suite). So the arms below pin THIS layer's
+#        refusals for the whole family, and the one shape the extension does hand over is
+#        the #1775 over-read: a construct plus the word `admin` with NO merge in the text
+#        (a PR title supplying the word). Pinned in BOTH polarities — refused with no
+#        evidence, and ALLOWED with evidence — because a mis-parse can refuse for the
+#        wrong reason, but it cannot let the merge through with the caller's argv intact.
+#        (a)-(d) are SHIM-ONLY arms: each ends in a LITERAL `--admin`, which keeps the
+#        text-layer decision, so they are here to prove this layer refuses them too, not
+#        because they are deferred.
+#        (e) is NOT deferred either: the flag comes from a VARIABLE, but the verb is read
+#        (the stripper leaves `$M` in the verb position), so the extension decides it and
+#        this arm pins the argv layer's refusal of the same command.
+echo "== 12. the shapes around the deferral (#1776) =="
+for shape in 'pr --repo owner/other merge 123' 'pr -Rowner/other merge 123' \
+             '--repo owner/other pr merge 123' '--repo=owner/other pr merge 123'; do
+  tag="defer$(echo "$shape" | tr -dc 'a-z0-9')"
+  # (a) no evidence at all in the fixture → this layer must refuse.
+  new_scen "$tag-no"
+  bash "$SHIM" $shape --admin >/dev/null 2>"$TMP/err"; rc=$?
+  if [ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls"; then
+    pass "\`gh $shape --admin\` with no evidence → REFUSED (exit $rc)"
+  else
+    fail "\`gh $shape --admin\` was ALLOWED with no evidence (rc=$rc)"
+  fi
+  # (b) certifying evidence for the current head → allowed, and the forwarded argv must
+  # be the ORIGINAL spelling, ANCHORED. An unanchored `--repo owner/other` also matches
+  # the VERIFIER's own normalised call — a different line in the same file — so it would
+  # pass even if the forwarded spelling had been mangled.
+  new_scen "$tag-yes"
+  jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+  bash "$SHIM" $shape --admin >/dev/null 2>"$TMP/err"; rc=$?
+  if [ "$rc" -eq 0 ] && grep -q -- "^$shape --admin$" "$SCEN/calls"; then
+    pass "  …with head-bound evidence → allowed, and the ORIGINAL argv was forwarded intact"
+  else
+    fail "  …evidence did not open \`gh $shape --admin\` intact (rc=$rc): $(head -1 "$TMP/err")"
+  fi
+done
+# The verb SPLICED, so the resolved argv is the only place the word `merge` exists.
+# (The text layer reads this one too — `$M` lands in the verb position after the repo flag
+# is stripped — so the arm pins THIS layer's refusal, not a text-side defeat.)
+new_scen defer-spliced
+M=merge
+bash "$SHIM" pr --repo owner/other "$M" 123 --admin >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls" \
+  && pass "a \$VAR-supplied verb BEHIND a repo flag → REFUSED (exit $rc)" \
+  || fail "a spliced verb behind a repo flag slipped past"
+
+# The verb SPLICED and the FLAG supplied by a variable — neither is a literal token, but
+# this is NOT a deferred shape at the extension layer: the repo-flag stripper leaves `$M`
+# in the verb position, so the extension reads the text as a merge (`mergeVerbInText`) and
+# keeps its own fail-closed decision. This arm pins that the SHIM refuses it too, which is
+# what a command of this family faces if the extension's decision is ever overridden.
+new_scen defer-spliced-noflag
+M=merge
+V=--admin
+bash "$SHIM" pr --repo owner/other "$M" 123 "$V" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -ne 0 ] && ! grep -q "pr merge" "$SCEN/calls" \
+  && pass "a \$VAR verb AND a \$VAR flag behind a repo flag → REFUSED (exit $rc)" \
+  || fail "a spliced verb + variable flag slipped past"
+new_scen defer-spliced-noflag-yes
+jq -n --rawfile b "$TMP/body-good" '{headRefOid:"'"$HEAD_A"'",comments:[{body:$b}]}' > "$SCEN/pr.json"
+bash "$SHIM" pr --repo owner/other "$M" 123 "$V" >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q -- "--repo owner/other" "$SCEN/calls" \
+  && pass "  …with head-bound evidence → allowed (the decisive half of the pair)" \
+  || fail "  …valid evidence did not open the variable-flag shape (rc=$rc)"
+
+# STATED LIMIT, pinned so it cannot be mistaken for coverage: `gh alias`. gh expands an
+# alias AFTER this process has run, so an alias whose body is `pr merge --admin` is
+# invisible to BOTH layers (the shim's own header declares it). This asserts the
+# pass-through, which is the honest statement of the hole — NOT a claim that it is closed.
+new_scen alias-limit
+bash "$SHIM" ship-it 123 >/dev/null 2>"$TMP/err"; rc=$?
+[ "$rc" -eq 0 ] && grep -q "^ship-it 123$" "$SCEN/calls" \
+  && pass "STATED LIMIT (declared, not closed): an alias-shaped argv passes through to gh" \
+  || fail "the alias pass-through changed shape — revisit the declared limit"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks gh-shim test(s) failed"

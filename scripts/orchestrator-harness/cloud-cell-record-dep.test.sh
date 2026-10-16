@@ -31,6 +31,12 @@ SUP="$HERE/../cloud-cell-supervisor.sh"
 MERGE="$HERE/merge-one.sh"
 # Resolved BEFORE any PATH replacement — the supervisor is invoked through it.
 BASH_BIN="$(command -v bash)"
+# The fixture harness must be a REAL git checkout (#1745 provenance) and the per-repo merge
+# contract needs Python, so both are resolved here — BEFORE any PATH replacement — and symlinked
+# into the stub dir. The negative cases (§4 for the cell, none for the merge worker) remove those
+# links, so "absent on PATH" is still exercised.
+GIT_BIN="$(command -v git || true)"
+PY_BIN="$(command -v python3 || true)"
 [ -x "$SUP" ]   || { echo "❌ missing $SUP"; exit 1; }
 [ -x "$MERGE" ] || { echo "❌ missing $MERGE"; exit 1; }
 
@@ -50,7 +56,7 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
 # The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
 # under test are trivial `exit 0` stubs.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname env sed grep chmod head tail awk seq sleep diff stat touch true false"
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename cut env sed grep chmod head tail awk seq sleep diff stat touch true false df openssl sha256sum shasum"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -86,9 +92,14 @@ SH
 
 # ── a complete cell fixture, one missing dependency at a time ─────────────────
 CELL="$TMP/cell"
-CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"; CELL_HARNESS="$CELL/harness"
+CELL_HOME="$CELL/home"; CELL_REPO="$CELL/repo"; CELL_O="$CELL/o"
+# #1745: `cmd_check`/`start` verify WHICH COMMIT the harness is (cmd_check_provenance) and `start`
+# pins it into a detached worktree, so the fixture harness must be a REAL, CLEAN git checkout whose
+# `origin/main` ref equals its HEAD — an untracked hand copy is refused `DRIFT (untracked)` before
+# any recorder assertion runs. (selftest.sh §16 builds the same fixture for the same reason.)
+CELL_HREPO="$CELL/hrepo"; CELL_HARNESS="$CELL_HREPO/scripts/orchestrator-harness"
 CELL_STUBS="$CELL/stubs"
-mkdir -p "$CELL_HOME" "$CELL_REPO/.git" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
+mkdir -p "$CELL_HOME" "$CELL_O/logs" "$CELL_O/state" "$CELL_HARNESS"
 # cmd_check also judges DISPATCH PROVISIONING (agent-infra#1736): the target repo must carry its
 # own tools/collision_preflight.py (or resolve a tortoise checkout), else the whole cell is refused
 # as MERGE-ONLY before the recorder assertions below are ever reached — which would make them pass
@@ -96,9 +107,27 @@ mkdir -p "$CELL_HOME" "$CELL_REPO/.git" "$CELL_O/logs" "$CELL_O/state" "$CELL_HA
 # recorder probe it names, not by an earlier refusal.
 mkdir -p "$CELL_REPO/tools"; printf '#!/usr/bin/env python3\n' > "$CELL_REPO/tools/collision_preflight.py"
 cp "$HERE"/*.sh "$CELL_HARNESS/"
+# Commit the harness so `cmd_check_provenance` can answer "which commit is this cell running?" and
+# `harness_apply` takes its `unchanged` branch (leaving $HARNESS where the recorder_* resolvers
+# expect it). `origin/main` == HEAD makes the relation `current`.
+git init -q "$CELL_HREPO"
+git -C "$CELL_HREPO" config user.email selftest@test.local
+git -C "$CELL_HREPO" config user.name selftest
+git -C "$CELL_HREPO" config commit.gpgsign false
+git -C "$CELL_HREPO" add -A
+git -C "$CELL_HREPO" commit -q -m "fixture harness"
+git -C "$CELL_HREPO" branch -M main
+git -C "$CELL_HREPO" update-ref refs/remotes/origin/main "$(git -C "$CELL_HREPO" rev-parse HEAD)"
+# The TARGET repo must be a real git checkout too: cmd_check asks `git -C $REPO rev-parse --git-dir`
+# (a linked worktree has a .git FILE, which the old `-d` test wrongly refused).
+git init -q "$CELL_REPO"
 # `cmd_check` asserts the workers are in $O; production gets them from `start`'s seed of $HARNESS.
 cp "$HERE"/*.sh "$CELL_O/"
 mkstubs "$CELL_STUBS"
+# git/python3 must be REAL here: the provenance check runs `git rev-parse`, and repo-authority's
+# `_normalise_set` runs Python. (§4 removes these links to test the absent-dependency refusals.)
+[ -n "$GIT_BIN" ] && ln -sf "$GIT_BIN" "$CELL_STUBS/git"
+[ -n "$PY_BIN" ] && ln -sf "$PY_BIN" "$CELL_STUBS/python3"
 RECORDER="$CELL_HOME/.pi/agent/scripts/record-review.sh"
 mkdir -p "$(dirname "$RECORDER")"
 printf '#!/bin/bash\nexit 0\n' > "$RECORDER"; chmod +x "$RECORDER"
@@ -112,14 +141,15 @@ printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
   env -u SCOPE -u AI_REVIEW_GATE_KEY \
     PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
-    O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
+    O="$CELL_O" HARNESS="$CELL_HARNESS" HARNESS_REPO="$CELL_HREPO" HARNESS_REF=origin/main HARNESS_FETCH=0 \
+    ENV_FILE="$CELL/absent.env" \
     "$BASH_BIN" "$SUP" check 2>&1
 }
 cell_start() { # cell_start — drive the SHIPPED `start` with a tmux stub that records the session
   mkdir -p "$CELL/tmstate"
   env -u AI_REVIEW_GATE_KEY SCOPE=own \
     PATH="$CELL_STUBS" TM_STATE="$CELL/tmstate" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" \
-    REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" OR="acme/widget" \
+    REPO="$CELL_REPO" O="$CELL_O" HARNESS="$CELL_HARNESS" HARNESS_REPO="$CELL_HREPO" HARNESS_REF=origin/main HARNESS_FETCH=0 OR="acme/widget" \
     "$BASH_BIN" "$SUP" start 2>&1
 }
 certified() { case "$1" in *'CELL CAN RUN A CONTROLLER'*) return 0 ;; *) return 1 ;; esac; }
@@ -220,8 +250,8 @@ done
 # copy ships one directory up from the harness, exactly where recorder_src()/recorder_lib_src() look.
 # The normalizer is the recorder's DECLARED SIBLING, so both must be provisioned, preserving the
 # relative position (scripts/record-review.sh <-> scripts/lib/diff-normalize.py).
-printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
-mkdir -p "$CELL/lib"; printf '#!/usr/bin/env python3\n' > "$CELL/lib/diff-normalize.py"
+printf '#!/bin/bash\nexit 0\n' > "$CELL_HARNESS/../record-review.sh"; chmod +x "$CELL_HARNESS/../record-review.sh"
+mkdir -p "$CELL_HARNESS/../lib"; printf '#!/usr/bin/env python3\n' > "$CELL_HARNESS/../lib/diff-normalize.py"
 rm -f "$RECORDER" "$RECORDER_LIB" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
 [ "$rc" -eq 0 ] && [ -x "$RECORDER" ] && rc=0 || { rc=1; note "rc=$rc recorder=$([ -x "$RECORDER" ] && echo present || echo absent) out=$(printf '%s' "$out" | tail -3)"; }
@@ -244,7 +274,7 @@ ck "start provisions ONLY the missing normalizer when the recorder already exist
 # ran only when the path was ABSENT, so a `cp` killed mid-write (or a full disk) would persist
 # across every restart and then be blessed by `cmd_check`. The write is atomic (tmp + mv), so a
 # concurrent reader cannot observe a half-written recorder either.
-printf '#!/bin/bash\nexit 0\n' > "$CELL/record-review.sh"; chmod +x "$CELL/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$CELL_HARNESS/../record-review.sh"; chmod +x "$CELL_HARNESS/../record-review.sh"
 : > "$RECORDER"          # a truncated/zero-byte operator copy
 rm -f "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
@@ -256,7 +286,7 @@ ck "the re-provisioned cell is then certified" $rc
 
 # 6) …and when there is nothing to provision FROM, `start` refuses rather than creating a cell that
 # can never merge. Non-vacuity: the same invocation WITHOUT the missing source succeeds above.
-rm -f "$RECORDER" "$CELL/record-review.sh" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
+rm -f "$RECORDER" "$CELL_HARNESS/../record-review.sh" "$CELL/tmstate/up" "$CELL/tmstate/cmd"
 out="$(cell_start)"; rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$CELL/tmstate/cmd" ] && rc=0 || { rc=1; note "rc=$rc session=$([ -f "$CELL/tmstate/cmd" ] && echo created || echo none)"; }
 ck "start refuses (and creates no session) when the recorder cannot be provisioned" $rc
@@ -268,23 +298,40 @@ HEAD="0123456789abcdef0123456789abcdef01234567"
 PR=7
 MRG="$TMP/mrg"
 
-mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder, stubs, state dirs
+# The gate key the producer signs with and this consumer verifies. Written as the KEY FILE (env is
+# explicitly unset by run_merge) so the fixture exercises the same resolution order as production.
+GATE_KEY_TEST="1717-fixture-gate-key-0123456789abcdef"
+
+mkmrg() { # mkmrg — a fresh merge fixture: repo, HOME with a recorder+key, stubs, state dirs
   rm -rf "$MRG"
   mkdir -p "$MRG/home/.pi/agent/scripts" "$MRG/repo" "$MRG/o/logs" "$MRG/o/state"
   mkstubs "$MRG/stubs"
+  # python3 must be REAL: repo-authority's `_normalise_set` and merge-one's gate-name reader run it.
+  [ -n "$PY_BIN" ] && ln -sf "$PY_BIN" "$MRG/stubs/python3"
+  printf '%s\n' "$GATE_KEY_TEST" > "$MRG/home/.pi/agent/.ai-review-gate-key"
   : > "$MRG/pi-count"
   : > "$MRG/pr-body"
 }
-# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it posts the SIGNED marker
-# into the PR body — the artifact ai-review-gate reads. `rc=0` alone is not that artifact, which is
-# the fail-open §8f pins. The gh stub above serves this file back for `pr view --json body`.
-mkrecorder_posts() {
+# A recorder REPLICA that honours record-review.sh's ACTUAL contract: it posts a marker whose HMAC
+# VERIFIES under the gate key — the artifact ai-review-gate reads. `rc=0` alone is not that artifact
+# (§8f), and a correctly-SHAPED-but-unverified sig is not either (§8g). The gh stub serves the file
+# back for `pr view --json body`.
+mkrecorder_with_sig() { # <sig> — write a replica posting the marker with sig=$1
   cat > "$MRG/home/.pi/agent/scripts/record-review.sh" <<EOF
 #!/bin/bash
-printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" "0000000000000000000000000000000000000000000000000000000000000000" >> '$MRG/pr-body'
+printf 'review recorded: reviews/%s.json verdict=clean @ %s (acme/widget) sig=%s\n' "\$1" "\$2" '$1' >> '$MRG/pr-body'
 exit 0
 EOF
   chmod +x "$MRG/home/.pi/agent/scripts/record-review.sh"
+}
+mkrecorder_posts() { # the producer's exact HMAC over the marker text it emits
+  local text sig
+  text="review recorded: reviews/$PR.json verdict=clean @ $HEAD (acme/widget)"
+  sig="$(printf '%s' "$text" | openssl dgst -sha256 -hmac "$GATE_KEY_TEST" | awk '{print $NF}')"
+  mkrecorder_with_sig "$sig"
+}
+mkrecorder_forges() { # a shape-valid marker with a 64-hex sig that is NOT the HMAC (the P1 shape)
+  mkrecorder_with_sig "0000000000000000000000000000000000000000000000000000000000000000"
 }
 # Drive the SHIPPED merge-one.sh. `pi`, `gh` and `git` are EXPORTED SHELL FUNCTIONS, not file stubs:
 # merge-one.sh prepends /opt/homebrew/bin and /usr/local/bin to PATH itself, so a file stub could be
@@ -301,7 +348,12 @@ run_merge() {
       case "$*" in
         *"pr view"*headRefOid*) printf '%s\n' "$FAKE_HEAD"; return 0 ;;
         *"pr view"*body*) cat "$FAKE_BODY_FILE" 2>/dev/null; return 0 ;;
-        *"pr checks"*) printf 'SUCCESS\n'; return 0 ;;
+        # repo-authority.sh reads branch protection for the merge contract (#1764). WITHOUT this the
+        # read fails, REQ falls back and merge-one.sh REFUSES (exit 5) before the record step — every
+        # assertion below would then pass for the wrong reason.
+        *"api"*protection/required_status_checks*) printf 'ai-review-gate\npipeline-compliance\n'; return 0 ;;
+        # Step 3 parses this JSON and selects the repo's gate NAME; a bare `SUCCESS` no longer parses.
+        *"pr checks"*) printf '[{"name":"ai-review-gate","state":"SUCCESS"}]\n'; return 0 ;;
         *) return 0 ;;
       esac
     }
@@ -482,6 +534,28 @@ out="$(run_merge)"; rc2=$?
 ck "a parked no-marker head does not re-pay on the next run" $rc
 [ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
 ck "the no-marker park refuses re-review with exit 5" $rc
+
+# 8g) RED→GREEN — A CORRECTLY-SHAPED MARKER WITH AN UNVERIFIED SIGNATURE IS NOT EVIDENCE (#1717
+# review, P1). The PR body is attacker-writable, so a `sig=<64 hex>` line proves nothing: the
+# pre-fix guard was SHAPE-ONLY, so this fixture (a real marker line carrying 64 zeros) satisfied it,
+# the gate wait ran, gate=SUCCESS (the stub), and the worker MERGED — with no signed review behind
+# the merge. The consumer must recompute the HMAC exactly as the producer does and refuse a marker
+# that does not verify, parking it so the loop does not re-pay. Non-vacuity: §9 (the HMAC'd marker)
+# proceeds to MERGED, so this refusal is about the SIGNATURE, not about "markers are refused".
+mkmrg
+mkrecorder_forges
+out="$(run_merge)"; rc=$?
+[ ! -f "$MRG/o/state/merged-$PR.done" ] && rc=0 || { rc=1; note "a FORGED sig=000… merged; log: $(tail -3 "$MRG/o/logs/merge-$PR.log" 2>/dev/null)"; }
+ck "RED→GREEN: a marker whose sig does NOT verify never merges" $rc
+[ "$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)" = "$HEAD" ] && rc=0 || { rc=1; note "parked=$(cat "$MRG/o/state/parked-$PR" 2>/dev/null)"; }
+ck "a forged marker writes the terminal park" $rc
+case "$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)" in *'does NOT verify'*) rc=0 ;; *) rc=1; note "reason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)";; esac
+ck "the forged-marker park names the failed signature verification" $rc
+out="$(run_merge)"; rc2=$?
+[ "$(pi_calls)" = "1" ] && rc=0 || { rc=1; note "pi calls=$(pi_calls) — a parked forged-marker head was re-reviewed"; }
+ck "a parked forged-marker head does not re-pay on the next run" $rc
+[ "$rc2" -eq 5 ] && rc=0 || { rc=1; note "rc=$rc2"; }
+ck "the forged-marker park refuses re-review with exit 5" $rc
 
 # 9) NON-VACUITY for the whole park arm: with a recorder that SUCCEEDS the worker proceeds to the
 # merge, so the terminal state is a response to the failure and not a blanket refusal to merge.

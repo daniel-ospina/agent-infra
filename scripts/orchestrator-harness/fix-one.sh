@@ -8,34 +8,46 @@ if [ "${1:-}" = "--argv" ]; then
   [ -f "$ARGV" ] || { echo "[fix] missing argv file: $ARGV" >&2; exit 1; }
   { read -r REPO; read -r OR; read -r PR; read -r BR; } < "$ARGV"
   rm -f "$ARGV"
+  # Only a CONTROLLER dispatch books an attempt in fixcount-<PR>. See the refund in the load-refusal
+  # path below: a manual run must not decrement a counter it never incremented.
+  CTRL=1
 else
-  REPO="$1"; OR="$2"; PR="$3"; BR="$4"
+  REPO="$1"; OR="$2"; PR="$3"; BR="$4"; CTRL=0
 fi
 case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty>}" >&2; exit 1 ;; esac
+# Guard-before-use for env tunables (same P1 class as merge-one.sh): FIX_TIMEOUT feeds ARITHMETIC
+# below to derive the lease, and on /bin/bash 3.2.57 a failed arithmetic assignment aborts the rest
+# of the enclosing `if` body with status 0 — silently disabling the claim.
+# ⛔ REJECT LEADING ZEROS (P2, second review round, 2026-10-14): `''|*[!0-9]*` ACCEPTED `08`, so
+# `FIX_LEASE=$(( 08 + 1200 ))` still reached the arithmetic and aborted the claim block with status
+# 0. `$(( ))` parses base 0 (leading 0 = octal) and `08`/`09` are not octal. Accept only `0` or
+# `[1-9][0-9]*`.
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
+# accepted `9223372036854775807`; `FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))` then wrapped NEGATIVE, the
+# lease failed to parse (`_lease_of`'s `[0-9]*` cannot match a minus sign), and an unparseable lease
+# is read as LIVE — so the head was frozen across ALL boxes and `claim_prune` could never reap it.
+# FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
+# digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+KIND=fixer; TAG="$PR"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/fix-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# The wall-clock limit AND the load gate both live in the shared helper, so this script has no
+# `pi` invocation of its own to forget to gate (agent-infra#1720). NB: L above is a LOG PATH, not a
+# load reading — the gate takes its reading as an argument for exactly that reason.
+# Fail LOUD if the helper is missing: an unsourced helper leaves `run_agent` undefined, and that must
+# never degrade into "the fixer ran" — see README §9 on syncing $O.
+# ⛔ SOURCED AFTER THE PATH EXPORT: spawn-gate.sh derives `_NCPU` at SOURCE time, so sourcing it
+# under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 cd "$REPO" || exit 1
 
-# Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
-# model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
-# silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
-# agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
-# reaper in orch-loop.sh is the second line of defence.
-run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
-  pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
-  wait "$pid" 2>/dev/null; rc=$?
-  kill "$w" 2>/dev/null
-  echo "[timeout] agent pid=$pid wall_limit=${t}s rc=$rc" >> "$log"
-  return "$rc"
-}
 # locate the branch's worktree
 WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
 echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
@@ -51,6 +63,64 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
   [ -z "$WT" ] && { echo "[fix $PR] ABORT: could not materialise a worktree for $BR" >> "$L.log"; exit 1; }
   echo "[fix $PR] materialised worktree=$WT" >> "$L.log"
 }
+
+# ── cross-box claim for the FIXER (P3.3, 2026-10-14 adversarial review) ───────
+# merge-one.sh claims before reviewing, but fix-one.sh ran the fixer FIRST and only then called
+# merge-one.sh (the sole claim_acquire caller), so two boxes could each spawn a fixer for the same
+# PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
+# fixer and a reviewer never race each other for the same content version.
+HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+CROSS_OWN=""; CROSS_RC=0
+release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
+  # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
+  # release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the
+  # fenced push leaves the ref intact, and every box then refuses that head until the lease expires
+  # (FIX_TIMEOUT+1200, up to ~1 h). Accepted because an UNBOUNDED exit path is strictly worse: it
+  # holds the process open with the local lock already dropped, so the controller can spawn a second
+  # fixer for the same head. DO NOT remove the bound; move the release OFF the exit path instead.
+  local p w rc
+  [ -n "${CROSS_OWN:-}" ] || return 1
+  claim_release "$REPO" "$PR" "$HEAD" "$CROSS_OWN" >/dev/null 2>&1 &
+  p=$!
+  ( sleep 20; kill -TERM "$p" 2>/dev/null; sleep 5; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  return "$rc"
+}
+trap 'release_fix_claim' EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$O/claims.sh"
+  if ! is_limit "${FIX_TIMEOUT:-2400}"; then
+    echo "[fix $PR] FIX_TIMEOUT='${FIX_TIMEOUT:-}' is not an integer in range (at most 9 digits) — using 2400 (the cross-box lease needs a number that cannot overflow)" >> "$L.log"
+    FIX_TIMEOUT=2400
+  fi
+  # Overflow-safe by construction: the guard above leaves FIX_TIMEOUT <= 999999999, so this sum is
+  # < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site.
+  FIX_LEASE=$(( ${FIX_TIMEOUT:-2400} + 1200 ))
+  claim_acquire "$REPO" "$PR" "$HEAD" "$FIX_LEASE" >/dev/null
+  CROSS_RC=$?
+  case "$CROSS_RC" in
+    0) CROSS_OWN="$CLAIM_COMMIT"
+       echo "[fix $PR] cross-box fixer claim: $CLAIM_RESULT" >> "$L.log" ;;
+    1) echo "[fix $PR] cross-box fixer claim REFUSED: $CLAIM_RESULT — another box is already fixing head $HEAD; recording a bail marker and exiting" >> "$L.log"
+       # ⛔ BAIL MARKER (P2, second review round, 2026-10-14). The controller books the attempt
+       # (fixcount+1) and DELETES the reviewer's findings marker at SPAWN, so this refusal — which
+       # did no work at all — used to burn one of MAX_FIX_TRIES and leave the findings unrecorded.
+       # Three refusals PARK the PR as needs-a-human although no fixer ever ran. orch-loop.sh reads
+       # this marker and refunds both.
+       : > "$O/state/fixbail-$PR-$HEAD"
+       exit 0 ;;
+    *) echo "[fix $PR] cross-box fixer claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding (fail-open on purpose)" >> "$L.log"
+       if [ -n "${CLAIM_COMMIT:-}" ]; then
+         CROSS_OWN="$CLAIM_COMMIT"
+         release_fix_claim && CROSS_OWN=""
+       fi ;;
+  esac
+fi
 
 # Capture the FAILING REQUIRED CHECK and its log. The fixer is also dispatched for CI failures
 # that are not a reviewer finding (docs lint, a committed conflict marker, legal-e2e,
@@ -104,8 +174,54 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
-run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt"
+run_agent "${FIX_TIMEOUT:-2400}" "$L.log" "$L-fixer.txt" "fixer for PR #$PR"
+# ⛔ AGENT_STARTED (set by run_agent) is the authority, NOT the exit code: `pi` shares the 0–255
+# status namespace, so a pi that exited 75 for its own reason must not be read as a load refusal —
+# that would silently skip the merge-chain re-run below (#1720 advisory).
+if [ "$AGENT_STARTED" = "0" ]; then
+  # Nothing was fixed, so re-running the merge chain would be a fresh-context review of an
+  # unchanged head — pure cost on an already-overloaded box, and the re-review would be refused by
+  # the same gate anyway. Exit and let the controller's next cycle re-dispatch.
+  echo "[fix $PR] fixer NOT started (load gate) — merge chain NOT re-run" >> "$L.log"
+  if [ "${CTRL:-0}" = "1" ]; then
+    # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when
+    # it CREATES the session, which is UPSTREAM of the gate inside run_agent(); this worker is the
+    # only party that knows no agent ran. Without the refund, three refusals reach MAX_FIX_TRIES and
+    # the PR is PARKED "needs a human" having never had a single fixer run (agent-infra#1720). A
+    # manual (positional) run booked nothing, so it must refund nothing.
+    CF="$O/state/fixcount-$PR"
+    if [ -f "$CF" ]; then
+      NF="$(cat "$CF" 2>/dev/null || echo 0)"
+      # `is_num`, not a hand-rolled `case`: the predicate is already in scope (spawn-gate.sh defines
+      # it, and this script uses it for its own tunables), and a second, weaker copy is exactly how
+      # `08` grew an octal read in the first place.
+      is_num "$NF" || NF=0
+      if [ "$NF" -gt 0 ]; then
+        echo $((NF - 1)) > "$CF"
+        echo "[fix $PR] load refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
+      fi
+    fi
+  fi
+  exit "$AGENT_LOAD_REFUSED"
+fi
 echo "[fix $PR] fixer done $(date) — re-running merge chain" >> "$L.log"
+# Release BEFORE the merge chain. If the fixer pushed, merge-one.sh claims the NEW head. If it did
+# NOT push, the SAME head is still claimed by us and merge-one.sh would refuse it as "another box
+# owns head" — so the release is mandatory, not tidiness.
+# ⛔ ONLY clear the latch when the release actually succeeded. A failed release (rc=1: fenced/torn
+# push) must leave CROSS_OWN set so the EXIT trap (`trap 'release_fix_claim' EXIT`) retries it at
+# process exit — otherwise the claim strands on the remote for the whole fixer lease
+# (FIX_TIMEOUT+1200, up to ~1 h) and the controller, reading the live lease as data, stops
+# re-dispatching that head. Same latch in merge-one.sh's claim block.
+# The failure is also LOGGED (P3, second review round, 2026-10-14): a retained latch that leaves no
+# trace is indistinguishable from a released claim to anyone reading the log afterwards.
+if [ -n "${CROSS_OWN:-}" ]; then
+  if release_fix_claim >/dev/null 2>&1; then
+    CROSS_OWN=""
+  else
+    echo "[fix $PR] cross-box fixer claim: could not release ${CROSS_OWN:0:12} — the EXIT trap will retry" >> "$L.log"
+  fi
+fi
 # re-run the full chain at the new head
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$L.log" 2>&1
 echo "[fix $PR] end $(date)" >> "$L.log"

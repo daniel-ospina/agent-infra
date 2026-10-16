@@ -18,7 +18,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 **Protocol additions:**
 - **Domain detection at Phase 1 start:** Classify the strategy context. Market analysis in known categories = Complicated. New market entry = Complex.
 - **Estuarine Mapping trigger for complex market analysis:** In Phases 2 (Customer Definition) and 3.5 (Competitor Intelligence), for Complex domains, add constraint-and-constructor mapping: "What are the market constraints? Which can we change? Where are the energy gradients?"
-- **Distributed sensing for Complex:** Run 2-3 independent market analyses from different lenses before converging on strategy.
+- **Distributed sensing for Complex:** Run 2-3 independent market analyses from different lenses before converging on strategy — the group shares ONE aggregate budget of **at most 2 concurrent external searches** (`research` Step 3; stagger them), never 2 per analysis (agent-infra#1779).
 
 **Protocol compliance self-audit:**
 ```

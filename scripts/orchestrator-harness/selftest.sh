@@ -21,6 +21,19 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
+# ── PLATFORM GATE (agent-infra#1769 review) ──────────────────────────────────────
+# install.sh is macOS-only BY CONSTRUCTION: its preflight is
+# `[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"`,
+# and every check that drives it to a rendered plist needs `plutil` and launchd. Wiring this suite
+# into `scripts/run-bash-shards.sh` (the shard list BOTH CI lanes run on ubuntu-latest) therefore
+# reddened `bash-suites` and would redden main's `script-validate` — the #1369 class the shard list
+# exists to close. Those checks are SKIPPED LOUDLY off macOS instead of failing: a silently-absent
+# suite would be the SAME class again. `skipd` counts and names each skip, and the final summary
+# reports the count, so a green Linux run cannot hide a suite that did not run.
+PLATFORM="$(uname)"
+skip=0
+skipd() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; skip=$((skip+1)); }
+on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # OFFLINE: install.sh probes the REAL `gh` (`gh auth status`) and dies without a live authenticated
 # session, so the install/render checks below would need network. A `gh` stub that reports success
 # is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
@@ -55,11 +68,17 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim; only the bash-side $REQ is substituted.
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
+# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
+# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+CL_GATE="ai-review-gate"
 awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed "s/'\\\$REQ'/'$REQ'/" | sed -n '1,/^print(/p' > "$TMP/classify.py"
-cl() { printf '%s' "$1" | python3 "$TMP/classify.py" 2>/dev/null; }
+  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
+# clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
+# ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
+clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
 if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
@@ -76,6 +95,25 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+# (z) THE REPO SHAPE THAT WAS DEADLOCKED (agent-infra#1764). Measured live on agent-infra PR #1763:
+# 22 checks, every one SUCCESS/NEUTRAL, and ZERO `ai-review-gate` runs — against agent-infra's OWN
+# required set (`pipeline-compliance`). The pre-fix classifier named `ai-review-gate` as the
+# authority by CONSTANT, so `gate` was empty, `gate_ok` false, and it forced
+# `FAILED:ai-review-gate` here: no PR could ever read GREEN and the merge queue could not drain.
+# Exact verdict, so a regression to the constant (or any re-introduced absence-is-RED rule for a
+# name this repo does not require) is RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"ci / skill-lint","state":"SUCCESS"},{"name":"ci / script-validate","state":"SUCCESS"},{"name":"test","state":"SUCCESS"},{"name":"pi-config-extensions","state":"SUCCESS"},{"name":"setup-suite","state":"SUCCESS"},{"name":"ci / unit-test","state":"SUCCESS"},{"name":"ci / typecheck","state":"SUCCESS"},{"name":"search-cost","state":"SUCCESS"},{"name":"workflow-lock","state":"SUCCESS"},{"name":"workflow-drift","state":"SUCCESS"},{"name":"actionlint","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]')"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: agent-infra's shape (22 checks, no ai-review-gate) reads GREEN on its own required set" $rc
+# (z2) …and the scoping above does NOT weaken the fail-closed rule INSIDE that set: a required
+# check this repo has not reported stays PENDING, never GREEN ("a missing check is not a green
+# check"), and a red one stays RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"ci / lint","state":"SUCCESS"}]')"
+[ "$got" = "PENDING:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a required check that never reported is PENDING, not GREEN" $rc
+got="$(clreq 'pipeline-compliance' '[{"name":"pipeline-compliance","state":"FAILURE"}]')"
+[ "$got" = "FAILED:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red required check is FAILED on a non-review-gate repo" $rc
 
 # ── 3b) the classifier's POLARITY — an allow-list, not a deny-list ───────────────
 # agent-infra#1714: the classifier named the red conclusions and filed EVERYTHING ELSE as PENDING,
@@ -235,6 +273,7 @@ SH
     printf '%s\n' "OR='example/repo'"
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
+    printf '%s\n' "REVIEW_GATE='ai-review-gate'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -272,6 +311,14 @@ out="$( O="$TMP/O" PR=901 L="$TMP/claimtest2" bash -c "set -u; . '$TMP/claim.sh'
 case "$out" in *ALIVE*) rc=0 ;; *) rc=1; echo "      got '$out'";; esac
 ck "shipped claim block: a dead owner's claim is reclaimed" $rc
 fi
+# (c) ORDERING PIN (P2, 2026-10-14 review): the local lock must be taken BEFORE the log is
+# truncated, or a losing duplicate wipes the live winner's log (and its "cross-box claim:
+# acquired …" evidence) on its way to discovering it does not own the PR. Structural on the
+# shipped file, so the pre-fix ordering (truncate before the lock) is RED.
+lock_ln="$(grep -nF 'CLAIM="$O/state/mergeclaim-$PR.lock"' "$MERGE" | head -1 | cut -d: -f1)"
+trunc_ln="$(grep -nF '[merge $PR] start' "$MERGE" | head -1 | cut -d: -f1)"
+if [ -n "$lock_ln" ] && [ -n "$trunc_ln" ] && [ "$lock_ln" -lt "$trunc_ln" ]; then rc=0; else rc=1; echo "      lock line=$lock_ln truncation line=$trunc_ln"; fi
+ck "shipped merge-one: the local lock is taken BEFORE the log is truncated" $rc
 
 # ── 5) the shipped reaper un-blacklists only undelivered dispatches ──────────────
 # Extracted from refresh-candidates.sh and run against fixtures:
@@ -476,6 +523,7 @@ ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 # EXECUTES pi — so a sandbox HOME must expose a runnable pi, exactly as a real install's HOME does.
 mkdir -p "$SB/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmod +x "$SB/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
@@ -495,6 +543,9 @@ if [ -f "$PL" ]; then
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
 fi
+else
+  skipd "install.sh renders a plist (§6) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6b) install.sh on a fresh checkout: dir-only gitignore, .worktrees not created yet ─
 # install.sh is the FIRST step on a fresh box (README §4) and dispatch-merge.sh creates the
@@ -509,6 +560,7 @@ printf '.worktrees/\n' > "$FR/repo/.gitignore"
 ck "non-vacuity: the pre-fix bare .worktrees guard fails on a fresh checkout" $rc
 grep -q 'check-ignore -q .worktrees/' "$INST" && rc=0 || rc=1
 ck "install.sh's gitignore guard uses the directory form .worktrees/" $rc
+if on_darwin; then
 SB2="$TMP/sb2"; mkdir -p "$SB2/Library/LaunchAgents" "$SB2/.config" "$SB2/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
@@ -517,6 +569,9 @@ HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$T
 PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
+else
+  skipd "install.sh renders on a fresh checkout (§6b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6c) the self-test resolves REPO to the checkout, not its parent ─────────────
 # It passed `$HERE/../../..` (the PARENT of the repo root) to install.sh, which died
@@ -536,6 +591,7 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # Render in a sandbox with a CONTROLLED PATH whose tools live in one fixture dir: the rendered PATH
 # must contain it (so the check is red under the hardcoded base) and no shim/.pi segment. `uv` is
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
+if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
 for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
@@ -548,6 +604,9 @@ case ":$PLP:" in *":$FB:"*) rc=0;; *) rc=1; echo "      rendered PATH=$PLP lacks
 ck "the rendered plist PATH is resolved, not the pre-fix hardcoded base" $rc
 case ":$PLP:" in *"/shims"*|*"/.pi/"*) rc=1;; *) rc=0;; esac
 ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
+else
+  skipd "install.sh's plist PATH render checks (§6d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6e) install.sh CREATES the plist directory ─────────────────────────────────
 # Every sandbox above pre-creates $HOME/Library/LaunchAgents, so `mkdir -p "$(dirname "$PLIST")"`
@@ -555,6 +614,7 @@ ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
 # HOME has no such directory — the render died with a raw redirect error after $O's state dirs were
 # already created (the pre-fix half-install). Assert the directory is absent first (non-vacuity),
 # then that install succeeds and the plist exists.
+if on_darwin; then
 SB4="$TMP/sb4"; mkdir -p "$SB4/.config" "$SB4/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB4/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB4/.pi/agent/scripts/record-review.sh"
@@ -567,6 +627,9 @@ inst_rc=$?
 [ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
+else
+  skipd "install.sh creates the plist directory (§6e) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
@@ -662,9 +725,15 @@ ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped file
 GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/^  fi$/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
-mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM
+mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]
   ( L=$1; LANES=$2; SWTOTAL=$3; SWFREE=$4; MEM_UNKNOWN=$5; MEMAVAIL_MB=$6
     MAX_LOAD=$7; MAX_LANES=$8; MIN_SWAP_FREE=$9; MIN_MEM_FREE_MB=${10}; OPEN_N=0
+    # ⛔ WORKERS IS REQUIRED (P3.2, second review round, 2026-10-14). It was omitted, so
+    # `eval "$GATE_BLOCK"` emitted `WORKERS: unbound variable` SIX times on stderr and its FIRST
+    # line — `GATE_WHY="$(mp_reason … "$WORKERS")"` — never executed. Every assertion still passed
+    # because the gates below it produced the same GATE_WHY, so the gate chain's entry line was
+    # UNTESTED. The `WORKERS=${11:-0}` default and the stderr assertion below are the fix.
+    WORKERS=${11:-0}
     GATE_WHY=""; mp_reason() { :; }
     eval "$GATE_BLOCK"; printf '%s' "${GATE_WHY:-}" )
 }
@@ -672,6 +741,13 @@ mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_
 ck "the memory gate FIRES below the ceiling and names it (mem_avail<=min_mem_free_mb)" $rcw
 [ -z "$(mrw 1 0 0 9999 0 9999 100 4 600 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the memory gate does NOT fire when available memory is above the ceiling" $rcw
+# ⛔ The fixture omitted WORKERS, so the extracted chain's first line (`GATE_WHY="$(mp_reason …
+# "$WORKERS")"`) never ran and `WORKERS: unbound variable` went to stderr — silently, because a
+# command substitution's stderr is not captured by the assertions. Assert clean stderr, so the
+# entry line is actually exercised.
+mrw_err="$( { mrw 1 0 0 9999 0 9999 100 4 600 "$mem_def" >/dev/null; } 2>&1 )"
+[ -z "$mrw_err" ] && rc=0 || { rc=1; echo "      mrw stderr: $mrw_err"; }
+ck "the extracted gate-chain fixture runs with NO unbound-variable noise (WORKERS is set)" $rc
 # ⛔ The swap gate is the other half of "the binding gates in practice", and it was UNTESTED: §7's
 # default-agreement check only requires a limit to be NOT-UNSET, so setting MIN_SWAP_FREE to 0 in
 # BOTH files left the suite at 284/0 while the gate became `[ "$SWFREE" -le 0 ]`, which can never
@@ -787,28 +863,23 @@ review of this very file, and 19 of its checks fail when it is dropped into the
 MD
 grep -qE "$OVERC" "$TMP/overclaim.md" && rc=0 || rc=1
 ck "the drift guard matches the pre-fix phrasings (non-vacuous)" $rc
-# The REQUIRED-check count is the page's own invariant, not a drifting number: it is fixed by the
-# repo's protection. It must equal REQ and the README must never spell a different count beside
-# the list it ships (it said "eight"/"8" against a live set of 7).
-nreq="$(sed -n 's/^REQ="\(.*\)"$/\1/p' "$LOOP" | tr ' ' '\n' | grep -c .)"
-case "$nreq" in 7) rword=seven;; 8) rword=eight;; *) rword="" ;; esac
-[ -n "$rword" ] && grep -qE "($nreq|$rword) required check" "$HERE/README.md" && rc=0 || rc=1
-ck "README states the required-check count REQ has ($nreq)" $rc
+# The required-check set is PER-REPO now (agent-infra#1764): resolved from the target repo's
+# branch protection, with FALLBACK_REQ as the fail-closed last resort. A fixed count in the README
+# would be wrong for one of the two repos, so the guard is INVERTED: the README must DESCRIBE the
+# per-repo resolution, the shipped fallback must be non-empty (an unreadable endpoint must not
+# become an empty required set), and the README must not spell a fixed count beside it.
+nreq="$(sed -n 's/^FALLBACK_REQ="\(.*\)"$/\1/p' "$HERE/repo-authority.sh" | tr ' ' '\n' | grep -c .)"
+[ "$nreq" -ge 1 ] && rc=0 || { rc=1; echo "      fallback names: $nreq"; }
+ck "the shipped FALLBACK_REQ is NON-EMPTY ($nreq names — the unreadable-protection arm fails CLOSED)" $rc
+grep -q 'branch protection' "$HERE/README.md" && rc=0 || rc=1
+ck "README documents the per-repo required-check resolution" $rc
 numerals='([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten) required check'
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(grep -oE "$numerals" "$HERE/README.md")
-[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad required check'"; }
-ck "README never disagrees with REQ on the required-check count" $rc
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(printf 'read the 8 required checks\nand the eight required check names\n' | grep -oE "$numerals")
+bad="$(grep -oE "$numerals" "$HERE/README.md" | head -1)"
+[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad'"; }
+ck "README states no fixed required-check count (the set is per-repo now)" $rc
+bad="$(printf 'read the 7 required checks\nand the eight required check names\n' | grep -oE "$numerals" | head -1)"
 [ -n "$bad" ] && rc=0 || rc=1
-ck "non-vacuity: the required-count guard flags the pre-fix '8'/'eight' (saw '$bad')" $rc
+ck "non-vacuity: the count guard still flags a fixed count of required checks (saw '$bad')" $rc
 grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
 ck "README points at the self-test" $rc
 
@@ -830,9 +901,33 @@ if need "$TMP/saferef.sh" "safe_ref() is extracted from the shipped orch-loop.sh
   safe_ref "feat/1234-tm" && rc=0 || rc=1
   ck "shipped safe_ref() accepts a generated branch name" $rc
 fi
-is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 grep -q '^is_num() {' "$LOOP" && rc=0 || rc=1
 ck "the shipped loop defines is_num() for PR ids" $rc
+# ⛔ ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH (P3, third review round, 2026-10-14).
+# selftest.sh carried its OWN lenient `is_num` (`''|*[!0-9]*`, which ACCEPTS `08`) beside the
+# tightened copies in orch-loop.sh / merge-one.sh / fix-one.sh / install.sh. It was unused — every
+# driver in this file extracts and sources the SHIPPED predicate it is testing, not this one — so it
+# was a documentation hazard rather than a live defect. But it contradicted "all copies agree", and
+# the next reader to copy the nearest definition would take the lax form. The lenient copy is DELETED
+# and this check requires the tight form in every copy that exists, including this file's. Restoring
+# the lenient definition anywhere is RED.
+_tight='0*) return 1'
+_lax=0; _ndefs=0
+for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
+  _found=0
+  while IFS= read -r _d; do
+    [ -n "$_d" ] || continue
+    _found=1
+    case "$_d" in *"$_tight"*) ;; *) _lax=1; echo "      $_f has a lenient is_num(): $_d";; esac
+  # DEFINITIONS only (`^is_num() {`) — a bare `is_num() {` also appears inside this file's own
+  # extraction greps, and matching those would flag every one of them as a lenient copy.
+  done < <(grep -E '^[[:space:]]*is_num\(\) \{' "$_f" 2>/dev/null)
+  [ "$_found" = "1" ] && _ndefs=$((_ndefs+1))
+done
+[ "$_lax" = "0" ] && rc=0 || rc=1
+ck "every is_num() copy in the tree (including selftest's) rejects leading zeros and accepts 0" $rc
+[ "$_ndefs" = "4" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 4 shipped files that need it"; }
+ck "the four SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
 grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc
 grep -qE "'\\\$OR' \\\$PR '\\\$BR'" "$LOOP" && rc=1 || rc=0
@@ -859,10 +954,147 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   ck "shipped claim_live(): a dead owner is not in flight" $rc
   [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
   ck "shipped claim_live(): the stale claim file is removed" $rc
+  # ⛔ A FOREIGN OVERSIZED (>= 2**63) LEASE (P2, fourth review round, 2026-10-14). claim_acquire()
+  # treats such a lease as unparseable => LIVE (claims.sh's 18-digit bound; test-claims.sh §P3e seeds
+  # the same value), but claim_live() read the SAME datum with a bare `[ "$now" -le "$until" ]`,
+  # which ERRORS at 2**63 and — read as false — reported it DEAD. The two readers then disagreed
+  # forever: the controller reached the spawn branch EVERY cycle, fix-one.sh was refused by
+  # claim_acquire, wrote fixbail-<pr>-<head>, and refund_bailed_fixer deleted that marker AND
+  # `parked-<pr>` next cycle — so the cap never tripped and the PR was never parked. One refused
+  # spawn + 1 GitHub call + 3 remote round trips per cycle, indefinitely, on a PR no box could work.
+  # Drive the snapshot file the function actually reads, with a lease whose ONLY defect is magnitude.
+  CLSHA=deadbeefcafebabe0123456789abcdef01234567
+  printf 'refs/claims/3-%s\tforeignbox\t9223372036854775808\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  # The shipped CONFLICTING arm is `elif claim_live "$PR" "$HEAD" || sess "fix-$PR" || sess "merge-$PR"`;
+  # `false` stands in for a `sess` that finds no local worker session, so `spawn=yes` is exactly the
+  # fall-through that runs `tmux … fix-one.sh`.
+  spawn=no
+  if claim_live 3 "$CLSHA" || false; then :; else spawn=yes; fi
+  claim_live 3 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): an oversized (>=2**63) lease reports LIVE, not dead" $rc
+  [ "$spawn" = "no" ] && rc=0 || rc=1
+  ck "shipped claim_live(): no spawn is attempted for an oversized-lease claim" $rc
+  # ⛔ THE `0` SENTINEL IS NOT THE SAME AS ABSENT (P2, fifth review round, 2026-10-14). claims.sh
+  # documents `0` as "a claim exists whose lease is UNREADABLE" and treats it as LIVE (claim_acquire's
+  # `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via `[ "$until" != "0" ]`).
+  # `_lease_of` collapses a negative lease to the same `0` (its `[0-9]*` cannot match the minus sign),
+  # so `lease_until=-5` ARRIVES HERE AS `0`. claim_live used to read that `0` as DEAD while
+  # claim_acquire read the same datum as LIVE — the SAME disagreement as the oversized class above,
+  # with the same consequence (refund_bailed_fixer un-parks the PR every cycle, so the cap never
+  # trips). Drive the snapshot entry the function actually reads.
+  printf 'refs/claims/5-%s\tforeignbox\t0\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  spawn=no
+  if claim_live 5 "$CLSHA" || false; then :; else spawn=yes; fi
+  claim_live 5 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): an unreadable lease (0) reports LIVE, not dead" $rc
+  [ "$spawn" = "no" ] && rc=0 || rc=1
+  ck "shipped claim_live(): no spawn is attempted for an unreadable-lease claim" $rc
+  # The literal negative too — the form _lease_of collapses, and the one claim_prune reads as "keep"
+  # (never as reaped). The reader must AGREE on this row as well.
+  printf 'refs/claims/6-%s\tforeignbox\t-5\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  claim_live 6 "$CLSHA" && rc=0 || rc=1
+  ck "shipped claim_live(): a negative lease reports LIVE, matching claim_acquire/claim_prune" $rc
+  # Non-vacuity: an entry ABSENT from the snapshot is still NOT live. Without this the fix could be
+  # "return 0 always" and every assertion above would still pass.
+  printf 'refs/claims/999-%s\tforeignbox\t1799999999\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
+  claim_live 6 "$CLSHA" && rc=1 || rc=0
+  ck "shipped claim_live(): a PR absent from the snapshot is NOT live (the sentinel fix is not vacuous)" $rc
 fi
 
-grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
-ck "a non-review required check failure is routed to the fixer" $rc
+# ── 15) a BAILED fixer refunds its attempt and restores the findings marker ─────
+# fix-one.sh exits 0 when the cross-box CAS refuses it, having done NO work. The controller booked
+# the attempt at spawn and (on the reviewer-findings arm) deleted the findings marker there, so
+# before this refund three refusals PARKED a PR no fixer ever touched, with the reviewer's findings
+# gone. The function is EXTRACTED and DRIVEN, not grepped (P2, second review round, 2026-10-14).
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^refund_bailed_fixer() {/,/^}/p' "$LOOP"; } > "$TMP/refund-all.sh"
+if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted from the shipped orch-loop.sh"; then
+  mkdir -p "$TMP/RB/state"; O="$TMP/RB"; LOG="$TMP/RB/loop.log"; : > "$LOG"
+  # shellcheck disable=SC1090
+  . "$TMP/refund-all.sh"
+  # (a) reviewer-findings arm: booked to 2, findings marker deleted at spawn, bail recorded.
+  echo 2 > "$O/state/fixcount-77"; : > "$O/state/fixbail-77-abc"; : > "$O/state/parked-77"
+  refund_bailed_fixer 77 abc 1
+  if [ "$(cat "$O/state/fixcount-77" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-77-abc" ] \
+     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no)"; fi
+  ck "a bailed fixer refunds the attempt AND restores the findings marker" $rc
+  # (b) CI-red / CONFLICTING arm: no findings marker was deleted, so NONE may be invented.
+  rm -f "$O/state/needsfix-88-abc" "$O/state/parked-88"; echo 1 > "$O/state/fixcount-88"; : > "$O/state/fixbail-88-abc"
+  refund_bailed_fixer 88 abc 0
+  [ "$(cat "$O/state/fixcount-88" 2>/dev/null)" = "0" ] && [ ! -f "$O/state/needsfix-88-abc" ] && rc=0 || rc=1
+  ck "a bail on an arm that deleted no findings marker does not invent one" $rc
+  # (c) NO bail marker -> nothing to refund. Non-vacuity: the refund is conditional on a real bail.
+  echo 3 > "$O/state/fixcount-99"; refund_bailed_fixer 99 abc 1
+  [ "$(cat "$O/state/fixcount-99" 2>/dev/null)" = "3" ] && [ ! -f "$O/state/needsfix-99-abc" ] && rc=0 || rc=1
+  ck "no bail marker means no refund (the refund is not unconditional)" $rc
+  # (d) a leading-zero fixcount must not reach `$(( 08 ))` — is_num normalises it first.
+  echo 08 > "$O/state/fixcount-55"; : > "$O/state/fixbail-55-abc"; refund_bailed_fixer 55 abc 0
+  [ "$(cat "$O/state/fixcount-55" 2>/dev/null)" = "0" ] && rc=0 || { rc=1; echo "      got '$(cat "$O/state/fixcount-55" 2>/dev/null)'"; }
+  ck "a leading-zero fixcount is normalised by is_num (no arithmetic abort)" $rc
+  # (e) ⛔ THE ORDERING AT THE THIRD CALL SITE, DRIVEN (P2, third review round, 2026-10-14). The
+  # CONFLICTING arm and the ai-review-gate arm read the count AFTER the refund; the CI-red arm read
+  # it BEFORE, so the decrement was immediately overwritten by `NFC2 + 1` and a bailed fixer still
+  # consumed an attempt. Three no-op cross-box refusals PARKED the PR as needs-a-human. The block
+  # below extracts the THREE statements of the SHIPPED CI-red arm IN FILE ORDER and runs them on a
+  # fixture: start=3 with a bail marker must leave NFC2=2 (refunded, then read) — not 3. Moving the
+  # read back above the refund is RED, and the cap predicate on the shipped NFC2 is then false, so
+  # the arm spawns instead of parking.
+  awk 'index($0,"# CI-red arm (agent-infra")>0{b=1}
+       b&&index($0,"if grep -q python-ci-gate")>0{b=0}
+       b' "$LOOP" \
+    | grep -E '^ *(NFC2=|is_num "\$NFC2"|refund_bailed_fixer "\$PR")' > "$TMP/ci-arm-seq.sh"
+  if need "$TMP/ci-arm-seq.sh" "the CI-red arm's refund+read sequence is extracted from the shipped loop"; then
+    rm -f "$O/state/fixcount-231" "$O/state/fixbail-231-abc" "$O/state/parked-231"
+    echo 3 > "$O/state/fixcount-231"; : > "$O/state/fixbail-231-abc"; : > "$O/state/parked-231"
+    PR=231; HEAD_N=abc; MAX_FIX_TRIES=3; NFC2=unset
+    # shellcheck disable=SC1090
+    eval "$(cat "$TMP/ci-arm-seq.sh")"
+    if [ "${NFC2:-x}" = "2" ] && [ "$(cat "$O/state/fixcount-231" 2>/dev/null)" = "2" ] \
+       && [ "${NFC2:-0}" -lt "${MAX_FIX_TRIES:-3}" ]; then rc=0
+    else rc=1; echo "      CI-red arm: NFC2='${NFC2:-}' fixcount='$(cat "$O/state/fixcount-231" 2>/dev/null)' parked=$([ -f "$O/state/parked-231" ] && echo yes || echo no)"; fi
+    ck "the CI-red arm refunds BEFORE reading the count (start=3 -> NFC2=2 < cap, respawn not PARK)" $rc
+  fi
+fi
+
+# The CI-red arm is DERIVED from the repo's required set now (#1764): the pre-fix form named
+# tortoise's five checks as a literal, so a red `pipeline-compliance` on agent-infra matched
+# nothing and the PR sat red with no worker. Pin BOTH halves — the literal is gone AND the arm is
+# driven by $REQ — so a revert to a name list, or a broken derivation, is RED.
+grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=1 || rc=0
+ck "the CI-red arm no longer names tortoise's checks as a literal" $rc
+grep -q 'CI_RED=' "$LOOP" && rc=0 || rc=1
+ck "the CI-red arm derives its red name from the required set" $rc
+# The derivation is EXTRACTED and DRIVEN against both repo shapes: a red pipeline-compliance must
+# be recognised as a required name (fixer), and the review gate must be excluded (it has its own
+# arm), on agent-infra's set and on tortoise's.
+sed -n '/^        RERUN_RED=/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
+if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the shipped orch-loop.sh"; then
+  REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'; V='FAILED:pipeline-compliance'
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "pipeline-compliance" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' req=$REQ"; }
+  ck "CI-red derivation: a red agent-infra required check is recognised (no name list needed)" $rc
+  REQ='pipeline-compliance'; V='FAILED:ci / lint'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (non-required must not route)"; }
+  ck "CI-red derivation: a non-required red does not route to the fixer" $rc
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:ai-review-gate,docs'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "docs" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (review gate must be excluded)"; }
+  ck "CI-red derivation: the review gate is excluded (it has its own arm), tortoise's docs still routes" $rc
+  # Review P2, round 1 — the RERUN carve-out: python-ci-gate is owned by the rerun block at the
+  # bottom of the case, exactly as in the pre-#1764 arm, so a flaky CI lane must NOT route to the
+  # code-pushing fixer (it would also double-fire: rerun AND fixer).
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:python-ci-gate'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (python-ci-gate must stay with the rerun block, not the fixer)"; }
+  ck "CI-red derivation: python-ci-gate is EXCLUDED (the rerun block owns it — the pre-#1764 carve-out is preserved)" $rc
+fi
 grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the CI-red fixer is logged and capped like other fix loops" $rc
 grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
@@ -1113,6 +1345,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
+if on_darwin; then
 PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
@@ -1130,6 +1363,9 @@ done
 got="$(render_scope __UNSET__)"
 [ "$got" = "auto" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted 'auto'"; }
 ck "an UNSET SCOPE renders the auto default" $rc
+else
+  skipd "install.sh's plist SCOPE render checks (§16b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # set-but-EMPTY is FATAL on BOTH launchers — a blank plist / keys.env entry must not become `auto`,
 # which is the shared-queue drain the override exists to prevent. install.sh:
@@ -1141,21 +1377,46 @@ ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
 # PATH — under the very regression this check guards (a validator that passes), the supervisor would
 # otherwise create a REAL session and execute the live controller.
-mkdir -p "$TMP/cellhome/.pi/agent/scripts" "$TMP/cellrepo/.git"
+# A fixture harness that is a REAL checkout at a REAL ref. Since #1745 cmd_check runs
+# cmd_check_provenance, which asks WHICH COMMIT the harness is: a harness that is a bare copy of
+# $HERE (untracked), or HEAD of a PR merge commit (diverged), is refused `DRIFT (...)`, and the
+# SCOPE/key verdicts below are then never reached. Build a throwaway repo whose origin/main IS its
+# HEAD and point every supervisor invocation in 16d-16f at $HFIX_H. HARNESS_FETCH=0 keeps the
+# suite offline (the supervisor default is 1).
+HFIX="$TMP/hfix"; HFIX_H="$HFIX/scripts/orchestrator-harness"
+git init -q "$HFIX"
+git -C "$HFIX" config user.email selftest@test.local
+git -C "$HFIX" config user.name selftest
+git -C "$HFIX" config commit.gpgsign false
+mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+# #1717: the checkout `start` provisions the recorder from is `$HARNESS/../record-review.sh`, and the
+# recorder's declared sibling must sit beside it — so the PAIR is committed into the fixture checkout.
+# Untracked, it would also make the tree dirty and the #1745 provenance gate would refuse it.
+mkdir -p "$HFIX/scripts/lib"
+printf '#!/bin/bash\nexit 0\n' > "$HFIX/scripts/record-review.sh"; chmod +x "$HFIX/scripts/record-review.sh"
+printf '#!/usr/bin/env python3\n' > "$HFIX/scripts/lib/diff-normalize.py"
+git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
+git -C "$HFIX" branch -M main
+git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
+
+git init -q "$TMP/cellrepo"
 # #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
-# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
-# shapes that do not.
+# dependency probe needs one — the stub is for the shapes that do not die at validate_scope() first.
+# The recorder's declared sibling must exist too (non-empty), or cmd_check refuses the cell on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
 printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
 chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
-# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
-mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
 # #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the CI runner `pi` is not
 # installed, so every fixture that reaches that probe must stub it instead of leaning on the host
 # PATH — otherwise the suite reddens on the runner only (the #1348/#1369 lane-split class). git and
 # python3 are stubbed too so the probe is hermetic rather than host-dependent.
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; done
+# The runtime-dependency probe (#1717) needs `pi` on PATH and the CI runner does not install it, so
+# it alone is stubbed. `git`/`python3` must be REAL: the #1745 provenance gate runs `git rev-parse`
+# in $HFIX and repo-authority's `_normalise_set` runs Python — a stub `git` (empty output) makes
+# every `check`/`start` below die `cannot resolve origin/main in $HFIX` before the key verdicts run.
+printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/pi"; chmod +x "$STUB_TM/pi"
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1169,7 +1430,7 @@ chmod +x "$STUB_TM/tmux"
 # session-file clause below could never fire and a mutant that started a real session would surface
 # only through the refusal-message clause. Created empty, the stub still reports has-session=absent.
 mkdir -p "$TMP/sup-empty"
-( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
 # ONE conjunction. This was two statements and the second RECOMPUTED rc from its own exit status,
 # discarding the first — so a mutant that created the session and only then died with the SCOPE
@@ -1183,7 +1444,7 @@ ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted value
 # preflight that certifies a SCOPE its own `start` then dies on is a FALSE PASS on the only question
 # that verdict answers. Driven with a value NEITHER subcommand accepts, and both halves asserted: the
 # refusal names the accepted values, AND the certification line is absent.
-( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" check >"$TMP/sup.chkbad.out" 2>"$TMP/sup.chkbad.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.chkbad.err" \
   && ! grep -qF 'CELL CAN RUN A CONTROLLER' "$TMP/sup.chkbad.out" && rc=0 \
@@ -1218,9 +1479,13 @@ SB5="$TMP/sb5"; mkdir -p "$SB5/Library/LaunchAgents" "$SB5/.config" "$SB5/.pi/ag
 ln -s "$HOME/.config/gh" "$SB5/.config/gh" 2>/dev/null || true
 mkdir -p "$SB5/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB5/.local/share/pi-node/current/bin/pi"; chmod +x "$SB5/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 ( HOME="$SB5" O="$TMP/clean-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.clean.err" ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh refused a clean \$O: $(tail -2 "$TMP/inst.clean.err")"; }
 ck "install.sh accepts a clean \$O (non-vacuity for the guard loop below)" $rc
+else
+  skipd "install.sh accepts a clean \$O (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
   ( HOME="$SB5" O="$TMP/$bad" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.og.err" ); rc=$?
   [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.og.err" && rc=0 \
@@ -1236,6 +1501,7 @@ ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
 # A ZERO-BYTE key file is not a key: `-f` blessed it, and the daemon then recorded reviews
 # UNSIGNED and failed ai-review-gate — the env-only failure with the file branch taken (README §7.4).
+if on_darwin; then
 : > "$SB/.pi/agent/.ai-review-gate-key"
 ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
 case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed an empty key file" ;; *) rc=0 ;; esac
@@ -1260,13 +1526,20 @@ chmod 600 "$SB/.pi/agent/.ai-review-gate-key"
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      install.sh did not name an unreadable key file: $(printf '%s\n' "$ikout" | grep -i 'key' | head -2)";; esac
 ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" $rc
+else
+  skipd "install.sh's gate-key file verdict (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
 # the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
 # documentation, not a setting. Drive the shipped cmd_start with a tmux stub that records the
 # command it is handed (this is the only place the forwarding can be observed).
-TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
+TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
+# A REAL checkout, not a mocked `.git` directory (see the §16fixture below): since #1745 cmd_check
+# verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
+# before any session command can be recorded.
+git init -q "$TMP/tm/repo"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
 # provision path) as the canonical copy one directory up from the harness. Both are placed so no
@@ -1280,8 +1553,9 @@ chmod +x "$TMP/tm/record-review.sh"
 # #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
 mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
 printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
-# …and the runtime-dependency probe needs `pi` (absent on the CI runner) and the other two, stubbed.
-for c in pi git python3; do printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; done
+# …and the runtime-dependency probe (#1717) needs `pi` on PATH (absent on the CI runner), so it is
+# stubbed. `git`/`python3` stay REAL for the same reason as $STUB_TM above (`start` here pins $HFIX).
+printf '#!/bin/bash\nexit 0\n' > "$TM/pi"; chmod +x "$TM/pi"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
@@ -1300,11 +1574,11 @@ sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
   rm -f "$TMP/tm/up" "$TMP/tm/cmd"
   if [ "$1" = "__UNSET__" ]; then
     env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   else
     PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE="$1" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE="$1" \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   fi
 }
@@ -1318,7 +1592,7 @@ done
 # die BEFORE a session is created (nothing started, no tmux command recorded).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
@@ -1331,7 +1605,7 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # enables the break-out — not merely the class as a whole.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
@@ -1341,7 +1615,7 @@ ck "a metacharacter in \$O is refused before any session is created" $rc
 # was a live injection (a quote in OR broke out of the sh -c string and executed a command).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1350,14 +1624,14 @@ ck "a metacharacter in \$OR is refused before any session is created" $rc
 # match: a guard that lost only the quote alternatives must still go red here.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x'q" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x'q" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1379,7 +1653,7 @@ mkdir -p "$TMP/tm/home/.pi/agent"
 printf 'secret\n' > "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 chmod 000 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 supchk="$( env -u AI_REVIEW_GATE_KEY PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1 )"
 chmod 600 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 rm -f "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
@@ -1390,7 +1664,13 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
 # ambient-only export does NOT (tmux serves a new session the server's environment). Reporting the
 # ambient one as "present" was a false green on a cell that merges without the key.
-KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
+KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
+# ⛔ A REAL checkout, not a mocked `.git` directory. `mkdir -p "$KC/repo/.git"` passed the old
+# `[ -d "$REPO/.git" ]` test, but since #1745 cmd_check asks the real question —
+# `git -C "$REPO" rev-parse --git-dir` — because a LINKED worktree has a `.git` FILE, and the old
+# `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
+# must be one or every case below dies at the repo gate before reaching the key verdicts.
+git init -q "$KC/repo"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
 mkdir -p "$KC/home/.pi/agent/scripts"
@@ -1406,10 +1686,10 @@ printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
     env "$2" PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   else
     PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   fi
 }
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys.env" '' )"
@@ -1428,7 +1708,7 @@ ck "an EMPTY key in keys.env is NOT reported present" $rc
 # operator who exported the key ambiently gets a keyless cell and no signal otherwise.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
@@ -1436,7 +1716,7 @@ ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # (filtering on just the two easy-to-grep verdicts left this one silent).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr2" in *'AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr2" | tail -2)" ;; esac
 ck "the start path surfaces the no-key verdict on stderr" $rc
@@ -1471,7 +1751,7 @@ ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
 # signal the operator gets.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
@@ -1544,11 +1824,22 @@ printf '#!/bin/bash\necho 200\n' > "$BG/stub/curl"
 printf '#!/bin/bash\necho LANE_READY\n' > "$BG/stub/pi"
 printf '#!/bin/bash\nshift; exec "$@"\n' > "$BG/stub/timeout"
 printf '#!/bin/bash\nexit 0\n' > "$BG/stub/docker"
+# ⛔ `uv` and `tmux` are REQUIRED BY cloud-cell-bringup.sh's own toolchain check
+# (`check_tools`: `for c in git gh node python3 uv tmux`), so they must be stubbed here exactly
+# like the tools above. Without them this check passes ONLY on a box that happens to have both,
+# and the shard is RED on the Linux CI runner — the ubuntu-24.04 image ships neither (verified
+# against actions/runner-images Ubuntu2404-Readme.md, which lists no `uv` and no `tmux`). That is
+# the measured difference between a dev container (selftest.sh 330/0) and `bash-suites` on
+# agent-infra#1769 (`==> 328 passed, 2 failed`, both bringup checks): a platform-dependent
+# dependency smuggled into the shard list BOTH lanes run, which is the #1369 class itself.
+printf '#!/bin/bash\nprintf "uv 0.0.0-stub\\n"\n' > "$BG/stub/uv"
+printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
 GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
-  WORKDIR="$BG/work" ENV_FILE= bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
+  WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
+  bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
   [ "$(cat "$TMP/bg-gh-home.txt")" = "$BG/home" ] && rc=0 || { rc=1; echo "      bringup's gh saw HOME=$(cat "$TMP/bg-gh-home.txt"), cell home is $BG/home"; }
 else
@@ -1697,15 +1988,18 @@ if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; the
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
 fi
-# Assert each of the four spawn SITES, not a count — a count is satisfied by decoy comments,
+# Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
+# NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
+# and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# Each is asserted to carry can_spawn, which is the property under test.
 fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "2" ] && rc=0 || rc=1
 ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
-[ "$merge_site" = "1" ] && rc=0 || rc=1
-ck "the merge re-review spawn carries the load gate" $rc
+[ "$merge_site" = "2" ] && rc=0 || rc=1
+ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
@@ -1961,11 +2255,59 @@ ck "the reaper reads the log mtime through file_mtime_epoch() and skips on unkno
 # files' effective defaults — a divergence there would only surface ON a Linux host, so pin it here.
 grep -q 'nproc 2>/dev/null' "$INST" && rc=0 || rc=1
 ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on any host)" $rc
+# ⛔ AND install.sh MUST CARRY THE SAME GUARD (P3, third review round, 2026-10-14). orch-loop.sh
+# coerces `_NCPU` on the line above its only read; install.sh had NO is_num at all, so a `sysctl`
+# that SUCCEEDS while printing garbage (or empty) made `$(( 10#$_NCPU * 10 ))` a syntax error that
+# ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back to 4 as the loop
+# does. Extract the shipped lines and DRIVE them with a sysctl stub: a missing guard is a hard
+# failure, not a cosmetic difference from the loop. Red on the pre-fix install.sh.
+# ⛔ AND THE EXTRACTION MUST TAKE THE WHOLE GUARD (P3, fifth review round, 2026-10-14). The pattern
+# used to name `is_num("${_NCPU` explicitly; install.sh now uses `is_limit` (the magnitude bound)
+# plus the `_NCPU >= 1` probe guard, so an extraction that still named the old lines would miss the
+# newly added ones and drive an incomplete block. It is a RANGE: from the predicate definitions
+# through the last MAX_LOAD guard, so any guard added inside it is picked up automatically.
+sed -n '/^_NCPU=/,/^is_limit "${MAX_LOAD:-}"/p' "$INST" > "$TMP/ncpu-inst.sh"
+if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
+  _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
+  [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
+  ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
+  # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
+  _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
+  [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
+  ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
+  # ⛔ THE PRODUCTION PATH'S OWN WRAP (P3, fifth review round, 2026-10-14). install.sh substitutes
+  # __MAX_LOAD__ into the LIVE plist, so an absurd-but-numeric `_NCPU` here — not in the loop — was
+  # the one that actually wrote `MAX_LOAD=0` into a running box. 2**63 * 10 wraps to exactly 0 and
+  # every guard accepts 0, so this is RED on the pre-fix install.sh (which had is_num only).
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
+  _nout3="$(bash "$TMP/ncpu-drive3.sh" 2>&1)"
+  [ "$_nout3" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 40 (not 0)"; }
+  ck "install.sh bounds an absurd _NCPU so the plist cannot get MAX_LOAD=0 (would dispatch nothing)" $rc
+  # A 0-valued probe is a failed probe: the same guard as the loop's.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
+  _nout4="$(bash "$TMP/ncpu-drive4.sh" 2>&1)"
+  [ "$_nout4" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 40 (not 0)"; }
+  ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=40, not 0)" $rc
+  # The other wrap a MAX_LOAD-only guard cannot see: a 9-digit probe is IN range, but its product is
+  # 10 digits and never binds. Only the true-default fallback catches it.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
+  _nout5="$(bash "$TMP/ncpu-drive5.sh" 2>&1)"
+  [ "$_nout5" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 40"; }
+  ck "install.sh falls back to 40 for a product that outgrows the 9-digit bound" $rc
+  # ⛔ A DELIBERATE plist MAX_LOAD=0 MUST STILL BE ACCEPTED (keep the `0) : ;;` arm): the loop's
+  # second guard bounds the DERIVATION, never a value that passes is_limit. Non-vacuity for the fix.
+  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive6.sh"
+  _nout6="$(MAX_LOAD=0 bash "$TMP/ncpu-drive6.sh" 2>&1)"
+  [ "$_nout6" = "0" ] && rc=0 || { rc=1; echo "      a deliberate MAX_LOAD=0 became '$_nout6', expected 0"; }
+  ck "install.sh still accepts a deliberate plist MAX_LOAD=0 (only the derivation is bounded)" $rc
+fi
 # ⛔ ORDER, not presence: the `_NCPU` coercion was added in the input-validation block, ~30 lines
 # AFTER `MAX_LOAD="${MAX_LOAD:-$(( _NCPU * 10 ))}"` — its only read. A guard that runs after the
 # arithmetic cannot protect it ("dead-guard"), so the property to pin is that the coercion line
 # PRECEDES the MAX_LOAD line. Both are asserted line-ordered; the check fails on the pre-fix file.
-_ncpu_guard_line="$(grep -n 'is_num "${_NCPU:-}"' "$LOOP" | head -1 | cut -d: -f1)"
+_ncpu_guard_line="$(grep -n 'is_limit "${_NCPU:-}"' "$LOOP" | head -1 | cut -d: -f1)"
 _maxload_line="$(grep -n '^MAX_LOAD="' "$LOOP" | head -1 | cut -d: -f1)"
 [ -n "$_ncpu_guard_line" ] && [ -n "$_maxload_line" ] && [ "$_ncpu_guard_line" -lt "$_maxload_line" ] && rc=0 || rc=1
 ck "orch-loop.sh coerces _NCPU BEFORE MAX_LOAD reads it (guard is not guard-after-use)" $rc
@@ -1974,20 +2316,36 @@ ck "orch-loop.sh coerces a non-numeric MAX_LOAD instead of letting the load gate
 # ⛔ Behaviour, not source text. The grep above restates the implementation line, and every other
 # fixture in this file sets MAX_LOAD to a valid integer, so nothing ever DROVE the coercion. Extract
 # the shipped coercion lines and run them, the way the memory and swap gates are driven above.
-NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; } )"
+# ⛔ THE CYC FLOOR IS MATCHED ON AN ANCHORED CODE LINE, not by substring (P3, fourth review round,
+# 2026-10-14). `grep -F '[ "$CYC" -ge 5 ] || CYC=240'` also matched the COMMENTED-OUT line
+# (`# [ "$CYC" -ge 5 ] || CYC=240`), so commenting the floor out still satisfied the extraction —
+# the guard could not fail while the comment text survived. The `^` is an ANCHOR here, which `-F`
+# would have taken literally (verified: `grep -F '^x'` matches nothing), so this is an anchored
+# BRE. The behavioural assertion below is the real gate; this only makes the extraction honest.
+NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E '^is_(num|limit) "\$\{[A-Z_]+:' "$LOOP"; grep '^\[ "\$CYC" -ge 5 \] || CYC=240' "$LOOP"; } )"
 # ⛔ Non-vacuity: NGRD ALWAYS contains the is_num() definition, so `[ -n "$NGRD" ]` passes with zero
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-[ "$_ngrd_n" = "12" ] && rcn=0 || { rcn=1; echo "      expected 12 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 12 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# a coercion added without its pin must redden this check, not pass as "more is better".
+[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
+# explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
+# CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
+# make the fix look broken. Non-vacuity: require the floor line to be present in the extraction, again
+# ANCHORED so a commented-out floor cannot satisfy it, and via a here-string (the `printf … | grep -q`
+# form is the #841 SIGPIPE false-negative idiom that scripts/check-no-sigpipe-grep.sh rejects).
+grep -q '^\[ "\$CYC" -ge 5 \] || CYC=240' <<<"$NGRD" && rcf=0 || { rcf=1; echo "      the CYC floor line is missing from the extraction"; }
+ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" $rcf
 # <MAX_LOAD> <MAX_LANES> <MERGE_PRIORITY_AT> <BATCH>, with MAX_REVIEW/MAX_FIX/MAX_FIX_TRIES/STALE_MIN
 # unset and CYC non-numeric -> the values the shipped coercion leaves behind
 # ⛔ HERMETIC: every variable the coercion block touches is set explicitly. Leaving them unset is not
 # enough -- an earlier section sets STALE_MIN=1, the subshell inherits it, is_limit sees a valid value
 # and does not coerce, and the assertion then measures the wrong thing while still passing its shape.
-nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"
-           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; CYC=abc; STALE_MIN=
+nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
+           MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
 [ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
@@ -1999,6 +2357,75 @@ ck "numeric plist limits survive the coercion unchanged" $rc
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
 [ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
+# ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
+# passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
+# — which re-derived from the SAME unbounded `_NCPU` and could therefore leave an out-of-range value
+# in place. Extract the shipped `_NCPU` guard + derivation + coercion and DRIVE it with an absurd
+# probe, whose magnitude WRAPS (it does not abort), so the range guard cannot see it downstream.
+# The block always carries the two is_* DEFINITIONS, so a non-empty extraction proves nothing; the
+# `a sane _NCPU still derives MAX_LOAD=cores*10` assertion below IS the non-vacuity guard (it can
+# only pass if the derivation line was evaluated).
+{ grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; sed -n '/^is_limit "\${_NCPU:-}"/,/^[[:space:]]*is_limit "\${MAX_LOAD:-}"/p' "$LOOP"; } > "$TMP/maxb.sh"
+if need "$TMP/maxb.sh" "the shipped _NCPU guard + MAX_LOAD derivation are extracted"; then
+  MAXB="$(cat "$TMP/maxb.sh")"
+  maxload_probe() { ( _NCPU="$1"; MAX_LOAD="$2"; eval "$MAXB"; printf '%s' "$MAX_LOAD" ); }
+  [ "$(maxload_probe 12 '')" = "120" ] && rc=0 || { rc=1; echo "      _NCPU=12 -> '$(maxload_probe 12 '')', expected 120"; }
+  ck "a sane _NCPU still derives MAX_LOAD=cores*10 through the shipped block" $rc
+  # A 0-valued probe is a FAILED probe: `10 * 0` = 0 passes is_limit and `[ "$L" -ge 0 ]` is always
+  # true, so the load gate closes forever. The `_NCPU >= 1` guard converts it to the default.
+  [ "$(maxload_probe 0 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=0 -> '$(maxload_probe 0 '')', expected 40 (not 0)"; }
+  ck "a 0-valued _NCPU probe is treated as failed (MAX_LOAD=40, not a gate that never opens)" $rc
+  [ "$(maxload_probe 99999999999999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=1e20 -> '$(maxload_probe 99999999999999999999 '')', expected 40"; }
+  ck "an absurd _NCPU (>= 2**63) falls back to 40, not a 19-digit load gate that never binds" $rc
+  # The other wrap, and the one a MAX_LOAD-only guard CANNOT catch: 2**63 * 10 wraps to 0, and
+  # `is_limit 0` is TRUE (install.sh allows 0 for every limit but CYC), so `[ "$L" -ge 0 ]` is always
+  # true and the controller dispatches nothing, forever. Only bounding the PROBE closes it.
+  [ "$(maxload_probe 9223372036854775808 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=2**63 -> '$(maxload_probe 9223372036854775808 '')', expected 40"; }
+  ck "an _NCPU that wraps the product to 0 (which passes is_limit) is bounded to 40" $rc
+  # A 9-digit _NCPU is in range, but its product is 10 digits and still under 2**63 — `[ -ge ]` does
+  # not error, it just never binds, so ONLY the true-default fallback catches it.
+  [ "$(maxload_probe 999999999 '')" = "40" ] && rc=0 || { rc=1; echo "      _NCPU=999999999 -> '$(maxload_probe 999999999 '')', expected 40"; }
+  ck "a product that outgrows the 9-digit bound falls back to 40, not a gate that never binds" $rc
+  [ "$(maxload_probe 99999999999999999999 30)" = "30" ] && rc=0 || { rc=1; echo "      absurd _NCPU + MAX_LOAD=30 -> '$(maxload_probe 99999999999999999999 30)'"; }
+  ck "a valid plist MAX_LOAD survives even an absurd _NCPU (the derivation is bounded, not the value)" $rc
+fi
+# ⛔ LEADING ZEROS — the third failure mode, and the one the FIRST fix missed (P1/P2, second review
+# round, 2026-10-14). `is_num` used `''|*[!0-9]*`, which ACCEPTS `08`; that reached `$(( 08 + … ))`,
+# where bash parses base 0 (leading 0 = OCTAL) and `08` is not octal. On /bin/bash 3.2.57 the failed
+# arithmetic ASSIGNMENT aborts the rest of the enclosing block and resumes after it with status 0 —
+# so `CYC=08` DISCARDED the controller's `while true` loop (exit 0 after one cycle, relaunch-per-cycle
+# under KeepAlive) and `REVIEW_TIMEOUT=08` silently skipped claim_acquire. `is_limit` delegates to
+# `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
+# that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
+# single `0`-followed-by-digit forms.)
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
+# ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
+# integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
+# cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
+# The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
+# drops the floor line leaves cyc=0 here — RED.
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
+# Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+ck "a deliberate small CYC=5 survives the floor unchanged" $rc
+# And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
+# `is_num 08` must be FALSE, while `0` and a real number stay true.
+{ grep -m1 '^is_num() {' "$LOOP"; } > "$TMP/isnum.sh"
+_isnum_ok=1
+( . "$TMP/isnum.sh"
+  is_num 08 && exit 1
+  is_num 09 && exit 1
+  is_num 030 && exit 1
+  is_num 0  || exit 1
+  is_num 8  || exit 1
+  is_num 1800 || exit 1
+  is_num '' && exit 1
+  is_num abc && exit 1
+  exit 0 ) || _isnum_ok=0
+[ "$_isnum_ok" = "1" ] && rc=0 || { rc=1; echo "      the shipped is_num() still accepts a leading-zero or non-number value"; }
+ck "the shipped is_num() rejects leading zeros and non-numbers, accepts 0 and real numbers" $rc
 # ⛔ MAX_LOAD's DEFAULT -- not its coercion -- decides the value when the plist does not set one, and
 # every other fixture passes MAX_LOAD explicitly, so `_NCPU * 10` -> `_NCPU * 5` in BOTH files stayed
 # green. Pin the FORMULA, which is host-independent even though its evaluation is not.
@@ -2015,6 +2442,7 @@ grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
 ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
 grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
 ck "the reaper reads STALE_MIN in base 10" $rc
+if on_darwin; then
 # ── install.sh's render guards, DRIVEN (not grepped) ─────────────────────────────
 # Source-text pins are exactly what this file was told to stop doing: `if false && grep …` leaves the
 # text intact and the guard dead. So RUN the real installer. This is §6's sandbox pattern, seeded with
@@ -2043,6 +2471,23 @@ ck "install.sh refuses a non-integer limit AND leaves the live plist untouched" 
 out="$(run_inst "$(mk_sb)" MAX_LANES=99999999999999999999)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      huge MAX_LANES -> '$out'"; }
 ck "install.sh refuses an out-of-range limit (>=2**63, where [ errors and the gate fails OPEN)" $rc
+# ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14): install.sh's `''|*[!0-9]*` accepted
+# `08`, rendered it into the plist and exited 0 — while the loop now COERCES it to the default, so
+# the plist would LIE about the ceiling. Refusing loudly is the only consistent behaviour: a value
+# this installer accepts must be the value the loop uses. Pre-fix this case exits 0 (RED).
+out="$(run_inst "$(mk_sb)" CYC=08)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=08 -> '$out'"; }
+ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched" $rc
+# ⛔ CYC=0 (P3, third review round, 2026-10-14): a VALID integer that passes the range loop and then
+# makes the loop `sleep 0` — a zero-delay cycle that re-hits the GitHub API. Refused here, floored in
+# the loop, so the two ends cannot disagree. Pre-fix this case exits 0 (RED).
+out="$(run_inst "$(mk_sb)" CYC=0)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=0 -> '$out'"; }
+ck "install.sh refuses CYC=0 (a zero-delay cycle) and leaves the live plist untouched" $rc
+# Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
+SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }
+ck "install.sh accepts a deliberate small CYC=5 (the floor is not a blanket refusal)" $rc
 out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
@@ -2096,6 +2541,9 @@ grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
 ck "the freshly rendered plist is valid XML" $rc
+else
+  skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -2175,8 +2623,16 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
   # command completes, so a bare `sleep "$CYC"` deferred the stop for up to the whole cycle
   # (measured 5.07s of a 6s sleep, vs 0.09s for `sleep … & wait $!`). Drive the SHIPPED line with
   # CYC=8 and require the stop inside 4s, so a revert to the bare sleep fails here.
-  grep -m1 '^  sleep "\$CYC" & wait \$!$' "$LOOP" > "$TMP/cycsleep.sh"
+  # ⛔ Extract from the JIT assignment THROUGH the backgrounded sleep, not just the sleep line
+  # (agent-infra#1709 rec 4): the shipped sleep is now `sleep $(( CYC - JIT + RANDOM % (2*JIT+1) ))`,
+  # so JIT must be in the extracted driver or the arithmetic fails. A bare `grep 'sleep "$CYC"'`
+  # matched the pre-jitter form ONLY and silently extracted nothing once jitter landed.
+  awk '/^  JIT=/{f=1} f{print} f&&/& wait \$!$/{exit}' "$LOOP" > "$TMP/cycsleep.sh"
   if need "$TMP/cycsleep.sh" "the interruptible cycle sleep is extracted from the shipped orch-loop.sh"; then
+    # The extraction must still carry the JITTER, or a revert to a fixed interval would pass the
+    # interruptibility check below while re-introducing the thundering herd it exists to prevent.
+    grep -q 'RANDOM' "$TMP/cycsleep.sh" && rc=0 || rc=1
+    ck "the shipped cycle sleep is jittered (±20% of CYC), not a fixed interval" $rc
     { echo 'set -u'; echo "O='$LK'"; cat "$TMP/lockblock.sh"; echo 'CYC=8'; cat "$TMP/cycsleep.sh"; } > "$LK/cyc.sh"
     bash -n "$LK/cyc.sh" && rc=0 || rc=1
     ck "the cycle-sleep driver parses" $rc
@@ -2196,6 +2652,24 @@ if need "$TMP/lockblock.sh" "the lock+trap block is extracted from the shipped o
     [ "$ydead" = "1" ] && rc=0 || { rc=1; kill -9 "$ypid" 2>/dev/null; }
     wait "$ypid" 2>/dev/null
     ck "the shipped cycle sleep is interrupted by TERM inside CYC (stopped <4s, not 8s)" $rc
+    # ⛔ DEFENCE IN DEPTH (P1, second review round, 2026-10-14). The predicate now coerces CYC=08
+    # to 240 before the loop, but that is not the only guard: give the EXTRACTED shipped lines
+    # CYC=08 DIRECTLY and wrap them in the shipped `while true` shape. With the old
+    # `JIT=$(( CYC / 5 ))`, /bin/bash 3.2.57 printed `08: value too great for base` and DISCARDED
+    # the loop — the driver echoed CYCLES=1 and exited 0, i.e. a relaunch-per-cycle controller
+    # under KeepAlive. `10#${CYC}` keeps it cycling. Break at 3 so a failure (1) is distinguishable
+    # from a pass (3); `sleep` is stubbed so the driver is instant.
+    { echo 'set -u'; echo 'CYC=08'; echo 'sleep() { :; }'; echo 'n=0'
+      echo 'while true; do'
+      echo '  n=$((n+1))'
+      cat "$TMP/cycsleep.sh"
+      echo '  [ "$n" -ge 3 ] && break'
+      echo 'done'
+      echo 'echo "CYCLES=$n"'
+    } > "$LK/cyc08.sh"
+    out08="$(bash "$LK/cyc08.sh" 2>&1)"
+    case "$out08" in *CYCLES=3*) rc=0;; *) rc=1; echo "      CYC=08 did not keep the loop alive: $out08";; esac
+    ck "CYC=08 does not discard the controller's while loop (arithmetic read in base 10)" $rc
   fi
 
   # Reclamation must be REAL, not silently skipped: a lock whose PID is dead is reclaimed by the
@@ -2301,6 +2775,39 @@ else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
 fi
 
+# ── O) the sweep listing is CONDITIONAL and rate-limit-aware (#1762) ─────────────
+# The full contract — the listing is a REST `gh api` call carrying the stored ETag, a 304 reuses the
+# listing and skips the per-PR reads, response headers (not `/rate_limit`) drive the health decision,
+# a rate-limit failure is distinct from a network one and records the reset — lives in its own
+# hermetic suite, driven against the shipped block with a stub `gh`. Run it here so `./selftest.sh`
+# stays the one command that pins the harness.
+if [ -f "$HERE/sweep-quota.test.sh" ]; then
+  if bash "$HERE/sweep-quota.test.sh" > "$TMP/sweep-quota.out" 2>&1; then
+    ck "sweep-quota.test.sh: conditional listing + rate-limit headers (#1762)" 0
+  else
+    ck "sweep-quota.test.sh: conditional listing + rate-limit headers (#1762)" 1
+    grep -E '❌|Summary|PASS=' "$TMP/sweep-quota.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "sweep-quota.test.sh: the #1762 suite is present" 1
+fi
+
 echo
+# ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
+# A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
+# `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
+# off macOS every skip is an install.sh-driven group and the run must still have exercised the bulk
+# of the suite (the classifier/reaper/parity checks), so a widened gate cannot go unnoticed.
+if on_darwin; then
+  [ "$skip" -eq 0 ] && rc=0 || { rc=1; echo "      platform gate skipped $skip group(s) on Darwin — the gated checks MUST run here"; }
+  ck "platform gate: macOS runs every gated check (a skip is never a pass)" $rc
+else
+  [ "$skip" -gt 0 ] && [ "$pass" -ge 250 ] && rc=0 \
+    || { rc=1; echo "      skip=$skip pass=$pass — a $PLATFORM run must skip ONLY the install.sh groups, not the suite"; }
+  ck "platform gate: $PLATFORM skips only install.sh-driven checks and still runs the suite ($pass checks)" $rc
+fi
+if [ "$skip" -gt 0 ]; then
+  echo "==> $skip install-check group(s) SKIPPED (platform=$PLATFORM; install.sh is macOS-only) — a skip is NOT a pass"
+fi
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
