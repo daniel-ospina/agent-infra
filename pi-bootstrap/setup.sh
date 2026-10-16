@@ -308,12 +308,17 @@ fi
 # VERSIONED half of the SAME layer is seven producers, and the farm used to carry NONE of them, so a
 # box rebuilt from this file got every farmed CONSUMER without the PRODUCER it executes. FIVE of the
 # seven now join THIS array (`lane-actions.py`, `lane-watchdog.py`, `objective.py`, `cadence-nudge.sh`,
-# `publish-live-workspaces.py`), each because a FARMED caller execs it by sibling path:
-#   * `lane-actions.py`  <- pr-doctor.py:238, lane-scan-fallback.sh:98, heartbeat-loop.sh:315
-#   * `lane-watchdog.py` <- heartbeat-loop.sh:348,350 (the armed reaper)
-#   * `objective.py`     <- cadence-nudge.sh:256,400 and lane-scan-fallback.sh step 3 (`objective.last`)
-#   * `cadence-nudge.sh` <- cadence-timer.sh:60 (the single cadence driver)
-#   * `publish-live-workspaces.py` <- live-workspaces-publisher.py:31
+# `publish-live-workspaces.py`). FOUR are exec'd by a caller THIS array already farms:
+#   * `lane-actions.py`  <- pr-doctor.py:238, lane-scan-fallback.sh:98 (both farmed; also
+#                           heartbeat-loop.sh:315, withheld — see below)
+#   * `objective.py`     <- cadence-nudge.sh:256,400 and orchestrator-heartbeat.sh:224 (both farmed),
+#                           plus lane-scan-fallback.sh step 0 (`objective.last`)
+#   * `cadence-nudge.sh` <- cadence-timer.sh:60 (the single cadence driver, farmed)
+#   * `publish-live-workspaces.py` <- live-workspaces-publisher.py:31 (farmed)
+# The FIFTH, `lane-watchdog.py`, is NOT needed by a farmed caller today: its ONLY caller is
+# `heartbeat-loop.sh:348,350`, and `heartbeat-loop.sh` is itself withheld pending #1553 (below). It is
+# farmed NOW so #1553's landing cannot yield a fresh farm whose caller is present and whose producer
+# is absent.
 # They farm FLAT for the same reason as the rest of this list (the layer resolves siblings as
 # `$SCRIPTS/<name>` at $DEST/scripts/). Measured before the edit: absent from `fleet_srcs` AND from
 # every other farm array, so on a fresh `$DEST/scripts` each consumer either failed closed or failed

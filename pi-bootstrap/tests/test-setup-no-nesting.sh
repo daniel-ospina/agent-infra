@@ -247,9 +247,10 @@ check_fleet_srcs_farmed() {
 # present and whose PRODUCERS are all undelivered. Measured 2026-10-16: the layer's seven versioned
 # producers were in NO farm array, so a fresh `$DEST/scripts` got `pr-doctor.py`/`lane-scan-fallback.sh`
 # without the `lane-actions.py` they exec, `cadence-timer.sh` without `cadence-nudge.sh`,
-# `live-workspaces-publisher.py` without `publish-live-workspaces.py`, and the heartbeat without
-# `lane-watchdog.py`/`objective.py`. Five were then added to `fleet_srcs`; this check is what keeps a
-# producer from silently falling out again.
+# `live-workspaces-publisher.py` without `publish-live-workspaces.py`, and `orchestrator-heartbeat.sh`
+# without `objective.py`. Five were then added to `fleet_srcs` (the fifth, `lane-watchdog.py`, AHEAD of
+# #1553 rather than for a farmed caller — its only caller `heartbeat-loop.sh` is the withheld file);
+# this check is what keeps a producer from silently falling out again.
 #
 # ⚠️ DECLARED GAP (2 of 7) — deliberate, and named so it cannot go quiet:
 #   * `lane-status.py` — the DESTINATION copy is AHEAD (repo 1993 lines / live 2005 at the 2026-10-15
@@ -259,6 +260,11 @@ check_fleet_srcs_farmed() {
 # #1553 declares both in `lane_root_srcs`. Once it lands, both take the membership branch below and
 # `LANE_PRODUCERS_EXEMPT` becomes inert — delete it then, so this check covers all seven with no gap.
 LANE_PRODUCERS="lane-status.py lane-actions.py lane-watchdog.py objective.py heartbeat-loop.sh cadence-nudge.sh publish-live-workspaces.py"
+# The published population, on its own line because the list above is the guard's SUBJECT: a shrunk (or
+# emptied) list makes the loop below run fewer (or zero) times and leaves `missing` empty, so the
+# summary would otherwise report a clean 0/0 — the maximal silent skip, read as green. This pins the
+# count the list must carry, so DROPPING a producer is a failure, not a quieter green.
+LANE_PRODUCERS_EXPECTED=7
 LANE_PRODUCERS_EXEMPT="lane-status.py heartbeat-loop.sh"
 # Whole-word membership, the `ci_runner_gate.test.sh` idiom: a plain `grep -F` for the basename is
 # also satisfied by `lane-actions.py.old`, i.e. by the exact rename that leaves the producer
@@ -270,28 +276,64 @@ farm_declares() { # <array-name> <entry> -> 0 when the array carries the entry a
   printf '%s\n' "$line" | tr -s ' ' '\n' | grep -Fxq -- "$entry"
 }
 check_producer_farm_declared() {
-  local label="$1" p covered=0 exempted=0 missing=""
+  local label="$1" p covered=0 exempted=0 missing="" considered=0 floor_ok=1 exempted_names=""
   for p in $LANE_PRODUCERS; do
+    considered=$((considered+1))
     # `lane_root_srcs` absent on this tree is not a failure: #1553 declares it, and the membership
     # branch simply goes false until then.
     if farm_declares fleet_srcs "$p" || farm_declares lane_root_srcs "$p"; then
       covered=$((covered+1)); continue
     fi
     case " $LANE_PRODUCERS_EXEMPT " in
-      *" $p "*) exempted=$((exempted+1)); continue ;;
+      *" $p "*) exempted=$((exempted+1)); exempted_names="$exempted_names $p"; continue ;;
     esac
     missing="$missing $p"
   done
+  # POPULATION FLOOR — the sibling `check_fleet_srcs_farmed` pins `declared -gt 0` for the same
+  # reason: with a shrunk or emptied list the loop runs fewer (or zero) times, `missing` stays empty,
+  # and `0/0` reads exactly like full coverage. Assert the published count, so a DROPPED producer
+  # fails rather than reporting a quieter green.
+  if [ "$considered" -lt 1 ] || [ "$considered" -ne "$LANE_PRODUCERS_EXPECTED" ]; then
+    fail "$label: LANE_PRODUCERS carries $considered of $LANE_PRODUCERS_EXPECTED producers — an empty or undersized list must never read as clean (#1552)"
+    floor_ok=0
+  fi
   [ -z "$missing" ] \
     || fail "$label: lane producer(s) declared by NO farm array:$missing — a fresh \$DEST/scripts gets the farmed consumer without the executable it calls (#1552)"
-  if [ -z "$missing" ] && [ "$exempted" -gt 0 ]; then
+  if [ "$floor_ok" -eq 1 ] && [ -z "$missing" ] && [ "$exempted" -gt 0 ]; then
     # Never `ok:` while a declared gap remains: the two are separately delivered by #1553, and a
-    # reader must not read 5/7 as full cover.
-    echo "DECLARED-GAP: $label lane producers in a farm array: $covered/$((covered+exempted)) ($exempted not carried here, owned by #1553: $LANE_PRODUCERS_EXEMPT) (#1552)"
-  elif [ -z "$missing" ]; then
+    # reader must not read 5/7 as full cover. Echo the names ACTUALLY exempted THIS run, never the
+    # static list: after a partial #1553 landing a full-list echo contradicts its own count.
+    echo "DECLARED-GAP: $label lane producers in a farm array: $covered/$((covered+exempted)) ($exempted not carried here, owned by #1553:$exempted_names) (#1552)"
+  elif [ "$floor_ok" -eq 1 ] && [ -z "$missing" ]; then
     echo "ok: $label all $((covered+exempted)) lane producers declared in a farm array (#1552)"
   fi
 }
+
+# H1 (review, PR #1855) — pin that the POPULATION FLOOR above actually FIRES. The guard's whole
+# subject is "a producer no array declares", so an emptied or shrunk `LANE_PRODUCERS` is the maximal
+# silent skip; without the floor it reports a clean 0/0 (or N/N). Each probe runs in a SUBSHELL with a
+# stderr-suppressed call, so it can read the FAILURES delta without perturbing this suite's counter.
+producer_floor_probe() { # <probe-label> <producer-list> -> prints the FAILURES delta
+  local saved_list="$LANE_PRODUCERS" saved_failures="$FAILURES" delta
+  LANE_PRODUCERS="$2"
+  check_producer_farm_declared "$1" >/dev/null 2>&1
+  delta=$((FAILURES - saved_failures))
+  FAILURES="$saved_failures"
+  LANE_PRODUCERS="$saved_list"
+  printf '%s' "$delta"
+}
+if [ "$(producer_floor_probe "floor-probe-empty" "")" -gt 0 ]; then
+  echo "ok: an EMPTY LANE_PRODUCERS trips the population floor (0/0 never reads as clean)"
+else
+  fail "an EMPTY LANE_PRODUCERS did NOT trip the population floor — the guard read 0/0 as clean"
+fi
+# Undersized: six of the seven, every one declared or exempt, so `missing` stays EMPTY and ONLY the
+# floor can catch it — this is the exact shape a dropped producer takes.
+if [ "$(producer_floor_probe "floor-probe-short" "lane-actions.py lane-watchdog.py objective.py heartbeat-loop.sh cadence-nudge.sh publish-live-workspaces.py")" -gt 0 ]; then
+  echo "ok: an UNDERSIZED LANE_PRODUCERS (6/7) trips the population floor"
+else
+  fail "an UNDERSIZED LANE_PRODUCERS (6/7) did NOT trip the population floor — a dropped producer read as clean"
+fi
 
 # #1178 — shared-library farm: scripts/lib/pid-identity.sh must land at
 # $DEST/scripts/lib/pid-identity.sh, byte-identical to the repo copy, and the
