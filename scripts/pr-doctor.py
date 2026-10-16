@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -81,10 +82,30 @@ NONRED = {"cancelled", "stale"}
 
 # Guards
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
-MAX_INFLIGHT = 4              # concurrent PR work orders fleet-wide
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
 SURFACE_FILES = ("tool_registry.py", "sdk.py", "surface-manifest")
 MAX_LANE_ATTEMPTS = 3     # a refused dispatch tries the next idle lane, bounded
+
+# ── CAPACITY: the machine's own thresholds, never a private literal ─────────────────────
+# ⛔ THIS FILE USED TO HARDCODE `MAX_INFLIGHT = 4` "fleet-wide". The box is configured for
+# MAX_FIX=16 / MAX_REVIEW=12, so the PR chain -- the backlog drain -- was throttled to 4 while
+# the rest of the fleet ran at the machine's real capacity, and neither the plist nor an
+# operator could override it (the launch job passes no `--max`). The thresholds have ONE home:
+# the orchestrator launchd plist that `install.sh` renders (README §4). launchd feeds its
+# EnvironmentVariables to `orch-loop.sh`; pr-doctor reads the SAME block out of that file, so
+# the two readers share one model and neither duplicates the values. The environment wins when
+# present, so a cell's `keys.env`, a manual run or a test can supply them without a plist; the
+# shipped defaults are `orch-loop.sh`'s `${VAR:-…}` fallbacks (pinned equal by
+# `scripts/test_pr_doctor.py`) and are the last resort only.
+ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestrator-loop.plist")
+DEFAULT_MAX_FIX = 3
+DEFAULT_MAX_REVIEW = 4
+
+# A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
+# `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
+# `unreviewed` is review work (MAX_REVIEW); `ready` is the terminal merge of an already-reviewed
+# PR, so it rides the review chain. `running` never dispatches.
+ACTION_CLASS = {"failing": "fix", "no-checks": "fix", "unreviewed": "review", "ready": "review"}
 
 # ⛔ `tools/cmux_dispatch.py` REQUIRES PYTHON >= 3.12 and REFUSES to run under the system
 # `python3` (3.9.6 on this box) -- it exits 0 with a one-line complaint, so a caller that only
@@ -98,6 +119,67 @@ def now() -> float:
 
 def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _orchestrator_env() -> dict:
+    """The orchestrator's EnvironmentVariables -- the machine's capacity model, one home.
+
+    `install.sh` renders this plist and launchd feeds the block to `orch-loop.sh`; reading the
+    file is reading the SAME block, so this source never carries a private copy of the limits.
+    An unreadable or absent plist is NOT an error here: the environment and then the shipped
+    defaults still apply, and every read below is total.
+    """
+    try:
+        with open(ORCH_PLIST, "rb") as f:
+            pl = plistlib.load(f)
+    except Exception:
+        return {}
+    env = pl.get("EnvironmentVariables")
+    return env if isinstance(env, dict) else {}
+
+
+def capacity() -> dict:
+    """MAX_FIX / MAX_REVIEW for THIS machine -- env first, then the orchestrator plist then
+    the shipped defaults. The returned numbers are the same source `orch-loop.sh` reads."""
+    cfg = _orchestrator_env()
+    cfg.update(os.environ)
+
+    def _limit(key, default):
+        try:
+            n = int(str(cfg.get(key)).strip())
+        except Exception:
+            return default
+        # Same range guard the loop applies: a non-number or an absurd value must fall back,
+        # never open the gate it configures (a `[ -ge ]` on a non-number is FALSE).
+        return n if 0 <= n <= 999_999_999 else default
+
+    return {"max_fix": _limit("MAX_FIX", DEFAULT_MAX_FIX),
+            "max_review": _limit("MAX_REVIEW", DEFAULT_MAX_REVIEW)}
+
+
+def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> dict:
+    """Available dispatches this pass, per work class and in total.
+
+    The machine's own MAX_FIX / MAX_REVIEW (see `capacity()`) set the per-class ceilings. A
+    state row still inside STALE_DISPATCH_S consumes one slot of its class. `total_override`
+    (the CLI `--max`) is an optional extra hard ceiling on the whole pass. Pure, so the cap
+    can be asserted without a fleet.
+    """
+    if now_epoch is None:
+        now_epoch = now()
+    used = {"fix": 0, "review": 0}
+    for k, v in st.items():
+        if k.startswith("_") or v.get("action") == "closed":
+            continue
+        if now_epoch - v.get("at_epoch", 0) >= STALE_DISPATCH_S:
+            continue
+        used[ACTION_CLASS.get(v.get("action", ""), "fix")] += 1
+    out = {c: max(0, cap["max_" + c] - used[c]) for c in ("fix", "review")}
+    out["used"] = used["fix"] + used["review"]
+    out["total"] = out["fix"] + out["review"]
+    if total_override is not None:
+        out["total"] = min(out["total"], max(0, total_override))
+    return out
 
 
 def log(msg: str) -> None:
@@ -411,7 +493,9 @@ def save_state(st: dict) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--max", type=int, default=MAX_INFLIGHT)
+    ap.add_argument("--max", type=int, default=None,
+                    help="hard ceiling on dispatches this pass; default is the machine's "
+                         "MAX_FIX+MAX_REVIEW (see capacity())")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--only", type=int, default=0, help="limit to one PR number")
     args = ap.parse_args()
@@ -443,32 +527,39 @@ def main() -> int:
     ranked = {"ready": 0, "no-checks": 1, "unreviewed": 2, "failing": 3, "running": 9}
     classified.sort(key=lambda t: ranked.get(t[1], 8))
 
-    inflight = sum(1 for k, v in st.items()
-                   if not k.startswith("_") and v.get("action") != "closed"
-                   and now() - v.get("at_epoch", 0) < STALE_DISPATCH_S)
-    budget = max(0, args.max - inflight)
+    # ⛔ THE CAP COMES FROM THE MACHINE, NOT FROM THIS SOURCE. `capacity()` reads MAX_FIX /
+    # MAX_REVIEW from the environment or the orchestrator plist that `install.sh` renders (the
+    # SAME block `orch-loop.sh` gets from launchd). `--max` is an optional extra ceiling.
+    cap = capacity()
+    budgets = pass_budgets(st, cap, args.max)
 
     counts: dict[str, int] = {}
     for _, a in classified:
         counts[a] = counts.get(a, 0) + 1
-    log("pass: %d open PRs :: %s (inflight=%d budget=%d)" %
-        (len(classified), " ".join("%s=%d" % kv for kv in sorted(counts.items())), inflight, budget))
+    log("pass: %d open PRs :: %s (capacity fix=%d review=%d, inflight=%d, budget fix=%d review=%d total=%d)" %
+        (len(classified), " ".join("%s=%d" % kv for kv in sorted(counts.items())),
+         cap["max_fix"], cap["max_review"], budgets["used"],
+         budgets["fix"], budgets["review"], budgets["total"]))
 
     lanes, lane_err = idle_lanes()
     if lane_err:
         # NOT the same as "no idle lanes". Say which one it is.
         log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
         return 0
-    if budget and not lanes:
+    if budgets["total"] and not lanes:
         log("no idle lanes -- nothing dispatched this pass")
         return 0
 
     dispatched = 0
+    spent = {"fix": 0, "review": 0}
     for p, action in classified:
         if action in ("running",):
             continue
-        if dispatched >= budget:
+        if dispatched >= budgets["total"]:
             break
+        cls = ACTION_CLASS.get(action, "fix")
+        if spent[cls] >= budgets[cls]:
+            continue
         key = str(p["number"])
         prev = st.get(key) or {}
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
@@ -501,6 +592,7 @@ def main() -> int:
         if not args.dry_run:
             st[key] = {"action": action, "lane": sent["lane"], "ws": sent["ws"],
                        "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
+        spent[cls] += 1
         dispatched += 1
 
     if not args.dry_run:
