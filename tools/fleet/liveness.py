@@ -1113,6 +1113,14 @@ def tool_from_jsonl(
     than the 30 min one (a lane whose transcript shows an unanswered call is by
     definition not resting).
 
+    The derived age is bounded from TWO sources, not one. The transcript's own
+    mtime is a genuine lower bound on the call's age (the file is written at or
+    after the call), so ``min(started, mtime)`` covers both shapes an entry
+    stamp alone cannot: an UNREADABLE stamp (age would be unknown → an unknown
+    age never expires) and a FUTURE-dated stamp from a writer host on a bad
+    clock (a bare ``now - started`` clamps to 0 and STAYS 0 → the 4 h backstop
+    is never reached). Both are the permanent veto T9 forbids (#5389 review F2).
+
     Returns None — never a zeroed Tool — when the tail shows no in-flight tool:
     a ``None`` veto and an empty one are different claims, and manufacturing the
     empty one would assert "no tool is running" from a transcript this parser
@@ -1139,6 +1147,13 @@ def tool_from_jsonl(
     # the boundary cannot disagree about whether this message is open).
     if msg.get("stopReason") in CALL_DISCARDING_STOP_REASONS:
         return None
+    # The transcript's OWN mtime, read once and used for BOTH bounds below. It
+    # is a genuine lower bound on the call's age: the file is written at or
+    # after the call, so the call is at least as old as the file.
+    try:
+        mtime_ms = int(os.stat(path).st_mtime * 1000)
+    except OSError:
+        mtime_ms = None
     started = _iso_ms(entry.get("timestamp"))
     if started is None:
         # #5389 review P1: an UNREADABLE entry stamp must not leave the age
@@ -1148,12 +1163,9 @@ def tool_from_jsonl(
         # veto PERMANENT: the lane would read `running-quiet/tool-in-flight`
         # forever and `idle` would become unreachable, which is the one outcome
         # T9 forbids. Fall back to the transcript's OWN mtime: it is a genuine
-        # measurement, it UNDERSTATES the call's age (the file is written at or
-        # after the call), and it grows without bound while the file is frozen,
-        # so the veto still expires.
-        try:
-            started = int(os.stat(path).st_mtime * 1000)
-        except OSError:
+        # measurement and it grows without bound while the file is frozen, so
+        # the veto still expires.
+        if mtime_ms is None:
             # Cannot date the call from ANY source. Do NOT return a Tool here:
             # `_exceeds(None, bound)` is False, so an unmeasurable age makes the
             # veto PERMANENT (T9 forbids it — and that is the defect the previous
@@ -1163,6 +1175,17 @@ def tool_from_jsonl(
             # `evaluate` names that `jsonl-age-unknown` — an ABSTENTION reached
             # after the (now absent) veto, never `wedged`. (#5389 review, cycle 3.)
             return None
+        started = mtime_ms
+    elif mtime_ms is not None:
+        # #5389 review F2: a FUTURE-dated entry stamp (a writer host with a
+        # wrong clock — a VM booting on a bad RTC before NTP corrects it) makes
+        # `now - started` clamp to 0 and STAY 0 while the stamp is ahead of the
+        # clock, so the 4 h AGE backstop is never reached and the veto is
+        # PERMANENT (`idle` unreachable) — the same outcome T9 forbids by
+        # another route. `min` takes the EARLIER timestamp, which never reports
+        # the call as younger than it is, so the veto can only expire no earlier
+        # than the call's true age allows.
+        started = min(started, mtime_ms)
     age = max(0, now_ms - started)
     return Tool(
         name=str(calls[0].get("name") or ""),

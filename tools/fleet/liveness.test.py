@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty-three tests with twenty-nine paired mutations: every mutation re-
+Twenty-three tests with thirty paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -1035,6 +1035,26 @@ def t21_tool_from_jsonl():
         check(undatable is None,
               "an undateable call must assert NO veto (an unmeasurable age would be FOREVER)")
 
+        # (h) #5389 review F2: a FUTURE-dated entry stamp must not pin the age at
+        #     0 forever. A writer host with a wrong clock (a VM booting on a bad
+        #     RTC before NTP corrects it) stamps the entry ahead of the
+        #     classifier's clock; a bare `now - started` clamps to 0 and STAYS 0,
+        #     so the 4h AGE backstop is never reached and the veto is PERMANENT —
+        #     `idle` becomes unreachable (T9: never forever). The transcript's own
+        #     mtime is a genuine LOWER bound on the call's age (the file is written
+        #     at or after the call), so it bounds the age from the other side too.
+        write([real("assistant", NOW_MS + 10 * H, stopReason="toolUse",
+                    content=[{"type": "toolCall", "name": "bash", "id": "call_A"}])])
+        os.utime(path, ((NOW_MS - 5 * H) / 1000.0,) * 2)
+        future = liv.tool_from_jsonl(path, NOW_MS)
+        check(future is not None and future.tool_age_ms is not None,
+              "a future-stamped in-flight call is still a tool")
+        check(future.tool_age_ms >= 5 * H - 2000,
+              "a future stamp is bounded by the transcript's own mtime, never 0; got %s"
+              % future.tool_age_ms)
+        check(liv.tool_veto_expired(future) is True,
+              "and past the 4h backstop it EXPIRES — a future stamp is not a permanent veto (T9)")
+
         # (f) no file / an empty file is an ABSTENTION, never a tool.
         check(liv.tool_from_jsonl(None, NOW_MS) is None, "no path -> no assertion")
         check(liv.tool_from_jsonl(os.path.join(d, "absent.jsonl"), NOW_MS) is None,
@@ -1390,6 +1410,14 @@ MUTATIONS = [
         "the derived age is left UNMEASURABLE, and an unknown age never expires "
         "(`_exceeds(None, ...)` is False) — so the veto becomes PERMANENT and `idle` becomes "
         "unreachable (T9; #5389 review, cycles 1 and 3)",
+    ),
+    Mutation(
+        "T21", "module",
+        '        started = min(started, mtime_ms)\n',
+        '        started = max(started, mtime_ms)\n',
+        "a FUTURE-dated entry stamp is no longer bounded by the transcript's own mtime, so "
+        "`now - started` clamps to 0 and STAYS 0 — the 4h age backstop is never reached and "
+        "the veto is PERMANENT (T9; #5389 review F2)",
     ),
     Mutation(
         "T23", "module",

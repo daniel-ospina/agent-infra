@@ -216,7 +216,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T23 with 29 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T23 with 30 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
