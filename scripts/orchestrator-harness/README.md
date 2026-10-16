@@ -676,13 +676,15 @@ These are kept as a record because each one is a *failure mode of the design*, n
 
 ### 7.5 Still open, deliberately not fixed here
 
-> **Six entries that were here are now FIXED by the #1712 port** and have been removed from
-> this list: the fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519),
-> `checked.txt` written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the
-> returning INT/TERM trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516),
-> the controller's macOS-only capacity probes (agent-infra#1702, tortoise#8514), the deny-list
-> check classifier in `orch-loop.sh` (agent-infra#1714, tortoise#8518), and this directory being
-> older than its source (agent-infra#1712 — see the provenance note at the top of this file).
+> **Seven entries that were here are now FIXED** and have been removed from this list: the
+> fail-open reaper when the PR listing fails (agent-infra#1705, tortoise#8519), `checked.txt`
+> written before the pre-flight verdict (agent-infra#1716, tortoise#8515), the returning INT/TERM
+> trap in `orch-loop.sh` and `merge-one.sh` (agent-infra#1715, tortoise#8516), the controller's
+> macOS-only capacity probes (agent-infra#1702, tortoise#8514), the deny-list check classifier in
+> `orch-loop.sh` (agent-infra#1714, tortoise#8518), this directory being older than its source
+> (agent-infra#1712 — see the provenance note at the top of this file), and
+> `cloud-cell-bringup.sh` deleting the pushed gh token only on the success branch
+> (agent-infra#1718 — fixed in this branch, independent of the #1712 port).
 
 - **`can_spawn()` gates on load only, so the memory ceiling does not cover the five controller spawn
   sites** (agent-infra#1732). Lane dispatch is bounded by swap and available memory; the five spawn
@@ -750,9 +752,6 @@ These are kept as a record because each one is a *failure mode of the design*, n
   `$HOME/.pi/agent/scripts/record-review.sh` and neither cell script provisions it, so a fresh cell
   prints "CELL CAN RUN A CONTROLLER", runs a full paid first review, then 127s **before** any parked
   marker is written — one fresh review per cycle, forever, with no terminal state.
-- **`cloud-cell-bringup.sh` deletes the pushed gh token only on the success branch (agent-infra#1718).**
-  `die` on a failed `gh auth login` exits before `rm -f "$tokfile"`, leaving a push-capable token at
-  `/tmp/.gh-tok` on the VM.
 - **`ci_runner_gate.sh` is versioned here but wired to nothing (agent-infra#1719).** No
   `templates/launchd/` job renders it and `pi-bootstrap/setup.sh`'s farm lists omit it, so this box
   still executes a hand-made duplicate at `~/.pi/agent/scripts/` — a fix here never reaches the copy
