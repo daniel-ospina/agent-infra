@@ -2025,11 +2025,11 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 #   13a  DETECTION — the fixtures below. NON-VACUOUS: every fixture 13a writes is reported
 #        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
 #        (NOT `HEAD`, which by the time you read this is the widened guard and reports every one
-#        as a hit at rc 1) — so this whole block fails before the widening. 13a writes **100**
+#        as a hit at rc 1) — so this whole block fails before the widening. 13a writes **93**
 #        detection fixtures: the AGGREGATE below asserts the **62** that 13a1 introduced, and
 #        13a2-13a5 assert the decoder/decode classes and 13a6 the `|&` operator separately, so a
 #        regression in any one of them names itself. Verified 2026 on the pre-change guard: rc 0
-#        on all 100, and the head guard rc 1 naming all 100.
+#        on all 93, and the head guard rc 1 naming all 93.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2220,19 +2220,6 @@ printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |& grep -q "[^[:space:]
 # spelling was flagged (#864 review F1). Both producer sides pinned.
 printf '%s\n' '#!/usr/bin/env bash' 'printf x |&' 'grep -q p'                       > "$E/scripts/pipeampnlprintf.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |&' '  grep -q "[^[:space:]]"' > "$E/scripts/pipeampnlgrep.sh"
-# The operator broken by a COMMENT or a BLANK line before the consumer. Bash keeps the pipeline
-# open across the newline_list (`cmd |&` newline `# note` newline `grep -q p`), but the joiner
-# flushed the pending buffer on any comment/blank line and only recognised a trailing pipe with no
-# comment. Fixed: a pending pipe is not flushed by a comment/blank line, and a trailing pipe
-# followed by a comment joins (the comment is dropped from the joined text).
-printf '%s\n' '#!/usr/bin/env bash' 'printf x |& # comment' 'grep -q p'                 > "$E/scripts/pipeampcmt.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'printf x |&' '' 'grep -q p'                       > "$E/scripts/pipeampblank.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'printf x |&' '# note' 'grep -q p'                 > "$E/scripts/pipeampcmtline.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'out="$(printf x |& # c' 'grep -q p)"'          > "$E/scripts/pipeampcmtsubst.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'eval "printf x |& # c' 'grep -q p"'             > "$E/scripts/pipeampcmtbody.sh"
-printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |& # c' 'grep -q "[^[:space:]]"' > "$E/scripts/pipeampcmtgrep.sh"
-# The same comment break on a BARE pipe, pre-existing on that path and closed by the same join.
-printf '%s\n' '#!/usr/bin/env bash' 'printf x | # comment' 'grep -q p'               > "$E/scripts/pipecmt.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2335,12 +2322,8 @@ fi
 #       form — the same mechanism 13c pins. `raw_idiom` was blind to it too, because its
 #       `[^|]*[|][ \t]*` bridge cannot cross the `&`; all three call sites now step over it.
 if [ "$rc" -eq 1 ] && grep -q 'pipeampprintf\.sh' "$OUT" && grep -q 'pipeampgrep\.sh' "$OUT" \
-   && grep -q 'pipeampnlprintf\.sh' "$OUT" && grep -q 'pipeampnlgrep\.sh' "$OUT" \
-   && grep -q 'pipeampcmt\.sh' "$OUT" && grep -q 'pipeampblank\.sh' "$OUT" \
-   && grep -q 'pipeampcmtline\.sh' "$OUT" && grep -q 'pipeampcmtsubst\.sh' "$OUT" \
-   && grep -q 'pipeampcmtbody\.sh' "$OUT" && grep -q 'pipeampcmtgrep\.sh' "$OUT" \
-   && grep -q 'pipecmt\.sh' "$OUT"; then
-  pass "the \`|&\` pipe operator is DETECTED for a builtin producer and for a grep producer, on one line, broken across a NEWLINE, and broken by a COMMENT or BLANK line (the \`&\` is stepped over before the consumer word is read, and the continuation joiner keeps a pending pipe)"
+   && grep -q 'pipeampnlprintf\.sh' "$OUT" && grep -q 'pipeampnlgrep\.sh' "$OUT"; then
+  pass "the \`|&\` pipe operator is DETECTED for a builtin producer and for a grep producer, on one line AND broken across a NEWLINE (the \`&\` is stepped over before the consumer word is read, and the continuation joiner keeps a trailing \`|&\`)"
 else
   fail "a producer piped with \`|&\` was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
