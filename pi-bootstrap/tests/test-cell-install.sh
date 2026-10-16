@@ -458,9 +458,9 @@ else
     || fail "the config loop certified a zero-file agents/ source"
 fi
 # A source tree that cannot be READ in FULL must not be certified over the part `find` managed to
-# reach: it exits non-zero and prints a PARTIAL list, which the pre-delta form discarded
-# (`done < <(find … 2>/dev/null)`), so the comparison silently covered a subset and vouched for
-# the rest unseen — in a tree whose every file is later executed.
+# reach: it exits non-zero and prints a PARTIAL list, and a `find` whose status is discarded
+# (`done < <(find … 2>/dev/null)`) leaves the comparison covering a subset while the rest goes
+# unvouched for — in a tree whose every file is later executed.
 if [ "$(id -u)" = "0" ]; then
   ok "skipped the unreadable-subtree pin: running as root, where chmod 000 does not block a read"
 else
@@ -470,28 +470,41 @@ else
   chmod 000 "$EMPTY_EXT/pi-bootstrap/pi-config/agents/.unreadable"
   out2="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
   chmod 700 "$EMPTY_EXT/pi-bootstrap/pi-config/agents/.unreadable" 2>/dev/null
-  grep -q 'config artifact agents could not be READ in the checkout' <<<"$out2" \
+  grep -q 'config artifact agents could not be compared IN FULL' <<<"$out2" \
     && ok "a source tree that cannot be read in full is REFUSED, not certified over a partial file list" \
     || fail "an unreadable subtree produced a certified comparison over the files find could reach"
 fi
-# Two more ways a file goes unread while the run reports a match, both refused the same way:
-# a name containing a NEWLINE breaks the line-based list (the captured text carries a duplicate
-# of a sibling's line), and a shipped SYMLINK is copied as a link and so never byte-compared.
+# Two more ways a file goes unread while the call still reports a match, both refused the same
+# way: a name containing a NEWLINE (the line-based list drops the entry and duplicates a
+# sibling's line in its place, so the file itself may never be compared at all — the sibling is
+# in the fixture so that shape is represented), and a shipped SYMLINK (copied as a link, so it
+# was never byte-compared).
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard"
 mkdir -p "$EMPTY_EXT/extensions/task-cwd-guard"
 cp -R "$ROOT/extensions/task-cwd-guard/." "$EMPTY_EXT/extensions/task-cwd-guard/"
-printf 'x\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'
+printf 'same\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"
+printf 'same\n' > "$TMP/emptyext-home/.pi/agent/extensions/task-cwd-guard/evil"
+printf 'EVIL\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
 out3="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
-grep -q 'extension task-cwd-guard could not be READ in the checkout' <<<"$out3" \
-  && ok "a shipped filename containing a NEWLINE is refused, not dropped from the comparison" \
-  || fail "a newline-bearing filename produced a certified comparison"
-rm -f "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'
+grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out3" \
+  && ok "a shipped filename containing a NEWLINE is refused, not lost from the comparison" \
+  || fail "a newline-bearing filename was not refused — the list is lossy, so no comparison over it can be trusted"
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'"evil"
 ln -s /etc/hostname "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
 out4="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
-grep -q 'extension task-cwd-guard could not be READ in the checkout' <<<"$out4" \
+grep -q 'extension task-cwd-guard could not be compared IN FULL' <<<"$out4" \
   && ok "a shipped SYMLINK is refused (cp -R copies it as a link, so it was never byte-compared)" \
   || fail "a shipped symlink was certified without ever being compared"
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
+# ... and the same refusal must NOT fire on the one namespace that is excluded by construction:
+# a LINKED node_modules (a hoisted or shared dep store) is legitimate.
+ln -s "$TMP/emptynm" "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"
+mkdir -p "$TMP/emptynm"
+out5="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+grep -q 'extension task-cwd-guard' <<<"$out5" \
+  && fail "a linked node_modules made the extension fail verification: $(grep 'task-cwd-guard' <<<"$out5" | head -1)" \
+  || ok "a LINKED node_modules is not refused (the excluded namespace covers the entry itself)"
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard/node_modules"; rmdir "$TMP/emptynm"
 rm -rf "$EMPTY_EXT" "$TMP/emptyext-home"
 rm -rf "$DEST/agents"
 run_verify
