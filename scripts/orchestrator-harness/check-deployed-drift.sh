@@ -43,7 +43,15 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-O=""; REPO=""; REF=""; REL=""; QUIET=0; FETCH=1
+# ⛔ `O` is deliberately NOT pre-cleared here. Every sibling in this directory honours an env
+# `O=<dir>` (`install.sh:16`, `report.sh:18`, `orch-loop.sh`), and install.sh's own printed remedy
+# uses that form (`O='$O' bash install.sh`). Clearing it made line 66's `${O:-...}` fallback
+# unconditional, so `O=<dir> check-deployed-drift.sh --repo <r>` silently verified
+# `$HOME/orchestrator` instead: measured, a drifted surface named on the command line exited 1
+# while the SAME surface named by env printed `OK` and exited 0 — a false PASS asserted about a
+# directory the operator never named. `REPO`/`REF`/`REL` have no such env convention upstream, so
+# they stay cleared (they are resolved from --flags and defaults below).
+REPO=""; REF=""; REL=""; QUIET=0; FETCH=1
 DEFAULT_REF="${HARNESS_REF:-origin/main}"
 
 while [ $# -gt 0 ]; do
@@ -63,7 +71,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -n "$O" ] || O="${O:-$HOME/orchestrator}"
+# ⛔ `${O:-}` (not `$O`): `$O` may be unset, and this script is `set -u`, so a bare `$O` here would
+# abort with "O: unbound variable" instead of falling back to the default deploy dir.
+O="${O:-$HOME/orchestrator}"
 [ -n "$REF" ] || REF="$DEFAULT_REF"
 
 note() { [ "$QUIET" -eq 1 ] || echo "$@"; }

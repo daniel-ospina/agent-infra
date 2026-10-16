@@ -2836,6 +2836,20 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     ck "the stamp classifies the source as current at the ref" $rc
     grep -qE '"payloadSha256": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "the stamp records a payload hash over \$O/*.sh" $rc
+    # #1837 review (P2): `install.sh` NEVER copies — the operator syncs `$O` — so the source commit
+    # and the deployed bytes can genuinely disagree. Without a field saying so, the record reads as
+    # "this commit describes these bytes" while the box runs other ones. Declared as a field, not
+    # inferred from `relation` (which is git ancestry of the SOURCE, not a statement about `$O`).
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp says whether the deployed copy matches the source (in-sync: true)" $rc
+    # `DRIFTED` is computed OUTSIDE the extracted provenance block (the block starts at its own
+    # marker), so the fixture supplies it — the same seam the real installer uses at module scope.
+    ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; DRIFTED="orch-loop.sh"; . "$TMP/prov-block.sh" )
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "a DRIFTED \$O records deployedMatchesSource: false" $rc
+    prov
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
     dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
     ck "check-deployed-drift: a matching deployment exits 0" $rc
     # a DIRTY source: its recorded commit cannot describe the deployed bytes
