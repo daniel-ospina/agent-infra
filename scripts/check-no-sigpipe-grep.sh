@@ -91,6 +91,17 @@
 #     through scripts/sigpipe-grep-exceptions.txt (which carries no live line). No live
 #     occurrence of the shape exists on this tree (the whole-repo run is rc 0).
 #
+#     PRODUCER-SIDE OVER-BLOCK FROM THE `|&`-IN-DATA FAMILY (#864). The `|&` operator is read as
+#     a real pipe even when it is DATA: a one-line quoted string (`echo "run cmd |& grep -q p"`,
+#     and its single-quoted spelling), a trailing comment, a here-string (`grep -q p <<<"a |& grep
+#     -q b"`), and the DATA-REGION shapes when the break carries `|&` rather than `|` (a heredoc
+#     body, the interior line of a multi-line quoted string or assignment). A LINE-oriented text
+#     matcher cannot tell the operator from the data, exactly as it cannot for `|` — SAME polarity
+#     as the classes above (over-block, visible, recoverable through the exceptions file) and no
+#     live occurrence of the shape exists on this tree (the whole-repo run is rc 0). Each is
+#     FLAGGED here and CLEAN at the pre-change guard `39e65457`, which recognised no `grep`
+#     producer at all.
+#
 #     PRODUCER SPELLINGS THAT REACH THE SAME FALSE CLEAN, AND ARE NOW CLOSED. Each of these needed
 #     the SAME conjunction — a producer word the token walk had to resolve AND a `|` inside the
 #     producer's own argument that defeats raw_idiom's `[^|]*` bridge — and each was measured at rc
@@ -1796,13 +1807,25 @@ HITS="$(
         raw = $0
         if (start == 0) start = NR
         # join a continuation: an explicit trailing backslash AND a pipeline broken after a
-        # bare `|` (both are legal bash line breaks). THE TWO JOINS DIFFER: the shell deletes a
-        # backslash-newline with NOTHING at all (`gr\<newline>ep` is the single word `grep`), while a
-        # bare `|` is a real pipe the next line continues. Joining both with a space split `grep`
-        # into `gr ep` and reported the body clean.
+        # bare `|` or a `|&` (all are legal bash line breaks). THE JOINS DIFFER: the shell deletes
+        # a backslash-newline with NOTHING at all (`gr\<newline>ep` is the single word `grep`),
+        # while a bare `|` or `|&` is a real pipe the next line continues. Joining a backslash with
+        # a space split `grep` into `gr ep` and reported the body clean. `|&` must be joined with
+        # the `&` KEPT: it is part of the operator itself (`| pipeline BAR_AND newline_list
+        # pipeline`, bash parse.y), and dropping it either loses the pipe or leaves a bare `&` that
+        # the token walk reads as backgrounding. Without this arm `printf x |&` newline `grep -q p`
+        # is a silent false CLEAN while the backslash spelling is flagged.
         if (raw ~ /\\[ \t]*$/) {
           sub(/\\[ \t]*$/, "", raw)
           buf = buf raw
+          next
+        }
+        if (raw ~ /\|&[ \t]*$/) {
+          # `match`+`substr`, not `sub`: a `&` in a `sub` replacement means the matched TEXT, so
+          # `sub(/\|&[ \t]*$/, "|&", raw)` emits `||&`. Keep the `&` literally.
+          match(raw, /\|&[ \t]*$/)
+          raw = substr(raw, 1, RSTART - 1) "|&"
+          buf = buf raw " "
           next
         }
         if (raw ~ /\|[ \t]*$/) {
