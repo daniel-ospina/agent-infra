@@ -182,6 +182,43 @@ _lease_of() {
   printf '%s\t%s' "${o:-?}" "${u:-0}"
 }
 
+# _lease_unparseable <lease_until> -> 0 when this reader cannot parse the lease at all
+_lease_unparseable() {
+  case "${1:-}" in
+    ''|0|*[!0-9]*) return 0 ;;
+  esac
+  [ "${#1}" -gt 18 ]
+}
+
+# _lease_is_live <lease_until> <now> -> 0 LIVE (do not steal), 1 expired
+#
+# ⛔ THE ONE IMPLEMENTATION OF THE LEASE POLARITY (2026-10-16 review). Four readers used to derive
+# it independently — claim_acquire, claim_issue_preflight, claim_prune and orch-loop.sh's
+# claim_live — and a divergence between them is not a cosmetic defect: on 2026-10-14 a disagreement
+# about exactly this datum made the controller re-spawn a refused fixer EVERY cycle, indefinitely,
+# on a PR no box could work. claim_acquire already carried a note saying the bound must not be
+# re-derived; three copies of it were still there. These three sites now share this one. (The
+# fourth, orch-loop.sh's claim_live, reads the SNAPSHOT rather than a ref and is extracted
+# standalone by selftest.sh, so it keeps its own copy deliberately — see its comment.)
+#
+# ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE. An absent value, the `0` sentinel, any non-digit (a
+# negative collapses to `0` in _lease_of, whose `[0-9]*` cannot match a minus sign) and a 19+-digit
+# value all mean "a claim EXISTS whose lease this reader cannot parse". The 18-digit bound is not
+# tidiness: `[` ERRORS at or above 2**63 and an errored test is FALSE, so a full-width lease used to
+# fall through to the reclaim path and STEAL a live claim. And the bound is 18, NOT 9, because a
+# lease is an EPOCH SECOND (10 digits today) — a 9-digit bound would call every legitimate lease
+# unparseable, so nothing would ever expire and the fleet would deadlock.
+#
+# ⛔ AND AN UNREADABLE CLOCK IS NOT EVIDENCE OF EXPIRY (2026-10-16 review). `[ "" -le "$until" ]`
+# prints "integer expression expected" and evaluates FALSE, and the OLD shape — two sequential `if`s
+# whose fall-through was the CLEAN return — therefore reported a FALSE CLEAN whenever `date` could
+# not be read. That is the one direction this gate must never fail in: it duplicates the work.
+_lease_is_live() {
+  _lease_unparseable "${1:-}" && return 0
+  case "${2:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$2" -le "$1" ]
+}
+
 # claim_acquire <repo> <pr> <head-sha> [ttl]
 #   0 = acquired (or reclaimed an EXPIRED claim), 1 = held by a live claim, 2 = error
 # Sets CLAIM_RESULT (human-readable reason), CLAIM_COMMIT, CLAIM_REF, CLAIM_OWNER.
@@ -271,12 +308,12 @@ _claim_acquire_at() {
   # 999999999999999999 < 2**63, so the comparison cannot error. Rejecting 19+ digits is therefore the
   # precise magnitude guard — and it is the CONSERVATIVE direction (a foreign full-width lease reads
   # as live, never as stolen).
-  if [ -z "$held_until" ] || [ "$held_until" = "0" ] || [ "${#held_until}" -gt 18 ]; then
-    CLAIM_RESULT="held by $held_owner (no parseable lease — treating as live)"
-    echo "$CLAIM_RESULT"; return 1
-  fi
-  if [ "$now" -le "$held_until" ]; then
-    CLAIM_RESULT="held by $held_owner until $held_until ($(( held_until - now ))s left)"
+  if _lease_is_live "$held_until" "$now"; then
+    if _lease_unparseable "$held_until"; then
+      CLAIM_RESULT="held by $held_owner (no parseable lease — treating as live)"
+    else
+      CLAIM_RESULT="held by $held_owner until $held_until ($(( held_until - now ))s left)"
+    fi
     echo "$CLAIM_RESULT"; return 1
   fi
 
@@ -421,17 +458,26 @@ claim_issue_preflight() {
   fi
   lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
   owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
-  # ⛔ THE SAME UNPARSEABLE-IS-LIVE POLARITY AS claim_acquire(). An absent lease, the `0` sentinel,
-  # a negative, or an oversized value all mean "a claim EXISTS whose lease this reader cannot
-  # parse" — never "free". Reading any of them as free would steal a live claim, and the fourth
-  # reader (orch-loop.sh's claim_live) already agrees on this datum; a fifth polarity would be a
-  # new disagreement about the same fact.
-  if [ -z "$until" ] || [ "$until" = "0" ] || [ -n "${until//[0-9]/}" ] || [ "${#until}" -gt 18 ]; then
+  # ⛔ THE SAME UNPARSEABLE-IS-LIVE POLARITY AS claim_acquire(), taken from the ONE function that
+  # owns it (§_lease_is_live): an absent lease, the `0` sentinel, a negative, or an oversized value
+  # all mean "a claim EXISTS whose lease this reader cannot parse" — never "free". Reading any of
+  # them as free would steal a live claim, and the snapshot reader (orch-loop.sh's claim_live)
+  # already agrees on this datum; a fifth polarity would be a new disagreement about the same fact.
+  # ⛔ THE CLOCK IS A SECOND INPUT TO THE SAME DECISION, SO IT IS GUARDED FIRST (2026-10-16 review).
+  # `[ "" -le "$until" ]` prints "integer expression expected" and evaluates FALSE, and this block
+  # used to fall THROUGH that comparison to `return 0` — a FALSE CLEAN from a registry that could not
+  # answer, which is the one direction this gate must never fail in (it duplicates the work).
+  now="$(date +%s)"
+  if _lease_unparseable "$until"; then
     CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} (lease unreadable — treated as live)"
     echo "$CLAIM_RESULT"; return 1
   fi
-  now="$(date +%s)"
-  if [ "$now" -le "$until" ]; then
+  case "${now:-}" in
+    ''|*[!0-9]*)
+      CLAIM_RESULT="the local clock is unreadable (date +%s -> '${now:-}') — INCOMPLETE, never CLEAN"
+      echo "$CLAIM_RESULT"; return 2 ;;
+  esac
+  if _lease_is_live "$until" "$now"; then
     CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} until $until ($(( until - now ))s left)"
     echo "$CLAIM_RESULT"; return 1
   fi
@@ -462,16 +508,46 @@ claim_issue_record() {
   return 0
 }
 
-# claim_issue_release_record <state-dir> <repo> <issue> -> claim_issue_release's status (1 = refused
-# or nothing to do). Removes the record in EVERY case: an empty or unreadable record can never fence
-# a release, so leaving it behind makes every later attempt re-read a dead file.
-claim_issue_release_record() {
-  local f="${1:-$HOME/orchestrator}/state/issueclaim-${3:-}" own
+# claim_issue_record_commit <state-dir> <issue> -> the recorded commit ("" and rc=1 when none)
+# ⛔ THE READER EXISTS SO A CALLER CAN CAPTURE THE RECORD WHEN IT BECOMES THE HOLDER, rather than
+# reading it inside its release trap — see claim_issue_release_record's generation guard.
+claim_issue_record_commit() {
+  local f="${1:-$HOME/orchestrator}/state/issueclaim-${2:-}"
   [ -f "$f" ] || return 1
+  cat "$f" 2>/dev/null || return 1
+}
+
+# claim_issue_release_record <state-dir> <repo> <issue> [<expected-commit>] -> claim_issue_release's
+# status (1 = refused or nothing to do). Removes the record in every case EXCEPT a generation
+# mismatch (below): an empty or unreadable record can never fence a release, so leaving it behind
+# makes every later attempt re-read a dead file.
+# ⛔ THE OPTIONAL EXPECTED COMMIT IS THE GENERATION GUARD (2026-10-16 review). The record is keyed on
+# the ISSUE, and the SAME box can become the holder of the same issue a second time while its first
+# chain is still running (the lease lapsed; the chain is still waiting on a PR). The acquire path
+# then OVERWRITES $O/state/issueclaim-<N> with the new commit, and a trap that read the file when it
+# fired would fence on that NEW commit — which IS the ref tip — so the FIRST chain would delete the
+# claim of the chain that legitimately holds it, and a peer would read the issue as free: the
+# duplicate this registry exists to prevent, and a fail-OPEN. A caller that captured the record when
+# it BECAME the holder passes it here; a mismatch means "overwritten by a newer generation", so this
+# chain must not release AND must not delete the file (it belongs to that newer chain).
+claim_issue_release_record() {
+  local dir="${1:-$HOME/orchestrator}" repo="${2:-}" issue="${3:-}" expect="${4:-}"
+  local f="$dir/state/issueclaim-$issue" own
+  if [ ! -f "$f" ]; then
+    CLAIM_RESULT="no recorded claim commit for #${issue:-?} — nothing to fence the release on"
+    echo "$CLAIM_RESULT"; return 1
+  fi
   own="$(cat "$f" 2>/dev/null || true)"
+  if [ -n "$expect" ] && [ "$own" != "$expect" ]; then
+    CLAIM_RESULT="the record for #$issue was overwritten by a NEWER generation (${own:-empty} != $expect) — NOT releasing; that claim is not this chain's"
+    echo "$CLAIM_RESULT"; return 1
+  fi
   rm -f "$f" 2>/dev/null
-  [ -n "$own" ] || return 1
-  claim_issue_release "${2:-}" "${3:-}" "$own"
+  if [ -z "$own" ]; then
+    CLAIM_RESULT="the recorded claim commit for #$issue is EMPTY — it cannot fence a release"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  claim_issue_release "$repo" "$issue" "$own"
 }
 
 # claim_snapshot [<outfile>]
@@ -515,11 +591,11 @@ claim_prune() {
     _git fetch -q origin "+$ref:$tmp" 2>/dev/null || continue
     lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
     until="${lease##*$'\t'}"
-    # The same 18-digit bound as claim_acquire's live check: a 19+ digit lease can error `[` (2**63),
-    # and the safe reading of an unreadable lease is "still live, do not reap". The explicit bound
-    # also keeps an ignored `[` error from being relied on as control flow. (10 digits is a REAL
-    # epoch second — see the note in claim_acquire; do not tighten this to 9.)
-    if [ -n "$until" ] && [ "$until" != "0" ] && [ "${#until}" -le 18 ] && [ "$now" -gt "$until" ]; then
+    # The polarity is `_lease_is_live`'s, not a fourth derivation of it: reap exactly what that
+    # function calls expired. "Still live, do not reap" covers the absent, the `0` sentinel, the
+    # non-digit and the 19+-digit lease (which ERRORS `[` at 2**63 — an errored test is FALSE, so an
+    # inline copy here would reap a claim the readers call live).
+    if ! _lease_is_live "$until" "$now"; then
       _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && echo "pruned expired $ref"
     fi
   done
