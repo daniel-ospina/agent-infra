@@ -92,9 +92,15 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # print-mode flag as a TOKEN and `--no-session` ANYWHERE. No line joining, no flag order, and an
   # EXCLUSION list of non-launcher paths rather than an extension allow-list (a new extension cannot
   # silently drop a launch path out of the census).
-  # STATED LIMIT: an invocation that omits `--no-session` (the harness convention requires it), or one
-  # whose command name AND flags are both assembled at runtime, is outside a static census — that
-  # residue is the runtime `run_agent` contract's job, not a grep's.
+  # STATED LIMITS, all three (a limit nobody writes down is a limit the next lane rediscovers):
+  #   (1) an invocation that omits `--no-session` (the harness convention requires it);
+  #   (2) one that omits the PRINT-MODE FLAG (`pi --no-session …`) — the detector keys on the flag
+  #       PAIR, not on `--no-session` alone; and
+  #   (3) one whose command name AND flags are both assembled at runtime.
+  # Those residues are the runtime `run_agent` contract's job, not a grep's. SCOPE: `scripts/` only —
+  # `extensions/` also launches `pi` and is outside this guard's declared population. It can also
+  # FALSE-POSITIVE on a non-launcher carrying a `-p` token and a `--no-session` mention, which fails
+  # CLOSED (RED, and the file is named), so it cannot hide a launch path.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
