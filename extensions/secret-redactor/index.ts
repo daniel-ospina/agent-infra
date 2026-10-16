@@ -308,6 +308,12 @@ function refresh(): void {
     /* keep the previous cache */
   }
 }
+
+/** Re-read the configured stores immediately (the 30s timer does the same). Exported so
+ *  the suite can re-load after it repairs a deliberately-broken store. */
+export function refreshSecrets(): void {
+  refresh();
+}
 function secrets(): Secret[] {
   return cache;
 }

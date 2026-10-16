@@ -244,6 +244,11 @@ process.env.CACHE_KEY = CACHE_ENV_SECRET;
 process.env.ID_KEY = ID_ENV_SECRET;
 delete process.env.ZAI_API_KEY;
 
+// Review round 10: a store that EXISTS but cannot be parsed. Written BEFORE the module
+// is imported so the handler's fail-closed path is exercised for real; the first test
+// repairs it and re-loads, and the rest of the suite runs on a complete set.
+writeFileSync(join(AGENT, "broken-store.json"), "{ this is not json");
+
 let passed = 0;
 let failed = 0;
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -258,8 +263,9 @@ async function test(name: string, fn: () => void | Promise<void>): Promise<void>
 }
 
 async function main(): Promise<void> {
-  const { default: secretRedactor } = (await import("./index.js")) as {
+  const { default: secretRedactor, refreshSecrets } = (await import("./index.js")) as {
     default: (pi: unknown) => void;
+    refreshSecrets: () => void;
   };
 
   let handler: ((event: unknown) => unknown) | undefined;
@@ -270,6 +276,22 @@ async function main(): Promise<void> {
   };
   secretRedactor(pi);
   const run = (event: Record<string, unknown>): Promise<any> => Promise.resolve(handler!(event));
+
+  // ── review round 10: an unreadable store fails CLOSED, it is not dropped silently ──
+  // FIRST, because the broken store must be present when the module loads its cache.
+  await test("a store that EXISTS but cannot be parsed fails closed and names the store", async () => {
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "hello" }] });
+    ok(out, "an incomplete exact detector must not pass a result through (it used to be silent)");
+    equal((out as { isError?: boolean }).isError, true, "the withheld result is an error");
+    ok(
+      JSON.stringify(out).includes("broken-store"),
+      "the message NAMES the unreadable store so the degradation is not silent",
+    );
+    ok(JSON.stringify(out).toLowerCase().includes("withheld"), "the message explains the state");
+    // Repair the store and re-load: the rest of the suite runs against a complete set.
+    writeFileSync(join(AGENT, "broken-store.json"), "{}");
+    refreshSecrets();
+  });
 
   // ── exact-value detection (config store + env) ─────────────────────────────
   await test("exact configured value is redacted from content", async () => {
@@ -589,40 +611,6 @@ async function main(): Promise<void> {
       const out = await run({ toolName: "bash", content: [{ type: "text", text: `${leaf}=${value}` }] });
       ok(out && !JSON.stringify(out).includes(value), `${leaf} must be collected (was emitted verbatim)`);
     }
-  });
-
-  // ── review round 10: an unreadable store must fail closed, not silently vanish ──
-  await test("a store that EXISTS but cannot be parsed fails closed and names the store", async () => {
-    const badHome = mkdtempSync(join(tmpdir(), "secret-redactor-bad-"));
-    const badAgent = join(badHome, ".pi", "agent");
-    mkdirSync(badAgent, { recursive: true });
-    // A declared fleet store that exists but is not valid JSON. Pre-fix its values were
-    // dropped from the exact detector with no warning; a result then passed through.
-    writeFileSync(join(badAgent, "tortoise-config.json"), "{ this is not json");
-    const savedHome = process.env.HOME;
-    let badHandler: ((event: unknown) => unknown) | undefined;
-    try {
-      process.env.HOME = badHome;
-      // A FRESH module instance (query-bust): its AGENT_DIR is the bad HOME, because the
-      // suite's own instance already captured HOME at load time.
-      const mod = (await import("./index.js?degraded-store")) as { default: (pi: unknown) => void };
-      mod.default({
-        on: (name: string, fn: (event: unknown) => unknown) => {
-          if (name === "tool_result") badHandler = fn;
-        },
-      });
-    } finally {
-      process.env.HOME = savedHome;
-    }
-    const out = await Promise.resolve(badHandler!({ toolName: "read", content: [{ type: "text", text: "hello" }] }));
-    ok(out, "an incomplete exact detector must not pass a result through (it used to be silent)");
-    equal((out as { isError?: boolean }).isError, true, "the withheld result is an error");
-    ok(
-      JSON.stringify(out).includes("tortoise-config"),
-      "the message NAMES the unreadable store so the degradation is not silent",
-    );
-    ok(JSON.stringify(out).toLowerCase().includes("withheld"), "the message explains the state");
-    rmSync(badHome, { recursive: true, force: true });
   });
 
   // ── negatives: no over-redaction, no touch when clean ──────────────────────
