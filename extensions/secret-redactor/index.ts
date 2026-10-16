@@ -40,7 +40,16 @@
  *       enumerable entries, and only string `Map` keys are redacted (they are passed
  *       through untouched, not withheld);
  *     - only exact configured values and the five credential shapes are caught; an
- *       unknown-format secret in a store not under ~/.pi/agent is not.
+ *       unknown-format secret in a store not under ~/.pi/agent is not;
+ *     - camelCase credential-key leaves are collected only for the shapes the LEAF
+ *       matcher names (`apiKey`, `secretKey`, `secretPassphrase`, `privateKey`,
+ *       `signingKey`, …). An unlisted camelCase spelling (`encryptionKey`,
+ *       `accessKey`) is not collected from a STORE, while the env collector accepts
+ *       any `*_KEY` name; that asymmetry is this one (review P2);
+ *     - a store that EXISTS but cannot be read or parsed (EACCES, truncated JSON) is
+ *       NOT silently dropped: the exact detector is then incomplete, so the handler
+ *       FAILS CLOSED and names the store. A store that is simply ABSENT is not a
+ *       degradation — there are no values to lose — so a fresh machine is unaffected.
  *   The durable fix for the class is to redact at the point of PERSISTENCE (one
  *   choke point) rather than recognise values in flight — and, for this incident,
  *   ROTATION, which is what makes the 301 existing copies moot.
@@ -58,7 +67,9 @@
  * TRAVERSAL FAILURE is treated separately and FAILS CLOSED: an incomplete scan is not
  * evidence of absence, so "no hit recorded yet" is not the same statement as "no
  * secret present" (the earlier code returned the original result on any throw, which
- * re-emitted a secret sitting in a later, unvisited sibling).
+ * re-emitted a secret sitting in a later, unvisited sibling). For the same reason, a
+ * configured store that exists but cannot be read or parsed also fails closed: the
+ * exact-value set is then partial and the handler withholds, naming the store.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -81,7 +92,12 @@ const SECRET_WORD = "(secret|password|passwd|credentials?)";
  *  `PRIVATE_KEY`…) is collected too; without it the SAME value was redacted from the
  *  environment and emitted verbatim from `.mcp.json` (review round 5). Camel-case
  *  `*Key` is deliberately NOT included: a bare `key$` would also match `monkey`/
- *  `sortKey`/`foreignKey` and redact ordinary data (over-redaction is a harm).
+ *  `sortKey`/`foreignKey` and redact ordinary data (over-redaction is a harm) EXCEPT
+ *  for the unambiguous credential adjectives, which are matched explicitly
+ *  (`(private|signing)[_-]?key$`): `privateKey` / `signingKey` are private key material
+ *  and a private HMAC/JWT signing secret, and they are the ONE camelCase `*Key` family
+ *  the env collector caught (`JWT_SIGNING_KEY`) while a store leaf did not — a configured
+ *  secret emitted verbatim (review P2).
  *  `NON_SECRET_KEY_RE` is the snake_case half of that same guard: `_key$` accepts
  *  EVERY `*_key` leaf, so `sort_key`/`foreign_key`/`primary_key` — the snake_case
  *  spelling of the very words above — were redacted too (review round 6). The env
@@ -100,11 +116,12 @@ const SECRET_WORD = "(secret|password|passwd|credentials?)";
  *  EVERY following word is itself credential vocabulary; that is what keeps round 8's
  *  negatives negative (`credentialsFile` → `File`, `passwordPolicy` → `Policy`,
  *  `secretary` → `ary`, `secretariatOffice` → `ariatOffice` — none is a compound word)
- *  (review round 9). */
-const SECRET_COMPOUND_WORD = "(key|value|hash|id|token|secret|access)";
+ *  (review round 9). `passphrase` is credential vocabulary too: `secretPassphrase` was
+ *  collected before the round-8 anchoring and emitted verbatim after it (review P2). */
+const SECRET_COMPOUND_WORD = "(key|value|hash|id|token|secret|access|passphrase)";
 const SECRET_COMPOUND_RE = `${SECRET_WORD}([_-]?${SECRET_COMPOUND_WORD})+$`;
 const SECRET_LEAF_RE = new RegExp(
-  `(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|(^|[_-])${SECRET_WORD}([_-]|$)|${SECRET_WORD}$|${SECRET_COMPOUND_RE}|(^|[_-])key$)`,
+  `(api[_-]?key|access[_-]?token|refresh[_-]?token|token$|(^|[_-])${SECRET_WORD}([_-]|$)|${SECRET_WORD}$|${SECRET_COMPOUND_RE}|(private|signing)[_-]?key$|(^|[_-])key$)`,
   "i",
 );
 /** Leaves that END in `key` but hold ordinary relational/identity data, not a
@@ -152,19 +169,26 @@ const PATTERNS: Array<[string, RegExp]> = [
 const leafOf = (path: string): string => path.split(".").pop() ?? path;
 const isReference = (v: string): boolean => REFERENCE_RE.test(v.trim());
 
-function collectFromJson(label: string, file: string, into: Secret[]): void {
+function collectFromJson(label: string, file: string, into: Secret[], degraded: string[]): void {
   let raw: string;
   try {
     raw = readFileSync(file, "utf8");
-  } catch {
+  } catch (err) {
+    // A store that is simply ABSENT has no values to lose and is not a degradation;
+    // one that EXISTS but cannot be read IS — the exact detector would otherwise
+    // report "no secret" over an incomplete set (fail-closed contract; see below).
+    if ((err as { code?: string }).code !== "ENOENT") degraded.push(label);
     return;
   }
   let obj: unknown;
   try {
     obj = JSON.parse(raw);
   } catch {
+    // A truncated / hand-edited store is the same incomplete-scan case as EACCES.
+    degraded.push(label);
     return;
   }
+  let ordinal = 0;
   const walk = (node: unknown, path: string): void => {
     if (typeof node === "string") {
       const leaf = leafOf(path);
@@ -175,12 +199,16 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
       const secretKey =
         (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) || SECRET_PATH_RE.test(path);
       if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
-        // The label is `store:path` — the traversal ROOT is the store label, so it must
-        // be stripped from the display path or it repeats (`store:store.apiKey`).
-        const p = path === label ? "" : path.slice(label.length + 1);
-        // The path is built from the store's KEYS and a key can itself BE a secret, so
-        // `scrubLabels` runs over every label before it can reach a marker or warning.
-        into.push({ label: `${label}:${p || "(root)"}`, value: node });
+        // The label is POSITION-INDEPENDENT of the store's contents (`store#N`), never
+        // `store:path`. The path is built from the store's KEYS and a key can itself BE
+        // a secret that is never a collected VALUE (`{"auths": {"<secret>": {…}}}`), so
+        // embedding the path re-emitted that secret in the marker AND in the appended
+        // warning — the class this extension closes. `scrubLabels` could only scrub a key
+        // that ALSO happened to be a value, which is why the old pin was vacuous (review
+        // finding). The store NAME is kept (it says where the leak came from) and is
+        // itself scrubbed; the ordinal keeps two secrets from the same store distinct.
+        ordinal += 1;
+        into.push({ label: `${label}#${ordinal}`, value: node });
       }
       return;
     }
@@ -195,33 +223,37 @@ function collectFromJson(label: string, file: string, into: Secret[]): void {
   walk(obj, label);
 }
 
-/** A label embeds the traversal PATH, and that path is built from the store's object
- *  KEYS — a key can itself BE a secret (`{"<apiKey>": {"password": …}}`). The marker
- *  and the warning are both built from labels, so an un-scrubbed path re-emitted the
- *  very secret being redacted, twice, into the transcript (review round 8). Scrub every
- *  label through the same substitution the content gets, so a label is position-
- *  independent of user data. Runs on the already-length-sorted list, so a longer secret
- *  is replaced before its shorter substring. */
+/** The one substitution both a label and the degraded-store notice go through: the
+ *  STORE NAME is filesystem-derived, so a file named after a secret (`<apiKey>.json`)
+ *  must not reach the marker or the warning either. Runs over the already-length-sorted
+ *  list, so a longer secret is replaced before its shorter substring. */
+function scrubWith(text: string, secrets: Secret[]): string {
+  let out = text;
+  for (const s of secrets) {
+    if (s.value && out.includes(s.value)) out = out.split(s.value).join("[REDACTED]");
+  }
+  for (const [label, re] of PATTERNS) {
+    out = out.replace(new RegExp(re.source, re.flags), `[REDACTED:${label}]`);
+  }
+  return out;
+}
+
+/** A label is `store#N`, and the STORE NAME is filesystem-derived — a file named after
+ *  a secret (`<apiKey>.json`) would put it in the marker and the warning. The path is no
+ *  longer embedded at all (a path is built from the store's KEYS and a key can itself BE
+ *  a secret that is never a collected value; review round 10), so this scrub is the
+ *  belt-and-braces for the name. */
 function scrubLabels(secrets: Secret[]): void {
-  const scrub = (text: string): string => {
-    let out = text;
-    for (const s of secrets) {
-      if (s.value && out.includes(s.value)) out = out.split(s.value).join("[REDACTED]");
-    }
-    for (const [label, re] of PATTERNS) {
-      out = out.replace(new RegExp(re.source, re.flags), `[REDACTED:${label}]`);
-    }
-    return out;
-  };
-  for (const s of secrets) s.label = scrub(s.label);
+  for (const s of secrets) s.label = scrubWith(s.label, secrets);
 }
 
 /** Every top-level *.json in the agent dir (a store added later is covered), falling
  *  back to the known stores when readdir itself fails — otherwise a readdir error
  *  silently reduced the exact detector to nothing (review finding). Runs OFF the hot
  *  path (see the cache below), which is what makes scanning all of them affordable. */
-function loadSecrets(): Secret[] {
+function loadSecrets(): { secrets: Secret[]; degraded: string[] } {
   const out: Secret[] = [];
+  const degraded: string[] = [];
   let names: string[] = [];
   try {
     names = readdirSync(AGENT_DIR).filter((fn) => fn.endsWith(".json"));
@@ -231,12 +263,14 @@ function loadSecrets(): Secret[] {
   if (names.length === 0) names = FALLBACK_STORES;
   for (const fn of names) {
     const p = join(AGENT_DIR, fn);
+    const label = fn.replace(/\.json$/, "");
     try {
       if (statSync(p).size > 2_000_000) continue;
-    } catch {
+    } catch (err) {
+      if ((err as { code?: string }).code !== "ENOENT") degraded.push(label);
       continue;
     }
-    collectFromJson(fn.replace(/\.json$/, ""), p, out);
+    collectFromJson(label, p, out, degraded);
   }
   // Configured secrets in the process environment. `_KEY$` is included (SSH_PRIVATE_KEY,
   // ENCRYPTION_KEY, MASTER_KEY… would otherwise be missed); PUBLIC ones are excluded.
@@ -257,13 +291,19 @@ function loadSecrets(): Secret[] {
   }
   const result = out.filter((s) => s.value.length >= MIN_LEN).sort((a, b) => b.value.length - a.value.length);
   scrubLabels(result);
-  return result;
+  // The degraded names go into a message too, so scrub them the same way as a label.
+  return { secrets: result, degraded: degraded.map((d) => scrubWith(d, result)) };
 }
 
 let cache: Secret[] = [];
+/** Stores that EXIST but could not be read or parsed. Non-empty ⇒ the exact detector is
+ *  incomplete ⇒ the handler fails closed and names them (it used to be silent). */
+let degradedStores: string[] = [];
 function refresh(): void {
   try {
-    cache = loadSecrets();
+    const loaded = loadSecrets();
+    cache = loaded.secrets;
+    degradedStores = loaded.degraded;
   } catch {
     /* keep the previous cache */
   }
@@ -461,6 +501,17 @@ const WITHHELD =
   "credential, so the output is withheld. Read the value at its source and pass it directly " +
   "to the consumer instead of printing it.";
 
+/** The exact detector could not read a configured store, so it cannot certify "no secret".
+ *  Withhold (never proceed on a partial set) and NAME the store so the state is not
+ *  silent — an unreadable store used to drop its own secrets from the set with no warning. */
+function withheldDegraded(stores: string[]): string {
+  return (
+    `[secret-redactor] The configured secret store(s) ${stores.join(", ")} could not be read or parsed, ` +
+    `so the exact-value detector is incomplete and this result is withheld. Repair the store ` +
+    `(readable, valid JSON) or remove it, then retry.`
+  );
+}
+
 export default function (pi: ExtensionAPI): void {
   refresh();
   const timer = setInterval(refresh, CACHE_MS);
@@ -469,6 +520,15 @@ export default function (pi: ExtensionAPI): void {
   pi.on("tool_result", async (event) => {
     const content = (event as { content?: unknown }).content;
     if (!Array.isArray(content)) return; // not ours to touch; a string here breaks downstream
+
+    if (degradedStores.length > 0) {
+      // A store EXISTS but could not be read or parsed, so the exact detector is
+      // INCOMPLETE: over a partial set, "no hit" is not evidence of absence. Fail closed
+      // (the same doctrine as a traversal throw) and name the store — dropping an
+      // unreadable store was silent before (review finding). The 30s refresh clears this
+      // once the store is readable again; an ABSENT store is not a degradation.
+      return { content: [{ type: "text", text: withheldDegraded(degradedStores) }], details: {}, isError: true } as never;
+    }
 
     const hits = new Set<string>();
     try {
