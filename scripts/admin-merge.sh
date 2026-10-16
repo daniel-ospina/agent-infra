@@ -1395,6 +1395,19 @@ merge_art_knobs_ok() {
     && ! counter_exceeds_max "$VERIFY_ATTEMPTS" "$TIMING_KNOB_MAX"
 }
 
+# refuse_bad_merge_art_attempts_override <value> -> 1 (having said why) when the
+# SINGLE-SHOT override is unusable (#1709 rec 7 review). The override is a CALLER's
+# arithmetic bound on the one door, so it gets the knob's own three refusals, named —
+# rather than the silent substitution that would reproduce #1690's defaulting.
+refuse_bad_merge_art_attempts_override() {
+  say_err "admin-merge: ✗ refusing a bad merge-artifact attempts override ('${1:-}')"
+  say_err "   — the single-shot pre-check's bound must be a POSITIVE integer without a leading"
+  say_err "   zero (max ${TIMING_KNOB_MAX}): a leading zero is octal to the loop's arithmetic, a"
+  say_err "   non-positive value attempts no read, and a larger one is a bound the arithmetic"
+  say_err "   cannot hold. Fix the caller — this is not defaulted."
+  return 1
+}
+
 # refuse_bad_merge_art_knobs -> 1 (having said why) when the bound is unusable.
 refuse_bad_merge_art_knobs() {
   say_err "admin-merge: ✗ refusing a bad merge-artifact knob (ADMIN_MERGE_VERIFY_ATTEMPTS='${VERIFY_ATTEMPTS}')"
@@ -1695,11 +1708,17 @@ poll_merge_artifact() { # <pr> [attempts-override]
   # just issued land?" — a bounded WAIT. Running the WAIT at the top of every merge would
   # idle 6 attempts × 2s on every healthy (unmerged) PR, so the pre-check needs ONE shot;
   # the polarity, the projection and the three-outcome contract must nevertheless stay
-  # ONE implementation, which is why the override lives here and not in a copy. A caller
-  # passes a literal positive integer; anything else (absent, non-numeric, zero, leading
-  # zero) leaves the configured window untouched, so a future caller cannot smuggle an
-  # invalid arithmetic bound in past `merge_art_knobs_ok` and reproduce #1690's
-  # zero-reads-but-claims-a-bound symptom.
+  # ONE implementation, which is why the override lives here and not in a copy. ABSENT
+  # (`''`) is the optional-arg contract and keeps the configured window — both in-rail
+  # callers pass no override. A PRESENT value is a CALLER's arithmetic bound, so it is
+  # REFUSED BY NAME unless it is a validated positive integer within TIMING_KNOB_MAX
+  # (refuse_bad_merge_art_attempts_override) — never silently defaulted. The first version
+  # of this accepted any all-digit value with no leading zero and DEFAULTED every other
+  # shape, which is #1690's defaulting one arm over: `… 08` quietly polled the configured
+  # window, and `… 1000000000` — one past TIMING_KNOB_MAX — became a bound the loop's
+  # arithmetic cannot hold, the very symptom this block exists to prevent. A caller's typo
+  # must be LOUD, not silently substituted.
+  # (Pinned by tests/admin-merge/run.sh's `override-probe` block.)
   local pr="$1" attempts_override="${2:-}"
   MERGE_ART_VERDICT="unreadable"
   MERGE_ART_STATE="<unreadable>"
@@ -1712,10 +1731,22 @@ poll_merge_artifact() { # <pr> [attempts-override]
   MERGE_ART_ATTEMPTS="0"
   MERGE_ART_DIAG=""
   local attempts="$VERIFY_ATTEMPTS"
-  case "$attempts_override" in
-    ''|0*|*[!0-9]*) : ;;   # absent / zero / leading zero / non-numeric → keep the window
-    *) attempts="$attempts_override" ;;
-  esac
+  # ⛔ ABSENT keeps the window (optional arg); PRESENT is VALIDATED, NOT DEFAULTED (#1709
+  # rec 7 review). The three refusals below are the same three the knob itself is refused
+  # for, so no path can put an arithmetic bound in here that `merge_art_knobs_ok` would have
+  # rejected had it been the knob — which is exactly what the block comment above claims.
+  # `return 1` here is the same shape as the knob refusal below: the globals are already set
+  # (MERGE_ART_ATTEMPTS is the TRUE `0`, i.e. zero reads ran), so every caller's message
+  # stays truthful and no unbound-variable abort can reach `set -u`.
+  if [ -n "$attempts_override" ]; then
+    if counter_has_leading_zero "$attempts_override" \
+       || ! counter_is_positive "$attempts_override" \
+       || counter_exceeds_max "$attempts_override" "$TIMING_KNOB_MAX"; then
+      refuse_bad_merge_art_attempts_override "$attempts_override"
+      return 1
+    fi
+    attempts="$attempts_override"
+  fi
   # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
   # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
   # different budget for a typo) and — measured — a leading-zero value reached this
