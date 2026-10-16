@@ -144,6 +144,16 @@ REAP_ORPHAN_LSOF_TIMEOUT="${REAP_ORPHAN_LSOF_TIMEOUT:-60}"
 REAP_ORPHAN_BUDGET_SECONDS="${REAP_ORPHAN_BUDGET_SECONDS:-300}"
 REAP_ORPHAN_LOCK_STALE_SECONDS="${REAP_ORPHAN_LOCK_STALE_SECONDS:-1800}"
 REAP_ORPHAN_CWD_ROOTS="${REAP_ORPHAN_CWD_ROOTS:-}"
+# BSD stat uses `-f '%m'`, GNU stat uses `-c '%Y'`. Auto-detected from uname;
+# overridable so a test can pin either form. (Used ONLY for the lock dir mtime.)
+STAT_BIN="${STAT_BIN:-stat}"
+REAP_ORPHAN_STAT_FLAVOR="${REAP_ORPHAN_STAT_FLAVOR:-}"
+if [ -z "$REAP_ORPHAN_STAT_FLAVOR" ]; then
+    case "$(uname -s 2>/dev/null)" in
+        Linux) REAP_ORPHAN_STAT_FLAVOR=gnu ;;
+        *)     REAP_ORPHAN_STAT_FLAVOR=bsd ;;
+    esac
+fi
 
 MODE=unknown
 LIST_ONLY=0
@@ -278,8 +288,18 @@ scratch_file() { # <tag> -> path on stdout ("" on failure)
 
 # ── lock (macOS has no flock) ──────────────────────────────────────────
 lock_release() { [ "$LOCK_HELD" = 1 ] && { rm -rf "$LOCK_DIR"; LOCK_HELD=0; }; return 0; }
+# stat_mtime <path> -> epoch seconds, or empty when unknown. ONE implementation,
+# flavour-detected: `stat -f %m` is BSD-only and errored out on Linux (the CI
+# runner), which left the lock age at 0 and meant a STALE lock was never broken —
+# every later pass exited 3 forever. Mirrors pi-reap-scratch.sh's stat_mtime().
+stat_mtime() {
+    case "$REAP_ORPHAN_STAT_FLAVOR" in
+        gnu) "$STAT_BIN" -c '%Y' "$1" 2>/dev/null ;;
+        *)   "$STAT_BIN" -f '%m' "$1" 2>/dev/null ;;
+    esac
+}
 lock_acquire() {
-    local owner age
+    local owner age mtime
     mkdir -p "$STATE_DIR" 2>/dev/null || return 1
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         printf '%s\n' "$$" >"$LOCK_DIR/pid" 2>/dev/null || true
@@ -287,17 +307,18 @@ lock_acquire() {
         return 0
     fi
     owner="$(cat "$LOCK_DIR/pid" 2>/dev/null | head -1)"
-    age=0
+    # A LIVE owner holds the lock, full stop — only a lock its owner no longer
+    # holds may be broken. The old code set `age=0` here and then OVERWROTE it
+    # unconditionally below, so on macOS a live owner's lock older than the stale
+    # bound was broken and two passes could run concurrently. Mirrors
+    # pi-reap-scratch.sh's lock_acquire().
     if [ -n "$owner" ] && is_pos_int "$owner" && kill -0 "$owner" 2>/dev/null; then
-        # A live owner holds it; only a stale age may break it.
-        age=0
+        return 1
     fi
-    if [ -n "$owner" ] && is_pos_int "$owner"; then
-        local mtime
-        mtime="$(stat -f %m "$LOCK_DIR" 2>/dev/null || printf 0)"
-        if is_pos_int "$mtime" && [ "$mtime" -gt 0 ]; then
-            age="$(( $(now_epoch) - mtime ))"
-        fi
+    age=0
+    mtime="$(stat_mtime "$LOCK_DIR")"
+    if is_pos_int "$mtime" && [ "$mtime" -gt 0 ]; then
+        age="$(( $(now_epoch) - mtime ))"
     fi
     if [ "$age" -ge "$REAP_ORPHAN_LOCK_STALE_SECONDS" ]; then
         log "lock: breaking stale lock (age ${age}s >= ${REAP_ORPHAN_LOCK_STALE_SECONDS}s)"
@@ -312,6 +333,17 @@ lock_acquire() {
 }
 
 # ── probes ─────────────────────────────────────────────────────────────
+# ps_table_shaped <raw> — is this a `ps` table AT ALL? Returns 1 when no row
+# carries integer pid/ppid/uid fields. A non-empty table that is not ps-shaped
+# (a wrapper banner, a shell error string) is the SAME failure class as an empty
+# one: every row is dropped by the `$2 == 1` candidate filter, the loop body
+# never runs, and the pass reports a clean exit 0 — a false PASS for exactly the
+# case the empty-table check misses (#1161 review).
+ps_table_shaped() {
+    awk '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { found = 1; exit }
+         END { exit(found ? 0 : 1) }' "$1" 2>/dev/null
+}
+
 # ps_load <outfile> — ONE ps pass. An empty table is a probe FAILURE, never "no
 # orphaned processes": reading it as clean is exactly the fail-open this tool
 # exists to avoid. Returns 1 on any unevaluable outcome.
@@ -322,14 +354,24 @@ ps_load() {
     rc=$?
     [ "$rc" = 0 ] || { [ "$rc" = 124 ] && log "ps pass timed out after ${REAP_ORPHAN_PS_TIMEOUT}s"; return 1; }
     [ -s "$out" ] || return 1
+    ps_table_shaped "$out" || { log "ps pass produced a non-ps table (unparseable)"; return 1; }
     return 0
 }
 
-# ps_normalize <raw> — "pid<TAB>ppid<TAB>uid<TAB>cpu_secs<TAB>elapsed_secs<TAB>command".
-# cpu/elapsed are coerced to INTEGERS here, in ONE awk pass, so no per-candidate
-# fork is needed and the comparison is a plain integer compare. A record whose
-# pid/ppid/uid are not integers is passed through with EMPTY cpu/elapsed — the
+# ps_normalize <raw> — "pid<TAB>ppid<TAB>uid<TAB>cpu_cs<TAB>elapsed_s<TAB>command".
+# Both numeric fields are coerced to INTEGERS here, in ONE awk pass, so no
+# per-candidate fork is needed and the comparisons are plain integer compares. A
+# record whose pid/ppid/uid are not integers is passed through with EMPTY
+# cpu/elapsed — the
 # caller treats an empty value as "unevaluable" and preserves.
+#
+# UNITS, and why they are normalised HERE: cpu stays in CENTISECONDS (the
+# resolution `ps -o time` actually gives — see `csecs`), but elapsed is converted
+# to SECONDS. Both used to share `csecs()`, so `elapsed` was a centisecond count
+# compared against a seconds threshold — a 100x-weaker age floor (a 60 s default
+# behaved as 0.6 s) and a detail line that printed centiseconds labelled `s`
+# (#1161 review). Converting at this ONE boundary keeps the comparison and the
+# message unit-correct without a second helper.
 #
 # DEFAULT awk field splitting (NOT `-F'[ \t]+'`): `ps` pads every column, so an
 # explicit separator regex matches at offset 0 and shifts every field by one.
@@ -344,6 +386,9 @@ ps_normalize() {
                 printf "%s\t%s\t%s\t\t\t%s\n", pid, ppid, uid, cmd; next
             }
             c = csecs(t); el = csecs(e)
+            # elapsed -> SECONDS so the age floor is compared second-to-second
+            # (cpu stays in centiseconds: the leak detector needs that resolution).
+            if (el != "") el = int(el / 100)
             printf "%s\t%s\t%s\t%s\t%s\t%s\n", pid, ppid, uid, c, el, cmd
         }
         function csecs(v,   n, a, r, dash) {
@@ -377,6 +422,12 @@ ps_normalize() {
 # because the caller would then report a kill it cannot prove.
 pid_alive() {
     local raw="$1" p="$2" n row rc=0
+    # A table that is not ps-shaped cannot answer "is pid P alive" — and its
+    # silence must NOT read as absence. The caller treats this as STILL ALIVE
+    # (fail-closed); reading it as absent let a post-TERM probe of garbage print
+    # `REAPED — exited on SIGTERM`, skip the SIGKILL escalation and exit 0
+    # without ever proving death (#1161 review).
+    ps_table_shaped "$raw" || return 0
     n="$(mktemp "${TMPDIR:-/tmp}/pi-reap-orp-alive.XXXXXX" 2>/dev/null)" || return 0
     ps_normalize "$raw" >"$n" 2>/dev/null
     row="$(ps_row "$n" "$p")"

@@ -128,6 +128,8 @@ run_shard scripts/install-launchd.test.sh                                  # #30
 run_shard scripts/pi-reap-idle.test.sh                                     # #469 session reaper (fake PS/KILL/DATE shims)
 run_shard scripts/pi-task-session-prune.test.sh                            # #783 retention sweep (dry-run default)
 run_shard scripts/pi-reap-worktrees.test.sh                                # #1095 worktree reaper gates
+run_shard scripts/pi-reap-orphans.test.sh                                  # #1142 orphan reaper (fake PS/KILL/LSOF shims; every fail path PRESERVES)
+run_shard scripts/pi-reap-scratch.test.sh                                  # #1143 scratch reaper (/private/tmp + $TMPDIR; one lsof pass + all guards PRESERVE)
 run_shard scripts/scratch-worktree.test.sh                                 # #1141 scratch-checkout helper
 run_shard scripts/record-review.test.sh                                    # #1348 THE INCIDENT: runner-only rc=127 shipped green
 run_shard scripts/ci_runner_gate.test.sh                                   # #1704 an unreadable queue count / a failed runner enumeration must not read as healthy; #1719 the launcher, the farm and the script must agree

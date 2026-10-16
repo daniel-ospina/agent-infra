@@ -160,6 +160,7 @@ SELF_PREFIX="pi-reap-scratch."
 MODE=unknown
 LIST_ONLY=0
 VERBOSE=0
+ANY_ROOT=0
 MIN_AGE_OVERRIDE=""
 USER_ROOTS=()
 FLOORS=()          # parallel to ROOTS, filled once the roots are normalized
@@ -193,13 +194,17 @@ usage() {
 $SCRIPT_NAME — reclaim aged temp scratch from /tmp and \$TMPDIR ($ISSUE_REF)
 
 Usage:
-  $SCRIPT_NAME [--dry-run] [--apply] [--root PATH] [--min-age-min N]
-               [--sizes] [--verbose] [--list] [--help]
+  $SCRIPT_NAME [--dry-run] [--apply] [--root PATH] [--any-root]
+               [--min-age-min N] [--sizes] [--verbose] [--list] [--help]
 
   (no mode flag)  dry-run: classify + report, remove NOTHING (default)
   --dry-run       explicit dry-run
   --apply         armed one-shot pass (or env REAP_SCRATCH_DRY_RUN=0)
-  --root PATH     reap this root (repeatable; REPLACES the defaults)
+  --root PATH     reap this root (repeatable; REPLACES the defaults). PATH must
+                  canonicalize inside the scratch set (/tmp, $TMPDIR,
+                  /private/var/folders); anything else is refused.
+  --any-root      allow a --root outside the scratch set (loud override; a root
+                  of `/` is still always refused)
   --min-age-min N override the per-root age floor for every root
   --sizes         force the reclaimable-size probe (on by default)
   --verbose       print every preserved row, not only the histogram
@@ -306,6 +311,31 @@ scratch_file() {
 
 canonicalize() { ( cd "$1" 2>/dev/null && pwd -P ) || printf ''; }
 
+# scratch-scope guard (#1161 review). `--root` selects a SCRATCH tree; it is not
+# an arbitrary-path selector. Root validation used to check only `[ -d ]`, so
+# `--root /` (or any root whose canonicalization escapes the scratch set — e.g. a
+# symlink to `/`) was accepted and `run()` enumerated the TOP LEVEL of the
+# filesystem: /Users, /etc, /Applications, /System. `--apply` then reached
+# `run_bounded ... rm -rf -- "$path"` on each. The shipped plists pass no
+# `--root`, so the deployed jobs were never exposed, but the flag is documented
+# and reachable by an operator. `--any-root` is the explicit, loud escape hatch
+# for an operator who genuinely means another tree.
+root_in_scope() {
+    local c="$1" base
+    # `/` is refused FIRST: `--any-root` cannot re-enable the filesystem root,
+    # because enumerating its top level is the exact P0 this guard exists for.
+    [ "$c" = "/" ] && return 1
+    [ "$ANY_ROOT" = 1 ] && return 0
+    # canonicalize() resolves symlinks, so /tmp on macOS (/private/tmp) and
+    # $TMPDIR (/private/var/folders/...) both compare against their real path.
+    for base in /tmp /private/tmp /var/folders /private/var/folders ${TMPDIR:-}; do
+        base="$(canonicalize "$base")"
+        [ -n "$base" ] && [ "$base" != "/" ] || continue
+        case "$c" in "$base"|"$base"/*) return 0 ;; esac
+    done
+    return 1
+}
+
 # mount_points — ONE `mount` call, parsed into a newline-delimited set of mount
 # points (writes "$MOUNT_PTS"). Returns 1 when the table cannot be trusted, and
 # the caller then removes NOTHING.
@@ -334,6 +364,12 @@ mount_points() {
         { i = index($0, " on "); if (i == 0) next
           p = substr($0, i + 4)
           sub(/ \([^)]*\)$/, "", p)
+          # Linux `mount` prints `dev on /path type fstype (opts)`, so after the
+          # options are stripped a ` type fstype` token REMAINS and no parsed
+          # name ever equals a real path — the gate silently never fired on
+          # Linux (#1161 review). Strip it too; on macOS there is no such token,
+          # so this is a no-op there.
+          sub(/ type [^ ]+$/, "", p)
           if (p == "") next
           if (length(p) > 1) sub(/\/$/, "", p)
           print p }' "$MOUNT_OUT" >"$MOUNT_PTS" 2>/dev/null
@@ -412,8 +448,13 @@ held_blob() {
     local root="$1"
     printf '\n'
     awk -v root="$1" '
-        index($0, root "/") == 1 {
-            rest = substr($0, length(root) + 2)
+        # Prefix built ONCE and normalised for the root case: `root "/"` on
+        # root=/ yields the literal `//`, which no real absolute lsof path
+        # (/Users/..., /private/tmp/...) starts with — so the live-held gate was
+        # INERT for a `/` root and every held entry looked unheld (#1161 review).
+        BEGIN { prefix = (root == "/" ? "/" : root "/") }
+        index($0, prefix) == 1 {
+            rest = substr($0, length(prefix) + 1)
             if (rest == "") next
             sub(/\/.*$/, "", rest)
             if (rest != "") print rest
@@ -507,6 +548,7 @@ parse_args() {
             --root)
                 [ $# -ge 2 ] || { echo "bad --root: missing value" >&2; exit 2; }
                 USER_ROOTS+=("$2"); shift 2 ;;
+            --any-root) ANY_ROOT=1; shift ;;
             --min-age-min)
                 [ $# -ge 2 ] || { echo "bad --min-age-min: missing value" >&2; exit 2; }
                 MIN_AGE_OVERRIDE="$2"; shift 2 ;;
@@ -572,6 +614,12 @@ run() {
         if [ -z "$c" ] || [ ! -d "$c" ]; then
             printf 'root %s: UNUSABLE (not a resolvable directory) — this root contributed NOTHING\n' "${PRE_ROOTS[$i]}" >&2
             log "ROOT-UNUSABLE ${PRE_ROOTS[$i]}"
+            DEGRADED=$((DEGRADED + 1))
+            i=$((i + 1)); continue
+        fi
+        if ! root_in_scope "$c"; then
+            printf 'root %s: OUT OF SCRATCH SCOPE (canonical: %s) — refusing; pass --any-root to override\n' "${PRE_ROOTS[$i]}" "$c" >&2
+            log "ROOT-OUT-OF-SCOPE ${PRE_ROOTS[$i]} (canonical: $c)"
             DEGRADED=$((DEGRADED + 1))
             i=$((i + 1)); continue
         fi
@@ -791,19 +839,38 @@ run() {
             FAILED=$((FAILED + 1))
         else
             MOUNT_LIST="$(cat "$MOUNT_PTS")"
-            local removed_now=0
+            local removed_now=0 hb
             for path in ${RECLAIM[@]+"${RECLAIM[@]}"}; do
                 base="${path%/}"; base="${base##*/}"
                 root=""
                 i=0
                 while [ "$i" -lt "${#ROOTS[@]}" ]; do
-                    case "$path" in "${ROOTS[$i]}"/*) root="${ROOTS[$i]}"; break ;; esac
+                    # Normalise the root for the GLOB too: `"${ROOTS[$i]}"/*` on
+                    # root=/ is `//*`, which a real absolute path never matches,
+                    # so the re-probe's root lookup silently failed (#1161 review).
+                    local rp="${ROOTS[$i]}"; [ "$rp" = "/" ] && rp=""
+                    case "$path" in "$rp"/*) root="${ROOTS[$i]}"; break ;; esac
                     i=$((i + 1))
                 done
-                if [ -n "$root" ] && held_blob "$root" | grep -qxF -- "$base"; then
-                    printf 'preserve %s\n          reason=live-held-since-classification (pre-removal re-probe)\n' "$path"
-                    log "LATE-PRESERVE $path reason=live-held-since-classification"
-                    continue
+                # ⛔ The live-held test is a CAPTURE + bash `case`, never
+                # `held_blob | grep -q`. With `set -o pipefail`, `grep -q` exits at
+                # its first match while held_blob's trailing `printf` is still
+                # writing; the writer takes SIGPIPE (141) and the WHOLE pipeline
+                # reports 141 even though grep matched -> the `if` took the REMOVE
+                # branch and a live-held entry was `rm -rf`'d. That is the repo's
+                # own SIGPIPE+quiet-grep false-negative class (#841/#861) sitting
+                # in a deletion safety net, and `check-no-sigpipe-grep.sh` cannot
+                # see it because the producer is a shell FUNCTION, not printf/echo
+                # (#1161 review). The classification path already used this exact
+                # form -- mirror it.
+                if [ -n "$root" ]; then
+                    hb="$(held_blob "$root")"
+                    case $'\n'"$hb"$'\n' in
+                        *$'\n'"$base"$'\n'*)
+                            printf 'preserve %s\n          reason=live-held-since-classification (pre-removal re-probe)\n' "$path"
+                            log "LATE-PRESERVE $path reason=live-held-since-classification"
+                            continue ;;
+                    esac
                 fi
                 case $'\n'"$MOUNT_LIST"$'\n' in
                     *$'\n'"$path"$'\n'*)
