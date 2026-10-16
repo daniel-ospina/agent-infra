@@ -63,7 +63,7 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<strategy-domain
 
 **Interpretation:**
 - **Existing strategy Points found:** Summarize prior decisions, constraints, and assumptions. Use them as inputs to the gap analysis — what changed since the last strategy? What assumptions held true? Which didn't?
-- **\"tortoise unavailable\":** Skip — memory system offline. Proceed without prior context.
+- **`status: "not_configured"`** (no usable `TORTOISE_API_KEY` — never set up, or the key was rejected with HTTP 401/403) or **`status: "tortoise_unavailable"`** (the store was unreachable): skip — memory is not available here. Proceed without prior context.
 - **Zero results:** First strategy cycle for this domain. Note \"no prior strategy Points found.\"
 
 ### After Strategy — Write Strategy Points to Memory
@@ -86,7 +86,7 @@ node scripts/tortoise-memory.mjs write-points \
 - Explicit trade-offs (\"we chose X over Y because Z\")
 - Resources allocated and why
 
-**Graceful degradation:** If `tortoise unavailable` → skip with note.
+**Graceful degradation:** If `status` is `not_configured` or `tortoise_unavailable` → skip with note.
 
 ## What fails if you skip
 

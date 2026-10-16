@@ -379,16 +379,16 @@ localhost
 
 ```bash
 # URL fetching functions
-grep -rn "requests\.get\|requests\.post\|urllib\.request\|urlopen\|fetch\|axios" --include="*.py" --include="*.js"
+git grep -n -e "requests\.get\|requests\.post\|urllib\.request\|urlopen\|fetch\|axios" -- '*.py' '*.js'
 
 # URL from user input
-grep -rn "request\.args\|request\.form\|request\.json\|req\.query\|req\.body" --include="*.py" --include="*.js" | grep -i "url"
+git grep -n -e "request\.args\|request\.form\|request\.json\|req\.query\|req\.body" -- '*.py' '*.js' | grep -i "url"
 
 # Potential SSRF sinks
-grep -rn "curl_exec\|file_get_contents\|fopen\|readfile" --include="*.php"
+git grep -n -e "curl_exec\|file_get_contents\|fopen\|readfile" -- '*.php'
 
 # Missing validation
-grep -rn "requests\.get(url\|fetch(url" --include="*.py" --include="*.js"
+git grep -n -e "requests\.get(url\|fetch(url" -- '*.py' '*.js'
 ```
 
 ---

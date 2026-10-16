@@ -32,7 +32,7 @@
  * Run: npx tsx extensions/builtin-tools/provider-failover.integration.test.ts
  */
 
-import { spawnSubAgent, recordVeniceRoute } from "./index.js";
+import builtinToolsExt, { spawnSubAgent, recordVeniceRoute, DEFAULT_TASK_MODEL } from "./index.js";
 import { readLatchState } from "../shared/provider-failover.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -70,6 +70,11 @@ NONCE="${"${TASK_HEARTBEAT_NONCE:-}"}"
 SCENARIO="${"${FAKE_PI_SCENARIO:-}"}"
 NONCE_FILE="${"${FAKE_PI_NONCE_FILE:-}"}"
 [ -n "$NONCE_FILE" ] && echo "$NONCE" > "$NONCE_FILE"
+# #623: record the hatch vars THIS child actually observed, out of band.
+# #1030: also record the NON-INTERACTIVE git env, out of band — the only proof
+# that the hardening reaches the real child PROCESS, not just a built env object.
+HATCH_FILE="${"${FAKE_PI_HATCH_FILE:-}"}"
+[ -n "$HATCH_FILE" ] && printf 'agent=%s\neldato=%s\ngiteditor=%s\nseqeditor=%s\nprompt=%s\n' "${"${AGENT_ALLOW_MAIN_EDITS:-}"}" "${"${ELDATO_ALLOW_MAIN_EDITS:-}"}" "${"${GIT_EDITOR:-}"}" "${"${GIT_SEQUENCE_EDITOR:-}"}" "${"${GIT_TERMINAL_PROMPT:-}"}" > "$HATCH_FILE"
 m() { echo "[task-heartbeat] $1" >&2; }
 em() { echo "[provider-exhaustion] $1" >&2; }
 case "$SCENARIO" in
@@ -181,6 +186,83 @@ async function dispatch(
 
 function markerOf(value: { details: Record<string, unknown> } | undefined): any {
 	return (value?.details?.exhaustionMarker as any) ?? null;
+}
+
+// ── #623 task-tool (primary dispatcher) runtime harness ───────────────
+// The task tool's default-strip lives INSIDE its execute() (subAgentEnv),
+// which the dispatch() helper above bypasses (it composes subAgentEnv by
+// hand + calls spawnSubAgent). Cover the real execute() path: capture the
+// registered task tool def through a minimal pi mock (the provider-fallback
+// precedent), then invoke it with a hatched parent env and read the CHILD's
+// observed env from the fake pi's out-of-band hatch file.
+let taskToolDef: any = null;
+const registeredToolNames: string[] = [];
+const piMock: any = new Proxy(
+	{
+		registerTool: (def: any) => {
+			registeredToolNames.push(def?.name);
+			if (def?.name === "task") taskToolDef = def;
+		},
+	},
+	{ get: (target: any, key: string) => (key in target ? target[key] : () => {}) },
+);
+(builtinToolsExt as any)(piMock);
+
+function readHatchFile(file: string): { agent: string; eldato: string; gitEditor: string; seqEditor: string; terminalPrompt: string } | null {
+	try {
+		const txt = fs.readFileSync(file, "utf-8");
+		return {
+			agent: (/agent=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			eldato: (/eldato=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			gitEditor: (/giteditor=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			seqEditor: (/seqeditor=(.*)/.exec(txt)?.[1] ?? "").trim(),
+			terminalPrompt: (/prompt=(.*)/.exec(txt)?.[1] ?? "").trim(),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Invoke the REAL task-tool execute() with a controlled PARENT hatch state and
+ * return the hatch vars the spawned child observed. */
+async function dispatchTaskTool(
+	params: Record<string, unknown>,
+	parentHatch: "both" | "none",
+): Promise<{ hatch: { agent: string; eldato: string; gitEditor: string; seqEditor: string; terminalPrompt: string } | null }> {
+	const hatchFile = path.join(tmpDir, `hatch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}.txt`);
+	const savedAgent = process.env.AGENT_ALLOW_MAIN_EDITS;
+	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
+	const savedScenario = process.env.FAKE_PI_SCENARIO;
+	const savedHatchFile = process.env.FAKE_PI_HATCH_FILE;
+	// #783 Task 1: the real execute() now creates + persists child sessions;
+	// point the session root at the suite's tmpdir so tests never accumulate
+	// real child session dirs under the operator's $HOME.
+	const savedSessionRoot = process.env.TASK_SESSION_ROOT;
+	process.env.TASK_SESSION_ROOT = path.join(tmpDir, "task-sessions");
+	if (parentHatch === "both") {
+		process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+		process.env.ELDATO_ALLOW_MAIN_EDITS = "1";
+	} else {
+		delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	}
+	process.env.FAKE_PI_SCENARIO = "healthy";
+	process.env.FAKE_PI_HATCH_FILE = hatchFile;
+	try {
+		await taskToolDef.execute("hatch-call", params, undefined);
+		return { hatch: readHatchFile(hatchFile) };
+	} finally {
+		if (savedAgent === undefined) delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		else process.env.AGENT_ALLOW_MAIN_EDITS = savedAgent;
+		if (savedEldato === undefined) delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+		else process.env.ELDATO_ALLOW_MAIN_EDITS = savedEldato;
+		if (savedScenario === undefined) delete process.env.FAKE_PI_SCENARIO;
+		else process.env.FAKE_PI_SCENARIO = savedScenario;
+		if (savedHatchFile === undefined) delete process.env.FAKE_PI_HATCH_FILE;
+		else process.env.FAKE_PI_HATCH_FILE = savedHatchFile;
+		if (savedSessionRoot === undefined) delete process.env.TASK_SESSION_ROOT;
+		else process.env.TASK_SESSION_ROOT = savedSessionRoot;
+	}
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -346,6 +428,117 @@ test("usage ledger round-2 P2-3: venice-route + dispatch-usage rows SHARE the pr
 		if (savedLedger === undefined) delete process.env.TASK_USAGE_LEDGER;
 		else process.env.TASK_USAGE_LEDGER = savedLedger;
 	}
+});
+
+section("#623 — task-tool runtime child-env hatch strip (primary dispatcher)");
+
+test("#623 harness: the real task tool registered and exposes the allow_main_edits opt-in", async () => {
+	ok(registeredToolNames.includes("task"), `task tool registered (got: ${registeredToolNames.join(",")})`);
+	ok(taskToolDef, "task tool def captured from the extension registration");
+	ok(
+		Object.keys(taskToolDef.parameters?.properties ?? {}).includes("allow_main_edits"),
+		"task tool schema exposes the per-dispatch allow_main_edits opt-in",
+	);
+});
+
+test("#715: the task tool schema description INTERPOLATES the default (no hand-written literal can drift)", () => {
+	const desc: string = taskToolDef?.parameters?.properties?.model?.description ?? "";
+	ok(desc, "task tool exposes a model description");
+	// Re-hardcoding the literal would let the description advertise a stale
+	// default the moment DEFAULT_TASK_MODEL changes — the drift class #715 r2
+	// fixed by construction. Pin the interpolation, not just the constant.
+	ok(
+		desc.includes(`default: ${DEFAULT_TASK_MODEL}`),
+		`model description must interpolate DEFAULT_TASK_MODEL as the default (got: ${desc.slice(0, 60)}…)`,
+	);
+	ok(
+		desc.includes(`'${DEFAULT_TASK_MODEL}' → deepseek`),
+		"model description must interpolate the bare-id example from DEFAULT_TASK_MODEL",
+	);
+});
+
+test("#623: a HATCHED controller's task-tool child observes NO hatch by default (runtime, not source-scan)", async () => {
+	const { hatch } = await dispatchTaskTool({ prompt: "#623 runtime hatch probe — default strip" }, "both");
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "", "child AGENT_ALLOW_MAIN_EDITS must be unset (default-strip)");
+	equal(hatch!.eldato, "", "child ELDATO_ALLOW_MAIN_EDITS must be unset (default-strip)");
+});
+
+test("#623: allow_main_edits: true restores the hatch for THAT dispatch only (runtime)", async () => {
+	const { hatch } = await dispatchTaskTool(
+		{ prompt: "#623 runtime hatch probe — opt-in", allow_main_edits: true },
+		"both",
+	);
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "1", "opt-in restored AGENT_ALLOW_MAIN_EDITS");
+	equal(hatch!.eldato, "1", "opt-in restored ELDATO_ALLOW_MAIN_EDITS");
+});
+
+test("#623: allow_main_edits: true is a NO-OP for an UNHATCHED controller (cannot grant what the parent lacks)", async () => {
+	const { hatch } = await dispatchTaskTool(
+		{ prompt: "#623 runtime hatch probe — unhatched opt-in", allow_main_edits: true },
+		"none",
+	);
+	ok(hatch, "the fake pi child wrote its observed-hatch file");
+	equal(hatch!.agent, "", "unhatched parent cannot hatch a child");
+	equal(hatch!.eldato, "", "unhatched parent cannot hatch a child");
+});
+
+// ── #1030: the task child's NON-INTERACTIVE git env (runtime, not source-scan)
+// A task child has no TTY (`stdio: ["ignore","pipe","pipe"]`), so an
+// interactive git invoker can only ever hang. The incident's one genuinely
+// wedged child was a merge `git commit` with no -m/-F that opened vim and sat
+// silent for 1211s until the inactivity bound killed it. These tests read the
+// values off the REAL spawned child process via the out-of-band hatch file —
+// the only way to prove the hardening survives the env composition (the
+// `...process.env` spread, the #285/#623 strips) rather than merely existing in
+// the literal.
+test("#1030 (E2E): a task child observes a NON-INTERACTIVE git env", async () => {
+	const { hatch } = await dispatchTaskTool({ prompt: "#1030 runtime git-env probe" }, "none");
+	ok(hatch, "the fake pi child wrote its observed-env file");
+	equal(hatch!.gitEditor, "true", "GIT_EDITOR must be the non-interactive no-op in the child");
+	equal(hatch!.seqEditor, "true", "GIT_SEQUENCE_EDITOR must be the non-interactive no-op in the child");
+	equal(hatch!.terminalPrompt, "0", "GIT_TERMINAL_PROMPT=0 — a credential prompt must fail, not wait");
+});
+
+test("#1030 (E2E): a parent's OWN interactive editor env cannot leak into the child", async () => {
+	// The forced keys are written AFTER the `...process.env` spread, so the
+	// dispatch wins. Without this ordering a parent launched with
+	// GIT_EDITOR=vim (or a `core.editor`-shaped env) re-creates the hang in
+	// every child — the hardening would be decorative (raised in the #1030
+	// problem-verify review).
+	const savedEditor = process.env.GIT_EDITOR;
+	const savedSeq = process.env.GIT_SEQUENCE_EDITOR;
+	const savedPrompt = process.env.GIT_TERMINAL_PROMPT;
+	process.env.GIT_EDITOR = "vim";
+	process.env.GIT_SEQUENCE_EDITOR = "vim";
+	process.env.GIT_TERMINAL_PROMPT = "1";
+	try {
+		const { hatch } = await dispatchTaskTool({ prompt: "#1030 runtime git-env probe — hostile parent" }, "none");
+		ok(hatch, "the fake pi child wrote its observed-env file");
+		equal(hatch!.gitEditor, "true", "a hostile parent GIT_EDITOR=vim must NOT reach the child");
+		equal(hatch!.seqEditor, "true", "a hostile parent GIT_SEQUENCE_EDITOR=vim must NOT reach the child");
+		equal(hatch!.terminalPrompt, "0", "a hostile parent GIT_TERMINAL_PROMPT=1 must NOT reach the child");
+	} finally {
+		if (savedEditor === undefined) delete process.env.GIT_EDITOR;
+		else process.env.GIT_EDITOR = savedEditor;
+		if (savedSeq === undefined) delete process.env.GIT_SEQUENCE_EDITOR;
+		else process.env.GIT_SEQUENCE_EDITOR = savedSeq;
+		if (savedPrompt === undefined) delete process.env.GIT_TERMINAL_PROMPT;
+		else process.env.GIT_TERMINAL_PROMPT = savedPrompt;
+	}
+});
+
+test("#1030: the task tool schema exposes stream_stall_ms as a number (runtime)", async () => {
+	ok(
+		Object.keys(taskToolDef.parameters?.properties ?? {}).includes("stream_stall_ms"),
+		"task tool schema exposes the per-dispatch inactivity bound",
+	);
+	equal(
+		taskToolDef.parameters.properties.stream_stall_ms.type,
+		"number",
+		"stream_stall_ms must be numeric — a string would end up in Number(), where 'Infinity' is truthy",
+	);
 });
 
 function deepEqualKeys(obj: Record<string, unknown>, keys: string[], msg: string) {

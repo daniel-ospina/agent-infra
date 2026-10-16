@@ -108,6 +108,7 @@ Fail-open ONLY when ALL of: no `SWARM_CARD_ID`/`CARD_ID`, no board URL (+key), n
 
 ## Session gotchas (learned this run — apply in the fresh session)
 - **Branch ownership guard:** session baseline re-adopts new branches via the `git checkout -b <branch>` M3 carve-out in agent-infra; commits on the current branch are allowed once the baseline matches. If a commit/push to the branch is blocked with "branch ownership violated", use the TTL escape marker: `touch ~/.pi/agent/.allow-main-edits` as a BARE command (the guard stamps it with the session id on observation), then the op, then `rm -f` it. Never compound the touch with other commands.
+  > **⚠️ SUPERSEDED (#626, 2026-09):** the agent-infra M3 `create-new` carve-out above was REMOVED. In-hub `git checkout -b` / `git switch -c` is now BLOCKED in agent-infra like every other hub. Create feature branches with `bash scripts/checkout-hygiene/hub-worktree.sh <branch>` and work inside the worktree.
 - **Checkpoint C1 start** currently DEFERs ("checkout collision" — agent-infra has ~22 worktrees) → mapped STALE. Expected; don't chase it. The no-board skip fix is exactly what makes this stop mattering.
 - **Write commit messages with the `write` tool** to /tmp and `git commit -F <file>` — heredocs break on backticks/`$()`/braces.
 - **Never `git add -A`** — stage specific files.

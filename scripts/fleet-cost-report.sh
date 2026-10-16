@@ -13,23 +13,40 @@
 #       at 270K — below the 283,616 trigger — and would classify every
 #       post-clamp compaction as ceiling). Expected post-clamp: 0.
 #       Escalate when > 0.
-#   (b) cache-share of spend over COMPACTING sessions in the shipped
-#       300K-clamp regime (max compaction tokensBefore ≥ FLEET_REGIME_TB
-#       283616 = the 300K-clamp compaction trigger, 300000 − 16384 — sessions
-#       compacting in the 283.6–300K band ARE post-clamp, not legacy; the
-#       floor only excludes the pre-clamp 200K-transient legacy sessions
-#       (~196–205K), whose smaller window has different cache economics and
-#       never belonged to the clamp):
+#   (b) cache-share of spend over COMPACTING sessions in the clamp population
+#       (max compaction tokensBefore ≥ FLEET_REGIME_TB 283616 = the 300K-clamp
+#       compaction trigger, 300000 − 16384 — sessions compacting AT/ABOVE the
+#       trigger ARE post-clamp, not legacy; the floor only excludes the
+#       pre-clamp 200K-transient legacy sessions (~196–205K), whose smaller
+#       window has different cache economics and never belonged to the clamp).
+#       The population is regime-MIXED for one window after the 2026-09-21
+#       withdrawal — see REGIME HISTORY below:
 #       Σ cost.cacheRead+cacheWrite / Σ cost.total over MESSAGE usage, pooled
 #       over the whole window. Compaction summarizer calls (cacheRead≈0,
 #       distinct LLM call) are reported separately, excluded from (b) so the
-#       metric matches the pre-registered 65–70% band (measured regime-pure
-#       message-only: 85.9% pre-clamp / ~70% post-clamp — #373-era anchors,
+#       metric matches the pre-registered 65–70% band (measured message-only
+#       in a single-regime window: 85.9% pre-clamp / ~70% post-clamp — #373-era
 #       clamp-level independent; compaction-included would read ~62% and
 #       false-alarm). Escalate below the floor (FLEET_CACHE_FLOOR default
 #       0.65 = the pre-registered band low) — real drift below the 300K-clamp
 #       regime trips; small-n weeks (n<3 compacting sessions) are reported not
 #       escalated (a single-session share is noise).
+#
+# REGIME HISTORY (withdrawal, 2026-09-21): the #1213/#1226 300K→700K re-clamp
+# is WITHDRAWN (the deployed floor fix — `MIN_USABLE_MAX_TOKENS = 1024`,
+# pi-patch #1214(b) — closes the one-token silent death the wider window was
+# bought for, at a recurring ~+20% fleet spend), so (b)'s regime floor is back
+# at 283616. THE FLOOR IS NOT REGIME-PURE FOR ONE WINDOW: sessions that
+# compacted 2026-09-18..21 ran the retired 700K clamp, and 3 compaction records
+# in that era's session files (measured 2026-09-21) sit at/above the 650000
+# trigger (650,134–650,426), putting the 2 sessions carrying them into n_clamp
+# and into the cache-share pools of a run whose window still reaches them. The
+# number is still reported
+# (it is the same cache economics — cache-level independent); read n_clamp on
+# the first post-withdrawal run knowing it mixes regimes for that one window.
+# The TRUNCATION instrument is unaffected: it buckets only
+# stopReason:"length" records, and the retired era produced none — its bucket
+# is empty (watch-truncation.sh, header).
 #   (c) output+reasoning share over non-cache tokens — the #365 TREND
 #       instrument (recorded every run, never escalates). Formula matches the
 #       pre-registered "real median 58%": per-session (output+reasoning) /
@@ -49,7 +66,7 @@
 #   PI_SESSIONS_DIR / --sessions-dir   session JSONL root (default ~/.pi/agent/sessions)
 #   FLEET_WINDOW_DAYS / --days         report window (default 7)
 #   FLEET_CACHE_FLOOR                  cache-share escalation floor (default 0.65)
-#   FLEET_REGIME_TB                    regime purity floor (default 283616 =
+#   FLEET_REGIME_TB                    clamp-population floor (default 283616 =
 #                                       the 300K-clamp compaction trigger)
 #   SPM_SH                             shared-parser script path override (tests)
 # NOTE: the ceiling classification (tokensBefore ≥ 900000) lives in the SHARED
@@ -82,7 +99,7 @@ case "$WINDOW_DAYS" in
     ''|*[!0-9]*|0) echo "ERROR: --days must be a positive integer (got: '$WINDOW_DAYS')" >&2; exit 2 ;;
 esac
 if [ -n "$SINCE" ]; then
-    if ! printf '%s' "$SINCE" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+    if ! grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' <<<"$SINCE" \
        || ! python3 -c "import datetime,sys; datetime.date.fromisoformat('$SINCE')" 2>/dev/null; then
         echo "ERROR: --since must be a real YYYY-MM-DD date (got: '$SINCE')" >&2
         exit 2
@@ -162,19 +179,20 @@ for line in sys.stdin:
 fi
 
 python3 - "$SUMMARY_JSONL" "$CACHE_FLOOR" "$REGIME_TB" <<'PYEOF'
-import json, sys, statistics
+import json, sys, statistics, math
 
 raw, floor, regime_tb = (sys.argv[1], float(sys.argv[2]), float(sys.argv[3]))
 rows = [json.loads(l) for l in raw.splitlines() if l.strip()]
 rows = [r for r in rows if not r.get("error")]
 
 comps = [r for r in rows if r["compacting"]]
-# regime-pure clamp population: compactions at/above the 300K-clamp
-# compaction trigger (283,616 = 300,000 − 16,384) — incl. the 283.6–300K band
+# clamp population: compactions at/above the 300K-clamp
+# compaction trigger (283,616 = 300,000 − 16,384) — incl. the band
 # a pre-dial sub-300K floor would have misclassified as legacy. Pre-clamp
 # 1M-drift sessions (≥900K) also belong here (they ARE the drift (a) detects);
 # only the sub-trigger legacy/200K-window sessions (~196–205K) are excluded
-# from the cache-share economics pool.
+# from the cache-share economics pool. NOT single-regime for one window after
+# the 2026-09-21 withdrawal — see REGIME HISTORY above.
 clamp_comps = [r for r in comps if r["max_tokensBefore"] >= regime_tb]
 legacy_comps = [r for r in comps if r["max_tokensBefore"] < regime_tb]
 n_comp_recs = sum(r["comp_count"] for r in comps)
@@ -207,6 +225,52 @@ for r in rows:
 
 n_len = sum(r["genuine_len_stops"] for r in rows)
 n_len_sess = sum(1 for r in rows if r["genuine_len_stops"] > 0)
+
+# (d) peak/off-peak spend split (#634). DeepSeek bills 2x during 01:00-04:00
+# and 06:00-10:00 UTC, Mon-Fri; weekends are off-peak. The parser buckets
+# every costed call by its own timestamp, so the split is measured, not
+# modelled.
+#
+# THE RECORDED COST IS *NOT* WHAT WE WERE BILLED. models.json carries the
+# OFF-PEAK card and pi has no time-of-day cost logic (models.js calculateCost()
+# bills rates+tiers only), so a peak call logged at L was actually billed 2L.
+# Deferring that call to off-peak bills L — so the saving is the FULL logged
+# peak amount, NOT half of it. Evidence: the logged peak/off ratio per call is
+# ~0.98 (a real 2x would read ~2.0), i.e. every record is stamped at one flat
+# (off-peak) rate. NOTE that is a ratio of $ PER CALL, not of dollar totals —
+# the totals differ by call volume. (Whether the flash figure in models.json
+# and the research doc's rate card agree is a separate open question; the
+# structural premise here rests on the pro row, which matches off-peak exactly
+# and is half its documented peak.)
+peak_cost = sum(r.get("msg_cost_peak", 0) for r in rows)
+off_cost = sum(r.get("msg_cost_off", 0) for r in rows)
+undated_cost = sum(r.get("msg_cost_undated", 0) for r in rows)
+peak_calls = sum(r.get("msg_calls_peak", 0) for r in rows)
+off_calls = sum(r.get("msg_calls_off", 0) for r in rows)
+undated_calls = sum(r.get("msg_calls_undated", 0) for r in rows)
+if not all(math.isfinite(v) and v >= 0 for v in (peak_cost, off_cost, undated_cost)):
+    # An absurd aggregate (NaN, inf, or NEGATIVE) must not silently render as
+    # "no data" — this script fail-closes elsewhere on the same principle (a
+    # report that shows healthy absence while data exists is worse than a loud
+    # failure). Zero still flows to the genuine-absence path below.
+    print("ERROR: non-finite or negative cost aggregate (peak=%r off=%r) — "
+          "refusing to render a split that would read as data absence" % (peak_cost, off_cost),
+          file=sys.stderr)
+    sys.exit(2)
+split_total = peak_cost + off_cost
+peak_share = peak_cost / split_total if split_total > 0 else None
+# Billed view: peak dollars are doubled, off-peak are as logged.
+peak_billed = 2 * peak_cost
+billed_total = peak_billed + off_cost
+billed_share = peak_billed / billed_total if billed_total > 0 else None
+# Perfect deferral moves every peak call to off-peak: it saves the peak
+# premium, which is exactly the (doubled minus flat) difference = the logged
+# peak amount.
+premium_ceiling = peak_cost
+by_hour = {}
+for r in rows:
+    for h, v in (r.get("msg_cost_by_hour") or {}).items():
+        by_hour[h] = by_hour.get(h, 0.0) + v
 
 # ── render ──────────────────────────────────────────────────────────────────
 CEILING_TB = 900000   # must match session-postmortem.sh's parser constant
@@ -245,6 +309,31 @@ if trend:
           f"range: {min(trend):.1%}–{max(trend):.1%}   (n={len(trend)} sessions)")
 else:
     print("- no usage data")
+
+print("")
+print("## (d) Peak/off-peak spend split (#634 — DeepSeek 2x windows)")
+if peak_share is None:
+    print("- no time-stamped cost data in this window")
+    if undated_calls:
+        print(f"- ALERT: {undated_calls:,} costed call(s) (${undated_cost:.2f}) carry no "
+              "usable timestamp, so the split is not merely empty — it is unmeasurable")
+else:
+    print("- recorded dollars are stamped at the OFF-PEAK card, so a peak call was")
+    print("  actually billed 2x what is logged here — both views are shown:")
+    print(f"- peak:     ${peak_cost:9.2f} logged  ${peak_billed:9.2f} billed   "
+          f"{peak_calls:,} calls")
+    print(f"- off-peak: ${off_cost:9.2f} logged                "
+          f"{off_calls:,} calls")
+    print(f"- share of logged spend: {peak_share:.1%}      "
+          f"share of BILLED spend: {billed_share:.1%}")
+    if undated_calls:
+        print(f"- undated calls excluded from the split: {undated_calls:,} (${undated_cost:.2f})")
+    print(f"- deferrable premium ceiling: ${premium_ceiling:.2f}   "
+          "(moving every peak call off-peak saves its full logged amount)")
+    print("  windows: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri")
+    top = sorted(by_hour.items(), key=lambda kv: -kv[1])[:5]
+    if top:
+        print("  busiest UTC hours: " + "   ".join(f"{h}Z ${v:.2f}" for h, v in top))
 
 print("")
 print("## Compaction + cost vs regenerated Aug baseline")

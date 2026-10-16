@@ -11,32 +11,146 @@ npx eslint --fix <relevant files>
 # Stage relevant files (specific paths, not git add -A)
 git add <relevant files>
 
-# Commit — write the message to a temp file, then commit with -F
-# ⛔ NEVER use `git commit -m "$(cat <<'EOF' ... EOF)"` heredocs. The pi bash
-#    wrapper re-processes the command string and breaks on backticks, `$()`,
-#    braces, or parens inside the message (`/bin/bash: bad substitution: no
-#    closing ')'` — observed twice, e.g. messages containing `{message,
-#    error_code}` or `over_email_send_rate_limit → ...`). Message content must
-#    never pass through bash args/substitution.
-# Write the message with the `write` tool (bypasses bash entirely) to a
-# deterministic path, then commit with -F and remove the file:
-#   /tmp/commit-msg-<branch>.md
+# Commit — the message goes to a file, and the commit reads that file with -F.
+# ⛔ NEVER `git commit -m "…"`. NEVER a heredoc. Both let the shell parse the
+#    message before git sees it — see "⛔ Commit messages" below.
+# #729: never /tmp/commit-msg-<branch>.md — a branch name is unique per repo,
+#       not globally, so concurrent sessions in different repos collide there.
+#       The file goes in a REPO+WORKTREE-UNIQUE temp dir, keyed by the cksum of
+#       the absolute git dir.
+#       ⛔ NOT under `.git/`: main-worktree-guard freezes `.git/…` writes as
+#          "hub git-metadata" for every unhatched session (the fleet default for
+#          `task` children), so that write is blocked.
+
+# ── CALL 1 of 4: learn the path ─────────────────────────────────────
+echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+# → e.g. /var/folders/…/T//pi-commit-msg-493983288/fix-729-commit-msg-path.md
+#   (macOS $TMPDIR already ends in `/`, so the real output has `T//pi-…` — a
+#    duplicate separator every tool collapses; harmless.)
+#   `tr '/' '-'` sanitizes a slash-bearing branch; the cksum is per-repo AND
+#   per-worktree (`--absolute-git-dir` differs per linked worktree).
+
+# ── CALL 2 of 4: `write` the message to that path (the write tool bypasses bash) ──
 #   <type>(<scope>): <subject>
 #
 #   Closes #ISSUE_NUMBER
-git commit -F /tmp/commit-msg-<branch>.md
-rm -f /tmp/commit-msg-<branch>.md
+
+# ── CALL 3 of 4: commit ─────────────────────────────────────────────
+# ⛔ Do NOT assign MSG in this call. Two independent reasons:
+#    (a) every bash call is a FRESH SHELL, so a `MSG=…` set in CALL 1 is unset
+#        here — `-F "$MSG"` would read an EMPTY path, and `rm -f "$MSG"` would
+#        silently delete nothing (this is exactly what orphaned 12 message files);
+#    (b) assigning a variable in the same call as the commit is refused by the
+#        verification gate as an "in-batch mutation chain".
+#    Inline the substitution instead — self-contained and gate-safe:
+git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+
+# ── CALL 4 of 4: delete the message file (re-derive; never reuse a variable) ──
+rm -f "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 **IMPORTANT — commit timeout:** Always run `git commit` **foreground** with `timeout: 300000` (5 minutes minimum). Never set `run_in_background: true` for `git commit`. Never use a timeout below 300 seconds. The pre-commit hook (lint-staged running ESLint on staged TS files) takes 20–90 seconds. Killing it mid-run orphans the lint-staged backup stash and leaves `.git/index.lock` behind — causing exit code 128 on every subsequent commit until the lock is manually removed. This timeout rule also applies to all fix-loop `git commit` calls in Steps 2 and 2.5.
 
+### ⛔ Commit messages: `-F` always — never `-m`, never a heredoc
+
+`git commit -m "…"` is the *same* hazard as the heredoc #194 banned — **the
+shell parses the message before git ever sees it.** Inside double quotes,
+backticked spans are command substitution, `$VAR`/`$(…)` expand, and `${…}` /
+`{{ }}` break. The substitution usually yields an **empty string**, so the
+failure is silent: git accepts the mangled message and only a human reading the
+log sees the hole. Both of these happened while landing #640 (#668):
+
+```sh
+# source message contains a backticked span
+#   … key matching via keyRe() which tolerates `key :` — and anchors …
+git commit -m "fix(ci): … keyRe() which tolerates \`key :\` — and anchors …"
+# COMMITTED AS (span eaten, silent):
+#   … keyRe() which tolerates  — and anchors …
+
+# the substitution actually runs:
+#   bash: key: command not found
+git commit -m "fix(ci): … set the binding to \`|| true\` …"
+```
+
+Both mangles were pushed before anyone noticed and each cost an `--amend` +
+force-push. Author the message with the **`write` tool** — it bypasses bash
+entirely, so nothing in the message is ever interpreted:
+
+```bash
+# Resolve the per-repo message path (#729) — worktree-aware, collision-free.
+# This is CALL 1; the path must be known before the `write` tool can be used.
+# Echo the substitution rather than assigning a variable: a `MSG=…` set here
+# would be UNSET in the call that commits, which is how the empty-path bug
+# happened in the first place.
+echo "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+# → /var/folders/…/T//pi-commit-msg-493983288/fix-668-commit-msg.md
+#   (in a linked worktree: that worktree's own gitdir under .git/worktrees/)
+```
+
+```text
+write  <the absolute path printed above>
+
+  fix(commit-workflow): ban -m commit messages + flag mangled ones (#668)
+
+  `git commit -m "…"` lets the shell eat backticked spans before git sees
+  them: the message "which tolerates `key :` — and anchors" commits as
+  "which tolerates  — and anchors". New commit-msg hook warns on the
+  signature: unbalanced backticks or a doubled space where code should be.
+
+  Closes #668
+```
+
+```bash
+# then, in bash — the message never appears on the command line.
+# This is a SEPARATE call, so no variable survives: inline the substitution.
+# (Assigning MSG here would ALSO be refused by the verification gate.)
+git commit -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+
+# separate call — re-derive the path, never reuse a variable:
+rm -f "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+```
+
+`git commit -m` and heredocs are forbidden **everywhere** (commit messages, PR
+bodies, issue comments) — the rule is about the message crossing the shell, not
+about heredocs specifically.
+
+### Mangled commit message — repair
+
+The `.husky/commit-msg` hook warns when it sees the signature of a lost shell
+substitution (unbalanced backticks, or a doubled space where inline code should
+be). By default it merely warns — both signatures have realistic false
+positives (a lone backtick in prose; an aligned code block) — so a warning is a
+prompt to *look*, not a failure. `COMMIT_MSG_MANGLE_STRICT=1` makes it fatal.
+
+On a hit:
+
+1. **Not pushed yet** — amend before anything else:
+   ```bash
+   # `write` the corrected message to the same path first, then amend.
+   # Inline the substitution: a separate call, and no variable assignment
+   # may share a call with the commit (#729).
+   git commit --amend -F "${TMPDIR:-/tmp}/pi-commit-msg-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+   ```
+2. **Pushed, branch under review** — do **not** silently force-push the
+   rewritten message. Post a correction note on the PR/issue (what was wrong,
+   what it now says), *then* `git push --force-with-lease`. A silently rewritten
+   record is exactly what happened twice on #640; a visible correction is the
+   point.
+3. **Pushed, not under review** — `git commit --amend -F …` then
+   `git push --force-with-lease` is safe.
+
 ```bash
 # Push and open as DRAFT
 git push -u origin <branch>
-# ⛔ Same rule as the commit message: NEVER use `--body "$(cat <<'EOF' ...)"`
-#    heredocs — write the PR body to a temp file with the `write` tool and
-#    pass --body-file, then remove the file:
-#   /tmp/pr-body-<branch>.md
+# ⛔ Same rule as the commit message: never pass the PR body through the shell.
+#    `--body "…"` and `--body "$(cat <<'EOF' …)"` both let the shell eat
+#    backticked spans / expand `$()` and `{{ }}`. Write the PR body to a temp
+#    file with the `write` tool and pass --body-file, then remove the file.
+#    ⛔ NOT /tmp/pr-body-<branch>.md (#729): a branch name is unique per repo, not
+#       globally, so four repos on `fix/700-review-cap` collide there and
+#       `gh pr create` publishes ANOTHER repo's PR description. Same derivation
+#       as the commit message, with a distinct `pi-pr-body-` prefix:
+#   ${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md
 #   ## Summary
 #   - <bullet 1>
 #   - <bullet 2>
@@ -45,11 +159,94 @@ git push -u origin <branch>
 gh pr create --draft \
   --base main \
   --title "<title>" \
-  --body-file /tmp/pr-body-<branch>.md
-rm -f /tmp/pr-body-<branch>.md
+  --body-file "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
+rm -f "${TMPDIR:-/tmp}/pi-pr-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1)/$(git rev-parse --abbrev-ref HEAD | tr '/' '-').md"
 ```
 
 The PostToolUse hook fires on `gh pr merge` as a safety net for manual merges outside commit-workflow. Step 2 is the primary code-review gate.
+
+### `--admin` merges: `scripts/admin-merge.sh` is the REQUIRED path (#930)
+
+`gh pr merge --admin` bypasses required checks by design, so nothing makes it
+*safe*: it cannot tell a check already red on `main` from a NEW failure the PR
+introduces. tortoise #3420 merged at 08:15 carrying
+`tests/test_markers.py::test_no_redirect_stems_registry_exact` — a test that was
+**not** in main's failing set — and main ratcheted redder. A convention is what
+produced that; this is a rail.
+
+**Never run `gh pr merge --admin` directly.** The `review-enforcer` merge gate
+REFUSES a raw `--admin` merge that carries no head-bound evidence comment, and
+the evidence is bound to the head SHA — so **every push invalidates it**.
+
+```bash
+# The MANDATED path. Computes the failing set, refuses a genuinely new failure,
+# posts the head-bound evidence, and only then runs `gh pr merge --admin`.
+# Extra flags (--squash, --rebase, --delete-branch, …) pass through.
+scripts/admin-merge.sh <PR> --squash
+
+# Inside, it is:
+#   pr-fails.txt   ← scripts/ci-failure-set.sh --commit <head>   # the head SHA,
+#                    the exact revision the evidence marker binds to
+#   main-fails.txt ← scripts/ci-failure-set.sh --main-union 10   # the UNION
+#   comm -23 pr-fails.txt main-fails.txt   ⇒ must be EMPTY
+#   non-empty → re-run the PR's failed jobs once (pass-on-retry = flaky, not new)
+#   residual non-empty → BLOCK: prints the list, exits non-zero, does NOT merge
+#
+# Both sides are lane-filtered to the same workflow (default `python-ci.yml`,
+# `--workflow` to override), and the rail BLOCKS unless the lane has actually
+# TESTED the head — a run that is queued, or one that finished `cancelled`,
+# exercised nothing, so an empty failing set would prove nothing.
+#
+# A lane is only usable if it runs on BOTH sides. The rail also BLOCKS when the
+# lane never tested `main`, because the certificate claims "every failure here is
+# already red on main" — that claim IS a comparison, and an empty baseline
+# absorbs nothing, so a pre-existing failure would be charged to the PR. This
+# matters for repos that split their lanes by TRIGGER: agent-infra's `ci.yml` is
+# `pull_request`-only and `ci-main.yml` is `push`-only, so neither spans both
+# sides. Pass `--any-workflow` there to compare against every lane on main.
+#
+# A VACUOUS comparison is NOT a certificate (#1319). `PR failing: 0 | main
+# failing: 0` is an ABSENCE of a measurement, not a clean one: the two zeros mean
+# "both lanes were green" only if both sides ran the SAME lane. tortoise #4263
+# merged on exactly that line while its tier-2 PR lane had SKIPPED shards main's
+# push lane runs; the failure lived in one of them, so it could appear in
+# NEITHER set, and the merge reddened main's required check for the whole fleet
+# (#4457). The rail therefore REFUSES a vacuous comparison — verdict `NOT
+# COMPARABLE`, distinct from "compared, clean" and "compared, dirty" — unless
+# the PR demonstrably EXECUTED every test shard main's lane executed, and it
+# fails CLOSED: an unreadable shard list is never read as "the same lane". The
+# refusal NAMES both lanes. Remedy: run the FULL lane for the head — the shards
+# named in the refusal are what main measures. If this repo's test shards are not
+# named `test*`, set `ADMIN_MERGE_LANE_JOB_PREFIX` to the prefix they use.
+#
+# A repo whose PR lane CANNOT run a shard main's push lane runs (a trigger-split
+# repo — this one: main's push calls the reusable `python-ci.yml` and no PR lane
+# does, #1349) is NOT excused by a flag. `ADMIN_MERGE_LANE_PARITY=declared-off` is
+# still accepted and still RUNS the comparison, but it no longer certifies: the
+# evidence gate refuses a vacuous certificate without the positive
+# `lane parity: PR ⊇ main` line (`verify-admin-merge-evidence.sh` clause 5), so
+# that escape posted evidence the merge shim then refused and retracted — a merge
+# path that reported certified and ended unmerged (#1439). Both values now REFUSE,
+# and the refusal names the route that does work: `AGENT_ADMIN_MERGE_OVERRIDE=1`,
+# which bypasses the certificate rather than faking one. Any other value is
+# refused at startup, so a typo cannot read as 'off'. Narrowing
+# `ADMIN_MERGE_LANE_JOB_PREFIX` is NOT the escape: it removes the excluded shard
+# family from the gate, which is the family the gate exists to protect.
+```
+
+⚠️ The baseline is the **union of main's last N runs** (default 10), never a
+single run. tortoise #3469: raw `comm -23` reported 1 unique failure while the
+true value was 0 — `test_import_wrong_key_422` and
+`test_import_count_mismatch_422` share one assertion and *which sibling trips
+depends on execution order*, so main fails each in different runs. A single-run
+baseline hard-blocks a SAFE merge, and a gate that false-blocks once gets
+disabled — which is how a convention comes back.
+
+Deliberate operator use only: set `AGENT_ADMIN_MERGE_OVERRIDE=1` (or the
+`ELDATO_ADMIN_MERGE_OVERRIDE` alias) — the same escape-hatch convention as
+`AGENT_SKIP_REVIEW_GATE`, and audited as `admin_merge_override`. The post-merge
+detector (`.github/workflows/admin-merge-detector.yml`) still runs and files an
+issue whenever a merge to main carried unique failures.
 
 ## Step 1.5 — Fallback Tier Classification (only if TIER = unknown)
 

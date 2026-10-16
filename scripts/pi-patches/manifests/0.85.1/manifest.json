@@ -1,0 +1,175 @@
+{
+  "schema": 1,
+  "issue": "#1214, #1263, #1316",
+  "writtenAgainst": {
+    "pi-coding-agent": "0.85.1",
+    "pi-ai": "0.85.1"
+  },
+  "note": "Derived by scripts/pi-patches/make-manifest.mjs from the installed tree. Re-derive (do not hand-edit) after a pi upgrade, then re-run the verification suite.",
+  "entries": [
+    {
+      "id": "b1-clamp-floor-esm",
+      "change": "b",
+      "file": "node_modules/@earendil-works/pi-ai/dist/api/simple-options.js",
+      "find": "const CONTEXT_SAFETY_TOKENS = 4096;\nconst MIN_MAX_TOKENS = 1;\nexport function clampMaxTokensToContext(model, context, maxTokens) {\n    if (model.contextWindow <= 0)\n        return Math.max(MIN_MAX_TOKENS, maxTokens);\n    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;\n    return Math.min(maxTokens, Math.max(MIN_MAX_TOKENS, available));\n}",
+      "replace": "const CONTEXT_SAFETY_TOKENS = 4096;\nconst MIN_MAX_TOKENS = 1;\n// pi-patch #1214(b): never clamp below a usable output budget. Asking for a single token\n// turns \"no output budget left\" into stopReason \"length\" with output 1 - a turn that looks\n// normal and leaves the session unable to ever reply again. Ask for a usable floor instead\n// and let the provider reject a request that is genuinely over its limit (loud, and the\n// overflow path already handles it) rather than dying silently.\nconst MIN_USABLE_MAX_TOKENS = 1024;\nexport function clampMaxTokensToContext(model, context, maxTokens) {\n    if (model.contextWindow <= 0)\n        return Math.max(MIN_MAX_TOKENS, maxTokens);\n    const available = model.contextWindow - estimateContextTokens(context).tokens - CONTEXT_SAFETY_TOKENS;\n    if (available < MIN_USABLE_MAX_TOKENS)\n        return Math.max(MIN_MAX_TOKENS, Math.min(maxTokens, MIN_USABLE_MAX_TOKENS));\n    return Math.min(maxTokens, available);\n}",
+      "verifyPresent": [
+        "const MIN_USABLE_MAX_TOKENS = 1024;",
+        "if (available < MIN_USABLE_MAX_TOKENS)"
+      ]
+    },
+    {
+      "id": "b2-clamp-floor-bundle-http",
+      "change": "b",
+      "file": "dist/bundle/chunks/chunk-AXIIZGTV.js",
+      "find": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1;function clampMaxTokensToContext(model,context,maxTokens){if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return Math.min(maxTokens,Math.max(MIN_MAX_TOKENS,available))}",
+      "replace": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}",
+      "verifyPresent": [
+        "MIN_USABLE_MAX_TOKENS=1024",
+        "available<MIN_USABLE_MAX_TOKENS?"
+      ]
+    },
+    {
+      "id": "b3-clamp-floor-bundle-bedrock",
+      "change": "b",
+      "file": "dist/bundle/chunks/bedrock-converse-stream.js",
+      "find": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1;function clampMaxTokensToContext(model,context,maxTokens){if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return Math.min(maxTokens,Math.max(MIN_MAX_TOKENS,available))}",
+      "replace": "var CONTEXT_SAFETY_TOKENS=4096,MIN_MAX_TOKENS=1,MIN_USABLE_MAX_TOKENS=1024;function clampMaxTokensToContext(model,context,maxTokens){/*pi-patch:#1214(b)*/if(model.contextWindow<=0)return Math.max(MIN_MAX_TOKENS,maxTokens);let available=model.contextWindow-estimateContextTokens(context).tokens-CONTEXT_SAFETY_TOKENS;return available<MIN_USABLE_MAX_TOKENS?Math.max(MIN_MAX_TOKENS,Math.min(maxTokens,MIN_USABLE_MAX_TOKENS)):Math.min(maxTokens,available)}",
+      "verifyPresent": [
+        "MIN_USABLE_MAX_TOKENS=1024",
+        "available<MIN_USABLE_MAX_TOKENS?"
+      ]
+    },
+    {
+      "id": "d1-summarization-budget-esm",
+      "change": "d",
+      "file": "dist/core/compaction/compaction.js",
+      "find": "    const maxTokens = Math.min(Math.floor(0.8 * reserveTokens), model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY);",
+      "replace": "    // pi-patch #1263(d): the update prompt (UPDATE_SUMMARIZATION_PROMPT) instructs the model to\n    // PRESERVE the previous summary, so a budget below that summary's own size is unsatisfiable:\n    // the generation runs to the cap, returns stopReason \"length\", and getSummarizationFailure()\n    // discards the partial summary and fails the whole compaction - which then fails identically\n    // on the overflow path, so the session can never compact again. Measured on this fleet when\n    // reserveTokens was 16384 (cap 13,107) against a 56,077-char previous summary (13,452 output\n    // tokens): 21 session files were over the cap. Floor the budget at what we are asking it to\n    // preserve. An upper bound costs nothing unless the model actually emits it. chars/2 is a\n    // deliberately conservative token estimate: pi's own estimateTextTokens uses chars/4, and the\n    // densest summary measured on this fleet is 3.19 chars per summary token (81,542 chars / 25,534\n    // output tokens net of reasoning) - so chars/2 over-estimates the summary's own token count.\n    const modelCeiling = model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY;\n    const summaryCap = Math.min(Math.floor(0.8 * reserveTokens), modelCeiling);\n    const priorTokens = previousSummary ? Math.ceil(previousSummary.length / 2) : 0;\n    // Applied ONLY when there IS a previous summary to preserve. With none, the budget stays\n    // exactly min(floor(0.8 * reserveTokens), model.maxTokens), so the initial-summary path is\n    // provably unchanged — a residual the VGATE verifier proved for the unconditional form.\n    const maxTokens = previousSummary ? Math.max(summaryCap, Math.min(priorTokens + 4096, modelCeiling)) : summaryCap;",
+      "verifyPresent": [
+        "maxTokens = previousSummary ? Math.max(summaryCap",
+        "const priorTokens = previousSummary"
+      ]
+    },
+    {
+      "id": "d2-summarization-budget-bundle",
+      "change": "d",
+      "file": "dist/bundle/chunks/chunk-JVUZSMYM.js",
+      "find": "let maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)",
+      "replace": "/*pi-patch:#1263(d)*/let modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap",
+      "verifyPresent": [
+        "maxTokens=previousSummary?Math.max(summaryCap",
+        "/*pi-patch:#1263(d)*/let modelCeiling="
+      ]
+    },
+    {
+      "id": "d3-summarization-budget-bundle-request",
+      "change": "d",
+      "file": "dist/bundle/chunks/chunk-JVUZSMYM.js",
+      "find": "previousSummary,thinkingLevel}=options,maxTokens=Math.min(Math.floor(.8*reserveTokens),model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY)",
+      "replace": "previousSummary,thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=model.maxTokens>0?model.maxTokens:Number.POSITIVE_INFINITY,summaryCap=Math.min(Math.floor(.8*reserveTokens),modelCeiling),priorTokens=previousSummary?Math.ceil(previousSummary.length/2):0,maxTokens=previousSummary?Math.max(summaryCap,Math.min(priorTokens+4096,modelCeiling)):summaryCap",
+      "verifyPresent": [
+        "thinkingLevel}=options,/*pi-patch:#1263(d)*/modelCeiling=",
+        "maxTokens=previousSummary?Math.max(summaryCap"
+      ]
+    },
+    {
+      "id": "e1-summarization-clamp-esm",
+      "change": "e",
+      "file": "dist/core/compaction/compaction.js",
+      "find": "function createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId) {\n    const options = { maxTokens, signal, apiKey, headers, env, sessionId };",
+      "replace": "function createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId) {\n    // pi-patch #1316(e): mark the summarization request so buildBaseOptions exempts it from the\n    // shared output-budget clamp. The summarization prompt IS the conversation being summarized,\n    // so it is large by construction; the clamp assumes a normal turn's leaf context and would\n    // cut this budget below the summary the model is told to PRESERVE. That is the #1263(d)\n    // failure reached through a different binding constraint. The budget is already bounded by\n    // the model ceiling and by the preserved summary's own size, and the exemption is scoped to\n    // this caller alone: a normal turn carries no marker and stays clamped.\n    const options = { maxTokens, signal, apiKey, headers, env, sessionId, skipContextClamp: true };",
+      "verifyPresent": [
+        "skipContextClamp: true",
+        "sessionId, skipContextClamp: true };"
+      ]
+    },
+    {
+      "id": "e2-summarization-clamp-bundle",
+      "change": "e",
+      "file": "dist/bundle/chunks/chunk-JVUZSMYM.js",
+      "find": "function createSummarizationOptions(model,maxTokens,apiKey,headers,env2,signal,thinkingLevel,sessionId){let options={maxTokens,signal,apiKey,headers,env:env2,sessionId};",
+      "replace": "function createSummarizationOptions(model,maxTokens,apiKey,headers,env2,signal,thinkingLevel,sessionId){/*pi-patch:#1316(e)*/let options={maxTokens,signal,apiKey,headers,env:env2,sessionId,skipContextClamp:!0};",
+      "verifyPresent": [
+        "skipContextClamp:!0",
+        "env:env2,sessionId,skipContextClamp:!0"
+      ]
+    },
+    {
+      "id": "e3-clamp-exemption-esm",
+      "change": "e",
+      "file": "node_modules/@earendil-works/pi-ai/dist/api/simple-options.js",
+      "find": "export function buildBaseOptions(model, context, options, apiKey) {\n    const samplingParams = model.samplingParams || options?.samplingParams\n        ? { ...model.samplingParams, ...options?.samplingParams }\n        : undefined;\n    return {\n        temperature: options?.temperature,\n        samplingParams,\n        maxTokens: clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),",
+      "replace": "function summarizationMaxTokens(model, context, maxTokens) {\n    // pi-patch #1316(e): the summarization request is exempt from clampMaxTokensToContext. Its\n    // prompt is the conversation being summarized, so it is large by construction; the clamp\n    // would cut the output budget to what fits the window, below the summary the model is told\n    // to PRESERVE. The budget is already bounded by the model ceiling and by that summary. If\n    // the prompt cannot fit the window at all, fail LOUDLY here and name the sizes — never let\n    // the provider truncate the generation into a summary getSummarizationFailure() throws away.\n    // This is NOT the token-cap error, and it is reachable only for the marked caller.\n    if (model.contextWindow > 0) {\n        const promptTokens = estimateContextTokens(context).tokens;\n        if (promptTokens + CONTEXT_SAFETY_TOKENS >= model.contextWindow)\n            throw new Error(`Summarization prompt does not fit the model context window: prompt ~${promptTokens} tokens against a ${model.contextWindow}-token window (safety reserve ${CONTEXT_SAFETY_TOKENS}). This is NOT the \"generation hit the token cap\" truncation and the output budget was not clamped: the prompt itself must shrink before compaction can run.`);\n    }\n    return Math.max(MIN_MAX_TOKENS, maxTokens);\n}\nexport function buildBaseOptions(model, context, options, apiKey) {\n    const samplingParams = model.samplingParams || options?.samplingParams\n        ? { ...model.samplingParams, ...options?.samplingParams }\n        : undefined;\n    return {\n        temperature: options?.temperature,\n        samplingParams,\n        maxTokens: options?.skipContextClamp\n            ? summarizationMaxTokens(model, context, options?.maxTokens ?? model.maxTokens)\n            : clampMaxTokensToContext(model, context, options?.maxTokens ?? model.maxTokens),",
+      "verifyPresent": [
+        "? summarizationMaxTokens(model, context, options?.maxTokens",
+        "promptTokens + CONTEXT_SAFETY_TOKENS >= model.contextWindow",
+        "does not fit the model context window"
+      ]
+    },
+    {
+      "id": "e4-clamp-exemption-bundle-http",
+      "change": "e",
+      "file": "dist/bundle/chunks/chunk-AXIIZGTV.js",
+      "find": "function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),",
+      "replace": "function summarizationMaxTokens(model,context,maxTokens){/*pi-patch:#1316(e)*/if(model.contextWindow>0){let promptTokens=estimateContextTokens(context).tokens;if(promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow)throw new Error(`Summarization prompt does not fit the model context window: prompt ~${promptTokens} tokens against a ${model.contextWindow}-token window (safety reserve ${CONTEXT_SAFETY_TOKENS}). This is NOT the \"generation hit the token cap\" truncation and the output budget was not clamped: the prompt itself must shrink before compaction can run.`)}return Math.max(MIN_MAX_TOKENS,maxTokens)}function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:options?.skipContextClamp?summarizationMaxTokens(model,context,options?.maxTokens??model.maxTokens):clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),",
+      "verifyPresent": [
+        "?summarizationMaxTokens(model,context,options?.maxTokens",
+        "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow",
+        "does not fit the model context window"
+      ]
+    },
+    {
+      "id": "e5-clamp-exemption-bundle-bedrock",
+      "change": "e",
+      "file": "dist/bundle/chunks/bedrock-converse-stream.js",
+      "find": "function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),",
+      "replace": "function summarizationMaxTokens(model,context,maxTokens){/*pi-patch:#1316(e)*/if(model.contextWindow>0){let promptTokens=estimateContextTokens(context).tokens;if(promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow)throw new Error(`Summarization prompt does not fit the model context window: prompt ~${promptTokens} tokens against a ${model.contextWindow}-token window (safety reserve ${CONTEXT_SAFETY_TOKENS}). This is NOT the \"generation hit the token cap\" truncation and the output budget was not clamped: the prompt itself must shrink before compaction can run.`)}return Math.max(MIN_MAX_TOKENS,maxTokens)}function buildBaseOptions(model,context,options,apiKey){let samplingParams=model.samplingParams||options?.samplingParams?{...model.samplingParams,...options?.samplingParams}:void 0;return{temperature:options?.temperature,samplingParams,maxTokens:options?.skipContextClamp?summarizationMaxTokens(model,context,options?.maxTokens??model.maxTokens):clampMaxTokensToContext(model,context,options?.maxTokens??model.maxTokens),",
+      "verifyPresent": [
+        "?summarizationMaxTokens(model,context,options?.maxTokens",
+        "promptTokens+CONTEXT_SAFETY_TOKENS>=model.contextWindow",
+        "does not fit the model context window"
+      ]
+    },
+    {
+      "id": "e6-reclamp-anthropic-esm",
+      "change": "e",
+      "file": "node_modules/@earendil-works/pi-ai/dist/api/anthropic-messages.js",
+      "find": "    const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n    const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+      "replace": "    const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n    // pi-patch #1316(e): the provider adapter clamps AGAIN, after buildBaseOptions, for the\n    // budget-based thinking branch. The same marker gate as buildBaseOptions, or the summarization\n    // exemption is undone here for every reasoning model on this API.\n    const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+      "verifyPresent": [
+        "options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"
+      ]
+    },
+    {
+      "id": "e7-reclamp-bedrock-esm",
+      "change": "e",
+      "file": "node_modules/@earendil-works/pi-ai/dist/api/bedrock-converse-stream.js",
+      "find": "        const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n        const maxTokens = clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+      "replace": "        const adjusted = adjustMaxTokensForThinking(base.maxTokens, model.maxTokens, options.reasoning, options.thinkingBudgets);\n        // pi-patch #1316(e): same second-clamp gate as anthropic-messages — see that entry.\n        const maxTokens = options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens);",
+      "verifyPresent": [
+        "options?.skipContextClamp ? adjusted.maxTokens : clampMaxTokensToContext(model, context, adjusted.maxTokens)"
+      ]
+    },
+    {
+      "id": "e8-reclamp-anthropic-bundle",
+      "change": "e",
+      "file": "dist/bundle/chunks/anthropic-messages-VWZZOSJQ.js",
+      "find": ",maxTokens=clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
+      "replace": ",/*pi-patch:#1316(e)*/maxTokens=options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
+      "verifyPresent": [
+        "options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"
+      ]
+    },
+    {
+      "id": "e9-reclamp-bedrock-bundle",
+      "change": "e",
+      "file": "dist/bundle/chunks/bedrock-converse-stream.js",
+      "find": ",maxTokens=clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
+      "replace": ",/*pi-patch:#1316(e)*/maxTokens=options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens);return stream(model,context,{",
+      "verifyPresent": [
+        "options?.skipContextClamp?adjusted.maxTokens:clampMaxTokensToContext(model,context,adjusted.maxTokens)"
+      ]
+    }
+  ]
+}

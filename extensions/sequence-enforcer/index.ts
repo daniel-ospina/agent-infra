@@ -48,6 +48,16 @@ import { existsSync, readFileSync, writeFileSync, appendFileSync, mkdirSync, unl
 import { resolve, join, dirname } from "node:path";
 import { isIP } from "node:net"; // #383 (Task 3, P3-1 FINAL mechanical): true IPv6 mirror — zero-dep builtin
 import { isPrintMode, isPrintModeEnv } from "../shared/print-mode.js";
+// #1419: the kill switch has ONE home. It used to be defined here and
+// referenced-but-never-imported in loop-enforcer, where every write raised
+// `ReferenceError` into a swallowed catch — the documented escape was inert.
+import {
+  isKillSwitchSet,
+  clearKillSwitch,
+  isEnforcementBypassed,
+  clearSessionEscape,
+  sessionEscapeStatus,
+} from "../shared/kill-switch.js";
 
 // #357 (Task 1): inline copy of pi's `isToolCallEventType` — the suite runs in
 // CI with ZERO node_modules (zero-dep route), so the runtime value import from
@@ -64,8 +74,8 @@ function isToolCallEventType(toolName: string, event: unknown): boolean {
 function _getEnv(name: string): string | undefined {
   return process.env[`AGENT_${name}`] ?? process.env[`ELDATO_${name}`];
 }
-// Namespaced files (Phase 1 — #7549)
-const KILL_SWITCH_FILE = "/tmp/agent-state-machine.kill";
+// Namespaced files (Phase 1 — #7549). KILL_SWITCH_FILE now lives in
+// shared/kill-switch.ts — imported above, never re-declared (#1419).
 const MODE_FILE = "/tmp/agent-sequence-mode";
 
 // ── Types ────────────────────────────────────────────
@@ -303,8 +313,41 @@ function resetSequenceTimeout() {
 // ── Kill switch ──────────────────────────────────────
 
 function isKillSwitchActive(): boolean {
-  if (_getEnv("STATE_MACHINE")) return true;
-  try { return existsSync(KILL_SWITCH_FILE); } catch { return false; }
+  // The human's machine-global valve (env bypass AGENT_/ELDATO_STATE_MACHINE, or
+  // the file) OR this session's own escape (#1419). The session part lives on
+  // `globalThis` (see shared/kill-switch.ts) precisely because sequence-enforcer
+  // and loop-enforcer do NOT share a module graph, so a sibling session's boot
+  // cannot revoke it and the granting extension cannot hide it from this one.
+  return isEnforcementBypassed();
+}
+
+/** One `session_escape_granted` audit entry per grant. */
+let sessionEscapeAudited = false;
+
+/**
+ * Record the GRANT, once per session, from whichever bypass path sees it first.
+ *
+ * Every subsequent call logs `bypassed`, so without this a reader sees the EFFECT
+ * and can never find the CAUSE: when the escape was granted, or by which surface.
+ * The operator force-pass path sets the same bar (`checkpoint_force_pass`). Both
+ * bypass paths call this — `tool_call` alone would miss the case where the
+ * escaping call's own `tool_result` is the first bypass, leaving no record at all
+ * if the session ended immediately after escaping.
+ */
+function auditSessionEscapeGrantIfFirst(reason: "kill_switch" | "session_escape", tool: string): void {
+  if (reason !== "session_escape" || sessionEscapeAudited) return;
+  sessionEscapeAudited = true;
+  auditLog({
+    ts: new Date().toISOString(),
+    event: "session_escape_granted",
+    granted_at: sessionEscapeStatus(),
+    tool,
+  });
+}
+
+/** Audit `reason` for a bypass, so a reader can tell which bypass fired. */
+function bypassReason(): "kill_switch" | "session_escape" {
+  return isKillSwitchSet() ? "kill_switch" : "session_escape";
 }
 
 // ── Mode ─────────────────────────────────────────────
@@ -1344,7 +1387,7 @@ export function gateGuidance(step: Step, mode: Mode = "gate"): string {
   if (gate === "human_approval" || gate === "human_review") {
     return `→ Allowed tools: ${tools}
 → To proceed: present findings to the user for approval
-→ Or: end your turn to auto-advance this gate, or use /loop stop`;
+→ Or: end your turn to auto-advance this gate, or call the loop_enforcer tool with action: "stop" (this session only)`;
   }
   return "";
 }
@@ -1645,12 +1688,24 @@ export default function (pi: ExtensionAPI) {
     parkedCheckpoints.clear();
     checkpointBlockStreak = null;
     auditCoalesce.clear();
-    if (sequenceTimeout) { clearTimeout(sequenceTimeout); sequenceTimeout = null; } // cycle 2: a stale timer must never fire into a new session
+    if (sequenceTimeout) {
+      clearTimeout(sequenceTimeout); sequenceTimeout = null; // cycle 2: a stale timer must never fire into a new session
+    }
+    // #1419: the AGENT's session escape is process-local, and pi reuses the
+    // module scope across /new /resume /fork — so a NEW session must not inherit
+    // the previous one's bypass. A mid-session `/reload` must NOT discard the
+    // CURRENT session's escape, the same rule the operator force-pass file is
+    // given a few lines below (reason === "reload").
+    if ((event as any)?.reason !== "reload") {
+      if (clearSessionEscape()) {
+        console.log("[sequence-enforcer] 🧹 Cleared the previous session's enforcement escape");
+      }
+      sessionEscapeAudited = false;
+    }
     // ponytail: kill switch is a single-session escape — clear stale switches so new
     // sessions don't start silently bypassed (#7470). Env var bypass is unaffected.
     try {
-      if (existsSync(KILL_SWITCH_FILE)) {
-        unlinkSync(KILL_SWITCH_FILE);
+      if (clearKillSwitch()) {
         console.log("[sequence-enforcer] 🧹 Cleared stale kill switch from previous session");
       }
       // #357 (Task 10, h): session_start cleanup mirrors the kill-switch hygiene.
@@ -1668,7 +1723,10 @@ export default function (pi: ExtensionAPI) {
       }
     } catch { /* best-effort */ }
     if (isKillSwitchActive()) {
-      console.log("[sequence-enforcer] ⏸️  Kill switch active — all enforcement bypassed");
+      const why = isKillSwitchSet()
+        ? "Kill switch active — all enforcement bypassed, EVERY session"
+        : "Session escape active — enforcement bypassed for THIS session";
+      console.log(`[sequence-enforcer] ⏸️  ${why}`);
     } else {
       const mode = resolveMode();
       auditLog({ ts: new Date().toISOString(), event: "startup", mode });
@@ -1857,7 +1915,9 @@ export default function (pi: ExtensionAPI) {
     const top = topSkill();
     const toolName = (event as any).toolName ?? event.toolName ?? "";
     if (isKillSwitchActive()) {
-      auditLog({ ts: new Date().toISOString(), event: "bypassed", reason: "kill_switch", tool: toolName });
+      const reason = bypassReason();
+      auditSessionEscapeGrantIfFirst(reason, toolName);
+      auditLog({ ts: new Date().toISOString(), event: "bypassed", reason, tool: toolName });
       return undefined;
     }
     if (!top) return undefined;
@@ -2088,7 +2148,9 @@ function tokenStateLabel(reason: string): string {
     captureAuditSession(_ctx);
     const top = topSkill();
     if (isKillSwitchActive()) {
-      auditLog({ ts: new Date().toISOString(), event: "bypassed", reason: "kill_switch", tool: event.toolName });
+      const reason = bypassReason();
+      auditSessionEscapeGrantIfFirst(reason, event.toolName);
+      auditLog({ ts: new Date().toISOString(), event: "bypassed", reason, tool: event.toolName });
       return undefined;
     }
     if (!top) return undefined;
@@ -2200,7 +2262,9 @@ function tokenStateLabel(reason: string): string {
   // #5672: suppress banner in print mode (task sub-agent output)
   if (!isPrintMode()) {
     if (isKillSwitchActive()) {
-      console.log("[sequence-enforcer] ⏸️  Loaded — kill switch active, all enforcement bypassed");
+      console.log(isKillSwitchSet()
+        ? "[sequence-enforcer] ⏸️  Loaded — kill switch active, all enforcement bypassed"
+        : "[sequence-enforcer] ⏸️  Loaded — session escape active, enforcement bypassed for this session");
     } else {
       console.log(`[sequence-enforcer] ✅ Loaded — mode: ${resolveMode()} — enforcing step sequences`);
     }

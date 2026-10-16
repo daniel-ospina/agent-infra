@@ -7,13 +7,17 @@
  * Run: npx tsx extensions/verification-gate.test.ts
  */
 
-import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, applyScopeGate, routeScopeGate, combineScopes } from "./index.js";
+import { extractJson, isValidResult, isGitOp, isGitCommit, resolveProjectRoot, resolveMergeRoot, scopeFiles, extractCdPath, normalizeRegistryPath, mergeVerifiedFiles, hashAndMergeFiles, extractRepoFlag, extractGhRepoEnv, extractPrNumber, repoNameFromRemote, evaluateMergeScope, isMergeCommand, mergeCommandWindow, hashMatchesDisk, buildSubAgentBlockMessage, isTaskSubAgent, SHAPE_EXEMPT_EXTENSIONS, BUILD_OUTPUT_SEGMENTS, isShapeExemptFile, isDeletionPush, isBareCommitShape, commitSweepClass, wtPathCommitInfo, commitChainMutationClass, commandRunsCommit, parsePushRefSpecs, resolvePushTier, buildPushRangeDiffCommand, resolveCommitOid, isAncestorOrEqual, resolvePushRangeScope, formatCeremonyDiagnostics, recordDispatchFailure, recordDispatchJudgment, recordDispatchSuccess, dispatchState, parseDiffNameStatus, parseDiffNameStatusDetailed, applyScopeGate, routeScopeGate, combineScopes, pickVerifiedRoot, indexRecordsContent, verificationCandidates } from "./index.js";
 import { createHash } from "node:crypto";
+import { execSync } from "node:child_process";
 import { ok, equal, deepEqual, throws } from "node:assert/strict";
-import { mkdtempSync, symlinkSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, symlinkSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync, existsSync } from "node:fs";
 import { join, sep, dirname } from "node:path";
 import { tmpdir, homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+// #966: the shared parser module — the drift-pin below asserts this extension's
+// exported helpers ARE these functions (one copy, not a lookalike).
+import * as sharedParse from "../shared/git-command-parse.js";
 
 let passed = 0;
 let failed = 0;
@@ -453,58 +457,94 @@ test("rejects substring match in longer word", () => {
 
 // ── Module load regression ───────────────────────────
 
-section("extractCdPath — worktree cwd detection");
+// ── Drift-pin: ONE copy of the command parsers (#966) ─
+//
+// The behavioural truth table for the four helpers (and the delete-the-wrong-
+// pin fix for `cd /a && cd /b`, plus the #960 newline-terminated cd) now lives
+// in the shared suite: extensions/shared/git-command-parse.test.ts. What must
+// be pinned HERE is that this extension has no private copy to drift again —
+// the copies drifted silently for a month and the two suites ended up
+// asserting OPPOSITE answers for the same input.
 
-test("extracts path from cd && pattern", () => {
-  const result = extractCdPath("cd /some/worktree && git commit -m test");
-  ok(result !== null);
-  ok(result!.endsWith("/some/worktree"));
+section("drift-pin — shared command parsers (#966)");
+
+test("the four helpers ARE the shared module's functions (no per-extension copy)", () => {
+  equal(extractCdPath, sharedParse.extractCdPath, "extractCdPath");
+  equal(extractRepoFlag, sharedParse.extractRepoFlag, "extractRepoFlag");
+  equal(extractGhRepoEnv, sharedParse.extractGhRepoEnv, "extractGhRepoEnv");
+  equal(extractPrNumber, sharedParse.extractPrNumber, "extractPrNumber");
 });
 
-test("extracts path from cd ; pattern", () => {
-  const result = extractCdPath("cd /tmp ; git push");
-  ok(result !== null);
-  ok(result!.endsWith("/tmp"));
+/** Does `src` DECLARE a local copy of `helper`? Declaration-form-agnostic: a
+ * `function` / `async function` / `export default function`, or a `const`/`let`/
+ * `var` with an optional TYPE ANNOTATION between the name and `=`. Scanning only
+ * `function` let the idiomatic TS forms through. The scan is over RAW text, so a
+ * COMMENT that quotes a declaration also trips it — deliberate: the guard fails
+ * CLOSED (a false positive costs a look; a miss re-opens #966). The one shape it
+ * cannot see is a copy relocated to a sibling module and imported under the same
+ * name, for the helpers neither extension re-exports (recorded residual). */
+function declaresHelper(src: string, helper: string): boolean {
+  return new RegExp(
+    `(?:export\\s+)?(?:default\\s+)?(?:async\\s+)?function\\s+${helper}\\b` +
+      `|(?:const|let|var)\\s+${helper}\\s*(?::[^=;]*)?=`,
+  ).test(src);
+}
+
+test("the declaration scan detects every form it claims — and only those", () => {
+  // A guard only ever run against today's CLEAN sources cannot fail when the
+  // regex is weakened: it would drift OPEN silently. Pin the detector itself.
+  for (const positive of [
+    "function extractCdPath(cmd: string) { return null; }",
+    "export function extractCdPath(cmd: string) { return null; }",
+    "async function extractCdPath(cmd: string) { return null; }",
+    "export default function extractCdPath(cmd: string) { return null; }",
+    "const extractCdPath = (cmd: string) => null;",
+    "const extractCdPath: CdParser = (cmd) => null;",
+    "const extractCdPath: (c: string) => string | null = (c) => null;",
+    "let extractCdPath = function (cmd: string) { return null; };",
+    "var extractCdPath = (cmd) => null;",
+    // RAW-text scan ⇒ a comment quoting a declaration also trips it (fail-closed).
+    "// const extractCdPath = old copy;",
+  ]) {
+    ok(declaresHelper(positive, "extractCdPath"), `must detect: ${positive}`);
+  }
+  for (const decoy of [
+    "const extractCdPathRegex = /x/;",
+    "const myExtractCdPath = 1;",
+    "const x = extractCdPath(cmd);",
+    'import { extractCdPath } from "../shared/git-command-parse.js";',
+    "export { extractCdPath, extractPrNumber };",
+  ]) {
+    ok(!declaresHelper(decoy, "extractCdPath"), `must ignore: ${decoy}`);
+  }
 });
 
-test("extracts quoted path", () => {
-  const result = extractCdPath("cd '/path with spaces' && git commit");
-  ok(result !== null);
-  ok(result!.endsWith("/path with spaces"));
-});
-
-test("returns null for non-cd command", () => {
-  equal(extractCdPath("git commit -m test"), null);
-});
-
-test("returns null for cd without git op suffix", () => {
-  // The regex requires && or ; after the cd path to avoid false positives
-  equal(extractCdPath("cd /tmp"), null);
-});
-
-test("cd inside quoted prose does not poison cwd (P2-2 fix)", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see cd /tmp && x"'), null);
-  equal(extractCdPath("git commit -m 'run cd /tmp && fix'"), null);
-});
-
-test("cd after a command separator is still detected (P2-2 fix)", () => {
-  ok(extractCdPath("echo x && cd /tmp && git commit")!.endsWith("/tmp"));
-  ok(extractCdPath("cd /a && cd /b && git commit")!.endsWith("/a")); // first boundary-anchored cd wins
-});
-
-test("cd after a bare newline separator is detected (cycle-4 P2-1 fix)", () => {
-  ok(extractCdPath("echo hello\ncd /tmp && git commit")!.endsWith("/tmp"));
-});
-test("review 230 P2-3: quoted prose cd shapes never poison cwd", () => {
-  equal(extractCdPath('gh pr merge 1 --comment "see; cd /tmp && x"'), null);
-  equal(extractCdPath('gh pr merge 1 --body "first\ncd /tmp && second"'), null);
-  ok(extractCdPath('cd "/path with spaces" && git commit')!.endsWith("/path with spaces"));
-});
-
-test("review 230 P2-2: HOST/OWNER/REPO forms normalize to OWNER/REPO", () => {
-  equal(extractGhRepoEnv("GH_REPO=github.com/owner/repo gh pr merge 123"), "owner/repo");
-  equal(extractGhRepoEnv("GH_REPO=a/b/c/d gh pr merge 123"), null);
-  equal(extractRepoFlag("gh pr merge 123 --repo github.com/owner/repo"), "owner/repo");
+test("neither extension declares a local copy of the command parsers (#966)", () => {
+  const sources: Array<[string, string]> = [
+    ["verification-gate", readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8")],
+    ["review-enforcer", readFileSync(fileURLToPath(new URL("../review-enforcer/index.ts", import.meta.url)), "utf-8")],
+  ];
+  for (const [name, src] of sources) {
+    ok(src.includes("shared/git-command-parse.js"), `${name} must import the shared parser`);
+    for (const helper of [
+      "extractCdPath",
+      "extractRepoFlag",
+      "extractGhRepoEnv",
+      "extractPrNumber",
+      "parseCdChains",
+      "expandCdTarget",
+      // The quote model was promoted to shared on the #966 merge — review-enforcer's
+      // `matchUnquoted` / `countUnquotedMergeVerbs` and the shared masked PR scan are
+      // consumers of ONE model, so a local re-declaration here is the drift again.
+      "unquotedMask",
+      // The verb grammar is a shared export too (this extension's merge window
+      // matches on it). It is a `const` regex, so only the declaration scan above
+      // can see a re-declaration.
+      "GH_PR_MERGE_VERB",
+    ]) {
+      ok(!declaresHelper(src, helper), `${name} must not declare a local ${helper} (#966: one copy only)`);
+    }
+  }
 });
 
 // ── Module load regression ───────────────────────────
@@ -847,35 +887,11 @@ test("VGATE PASS overwrites even when path not in lastBlockedFiles", () => {
 
 // ── #204: gh pr merge scope — PR repo resolution ─────
 
-section("extractRepoFlag / extractGhRepoEnv — PR repo resolution (#204)");
-
-test("extractRepoFlag: --repo owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: -R owner/name", () => {
-  equal(extractRepoFlag("gh pr merge 123 -R acme/widget --squash"), "acme/widget");
-});
-
-test("extractRepoFlag: --repo=owner/name (equals form)", () => {
-  equal(extractRepoFlag("gh pr merge 123 --repo=acme/widget"), "acme/widget");
-});
-
-test("extractRepoFlag: absent → null", () => {
-  equal(extractRepoFlag("gh pr merge 123"), null);
-});
-
-test("extractRepoFlag: does not match git remote args", () => {
-  equal(extractRepoFlag("git remote add origin git@github.com:a/b.git"), null);
-});
-
-test("extractGhRepoEnv: GH_REPO=owner/name prefix", () => {
-  equal(extractGhRepoEnv("GH_REPO=acme/widget gh pr merge 123"), "acme/widget");
-});
-
-test("extractGhRepoEnv: absent → null", () => {
-  equal(extractGhRepoEnv("gh pr merge 123"), null);
-});
+section("repo context priority — PR repo resolution (#204)");
+// The helper-level cases for extractRepoFlag/extractGhRepoEnv (the
+// [HOST/]OWNER/REPO normalization and the garbage-identity fail-closed rule)
+// live in the shared suite. This pins the resolution ORDER the merge-scope
+// path depends on.
 
 test("repo priority: flag beats env when both present", () => {
   const command = "GH_REPO=env/repo gh pr merge 123 --repo flag/repo";
@@ -935,37 +951,6 @@ test("trailing slash / .git forms never yield a garbage identity (P2 fix)", () =
 test("local path remote → null (fail-closed, no accidental skip)", () => {
   equal(repoNameFromRemote("/tmp/some/repo.git"), null);
   equal(repoNameFromRemote("relative/path"), null);
-});
-
-// ── #204: extractPrNumber ─────────────────────────────
-
-section("extractPrNumber — PR number from merge command (#204)");
-
-test("extracts PR number from gh pr merge", () => {
-  equal(extractPrNumber("gh pr merge 123 --squash"), 123);
-});
-
-test("extracts PR number after cd prefix", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge 42"), 42);
-});
-
-test("extracts PR number when flags precede the number (P2 fix: gh pr merge --squash 123)", () => {
-  equal(extractPrNumber("gh pr merge --squash 123"), 123);
-});
-
-test("extracts PR number with flags + cd prefix in either order", () => {
-  equal(extractPrNumber("cd /wt && gh pr merge --repo x/y 42"), 42);
-  equal(extractPrNumber("gh pr merge -R x/y --squash 7"), 7);
-});
-
-test("extracts PR number with global -R flag before the verb (P2-1 fix)", () => {
-  equal(extractPrNumber("gh -R owner/name pr merge 123"), 123);
-  equal(extractPrNumber("GH_REPO=a/b gh --repo=owner/name pr merge 456"), 456);
-});
-
-test("does not mistake flag values for the PR number", () => {
-  // --repo owner/name never tokenizes as a bare integer.
-  equal(extractPrNumber("gh pr merge --repo 123/owner"), null);
 });
 
 // ── #204: verb-anchored merge detection + command window ─
@@ -1204,6 +1189,114 @@ test("missing file throws (consistent with hashFile; callers fail closed)", () =
   }
 });
 
+// ── symlink hashing (#1092) ──────────────────────────
+
+section("symlink hashing — the link TARGET is the committed blob (#1092)");
+
+test("symlink to a DIRECTORY hashes its link target — no EISDIR (#1092)", () => {
+  // The #1092 reproduction: `readFileSync` throws EISDIR on a directory
+  // symlink, and the commit loop routes every errno but ENOENT/ENOTDIR to
+  // `unverified` — so a path like pi-config/extensions/<new-dir> was
+  // PERMANENTLY un-committable. It must hash the link target instead.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    writeFileSync(join(root, "ext-real", "index.ts"), "export const a = 1;\n");
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    const stored = createHash("sha256").update("ext-real").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", stored), true, "a dir symlink must verify by its link target");
+    // NOT the content reachable through it (which is a directory, unreadable)
+    const throughContent = createHash("sha256").update("export const a = 1;\n").digest("hex");
+    equal(hashMatchesDisk(root, "farm-entry", throughContent), false, "must not hash a file inside the linked dir");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a symlink to a FILE also hashes the link target (git 120000 blob), not the target's content", () => {
+  // Deliberate semantics (the #305 completion): git commits the TARGET STRING.
+  // Hashing followed content would miss a retarget to an equal-content file.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "target.ts"), "same bytes\n");
+    symlinkSync("target.ts", join(root, "link.ts"));
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("target.ts").digest("hex")), true);
+    equal(hashMatchesDisk(root, "link.ts", createHash("sha256").update("same bytes\n").digest("hex")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a retargeted symlink is drift (anti-drift preserved) — same link, different bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "a"));
+    mkdirSync(join(root, "b"));
+    symlinkSync("a", join(root, "entry"));
+    const stored = createHash("sha256").update("a").digest("hex");
+    equal(hashMatchesDisk(root, "entry", stored), true);
+    rmSync(join(root, "entry"));
+    symlinkSync("b", join(root, "entry"));
+    equal(hashMatchesDisk(root, "entry", stored), false, "a post-verification retarget must fail closed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a broken symlink hashes its target string (lstat, never follow-through)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    symlinkSync("nowhere-at-all", join(root, "dangling"));
+    equal(hashMatchesDisk(root, "dangling", createHash("sha256").update("nowhere-at-all").digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("non-UTF-8 link targets are hashed byte-exact ({ encoding: 'buffer' })", () => {
+  // A string readlink would decode-lossy the target and hash bytes git never
+  // stored; the digest must be over the raw link bytes.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    const rawTarget = Buffer.from([0x61, 0xff, 0xfe, 0x62]);
+    symlinkSync(rawTarget, join(root, "weird"));
+    equal(hashMatchesDisk(root, "weird", createHash("sha256").update(rawTarget).digest("hex")), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("errno semantics preserved: a D/F conflict still throws ENOTDIR (not EISDIR-swallowed)", () => {
+  // The #920 branch discriminates on these errnos — lstatSync must throw the
+  // same ones readFileSync did, or a genuine D/F deletion would start blocking.
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    writeFileSync(join(root, "parent"), "a regular file\n");
+    let code: string | undefined;
+    try { hashMatchesDisk(root, "parent/child.ts", "0".repeat(64)); } catch (err: any) { code = err?.code; }
+    equal(code, "ENOTDIR");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the hashed bytes are git's own blob for the link (index agreement)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-sym-"));
+  try {
+    mkdirSync(join(root, "ext-real"));
+    symlinkSync("ext-real", join(root, "farm-entry"));
+    execSync("git init -q -b main && git add farm-entry", { cwd: root, stdio: "ignore" });
+    // git records the entry as a mode-120000 blob whose contents ARE the target
+    const entry = execSync("git ls-files -s -- farm-entry", { cwd: root, encoding: "utf-8" }).trim();
+    equal(entry.split(/\s+/)[0], "120000", "staging a symlink yields a mode-120000 entry");
+    const targetBytes = execSync("git cat-file -p :farm-entry", { cwd: root, encoding: "buffer" });
+    equal(hashMatchesDisk(root, "farm-entry", createHash("sha256").update(targetBytes).digest("hex")), true,
+      "the gate hashes exactly the bytes git stored for that path");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // ── hashAndMergeFiles (#336) ─────────────────────────
 
 section("hashAndMergeFiles — hash-less PASS records blocked files (#336)");
@@ -1397,24 +1490,33 @@ section("isDeletionPush — delete-shaped push classification (#472 mechanism b)
 // fixture stays in sync across the isDeletionPush and isBareCommitShape
 // classification surfaces.
 const FULL_05_CLEANUP_BLOCK = `# BRANCH = the merged PR branch — resolve via gh FIRST. Deriving from the current
-# branch is ambiguous after the #376 Step C return: an in-main ceremony session
-# now sits on main, and \`git branch --show-current\` would target the default
-# branch. gh knows the PR's head branch regardless of local checkout state.
+# branch is ambiguous after the ceremony: a worktree session returns to its base
+# (or is torn down) and its current checkout is no longer the PR head — and
+# \`git branch --show-current\` would target the wrong branch. gh knows the PR's
+# head branch regardless of local checkout state.
 BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName' 2>/dev/null)
 [ -n "$BRANCH" ] || BRANCH=$(git branch --show-current)
 
-# Remote delete — server-side, always possible after merge; "remote ref does not
-# exist" means deleteBranchOnMerge already removed it = success.
+# Remote delete — server-side; run it AFTER the teardown above. The #73
+# coordinated-delete guard blocks deleting a branch still checked out in ANY
+# worktree, but it matches the LITERAL ref in the command text, so this
+# shell-variable form is not guard-matched (the teardown ordering makes it moot).
+# "remote ref does not exist" means deleteBranchOnMerge already removed it = success.
 git push origin --delete "$BRANCH" 2>/dev/null \\
   || echo "ℹ️ remote branch $BRANCH already deleted or unavailable"
 
-# Local delete — now safe IF the worktree was removed above (lock released).
-# If the worktree removal FAILED, do not fail the ceremony: WARN + leave a teardown note.
+# Local delete — best-effort. If the worktree was removed above the branch is no
+# longer checked out, but the HUB's main-checkout branch-force-delete gate still
+# blocks a branch that is not the session's baseline or pid-owned (a \`git worktree
+# add -b\` branch is never recorded as owned — create-new is blocked, #626). A block
+# or git refusal is a WARN — never fail the ceremony. A GUARD block rejects the bash
+# call before the shell runs, so the \`||\` echo below never fires on it: the agent
+# must surface the teardown note itself.
 if git worktree list --porcelain | grep -q "branch refs/heads/$BRANCH"; then
   echo "⚠️ branch $BRANCH is still checked out in a worktree — local delete deferred."
   echo "   TEARDOWN NOTE: remove the worktree and run: git branch -D $BRANCH"
 else
-  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not found or could not be deleted — delete manually: git branch -D $BRANCH"
+  git branch -D "$BRANCH" 2>&1 || echo "⚠️ local branch $BRANCH not deleted (guard-blocked or missing) — remove manually: git branch -D $BRANCH"
 fi`;
 
 // ── #482 — shared drift-guard skip-arm messaging for the THREE guards (01-preflight,
@@ -1440,7 +1542,7 @@ const DRIFT_GUARD_05_FENCE_MARKER = "```bash\n# BRANCH = the merged PR branch";
 // of the ceremony (skills/commit-workflow/workflow/04-merge-deploy.md:91), VERBATIM.
 // Shared by the TRUE-fixture pin below and the #482 drift guard. Line-only surface: prose
 // edits elsewhere in Step B (worktree-defer comments/echoes) must NOT red the guard.
-const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
+const MERGE_DEPLOY_STEP_B_DELETE = `git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"`;
 
 test("TRUE: delete-shaped forms (flag either position, :refspec, -d, multi-target, redirects, cd-prefix)", () => {
   const truePins = [
@@ -2711,6 +2813,70 @@ test("tier B emits whatever base the resolver chose — NON-ORIGIN base flows th
   );
 });
 
+// ── #3716 — OID pinning + the OID-only probe whitelist ──────────────────────
+test("#3716: resolveCommitOid pins a ref to an OID and refuses everything else; isAncestorOrEqual is OID-only", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-oid-"));
+  try {
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "a.txt"), "a\n");
+    execSync("git add . && git commit -q -m one", { cwd: dir });
+    const c1 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    writeFileSync(join(dir, "b.txt"), "b\n");
+    execSync("git add . && git commit -q -m two", { cwd: dir });
+    const c2 = execSync("git rev-parse HEAD", { cwd: dir, encoding: "utf-8" }).trim();
+    equal(resolveCommitOid(dir, "HEAD"), c2, "resolveCommitOid pins HEAD to its commit OID");
+    equal(resolveCommitOid(dir, "refs/heads/nope"), null, "an unresolvable ref → null (fail-closed)");
+    equal(resolveCommitOid(dir, "evil; rm -rf /"), null, "a non-whitelisted ref never reaches the shell");
+    equal(resolveCommitOid(dir, "-D"), null, "an option-shaped token is refused");
+    equal(resolveCommitOid(dir, "--upload-pack=x"), null, "an option-shaped token is refused (long form)");
+    // ⛔ The probe interpolates into /bin/sh -c: a ref NAME must never reach it.
+    equal(isAncestorOrEqual(dir, "HEAD", "HEAD"), null, "a refname is refused — OIDs only");
+    equal(isAncestorOrEqual(dir, c1, c1), true, "an OID is an ancestor-or-equal of itself");
+    equal(isAncestorOrEqual(dir, c1, c2), true, "the ancestor direction resolves true");
+    equal(isAncestorOrEqual(dir, c2, c1), false, "a descendant is an EXPLICIT negative, never null");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── #3716 — the kill switch must cover the NARROWING, not only #755 ────────
+test("#3716: the kill switch (subDisabled) keeps the pre-#3716 scope — a rewrite push is not narrowed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "vgate-nosub-"));
+  try {
+    const g = (a: string) => execSync(`git ${a}`, { cwd: dir, encoding: "utf-8" }).trim();
+    execSync("git init -q -b main", { cwd: dir });
+    execSync("git config user.email t@t", { cwd: dir });
+    execSync("git config user.name t", { cwd: dir });
+    writeFileSync(join(dir, "baseline.ts"), "b\n");
+    execSync("git add . && git commit -q -m c0", { cwd: dir });
+    execSync("git checkout -q -b feat", { cwd: dir });
+    writeFileSync(join(dir, "feat.ts"), "f\n");
+    execSync("git add . && git commit -q -m feat", { cwd: dir });
+    const preRebase = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/feat ${preRebase}`, { cwd: dir });
+    // main advances, then the branch is rebased onto it — the #3716 rewrite shape.
+    execSync("git checkout -q main", { cwd: dir });
+    writeFileSync(join(dir, "main-delta.ts"), "m\n");
+    execSync("git add . && git commit -q -m upstream", { cwd: dir });
+    const mainTip = g("rev-parse HEAD");
+    execSync(`git update-ref refs/remotes/origin/main ${mainTip}`, { cwd: dir });
+    // #1491 — the narrowing requires an explicit declaration of the integration ref.
+    execSync("git config vgate.integrationRef refs/remotes/origin/main", { cwd: dir });
+    execSync("git checkout -q feat && git rebase -q origin/main", { cwd: dir });
+    // Proofs hold: origin/main IS an ancestor of the rebased tip; origin/feat is not.
+    const narrowed = resolvePushRangeScope("git push --force origin feat", dir, null, false);
+    const widened = resolvePushRangeScope("git push --force origin feat", dir, null, true);
+    deepEqual(narrowed?.files, ["feat.ts"],
+      "narrowed: the branch's own diff — main's delta is base-identical (the #3716 scope)");
+    deepEqual(widened?.files, ["main-delta.ts"],
+      "kill switch: the pre-#3716 2-dot scope is kept — main's delta is demanded again");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── #490 T2: head-anchored git-global-option parse + shared verb scanner ──
 // Group A = RED pins (fail on the pre-fix regex family — write-first, each
 // confirmed failing before the scanner landed). Group B = green guards
@@ -3184,6 +3350,561 @@ test("G4: combineScopes — files dedup, renameOldPaths union, clean AND", () =>
   ok(u.clean);
   equal(combineScopes(a, { ...b, clean: false }).clean, false, "clean is AND");
 });
+
+// ── #755: parseDiffNameStatusDetailed status map ──────
+// The subtraction rule's condition (E) reads `statuses.get(P) ∈ {A, M}`, so the
+// status map is safety-relevant: a WRONG or MISSING letter silently disables the
+// subtraction for that path (over-gate, safe) — but an accidental extra `A`/`M`
+// on a path that is not actually added/modified would be an UNDER-gate. These
+// pins live here rather than in subtract-scope.test.ts because the parser lives
+// in index.ts, whose `:2` is a VALUE import of the pi SDK — the subtraction suite
+// must stay SDK-free so it can run in the no-`npm ci` verify job.
+section("#755: parseDiffNameStatusDetailed — status-map eligibility (E)");
+
+test("#755 E: A and M are the only eligible letters", () => {
+  deepEqual([...parseDiffNameStatusDetailed("A\0new.ts\0").statuses.entries()], [["new.ts", "A"]]);
+  deepEqual([...parseDiffNameStatusDetailed("M\0mod.ts\0").statuses.entries()], [["mod.ts", "M"]]);
+});
+
+test("#755 E: every ineligible letter is carried faithfully (never coerced to A/M)", () => {
+  // D/T/U/X/B are single-path rows. R/C are 3-field (score + OLD + NEW).
+  for (const letter of ["D", "T", "U", "X", "B"]) {
+    const { statuses } = parseDiffNameStatusDetailed(`${letter}\0p.ts\0`);
+    equal(statuses.get("p.ts"), letter, `${letter} must be preserved verbatim`);
+    ok(letter !== "A" && letter !== "M", "(sanity) the letter under test is ineligible");
+  }
+});
+
+test("#755 E: R/C are keyed by the NEW path, not the old one", () => {
+  const r = parseDiffNameStatusDetailed("R100\0old.ts\0new.ts\0");
+  equal(r.statuses.get("new.ts"), "R");
+  equal(r.statuses.get("old.ts"), undefined,
+    "the OLD path must carry NO status — keying it would let an ineligible rename source leak an eligible letter");
+  deepEqual(r.scope.files, ["new.ts"]);
+  deepEqual(r.scope.renameOldPaths, ["old.ts"]);
+  const c = parseDiffNameStatusDetailed("C75\0src.ts\0copy.ts\0");
+  equal(c.statuses.get("copy.ts"), "C");
+  equal(c.statuses.get("src.ts"), undefined);
+});
+
+test("#755 E: an anomaly yields a PARTIAL map and clean=false — never a fabricated letter", () => {
+  // Truncated stream (no final NUL) → clean=false, EMPTY map.
+  const trunc = parseDiffNameStatusDetailed("A\0new.ts");
+  equal(trunc.scope.clean, false);
+  equal(trunc.statuses.size, 0);
+  ok(!trunc.statuses.has("new.ts"), "a truncated row must not register the path");
+  // Good row followed by an unknown status → the good row IS registered, clean=false.
+  const partial = parseDiffNameStatusDetailed("A\0ok.ts\0Z\0bad.ts\0");
+  equal(partial.scope.clean, false);
+  equal(partial.statuses.get("ok.ts"), "A");
+  equal(partial.statuses.get("bad.ts"), undefined);
+  deepEqual(partial.scope.files, ["ok.ts"]);
+  // Bare R without a similarity score is an anomaly, not a rename.
+  const bareR = parseDiffNameStatusDetailed("R\0old.ts\0new.ts\0");
+  equal(bareR.scope.clean, false);
+  equal(bareR.statuses.size, 0);
+  // A similarity score is valid on R/C rows (3-field, handled above) and on `M`
+  // rows for file rewrites — git-diff(1) RAW OUTPUT FORMAT: "Status letter M may
+  // be followed by a score (denoting the percentage of dissimilarity) for file
+  // rewrites". On any other single-path letter it is not producible by git, and
+  // without a guard the token would register as an eligible A/M — the one input
+  // class where the parser could report an eligibility git never granted.
+  const scoredM = parseDiffNameStatusDetailed("M100\0p.ts\0");
+  equal(scoredM.scope.clean, true, "M<score> is a legitimate rewrite row (git diff -B), NOT an anomaly");
+  equal(scoredM.statuses.get("p.ts"), "M");
+  deepEqual(scoredM.scope.files, ["p.ts"]);
+  for (const letter of ["A", "D", "T", "U", "X", "B"]) {
+    const scored = parseDiffNameStatusDetailed(`${letter}100\0p.ts\0`);
+    equal(scored.scope.clean, false, `${letter}100 must be an anomaly`);
+    equal(scored.statuses.size, 0, `${letter}100 must not register the path`);
+  }
+});
+
+test("#755 E: empty output is clean with an empty map (vacuous, not an anomaly)", () => {
+  const e = parseDiffNameStatusDetailed("");
+  deepEqual(e.scope, { files: [], renameOldPaths: [], clean: true });
+  equal(e.statuses.size, 0);
+});
+
+// ── #7526: deletion-aware verification candidates ──────
+// The gate was deletion-blind: a `D` row was treated exactly like a modified
+// path, so untracking N files produced N "Unverified files" entries demanding a
+// sha256 of content the commit no longer contains. The fix is ADDITIVE and lives
+// at the DECISION point (`verificationCandidates`), never in the parser: `files`
+// must stay a faithful projection (the G1 pin owns it), and the parse-block /
+// empty / exemption routing must still see every path.
+section("#7526: deleted paths are excluded from the verification candidate set");
+
+test("#7526: contract pin — `D` still lands in `files` and the wrapper shape is unchanged", () => {
+  // The parser must NOT be where deletion is dropped: this exact object is the
+  // G1 pin, and `files` is the faithful projection of what git emitted. If this
+  // fails, the change was made in the wrong layer — re-read the #7526 spec.
+  deepEqual(parseDiffNameStatus("D\0src/old.ts\0"), { files: ["src/old.ts"], renameOldPaths: [], clean: true });
+});
+
+test("#7526: the DETAILED parse carries the deleted projection, files untouched", () => {
+  const { scope } = parseDiffNameStatusDetailed("D\0src/old.ts\0");
+  deepEqual(scope.deleted, ["src/old.ts"]);
+  deepEqual(scope.files, ["src/old.ts"], "files keeps the D path — the projection is separate");
+});
+
+test("#7526: a MIXED diff lists the deleted path AND keeps both paths in files", () => {
+  const { scope } = parseDiffNameStatusDetailed("A\0docs/new.md\0D\0src/old.ts\0");
+  deepEqual(scope.deleted, ["src/old.ts"]);
+  deepEqual(scope.files.sort(), ["docs/new.md", "src/old.ts"].sort());
+});
+
+test("#7526: no deletions → `deleted` is ABSENT (not `[]`)", () => {
+  const { scope } = parseDiffNameStatusDetailed("A\0docs/new.md\0M\0src/app.ts\0");
+  equal(scope.deleted, undefined, "absent, mirroring the subtractions absence contract");
+  deepEqual(scope, { files: ["docs/new.md", "src/app.ts"], renameOldPaths: [], clean: true });
+});
+
+test("#7526: combineScopes keeps `files` the PLAIN union and excludes only paths no arm contributes live", () => {
+  // The pre-fix version of this test pinned `combineScopes(a, b).deleted` to the
+  // UNION of both arms' deletions and never fed the result through
+  // `verificationCandidates`. That is exactly why the P0 shipped: the consumer
+  // then subtracted the union from the unioned `files`, so one arm's deletion
+  // erased another arm's live path. The rule is now: `files` is the plain union
+  // (so routing sees every path), and `deleted` is the union of arms' deletions
+  // MINUS the paths any arm contributes live.
+  const a = { files: ["a.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["b.ts", "gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts", "other.ts"] };
+  const combined = combineScopes(a, b);
+  // (4) `files` is the PLAIN union — the `D` path is NOT dropped here.
+  deepEqual(combined.files, ["a.ts", "gone.ts", "b.ts"], "plain union: D rows stay in `files`");
+  // gone.ts is in BOTH arms' `files` and BOTH arms' `deleted` ⇒ excluded.
+  // other.ts is deleted in b but never listed in b.files, so no arm contributes
+  // it live (vacuously deleted).
+  deepEqual(combined.deleted, ["gone.ts", "other.ts"]);
+  deepEqual(verificationCandidates(combined.files, combined.deleted),
+    ["a.ts", "b.ts"],
+    "a path deleted on every arm never reaches the candidate set");
+  const none = combineScopes(
+    { files: ["x.ts"], renameOldPaths: [], clean: true },
+    { files: ["y.ts"], renameOldPaths: [], clean: true },
+  );
+  equal(none.deleted, undefined, "no deletions on either arm → absent, never []");
+  deepEqual(none.files, ["x.ts", "y.ts"], "plain union");
+});
+
+test("#7526 P1: a combined scope keeps the deleted path in `files` so the exemption does NOT widen", () => {
+  // THE FAIL-OPEN THE PER-ARM EXCLUSION INTRODUCED (532ee59). The reviewer's
+  // case, built from the arms the bare-commit + `gh pr create` composition
+  // produces:
+  //   branch/commit arm: `D src/app.ts`   (non-exempt code, deleted)
+  //   gh-record arm:     `A docs/code.md` (exempt path, holds the moved code)
+  // Git detects no rename (dissimilar content), so nothing carries the
+  // rename-source guard. At 532ee59 `combineScopes` dropped src/app.ts from
+  // `files` — UPSTREAM of `applyScopeGate` — so the gate saw only the exempt
+  // path and routed `exempt-allow`; the code shipped unverified. Verified
+  // against a scratch copy of 2d9ec45^ (`main`): files included src/app.ts and
+  // `applyScopeGate` returned `verify`. This test pins that routing back.
+  const armD = { files: ["src/app.ts"], deleted: ["src/app.ts"], renameOldPaths: [], clean: true };
+  const armA = { files: ["docs/code.md"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(armD, armA);
+  // (4) the `D` path REMAINS in `files` — the property that keeps routing honest.
+  deepEqual(combined.files, ["src/app.ts", "docs/code.md"], "D path stays in `files` (plain union)");
+  const gate = applyScopeGate(combined.files, combined.renameOldPaths, combined.clean, true, isShapeExemptFile);
+  equal(gate.kind, "verify", "a deleted non-exempt path must force verify, never exempt-allow");
+  deepEqual(routeScopeGate(gate, combined.files),
+    { action: "verify", files: ["src/app.ts", "docs/code.md"] },
+    "#559 T1 routing: the deleted non-exempt path keeps the gate ON");
+  // The exclusion still runs at the consumer, so only docs/code.md is hashed —
+  // and it IS hashed (this is what the fail-open skipped).
+  deepEqual(combined.deleted, ["src/app.ts"]);
+  deepEqual(verificationCandidates(combined.files, combined.deleted), ["docs/code.md"],
+    "the code moved into docs/code.md is the verification candidate");
+});
+
+test("#7526 P1: a combined deletion-only scope still reaches `verify` with non-empty `route.files` (audit precondition)", () => {
+  // The `deletion_only_no_content` audit fires only when `route.files.length > 0`
+  // at the verify path. Restoring `files` to the plain union restores exactly
+  // that: both arms delete the same non-exempt path, so `applyScopeGate` sees a
+  // non-empty, non-exempt set and routes `verify` (previously the per-arm
+  // exclusion emptied `files` upstream, so the scope took `empty-allow` and no
+  // audit line was emitted). The emission itself lives in the unexported
+  // `pi.on("tool_call")` handler (e2e-only); this pins its precondition.
+  const a = { files: ["src/gone.ts"], deleted: ["src/gone.ts"], renameOldPaths: [], clean: true };
+  const b = { files: ["src/gone.ts"], deleted: ["src/gone.ts"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(a, b);
+  deepEqual(combined.files, ["src/gone.ts"], "plain union keeps the D path in `files`");
+  const gate = applyScopeGate(combined.files, combined.renameOldPaths, combined.clean, true, isShapeExemptFile);
+  equal(gate.kind, "verify", "non-empty D set routes verify (not empty-allow) so the skip is audited");
+  const route = routeScopeGate(gate, combined.files);
+  deepEqual(route, { action: "verify", files: ["src/gone.ts"] });
+  deepEqual(verificationCandidates(route.files, combined.deleted), [],
+    "every candidate is deleted ⇒ the handler's non-empty-route audit branch is taken");
+});
+
+test("#7526 P0: a path deleted in ONE arm but live in ANOTHER stays a candidate (per-arm exclusion)", () => {
+  // THE REGRESSION. Reachable with no malice: the branch arm deletes f.ts while
+  // the staged/record arm (re-)adds it (`D f.ts` + `A f.ts`, the bare-commit +
+  // `gh pr create` composition). Pre-fix `combineScopes` → { files: [f.ts],
+  // deleted: [f.ts] }, the consumer → [], and an unverified rewrite was ALLOWED;
+  // at 2d9ec45^ it blocked as unverified.
+  const a = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["gone.ts"], renameOldPaths: [], clean: true };
+  const combined = combineScopes(a, b);
+  // State it behaviourally: the ACTUAL composition the verify path performs must
+  // still name gone.ts, i.e. it must reach the hash loop and block when
+  // unverified. (The pre-fix test asserted the object shape instead and could not
+  // see this.)
+  deepEqual(verificationCandidates(combined.files, combined.deleted), ["gone.ts"],
+    "deleted in one arm, present in another ⇒ still a verification candidate");
+  // `undefined` here is the RESULT OF THE FILTER, not a general "combineScopes
+  // never emits a unioned `deleted`" contract. Arm b lists gone.ts in `files`
+  // and NOT in its `deleted`, so b contributes it LIVE and the union filter
+  // ERASES a's deletion — ABSENT, never `[]`. d9924ed deliberately keeps
+  // `deleted` a live projection (the exact-value positive control below), so
+  // reading this as "the `deleted` computation is dead code" is the mistake
+  // this message now guards against.
+  equal(combined.deleted, undefined,
+    "the deleting arm's deletion is erased by the other arm's live copy ⇒ `deleted` absent for THIS input");
+  // Positive control for the line above: with NO arm contributing the path live,
+  // the SAME call DOES emit a concrete unioned `deleted`. Without it, a no-op
+  // `deleted` (or a dropped filter input) would satisfy the assertion above.
+  deepEqual(
+    combineScopes(
+      { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] },
+      { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] },
+    ).deleted,
+    ["gone.ts"],
+    "no arm contributes gone.ts live ⇒ the unioned `deleted` IS emitted (exact value)");
+  // Mirror arm ordering — the union must be order-independent.
+  deepEqual(verificationCandidates(combineScopes(b, a).files, combineScopes(b, a).deleted), ["gone.ts"]);
+});
+
+test("#7526 P0: a path deleted in BOTH arms is excluded (the intended behaviour)", () => {
+  const a = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["gone.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  deepEqual(verificationCandidates(combineScopes(a, b).files, combineScopes(a, b).deleted), [],
+    "deleted on every arm ⇒ nothing to verify ⇒ allowed");
+});
+
+test("#7526 P0: a SINGLE arm still excludes its own deletion (the single-scope seam)", () => {
+  const a = { files: ["gone.ts", "kept.ts"], renameOldPaths: [], clean: true, deleted: ["gone.ts"] };
+  deepEqual(verificationCandidates(a.files, a.deleted), ["kept.ts"],
+    "a lone scope keeps carrying `deleted` and the consumer subtracts it");
+});
+
+test("#7526: renameOldPaths keeps unioning unchanged (an R/C-source conjunction, not a `files` projection)", () => {
+  // One path carries one row letter, so a `D` path can never be an R/C source;
+  // there is no per-arm exclusion to apply here and the union semantics stay.
+  const a = { files: ["new-a.ts"], renameOldPaths: ["old-a.ts"], clean: true, deleted: ["gone.ts"] };
+  const b = { files: ["new-b.ts"], renameOldPaths: ["old-b.ts"], clean: true };
+  deepEqual(combineScopes(a, b).renameOldPaths, ["old-a.ts", "old-b.ts"]);
+});
+
+test("#7526 DECISION: verificationCandidates subtracts deleted; a deletion-only set is EMPTY", () => {
+  // The verify path lives inside the `pi.on("tool_call")` handler and is NOT
+  // reachable from this unit suite — this pure function IS the decision it makes.
+  deepEqual(verificationCandidates(["docs/new.md", "src/old.ts"], ["src/old.ts"]), ["docs/new.md"],
+    "a mixed set keeps only the non-deleted candidate");
+  deepEqual(verificationCandidates(["src/old.ts"], ["src/old.ts"]), [],
+    "deletion-only ⇒ EMPTY candidate set ⇒ nothing to verify ⇒ allowed (not blocked)");
+  deepEqual(verificationCandidates(["a.ts"], undefined), ["a.ts"], "no projection ⇒ identity");
+  deepEqual(verificationCandidates(["a.ts"], []), ["a.ts"], "empty projection ⇒ identity");
+});
+
+test("#7526 DECISION: only `D` is excluded — A/M/R/T/U/X/B all remain candidates", () => {
+  const { scope } = parseDiffNameStatusDetailed(
+    "A\0a.ts\0M\0m.ts\0R100\0old.ts\0r.ts\0T\0t.ts\0U\0u.ts\0X\0x.ts\0B\0b.ts\0",
+  );
+  equal(scope.deleted, undefined, "no D row ⇒ no deleted projection");
+  deepEqual(scope.files.sort(), ["a.ts", "b.ts", "m.ts", "r.ts", "t.ts", "u.ts", "x.ts"].sort());
+  deepEqual(
+    verificationCandidates(scope.files, scope.deleted).sort(),
+    ["a.ts", "b.ts", "m.ts", "r.ts", "t.ts", "u.ts", "x.ts"].sort(),
+    "every non-D letter is still verified",
+  );
+});
+
+// ── #7526 P2-1: the PUSH path's OWN per-refspec deletion union ──
+// `resolvePushRangeScope` implements the SAME rule as `combineScopes` a second
+// time (the `unionLiveFiles` accumulator + the `unionLive` filter). Only
+// `combineScopes` was pinned, so a refactor that filtered the push union's
+// `deleted` against `union.files` instead of the live accumulator — or dropped
+// the accumulator — could re-open the P0 with every other suite green. These
+// tests drive the real resolver against a real repo with REAL remote-tracking
+// refs. Unit route (not e2e): `resolvePushRangeScope` is exported and already
+// unit-driven against real git in this file (the #3716 kill-switch pin above).
+section("#7526 P2-1: the PUSH union applies the per-refspec live rule (real git)");
+
+test("#7526 P2-1: one refspec DELETES a path another keeps LIVE ⇒ still a candidate (route verify)", () => {
+  const root = mkdtempSync(join(tmpdir(), "vgate-7526-push-"));
+  const remote = join(root, "origin.git");
+  const repo = join(root, "repo");
+  try {
+    const g = (a: string) => execSync(`git ${a}`, { cwd: repo, encoding: "utf-8", timeout: 20000 }).trim();
+    mkdirSync(remote, { recursive: true });
+    execSync("git init -q --bare -b main", { cwd: remote, timeout: 20000 });
+    mkdirSync(repo, { recursive: true });
+    execSync("git init -q -b main", { cwd: repo, timeout: 20000 });
+    g("config user.email 7526@test");
+    g("config user.name 7526");
+    g(`remote add origin ${remote}`);
+    writeFileSync(join(repo, "seed.ts"), "s\n");
+    g("add seed.ts");
+    g("commit -q -m seed");
+    const seedOid = g("rev-parse HEAD");
+    writeFileSync(join(repo, "shared.ts"), "v1\n");
+    g("add shared.ts");
+    g("commit -q -m add-shared");
+    g("push -q origin main");
+
+    // delete refspec — tracking at v1, tip deletes shared.ts (range: D shared.ts)
+    g("checkout -q -b delarm");
+    g("push -q -u origin delarm");
+    g("rm -q shared.ts");
+    g("commit -q -m delete-shared");
+
+    // modify refspec — tracking at v1, tip modifies shared.ts (range: M shared.ts)
+    g("checkout -q main");
+    g("checkout -q -b modarm");
+    g("push -q -u origin modarm");
+    writeFileSync(join(repo, "shared.ts"), "v2\n");
+    g("add shared.ts");
+    g("commit -q -m modify-shared");
+
+    // add refspec — tracking at seed (no shared.ts), tip adds it (range: A shared.ts)
+    g(`checkout -q -b addarm ${seedOid}`);
+    g("push -q -u origin addarm");
+    writeFileSync(join(repo, "shared.ts"), "new\n");
+    g("add shared.ts");
+    g("commit -q -m add-shared-2");
+
+    // a SECOND delete refspec for the both-delete case
+    g("checkout -q main");
+    g("checkout -q -b delarm2");
+    g("push -q -u origin delarm2");
+    g("rm -q shared.ts");
+    g("commit -q -m delete-shared-2");
+
+    // ── one DELETES, the other MODIFIES: shared.ts must stay a candidate ──
+    const modify = resolvePushRangeScope("git push origin delarm:delarm modarm:modarm", repo, null, true);
+    ok(modify !== null, "the two-refspec push must resolve (tier A on both)");
+    deepEqual(modify!.files, ["shared.ts"], "plain union: the D path stays in `files`");
+    equal(modify!.deleted, undefined,
+      "the modify refspec contributes shared.ts live ⇒ the deletion is erased, never a unioned `deleted`");
+    deepEqual(verificationCandidates(modify!.files, modify!.deleted), ["shared.ts"],
+      "P0: deleted on one refspec + live on another ⇒ STILL a verification candidate");
+    deepEqual(
+      routeScopeGate(
+        applyScopeGate(modify!.files, modify!.renameOldPaths, modify!.clean, true, isShapeExemptFile),
+        modify!.files,
+      ),
+      { action: "verify", files: ["shared.ts"] },
+      "the shared path is routed `verify`, not exempted and not emptied",
+    );
+
+    // ── one DELETES, the other ADDS: shared.ts must stay a candidate ──
+    const add = resolvePushRangeScope("git push origin delarm:delarm addarm:addarm", repo, null, true);
+    ok(add !== null, "the delete+add push must resolve");
+    equal(add!.deleted, undefined, "the add refspec contributes shared.ts live ⇒ erased");
+    deepEqual(verificationCandidates(add!.files, add!.deleted), ["shared.ts"],
+      "P0: deleted on one refspec + ADDED on another ⇒ still a candidate");
+
+    // ── BOTH refspecs delete the same path: it must be excluded ──
+    const both = resolvePushRangeScope("git push origin delarm:delarm delarm2:delarm2", repo, null, true);
+    ok(both !== null, "the two-delete push must resolve");
+    deepEqual(both!.files, ["shared.ts"], "no refspec is live ⇒ the path is still listed (plain union)");
+    deepEqual(both!.deleted, ["shared.ts"],
+      "no refspec contributes shared.ts live ⇒ the unioned `deleted` DOES carry it");
+    deepEqual(verificationCandidates(both!.files, both!.deleted), [],
+      "deleted on every refspec ⇒ nothing left to verify");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── #3255: worktree-aware root resolution ─────────────
+// The cwd's git root is the HUB when the change lives in a linked worktree,
+// while the bridge's compound keys are keyed on the WORKTREE (verification is
+// dispatched with the worktree as project root). Adopting the sibling root is
+// what stops the hub-vs-worktree hash comparison that blocks every push.
+const sameRepo3255 = (r: string) => (r.startsWith("/repo") ? "/repo/.git" : "/other/.git");
+
+test("pickVerifiedRoot: adopts a same-repo worktree root when the cwd root has no entries", () => {
+  equal(pickVerifiedRoot("/repo", ["/repo/.worktrees/feat"], sameRepo3255), "/repo/.worktrees/feat");
+});
+
+test("pickVerifiedRoot: status quo when the cwd root has its own entries", () => {
+  equal(
+    pickVerifiedRoot("/repo", ["/repo", "/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "the hub's own entries mean there is nothing to adopt",
+  );
+});
+
+test("pickVerifiedRoot: never adopts a DIFFERENT repository's root", () => {
+  equal(
+    pickVerifiedRoot("/other", ["/repo/.worktrees/feat"], sameRepo3255),
+    null,
+    "a foreign repo's verified entries must stay inert",
+  );
+});
+
+test("pickVerifiedRoot: ambiguous siblings fall back to the status quo (fail-closed)", () => {
+  equal(pickVerifiedRoot("/repo/hub", ["/repo/w1", "/repo/w2"], () => "/repo/.git"), null);
+});
+
+test("pickVerifiedRoot: no entries, or an unresolvable repo, falls back", () => {
+  equal(pickVerifiedRoot("/repo", [], sameRepo3255), null);
+  equal(pickVerifiedRoot("/repo", ["/repo/w1"], () => null), null);
+});
+
+test("#3255 policy: the git-op root is authoritative — adoption must never gate an op (fail-closed)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  // The first attempt resolved the git-op root through the bridge-adopting
+  // helper. A clean adopted tree then produced an EMPTY scope, which takes the
+  // gate's empty-scope path and ALLOWS an op carrying unverified content in the
+  // session's real tree — a fail-open. This pins the direction, because that is
+  // the property a unit test of the helper itself cannot express.
+  ok(
+    !/const cwd = recoveryOnlyRoot\(/.test(src),
+    "the git-op root must not be bridge-adopted (adoption ⇒ empty scope ⇒ ALLOW)",
+  );
+  ok(
+    /const cwd = resolveGitRoot\(cdPath \?\? inputCwd\)/.test(src),
+    "the git-op root must come from the command's own cwd",
+  );
+  ok(
+    /const sessionRoot = normalizeWorktreeRoot\(recoveryOnlyRoot\(/.test(src),
+    "session-start bridge recovery is the one place adoption is permitted",
+  );
+});
+
+// ── #920 (O3) cycle-4 review, P2: ASK THE INDEX, never parse stderr ──
+//
+// The cycle-2 P2-A rule read a `git cat-file -e` 128 as absence when stderr
+// carried `does not exist (neither on disk nor in the index)`. git ECHOES THE
+// PROBED PATH in its fatal messages, so a path literally NAMED after that
+// phrase satisfied the substring test. The conflicted-index form — `fatal:
+// path '<p>' is in the index, but not at stage 0` — is a 128 that echoes the
+// path, so such a path read as ABSENT, the `ENOTDIR` branch `continue`d, and
+// the op was ALLOWED. The fix replaces stderr interpretation with a direct
+// membership question, `git ls-files -z -- :(top,literal)<path>`.
+//
+// The tests below are the four pins the new rule needs — entry present ⇒
+// records content; entry absent ⇒ absent; non-zero exit ⇒ fail CLOSED;
+// ambiguous/spawn failure ⇒ fail CLOSED — plus the cycle-4 counterexample
+// itself (REAL git, conflicted index) and a structural pin that no stderr
+// substring matching survives in the helper.
+section("indexRecordsContent — membership comes from the index, never from stderr (#920 P2)");
+
+// A real file name chosen to collide with the phrase the OLD rule matched on.
+const ABSENCE_PHRASE_PATH = "does not exist (neither on disk nor in the index)";
+
+/** Initialise a scratch repo and return a blob-hash helper bound to it. */
+function scratchRepo(prefix: string) {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  execSync("git init -q -b main .", { cwd: dir, stdio: "ignore" });
+  const blob = (content: string) =>
+    execSync("git hash-object -w --stdin", { cwd: dir, input: content, encoding: "utf-8" }).trim();
+  return { dir, blob };
+}
+
+test("REAL git: a staged index entry reads as RECORDS CONTENT", () => {
+  const { dir } = scratchRepo("vgate-indexprobe-staged-");
+  try {
+    writeFileSync(join(dir, "staged.ts"), "staged\n");
+    execSync("git add staged.ts", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "staged.ts"), true,
+      "a non-empty `ls-files` listing — the index holds the blob a bare commit records ⇒ must block if unread");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a path in NEITHER the index nor the worktree is ABSENT — the skip branch stays intact", () => {
+  // The other half of the discrimination: an empty listing with exit 0 must
+  // still read as ABSENT, or every D/F deletion would name-block (e2e 920(P1)
+  // leg (b)). There is no message to parse any more, so this is the only way to
+  // over-block — and it is pinned here.
+  const { dir } = scratchRepo("vgate-indexprobe-empty-");
+  try {
+    equal(indexRecordsContent(dir, "ghost.ts"), false,
+      "genuine absence (empty stdout, exit 0) must stay a skip; it must not name-block every deletion");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: a non-zero exit outside any repo reads as RECORDS CONTENT (fail CLOSED)", () => {
+  // Not a synthetic err: git itself returns 128 with `fatal: not a git
+  // repository` here. A probe that cannot answer must never read as absence.
+  const dir = mkdtempSync(join(tmpdir(), "vgate-indexprobe-norepo-"));
+  try {
+    throws(() => execSync("git rev-parse --show-toplevel", { cwd: dir, stdio: "ignore" }),
+      "precondition: the temp dir must NOT be inside a git repo");
+    equal(indexRecordsContent(dir, "a.ts"), true,
+      "outside a repo the probe cannot answer ⇒ records-content (fail CLOSED), not absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ambiguous/spawn failure ⇒ fail CLOSED (unanswerable cwd reads as RECORDS CONTENT)", () => {
+  // A cwd that does not exist makes `execSync` fail to spawn git at all — the
+  // pure "probe could not RUN" class, with no exit status and no stderr.
+  const ghostCwd = join(tmpdir(), "vgate-indexprobe-no-such-cwd-", String(Date.now()));
+  equal(existsSync(ghostCwd), false, "precondition: the cwd must not exist");
+  equal(indexRecordsContent(ghostCwd, "a.ts"), true,
+    "a spawn failure is ambiguous ⇒ must read as records-content (fail CLOSED), never as absence");
+});
+
+test("REAL git: a conflicted-index path NAMED like git's absence message is RECORDS CONTENT (#920 P2)", () => {
+  // The cycle-4 counterexample, with real git. An unmerged index (stages 1/2/3,
+  // no stage 0) is exactly the shape that made the OLD `cat-file -e` probe
+  // print `fatal: path '<name>' is in the index, but not at stage 0` — a 128
+  // that echoes the path. When the path is literally named after the phrase the
+  // old rule substring-matched, that echo read as absence ⇒ skip ⇒ ALLOW: the
+  // fail-open this test is RED against pre-fix.
+  const { dir, blob } = scratchRepo("vgate-indexprobe-echo-");
+  try {
+    const info = `100644 ${blob("base\n")} 1\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("ours\n")} 2\t${ABSENCE_PHRASE_PATH}\n`
+      + `100644 ${blob("theirs\n")} 3\t${ABSENCE_PHRASE_PATH}\n`;
+    execSync("git update-index --index-info", {
+      cwd: dir, input: info, stdio: ["pipe", "ignore", "ignore"],
+    });
+    equal(indexRecordsContent(dir, ABSENCE_PHRASE_PATH), true,
+      "the index DOES hold entries at this path ⇒ records content; a path-echoing fatal message must not read as absence");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("REAL git: glob metacharacters in a real file name are matched LITERALLY", () => {
+  // A plain pathspec would expand `a[1].ts` as a bracket expression and could
+  // list nothing (or the wrong entry) for a path that IS in the index —
+  // `:(top,literal)` is what makes the listing authoritative.
+  const { dir } = scratchRepo("vgate-indexprobe-glob-");
+  try {
+    writeFileSync(join(dir, "a[1].ts"), "brackets\n");
+    execSync("git add -A", { cwd: dir, stdio: "ignore" });
+    equal(indexRecordsContent(dir, "a[1].ts"), true,
+      "a literal file name with glob metacharacters must resolve to its own index entry");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the index probe never substring-matches stderr (#920 P2 structural pin)", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.ts", import.meta.url)), "utf-8");
+  const start = src.indexOf("export function indexRecordsContent");
+  ok(start >= 0, "precondition: the index probe must exist");
+  const end = src.indexOf("\n}\n", start);
+  const body = src.slice(start, end);
+  ok(/git ls-files -z -- /.test(body), "the probe must ask the index via `git ls-files -z --`");
+  ok(!/cat-file/.test(body), "`cat-file -e` must be gone from the probe — its path-echoing stderr was the defect");
+  ok(!/includes\s*\(/.test(body),
+    "no substring `includes(...)` test may remain anywhere in the probe");
+  ok(!/does not exist \(neither on disk nor in the index\)/.test(body),
+    "the absence-message constant must be gone from the probe");
+});
+
 // ── Results ───────────────────────────────────────────
 
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);

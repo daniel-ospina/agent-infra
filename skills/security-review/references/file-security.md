@@ -412,21 +412,21 @@ with tempfile.TemporaryDirectory() as tmpdir:
 
 ```bash
 # Path traversal risks
-grep -rn "open(.*request\|send_file(.*request" --include="*.py"
-grep -rn "fs\.readFile.*req\|fs\.writeFile.*req" --include="*.js"
+git grep -n -e "open(.*request\|send_file(.*request" -- '*.py'
+git grep -n -e "fs\.readFile.*req\|fs\.writeFile.*req" -- '*.js'
 
 # Dangerous file operations
-grep -rn "os\.system.*file\|subprocess.*file" --include="*.py"
+git grep -n -e "os\.system.*file\|subprocess.*file" -- '*.py'
 
 # XML parsing (XXE risk)
-grep -rn "etree\.parse\|xml\.parse\|DOM\.parse" --include="*.py" --include="*.java"
-grep -rn "XMLReader\|DocumentBuilder" --include="*.java"
+git grep -n -e "etree\.parse\|xml\.parse\|DOM\.parse" -- '*.py' '*.java'
+git grep -n -e "XMLReader\|DocumentBuilder" -- '*.java'
 
 # ZIP handling
-grep -rn "zipfile\|ZipFile\|extractall" --include="*.py" --include="*.java"
+git grep -n -e "zipfile\|ZipFile\|extractall" -- '*.py' '*.java'
 
 # File permissions
-grep -rn "chmod 777\|chmod 666\|chmod 755" --include="*.py" --include="*.sh"
+git grep -n -e "chmod 777\|chmod 666\|chmod 755" -- '*.py' '*.sh'
 ```
 
 ---

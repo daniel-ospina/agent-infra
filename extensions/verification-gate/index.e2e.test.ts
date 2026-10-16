@@ -15,16 +15,37 @@
  *   npx tsx index.e2e.test.ts
  */
 
-import { ok, equal } from "node:assert/strict";
-import { execSync } from "node:child_process";
+import { ok, equal, deepEqual } from "node:assert/strict";
+import { execSync, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, mkdirSync, rmSync, realpathSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ── Isolation: bridge lives under a temp HOME (never touch the real one) ──
 const TEST_ROOT = mkdtempSync(join(tmpdir(), "vgate-e2e-"));
 process.env.HOME = TEST_ROOT;
+// #851 — give the hermetic temp HOME a git identity. Without it, every `git commit`
+// in a scenario depends on the AMBIENT identity git auto-detects from the user name and
+// hostname: on a dev machine that resolves to a non-empty name (so the suite passed),
+// while on a GitHub runner it resolves to `runner@<host>` with an EMPTY name and git
+// aborts with `fatal: empty ident name (for <runner@…>) not allowed`. Scenario #3255
+// does not set the identity inline (59 sibling scenarios do, which papered over the
+// instance), so `extension-tests / unit-test` was RED on main for every merge — see
+// #851. A global config inside the temp HOME fixes the CLASS and makes the file's
+// "hermetic" claim true — but ONLY together with the overrides below: an ambient
+// `GIT_CONFIG_GLOBAL` takes precedence over `$HOME/.gitconfig`, and `GIT_AUTHOR_*` /
+// `GIT_COMMITTER_*` override the config outright, so relying on the file alone would
+// leave the runner failure reachable through any of them.
+const TEST_GITCONFIG = join(TEST_ROOT, ".gitconfig");
+writeFileSync(TEST_GITCONFIG, "[user]\n\tname = vgate-e2e\n\temail = e2e@test\n");
+process.env.GIT_CONFIG_GLOBAL = TEST_GITCONFIG;
+process.env.GIT_CONFIG_SYSTEM = "/dev/null";
+for (const k of [
+  "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+  "EMAIL", "GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE",
+]) delete process.env[k];
 // The gate under test must be ACTIVE — clear the escape hatch if the parent
 // environment inherited it (sub-agent sessions pre-disable extension gates).
 delete process.env.ELDATO_SKIP_VGATE;
@@ -116,10 +137,10 @@ const fakePi: any = {
     handlers.get(evt)!.push(h);
   },
 };
-async function fire(evt: string, event: any): Promise<any> {
+async function fire(evt: string, event: any, ctx: any = {}): Promise<any> {
   let result: any = undefined;
   for (const h of handlers.get(evt) ?? []) {
-    const r = await h(event, {});
+    const r = await h(event, ctx);
     if (r !== undefined) result = r;
   }
   return result;
@@ -529,9 +550,9 @@ async function main() {
     const paths = bridge.verified_files.map((vf: any) => vf.path);
     // #190: the bridge now persists FULL compound keys (worktree-root::rel) so
     // recovery can be worktree-isolated (#37) with stored-hash match-or-drop.
-    // The bridge holds the MOST RECENT merge — after the #132 scenarios that is
-    // scenario 11's plain-text-PASS merge of fileG.txt (fileA.txt was merged in
-    // scenarios 2-5 and overwritten). Compound keying is the new contract.
+    // #1225/#1573: the bridge is a MERGED multi-root registry, not a single
+    // snapshot — scenario 11's plain-text-PASS merge of fileG.txt is present
+    // ALONGSIDE earlier scenarios' entries. Compound keying is the contract.
     ok(paths.some((p: string) => p.includes("::") && p.endsWith("fileG.txt")), `bridge keys must be compound (root::rel), got: ${JSON.stringify(paths)}`);
     ok(paths.every((p: string) => p.includes("::")), `bridge must not contain bare repo-relative keys, got: ${JSON.stringify(paths)}`);
   });
@@ -841,6 +862,274 @@ async function main() {
     }
   });
 
+  test("scenario 21b (#1225/#1573 P0): a concurrent lane's bridge write must not erase another root's verified entries", async () => {
+    // The P0: writeBridge() published a WHOLE-FILE SNAPSHOT of the writer's own
+    // registry, so any other lane's merge erased every foreign-root entry. A
+    // parent's verified file was then gone before its task child read the
+    // bridge, and the child blocked a change that had already been verified.
+    // This pins the mechanism end-to-end: parent PASS in repo W -> a second
+    // lane's PASS in repo D -> the child in W still commits.
+    const repoW = join(TEST_ROOT, "repo-clobber-w");
+    mkdirSync(repoW, { recursive: true });
+    git(repoW, "init -b main");
+    git(repoW, "config user.email e2e@test");
+    git(repoW, "config user.name e2e");
+    writeFileSync(join(repoW, "fileW.txt"), "w1\n");
+    git(repoW, "add fileW.txt");
+    git(repoW, "commit -m baseline");
+    writeFileSync(join(repoW, "fileW.txt"), "w2\n");
+    git(repoW, "add fileW.txt");
+    const realW = realpathSync(repoW);
+    // Parent session verifies fileW → bridge carries <realW>::fileW.txt.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileW.txt. Classification: backend. Project root: ${repoW}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoW, "fileW.txt"), hash: sha("w2\n") }] }) }],
+    });
+    // A concurrent lane in a DIFFERENT repo verifies its own file and writes the
+    // bridge. Pre-fix this REPLACED the whole file, dropping <realW>::fileW.txt.
+    const repoD = join(TEST_ROOT, "repo-clobber-d");
+    mkdirSync(repoD, { recursive: true });
+    git(repoD, "init -b main");
+    git(repoD, "config user.email e2e@test");
+    git(repoD, "config user.name e2e");
+    writeFileSync(join(repoD, "fileD.txt"), "d1\n");
+    git(repoD, "add fileD.txt");
+    git(repoD, "commit -m baseline");
+    writeFileSync(join(repoD, "fileD.txt"), "d2\n");
+    git(repoD, "add fileD.txt");
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: fileD.txt. Classification: backend. Project root: ${repoD}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoD, "fileD.txt"), hash: sha("d2\n") }] }) }],
+    });
+    // The bridge must hold BOTH roots (merge), not only the last writer's.
+    const bridge = JSON.parse(readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf-8"));
+    const roots = new Set(bridge.verified_files.map((vf: any) => String(vf.path).split("::")[0]));
+    ok(roots.has(realW), `foreign-lane write must preserve the parent root's entries; roots on disk: ${JSON.stringify([...roots])}`);
+    // Sub-agent commits W's parent-verified file — must pass with no re-dispatch.
+    const prevMode = process.env.PI_MODE;
+    const prevHeartbeat = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m 'clobber'", cwd: repoW },
+      });
+      equal(res, undefined, "parent-verified file must still pass after a concurrent lane wrote the bridge (#1225/#1573)");
+      git(repoW, "commit -m clobber");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      if (prevHeartbeat === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHeartbeat;
+    }
+  });
+
+  test("scenario 21c (#1225/#1573 P0): a merge PRUNES entries for files deleted under a still-live root (bounded bridge)", async () => {
+    // A merge never rewrites the bridge down to the writer's own registry the
+    // way the old snapshot did, so an entry for a DELETED file under a live
+    // root would otherwise live forever and the machine-global file would grow
+    // without bound (every git op re-parses and scans every entry).
+    const repoP = join(TEST_ROOT, "repo-prune");
+    mkdirSync(repoP, { recursive: true });
+    git(repoP, "init -b main");
+    git(repoP, "config user.email e2e@test");
+    git(repoP, "config user.name e2e");
+    writeFileSync(join(repoP, "keep.txt"), "k1\n");
+    // A second LIVE file in the same root that the writer below does NOT
+    // re-verify. Its seeded entry is the discriminator between a real MERGE
+    // (preserves foreign/untouched keys) and the old whole-file SNAPSHOT
+    // (rewrites the bridge down to the writer's own keys, dropping this one).
+    writeFileSync(join(repoP, "other.txt"), "other\n");
+    git(repoP, "add keep.txt other.txt");
+    git(repoP, "commit -m baseline");
+    // Stage a fresh edit so the proactive PASS is diff-scoped and actually
+    // merges (a PASS that matches nothing in the diff writes no bridge at all).
+    writeFileSync(join(repoP, "keep.txt"), "k2\n");
+    git(repoP, "add keep.txt");
+    const realP = realpathSync(repoP);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    // Add (do not replace) two entries for a LIVE root, one of them for a file
+    // that no longer exists on disk.
+    const seeded = existsSync(bridgePath)
+      ? JSON.parse(readFileSync(bridgePath, "utf-8"))
+      : { status: "PASS", verified_files: [] };
+    seeded.verified_files = [
+      ...(Array.isArray(seeded.verified_files) ? seeded.verified_files : []),
+      { path: `${realP}::keep.txt`, hash: sha("k1\n") },
+      { path: `${realP}::other.txt`, hash: sha("other\n") },
+      { path: `${realP}::deleted-long-ago.txt`, hash: sha("gone\n") },
+    ];
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    writeFileSync(bridgePath, JSON.stringify(seeded));
+    // A write (any PASS merge) must prune the deleted file's entry and keep the live one.
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: keep.txt. Classification: backend. Project root: ${repoP}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoP, "keep.txt"), hash: sha("k2\n") }] }) }],
+    });
+    const after = JSON.parse(readFileSync(bridgePath, "utf-8"));
+    const paths = after.verified_files.map((vf: any) => String(vf.path));
+    ok(!paths.some((p: string) => p.endsWith("deleted-long-ago.txt")),
+      `a deleted file's entry under a live root must be pruned, got: ${JSON.stringify(paths)}`);
+    ok(paths.some((p: string) => p.endsWith("::keep.txt")), "the live file's entry must survive the prune");
+    // #1783 review Finding 1 (P2): the writer re-verified only keep.txt. An
+    // untouched LIVE file's entry must therefore survive this write — the old
+    // whole-file snapshot dropped it, so this assertion is what makes 21c
+    // discriminate the fix rather than merely the prune.
+    ok(paths.some((p: string) => p.endsWith("::other.txt")),
+      `an untouched live-root entry must survive another file's write (merge, not snapshot), got: ${JSON.stringify(paths)}`);
+  });
+
+  test("scenario 21d (#1225/#1573): a non-regular lock path must not WEDGE writeBridge — no hang, no spin", () => {
+    // Two shapes used to wedge the tool_call hook that calls writeBridge:
+    //   directory — openSync throws EEXIST and the stale-read throws each
+    //               iteration; a bare `continue` skipped the only deadline
+    //               check -> ~100% CPU busy-loop.
+    //   FIFO      — the stale-read BLOCKS inside open(2) forever, which no
+    //               top-of-loop deadline can bound.
+    // A synchronous unbounded loop/block cannot be asserted on in-process (it
+    // would hang the suite), so drive the exported lock seam in a CHILD with a
+    // timeout: a regression fails as ETIMEDOUT instead of hanging the run.
+    const home = join(TEST_ROOT, "lock-home");
+    const verDir = join(home, ".pi", "agent", "verification");
+    mkdirSync(verDir, { recursive: true });
+    const modUrl = new URL("./index.js", import.meta.url).href;
+    const script = join(home, "probe.mjs");
+    writeFileSync(
+      script,
+      `process.env.HOME = ${JSON.stringify(home)};\n` +
+        `const m = await import(${JSON.stringify(modUrl)});\n` +
+        `const t = Date.now();\n` +
+        `const release = m.acquireBridgeLock();\n` +
+        `console.log(JSON.stringify({ degraded: release === null, ms: Date.now() - t }));\n` +
+        `if (release) release();\n`,
+    );
+    for (const kind of ["directory", "fifo"] as const) {
+      const lockPath = join(verDir, "latest.json.lock");
+      rmSync(lockPath, { recursive: true, force: true });
+      if (kind === "directory") mkdirSync(lockPath, { recursive: true });
+      else execFileSync("mkfifo", [lockPath]);
+      let stdout = "";
+      try {
+        stdout = execFileSync("npx", ["tsx", script], {
+          encoding: "utf-8",
+          // Generous: the child re-resolves tsx through npx (as the CI job's own
+          // `npx tsx` steps do). `res.ms` below is what actually bounds the
+          // handling, and it excludes this startup.
+          timeout: 60000,
+          cwd: fileURLToPath(new URL(".", import.meta.url)),
+        });
+      } catch (err: any) {
+        throw new Error(
+          `acquireBridgeLock must not wedge on a ${kind} at the lock path; the child did not return — the unbounded lock path is back: ${err?.message ?? err}`,
+        );
+      }
+      const res = JSON.parse(stdout.trim().split("\n").pop()!);
+      // Either outcome is acceptable — a directory is unremovable so it
+      // DEGRADES, a FIFO is reclaimable so it is unlinked and ACQUIRED. What
+      // must never happen is a hang or a spin.
+      ok(res.ms < 10000, `the ${kind} lock path must be handled promptly, took ${res.ms}ms`);
+    }
+    rmSync(join(verDir, "latest.json.lock"), { recursive: true, force: true });
+  });
+
+  test("scenario 21e (#1225/#1573, #1092): a verified DANGLING SYMLINK must not be pruned by another lane's write", async () => {
+    // The prune tests PRESENCE WITHOUT following the link (#1092 hashes a
+    // symlink's link bytes and needs no existing target, so a verified dangling
+    // symlink is legitimate). `existsSync` reads it as absent and pruned it —
+    // re-blocking an already-verified change on the next foreign write.
+    const repoL = join(TEST_ROOT, "repo-link");
+    mkdirSync(repoL, { recursive: true });
+    git(repoL, "init -b main");
+    git(repoL, "config user.email e2e@test");
+    git(repoL, "config user.name e2e");
+    writeFileSync(join(repoL, "keep.txt"), "k1\n");
+    git(repoL, "add keep.txt");
+    git(repoL, "commit -m baseline");
+    // A dangling symlink plus a staged fresh edit, so the PASS is diff-scoped
+    // and writeBridge actually runs (and prunes).
+    symlinkSync("does-not-exist-target", join(repoL, "dangling.txt"));
+    writeFileSync(join(repoL, "keep.txt"), "k2\n");
+    git(repoL, "add keep.txt");
+    const realL = realpathSync(repoL);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    const seeded = existsSync(bridgePath)
+      ? JSON.parse(readFileSync(bridgePath, "utf-8"))
+      : { status: "PASS", verified_files: [] };
+    seeded.verified_files = [
+      ...(Array.isArray(seeded.verified_files) ? seeded.verified_files : []),
+      { path: `${realL}::dangling.txt`, hash: sha("link-bytes") },
+    ];
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    writeFileSync(bridgePath, JSON.stringify(seeded));
+    await fire("session_start", {});
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: keep.txt. Classification: backend. Project root: ${repoL}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [{ path: join(repoL, "keep.txt"), hash: sha("k2\n") }] }) }],
+    });
+    const after = JSON.parse(readFileSync(bridgePath, "utf-8"));
+    const paths = after.verified_files.map((vf: any) => String(vf.path));
+    ok(paths.some((p: string) => p.endsWith("::dangling.txt")),
+      `a verified dangling symlink must survive a foreign write (presence via lstat, never existsSync), got: ${JSON.stringify(paths)}`);
+  });
+
+  test("scenario 21f (#1225/#1573): a malformed bridge entry must not abort session_start recovery", async () => {
+    // bridgeRoots() dereferenced vf.path with no shape guard, so a bridge
+    // holding a non-object entry (null / number) threw inside session_start —
+    // rejecting the handler, skipping recovery AND the init reset block, and
+    // wedging the gate on spurious blocks until the bridge was cleared. Same
+    // symptom class as the P0 this PR fixes.
+    const repoM = join(TEST_ROOT, "repo-malformed");
+    mkdirSync(repoM, { recursive: true });
+    git(repoM, "init -b main");
+    git(repoM, "config user.email e2e@test");
+    git(repoM, "config user.name e2e");
+    writeFileSync(join(repoM, "fileM.txt"), "m1\n");
+    git(repoM, "add fileM.txt");
+    git(repoM, "commit -m baseline");
+    const realM = realpathSync(repoM);
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    mkdirSync(dirname(bridgePath), { recursive: true });
+    // Every malformed SHAPE must be survivable: a non-array container (which
+    // made `for (const vf of ...)` throw "is not iterable") and an array whose
+    // entries are not objects with a string path (which threw reading `.path`).
+    const shapes: unknown[] = [
+      [null, 42, { path: 123 }, { path: `${realM}::fileM.txt`, hash: sha("m1\n") }],
+      {},
+      null,
+      5,
+    ];
+    for (const vf of shapes) {
+      writeFileSync(
+        bridgePath,
+        JSON.stringify({ status: "PASS", verified_files: vf, timestamp: new Date().toISOString() }),
+      );
+      // Must not throw, for ANY shape.
+      await fire("session_start", {});
+    }
+    // And a well-formed bridge must still enumerate its valid root.
+    writeFileSync(
+      bridgePath,
+      JSON.stringify({
+        status: "PASS",
+        verified_files: [{ path: `${realM}::fileM.txt`, hash: sha("m1\n") }],
+        timestamp: new Date().toISOString(),
+      }),
+    );
+    await fire("session_start", {});
+    const m = await import("./index.js");
+    ok(
+      (m as any).bridgeRoots().includes(realM),
+      `malformed shapes must not abort recovery or hide valid roots; got ${JSON.stringify((m as any).bridgeRoots())}`,
+    );
+  });
+
   test("scenario 22 (#825/#264): sub-agent commit on UNVERIFIED files is blocked with a self-verify instruction", async () => {
     const repo = join(TEST_ROOT, "repo-subagent");
     git(repo, "reset -q");
@@ -972,6 +1261,14 @@ async function main() {
           ok(/Hash mismatch/.test(res.reason), "block reason must carry the hash-mismatch diagnostic");
           ok(res.reason.includes("remedy: file edited after verification OR verifier hash typo"), "mismatch reason must name BOTH causes (#561 dual-cause remedy)");
           ok(res.reason.includes("sha256sum"), "mismatch reason must name the never-hand-type-sha256 fix (#561)");
+          // #1092: the remedy must be BYTE-EXACT for a symlink. `sha256sum <link>`
+          // follows the link (and EISDIRs on a directory link), and a
+          // `printf '%s' "$(readlink …)"` form is not byte-exact either — command
+          // substitution strips a trailing newline from the target and an
+          // unquoted path word-splits. Pin the raw-link-bytes form so the recipe
+          // cannot silently regress to a digest the gate will never accept.
+          ok(res.reason.includes("readlinkSync"), "mismatch remedy must carry the byte-exact symlink form (#1092)");
+          ok(!res.reason.includes("printf '%s'"), "mismatch remedy must NOT carry the non-byte-exact printf/readlink recipe (#1092)");
           ok(res.reason.includes("This session is a task sub-agent"), "mismatch block must still carry the sub-agent marker");
           ok(/Dispatch your own VGATE verification/.test(res.reason), "mismatch block must instruct the child to self-satisfy the gate in-band");
           ok(res.reason.includes("task(prompt="), "mismatch block must show the self-dispatch task(...) template");
@@ -2526,6 +2823,9 @@ async function main() {
     ok(legB.reason.includes("wip55.ts"), "55b: block names the parked WIP");
     // Leg (c): force-push 2-dot over a DIVERGED origin/main — the D-row comes
     // from the REF tree (a remote-side-only file), never from a local git rm.
+    // It stays on the 2-dot path after #3716: origin/main is not an ancestor of
+    // HEAD, so the rewrite narrowing's proof (1) does not hold and the push is
+    // measured against the tracking ref exactly as before.
     // The sibling commit is PATHSpec-limited (scenario 44-leg-4 precedent) so
     // the still-staged wip55.ts is NOT swept into the sibling tree — a plain
     // add+commit would empty the main index and kill this leg's RED.
@@ -3911,6 +4211,1179 @@ async function main() {
     ok(sweep && sweep.block === true, "wrapper pure sweep still blocks via the WT scope (not refused, not mis-scoped)");
     ok(sweep.reason.includes("f76.ts"), "wrapper pure sweep block names the dirty tracked code file");
   });
+  // ── #755: merge-scope subtraction ─────────────────────
+  // Shared fixture: a repo mid-merge where the incoming side touched ONLY
+  // `basesub.ts` (base-identical to the trusted base) while the branch has an
+  // uncommitted authored change in the index. Without the fix, BOTH flood the
+  // verifier; with it, only the authored one is in scope.
+  function mkMergeRepo(name: string): string {
+    const repo = join(TEST_ROOT, name);
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "basesub.ts"), "base v1\n");
+    writeFileSync(join(repo, "authored.ts"), "a v1\n");
+    git(repo, "add .");
+    git(repo, "commit -m base");
+    git(repo, "update-ref refs/remotes/origin/main HEAD");
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "basesub.ts"), "base v2\n");
+    git(repo, "add .");
+    git(repo, "commit -m upstream-touches-basesub");
+    git(repo, "update-ref refs/remotes/origin/main HEAD");
+    git(repo, "checkout -q main");
+    // The branch MUST diverge from the trusted base, or guard (3) blocks.
+    writeFileSync(join(repo, "feat.ts"), "f v1\n");
+    git(repo, "add .");
+    git(repo, "commit -m branch-diverges");
+    git(repo, "merge --no-commit --no-ff upstream");
+    // An authored index change so the post-subtraction scope is NON-empty.
+    writeFileSync(join(repo, "authored.ts"), "a v2 (index only)\n");
+    git(repo, "add authored.ts");
+    return repo;
+  }
+  const skipCount = (reason: string) =>
+    readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === reason).length;
+
+  test("scenario 77 (#755): a merge-in-progress scope SUBTRACTS base-identical paths and audits it", async () => {
+    const repo = mkMergeRepo("repo-755-77");
+    await fire("session_start", {});
+    const before = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m merge", cwd: repo },
+    });
+    const after = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after.length > before, "#755: a merge scope emits a base_identical_satisfied audit line");
+    const last = after[after.length - 1] as any;
+    ok(Array.isArray(last.subtractedPaths) && last.subtractedPaths.includes("basesub.ts"),
+      "#755: the audit records the subtracted base-identical path");
+    ok(Array.isArray(last.arms) && last.arms.length > 0 && last.arms[0].perArmSubtracted.includes("basesub.ts"),
+      "#755: per-arm provenance is carried (arms[].perArmSubtracted)");
+    ok(res && res.block === true, "#755: the op still blocks on the unverified authored file");
+    ok(res.reason.includes("authored.ts"), "#755: the block names the branch-authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "#755 (the point of the issue): the block does NOT name the base-identical path — the base delta no longer floods the verifier");
+  });
+
+  test("scenario 78 (#755): ELDATO_VGATE_NO_SUBTRACT restores the over-gate and audits the opt-out", async () => {
+    const repo = mkMergeRepo("repo-755-78");
+    const baseBefore = skipCount("base_identical_satisfied");
+    const disabledBefore = skipCount("subtract_disabled_by_env");
+    process.env.ELDATO_VGATE_NO_SUBTRACT = "1";
+    try {
+      await fire("session_start", {});
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m merge", cwd: repo },
+      });
+      ok(skipCount("subtract_disabled_by_env") > disabledBefore,
+        "#755: the kill switch leaves a distinct audited marker (silence would be inconsistent with ELDATO_SKIP_VGATE)");
+      equal(skipCount("base_identical_satisfied"), baseBefore,
+        "#755: NO subtraction line while disabled — the audit cannot claim disabled and subtract anyway");
+      ok(res && res.block === true, "#755: the op still blocks");
+      ok(res.reason.includes("basesub.ts"),
+        "#755: over-gate restored — the base-identical path is back in scope with the kill switch set");
+    } finally {
+      delete process.env.ELDATO_VGATE_NO_SUBTRACT;
+    }
+  });
+
+  test("scenario 79 (#755): with the kill switch UNSET the same repo de-floods (control for 78)", async () => {
+    const repo = mkMergeRepo("repo-755-79");
+    delete process.env.ELDATO_VGATE_NO_SUBTRACT;
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m merge", cwd: repo },
+    });
+    ok(res && res.block === true, "#755: blocks on the authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "#755: control — the SAME fixture without the flag IS de-flooded (proves 78's difference is the flag, not the fixture)");
+  });
+
+  test("scenario 80 (#755): the PUSH leg subtracts a base-identical path on a FEATURE-branch push", async () => {
+    // Geometry that makes the push arm non-inert (traced, not assumed):
+    //   tier A scope  = diff <tracking> <srcRef>   = origin/feature .. feature
+    //   subtraction T = resolveTrustedBase()       = origin/main   (DIFFERENT ref)
+    // When the pushed branch IS the current branch AND T == tracking (the
+    // `git push origin main` case) condition (1) is the exact complement of
+    // scope membership, so nothing can ever be subtracted. The arm only does
+    // work when the two refs differ — i.e. the common feature-branch push.
+    const repo = join(TEST_ROOT, "repo-755-80");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "basesub.ts"), "v1\n");
+    writeFileSync(join(repo, "kept.ts"), "k1\n");
+    git(repo, "add .");
+    git(repo, "commit -m c0");
+    const c0 = git(repo, "rev-parse HEAD");
+    // Upstream advances basesub.ts to v2 — this becomes origin/main.
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "basesub.ts"), "v2\n");
+    git(repo, "add .");
+    git(repo, "commit -m upstream-basesub-v2");
+    const cm = git(repo, "rev-parse HEAD");
+    git(repo, "update-ref refs/remotes/origin/main " + cm);
+    // The feature branch: authored work, then it merges upstream in.
+    git(repo, "checkout -q -b feature " + c0);
+    writeFileSync(join(repo, "feat80.ts"), "f1\n");
+    git(repo, "add .");
+    git(repo, "commit -m feature-work");
+    // The feature's own previously-pushed tip (the previously-pushed tip must be
+    // an ANCESTOR of the merge's first parent, or guard (5) fails).
+    git(repo, "update-ref refs/remotes/origin/feature " + c0);
+    git(repo, "merge --no-ff -m merge-upstream upstream");
+    // Sanity: the merge really did pull the base-identical content in.
+    equal(git(repo, "rev-parse HEAD:basesub.ts"), git(repo, "rev-parse origin/main:basesub.ts"),
+      "80: (fixture) the merge result's basesub.ts is byte-identical to the trusted base's");
+    await fire("session_start", {});
+    const before = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin feature", cwd: repo },
+    });
+    const after = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after.length > before, "80: the PUSH leg emits base_identical_satisfied (pre-this-scenario the push leg had NO e2e pin at all)");
+    const last = after[after.length - 1] as any;
+    ok(Array.isArray(last.subtractedPaths) && last.subtractedPaths.includes("basesub.ts"),
+      "80: push leg subtracts the base-identical path");
+    ok(!last.subtractedPaths.includes("feat80.ts"),
+      "80: the branch-authored path is NOT subtracted");
+    ok(res && res.block === true, "80: still blocks on the unverified authored file");
+    ok(res.reason.includes("feat80.ts"), "80: the block names the branch-authored file");
+    ok(!res.reason.includes("basesub.ts"),
+      "80: and does NOT name the base-identical incoming path — the push-leg de-flood");
+  });
+
+  // ── #3255: the git-op root must come from the cwd the runtime actually spawns
+  // the command in (ctx.cwd), NOT process.cwd(). The first attempt at this fix
+  // instead INFERRED the root from the verification bridge, which let a clean
+  // adopted tree produce an empty scope and silently ALLOW an op whose
+  // unverified content lived in the session's real tree. This pins the plumbing
+  // that replaced it: with no `input.cwd`, the root follows `ctx.cwd`. Ignoring
+  // ctx (falling back to process.cwd()) must turn this red.
+  test("scenario #3255: ctx.cwd decides the git-op root when input carries no cwd", async () => {
+    const hub = join(TEST_ROOT, "cwd-hub");
+    const wt = join(TEST_ROOT, "cwd-wt");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    writeFileSync(join(hub, "base.txt"), "base\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m baseline");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+
+    // An unverified staged change exists in the WORKTREE ...
+    writeFileSync(join(wt, "wtfile.txt"), "v1\n");
+    git(wt, "add wtfile.txt");
+
+    // ... while the HUB has nothing staged, so the two roots are observably different.
+    const fromWt = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" }, // no input.cwd — ctx.cwd is the only signal
+    }, { cwd: wt });
+    ok(fromWt && fromWt.block === true,
+      "ctx.cwd=worktree must scope the op to the worktree and BLOCK on its unverified staged file");
+    ok(fromWt.reason.includes("wtfile.txt"),
+      "the block must name the worktree's own file, not another tree's");
+
+    const fromHub = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m 'ctx'" },
+    }, { cwd: hub });
+    equal(fromHub, undefined,
+      "ctx.cwd=hub is clean → allowed; the two fires must DIFFER (identical results would mean ctx is ignored)");
+  });
+
+  // ── #920 (O3): a changed file whose worktree copy is UNREADABLE is not a
+  // deleted one. The verify loop's bare `catch { continue }` treated EVERY
+  // read failure as ENOENT (deletion) and skipped the file → it was never
+  // named `unverified`, so the gate printed `✅ … verified — allowing` for a
+  // file it never read. `chmod 000` is the exploit primitive: the staged
+  // content is still committed by the bare commit. RED pre-fix (allow),
+  // GREEN post-fix (block). No other test in either suite chmods anything.
+  test("scenario 920: unreadable changed file (EACCES, not ENOENT) must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-eacces");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base920.txt"), "b\n");
+    git(repo, "add base920.txt");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "unreadable920.ts"), "staged content\n");
+    git(repo, "add unreadable920.ts"); // staged — a bare commit records the index blob
+    await fire("session_start", {});
+    chmodSync(join(repo, "unreadable920.ts"), 0o000); // worktree copy unreadable (owner denied)
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m unreadable", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920: an EACCES (mode-000) changed file must BLOCK — RED pre-fix: the bare catch treated it as deleted and ALLOWED an unreadable-but-staged file");
+      ok(res.reason.includes("unreadable920.ts"),
+        "920: the block names the unreadable file — it is unverified, not content-free like a deletion");
+    } finally {
+      // Never leak a 000 fixture: restore the mode so cleanup (rmSync) succeeds.
+      chmodSync(join(repo, "unreadable920.ts"), 0o644);
+    }
+  });
+
+  // ── #920 (O3) cycle-1 review, P1: `ENOTDIR` is NOT "genuinely absent".
+  // A path COMPONENT replaced by a non-directory (a D/F conflict) still leaves
+  // the INDEX holding a staged blob for that path, which a bare `git commit`
+  // records. Putting `ENOTDIR` in the skip set therefore re-opened the very
+  // fail-open the EACCES case above closes, through another errno: the gate
+  // printed `✅ N files verified — allowing` for a file it never read. The
+  // discriminator is the INDEX, not the errno — `git ls-files -z --
+  // :(top,literal)<path>` (non-empty stdout ⇒ an index entry exists ⇒ the
+  // commit records content ⇒ BLOCK; empty stdout at exit 0 ⇒ a deletion ⇒
+  // skip; any probe fault ⇒ fail CLOSED). The three legs below pin every
+  // branch of that discrimination:
+  //   (a) ENOTDIR + index entry present (staged `M` row)  → BLOCK
+  //   (b) ENOTDIR + index entry absent  (staged `D` row)  → skip, never named
+  //   (c) ENOENT  (a genuine deletion)                    → skip (49b/55c policy)
+  // (a) is RED pre-fix (the skip set let the staged blob through unverified);
+  // (b)/(c) are policy pins — green either side of the fix, and (b) is what a
+  // naive "just drop ENOTDIR from the skip set" would break.
+  test("scenario 920 (P1): ENOTDIR from a D/F conflict WITH an index entry must BLOCK, never be skipped as deleted", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-indexed");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920/inner920.ts");
+    git(repo, "commit -m base");
+    writeFileSync(join(repo, "dfdir920", "inner920.ts"), "v2 staged content\n");
+    git(repo, "add dfdir920/inner920.ts"); // staged M row — a bare commit records this blob
+    // D/F conflict: replace the parent DIRECTORY with a regular FILE, so the
+    // child read throws ENOTDIR while the index still holds the staged blob.
+    rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict", cwd: repo },
+      });
+      ok(res && res.block === true,
+        "920 (P1): ENOTDIR with an index entry must BLOCK — RED pre-fix: ENOTDIR was skipped as a deletion, so the staged blob was allowed unverified");
+      ok(res.reason.includes("dfdir920/inner920.ts"),
+        "920 (P1): the block names the D/F child — it has staged content, it is not content-free like a deletion");
+    } finally {
+      // Deterministic fixture teardown: restore the directory shape.
+      rmSync(join(repo, "dfdir920"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOTDIR on a genuine DELETION row (no index entry) must still be skipped, never name-blocked", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enotdir-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "dfdir920b"), { recursive: true });
+    writeFileSync(join(repo, "dfdir920b", "inner920.ts"), "v1\n");
+    git(repo, "add dfdir920b/inner920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm dfdir920b/inner920.ts"); // staged D row — content-free
+    // Same D/F conflict shape, but the index holds NO entry: the row is a
+    // deletion, so the read failure must stay a skip (the errno alone cannot
+    // tell this from leg (a) — that is exactly why the probe exists).
+    rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    writeFileSync(join(repo, "dfdir920b"), "now a file\n");
+    await fire("session_start", {});
+    try {
+      const res = await fire("tool_call", {
+        type: "tool_call", toolName: "bash",
+        input: { command: "git commit -m dfconflict-del", cwd: repo },
+      });
+      equal(res, undefined,
+        "920 (P1): ENOTDIR with NO index entry is a deletion — it must be skipped, never block (dropping ENOTDIR from the skip set would red here)");
+    } finally {
+      rmSync(join(repo, "dfdir920b"), { recursive: true, force: true });
+    }
+  });
+
+  test("scenario 920 (P1): ENOENT (a genuine deletion) must still be skipped — the pinned deletion policy", async () => {
+    const repo = join(TEST_ROOT, "repo-920-enoent-deleted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "gone920.ts"), "v1\n");
+    git(repo, "add gone920.ts");
+    git(repo, "commit -m base");
+    git(repo, "rm gone920.ts"); // staged deletion AND worktree copy removed → ENOENT
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m del920", cwd: repo },
+    });
+    equal(res, undefined,
+      "920 (P1): ENOENT = genuinely absent = content-free — a deletion must still be skipped (policy pinned by 49b/55c)");
+  });
+
+  // ── #3398: the merge-inherited face of the trusted-base defect ────────
+  // A `git push -u` records the branch's OWN name in `branch.<cur>.merge`, so
+  // `resolveTrustedBase` used to return the branch's own remote ref as the
+  // trusted base T. That made the push arm's guard (4) unsatisfiable — T then
+  // EQUALS HEAD^1 (the branch's own side, a FIRST parent) and is never an
+  // ancestor of a NON-FIRST parent — so merge-inheritance subtraction silently
+  // no-opped and every file `git merge origin/main` carried in was demanded for
+  // verification. The base is the INTEGRATION branch (origin/main). The fixture
+  // carries a NEW branch-authored file into the push range ON TOP of the
+  // inherited ones, so a bare "allow" cannot pass vacuously: the authored file
+  // must still block while the inherited files must not be named.
+  test("scenario 81 (#3398): a merge of origin/main does not demand its inherited files — the base is the integration branch, not the branch's own tracking ref", async () => {
+    const remote = join(TEST_ROOT, "repo-3398-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3398");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "base.txt"), "base\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // The feature branch is pushed NORMALLY — the trigger for #3398.
+    git(repo, "checkout -q -b feature");
+    writeFileSync(join(repo, "authored.txt"), "a1\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feature-work");
+    git(repo, "push -q -u origin feature");
+    equal(git(repo, "config branch.feature.merge"), "refs/heads/feature",
+      "81: (fixture) a normal `push -u` records the branch's OWN name as its upstream — that is the defect's trigger");
+    // main advances with brand-new files — exactly what the merge inherits.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "inherited-a.ts"), "upstream a\n");
+    writeFileSync(join(repo, "inherited-b.yml"), "upstream b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    // Back on feature: a NEW branch-authored file, then the merge.
+    git(repo, "checkout -q feature");
+    git(repo, "fetch -q origin");
+    writeFileSync(join(repo, "authored2.txt"), "a2\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-authored-2");
+    git(repo, "merge --no-ff -q -m merge-origin-main origin/main");
+    equal(git(repo, "rev-parse HEAD:inherited-a.ts"), git(repo, "rev-parse origin/main:inherited-a.ts"),
+      "81: (fixture) the merge result's inherited-a.ts is byte-identical to the base's — it is inherited, not authored");
+    await fire("session_start", {});
+    const before81 = skipCount("base_identical_satisfied");
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true, "81: the push still blocks on the branch's own new file (not a vacuous empty-range allow)");
+    ok(res.reason.includes("authored2.txt"), "81: the block names the branch-authored file");
+    ok(!res.reason.includes("inherited-a.ts") && !res.reason.includes("inherited-b.yml"),
+      "81: files inherited from the merge of origin/main are NOT demanded — a merge commit is not a scope expansion");
+    const after81 = readAuditLines().filter((l) => l.event === "gate_skip" && l.reason === "base_identical_satisfied");
+    ok(after81.length > before81, "81: the push leg emits base_identical_satisfied (subtraction actually ran)");
+    const last81 = after81[after81.length - 1] as any;
+    ok(last81.arms?.[0]?.t?.ref === "refs/remotes/origin/main",
+      `81: the trusted base is origin/main, not the branch's own tracking ref (got ${last81.arms?.[0]?.t?.ref})`);
+    ok(Array.isArray(last81.subtractedPaths) && last81.subtractedPaths.includes("inherited-a.ts"),
+      "81: the inherited paths are recorded as subtracted");
+    ok(!last81.subtractedPaths.includes("authored2.txt"),
+      "81: the branch-authored path is NOT subtracted (the fix must not over-subtract)");
+  });
+
+  // ── #3398/#960: the git-op ROOT is the pushed repo, not a sibling checkout ──
+  // The measured incident: a session running in one repo ran `cd <other repo>\n
+  // <git op>` and the gate resolved the project root to the SESSION's repo,
+  // then demanded that repo's files (which are in no diff of the pushed tree).
+  // The root must follow the command's actual cwd. A second repo with its own
+  // unverified staged file is the discriminator: if the gate resolved the
+  // sibling, the block would name the SIBLING's file.
+  test("scenario 82 (#3398): a cd-prefixed git op resolves to the repo being operated on, not the session's sibling checkout", async () => {
+    const sibling = join(TEST_ROOT, "repo-3398-sibling");
+    mkdirSync(sibling, { recursive: true });
+    git(sibling, "init -q -b main");
+    git(sibling, "config user.email e2e@test");
+    git(sibling, "config user.name e2e");
+    writeFileSync(join(sibling, "sibling.ts"), "s1\n");
+    git(sibling, "add .");
+    git(sibling, "commit -q -m sibling-base");
+    writeFileSync(join(sibling, "sibling.ts"), "s2 (staged, unverified)\n");
+    git(sibling, "add sibling.ts");
+
+    const hub = join(TEST_ROOT, "repo-3398-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -q -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "hub-base.txt"), "h\n");
+    git(hub, "add .");
+    git(hub, "commit -q -m hub-base");
+    const wt = join(TEST_ROOT, "repo-3398-wt");
+    git(hub, `worktree add -q ${wt} -b wtbranch`);
+    writeFileSync(join(wt, "wt-file.ts"), "w1 (staged, unverified)\n");
+    git(wt, "add wt-file.ts");
+
+    await fire("session_start", {});
+    // Newline-separated cd — bash's separator, and the form the incident used.
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: `cd ${wt}\ngit commit -m probe-3398` },
+    }, { cwd: sibling });
+    ok(res && res.block === true, "82: the op in the worktree blocks on its own unverified file");
+    ok(res.reason.includes("wt-file.ts"), "82: the block names the OPERATED-ON repo's file");
+    ok(!res.reason.includes("sibling.ts"),
+      "82: the SIBLING checkout's staged file is never named — the root is not the session's repo");
+    ok(res.reason.includes(wt),
+      `82: the reported Project root is the operated-on repo (${wt})`);
+  });
+
+  // ── #3716 — a REBASED branch is unpushable ────────────────────────────────
+  // The issue's reproduction, reproduced as fixture geometry: `git rebase
+  // origin/main` on an ALREADY-PUSHED branch leaves the remote-tracking ref on
+  // the pre-rebase tip (a different base), so the tier-A 2-dot range
+  // `diff refs/remotes/origin/feat HEAD` is no longer "what this push changes"
+  // — it is main's whole delta PLUS the branch's own files, and the required
+  // set explodes (3 → 629 in the field). The true change is
+  // `git diff origin/main...HEAD` = the branch's own files.
+  // ⛔ ONE DEFECT, MANY FILINGS — do not re-file it again. The CLOSED family is
+  // agent-infra #737 (the rebase repro + the recorded fix direction: make the
+  // tier CONDITIONAL ON ANCESTRY) → #811 → #914, closed out as MUTUAL duplicates
+  // (#737 ↦ #914 and #914 ↦ #737) with no fix landed, #914 having re-reproduced
+  // the bug at close time. Still-OPEN peers of the SAME root, which this change
+  // closes, are agent-infra #1363 (tier A's base is the stale tracking ref, open
+  // since 2026-09-23) and #1490 (a rebase onto main scopes the whole upstream
+  // delta, open since 2026-09-26) — cross-linked on the root rather than re-filed.
+  // Root of record: tortoise #3716 (this one). The scenario name below carries
+  // #737's recorded greppable trigger (`#737): rebase push range excludes
+  // base-identical paths`) so the deliverable is findable.
+  test("scenario 83 (#3716/#737): rebase push range excludes base-identical paths — scoped 3-dot against the trusted base, never the stale tracking ref", async () => {
+    const remote = join(TEST_ROOT, "repo-3716-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // The branch's own work, pushed BEFORE the rebase — the trigger: a real
+    // remote-tracking ref pinned to the pre-rebase tip.
+    git(repo, "checkout -q -b feat");
+    const branchFiles = ["branch-a.ts", "branch-b.ts", "branch-c.ts"];
+    for (const f of branchFiles) writeFileSync(join(repo, f), f + "\n");
+    // …plus a DELETION the branch carries (`baseline.ts` is on main). A rewrite
+    // push's range can hold D rows — the merge-base tree is the base here — so
+    // the range-path deletion policy (a D row is content-free: ENOENT-skipped,
+    // never name-blocked, never a forever-block) needs a live pin ON THIS PATH.
+    // (Over-demand caveat: a narrowed range can also carry a D row for a path the
+    // remote tip already lacks — see the residual note in
+    // docs/plans/2026-09-06-issue-487-vgate-push-range.md.)
+    git(repo, "rm -q baseline.ts");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-work");
+    git(repo, "push -q -u origin feat");
+    const preRebaseTip = git(repo, "rev-parse refs/remotes/origin/feat");
+    // main advances with unrelated files — exactly the delta the stale ref imports.
+    git(repo, "checkout -q main");
+    const mainDelta = Array.from({ length: 6 }, (_, i) => `main-delta-${i}.ts`);
+    for (const f of mainDelta) writeFileSync(join(repo, f), f + "\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    // The rebase the issue describes.
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+    // #1491 — the narrowing requires the integration ref to be DECLARED.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "83: (fixture) the rebase landed cleanly — merge-base(HEAD, origin/main) == origin/main");
+    equal(git(repo, "rev-parse refs/remotes/origin/feat"), preRebaseTip,
+      "83: (fixture) the remote-tracking ref still points at the PRE-rebase tip");
+    const ownDiff = git(repo, "diff --name-only origin/main...HEAD").split("\n").filter(Boolean).sort();
+    equal(ownDiff.join(","), [...branchFiles, "baseline.ts"].sort().join(","),
+      "83: (fixture) the branch's OWN diff is its 3 authored files plus the file it deleted — the true change, not main's delta");
+    ok(git(repo, "diff --name-status origin/main...HEAD").includes("D\tbaseline.ts"),
+      "83: (fixture) the deletion is a D row on the REWRITE path (merge-base tree = the base) — this leg owns the range-path deletion policy now that a diverged tracking ref no longer takes the 2-dot path");
+    const staleRange = git(repo, "diff --name-only refs/remotes/origin/feat HEAD").split("\n").filter(Boolean);
+    ok(mainDelta.every((f) => staleRange.includes(f)),
+      `83: (fixture) the 2-dot range against the STALE ref is main's delta (${staleRange.length} files), not the branch's change (${ownDiff.length}) — the issue's explosion geometry`);
+    ok(!branchFiles.some((f) => staleRange.includes(f)),
+      "83: (fixture) the branch's OWN files are OUT of the stale range — pre-fix the gate demands main's delta and not even the rebased branch's own files");
+
+    await fire("session_start", {});
+    const before83 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "83: the unverified rebased branch still BLOCKS — the fix must narrow the SCOPE, never allow an unverified push outright");
+    for (const f of mainDelta) {
+      ok(!res.reason.includes(f),
+        `83: the block does NOT name ${f} — main's delta is not this push's change (RED pre-fix: the stale tracking ref imports every one of them)`);
+    }
+    for (const f of branchFiles) {
+      ok(res.reason.includes(f), `83: the block names the branch's own file ${f}`);
+    }
+    ok(!res.reason.includes("baseline.ts"),
+      "83: the D row is content-free FOR A PATH ABSENT FROM DISK — ENOENT-skipped, never named, so a rebased branch that deletes a file main carries does not forever-block here. (Declared residual: the narrowed 3-dot range can ALSO carry a D/R row for a path the remote tip already lacks — a deletion the branch carried before the rebase — which this push does not change; if such a path exists on disk as untracked/ignored content it is an over-demand, never an under-demand. See the #487 plan's residual note.)");
+    // The separately-REPORTED rewrite condition (the issue's Fix section): the
+    // stale ref's real signal is "this push discards commits", which belongs in
+    // the audit, never in the verification scope.
+    const rewrite = readAuditLines().slice(before83)
+      .find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite, "83: the history-rewrite condition is explicitly reported (audited) instead of silently expanding the scope");
+    equal(rewrite.discardedCommits, 1,
+      "83: the report carries the count of commits this push discards (the pre-rebase tip's own work)");
+    equal(rewrite.trackingRef, "refs/remotes/origin/feat", "83: the report names the stale ref it detected");
+    // ACCEPTANCE: verifying ONLY the branch's own changes makes the rebased push
+    // possible. A 3-file PASS cannot clear a main-delta-sized requirement — the
+    // extra paths are outside the block context, so scopeFiles drops them and
+    // the retry would re-block (zero-merge).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: ${branchFiles.join(", ")}. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: branchFiles.map((f) => ({ path: join(repo, f), hash: sha(f + "\n") })),
+      }) }],
+    });
+    const retry = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    equal(retry, undefined,
+      "83: ACCEPTANCE — the rebased branch is PUSHABLE after verifying only its own 3 files (RED pre-fix: a main-delta-sized requirement is not cleared by 3 verified files)");
+  });
+
+  test("scenario 84 (#3716/#737): rebase push range excludes base-identical paths — CONTROL: an ancestor tracking ref still resolves 2-dot, so the tier-A fast-forward case is not silently narrowed", async () => {
+    // The counterweight to 83: the fix must key on the REWRITE (tracking ref not
+    // an ancestor of the pushed tip), not on "a branch with a tracking ref". If
+    // it narrowed every push to the branch-vs-base diff, an already-justified
+    // increment would demand its whole branch history's files — a wider scope,
+    // and this leg's first assert would still name only the increment.
+    const repo = join(TEST_ROOT, "repo-3716-ff");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base84.ts"), "b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m base");
+    const base84 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${base84}`);
+    // #1491 — declared, so this is a genuine narrowing-disabled-by-proof control.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    git(repo, "checkout -q -b feat");
+    // Already-pushed work (tracking ref = this tip ⇒ an ordinary fast-forward push).
+    writeFileSync(join(repo, "pushed84.ts"), "p\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m already-pushed");
+    const pushed84 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/feat ${pushed84}`);
+    // The increment this push actually ships.
+    writeFileSync(join(repo, "increment84.ts"), "i\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m increment");
+    await fire("session_start", {});
+    const before84 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true, "84: blocks on the unverified increment");
+    ok(res.reason.includes("increment84.ts"), "84: the block names the pushed increment");
+    ok(!res.reason.includes("pushed84.ts"),
+      "84: the already-pushed file is NOT demanded — a fast-forward push keeps the narrow 2-dot range (a branch-vs-base narrowing would name it)");
+    ok(!readAuditLines().slice(before84).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "84: no rewrite report on a genuine fast-forward push (the report must not cry wolf)");
+  });
+
+  test("scenario 85 (#3716/#737): the narrowing needs the integration base to BE an ancestor — a BEHIND branch that would REVERT base content keeps the 2-dot scope", async () => {
+    // The counterexample the verification dispatch found against the first cut
+    // of this fix, reproduced. That cut keyed only on "the tracking ref is not
+    // an ancestor", so a branch that is NOT based on origin/main (here: local
+    // main BEHIND origin/main after origin's base.txt moved to v2) narrowed to
+    // `git diff origin/main...HEAD` — which for a behind branch is EMPTY, so a
+    // force-push that REVERTS base.txt to the older blob was reported as an
+    // up-to-date no-op (`push_range_empty`) and ALLOWED. Measured on this
+    // fixture, untightened: 2-dot = `M base.txt` (block), 3-dot = empty (allow).
+    // Requiring the integration base itself to be an ancestor pins the 2-dot
+    // range here, so the reverted path is still demanded. Fail-closed both ways:
+    // 83 must narrow, 85 must not.
+    const repo = join(TEST_ROOT, "repo-3716-behind");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "base85.txt"), "v1\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m c0");
+    // origin/main advances, modifying (not merely adding) a file the behind
+    // branch still carries at the OLD blob — the modification is what makes the
+    // 3-dot range omit a path the force-push would revert.
+    git(repo, "checkout -q -b upstream");
+    writeFileSync(join(repo, "base85.txt"), "v2\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m c1");
+    const c1 = git(repo, "rev-parse HEAD");
+    git(repo, `update-ref refs/remotes/origin/main ${c1}`);
+    // #1491 — declared, so the refusal is the tri-state proof, not a missing declaration.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    git(repo, "checkout -q main"); // local main is BEHIND origin/main
+    await fire("session_start", {});
+    const before85 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin main", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "85: a force-push that REVERTS the integration base's content must BLOCK — the untightened fix reported this as an empty up-to-date push (fail-OPEN)");
+    ok(res.reason.includes("base85.txt"),
+      "85: the block names the path the push would revert (2-dot `M` row); a 3-dot narrowing omits it entirely");
+    ok(!readAuditLines().slice(before85).some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
+      "85: and it is never reported as an up-to-date no-op — the audit must not claim nothing ships");
+  });
+
+  test("scenario 86 (#3716/#737): a rewrite push with an EMPTY narrowed range is reported as a history rewrite — never as an up-to-date no-op", async () => {
+    // The empty-range corner: the pushed tip's tree IS the integration base
+    // (a branch reset onto origin/main) while the remote-tracking ref still holds
+    // the branch's old, discarded commits. The narrowed range is empty, so
+    // nothing unverified ships (allow is correct), BUT the push rewrites the
+    // remote branch and discards commits — so the op must be reported as the
+    // rewrite it is. `push_range_empty` means "an up-to-date push ships
+    // nothing"; emitting it here would report a history-rewriting force-push as
+    // a no-op. The rewrite report is the op's single op-level line.
+    const remote = join(TEST_ROOT, "repo-3716-empty-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-empty");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "base86.ts"), "b\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "work86.ts"), "w\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m branch-work");
+    git(repo, "push -q -u origin feat");
+    // main advances, then the branch is RESET onto it — the branch's pushed
+    // commit is now discarded and its tree equals the base's.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "upstream86.ts"), "u\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "reset -q --hard origin/main");
+    // #1491 — declared, so the empty-range rewrite path is actually taken.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    equal(git(repo, "diff --name-only origin/main HEAD"), "",
+      "86: (fixture) the pushed tip's tree IS the integration base — the narrowed range is empty");
+    equal(git(repo, "rev-parse refs/remotes/origin/feat").length, 40,
+      "86: (fixture) the tracking ref still holds the discarded branch commit");
+    await fire("session_start", {});
+    const before86 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat", cwd: repo },
+    }, { cwd: repo });
+    equal(res, undefined, "86: ALLOWED — the range is empty and every byte it lands is trusted base content");
+    const fresh86 = readAuditLines().slice(before86);
+    const rewrite86 = fresh86.find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite86, "86: the rewrite is explicitly reported even when the narrowed range is empty");
+    equal(rewrite86.discardedCommits, 1, "86: the report carries the discarded commit count");
+    ok(!fresh86.some((l) => l.event === "gate_skip" && l.reason === "push_range_empty"),
+      "86: and the op is NOT also reported as an up-to-date empty range (RED against the unsuppressed first cut)");
+  });
+
+  test("scenario 87 (#3716): the narrowing base is the #3398 TRUSTED base, never the push remote's main", async () => {
+    // H3: the narrowing must use the INTEGRATION remote's base (`resolveTrustedBase`
+    // — #3398), never `<push remote>/main`. A push remote says where content GOES,
+    // not what was integrated; trusting a fork's `main` let fork-only, un-merged
+    // content be treated as base-identical and OMITTED from the verified set
+    // (review F1 on #1106). Geometry: `origin/main` is the baseline (the trusted
+    // base), `fork/main` is AHEAD of it, and the branch is rebased onto `fork/main`
+    // — so proof (1) holds against BOTH bases, and only the trusted-base range
+    // carries `fork-only.ts`.
+    const origin = join(TEST_ROOT, "repo-3716-trusted-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const forkRemote = join(TEST_ROOT, "repo-3716-trusted-fork.git");
+    mkdirSync(forkRemote, { recursive: true });
+    git(forkRemote, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-trusted");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat.ts"), "feat\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "remote add fork " + forkRemote);
+    git(repo, "push -q -u fork feat"); // branch.feat.remote = fork
+    const preRebaseTip = git(repo, "rev-parse refs/remotes/fork/feat");
+    // fork/main advances BEYOND origin/main with content that is NOT integrated.
+    git(repo, "checkout -q -b forkbase main");
+    writeFileSync(join(repo, "fork-only.ts"), "fork\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m fork-only");
+    git(repo, "push -q fork forkbase:main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q fork");
+    git(repo, "rebase -q fork/main");
+    // #1491 — the operator declares `origin/main` as the integration ref (this is
+    // the trusted base the narrowing must use, never the push remote's `main`).
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    // `merge-base --is-ancestor` is exit-status-only (empty stdout on exit 0, and
+    // the `git()` helper throws on the exit-1 negative), so read the status.
+    const isAnc87 = (a: string, b: string): boolean => {
+      try { execSync(`git merge-base --is-ancestor ${a} ${b}`, { cwd: repo, stdio: "ignore" }); return true; }
+      catch { return false; }
+    };
+
+    equal(git(repo, "merge-base HEAD refs/remotes/fork/main"), git(repo, "rev-parse refs/remotes/fork/main"),
+      "87: (fixture) the rebase landed on fork/main — merge-base(HEAD, fork/main) == fork/main");
+    equal(git(repo, "rev-parse refs/remotes/fork/feat"), preRebaseTip,
+      "87: (fixture) the push remote's tracking ref still points at the PRE-rebase tip");
+    ok(isAnc87("origin/main", "HEAD"),
+      "87: (fixture) proof 1 holds against the TRUSTED base — origin/main IS an ancestor of the rebased tip");
+    ok(isAnc87("refs/remotes/fork/main", "HEAD"),
+      "87: (fixture) the PUSH remote's main is ALSO an ancestor — so the old base choice would pick fork/main and omit fork-only.ts");
+    ok(git(repo, "diff --name-only refs/remotes/fork/main HEAD").split("\n").filter(Boolean).join(",") === "feat.ts",
+      "87: (fixture) the OLD base range is only feat.ts — fork-only.ts is base-identical to the un-integrated fork/main");
+
+    await fire("session_start", {});
+    const before87 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease fork feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "87: the unverified rebased branch still BLOCKS — the narrowing never allows a push outright");
+    ok(res.reason.includes("fork-only.ts"),
+      "87: the block names the FORK-ONLY file the trusted-base range carries (RED pre-fix: the push remote's `main` is base-identical for it, so the range omits it and the un-integrated content looks verified)");
+    const rewrite87 = readAuditLines().slice(before87)
+      .find((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push") as any;
+    ok(rewrite87, "87: the history-rewrite condition is explicitly reported");
+    equal(rewrite87.baseRef, "refs/remotes/origin/main",
+      "87: the audit names the TRUSTED base (origin/main), not the push remote's main (RED pre-fix: baseRef was refs/remotes/fork/main)");
+    equal(rewrite87.branch, "feat", "87: the audit names the pushed branch");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: feat.ts, fork-only.ts. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: JSON.stringify({
+        status: "PASS", failures: [],
+        verified_files: [
+          { path: join(repo, "feat.ts"), hash: sha("feat\n") },
+          { path: join(repo, "fork-only.ts"), hash: sha("fork\n") },
+        ],
+      }) }],
+    });
+    const retry = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease fork feat", cwd: repo },
+    }, { cwd: repo });
+    equal(retry, undefined,
+      "87: ACCEPTANCE — verifying the trusted-base range (feat.ts + fork-only.ts) clears the push (a fork/main-scoped range would have demanded only feat.ts and still re-blocked)");
+  });
+
+  test("scenario 88 (#3716): a rewrite audit line may not outlive the op it describes — an abandoned multi-refspec push emits none", async () => {
+    // A2-1: the rewrite audit must be deferred to the point the union RESOLVES.
+    // An in-loop emit writes the line for refspec #1 and then refspec #2 returns
+    // null, discarding the whole union and sending the caller to the STAGED scope
+    // — so the audit would attest a base-scoped narrowing the op never used. The
+    // second refspec here is unresolvable (`nonexist`), which is exactly that
+    // null-for-the-whole-command path (scenario 59's whole-command rule).
+    const origin = join(TEST_ROOT, "repo-3716-abandoned-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-abandoned");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat88.ts"), "f\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u origin feat");
+    // main advances, then the branch is rebased — the #3716 rewrite geometry of
+    // scenario 83, which makes refspec #1 (`feat`) take the narrowing path.
+    git(repo, "checkout -q main");
+    writeFileSync(join(repo, "main88.ts"), "m\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m upstream-advance");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+    // #1491 — declared, so refspec #1 would take the narrowing path if it resolved.
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "88: (fixture) the rebase landed cleanly — refspec #1 is a rewrite push");
+    // Parked WIP so the STAGED fallback (the null that abandoned the range) has
+    // something to block on (scenario 59's idiom).
+    writeFileSync(join(repo, "wip88.ts"), "w\n");
+    git(repo, "add wip88.ts");
+    await fire("session_start", {});
+    const before88 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force-with-lease origin feat nonexist", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "88: the unresolvable second refspec nulls the whole command → the staged WIP blocks");
+    ok(res.reason.includes("wip88.ts"),
+      "88: the block names the STAGED file — the rewrite range was abandoned, never used");
+    ok(!readAuditLines().slice(before88).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "88: an abandoned op (a later refspec nulled the whole command) must not leave a rewrite audit line — RED pre-fix");
+  });
+
+  test("scenario 89 (#3716/#1491): the narrowing base must EQUAL the declared integration ref — a checkout whose own upstream is a TOPIC branch keeps the 2-dot scope", async () => {
+    // The review's fail-open, reproduced. `resolveTrustedBase` prefers a branch's
+    // DECLARED upstream naming another branch (#3398 — for the SUBTRACTION arm,
+    // where guards (0)-(5) neutralise it). The narrowing has no guard set: it
+    // omits every path the pushed tip SHARES with its base, so a TOPIC base omits
+    // content the push LANDS on the remote — which then ships unverified. Pre-fix
+    // on this geometry the resolver returned `["feat89.ts"]` while the pre-#3716
+    // range was `["develop-only.ts"]`: `develop-only.ts` (a sibling branch's
+    // content, never integrated into main) was landed on remote `feat` undemanded.
+    // The narrowing now requires the integration ref to be DECLARED (#1491), so a
+    // base that does not equal the declaration is a non-integration base ⇒ wider
+    // scope (fail-closed).
+    const origin = join(TEST_ROOT, "repo-3716-topicbase-origin.git");
+    mkdirSync(origin, { recursive: true });
+    git(origin, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-3716-topicbase");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + origin);
+    writeFileSync(join(repo, "baseline89.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin main");
+    // `develop` is a SIBLING topic branch — its content is NOT integrated into main.
+    git(repo, "checkout -q -b develop");
+    writeFileSync(join(repo, "develop-only.ts"), "dev\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m develop-work");
+    git(repo, "push -q -u origin develop");
+    git(repo, "checkout -q main"); // feat must branch from MAIN, so the rebase onto develop REWRITES it
+    // `feat` is pushed from main, then REBASED onto the topic branch — so proof
+    // (1) holds against origin/develop AND origin/main; only the base choice
+    // decides the range.
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat89.ts"), "f\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u origin feat");
+    git(repo, "checkout -q feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/develop");
+    // #1491 — the operator declares the HOUSE integration ref. The checkout's
+    // resolved base is the topic upstream (`origin/develop`), which does NOT equal
+    // the declaration, so the narrowing must be refused (fail-closed).
+    git(repo, "config vgate.integrationRef refs/remotes/origin/main");
+    equal(git(repo, "merge-base HEAD origin/develop"), git(repo, "rev-parse origin/develop"),
+      "89: (fixture) the rebase landed on origin/develop — proof (1) holds against the TOPIC base");
+    equal(git(repo, "merge-base HEAD origin/main"), git(repo, "rev-parse origin/main"),
+      "89: (fixture) origin/main is ALSO an ancestor — only the base CHOICE decides the range");
+    // The checkout's own upstream is the TOPIC branch (branch.work.merge = develop),
+    // which is what made `resolveTrustedBase` return a non-integration base.
+    git(repo, "checkout -q -b work");
+    git(repo, "config branch.work.remote origin");
+    git(repo, "config branch.work.merge refs/heads/develop");
+    await fire("session_start", {});
+    const before89 = readAuditLines().length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "89: the force-push blocks — it LANDS develop-only.ts on remote `feat`");
+    ok(res.reason.includes("develop-only.ts"),
+      "89: the block NAMES develop-only.ts — a topic-base narrowing omits it entirely (RED pre-fix), shipping un-integrated content unverified");
+    ok(!readAuditLines().slice(before89).some((l) => l.event === "gate_skip" && l.reason === "non_fast_forward_push"),
+      "89: and no rewrite line is emitted — a non-integration base is never narrowed against");
+  });
+
+  test("scenario 90 (#1491): a FORK's `main` named origin/main is not the integration base — the content the push LANDS still blocks", async () => {
+    // #1491 vector 1, at the gate level. `resolveTrustedBase` falls back to
+    // `refs/remotes/origin/main`, the FORK's main in a fork-as-`origin` layout.
+    // The retired NAME guard accepted it and narrowed against the fork, omitting
+    // `fork-only.ts` — content the push LANDS on canonical `upstream`. The #1491
+    // declaration guard refuses the narrowing (no declaration), so the pre-#3716
+    // range keeps the landed content and the gate BLOCKS.
+    const upstream = join(TEST_ROOT, "repo-1491-fork-upstream.git");
+    mkdirSync(upstream, { recursive: true });
+    git(upstream, "init -q --bare -b main");
+    const fork = join(TEST_ROOT, "repo-1491-fork.git");
+    mkdirSync(fork, { recursive: true });
+    git(fork, "init -q --bare -b main");
+    const repo = join(TEST_ROOT, "repo-1491-fork-work");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + fork);
+    git(repo, "remote add upstream " + upstream);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u upstream main");
+    git(repo, "checkout -q -b forkbase main");
+    writeFileSync(join(repo, "fork-only.ts"), "fork\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m fork-only");
+    git(repo, "push -q origin forkbase:main");
+    git(repo, "checkout -q main");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "feat.ts"), "feat\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m feat-work");
+    git(repo, "push -q -u upstream feat");
+    git(repo, "fetch -q origin");
+    git(repo, "rebase -q origin/main");
+    // The SHIPPED checked-in declaration (agent-infra lands
+    // `refs/remotes/origin/main`) is INHERITED by the fork clone, where it names
+    // the FORK's main. It must NOT activate on its own: the per-clone config is
+    // the operator's assertion, the file only an agreement tripwire. No config
+    // here ⇒ still no narrowing ⇒ still BLOCK.
+    mkdirSync(join(repo, ".vgate"), { recursive: true });
+    writeFileSync(join(repo, ".vgate", "integration-ref"), "refs/remotes/origin/main\n");
+    equal(git(repo, "config --get vgate.integrationRef || echo UNSET"), "UNSET",
+      "90: (fixture) NO per-clone config — the inherited file alone must not activate");
+    equal(git(repo, "config branch.feat.remote"), "upstream",
+      "90: (fixture) the push remote is canonical `upstream`");
+    equal(git(repo, "diff --name-only refs/remotes/upstream/feat HEAD").trim(), "fork-only.ts",
+      "90: (fixture) the pre-#3716 range is the landed `fork-only.ts`");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force upstream feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "90: the force-push BLOCKS — the fork-only content it lands is demanded (RED on the name guard, which narrowed against the fork and ALLOWED)");
+    ok(res.reason.includes("fork-only.ts"),
+      "90: the block names `fork-only.ts` — the content the fork-scoped narrowing omitted entirely");
+  });
+
+  test("scenario 91 (#1491): a legacy `main` on a master-default remote is not the integration base — the legacy-only content still blocks", async () => {
+    // #1491 vector 2, at the gate level. A single remote whose integration branch
+    // is `master` also carries a legacy branch literally named `main`. The
+    // retired NAME guard accepted `refs/remotes/origin/main` and narrowed against
+    // the legacy branch, omitting `legacy-only.ts`. The declaration guard refuses
+    // the narrowing (no declaration), so the pre-#3716 range keeps it and the gate
+    // BLOCKS.
+    const remote = join(TEST_ROOT, "repo-1491-legacy-origin.git");
+    mkdirSync(remote, { recursive: true });
+    git(remote, "init -q --bare -b master");
+    const repo = join(TEST_ROOT, "repo-1491-legacy");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -q -b master");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    git(repo, "remote add origin " + remote);
+    writeFileSync(join(repo, "baseline.ts"), "baseline\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m baseline");
+    git(repo, "push -q -u origin master");
+    git(repo, "checkout -q -b main master");
+    writeFileSync(join(repo, "legacy-only.ts"), "legacy\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m legacy");
+    git(repo, "push -q origin main");
+    git(repo, "checkout -q master");
+    git(repo, "checkout -q -b feat");
+    writeFileSync(join(repo, "own.ts"), "own\n");
+    git(repo, "add .");
+    git(repo, "commit -q -m own");
+    git(repo, "push -q -u origin feat");
+    git(repo, "fetch -q origin");
+    git(repo, "symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/master");
+    git(repo, "rebase -q origin/main");
+    // Same inheritance shape as scenario 90: the shipped file names a legacy
+    // `main` here, and must not activate without a per-clone assertion.
+    mkdirSync(join(repo, ".vgate"), { recursive: true });
+    writeFileSync(join(repo, ".vgate", "integration-ref"), "refs/remotes/origin/main\n");
+    equal(git(repo, "config --get vgate.integrationRef || echo UNSET"), "UNSET",
+      "91: (fixture) NO per-clone config — the inherited file alone must not activate");
+    equal(git(repo, "symbolic-ref --short refs/remotes/origin/HEAD"), "origin/master",
+      "91: (fixture) the integration branch is `master`");
+    equal(git(repo, "diff --name-only refs/remotes/origin/feat HEAD").trim(), "legacy-only.ts",
+      "91: (fixture) the pre-#3716 range is the landed `legacy-only.ts`");
+    await fire("session_start", {});
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git push --force origin feat", cwd: repo },
+    }, { cwd: repo });
+    ok(res && res.block === true,
+      "91: the force-push BLOCKS — the legacy-only content it lands is demanded (RED on the name guard, which narrowed against the legacy `main` and ALLOWED)");
+    ok(res.reason.includes("legacy-only.ts"),
+      "91: the block names `legacy-only.ts` — the content the legacy-main-scoped narrowing omitted entirely");
+  });
+
+  test("scenario 1092: a DIRECTORY symlink commits its LINK TARGET — never a permanent EISDIR block (#1092)", async () => {
+    // The #1092 reproduction, driven through the REAL handler. A symlink to a
+    // directory is the only shape a multi-file extension's pi-config farm entry
+    // can take (`check-pi-config-extensions.sh` requires both the exact
+    // basename and a resolvable symlink into extensions/). Pre-fix,
+    // `hashFile`'s readFileSync threw EISDIR, the commit loop routed every errno
+    // but ENOENT/ENOTDIR to `unverified`, and NO verifier PASS could ever clear
+    // it — the path was un-committable from any non-interactive session.
+    const repo = join(TEST_ROOT, "repo-1092-symlink");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    mkdirSync(join(repo, "ext-real"), { recursive: true });
+    writeFileSync(join(repo, "ext-real", "index.ts"), "export const a = 1;\n");
+    git(repo, "add ext-real/index.ts");
+    git(repo, "commit -m base");
+    symlinkSync("ext-real", join(repo, "farm-entry")); // the pi-config farm entry
+    git(repo, "add farm-entry");
+    await fire("session_start", {});
+
+    // 1. unverified → blocked (and the reason must name the symlink)
+    const blocked = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    ok(blocked && blocked.block === true, "an unverified directory symlink must block");
+    ok(blocked.reason.includes("farm-entry"), "the block reason must name the symlink path");
+
+    // 2. verify the symlink by its LINK TARGET (git's mode-120000 blob) ...
+    const passJson = JSON.stringify({
+      status: "PASS", failures: [],
+      verified_files: [{ path: join(repo, "farm-entry"), hash: sha("ext-real") }],
+    });
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: farm-entry. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: passJson }],
+    });
+
+    // 3. ... and a RETARGET after that PASS is drift, not a free pass. (Ordered
+    //    before any ALLOWED commit on purpose: an allowed commit arms #7574
+    //    pendingRehash, which re-hashes the committed paths on the next git op
+    //    and would re-bless the retargeted link — that window is a documented,
+    //    file-type-agnostic #7574 property, not something #1092 introduces.)
+    //    Pre-fix this leg was ALLOWED, in the opposite direction from leg 1:
+    //    the retarget points at a path that does not exist, so `readFileSync`
+    //    followed the link and threw ENOENT — which the commit loop reads as
+    //    "deleted, content-free" and SKIPS (#1018's residual class). A symlink
+    //    retarget therefore rode through unverified. `lstatSync` never follows,
+    //    so the link target is hashed and the change is a MISMATCH.
+    rmSync(join(repo, "farm-entry"));
+    symlinkSync("ext-real-2", join(repo, "farm-entry"));
+    git(repo, "add farm-entry");
+    const drifted = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    ok(drifted && drifted.block === true,
+      "#1092: a retargeted symlink is drift — the link-target hash changed, so the commit must block (pre-fix: ENOENT-on-follow-through SKIPPED the path ⇒ allowed)");
+    ok(/Hash mismatch/.test(drifted.reason), "the drift block must be a hash mismatch, not a fresh 'unverified'");
+    ok(drifted.reason.includes("farm-entry"), "the drift block must name the retargeted symlink");
+
+    // 4. re-verify the NEW target → allowed → the committed content is the target
+    const passJson2 = JSON.stringify({
+      status: "PASS", failures: [],
+      verified_files: [{ path: join(repo, "farm-entry"), hash: sha("ext-real-2") }],
+    });
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: farm-entry. Classification: backend. Project root: ${repo}` },
+      content: [{ type: "text", text: passJson2 }],
+    });
+    const allowed = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m sym1", cwd: repo },
+    });
+    equal(allowed, undefined,
+      "#1092: a dir symlink must verify by its link target — pre-fix this was EISDIR ⇒ unverified forever (NO verifier PASS could clear it)");
+    git(repo, "commit -m sym1");
+    equal(git(repo, "cat-file -p HEAD:farm-entry"), "ext-real-2",
+      "git records the link TARGET as the committed content (mode-120000 semantics)");
+  });
+
+  // ── #7526 P2-2: the deletion-only ALLOW must be AUDITED, never silent ──
+  // `deletion_only_no_content` is the ONLY thing that keeps the deletion-only
+  // allow from being a silent allow. Its emission site is the unexported
+  // `pi.on("tool_call")` handler, so THIS suite is the only surface that can
+  // observe it directly: a BARE commit whose ONLY staged change is
+  // `git rm --cached <non-exempt>` (the original #7526 trigger — untracking a
+  // vendored file) routes `verify` with a non-empty `route.files`, filters the
+  // candidate set to EMPTY, and must emit the audit line.
+  test("scenario 7526-P2-2: a bare deletion-only commit is ALLOWED but AUDITED (deletion_only_no_content)", async () => {
+    const repo = join(TEST_ROOT, "repo-7526-p2");
+    mkdirSync(repo, { recursive: true });
+    git(repo, "init -b main");
+    git(repo, "config user.email e2e@test");
+    git(repo, "config user.name e2e");
+    writeFileSync(join(repo, "vendored.ts"), "export const v = 1;\n");
+    git(repo, "add vendored.ts");
+    git(repo, "commit -m baseline");
+    // The #7526 trigger: untrack the file (index deletion; worktree copy kept).
+    git(repo, "rm --cached -q vendored.ts");
+    // Fixture self-check: the staged diff really is a lone non-exempt D row.
+    const z = execSync("git diff --cached --name-status -z", { cwd: repo, encoding: "utf-8" });
+    ok(z.includes("D\0vendored.ts\0"), `7526-P2-2: fixture must stage a lone D row (got ${JSON.stringify(z)})`);
+
+    await fire("session_start", {});
+    const before = readAuditLines().filter(
+      (l) => l.event === "gate_skip" && l.reason === "deletion_only_no_content",
+    ).length;
+    const res = await fire("tool_call", {
+      type: "tool_call", toolName: "bash",
+      input: { command: "git commit -m untrack-vendored", cwd: repo },
+    });
+    equal(res, undefined, "7526-P2-2: a deletion-only change has no post-commit content to verify ⇒ ALLOWED");
+    const after = readAuditLines().filter(
+      (l) => l.event === "gate_skip" && l.reason === "deletion_only_no_content",
+    );
+    ok(after.length > before,
+      "7526-P2-2: the allow must NOT be silent — a deletion_only_no_content audit line is emitted");
+    deepEqual(after[after.length - 1].files, ["vendored.ts"],
+      "7526-P2-2: the audit names the routed D path the allow swallowed");
+    git(repo, "commit -m untrack-vendored");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

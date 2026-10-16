@@ -35,6 +35,16 @@ import { startScheduler, releaseCronLock } from "./scheduler.js";
 import { executeWriteBack } from "./writeback.js";
 import { homedir } from "node:os";
 import { isPrintMode } from "../shared/print-mode.js";
+// #1419: KILL_SWITCH_FILE used to be referenced here without being defined or
+// imported (5 sites), so every write raised ReferenceError into a swallowed
+// catch — the "guaranteed escape" could not fire. One home, imported.
+import {
+  loopStopEscape,
+  killSwitchStatus,
+  isSessionEscaped,
+  sessionEscapeStatus,
+  isEnforcementBypassed,
+} from "../shared/kill-switch.js";
 import { LOOPS_DIR, readManifest, writeManifest, abortLoop, abortAllLoops, buildEndSummary, pauseLoop, blockLoop, resumeLoop, type Manifest } from "./manifest.js";
 
 // ── Session context resolution ──────────────────────────────────
@@ -105,6 +115,13 @@ const PATTERNS_PATH = join(
 
 // ── Loop-sequence bridge (#7040) ─────────────────────────────────
 const BRIDGE_FILE = join(homedir(), ".pi", "agent", "bridge", "loop-sequence.json");
+// #1419 (same class, second instance): this was declared INSIDE the
+// `if (Type) { … }` block that registers /loop, and read 300 lines later from
+// the `agent_end` handler OUTSIDE that block. The read threw ReferenceError into
+// `catch { return true; }`, which made every manifest look fresh — so the 7-day
+// window was silently dead and a zombie `running` manifest was resumed. Module
+// scope is the only scope all three call sites share.
+const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 function readBridgeStep(): string | null {
   try {
@@ -684,22 +701,23 @@ export default function (pi: ExtensionAPI) {
       }
       if (action === "stop") {
         const slug = getActiveLoop();
-        if (!slug) return { content: [{ type: "text", text: "No active loop to stop." }] };
+        // #1419: the escape is granted FIRST — before any "nothing to stop"
+        // return. A session blocked at a checkpoint normally has NO active loop,
+        // and that IS the session this escape exists for (#357 (d)); the early
+        // return made it unreachable exactly when it was needed. It is
+        // SESSION-LOCAL, not the human's machine-global kill switch — see the
+        // module header in shared/kill-switch.ts. `loopStopEscape` owns the
+        // effect AND the wording, so the escape and its message are one unit.
+        const escape = loopStopEscape(slug);
+        if (!slug) return { content: [{ type: "text", text: escape.text }] };
         abortLoop(slug, LOOPS_DIR, "manual_stop");
         clearBridgeState();
-        // Guaranteed escape from sequence-enforcer deadlocks: stop sets the kill
-        // flag that sequence-enforcer checks on every tool_call (#7470).
-        let killWritten = true;
-        try { writeFileSync(KILL_SWITCH_FILE, new Date().toISOString()); } catch { killWritten = false; console.error("[loop-enforcer] ⚠️  Could not write kill switch file — bypass not set"); }
         // CRITICAL: clear ALL 4 state items synchronously — before agent_end
         activeLoopSlugs.clear();
         pendingVerificationSlug = null;
         pi.appendEntry("loop-active", null);
         _ctx.ui.setStatus("loop-enforcer", undefined);
-        const bypassMsg = killWritten
-          ? `Loop '${slug}' stopped. Sequence enforcement bypassed for this session (kill switch set).`
-          : `Loop '${slug}' stopped. Warning: kill switch could not be written. Run: touch ${KILL_SWITCH_FILE}`;
-        return { content: [{ type: "text", text: bypassMsg }] };
+        return { content: [{ type: "text", text: escape.text }] };
       }
       if (action === "pause") {
         const slug = getActiveLoop();
@@ -745,17 +763,32 @@ Goal: ${m.goal}` }] };
         const lines: string[] = ["### Gate Diagnostics"];
 
         // 1. Kill-switch status
-        const killFile = KILL_SWITCH_FILE;
-        if (existsSync(killFile)) {
-          const ts = readFileSync(killFile, "utf-8").trim();
-          lines.push(`\nKill switch: ✅ ACTIVE (set at ${ts})`);
-          lines.push("  All enforced gates are bypassed. If you're still blocked, a");
-          lines.push("  different enforcer (skill-enforcer, verification-gate, main-worktree-guard)");
-          lines.push("  may be blocking. Check gate messages for which enforcer fired.");
+        const ks = killSwitchStatus();
+        if (ks.set) {
+          // NAME THE SOURCE. The file alone is not the whole answer: an env-only
+          // bypass leaves no file, and reporting "NOT SET" while every gate is
+          // bypassed is the one thing a diagnostic must never do.
+          const how = ks.source === "env"
+            ? "via env (AGENT_STATE_MACHINE / ELDATO_STATE_MACHINE)"
+            : `set at ${ks.ts ?? "unknown"}`;
+          lines.push(`\nKill switch (human, machine-wide): ✅ ACTIVE — ${how}`);
+          lines.push("  Every sequence-enforcer gate is bypassed in EVERY session on this machine.");
+          lines.push("  (It reaches sequence-enforcer only — the worktree, merge and search guards");
+          lines.push("  do not read it.) If you're still blocked, a different enforcer may be");
+          lines.push("  firing; check the gate message for which.");
         } else {
-          lines.push("\nKill switch: ❌ NOT SET");
-          lines.push(`  To set: touch ${KILL_SWITCH_FILE} (from your terminal)`);
-          lines.push("  Or: /loop stop (if a loop is active — sets the kill switch on stop)");
+          lines.push("\nKill switch (human, machine-wide): ❌ NOT SET");
+          lines.push(`  To set: touch ${ks.path} (from your terminal — agents must not; see`);
+          lines.push("  skills/enforcement/SKILL.md. The agent escape is the session escape below.)");
+        }
+
+        // 1b. Session escape — the AGENT's, this session only (#1419)
+        if (isSessionEscaped()) {
+          lines.push(`\nSession escape: ✅ ACTIVE (set at ${sessionEscapeStatus() ?? "unknown"})`);
+          lines.push("  Sequence enforcement is bypassed for THIS session only — sibling");
+          lines.push("  sessions are unaffected, and this cannot be revoked by another process.");
+        } else {
+          lines.push("\nSession escape: ❌ not set");
         }
 
         // 2. Active loop
@@ -774,17 +807,21 @@ Goal: ${m.goal}` }] };
             if (bridge.gate) {
               lines.push(`  Gate type: ${bridge.gate}`);
               if (bridge.gate === "verifier") lines.push("  Escape: dispatch a task sub-agent to review this stage");
-              if (bridge.gate === "human_approval" || bridge.gate === "human_review") lines.push("  Escape: end your turn to auto-advance this gate, or use /loop stop");
+              if (bridge.gate === "human_approval" || bridge.gate === "human_review") lines.push("  Escape: end your turn to auto-advance this gate, or call the loop_enforcer tool with action: \"stop\" (this session only)");
             }
           }
         } catch { /* bridge file may not exist — skip */ }
 
-        // 4. Recommended escape
-        if (!existsSync(killFile)) {
+        // 4. Recommended escape — only while nothing is already bypassed, and
+        //    naming the surface an AGENT may actually use.
+        if (!isEnforcementBypassed()) {
           lines.push("\n─── Recommended escape ───");
-          lines.push("1. End your turn (gates auto-advance on agent_end)");
-          lines.push(`2. Or ask the user to: touch ${KILL_SWITCH_FILE}`);
-          lines.push("3. Or set env: SKILL_ENFORCER_DISABLED=1 (for skill gates)");
+          lines.push("1. loop_enforcer with action: \"stop\" — grants the session escape for");
+          lines.push("   this session only, and needs no active loop. (A HUMAN can type /loop stop.)");
+          lines.push("2. End your turn (gates auto-advance on agent_end)");
+          lines.push(`3. Machine-wide, if enforcement itself is broken: ask the USER to touch ${ks.path}`);
+          lines.push("   — that is the human kill switch, not an agent action.");
+          lines.push("4. Or set env: SKILL_ENFORCER_DISABLED=1 (for skill gates)");
         }
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
@@ -978,8 +1015,14 @@ Goal: ${m.goal}` }] };
 
         case "stop": {
           const slug = rest || getActiveLoop();
+          // #1419: `/loop stop` is the rescue path the disable guidance and the
+          // gate messages NAME, so it must grant the SAME session escape the
+          // `loop_enforcer` tool does. With no loop it used to error with
+          // "No active loop to stop." — a dead end advertised as the escape, in
+          // exactly the state a checkpoint deadlock is in.
+          const escape = loopStopEscape(slug);
           if (!slug) {
-            ctx.ui.notify("[loop-enforcer] No active loop to stop.", "error");
+            ctx.ui.notify(`[loop-enforcer] ${escape.text}`, "info");
             return;
           }
           abortLoop(slug, LOOPS_DIR, "manual_stop");
@@ -988,7 +1031,10 @@ Goal: ${m.goal}` }] };
           pendingVerificationSlug = null;
           pi.appendEntry("loop-active", null);
           ctx.ui.setStatus("loop-enforcer", undefined);
-          ctx.ui.notify(`[loop-enforcer] ⏹ Loop stopped: ${slug}`, "info");
+          // The escape was granted above — say so. Stopping a loop now ALSO
+          // bypasses sequence enforcement for the rest of the session, and a
+          // silent state change is how the previous escape went unnoticed.
+          ctx.ui.notify(`[loop-enforcer] ⏹ Loop stopped: ${slug}. ${escape.text}`, "info");
           break;
         }
 
@@ -1292,7 +1338,7 @@ Goal: ${m.goal}` }] };
   });
 
   // ponytail: mtime filter window for session_start manifest reads
-const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+  // (#1419: hoisted to module scope — see its declaration; read from agent_end too)
 
 // ── session_start: crash recovery + zombie reclamation ──────
   pi.on("session_start", async (_event, ctx) => {
@@ -1717,35 +1763,50 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       filesChanged: 0, // ponytail: not tracked per-cycle yet
       wallClockMs: 0,
     }));
-    const termResult = evaluateTermination(cycleData, 10);
+    // #723: no explicit bound here — the canonical default in
+    // `evaluateTermination` governs, so there is exactly ONE live cap and
+    // `tier-config-parity.test.ts` pins it (behaviourally + against the skill
+    // table). Also: never pass a `tier` here — it would override the cap.
+    const termResult = evaluateTermination(cycleData);
     if (termResult.shouldExit) {
       // ── L3 Ralph Loop: stall recovery before escalation ──
       if (termResult.reason === "L3-deadlock" && !manifest.ralph_loop_attempted) {
         manifest.ralph_loop_attempted = true;
         manifest.cycles.push({
           number: nextCycle, verdict: "NEEDS_FIX", issues_found: 1,
-          exit_signal: `ralph-loop:${termResult.reason}`, timestamp: new Date().toISOString(),
+          // #847 — the FIRST stall hit returns through here without ever writing
+          // `exit_reason`, so the detector has to ride on the exit_signal; with the
+          // bare layer reason it read "L3-deadlock" for both detectors, which is
+          // exactly the ambiguity the detector field exists to remove.
+          exit_signal: `ralph-loop:${termResult.detector ?? termResult.reason}`, timestamp: new Date().toISOString(),
         });
         writeManifest(slug, manifest);
         
         const lastSignal = manifest.cycles[manifest.cycles.length - 2]?.exit_signal || "unknown";
-        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "ralph_loop_injected", data: { reason: termResult.reason, last_signal: lastSignal, cycles: manifest.cycles?.length ?? 0 } });
-        notify(manifest, "ralph_loop", `${termResult.reason} | last: ${lastSignal}`);
+        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "ralph_loop_injected", data: { reason: termResult.reason, detector: termResult.detector, last_signal: lastSignal, cycles: manifest.cycles?.length ?? 0 } });
+        notify(manifest, "ralph_loop", `${termResult.detector ?? termResult.reason} | last: ${lastSignal}`);
         
         injectContinuation(pi, slug, manifest,
-          `You appear stuck. Last cycles had the same issue pattern (${termResult.reason}). Goal: ${manifest.goal}. Try a different approach. What assumption are you making that might be wrong?`
+          `You appear stuck. Last cycles had the same issue pattern (${termResult.detector ?? termResult.reason}). Goal: ${manifest.goal}. Try a different approach. What assumption are you making that might be wrong?`
         );
         console.log(`[loop-enforcer] 🔄 Ralph Loop injected for ${slug} (${termResult.reason})`);
         return;
       }
 
-      notify(manifest, "cap_fired", termResult.reason);
+      notify(manifest, "cap_fired", termResult.detector ?? termResult.reason);
       console.log(`[loop-enforcer] 🛑 Cap fired: ${termResult.reason} — ${termResult.message}`);
       if (termResult.escalate) {
         const escalation = resolveEscalation(manifest);
         const chain = escalation ? escalation.path.join(" → ") : "unknown";
-        manifest.human_gate_flags.push(`cap-escalate:${termResult.reason} → ${chain}`);
-        notify(manifest, "escalation_needed", `${termResult.reason} | chain: ${chain} | target: ${escalation?.target || "unknown"}`);
+        // #847 cycle-3 — this is the ORDINARY path: it runs before the completion
+        // branch below, so it is the only human-gate write for a cron/trigger/
+        // continuous loop, and the first of two for a completion loop that
+        // HARD-STOPS (for one that soft-pauses it is the only one — that branch
+        // returns before the second push).
+        // With the bare layer reason it persisted `cap-escalate:L3-deadlock` for
+        // BOTH detectors — the exact ambiguity the detector field exists to remove.
+        manifest.human_gate_flags.push(`cap-escalate:${termResult.detector ?? termResult.reason} → ${chain}`);
+        notify(manifest, "escalation_needed", `${termResult.detector ?? termResult.reason} | chain: ${chain} | target: ${escalation?.target || "unknown"}`);
         console.log(`[loop-enforcer] 🚨 Escalation: ${termResult.reason} → ${chain}`);
       }
       // Non-completion loops don't terminate on cap — they reset for next trigger
@@ -1757,13 +1818,22 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         if (currentResets < maxResets) {
           // Soft pause — allow user to restart session with fresh context
           manifest.context_resets = currentResets + 1;
-          manifest.cycles = manifest.cycles.slice(-1); // reset counter, keep last fingerprint
-          manifest.exit_reason = termResult.reason;
+          manifest.cycles = manifest.cycles.slice(-1); // reset counter, keep only the most recent cycle
+          // Restored (#847 cycle-4 review): this line is present at `5612d07` and
+          // was dropped without explanation while the `exit_reason` line below it
+          // was rewritten. `session_start` recovery requires `status === "running"`,
+          // so this is not a no-op for a paused loop resumed by a new session.
           manifest.status = "running";
+          // #847 — persist the DETECTOR, not just the layer, when L3 fired:
+          // `reason` is "L3-deadlock" for both stalls, so storing it alone made
+          // the canonical exit vocabulary (`fingerprint-stall` / `honest-stuck`)
+          // unreachable in the persisted record. `?? reason` keeps every other
+          // layer's value byte-identical (none of them set `detector`).
+          manifest.exit_reason = termResult.detector ?? termResult.reason;
           writeManifest(slug, manifest);
           
           const usage1 = extractLastUsage(process.cwd());
-          logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_paused", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1?.input, tokens_out: usage1?.output, total_tokens: usage1?.totalTokens, cost_usd: usage1?.cost } });
+          logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_paused", data: { exit_reason: manifest.exit_reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1?.input, tokens_out: usage1?.output, total_tokens: usage1?.totalTokens, cost_usd: usage1?.cost } });
           
           pi.sendUserMessage(
             `[loop-enforcer] Loop '${slug}' hit cycle cap. Restart your Pi session to resume with fresh context. (Reset ${manifest.context_resets}/${maxResets})`,
@@ -1777,20 +1847,23 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
         
         // Max resets reached — hard stop
         manifest.status = "complete";
-        manifest.exit_reason = termResult.reason;
+        manifest.exit_reason = termResult.detector ?? termResult.reason;
         manifest.resume_from_cycle = null;
         manifest.cycles.push({
           number: nextCycle, verdict: "NEEDS_FIX", issues_found: 1,
-          exit_signal: `cap:${termResult.reason}`, timestamp: new Date().toISOString(),
+          // #847 cycle-3 — `cap:` prefix preserved (scheduler.ts matches
+          // `startsWith("cap:")`), cause disambiguated. Without this the cycle row
+          // read `cap:L3-deadlock` beside an `exit_reason` of `honest-stuck`.
+          exit_signal: `cap:${termResult.detector ?? termResult.reason}`, timestamp: new Date().toISOString(),
         });
         writeManifest(slug, manifest);
         const usage1b = extractLastUsage(process.cwd());
-        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1b?.input, tokens_out: usage1b?.output, total_tokens: usage1b?.totalTokens, cost_usd: usage1b?.cost } });
+        logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: manifest.exit_reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, context_resets: manifest.context_resets, tokens_in: usage1b?.input, tokens_out: usage1b?.output, total_tokens: usage1b?.totalTokens, cost_usd: usage1b?.cost } });
         if (termResult.escalate) {
           const escalation = resolveEscalation(manifest);
           const chain = escalation ? escalation.path.join(" → ") : "unknown";
-          manifest.human_gate_flags.push(`cap-escalate:${termResult.reason} → ${chain}`);
-          notify(manifest, "escalation_needed", `${termResult.reason} | chain: ${chain}`);
+          manifest.human_gate_flags.push(`cap-escalate:${termResult.detector ?? termResult.reason} → ${chain}`);
+          notify(manifest, "escalation_needed", `${termResult.detector ?? termResult.reason} | chain: ${chain}`);
         }
         clearBridgeState();
         activeLoopSlugs.clear();
@@ -1800,13 +1873,13 @@ const MANIFEST_MTIME_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
       }
       // Cron/trigger/continuous: cap fires, but loop resets for next trigger rather than exiting
       const capUsage = extractLastUsage(process.cwd());
-      logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.reason, cycles: manifest.cycles?.length ?? 0, escalate: termResult.escalate, tokens_in: capUsage?.input, tokens_out: capUsage?.output, total_tokens: capUsage?.totalTokens, cost_usd: capUsage?.cost } });
+      logCost({ loop_id: slug, loop_type: manifest.loop_type, team: manifest.subject?.team, role: manifest.subject?.role, event: "cap_fired", data: { exit_reason: termResult.detector ?? termResult.reason, detector: termResult.detector, cycles: manifest.cycles?.length ?? 0, escalate: termResult.escalate, tokens_in: capUsage?.input, tokens_out: capUsage?.output, total_tokens: capUsage?.totalTokens, cost_usd: capUsage?.cost } });
       if (!manifest.trigger_history) manifest.trigger_history = [];
       manifest.trigger_history.push({
         trigger_id: `${slug}-${Date.now()}`,
         started_at: new Date().toISOString(),
         cycles: manifest.cycles?.length || 0,
-        verdict: termResult.reason,
+        verdict: termResult.detector ?? termResult.reason,
         tokens_consumed: capUsage?.totalTokens || 0,
       });
       console.log(`[loop-enforcer] ${manifest.loop_type} loop — cap ${termResult.reason}, resetting for next trigger`);

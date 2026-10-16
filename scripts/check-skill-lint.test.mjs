@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 /**
- * check-skill-lint.test.mjs — CI fixture-regression test for the #254
- * frontmatter validator. No pi import (the dev oracle test owns pi parity).
+ * check-skill-lint.test.mjs — CI suite for the #254 frontmatter validator. No pi
+ * import (the dev oracle test owns pi parity). Single-purpose as of #666: the
+ * #637 pi-pin lockstep tripwires (h)/(i)/(j) were extracted into
+ * scripts/check-pi-pin-lockstep.mjs (plan alternative F). Both suites are run by
+ * ONE `ci.yml` `test-command` (a failure accumulator), so they still share a
+ * single `ci / unit-test` signal — the split makes a validator regression and a
+ * pin-drift failure distinguishable in that job's LOG, and guarantees both
+ * always run, but a separate check CONTEXT is #673.
  *
  * Run: node scripts/check-skill-lint.test.mjs
  *
@@ -14,7 +20,9 @@
  *   (e) extraction-edge fixtures (BOM/CRLF/`---abc`/indented-`---`/
  *       missing-closing/empty) — verdict + extraction-mirror assertions
  *   (f) name≠dir with quoted-name regression (quote-aware data)
- *   (g) 121-tree sweep: validator over skills/ → ZERO findings
+ *   (f2) issue-381 structural rules (subjects.team + mandatory blocks)
+ *   (g) 122-tree sweep: validator over skills/ → ZERO findings
+ * The pi-pin lockstep tripwires live in scripts/check-pi-pin-lockstep.mjs.
  *
  * Repo-convention harness: node:assert, custom test() with ✅/❌ markers,
  * process.exit(1) on failure (load-gate.test.mjs pattern). Assertion markers
@@ -85,7 +93,7 @@ section("fixture verdict classes match expected");
 
 test(`FIXTURES module loads (${FIXTURES.length} fixtures, pi pin ${PI_VERSION_PIN})`, () => {
   assert.ok(FIXTURES.length >= 100, "matrix should cover every enumerated class");
-  assert.equal(PI_VERSION_PIN, "0.84.3");
+  assert.equal(PI_VERSION_PIN, "0.85.1");
 });
 
 for (const fx of FIXTURES) {
@@ -296,8 +304,8 @@ test("missing continuity directive → P0 mandatory-blocks (Continue following),
   assert.match(r.stdout, /\[P0\] mandatory-blocks: missing 'Continue following the workflow' continuity directive/);
 });
 
-// ── (g) 121-tree sweep — zero false positives ───────────────────────────────
-section("121-tree sweep — zero findings (zero false positives)");
+// ── (g) 122-tree sweep — zero false positives ───────────────────────────────
+section("122-tree sweep — zero findings (zero false positives)");
 
 test(`validator over ${SKILLS_DIR} → zero findings`, () => {
   assert.ok(fs.existsSync(SKILLS_DIR), "skills tree exists");
@@ -311,7 +319,7 @@ test(`validator over ${SKILLS_DIR} → zero findings`, () => {
     }
   };
   walk(SKILLS_DIR);
-  assert.ok(files.length >= 120, `expected the 121-file corpus, found ${files.length}`);
+  assert.ok(files.length >= 122, `expected the 122-file corpus, found ${files.length}`);
   const offenders = [];
   for (const f of files) {
     const r = validateFrontmatter(fs.readFileSync(f, "utf8"));

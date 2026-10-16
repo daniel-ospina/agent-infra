@@ -230,22 +230,22 @@ expr.setVariable("name", userName);
 
 ```bash
 # SQL Injection
-grep -rn "execute.*+" --include="*.py"
-grep -rn "raw_sql\|rawQuery\|raw(" --include="*.py" --include="*.js"
-grep -rn "\\.query\\(.*\\+" --include="*.js"
-grep -rn "\\$.*\\+" --include="*.php"
+git grep -n -e "execute.*+" -- '*.py'
+git grep -n -e "raw_sql\|rawQuery\|raw(" -- '*.py' '*.js'
+git grep -n -e "\\.query\\(.*\\+" -- '*.js'
+git grep -n -e "\\$.*\\+" -- '*.php'
 
 # Command Injection
-grep -rn "os\\.system\\|subprocess\\.run.*shell=True\\|os\\.popen" --include="*.py"
-grep -rn "child_process\\.exec" --include="*.js"
-grep -rn "system(\\|exec(\\|shell_exec(" --include="*.php"
+git grep -n -e "os\\.system\\|subprocess\\.run.*shell=True\\|os\\.popen" -- '*.py'
+git grep -n -e "child_process\\.exec" -- '*.js'
+git grep -n -e "system(\\|exec(\\|shell_exec(" -- '*.php'
 
 # Template Injection
-grep -rn "Template(.*\\+" --include="*.py"
-grep -rn "render_template_string" --include="*.py"
+git grep -n -e "Template(.*\\+" -- '*.py'
+git grep -n -e "render_template_string" -- '*.py'
 
 # LDAP Injection
-grep -rn "ldap_search\\|ldap_bind" --include="*.py" --include="*.php"
+git grep -n -e "ldap_search\\|ldap_bind" -- '*.py' '*.php'
 ```
 
 ---

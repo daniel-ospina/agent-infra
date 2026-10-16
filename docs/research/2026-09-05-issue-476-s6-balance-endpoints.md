@@ -59,6 +59,13 @@ aboutObjects: agent-infra, pi, api.deepseek.com, openrouter.ai, issue-476
 - Poller parse hazards: DeepSeek balances are string-typed; multi-currency entries exist; 401/403 = SKIP (auth class), 5xx/timeout = defer+escalate.
 
 ## Implications for the #476 design (Phase 5 poller)
+
+> ⚠️ **PARTLY SUPERSEDED (2026-09-28, #1512 / #1508).** The bullet below frames a
+> `SET`-on-~0 decision. The poller no longer sets a latch on any balance verdict:
+> at/below `DBW_WARN_USD` (default 30) it only **WARNS**. A pre-emptive switch on a
+> balance warning routed every dispatch to a keyless provider (2026-09-28). The
+> hard-stop signal is an observed 402 marker. Kept as the dated research record.
+
 - `deepseek-balance-watch.sh` parses `balance_infos` with float conversion of string totals, keys the threshold on the USD entry (deepseek official spend currency), and treats 401/403 as SKIP (never SET on auth failure — the SET-on-~0 decision must come from a 200 with parsed ~0 balance or the documented exhaustion signature, not from an auth error).
 - OpenRouter leg probe = `/auth/key` 200 + `limit_remaining` above threshold.
 - Notices carry per-provider action_url (deepseek top-up page; openrouter credits page).

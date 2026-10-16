@@ -407,22 +407,22 @@ def create_data():
 
 ```bash
 # Debug mode
-grep -rn "debug.*=.*[Tt]rue\|DEBUG.*=.*[Tt]rue" --include="*.py" --include="*.js" --include="*.json"
+git grep -n -e "debug.*=.*[Tt]rue\|DEBUG.*=.*[Tt]rue" -- '*.py' '*.js' '*.json'
 
 # CORS wildcards
-grep -rn "Access-Control-Allow-Origin.*\*\|origins.*\*\|origin.*\*" --include="*.py" --include="*.js"
+git grep -n -e "Access-Control-Allow-Origin.*\*\|origins.*\*\|origin.*\*" -- '*.py' '*.js'
 
 # SSL verification disabled
-grep -rn "verify.*=.*[Ff]alse\|rejectUnauthorized.*false\|NODE_TLS_REJECT_UNAUTHORIZED" --include="*.py" --include="*.js"
+git grep -n -e "verify.*=.*[Ff]alse\|rejectUnauthorized.*false\|NODE_TLS_REJECT_UNAUTHORIZED" -- '*.py' '*.js'
 
 # Default credentials
-grep -rn "password.*=.*['\"]admin\|password.*=.*['\"]root\|password.*=.*['\"]123456" --include="*.py" --include="*.yaml" --include="*.yml"
+git grep -n -e "password.*=.*['\"]admin\|password.*=.*['\"]root\|password.*=.*['\"]123456" -- '*.py' '*.yaml' '*.yml'
 
 # Missing security headers (check for absence)
-grep -rn "after_request\|middleware" --include="*.py" | grep -v "X-Content-Type-Options\|X-Frame-Options"
+git grep -n -e "after_request\|middleware" -- '*.py' | grep -v "X-Content-Type-Options\|X-Frame-Options"
 
 # Exposed endpoints
-grep -rn "@app.route.*debug\|@app.route.*admin\|@app.route.*config\|/actuator" --include="*.py" --include="*.java"
+git grep -n -e "@app.route.*debug\|@app.route.*admin\|@app.route.*config\|/actuator" -- '*.py' '*.java'
 ```
 
 ---

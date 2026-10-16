@@ -65,13 +65,19 @@ The write operations appear once in this skill (by operation name). Invoke them 
 
 ## Mitigation Ranges
 
-Mitigations reduce claim confidence. Range: **0.10–0.50**.
+Mitigations dampen the OPERATOR's effective EP weight. Range: **0.10–0.50**
+(single source of truth: `tortoise/weights.py` module docstring, #2315):
 
-- 0.10: Minor caveat (claim is mostly true)
-- 0.30: Significant limitation
-- 0.50: Major counter-evidence (claim is substantially weakened)
+- 0.10: Minor caveat (claim is mostly true) — keeps 90% of the weight
+- 0.30: Significant limitation — keeps 70% of the weight
+- 0.50: Major counter-evidence (claim is substantially weakened) — keeps
+  50% of the weight (strongest sanctioned mitigation)
 
 Never use <0.10 (negligible) or >0.50 (would invert the claim — use NAND instead).
+
+Formula: `w_eff = w × (1 − strength)` — the mitigation is a graded
+DAMPENER, never a refutation (a mitigated NAND stays a contradiction, only
+weaker).
 
 ## The Critical Semantic: Truth vs Weight
 
@@ -81,7 +87,7 @@ When a claim faces challenge, you have two tools. They address different things:
 |---|------|-------------|
 | **What it says** | "This claim is FALSE" | "This claim is TRUE but matters LESS than it seems" |
 | **Dimension** | Correctness | Relevance |
-| **Effect on EP** | Contradiction propagates through graph | Confidence reduction on the edge |
+| **Effect on EP** | Contradiction propagates through graph | Dampens the operator's weight: `w_eff = w × (1 − strength)` (#2315) |
 | **Applies to** | The argument Point directly | The operator (IMPL connection) between argument and what it supports |
 
 **The golden rule:** Relevance lives on the OPERATOR, truth lives on the POINT.
@@ -275,13 +281,13 @@ Before creating a new evidence point, search whether it already exists:
 These run against a local FalkorDB via the SDK — the self-hosted path. Hosted tenants run the identical pattern with the MCP tools (`tortoise_create_point` → `tortoise_create_operator` → `tortoise_compute_confidence`); the scripts are reference implementations of the flow, not a hosted requirement.
 
 ### `graph-scripts/file_pricing_decision.py`
-Compares Pro/Team pricing options ($29/$49/$79) using criteria (competitor positioning, conversion rate, ARPU) and findings (devtool sweetspot, OSS conversion rates). Wires IMPL to chosen options, NAND to rejected ones. EP computes per-option confidence.
+Compares Pro ($29/$49/$79) and Team ($99 flat / $199 flat / $99+$20-per-seat) pricing options using criteria (competitor positioning, conversion rate, ARPU, and others) and findings (devtool sweetspot, OSS conversion rates, and others). Wires IMPL to chosen options, NAND to rejected ones. EP computes per-option confidence. **⚠️ Superseded prices — this is a worked example of the flow, not our price list.** The decided tiers are **free $0 · solo $9 · pro $25 · team $149** in `daniel-ospina/tortoise`'s `product/pricing.json` (`"status": "current"`, `"owner_confirmed": "2026-08-07"`).
 
 ### `graph-scripts/decide_licensing.py`
 Compares 3 license options (AGPLv3-dual, BSL+AGPL, SSPL) using 7 criteria and 20+ findings. Full pattern: criteria → options → findings → edges → compute_confidence → ranked output. Run as:
 
 ```bash
-TORTOISE_DB_URI=docker://:@localhost:16379/tortoise python3 graph-scripts/decide_licensing.py
+TORTOISE_DB_URI=docker://:@127.0.0.1:16379/tortoise python3 graph-scripts/decide_licensing.py
 ```
 
 ### `graph-scripts/decide.py`
@@ -458,11 +464,24 @@ sdk.expand_kind("WorkItem")  # returns ["dev:issue", "pm:task", ...]
 
 | Source | URI resolution | Behavior when unset |
 |--------|----------------|---------------------|
-| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@localhost:16379/tortoise`; a repo-root `.env` only fills keys `.mcp.json` does **not** set (useful for SDK scripts / direct launches — `.mcp.json` env always wins for the MCP server) | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
+| **MCP server (local)** | `TORTOISE_DB_URI` in `.mcp.json` — defaults to local `docker://:@127.0.0.1:16379/tortoise`; a repo-root `.env` only fills keys `.mcp.json` does **not** set (useful for SDK scripts / direct launches — `.mcp.json` env always wins for the MCP server) | Fails loud on startup (exit 1) — never silently connects to an empty embedded graph (`TORTOISE_ALLOW_EMBEDDED=1` is the test-only escape hatch) |
 | **SDK / graph-scripts** | `os.environ["TORTOISE_DB_URI"]` (or `FalkorProjection.from_uri`) | Embedded redislite (dev/test only) |
 | **Hosted API** | `FALKORDB_CLOUD_URI` secret → `TORTOISE_DB_URI` via entrypoint | Refuses to start without it |
 
 Supported URI schemes: `docker://` (local), `redis://` / `rediss://` (accepted so the hosted API can consume cloud connection strings).
+
+> ❗ **Use `127.0.0.1`, never `localhost`, for the local port `16379`.** `localhost` is **not** a
+> synonym for `127.0.0.1` here, because it resolves **IPv6-first** (`::1` before `127.0.0.1` on
+> macOS). If a second FalkorDB is ever bound on `::1:16379` — an ephemeral dev container,
+> another OrbStack service, a re-created sandbox — then `localhost:16379` reaches **that**
+> near-empty instance instead of the canonical one, and the failure is silent: writes **report
+> success** and the node is then "gone", because it landed on the other server. The canonical
+> local instance is **`127.0.0.1:16379`**. Bind to the address, never to the name.
+>
+> A connectivity check cannot tell the two apart — a bare connect succeeds against **either**
+> server. Verify by **reading back a point that must exist** (the objective cascade), never by
+> connecting. A connectivity test is not a persistence test, and a successful write is not a
+> durable one. (Root cause and measurement: tortoise#6666.)
 
 ## Always Verify First
 
@@ -488,11 +507,11 @@ Agent: "The graph has no licensing data. I'll create evidence from scratch."
        (files 20+ duplicate points on the wrong graph)
 ```
 
-**Fix:** point local tooling at the local FalkorDB. The default in `.mcp.json` is `docker://:@localhost:16379/tortoise` (the designated local container); override in the repo-root `.env` (gitignored — never commit credentials) if your local target differs.
+**Fix:** point local tooling at the local FalkorDB. The default in `.mcp.json` is `docker://:@127.0.0.1:16379/tortoise` (the designated local container, addressed by IP — see the `127.0.0.1` note above); override in the repo-root `.env` (gitignored — never commit credentials) if your local target differs.
 
 ```bash
 # .env (repo root, gitignored) — LOCAL target only
-TORTOISE_DB_URI=docker://:@localhost:16379/tortoise
+TORTOISE_DB_URI=docker://:@127.0.0.1:16379/tortoise
 ```
 
 Restart the MCP server after changing the URI — the connection is resolved once at startup. Do **not** point local tooling at the hosted (cloud) instance.
@@ -571,7 +590,7 @@ and terminal statuses too). The sanctioned promotion routes:
 - `promotion_policy="auto"` opts into #131 parity (source auto-promotion on
   first edge write) — the migration path from the old default.
 
-The response carries `warnings` (never fatal) — see the ELEVEN-key table.
+The response carries `warnings` (never fatal) — see the TWELVE-key table.
 
 ## Idempotent resubmission
 
@@ -595,9 +614,24 @@ by the retry (content+kind fallback scan), never duplicated.
 
 | Connection | Route | Result |
 |---|---|---|
-| Plain `operator: IMPL/NAND` | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
+| Plain `operator: IMPL/NAND` — **any endpoint is a plain `:Point`** | Operator point | `{"operator_id", "deduped"}` |
+| Plain `operator: IMPL/NAND` — **both endpoints non-Point** (e.g. `Object↔Object`) | Direct edge (operator-less) | `{"direct_edge", "from", "to", "deduped"}` |
 | `mitigation` / `reify: true` | Operator point | `{"operator_id", "deduped"}` |
 | `relation` | Structural edge | `{"relation", "from", "to", "deduped"}` |
+
+⛔ **Point↔Point relations are operator-mediated** (owner ruling 2026-10-13, tortoise #8499) — an
+operator-less edge carries no operator node, so it can be neither mitigated nor annotated, and it
+cannot carry the epistemic weighting a Point's relations claim. (Durability was the ruling's
+original third argument — plain direct edges were journaled but never replayed, so `rebuild_all`
+lost them — but #8499 landed the `DirectEdgeCreated` replay fold, so they survive a rebuild now
+too; the ruling does not rest on that argument any more.) The direct shape is reserved for
+`Object↔Object`, where no epistemic weighting is claimed. Write `reify: true` to say the operator
+route explicitly; a plain spelling that gets re-routed is reported as the `point_mediated_route`
+warning. Note `ingest`'s connection contract admits only plain `:Point` endpoints today (sole
+carve-out: an `Event` on the operator route), so in practice every plain `IMPL`/`NAND` in a bundle
+is operator-mediated and returns the bare operator-id string — the `{direct_edge, from, to}`
+descriptor is what `create_direct_edge` returns for an `Object↔Object` pair, while `create_edge`
+writes a *relation* edge (`{relation, from, to}`) instead.
 
 Multi-item `to` on a plain IMPL/NAND connection: use `reify:true` /
 mitigation (the operator route) or split into singular connections.
@@ -612,7 +646,7 @@ mitigation (the operator route) or split into singular connections.
   rejections — migrate via `reify:true` ×2 (the operator route preserves
   both labels).
 
-## Warnings — the ELEVEN keys (closed set)
+## Warnings — the TWELVE keys (closed set)
 
 `warnings` entries are key-prefixed strings. A key outside this table is a
 divergence — report it:
@@ -621,7 +655,8 @@ divergence — report it:
 · `mitigation_drift_duplicate` · `nfc_straddle_duplicate` ·
 `mitigation_strength_change` · `partial_operator_residue` ·
 `operator_absorb_completed` · `label_dropped_resubmit` ·
-`direction_dropped_resubmit` · `direction_changed_resubmit`
+`direction_dropped_resubmit` · `direction_changed_resubmit` ·
+`point_mediated_route`
 
 ## Query-back verification (J8 exit state)
 

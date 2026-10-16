@@ -52,6 +52,7 @@ import {
   isLatched,
   failoverDisabled,
   renderExhaustionMarker,
+  dispatchUnkeyedSet,
 } from "./shared/provider-failover.js";
 import type { ExhaustionMarker } from "./shared/provider-failover.js";
 
@@ -90,8 +91,8 @@ export function sessionFamily(model: string | undefined): string | undefined {
  * ({id, provider, api, baseUrl, ...} — empirically verified, round-2 P0); an
  * id string is accepted defensively (legacy/harness). Returns the parts the
  * pure helpers consume. NEVER feed the raw ctx.model into string parsing: an
- * openrouter leg id is "deepseek/deepseek-v4-flash" (slash INSIDE the id) and
- * must not be split as provider/model. */
+ * openrouter leg id is "deepseek/deepseek-v4.1-flash" (#727; slash INSIDE the
+ * id) and must not be split as provider/model. */
 export function modelParts(ctxModel: unknown): { provider: string; model: string } {
   if (ctxModel && typeof ctxModel === "object") {
     const m = ctxModel as { id?: unknown; provider?: unknown };
@@ -148,11 +149,12 @@ export function interactiveHopTarget(
   leg: { provider: string; model: string } | undefined,
   state: ReturnType<typeof readLatchState>,
   env: Record<string, string | undefined> = process.env,
+  unkeyed?: ReadonlySet<string>,
 ): { provider: string; model: string } | null {
   const { provider, model: id } = leg ?? { provider: "deepseek", model: "" };
   const fam = familyOf(id, provider);
   if (!fam) return null;
-  const outcome = resolveWithChain(fam, { provider, model: id }, state, { env });
+  const outcome = resolveWithChain(fam, { provider, model: id }, state, { env, unkeyed });
   if (outcome.halted || !outcome.leg) return null;
   if (outcome.leg.provider === provider && outcome.leg.model === id) return null;
   return outcome.leg;
@@ -186,10 +188,12 @@ export function interactiveRestoreTarget(
 let pendingMarker: string | null = null;
 
 // ── #512 per-dispatch usage capture (child side, TASK_USAGE_CAPTURE=1) ──
-// The task tool's children run --no-session (no persisted session file), so
-// per-dispatch token usage for the 0a cache-fraction gate has NO existing
-// data source. When the parent opts in (TASK_USAGE_CAPTURE=1 flows to the
-// child env), the child accumulates message_end usage and emits ONE
+// Task children persist their own session now (#783 Task 1: fresh
+// --session-id + --session-dir under TASK_SESSION_ROOT), but per-dispatch
+// token usage for the 0a cache-fraction gate is still not readable from the
+// parent's side without parsing that transcript. When the parent opts in
+// (TASK_USAGE_CAPTURE=1 flows to the child env), the child accumulates
+// message_end usage and emits ONE
 // [task-usage] stderr line at session_shutdown (same writeSync channel + nonce
 // as the exhaustion marker — the parent authenticates and appends its
 // dispatch-usage ledger). Default OFF → byte-identical behavior.
@@ -450,6 +454,7 @@ export default function (pi: ExtensionAPI) {
       source: "interactive",
       family: fam,
       fromLeg: { provider, model },
+      unkeyed: dispatchUnkeyedSet(ctx.modelRegistry, fam),
       notice: { title: "Provider credit exhausted", body: detail },
       env: process.env,
     });
@@ -478,6 +483,21 @@ export default function (pi: ExtensionAPI) {
       // the primary anyway, and its banner would misattribute the drain).
       // Switch directly to the root leg (resolution treats a stale/absent
       // root record as clear → the primary is dispatchable).
+      //
+      // #1508 residual (T6b, deliberately not gated): this site does NOT consult
+      // the failover predicate. `switchModel` is NOT a credential check — it
+      // resolves the target with `ctx.modelRegistry.find(...)` (existence) and
+      // applies `pi.setModel`, reporting `false` when either fails; the notice
+      // below says "no configured auth" but the condition it actually tests is
+      // resolvability + `setModel`'s return. So this site can move the session
+      // onto a provider the registry reports unkeyed. It is a WEAKER instance of
+      // T1, not the same one: it selects the family ROOT rather than a hop
+      // ALTERNATIVE — the cold-start leg, which an unlatched resolution hands back
+      // verbatim — and it is an interactive session switch, not a dispatch.
+      // Gating the ROOT here would refuse the ambient/OAuth providers whose lookup
+      // falls through to the stale snapshot (T4), i.e. refuse a usable leg, so it
+      // is recorded rather than fixed. The DISPATCH path itself is gated: an
+      // unkeyed alternative is excluded by the predicate even from this state.
       const rootLeg = fam ? familyLegs(fam)?.[0] : undefined;
       if (rootLeg && (rootLeg.provider !== provider || rootLeg.model !== model)) {
         await switchModel(ctx, rootLeg, (ok) => {
@@ -492,7 +512,7 @@ export default function (pi: ExtensionAPI) {
     }
     // ROOT exhaustion (or a chain continuation under a fresh root latch): hop
     // the NEXT turn onto the chain's next available leg.
-    const target = interactiveHopTarget({ provider, model }, state);
+    const target = interactiveHopTarget({ provider, model }, state, process.env, dispatchUnkeyedSet(ctx.modelRegistry, fam));
     if (target) {
       await switchModel(ctx, target, (ok) => {
         if (!ok) {
@@ -557,7 +577,7 @@ export default function (pi: ExtensionAPI) {
       const root = rootPrimaryOfFamily(fam);
       if (root && state.primaries?.[root] && isLatched(root, state)) latchSeenFamilies.add(fam);
     }
-    const target = interactiveHopTarget(parts, state);
+    const target = interactiveHopTarget(parts, state, process.env, dispatchUnkeyedSet(ctx.modelRegistry, fam));
     if (target) {
       await switchModel(ctx, target, (ok) => {
         if (ok) {

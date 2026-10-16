@@ -8,9 +8,11 @@
 // provides pure decision functions for the guard's M1 (warn on branch
 // deviation), M2 (block commit/push off-baseline), M3 (gate branch-state
 // mutations), and the ownership allowance (own-branch hygiene ops in
-// agent-infra main). `original` = the branch recorded at session_start BEFORE
-// any create-new re-baseline — immutable; M3's #376 ceremony return-to-main
-// carve-out lets a session switch back to it.
+// agent-infra main). `original` = the branch recorded at session_start —
+// immutable; M3's #376 ceremony return-to-original carve-out lets a session
+// switch back to it. (In-hub create-new re-baselines are gone since #626:
+// agent-infra main blocks `checkout -b` like every hub — branch creation
+// happens in worktrees, which never reach these gates.)
 //
 // Deliberately self-contained: it must NOT import classify-git.mjs (keeps the
 // destructive-git classifier dependency-free for jiti loading, per the #99
@@ -414,26 +416,49 @@ export function resolveEffectiveRepo(command, sessionCwd, preferVerb = null, pre
  * Returns null when git fails (caller applies fail-closed policy).
  * @param {{cdChain?: Array<string|null>, cHints?: string[], gitDirHint?: string|null, vars?: object}|null} inv
  * @param {string} [sessionCwd]
+ * @returns {{repoKey: string|null, gitDir: string, effectiveCwd: string, isWorktree: boolean, isBare: boolean, currentBranch: string|null, unresolvedTarget: boolean}|null}
+ *   `unresolvedTarget` is true when any `cd`/`-C`/`--git-dir` hint could not be
+ *   resolved (bare `cd`, an unexpandable `$VAR`, or classify-git's `\u0000`
+ *   sentinel). The repo fields then describe the CONSERVATIVE session-cwd
+ *   fallback, but a safety gate must REFUSE — never exempt as a worktree —
+ *   when the effective target is unverifiable (#805).
  */
 export function resolveRepoFromInv(inv, sessionCwd = process.cwd()) {
   if (!inv) return null;
   let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  // #805: an UNRESOLVED target hint means the command's effective repo cannot
+  // be determined. Keep the conservative session-cwd fallback (so the returned
+  // repo is a valid reference point) but FLAG it — the pre-#805 behaviour let
+  // `cd $UNRESOLVED && git commit` from a worktree session fall back to the
+  // session's own (exempt) worktree and land on the shared hub's foreign
+  // branch (the 2026-09-12 incident).
+  let unresolvedTarget = false;
   for (const cd of inv.cdChain || []) {
-    if (!cd) continue;
+    if (!cd) { unresolvedTarget = true; continue; } // bare cd / cd- → unknown
     const expanded = _expandCdVars(cd, inv.vars);
     // #337: an unresolvable `$VAR` cd target (no same-command assignment) must
     // NOT resolve to a bogus literal path (`<cwd>/$WT` → git read fails →
     // fail-closed block). Conservatively fall back to the session cwd — the
-    // KNOWN reference point (the hub/main checkout) so the main-checkout gates
-    // still apply rather than guessing a worktree.
-    if (expanded === null) continue;
+    // KNOWN reference point — and FLAG the target as unresolved (#805) so the
+    // caller fails closed instead of exempting a worktree.
+    if (expanded === null) { unresolvedTarget = true; continue; }
     cwd = resolve(cwd, expanded); // bash: `cd a && cd b` ends in b, relative to a
   }
   for (const c of inv.cHints || []) {
-    if (!c) continue;
+    if (!c) { unresolvedTarget = true; continue; }
+    // classify-git emits the `\u0000` sentinel for an unresolvable `-C`/`$VAR`
+    // (its own resolveInvocationTarget treats it conservatively); the
+    // branch-ownership layer must agree — never resolve it to a bogus path.
+    if (String(c).includes("\u0000")) { unresolvedTarget = true; continue; }
     cwd = resolve(cwd, c); // -C resolves relative to the current cwd, in order
   }
-  const gitDir = inv.gitDirHint ? resolve(cwd, inv.gitDirHint) : join(cwd, ".git");
+  let gitDir;
+  if (typeof inv.gitDirHint === "string" && inv.gitDirHint.includes("\u0000")) {
+    unresolvedTarget = true;
+    gitDir = join(cwd, ".git");
+  } else {
+    gitDir = inv.gitDirHint ? resolve(cwd, inv.gitDirHint) : join(cwd, ".git");
+  }
   const state = readBranchState(cwd, gitDir);
   if (!state) return null;
   return {
@@ -448,6 +473,8 @@ export function resolveRepoFromInv(inv, sessionCwd = process.cwd()) {
     // refuses to touch the checked-out branch) must not fire there.
     isBare: _isBareGitDir(state.gitDir),
     currentBranch: state.branch,
+    // #805: fail-closed signal — the caller must refuse an unverifiable target.
+    unresolvedTarget,
   };
 }
 
@@ -466,11 +493,12 @@ function _isBareGitDir(gitDir) {
   }
 }
 
-/** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments.
- * Returns the expanded path, or null when any `$VAR` is unresolvable (caller
- * falls back to the session cwd — conservative, #337). Tilde/home expansion is
- * out of scope (unchanged from the pre-#337 behavior). */
-function _expandCdVars(token, vars) {
+/** Expand `$VAR` / `${VAR}` in a cd target against same-command assignments,
+ * then the process environment. Returns the expanded path, or null when any
+ * `$VAR` is unresolvable (caller falls back to the session cwd — conservative,
+ * #337 — AND flags the target unforeseen so the gate fails closed, #805).
+ * Tilde/home expansion is out of scope (unchanged from the pre-#337 behavior). */
+function _expandCdVars(token, vars, env = process.env) {
   let t = String(token ?? "").replace(/^["']|["']$/g, "");
   if (!t.includes("$")) return t;
   const map = vars || {};
@@ -478,6 +506,13 @@ function _expandCdVars(token, vars) {
   t = t.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g, (m, braced, plain) => {
     const name = braced ?? plain;
     if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    // #805: fall back to the process environment — `cd $AGENT_INFRA_PATH` is a
+    // documented spelling and the shell DOES resolve it. Resolving faithfully
+    // keeps a hub-rooted session's on-baseline command allowed; a name that is
+    // defined nowhere stays unresolved (the caller fails closed).
+    if (env && Object.prototype.hasOwnProperty.call(env, name) && env[name] != null) {
+      return String(env[name]);
+    }
     ok = false;
     return m;
   });
@@ -647,11 +682,26 @@ function _branchPositionals(args) {
 export function classifyBranchOp(subcmd, args) {
   const a = args || [];
   if (subcmd === "checkout" || subcmd === "switch") {
-    if (a.includes("--")) return { op: "other" };          // path-restore form
     const flag = (f) => a.includes(f);
-    if (flag("--orphan")) return { op: "orphan" };
-    if (flag("-B")) return { op: "force-create", branch: _branchAfter(a, "-B") };
-    if (flag("-b") || flag("-c")) return { op: "create-new", branch: _branchAfter(a, flag("-b") ? "-b" : "-c") };
+    // #626 security fold-in: recognize git's FULL create/force-create/orphan
+    // spelling surface — NOT just the exact space-separated shorts. git accepts
+    // the value ATTACHED to a short cluster (`checkout -bfoo` / `-fb foo` /
+    // `switch -cfoo` / `-Cfoo`), the long forms `--create[=v]` /
+    // `--force-create[=v]` / `--orphan[=v]` and their verb-appropriate
+    // unambiguous prefixes. Without this they fell through to switch-existing:
+    // `git checkout -bfoo main` misclassified as a switch to `main`, and when
+    // that equals baseline.original the #376 return-to-original arm re-baselined
+    // (allow) while git actually CREATED a branch and flipped the shared hub.
+    //
+    // ORDER MATTERS: the create scan runs BEFORE the `--` path-restore
+    // early-return. `git switch -c foo --` and `git checkout -B foo --` DO
+    // create and flip (probe-verified); `--` only neutralizes options that
+    // FOLLOW it. The helper returns null when it meets `--` before any create
+    // option, so `git checkout -- -b q` and `git checkout main -- f.txt` stay
+    // op "other" (path-restore).
+    const opt = _checkoutCreateOpt(subcmd, a);
+    if (opt) return { op: opt.kind, branch: opt.branch };
+    if (a.includes("--")) return { op: "other" };          // path-restore form
     if (flag("-f") || flag("--force") || flag("--discard-changes")) return { op: "force" }; // --discard-changes is git's force-switch alias (throws away local modifications — second-model gate fold-in)
     if (flag("--detach")) return { op: "detach" };
     if (a.includes("-")) return { op: "switch-existing", target: "-" }; // prev branch
@@ -767,9 +817,67 @@ export function classifyBranchOp(subcmd, args) {
   return { op: "other" };
 }
 
-function _branchAfter(args, flag) {
-  const idx = args.indexOf(flag);
-  return args[idx + 1] ?? null;
+/**
+ * #626: resolve a checkout/switch long option NAME to its create kind using
+ * git's parse-options UNAMBIGUOUS-PREFIX rules (probe-verified git 2.50.1).
+ * VERB-AWARE — the two verbs have different option tables:
+ *   git switch  : --create, --force-create, --orphan
+ *                 (`--cre=foo` ≡ `--create=foo`, `--force-c` ≡ `--force-create`)
+ *   git checkout: --orphan ONLY — it has NO --create/--force-create, so its
+ *                 `--c*` resolves to --conflict and `--f*` to --force. Those are
+ *                 VALID commands and must NOT classify as creates.
+ * `--force` (and for checkout `--f`/`--fo`/`--for`/`--forc`) is the force flag,
+ * not force-create → null. Ambiguous prefixes git itself rejects (switch `--c`,
+ * `--f`..`--forc`, `--o`; checkout `--o`) are still classified as their create
+ * kind — fail-closed on an rc-129 command is harmless.
+ * Returns "create-new" | "force-create" | "orphan" | null.
+ */
+function _longCreateKind(verb, name) {
+  if (!name) return null;
+  if ("orphan".startsWith(name)) return "orphan"; // both verbs have --orphan
+  if (verb === "switch") {
+    if (name === "force") return null; // --force: the force flag, not --force-create
+    if ("create".startsWith(name)) return "create-new";
+    if ("force-create".startsWith(name)) return "force-create";
+  }
+  return null;
+}
+
+/**
+ * #626: parse the create / force-create / orphan option from a checkout/switch
+ * argv, accepting git's FULL spelling surface:
+ *   - short cluster with the value ATTACHED (`checkout -bfoo` / `switch -cfoo` /
+ *     `-Cfoo`) or the value as the NEXT argv (`checkout -fb foo`);
+ *   - long forms `--create[=v]` / `--force-create[=v]` / `--orphan[=v]` AND
+ *     their unambiguous prefixes (`switch --cre=foo`, `switch --force-c main`,
+ *     `checkout --orph v`).
+ * Short letters: b/c → create-new, B/C → force-create. Scanning stops at a `--`
+ * terminator (path-restore form — never a branch option). Returns
+ * { kind, branch } or null. Fail-safe: a plausible create letter classifies as
+ * create/force-create → M3 blocks (git refuses invalid spellings anyway).
+ */
+function _checkoutCreateOpt(subcmd, args) {
+  for (let i = 0; i < args.length; i++) {
+    const x = args[i];
+    if (x === "--") return null;
+    const long = /^--([^=]+)(?:=(.*))?$/.exec(x);
+    if (long) {
+      const kind = _longCreateKind(subcmd, long[1]);
+      if (kind) return { kind, branch: long[2] !== undefined ? long[2] : (args[i + 1] ?? null) };
+    }
+    const sc = /^-(?!-)([A-Za-z]+)(.*)$/.exec(x);
+    if (sc) {
+      const letters = sc[1], rest = sc[2];
+      const k = letters.search(/[bBcC]/);
+      if (k !== -1) {
+        const L = letters[k];
+        const kind = (L === "b" || L === "c") ? "create-new" : "force-create";
+        const attached = letters.slice(k + 1) + rest;
+        return { kind, branch: attached.length > 0 ? attached : (args[i + 1] ?? null) };
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -802,15 +910,99 @@ export function decideM1(currentBranch, baselineBranch) {
  * Worktree-effective repos are exempt (isWorktree true → null).
  * pushTargets is authoritative when present (multi-refspec / --delete); else
  * pushDst, else currentBranch (bare push → push.default=simple).
+ *
+ * No-baseline callers (#805 P1) must also pass:
+ *   sessionRepoKey       — repoKey of the SESSION's cwd; the string/null
+ *                          distinction is load-bearing. A string means "the
+ *                          session's own checkout is that repo"; an explicit
+ *                          null means "the session cwd is not in any repo"
+ *                          (nothing of its own to contaminate); `undefined`
+ *                          means the caller did not say → fail closed.
+ *   effectiveIsAgentInfra — the resolved MAIN checkout is the agent-infra hub
+ *                          (protect it even for a session rooted elsewhere).
  */
 export function decideM2({
   effectiveRepo, baseline, currentBranch, pushDst, pushTargets, verdict, allowActive,
+  sessionRepoKey, effectiveIsAgentInfra = false,
 }) {
   if (allowActive) return null; // marker/flag: escape hatch — M2 inactive
-  if (!effectiveRepo || effectiveRepo.isWorktree) return null;
-  if (!baseline || effectiveRepo.repoKey !== baseline.repoKey) return null;
+  // #805: a gate that cannot determine the target must REFUSE, never allow.
+  // `!effectiveRepo` (git read failure) and `unresolvedTarget` (bare cd /
+  // unexpandable $VAR / `-C` sentinel) are BOTH indeterminate targets.
+  if (!effectiveRepo) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — could not determine the target repository.`,
+        `   The effective repo could not be resolved (git read failed or an`,
+        `   unresolvable cd/-C target); a safety gate refuses an unverifiable`,
+        `   target rather than exempting it (fail-closed, #805).`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.unresolvedTarget) {
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — the command's target repository is unresolved.`,
+        `   The command retargets its effective repo (cd/-C/--git-dir) to a path`,
+        `   that cannot be determined, so ownership cannot be verified (#805).`,
+        `   → Use an absolute path, or run the command from the target repo.`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.isWorktree) return null;
+  // #805: a MAIN-checkout commit/push by a session with no recorded baseline
+  // for that repo cannot prove ownership. Worktree sessions record no baseline
+  // (they are isolated), so a `cd`/`-C` into the shared hub previously slipped
+  // through — refuse it (fail-closed).
+  //
+  // #805 P1 (over-block regression): "no baseline" is TRUE for EVERY worktree
+  // session, so refusing every MAIN checkout also refused a worktree session
+  // committing in an UNRELATED repo (`cd ~/tortoise && git commit`) — work the
+  // session has no ownership relation to and that pre-#805 allowed. A gate that
+  // blocks legitimate work is as bad as one that allows illegitimate work: it
+  // gets disabled or routed around. The refine is: with no baseline, refuse
+  // ONLY a target this session could be contaminating — its OWN repo (a
+  // worktree shares its common dir, so `repoKey` equality is exactly "own
+  // shared checkout") or the agent-infra hub. Anything else falls through to the
+  // ordinary different-repo allow below.
+  if (!baseline) {
+    const ownCheckout = effectiveIsAgentInfra === true ||
+      (effectiveRepo.repoKey != null && effectiveRepo.repoKey === sessionRepoKey);
+    // `undefined` = the caller gave no session repo identity, and a null
+    // effectiveRepo.repoKey = the target's own identity could not be read:
+    // neither can tell whether this is the session's own checkout → refuse
+    // (fail closed). An explicit null sessionRepoKey with a KNOWN target repo
+    // is the genuinely-foreign case → fall through to the different-repo allow.
+    if (sessionRepoKey !== undefined && effectiveRepo.repoKey != null && !ownCheckout) return null;
+    return {
+      block: true,
+      reason: [
+        `⛔ Commit/push blocked — no branch baseline is recorded for the`,
+        `   resolved MAIN checkout, so ownership cannot be verified (#265/#805).`,
+        `   → Work in an isolated worktree (using-git-worktrees skill), or`,
+        `     operate on a checkout this session started in (baseline recorded).`,
+      ].join("\n"),
+    };
+  }
+  if (effectiveRepo.repoKey !== baseline.repoKey) return null;
   if (verdict === "block:commit") {
     if (currentBranch === baseline.branch) return null;
+    const recovery = baseline.original
+      ? [
+          `   → Work in an isolated worktree (using-git-worktrees skill), or`,
+          `     (agent-infra main only) switch back to the branch this session`,
+          `     STARTED on: \`git checkout ${baseline.original}\` — its recorded`,
+          `     original baseline (#376). In-hub checkout -b is NOT a recovery`,
+          `     (blocked, #626).`,
+        ]
+      : [
+          `   → Work in an isolated worktree (using-git-worktrees skill).`,
+          `     No original baseline was recorded (lock-contended/detached`,
+          `     session_start), so the #376 return is unavailable and in-hub`,
+          `     checkout -b is blocked (#626) — the worktree is the recovery.`,
+        ];
     return {
       block: true,
       reason: [
@@ -818,8 +1010,7 @@ export function decideM2({
         `   Session baseline branch: "${baseline.branch}"`,
         `   Resolved repo is on:      "${currentBranch ?? "detached HEAD"}"`,
         `   The shared checkout was switched out from under this session (#265).`,
-        `   → Recover your branch: git checkout -b <your-branch> (agent-infra) or`,
-        `     work in an isolated worktree (using-git-worktrees skill).`,
+        ...recovery,
       ].join("\n"),
     };
   }
@@ -828,7 +1019,21 @@ export function decideM2({
       ? pushTargets
       : (pushDst ? [pushDst] : [currentBranch]);
     targets = targets.map((t) => (t === "HEAD" ? currentBranch : t)).filter(Boolean);
-    if (targets.length === 0) return null;
+    // #805: an EMPTY target set means the push destination is indeterminate
+    // (no refspec, no pushDst, and no resolvable current branch — e.g. a
+    // detached/unresolvable HEAD). Refuse it (fail-closed); the pre-fix code
+    // returned null here, which is the exact bypass class this issue closes.
+    if (targets.length === 0) {
+      return {
+        block: true,
+        reason: [
+          `⛔ Push blocked — the push target could not be determined.`,
+          `   No refspec/upstream and no resolvable current branch — ownership`,
+          `   cannot be verified (fail-closed, #805).`,
+          `   → Push an explicit branch you own: git push <remote> <branch>.`,
+        ].join("\n"),
+      };
+    }
     if (targets.every((t) => t === baseline.branch)) return null;
     return {
       block: true,
@@ -847,10 +1052,12 @@ export function decideM2({
 
 /**
  * M3: gate branch-state mutations in the MAIN checkout.
- *   create-new (checkout -b / switch -c): allowed ONLY in agent-infra main →
- *     returns { reBaseline: <branch> } so the guard re-adopts the baseline
- *     SYNCHRONOUSLY (the allowed carve-out must never trigger a spurious M1
- *     warn on the next tool_call).
+ *   create-new (checkout -b / switch -c): BLOCKED in every main checkout —
+ *     agent-infra included since #626. The #99 in-main-work model (whose
+ *     ceremonies needed an in-hub `checkout -b`) was removed by #615; worktree
+ *     sessions are exempt BEFORE this gate (index.ts isWorktree continue), and
+ *     `git worktree add -b` is not a branchState op — so no legit flow needs an
+ *     in-hub create-new. Returns the block (never reBaseline).
  *   rename of the session's OWN baseline branch → { reBaseline: <to> } — but
  *     NOT onto an EXISTING branch that is neither the branch being renamed
  *     nor owned by this session (#598: renameDstExists + ownedBranches — that
@@ -861,14 +1068,16 @@ export function decideM2({
  *     (a detached 1-pos rename — from null — passes through to git's rc-128
  *     refusal, never a phantom reBaseline).
  *   switch-existing to the session's ORIGINAL baseline branch (baseline.original
- *     — the branch recorded at session_start BEFORE any create-new re-baseline):
- *     allowed in agent-infra main → { reBaseline: <target> } — the sanctioned
- *     post-ceremony return-to-main (#376). The target is the session's de-facto
- *     own baseline: the branch the shared tree was on when THIS session started
- *     (the lock serializes concurrent starts only — a resumed/overlapping start
- *     records whatever branch was current). Harm is bounded exactly like the
- *     create-new carve-out: M2 still blocks off-baseline commits. The
- *     synchronous re-baseline keeps the next tool_call's M1 warn silent.
+ *     — the branch recorded at session_start): allowed in agent-infra main →
+ *     { reBaseline: <target> } — the #376 recovery return-to-original (kept
+ *     after #626 as a RECOVERY path: a hub session switched out from under it
+ *     may switch back to the branch it STARTED on — its recorded original;
+ *     no skill ceremony uses it anymore since #615 ceremonies run in
+ *     worktrees, which never reach this gate). Unlike the removed create-new
+ *     carve-out it targets ONLY the session's own recorded start branch,
+ *     never an arbitrary new branch. Harm is bounded exactly as before: M2
+ *     still blocks off-baseline commits. The synchronous re-baseline keeps
+ *     the next tool_call's M1 warn silent.
  *   everything else (switch-existing to any OTHER branch / force / force-create
  *   / orphan / detach / symbolic-ref HEAD / update-ref refs/heads / branch -f
  *   targeting a branch other than the checkout's OWN current branch — #591:
@@ -889,15 +1098,30 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
   if (!branchOp) return null;
   const op = branchOp.op;
   if (op === "create-new") {
-    if (isAgentInfra) return { reBaseline: branchOp.branch };
+    // #626: the agent-infra create-new authorization is REMOVED. Post-#615 (in-
+    // main-work exemption gone, hub = main+clean) no legit flow creates a branch
+    // IN the agent-infra main checkout — implementers work in worktrees, where
+    // branch-state mutations are worktree-effective and never reach this gate
+    // (index.ts exempts isWorktree repos BEFORE decideM3), and `git worktree
+    // add -b` is not a branchState op at all (it creates a NEW ref without
+    // touching the hub HEAD; the `-B` sibling force-resets an EXISTING ref and
+    // is a residual, tracked separately). The former #99 rationale (in-main
+    // ceremonies) is gone with the exemption; the carve-out was the exact hole
+    // that let a stale-skill session flip the shared tree off-main. Worktree/
+    // own-baseline ceremonies need NO in-hub create-new: worktree creation is
+    // exempt upstream, and own-baseline returns use the #376 switch-existing
+    // arm below. Escape hatches (env/TTL marker) keep M2/M3 inactive for
+    // deliberate in-hub work (#265).
     return {
       block: true,
       reason: [
         `⛔ git checkout -b / switch -c blocked in the MAIN checkout.`,
         `   Why: creating a branch here switches the SHARED tree for every`,
-        `   parallel session (#265).`,
-        `   → Non-infra repos: create a worktree (using-git-worktrees skill).`,
-        `   → Agent-infra: this is allowed only for the infra repo itself.`,
+        `   parallel session (#265) — agent-infra included (the #99 in-main`,
+        `   work model was removed by #615).`,
+        `   → Create an isolated worktree instead: using-git-worktrees skill`,
+        `     (agent-infra: hub-worktree.sh <branch>), or create the branch`,
+        `     inside an existing worktree (worktree-effective → exempt).`,
       ].join("\n"),
     };
   }
@@ -918,7 +1142,7 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
     // and the substitution below resolves it to currentBranch, so the
     // old-name check runs against the CURRENT checkout branch (a classifier-
     // visible old name is impossible there). ownedBranches (this session's
-    // created/renamed-to branches in this repo — the #543/#588 ownership
+    // renamed-to branches in this repo — the #543/#588 ownership
     // check) still allows overwriting the session's OWN refs. Round-1 review
     // fold-in: the carve-out is scoped to the repo that recorded the baseline
     // (baseline.repoKey === repoKey — the #376 discipline): a rename in a
@@ -1045,9 +1269,10 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
       && (stateOpCount ?? 1) === 1 && !isBare && !hiddenStateSubst) {
     return null;
   }
-  // #376 carve-out: sanctioned ceremony return-to-baseline — switch back to the
-  // branch this session STARTED on (before any create-new re-baseline), allowed
-  // in agent-infra main only. No original recorded (contended/detached start —
+  // #376 carve-out: ceremony return-to-original — switch back to the branch
+  // this session STARTED on (its immutable `original`; the mid-ceremony
+  // re-base now comes from an own-baseline rename or a legacy/hatch ceremony,
+  // since in-hub create-new is blocked, #626), allowed in agent-infra main only. No original recorded (contended/detached start —
   // the tree may already sit on ANOTHER session's branch) → fail-closed block.
   // The resolved repo must be the SAME repo that recorded the original baseline
   // (repoKey equality — M2 semantics); a baseline owned by another agent-infra
@@ -1070,7 +1295,9 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
       `   branches here moves the tree out from under every other session and`,
       `   commits land on the wrong branch (#265).`,
       `   → Work in an isolated worktree: invoke the using-git-worktrees skill.`,
-      `   → Agent-infra create-new: git checkout -b <branch> is allowed.`,
+      `   → Agent-infra main is NOT exempt (the #99 exemption was removed in`,
+      `     #615): in-hub checkout -b / switch -c is blocked like every hub`,
+      `     (#626); create feature branches in a worktree instead.`,
       `   → Agent-infra ceremony return: git checkout back to the branch your`,
       `     session STARTED on (its original baseline) is allowed (#376).`,
     ].join("\n"),
@@ -1087,8 +1314,8 @@ export function decideM3({ branchOp, isAgentInfra, baseline, currentBranch, repo
  *     must never slip a foreign target past the gate; symmetric with the
  *     delete case).
  *   branch-force-delete (LOCAL `git branch -D`) → every named target ==
- *     baseline branch OR a branch THIS session itself created via the M3
- *     create-new/rename carve-outs (ownedBranches — #376 review fold-in: after
+ *     baseline branch OR a branch THIS session itself renamed its own baseline
+ *     to via the M3 rename carve-out (ownedBranches — #376 review fold-in: after
  *     the sanctioned ceremony return-to-baseline the baseline is main again,
  *     but deleting the session's OWN merged ceremony branch locally must still
  *     pass; git already refuses deleting a branch checked out in ANY worktree,

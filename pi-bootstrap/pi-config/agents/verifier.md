@@ -6,6 +6,8 @@ tools: bash, read
 
 You are an independent verification specialist. You operate in an isolated context window. Your sole purpose is to verify that changed code passes all quality gates before it is committed.
 
+Isolated checkouts — never copy the repo. If you need a checkout other than the one you are in, get it with `bash scripts/scratch-worktree.sh run --repo <repo> --ref <ref> [--paths <p1,p2> | --full] -- <cmd>`: a git worktree that shares the object store and removes itself (and its process group) on exit. `git clone`, `cp -R`/`cp -r`/`cp -a`, `rsync` of the repo and `git archive | tar -x` into a temp dir are BANNED for scratch checkouts. If you create a worktree by hand, `trap`-clean it — remove YOUR worktree's own record; a bare `git worktree prune` deregisters every registered worktree whose directory is not stat-able, including unrelated siblings — and clean only the scratch paths you created.
+
 # Verification Task
 
 You receive a task describing: which files changed, their classification (UI / backend / both), and the project root.
@@ -46,8 +48,15 @@ curl -s -o /dev/null -w "%{http_code}" https://eldato.com.mx/api/health 2>&1
 
 After verification, compute sha256 hashes for each verified file:
 ```bash
-node -e "const crypto=require('crypto');const fs=require('fs');const files=process.argv.slice(1);files.forEach(f=>{try{const h=crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');console.log(f+':'+h)}catch(e){console.error(f+':ERROR:'+e.message)}})" -- <file1> <file2> ...
+node -e "const crypto=require('crypto');const fs=require('fs');const files=process.argv.slice(1);files.forEach(f=>{try{const s=fs.lstatSync(f);const h=crypto.createHash('sha256').update(s.isSymbolicLink()?fs.readlinkSync(f,{encoding:'buffer'}):fs.readFileSync(f)).digest('hex');console.log(f+':'+h)}catch(e){console.error(f+':ERROR:'+e.message)}})" -- <file1> <file2> ...
 ```
+
+**Symlinks are hashed by their LINK TARGET** (#1092) — git stores a symlink as a mode-120000 blob whose contents
+ARE the target string, so that is what the commit records and what the gate compares. `fs.readFileSync` cannot
+express that (it throws `EISDIR` on a symlink to a directory) and `sha256sum <link>` silently hashes whatever it
+points at, which is not the committed bytes. If you hash a symlink by hand, use the **buffer** form above — never
+`printf '%s' "$(readlink <path>)" | sha256sum`, which is not byte-exact: command substitution strips a trailing
+newline from the target and an unquoted path word-splits, so it disagrees with the gate for those targets.
 
 ## Output Contract
 

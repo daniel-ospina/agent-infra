@@ -58,7 +58,14 @@
 //     main-rooted session writing another hub via bash is gated too — review
 //     fold-in); same-vs-cross-checkout is judged by the SESSION's checkout,
 //     never a command `cd`-site; cross-checkout tracked AND `.git/`-metadata
-//     writes block regardless of hub state. Cycle-2/3 fold-ins: main checkouts
+//     writes block regardless of hub state. #625 extends the SAME-checkout
+//     decision to be state-independent too: a tracked hub-main write from a
+//     hub-rooted session blocks whether that hub is CLEAN or disordered (the
+//     old clean-hub carve-out let one compound `printf … >> MEMORY.md && git
+//     add && git commit && git push` through), and the bash walker now
+//     surfaces the in-place overwrite VERBS (sed -i / perl -pi / awk -i
+//     inplace / cp / mv / install / truncate / dd of=) that carried no
+//     write-primitive token. Cycle-2/3 fold-ins: main checkouts
 //     NESTED under a session's own checkout tree are private subtrees (not
 //     shared hubs) and are not frozen ONLY when the session itself is a
 //     NON-main checkout — a worktree/private checkout owns its tree; a
@@ -93,31 +100,47 @@
 // cannot retry its way past it.
 //
 // Degradation contract:
-//  - classify-git.mjs load failure → bash git guard degrades to warn-only
-//    (fail-safe, never false-blocks) while the write/edit guard stays fully
-//    enforced.
+//  - classify-git.mjs TOTAL load failure → the bash git guard degrades to
+//    non-blocking — one load-time warning, then every command passes silently
+//    (fail-safe, never false-blocks) — AND the write/edit gate fails OPEN. (A
+//    PARTIAL abort — the #744 shape — is different: it keeps whatever was bound
+//    before the abort point, so the gates bound earlier keep working.)
+//    The write/edit gate's target classification comes from the same import:
+//    `resolveTargetCheckout` stays `() => null` and `hasDotGitAncestor` stays
+//    `() => false`, so `_checkoutOf` returns null and the gate takes its
+//    "!tgtCheck → isolated by construction" branch and ALLOWS the write. The
+//    inert defaults are deliberate (a failed import must never false-block),
+//    but the consequence is that a load failure is a SILENT LOSS OF
+//    ENFORCEMENT, not a safe mode. Tracked as #761.
 //  - branch-ownership.mjs load failure → M1/M2/M3 are OFF (one-time warn) and
 //    the guard falls back to the frozen-legacy classifier for EVERY repo — no
-//    agent-infra exemption (#615); write/edit never depends on either module.
+//    agent-infra exemption (#615); write/edit never depends on THIS module (its
+//    classify-git dependency is the bullet above, #761).
 //  - isWorktreeCwd defaults are SPLIT: the bash path fails OPEN (() => true —
 //    a worktree lookalike is treated as isolated), the write/edit path fails
-//    CLOSED (() => false — an unverifiable target is treated as main and
+//    CLOSED (() => false — an unverifiable SESSION cwd is treated as main and
 //    blocked). This fixes the latent fail-open at the old shared default.
+//    Note this covers the SESSION-cwd checks only — the TARGET-classification
+//    path (`_checkoutOf`) is a separate input, and it is the one that fails
+//    open when the import degrades (first bullet, #761).
 // The TTL'd file-based escape marker (~/.pi/agent/.allow-main-edits, #207)
 // allows a deliberate mid-session escalation — see README.md.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { isToolCallEventType } from "@earendil-works/pi-coding-agent";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { resolve, dirname, join, relative } from "node:path";
 import { realpathSync, existsSync, statSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { isPrintMode } from "../shared/print-mode.js";
 import { appendJsonl } from "../shared/audit-log.js";
 
-// Shared destructive-git rules (also used by test.mjs). If the import ever
-// fails (jiti resolution edge case), the bash guard degrades to warn-only
-// while write/edit protection stays fully enforced.
+// Shared destructive-git rules (also used by test.mjs). If the import fails
+// TOTALLY (jiti resolution edge case), the bash guard degrades to non-blocking
+// and the write/edit gate fails OPEN — see the degradation contract above,
+// #761. (A partial abort can leave the write/edit classification bound: its
+// targets are #32/#34/#35-37 of 37, so an abort at the tail keeps it live.)
 let classifyGitCommand: (cmd: string) => string = () => "allow";
 let classifyGitCommandDetailed: (cmd: string) => any = () => ({ verdict: "allow" });
 let isWorktreeCwd: (cwd: string) => boolean = () => true;      // bash path: fail-open
@@ -128,6 +151,17 @@ let getWorktreeBranches: () => Map<string, string[]> = () => new Map();
 let isBranchInMainCheckout: (branch: string) => boolean = () => false;
 let getMainCheckoutBranch: () => string | null = () => null;
 let isAgentInfraRepo: (cwd?: string, env?: Record<string, string | undefined>) => boolean = () => false;
+// #1129: the exemption's root anchor (pure fn in classify-git). Fail-safe
+// default null → the inline realpath-first fallback runs; never null-holes the
+// exemption (a stale module must not silently disable it) and never throws.
+let _frameworkRootFromModuleUrl: ((moduleUrl: string) => string) | null = null;
+// #1139 (review cycle-2 P1): the pipe-seed walk's tokenizer. Fail-safe default
+// is the previous whitespace split (a stale module without `wtShellWords` keeps
+// today's quote-blind behaviour rather than seeding nothing at all — fewer seeds
+// would be the fail-OPEN direction); the same commit ships both halves, and
+// test.mjs pins the export so the skew fails a test instead of silently
+// reverting.
+let wtShellWords: (s: string) => string[] = (s) => String(s).split(/\s+/);
 // #1484 M4 hub-state gate + script-backdoor closure. Fail-safe defaults: every
 // decision degrades to inactive/allow so a failed import NEVER false-blocks
 // (the git commands were allow-listed before M4; the guard stays permissive).
@@ -142,16 +176,76 @@ let resolveTargetCheckout: (targetPath: string, cwd?: string) => { top: string; 
 let trackedRelsIn: (repoTop: string, rels: string[]) => string[] = () => [];
 let hasDotGitAncestor: (p: string) => boolean = () => false;
 let extractScriptPath: (command: string) => string | null = () => null;
-let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+let extractScriptArgs: (command: string, scriptPath: string) => string[] = () => [];
+let scriptGitVerdict: (path: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string, scriptArgs?: string[] | null) => "allow" | "block" = () => "allow";
+// #627: non-shell code-interpreter payload surface (python -c / node -e / …).
+// Fail-safe defaults inert so a failed import NEVER false-blocks.
+let extractCodePayload: (command: string) => { kind: "inline" | "file" | "stdin-file" | "module" | "stdin"; value: string | null } | null = () => null;
+let codePayloadGitVerdict: (content: string, currentBranch: string | null, executionCwd?: string, sessionCwd?: string) => "allow" | "block" = () => "allow";
+// #744 skew-guard temps: the import block below uses RENAME destructuring
+// (`extractCodePayload: _extractCodePayload`) so the typeof guard can test the
+// freshly-imported value BEFORE it overwrites the fail-safe default above.
+// In a destructuring ASSIGNMENT (no `let`/`const` keyword) every `prop: ident`
+// target must already be a declared binding — ESM is always strict mode, so an
+// undeclared target throws ReferenceError. That throw lands inside the try
+// below, is swallowed by the catch, and ABORTS the import at that target. The
+// assignment is left-to-right, so targets listed BEFORE it stay bound to the
+// real exports — but every target from there on keeps its fail-safe default and
+// `classifierLoaded` never flips, silently disabling the #627/#628/#350 gates
+// and the disordered-hub write helpers for every session (#697 shipped this).
+// Seeded with the same fail-safe defaults the guards fall back to.
+let _extractCodePayload: typeof extractCodePayload = () => null;
+let _codePayloadGitVerdict: typeof codePayloadGitVerdict = () => "allow";
 // #350: hub-WIP hygiene helpers (warn-only). Fail-safe defaults: inert
 // (null/[]) so a failed import NEVER false-blocks — these warnings are
 // discipline prompts, not gates.
 let matchHubWipPattern: (resolvedPath: string) => "docs/plans" | "migrations" | "scratch" | null = () => null;
 let extractBashWriteTargets: (command: string, cwd?: string) => { resolvedPath: string; via: string }[] = () => [];
+// #628: disordered-hub new-file volume policy (pure decision in classify-git).
+let hubNewFileVolumeVerdict: (count: number) => "warn" | "escalate" | "block" = () => "warn";
+let HUB_NEW_FILE_WARN_BUDGET = 10;
+let HUB_NEW_FILE_BLOCK_CAP = 25;
+// #744 skew-guard temps (same contract as the #627 pair above): declared
+// targets for the rename destructuring in the import block — without these the
+// assignment throws ReferenceError and the catch below degrades the import.
+let _hubNewFileVolumeVerdict: typeof hubNewFileVolumeVerdict = () => "warn";
+let _HUB_NEW_FILE_WARN_BUDGET = 10;
+let _HUB_NEW_FILE_BLOCK_CAP = 25;
 let classifyUntrackedWip: (porcelain: string) => { untracked: string[]; wip: { path: string; pattern: string }[] } = () => ({ untracked: [], wip: [] });
 // #437 (C): PER-WRITE-SITE bash-write candidates (cd-aware) for the
 // disordered-hub gate + the pure tracked intersect. Fail-safe defaults inert.
 let bashWriteTargetsResolved: (command: string, cwd?: string) => ({ resolvedPath: string; via: string; site: string; cwd: string; scriptToks?: { path: string; cwd: string }[] })[] = () => [];
+// #709: the working-tree-discard family + its effect decision. Fail-safe
+// defaults: [] / false → M5 is inert when the classifier fails to load (the
+// gate must never false-block on a degraded import; test-module-load.mjs is
+// the regression tripwire for the degradation itself).
+let extractWorkingTreeDiscards: (command: string) => { form: string; scope: string; pathspecs: string[]; fromTree?: boolean; verb: string; args: string[]; inv: unknown }[] = () => [];
+let discardDestroysWip: (porcelain: string, d: { scope: string; fromTree?: boolean }) => boolean = () => false;
+let resolveInvocationTarget: (inv: unknown, sessionCwd?: string, baseCwd?: string) => { effectiveCwd: string; gitDir: string; worktreePath: string | null; worktreeBranch: string | null; isWorktree: boolean; foreignWorktree: boolean } | null = () => null;
+// M5 fail-closed helper: xargs/find `-exec` placeholder pathspec. Fail-safe
+// default false is safe — a degraded import leaves extractWorkingTreeDiscards
+// inert (`[]`), so nothing reaches this call.
+let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
+// Fail-safe default = the old bare-word regex: a degraded import must not make
+// the piped-code arms over-claim, and must not silently widen them either.
+let wtPipelineFeedsShell: (cmd: string) => boolean =
+  (cmd: string) => /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(cmd ?? ""));
+let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean }[] =
+  // FAIL-SAFE fallback, not inert: a stale/partial classify-git.mjs (the export
+  // missing while `classifierLoaded` is still true) must not silently delete the
+  // opaque `-c` arm. This is the same quote-aware scan, minus the spawner/keyword
+  // head analysis — it can only OVER-report, which keeps the arm fail-closed.
+  (cmd: string) => {
+    const out: { text: string; opaque: boolean }[] = [];
+    const re = /(?:^|[\s;&|(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)\s+("[^"]*"|'[^']*'|\S+)/g;
+    for (const m of String(cmd ?? "").matchAll(re)) {
+      const t = m[1] ?? "";
+      out.push({ text: t, opaque: /[$`]/.test(t) });
+    }
+    return out;
+  };
+let joinContinuations: (cmd: string) => string = (c: string) => String(c ?? "");
+let ansiTranslate: (s: string) => string = (s: string) => String(s ?? "");
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -178,10 +272,56 @@ try {
      extractMarkerReason, parseMarkerContent, isAllowMarkerRealpath,
      readAllowMarkerState, readHubDisorder,
      extractScriptPath, scriptGitVerdict, evaluateHubGateWithTargets,
+     extractCodePayload: _extractCodePayload, codePayloadGitVerdict: _codePayloadGitVerdict,
      commandExecutionCwd, resolveTargetTopLevel, matchHubWipPattern,
      extractBashWriteTargets, classifyUntrackedWip, branchDeleteAllowance, newFileWriteCollisionFree,
-     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor } =
+     bashWriteTargetsResolved, resolveTargetCheckout, trackedRelsIn, hasDotGitAncestor,
+     hubNewFileVolumeVerdict: _hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET: _HUB_NEW_FILE_WARN_BUDGET,
+     HUB_NEW_FILE_BLOCK_CAP: _HUB_NEW_FILE_BLOCK_CAP } =
     await import("./classify-git.mjs"));
+  // #709: M5's exports are read from the (cached) module namespace rather than
+  // added to the destructuring assignment above — every new target there is a
+  // new assertion in test-module-load.mjs Part A, and that suite's contract is
+  // exactly 49 passed / 0 failed.
+  const _m5 = await import("./classify-git.mjs");
+  extractWorkingTreeDiscards = _m5.extractWorkingTreeDiscards;
+  discardDestroysWip = _m5.discardDestroysWip;
+  resolveInvocationTarget = _m5.resolveInvocationTarget;
+  if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
+  if (typeof _m5.wtPipelineFeedsShell === "function") wtPipelineFeedsShell = _m5.wtPipelineFeedsShell;
+  if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
+  if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
+  if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
+  hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
+  HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
+  HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
+  // #627 bindings: same stale-classify-git skew guard as #628 — a missing
+  // export must leave the fail-safe defaults (an undefined here would throw in
+  // _backdoorBlock, whose catch turns the whole #627 gate fail-OPEN).
+  if (typeof _extractCodePayload === "function") extractCodePayload = _extractCodePayload;
+  if (typeof _codePayloadGitVerdict === "function") codePayloadGitVerdict = _codePayloadGitVerdict;
+  // #1129: the sanctioned-script exemption's anchor (see
+  // frameworkRootFromModuleUrl). Namespace read + typeof guard, same skew
+  // contract as #709/#627 above — a stale module leaves the inline fallback.
+  if (typeof _m5.frameworkRootFromModuleUrl === "function") _frameworkRootFromModuleUrl = _m5.frameworkRootFromModuleUrl;
+  // #1139: the quote-aware shell tokenizer the pipe-seed walk uses (same skew
+  // contract as above).
+  if (typeof _m5.wtShellWords === "function") wtShellWords = _m5.wtShellWords;
+  // #967/#1484: the invocation's positional args feed the subcommand
+  // reachability filter. Stale-module skew guard: a missing export leaves the
+  // fail-safe default ([] → no reachability proof → the whole script gates).
+  if (typeof _m5.extractScriptArgs === "function") extractScriptArgs = _m5.extractScriptArgs;
+  // Stale-classify-git skew guard: a missing export must leave the fail-safe
+  // defaults (never overwrite a function with undefined → TypeError on the
+  // write branch).
+  if (typeof _hubNewFileVolumeVerdict !== "function") hubNewFileVolumeVerdict = () => "warn";
+  if (typeof _HUB_NEW_FILE_WARN_BUDGET !== "number") HUB_NEW_FILE_WARN_BUDGET = 10;
+  if (typeof _HUB_NEW_FILE_BLOCK_CAP !== "number") HUB_NEW_FILE_BLOCK_CAP = 25;
+  // #709 skew guard (same contract): a stale/short classify-git must leave M5
+  // inert rather than bind `undefined` and throw inside the bash gate.
+  if (typeof extractWorkingTreeDiscards !== "function") extractWorkingTreeDiscards = () => [];
+  if (typeof discardDestroysWip !== "function") discardDestroysWip = () => false;
+  if (typeof resolveInvocationTarget !== "function") resolveInvocationTarget = () => null;
   classifierLoaded = true;
   isWorktreeCwdWrite = isWorktreeCwd; // real function once loaded
 } catch (e) {
@@ -192,9 +332,83 @@ try {
 // Try/catch-guarded: load failure → M1/M2/M3 OFF + one-time warn; write/edit
 // never depends on it.
 let branchOwnership: any = null;
+// The extension host keeps ONE process-wide module registry for its entire
+// life. A `../shared/branch-ownership.mjs` first imported by an EARLIER
+// generation of this file is therefore served from cache on every later
+// reload — present, cached, and missing any export added since it was first
+// evaluated. Because a reload re-evaluates THIS file but NOT its dependencies,
+// a newly-added call site here meets that stale namespace and throws
+// `… is not a function` at RUNTIME, mid-decision, from inside the tool hook.
+// The throw escapes the hook and aborts the entire bash tool call (pi's
+// emitToolCall runs the handler with no try/catch), so the guard ends up
+// blocking EVERY mutating git command (`add`/`commit`/`push`) instead of
+// guarding it — a safety control failing into a total work stoppage, which its
+// own degradation contract (above) is explicitly designed to avoid.
+//
+// The fix is VALIDATION, not cache-busting: verify that every export we call is
+// actually present, and if not, take the documented M1/M2/M3-OFF path instead
+// of throwing. The load-failure catch below never covers this case — the
+// import SUCCEEDS, it just returns an old namespace.
+//
+// Do NOT "fix" this with a specifier query (`…branch-ownership.mjs?gen=N`).
+// pi loads extensions through jiti, whose resolver STRIPS the query before the
+// module registry sees it: `jiti.resolve("./dep.mjs?gen=1")` and
+// `jiti.resolve("./dep.mjs?gen=2")` return the same path, and three different
+// query specifiers in one jiti load yield ONE module instance (a native-ESM
+// host honours the query instead). So the query is inert HERE — and in a
+// native host it would leak one module instance per reload. An earlier version
+// of this change carried exactly that query and documented it as the fix; it
+// was a no-op in production.
+//
+// What this fix DOES guarantee: a namespace missing any of the members we call
+// degrades to the documented M1/M2/M3-OFF path instead of throwing. What it does
+// NOT guarantee: it cannot stop a throw from a member that EXISTS but fails at
+// call time, nor from a stale module whose shape drifted under an unchanged
+// name. Those still surface as an aborted tool call, because the host rethrows
+// an extension error to BLOCK the call (`emitToolCall` itself has no try/catch;
+// the host wrapper rethrows "Extension failed, blocking execution"). Closing
+// that larger class means wrapping the branch-ownership block in a try/catch
+// that falls back to the legacy classifier — filed as follow-up, deliberately
+// not attempted here because it restructures a 300-line safety block with no
+// test coverage for the fallback path.
+//
+// Also NOT covered by this guard: the same "loaded but stale" exposure exists in
+// `classify-git.mjs` (only 2 of ~35 destructured targets carry a typeof guard)
+// and in `extensions/auto-sync.ts` (a STATIC import of this same helper, no
+// validation). Both are filed as follow-ups.
+//
+// Consequence, stated plainly: on a stale namespace this guard is DOWN for the
+// life of the process. A reload cannot recover it (the registry survives
+// reloads) — only a full pi restart can. That is still strictly better than
+// breaking git, but it is NOT self-healing. Specifier tricks do NOT fix it (see
+// above). A `.ts` helper WOULD hot-reload — jiti re-evaluates a `.ts`
+// dependency on reload — so migrating `shared/branch-ownership.mjs` to `.ts`
+// (or having the loader set `tryNative: false` for extension deps) is the real
+// self-healing path, blocked only by the plain-Node test/consumer imports of
+// the `.mjs`. Filed, not done here.
+const _BRANCH_OWNERSHIP_MEMBERS = [
+  "acquireRepoLock", "classifyBranchOp", "decideM1", "decideM2", "decideM3",
+  "localBranchExists", "ownershipAllowed", "readBranchState", "releaseRepoLock",
+  "repoKey", "resolveEffectiveRepo", "resolveRepoFromInv",
+] as const;
 try {
   branchOwnership = await import("../shared/branch-ownership.mjs");
+  const _missing = _BRANCH_OWNERSHIP_MEMBERS.filter(
+    (k) => typeof branchOwnership?.[k] !== "function",
+  );
+  if (_missing.length > 0) {
+    console.warn(
+      "[main-worktree-guard] ⚠️ branch-ownership.mjs namespace is STALE/incomplete — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior). Missing exports:",
+      _missing.join(", "),
+      "— ⚠️ THIS PERSISTS FOR THE LIFE OF THIS PROCESS: a reload cannot recover it, only a full pi restart can. Do that now if you need branch-ownership enforcement.",
+    );
+    branchOwnership = null;
+  }
 } catch (e) {
+  // Clear the binding FIRST: if the import assigned a namespace and a later
+  // property access in the validation threw (e.g. a jiti-interop getter), the
+  // binding would otherwise stay set with no validation and be used unguarded.
+  branchOwnership = null;
   console.warn("[main-worktree-guard] ⚠️ branch-ownership.mjs failed to load — M1/M2/M3 branch-ownership guards DISABLED (falling back to legacy behavior):", String(e));
 }
 
@@ -230,8 +444,10 @@ function _currentSessionId(ctx?: { sessionManager?: { getSessionId?: () => strin
   return process.env.PI_SESSION_ID ?? ctx?.sessionManager?.getSessionId?.() ?? null;
 }
 // Guard-stamping at creation-observation: write the stamp BEFORE allowing the
-// touch command. try/catch fail-silent (F7) — on failure the marker stays
-// absent → block; a failed stamp never weakens the gate.
+// touch command. try/catch fail-silent (F7) — when the stamp write FAILS no
+// stamp exists, so the shell `touch` then leaves an EMPTY (unparseable →
+// inert) marker: readAllowMarkerState stays false → blocked. A failed stamp
+// never weakens the gate (and a later guard-observed touch re-stamps over it).
 function _stampMarker(path: string, sessionId: string | null, reason: string | null): void {
   try {
     // P2 (review): ensure ~/.pi/agent exists — a missing dir made the stamp
@@ -379,6 +595,11 @@ let lastMainTopAttemptMs = 0;
 let lastHubHygieneMs = 0;
 const warnedWipTargets = new Set<string>(); // tool-call warnings: once per (pattern,path) per session
 const warnedWipPaths = new Set<string>();    // inventory warnings: once per path per session
+// #628: disordered-hub new-file volume policy — per-session counter (pid =
+// one pi process = one session) + per-path warn dedupe. See classify-git
+// hubNewFileVolumeVerdict for the pure decision + constants.
+const hubNewFileCounts = new Map<number, number>();
+const warnedNewFileTargets = new Set<string>();
 
 // The MAIN checkout's toplevel (git worktree list first entry = the primary
 // worktree — empirically stable on git 2.50.1, though not formally guaranteed
@@ -674,6 +895,57 @@ function _maybeWarnHubWipWrite(targetPath: string | undefined, hubTop?: string) 
   } catch { /* warn-only — never blocks */ }
 }
 
+// #628 (write-time signal): the disordered-hub M4 new-file carve-out returns
+// BEFORE the #350 WIP prompt, so new hub files accumulated silently. Every
+// carve-out write now warns (all paths — not just WIP patterns) and the
+// warning escalates past the budget; the caller blocks past the hard cap.
+// Prompts follow the documented marker contract: suppressed under the env
+// hatch AND an active TTL marker (the marker is an audited solo-session
+// window); the CAP block is M4 discipline and stays active under the marker
+// (D3 — the marker never re-enables hub writes).
+function _warnHubNewFile(targetPath: string, count: number, level: "warn" | "escalate") {
+  const L = (t: string) => "║  " + t.padEnd(62) + "║";
+  const lines = [
+    "",
+    "╔══════════════════════════════════════════════════════════════════╗",
+    L("⚠️  NEW FILE IN A DISORDERED HUB — PUT IT IN A WORKTREE (#628)"),
+    "╠══════════════════════════════════════════════════════════════════╣",
+    L(`Target: ${_truncatePath(targetPath, 52)}`),
+    L(`New hub files this session: ${count} (budget ${HUB_NEW_FILE_WARN_BUDGET}, cap ${HUB_NEW_FILE_BLOCK_CAP})`),
+    L(""),
+    ...(level === "escalate"
+      ? [
+        L("Budget exceeded — this is accumulation, not a one-off. The hub's"),
+        L("only legal state is main+clean; stop adding to the dirty set."),
+        L(`Further new files block past ${HUB_NEW_FILE_BLOCK_CAP}.`),
+      ]
+      : [
+        L("The hub is off-main/dirty. New files are allowed (additive, they"),
+        L("cannot collide with a sibling's WIP) but they GROW the dirty set"),
+        L("the hub recovery must later carry."),
+      ]),
+    L("→ Recover the hub, then work in a worktree:"),
+    L("  bash scripts/checkout-hygiene/hub-worktree.sh <branch>"),
+    "╚══════════════════════════════════════════════════════════════════╝",
+    "",
+  ];
+  console.warn(lines.join("\n"));
+}
+
+// Deduped per path per session (mirrors warnedWipTargets). Suppressed under
+// the env hatch / active marker per the marker contract; the volume COUNTER
+// still advances (the cap must count even while prompts are suppressed).
+function _maybeWarnHubNewFile(targetPath: string, count: number, level: "warn" | "escalate") {
+  try {
+    if (_isAllowMainEdits()) return;
+    if (readAllowMarkerState(_markerPath(), _currentSessionId(undefined))) return;
+    const key = `newfile:${count > HUB_NEW_FILE_WARN_BUDGET ? "escalated" : "warn"}:${targetPath}`;
+    if (warnedNewFileTargets.has(key)) return;
+    warnedNewFileTargets.add(key);
+    _warnHubNewFile(targetPath, count, level);
+  } catch { /* warn-only — never blocks */ }
+}
+
 // #350 bash-write detection (never block): heredoc/tee/python open() writing a
 // WIP pattern into the hub main checkout. Pure quote-aware scan + cached hub
 // toplevel (realpath-normalized) — no per-command git; warnings dedupe per
@@ -711,10 +983,14 @@ function _maybeWarnBashWrite(command: string) {
 //   - SAME-checkout — the SESSION's own checkout IS that main (judged by the
 //     session cwd's checkout, NEVER by the command's transient cd-site: a
 //     worktree/foreign session that `cd`s into a hub and writes is still a
-//     deliberate cross-checkout session): #437 semantics — block tracked
-//     overwrites ONLY while that main is DISORDERED (build/formatter/
-//     npm-install side effects on a clean main must never false-block;
-//     tracked-ness is exact via `git ls-files`).
+//     deliberate cross-checkout session): #437 semantics, EXTENDED by #625 to
+//     a state-INDEPENDENT decision — block tracked overwrites whether that
+//     main is clean or disordered (the write/edit route has been a permanent
+//     target-aware gate since #618/#621; the old clean-hub carve-out let a
+//     compound `printf … >> MEMORY.md && git add && git commit && git push`
+//     through). Own-main UNTRACKED/new writes stay allowed (build/formatter
+//     side effects on genuinely new files must never false-block; tracked-
+//     ness is exact via `git ls-files`).
 //   - CROSS-checkout — session shell NOT rooted in the target main (a
 //     worktree session writing its own repo's main, a foreign/non-git cwd, or
 //     another repo's session, incl. a clean agent-infra main): block TRACKED
@@ -823,11 +1099,20 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       } else if (gitMeta) {
         gitInternalHit = { resolvedPath: tPath, rel };
         return;
-      } else if (sameCheckout) {
-        if (sessionDisorder === null) return; // clean same-checkout main — documented residual (#437)
       }
-      // reached → disordered-same-checkout OR deliberate cross-checkout: the
-      // tracked test decides.
+      // #625: NO clean-same-checkout early return. The gate decides on the
+      // command's EFFECT (does it write a TRACKED hub-main file?), not on
+      // pre-execution hub disorder — the write/edit route has been a permanent
+      // target-aware gate since #618/#621, while the old #437 "clean
+      // same-checkout" residual let a hub-rooted main+CLEAN session commit
+      // tracked shared files with ONE compound (`printf … >> MEMORY.md && git
+      // add && git commit && git push`: no disorder → M4's git gate skipped,
+      // decideM2 saw an on-baseline session). Own-main UNTRACKED writes stay
+      // allowed (the `crossTop` guard below freezes an existing-untracked
+      // overwrite only CROSS-checkout — genuinely-new build/formatter side
+      // effects keep working).
+      // reached → same-checkout (clean OR disordered) OR deliberate
+      // cross-checkout: the tracked test decides.
       const arr = grouped.get(ck.top) ?? [];
       arr.push({ tPath, rel });
       grouped.set(ck.top, arr);
@@ -874,14 +1159,15 @@ function _hubBashTrackedWrite(command: string, sessionDisorder: string | null, m
       // Budget exhausted with script tokens still unprocessed — their write
       // content is UNVERIFIABLE. Fail closed ONLY on hub-proximity evidence:
       // the walk already placed a candidate under the block-or-block-if-
-      // tracked tests (grouped) or the session shell is rooted in a DISORDERED
-      // hub main (the classic chain-write incident shape). A >64-token chain
-      // that never resolved a target into a hub-main candidate (non-git /tmp
-      // cwd, a CLEAN own-main build fan-out of sourced helpers) is NO evidence
-      // of a hub write — failing closed there false-blocks legit wide source
-      // fan-outs (cycle-3 A-1). Residual: a >64-token foreign chain whose hub
-      // write sits in the unprocessed tail slips (documented; tool route is
-      // authoritative and the write gate is marker/tool-checked).
+      // tracked tests (grouped) or the session shell is rooted in a hub main
+      // (the classic chain-write incident shape). A >64-token chain that
+      // never resolved any target into a hub-main candidate AND is not rooted
+      // in a DISORDERED hub (non-git /tmp cwd, a worktree fan-out of sourced
+      // helpers, or a clean own hub) stays NO evidence of a hub write —
+      // failing closed there false-blocks legit wide source fan-outs
+      // (cycle-3 A-1). Residual: a >64-token chain
+      // whose hub write sits in the unprocessed tail slips (documented; the
+      // tool route is authoritative and the write gate is marker/tool-checked).
       if (grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)) return null;
       return { resolvedPath: base, rel: "script-chain", kind: "script-depth" };
     }
@@ -944,9 +1230,10 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
       "⛔ Bash script execution blocked — script chain exceeds the verify budget.",
       `   A script/source chain deeper than the guard's walk budget was detected`,
       `   with hub-main candidates already in view (or the session shell rooted`,
-      `   in a disordered hub main); its tail writes into hub-main checkouts are`,
-      `   UNVERIFIABLE and the guard fails closed rather than risk a tracked hub`,
-      `   file write. A chain with NO hub proximity is not blocked (cycle-3 A-1).`,
+      `   in a DISORDERED hub main); its tail writes into hub-main`,
+      `   checkouts are UNVERIFIABLE and the guard fails closed rather than risk`,
+      `   a tracked hub file write. A chain with NO hub proximity is not blocked`,
+      `   (cycle-3 A-1).`,
       `   → Run the shell commands directly (in a worktree), or flatten the chain.`,
       `   → Or set AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1) to`,
       `     override (deliberate solo sessions only).`,
@@ -956,12 +1243,13 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
   return [
     `⛔ Bash write to a hub ${gitMeta ? "git-metadata file" : "tracked file"} blocked (${hit.rel}).`,
     `   The write target's repo is a shared MAIN checkout (#618/#621) — bash`,
-    `   write primitives respect the SAME gate as the write/edit tools: a`,
-    `   DELIBERATE cross-checkout write (your session is not rooted in that`,
-    `   repo) freezes regardless of hub state, a session rooted in a`,
-    `   DISORDERED main freezes on tracked overwrites, and hub .git-metadata`,
-    `   writes (hooks/, config) freeze for every session in every state except`,
-    `   an active escape-marker's own-rooted clean recovery window.`,
+    `   write primitives AND in-place overwrite verbs (sed -i, perl -pi, cp,`,
+    `   mv, install, truncate, dd of=) respect the SAME gate as the write/edit`,
+    `   tools: a DELIBERATE cross-checkout write (your session is not rooted`,
+    `   in that repo) freezes regardless of hub state, a session rooted in`,
+    `   that repo's main freezes on tracked overwrites (clean OR disordered),`,
+    `   and hub .git-metadata writes (hooks/, config) freeze for every session in`,
+    `   every state except an active escape-marker's own-rooted clean recovery window.`,
     `   NEW-file writes and own-main untracked writes stay allowed. Only`,
     `   session-start host env (AGENT_ALLOW_MAIN_EDITS=1) bypasses — a`,
     `   mid-command export cannot.`,
@@ -972,6 +1260,790 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
   ].join("\n");
 }
 
+// ── M5 (#709): working-tree-discard gate (effect-keyed) ────────
+// The legacy destructive arms key on the VERB (so `git checkout -- <path>` —
+// the incident verb — classifies `allow`, pinned by test.mjs) and exempt
+// worktrees wholesale (so `git restore`/`checkout .`/`reset --hard` run free
+// where the `pi -p` mutation-test fixers work). M4 catches the incident verb
+// only while the hub is DISORDERED (test.mjs:2247). M5 keys on the EFFECT
+// instead: a discard-family command is blocked when the checkout it targets is
+// carrying uncommitted state the discard would destroy — in the hub AND in a
+// linked worktree. Read-only commands, clean targets, untracked-only dirt and
+// index-only restores stay allow, and so do the framework's OWN sanctioned
+// scripts (#1139 — SANCTIONED_SCRIPT_RELPATHS, the set-scoped exemption in the
+// script walk below; a non-sanctioned script's discards stay gated). Placed
+// AFTER the env/marker hatch return, so both hatches bypass it unchanged (task
+// children are unhatched by #617/#623, which is why this is the enforcement
+// surface for them).
+
+/** Bounded porcelain probe for a discard's target checkout.
+ *  @returns true = would destroy uncommitted work; false = nothing to destroy;
+ *           null = unverifiable (caller fails closed). */
+function _discardStatusPorcelain(probeCwd: string, d: { scope: string; pathspecs: string[]; fromTree?: boolean }): boolean | null {
+  try {
+    const args = ["status", "--porcelain=v1"];
+    if (d.scope === "paths" && d.pathspecs.length > 0) args.push("--", ...d.pathspecs);
+    // execFileSync (array args, no shell): pathspecs are DATA — a path
+    // containing shell metacharacters can never become a command.
+    //
+    // #1139 (review P1): stderr is PIPED, not ignored. With a terminal `ignore`
+    // Node leaves `error.stderr` null and `error.message` is only
+    // `Command failed: git status …`, so the not-a-checkout test below could
+    // NEVER match and the documented fail-open carve-out was DEAD CODE — a
+    // discard whose resolved target is not a checkout was always blocked with
+    // `null` (and, before #1139, with a message claiming the checkout was
+    // dirty). Capturing stderr is what makes the branch reachable.
+    const out = execFileSync("git", args, {
+      cwd: probeCwd, encoding: "utf-8", timeout: 5000, stdio: ["ignore", "pipe", "pipe"],
+    });
+    return discardDestroysWip(String(out), d);
+  } catch (e) {
+    const msg = String((e as { stderr?: unknown })?.stderr ?? "") + String((e as { message?: string })?.message ?? e);
+    // Not a checkout (or a bare repo): there is no working tree to destroy, so
+    // this is the probe's one ALLOW arm. Everything else — an unreadable status
+    // on a REAL checkout (index.lock contention, permissions, the 5s timeout) —
+    // is `null` and fails closed at the caller.
+    if (/not a git repository|must be run in a work tree|does not have a working tree/i.test(msg)) return false;
+    return null; // unverifiable → fail closed
+  }
+}
+
+/** Characters a backslash escapes INSIDE double quotes (POSIX: `$`, `` ` ``, `"`, `\`, newline).
+ *  Outside quotes and inside them the rule differs, which is what
+ *  `_dequoteShellWord` and the shared `wtShellWords` tokenizer must agree on. */
+const _DQ_ESCAPABLE = new Set(["\"", "$", "`", "\\", "\n"]);
+
+/**
+ * Strip ONE shell word's quoting/escaping, the way the shell does (#1139,
+ * review cycle-3 P1). `wtShellWords` returns words with their quotes and
+ * escapes still in place; resolving a file path from one therefore needs a
+ * faithful unquote, not a blanket character strip.
+ *
+ * HISTORY — the first two attempts were both wrong, in opposite directions.
+ * A whitespace split with the quotes LEFT ON never resolved `"undo.sh"`
+ * (fail-OPEN: a discard in a quoted piped script ran ungated). Replacing every
+ * `["']` and every backslash anywhere in the token then mis-read the cases
+ * where those characters are LITERAL: `'a\b.sh'` is one file named `a\b.sh`,
+ * but the blanket strip produced `ab.sh` — a seed for a file the shell never
+ * reads, and (worse than the residual it left) a REGRESSION against the
+ * parent commit, where `a\b.sh` had been seeded correctly. The rules below are
+ * the shell's: single quotes are literal until closed, a backslash escapes
+ * anything outside quotes, and inside double quotes only `$`, `` ` ``, `"`,
+ * `\` and newline.
+ */
+function _dequoteShellWord(raw: string): string {
+  let out = "";
+  let quote: string | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (quote === "'") { if (c === "'") quote = null; else out += c; continue; }
+    if (quote === "\"") {
+      if (c === "\"") { quote = null; continue; }
+      if (c === "\\" && _DQ_ESCAPABLE.has(raw[i + 1] ?? "")) { out += raw[i + 1]; i++; continue; }
+      out += c; continue;
+    }
+    if (c === "'" || c === "\"") { quote = c; continue; }
+    if (c === "\\") { out += raw[i + 1] ?? ""; i++; continue; }
+    out += c;
+  }
+  return out;
+}
+
+/** Shared block reason for M5. */
+function _worktreeDiscardBlockReason(
+  d: { form: string; scope: string; pathspecs: string[] },
+  probeCwd: string,
+  unverifiable: string | null,
+): string {
+  const target = d.pathspecs.length > 0 ? d.pathspecs.slice(0, 5).join(", ") : "(the whole working tree)";
+  // #1139 — the two arms must not read alike, and the fail-closed arm must not
+  // name a cause it did not establish. The old single wording asserted "This
+  // checkout carries uncommitted changes to tracked files that this command
+  // would revert" in BOTH arms, which on a provably clean checkout
+  // (`git status --porcelain` empty) sent the reader hunting a phantom dirty
+  // tree — and printed the AGENT_ALLOW_MAIN_EDITS=1 bypass hatch as the remedy
+  // for a discard the guard never located.
+  //
+  // The fail-closed arm is reached with NINE different reasons, and only two of
+  // them are target-resolution failures (`the target pathspec …`, `the
+  // invocation's effective repo …`). The rest are payload/script/status
+  // failures (script-indirection, piped-shell-payload, eval-payload, the three
+  // interpreter `-c` arms, and `the target checkout's status could not be read`
+  // — where the target WAS resolved and only the probe failed). So the arm's
+  // headline and remedy stay CAUSE-NEUTRAL and defer the specifics to the
+  // `⚠️ ${unverifiable}` line above them (review fold-in: a header naming
+  // "target not statically resolvable" for every one of the nine is the same
+  // misattribution class this function exists to remove).
+  // #1139: the remedy must be a REAL file — in the geometry where the guard is
+  // loaded from a checkout with no `scripts/` (the T6 fixture), `_frameworkRoot`
+  // is non-null but the path does not exist, and printing it would hand the
+  // reader a command that cannot run (review cycle-2 P2).
+  let sanctionedHelper: string | null = null;
+  if (_frameworkRoot) {
+    const p = resolve(_frameworkRoot, "scripts/checkout-hygiene/hub-worktree.sh");
+    try { if (existsSync(p)) sanctionedHelper = p; } catch { sanctionedHelper = null; }
+  }
+  return [
+    unverifiable !== null
+      ? `⛔ Working-tree discard blocked — the discard's effect could not be verified, failing closed (#709).`
+      : `⛔ Working-tree discard blocked — it would destroy uncommitted work (#709).`,
+    `   Form: ${d.form}   Target: ${target}`,
+    `   Checkout: ${probeCwd}`,
+    ...(unverifiable !== null ? [`   ⚠️ ${unverifiable} — failing closed.`] : []),
+    `   The guard gates the EFFECT, not the verb: \`git checkout -- <path>\``,
+    `   classifies as a plain path restore, so it used to run ungated in a`,
+    `   linked worktree (where pi -p mutation-test fixers run) and in a CLEAN`,
+    `   hub — the 2026-09-10 leaked-mutant path.`,
+    ...(unverifiable !== null
+      ? [
+          `   ⚠️ This block is NOT a claim that the checkout is dirty: the guard`,
+          `   could not verify what this command would discard (see the reason`,
+          `   line above), so it never compared it against real uncommitted work.`,
+          `   Check first:`,
+          `       git status --porcelain`,
+          `   → Resolve what the guard could not — the reason line above names`,
+          `     which of these it is: a literal path / literal \`cd\` (no \`$VAR\` or`,
+          `     placeholder), a target whose status you can read, or a script`,
+          `     whose discards are statically visible.`,
+          `   → The sanctioned recovery surface, if that is what you wanted —`,
+          `     address the FRAMEWORK CHECKOUT's own copy, because a`,
+          `     worktree-local copy of it is gated by design (#1139):`,
+          ...(sanctionedHelper
+            ? [`       bash "${sanctionedHelper}" <branch>`]
+            : [`       bash <framework-checkout>/scripts/checkout-hygiene/hub-worktree.sh <branch>`]),
+          `   → This arm fails closed because the EFFECT was unverifiable, not`,
+          `     because uncommitted work was found, so AGENT_ALLOW_MAIN_EDITS=1 is`,
+          `     not its remedy: the hatch suppresses the whole gate instead of`,
+          `     resolving the reason.`,
+        ]
+      : [
+          `   This checkout carries uncommitted changes to tracked files that`,
+          `   this command would revert (\`git status --porcelain\` was read for`,
+          `   this scope).`,
+          `   → Probe a mutation on a COPY, never in place (#664):`,
+          `       D=$(git rev-parse --show-toplevel)/.worktrees/scratch-$$`,
+          `       git worktree add --detach "$D" <ref>; ( cd "$D" && <cmd> )`,
+          `       rm -rf "$D"                        # TREE first, then the record:`,
+          `       git worktree remove --force "$D"   # this drops the record even when it`,
+          `       # FAILS to delete the dir, so the reverse order hides a survivor.`,
+          `       # Remove THAT record too if needed — a bare \`git worktree prune\``,
+          `       # deregisters every worktree whose dir is not stat-able right now,`,
+          `       # unrelated siblings included (#1141).`,
+          `     A worktree shares the object store. NEVER \`git clone\` / \`cp -R\` /`,
+          `     \`rsync\` the repo into /tmp: the copy outlives its owner and costs`,
+          `     ~2.4M files of I/O per cycle (#1141). Where it exists, prefer`,
+          `     \`scripts/scratch-worktree.sh run ...\` — it removes the worktree itself.`,
+          `   → Inspect first: git status --porcelain; git diff <path>.`,
+          `   → Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1 (or`,
+          `     ELDATO_ALLOW_MAIN_EDITS=1), or stamp the ~/.pi/agent/.allow-main-edits`,
+          `     marker — both bypass this gate unchanged.`,
+        ]),
+  ].join("\n");
+}
+
+/** Placeholder tokens declared by `xargs -I<tok>` / `-I <tok>` — the token is
+ *  substituted into the child command at execution time, so it can carry the
+ *  code the gate would otherwise walk (`printf … | xargs -I@ sh -c '@'`).
+ *  Arbitrary by design, hence read from the invocation instead of `{}`
+ *  (reviewer round-8b P1). */
+function _wtXargsPlaceholders(command: unknown): string[] {
+  const out: string[] = [];
+  // Scoped to REAL xargs segments: a bare `-I <arg>` belongs to some other
+  // program too often to harvest globally (`grep -I clean.txt` false-blocked a
+  // clean checkout, reviewer round-10 P2).
+  for (const seg of String(command ?? "").split(/[|;&]/)) {
+    // Accept a PATH-QUALIFIED, QUOTED or BACKSLASH-ESCAPED feeder word
+    // (`/usr/bin/xargs`, `"xargs"`, `\xargs`) — scoping to a literal `xargs`
+    // word let each spelling hide its `-I` placeholder and re-opened the
+    // round-9 bypass (reviewer round-10 P1 / round-11 P1).
+    if (!/(?:^|[\s(])(?:[\w./-]*\/)?\\?["']?xargs["']?(?![A-Za-z0-9_.-])/.test(seg)) continue;
+    // `-J` is BSD xargs' replstr (macOS); `-I` is the POSIX/GNU one.
+    for (const m of seg.matchAll(/(?:^|\s)-[IJ]\s*("[^"]*"|'[^']*'|\S+)/g)) {
+      const tok = String(m[1] ?? "").replace(/^["']|["']$/g, "");
+      if (tok && tok !== "-") out.push(tok);
+    }
+  }
+  return out;
+}
+
+/** True when `text` names a discard-family verb. The LONG verbs stay substring
+ *  matches — they are distinctive, and a verb embedded in a PATH or FILENAME
+ *  (`bash -c "$(cat /tmp/checkout-undo.sh)"`) is a real signal (reviewer
+ *  round-8: word-anchoring them let that payload fail OPEN). `rm` is the one
+ *  that needs a word boundary, or `format`/`normal`/`terraform` false-block an
+ *  unresolvable payload that names no verb at all. */
+const _MENTIONS_DISCARD_VERB = (text: unknown): boolean => {
+  // ANSI-C quoting hides a verb from a raw-text scan (`bash -c $'git
+  // \x63heckout -- f'` really discards), and the direct extractor already
+  // decodes it — the fail-closed test must look at the same text
+  // (reviewer round-8b).
+  let s = String(text ?? "");
+  try { s = ansiTranslate(s); } catch { /* malformed escape → raw text stands */ }
+  return /(?:checkout|restore|switch|reset|read-tree|apply)|(?:^|[^A-Za-z0-9_-])rm(?:[^A-Za-z0-9_-]|$)/.test(s);
+};
+
+/** M5 gate: returns a block reason when `command` would discard uncommitted
+ *  tracked work in the checkout it targets, else null. Covers the direct argv
+ *  surface, interpreter-inline payloads (via allGitInvocations) and the
+ *  script-file surface (`bash /tmp/restore.sh`) to a bounded depth. */
+function _worktreeDiscardBlock(command: string): string | null {
+  if (!classifierLoaded) return null; // degraded import → inert (module-load tripwire guards this)
+  // Backslash-newline line continuations (`git \<LF> checkout -- f`) are joined
+  // by the shell BEFORE it tokenizes — join them here too, so every textual arm
+  // below sees the same command the shell runs (reviewer round-7 P1).
+  command = joinContinuations(command);
+  // Cheap superset pre-bail. NOT a raw-verb regex: the tokenizer resolves
+  // quote-split verbs (`git ch'ec'kout -- x` ≡ `git checkout -- x`, reviewer
+  // P1), so the only safe textual bail is "no `git` anywhere and no script to
+  // read". The extractor is a pure string walk — the same cost the full
+  // classifier already pays per bash call.
+  //
+  // Round-3 P1: the bail itself must not defeat the tokenizer — a quote/escape
+  // or `$'…'`-concat name (`g"it"`, `'g'it`, `g\it`, `$'\x67it'`) has no
+  // literal `git` word but DOES run git. Bail only when the command contains
+  // no quoting/expansion character at all.
+  let _scriptPath = extractScriptPath(command);
+  // A FILE piped into a shell interpreter (`cat /tmp/undo.sh | bash`) carries no
+  // literal `git` either — it must survive the bail so the script walk can read
+  // it (reviewer round-5 P1).
+  const pipesToShell = wtPipelineFeedsShell(command);
+  // Runtime placeholder tokens declared by `xargs -I<tok>` — the token is
+  // substituted at execution time, so it is never a literal path/spec (reviewer
+  // round-9 P1).
+  const xargsPlaceholders = _wtXargsPlaceholders(command);
+  if (!/\bgit\b/.test(command) && !_scriptPath && !pipesToShell && !/['"\\$`]/.test(command)) return null;
+  let direct: ReturnType<typeof extractWorkingTreeDiscards> = [];
+  try { direct = extractWorkingTreeDiscards(command) ?? []; } catch { return null; }
+  const sessionCwd = resolve(process.cwd());
+  const execCwd = commandExecutionCwd(command, sessionCwd) ?? sessionCwd;
+
+  // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
+  // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
+  // script would otherwise never be read (reviewer P1).
+  if (!_scriptPath) {
+    const firstTok = String(command).trim().split(/\s+/)[0] ?? "";
+    if (/^[.~]?\//.test(firstTok) || firstTok.startsWith("/")) {
+      try {
+        const p = realpathSync(resolve(execCwd, firstTok));
+        const st = statSync(p);
+        if (st.isFile() && (st.mode & 0o111) !== 0) _scriptPath = firstTok;
+      } catch { /* nonexistent/non-executable — not a script invocation */ }
+    }
+  }
+
+  // An unresolvable script path (`bash $S`, `cat x.sh | sh`) is refused
+  // unconditionally: the discard target is unknown, and an unreadable script may
+  // discard uncommitted work in ANY checkout, so it cannot be assumed safe
+  // (#709). The reason below names only what was measured — the shared helper
+  // already renders "NOT a claim that the checkout is dirty" (#1139/PR #1152),
+  // so this arm must never name a state it did not observe. What this change
+  // touches is the MESSAGE only; the arm already failed closed.
+  if (_scriptPath && /[$`]/.test(_scriptPath)) {
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      // WHAT was measured (the path's text), WHAT it costs (an unreadable script
+      // may discard anywhere), and the edit that makes it verifiable.
+      "the script path contains a $ or a backtick, so it is not statically " +
+        "resolvable — the shell may expand it at runtime, and an unreadable script may " +
+        "discard uncommitted work in ANY checkout; pass the path literally (e.g. " +
+        "`bash ./tools/your-script.sh`) so its contents can be read and verified",
+    );
+  }
+
+  // Probe sets: the command itself, plus any script FILES it runs/sources
+  // (`bash /tmp/restore.sh` is the documented backdoor shape — M4's
+  // _backdoorBlock closes it only for hub sessions, so a worktree `pi -p`
+  // child could otherwise hide a discard there). Bounded depth 3, 64KB per
+  // file, cycle-guarded; a read failure is a no-op (the direct argv surface
+  // still gates).
+  //
+  // `baseCwd` is the frame resolveInvocationTarget applies the invocation's own
+  // cdChain to: for DIRECT argv invocations that is the SESSION cwd (the chain
+  // is already expressed relative to it — passing the execution cwd
+  // DOUBLE-APPLIED the cd and false-blocked `cd .. && bash noop.sh && git
+  // checkout -- <clean file>`, reviewer P1). `writeCwd` (redirect targets) IS
+  // the execution cwd.
+  const sets: { discs: ReturnType<typeof extractWorkingTreeDiscards>; baseCwd: string; writeCwd: string; script: string | null }[] = [
+    { discs: direct, baseCwd: sessionCwd, writeCwd: execCwd, script: null },
+  ];
+  try {
+    const seen = new Set<string>();
+    // Seeds: the resolved script path, plus any FILE piped into a shell
+    // interpreter (`cat /tmp/undo.sh | bash`), which `extractScriptPath` cannot
+    // see because the head of the line is not the interpreter (reviewer
+    // round-5 P1).
+    const seeds: string[] = [];
+    if (_scriptPath) seeds.push(_scriptPath);
+    const pipeSeg = String(command).split("|");
+    const execPlaceholder = /(?:^|\s)(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]+\s+)?\{/.test(String(command));
+    if (pipeSeg.length > 1 && pipesToShell) {
+      // #1139 (review cycle-1 P1, T4-pipe): the whitespace split kept the SHELL
+      // QUOTES, so `cat "undo.sh" | bash` resolved `'"undo.sh"'`, realpathSync
+      // threw, the file was never read — and a discard inside it ran UNGATED,
+      // while the identical unquoted spelling was walked.
+      //
+      // FIXED WITH THE SHARED, QUOTE-AWARE TOKENIZER (review cycle-2 P1). The
+      // first attempt dequoted the whole segment then split on whitespace, which
+      // does NOT reconstruct shell words: it INVENTED a seed for unquoted input
+      // (`cat a b | bash` seeded `a`, `b` AND the non-existent `a b`) and
+      // over-split a quoted one (`cat "a b" | bash` seeded `a` and `b`), so a
+      // file that the shell NEVER reads could pin a false block. `wtShellWords`
+      // returns exactly one token per shell word; each token is then dequoted
+      // per-token (quotes + backslash escapes), and NOTHING is re-joined — so
+      // every seed is a string the shell itself would read as one word, and
+      // `cat -n "a b.sh" | bash` still resolves `a b.sh`.
+      for (const raw of wtShellWords(String(pipeSeg.slice(0, -1).join("|")))) {
+        const tok = _dequoteShellWord(raw);
+        if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
+        try {
+          const real = realpathSync(resolve(execCwd, tok));
+          if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) seeds.push(tok);
+        } catch { /* not a readable file */ }
+      }
+    }
+    // `printf 'git checkout -- f\n' | bash` feeds the shell CODE from a producer
+    // the seed loop cannot resolve (it only seeds readable FILES). Fail closed
+    // when the command names a discard-family verb (reviewer round-8 P1). A
+    // genuine `cat undo.sh | bash` never reaches here (no verb in the text; the
+    // file seed is what catches it).
+    if (pipeSeg.length > 1 && pipesToShell && _MENTIONS_DISCARD_VERB(command)) {
+      return _worktreeDiscardBlockReason({ form: "piped-shell-payload", scope: "all", pathspecs: [] }, execCwd, "a piped shell payload is not statically resolvable");
+    }
+    // `find <file> -exec sh {} \;` runs the file as a script (reviewer round-7
+    // P2) — seed every existing file token of the command.
+    if (execPlaceholder) {
+      for (const tok of String(command).split(/\s+/)) {
+        if (!tok || tok.startsWith("-") || /[$`*?]/.test(tok)) continue;
+        try {
+          const real = realpathSync(resolve(execCwd, tok));
+          if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) seeds.push(tok);
+        } catch { /* not a readable file */ }
+      }
+    }
+    let p: string | null = seeds.shift() ?? null;
+    for (let depth = 0; depth < 3 && p; depth++) {
+      let real: string;
+      try { real = realpathSync(resolve(execCwd, p)); } catch { p = seeds.shift() ?? null; continue; }
+      if (seen.has(real)) { p = seeds.shift() ?? null; continue; }
+      seen.add(real);
+      let content: string;
+      try {
+        if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) { p = seeds.shift() ?? null; continue; }
+        content = readFileSync(real, "utf8");
+      } catch { p = seeds.shift() ?? null; continue; }
+      if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
+        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: p });
+      }
+      p = extractScriptPath(content) ?? seeds.shift() ?? null;
+    }
+  } catch { /* script walk is best-effort — never false-block on its failure */ }
+
+  // `eval '<payload>'` (reviewer P1): allGitInvocations does not walk eval
+  // payloads, so extract them here (one level — a nested eval is a documented
+  // residual). Round-8 P1: the arm also has to see the UNQUOTED variable form
+  // (`eval $P`), and an unresolvable payload fails closed on the COMMAND's
+  // verbs — `P='git checkout -- f'; eval "$P"` previously fell through at the
+  // payload-scoped verb test and destroyed the file.
+  for (const m of String(command).matchAll(/\beval\s+(\$)?(['"])([\s\S]*?)\2|\beval\s+(\S+)/g)) {
+    const payload = m[1] ? ansiTranslate(m[3] ?? m[4] ?? "") : (m[3] ?? m[4] ?? "");
+    const bare = payload.replace(/^["']|["']$/g, "");
+    const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
+    const name = vm?.[1] ?? vm?.[2];
+    if (name) {
+      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
+      const val = am ? String(am[1]).replace(/^["']|["']$/g, "") : null;
+      if (val && !/[$`]/.test(val)) {
+        sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        continue;
+      }
+    }
+    if (/[$`]/.test(payload)) {
+      // Still opaque (env-fed `$P`, `$(…)`): the `-c` arm's contract — fail
+      // closed when the command names a discard verb.
+      if (_MENTIONS_DISCARD_VERB(command)) {
+        return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, "an `eval` payload is not statically resolvable");
+      }
+      continue;
+    }
+    if (!_MENTIONS_DISCARD_VERB(payload)) continue;
+    sets.push({ discs: extractWorkingTreeDiscards(payload) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+  }
+
+  // `xargs -I<tok> … <shell> -c '<tok>'` — the placeholder token is ARBITRARY and
+  // is substituted from the pipe/input at execution time, so the payload cannot
+  // be resolved statically. The extractor cannot even see this payload: the
+  // segment head is `xargs`, which is not a spawner word, so the whole segment
+  // is skipped. Check the invocation pair directly and fail closed (reviewer
+  // round-8b P1).
+  if (xargsPlaceholders.length > 0 &&
+      /(?:^|[\s;|&(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)(?![A-Za-z])/.test(String(command))) {
+    return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is a runtime placeholder");
+  }
+
+  // Interpreter `-c` payloads: `allGitInvocations` resolves a LITERAL payload,
+  // but an opaque one (`bash -c "$S"`) yields no invocation at all. Resolve a
+  // same-command assignment (`S='git checkout -- f'; bash -c "$S"`) and probe
+  // it; anything that is STILL opaque fails closed when the command mentions a
+  // discard-family verb.
+  //
+  // The verb test is deliberately over the WHOLE command, not just the payload
+  // segment (reviewer round-7, second pass): the payload's value can come from
+  // a producer the walker cannot follow — `S=$(printf 'git checkout -- f')`,
+  // `printf -v S '%s' 'git checkout -- f'`, `read -r S <<<'git checkout -- f'`,
+  // `eval "S='git checkout -- f'"`, `printf … > /tmp/p.sh; bash -c "$(cat
+  // /tmp/p.sh)"` — and payload-scoping let every one of those destroy WIP. This
+  // is the pre-round-7 contract: an unresolvable opaque payload sharing a
+  // command with a discard verb is exactly the case the arm exists for. The
+  // cost is a conservative block on `bash -c "$L" && git checkout main`; that
+  // ambiguity is the arm's documented residual, not a false positive to trade
+  // real discards for.
+  for (const pl of wtShellInlinePayloads(command)) {
+    // A RUNTIME placeholder inside the payload (`-I{}` is by far the common
+    // form) can never be resolved statically (reviewer round-8 P1).
+    if (/\{\}/.test(pl.text)) {
+      return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is a runtime placeholder");
+    }
+    if (!pl.opaque) {
+      // A literal payload that runs/sources a SCRIPT FILE seeds the bounded
+      // walk (`bash -c 'source /tmp/undo.sh'`, round-7 P1). Outer quotes are
+      // stripped first — `extractScriptPath` tokenizes the payload as a COMMAND,
+      // and a leading `'` would make `'source` an unrecognised head.
+      try {
+        const sp = extractScriptPath(pl.text.replace(/^["']|["']$/g, ""));
+        if (sp && !/[$`]/.test(sp)) sets.push({ discs: extractWorkingTreeDiscards(readFileSync(resolve(execCwd, sp), "utf8")) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+      } catch { /* missing/unreadable — the direct surface still gates */ }
+      continue;
+    }
+    const bare = pl.text.replace(/^["']|["']$/g, "");
+    // Opaque, but its ONLY substitution reads a statically named FILE
+    // (`bash -c "$(cat /tmp/undo.sh)"`): seed the bounded script walk from that
+    // file rather than relying on the verb appearing in the command text
+    // (reviewer round-8b P1). Anything the walk cannot resolve still falls
+    // through to the verb test below.
+    const catM = /^\$\(\s*(?:cat|bat)\s+([^\s)$]+)\s*\)$|^`cat\s+([^`]+)`$/.exec(bare);
+    const catPath = catM?.[1] ?? catM?.[2];
+    if (catPath && !/[$`*?]/.test(catPath)) {
+      try {
+        const real = realpathSync(resolve(execCwd, catPath));
+        if (statSync(real).isFile() && statSync(real).size <= 64 * 1024) {
+          sets.push({ discs: extractWorkingTreeDiscards(readFileSync(real, "utf8")) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: catPath });
+          continue;
+        }
+      } catch { /* missing/unreadable → the verb test still applies */ }
+    }
+    const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
+    const name = vm?.[1] ?? vm?.[2];
+    if (name) {
+      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
+      if (am) {
+        const val = String(am[1]).replace(/^["']|["']$/g, "");
+        // A value that is ITSELF opaque (`S=$(printf 'git checkout -- f')`,
+        // `read`-fed, `printf -v`-fed) is NOT resolved — falling through to the
+        // fail-closed test is the whole point. Only a statically readable value
+        // is probed and short-circuits (reviewer round-7, second pass).
+        if (!/[$`]/.test(val)) {
+          sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+          continue;
+        }
+      }
+    }
+    if (_MENTIONS_DISCARD_VERB(command)) {
+      return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, "an interpreter `-c` payload is not statically resolvable");
+    }
+  }
+
+  // #1139 — M5's own sanctioned-script exemption, the M5 twin of #1129's M4
+  // exemption (`_backdoorBlock`). SAME list, SAME anchor: `SANCTIONED_SCRIPT_RELPATHS`
+  // resolved under the running guard's OWN checkout, realpath-keyed on both
+  // sides. Without it M4 and M5 disagree about the framework's recovery
+  // helper — M4 exempts `hub-worktree.sh` while M5 blocks it anyway, which is
+  // what made the file's own comment ("Recovery scripts … keep working")
+  // false.
+  //
+  // The reported block: the salvage path reverts the hub's tracked dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`. The pure extractor can only
+  // surface that as a `cat-file-revert` HINT whose pathspec is the SHELL LOOP
+  // VARIABLE `$rest`, and the unresolvable-pathspec rule below then fails
+  // closed — on a provably clean checkout, for a script whose every discard is
+  // preceded by its own capture+push (and which refuses to clean the hub when
+  // that push fails).
+  //
+  // SCOPE — the SET is dropped, never the command: `sets[0]` (the command's own
+  // argv) always carries `script: null` and is always gated, and a script
+  // reached through a second hop keeps its OWN set, so `bash /tmp/wrapper.sh`
+  // that sources the sanctioned file is still gated on everything the wrapper
+  // itself says. SAFETY — this is why a path-keyed exemption is safe HERE: a
+  // set's `script` is always the file the set's discards were READ from (the
+  // seed walk stores `realpathSync(resolve(execCwd, p))`'s content with `p`;
+  // every other push site reads the file it stores), so the exemption can only
+  // ever drop discards that came from the sanctioned file's OWN bytes. Naming
+  // the sanctioned path from elsewhere buys nothing — the content is still
+  // that file's, and a wrapper's own discards stay in the wrapper's set.
+  // KEYING — a copy at the same relpath in another checkout is NOT
+  // exempt (the anchor is the guard's own checkout, not a repo fingerprint and
+  // not the invoking cwd); the hub's own `scripts/` spelling still matches when
+  // a session addresses it through a symlink, because both sides are realpath'd.
+  // A wrong anchor here is fail-OPEN on other sessions' uncommitted work, which
+  // is why this reuses the hardened #1129 helper instead of re-deriving one.
+  //
+  // AUDIT — one row per command, emitted only when a set was ACTUALLY dropped,
+  // aggregating BY REALPATH and recording HOW MANY discards the relaxation hid.
+  // A row that said only "an exemption fired" cannot answer "did this exemption
+  // suppress a block?" (review fold-in); a row written from inside the filter
+  // predicate fires even when nothing was dropped; and summing raw push-sites
+  // double-counts, because the same sanctioned file can be pushed as TWO sets in
+  // one command (the bounded walk's `seen` set is local to the walk; the inline
+  // `-c` / `$( )` push sites never consult it), which reported 2 / 2 for
+  // `bash <s>; bash -c 'source <s>'` (review cycle-2 P2).
+  const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>();
+  const gatedSets = sets.filter((s) => {
+    if (s.script === null) return true; // the command's own argv is never exempt
+    let rel: string | null = null;
+    // Fail closed on a probe failure: keep the set gated.
+    try { rel = _sanctionedScriptExemption(resolve(execCwd, s.script)); } catch { rel = null; }
+    if (rel === null) return true;
+    let real = resolve(execCwd, s.script);
+    try { real = realpathSync(real); } catch { /* keep the lexical path as the key */ }
+    const prev = exempted.get(real);
+    if (prev) {
+      // The same realpath always yields the same discard list (the content is
+      // read from that file), so repeated push sites must NOT add up: `max`
+      // keeps `discards_dropped` consistent with `sets_exempted` — a row saying
+      // 1 set hid 2 discards misstates the suppression it exists to report
+      // (review cycle-3 P2).
+      prev.discards = Math.max(prev.discards, s.discs.length);
+      for (const d of s.discs) prev.forms.add(d.form);
+    } else {
+      exempted.set(real, { rel, discards: s.discs.length, forms: new Set(s.discs.map((d) => d.form)) });
+    }
+    return false;
+  });
+  if (exempted.size > 0) {
+    const rows = [...exempted.entries()];
+    try {
+      appendJsonl({
+        event: "m5_script_exemption",
+        extension: "main-worktree-guard",
+        script: rows[0][1].rel,
+        script_realpath: rows[0][0],
+        scripts: rows.map(([, v]) => v.rel),
+        sets_exempted: rows.length,
+        discards_dropped: rows.reduce((n, [, v]) => n + v.discards, 0),
+        discard_forms: [...new Set(rows.flatMap(([, v]) => [...v.forms]))],
+        framework_root: _frameworkRoot,
+        session_cwd: sessionCwd,
+        command: command.slice(0, 300),
+        session_id: _currentSessionId(),
+      });
+    } catch { /* audit is best-effort — never blocks */ }
+  }
+
+  if (gatedSets.every((s) => s.discs.length === 0)) return null;
+
+  for (const set of gatedSets) {
+    // The `cat-file-revert` form (`git show HEAD:x > x`) needs the source's
+    // bash WRITE targets (pure string walk) to find where the content lands.
+    let writeTargets: string[] = [];
+    if (set.discs.some((d) => d.form === "cat-file-revert")) {
+      try {
+        const src = set.script === null ? command : readFileSync(resolve(execCwd, set.script), "utf8");
+        writeTargets = extractBashWriteTargets(src, set.writeCwd).map((t) => resolve(set.writeCwd, t.resolvedPath));
+      } catch { /* best-effort — a miss only means no extra block */ }
+    }
+
+    for (const d of set.discs) {
+      // Fail closed on anything whose blast radius is not statically known:
+      // `--pathspec-from-file` (the list lives in a FILE), an unresolvable
+      // `$VAR`/backtick pathspec, or an xargs/find `-exec` placeholder.
+      const unresolvable = (d as { unverifiable?: boolean }).unverifiable === true ||
+        d.pathspecs.some((p) => /[$`]/.test(String(p))) ||
+        // Brace expansion (`git checkout -- {dirty,clean}.txt`) is expanded by
+        // the SHELL; the probe would pass the literal token to git, match
+        // nothing, read the tree as clean and release the discard (reviewer
+        // round-8 P2). Not statically resolvable → fail closed.
+        d.pathspecs.some((p) => /[{}]/.test(String(p))) ||
+        d.pathspecs.some((p) => {
+          const bare = String(p).replace(/^["']|["']$/g, "");
+          // Equality OR a whole path SEGMENT — the placeholder is usually
+          // interpolated INTO a path (`src/@`), but a bare substring test made
+          // `-I c`/`-I .` match nearly every pathspec (`clean.txt`) and blocked a
+          // clean target (reviewer round-10 P2). A PLACEHOLDER-SIGNIFICANT token
+          // (multi-character, or one of the classic replstrs) may also appear as
+          // a prefix/suffix (`@.txt`, `f@` — reviewer round-11 P1).
+          return xargsPlaceholders.some((t) => {
+            if (!t) return false;
+            const significant = t.length > 1 || /^(?:@|%|\+|\{\})$/.test(t);
+            return bare === t || bare.includes(`${t}/`) || bare.includes(`/${t}`) || (significant && bare.includes(t));
+          });
+        }) ||
+        d.pathspecs.some((p) => wtIsPlaceholderPathspec(p));
+      if (unresolvable) {
+        return _worktreeDiscardBlockReason(d, execCwd, "the target pathspec is not statically resolvable");
+      }
+
+      let probeCwd: string;
+      let scope: { scope: string; pathspecs: string[]; fromTree?: boolean } = d;
+      if (d.form === "cat-file-revert") {
+        const lands = writeTargets.filter((t) => d.pathspecs.some((p) => resolve(set.writeCwd, p) === t));
+        if (lands.length === 0) continue; // the committed content is not redirecting onto its own path
+        probeCwd = set.writeCwd;
+        scope = { scope: "paths", pathspecs: lands.map((t) => relative(set.writeCwd, t) || "."), fromTree: true };
+      } else {
+        let eff: { effectiveCwd: string; worktreePath?: string | null } | null = null;
+        try { eff = resolveInvocationTarget(d.inv, sessionCwd, set.baseCwd); } catch { eff = null; }
+        if (eff === null) {
+          return _worktreeDiscardBlockReason(d, set.baseCwd, "the invocation's effective repo could not be resolved (unresolvable cd/$VAR)");
+        }
+        probeCwd = eff.effectiveCwd;
+        // `--work-tree=<dir>` / a worktree git-dir targets a DIFFERENT working
+        // tree than the cwd (reviewer P2): probe the work-tree when it exists.
+        const wtHint = (d.inv as { workTreeHint?: string | null } | null)?.workTreeHint;
+        if (wtHint && wtHint !== "\u0000") {
+          try {
+            const wtReal = realpathSync(resolve(probeCwd, wtHint));
+            if (existsSync(wtReal)) probeCwd = wtReal;
+          } catch { /* unresolvable work-tree → keep the cwd probe */ }
+        }
+      }
+      // A single bare `git checkout <token>` is a REF SWITCH when the token
+      // names one and a PATH RESTORE otherwise (`git checkout f.txt` reverts
+      // f.txt — the incident verb's twin without `--`, reviewer round-4 P1).
+      // `git checkout -f <token>` inverts the default: a ref is a FORCED switch
+      // (destroys all local changes → keep whole-tree scope), a path is a
+      // single-path restore (reviewer round-5 P2).
+      if ((d as { ambiguousRef?: boolean }).ambiguousRef && d.pathspecs.length === 1) {
+        let isRef = false;
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "--quiet", `${d.pathspecs[0]}^{commit}`],
+            { cwd: probeCwd, stdio: ["ignore", "ignore", "ignore"] });
+          isRef = true;
+        } catch { /* not a ref → treat as a path */ }
+        const refIsAll = (d as { refIsAll?: boolean }).refIsAll === true;
+        if (isRef && !refIsAll) continue; // a plain branch/tag switch, not a discard
+        if (!isRef && refIsAll) scope = { scope: "paths", pathspecs: d.pathspecs, fromTree: false };
+      }
+      // `git checkout <tok> <paths>`: the first positional is a tree-ish ONLY
+      // when it names a commit; otherwise EVERY positional is a pathspec
+      // (reviewer round-7 P1).
+      if ((d as { ambiguousTree?: string }).ambiguousTree && (d as { allPathspecs?: string[] }).allPathspecs) {
+        let isRef = false;
+        try {
+          execFileSync("git", ["rev-parse", "--verify", "--quiet", `${(d as { ambiguousTree?: string }).ambiguousTree}^{commit}`],
+            { cwd: probeCwd, stdio: ["ignore", "ignore", "ignore"] });
+          isRef = true;
+        } catch { /* not a ref → all positionals are pathspecs */ }
+        if (!isRef) scope = { scope: "paths", pathspecs: (d as { allPathspecs?: string[] }).allPathspecs ?? d.pathspecs, fromTree: false };
+      }
+      const dirty = _discardStatusPorcelain(probeCwd, scope);
+      if (dirty === true) return _worktreeDiscardBlockReason(d, probeCwd, null);
+      if (dirty === null) return _worktreeDiscardBlockReason(d, probeCwd, "the target checkout's status could not be read");
+    }
+  }
+  return null;
+}
+
+// #1129 — sanctioned framework scripts, keyed on the running guard's OWN
+// checkout (never on a path the command supplies).
+//
+// WHY THIS EXISTS: `scriptGitVerdict` false-blocks the framework's own
+// mandated preflight from a HUB-rooted session on PURE TEXT shapes —
+// `scripts/check-pipeline-compliance.sh` contains ```bash fences inside a
+// single-quoted TEST FIXTURE and a usage heredoc whose prose says "git
+// remote", and either alone pins the verdict to `block` even though the
+// script's only real git invocation is a read-only `remote get-url`. That
+// block makes commit-workflow Step 1 (the mandated preflight) unrunnable.
+//
+// WHY A NAMED LIST AND NOT THE DIRECTORY (adversarial review P0): `scripts/`
+// also carries git-DESTRUCTIVE helpers — `cleanup-worktree.sh` runs `git
+// worktree remove --force` + `git branch -D` on an agent-supplied branch, and
+// `cleanup-stale-branches.sh --execute` deletes remote branches. Neither needs
+// a write, so "the write gate already covers authoring a malicious script"
+// does NOT cover RUNNING a pre-existing destructive one; a directory-wide
+// exemption would let a hub-rooted session destroy another session's
+// uncommitted work with the content walker switched off. Only scripts whose
+// git content is read-only or the documented recovery surface are listed.
+//
+// WHY THE GUARD'S OWN CHECKOUT: the realpath anchor is derived from this
+// module's location, so an agent-editable COPY of the framework (a linked
+// worktree, where the write gate is lifted) has a different realpath and is
+// NOT exempt. A repo-fingerprint anchor (isAgentInfraRepo) would have been
+// forgeable by exactly that route.
+const SANCTIONED_SCRIPT_RELPATHS = [
+  // commit-workflow Step 1 (01-preflight.md) — the mandated pre-push gate.
+  "scripts/check-pipeline-compliance.sh",
+  // The recovery helper most guard messages recommend.
+  "scripts/checkout-hygiene/hub-worktree.sh",
+  // #1141 — the mandated scratch-checkout helper. It is the fix for the
+  // /tmp copy debris, and it is NOT usable from a hub-rooted session without
+  // this exemption: its content carries `git worktree add/remove/prune`,
+  // `sparse-checkout` and `read-tree`, so the content walk blocked exactly the
+  // hub-rooted reviewers the rule is written for — who then fell back to the
+  // improvisation the issue exists to stop (code-review cycle-2 P1, driven
+  // through this module's real handler). Same class as hub-worktree.sh (worktree
+  // create/remove, resolved at runtime), and TIGHTER than it: removal is
+  // confined by `owns()` to a path that is under the scratch root AND carries
+  // the tool's marker AND whose admin gitdir is under the COMMON
+  // .git/worktrees/ AND whose admin dir's own `gitdir` back-link names that
+  // checkout — the last of which is written by git, so it cannot be forged to
+  // deregister a worktree the caller does not control (code-review-cycle-9 P1),
+  // so it cannot be pointed at the hub or another checkout.
+  "scripts/scratch-worktree.sh",
+  // #1484/#1141 class, second instance — the review RECORDER. `record-review.sh` is mandated by the
+  // review/merge path and its git surface is READ-ONLY (`merge-tree` incl. `--write-tree`,
+  // `merge-base`, `cat-file`, `ls-tree`, `rev-parse`, `rev-list`, `diff`) — no `checkout`/`reset`/
+  // `clean`/`stash`/`commit`/`push`/`rebase`/`worktree remove`. It is therefore LESS privileged
+  // than the two entries above, which do `worktree add/remove/prune`, `sparse-checkout` and
+  // `read-tree`. Without this entry its content walk blocks exactly the hub-rooted lanes the merge
+  // path is written for, and the only remaining route is the improvisation this guard exists to
+  // stop: measured 2026-10-05, a lane that had completed a review (tortoise #7433, comment
+  // 6000279278) could review but never RECORD, which left a reviewed-but-unlandable PR — and the
+  // same step gates every `blocked` row of the drain, since the rail requires a record bound to the
+  // current head.
+  "scripts/record-review.sh",
+];
+const _frameworkRoot: string | null = (() => {
+  try {
+    // #1129 (code-review P0): realpath the MODULE, THEN walk up — the
+    // computation lives in classify-git (pure, so it is tested against a real
+    // symlinked extension dir); the inline form below is the SAME expression
+    // and exists so a stale classify-git cannot silently disable the
+    // exemption. pi deploys this extension from the symlink farm
+    // `~/.pi/agent/extensions/<name>` → this checkout and its loader preserves
+    // the symlink spelling, so a lexical `../..` yields `~/.pi/agent`: not the
+    // checkout (exemption inert → the mandated preflight stays blocked) and not
+    // a git checkout (agent-WRITABLE, so a minted
+    // `<~/.pi/agent>/scripts/<listed relpath>` would take the exemption).
+    if (_frameworkRootFromModuleUrl) return _frameworkRootFromModuleUrl(import.meta.url);
+    const self = realpathSync(fileURLToPath(import.meta.url));
+    return realpathSync(resolve(dirname(self), "..", ".."));
+  } catch {
+    return null; // unknown location → no exemption (fail-closed)
+  }
+})();
+
+/** Sanctioned-framework-script exemption (#1129) — returns the matched
+ *  relative path (for the audit row), or null. Realpath-keyed on BOTH sides:
+ *  a symlinked spelling (the hub's `scripts/`) resolves to the same file, and a
+ *  copy in another checkout does not. The listed relpath is realpath'd too, so
+ *  a symlinked component inside the framework's own tree cannot silently
+ *  disable the exemption. */
+function _sanctionedScriptExemption(resolvedScript: string): string | null {
+  if (!_frameworkRoot) return null;
+  let real: string;
+  try {
+    real = realpathSync(resolvedScript);
+  } catch {
+    return null;
+  }
+  for (const rel of SANCTIONED_SCRIPT_RELPATHS) {
+    let sanctioned: string;
+    try { sanctioned = realpathSync(resolve(_frameworkRoot, rel)); } catch { continue; }
+    if (real === sanctioned) return rel;
+  }
+  return null;
+}
+
 // Script-backdoor closure (Slice E): the documented escape
 // (`write /tmp/x.sh` + `bash /tmp/x.sh`) is closed by gating the script's git
 // content with the SAME recovery allowlist — a script that performs a
@@ -980,6 +2052,54 @@ function _hubBashWriteBlockReason(hit: { resolvedPath: string; rel: string; kind
 function _backdoorBlock(command: string, execCwd?: string): string | null {
   try {
     if (isWorktreeCwdWrite(resolve(process.cwd()))) return null; // worktree sessions are isolated
+    // #627: non-shell CODE interpreters (python -c / python <file> / node -e /
+    // ruby -e / perl -e / php -r / …) carry git payloads past the SHELL-only
+    // script gate — the payload is quoted/arrayed, so evaluateHubGateWithTargets
+    // sees no git token either. Resolve the code payload BEFORE
+    // extractScriptPath: the latter's `/abs/path` rule would resolve
+    // `/usr/bin/python3` and read the interpreter BINARY as a script.
+    // codePayloadGitVerdict shares the script surface's allowlist + per-
+    // invocation target resolution, so read-only and worktree-targeted git ops
+    // from code keep working (false-blocks stay exceptional).
+    const code = extractCodePayload(command);
+    // #627 scope: INLINE interpreter payloads (`python -c`, `node -e`,
+    // `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`, …). File / module /
+    // stdin payloads are NOT content-gated here — reading an arbitrary
+    // repo script (e.g. the guard's own `node test.mjs`) against the
+    // hub-recovery allowlist false-blocks legitimate test fixtures that run
+    // git in temp repos, which is the same semantics the shell surface has
+    // (#1484). File/shebang/module/stdin forms are documented residuals
+    // (README backdoor table + tracked follow-ups).
+    if (code && code.kind === "inline") {
+      const base = execCwd ? resolve(execCwd) : resolve(process.cwd());
+      const content = code.value ?? "";
+      {
+        const branch = getMainCheckoutBranch();
+        // #627 reviewer P2: an opaque inline payload (`python3 -c "$PYCODE"`,
+        // `python3 -c "$(cat code.py)"`) is not statically resolvable. Mirror
+        // the shell surface's round-11 `sh -c '$VAR'` arm: a valid payload
+        // variable whose command assigns a git-bearing value is unverifiable →
+        // block. A non-git command string still allows (no blanket block).
+        const opaqueInline =
+          /^\s*\$(?:\{?[A-Za-z_][A-Za-z0-9_]*\}?|\([\s\S]*\)|\[[\s\S]*\])\s*$/.test(content);
+        const verdict = opaqueInline
+          ? (/\bgit\b/.test(command) ? "block" : "allow")
+          : codePayloadGitVerdict(content, branch, base, resolve(process.cwd()));
+        if (verdict === "block") {
+          return [
+            `⛔ Script execution blocked — git-bearing code payload in the shared main checkout (#627).`,
+            `   The non-shell interpreter backdoor (python -c, node -e, ruby -e,`,
+            `   perl -e, php -r, pwsh -Command) is closed: the inline payload`,
+            `   contains a non-sanctioned git operation.`,
+            `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
+            `     or work in an isolated worktree:`,
+            `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+          ].join("\n");
+        }
+      }
+      return null; // resolved inline code invocation — no shell script to gate
+    }
+    if (code) return null; // non-inline code form — out of #627 scope (residual)
     const scriptPath = extractScriptPath(command);
     if (!scriptPath) return null;
     // #347: resolve the script path + content gating against the command's
@@ -989,14 +2109,67 @@ function _backdoorBlock(command: string, execCwd?: string): string | null {
     const resolved = resolve(base, scriptPath);
     if (!existsSync(resolved) || !statSync(resolved).isFile()) return null;
     const branch = getMainCheckoutBranch();
-    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd())) === "block") {
+    // #967/#1484: pass the invocation's positional args so a branch only a
+    // DIFFERENT subcommand reaches cannot gate this one (e.g. `--probe` must
+    // not be blocked by a `--reset`-only discard). [] is a real argv (no args)
+    // — `$1` is then provably empty; undefined would be "unknown".
+    const scriptArgs = extractScriptArgs(command, scriptPath);
+    // #1129 — the framework's OWN sanctioned scripts are exempted before the
+    // content walk (see SANCTIONED_SCRIPT_RELPATHS for why this is a named
+    // list keyed on the guard's own checkout). Deliberate gate relaxation →
+    // audited (best-effort, never blocks) so the exemption is observable.
+    const sanctionedRel = _sanctionedScriptExemption(resolved);
+    if (sanctionedRel) {
+      try {
+        // #1129 (code-review P2): record the REALPATH that matched, not just
+        // the listed relpath — with only the relpath, an exemption taken
+        // through a file at the same relpath under a different root (the
+        // pre-fix anchor pointed at `~/.pi/agent`) logs an identical row. The
+        // session cwd is recorded too, since that is what an operator needs to
+        // reconstruct where the command came from.
+        appendJsonl({
+          event: "m4_script_exemption",
+          extension: "main-worktree-guard",
+          script: sanctionedRel,
+          script_realpath: realpathSync(resolved),
+          framework_root: _frameworkRoot,
+          session_cwd: resolve(process.cwd()),
+          command: command.slice(0, 300),
+          session_id: _currentSessionId(),
+        });
+      } catch { /* audit is best-effort — never blocks */ }
+      return null;
+    }
+    if (scriptGitVerdict(resolved, branch, base, resolve(process.cwd()), scriptArgs) === "block") {
+      // #743: label the SCRIPT's own checkout, not the session's. A linked
+      // worktree's copy is not "the shared main checkout", and the old message
+      // offered hub-worktree.sh — which creates a worktree but cannot make a
+      // hub-rooted session run a content-gated script.
+      let scriptInWorktree = false;
+      try { scriptInWorktree = isWorktreeCwdWrite(resolve(dirname(resolved))); } catch { /* main (safe default) */ }
+      // #1129 — report the file that was actually READ. The hub's `scripts/` is
+      // a symlink into agent-infra, so the typed path names one checkout while
+      // the gated CONTENT belongs to another; and since the verdict comes from
+      // that content (not from session state), a verdict that flipped in the
+      // field without a code change is checkable against the tree only if the
+      // resolved path is printed.
+      let realResolved = resolved;
+      try { realResolved = realpathSync(resolved); } catch { /* keep the spelling */ }
       return [
-        `⛔ Script execution blocked — git-bearing script in the shared main checkout (#1484).`,
+        `⛔ Script execution blocked — script content contains a blocked git operation (#1484).`,
         `   The script backdoor (write /tmp/x.sh + bash /tmp/x.sh) is closed:`,
-        `   ${resolved} contains a non-sanctioned git operation.`,
-        `   → Run the git commands directly (recovery: git checkout main && git pull --ff-only),`,
-        `     or work in an isolated worktree:`,
-        `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+        `   ${resolved}`,
+        ...(realResolved !== resolved ? [`   (resolves to: ${realResolved})`] : []),
+        `   (script location: ${scriptInWorktree ? "a linked worktree" : "the shared main checkout"})`,
+        `   (verdict source: the script's CONTENT as read at that path, resolved against the`,
+        `    execution/session cwd below and the hub's current branch — not session state alone;`,
+        `    execution cwd: ${base ?? resolve(process.cwd())}; session cwd: ${resolve(process.cwd())})`,
+        `   performs a git operation that is not sanctioned against the shared main checkout.`,
+        `   → Run the underlying git commands directly (each is gated on its own), or do`,
+        `     this work in an isolated worktree (invoke the using-git-worktrees skill).`,
+        `   → cd-ing into a worktree from a HUB-ROOTED session does not lift this — the`,
+        `     gate keys on the session cwd. Start the session in the worktree, or set`,
+        `     the documented AGENT_ALLOW_MAIN_EDITS escape hatch for a solo session.`,
       ].join("\n");
     }
     return null;
@@ -1022,21 +2195,25 @@ const WHY = [
 // carries no sessionId). Baseline = { repoKey, branch, head, original } of the
 // shared MAIN checkout at session_start. M1 dedupe: Set of "from→to" deviations.
 // `original` = the branch recorded at an UNCONTENDED session_start and is
-// IMMUTABLE — create-new/rename re-baselines update only `.branch` (#376: the
-// ceremony return-to-main carve-out switches back to `original`, provably the
-// session's own starting state). A lock-contended start (pendingBaseline →
-// first-tool_call record) sets original null → the #376 carve-out fails closed
-// (the tree may already sit on ANOTHER session's branch — not provably own).
+// IMMUTABLE — the own-baseline RENAME re-baseline updates only `.branch` (#376:
+// the ceremony return-to-original carve-out switches back to `original`,
+// provably the session's own starting state). In-hub create-new no longer
+// re-baselines (#626 blocks it — worktree ceremonies never reach decideM3).
+// A lock-contended start (pendingBaseline → first-tool_call record) sets
+// original null → the #376 carve-out fails closed (the tree may already sit on
+// ANOTHER session's branch — not provably own).
 const baselines = new Map<number, { repoKey: string; branch: string | null; head: string; original: string | null }>();
 const warnedDeviations = new Map<number, Set<string>>();
 const pendingBaseline = new Set<number>(); // lock contended at session_start → record on first tool_call
-// Branches THIS pid created via the M3 create-new/rename carve-outs, scoped by
+// Branches THIS pid renamed its own baseline to via the M3 rename carve-out,
+// scoped by
 // repoKey (#376 review fold-in): their LOCAL deletion stays allowed after the
 // ceremony return re-bases the baseline to main (git refuses deleting a branch
 // checked out anywhere, so a pid-owned local delete is collision-free). Scoped
 // per repo and marked only in the BASELINE repo, so an owned name from one
 // agent-infra checkout can never authorize a delete in another (review fold-in).
-// Never seeded from session state.
+// Never seeded from session state. (create-new is no longer marked — in-hub
+// create-new is blocked since #626 and never re-baselines.)
 const ownedBranches = new Map<number, Map<string, Set<string>>>();
 
 function _markOwned(pid: number, repoKey: string | null | undefined, branch: string) {
@@ -1105,6 +2282,10 @@ export default function (pi: ExtensionAPI) {
   // ── Session-start: record the branch-ownership baseline + hub check ──────
   pi.on("session_start", async () => {
     const pid = process.pid;
+    // #628 reviewer P3: the new-file volume counter is per-SESSION state — a
+    // resumed/reused process must not inherit a prior session's count.
+    hubNewFileCounts.clear();
+    warnedNewFileTargets.clear();
     if (branchOwnership) {
       try {
         // Only main-checkout sessions get a baseline (worktrees are isolated).
@@ -1244,9 +2425,13 @@ export default function (pi: ExtensionAPI) {
         // python/heredoc/tee is a deliberate cross-checkout write and must block
         // exactly like the write/edit tool does; the old `st.disorder ||
         // !_sessionIsMainRooted()` guard skipped it because the SESSION's OWN hub
-        // was clean. Same-checkout clean-main writes stay free INSIDE the gate
-        // (#437's residual — classify returns null), so running unconditionally
-        // costs only the pure string walk on write-free commands. Under an active
+        // was clean. Same-checkout writes now gate on the command's EFFECT for
+        // a session's own hub too: a TRACKED hub-main write blocks whether the
+        // hub is clean or disordered (#625 — the old clean-hub early-return let
+        // a compound `printf … >> MEMORY.md && git add && git commit && git
+        // push` through); own-main untracked/NEW writes stay free, so running
+        // unconditionally costs only the pure string walk on write-free
+        // commands. Under an active
         // TTL marker only M4 D3's disordered-own-hub freeze remains (parity with
         // the write/edit route, whose #618 gate the marker return precedes — the
         // marker is an audited solo-session recovery hatch, not a license to
@@ -1295,7 +2480,21 @@ export default function (pi: ExtensionAPI) {
             return { block: true, reason: gate.reason ?? "" };
           }
           if (gate.verdict === "recovery" || gate.verdict === "allowed") {
-            return undefined; // sanctioned recovery / read-only / worktree-isolated — done
+            // #805: M4's recovery allowlist sanctions `git push
+            // <checked-out-branch>` for WIP preservation. M4 cannot see the
+            // SESSION's baseline — pushing whatever branch the SHARED hub
+            // happens to be on is exactly the cross-session contamination
+            // (#265) the branch-ownership gate exists to refuse. Never let
+            // this early-return swallow a push: fall through to the
+            // ownership/M2 path below (which allows the session's OWN branch
+            // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
+            const pushDet = classifyGitCommandDetailed(command);
+            const gateablePush = pushDet?.verdict === "block:push" ||
+              pushDet?.verdict === "block:force-push" ||
+              pushDet?.verdict === "block:push-delete";
+            if (!gateablePush) {
+              return undefined; // sanctioned recovery / read-only / non-push — done
+            }
           }
         }
       } else if (isWrite || isEdit) {
@@ -1318,6 +2517,30 @@ export default function (pi: ExtensionAPI) {
             // stay blocked. D3 preserved: the marker bypass does not re-enable
             // overwrites (this block still runs before the marker check).
             if (_hubNewFileWriteAllowed(targetPath)) {
+              // #628: volume policy — warn at write time for EVERY new hub file
+              // (all paths, not just the #350 WIP patterns), escalate past the
+              // budget, BLOCK past the hard cap. The counter is per-session and
+              // only advances while the hub is disordered (this branch).
+              const pid = process.pid;
+              const newFileCount = (hubNewFileCounts.get(pid) ?? 0) + 1;
+              hubNewFileCounts.set(pid, newFileCount);
+              const volume = hubNewFileVolumeVerdict(newFileCount);
+              if (volume === "block") {
+                return {
+                  block: true,
+                  reason: [
+                    `⛔ New-file write blocked — new-file cap exhausted in a disordered hub (#628).`,
+                    `   This session has created ${newFileCount - 1} new files directly in the`,
+                    `   shared main checkout while it is OFF-MAIN or DIRTY (cap ${HUB_NEW_FILE_BLOCK_CAP}).`,
+                    `   New files are additive (they cannot collide with a sibling's uncommitted`,
+                    `   work) but unbounded accumulation is the #347 amplifier, and the hub's`,
+                    `   only legal state is main+clean.`,
+                    `   → Recover first: cd <repo> && git checkout main && git pull --ff-only`,
+                    `   → Do feature work in a worktree: bash scripts/checkout-hygiene/hub-worktree.sh <branch>`,
+                  ].join("\n"),
+                };
+              }
+              _maybeWarnHubNewFile(targetPath, newFileCount, volume);
               return undefined; // new-file write — collision-free by construction
             }
             return {
@@ -1335,6 +2558,43 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // ── Escape marker (#207): the guard-stamped bash route is the ONLY
+    // minting path (#620) ──
+    // Runs BEFORE the hatch/marker bypass so a marker touch from ANY session
+    // — the AGENT_ALLOW_MAIN_EDITS=1 env hatch included — is guard-stamped
+    // {session_id, reason, ts} + audited here instead of minting an
+    // un-stamped, un-audited marker file (the 2026-09-08 evidence: a 3-line
+    // plain-text marker outside the gate_bypass audit trail). M4 ran above and
+    // a bare `touch <marker>` is pure non-git → never M4-blocked, so F10c (a
+    // BLOCKED command never stamps) still holds; a compound
+    // `touch … && git …` is not a marker command (single-command contract)
+    // and stays git-classified first.
+    if (isBash) {
+      const command = (event.input as { command?: string }).command ?? "";
+      if (isAllowMarkerCommand(command, homedir())) {
+        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
+        return undefined;
+      }
+    }
+    // The write/edit tool can never mint the marker either — a write to the
+    // marker path is blocked in EVERY session state (hatch / active-marker /
+    // worktree / agent-infra): an agent could `write` a stamped-looking JSON
+    // straight to the file with no gate_bypass audit event. Route creation
+    // through the bash touch path (guard-stamped + audited).
+    if (isWrite || isEdit) {
+      const targetPath = (event.input as { path?: string }).path ?? "";
+      if (resolve(process.cwd(), targetPath) === resolve(_markerPath())) {
+        return {
+          block: true,
+          reason: [
+            "⛔ The escape-marker file must be created via a bash `touch` command,",
+            "   not the write/edit tool — the guard stamps {session_id, reason, ts}",
+            "   and audits the creation only on the bash route (#207).",
+          ].join("\n"),
+        };
+      }
+    }
+
     // ── bash: branch-ownership + destructive git ──
     // Marker OR branch covers bash + write + edit in one check point (#266).
     if (_isAllowMainEdits() || readAllowMarkerState(_markerPath(), _currentSessionId(_ctx))) {
@@ -1342,6 +2602,14 @@ export default function (pi: ExtensionAPI) {
     }
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
+      // ── M5 (#709): effect-keyed working-tree-discard gate ──
+      // Runs BEFORE the degradation/full classifier arms and BEFORE the
+      // worktree exemptions below, so a discard is caught whether or not
+      // branch-ownership loaded, and in a linked worktree as well as the hub.
+      // It sits AFTER the env/marker hatch return above, so both hatches
+      // bypass it unchanged.
+      const discardBlock = _worktreeDiscardBlock(command);
+      if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
       // scan (once per 5 min — never per-command).
@@ -1487,6 +2755,15 @@ export default function (pi: ExtensionAPI) {
               reason: "⛔ Branch-state command blocked — could not resolve the effective repo (fail-closed; #265).",
             };
           }
+          // #805: an UNRESOLVED target (bare cd / unexpandable $VAR / `-C`
+          // sentinel) must never be worktree-exempted — the command may run in
+          // the shared hub. Same fail-closed rule as M2.
+          if (muEff.unresolvedTarget) {
+            return {
+              block: true,
+              reason: "⛔ Branch-state command blocked — the command's target repository is unresolved (fail-closed; #805).",
+            };
+          }
           if (muEff.isWorktree) continue; // THIS mutation is wt-scoped — exempt
           const baseline = baselines.get(pid);
           const isInfra = isAgentInfraRepo(muEff.effectiveCwd);
@@ -1509,13 +2786,13 @@ export default function (pi: ExtensionAPI) {
             // semantics); a baseline owned by another checkout must not
             // authorize a switch here.
             repoKey: muEff.repoKey,
-            // #598: branches this pid CREATED (create-new) or renamed its own
-            // baseline to are owned (the #543/#588 ownership check). The read
+            // #598: branches this pid renamed its own baseline to are owned
+            // (the #543/#588 ownership check). The read
             // is keyed on the MUTATION's repo (muEff.repoKey): _markOwned
             // writes under baseline.repoKey when the baseline repo IS the
             // mutation repo; with NO baseline, under muEff.repoKey; a baseline
-            // in a DIFFERENT repo records nothing (repo-scoped — the create-
-            // new/rename _markOwned calls below guard on repoKey equality).
+            // in a DIFFERENT repo records nothing (repo-scoped — the rename
+            // _markOwned call below guards on repoKey equality).
             // The rename arm requires baseline.repoKey === repoKey, so for the
             // rename allow-path the muEff.repoKey read is the write key — the
             // own-baseline rename carve-out still holds when the dst is one of
@@ -1542,17 +2819,14 @@ export default function (pi: ExtensionAPI) {
           });
           if (m3?.block) return { block: true, reason: m3.reason };
           if (m3?.reBaseline) {
-            // Synchronous re-baseline: the allowed carve-out / own rename
+            // Synchronous re-baseline: the own-baseline RENAME (create-new
+            // never re-baselines since #626 — in-hub create-new is blocked)
             // adopts the new branch NOW — the next tool_call emits ZERO M1
-            // warns (AC3). Record branches this pid CREATED (create-new) or
-            // renamed its own baseline to — scoped to the BASELINE repo — so
-            // their post-ceremony LOCAL delete is still allowed after the #376
-            // return re-baselines to the original (#376 review fold-in).
-            if (branchOp.op === "create-new" && branchOp.branch) {
-              if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
-                _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.branch);
-              }
-            } else if (branchOp.op === "rename" && branchOp.to) {
+            // warns (AC3). Record the renamed-to branch — scoped to the
+            // BASELINE repo — so its post-ceremony LOCAL delete is still
+            // allowed after the #376 return re-baselines to the original
+            // (#376 review fold-in).
+            if (branchOp.op === "rename" && branchOp.to) {
               if (!baseline || (muEff.repoKey != null && baseline.repoKey === muEff.repoKey)) {
                 _markOwned(pid, baseline?.repoKey ?? muEff.repoKey, branchOp.to);
               }
@@ -1565,22 +2839,11 @@ export default function (pi: ExtensionAPI) {
 
       // Under the escape hatch, M2/M3 are inactive (contract preserved) but M1
       // above stays active. Legacy destructive blocks are also bypassed (today's
-      // semantics — the hatch is a full bypass).
+      // semantics — the hatch is a full bypass). Marker-command stamping moved
+      // ABOVE this point (the pre-bypass section, #620): a marker touch from any
+      // session — env hatch included — is stamped + audited there, so a bare
+      // `touch <marker>` can never fall through to mint un-stamped here.
       if (allowActive) return undefined;
-
-      // ── Escape marker (#207): stamp + audit at creation-observation ──
-      // ORDERING FIX (#1484): the stamp must run BEFORE the allow/allow-non-git
-      // early return — a bare `touch <marker>` classifies "allow-non-git" and
-      // was silently swallowed by that return, so the guard NEVER stamped and
-      // the marker was inert in production (the 2026-08-18 incident's empty
-      // unscoped marker file is exactly this bug's evidence). Git classification
-      // ran FIRST (M3 above), so a blocked command NEVER stamps — `touch ... &&
-      // git checkout main` is blocked and the touch never runs (F10c). Only an
-      // ALLOWED bare `touch <marker>` (own command) reaches here.
-      if (isAllowMarkerCommand(command, homedir())) {
-        _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
-        return undefined;
-      }
 
       if (!det || det.verdict === "allow" || det.verdict === "allow-non-git") return undefined;
 
@@ -1621,9 +2884,10 @@ export default function (pi: ExtensionAPI) {
           baselineBranch: baseline?.branch ?? null,
           targets,
           syncSource: det.syncSource,
-          // #376 review fold-in: branches this pid created (scoped to THIS
-          // repo) stay locally deletable after the ceremony return re-bases the
-          // baseline (own-branch hygiene).
+          // #376 review fold-in: branches this pid renamed its own baseline
+          // to (scoped to THIS repo) stay locally deletable after the ceremony
+          // return re-bases the baseline (own-branch hygiene). create-new is
+          // never marked — it is blocked since #626 and never re-baselines.
           ownedBranches: ownedBranches.get(pid)?.get(eff.repoKey ?? ""),
         })) {
           // #443: det.pushTargets describe ONLY the first push invocation. A
@@ -1720,10 +2984,20 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const baseline = baselines.get(pid);
+        // #805 P1: with NO baseline, decideM2 must know whether the resolved
+        // MAIN checkout is THIS session's own (a worktree shares its common
+        // dir, so `repoKey` equality identifies it) or the agent-infra hub —
+        // only those two are refused; a different repo's MAIN checkout is
+        // ordinary cross-repo work and stays allowed. Both probes spawn git, so
+        // they run only in the (rare, anomalous) no-baseline case.
         const m2 = branchOwnership.decideM2({
           effectiveRepo: m2Eff, baseline, currentBranch: m2Eff.currentBranch,
           pushDst: det.pushDst, pushTargets: det.pushTargets,
           verdict: det.verdict, allowActive: false,
+          ...(baseline ? {} : {
+            sessionRepoKey: branchOwnership.repoKey(process.cwd()) ?? null,
+            effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd),
+          }),
         });
         if (m2?.block) return { block: true, reason: m2.reason };
         return undefined; // on-baseline or unverifiable-but-exempt
@@ -1771,20 +3045,9 @@ export default function (pi: ExtensionAPI) {
 
     const resolvedTarget = resolve(process.cwd(), targetPath ?? "");
 
-    // P2 (review): the write/edit tool is an UNAUDITED marker-creation path —
-    // an agent could `write` a stamped JSON straight to the marker file,
-    // bypassing the audited touch->stamp route (no gate_bypass audit event).
-    // Force creation through the bash touch path (guard-stamped + audited).
-    if (resolvedTarget === resolve(_markerPath())) {
-      return {
-        block: true,
-        reason: [
-          "⛔ The escape-marker file must be created via a bash `touch` command,",
-          "   not the write/edit tool — the guard stamps {session_id, reason, ts}",
-          "   and audits the creation only on the bash route (#207).",
-        ].join("\n"),
-      };
-    }
+    // (Marker-path write/edit block moved to the pre-bypass section above —
+    // #620: the write tool can never mint the escape marker in ANY session
+    // state; the audited bash touch route is the only mint.)
 
     // Classify the TARGET's checkout (cached per realpath-normalized path).
     // Not in a git repo, or in a linked WORKTREE → isolated by construction:

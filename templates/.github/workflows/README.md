@@ -17,6 +17,20 @@ Templates:
 - `docs-ci.yml` — markdownlint, lychee link check, doc frontmatter
 - `node-ci.yml` — Node script validation, skill lint, typecheck, lint
 - `python-ci.yml` — Python CI
+- `admin-merge-detector.yml` — post-merge detector for the #930 safe-admin-merge
+  rail (**detection only, never gates prevention**). It is NOT a `workflow_call`
+  reusable — it triggers itself via `workflow_run` on the `CI on main` workflow.
+  It files an issue when a merge to main carried tests that were not in main's
+  prior failing set (the path a human clicking "admin merge" leaves open).
+  **Two things a consumer must provide:** (1) the workflow's `WORKFLOW` env must
+  name that repo's TEST lane, and (2) `scripts/ci-failure-set.sh` must be present
+  in the checkout — this file is one of FIVE surfaces for #930 and the
+  materialization step (`scripts/sync-ci-workflows.sh`) copies only
+  `.github/workflows/*.yml`, not `scripts/`. A `scripts/` SYMLINK is not enough
+  either: it resolves on a laptop, not on a runner. Until the script is a real
+  file in the consumer checkout the detector FAILS LOUDLY rather than no-opping
+  silently: "cannot run" must never read as "found nothing". Shipping
+  `ci-failure-set.sh` on the materialization path is open follow-up work.
 - `pipeline-compliance.yml` — pipeline compliance gate (below)
 
 ---

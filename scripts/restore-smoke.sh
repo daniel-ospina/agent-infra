@@ -79,7 +79,7 @@ if [ ! -s "$BACKUP_DIR/dump.rdb" ]; then
 fi
 # Check for Redis magic bytes (REDIS0009 or similar)
 RDB_HEADER=$(head -c 9 "$BACKUP_DIR/dump.rdb" 2>/dev/null || echo "")
-if echo "$RDB_HEADER" | grep -q "REDIS"; then
+if grep -q "REDIS" <<<"$RDB_HEADER"; then
     echo -e "${GREEN}  RDB file has valid Redis header: $RDB_HEADER${NC}"
 else
     echo -e "${YELLOW}  RDB header not recognized (got: $RDB_HEADER) — continuing anyway${NC}"

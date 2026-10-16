@@ -30,7 +30,7 @@ steps:
 
 **Verifier gate:** dispatches AI reviewers. Pipeline auto-advances when clean.
 
-> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic and `$SECOND_MODEL` gates never route venice (docs/providers.md §8).
+> **Cold-class seam (#512):** reviewer/eval dispatches are cache-cold one-shot traffic — an operator who exports `COLD_CLASS_PROVIDER=venice` opts them into the venice leg (`--provider venice --model deepseek-v4-flash`; same model id — venice serves cold prompts with cache reads). **Unset (default) = inert.** Interactive/warm traffic never routes venice (docs/providers.md §8).
 
 # Test Review
 
@@ -48,6 +48,8 @@ Automated review-fix cycle for tests. Ensures tests are correct, complete, and a
 
 At minimum, provide the test file content. Surface map and journey map are extracted from the plan doc if available.
 
+**Also required for Reviewer #1, and passed by the `test-writing` Step 3.5 dispatch:** `TEST DIFF` (the diff of the test files in this batch) and `SABOTAGE EVIDENCE` (the observed failure against the unfixed code). Reviewer #1's discriminating-power check is decidable *only* from these; pass `"none supplied"` when either is genuinely absent (the check then names the missing evidence rather than guessing). A manual invocation that omits them runs that check blind.
+
 ## Review Cycle
 
 ```
@@ -59,7 +61,7 @@ Phase 3: Fix (research-backed, surgical edits)
     ↓
 Phase 4: Re-review (fresh sub-agents, no memory of prior cycle)
     ↓
-Loop until NO ISSUES FOUND or convergence (fingerprint-stall; safety cap: 10 cycles)
+Loop until NO ISSUES FOUND or convergence (safety cap: 10 cycles)
 ```
 
 ### Phase 0 — Research Intake (Proactive Testing Knowledge)
@@ -167,6 +169,8 @@ Launch 4 reviewers **in parallel** via Pi `task`. Each receives the full test fi
 You are reviewing tests for correctness and quality. Your job is to find issues — NOT to fix them.
 
 TEST FILE: <full test file content>
+TEST DIFF: <the diff of test files in this PR, or "none supplied">
+SABOTAGE EVIDENCE: <the observed-failure output the author recorded for the changed assertions, or "none supplied">
 SURFACE MAP: <integration surface map from plan, or "none">
 JOURNEY MAP: <journey test map from plan, or "none">
 TESTING KNOWLEDGE: <Phase 0 research findings, or "none — no surface map">
@@ -180,6 +184,8 @@ CHECK THESE DIMENSIONS:
    - Are assertions testing user-visible outcomes (returned data, UI state, side effects, error messages) — NOT internal variables?
    - Are assertions precise (expected value matches actual semantics)?
    - Is there at least one assertion per test? (No tests that "pass" by running without asserting)
+   - **Discriminating power — for each assertion the TEST DIFF adds or changes, does SABOTAGE EVIDENCE show it failing against the unfixed code?** A green suite cannot distinguish a real pin from a vacuous one: both are green. This check is decidable only from the diff plus the evidence — so when TEST DIFF or SABOTAGE EVIDENCE is "none supplied", flag P0 **only** for a changed assertion whose description names a fixed defect, and name the missing evidence rather than guessing. Do not flag assertions the diff does not touch.
+   - **Could this assertion pin a race?** An equality on a value that is identical under *every* schedule cannot — the observable must *differ* between the buggy and fixed schedules. Where a changed assertion claims to pin a concurrency bug, require an operation-history oracle instead: count invocations (a `PATH` shim suffices) and assert the exact count. Flag P0 if the assertion is invariant across schedules — but schedule-invariance is not decidable from the diff alone, so when `SABOTAGE EVIDENCE` is `"none supplied"`, name the missing schedule evidence rather than asserting invariance.
 
 2. TEST QUALITY:
    - Is the test deterministic? (No Math.random(), no Date.now() without injection, no shared mutable state)
@@ -193,7 +199,7 @@ CHECK THESE DIMENSIONS:
    - Assert: are assertions grouped logically?
 
 4. FALSE POSITIVES:
-   - Could this test pass when the code is broken?
+   - Could this test pass when the code is broken? — but see the evidence rider under ASSERTION CORRECTNESS: when `SABOTAGE EVIDENCE` is `"none supplied"`, name the missing evidence rather than asserting it.
    - Are there assertions that always pass (e.g., expect(true).toBe(true))?
    - Are there missing await/async that cause tests to pass without waiting?
 
@@ -205,7 +211,7 @@ ISSUE:
   description: <what's wrong>
   suggestion: <what to fix>
 
-P0=wrong assertion (test passes but tests wrong thing, or would pass if code broken)
+P0=wrong assertion (test passes but tests wrong thing, or would pass if code broken — **a vacuous pin belongs here: it is exactly "would pass if code broken"**)
 P1=important gap (flaky, unrealistic setup, misleading name)
 P2=improvement (AAA clarity, naming polish)
 If no issues: NO ISSUES FOUND
@@ -415,7 +421,14 @@ For each cycle:
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
 - [ ] Cycle log posted: each cycle's issues and fixes documented
 
-**Hard cap: 10 cycles (fingerprint-stall).** Test review is narrower scope than plan review. On cap:
+**Stuckness detection:** recurrence = `|current ∩ prev| / |prev|` (the fraction of the previous cycle's issues that recurred). Fingerprints are taken over `location + severity` — **not** `description`/`suggestion`, which a fresh reviewer re-words every cycle.
+- **Fingerprint-stall:** recurrence ≥ `stall_threshold` (default `0.8`) → escalate to human.
+- **Honest-stuck:** issue count non-decreasing for 3 consecutive cycles → escalate to human. **Independent signal — fires regardless of recurrence** (a one-for-one churn has low recurrence but is not converging).
+- **Zero-progress:** no files changed 2 consecutive cycles → escalate to human.
+
+> **Fire if `recurrence ≥ stall_threshold` OR the count is non-decreasing for 3 cycles.** Either alone is sufficient. Recurrence picks the *label* only (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`) — never a precondition for the count signal. The executable predicate lives in `code-review/references/fixer-loop.md`.
+
+**Hard cap: 10 cycles.** Test review is narrower scope than plan review. On cap:
 ```
 ⚠️ Test review capped at 10 cycles — N issues remain:
   - [issue 1]
@@ -434,7 +447,7 @@ After all reviewers return clean, output:
 ```
 ✅ Test review complete:
   - Review cycles: N
-  - Reviewers per cycle: <1-3>
+  - Reviewers per cycle: <3-4>
   - Issues found and fixed: N
   - Final status: CLEAN
 
@@ -446,19 +459,17 @@ Journey map coverage: ✓ | skipped (no journey map)
 7-point quality checklist: ✓
 ```
 
-**Hash output (test-writing caller only):** If invoked with `--caller test-writing` context, write per-file hash to `~/.pi/agent/test-review/<sha256-of-absolute-test-file-path>.json`. Schema defined in test-writing/SKILL.md Step 7. Include `PASS` on its own line in console output for VGATE compatibility. If invoked standalone or from code-review: skip hash write.
-
 ## Integration
 
 **Invoked by:**
-- `test-writing` — after Step 3 (7-point self-check) and before Step 4 (Green phase). Catches issues before implementation code is written.
+- `test-writing` — after Step 3.5 (Test Review) and before Step 4. On the TDD path this runs before implementation code is written; for a **pin added to an existing suite** the implementation already exists, and Step 4's sabotage evidence is produced *before* the dispatch.
 - `code-review` Step 0.5 — during PR review. Re-runs the same review with fresh eyes to catch issues the implementation agent missed.
 
 **Consumes:**
 - `test-design` output (Integration Surface Map)
 - Plan doc's `### Journey Test Map` section
 
-**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, 3-cycle cap instead of 10).
+**Pattern:** Mirrors `plan-review`'s research+review+fix+re-review loop structure, adapted for test-level scope (narrower, 4 reviewers, **10-cycle cap** — see "Hard cap: 10 cycles" above).
 
 ## When NOT to Use
 

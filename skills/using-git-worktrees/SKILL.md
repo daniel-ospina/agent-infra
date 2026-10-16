@@ -29,7 +29,7 @@ The main checkout is a **SHARED HUB** that stays on `main`. Feature work happens
 
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
-If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the recovery git ops needed to un-strand (`git checkout main`, `git pull`, branch recovery) — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note `git checkout main` and `git pull --ff-only` are M4-sanctioned and need no window — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
 
 ```bash
 # must be its OWN bash tool call inside a guard-loaded session
@@ -228,16 +228,29 @@ agents in the hub) is prevented by discipline, not just guards:
    ```
 2. **Delete-on-merge.** Every worktree created for a PR/issue must be removed
    when its branch merges: `git worktree remove <path>` (no `--force` — it
-   refuses tracked WIP). If the branch merged but the worktree lingers, prune
-   with `git worktree prune`. Accumulated worktrees are the tortoise 178-
-   worktree failure mode (#1218).
+   refuses tracked WIP). If the branch merged but the worktree lingers, remove
+   THAT worktree's own record — read its `gitdir:` line from `<path>/.git` and
+   delete only that admin dir; **never** a bare `git worktree prune`, which
+   deregisters every record whose directory is not stat-able right now
+   (unmounted volume, permission blip, stale mount) and destroys unrelated
+   sibling checkouts while their files stay on disk (#1141). Accumulated
+   worktrees are the tortoise 178-worktree failure mode (#1218).
 3. **Corruption canary.** The shared canary
    (`~/.pi/agent/scripts/checkout-hygiene/corruption_canary.py`, canonical in
    agent-infra) detects the mass-replace corruption class (.bak files +
    known tokens). Run it before committing or on suspicion.
 4. **Never disable the guard ambiently.** Do not export
-   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles; the
-   escape hatch is per-session and time-boxed.
+   `AGENT_ALLOW_MAIN_EDITS=1` (or VGATE/review skips) in shell profiles,
+   launchers, or session-wide env; the escape hatch is per-session and
+   time-boxed. Since #623 the blast radius of an ambient hatch is bounded:
+   `task`/`subagent` children of a hatched controller are **stripped by
+   default** (the hatch must be re-passed per-dispatch via `allow_main_edits:
+   true`), so a launcher that leaks the hatch can no longer silently hatch a
+   whole fleet — but it still hatches every interactive session it starts.
+   (Finding: on this machine the ambient source was cmux.app's own long-lived
+   process env — launched before `~/.zshenv` had the exports commented out and
+   propagated via `login -p` — not any shell rc. Remediation: relaunch cmux so
+   new surfaces inherit the clean launchd env.)
 
 ## Quick Reference
 
@@ -278,10 +291,10 @@ agents in the hub) is prevented by discipline, not just guards:
 - **Problem:** When the skill runs from inside an agent worktree, using `$(git rev-parse --show-toplevel)` or `$PWD` resolves to the current worktree, not the main repo. `git worktree add` then creates the new worktree nested inside the parent (e.g. `.worktrees/agent-a/.worktrees/agent-b/`), which accumulates cruft and breaks cleanup.
 - **Fix:** Always derive `$MAIN_REPO` in Step 0 via `git rev-parse --git-common-dir` and anchor every path (ls, check-ignore, worktree add) to `$MAIN_REPO`. Never use `$PWD` or `--show-toplevel` for path construction in this skill.
 
-### Stranded main checkout — the ONLY sanctioned recovery is a terminal one-liner (#206)
+### Stranded main checkout — terminal one-liner when M4 does NOT sanction (#206)
 
-- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, the guard blocks agent-side `checkout`/`pull`) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process.
-- **Fix (the ONLY sanctioned recovery):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
+- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
+- **Fix (the sanctioned recovery when M4 blocks):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
   ```bash
   cd <repo> && git checkout main && git pull --ff-only
   ```

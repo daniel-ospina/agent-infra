@@ -9,7 +9,7 @@ tags: [pipeline, issue, routing, fractal, orchestrator, entry-point]
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
 summary: "Fractal entry-point router — detects Level + complexity and dispatches to epic-workflow, project-workflow, task-workflow (micro), or task-workflow-standard (gated)."
 created: 2026-07-07
-updated: 2026-08-08
+updated: 2026-09-15
 steps:
   - name: classify_ask
     type: skill
@@ -48,7 +48,28 @@ Entry-point router for the fractal planning pipeline. Detects the issue's Level 
 
 > **Ontology:** `tortoise/docs/ONTOLOGY.md` (v3.1, canonical) — fetch: `gh api repos/daniel-ospina/tortoise/contents/docs/ONTOLOGY.md --jq .content | base64 -d` (§5 = controlled vocabulary).
 
+## ⛔ Gate 0 — Classify A or B before routing
+
+**No infrastructure/machinery issue is routed before it is classified.** Run this before `## Routing`; a category-B issue does not enter a planning pipeline at all. This test classifies *machinery* only — a product, capability, or user-facing issue is out of scope and routes normally. Canonical definition: `AGENTS.md` → **Product Over Process**.
+
+This adds no new plan, report, or gate script, and no new planning stage: it is a routing decision that *removes* work — a B item is closed, or left open as a note, instead of planned.
+
+| | Failure mode | What happens |
+|---|---|---|
+| **A** | silent destruction of work · a **false PASS** (a gate reports OK over a wrong/unverified artifact) · a **bypass** (a PR or agent can *defeat* a gate) · a **no-op gate** (exits 0 when it cannot run) · an **inert enforcer** (its condition can never fire) | **Route normally** — full pipeline, proportional depth |
+| **B** | friction (**including false blocks**) · ceremony · doc drift · consistency between process docs · observability *of the machinery* · gate marker/format negotiation · meta-process (how issues are filed, how plans are reviewed, cycle counts) · machinery test flakiness | **Do not route.** A B item never enters a planning pipeline. If its honest answer to *what does the user lose?* is "nothing but time" — or no consequence is named — close it `not planned` with one sentence naming the failure mode and an invitation to reopen (if it was already filed, close it now). A B item whose admission sentence names a real consequence is still not routed and not planned: leave it open as a note |
+| **not machinery** | — a product, capability, or user-facing issue | **Out of scope** — the A/B test classifies machinery only; route normally |
+
+The three questions that decide a borderline case:
+1. Can a PR or an agent **defeat** it? → **A**. Does its **wording or marker parsing** merely mis-grade? → **B**.
+2. **Fail-open** (something wrong slips through) → **A**. **Fail-closed / over-block** (something right is refused) → **B**.
+3. If this is never fixed, what does the user lose? **"Nothing but time" is a valid answer — B, and for an item not yet filed it means do not file it.**
+
+**Why this gate exists:** the backlog reached ~260 open issues, ~172 of them category B. A planning pipeline run over a B issue produces process artifacts that satisfy process checks and change nothing about the product. See the drift note in `AGENTS.md`.
+
 ## Routing
+
+**Gate 0 (above) is resolved first.** A category-B *machinery* issue exits there, before this diagram; product/capability issues and category-A issues route below.
 
 ```
 ISSUE IN (#N)
@@ -87,12 +108,73 @@ fi
 
 ## Dispatch
 
+**⛔ Collision pre-flight (#3061) — FAIL-CLOSED, before ANY dispatch.** The gate is provided by **tortoise** (the only repo carrying `tools/collision_preflight.py`) and applies to *any* issue's repo through `--repo`. Run it before dispatching ANY work for the issue — worktree, branch, sub-agent, or parallel workstream. It checks every in-flight surface (open + closed PRs, local + remote branches, worktrees, assignee/claim comments) and fails loudly in **both** directions: a hit, and a surface that could not be queried.
+
+```bash
+# 1. The tool lives ONLY in tortoise. Resolve that checkout EXPLICITLY — unset, `"$TORTOISE"/tools/…`
+#    collapses to `/tools/…` and PYTHON exits 2, which the exit table would report as INCOMPLETE
+#    ("a surface could not be queried"): a caller misconfiguration wearing a real verdict's face.
+#    $TORTOISE if set; else the cwd itself (when it IS tortoise), the tortoise sibling of the cwd's
+#    MAIN checkout (so it still resolves from a linked worktree), then the standard GITHUB root.
+if [ -z "${TORTOISE:-}" ]; then
+  TOPLEVEL="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"
+  COMMON="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  for CAND in "$TOPLEVEL" "$(dirname "${COMMON%/.git}")/tortoise" "${HOME:-/nonexistent}/Documents/GitHub/tortoise"; do
+    if [ -n "$CAND" ] && [ -f "$CAND/tools/collision_preflight.py" ]; then
+      TORTOISE="$(cd "$CAND" && pwd -P)"; break
+    fi
+  done
+fi
+if [ ! -f "${TORTOISE:-}/tools/collision_preflight.py" ]; then
+  echo "❌ collision pre-flight: no tortoise checkout resolved (TORTOISE='${TORTOISE:-}') — #3061 pre-flight NOT run."
+  echo "   Record this in the dispatch log; do NOT silently skip. Set TORTOISE=<a tortoise worktree> and re-run."
+  exit 1   # do not dispatch
+fi
+
+# 2. --repo is MANDATORY. Omitted it means "cwd", and the tool then silently resolved the WRONG
+#    repository's issue — a tortoise worktree asked for an agent-infra #NNNN and returned CLEAN (#4027).
+ISSUE_NUMBER="${ISSUE_NUMBER:-<N>}"             # the issue being gated
+REPO="${REPO:-<owner/name>}"                   # the issue's repo, e.g. daniel-ospina/agent-infra
+case "$REPO" in ''|*'<'*|*'>'*) echo "❌ REPO is unset or still the literal placeholder ('$REPO') — set it to the issue's repo owner/name; #3061 pre-flight NOT run."; exit 1 ;; esac
+#    The `owner/name` form needs tortoise #3978. Until it lands, tortoise main rejects a slug with
+#    exit 3 (`--repo not a directory`), so probe the tool's own usage and pass the form it accepts.
+if python3 "$TORTOISE"/tools/collision_preflight.py --help 2>&1 | grep -q 'owner/name'; then
+  REPO_ARG="$REPO"                                # slug form
+else
+  #    Pre-#3978 only a PATH is accepted, and it must be a checkout of $REPO. Falling back to `.`
+  #    would check the CWD's repo and return CLEAN — the ONE code that authorizes dispatch, i.e.
+  #    the #4027 wrong-repo false CLEAN. Resolve a path whose origin slug really is $REPO, or stop.
+  SLOT="$(git -C "$PWD" rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed -e 's#/\.git$##')"
+  REPO_ARG=""
+  for CAND in "${ISSUE_REPO_PATH:-}" "$PWD" "$TORTOISE" "$(dirname "$SLOT")/$(basename "$REPO")"; do
+    [ -n "$CAND" ] || continue   # `git -C ""` silently uses the CWD — an empty candidate would "match" anything
+    SLUG="$(git -C "$CAND" config --get remote.origin.url 2>/dev/null | sed -e 's#.*github\.com[:/]##' -e 's#\.git$##')"
+    [ -n "$SLUG" ] && [ "$SLUG" = "$REPO" ] && { REPO_ARG="$CAND"; break; }
+  done
+  [ -n "$REPO_ARG" ] || { echo "❌ pre-#3978 tool: no local checkout of $REPO — '.' would check the WRONG repo (#4027). Set ISSUE_REPO_PATH=<a checkout of $REPO>; pre-flight NOT run."; exit 1; }
+fi
+python3 "$TORTOISE"/tools/collision_preflight.py "$ISSUE_NUMBER" --repo "$REPO_ARG"
+```
+
+| Exit | Verdict | Action |
+|------|---------|--------|
+| `0` | CLEAN | every surface queried, no in-flight work — the **only** outcome that authorizes dispatch |
+| `1` | COLLISION | a worktree/branch/PR/claim already covers #N — **do NOT dispatch**; report the named surface |
+| `2` | INCOMPLETE | a surface could not be queried — **NOT clean**; fix `gh` auth/network, re-run |
+| `3` | usage/internal error | **stop** |
+
+**ANY non-zero exit stops the dispatch.** There is no "warn and proceed" and no graceful degradation: if `gh` is unavailable the tool returns INCOMPLETE (`2`) **by construction** — a stop, not a fallback path. A pre-flight that cannot tell "no collision" from "could not check" is exactly the bug this gate exists to prevent.
+
+**Distinguish the two exit-`2` causes.** A `VERDICT: INCOMPLETE` line on stdout is the tool's INCOMPLETE. An argparse `usage:` line with no `VERDICT:` line is a **wrong invocation** (unsubstituted or non-integer `<N>`) — fix the argument, not `gh`.
+
+**Pre-run precondition — do NOT run this from the issue's own worktree.** The tool has no self-exclusion: a branch/worktree this checkout already owns is reported as a `strong` hit under `[local branches]` / `[local worktrees]`, so a run from inside `feat/<N>-…` / `.worktrees/<N>-…` collides with the artifact of the very work being gated. That is a property of the tool, **not** a licence to excuse a non-zero exit: "ANY non-zero exit stops the dispatch" is unaffected, and a surface reported INCOMPLETE is never excused either. Run the gate from a checkout that does not carry `<N>` (the dispatcher's checkout, or a separate clone of `$REPO`). If none exists — a child already placed inside `<N>`'s worktree — record in the dispatch log that the pre-flight could not be run untainted and defer to the dispatcher's pre-dispatch gate, which runs before any worktree exists.
+
 | Level | Complexity | Dispatches to | Depth |
 |-------|-----------|--------------|-------|
 | `epic` | any | `epic-workflow` | Full: 6 stages, all review gates, 3 human gates |
 | `project` | any | `project-workflow` | Proportional: shared sub-skills, reduced depth |
 | `task` | `micro` (or all-low) | `task-workflow` | Inline: all 6 stages, no sub-skill dispatch |
-| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: 2 parallel verifiers at scope AND plan before implementation |
+| `task` | `standard` \| `complex` (or missing/unknown) | `task-workflow-standard` | Gated: scope verifiers per `issue-scoping` §Tier Scaling, plan reviewers per `proportional-gates` §Review Cycles — before implementation |
 
 **Task complexity routing rules:**
 
@@ -137,11 +219,11 @@ gh issue edit $ISSUE --remove-label implementing || true
 
 > ⛔ **This gate runs BEFORE any work on the issue.** Every issue gets its own branch. Every parallel subagent gets its own worktree. This prevents the 2026-08-06 incident where parallel agents collided in the shared main checkout and #74's work landed on #73's branch (PR #75 contained both).
 
-### 0. Worktree-first rule (#265 — enforced, not advisory)
+### 0. Worktree-first rule (#265/#615 — enforced, not advisory)
 
-**Non-infra repos:** primary sessions AND write-capable sub-agent dispatches MUST run in an isolated worktree — never on the shared main checkout. The main-worktree-guard now enforces this mechanically: branch-state changes in a non-infra main checkout are BLOCKED, commits off the session baseline are BLOCKED, and sub-agents no longer inherit `AGENT_ALLOW_MAIN_EDITS` (the env pivot, #265). If the Branch Gate below detects you are in a non-infra main checkout, create a worktree first (using-git-worktrees skill) and run the gate from there.
+**Every repo — agent-infra included:** primary sessions AND write-capable sub-agent dispatches MUST run in an isolated worktree — never on the shared main checkout. The main-worktree-guard enforces this mechanically for ALL repos: branch-state changes in any main checkout are BLOCKED (agent-infra included since #615 removed the #99 in-main-work exemption), commits off the session baseline are BLOCKED, and sub-agents carry no `AGENT_ALLOW_MAIN_EDITS` — #617/#623: the hatch is **stripped by default** from `task`/`subagent` children, so even a HATCHED controller dispatches an UNHATCHED fleet unless the dispatch passes `allow_main_edits: true`; never rely on the child env for isolation — always pass a worktree `cwd`. If the Branch Gate below detects you are in a main checkout, create a worktree first (using-git-worktrees skill; agent-infra: `hub-worktree.sh <branch>`) and run the gate from there.
 
-**Agent-infra (the infra repo itself):** sessions work IN main by design (#99 — extensions/skills load from the main checkout via the symlink farm). In-main `git checkout -b <branch>` is legal there (the guard's M3 create-new carve-out, #265) and the baseline re-adopts the new branch synchronously. Do NOT create a worktree for agent-infra issues.
+**Agent-infra has NO in-main-work exemption.** Extensions/skills/config are read from committed state (pi loads skills from `~/.pi/agent`, extensions at startup — a copy synced post-merge; `MEMORY.md` is a repo file read by agents on demand, not an auto-loaded copy), so shared-state edits do NOT need the shared main checkout: they land via worktree → merge → sync, exactly like every other repo. A one-line MEMORY.md/skill append is a low-risk `complexity:micro` change, but micro is a review-scope tier — it does NOT exempt the worktree rule: it still runs through the same worktree → commit → merge → sync ceremony. The agent-infra hub stays main + clean; in-main `git checkout -b <branch>` is BLOCKED there like any other hub (the M3 create-new carve-out was removed in #626).
 
 ### 1. Branch Gate (runs first — before edits or dispatch)
 
@@ -154,35 +236,23 @@ CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
 # Already on the correct branch — proceed
 [ "$CURRENT_BRANCH" = "$EXPECTED_BRANCH" ] && echo "✅ On correct branch: $CURRENT_BRANCH" && exit 0
 
-# On main/master — create the dedicated branch from FRESH origin state
-# (#178/#179: never branch from stale local main — a stale base silently
-# re-introduces already-fixed code and merges cleanly = worst-case regression)
+# On main/master — you are in the HUB, where an in-place branch flip is BLOCKED
+# (#626; agent-infra included since #615 removed the #99 exemption). Create an
+# ISOLATED WORKTREE instead (using-git-worktrees skill; agent-infra:
+# `bash scripts/checkout-hygiene/hub-worktree.sh "$EXPECTED_BRANCH"`), cd into it,
+# and RE-RUN this gate there. The worktree branch is created from FRESH origin
+# state by the worktree command (#178/#179: never branch from stale local main).
 if [ "$CURRENT_BRANCH" = "main" ] || [ "$CURRENT_BRANCH" = "master" ]; then
-  # Detect the default branch via origin/HEAD (fallback: main)
-  DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')
-  [ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH="main"
-  # Fetch latest; on failure (offline / no origin) fall back to the existing
-  # local origin ref WITH A WARN — never silently branch from stale state
-  if ! git fetch origin "$DEFAULT_BRANCH" --quiet; then
-    if git rev-parse --verify "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
-      echo "⚠️ fetch failed — branching from LAST KNOWN origin/$DEFAULT_BRANCH (verify freshness before shipping)"
-    else
-      echo "⛔ ABORT: fetch failed and no origin/$DEFAULT_BRANCH ref exists locally."
-      exit 1
-    fi
-  fi
-  # Fail-closed: a failed checkout must never false-report success (#179)
-  git checkout -b "$EXPECTED_BRANCH" "origin/$DEFAULT_BRANCH" || {
-    echo "⛔ ABORT: could not create $EXPECTED_BRANCH from origin/$DEFAULT_BRANCH"
-    exit 1
-  }
-  echo "✅ Created and switched to: $EXPECTED_BRANCH (from fresh origin/$DEFAULT_BRANCH)"
-  exit 0
+  echo "ℹ️ On $CURRENT_BRANCH (hub): create an isolated worktree first, then re-run this gate from it."
+  echo "   agent-infra: bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\""
+  echo "   other repos: using-git-worktrees skill (git worktree add -b \"$EXPECTED_BRANCH\" <path> origin/main)"
+  echo "⛔ In-hub 'git checkout -b' is BLOCKED (#626) — do not attempt it here."
+  exit 1
 fi
 
 # Detached HEAD? ABORT — no branch to verify
 if [ -z "$CURRENT_BRANCH" ]; then
-  echo "⛔ ABORT: Detached HEAD. Branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
+  echo "⛔ ABORT: Detached HEAD. Create an isolated worktree: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 
@@ -190,8 +260,8 @@ fi
 if ! echo "$CURRENT_BRANCH" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
   echo "⛔ ABORT: You are on branch \"$CURRENT_BRANCH\" which belongs to a DIFFERENT issue."
   echo "   This is how #74's work committed onto #73's branch (incident 2026-08-06)."
-  echo "   → Stash or commit your changes on $CURRENT_BRANCH first."
-  echo "   → Then branch from fresh origin: git fetch origin main --quiet && git checkout -b $EXPECTED_BRANCH origin/main"
+  echo "   → Commit or stash your changes on $CURRENT_BRANCH first."
+  echo "   → Then create an isolated worktree for THIS issue: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi
 
@@ -201,7 +271,7 @@ echo "✅ On matching branch: $CURRENT_BRANCH"
 
 ### 2. Worktree Gate (runs for parallel subagent dispatch)
 
-When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout. **After #265 this extends to SINGLE write-capable implementer sub-agents in non-infra repos:** the sub-agent env no longer carries `AGENT_ALLOW_MAIN_EDITS`, so a write-capable sub-agent dispatched with `cwd` = a non-infra main checkout is blocked on write/edit + destructive git. Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
+When dispatching multiple subagents that write to the same repo, each subagent MUST get its own worktree. The dispatcher creates them and passes the path via `cwd` — never dispatch two subagents to the same checkout. **After #265/#615 this extends to EVERY write-capable implementer sub-agent in EVERY repo (agent-infra included):** the sub-agent env no longer carries `AGENT_ALLOW_MAIN_EDITS` (#617/#623 — the hatch is default-stripped from `task`/`subagent` children, so even a hatched controller dispatches an unhatched fleet unless the dispatch opts in with `allow_main_edits: true`; never rely on the child env for isolation — always pass a worktree `cwd`), so a write-capable sub-agent dispatched with `cwd` = a main checkout (any repo — the #99 agent-infra exemption was removed by #615) is blocked on write/edit + destructive git. Read-only sub-agents (reviewers, researchers) need no worktree — the guard only blocks writes.
 
 ```bash
 # Dispatcher creates an isolated worktree for each subagent:

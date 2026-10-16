@@ -289,17 +289,17 @@ if (/^[a-zA-Z0-9-]+$/.test(hash)) {
 
 ```bash
 # Dangerous DOM sinks
-grep -rn "innerHTML\|outerHTML\|document\.write" --include="*.js" --include="*.jsx"
-grep -rn "dangerouslySetInnerHTML" --include="*.jsx" --include="*.tsx"
-grep -rn "v-html" --include="*.vue"
-grep -rn "\|safe\|autoescape off" --include="*.html" --include="*.jinja"
+git grep -n -e "innerHTML\|outerHTML\|document\.write" -- '*.js' '*.jsx'
+git grep -n -e "dangerouslySetInnerHTML" -- '*.jsx' '*.tsx'
+git grep -n -e "v-html" -- '*.vue'
+git grep -n -e "\|safe\|autoescape off" -- '*.html' '*.jinja'
 
 # Dangerous JavaScript
-grep -rn "eval(\|Function(\|setTimeout.*string\|setInterval.*string" --include="*.js"
+git grep -n -e "eval(\|Function(\|setTimeout.*string\|setInterval.*string" -- '*.js'
 
 # Framework bypasses
-grep -rn "bypassSecurityTrust" --include="*.ts"
-grep -rn "mark_safe\|SafeString" --include="*.py"
+git grep -n -e "bypassSecurityTrust" -- '*.ts'
+git grep -n -e "mark_safe\|SafeString" -- '*.py'
 ```
 
 ---

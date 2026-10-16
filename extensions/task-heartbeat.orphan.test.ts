@@ -398,6 +398,30 @@ test("real reparenting: orphan watchdog reaps child + grandchild after parent SI
   try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
 });
 
+// ── #1074: the catch-net's unmeasured paths must be DIAGNOSED, not silent ──
+
+test("#1074: default kill-descendants warns + skips when the own pgid is unmeasured", async () => {
+  // `getPgid` null covers "ps failed/timed out" as well as "no such pid"; the
+  // catch-net is skipped either way (fail-closed), but the miss must be
+  // audible. Calls the REAL default implementation (the module's own hook
+  // object holds it), with no children of our own to walk.
+  const real = { ...orphanWatchdogHooks };
+  const warns: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (m: unknown) => { warns.push(String(m)); };
+  try {
+    orphanWatchdogHooks.ownPgidGetter = () => null;
+    await orphanWatchdogHooks.killDescendants(0);
+    ok(
+      warns.some((w) => w.includes("own pgid unmeasured")),
+      `the skipped catch-net must be diagnosed: ${warns.join(" | ")}`,
+    );
+  } finally {
+    console.warn = origWarn;
+    Object.assign(orphanWatchdogHooks, real);
+  }
+});
+
 // ── Runner ───────────────────────────────────────────────────────────────
 
 (async () => {

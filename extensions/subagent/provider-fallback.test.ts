@@ -112,7 +112,8 @@ if (logPath) {
       modelFlags: argv.filter((a) => a === "--model").length,
       model: modelIdx >= 0 ? argv[modelIdx + 1] : null,
       providerFlags: argv.filter((a) => a === "--provider").length,
-      provider: providerIdx >= 0 ? argv[providerIdx + 1] : null }) + "\\n");
+      provider: providerIdx >= 0 ? argv[providerIdx + 1] : null,
+      hatch: process.env.AGENT_ALLOW_MAIN_EDITS || process.env.ELDATO_ALLOW_MAIN_EDITS || null }) + "\\n");
   } catch {}
 }
 const writeEvent = (msg) => { fs.writeSync(1, JSON.stringify({ type: "message_end", message: msg }) + "\\n"); };
@@ -199,7 +200,7 @@ function runTool(params: any, opts: { signal?: AbortSignal; cwd: string; mode?: 
 	});
 }
 
-function readSpawnLog(logPath: string): Array<{ attempt: string; task: string; modelFlags: number; model: string | null; providerFlags: number; provider: string | null }> {
+function readSpawnLog(logPath: string): Array<{ attempt: string; task: string; modelFlags: number; model: string | null; providerFlags: number; provider: string | null; hatch: string | null }> {
 	try {
 		return fs
 			.readFileSync(logPath, "utf-8")
@@ -679,5 +680,88 @@ async function run() {
 	}
 	console.log("✅ ALL TESTS PASSED");
 }
+
+section("#623 — hatch default-strip + per-dispatch opt-in (runtime child env)");
+
+test("a HATCHED controller's subagent child does NOT inherit AGENT/ELDATO_ALLOW_MAIN_EDITS by default (#623)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	// Simulate the ambient-launcher contamination class: the controller's OWN
+	// launch env carries both hatch vars (observed live on this machine). The
+	// childEnv ...process.env spread would inherit them; the #623 default-strip
+	// must delete them before the spawn.
+	process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+	process.env.ELDATO_ALLOW_MAIN_EDITS = "1";
+	let resp: any;
+	try {
+		resp = await runTool(singleParams(cwd, `pfbt-hatch-${Date.now()}`), { cwd, logPath, mode: "always-success" });
+	} finally {
+		delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	}
+	ok(!resp.isError, `dispatch must succeed: ${resp.content?.[0]?.text}`);
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 1, "success → exactly one spawn");
+	equal(lines[0].hatch, null, "child env must NOT carry the hatch — hatched controller dispatches an UNHATCHED child (#623)");
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
+
+test("allow_main_edits: true opt-in restores the hatch for THAT dispatch only (#623)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	process.env.AGENT_ALLOW_MAIN_EDITS = "1";
+	process.env.ELDATO_ALLOW_MAIN_EDITS = "1";
+	let resp: any;
+	try {
+		resp = await runTool(
+			{ ...singleParams(cwd, `pfbt-hatchopt-${Date.now()}`), allow_main_edits: true },
+			{ cwd, logPath, mode: "always-success" },
+		);
+	} finally {
+		delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	}
+	ok(!resp.isError, `dispatch must succeed: ${resp.content?.[0]?.text}`);
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 1, "success → exactly one spawn");
+	ok(lines[0].hatch !== null, "child env MUST carry the hatch when the per-dispatch opt-in is passed (#623)");
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
+
+test("allow_main_edits: true is a NO-OP for an UNHATCHED controller — subagent side (#623)", async () => {
+	const cwd = makeProjectCwd([{ name: "test-agent" }]);
+	const logPath = path.join(tmpRoot, `log-${Date.now()}-${Math.random().toString(36).slice(2)}.log`);
+	// The escalation guard: an opt-in can only re-add a hatch the CONTROLLER
+	// itself carries. This machine's ambient env IS hatched (observed live), so
+	// save + clear to make the "unhatched controller" premise real, then restore.
+	const savedAgent = process.env.AGENT_ALLOW_MAIN_EDITS;
+	const savedEldato = process.env.ELDATO_ALLOW_MAIN_EDITS;
+	delete process.env.AGENT_ALLOW_MAIN_EDITS;
+	delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+	let resp: any;
+	try {
+		resp = await runTool(
+			{ ...singleParams(cwd, `pfbt-hatch-unhatched-${Date.now()}`), allow_main_edits: true },
+			{ cwd, logPath, mode: "always-success" },
+		);
+	} finally {
+		if (savedAgent === undefined) delete process.env.AGENT_ALLOW_MAIN_EDITS;
+		else process.env.AGENT_ALLOW_MAIN_EDITS = savedAgent;
+		if (savedEldato === undefined) delete process.env.ELDATO_ALLOW_MAIN_EDITS;
+		else process.env.ELDATO_ALLOW_MAIN_EDITS = savedEldato;
+	}
+	ok(!resp.isError, `dispatch must succeed: ${resp.content?.[0]?.text}`);
+	const lines = readSpawnLog(logPath);
+	equal(lines.length, 1, "success → exactly one spawn");
+	equal(
+		lines[0].hatch,
+		null,
+		"an UNHATCHED controller must NEVER hatch a child — the opt-in re-adds only what the controller env carries (#623)",
+	);
+	fs.rmSync(cwd, { recursive: true, force: true });
+	fs.rmSync(logPath, { force: true });
+});
 
 run();

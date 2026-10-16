@@ -265,6 +265,54 @@ ok("branchOp: checkout -b", op("checkout", ["-b", "feat/x"]) === "create-new");
 ok("branchOp: switch -c", op("switch", ["-c", "feat/x"]) === "create-new");
 ok("branchOp: checkout -B", op("checkout", ["-B", "feat/x"]) === "force-create");
 ok("branchOp: checkout --orphan", op("checkout", ["--orphan", "x"]) === "orphan");
+// #626 review round-2 (P1): git's ATTACHED/cluster create spellings. Before the
+// fix these classified switch-existing (target = the start-point, e.g. "main"),
+// so the #376 return-to-original arm re-baselined while git CREATED a branch —
+// the #99 hole reopened. Every form must classify create/force-create/orphan.
+ok("branchOp #626: checkout -bfoo (attached) → create-new branch foo", (() => { const r = classifyBranchOp("checkout", ["-bfoo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: checkout -Bfoo (attached) → force-create branch foo", (() => { const r = classifyBranchOp("checkout", ["-Bfoo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch -cfoo (attached) → create-new branch foo", (() => { const r = classifyBranchOp("switch", ["-cfoo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch -Cfoo (attached) → force-create branch foo", (() => { const r = classifyBranchOp("switch", ["-Cfoo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch --create=foo → create-new (long = form)", (() => { const r = classifyBranchOp("switch", ["--create=foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --create foo → create-new (long space form)", (() => { const r = classifyBranchOp("switch", ["--create", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-create=foo → force-create", (() => { const r = classifyBranchOp("switch", ["--force-create=foo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: checkout -fb foo (cluster, value = next argv) → create-new foo", (() => { const r = classifyBranchOp("checkout", ["-fb", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: checkout --orphan=foo → orphan branch foo", (() => { const r = classifyBranchOp("checkout", ["--orphan=foo"]); return r.op === "orphan" && r.branch === "foo"; })());
+ok("branchOp #626: switch -d (detach) stays other (no false create)", op("switch", ["-d"]) === "other");
+// #626 review round-3 (P0): git's parse-options accepts UNAMBIGUOUS long-option
+// PREFIXES (`--cre` ≡ `--create`, `--force-c` ≡ `--force-create`, `--orph` ≡
+// `--orphan`; probe-verified git 2.50.1). Matching only the exact names left the
+// whole abbreviation family as a bypass.
+ok("branchOp #626: switch --cre=foo → create-new (long prefix)", (() => { const r = classifyBranchOp("switch", ["--cre=foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --crea foo → create-new (long prefix, space form)", (() => { const r = classifyBranchOp("switch", ["--crea", "foo", "main"]); return r.op === "create-new" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-c=foo → force-create (long prefix)", (() => { const r = classifyBranchOp("switch", ["--force-c=foo", "main"]); return r.op === "force-create" && r.branch === "foo"; })());
+ok("branchOp #626: switch --force-creat main → force-create main", (() => { const r = classifyBranchOp("switch", ["--force-creat", "main"]); return r.op === "force-create" && r.branch === "main"; })());
+ok("branchOp #626: checkout --orph=v → orphan branch v", (() => { const r = classifyBranchOp("checkout", ["--orph=v"]); return r.op === "orphan" && r.branch === "v"; })());
+ok("branchOp #626: checkout --orp v → orphan branch v", (() => { const r = classifyBranchOp("checkout", ["--orp", "v"]); return r.op === "orphan" && r.branch === "v"; })());
+// ...while the EXACT --force flag is the force-switch, NOT force-create.
+ok("branchOp #626: switch --force main → force (exact --force is not --force-create)", op("switch", ["--force", "main"]) === "force");
+// ...and non-create long options that merely start with c/o stay non-create.
+ok("branchOp #626: checkout --conflict=merge main → not create", op("checkout", ["--conflict=merge", "main"]) !== "create-new");
+ok("branchOp #626: checkout --no-guess → other (not create)", op("checkout", ["--no-guess"]) === "other");
+// #626 review-round-4: the resolver is VERB-AWARE — `git checkout` has NO
+// --create/--force-create, so `--f`/`--fo`/`--for`/`--forc` are prefixes of the
+// VALID --force and `--c`/`--c=style` resolve to --conflict. Those must NOT be
+// classified as creates (git rc 0), or the guard blocks valid commands.
+ok("branchOp #626: checkout --f main → not create (git: --force, rc 0)", op("checkout", ["--f", "main"]) !== "create-new" && op("checkout", ["--f", "main"]) !== "force-create");
+ok("branchOp #626: checkout --forc main → not create (git: --force, rc 0)", op("checkout", ["--forc", "main"]) !== "create-new" && op("checkout", ["--forc", "main"]) !== "force-create");
+ok("branchOp #626: checkout --c=merge main → not create (git: --conflict, rc 0)", op("checkout", ["--c=merge", "main"]) !== "create-new" && op("checkout", ["--c=merge", "main"]) !== "force-create");
+ok("branchOp #626: checkout --orph / --orp still orphan (both verbs have --orphan)", op("checkout", ["--orph", "v"]) === "orphan" && op("switch", ["--orp", "v"]) === "orphan");
+// #626 review-round-4 (P1): a trailing `--` does NOT neutralize a create option
+// that PRECEDES it — `git switch -c foo --` / `git checkout -B foo --` create and
+// flip (probe-verified git 2.50.1). The create scan must run BEFORE the `--`
+// path-restore early-return, while `--` BEFORE any create option stays a
+// path-restore (op "other").
+ok("branchOp #626: switch -c ev1 -- → create-new (trailing -- does not neutralize)", (() => { const r = classifyBranchOp("switch", ["-c", "ev1", "--"]); return r.op === "create-new" && r.branch === "ev1"; })());
+ok("branchOp #626: checkout -B ev2 -- → force-create", (() => { const r = classifyBranchOp("checkout", ["-B", "ev2", "--"]); return r.op === "force-create" && r.branch === "ev2"; })());
+ok("branchOp #626: switch --orphan ev3 -- → orphan", (() => { const r = classifyBranchOp("switch", ["--orphan", "ev3", "--"]); return r.op === "orphan" && r.branch === "ev3"; })());
+ok("branchOp #626: checkout -b ev5 -- → create-new", (() => { const r = classifyBranchOp("checkout", ["-b", "ev5", "--"]); return r.op === "create-new" && r.branch === "ev5"; })());
+ok("branchOp #626: checkout -- -b q → other (leading -- is a pathspec)", op("checkout", ["--", "-b", "q"]) === "other");
+ok("branchOp #626: checkout main -- f.txt → other (path-restore)", op("checkout", ["main", "--", "f.txt"]) === "other");
 ok("branchOp: checkout -f", op("checkout", ["-f", "main"]) === "force");
 ok("branchOp: checkout --force → force", op("checkout", ["--force", "main"]) === "force");
 ok("branchOp: switch --discard-changes → force (never the #376 return)", op("switch", ["--discard-changes", "main"]) === "force");
@@ -422,6 +470,17 @@ const effMain = resolveEffectiveRepo("git commit -m x", MAIN); // on main
 const effWt = resolveEffectiveRepo(`git -C "${WT}" commit -m x`, MAIN);
 ok("M2: worktree exempt", decideM2({ effectiveRepo: effWt, baseline, currentBranch: effWt.currentBranch, verdict: "block:commit" }) === null);
 ok("M2: commit off-baseline blocks", (() => { const d = decideM2({ effectiveRepo: effMain, baseline, currentBranch: effMain.currentBranch, verdict: "block:commit" }); return d?.block === true; })());
+// #626 review fold-in: the recovery text offers the #376 return ONLY when an
+// original baseline was recorded (contended/detached starts store original null
+// → that switch is itself blocked, so the message must fail over to worktree).
+ok("M2: recovery offers #376 return + names the original when recorded", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: { ...baseline, original: "main" }, currentBranch: "feat/other", verdict: "block:commit" });
+  return d?.block === true && d.reason.includes("git checkout main") && d.reason.includes("#376");
+})());
+ok("M2: no original (contended/detached) → no switch hint, worktree recovery", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: { ...baseline, original: null }, currentBranch: "feat/other", verdict: "block:commit" });
+  return d?.block === true && !d.reason.includes("git checkout main") && d.reason.includes("using-git-worktrees");
+})());
 ok("M2: commit on-baseline passes", decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", verdict: "block:commit" }) === null);
 ok("M2: push foreign blocks", (() => { const d = decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: "main", pushTargets: ["main"], verdict: "block:push" }); return d?.block === true; })());
 ok("M2: push own passes", decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: "feat/1", pushTargets: ["feat/1"], verdict: "block:push" }) === null);
@@ -431,8 +490,94 @@ ok("M2: multi-refspec foreign blocks", (() => { const d = decideM2({ effectiveRe
 ok("M2: allowActive bypasses", decideM2({ effectiveRepo: effMain, baseline, currentBranch: effMain.currentBranch, verdict: "block:commit", allowActive: true }) === null);
 ok("M2: different repo allows", decideM2({ effectiveRepo: (() => { const r = resolveEffectiveRepo(`git -C "${OTHER}" commit`, MAIN); return r; })(), baseline, currentBranch: "main", verdict: "block:commit" }) === null);
 
+// ── #805: fail-closed holes (bare push / unverifiable target / no baseline) ─
+// The gate must REFUSE when ownership cannot be proven. These are the #805
+// regression pins: before the fix each of the first four returned null
+// (ALLOW), and the fifth fell open on an empty target list.
+ok("M2 #805: no recorded baseline + MAIN checkout → BLOCK (fail-closed)", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "feat/1", verdict: "block:commit" });
+  return d?.block === true;
+})());
+ok("M2 #805: no recorded baseline + push in MAIN checkout → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "feat/1", pushDst: "feat/1", pushTargets: ["feat/1"], verdict: "block:push" });
+  return d?.block === true;
+})());
+ok("M2 #805: no baseline + worktree is still exempt (worktree sessions have no baseline)",
+  decideM2({ effectiveRepo: effWt, baseline: undefined, currentBranch: "feat/wt", verdict: "block:commit" }) === null);
+ok("M2 #805: unresolvable target (unresolvedTarget) → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: { ...effMain, unresolvedTarget: true }, baseline, currentBranch: "feat/1", verdict: "block:commit" });
+  return d?.block === true;
+})());
+ok("M2 #805: unparseable push target (no refspec + no current branch) → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline, currentBranch: null, pushDst: null, pushTargets: [], verdict: "block:push" });
+  return d?.block === true;
+})());
+ok("M2 #805: null effectiveRepo → BLOCK (fail-closed)", (() => {
+  const d = decideM2({ effectiveRepo: null, baseline, currentBranch: "feat/1", verdict: "block:commit" });
+  return d?.block === true;
+})());
+// Regression guards — the fix must NOT tighten the ordinary on-baseline paths.
+ok("M2 #805: on-baseline bare push still passes (regression guard)",
+  decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", pushDst: null, pushTargets: [], verdict: "block:push" }) === null);
+ok("M2 #805: on-baseline commit still passes (regression guard)",
+  decideM2({ effectiveRepo: effMain, baseline, currentBranch: "feat/1", verdict: "block:commit" }) === null);
+
+// ── #805 P1: no-baseline refusal is scoped to the SESSION's own checkout ────
+// "No baseline" is true for EVERY worktree session, so the original #805 arm
+// refused a worktree session committing in an UNRELATED repo too — work that
+// pre-#805 allowed (an over-blocking regression). `sessionRepoKey` (the session
+// cwd's repoKey; an explicit null = the cwd is not in any repo) plus
+// `effectiveIsAgentInfra` scope the refusal to the two targets this session
+// could be contaminating: its own shared checkout and the agent-infra hub.
+const effOther = resolveEffectiveRepo(`git -C "${OTHER}" commit -m x`, MAIN);
+ok("M2 #805 P1: no baseline + session's OWN main checkout (repoKey matches) → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + OWN checkout push → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effMain, baseline: undefined, currentBranch: "main", pushDst: "main", pushTargets: ["main"], verdict: "block:push", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + UNRELATED repo's main checkout → ALLOW (no over-block)",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey }) === null);
+ok("M2 #805 P1: no baseline + UNRELATED repo push → ALLOW (no over-block)",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", pushDst: "main", pushTargets: ["main"], verdict: "block:push", sessionRepoKey: mainKey }) === null);
+ok("M2 #805 P1: no baseline + session cwd in NO repo (explicit null) + non-infra target → ALLOW",
+  decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: null }) === null);
+ok("M2 #805 P1: no baseline + agent-infra target from a FOREIGN session repo → BLOCK", (() => {
+  const d = decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey, effectiveIsAgentInfra: true });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + caller supplied NO session repo identity → BLOCK (fail closed)", (() => {
+  const d = decideM2({ effectiveRepo: effOther, baseline: undefined, currentBranch: "main", verdict: "block:commit" });
+  return d?.block === true;
+})());
+ok("M2 #805 P1: no baseline + target repoKey unreadable → BLOCK (fail closed)", (() => {
+  const d = decideM2({ effectiveRepo: { ...effOther, repoKey: null }, baseline: undefined, currentBranch: "main", verdict: "block:commit", sessionRepoKey: mainKey });
+  return d?.block === true;
+})());
+// resolveRepoFromInv: the unresolved-target flag is the fail-closed signal.
+ok("resolveRepoFromInv #805: unknown $VAR cd → unresolvedTarget flag + session-cwd fallback", (() => {
+  const r = resolveRepoFromInv({ cdChain: ["$BO805_NOPE"], cHints: [], gitDirHint: null, vars: {} }, MAIN);
+  return r && r.unresolvedTarget === true && r.isWorktree === false && r.currentBranch === "main";
+})());
+ok("resolveRepoFromInv #805: env-var cd target resolves faithfully (no false unresolved)", (() => {
+  const saved = process.env.BO805_WT;
+  process.env.BO805_WT = WT;
+  try {
+    const r = resolveRepoFromInv({ cdChain: ["$BO805_WT"], cHints: [], gitDirHint: null, vars: {} }, MAIN);
+    return r && r.unresolvedTarget === false && r.isWorktree === true && r.currentBranch === "feat/wt";
+  } finally {
+    if (saved === undefined) delete process.env.BO805_WT; else process.env.BO805_WT = saved;
+  }
+})());
+ok("resolveRepoFromInv #805: classify-git -C sentinel → unresolvedTarget (no bogus path)", (() => {
+  const r = resolveRepoFromInv({ cdChain: [], cHints: ["\u0000"], gitDirHint: null, vars: {} }, MAIN);
+  return r && r.unresolvedTarget === true;
+})());
+
 // ── decideM3 ───────────────────────────────────────────────────────────────
-ok("M3: create-new agent-infra → reBaseline", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline }); return d?.reBaseline === "feat/2"; })());
+ok("M3: create-new agent-infra BLOCKS in main (#626)", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline }); return d?.block === true && d.reason.includes("worktree"); })());
 ok("M3: create-new non-infra blocks", (() => { const d = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: switch-existing blocks", (() => { const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline }); return d?.block === true; })());
 ok("M3: force blocks", (() => { const d = decideM3({ branchOp: { op: "force" }, isAgentInfra: true, baseline }); return d?.block === true; })());
@@ -656,11 +801,14 @@ ok("M3 #598: localBranchExists empty name → null", localBranchExists(MAIN, "")
 }
 
 // ── decideM3 #376: ceremony return-to-original-baseline carve-out ──────────
-// Post-ceremony session state: started on main (baseline.original — IMMUTABLE),
-// then created feat/2 via the agent-infra create-new carve-out (baseline re-based
-// to feat/2). `git checkout main` is the sanctioned return-to-main: the target is
-// provably the session's OWN recorded starting state, so #265's parallel-agent
-// hazard doesn't apply. Non-infra repos and foreign targets stay blocked.
+// Post-ceremony session state: started on main (baseline.original — IMMUTABLE).
+// In the #615 worktree model the create-new re-baseline no longer happens in
+// the hub (in-hub create-new is blocked since #626); the mid-ceremony state
+// (baseline re-based off main) arises from a RENAME of the session's own
+// baseline or a legacy/hatch ceremony. `git checkout main` remains the
+// sanctioned return-to-original: the target is provably the session's OWN
+// recorded starting state, so #265's parallel-agent hazard doesn't apply.
+// Non-infra repos and foreign targets stay blocked.
 const ceremony = { repoKey: mainKey, branch: "feat/2", original: "main" };
 ok("M3 #376: agent-infra switch-existing to ORIGINAL baseline → allowed (reBaseline)", (() => {
   const d = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey });
@@ -705,11 +853,10 @@ ok("M3 #376: other branch-state ops stay blocked (agent-infra, force/orphan/deta
     .every((op) => decideM3({ branchOp: { op }, isAgentInfra: true, baseline: ceremony, repoKey: mainKey })?.block === true);
 })());
 ok("M3 #376: sanctioned return does NOT fire M1 deviation (re-baseline silences next M1)", (() => {
-  let s = { repoKey: mainKey, branch: "main", original: "main" }; // uncontended session_start on main
-  // create-new re-baseline (agent-infra carve-out) → baseline.branch = feat/2
-  const c = decideM3({ branchOp: { op: "create-new", branch: "feat/2" }, isAgentInfra: true, baseline: s, repoKey: mainKey });
-  if (c?.reBaseline !== "feat/2") return false;
-  s = { ...s, branch: c.reBaseline };
+  // Mid-ceremony state built directly (create-new can no longer re-baseline in
+  // the hub — #626 blocks it; the re-based state now arises from an own-baseline
+  // rename or a legacy/hatch ceremony): baseline.branch = feat/2, original = main.
+  let s = { repoKey: mainKey, branch: "feat/2", original: "main" };
   if (decideM1("feat/2", s.branch) !== null) return false; // on own branch: no warn
   // sanctioned return to the ORIGINAL baseline → re-baseline back to main
   const r = decideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: true, baseline: s, repoKey: mainKey });

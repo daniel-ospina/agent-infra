@@ -5,8 +5,7 @@
 Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
 
 1. **Appropriate review clean** — the review matched to the ISSUE CONTENT + PR diff surface
-   returned 0 P0, 0 P1, and 0 P2 — all findings with confidence ≥ 50 resolved (fixer loop converged;
-   second-model final gate clean when applicable). The review
+   returned 0 P0, 0 P1, and 0 P2 — all findings with confidence ≥ 50 resolved (fixer loop converged). The review
    is domain-dispatched, not one-size. ALWAYS-ON reviewers: bug scan (shallow+deep), guidance
    compliance, history, prior-PR comments, and SECURITY (security-review skill — HIGH-confidence
    findings only, research-before-report). Domain reviewers as applicable: infrastructure
@@ -41,7 +40,7 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    on the merged state BEFORE merging. Non-overlapping, current branches skip this (no standing
    churn). Literal conflicts surface here and remain blocked by condition 4.
 6. **Review record at the final head (ai-review-gate, #2058)** — a clean review record
-   (`~/.pi/agent/reviews/<PR>.json`, verdict `clean`/`clean-micro`) exists at the CURRENT head
+   (`~/.pi/agent/reviews/<PR>.json`, verdict `clean`/`clean-micro`/`clean-low`) exists at the CURRENT head
    sha. Verdict by tier: **standard/complex** PRs record `clean` — the
    `code-review` skill records automatically on clean convergence (Step 10).
    **Micro-tier PRs** (linked issue `complexity:micro`) record `clean-micro`
@@ -59,14 +58,54 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    tier and the #485 ≥1-dispatch floor are enforced by their own gates. Where
    the linked ref's complexity label cannot be read (label-fetch failure,
    absent label, no closing ref, or only cross-repo refs) record-review.sh
-   WARNS and proceeds — tier attestation UNVERIFIED at mint. If
+   WARNS and proceeds — tier attestation UNVERIFIED at mint. **Content-only
+   diffs record `clean-low`** regardless of the linked issue's tier (#1348):
+   when EVERY changed path is prose or a stylesheet (`docs/**` with a content
+   extension, or a named root prose file) the Low value of the canonical tier
+   table's §Change Classification `Code impact` column applies, and
+   `record-review.sh <PR> <head-sha> clean-low <owner/repo>` is the honest
+   record. Its class is deliberately NARROWER than that cell — config and
+   strings are excluded, because a config change is
+   where a runtime-behaviour change hides — and its guard is FAIL-CLOSED on
+   every arm, so an unreadable or truncated diff is never certified Low; a
+   `clean-low` record is only obtainable for a diff `record-review.sh` actually
+   read at the recorded sha. The record is bound to BOTH ends of what was certified:
+   the head sha AND the MERGE BASE of `compare/<base>...<head>` (the commit the
+   three-dot diff is taken from, i.e. what identifies the certified content).
+   Repointing the PR's base (`gh pr edit --base`) or rewriting it moves that merge
+   base, so the gate refuses with `base_advanced` rather than merge a diff nobody
+   certified; a base branch that merely ADVANCES does not move it, so the record
+   survives unrelated merges to main. When either side cannot be read the gate
+   refuses with `base_unverifiable` instead — fail-closed, and re-record clears it. If
    the head moved after the record (fix commits, merge of main): re-run the
    review appropriate to the tier (the `code-review` skill at
    standard/complex; the micro flow at micro) on the new head, then re-record
    at the SAME verdict —
    `~/.pi/agent/scripts/record-review.sh <PR> <full-head-sha> clean
-   <owner/repo>` (standard/complex) or `… clean-micro <owner/repo>` (micro)
-   (the script is not on PATH — use the explicit path).
+   <owner/repo> --evidence <artifact>` (standard/complex), `… clean-micro <owner/repo>` (micro), or for a
+   content-only diff re-check the NEW head's shape and record `… clean-low
+   <owner/repo>` only if it is still content-only (otherwise take the normal route:
+   the code-review skill, then `clean`) — `clean-low`'s claim is about the diff's
+   shape, not about a tier, so it must be re-derived rather than carried forward.
+   **A `clean` record — first or re-record — additionally requires
+   `--evidence <artifact>`** (tortoise#7391): the current-head arm used to
+   record unconditionally, so the most natural invocation there is minted a
+   validly-signed, head-bound `clean` for a diff nobody had reviewed. The script
+   VERIFIES the artifact it is handed — it must exist, belong to THIS PR,
+   POSTDATE the recorded head's commit, and not assert an UNRESOLVED outcome
+   (NOT-CLEAN, or the review skills' stalled/failed/cap exit markers) — and
+   anything unverifiable, including an unreachable API, REFUSES with exit 3 and
+   prints the remedy. Accepted forms: `comment:<id>`, `review:<id>`,
+   `review-comment:<id>`, or the GitHub URL of one of those — the review comment
+   the `code-review` skill posts is the natural one to name. This is an
+   auditability and friction boundary, not proof of review: the gate checks that
+   an artifact EXISTS, is on THIS PR, postdates the recorded head and does not
+   assert an unresolved outcome — it does not check that the artifact is a review, so naming
+   a non-review (a bot comment, say) is a deliberate act, not an accident. A
+   genuine CARRY needs
+   no evidence (its evidence is the prior signed marker it re-verified, and its
+   record says `"mint":"carried"`), and `clean-micro`/`clean-low` are unaffected.
+   (The script is not on PATH — use the explicit path.)
    NEVER re-record a moved head without a fresh review: the `ai-review-gate` required check
    verifies signature + full-sha freshness, and the review-enforcer blocks the merge command
    without a matching record, so the ceremony stays red until evidence is genuinely refreshed.
@@ -107,8 +146,12 @@ gh pr merge <PR_NUMBER> --merge
 
 ```bash
 PR_BRANCH=$(gh pr view <PR_NUMBER> --json headRefName -q '.headRefName')
-# Remote delete always works — the branch is merged, and deletion is server-side:
-git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete failed — delete manually: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
+# Remote delete is server-side. The #73 coordinated-delete guard blocks deleting a
+# branch still checked out in ANY worktree (including your own) — but it matches the
+# LITERAL ref, so THIS shell-variable form is not guard-matched (#653). If you pass a
+# literal branch name, run the cleanup after 05-cleanup.md Step 3.8 teardown, or use
+# `gh api -X DELETE`, or the retry below.
+git push origin --delete "$PR_BRANCH" 2>&1 || echo "⚠️ remote delete blocked/failed — retry after teardown or: gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/$PR_BRANCH"
 # Local delete degrades gracefully: tolerate the worktree lock, do NOT fail the ceremony.
 # `git branch -D` (not -d) so a merged-but-not-fully-reconciled local branch still cleans up.
 if git worktree list --porcelain | grep -q "branch refs/heads/$PR_BRANCH"; then
@@ -125,43 +168,51 @@ touching the default-branch worktree. If Step B's remote delete reports
 `remote ref does not exist`, the branch was already deleted server-side
 (deleteBranchOnMerge) — that is success, not an error.
 
-> **#265 branch-ownership allowance:** in agent-infra main, the main-worktree-guard
-> allows this ceremony's commands when the session is on its OWN baseline branch:
-> condition-5 `git merge origin/main`, Step B `git push origin --delete "$PR_BRANCH"`
-> and `git branch -D "$PR_BRANCH"`, and Stale-Merge's `rebase` + bare
-> `git push --force-with-lease` (the bare push compares the CURRENT branch — push
-> `--force-with-lease` is NOT classified as `--force`). If the guard reports "branch
-> ownership violated", the shared checkout was switched mid-ceremony — `git
-> checkout -b <fresh-branch>` (M3 carve-out re-baselines) and re-run the ceremony.
+> **#265/#615 ceremony posture:** run the ceremony from the session's WORKTREE —
+> agent-infra included (the #99 in-main-work exemption was removed in #615, so
+> the agent-infra hub is main+clean like every hub). In a worktree BOTH the
+> M2/M3 gates and the legacy destructive-block arm are worktree-exempt
+> (`eff.isWorktree`; M2/M3 apply only to MAIN-checkout-effective mutations, and
+> the legacy arm carries its own exemption), so these pass: condition-5
+> `git merge origin/main`, Stale-Merge's `rebase` + bare
+> `git push --force-with-lease`. Running the ceremony from the
+> HUB is not an option: in-hub `checkout -b` is blocked (#626) and the hub is the
+> shared tree.
+>
+> ⛔ **The remote delete is #73-gated — and NOT worktree-exempt.**
+> `git push origin --delete <branch>` hits the #73 coordinated-delete guard, which
+> blocks deleting any branch checked out in ANY worktree — including the caller's
+> own (a worktree session that holds the branch therefore blocks its own remote
+> delete). The guard matches the LITERAL ref, so the shell-variable form
+> `git push origin --delete "$PR_BRANCH"` is NOT resolved by the classifier and is
+> not guard-matched. Run the cleanup AFTER the worktree teardown (05-cleanup.md
+> Step 3.8 → merged-branch cleanup, which orders teardown first), or delete the
+> remote ref via `gh api -X DELETE repos/{owner}/{repo}/git/refs/heads/<branch>`.
+>
+> The local `git branch -D "$PR_BRANCH"` is best-effort: git itself refuses it
+> while the branch is checked out in this worktree (the guard's branch-force-delete
+> arm is worktree-exempt, but the git refusal stands), and after teardown the
+> HUB's main-checkout `block:branch-force-delete` gate blocks a branch that is
+> neither the session's baseline nor pid-owned — a branch created via
+> `git worktree add -b` is never recorded as owned (create-new is blocked, #626).
+> A guard block rejects the bash call BEFORE the shell runs, so the `||` echo in
+> 05-cleanup never fires on it — write the teardown note yourself, or delete the
+> stale local ref manually (human terminal / `AGENT_ALLOW_MAIN_EDITS=1`).
 
-**Step C — return to the session's ORIGINAL baseline (#376, agent-infra main only):**
+**Step C — obsolete (#376 ceremony return applied only to the #99 in-main flow):**
 
-Applies ONLY to ceremonies run directly in the **agent-infra main checkout** (the #99/#265 in-main flow). Sessions working in an isolated worktree — infra or not — skip Step C; their worktree teardown (05-cleanup.md Step 3.8) handles the return.
-
-```bash
-# The ceremony session started on main, so `main` is its ORIGINAL baseline (the
-# branch recorded at session_start BEFORE the create-new re-baseline to the PR
-# branch). The merge-ceremony flow is: start on main → checkout -b feat/N →
-# merge → delete feat/N → RETURN to main. Without this step the session is
-# stranded on the deleted feature branch for the rest of its life.
-git checkout main
-# #376: allowed — M3's return-to-original-baseline carve-out lets the session
-# switch back to the branch recorded at its session_start (its de-facto baseline;
-# the lock serializes concurrent starts only). Agent-infra main ONLY, and ONLY in
-# the checkout that recorded that baseline (repoKey scoping); the guard re-adopts
-# main as the baseline, so no M1 deviation warning fires. Non-infra repos and
-# other checkouts still block switch-existing.
-
-# Step B may have deferred the merged branch's LOCAL delete while it was checked
-# out here; the return to main releases that lock. Deleting it now is own-branch
-# hygiene: the guard allows a LOCAL `git branch -D` of a branch this session
-# created via the M3 create-new carve-out (pid-owned), even after the baseline
-# re-based to main (#376). 05-cleanup.md's merged-branch cleanup resolves the PR
-# branch via `gh pr view` headRefName (never the current branch) and runs that
-# delete from main.
-```
-
-Non-agent-infra sessions and agent-infra **worktree** sessions skip Step C — after the merge ceremony their feature work lives in an isolated worktree, and 05-cleanup's teardown returns them to their base.
+Step C existed for ceremonies run directly in the **agent-infra main checkout**
+(start on main → `checkout -b feat/N` → merge → return to main) — the #99/#265
+in-main flow. #615 removed that flow: agent-infra implementers now work in
+isolated worktrees like every repo, and the guard BLOCKS in-hub `checkout -b`
+in agent-infra too (the M3 create-new carve-out was removed in #626). Worktree
+sessions need no return step — their teardown (05-cleanup.md Step 3.8) removes
+the worktree and returns the session to its base. The guard's #376
+return-to-original-baseline arm remains in code as a recovery path (a hub
+session switched out from under it may `git checkout` back to the branch it
+STARTED on — its recorded original; **agent-infra main only** — the arm is
+gated on `isAgentInfra`, so a non-infra hub session attempting it is blocked)
+but no skill ceremony uses it.
 
 ## Auto-merge for strict up-to-date protection (#500 — merge-race ladder)
 

@@ -1,9 +1,9 @@
 {
   "defaultProvider": "deepseek",
-  "defaultModel": "deepseek-v4-flash",
+  "defaultModel": "deepseek-flash",
   "defaultThinkingLevel": "high",
   "theme": "dark",
-  "httpIdleTimeoutMs": 600000,
+  "httpIdleTimeoutMs": 300000,
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,

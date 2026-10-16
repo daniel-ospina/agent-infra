@@ -483,7 +483,20 @@ test("#208: stopReason mapping wired in BOTH the close path and the exit-settle 
 });
 
 test("#208: sweep wired on the SETTLE-PATH basis + safety valves", () => {
-	ok(source.includes("sweepProcessGroup(childPgid, { detached })"), "sweep anchored on the captured pgid");
+	ok(source.includes("sweepProcessGroup(childPgid, { detached, spawnedPid: proc.pid })"), "sweep anchored on the captured pgid + the spawned-pid authorisation (#1074)");
+	// #1074 negative pin, alias-proof: copying `childPgid` (the pgid) into the
+	// `spawnedPid` slot makes the construction proof a tautology (pgid ===
+	// spawnedPid by definition) and silently degrades the guard to trusting the
+	// caller. A literal pin only catches the exact spelling — `const pg =
+	// childPgid; … spawnedPid: pg` evades it — so assert on EVERY `spawnedPid:`
+	// ARGUMENT instead.
+	const spawnedPidArgs = (source.match(/spawnedPid\s*:\s*([A-Za-z0-9_$.()!]+)/g) ?? []).map((m) =>
+		m.replace(/^spawnedPid\s*:\s*/, ""),
+	);
+	ok(
+		spawnedPidArgs.length > 0 && spawnedPidArgs.every((arg) => arg === "proc.pid"),
+		`every spawnedPid must be proc.pid (never a pgid-shaped variable or alias); got [${spawnedPidArgs.join(", ")}]`,
+	);
 	ok(source.includes('process.env.SUBAGENT_SWEEP !== "0"'), "SUBAGENT_SWEEP=0 disables the settle-path sweep");
 	ok(
 		source.includes("const childPgid: number | null = getPgid(proc.pid ?? 0) ?? proc.pid ?? null;"),

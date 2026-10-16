@@ -3,6 +3,19 @@
 Status: PLAN — scope approved (research round 3 adversarial confirmation: all
 practices verified good; 2×P1 + 1×P2 gaps folded).
 
+> **⚠️ SUPERSEDED (#626, 2026-09) — the L1 Branch Gate below is HISTORICAL.**
+> Since #615/#626 no hub (agent-infra included) may create a branch in the main
+> checkout, so the code quoted in “L1 — Branch Gate freshness” is NO LONGER in
+> `skills/issue-workflow/SKILL.md`. The #178/#179 freshness contract now lives in
+> `scripts/checkout-hygiene/hub-worktree.sh` CREATE MODE:
+> `git -C "$MAIN_REPO" fetch origin main --quiet` then
+> `git -C "$MAIN_REPO" worktree add "$WT_PATH" -b "$BRANCH" origin/main`
+> (fail-closed under `set -euo pipefail` — a failed fetch aborts with no worktree
+> and no hub change). The Branch Gate itself now EXITS 1 with worktree guidance
+> when it finds a hub / detached / wrong-issue checkout. Both halves are pinned by
+> `extensions/shared/test-git-freshness.mjs`. Do not rebuild the in-hub gate from
+> the historical text below.
+
 > **L2 EXTENSION (2026-08-17):** the dirty+behind case is now AUTO-HEALED when
 > it is *superseded* — every dirty path's content is already on
 > origin/<default> (the "staged work merged upstream via PRs" class). The
@@ -93,7 +106,7 @@ verified in-repo:
 
 ### Solution (converged)
 
-**L1 — Branch Gate freshness (skills/issue-workflow/SKILL.md):**
+**L1 — Branch Gate freshness (skills/issue-workflow/SKILL.md):** ⚠️ *SUPERSEDED (#626) — historical record only; the live contract is in `hub-worktree.sh` (see the banner at the top of this doc).*
 - Detect default branch: `DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD | sed 's@^origin/@@')` (fallback main).
 - Before branch creation: `git fetch origin "$DEFAULT_BRANCH" --quiet` and create with `git checkout -b "$EXPECTED_BRANCH" "origin/$DEFAULT_BRANCH"` — local main untouched.
 - Same treatment for the "checkout main first" abort guidance lines.

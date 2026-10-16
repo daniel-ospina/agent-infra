@@ -473,22 +473,22 @@ def method_not_allowed(e):
 
 ```bash
 # Missing authentication
-grep -rn "@app\.route\|@router\." --include="*.py" | grep -v "@require_auth\|@login_required"
+git grep -n -e "@app\.route\|@router\." -- '*.py' | grep -v "@require_auth\|@login_required"
 
 # Returning all fields
-grep -rn "to_dict()\|__dict__\|serialize" --include="*.py"
+git grep -n -e "to_dict()\|__dict__\|serialize" -- '*.py'
 
 # Mass assignment
-grep -rn "\*\*request\.\|update(\*\*\|create(\*\*" --include="*.py"
+git grep -n -e "\*\*request\.\|update(\*\*\|create(\*\*" -- '*.py'
 
 # Missing rate limiting
-grep -rn "login\|password\|reset" --include="*.py" | grep "route" | grep -v "limiter\|rate"
+git grep -n -e "login\|password\|reset" -- '*.py' | grep "route" | grep -v "limiter\|rate"
 
 # GraphQL introspection
-grep -rn "__schema\|introspection" --include="*.py"
+git grep -n -e "__schema\|introspection" -- '*.py'
 
 # CORS wildcards
-grep -rn "origins.*\*\|Access-Control-Allow-Origin.*\*" --include="*.py"
+git grep -n -e "origins.*\*\|Access-Control-Allow-Origin.*\*" -- '*.py'
 ```
 
 ---

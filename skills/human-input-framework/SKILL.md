@@ -5,7 +5,7 @@ description: "Reference taxonomy for when coding workflow skills should pause fo
 subjects.team: organisation-design-team
 type: reference
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task
-version: 2.0.0
+version: 2.1.1
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -141,6 +141,125 @@ When a P0 gate is hit, research is still conducted and presented, but the decisi
 
 ---
 
+## Approval Routing — Canonical
+
+> **This is the canonical copy** — consuming skills inline a short operational excerpt and cite this
+> section (consumer registry in "Inlining Instructions" at the end of this file).
+> Verified against `$SWARM_ROOT/operations/coordination/approval.py` (swarm `origin/main`, 011d69e4)
+> and `agent-infra/extensions/slack-bridge/index.ts` + `socket-mode.ts` — 2026-09-13.
+
+When a human gate fires, the agent surfaces the request by invoking the approval router.
+
+### Invocation (portable — works from ANY repo checkout)
+
+```bash
+python3 -c "
+import os, sys
+sys.path.insert(0, os.environ.get('SWARM_ROOT', os.path.expanduser('~/swarm')))
+from operations.coordination.approval import request_approval
+request_approval('<role>', artifact='<artifact>.md', context='<gate> approval', requires_human=<bool>)
+print('Approval request created')
+"
+```
+
+⛔ The bare `from operations.coordination.approval import …` resolves only when CWD *is* the swarm
+checkout — from an agent-infra checkout it raises `ModuleNotFoundError: No module named 'operations'`.
+Always use the `sys.path` form above. For escalation-chain routing instead of auto-approval, prefix the
+invocation with the env var: `APPROVAL_AUTO_APPROVE=0 python3 -c "…"` (see semantics below).
+
+### One store, two transports
+
+| | |
+|---|---|
+| **Store** | `~/.swarm/approvals/<slug>.json` (0600, per-repo; `SLACK_APPROVAL_FILE` overrides). ⚠️ **The two sides derive `<slug>` differently, so by default they do NOT share a file** — the Python router uses the `owner/repo` form (`_detect_repo()` → `daniel-ospina/agent-infra` → `daniel-ospina_agent-infra.json`), the slack-bridge uses the bare repo name (`repoNameFromUrl()` → `agent-infra.json`). **Pin `SLACK_APPROVAL_FILE` to one path if you are relying on Slack** — otherwise the bridge never sees the router's request, and the gate stalls (agent-infra #956). |
+| **Transport A — file** | `request_approval()` writes the record; `review_approval(id, 'approved'\|'rejected', feedback)` writes the verdict. |
+| **Transport B — Slack (optional)** | The slack-bridge approval poller posts `pending` records **whose reviewer is `human` or unset** (`index.ts:855`) to `SLACK_APPROVAL_CHANNEL` / `SLACK_CHANNEL` every `SLACK_APPROVAL_POLL_MS` (default 5000ms) when `SLACK_BOT_TOKEN` is set. A chain-routed pending is Slack-bound only when the role it was assigned *is* `human` — true for a top-of-chain requester like `team-strategist`; one assigned a role (e.g. `product-strategist`) is seen but not posted. Accept/Reject buttons (Socket Mode, needs `SLACK_APP_TOKEN`) write the verdict into the store. Only `pending` records are posted — auto-approved ones never reach Slack. |
+
+The poller starts independently of `SLACK_BRIDGE_DISABLE` (stopped only by `SLACK_APPROVAL_DISABLE=1` or
+pi print mode — i.e. task sub-agents get no Slack). The Socket Mode button receiver additionally
+requires `SLACK_BRIDGE_DISABLE != 1`.
+
+### Status semantics — what actually gates on a human
+
+| Condition | reviewer / status | Reaches a human? |
+|---|---|---|
+| `requires_human=True` | `human` / `pending` | **Yes** — hard checkpoint, never auto-approved |
+| Escalation keyword (`delete`, `deploy`, `destroy`, `migrate`, `release`) in `artifact`/`context` | `human` / `pending` | **Yes** |
+| Default — `APPROVAL_AUTO_APPROVE` unset (it **defaults to `1`**) | `policy:auto` / `approved` | **No** — resolved immediately, at request time |
+| `APPROVAL_AUTO_APPROVE=0` | next role in the escalation chain (`chain[1]`) / `pending` | **Depends on the requester** — it pends for `reports_to` (`approval.py:301`): `product-strategist` for `product-implementer`, but **`human` directly** for a top-of-chain role such as `team-strategist`. Only `chain[1]` is ever assigned, so nothing walks the chain further. |
+
+⚠️ **`requires_human=False` under the default config does NOT create a human checkpoint** — it
+auto-approves, unless an escalation keyword appears (row above). A gate that must genuinely wait for a
+human MUST pass `requires_human=True`. **Human gates are never rate-limited and never auto-approved**:
+`requires_human=True` pends unconditionally, and nothing throttles a gate — `_notify()` accepts a
+`rate_key` and ignores it.
+
+### The notification is a banner, not a dialog
+
+When — and only when — a record is left `pending`, `_notify()` runs:
+
+```
+osascript -e 'display notification "<role> requests approval for <artifact>" with title "Approval Needed"'
+```
+
+That is a macOS **notification banner**. It has **no buttons, no "Open"/"Dismiss", and no answer
+path**; it is best-effort (`capture_output=True`, exceptions swallowed, 15s timeout) and silently
+no-ops on non-macOS/CI/SSH.
+
+A `display dialog … buttons {"Open", "Dismiss"}` **did** exist here (swarm `f1aec8de`, 2026-08-06) and
+was replaced by this notification in the swarm #1402 rollout (`4e8a5871`, 2026-08-10) — which is why the
+four consumer skills this excerpt replaces described a control that no longer exists, not one that
+never did. ⚠️ Verify with the **path filter** — `git log -S "display dialog" --
+operations/coordination/approval.py` is empty on the current branch, but that emptiness is an artifact
+of squashed history (those commits are unreachable from `origin/main`; `git log --all -S …` shows
+them). Drop the path filter and you get a *different* file's hit: `operations/coordination/notify.sh`
+still ships a real `display dialog … buttons {"Open", "Dismiss"}` on `origin/main` — that script is
+not the approval router and is not covered by this section.
+
+⛔ **Never wait for a dialog. Never treat the banner as the response channel.** An agent waiting for
+a click that cannot happen stalls the pipeline (this is the drift this section consolidates).
+
+### How the agent detects the answer
+
+Resolution is a **record read**, never an inference from a shrinking list. The module ships a CLI for
+exactly this:
+
+```bash
+SWARM="${SWARM_ROOT:-$HOME/swarm}/operations/coordination/approval.py"
+python3 "$SWARM" --pending --role human    # what is still open
+python3 "$SWARM" --status <req_id>         # this record's status + reviewer
+```
+
+⚠️ Two traps, both verified:
+
+- **A shrinking list is NOT proof of approval.** A Slack thread reply sets the record to
+  `changes_requested` (`socket-mode.ts:1236` — the bridge's documented feedback path), which removes
+  it from `--pending` without approving anything. Read `status`: `changes_requested` means *revise*,
+  not *proceed*. It is also an **undeclared** status — the router's model comments only
+  `pending | approved | rejected`, while the merged bridge writes it (agent-infra #958).
+- **`is_approved(..., requires_human=True)` cannot confirm a Slack *button* approval.** It requires
+  `reviewer == 'human'`, and the button path overwrites `reviewer` with the clicking user's Slack id
+  (`socket-mode.ts:1186`) — so a genuine button approval leaves it returning `False` forever
+  (agent-infra #959). It is authoritative only for `review_approval()`-resolved gates, which preserve
+  the `human` marker. For a button approval, read `status == 'approved'` from `--status`.
+
+### Do not use — not in the current router
+
+`approval_feedback()` and the `parent=` / `revision` request fields exist only on **unmerged** swarm
+branches. `approval_feedback` is not importable from the router (an
+`from … import approval_feedback` raises `ImportError`; attribute access raises `AttributeError`) and
+`parent=` raises `TypeError: request_approval() got an unexpected keyword argument 'parent'`. ⚠️ Note
+the asymmetry: the **slack-bridge half is merged** (`index.ts` reads `req.parent` / `req.revision` /
+`req.thread`; `README.md` documents the loop as shipped), so those fields are not fictional — the
+router just cannot write them yet. See agent-infra #958 before reviving any conversation protocol.
+Likewise `APPROVAL_NO_NOTIFY` is advertised in swarm's `config/env.hosted.example` but is read by no
+code on `origin/main` in the current `$SWARM_ROOT` router — it silences nothing there (an unmerged
+daemon-exec worktree copy does read it).
+
+Full API: `$SWARM_ROOT/operations/coordination/approval.py`.
+
+---
+
 ## Research Tool Selection (Cost-Ordered)
 
 > **Note:** Tool names vary by agent. Pi: `mcp__seo-intelligence__perplexity_research`, `mcp__seo-intelligence__perplexity_search`, `mcp__context7__query_docs`. Claude Code: `perplexity` CLI or built-in web search. Check your agent's tool manifest for exact names.
@@ -175,5 +294,42 @@ When updating the taxonomy here, update all consuming skills:
 - `~/.pi/agent/skills/brainstorming/SKILL.md` (Pi symlink)
 - `~/.pi/agent/skills/executing-plans/SKILL.md` (Pi symlink)
 - `~/.pi/agent/skills/issue-scoping/SKILL.md` (Pi symlink)
+
+### Approval-Routing consumers (canonical block above)
+
+The **Approval Routing — Canonical** block is consumed by, and must be re-synced into, the inline
+excerpts in:
+
+- `agent-infra/skills/epic-workflow/SKILL.md`
+- `agent-infra/skills/project-workflow/SKILL.md`
+- `agent-infra/skills/writing-plans/SKILL.md`
+- `agent-infra/skills/verification-before-completion/SKILL.md`
+- `agent-infra/skills/executing-plans/SKILL.md`
+- `agent-infra/skills/issue-scoping/SKILL.md` — **still carries the stale pre-rollout wording**; it sits
+  on the guarded second-model surface, so its re-sync is handled separately (agent-infra #949).
+
+The Pi runtime copies live at `~/.pi/agent/skills/<name>/SKILL.md` for each of the six, and pi
+resolves skills from *those* paths. Two layouts exist: a **repo-pointing symlink farm** (a repo fix is
+then live immediately — `pi-bootstrap/setup.sh` deliberately preserves that layout, "updates via git
+pull"), or a **separate set of regular files** (as on this machine, where they are stale). The
+refresher is `pi-bootstrap/setup.sh`, run via `bash sync.sh` (or by the auto-sync extension) — so on a
+copy-layout machine a fix landed only in `agent-infra/skills/` is **not live for pi** until that runs.
+⚠️ `scripts/link-skills.sh` is a *different* tool: it hard-links skills into a **consumer repo's**
+`operations/skills` and refuses to run from agent-infra — it never touches `~/.pi/agent`.
+⚠️ A note earlier in this file calls these "(Pi symlink)"; that describes the symlink-farm layout only.
+
+Each consumer inlines only the **operational core** — the portable invocation, "no dialog pops, do
+not wait", the record-read detection + its two traps, the `requires_human`/auto-approve caveat, the
+one-line Slack/store warning (the #956 divergence is part of the operational core: an agent that does
+not know it will wait for a Slack answer that cannot come), and — where the gate's own call omits
+`requires_human` — a disclosure of that. What must **not** be restated, and belongs here: the store-slug
+**derivation internals** (`_detect_repo` vs `repoNameFromUrl`), the **status table**, and the **Slack
+enablement details** (`SLACK_APPROVAL_POLL_MS`, Socket Mode, kill switches). Restating those is how the
+original six copies drifted apart.
+
+The five active consumers carry the version pin in their heading (`### Approval Routing (inlined
+from human-input-framework v<version>)`) so a stale excerpt is detectable when this file is bumped;
+`issue-scoping` does not yet — it sits on the guarded surface, see the registry above.
+
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.

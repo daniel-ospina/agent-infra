@@ -4,10 +4,10 @@
 // Run: node extensions/main-worktree-guard/test.mjs  (from any agent-infra checkout)
 import { execSync } from "node:child_process";
 import { resolve, dirname, relative, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { realpathSync, existsSync, statSync, writeFileSync, utimesSync, symlinkSync, readFileSync, mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn } from "./classify-git.mjs";
+import { classifyGitCommand, classifyGitCommandDetailed, isWorktreeCwd, extractPushDeleteBranch, wholeCommandDeleteTargets, getWorktreeBranches, isBranchInMainCheckout, getMainCheckoutBranch, isAgentInfraRepo, ALLOW_MAIN_EDITS_MARKER_TTL_MS, isAllowMarkerActive, parseMarkerContent, isAllowMarkerPath, isAllowMarkerCommand, extractMarkerReason, isAllowMarkerRealpath, readAllowMarkerState, readHubDisorder, evaluateHubGate, extractScriptPath, extractScriptArgs, scriptGitVerdict, allGitInvocations, evaluateHubGateWithTargets, resolveInvocationTarget, commandExecutionCwd, resolveTargetTopLevel, worktreeGitdirMap, worktreeListPorcelainPaths, matchHubWipPattern, extractBashWriteTargets, classifyUntrackedWip, branchDeleteNames, branchDeleteAllowance, newFileWriteCollisionFree, firstHubTrackedWrite, bashWriteTargetsResolved, isHubRecoveryInvocation, resolveTargetCheckout, trackedRelsIn, extractCodePayload, extractCodeGitCommands, codePayloadGitVerdict, hubNewFileVolumeVerdict, HUB_NEW_FILE_WARN_BUDGET, HUB_NEW_FILE_BLOCK_CAP, frameworkRootFromModuleUrl, wtShellWords } from "./classify-git.mjs";
 
 const PROJECT_CWD = process.cwd();
 
@@ -333,12 +333,14 @@ try {
   // state, a cross-checkout `.git/` target blocks too (F4), a cross-checkout
   // overwrite of an EXISTING untracked hub file blocks (cycle-3 A-2 — only
   // genuinely NEW files are additive), the nested-own-tree exemption requires
-  // a NON-main session (cycle-3 B-1), and only a session rooted in a
-  // DISORDERED main freezes on its own tracked overwrites. markerOn mirrors
-  // the index marker branch: cross-checkout bypassed, own-rooted clean is an
-  // open recovery window, disordered-own keeps the M4 D3 freeze (cycle-2
-  // marker parity). Mirror contract = guardDecision (index.ts not importable;
-  // source pins below are the regression tripwire).
+  // a NON-main session (cycle-3 B-1), and (#625) a SAME-checkout tracked
+  // overwrite blocks in EITHER hub state — clean or disordered (the old
+  // clean-hub residual is removed; own-main untracked/new writes stay
+  // allowed). markerOn mirrors the index marker branch: cross-checkout
+  // bypassed, own-rooted clean is an open recovery window, disordered-own
+  // keeps the M4 D3 freeze (cycle-2 marker parity). Mirror contract =
+  // guardDecision (index.ts not importable; source pins below are the
+  // regression tripwire).
   const bashGateDecision = (command, sessionCwd, markerOn = false) => {
     const realp = (p) => {
       let d = resolve(p); let tail = "";
@@ -374,7 +376,7 @@ try {
         if (!sameCheckout) continue; // marker bypasses the #618 cross gate (tool parity)
         if (disorder === null) continue; // clean own main under the marker — open recovery window
         if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)"; // M4 D3 freeze
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
+        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
         continue;
       }
       // .git-metadata (exact ".git" pointer or ".git/..."): never tracked,
@@ -382,12 +384,10 @@ try {
       // (cycle-2 P1 + cycle-3 B-2: same-rooted included; only the marker's
       // own-rooted clean window is open, handled above).
       if (rel === ".git" || rel.startsWith(".git/")) return "BLOCK (hub .git)";
-      if (sameCheckout) {
-        if (disorder === null) return "ALLOW (clean same-checkout)";
-        if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (disordered tracked)";
-        continue;
-      }
+      // #625: the tracked test is STATE-INDEPENDENT — a tracked own-hub write
+      // blocks clean OR disordered (own untracked/new writes fall through).
       if (trackedRelsIn(ck.top, [rel]).length > 0) return "BLOCK (hub tracked)";
+      if (sameCheckout) continue;
       // cycle-3 A-2: cross-checkout overwrite of an EXISTING untracked hub
       // file (another session's hub WIP) blocks; NEW files stay additive.
       try { if (existsSync(tReal) && statSync(tReal).isFile()) return "BLOCK (hub existing untracked)"; } catch { /* treat as new */ }
@@ -411,7 +411,40 @@ try {
   bashPin("bash#618: foreign cwd → hub .git metadata (F4) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, parent, "BLOCK (hub .git)");
   bashPin("bash#621: hub-rooted CLEAN session → own hub .git hook (P1) → BLOCK", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)");
   bashPin("bash#621: infra-rooted session → hub TRACKED → BLOCK", `echo x > ${hub}/AGENTS.md`, infra, "BLOCK (hub tracked)");
-  bashPin("bash#621: hub-rooted session → own TRACKED while CLEAN → ALLOW (#437 residual)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (clean same-checkout)");
+  // #625 vector 1 — the clean-hub compound. The tracked write must gate on the
+  // command's EFFECT (a tracked hub-main write), not on pre-execution disorder:
+  // a hub-rooted main+CLEAN session running write+add+commit+push in ONE
+  // tool_call used to slip (M4's git gate never ran because st.disorder was
+  // null, and decideM2 saw an on-baseline session).
+  bashPin("#625: hub-rooted CLEAN session → own TRACKED redirect → BLOCK (effect-gated)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (write+add+commit+push) → BLOCK", `printf 'x' >> ${hub}/AGENTS.md && git add ${hub}/AGENTS.md && git commit -m chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound (tee+commit+push) → BLOCK", `echo x | tee -a ${hub}/AGENTS.md && git commit -am chore && git push origin main`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN compound via bash -c payload → BLOCK", `bash -c "printf 'x' >> ${hub}/AGENTS.md && git commit -am chore"`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN own UNTRACKED new file → ALLOW (additive)", `echo x > ${hub}/docs/_pin625-new.md`, hub, "ALLOW (no hub-main write)");
+  // #625 vector 2 — in-place overwrite VERBS (no write-primitive token).
+  bashPin("#625: hub-rooted CLEAN sed -i on tracked hub file → BLOCK", `sed -i s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN perl -pi on tracked hub file → BLOCK", `perl -pi -e 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session cp onto tracked hub file → BLOCK", `cp ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN mv onto tracked hub file → BLOCK", `mv ${hub}/tmp-625.md ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN truncate tracked hub file → BLOCK", `truncate -s 0 ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN dd of= tracked hub file → BLOCK", `dd if=/dev/zero of=${hub}/AGENTS.md bs=1 count=0`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp file INTO hub root (dir dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md .`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp into hub dir (trailing slash dst) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN cp ... 2>&1 (fd redirect) → BLOCK", `cp /tmp/evil-625/AGENTS.md ${hub}/AGENTS.md 2>&1`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sed -i '' (BSD) → BLOCK", `sed -i '' 's/a/b/' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN sort -o tracked hub file → BLOCK", `sort -o ${hub}/AGENTS.md /tmp/in-625.txt`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: wt session rsync onto tracked hub file → BLOCK", `rsync -a ${wt}/src-625.md ${hub}/AGENTS.md`, wt, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN ln -sf over tracked hub file → BLOCK", `ln -sf /tmp/x ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN in-place verb on WORKTREE file → ALLOW", `sed -i s/a/b/ ${wt}/wt-own.txt`, hub, "ALLOW (no hub-main write)");
+  // #625 cycle-10: getopt_long abbreviation (fail-open) + single-operand no-op.
+  bashPin("#625: hub-rooted CLEAN sed --in-pl (abbreviated --in-place) → BLOCK", `sed --in-pl s/a/b/ ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace (abbreviated) → BLOCK", `gawk --incl inplace '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk -i inplace --file p.awk → BLOCK", `gawk -i inplace --file p.awk ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN gawk --incl inplace --source prog → BLOCK", `gawk --incl inplace --source '{print}' ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN redirect operand after a leading line continuation → BLOCK", `echo x > \\\n  ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN tee -a after a line continuation → BLOCK", `printf y | tee \\\n -a ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
+  bashPin("#625: hub-rooted CLEAN single-operand cp on tracked file → ALLOW (malformed no-op)", `cp ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
+  bashPin("#625: hub-rooted CLEAN single-operand mv on tracked file → ALLOW (malformed no-op)", `mv ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)");
   bashPin("bash#621: hub-rooted session → own worktree file → ALLOW", `cd ${wt} && echo x > wt-own.txt`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker-parity pins (bashGateDecision markerOn param — the matrix
   // the index classify marker branch implements; the real marker file itself
@@ -420,10 +453,10 @@ try {
   bashPin("bashMarker: hub-rooted CLEAN own tracked under marker → ALLOW (recovery)", `echo x > ${hub}/AGENTS.md`, hub, "ALLOW (no hub-main write)", true);
   bashPin("bashMarker: hub-rooted CLEAN own .git hook under marker → ALLOW (window)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "ALLOW (no hub-main write)", true);
   execSync("touch stray.txt", { cwd: hub, stdio: "ignore" });
-  bashPin("bash#437: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)");
+  bashPin("bash#437/#625: hub-rooted session → own TRACKED while DIRTY → BLOCK", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)");
   bashPin("bash#437: hub-rooted DIRTY session → own NEW file → ALLOW", `echo x > ${hub}/docs/new-bash.md`, hub, "ALLOW (no hub-main write)");
   // cycle-2 marker parity, disordered-own side (M4 D3 keeps freezing).
-  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (disordered tracked)", true);
+  bashPin("bashMarker: hub-rooted DIRTY own tracked under marker → BLOCK (M4 D3)", `echo x > ${hub}/AGENTS.md`, hub, "BLOCK (hub tracked)", true);
   bashPin("bashMarker: hub-rooted DIRTY own .git hook under marker → BLOCK (M4 D3)", `echo x > ${hub}/.git/hooks/pre-commit`, hub, "BLOCK (hub .git)", true);
   execSync("rm stray.txt", { cwd: hub, stdio: "ignore" });
   // Cycle-2 fold-in fixtures: a PRIVATE nested repo under the session's own
@@ -543,13 +576,18 @@ try {
 // at the SOURCE level (comment text stripped first — a doc mention must not
 // false-trip). TRIPWIRE, NOT PROOF: naive/spaced/literal reintroductions of
 // the #99 carve-outs are caught (banned strings + whitespace-tolerant
-// call-site count + the surviving call pinned to its M3 decideM3 role), but
+// call-site count + each surviving call pinned to its role), but
 // deliberate rewrites (alias indirection, comment-split spellings, a guard
 // inserted between the isInfra assignment and decideM3, or restoring a
 // skipInfra option in classify-git) can evade source pins — index.ts is not
 // importable, so behavioral pins on it are impossible. A deliberate reverter
 // can delete the pins anyway; these exist to catch accidental/merge-confusion
 // reverts (verified: literal reverts of every removed hunk fail the suite).
+//
+// #805 P1: the count is TWO, both pinned to their role — the M3 ceremony
+// assignment and the M2 no-baseline `effectiveIsAgentInfra` argument. Any
+// THIRD call site (the write-tail exemption these pins exist to forbid) still
+// trips both count assertions below.
 const guardIndexSrc = readFileSync(
   join(PROJECT_CWD, "extensions", "main-worktree-guard", "index.ts"), "utf8");
 const pinSrc = guardIndexSrc.replace(/\/\/[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
@@ -557,8 +595,12 @@ for (const banned of ["Downgraded agent-infra", "isAgentInfraRepo()) return unde
   expectBool(`#615 source pin: index.ts has no ${JSON.stringify(banned)}`, !pinSrc.includes(banned), true);
 }
 const infraCallSites = (pinSrc.match(/isAgentInfraRepo\s*\(/g) ?? []).length;
-expectBool("#615 source pin: only the M3 ceremony isAgentInfraRepo( call remains (index.ts)", infraCallSites === 1, true);
-const m3AssignIdx = pinSrc.indexOf("isInfra = isAgentInfraRepo(muEff.effectiveCwd)");
+const M3_INFRA_CALL = "isInfra = isAgentInfraRepo(muEff.effectiveCwd)";
+const M2_INFRA_CALL = "effectiveIsAgentInfra: isAgentInfraRepo(m2Eff.effectiveCwd)";
+expectBool("#615 source pin: only the M3 ceremony + the M2 no-baseline isAgentInfraRepo( calls remain (index.ts)", infraCallSites === 2, true);
+expectBool("#615 source pin: every isAgentInfraRepo( call site is one of the two known roles",
+  pinSrc.includes(M3_INFRA_CALL) && pinSrc.includes(M2_INFRA_CALL), true);
+const m3AssignIdx = pinSrc.indexOf(M3_INFRA_CALL);
 expectBool("#615 source pin: the surviving call is the M3 isInfra assignment", m3AssignIdx !== -1, true);
 const afterM3 = m3AssignIdx !== -1 ? pinSrc.slice(m3AssignIdx, m3AssignIdx + 2500) : "";
 expectBool("#615 source pin: isInfra feeds decideM3 (isAgentInfra: isInfra) — not an exemption guard", afterM3.includes("isAgentInfra: isInfra"), true);
@@ -578,7 +620,7 @@ expectBool("#618 source pin: write gate imports resolveTargetCheckout", pinSrc.i
 expectBool("#618 source pin: write gate classifies the target checkout (_checkoutOf)", pinSrc.includes("_checkoutOf(tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd tracked-hub block wired (_targetTrackedAt)", pinSrc.includes("_targetTrackedAt(tgtCheck.top, tgtReal)"), true);
 expectBool("#618 source pin: cross-cwd block reason helper exists (_hubTargetWriteBlockReason)", pinSrc.includes("_hubTargetWriteBlockReason"), true);
-expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays ONE M3 ceremony call site)", infraCallSites === 1, true);
+expectBool("#621 source pin: no isAgentInfraRepo gate in the write tail (stays the M3 ceremony + M2 ownership call sites)", infraCallSites === 2, true);
 
 // ── 2026-09-09 review fold-in source pins (index.ts + classify-git.mjs) ────
 // Two fresh-context reviewers (correctness + adversarial bypass-surface)
@@ -608,8 +650,41 @@ expectBool("rev2: script budget hardened to 64 + fail-closed kind", pinSrc.inclu
 expectBool("rev2: .git rel-exact also in the block-reason fn", pinSrc.includes("hit.rel === \".git\" || hit.rel.startsWith(\".git/\")"), true);
 expectBool("rev3: containment capped at NON-main sessions (ancestor-main cannot lift the freeze)", pinSrc.includes("!sessionCheck.isMain && sessionTop"), true);
 expectBool("rev3: bash route existing-untracked overwrite freeze (kind + crossTop)", pinSrc.includes("kind: \"untracked-existing\"") && pinSrc.includes("crossTop"), true);
-expectBool("rev3: script exhaustion fails closed only on hub-proximity evidence", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
+expectBool("rev3: script exhaustion fails closed on hub-proximity evidence (cycle-3 A-1: own-hub arm needs a DISORDERED hub)", pinSrc.includes("grouped.size === 0 && !(sessionOwnHub !== null && sessionDisorder !== null)"), true);
 expectBool("rev3: .git doctrine reconciled (block reason names the marker window as the only open state)", pinSrc.includes("an active escape-marker's own-rooted clean recovery window"), true);
+
+// ── #625 source pins (index.ts + classify-git.mjs) ────────────────────────
+// The clean-hub bash tracked-write residual was removed (the tracked test is
+// now state-independent for a session's own hub), and the walker surfaces the
+// in-place overwrite VERBS. Trip on a literal/merge revert of either half.
+expectBool("#625 source pin: clean-same-checkout early return removed", !pinSrc.includes("} else if (sameCheckout) {"), true);
+expectBool("#625 source pin: only the marker's clean own-main window keeps a sessionDisorder-null skip", (pinSrc.match(/sessionDisorder === null\) return;/g) ?? []).length === 1, true);
+expectBool("#625 source pin: in-place verb set declared (INPLACE_WRITE_VERBS)", classifySrc.includes("INPLACE_WRITE_VERBS"), true);
+expectBool("#625 source pin: verb target resolver wired (verbTargets closure)", classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
+expectBool("#625 source pin: verb dispatch is command-position + basename-normalized", classifySrc.includes("INPLACE_WRITE_VERBS.has(verbBase)"), true);
+expectBool("#625 source pin: verb candidates enter the target assembly", classifySrc.includes("for (const v of verbToks) push(v.raw, v.cwd, v.via, \"site\")"), true);
+expectBool("#625 source pin: sed/perl in-place flag detected", classifySrc.includes("inPlace = true; ci = cluster.length"), true);
+expectBool("#625 source pin: cp/mv -t target-directory handled", classifySrc.includes("--target-directory="), true);
+expectBool("#625 source pin: dd of= operand surfaced", classifySrc.includes("w.startsWith(\"of=\")"), true);
+expectBool("#625 source pin: mv surfaces its sources (removal is a tracked mutation)", classifySrc.includes("const alsoSources = v === \"mv\""), true);
+expectBool("#625 source pin: rsync/ln destination handled (operand-aware)", classifySrc.includes("v === \"rsync\" || v === \"ln\"") && classifySrc.includes("isRsyncOperand") && classifySrc.includes("RSYNC_LONG"), true);
+expectBool("#625 source pin: directory destination expands per-source (dstIsDir/emitDst)", classifySrc.includes("const dstIsDir = (dst) => {") && classifySrc.includes("const emitDst = (dst, sources, alsoSources) => {"), true);
+expectBool("#625 source pin: verbTargets receives the site cwd (dir-expansion resolves)", classifySrc.includes("verbTargets(verbBase, i, cwd)") && classifySrc.includes("const verbTargets = (verb, k0, siteCwd) => {"), true);
+expectBool("#625 source pin: fd-prefixed redirects consumed before readWord", classifySrc.includes("if (rk < n && (s[rk] === \">\" || s[rk] === \"<\")) {"), true);
+expectBool("#625 source pin: empty quoted operand advances via w.k (BSD sed -i '')", classifySrc.includes("if (w.w === \"\" && w.k <= k)"), true);
+expectBool("#625 source pin: sed/perl in-place flag parsed letter-by-letter", classifySrc.includes("if (ch === \"i\") { inPlace = true; ci = cluster.length; continue; }"), true);
+expectBool("#625 source pin: gsed/awk attached-inplace/sort/sponge/ed/ex in the verb set", classifySrc.includes("\"gsed\", \"perl\"") && classifySrc.includes("-iinplace") && classifySrc.includes("\"sort\", \"sponge\", \"ed\", \"ex\", \"vi\", \"vim\", \"nvi\""), true);
+expectBool("#625 source pin: block reason names verb coverage", pinSrc.includes("in-place overwrite verbs"), true);
+// #625 cycle-10 mirror-drift tripwire: an exact-spelling-only long-option match is
+// a fail-open bypass (getopt_long accepts any unambiguous prefix).
+expectBool("#625 source pin: getopt_long unambiguous-prefix resolver present", classifySrc.includes("const _resolveLong = (tbl, name) => {") && classifySrc.includes("return hits.length === 1 ? hits[0] : null;"), true);
+expectBool("#625 source pin: sed + gawk long-option arity tables declared", classifySrc.includes("const SED_LONG = {") && classifySrc.includes("const AWK_LONG = {"), true);
+expectBool("#625 source pin: sed in-place resolved via the prefix table (BSD -i '' guard too)", classifySrc.includes('resolved === "in-place"') && classifySrc.includes("_isSedInPlaceLong(words[wi - 1])"), true);
+expectBool("#625 source pin: gawk --include resolved via the prefix table", classifySrc.includes('if (resolved === "include") {'), true);
+expectBool("#625 source pin: awk program-providing long options set hasProgFlag", classifySrc.includes('if (resolved === "file" || resolved === "source" || resolved === "exec") hasProgFlag = true;'), true);
+expectBool("#625 source pin: readWord skips a leading line continuation + indent", classifySrc.includes('if (w === "") { k = skipWs(k2); continue; }') && classifySrc.includes("const k2 = k + 2;"), true);
+expectBool("#625 source pin: tee segment scan does not break at a continuation newline", classifySrc.includes('if (dqT === null && cT === "\\\\" && s[kT + 1] === "\\n") { kT++; continue; }'), true);
+expectBool("#625 source pin: cp/mv/install destination requires a source operand", classifySrc.includes("positionals.length > 1") && classifySrc.includes("if (positionals.length > 0) emitDst(targetDir, positionals, alsoSources);"), true);
 
 // ── Push-delete branch extraction (#73) ────────────────────────────────────
 function expectBranches(command, expectedArray) {
@@ -739,6 +814,10 @@ expect("combined one-liner classifies block BEFORE stamping", "touch ~/.pi/agent
     parsed !== null && typeof parsed === "object" && parsed.session_id === "s1" && parsed.reason === "recovery" && typeof parsed.ts === "string", true);
   expectBool("parseMarkerContent garbage/empty → null",
     parseMarkerContent("not json {") === null && parseMarkerContent("") === null, true);
+  // #620: the un-stamped incident shape (3 plain-text reason lines, never
+  // guard-stamped) does NOT parse → inert on the read side → rejected.
+  expectBool("parseMarkerContent un-stamped 3-line plain text → null (#620)",
+    parseMarkerContent("recovery: stranded main\nreason line two\nreason line three") === null, true);
 }
 
 // Group B — content/session (readAllowMarkerState, real fs in a tmp dir) +
@@ -769,6 +848,20 @@ try {
   expectBool("marker unparseable content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
   writeFileSync(markerPath, "");
   expectBool("marker empty content → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
+
+  // #620 — an UN-STAMPED/UN-AUDITED marker is REJECTED (inert), even with a
+  // fresh mtime. Live-incident shape (2026-09-08): 3 plain-text reason lines,
+  // mtime-fresh but never guard-stamped (no {session_id, reason, ts} JSON, no
+  // matching gate_bypass audit event). Fresh mtime alone must NOT activate the
+  // marker — only the guard-stamped contract may; everything else is treated
+  // as absent → block. (The read side cannot see the audit log — the stamped-
+  // JSON contract is its proxy: absent/foreign session_id ⇒ un-audited ⇒ inert.)
+  writeFileSync(markerPath, [
+    "recovery: stranded main recovery marker",
+    "reason line two (plain text)",
+    "reason line three (plain text)",
+  ].join("\n"));
+  expectBool("#620 un-stamped plain-text marker (3 reason lines, fresh mtime) → inactive", readAllowMarkerState(markerPath, "sess-1"), false);
 
   // 11 — valid JSON without reason → still active (reason is audit-only)
   writeFileSync(markerPath, stamp("sess-1") + "\n");
@@ -951,11 +1044,12 @@ expectBool("detailed+shared: checkout main f.txt (restore) → other", co(`git c
 dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout main .`, { verdict: "block:checkout-branch", branchState: true });
 
 // ── #376: M3 ceremony return-to-baseline pins ─────────────────────────────
-// A ceremony session started on main (original baseline, immutable), re-based
-// to feat/2 via the agent-infra create-new carve-out, then merges. The guard
-// path classify → classifyBranchOp → decideM3 must ALLOW `git checkout main`
-// back to the ORIGINAL baseline in agent-infra, block foreign targets, and
-// keep non-infra repos fully blocked (worktrees only).
+// A ceremony session started on main (original baseline, immutable) and is
+// mid-ceremony off main (baseline re-based — via own-baseline rename or a
+// legacy/hatch ceremony; in-hub create-new itself has been blocked since
+// #626). The guard path classify → classifyBranchOp → decideM3 must ALLOW
+// `git checkout main` back to the ORIGINAL baseline in agent-infra, block
+// foreign targets, and keep non-infra repos fully blocked (worktrees only).
 {
   const ceremonyBaseline = { repoKey: "k", branch: "feat/2", original: "main" };
   const m3 = (cmd) => {
@@ -975,12 +1069,27 @@ dexpect("restore-from-branch verdict stays block:checkout-branch", `git checkout
   expectBool("#376: git checkout feat/other (≠ original) → blocked", foreign?.block === true, true);
   const prev = m3(`git checkout -`);
   expectBool("#376: git checkout - (prev-branch, ambiguous) → blocked", prev?.block === true, true);
+  // #626 review round-2 (P1): attached/cluster/long create spellings must NOT
+  // slip the #376 return-to-original arm (they previously classified
+  // switch-existing with target "main" → reBaseline while git created a branch).
+  for (const cmd of [`git checkout -bfoo main`, `git checkout -Bfoo main`, `git switch -cfoo main`, `git switch -Cfoo main`, `git switch --create=foo main`, `git switch --force-create=foo main`, `git checkout -fb foo main`, `git switch --cre=foo main`, `git switch --crea foo main`, `git switch --force-c=foo main`, `git switch --force-creat main`, `git checkout --orph=v`, `git checkout --orp v`, `git switch -c ev1 --`, `git checkout -B ev2 --`, `git switch --orphan ev3 --`, `git checkout -b ev5 --`]) {
+    const d = m3(cmd);
+    expectBool(`#626: ${cmd} → BLOCKED (no #376 reBaseline)`, d?.block === true && !d?.reBaseline, true);
+  }
+  // #626 review-round-4 (P2): pin classify-git's OWN duplicated create parser —
+  // `newBranch` must match branch-ownership's for every spelling (a one-sided edit
+  // would silently change the ownership-allowance target fallback).
+  for (const [cmd, want] of [[`git switch --cre=foo main`, "foo"], [`git switch -cfoo main`, "foo"], [`git checkout --orph=v`, "v"], [`git switch -c ev1 --`, "ev1"], [`git checkout --f main`, null], [`git checkout --c=merge main`, null], [`git checkout --conflict=merge main`, null], [`git checkout main .`, null]]) {
+    const det = classifyGitCommandDetailed(cmd);
+    expectBool(`#626: newBranch ${cmd} → ${JSON.stringify(want)}`, (det?.newBranch ?? null) === want, true);
+  }
   const nonInfra = sharedDecideM3({ branchOp: { op: "switch-existing", target: "main" }, isAgentInfra: false, baseline: ceremonyBaseline, currentBranch: "feat/2", repoKey: "k" });
   expectBool("#376: non-infra repo return-to-original STILL blocked", nonInfra?.block === true, true);
   // Post-return local delete of the session's OWN merged branch: the index.ts
-  // wiring records create-new branches per pid (ownedBranches), so once the
-  // baseline re-based to main the branch-force-delete allowance still accepts
-  // the merged ceremony branch (git refuses deleting a checked-out branch).
+  // wiring records pid-owned ceremony branches (ownedBranches — rename/_markOwned;
+  // legacy create-new), so once the baseline re-based to main the branch-force-
+  // delete allowance still accepts the merged ceremony branch (git refuses
+  // deleting a checked-out branch).
   expectBool("#376: post-return branch -D of pid-owned merged branch → allowed", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/2"], ownedBranches: ["feat/2"] }) === true, true);
   expectBool("#376: post-return branch -D of foreign branch → blocked (not owned)", sharedOwnershipAllowed({ opKind: "branch-force-delete", currentBranch: "main", baselineBranch: "main", targets: ["feat/other"] }) === false, true);
 }
@@ -2434,6 +2543,104 @@ try {
     // check-ignore must classify read-only (hub-worktree.sh's .worktrees warn).
     const ci = isHubRecoveryInvocation("check-ignore", ["-q", ".worktrees"], "main");
     expectBool("#444 check-ignore → readonly (hub-worktree.sh surface)", ci === "readonly", true);
+  }
+}
+
+// ── #967/#1484: gate the EFFECT, not the text ───────────────────────────────
+// The #1484 script surface gated the whole script TEXT, so a git-FREE script
+// could be frozen by a markdown/docstring backtick, and a discard-shaped op
+// reachable from only ONE subcommand blocked EVERY invocation. The second-model
+// resolution authority (`scripts/check-second-model.sh --probe`, git-free) was
+// unrunnable from every path → the second-model gate was permanently DEGRADED
+// → every guarded-surface PR was unmergeable fleet-wide. These cases pin the
+// fix: read-only/text-only content is allowed, real discards stay blocked, and
+// subcommand reachability is argv-driven.
+{
+  const BT = String.fromCharCode(96);
+  let t967 = null;
+  try {
+    t967 = execSync("mktemp -d", { encoding: "utf-8" }).trim();
+    const mk967 = (name, content) => {
+      const p = `${t967}/${name}`;
+      writeFileSync(p, content);
+      return p;
+    };
+    // (a) A QUOTED heredoc is literal text to the outer shell — the exact #967
+    // trigger: a Python docstring code span `` `/` `` misread as `$(/)`.
+    const docstring = mk967("docstring.sh", "python3 - \"$1\" \\\n  <<'PYEOF'\n# docs: a trailing " + BT + "/" + BT + " normalizes to empty\nPYEOF\n");
+    expectBool("#967: quoted python heredoc + docstring backtick → allow (no git effect)", scriptGitVerdict(docstring, "main", MAIN, MAIN, ["--probe"]) === "allow", true);
+    // A path-shaped span that names no real file executes nothing.
+    const prosePath = mk967("prose-path.sh", "echo \"see the " + BT + "/usr/local/bin/nope-" + process.pid + BT + " path\"\n");
+    expectBool("#967: prose path-span (nonexistent file) → allow", scriptGitVerdict(prosePath, "main", MAIN, MAIN) === "allow", true);
+    // (b) Every discard closure this gate exists for stays blocked.
+    const plainDiscard = mk967("plain-discard.sh", "#!/bin/bash\ngit reset --hard\n");
+    expectBool("#967: plain discard → block (unchanged)", scriptGitVerdict(plainDiscard, "main", MAIN, MAIN) === "block", true);
+    const interpSubst = mk967("interp-subst.sh", "echo \"$(bash /tmp/m4-evil.sh)\"\n");
+    expectBool("#967: interpreter-in-substitution → block (T87 intact)", scriptGitVerdict(interpSubst, "main", MAIN, MAIN) === "block", true);
+    const pipedHeredoc = mk967("piped-heredoc.sh", "cat <<'EOF' | sh\ngit reset --hard\nEOF\n");
+    expectBool("#967: piped quoted heredoc + discard → block (T104 intact)", scriptGitVerdict(pipedHeredoc, "main", MAIN, MAIN) === "block", true);
+    const unquotedHeredoc = mk967("unquoted-heredoc.sh", "cat <<EOF\n$(git reset --hard)\nEOF\n");
+    expectBool("#967: unquoted heredoc IS expanded → block", scriptGitVerdict(unquotedHeredoc, "main", MAIN, MAIN) === "block", true);
+    // (c) The documented dodge — write /tmp/x.sh + `bash /tmp/x.sh` — stays
+    // closed: extractScriptPath resolves the file and the content gate blocks,
+    // for an arg-taking invocation too.
+    expectBool("#967: /tmp dodge resolves + blocks (arg-taking)",
+      extractScriptPath(`bash ${plainDiscard} --status`) === plainDiscard &&
+      scriptGitVerdict(plainDiscard, "main", MAIN, MAIN, ["--status"]) === "block", true);
+
+    // Reachability: a top-level `case "$1"` dispatch gates only the branches
+    // THIS invocation can enter.
+    const dispatch = mk967("dispatch.sh", "#!/bin/bash\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\n  *) echo usage ;;\nesac\n");
+    expectBool("#967: dispatch --status → allow (discard branch unreachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: dispatch --reset → block (discard reachable)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    expectBool("#967: dispatch no args → allow (only the `*` branch runs)", scriptGitVerdict(dispatch, "main", MAIN, MAIN, []) === "allow", true);
+    expectBool("#967: dispatch args-unknown → block (fail closed)", scriptGitVerdict(dispatch, "main", MAIN, MAIN) === "block", true);
+    const dispatchGlob = mk967("dispatch-glob.sh", "case \"$1\" in\n  --res*|--hard) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: glob --st* → allow", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--status"]) === "allow", true);
+    expectBool("#967: glob --res* → block", scriptGitVerdict(dispatchGlob, "main", MAIN, MAIN, ["--reset"]) === "block", true);
+    // Fail-closed bail-outs: a `case "$1"` that is NOT the script's dispatch
+    // must never be pruned by the invocation's argv.
+    const fnCase = mk967("fn-case.sh", "f() {\n  case \"$1\" in\n    --reset) git reset --hard ;;\n  esac\n}\nf --reset\n");
+    expectBool("#967: function-local case $1 → NOT pruned (block)", scriptGitVerdict(fnCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const shiftCase = mk967("shift-case.sh", "shift\ncase \"$1\" in\n  --reset) git reset --hard ;;\n  --st*) git status ;;\nesac\n");
+    expectBool("#967: `shift` rewrites positionals → NOT pruned (block)", scriptGitVerdict(shiftCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const varCase = mk967("var-case.sh", "MODE=\"$1\"\ncase \"$MODE\" in\n  --reset) git reset --hard ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: non-$1 case word → NOT pruned (block)", scriptGitVerdict(varCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    // Structural bail-outs — malformed/ambiguous cases are never pruned.
+    const nestedCase = mk967("nested-case.sh", "case \"$1\" in\n  --reset)\n    case \"$2\" in\n      x) git reset --hard ;;\n    esac\n    ;;\n  --status) git status ;;\nesac\n");
+    expectBool("#967: multi-line nested case → NOT pruned (block)", scriptGitVerdict(nestedCase, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const fallthrough = mk967("fallthrough.sh", "case \"$1\" in\n  --status) git status ;;&\n  --reset) git reset --hard ;;\nesac\n");
+    expectBool("#967: `;;&` fallthrough → NOT pruned (block)", scriptGitVerdict(fallthrough, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    const unterminated = mk967("unterminated.sh", "case \"$1\" in\n  --reset) git reset --hard ;;\n");
+    expectBool("#967: unterminated case → NOT pruned (block)", scriptGitVerdict(unterminated, "main", MAIN, MAIN, ["--status"]) === "block", true);
+    expectBool("#967: extractScriptArgs reads the script argv", JSON.stringify(extractScriptArgs("bash x.sh --status a b", "x.sh")) === JSON.stringify(["--status", "a", "b"]), true);
+
+    // (a) end-to-end: the ACTUAL second-model resolution authority must no
+    // longer be classified git-bearing, and the #1484 gate's decision for the
+    // live command line (extractScriptPath → scriptGitVerdict with argv) must
+    // allow it from the hub.
+    const probeCandidates = [
+      fileURLToPath(new URL("../../scripts/check-second-model.sh", import.meta.url)),
+      resolve(PROJECT_CWD, "scripts/check-second-model.sh"),
+      resolve(MAIN, "scripts/check-second-model.sh"),
+    ];
+    const realProbe = probeCandidates.find((p) => existsSync(p));
+    if (!realProbe) {
+      console.log("⏭️  #967 real-probe case skipped — scripts/check-second-model.sh not found");
+    } else {
+      const liveCmd = `bash ${realProbe} --probe`;
+      const liveSp = extractScriptPath(liveCmd);
+      const liveArgs = extractScriptArgs(liveCmd, liveSp);
+      expectBool("#967: real check-second-model.sh --probe → allow (git-free resolution authority unblocked)",
+        liveSp === realProbe && scriptGitVerdict(realProbe, "main", MAIN, MAIN, liveArgs) === "allow", true);
+      expectBool("#967: live command argv parses as [--probe]", JSON.stringify(liveArgs) === JSON.stringify(["--probe"]), true);
+    }
+  } catch (e) {
+    console.error(`❌ #967 script-classifier cases FAILED to provision: ${String(e.message).slice(0, 160)}`); fail++;
+  } finally {
+    if (t967) {
+      try { execSync(`rm -rf "${t967}"`, { stdio: "ignore" }); } catch {}
+    }
   }
 }
 
@@ -4152,6 +4359,239 @@ try {
     none("echo hi", "prose silence");
   }
 
+  // ── #625: in-place overwrite VERBS — walker-level pins. The primitive-only
+  // walk (`>`/`>>`/`tee`/python open) never surfaced `sed -i`/`cp`/`mv`/
+  // `truncate`/`dd of=`/`perl -pi`/`awk -i inplace` onto a tracked hub file,
+  // so the same-file write was blocked via redirect but slipped via the verb.
+  {
+    const H = mkdtempSync(join(tmpdir(), "bwt625-"));
+    mkdirSync(join(H, "subdir"));
+    const rel = (x) => `${x.via}:${x.resolvedPath.replace(H, "H")}`;
+    const pluck = (cmd) => bashWriteTargetsResolved(cmd, H).filter((x) => x.resolvedPath).map(rel).sort();
+    const has = (cmd, needle, label) => expectBool(`C625: ${label}`, pluck(cmd).join(" | ").includes(needle), true);
+    const lacks = (cmd, needle, label) => expectBool(`C625: ${label}`, !pluck(cmd).join(" | ").includes(needle), true);
+    const none = (cmd, label) => expectBool(`C625: ${label}`, pluck(cmd).length === 0, true);
+    // sed
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i target");
+    has("sed --in-place s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place target");
+    has("sed -i.bak -e s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i.bak with -e script");
+    has("sed -ni s/a/b/ tracked.md", "sed:H/tracked.md", "sed -ni cluster");
+    has("sed -i -e s/a/b/ -e s/c/d/ one.md two.md", "sed:H/two.md", "sed -i multiple files");
+    none("sed s/a/b/ tracked.md", "sed without -i is a read → no target");
+    none("sed -e s/a/b/ tracked.md", "sed -e without -i → no target");
+    none("grep -i foo tracked.md", "grep -i is not an in-place editor");
+    // perl
+    has("perl -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl -pi target");
+    has("perl -i -pe 's/a/b/' tracked.md", "perl:H/tracked.md", "perl -i -pe target");
+    none("perl -p -e s/a/b/ tracked.md", "perl without -i is a read");
+    // awk (gawk -i inplace)
+    has("awk -i inplace '{print}' tracked.md", "awk:H/tracked.md", "awk -i inplace target");
+    has("gawk --include=inplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk --include=inplace target");
+    none("awk '{print}' tracked.md", "awk without inplace is a read");
+    // cp / mv / install
+    has("cp src.md tracked.md", "cp:H/tracked.md", "cp destination");
+    has("cp -f src.md tracked.md", "cp:H/tracked.md", "cp -f destination");
+    has("cp src.md mid.md tracked.md", "cp:H/tracked.md", "cp multi-source: last positional is dst");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t target-directory resolves per-source");
+    has("cp --target-directory=subdir src.md", "cp:H/subdir/src.md", "cp --target-directory= attached resolves per-source");
+    has("cp /tmp/evil/AGENTS.md .", "cp:H/AGENTS.md", "cp file INTO a directory dst expands to dir/basename(src)");
+    has("cp /tmp/x.md subdir", "cp:H/subdir/x.md", "cp file into dir positional dst expands");
+    has("cp src.md tracked.md 2>&1", "cp:H/tracked.md", "fd-prefixed redirect after dst does not become the dst");
+    has("sed -i '' 's/a/b/' tracked.md", "sed:H/tracked.md", "BSD empty-suffix sed -i '' (empty quoted operand)");
+    has("perl -pi -e '' tracked.md", "perl:H/tracked.md", "perl -e '' empty program operand");
+    has("perl -I./lib -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "perl attached -I./lib operand does not swallow -i");
+    has("sed -i -f./fix.sed tracked.md", "sed:H/tracked.md", "sed attached -f operand does not swallow the file");
+    has("sed -f./fix.sed -i tracked.md", "sed:H/tracked.md", "sed attached -f before -i");
+    has("gawk -iinplace '{print}' tracked.md", "gawk:H/tracked.md", "gawk attached -iinplace");
+    has("rsync -a src/ tracked.md --exclude pattern", "rsync:H/tracked.md", "rsync trailing flag operand does not become dst");
+    has("rsync -I src.md tracked.md -e ssh", "rsync:H/tracked.md", "rsync permuted -e operand after dst");
+    has("sort -o tracked.md in.txt", "sort:H/tracked.md", "sort -o writes its operand");
+    has("sponge tracked.md < in.txt", "sponge:H/tracked.md", "sponge in-place target");
+    has("ed -s tracked.md", "ed:H/tracked.md", "ed in-place file");
+    has("gsed -i s/a/b/ tracked.md", "gsed:H/tracked.md", "GNU-sed spelling gsed");
+    // read-only forms must NOT false-positive (cluster letters inside attached operands)
+    lacks("perl -MTime::HiRes -e 'print time' tracked.md", "perl:H/tracked.md", "perl -M attached operand is not in-place");
+    lacks("perl -e'print \"hi\"' tracked.md", "perl:H/tracked.md", "perl attached -e program is not in-place");
+    none("sed -ne p tracked.md", "sed -ne (no -i) is a read");
+    none("sort in.txt", "sort without -o is a read");
+    has("/bin/cp src.md tracked.md", "cp:H/tracked.md", "path-qualified cp");
+    has("mv src.md tracked.md", "mv:H/tracked.md", "mv destination overwrite");
+    has("mv tracked.md outdir", "mv:H/tracked.md", "mv SOURCE (deletes the tracked file)");
+    has("install -m 644 src.md tracked.md", "install:H/tracked.md", "install destination (-m operand skipped)");
+    has("rsync -a src/ tracked.md", "rsync:H/tracked.md", "rsync destination");
+    has("rsync -a --delete src/ mid/ tracked.md", "rsync:H/tracked.md", "rsync dst is the last positional");
+    lacks("rsync -a src/ host:dest", "rsync:H/src/", "rsync remote dst is not a local hub target");
+    has("ln -sf /tmp/x tracked.md", "ln:H/tracked.md", "ln link target");
+    // #625 review cycle-1: adversarial + correctness findings
+    has("cp src.md tracked.md >| /tmp/log.txt", "cp:H/tracked.md", "cp dst survives a >| noclobber-override redirect");
+    has("cp src.md tracked.md 2>|/tmp/log.txt", "cp:H/tracked.md", "cp dst survives a 2>| redirect");
+    has("ed -s tracked.md >| /tmp/log.txt", "ed:H/tracked.md", "ed target survives a >| redirect");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync unlisted operand flag (--modify-window)");
+    has("rsync -a src.md tracked.md --backup-dir /tmp/bk", "rsync:H/tracked.md", "rsync unlisted operand flag (--backup-dir)");
+    has("rsync -a src.md tracked.md --log-format X", "rsync:H/tracked.md", "rsync unlisted operand flag (--log-format)");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft target-directory");
+    has("cp -rt subdir src.md", "cp:H/subdir/src.md", "cp bundled -rt target-directory");
+    has("install -Dt subdir src.md", "install:H/subdir/src.md", "install bundled -Dt target-directory");
+    has("ln -sf /tmp/evil/AGENTS.md", "ln:H/AGENTS.md", "ln 2nd form (single operand) links into the CWD");
+    has("sort -ro tracked.md in.txt", "sort:H/tracked.md", "sort bundled -ro output");
+    has("sort -uo tracked.md in.txt", "sort:H/tracked.md", "sort bundled -uo output");
+    none("sort -k1.2o in.txt", "sort -k operand modifier is not an -o output");
+    has("vim -es +'%s/a/b/' +wq tracked.md", "vim:H/tracked.md", "vim ex-mode in-place file");
+    has("vi -c 'normal x' tracked.md", "vi:H/tracked.md", "vi -c operand skipped, file is the target");
+    lacks("sed -i '' 's/a/b/' tracked.md", "sed:H/s/a/b/", "BSD empty -i suffix is not emitted as a file");
+    // #625 review cycle-2: regressions from the cycle-1 fail-safe + cluster scans
+    has("rsync -a src.md --owner tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--owner) must not swallow the dst");
+    has("rsync -a src.md --itemize-changes tracked.md", "rsync:H/tracked.md", "rsync no-arg flag (--itemize-changes) must not swallow the dst");
+    has("rsync -a src.md -v subdir", "rsync:H/subdir/src.md", "rsync dir dst behind a no-arg flag still expands");
+    has("rsync -a src.md tracked.md --modify-window 2", "rsync:H/tracked.md", "rsync listed operand flag keeps the real dst");
+    lacks("rsync -a tracked.md -v /tmp/dst", "rsync:H/tracked.md", "rsync read-only export of a tracked file must not be a target");
+    has("cp -St src.md tracked.md", "cp:H/tracked.md", "cp -St is a suffix operand, not -t");
+    has("install -gtty src.md tracked.md", "install:H/tracked.md", "install -gtty is a group operand, not -t");
+    has("install -B.tmp src.md tracked.md", "install:H/tracked.md", "install -B.tmp is a backup operand, not -t");
+    has("cp -b -S.tmp src.md tracked.md", "cp:H/tracked.md", "cp -S.tmp is a suffix operand, not -t");
+    has("cp -ft subdir src.md", "cp:H/subdir/src.md", "cp bundled -ft still works after the cluster rewrite");
+    none("sort -to out in.txt", "sort -to is the -t separator 'o', not -o output");
+    has("vim -es +wq tracked.md +q", "vim:H/tracked.md", "vim trailing +cmd is not the file");
+    has("vim -es +wq tracked.md /tmp/decoy.md", "vim:H/tracked.md", "vim multi-file emits the first file");
+    has("ex -s +wq tracked.md +q", "ex:H/tracked.md", "ex trailing +cmd is not the file");
+    has("sponge one.md two.md", "sponge:H/two.md", "sponge multi-file emits every operand");
+    // #625 review cycle-3: scanner + redirect findings
+    has("cp src.md tracked.md # update the shared config", "cp:H/tracked.md", "trailing # comment is not the destination");
+    has("install -m 644 src.md tracked.md # note", "install:H/tracked.md", "trailing comment after install operands");
+    has("rsync -a src.md tracked.md # note", "rsync:H/tracked.md", "trailing comment after rsync operands");
+    has("ln -sf src.md tracked.md # note", "ln:H/tracked.md", "trailing comment after ln operands");
+    has("cp $(mktemp) tracked.md", "cp:H/tracked.md", "command substitution before the dst does not drop it");
+    has("sed -i $(cat s) tracked.md", "sed:H/tracked.md", "command substitution before the sed file");
+    has("cp src.md tracked.md \\\n  && echo done", "cp:H/tracked.md", "line continuation is not a bogus last positional");
+    has("sort --out=tracked.md in.txt", "sort:H/tracked.md", "sort --out= is an unambiguous --output prefix");
+    has("sort --o=tracked.md in.txt", "sort:H/tracked.md", "sort --o= prefix");
+    has("sort --out tracked.md in.txt", "sort:H/tracked.md", "sort --out with a separate operand");
+    has("perl -F -pi -e s/a/b/ tracked.md", "perl:H/tracked.md", "bare perl -F does not swallow -pi");
+    has("rsync -a src.md tracked.md --max-del 0", "rsync:H/tracked.md", "rsync unambiguous long-option prefix keeps the dst");
+    has("rsync -a src.md tracked.md --exclude foo", "rsync:H/tracked.md", "rsync exact operand flag keeps the dst");
+    // #625 cycle-3 B2/B3: ANY `N>file` truncates the file; `N<file` is a read.
+    has("echo x 2> tracked.md", "redirect:H/tracked.md", "stderr redirect truncates a tracked file");
+    has("echo x 3> tracked.md", "redirect:H/tracked.md", "fd-3 redirect truncates a tracked file");
+    has("echo hi 3>tracked.md 1>&3", "redirect:H/tracked.md", "fd-3 write-through is a tracked mutation");
+    has("echo x >& tracked.md", "redirect:H/tracked.md", "legacy >&FILE is a content write");
+    none("cat 0< tracked.md", "0< is a read, not a write");
+    none("cat 1< tracked.md", "1< is a read, not a write");
+    none("cat x 2>&1 tracked.md", "2>&1 is a dup, not a write");
+    // #625 review cycle-4: rsync boolean-prefix regression + list mode + scanner escapes + trap
+    has("rsync -a src.md --checksum tracked.md", "rsync:H/tracked.md", "--checksum is a complete boolean option, not --checksum-seed");
+    has("rsync -a src.md --partial tracked.md", "rsync:H/tracked.md", "--partial is boolean, not --partial-dir");
+    has("rsync -a src.md --backup tracked.md", "rsync:H/tracked.md", "--backup is boolean, not --backup-dir");
+    has("rsync -a src.md --group tracked.md", "rsync:H/tracked.md", "--group is boolean, not --groupmap");
+    none("rsync -a tracked.md -v", "single-operand rsync is list-only, not a write");
+    has("truncate -s 0 $(echo \\( ) tracked.md", "truncate:H/tracked.md", "escaped paren inside $( ) does not over-skip");
+    // #625 review cycle-5: --suffix regression + eval/trap option/ANSI-C forms
+    has("rsync -a src.md tracked.md --suffix .bak", "rsync:H/tracked.md", "--suffix is an operand option in the arity table");
+    has("rsync -a -S src.md tracked.md", "rsync:H/tracked.md", "rsync -S is --sparse (boolean), not --suffix");
+    lacks("rsync -a src.md /tmp/dst --suffix .bak", "rsync:H/.bak", "--suffix operand is not a destination");
+    has("rsync -a src.md tracked.md --info progress2", "rsync:H/tracked.md", "--info takes a required operand");
+    has("rsync -a src.md tracked.md --debug all", "rsync:H/tracked.md", "--debug takes a required operand");
+    has("trap -- 'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "trap with a leading -- still walks the payload");
+    has("trap $'printf x >> tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C dollar-single-quoted trap payload");
+    has("trap $'printf x \\x3e tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C \\x3e decodes to a redirect");
+    has("eval -- 'printf x > tracked.md'", "redirect:H/tracked.md", "eval with a leading -- still walks the payload");
+    has("eval 'printf x' '> tracked.md'", "redirect:H/tracked.md", "eval joins ALL its arguments");
+    none("trap -l", "trap -l is a list, no payload");
+    // #625 review cycle-7: ANSI-C escapes, eval arg joining, $'…' operands
+    has("trap $'printf \\'x\\' > tracked.md' EXIT", "redirect:H/tracked.md", "ANSI-C escaped quote does not truncate the payload");
+    has("eval 'printf x' $'\\x3e tracked.md'", "redirect:H/tracked.md", "eval decodes ANSI-C in a LATER argument");
+    has("echo hi >> $'tracked.md'", "redirect:H/tracked.md", "$'…' redirect operand decodes to the tracked path");
+    has("cp src.md $'tracked.md'", "cp:H/tracked.md", "$'…' verb operand decodes");
+    has("bash -c $'printf x \\x3e tracked.md'", "redirect:H/tracked.md", "interpreter -c ANSI-C payload decodes");
+    none("trap -p 'printf x > tracked.md' EXIT", "trap -p has no action operand");
+    lacks("tee /tmp/out.txt < tracked.md", "tee:H/tracked.md", "tee input redirect is not a write target");
+    // #625 review cycle-8: eval newline, tee ANSI-C, trap escaped action, dq escapes
+    has("eval true\ntee tracked.md", "tee:H/tracked.md", "eval does not swallow the next line");
+    has("eval true\ncp src.md tracked.md", "cp:H/tracked.md", "multi-line eval keeps the next line's verb");
+    has("tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target decodes");
+    has("printf y | tee $'tracked.md'", "tee:H/tracked.md", "tee ANSI-C target in a pipeline");
+    has("trap echo\\ x\\ \\>tracked.md EXIT", "redirect:H/tracked.md", "trap escaped unquoted action is walked");
+    lacks("echo x > \"MEMORY\\.md\"", "redirect:H/MEMORY.md", "dq backslash before a non-special char stays literal");
+    // #625 review cycle-9: tee quote-awareness, line continuations
+    has("printf y | tee $\"tracked.md\"", "tee:H/tracked.md", "locale-quoting tee target decodes");
+    has("printf y | tee track$'ed'.md", "tee:H/tracked.md", "ANSI-C concat tee target");
+    lacks("tee \"$'tracked.md'\"", "tee:H/tracked.md", "dq-wrapped ANSI-C is literal in bash");
+    lacks("printf y | tee safe.txt # $'tracked.md'", "tee:H/tracked.md", "a tee comment is not a target");
+    lacks("printf y | tee safe$'\\n'tracked.md", "tee:H/tracked.md", "decoded whitespace cannot inject a token");
+    has("echo x > tracked\\\n.md", "redirect:H/tracked.md", "backslash-newline is a line continuation");
+    has("printf y | tee tracked\\\n.md", "tee:H/tracked.md", "tee line continuation is not truncated");
+    // #625 review cycle-12: a LEADING `\`+newline + indent before a redirect/tee
+    // operand. readWord returned an EMPTY operand there (the `\` arm advanced
+    // over the continuation and then exited on the indent's whitespace), so the
+    // write target was dropped and the gate ALLOWed a tracked hub-main write.
+    has("echo x > \\\n  tracked.md", "redirect:H/tracked.md", "redirect operand after a leading line continuation + indent");
+    has("echo x >> \\\n  tracked.md", "redirect:H/tracked.md", "append operand after a leading line continuation");
+    has("echo x >| \\\n  tracked.md", "redirect:H/tracked.md", "clobber operand after a leading line continuation");
+    has("printf y | tee \\\n  tracked.md", "tee:H/tracked.md", "tee operand after a leading line continuation");
+    has("echo x >\\\n  tracked.md", "redirect:H/tracked.md", "continuation directly after the redirect operator");
+    lacks("echo x > foo\\\n  tracked.md", "redirect:H/tracked.md", "mid-word continuation + indent stays TWO words (bash semantics)");
+    // #625 review cycle-13: the tee SEGMENT-BOUNDARY scan treated the
+    // continuation's newline as the segment end, so `lim` truncated AT the
+    // continuation and every operand after it was dropped — the gate captured
+    // no target while bash appended to the tracked file.
+    has("printf y | tee \\\n -a tracked.md", "tee:H/tracked.md", "tee -a AFTER a line continuation still gates");
+    has("printf y | tee \\\n-a tracked.md", "tee:H/tracked.md", "continuation joined to the tee flag");
+    has("printf y | tee \\\n -- tracked.md", "tee:H/tracked.md", "tee -- after a line continuation");
+    has("printf y | tee \\\n -a \\\n tracked.md", "tee:H/tracked.md", "second-operand target on its own continued line");
+    has("printf y | tee \\\n /tmp/x tracked.md", "tee:H/tracked.md", "tee multi-operand: the 2nd operand after a continuation");
+    has("printf y | tee -a \\\n tracked.md", "tee:H/tracked.md", "continuation after the tee flag");
+    // #625 review cycle-10: getopt_long ABBREVIATIONS (fail-open) + single-operand no-ops.
+    // GNU sed/gawk accept any UNAMBIGUOUS long-option prefix, so matching exact
+    // spellings alone let `sed --in-pl …` / `gawk --incl inplace …` resolve to ZERO
+    // targets and the gate ALLOW a real in-place edit of a tracked hub file.
+    has("sed --in-pl s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl is an unambiguous --in-place prefix");
+    has("sed --in-pl=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-pl=.bak prefix with an attached suffix");
+    has("sed --in-place=.bak s/a/b/ tracked.md", "sed:H/tracked.md", "sed --in-place=.bak exact long spelling");
+    has("sed --expr s/a/b/ tracked.md -i", "sed:H/tracked.md", "sed --expr resolves to --expression");
+    has("sed --file script.sed -i tracked.md", "sed:H/tracked.md", "sed --file consumes its operand and keeps -i");
+    has("gawk --incl inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --incl is an unambiguous --include prefix");
+    has("gawk --inc=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --inc= prefix with the inplace operand attached");
+    has("gawk --include=inplace {print} tracked.md", "gawk:H/tracked.md", "gawk --include=inplace exact spelling");
+    // #625 review cycle-11: `--file`/`--source`/`--exec` PROVIDE the program, so
+    // the first positional is a DATA file. Losing hasProgFlag sliced that data
+    // file off as "the program" and dropped the in-place target entirely
+    // (`gawk -i inplace --file p.awk tracked.md` → zero targets).
+    has("gawk --incl inplace --file p.awk tracked.md", "gawk:H/tracked.md", "long --file provides the program (data file kept)");
+    has("gawk -i inplace -f p.awk tracked.md", "gawk:H/tracked.md", "short -f provides the program");
+    has("gawk --include inplace --file=p.awk tracked.md", "gawk:H/tracked.md", "--file= attached form provides the program");
+    has("gawk --incl inplace --source {print} tracked.md", "gawk:H/tracked.md", "long --source provides the program");
+    has("gawk -i inplace -e {print} tracked.md", "gawk:H/tracked.md", "short -e provides the program");
+    has("gawk -i inplace -E p.awk tracked.md", "gawk:H/tracked.md", "short -E provides the program");
+    has("gawk -i inplace --exec p.awk tracked.md", "gawk:H/tracked.md", "--exec provides the program");
+    has("gawk -i inplace --load lib.so {print} tracked.md", "gawk:H/tracked.md", "--load is a library — the program positional stays");
+    has("sed -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed -i still gates after the prefix change");
+    has("sed --separate -i s/a/b/ tracked.md", "sed:H/tracked.md", "sed --separate (arity 0) does not swallow -i");
+    lacks("sed --in-pl s/a/b/ subdir", "sed:H/tracked.md", "sed --in-pl on a non-tracked operand stays inert");
+    has("sed --in-pl s/a/b/ subdir", "sed:H/subdir", "sed --in-pl surfaces its (non-tracked) operand, not a false negative");
+    // Ambiguous prefixes are NOT options (getopt_long rejects them — the command
+    // fails, so nothing is written); resolving them would invent a target.
+    none("sed --s a/b/ tracked.md", "ambiguous sed --s prefix is not resolved to an option");
+    none("gawk --f prog.awk tracked.md", "ambiguous gawk --f prefix is not resolved");
+    // A destination requires at least ONE source: a single-operand
+    // `cp f`/`mv f`/`install f` is a malformed no-op ("missing destination file
+    // operand") that writes NOTHING — surfacing its lone operand as a
+    // destination was a pure false block. Also covers the empty `-t` form.
+    none("cp tracked.md", "single-operand cp writes nothing");
+    none("mv tracked.md", "single-operand mv writes nothing");
+    none("install tracked.md", "single-operand install writes nothing");
+    none("cp -t subdir", "cp -t with no source operand writes nothing");
+    none("mv -t subdir", "mv -t with no source operand writes nothing");
+    has("cp -t subdir src.md", "cp:H/subdir/src.md", "cp -t with a source still surfaces the destination");
+    // truncate / dd
+    has("truncate -s 0 tracked.md", "truncate:H/tracked.md", "truncate target");
+    has("truncate -s0 tracked.md", "truncate:H/tracked.md", "truncate attached size");
+    has("dd if=/dev/zero of=tracked.md bs=1 count=0", "dd:H/tracked.md", "dd of= target");
+    lacks("dd if=tracked.md of=/tmp/x", "dd:H/tracked.md", "dd reading a tracked file is not a hub write");    // command-position / arg-position discipline
+    none("git mv a b", "git mv is a git verb, not the bash mv");
+    none("echo cp a b", "cp as an ARG is not a command");
+    none("echo sed -i s/a/b/ tracked.md", "sed as an ARG is not a command");
+    lacks("cp tracked.md /tmp/", "cp:H/tracked.md", "cp OUT of the hub: dst is /tmp, src is a read");
+  }
+
   // ── #437 (C): firstHubTrackedWrite — pure intersect for the disordered-hub
   // bash-write GATE (index.ts feeds ONE bounded `git ls-files --error-unmatch`
   // output; this pure fn picks the first candidate that is index-tracked).
@@ -4189,6 +4629,452 @@ try {
   expectUntrackedWip("tracked-only changes → no wip", " M src/index.ts\nD  old.txt", [], []);
   expectUntrackedWip("quoted-spelling path unquoted", '?? "docs/plans/my file.md"', ["docs/plans/my file.md"], [{ path: "docs/plans/my file.md", pattern: "docs/plans" }]);
 
+  // ── #627 / #628: pins (adversarial-review findings of PR #624) ──────────
+  // #627 closes the non-shell sibling of the #1484 shell script backdoor;
+  // #628 bounds + surfaces the disordered-hub new-file carve-out. These pins
+  // are BEHAVIORAL on the exported pure functions + the shared walker (index.ts
+  // is not importable) — every one FAILS on origin/main.
+
+  // #627 extractCodePayload — leading-position, wrapper-aware, version/path
+  // normalized, inline/file/module/stdin kinds, attached inline spellings.
+  const cp = (c) => extractCodePayload(c);
+  expectBool("P627-1: python3 -c inline payload extracted", cp(`python3 -c 'import subprocess'`)?.kind === "inline" && cp(`python3 -c 'import subprocess'`)?.value === "import subprocess", true);
+  expectBool("P627-2: attached -c'payload' extracted (short form)", cp(`python3 -c'import os; os.system("git reset")'`)?.kind === "inline" && cp(`python3 -c'import os'`)?.value === "import os", true);
+  expectBool("P627-3: node -e / --eval= / -p extracted", cp(`node -e 'x'`)?.value === "x" && cp(`node --eval='x'`)?.value === "x" && cp(`node -p 'x'`)?.value === "x", true);
+  expectBool("P627-4: ruby/perl/php inline flags extracted", cp(`ruby -e 'x'`)?.value === "x" && cp(`perl -E 'x'`)?.value === "x" && cp(`php -r 'x'`)?.value === "x", true);
+  expectBool("P627-5: script-file positional extracted", cp(`python3 /tmp/x.py arg1`)?.kind === "file" && cp(`python3 /tmp/x.py arg1`)?.value === "/tmp/x.py", true);
+  expectBool("P627-6: version + path qualified interpreters match", cp(`python3.11 -c 'x'`)?.value === "x" && cp(`/usr/bin/python3 -c 'x'`)?.value === "x" && cp(`${m4Tmp}/venv/bin/python -c 'x'`)?.value === "x", true);
+  expectBool("P627-7: env/sudo/cd/assignment wrappers skip to the interpreter", cp(`FOO=1 python3 -c 'x'`)?.value === "x" && cp(`sudo -u root python3 -c 'x'`)?.value === "x" && cp(`cd /tmp && python3 -c 'x'`)?.value === "x" && cp(`env -i python3 -c 'x'`)?.value === "x", true);
+  expectBool("P627-8: -m module / bare - stdin / < file stdin kinds", cp(`python3 -m http.server`)?.kind === "module" && cp(`python3 -`)?.kind === "stdin" && cp(`python3 < /tmp/x.py`)?.kind === "stdin-file", true);
+  expectBool("P627-9: shell interpreters / git / non-interpreters are NOT code payloads", cp(`bash -c 'x'`) === null && cp(`git -c k=v status`) === null && cp(`ls -la`) === null && cp(`echo python3 -c 'x'`) === null, true);
+
+  // #627 extractCodeGitCommands — the execution-sink requirement is the
+  // false-block guard (inert literals stay allowed, matching the shell surface).
+  expectBool("P627-10: array-form git command reconstructed", JSON.stringify(extractCodeGitCommands(`import subprocess; subprocess.run(["git","reset","--hard","origin/main"])`)) === JSON.stringify(["git reset --hard origin/main"]), true);
+  expectBool("P627-11: os.system string + child_process execSync reconstructed", JSON.stringify(extractCodeGitCommands(`os.system("git reset --hard")`)) === JSON.stringify(["git reset --hard"]) && JSON.stringify(extractCodeGitCommands(`require('child_process').execSync('git push --force origin main')`)) === JSON.stringify(["git push --force origin main"]), true);
+  expectBool("P627-12: inert literal without a sink → NO candidate (no false-block)", extractCodeGitCommands(`print("git reset --hard")`).length === 0 && extractCodeGitCommands(`x = 'git commit -m x'`).length === 0, true);
+  expectBool("P627-13: sink without a git reference → NO candidate", extractCodeGitCommands(`import subprocess; subprocess.run(["ls","-la"])`).length === 0, true);
+
+  // #627 codePayloadGitVerdict — parity with scriptGitVerdict: hub mutations
+  // block, read-only/no-git/worktree-targeted pass, unresolvable fails closed.
+  const cpv = (c, cwd) => codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  // Mirrors the production `_backdoorBlock` path: extract the INLINE payload
+  // from the raw command, then classify that payload's content.
+  const cpvCmd = (c, cwd) => {
+    const p = extractCodePayload(c);
+    return p && p.kind === "inline"
+      ? codePayloadGitVerdict(p.value, "main", cwd ?? hubR, cwd ?? hubR)
+      : codePayloadGitVerdict(c, "main", cwd ?? hubR, cwd ?? hubR);
+  };
+  expectBool("P627-14: hub reset/push/commit from code → block",
+    cpv(`import subprocess; subprocess.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","push","--force","origin","main"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git","commit","-m","x"])`) === "block", true);
+  expectBool("P627-15: read-only git / no git from code → allow",
+    cpv(`import subprocess; subprocess.run(["git","status"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["git","log","--oneline"])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls","-la"])`) === "allow", true);
+  expectBool("P627-16: worktree-targeted code git op → allow (#347 parity)",
+    codePayloadGitVerdict(`import subprocess; subprocess.run(["git","reset","--hard"])`, "main", wtR, wtR) === "allow", true);
+  expectBool("P627-17: payload variable + git evidence → block (fail-closed / var-indirection)",
+    cpv(`git = "git"; subprocess.run([git, "reset"])`) === "block", true);
+  expectBool("P627-18: concatenated git spelling is a documented residual (allow)",
+    cpv(`subprocess.run(["gi"+"t","reset"])`) === "allow", true);
+
+  // #627 shared-walker recursion: the structured classifier (M2/M3/M4) sees
+  // inline code payloads — nested shell wrappers included.
+  expectBool("P627-19: allGitInvocations sees an inline code payload (cmdVisible false)", (() => {
+    const invs = allGitInvocations(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`);
+    return invs.length === 1 && invs[0].verb === "reset" && invs[0].cmdVisible === false;
+  })(), true);
+  expectBool("P627-20: nested shell -c wrapper still reaches the code payload", (() => {
+    const nested = `bash -c "python3 -c \\"import os; os.system('git reset --hard')\\""`;
+    const invs = allGitInvocations(nested);
+    return invs.length === 1 && invs[0].verb === "reset";
+  })(), true);
+  expectBool("P627-21: evaluateHubGateWithTargets blocks a code-carried hub mutation",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`, "main", hubR).verdict === "block", true);
+  expectBool("P627-22: read-only code payload is non-blocking in the hub gate",
+    evaluateHubGateWithTargets(`python3 -c 'import subprocess; subprocess.run(["git","status"])'`, "main", hubR).verdict !== "block", true);
+
+  // ── #627 code-review fold-in (cycle 1 P1/P2) ──
+  // P1: flag-with-operand / clustered flags made the operand the "payload" and
+  // skipped the real flag+payload entirely (probe moved HEAD).
+  expectBool("P627-24: operand-taking flags parse through to the real payload",
+    cp(`python3 -W ignore -c 'PAY'`)?.kind === "inline" && cp(`python3 -W ignore -c 'PAY'`)?.value === "PAY" &&
+    cp(`python3 -X dev -c 'PAY'`)?.value === "PAY" && cp(`ruby -I lib -e 'PAY'`)?.value === "PAY" &&
+    cp(`node -r ./m -e 'PAY'`)?.value === "PAY" && cp(`php -d k=v -r 'PAY'`)?.value === "PAY", true);
+  expectBool("P627-25: clustered flags (-Sc / -we) parse letter-by-letter",
+    cp(`python3 -Sc 'PAY'`)?.value === "PAY" && cp(`perl -we 'PAY'`)?.value === "PAY" && cp(`python3 -Sc'PAY'`)?.value === "PAY", true);
+  expectBool("P627-26: operand/cluster spellings still BLOCK the real git payload",
+    cpvCmd(`python3 -W ignore -c 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`python3 -Sc 'import subprocess; subprocess.run(["git","reset","--hard"])'`) === "block" &&
+    cpvCmd(`perl -we 'system("git reset --hard")'`) === "block" &&
+    cpvCmd(`node -r ./noop.js -e 'require("child_process").execSync("git reset --hard")'`) === "block", true);
+  // P1: paren-less Ruby/Perl system.
+  expectBool("P627-27: paren-less system \"git …\" blocks (Ruby/Perl)",
+    cpvCmd(`ruby -e 'system "git reset --hard"'`) === "block" && cpvCmd(`perl -e 'system "git reset --hard"'`) === "block", true);
+  // P1: prose/comments/docstrings/kwargs must NOT anchor (false-block class).
+  expectBool("P627-28: comment/docstring/data literals and trailing kwargs do NOT false-block",
+    cpv(`import subprocess\n# do not do git reset --hard here\nsubprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['echo','git reset needed'])`) === "allow" &&
+    cpv(`import os; os.system('echo git')`) === "allow" &&
+    cpv(`const {execSync}=require('child_process'); console.log(JSON.stringify({git:'repo'}))`) === "allow" &&
+    cpv(`subprocess.run(["git","branch","-a"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["git","branch"], cwd="/x")`) === "allow" &&
+    cpv(`subprocess.run(["cat",".git/HEAD"])`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  // P1: the documented #347 worktree parity must hold through the PRODUCTION
+  // base resolution (commandExecutionCwd), not just a hand-passed execCwd.
+  expectBool("P627-29: commandExecutionCwd resolves the code payload's cd-chain (worktree parity base)",
+    commandExecutionCwd(`cd ${wtR} && python3 -c 'x'`) === wtR &&
+    commandExecutionCwd(`cd ${wtR} && python3 ./x.py`) === wtR, true);
+  expectBool("P627-30: worktree-targeted inline code git op is exempt through the hub gate",
+    evaluateHubGateWithTargets(`cd ${wtR} && python3 -c "import subprocess; subprocess.run(['git','commit','-m','x'])"`, "main", hubR).verdict === "allowed", true);
+
+  // ── #627 code-review cycle-2 fold-in (fresh-reviewer regressions) ──
+  // P1: the cycle-1 "first-arg only" fix lost the wrapper/shell-interpreter argv
+  // and non-literal callee forms. Command-position anchoring restores them.
+  expectBool("P627-31: wrapper-shell argv arrays block (bash -c / sudo / env / timeout / abs path)",
+    cpv(`subprocess.run(["bash","-c","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.run(["sudo","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["env","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["timeout","5","git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess.run(["/bin/bash","-lc","git reset --hard"])`) === "block" &&
+    cpv(`subprocess.Popen(["bash","-c","git reset --hard"])`) === "block", true);
+  expectBool("P627-32: variable indirection blocks (argv literal or command string)",
+    cpv(`cmd = ["git","reset","--hard"]\nsubprocess.run(cmd)`) === "block" &&
+    cpv(`cmd = "git reset --hard"\nos.system(cmd)`) === "block", true);
+  expectBool("P627-33: aliased/destructured/chained sinks block (from-import, as-import, .execSync)",
+    cpv(`from subprocess import run\nrun(["git","reset","--hard"])`) === "block" &&
+    cpv(`import subprocess as sp\nsp.run(["git","reset","--hard"])`) === "block" &&
+    cpv(`subprocess . run (["git","reset","--hard"])`) === "block" &&
+    cpv(`require("child_process").execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-34: no comment over-strip — #private / // floor-division do not hide a same-line sink",
+    cpv(`class G { static #run() { return require('child_process').execSync("git reset --hard"); } }`) === "block" &&
+    cpv(`n = a//b; require('child_process').execSync("git reset --hard")`) === "block", true);
+  expectBool("P627-35: docstring / quoted-sink-in-a-string / regex stay inert",
+    cpv(`def f():\n    """\n    Example: subprocess.run(["git","reset","--hard"])\n    """\n    pass`) === "allow" &&
+    cpv(`x = "os.system('git reset --hard')"`) === "allow" &&
+    cpv(`const re = /git/; re.exec(s)`) === "allow", true);
+  expectBool("P627-36: cwd=<literal> is an implicit -C target (worktree exempt, hub blocks)",
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${wtR}")`, "main", hubR, hubR) === "allow" &&
+    codePayloadGitVerdict(`subprocess.run(["git","commit","-m","x"], cwd="${hubR}")`, "main", hubR, hubR) === "block", true);
+  expectBool("P627-37: pwsh -Command is an inline payload (not misread as python -m)",
+    cp(`pwsh -Command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -Command 'git reset --hard'`)?.value === "git reset --hard" &&
+    cp(`powershell -c 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -File /tmp/x.ps1`)?.kind !== "inline", true);
+  expectBool("P627-38: shell-payload interpreter (pwsh -Command) blocks through the pwsh surface",
+    cpv(`git reset --hard`) === "block" && cpv(`git commit -m x`) === "block", true);
+
+  // ── #627 code-review cycle-3 fold-in (fresh-reviewer bypasses) ──
+  // P1: argv wrappers between the sink and the command (`shlex.split`, `list()`,
+  // `sorted()`, splat, a user helper, `getattr`) must still anchor.
+  expectBool("P627-39: call-indirection argv wrappers still block",
+    cpv(`import subprocess,shlex; subprocess.run(shlex.split('git reset --hard'))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(list(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(sorted(['git','reset','--hard']))`) === "block" &&
+    cpv(`import subprocess; subprocess.run(*[['git','reset','--hard']])`) === "block" &&
+    cpv(`import subprocess\ndef sh(a): subprocess.run(a)\nsh(['git','reset','--hard'])`) === "block" &&
+    cpv(`import subprocess; getattr(subprocess,'run')(['git','reset','--hard'])`) === "block" &&
+    cpv(`from subprocess import run as r; r(['git','reset','--hard'])`) === "block", true);
+  // P1: the sink-method allowlist covers the rest of the real spawn primitives.
+  expectBool("P627-40: getoutput / os.exec* / posix_spawn / pty / asyncio / bracket-member sinks block",
+    cpv(`import subprocess; subprocess.getoutput('git reset --hard')`) === "block" &&
+    cpv(`import subprocess; subprocess.getstatusoutput('git reset --hard')`) === "block" &&
+    cpv(`import os; os.execv('/usr/bin/git',['git','reset','--hard'])`) === "block" &&
+    cpv(`import os; os.posix_spawn('git',['git','reset','--hard'],os.environ)`) === "block" &&
+    cpv(`import pty; pty.spawn(['git','reset','--hard'])`) === "block" &&
+    cpv(`import asyncio; asyncio.create_subprocess_exec('git','reset','--hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P1: repeated payload flags are UNIONED (node keeps the last `-e`; ruby/
+  // perl/osascript concatenate all of them).
+  expectBool("P627-41: repeated -e/-Command payloads are unioned",
+    cpvCmd(`node -e 'console.log(1)' -e "require('child_process').execSync('git reset --hard')"`) === "block" &&
+    cpvCmd(`ruby -e 'puts 1' -e "system('git reset --hard')"`) === "block" &&
+    cpvCmd(`perl -e 'print 1;' -e 'system("git reset --hard");'`) === "block" &&
+    cpvCmd(`osascript -e 'set x to 1' -e 'do shell script "git reset --hard"'`) === "block", true);
+  // P1: PowerShell parameter binding is case-insensitive.
+  expectBool("P627-42: pwsh flags are case-insensitive (-command / -COMMAND / -C)",
+    cp(`pwsh -command 'git reset --hard'`)?.kind === "inline" && cp(`pwsh -COMMAND 'git reset --hard'`)?.kind === "inline" &&
+    cp(`pwsh -C 'git reset --hard'`)?.kind === "inline" &&
+    cpvCmd(`pwsh -command 'git reset --hard'`) === "block" && cpvCmd(`pwsh -COMMAND 'git reset --hard'`) === "block", true);
+  // P1: command strings that don't START with git (`cd … && git …`, `sudo git …`).
+  expectBool("P627-43: cd-&&-git / sudo-git command strings block",
+    cpv(`import os; os.system("cd /hub && git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("sudo git reset --hard")`) === "block" &&
+    cpv(`import subprocess; subprocess.run("cd /hub && git push --force origin main", shell=True)`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["bash","-c","cd /hub && git reset --hard"])`) === "block", true);
+  // P2: keyword-argument names must not be appended to the git command, and an
+  // assignment target named `git` must not count as an unresolved anchor.
+  expectBool("P627-44: kwargs (capture_output/check/cwd=var) and `git =` assignment do not false-block",
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], capture_output=True)`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(['git','branch','-a'], check=True)`) === "allow" &&
+    cpv(`import subprocess; repo='/x'; subprocess.run(['git','branch','-a'], cwd=repo)`) === "allow" &&
+    cpv(`import subprocess; git = 'x'; subprocess.run(['ls'])`) === "allow" &&
+    cpv(`import subprocess, shutil; git = shutil.which('git'); subprocess.run([git,'status'])`) === "allow", true);
+  // P1: the shell scan of the payload runs ONLY for a shell-shaped payload, so
+  // ordinary host code (`print("git")`, a `//` comment) stays inert. A string
+  // that contains a command-line-shaped git invocation is deliberately
+  // fail-closed (same class as variable indirection).
+  expectBool("P627-45: host-code shell-scan false positives are gone",
+    cpv(`print("git")`) === "allow" && cpv(`console.log("git")`) === "allow" &&
+    cpv(`result = get("git")`) === "allow" && cpv(`// git reset --hard\nconsole.log(1)`) === "allow" &&
+    cpv(`const h = \`x\ngit reset --hard\``) === "block", true);
+
+  // ── #627 code-review cycle-4 fold-in ──
+  // P1: a lone `git` argv element joined by `+`/splat, wrapper-prefixed command
+  // strings, and backtick/`$(` command substitution must all block.
+  expectBool("P627-46: lone-git concat/splat + wrapper strings + backtick substitution block",
+    cpv(`import subprocess; subprocess.run(["git"]+["reset","--hard"])`) === "block" &&
+    cpv(`import subprocess; subprocess.run(["git", *["reset","--hard"]])`) === "block" &&
+    cpv(`import os; os.system("eval git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nice -n 5 git reset --hard")`) === "block" &&
+    cpv(`import os; os.system("nohup git reset --hard")`) === "block" &&
+    cpvCmd(`ruby -e 'puts \`git reset --hard\`'`) === "block" &&
+    cpvCmd("perl -e 'print `git reset --hard`'") === "block", true);
+  // P2: a generic method name on an UNKNOWN receiver is not a sink
+  // (`re.exec(s)`, `db.run('…')`); a spawn-specific name still is.
+  expectBool("P627-47: generic receiver methods stay inert; strong sink names block",
+    cpv(`const m = /x/.exec("git reset --hard")`) === "allow" &&
+    cpv(`db.run("git reset --hard")`) === "allow" &&
+    cpv(`import subprocess; subprocess.run(["ls"]); regex.exec("git reset --hard")`) === "allow" &&
+    cpv(`const cp=require('child_process'); cp.execSync('git reset --hard')`) === "block" &&
+    cpv(`const cp=require('child_process'); cp['execSync']('git reset --hard')`) === "block", true);
+  // P4: case folding applies only to case-insensitive CLIs — ruby's `-E utf8`
+  // must not collapse onto the `-e` payload flag.
+  expectBool("P627-48: ruby -E is an encoding operand, not the -e payload",
+    cp(`ruby -E utf8 script.rb`)?.kind === "file" && cp(`ruby -E utf8 script.rb`)?.value === "script.rb", true);
+  // P3: AppleScript `do shell script` handling is scoped to AppleScript-shaped
+  // payloads (a Python comment/docstring mentioning it stays inert).
+  expectBool("P627-49: do shell script blocks only in an AppleScript-shaped payload",
+    cpv(`import subprocess\n# osascript -e 'do shell script "git reset --hard"'\nsubprocess.run(["ls"])`) === "allow" &&
+    cpv(`import subprocess\ndef f():\n  """do shell script "git reset --hard" """\n  subprocess.run(["ls"])`) === "allow" &&
+    cpv(`do shell script "git reset --hard"`) === "block", true);
+  // P3: a compound kwarg value is skipped as ONE expression (balanced brackets),
+  // not three tokens.
+  expectBool("P627-50: compound kwarg values are skipped cleanly",
+    cpv(`import subprocess; subprocess.run(["git","branch","-a"], env={"A":"1"})`) === "allow" &&
+    cpv(`import subprocess, os; subprocess.run(["git","branch","-a"], cwd=os.path.join("a","b"))`) === "allow", true);
+
+  // #628 hubNewFileVolumeVerdict — pure boundaries + source pins (index.ts).
+  expectBool("P628-1: volume verdict boundaries",
+    hubNewFileVolumeVerdict(1) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET) === "warn" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_WARN_BUDGET + 1) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP) === "escalate" &&
+    hubNewFileVolumeVerdict(HUB_NEW_FILE_BLOCK_CAP + 1) === "block", true);
+  expectBool("P628-2: budget/cap constants are the documented values", HUB_NEW_FILE_WARN_BUDGET === 10 && HUB_NEW_FILE_BLOCK_CAP === 25, true);
+  expectBool("P628-3: index.ts wires the new-file volume policy + write-time warn",
+    pinSrc.includes("hubNewFileVolumeVerdict") && pinSrc.includes("_maybeWarnHubNewFile") && pinSrc.includes("hubNewFileCounts") && pinSrc.includes("#628"), true);
+  expectBool("P628-4: the #628 cap BLOCK reason exists (not warn-only)", pinSrc.includes("new-file cap exhausted in a disordered hub") && pinSrc.includes("_warnHubNewFile"), true);
+  expectBool("P627-23: index.ts wires the code-payload backdoor (#627)",
+    pinSrc.includes("extractCodePayload") && pinSrc.includes("codePayloadGitVerdict") && pinSrc.includes("#627"), true);
+
+  // ── #1129: hub-symlink checkout mislabel + sanctioned-script exemption ──
+  // (a) BASE-RESOLUTION FALSE POSITIVE. When a checkout's `scripts/` is a
+  // symlink into ANOTHER repo's SUBDIRECTORY, git prints an ABSOLUTE
+  // `--git-dir` beside a RELATIVE `--git-common-dir` (it resolves its own cwd
+  // through the symlink); resolving the relative half against the unrealpathed
+  // cwd lands it in the WRONG repo and the checkout was misread as "a linked
+  // worktree". Deterministic fixture: two one-file repos + the symlink. The
+  // same function feeds `resolveTargetCheckout`, where the misread is a
+  // fail-OPEN "isolated" verdict, so this is a gate-correctness pin too.
+  {
+    const symTmp = mkdtempSync(join(tmpdir(), "guard-symlink-1129-"));
+    const repoA = join(symTmp, "A");
+    const repoB = join(symTmp, "B");
+    mkdirSync(join(repoB, "sub"), { recursive: true });
+    execSync(`git init -q "${repoA}"`, { stdio: "ignore" });
+    execSync(`git init -q "${repoB}"`, { stdio: "ignore" });
+    const symlink = join(repoA, "scripts");
+    symlinkSync(join(repoB, "sub"), symlink);
+    expectBool("#1129: symlinked scripts/ into another repo's subdir is NOT a linked worktree",
+      isWorktreeCwd(symlink) === false, true);
+    expectBool("#1129: the checkout that OWNS the symlink is not a worktree either",
+      isWorktreeCwd(repoA) === false, true);
+    expectBool("#1129: the symlink TARGET repo is not a worktree (control)",
+      isWorktreeCwd(repoB) === false, true);
+    try { execSync(`rm -rf "${symTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+
+  // (b) SANCTIONED-SCRIPT EXEMPTION (#1129). Source pins. The negative half is
+  // the adversarial-review P0: `scripts/` also carries git-DESTRUCTIVE helpers
+  // (`cleanup-worktree.sh` does `git worktree remove --force` + `git branch -D`),
+  // neither of which needs a WRITE — so a directory-wide exemption would let a
+  // hub-rooted session destroy another session's work with the content walker
+  // off. The list must stay named, and destructive helpers must stay out of it.
+  expectBool("#1129: a named sanctioned-script list exists (realpath-keyed)",
+    pinSrc.includes("SANCTIONED_SCRIPT_RELPATHS") && pinSrc.includes("_sanctionedScriptExemption"), true);
+  expectBool("#1129: the mandated preflight + the recovery helper are the listed scripts",
+    pinSrc.includes('"scripts/check-pipeline-compliance.sh"') &&
+    pinSrc.includes('"scripts/checkout-hygiene/hub-worktree.sh"'), true);
+  // #1484, second instance (the #1141 class): the review RECORDER. Pinned for the
+  // same reason the two above are — the list must stay NAMED and explicit, so a
+  // later tidy-up cannot silently drop the entry and re-block every hub-rooted
+  // lane from recording a completed review. Note the pin is intentionally on the
+  // CHECKOUT spelling only: the farm copy at ~/.pi/agent/scripts/record-review.sh
+  // is a realpath-keyed miss and is tracked separately (agent-infra #1603) — do
+  // NOT "fix" that here by widening this list to a directory or a name pattern.
+  expectBool("#1484 (2nd instance): the review RECORDER is the listed script",
+    pinSrc.includes('"scripts/record-review.sh"'), true);
+  expectBool("#1129 P0 boundary: no DIRECTORY-wide exemption (destructive helpers stay gated)",
+    !pinSrc.includes("cleanup-worktree.sh") &&
+    !pinSrc.includes("cleanup-stale-branches.sh") &&
+    !pinSrc.includes("startsWith(_frameworkRoot") &&
+    !pinSrc.includes("startsWith(FRAMEWORK_SCRIPTS"), true);
+  expectBool("#1129: the exemption is evaluated BEFORE the content walk",
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") !== -1 &&
+    pinSrc.indexOf("_sanctionedScriptExemption(resolved)") <
+      pinSrc.indexOf("scriptGitVerdict(resolved, branch, base"), true);
+  expectBool("#1129: the exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m4_script_exemption"), true);
+  // #1129 (code-review P0) — the ANCHOR. The exemption is only as narrow as the
+  // root it is keyed on. pi deploys the guard through a symlink farm
+  // (`~/.pi/agent/extensions/<name>` → the checkout) and its loader preserves
+  // the symlink spelling in `import.meta.url`, so a LEXICAL `../..` on that
+  // spelling yields `~/.pi/agent`: not the checkout (exemption inert → the
+  // mandated preflight stays blocked) and not a git checkout (agent-WRITABLE,
+  // so an agent could mint `<that root>/scripts/<listed relpath>` and take the
+  // exemption with content of its choosing). BEHAVIOURAL, on the real
+  // geometry — the farm below is a symlink to this extension's own directory,
+  // so this fails on any regression to realpath-after-walk.
+  expectBool("#1129 P0: index.ts derives the anchor from its own module URL",
+    pinSrc.includes("_frameworkRootFromModuleUrl(import.meta.url)"), true);
+  expectBool("#1129 P0: the exemption realpaths BOTH sides of the comparison",
+    pinSrc.includes("realpathSync(resolve(_frameworkRoot, rel))"), true);
+  {
+    const farmTmp = mkdtempSync(join(tmpdir(), "guard-anchor-1129-"));
+    const realExtDir = fileURLToPath(new URL(".", import.meta.url));
+    const realRoot = realpathSync(resolve(realExtDir, "..", ".."));
+    const fakeAgentRoot = join(farmTmp, "pi-agent");
+    mkdirSync(join(fakeAgentRoot, "extensions"), { recursive: true });
+    const farmLink = join(fakeAgentRoot, "extensions", "main-worktree-guard");
+    symlinkSync(realExtDir, farmLink);
+    const farmedModule = join(farmLink, "index.ts");
+    expectBool("#1129 P0: the symlink-farm spelling is what the loader sees (lexical ../.. lands OUTSIDE the checkout)",
+      resolve(dirname(farmedModule), "..", "..") === fakeAgentRoot, true);
+    expectBool("#1129 P0: frameworkRootFromModuleUrl(farmed) is the CHECKOUT, not the farm parent",
+      frameworkRootFromModuleUrl(pathToFileURL(farmedModule).href) === realRoot, true);
+    try { execSync(`rm -rf "${farmTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+  expectBool("#1129: the block message names the realpath actually read + the verdict source",
+    pinSrc.includes("resolves to:") && pinSrc.includes("verdict source:"), true);
+
+  // (b2) THE SAME EXEMPTION, APPLIED TO M5 (#1139). #1129 exempted the
+  // framework's scripts from M4's content walk only; M5's working-tree-discard
+  // walk never asked, so `hub-worktree.sh` stayed blocked from a hub-rooted
+  // session — its salvage path reverts the hub's dirt with
+  // `git show "HEAD:$rest" > "$MAIN_REPO/$rest"`, whose SHELL LOOP VARIABLE
+  // pathspec the extractor can only surface as an unresolvable
+  // `cat-file-revert` hint, which fails closed. Source pins: ONE list and ONE
+  // anchor helper (a second, drift-prone copy is the regression shape), the
+  // exemption scoped to the harvested SET (never to the command), and the
+  // message correction.
+  expectBool("#1139: M5 consults the SAME hardened exempt helper — one definition, one anchor, one list",
+    pinSrc.includes("_sanctionedScriptExemption(resolve(execCwd, s.script))") &&
+    (pinSrc.match(/function _sanctionedScriptExemption\(/g) ?? []).length === 1 &&
+    (pinSrc.match(/const SANCTIONED_SCRIPT_RELPATHS = \[/g) ?? []).length === 1, true);
+  expectBool("#1139: the M5 exemption drops the harvested SET, never the command's argv",
+    pinSrc.includes("const gatedSets = sets.filter((s) => {") &&
+    pinSrc.includes("if (s.script === null) return true;") &&
+    pinSrc.includes("for (const set of gatedSets) {") &&
+    pinSrc.includes("gatedSets.every((s) => s.discs.length === 0)") &&
+    !pinSrc.includes("for (const set of sets) {"), true);
+  expectBool("#1139: the M5 exemption is audit-logged (deliberate relaxation is observable)",
+    pinSrc.includes("m5_script_exemption") &&
+    // ... and the row says what the relaxation HID, aggregated BY REALPATH
+    // (review fold-in: a row written from inside the filter predicate fires
+    // even when the dropped set carried no discards, and summing raw push sites
+    // double-counts one file pushed as two sets — review cycle-2 P2).
+    pinSrc.includes("discards_dropped") && pinSrc.includes("sets_exempted") &&
+    pinSrc.includes("const exempted = new Map<string, { rel: string; discards: number; forms: Set<string> }>()") &&
+    // …and a repeated push site must not ADD UP (review cycle-3 P2): the same
+    // realpath always yields the same discard list, so `sets_exempted=1` with
+    // `discards_dropped=2` misstated the suppression the row exists to report.
+    pinSrc.includes("prev.discards = Math.max(prev.discards, s.discs.length);"), true);
+  // The remedy must never print a path that cannot run (review cycle-2 P2).
+  expectBool("#1139: the fail-closed remedy is printed only when that file exists",
+    pinSrc.includes("if (existsSync(p)) sanctionedHelper = p;") &&
+    !pinSrc.includes("const sanctionedHelper = _frameworkRoot"), true);
+  expectBool("#1139 T6: a null anchor / a throwing probe keeps the set GATED (fail-closed, not inert-allow)",
+    pinSrc.includes("if (!_frameworkRoot) return null;") &&
+    pinSrc.includes("catch { rel = null; }") &&
+    pinSrc.includes("if (rel === null) return true;"), true);
+  expectBool("#1139 (review cycle-1 P1): the pipe-seed walk TOKENIZES shell words (a quoted piped script was unwalked)",
+    pinSrc.includes("wtShellWords(String(pipeSeg.slice(0, -1).join(\"|\")))") &&
+    // ... and does NOT dequote-then-split, which invents a seed for unquoted
+    // input (`cat a b` → `a b`) and over-splits a quoted one (`cat "a b"` →
+    // `a` + `b`): both pin a FALSE BLOCK on a file the shell never reads
+    // (review cycle-2 P1).
+    !pinSrc.includes("const dequoted = ") &&
+    !pinSrc.includes("words.slice(i).join(\" \")"), true);
+  // The tokenizer is the SHARED one (one shell-word tokenizer in the repo, not a
+  // second drift-prone copy), bound with the stale-module typeof guard. Pinned
+  // BEHAVIOURALLY via the real import (line 10) — if classify-git stops exporting
+  // it, test.mjs fails to load rather than silently regressing the pipe walk.
+  expectBool("#1139: the pipe walk reuses classify-git's exported quote-aware tokenizer",
+    typeof wtShellWords === "function" &&
+    wtShellWords('cat "a b"').length === 2 &&
+    wtShellWords("cat a b").length === 3 &&
+    wtShellWords('"a""b"').length === 1 &&
+    // review cycle-3 P2: an escaped quote does NOT close the word, and the rest
+    // of the line must not be swallowed into the token
+    wtShellWords('cat "a\\" b" | bash').length === 4 &&
+    wtShellWords('cat "a\\" b" | bash')[1] === '"a\\" b"' &&
+    pinSrc.includes("if (typeof _m5.wtShellWords === \"function\") wtShellWords = _m5.wtShellWords;"), true);
+  // review cycle-3 P1: the per-token dequote must follow the SHELL's rules — the
+  // blanket `[\"']`-and-backslash strip mis-read literal quotes/escapes and
+  // seeded files the shell never reads (one of them a fail-open REGRESSION).
+  expectBool("#1139: the per-token dequote is shell-faithful (single quotes literal, per-context backslash)",
+    pinSrc.includes("function _dequoteShellWord(raw: string): string") &&
+    pinSrc.includes("const _DQ_ESCAPABLE = new Set(") &&
+    pinSrc.includes("const tok = _dequoteShellWord(raw);") &&
+    !pinSrc.includes('raw.replace(/\\\\(.)/g, "$1").replace(/["\']/g, "")'), true);
+  expectBool("#1139 (review P1): the status probe CAPTURES stderr (the not-a-checkout allow arm was dead code)",
+    pinSrc.includes('stdio: ["ignore", "pipe", "pipe"]') &&
+    !pinSrc.includes('stdio: ["ignore", "pipe", "ignore"]'), true);
+  expectBool("#1139: the fail-closed arm stopped claiming a dirty tree",
+    pinSrc.includes("the discard's effect could not be verified, failing closed (#709)") &&
+    pinSrc.includes("NOT a claim that the checkout is dirty") &&
+    // Cause-neutral (review fold-in): the arm serves nine reasons and only two
+    // are target-resolution failures, so no single-cause headline.
+    !pinSrc.includes("target not statically resolvable, failing closed (#709)") &&
+    // The misattribution itself: this sentence was printed in BOTH arms,
+    // unconditionally, so a clean checkout was told it had uncommitted work.
+    !pinSrc.includes("uncommitted changes to tracked files that this command would revert.") &&
+    // The `!== null` contract — `unverifiable ? …` would render the DIRTY arm
+    // (with the hatch) for an empty-string reason.
+    pinSrc.includes("unverifiable !== null") && !pinSrc.includes("unverifiable ?"), true);
+  expectBool("#1139: the fail-closed arm stopped offering the bypass hatch as its remedy",
+    pinSrc.includes("not its remedy") &&
+    // The dirty arm (which really did read a dirty scope) KEEPS the hatch.
+    pinSrc.includes("Deliberate discard: set AGENT_ALLOW_MAIN_EDITS=1"), true);
+  const reasonFnStart = pinSrc.indexOf("function _worktreeDiscardBlockReason");
+  const reasonFnEnd = reasonFnStart === -1 ? -1 : pinSrc.indexOf("\nfunction ", reasonFnStart + 10);
+  const reasonFn = reasonFnStart === -1 ? "" : pinSrc.slice(reasonFnStart, reasonFnEnd === -1 ? pinSrc.length : reasonFnEnd);
+  expectBool("#1139 (review): the fail-closed remedy prints the framework checkout's OWN absolute path (no advice loop)",
+    reasonFn.includes("resolve(_frameworkRoot, \"scripts/checkout-hygiene/hub-worktree.sh\")") &&
+    !reasonFn.includes("bash scripts/checkout-hygiene/hub-worktree.sh <branch>") &&
+    reasonFn.includes("address the FRAMEWORK CHECKOUT's own copy, because a") &&
+    reasonFn.includes("worktree-local copy of it is gated by design (#1139):"), true);
+
+  // (c) RESIDUAL PIN — the text-shape false positives are NOT fixed by the
+  // exemption; they are contained. A lone markdown fence is enough to gate a
+  // file `block`, which is the spelling-not-behaviour shape the follow-up must
+  // remove. Pinning it keeps that fix a deliberate, visible change.
+  {
+    const fenceTmp = mkdtempSync(join(tmpdir(), "guard-fence-1129-"));
+    const fenceFile = join(fenceTmp, "fence.sh");
+    writeFileSync(fenceFile, "```bash\n");
+    expectBool("#1129 residual: a markdown ```bash fence alone still gates block (follow-up scope)",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "block", true);
+    writeFileSync(fenceFile, "#!/bin/bash\ngit status\n");
+    expectBool("#1129 control: a git-FREE/read-only script still allows",
+      scriptGitVerdict(fenceFile, "main", MAIN, MAIN) === "allow", true);
+    try { execSync(`rm -rf "${fenceTmp}"`, { stdio: "ignore" }); } catch {}
+  }
+
   // ── Degradation (D) ──
   const classifySrc = readFileSync(new URL("./classify-git.mjs", import.meta.url), "utf-8");
   // C2 static assert: no IMPORT of branch-ownership (comments may reference the
@@ -4207,7 +5093,11 @@ try {
     try { execSync(`git worktree remove --force "${m4Tmp}/wt"`, { stdio: "ignore" }); } catch {}
     try { execSync(`rm -rf "${m4Tmp}"`, { stdio: "ignore" }); } catch {}
   }
-  try { execSync("git worktree prune", { stdio: "ignore" }); } catch {}
+  // No bare `git worktree prune`: with no `cwd` it would prune whatever repo the
+  // suite was invoked from — a real checkout holding unrelated sibling worktree
+  // records, any of which is deregistered if its directory is not stat-able at
+  // that instant (#1141). The `worktree remove` above already dropped its own
+  // record, and the fixture repo itself is deleted by the line above.
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

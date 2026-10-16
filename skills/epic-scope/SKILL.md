@@ -128,6 +128,52 @@ Return: NO ISSUES FOUND | ISSUES: <list>
 
 Fix-loop until "NO ISSUES FOUND" or convergence; safety cap: 10 cycles.
 
+### Duplication & Architecture Reviewer (#688) — controller dispatch
+
+After the scope reviewer above is clean, the **controller** (not the reviewer) dispatches a **second, separate** `task` sub-agent. This is a second dispatch, not a dimension of the first — the scope reviewer has no `task` tool and must not be told to nest one.
+
+⚠️ **Run this check under a distinct heading in the gate report.** Both reviewers return `NO ISSUES FOUND`; a bare token from the duplication reviewer out of context reads as the scope gate passing.
+
+```
+Read skills/reviewers/duplication-architecture/SKILL.md IN FULL — the file is the
+specification, not this prompt. Then run both halves against the epic scope:
+
+DUPLICATION (D1–D9): does this epic duplicate a capability, a write path into
+state we already write, a vocabulary defined elsewhere, or a pattern already in
+the repo? Note explicitly that improvement-opportunities IO3 asks the same class
+of question at epic-Coherence-Review time — state what this check adds beyond it.
+ARCHITECTURE (A1–A6): is the WHOLE still coherent once this lands?
+
+REQUIRED OUTPUT — use the skill's own output block verbatim, including its
+Evidence / Writers / Shared contract / Verdict lines. Do not invent a shorter
+schema; the gate parser reads the skill's field names.
+A finding that is incomplete by the skill's own definition is an open issue.
+
+VERDICT (three-valued, on every duplication finding — not just D2/D5):
+  unify | keep separate | unify-contract-keep-drivers
+
+ADVISORY, never blocking — but see the disposition rule below.
+Tortoise is ONE source among several, never the only one. If a source was
+checked and found stale/unreachable, the finding is DEGRADED and must report
+which source was unavailable. A DEGRADED result is not a clean pass.
+
+Return the skill's summary block, then:
+  NO ISSUES FOUND — CLEAN
+  or  NO ISSUES FOUND — DEGRADED (<source> unavailable)
+  or  ISSUES: <list using the skill's output block>
+```
+
+**Disposition (this is what keeps it advisory without creating a spin loop):**
+
+| Result | Action |
+|---|---|
+| `CLEAN` | Record the verdict in the scope doc. Proceed. |
+| `DEGRADED` | Record + name the unavailable source. **Do not** treat as clean, **do not** block. Proceed with the caveat carried into the scope doc. |
+| `ISSUES` with a verdict | Record each verdict in the scope doc. `unify` → fold into the boundary decision. `keep separate` / `unify-contract-keep-drivers` → record the reason; an unjustified `keep separate` is a scope item, not a pass. |
+| `ISSUES` with **no** verdict | Not a valid result. Re-dispatch once; if it repeats, record `⚠️ reviewer returned unverdict findings` and proceed. |
+
+**This reviewer never fails the gate and never enters the 10-cycle fix-loop above.** P0 here is advisory severity, not blocking severity — record it and proceed. Concretely: do not re-dispatch the *scope* reviewer because the duplication reviewer found something, and do not hold the gate open on it.
+
 ## What Fails If You Skip
 
 | Skip | Consequence |

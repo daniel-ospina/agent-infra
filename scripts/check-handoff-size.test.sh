@@ -24,7 +24,7 @@ assert_rc() { # <want> <got> <label>
     if [ "$2" -eq "$1" ]; then ok "$3"; else bad "$3 (want rc=$1, got rc=$2)"; fi
 }
 assert_contains() { # <haystack> <needle> <label>
-    if printf '%s' "$1" | grep -qF -- "$2"; then ok "$3"; else bad "$3 (missing: $2)"; fi
+    if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi
 }
 
 T="$(mktemp -d /tmp/check-handoff-size.XXXXXX)"; trap 'rm -rf "$T"' EXIT

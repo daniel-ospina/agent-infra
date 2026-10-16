@@ -61,6 +61,6 @@ Store as `TIER` for all decisions below.
 
 4. **If `WORKTREE_ACTIVE` and the current branch matches or is compatible**, proceed normally.
 
-5. **If NOT in a worktree**, proceed normally — `writing-plans` will create one for Complex tier in Step 4.
+5. **If NOT in a worktree**, you are in a HUB: reading is fine, but the plan-doc WRITE is blocked (#626 — all main-checkout writes block). Create the worktree first: agent-infra → `bash scripts/checkout-hygiene/hub-worktree.sh <branch>`; other repos → `using-git-worktrees` skill. Then re-run this check from inside it.
 
 **Rationale:** Without this check, concurrent sub-agents running `git checkout -b` inside a shared epic worktree silently repoint the worktree's branch, causing sibling agents to lose their working state (observed: Agent A for #2969 had to recover via patch when Agent E repointed the worktree). The check is cheap (one `git rev-parse`) and prevents hours of recovery work.

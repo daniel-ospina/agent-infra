@@ -29,6 +29,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMain } from './is-main.mjs';
 
 // ── PI resolution (patch-pi-retry.sh precedent — node-v* glob layout) ──────
 export function resolvePiBundle() {
@@ -360,8 +361,10 @@ async function main() {
   process.exit(0);
 }
 
-const isMain =
-  process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+// #708 — symlink-insensitive entry guard: `path.resolve(argv1) ===
+// fileURLToPath(import.meta.url)` was false whenever any component of the
+// invocation path was a symlink (macOS `/var` → `/private/var`), and `main()`
+// then never ran — the CLI exited 0 having printed nothing.
+if (isMain(import.meta.url, process.argv[1])) {
   await main();
 }

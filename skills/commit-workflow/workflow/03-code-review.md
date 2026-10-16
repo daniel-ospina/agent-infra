@@ -5,7 +5,7 @@
 
 ### Step 3.6 — Complexity Ratings Extraction (P0-3)
 
-Before dispatching code-review agents, extract domain complexity ratings from the linked issue (optional — they scale review DEPTH). PR diff surface (detected per code-review Step 3.6) determines which domain agents (#5 UX, #6 Arch, #7 Data, #12 Config) dispatch.
+Before dispatching code-review reviewers, extract domain complexity ratings from the linked issue (optional — they scale review DEPTH). PR diff surface (detected per code-review Step 3.6) selects which sections of the merged reviewers **C** (Architecture & Data) and **D** (Surface & Config) apply — it never adds a reviewer.
 
 ```bash
 ISSUE_NUMBER=$(gh pr view <PR_NUMBER> --json closingIssuesReferences --jq '.closingIssuesReferences[0].number')
@@ -24,7 +24,7 @@ fi
 : ${ONTOLOGY_RATING:=""}
 ```
 
-Pass these ratings to code-review Step 4 dispatch logic. When all empty, the 6 always-on agents (Guidance, Bug-Shallow, Bug-Deep, History, PR Comments, Security) still run.
+Pass these ratings to code-review Step 4 dispatch logic. When all empty, the panel is still filled by the risk class: **A** (Guidance & History) and **B** (Correctness & Security — bug scan two-pass + security) run at every class **above Low**, while at **Low** the panel is **B alone**; the surface-matched sections apply at default depth and never add a reviewer.
 
 ## Step 2 — Code-Review Gate
 
@@ -40,10 +40,14 @@ record-review.sh WARNS and proceeds — tier attestation UNVERIFIED at mint.
 ≥1-dispatch floor above), NOT a multi-agent review — by the standard micro
 flow the record is `clean-micro`, and `clean` is never refused at any tier (a
 micro session that ran the code-review skill and records `clean` is a
-stronger claim, not a false one). Proceed directly to
+stronger claim, not a false one). **Content-only diffs (`docs/**` with a
+content extension, or a named root prose file, at ANY tier) record `clean-low`** (04-merge-deploy.md condition 6,
+code-review Step 10b) — the Low code-impact class's representation in the gate. Its
+class excludes config and strings, and its guard is fail-closed, so an
+unreadable or truncated diff is never certified Low. Proceed directly to
 Step 3 (`04-merge-deploy.md`).
 
-**Standard tier:** Invoke `code-review` with the 6-agent review (guidance, bug scan, security):
+**Standard tier:** Invoke `code-review` (the merged reviewers per `code-review` Step 4 — the risk class caps the count, the PR diff surface selects sections):
 
 The Standard tier fix-loop follows the same structure as Complex. Specifically:
 
@@ -67,7 +71,7 @@ LOOP:
     → Continue LOOP
 ```
 
-**Complex tier (and default when TIER is unknown):** Run the full 6-agent review + domain/infra/config reviewers (Agents #5-#12, per `code-review` Step 3.6/0.8):
+**Complex tier (and default when TIER is unknown):** Run the full merged review (reviewers A–E per `code-review` Step 4 — the risk class caps the count, the PR diff surface selects sections, and reviewer E fires only when `INFRA_RISK` is set):
 
 ```
 iteration = 0

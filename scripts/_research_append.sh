@@ -268,7 +268,7 @@ run_self_test() {
   local out2 rc2
   if out2=$(cd "$testrepo" && bash "$SCRIPT_PATH" --append "orphan" 2>&1); then rc2=0; else rc2=$?; fi
   [[ $rc2 -eq 0 ]] || { echo "FAIL: no-resolve exit code: $rc2"; exit 1; }
-  echo "$out2" | grep -q "No research brief found" || { echo "FAIL: no-resolve no-op message: $out2"; exit 1; }
+  grep -q "No research brief found" <<<"$out2" || { echo "FAIL: no-resolve no-op message: $out2"; exit 1; }
   [[ ! -f "$testrepo/orphan.md" ]] || { echo "FAIL: orphan appended despite no-op"; exit 1; }
 
   # 7. create-into-missing-directory (P3 guard)
@@ -283,7 +283,7 @@ run_self_test() {
   local out4 rc4
   if out4=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** $outtree/evil/brief.md" --create --append "evil" 2>&1); then rc4=0; else rc4=$?; fi
   [[ $rc4 -eq 3 ]] || { echo "FAIL: out-of-tree RC (got $rc4): $out4"; exit 1; }
-  echo "$out4" | grep -q "outside the repo root" || { echo "FAIL: out-of-tree message: $out4"; exit 1; }
+  grep -q "outside the repo root" <<<"$out4" || { echo "FAIL: out-of-tree message: $out4"; exit 1; }
   [[ ! -d "$outtree" ]] || { echo "FAIL: out-of-tree directory was created"; exit 1; }
 
   # 9. RELATIVE brief path (nested) resolves (issue #1145 — the cwd-mutating
@@ -295,7 +295,7 @@ run_self_test() {
   local out5 rc5
   if out5=$(cd "$testrepo" && bash "$SCRIPT_PATH" --issue-body "**Research:** docs/research/rel.md" --append "relative finding" --source-tag canonical 2>&1); then rc5=0; else rc5=$?; fi
   [[ $rc5 -eq 0 ]] || { echo "FAIL: relative path exit code (got $rc5): $out5"; exit 1; }
-  echo "$out5" | grep -q "Appended to" || { echo "FAIL: relative append message: $out5"; exit 1; }
+  grep -q "Appended to" <<<"$out5" || { echo "FAIL: relative append message: $out5"; exit 1; }
   grep -q 'relative finding' "$rel" || { echo "FAIL: relative append content missing"; exit 1; }
 
   echo "self-test OK"

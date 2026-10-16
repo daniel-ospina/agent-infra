@@ -363,26 +363,26 @@ function process(data: any) {  // No type checking
 
 ```bash
 # DOM XSS
-grep -rn "innerHTML\|outerHTML\|document\.write" --include="*.js" --include="*.jsx" --include="*.ts" --include="*.tsx"
+git grep -n -e "innerHTML\|outerHTML\|document\.write" -- '*.js' '*.jsx' '*.ts' '*.tsx'
 
 # React dangerous patterns
-grep -rn "dangerouslySetInnerHTML" --include="*.jsx" --include="*.tsx"
+git grep -n -e "dangerouslySetInnerHTML" -- '*.jsx' '*.tsx'
 
 # Vue dangerous patterns
-grep -rn "v-html" --include="*.vue"
+git grep -n -e "v-html" -- '*.vue'
 
 # eval and Function
-grep -rn "eval(\|new Function(\|setTimeout.*string\|setInterval.*string" --include="*.js" --include="*.ts"
+git grep -n -e "eval(\|new Function(\|setTimeout.*string\|setInterval.*string" -- '*.js' '*.ts'
 
 # Command injection
-grep -rn "child_process\|exec(\|execSync(\|spawn(" --include="*.js" --include="*.ts"
+git grep -n -e "child_process\|exec(\|execSync(\|spawn(" -- '*.js' '*.ts'
 
 # Prototype pollution
-grep -rn "__proto__\|constructor\[" --include="*.js" --include="*.ts"
+git grep -n -e "__proto__\|constructor\[" -- '*.js' '*.ts'
 
 # SQL/NoSQL injection
-grep -rn "\\\`SELECT.*\\\${\|\$where\|\.find({.*:.*req\." --include="*.js" --include="*.ts"
+git grep -n -e "\\\`SELECT.*\\\${\|\$where\|\.find({.*:.*req\." -- '*.js' '*.ts'
 
 # Angular bypass
-grep -rn "bypassSecurityTrust" --include="*.ts"
+git grep -n -e "bypassSecurityTrust" -- '*.ts'
 ```

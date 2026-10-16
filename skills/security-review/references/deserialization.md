@@ -359,26 +359,26 @@ def safe_parse(data):
 
 ```bash
 # Python
-grep -rn "pickle\.load\|pickle\.loads\|cPickle" --include="*.py"
-grep -rn "yaml\.load\|yaml\.unsafe_load" --include="*.py"
-grep -rn "marshal\.load\|shelve\.open" --include="*.py"
+git grep -n -e "pickle\.load\|pickle\.loads\|cPickle" -- '*.py'
+git grep -n -e "yaml\.load\|yaml\.unsafe_load" -- '*.py'
+git grep -n -e "marshal\.load\|shelve\.open" -- '*.py'
 
 # Java
-grep -rn "ObjectInputStream\|XMLDecoder\|XStream" --include="*.java"
-grep -rn "readObject\|fromXML" --include="*.java"
+git grep -n -e "ObjectInputStream\|XMLDecoder\|XStream" -- '*.java'
+git grep -n -e "readObject\|fromXML" -- '*.java'
 
 # .NET
-grep -rn "BinaryFormatter\|NetDataContractSerializer\|ObjectStateFormatter" --include="*.cs"
-grep -rn "TypeNameHandling\." --include="*.cs" | grep -v "None"
+git grep -n -e "BinaryFormatter\|NetDataContractSerializer\|ObjectStateFormatter" -- '*.cs'
+git grep -n -e "TypeNameHandling\." -- '*.cs' | grep -v "None"
 
 # PHP
-grep -rn "unserialize\s*\(" --include="*.php"
+git grep -n -e "unserialize\s*\(" -- '*.php'
 
 # Ruby
-grep -rn "Marshal\.load\|YAML\.load" --include="*.rb"
+git grep -n -e "Marshal\.load\|YAML\.load" -- '*.rb'
 
 # Node.js
-grep -rn "unserialize\|node-serialize" --include="*.js"
+git grep -n -e "unserialize\|node-serialize" -- '*.js'
 ```
 
 ---

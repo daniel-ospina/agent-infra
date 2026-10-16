@@ -51,6 +51,16 @@ if [ -f scripts/check-cost-config.sh ]; then
   bash scripts/check-cost-config.sh --shipped-only || exit 1
 fi
 
+# #841/#861 — builtin-writer SIGPIPE false-negative guard. `printf`/`echo`
+# piped into a quiet `grep` under `pipefail` can report "not found" for a match
+# that IS present (the writer takes SIGPIPE once grep exits early on a multiline
+# payload), silently turning a guard into a pass — the idiom cost data in
+# stale-worktrees.sh/cleanup-worktree.sh. Offline + fast; the scan set is
+# scripts/, .husky/ and pi-bootstrap/.
+if [ -f scripts/check-no-sigpipe-grep.sh ]; then
+  bash scripts/check-no-sigpipe-grep.sh || exit 1
+fi
+
 # AGENTS.md materialization gate (#600): stage-guard BEFORE spawning the
 # checker — one cheap git call unless AGENTS.md is staged, then the full
 # check. Resolve checker via scripts/ symlink OR $AGENT_INFRA_PATH

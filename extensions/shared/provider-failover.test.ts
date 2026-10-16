@@ -19,6 +19,7 @@ import {
   ALIAS_FAMILIES,
   classifyExhaustionText,
   familyOf,
+  legIdentity,
   rootPrimaryOfFamily,
   nextLegAfter,
   resolveWithChain,
@@ -29,6 +30,7 @@ import {
   manualClear,
   readLatchState,
   isLatched,
+  isResolutionOnlyLeg,
   blockedProviders,
   latchTtlMs,
   renderExhaustionMarker,
@@ -93,7 +95,10 @@ function testAsync(name: string, fn: () => Promise<void>) {
   });
 }
 
-const FLASH_PRIMARY = { provider: "deepseek", model: "deepseek-v4-flash" };
+const FLASH_PRIMARY = { provider: "deepseek", model: "deepseek-flash" };
+// #715: the LEGACY spelling of the flash family root — still a family member
+// (the family KEY is unchanged) and the migration-window input spelling.
+const FLASH_PRIMARY_LEGACY = { provider: "deepseek", model: "deepseek-v4-flash" };
 const PRO_PRIMARY = { provider: "deepseek", model: "deepseek-v4-pro" };
 
 // ── Exhaustion signature ─────────────────────────────────────────────
@@ -470,8 +475,16 @@ section("alias-family chain — rename, blocked skip, halt");
 test("familyOf: default-flash rename + openrouter slug + pro identity + unknown + variant exclusion", () => {
   equal(familyOf("deepseek-v4-flash"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-flash-0731"), "deepseek-v4-flash");
+  // #715: the CANONICAL root id resolves onto the same family as the legacy
+  // spelling (the family KEY stays the legacy spelling).
+  equal(familyOf("deepseek-flash"), "deepseek-v4-flash");
+  equal(familyOf("deepseek-flash", "deepseek"), "deepseek-v4-flash");
+  equal(familyOf("deepseek-v4-flash", "deepseek"), "deepseek-v4-flash");
   equal(familyOf("deepseek-v4-pro"), "deepseek-v4-pro");
   equal(familyOf("deepseek/deepseek-v4-flash", "openrouter"), "deepseek-v4-flash");
+  // #727: the V4.1 hop-leg slug normalizes onto the SAME (flash) family, and
+  // the variant-exclusion pins below must survive that addition.
+  equal(familyOf("deepseek/deepseek-v4.1-flash", "openrouter"), "deepseek-v4-flash");
   equal(familyOf("deepseek/deepseek-v4-pro", "openrouter"), "deepseek-v4-pro");
   // review R4: variants must NOT map onto the base family (silent model
   // substitution under a latch) — they resolve to no family (must-stay)
@@ -479,8 +492,121 @@ test("familyOf: default-flash rename + openrouter slug + pro identity + unknown 
   equal(familyOf("deepseek-v4-pro-0813"), undefined);
   equal(familyOf("deepseek/deepseek-v4-flash-vision-exp", "openrouter"), undefined);
   equal(familyOf("deepseek/deepseek-v4-pro-0813", "openrouter"), undefined);
+  // #715: the canonical-dotted spelling has no upstream existence → family-less.
+  equal(familyOf("deepseek/deepseek-flash"), undefined);
+  equal(familyOf("deepseek-flash:batch"), undefined);
+  equal(familyOf("deepseek-v4.1-flash"), undefined);
   equal(familyOf("glm-5.2"), undefined);
   equal(familyOf(null), undefined);
+});
+
+test("#715 legIdentity: root spellings normalize to the canonical root model; hop legs pass through", () => {
+  // canonical, legacy alias, and family-KEY spellings all normalize to the
+  // canonical root model.
+  equal(legIdentity("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }), "deepseek-flash");
+  equal(legIdentity("deepseek-v4-flash", FLASH_PRIMARY_LEGACY), "deepseek-flash");
+  equal(legIdentity("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-v4-flash" }), "deepseek-flash");
+  // hop legs keep their exact identity — no cross-leg normalization.
+  equal(legIdentity("deepseek-v4-flash", { provider: "qwen-tp", model: "deepseek-v4-flash-0731" }), "deepseek-v4-flash-0731");
+  equal(legIdentity("deepseek-v4-flash", { provider: "openrouter", model: "deepseek/deepseek-v4-flash" }), "deepseek/deepseek-v4-flash");
+  // #727: the V4.1 chain leg is a hop leg too — exact identity, no
+  // normalization onto the legacy slug (they are DISTINCT table entries).
+  equal(legIdentity("deepseek-v4-flash", { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" }), "deepseek/deepseek-v4.1-flash");
+  // an off-table provider is not the root leg even if its model spelling matches.
+  equal(legIdentity("deepseek-v4-flash", { provider: "venice", model: "deepseek-v4-flash" }), "deepseek-v4-flash");
+  // unknown family → unchanged.
+  equal(legIdentity("nope", { provider: "deepseek", model: "deepseek-v4-flash" }), "deepseek-v4-flash");
+});
+
+test("#715 WRITE: a CANONICAL-spelling root drain advances onto the first available hop leg (not the root)", () => {
+  const { env } = makeEnv("v715-write-canon");
+  const state = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "openrouter", "qwen-tp blocked by default → openrouter hop");
+  equal(fam.activeLeg?.model, "deepseek/deepseek-v4.1-flash", "#727: the hop leg serves the primary's V4.1 generation");
+  equal(fam.hopCount, 1);
+});
+
+test("#715 WRITE (migration window): a LEGACY-spelling root drain advances identically (the -1 walk regression)", () => {
+  const { env } = makeEnv("v715-write-legacy");
+  const state = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: FLASH_PRIMARY_LEGACY, env });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(fam.activeLeg?.provider, "openrouter", "legacy root spelling must NOT re-return the draining root");
+  equal(fam.activeLeg?.model, "deepseek/deepseek-v4.1-flash");
+  equal(fam.hopCount, 1);
+  // the durable record never lies: activeLeg is a hop, never the drained root
+  ok(fam.activeLeg?.model !== "deepseek-v4-flash", "activeLeg must not be the legacy root spelling");
+});
+
+test("#715 WRITE: hopCount counts a LEGACY-spelled marker from the CANONICAL active leg (restore-path normalization)", () => {
+  const { env } = makeEnv("v715-fromcurrentactive");
+  // Seed a latched family record whose activeLeg is the CANONICAL root spelling
+  // (a post-upgrade record) with hopCount 1, then send an incoming
+  // LEGACY-spelled marker for that SAME leg. The write path must recognize it
+  // as "the marker came from the current active leg" — without the
+  // legIdentity() normalization in setExhausted's fromCurrentActive check the
+  // two spellings compare unequal and hopCount silently under-counts (1, the
+  // stale-marker path) instead of recording the real re-advance (2).
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: {
+            "deepseek-v4-flash": {
+              activeLeg: { provider: "deepseek", model: "deepseek-flash" },
+              hopCount: 1,
+              lastReason: "402",
+            },
+          },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = setExhausted({
+    primaryProvider: "deepseek",
+    reason: "402",
+    source: "marker",
+    family: "deepseek-v4-flash",
+    fromLeg: FLASH_PRIMARY_LEGACY,
+    env,
+  });
+  const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
+  equal(
+    fam.hopCount,
+    2,
+    "a legacy-spelled marker from the canonical active root leg is a REAL re-advance (hopCount 2) — hopCount 1 means the normalization was dropped and the marker was misread as stale",
+  );
+  equal(fam.activeLeg?.provider, "openrouter", "the chain still advances to the next available hop leg");
+});
+
+test("#715 READ: a latched canonical root resolves onto the hop leg (qwen-tp unblocked, openrouter blocked)", () => {
+  // qwen-tp unblocked → first hop is qwen-tp
+  const envOpen = { PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-715-read-qwen-")), PROVIDER_FAILOVER_BLOCKED: "" };
+  const stOpen = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env: envOpen });
+  const outOpen = resolveWithChain("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }, stOpen, { env: envOpen });
+  equal(outOpen.reason, "latched-active");
+  equal(outOpen.leg?.provider, "qwen-tp");
+  equal(outOpen.leg?.model, "deepseek-v4-flash-0731");
+  equal(outOpen.hop, "deepseek->qwen-tp");
+  // default (qwen-tp blocked) → openrouter
+  const { env } = makeEnv("v715-read-or");
+  const st = setExhausted({ primaryProvider: "deepseek", reason: "402", source: "marker", family: "deepseek-v4-flash", fromLeg: { provider: "deepseek", model: "deepseek-flash" }, env });
+  const out = resolveWithChain("deepseek-v4-flash", { provider: "deepseek", model: "deepseek-flash" }, st, { env });
+  equal(out.reason, "latched-active");
+  equal(out.leg?.provider, "openrouter");
+  equal(out.hop, "deepseek->openrouter");
 });
 
 test("#512 DRIFT: venice never enters ALIAS_FAMILIES — the chain table stays venice-free", () => {
@@ -521,7 +647,7 @@ test("default flash chain: qwen-tp is blocked → skip to the openrouter slug wi
   const fam = state.primaries.deepseek.families["deepseek-v4-flash"];
   ok(fam.activeLeg !== null, "marker latch computed an active leg");
   equal(fam.activeLeg!.provider, "openrouter", "qwen-tp skipped (401-blocked)");
-  equal(fam.activeLeg!.model, "deepseek/deepseek-v4-flash");
+  equal(fam.activeLeg!.model, "deepseek/deepseek-v4.1-flash");
   equal(fam.lastReason, "402");
   // resolution agrees
   const outcome = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(env), { env });
@@ -579,7 +705,13 @@ test("ALL-LEGS-HALT: openrouter also blocked → structured halt class (leg null
   // nextLegAfter agrees
   const step = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
   equal(step.halted, true);
-  equal(step.skipped.length, 2, "both qwen-tp + openrouter reported as skipped (excluded-with-alert)");
+  equal(step.skipped.length, 2, "qwen-tp + the V4.1 openrouter entry are unavailable (excluded-with-alert)");
+  equal(step.resolutionOnly.length, 1, "the legacy 0423 leg is reported as resolution-only, NOT as blocked");
+  equal(step.resolutionOnly[0]?.model, "deepseek/deepseek-v4-flash");
+  ok(
+    !step.skipped.some((l) => l.model === "deepseek/deepseek-v4-flash"),
+    "an intentionally retired leg must never be reported as blocked/exhausted",
+  );
 });
 
 test("no latch / stale / disabled / no-hop → requested leg (must-stay semantics)", () => {
@@ -703,7 +835,7 @@ test("advance/serve never hops INTO a provider with a fresh own exhaustion recor
 
 test("second-leg exhaustion advances to halt (chain bounded)", () => {
   const env = { PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-adv-")), PROVIDER_FAILOVER_BLOCKED: "qwen-tp" };
-  // first exhaustion: deepseek -> openrouter
+  // first exhaustion: deepseek -> the V4.1 openrouter chain leg (#727)
   setExhausted({
     primaryProvider: "deepseek",
     reason: "402",
@@ -715,7 +847,11 @@ test("second-leg exhaustion advances to halt (chain bounded)", () => {
   let state = readLatchState(env);
   const leg1 = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
   equal(leg1.leg?.provider, "openrouter");
-  // the openrouter leg exhausts too → advance past it → halt (nothing left)
+  equal(leg1.leg?.model, "deepseek/deepseek-v4.1-flash", "#727: the chain target is the V4.1 slug");
+  // the V4.1 openrouter leg exhausts too → the chain HALTS. The legacy-generation
+  // entry ("DeepSeek V4 Flash 0423") is RESOLUTION-ONLY, so a fresh
+  // continuation is never served the older build — this is exactly where the
+  // chain halted before the V4.1 leg existed.
   setExhausted({
     primaryProvider: "deepseek",
     reason: "402",
@@ -728,6 +864,177 @@ test("second-leg exhaustion advances to halt (chain bounded)", () => {
   const outcome = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
   equal(outcome.halted, true, "chain exhausted → halt");
   equal(outcome.reason, "halt");
+});
+
+test("RESOLUTION-ONLY legacy leg (#727): matches its own position, never an advance target", () => {
+  const { env } = makeEnv("v727-resonly");
+  const state = readLatchState(env); // no latch: pure walk inputs
+  const envAll = { ...env, PROVIDER_FAILOVER_BLOCKED: "" };
+  // (a) a fresh advance from the canonical root lands on the V4.1 leg …
+  const fromRoot = nextLegAfter("deepseek-v4-flash", FLASH_PRIMARY, state, { env: envAll });
+  equal(fromRoot.leg?.provider, "qwen-tp", "qwen-tp first when unblocked");
+  // …and from the intermediate leg too, never on the legacy slug
+  const fromQwen = nextLegAfter(
+    "deepseek-v4-flash",
+    { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
+    state,
+    { env: envAll },
+  );
+  equal(fromQwen.leg?.model, "deepseek/deepseek-v4.1-flash", "the chain's openrouter target is the V4.1 slug");
+  // (b) a walk that starts FROM the legacy leg still MATCHES its own table
+  // position — no startIdx -1 re-return of the draining root — and halts.
+  const fromLegacy = nextLegAfter(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    state,
+    { env: envAll },
+  );
+  equal(fromLegacy.halted, true, "from the legacy leg → halt, never legs[0]");
+  equal(fromLegacy.leg, null);
+});
+
+test("RESOLUTION-ONLY legacy leg (#727) is never SERVED: a stale pre-#727 latch re-resolves to the V4.1 leg", () => {
+  // A PRE-#727 latch record, byte-for-byte what the old code wrote when the root
+  // drained with qwen-tp out: activeLeg = the legacy-generation openrouter leg
+  // (readLatchState has no migration and the TTL is 24h, so for a day after the
+  // upgrade this is what resolution sees). Serving it would re-introduce the
+  // very silent generation downgrade #727 removes.
+  const { env } = makeEnv("v727-serve"); // env blocks qwen-tp by default
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: {
+            "deepseek-v4-flash": {
+              activeLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+              hopCount: 1,
+              lastReason: "402",
+            },
+          },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = readLatchState(env);
+  // (a) root ask: the frozen legacy activeLeg is replaced by the CURRENT hop
+  // target — the same answer the family gives with no activeLeg recorded.
+  const rootAsk = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, state, { env });
+  equal(rootAsk.halted, false);
+  equal(
+    rootAsk.leg?.model,
+    "deepseek/deepseek-v4.1-flash",
+    "a stale legacy activeLeg must resolve to the current hop target, not itself",
+  );
+  ok(rootAsk.leg?.model !== "deepseek/deepseek-v4-flash", "never served the 0423 build (the #727 defect)");
+  equal(rootAsk.reason, "latched-advance", "served via the walk, not the latched-active fast path");
+  // (b) hop ask from a deeper family leg: same — never the frozen legacy leg
+  const hopAsk = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "qwen-tp", model: "deepseek-v4-flash-0731" },
+    state,
+    { env },
+  );
+  equal(hopAsk.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (c) a request for the CURRENT hop leg (the frozen record is stale, the ask
+  // is right): the walk from that leg halts ("nothing after it"), so resolution
+  // re-asks from the root — the answer is the hop leg itself, never a halt with
+  // an available target sitting at it and never the retired slug.
+  const askHop = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+    state,
+    { env },
+  );
+  equal(askHop.halted, false, "a request for the current hop leg must not halt");
+  equal(askHop.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (d) a request for the RETIRED slug under the stale latch is moved onto the
+  // current hop target (it is a failover event, not a must-stay: the family's
+  // chosen leg is being re-derived).
+  const askRetired = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    state,
+    { env },
+  );
+  equal(askRetired.halted, false);
+  equal(askRetired.leg?.model, "deepseek/deepseek-v4.1-flash");
+  // (e) ...but with NO latch it is honest must-stay: ask for an exact leg and
+  // you get it (no failover is in progress, so nothing is rewritten).
+  const emptyEnv = { ...env, PI_CODING_AGENT_DIR: fs.mkdtempSync(path.join(os.tmpdir(), "pf-727-muststay-")) };
+  const mustStay = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    readLatchState(emptyEnv),
+    { env: emptyEnv },
+  );
+  equal(mustStay.reason, "clear");
+  equal(mustStay.leg?.model, "deepseek/deepseek-v4-flash", "must-stay: the requested leg verbatim when no latch is fresh");
+  // (f) when the current hop leg's provider is itself out, resolution HALTS —
+  // it does not fall back to the legacy generation to keep a leg alive.
+  markLegBlocked("openrouter", "401", { env });
+  const tail = resolveWithChain("deepseek-v4-flash", FLASH_PRIMARY, readLatchState(env), { env });
+  equal(tail.halted, true, "no usable hop left → structured halt, never the 0423 build");
+  equal(tail.leg, null);
+  equal(tail.reason, "halt");
+});
+
+test("null activeLeg + a halting walk is a HALT, never a throw (the retry must not deref null)", () => {
+  // A fresh family record may legitimately carry `activeLeg: null` ("the primary
+  // is serving") — the shape the module's own fromLeg-less write branch produces.
+  // A request for the terminal usable leg then halts the walk (only the
+  // resolution-only leg follows it), and the #727 root-retry must not dereference
+  // the null sentinel: a designed HALT, not a TypeError on the dispatch path.
+  const { env } = makeEnv("v727-nullactive");
+  const now = Date.now();
+  fs.writeFileSync(
+    latchStateFile(env),
+    JSON.stringify({
+      version: 1,
+      epoch: 1,
+      updatedAt: new Date(now).toISOString(),
+      primaries: {
+        deepseek: {
+          status: "exhausted",
+          reason: "402",
+          source: "marker",
+          latchedAt: new Date(now).toISOString(),
+          expiresAt: new Date(now + 60 * 60 * 1000).toISOString(),
+          families: { "deepseek-v4-flash": { activeLeg: null, hopCount: 0, lastReason: "402" } },
+          notice: null,
+        },
+      },
+      blockedLegs: {},
+    }),
+  );
+  const state = readLatchState(env);
+  equal(state.primaries.deepseek.families["deepseek-v4-flash"].activeLeg, null, "seed: activeLeg null");
+  // ask for the terminal usable leg under a blocked openrouter provider so the
+  // walk genuinely halts (retired leg only after it)
+  markLegBlocked("openrouter", "401", { env });
+  const tail = resolveWithChain(
+    "deepseek-v4-flash",
+    { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
+    readLatchState(env),
+    { env },
+  );
+  equal(tail.halted, true, "no throw, no served leg");
+  equal(tail.leg, null);
+  equal(tail.reason, "halt");
+  // and the predicate itself is null-tolerant (defence in depth)
+  equal(isResolutionOnlyLeg(null), false);
+  equal(isResolutionOnlyLeg(undefined), false);
 });
 
 test("hopCount contract: first active-leg set = 1; re-advance from active leg = 2", () => {
@@ -864,7 +1171,7 @@ test("WRITE: venice-402 with NO root latch → venice own record advances onto d
   ok(!state.primaries["deepseek"], "healthy root never latched on venice evidence");
   const fam = state.primaries.venice.families["deepseek-v4-flash"];
   equal(fam.activeLeg?.provider, "deepseek", "venice→deepseek official (legs[0]) with a healthy root");
-  equal(fam.activeLeg?.model, "deepseek-v4-flash");
+  equal(fam.activeLeg?.model, "deepseek-flash", "#715: legs[0] is the canonical id");
 });
 
 test("WRITE parity: hop-leg (openrouter) drain under fresh root still records under the root (byte-parity)", () => {
@@ -883,7 +1190,7 @@ test("WRITE parity: hop-leg (openrouter) drain under fresh root still records un
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   ok(isLatched("deepseek", state, { env }), "record continues under the root (in-flight continuation)");
@@ -935,7 +1242,7 @@ test("READ: next venice ask after a venice own-latch → hops onto the own recor
   const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
   equal(out.reason, "latched-active");
   equal(out.leg?.provider, "deepseek", "venice latched → resolution hops to deepseek official");
-  equal(out.leg?.model, "deepseek-v4-flash");
+  equal(out.leg?.model, "deepseek-flash", "#715: back onto the canonical root leg");
   equal(out.hop, "venice->deepseek");
 });
 
@@ -966,7 +1273,7 @@ test("chain continuation: deepseek official also 402s after a venice drain → o
   const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, state, { env });
   equal(out.reason, "latched-advance");
   equal(out.leg?.provider, "openrouter", "venice→deepseek→openrouter fallback chain");
-  equal(out.leg?.model, "deepseek/deepseek-v4-flash");
+  equal(out.leg?.model, "deepseek/deepseek-v4.1-flash", "#727: the emerging leg is the V4.1 slug");
   ok(isLatched("venice", state, { env }), "venice record persists");
 });
 
@@ -1005,7 +1312,7 @@ test("second-model P2 (SM1): off-table activeLeg RETREATS to the recovered famil
   const out = resolveWithChain("deepseek-v4-flash", VENICE_FLASH, st2, { env });
   equal(out.reason, "latched-active");
   equal(out.leg?.provider, "deepseek", "retreat to the recovered family default");
-  equal(out.leg?.model, "deepseek-v4-flash");
+  equal(out.leg?.model, "deepseek-flash", "#715: the recovered default is the canonical root leg");
   // while the default stays unavailable, the frozen deeper leg is still honored
   // (no retreat past a still-latched default — same openrouter leg the chain
   // advance would produce, labeled latched-active because the frozen leg is
@@ -1064,7 +1371,7 @@ test("root-primary mapping: hop-leg drain with NO root latch records under the D
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   const state = readLatchState(env);
@@ -1092,7 +1399,7 @@ test("root-primary mapping: hop-leg drain UNDER a fresh root latch records under
     reason: "402",
     source: "marker",
     family: "deepseek-v4-flash",
-    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4-flash" },
+    fromLeg: { provider: "openrouter", model: "deepseek/deepseek-v4.1-flash" },
     env,
   });
   const state = readLatchState(env);

@@ -21,12 +21,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/templates/.github/workflows"
 DST="$ROOT/.github/workflows"
 
-if [ ! -f "$SRC/python-ci.yml" ] || [ ! -f "$SRC/node-ci.yml" ] || [ ! -f "$SRC/docs-ci.yml" ]; then
-  echo "❌ templates/.github/workflows/{python,node,docs}-ci.yml missing — run from the agent-infra repo root" >&2
+if [ ! -f "$SRC/python-ci.yml" ] || [ ! -f "$SRC/node-ci.yml" ] || [ ! -f "$SRC/docs-ci.yml" ] || [ ! -f "$SRC/admin-merge-detector.yml" ]; then
+  echo "❌ templates/.github/workflows/{python,node,docs}-ci.yml + admin-merge-detector.yml missing — run from the agent-infra repo root" >&2
   exit 1
 fi
 
-for f in python-ci.yml node-ci.yml docs-ci.yml; do
+for f in python-ci.yml node-ci.yml docs-ci.yml admin-merge-detector.yml; do
   if [ -L "$DST/$f" ]; then
     echo "❌ $DST/$f is a symlink — remove it first (symlinked workflows are invalid on GitHub Actions, #555)" >&2
     exit 1

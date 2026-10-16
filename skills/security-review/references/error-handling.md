@@ -391,25 +391,25 @@ def query_db():
 
 ```bash
 # Bare except clauses
-grep -rn "except:" --include="*.py" | grep -v "except Exception"
+git grep -n -e "except:" -- '*.py' | grep -v "except Exception"
 
 # Empty exception handlers
-grep -rn "except.*:\s*$" -A1 --include="*.py" | grep "pass"
+git grep -n -A1 -e "except.*:\s*$" -- '*.py' | grep "pass"
 
 # Stack traces in responses
-grep -rn "traceback\|format_exc\|exc_info" --include="*.py" | grep -v "logger\|logging"
+git grep -n -e "traceback\|format_exc\|exc_info" -- '*.py' | grep -v "logger\|logging"
 
 # Fail-open patterns
-grep -rn "except.*:\s*$" -A2 --include="*.py" | grep "return True\|return None"
+git grep -n -A2 -e "except.*:\s*$" -- '*.py' | grep "return True\|return None"
 
 # Detailed error messages
-grep -rn "str(e)\|str(err)\|e\.args\|e\.message" --include="*.py" | grep "return\|jsonify\|response"
+git grep -n -e "str(e)\|str(err)\|e\.args\|e\.message" -- '*.py' | grep "return\|jsonify\|response"
 
 # Differential error messages
-grep -rn "not found\|does not exist\|invalid password\|wrong password" --include="*.py"
+git grep -n -e "not found\|does not exist\|invalid password\|wrong password" -- '*.py'
 
 # Unhandled async
-grep -rn "await.*[^;]$" --include="*.js" --include="*.ts" | grep -v "try\|catch"
+git grep -n -e "await.*[^;]$" -- '*.js' '*.ts' | grep -v "try\|catch"
 ```
 
 ---
