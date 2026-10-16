@@ -144,6 +144,14 @@ ln -s "$FIX/foreign/extensions/links-into-hub" "$FARM649/indirect-tool" # parent
 # even when `a` is a symlink, so both directions regress if the slash is not stripped.
 ln -s "$HUB/extensions/redirect/" "$FARM649/redirect-slash"
 ln -s "$FIX/foreign/extensions/links-into-hub/" "$FARM649/indirect-slash"
+# …and on an INTERMEDIATE hop: the farm link's own target is clean, but a symlink IN
+# the chain carries the slash. Normalizing only on entry freezes the walk one hop deep.
+ln -s "$FIX/foreign/extensions/other" "$HUB/extensions/innocent"           # escapes the hub
+ln -s "$HUB/extensions/innocent/" "$HUB/extensions/hop-esc"                # intermediate hop with slash
+ln -s "$HUB/extensions/builtin-tools" "$FIX/foreign/extensions/links-into-hub2"
+ln -s "$FIX/foreign/extensions/links-into-hub2/" "$HUB/extensions/hop-in"  # intermediate hop with slash
+ln -s "$HUB/extensions/hop-esc" "$FARM649/inter-esc"
+ln -s "$HUB/extensions/hop-in" "$FARM649/inter-in"
 # The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
 # intended (anchor-safe) deployment, not the #649 defect.
 out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
@@ -161,6 +169,8 @@ assert_contains "$out" "$FARM649/indirect-tool -> $FIX/foreign/extensions/links-
 assert_contains "$out" "$FARM649/indirect-slash -> $FIX/foreign/extensions/links-into-hub/" "a TRAILING-SLASH target that resolves INTO the hub is still named"
 assert_not_contains "$out" "redirect-tool" "a link whose FINAL component escapes the hub is not named (pre-fix: mis-attributed)"
 assert_not_contains "$out" "redirect-slash" "a TRAILING-SLASH target that escapes the hub is still not named"
+assert_contains "$out" "$FARM649/inter-in -> $HUB/extensions/hop-in" "an INTERMEDIATE hop with a trailing slash that resolves INTO the hub is named"
+assert_not_contains "$out" "inter-esc" "an INTERMEDIATE hop with a trailing slash that escapes the hub is not named"
 assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
 git -C "$HUB" checkout -q main
 rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias"

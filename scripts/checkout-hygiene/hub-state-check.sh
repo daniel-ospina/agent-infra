@@ -315,13 +315,17 @@ extensions_farm_root() { printf '%s\n' "${PI_EXTENSIONS_DIR:-${HOME:-}/.pi/agent
 # the caller's `set -e` command substitution cannot be tripped).
 physical_path() { # $1=path
   local p="$1" hop=0 base dir final
-  # A TRAILING SLASH must come off FIRST: `test -L a/` is FALSE even when `a` is a
-  # symlink (POSIX resolves the slash as a directory reference), so the walk below
-  # would skip the final component, `dirname`/`basename` would then split `a/`
-  # lexically, and the caller would treat the symlink as an ordinary child — the
-  # exact mis-attribution / silent-miss the walk exists to prevent. Keep a bare "/".
-  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
-  while [ -L "$p" ] && [ "$hop" -lt 40 ]; do
+  while :; do
+    # `test -L a/` is FALSE even when `a` is a symlink (POSIX resolves the trailing
+    # slash as a directory reference), so strip ANY trailing slash before asking —
+    # on entry AND after EVERY hop, since `readlink` may return a target that itself
+    # ends in `/`. Without the per-hop strip the walk freezes on that hop,
+    # `dirname`/`basename` split the path lexically, and the final component's
+    # symlink is never followed — the same mis-attribution / silent-miss the walk
+    # exists to prevent, one hop deeper. Keep a bare "/".
+    while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+    [ -L "$p" ] || break
+    [ "$hop" -lt 40 ] || break
     base="$(readlink "$p" 2>/dev/null)" || break
     case "$base" in
       /*) p="$base" ;;
