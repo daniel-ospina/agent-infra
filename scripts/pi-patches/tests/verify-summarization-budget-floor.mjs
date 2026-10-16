@@ -374,6 +374,90 @@ for (const e of D_ENTRIES) {
 	);
 }
 
+// ── Payload-verbatim guard: a neutralised tree whose payload SURVIVES in an inert container ───
+// The applied-check now proves the payload WITH ITS POSITIONAL CONTEXT (#1341), but a tree can keep
+// the payload VERBATIM elsewhere while the patched region is GONE: replace the patched expression
+// with a textually different variant (so the pristine anchor is ABSENT), and append the payload
+// verbatim inside an inert container at end of file. That tree PARSES — `node --check` cannot see
+// it — which is exactly why the positional proof, and not the parse net in apply.mjs, is what must
+// refuse it. The container kind is asserted per entry: a payload that no container can hold would
+// make the fixture silently degenerate into "the payload is simply gone", which the marker-only
+// loop already covers.
+const inertContainer = (payload) => {
+	if (!payload.includes("`") && !payload.includes("${")) {
+		return { kind: "template-literal", text: `\nvar __piPatchInert = String.raw\`\n${payload}\n\`;\n` };
+	}
+	if (!payload.includes("*/")) return { kind: "block-comment", text: `\n/*\n${payload}\n*/\n` };
+	if (!payload.includes("\n")) return { kind: "line-comment", text: `\n// ${payload}\n` };
+	return null;
+};
+for (const e of D_ENTRIES) {
+	const verbatimRoot = buildTree(`payload-verbatim-${e.id}`);
+	revertToPristine(verbatimRoot, D_ENTRIES);
+	applyEntries(verbatimRoot, D_ENTRIES);
+	const file = join(verbatimRoot, e.file);
+	let text = readFileSync(file, "utf8");
+	const before = text.split(e.replace).length - 1;
+	if (before !== 1) {
+		throw new Error(`payload-verbatim fixture for ${e.id}: expected its patched payload exactly once in ${e.file}, found ${before}`);
+	}
+	// Neutralise the region. The variant must differ from BOTH the payload (it is gone) and the
+	// pristine anchor (otherwise the tree is merely pristine and the fixture proves nothing).
+	const neutralised = e.replace.replace("(", "( ");
+	if (neutralised === e.replace || neutralised === e.find || neutralised.includes(e.replace)) {
+		throw new Error(`payload-verbatim fixture for ${e.id}: cannot produce a neutralised variant distinct from both the payload and the pristine anchor`);
+	}
+	text = text.replace(e.replace, neutralised);
+	if (text.split(e.find).length - 1 !== 0) {
+		throw new Error(`payload-verbatim fixture for ${e.id}: the pristine anchor survived the neutralisation`);
+	}
+	const container = inertContainer(e.replace);
+	if (!container) {
+		throw new Error(`payload-verbatim fixture for ${e.id}: no inert container can hold the payload verbatim — extend inertContainer rather than silently skipping the case`);
+	}
+	text += container.text;
+	writeFileSync(file, text);
+	const verbatim = readFileSync(file, "utf8");
+	check(
+		`PAYLOAD-VERBATIM FIXTURE (${e.id}): the payload is present verbatim in an inert ${container.kind}, its patched region is gone, and its pristine anchor is ABSENT`,
+		verbatim.includes(e.replace) && !verbatim.includes(e.find),
+		`container=${container.kind} payload=${verbatim.includes(e.replace)} pristineAnchor=${verbatim.includes(e.find)}`,
+	);
+	const parsed = spawnSync(process.execPath, ["--check", file], { encoding: "utf8" });
+	check(
+		`PAYLOAD-VERBATIM FIXTURE (${e.id}): the neutralised tree PARSES, so the guard under test is the positional proof rather than a syntax error`,
+		parsed.status === 0,
+		`node --check exit=${parsed.status}${parsed.stderr ? `: ${parsed.stderr.trim()}` : ""}`,
+	);
+	const verbatimRun = spawnSync("bash", [APPLY_SH, "--check"], {
+		encoding: "utf8",
+		env: { ...process.env, PI_ROOT: verbatimRoot, NODE_ENV: "test" },
+	});
+	const verbatimOut = `${verbatimRun.stdout ?? ""}${verbatimRun.stderr ?? ""}`;
+	console.log(`\n  RAW apply.sh --check OUTPUT (PI_ROOT=<payload-verbatim temp tree: ${e.id}, ${container.kind}>), exit ${verbatimRun.status}:\n`);
+	console.log(verbatimOut.split("\n").map((l) => `  | ${l}`).join("\n"));
+	check(
+		`PAYLOAD-VERBATIM GUARD (${e.id}): --check on a payload-verbatim tree exits NON-ZERO (expect the neither-pristine-nor-patched refusal, exit 2)`,
+		verbatimRun.status !== 0,
+		`exit=${verbatimRun.status}`,
+	);
+	check(
+		`PAYLOAD-VERBATIM GUARD (${e.id}): --check reports the POSITIONAL refusal (the region is absent), not an acceptance of the payload`,
+		verbatimOut.includes("neither pristine nor patched"),
+		"",
+	);
+	check(
+		`PAYLOAD-VERBATIM GUARD (${e.id}): --check never claims the fix is in place on a payload-verbatim tree`,
+		!verbatimOut.includes("the fix is in place"),
+		"",
+	);
+	check(
+		`PAYLOAD-VERBATIM GUARD (${e.id}): --check never reports that entry as applied on a payload-verbatim tree`,
+		!verbatimOut.includes(`= ${e.id} — already applied`),
+		"",
+	);
+}
+
 // ── The needles themselves are the guard — this is what makes the assertions non-vacuous ─────
 // A direct unit table over the classifier, so the predicate ITSELF is falsifiable: every known
 // FRAGMENT of the provenance marker must classify as NOT code-shaped, and every real code needle

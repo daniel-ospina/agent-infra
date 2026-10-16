@@ -2500,7 +2500,10 @@ out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
 SBT="$(mk_sb)"; run_inst "$SBT" MAX_LANES=4x >/dev/null
-ls "$SBT/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+# Capture, then classify in the SHELL — never `ls … | grep -q`, whose false negative under
+# `pipefail` would report GREEN on a regression (this assertion pins the ABSENCE of a temp plist)
+# — the #864 class, and the guard does not scan this file's directory tree for it.
+case "$(ls "$SBT/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a rejected render leaves no temp plist behind (the render is not atomic by accident)" $rc
 # ⛔ The cases above fail BEFORE the render or AFTER it completes, so neither drives the window
 # BETWEEN `RENDER=` and the `mv`. The render runs under `set -euo pipefail`, so a template read that
@@ -2530,7 +2533,7 @@ ck "the unreadable-template fixture is in place (a swallowed cp must be loud, no
 # negative this repo bans (`scripts/check-no-sigpipe-grep.sh`, #841).
 grep -q 'Permission denied' <<<"$out" && rc=0 || { rc=1; echo "      the run did not fail AT THE RENDER: '$out'"; }
 ck "the unreadable-template case failed at the render, not at an earlier guard that also names it" $rc
-ls "$SBR/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+case "$(ls "$SBR/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a render that ABORTS mid-flight leaves no orphan temp plist (the path rm -f alone misses)" $rc
 chmod 644 "$HDR/launchd.plist.template"
 # ⛔ ATOMICITY ITSELF is untested by the three cases above: they all fail BEFORE the render, so a
@@ -2823,6 +2826,10 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     PG="git -C $PW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
     printf 'loop v1\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
+    # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
+    # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
+    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
     prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
@@ -2836,6 +2843,31 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     ck "the stamp classifies the source as current at the ref" $rc
     grep -qE '"payloadSha256": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "the stamp records a payload hash over \$O/*.sh" $rc
+    # #1837 review (P2): `install.sh` NEVER copies — the operator syncs `$O` — so the source commit
+    # and the deployed bytes can genuinely disagree. Without a field saying so, the record reads as
+    # "this commit describes these bytes" while the box runs other ones. Declared as a field, not
+    # inferred from `relation` (which is git ancestry of the SOURCE, not a statement about `$O`).
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp says whether the deployed copy matches the source (in-sync: true)" $rc
+    # `$O` that differs from the source: install.sh NEVER copies (`$O` is synced by the operator), so
+    # an install run from a newer checkout can stamp a commit over bytes from an older one. Tampered
+    # file is `check-port-drift.sh` — deliberately one NOT in install.sh's `DRIFTED` list, so this
+    # assertion is RED if the field is derived from that subset instead of from the whole surface.
+    printf 'tampered\n' > "$PO/check-port-drift.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "a \$O that differs from the source in a NON-DRIFTED script records deployedMatchesSource: false" $rc
+    deploy; prov
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
+    # The OTHER direction, which a one-way `$HERE -> $O` comparison would miss: a hand-placed
+    # `$O/*.sh` the repo does not ship is DRIFT to check-deployed-drift.sh, so the stamp must not
+    # call that deployment a match either.
+    printf 'hand-placed\n' > "$PO/legacy-probe.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "an extra \$O/*.sh the repo does not ship records deployedMatchesSource: false" $rc
+    deploy; prov
     dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
     ck "check-deployed-drift: a matching deployment exits 0" $rc
     # a DIRTY source: its recorded commit cannot describe the deployed bytes
@@ -2932,6 +2964,13 @@ if [ -f "$HERE/report.sh" ]; then
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
+  # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+  # "08: value too great for base" at the `FROM=` line and then died at the first use of `$FROM`
+  # ("FROM: unbound variable", rc=1), stopping the report partway. It must clamp to the 12h
+  # default instead.
+  rout08="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 08 2>&1)"; rrc08=$?
+  [ "$rrc08" -eq 0 ] && case "$rout08" in *"orchestrator report"*"12h"*) rc=0;; *) rc=1;; esac || rc=1
+  ck "report.sh clamps a leading-zero HOURS arg instead of dying in the arithmetic" $rc
   case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
   ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
   case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac

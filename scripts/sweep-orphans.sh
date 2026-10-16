@@ -157,8 +157,18 @@ while IFS= read -r line; do
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
-    # ORPHAN_WATCHDOG=0 valve parity with the watchdog
-    if ps eww -p "$PID" 2>/dev/null | tail -n +2 | grep -qx 'ORPHAN_WATCHDOG=0'; then
+    # ORPHAN_WATCHDOG=0 valve parity with the watchdog. `env_has_pair` above already uses
+    # the capture-then-here-string shape; the pipeline here was the last quiet grep in a
+    # destructive path, and the #864 class applies to the shape whatever the producer is.
+    # ⛔ WHAT THIS VALVE DOES NOT DO (measured, tracked separately): it reads `ps eww`, whose
+    # line carries the PID and the command AHEAD of the environment, so a whole-line `-qx`
+    # match against the bare token cannot succeed — the same reason `env_has_pair`'s `ps eww`
+    # fallback cannot. On this host (macOS, no /proc) the env gate above therefore skips every
+    # pid and the sweep classifies nothing; on Linux `env_has_pair` is live through
+    # /proc/<pid>/environ while THIS line still is not, i.e. the opt-out is ignored exactly
+    # where the sweep does run. Removing the pipe preserves the predicate exactly (verified on
+    # five inputs); repairing the predicate is a separate defect, filed as #1804, not fixed here.
+    if grep -qx 'ORPHAN_WATCHDOG=0' <<<"$(ps eww -p "$PID" 2>/dev/null | tail -n +2 || true)"; then
         echo "⚠️ pid $PID skipped — ORPHAN_WATCHDOG=0 (opt-out valve)"
         SKIPPED=$((SKIPPED + 1))
         continue

@@ -75,6 +75,30 @@ case "${CLAIM_TTL:-}" in
   ''|*[!0-9]*|0*) CLAIM_TTL=1800 ;;
   *) [ "${#CLAIM_TTL}" -le 9 ] || CLAIM_TTL=1800 ;;
 esac
+
+# ── THE ISSUE CLAIM'S LEASE (agent-infra#1850) ────────────────────────────────────────────────
+# An ISSUE claim is held for the WHOLE working period of its lane, not for one push. The PR claim's
+# 1800s default covers a review+merge; the issue claim must cover the lane's own budget plus the
+# chain that follows it, or it expires MID-FLIGHT, a peer reads it as free and reclaims it, and the
+# duplicate dispatch this file exists to prevent happens anyway. The arithmetic, from the shipped
+# defaults (orch-loop.sh's LANE_TIMEOUT is orch-loop.sh's own variable and is NOT readable here):
+#
+#   lane (LANE_TIMEOUT)            2400s   (~40 min — spawn-gate.sh's wall clock)
+#   chain-merge.sh waits for the PR 5400s  (90 x 60s)
+#   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
+#                                 ------  =======
+#                                 10800s  (3 h)
+#
+# ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
+# exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
+# box dies mid-lane. Raising LANE_TIMEOUT without raising this leaves a claim that expires before
+# the lane finishes — override CLAIM_ISSUE_TTL (env, or the cell's keys.env) at the same time.
+# The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
+CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-10800}"
+case "${CLAIM_ISSUE_TTL:-}" in
+  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=10800 ;;
+  *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=10800 ;;
+esac
 # The repository every git call runs against. Defaults to the cwd (correct for merge-one.sh,
 # which cd's into $REPO first) but the CONTROLLER must set it: orch-loop.sh runs from launchd
 # with cwd=$HOME, where `git fetch` fails and the claim snapshot silently comes back empty —
@@ -102,6 +126,36 @@ claim_key() { printf '%s-%s' "$1" "${2:0:12}"; }
 
 # claim_ref <pr> <head-sha> -> "refs/claims/<pr>-<sha12>"
 claim_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_key "$1" "$2")"; }
+
+# ── THE ISSUE KEY: "issue-<N>", ONE REF PER ISSUE (agent-infra#1850) ──────────────────────────
+# An issue has no head sha, so `claim_ref <pr> <sha>` cannot express it at all — `claim_live`
+# returns 1 on an empty sha and the WHOLE registry is bypassed for issue dispatch. This is the
+# keying that expresses it.
+#
+# ⛔ THE KEY IS THE ISSUE ALONE — NOT `issue-<N>-<box-id>`. The box id lives in the claim commit's
+# `owner=` field (where it already lives for PR claims), NOT in the key, and that is load-bearing:
+#   • A KEY CONTAINING THE BOX ID IS NOT A CAS. Two boxes mint two DISTINCT refs and BOTH pushes
+#     succeed, so the ref can only be READ, never WON. The pre-flight read is not enough to close
+#     the gap on its own: it runs BEFORE the claim, so both boxes can read CLEAN and then both
+#     claim. Only a mutually-exclusive ref makes the second acquisition impossible rather than
+#     merely unlikely.
+#   • IDEMPOTENT FOR THE SAME WORK. One issue is one work item, so `issue-<N>` is its content
+#     address exactly as `<PR>-<sha12>` is the head's: a re-acquire for the same issue lands on the
+#     same ref (and is refused while the holder's lease is live), never on a fresh one.
+#   • DISJOINT FROM THE PR KEY. A PR claim is `<number>-<sha12>`; the `issue-` prefix cannot collide
+#     with it, so an issue claim is never blocked by — and never blocks — a PR claim for the same
+#     number (`refs/claims/1850-abcdef123456` and `refs/claims/issue-1850` are different refs).
+#
+# ⛔ THE REF'S HOME IS THE **TARGET REPO'S** ORIGIN — the repo whose issue number is claimed, i.e.
+# whatever `CLAIM_REPO` points at (the same repo the PR claims already go to). It is NOT the harness
+# repo. Every would-be dispatcher of that issue already resolves `$REPO`/`--repo` to it, so it is
+# the one namespace all of them read; a claim pushed into agent-infra would be invisible to a peer
+# dispatching tortoise — which is exactly the 2026-10-16 collision (two cells dispatched tortoise
+# issues while running the agent-infra harness).
+claim_issue_key() { printf 'issue-%s' "$1"; }
+
+# claim_issue_ref <issue> -> "refs/claims/issue-<N>"
+claim_issue_ref() { printf '%s/%s' "$CLAIM_NS" "$(claim_issue_key "$1")"; }
 
 # _claim_commit <owner> <lease_until> -> commit sha carrying the lease as data
 #
@@ -133,19 +187,39 @@ _lease_of() {
 # Sets CLAIM_RESULT (human-readable reason), CLAIM_COMMIT, CLAIM_REF, CLAIM_OWNER.
 # Echoes CLAIM_RESULT as well, so a caller in a subshell still sees the reason.
 claim_acquire() {
-  local repo="$1" pr="$2" sha="$3" ttl="${4:-$CLAIM_TTL}"
+  _claim_acquire_at "$(claim_ref "$2" "$3")" "${4:-$CLAIM_TTL}"
+}
+
+# claim_issue_acquire <repo> <issue> [ttl] — the SAME CAS, keyed by ISSUE (agent-infra#1850)
+# Sets CLAIM_RESULT / CLAIM_COMMIT / CLAIM_REF / CLAIM_OWNER exactly as claim_acquire does, so a
+# caller that already handles rc=1 (another box owns it) and rc=2 (infra) needs no new vocabulary.
+# ⛔ The `<repo>` argument is API symmetry only, like claim_status's: every git call runs against
+#    CLAIM_REPO, and claim_issue_ref takes the issue alone.
+claim_issue_acquire() {
+  _claim_acquire_at "$(claim_issue_ref "$2")" "${3:-$CLAIM_ISSUE_TTL}" "$CLAIM_ISSUE_TTL"
+}
+
+# _claim_acquire_at <ref> [ttl] — the ref-explicit CAS core that BOTH keyings share.
+# ⛔ ONE IMPLEMENTATION, TWO KEYS. A second copy of the CAS for the issue key would let the two
+# drift, and every property #1709 established (atomic create, nonce, read-back, lease-as-data, CAS
+# reclaim, and the infra-vs-lost-race classification) is exactly what must NOT differ between them.
+_claim_acquire_at() {
+  local ref="$1" ttl="$2" dflt="${3:-$CLAIM_TTL}"
   local now until commit back cur tmp perr after
 
   # Same bound as CLAIM_TTL above, at the ARITHMETIC SITE, because `ttl` may arrive from the caller:
   # a leased value this function cannot parse back is worse than the default lease (see the note on
   # CLAIM_TTL). Leading zeros are refused for the same reason there — `$(( 08 ))` is an octal error.
+  # ⛔ THE FALLBACK IS THE KEYING'S OWN DEFAULT (`dflt`), NOT a shared literal: a bad value for an
+  # ISSUE claim must not silently become the PR claim's 1800s, which is SHORTER than LANE_TIMEOUT —
+  # it would expire mid-lane and hand the issue to a peer (agent-infra#1850).
   case "${ttl:-}" in
-    ''|*[!0-9]*|0?*) ttl="$CLAIM_TTL" ;;
+    ''|*[!0-9]*|0?*) ttl="$dflt" ;;
     0) ;;
-    *) [ "${#ttl}" -le 9 ] || ttl="$CLAIM_TTL" ;;
+    *) [ "${#ttl}" -le 9 ] || ttl="$dflt" ;;
   esac
 
-  CLAIM_REF="$(claim_ref "$pr" "$sha")"
+  CLAIM_REF="$ref"
   CLAIM_OWNER="$(claim_owner)"
   now="$(date +%s)"; until=$(( now + ttl ))
   commit="$(_claim_commit "$CLAIM_OWNER" "$until")"
@@ -257,8 +331,28 @@ claim_acquire() {
 # refuses a STALE commit; it does not refuse a caller who passes the ref's CURRENT sha. Shipped call
 # sites pass only the sha they pushed.
 claim_release() {
-  local repo="$1" pr="$2" sha="$3" own="$4" ref
-  ref="$(claim_ref "$pr" "$sha")"
+  # `"${3:-}"` as well as `"${4:-}"`: an arity slip (repo + PR only) must not abort the caller
+  # under `set -u` either. Both missing arguments land on the documented refusal inside the core,
+  # which pushes NOTHING — so a mis-called release stays a refusal, never a blind delete.
+  _claim_release_at "$(claim_ref "${2:-}" "${3:-}")" "${4:-}"
+}
+
+# claim_issue_release <repo> <issue> [<own-commit>] — fenced release of an ISSUE claim (#1850).
+# Same fence and same reason strings as claim_release, so a stale holder cannot delete a winner's
+# issue claim either.
+claim_issue_release() {
+  _claim_release_at "$(claim_issue_ref "${2:-}")" "${3:-}"
+}
+
+# _claim_release_at <ref> [<own-commit>]
+# ⛔ `own` IS READ WITH `:-`, AND THAT IS A FIX, NOT STYLE (agent-infra#1850). The PR-keyed wrapper
+# used to read `$4` BARE while `set -u` is on, so a three-argument call — a caller that has no
+# commit to fence on, which is exactly what a refused or half-completed acquire leaves it with —
+# aborted the caller with `line 260: $4: unbound variable` (measured on the release path). A
+# release that ERRORS leaves the claim held until the lease expires, and for an ISSUE claim that is
+# up to three hours of a free issue no box will dispatch: the failure this check exists to prevent.
+_claim_release_at() {
+  local ref="$1" own="${2:-}"
   if [ -z "${own:-}" ]; then CLAIM_RESULT="release refused — no claim commit to fence on"; echo "$CLAIM_RESULT"; return 1; fi
   if _git push -q --force-with-lease="$ref:$own" origin ":$ref" 2>/dev/null; then
     CLAIM_RESULT="released $ref"; echo "$CLAIM_RESULT"; return 0
@@ -272,8 +366,16 @@ claim_release() {
 # call uses the cwd. It must NOT be forwarded to claim_ref(), which takes (pr, sha) — forwarding
 # all three built `refs/claims/.-<sha>` and made every status lookup miss.
 claim_status() {
-  local ref tmp cur
-  ref="$(claim_ref "$2" "$3")"
+  _claim_status_at "$(claim_ref "$2" "$3")"
+}
+
+# claim_issue_status <repo> <issue> -> "owner\tlease_until", rc=1 if unheld (#1850)
+claim_issue_status() {
+  _claim_status_at "$(claim_issue_ref "$2")"
+}
+
+_claim_status_at() {
+  local ref="$1" tmp cur
   cur="$(_git ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
   [ -n "$cur" ] || return 1
   tmp="$CLAIM_TMP_NS/status-$RANDOM$$"
@@ -281,6 +383,95 @@ claim_status() {
   _lease_of "$tmp"; echo
   _git update-ref -d "$tmp" 2>/dev/null
   return 0
+}
+
+# claim_issue_preflight <issue> — THE PRE-FLIGHT'S REGISTRY READ (agent-infra#1850)
+#   0 CLEAN      — no issue claim is visible: the issue may be certified dispatchable
+#   1 COLLISION  — a LIVE claim is held (or one whose lease is unreadable, which claim_acquire also
+#                  treats as live): another box owns this issue
+#   2 INCOMPLETE — the registry could NOT be read. NEVER a CLEAN: a registry outage must not become
+#                  a duplicate dispatch (#1850). This is the fail-CLOSED direction, and it is
+#                  deliberately the opposite of claim_acquire's infra rc=2 (which fails OPEN so a
+#                  merge is not refused by a network blip): there, refusing costs one PR's merge;
+#                  here, certifying a free issue costs duplicated work on two boxes.
+# Sets CLAIM_RESULT; echoes it, so a caller in a subshell still sees the reason.
+claim_issue_preflight() {
+  local issue="$1" ref out rc cur tmp lease owner until now
+  ref="$(claim_issue_ref "$issue")"
+  # ⛔ THE EXIT STATUS IS THE DISTINCTION THAT MATTERS HERE. `git ls-remote <ref>` exits 0 with
+  # EMPTY output when the ref simply does not exist, and NON-ZERO only when the remote itself could
+  # not be consulted (measured: rc=128 for an unreachable remote). Collapsing the two — which is
+  # what a bare `[ -n "$(…)" ]` does — reads an outage as "nobody holds it", which is the exact
+  # false CLEAN this gate exists to remove.
+  out="$(_git ls-remote origin "$ref" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    CLAIM_RESULT="the claim registry is UNREADABLE ($ref: git ls-remote exited $rc) — INCOMPLETE, never CLEAN"
+    echo "$CLAIM_RESULT"; return 2
+  fi
+  cur="$(printf '%s\n' "$out" | awk '{print $1}')"
+  if [ -z "$cur" ]; then
+    CLAIM_RESULT="no claim on #$issue"
+    echo "$CLAIM_RESULT"; return 0
+  fi
+  tmp="$CLAIM_TMP_NS/pre-$RANDOM$$"
+  if ! _git fetch -q origin "+$ref:$tmp" 2>/dev/null; then
+    _git update-ref -d "$tmp" 2>/dev/null
+    CLAIM_RESULT="a claim ref exists for #$issue but its lease could not be read — INCOMPLETE, never CLEAN"
+    echo "$CLAIM_RESULT"; return 2
+  fi
+  lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
+  owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
+  # ⛔ THE SAME UNPARSEABLE-IS-LIVE POLARITY AS claim_acquire(). An absent lease, the `0` sentinel,
+  # a negative, or an oversized value all mean "a claim EXISTS whose lease this reader cannot
+  # parse" — never "free". Reading any of them as free would steal a live claim, and the fourth
+  # reader (orch-loop.sh's claim_live) already agrees on this datum; a fifth polarity would be a
+  # new disagreement about the same fact.
+  if [ -z "$until" ] || [ "$until" = "0" ] || [ -n "${until//[0-9]/}" ] || [ "${#until}" -gt 18 ]; then
+    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} (lease unreadable — treated as live)"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  now="$(date +%s)"
+  if [ "$now" -le "$until" ]; then
+    CLAIM_RESULT="a claim on #$issue is held by ${owner:-?} until $until ($(( until - now ))s left)"
+    echo "$CLAIM_RESULT"; return 1
+  fi
+  CLAIM_RESULT="the only claim on #$issue EXPIRED at $until (was ${owner:-?}) — free to reclaim"
+  echo "$CLAIM_RESULT"; return 0
+}
+
+# ── THE ISSUE CLAIM'S RELEASE RECORD (agent-infra#1850) ───────────────────────────────────────
+# The claim is taken by `orch-loop.sh` and released by whichever process ends up owning the END of
+# the work: `chain-merge.sh` (its EXIT trap — the normal path) or `dispatch-merge.sh` (the path that
+# decides NOT to spawn a chain, so no trap will ever run). Neither of those is the process that
+# ACQUIRED the claim, so the commit it pushed — the only thing `--force-with-lease` can be keyed on
+# — has to be handed over. It is handed over in `$O/state/issueclaim-<N>`.
+# ⛔ THE FORMAT LIVES HERE, BESIDE THE FENCE IT FEEDS, so there is ONE writer convention and ONE
+# reader implementation. Two copies of this is how a reader and a writer of the same datum drift,
+# and the drift is silent: a record nobody can parse releases nothing and the claim runs to its
+# lease instead (3h of a free issue).
+
+# claim_issue_record <state-dir> <issue> <own-commit> -> 0 written, 1 nothing to record (#1850)
+# ⛔ REFUSES AN EMPTY COMMIT rather than writing an empty file: an empty record is indistinguishable
+# from a corrupt one, and it can never fence anything.
+claim_issue_record() {
+  local dir="${1:-$HOME/orchestrator}" issue="${2:-}" own="${3:-}"
+  [ -n "$own" ] || return 1
+  [ -n "$issue" ] || return 1
+  mkdir -p "$dir/state" 2>/dev/null || true
+  printf '%s\n' "$own" > "$dir/state/issueclaim-$issue" 2>/dev/null || return 1
+  return 0
+}
+
+# claim_issue_release_record <state-dir> <repo> <issue> -> claim_issue_release's status (1 = refused
+# or nothing to do). Removes the record in EVERY case: an empty or unreadable record can never fence
+# a release, so leaving it behind makes every later attempt re-read a dead file.
+claim_issue_release_record() {
+  local f="${1:-$HOME/orchestrator}/state/issueclaim-${3:-}" own
+  [ -f "$f" ] || return 1
+  own="$(cat "$f" 2>/dev/null || true)"
+  rm -f "$f" 2>/dev/null
+  [ -n "$own" ] || return 1
+  claim_issue_release "${2:-}" "${3:-}" "$own"
 }
 
 # claim_snapshot [<outfile>]
