@@ -6,7 +6,11 @@ name: Pipeline Compliance
 #
 # WIRING OPTION 1 — copy into a consumer repo (self-contained):
 #   Copy this file to <repo>/.github/workflows/pipeline-compliance.yml AND
-#   scripts/check-pipeline-compliance.sh from agent-infra. The `pull_request`
+#   scripts/check-pipeline-compliance.sh AND scripts/record-review.sh from
+#   agent-infra. (record-review.sh is the ONE definition of the Low
+#   content-shape class that check (c)'s clean-low binding sources, #1356; the
+#   gate refuses a verdict=clean-low marker fail-closed if it cannot read it.)
+#   The `pull_request`
 #   trigger below then runs the gate on every PR with zero extra config —
 #   repo and PR number are taken from the github context, not hardcoded.
 #
@@ -26,7 +30,8 @@ name: Pipeline Compliance
 #           pr-number: ${{ github.event.pull_request.number }}
 #   The script is fetched from agent-infra when not present in the repo
 #   (override the source with the PIPELINE_COMPLIANCE_SCRIPT_URL env or a
-#   repo variable of the same name).
+#   repo variable of the same name). record-review.sh is fetched from the same
+#   base when not present (#1356).
 #
 # BRANCH PROTECTION: require the "Pipeline Compliance" check on main — this
 # is what actually blocks merges. Without a required check the gate only
@@ -77,6 +82,19 @@ jobs:
             echo "::group::Fetching check-pipeline-compliance.sh from agent-infra"
             mkdir -p scripts
             curl -fsSL --retry 3 "$PIPELINE_COMPLIANCE_SCRIPT_URL" -o scripts/check-pipeline-compliance.sh
+            echo "::endgroup::"
+          fi
+          # #1356: check (c)'s clean-low binding SOURCES the Low content-shape
+          # class from the producer, record-review.sh, resolved as a SIBLING of
+          # this gate (one definition, no second matcher). Fetch it too — from
+          # the same base URL — or a legitimate verdict=clean-low marker fails
+          # check (c) fail-closed, because the shape would be unverifiable.
+          # Fetched independently of the gate: WIRING OPTION 1 copies the gate
+          # into the repo, which would otherwise skip this branch entirely.
+          if [ ! -f scripts/record-review.sh ]; then
+            echo "::group::Fetching record-review.sh from agent-infra"
+            mkdir -p scripts
+            curl -fsSL --retry 3 "${PIPELINE_COMPLIANCE_SCRIPT_URL%/*}/record-review.sh" -o scripts/record-review.sh
             echo "::endgroup::"
           fi
           bash scripts/check-pipeline-compliance.sh
