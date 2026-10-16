@@ -726,6 +726,12 @@ while read -r N; do
         case "$ICR" in
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
+             # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
+             # can act on. Without this the pool property-assertion below reads an ALL-claim-held pool
+             # as "judged NOTHING" and aborts rc=1 every cycle, in exactly the cross-box-collision
+             # state this check exists for, while the pass has already printed a verdict per candidate
+             # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
+             usable=$((usable + 1))
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.

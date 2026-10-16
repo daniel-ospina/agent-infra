@@ -1178,6 +1178,16 @@ case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
   *42*) bad "claim-collision: #42 was BLACKLISTED — a transient claim must be re-attempted, not suppressed" ;;
   *) ok "claim-collision: #42 is left UNCHECKED for the next pass" ;;
 esac
+# ⛔ AND the pass must still SUCCEED. A claim collision is a COLLISION — one of the three verdicts the
+# `usable` contract counts — so an all-claim-held pool must not be read as "judged NOTHING". Without
+# this the cell logged `FAILED rc=1` every cycle in exactly the cross-box-collision state this check
+# exists for, while having printed a verdict per candidate (#1853 review).
+[ "$RC" -eq 0 ] && ok "claim-collision: the pass SUCCEEDS (rc=0 — a claim collision is a usable verdict)" \
+               || bad "claim-collision: rc=$RC (want 0) — a pool of peer-held issues was reported as judging NOTHING — output: $OUT"
+case "$OUT" in
+  *"judged NOTHING"*) bad "claim-collision: the pass aborted as if it had no verdict — output: $OUT" ;;
+  *) ok "claim-collision: no \"judged NOTHING\" abort over a pool of peer-held issues" ;;
+esac
 
 # (b) The registry is UNREACHABLE (origin removed): INCOMPLETE — never CLEAN. A registry outage must
 #     not become a duplicate dispatch, so nothing is queued and nothing is blacklisted either.
