@@ -511,6 +511,16 @@ prov_dirty() {
 
 write_provenance() {
   local commit rel dirty_word payload tmp drc
+  # ⛔ `relation`/`commit` describe the SOURCE checkout, and `payloadSha256` describes the DEPLOYED
+  # `$O/*.sh` — this installer never copies (`$O` is synced by the operator, see the DRIFTED warning
+  # above), so the two can genuinely disagree: an install run from a newer checkout while `$O` still
+  # holds older bytes records `commit: <new tip>, relation: "current"` over a payload from a different
+  # commit. Measured: `$O` at C1 bytes + writer at C2 → stamp `commit C2 / relation current /
+  # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
+  # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
+  # FIELD, so the record itself cannot be read as "this commit describes these bytes".
+  local dep_match
+  dep_match=true; [ -n "${DRIFTED:-}" ] && dep_match=false
   prov_classify
   commit="${PROV_COMMIT:-}"; [ -n "$commit" ] || commit=UNKNOWN
   rel="${PROV_REL:-unknown}"
@@ -536,6 +546,7 @@ write_provenance() {
   "refCommit": "${PROV_REFCOMMIT:-UNKNOWN}",
   "relation": "$rel",
   "agentInfraDirty": $dirty_word,
+  "deployedMatchesSource": $dep_match,
   "payloadSha256": "$payload",
   "recordedAt": "$(date -u +%FT%TZ)"
 }
@@ -552,6 +563,10 @@ STAMPEOF
   fi
   if [ "$dirty_word" = true ]; then
     warn "the source tree at $HERE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
+  fi
+  if [ "$dep_match" = false ]; then
+    warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$DRIFTED"
+    warn "  the record names $commit, but the box is not running those bytes — cp '$HERE'/*.sh '$O'/"
   fi
   return 0
 }
