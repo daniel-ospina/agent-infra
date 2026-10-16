@@ -190,11 +190,11 @@ check_ci_runner_gate_farmed() {
 # and the rest).
 #
 # ⚠️ SCOPE — what this guard does NOT cover, stated so nobody over-reads the green:
-#   * It pins the DECLARED set only. The VERSIONED half of the same layer (lane-status.py,
-#     lane-actions.py, lane-watchdog.py, objective.py, heartbeat-loop.sh, cadence-nudge.sh,
-#     publish-live-workspaces.py) is in NO farm list, so it is neither asserted nor delivered —
-#     a declared #1552 residual, not an oversight: `lane-status.py` is AHEAD at the destination,
-#     so farming it would REGRESS the running classifier (see the note at the fleet_srcs array).
+#   * It pins the DECLARED set only. The COMPLETENESS half — "is every producer of this layer in some
+#     farm array at all?" — is `check_producer_farm_declared` below, added because this function
+#     cannot see a producer that NO array declares: a fresh farm came to carry every CONSUMER without
+#     the executable it calls (five producers joined `fleet_srcs` on 2026-10-16 for exactly that
+#     reason). Two remain a DECLARED gap, named there.
 #   * It cannot see a stale DEPLOYED copy or an un-restarted long-lived process: it diffs repo bytes
 #     against a $DEST that THIS run just populated. #1738 is the NEAR-MISS that prompted looking for
 #     this gap, NOT an instance of it: #1738's own evidence records the deployed file as
@@ -239,6 +239,57 @@ check_fleet_srcs_farmed() {
     # summary authoritative: zero declared entries IS the failure.
     [ "$declared" -gt 0 ] \
       || fail "$label: fleet_srcs declared ZERO entries — array empty or unreadable, and 0/0 must never read as clean"
+  fi
+}
+
+# #1552 — PRODUCER COMPLETENESS, the half `check_fleet_srcs_farmed` cannot do. That function pins
+# whatever the array DECLARES and therefore reports a clean "N/N" for a farm whose CONSUMERS are all
+# present and whose PRODUCERS are all undelivered. Measured 2026-10-16: the layer's seven versioned
+# producers were in NO farm array, so a fresh `$DEST/scripts` got `pr-doctor.py`/`lane-scan-fallback.sh`
+# without the `lane-actions.py` they exec, `cadence-timer.sh` without `cadence-nudge.sh`,
+# `live-workspaces-publisher.py` without `publish-live-workspaces.py`, and the heartbeat without
+# `lane-watchdog.py`/`objective.py`. Five were then added to `fleet_srcs`; this check is what keeps a
+# producer from silently falling out again.
+#
+# ⚠️ DECLARED GAP (2 of 7) — deliberate, and named so it cannot go quiet:
+#   * `lane-status.py` — the DESTINATION copy is AHEAD (repo 1993 lines / live 2005 at the 2026-10-15
+#     measurement; the live copy carries the #1777 abstention text, in flight in #1784), so farming
+#     the repo copy would regress the running classifier.
+#   * `heartbeat-loop.sh` — byte-identical repo↔live, held back only because `lane-status.py` is.
+# #1553 declares both in `lane_root_srcs`. Once it lands, both take the membership branch below and
+# `LANE_PRODUCERS_EXEMPT` becomes inert — delete it then, so this check covers all seven with no gap.
+LANE_PRODUCERS="lane-status.py lane-actions.py lane-watchdog.py objective.py heartbeat-loop.sh cadence-nudge.sh publish-live-workspaces.py"
+LANE_PRODUCERS_EXEMPT="lane-status.py heartbeat-loop.sh"
+# Whole-word membership, the `ci_runner_gate.test.sh` idiom: a plain `grep -F` for the basename is
+# also satisfied by `lane-actions.py.old`, i.e. by the exact rename that leaves the producer
+# undelivered. `tr` splits the array on whitespace, `grep -Fxq` requires the whole entry.
+farm_declares() { # <array-name> <entry> -> 0 when the array carries the entry as a whole word
+  local arr="$1" entry="$2" line
+  line="$(sed -n "s/^${arr}=(\(.*\))$/\1/p" "$ROOT/pi-bootstrap/setup.sh")"
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line" | tr -s ' ' '\n' | grep -Fxq -- "$entry"
+}
+check_producer_farm_declared() {
+  local label="$1" p covered=0 exempted=0 missing=""
+  for p in $LANE_PRODUCERS; do
+    # `lane_root_srcs` absent on this tree is not a failure: #1553 declares it, and the membership
+    # branch simply goes false until then.
+    if farm_declares fleet_srcs "$p" || farm_declares lane_root_srcs "$p"; then
+      covered=$((covered+1)); continue
+    fi
+    case " $LANE_PRODUCERS_EXEMPT " in
+      *" $p "*) exempted=$((exempted+1)); continue ;;
+    esac
+    missing="$missing $p"
+  done
+  [ -z "$missing" ] \
+    || fail "$label: lane producer(s) declared by NO farm array:$missing — a fresh \$DEST/scripts gets the farmed consumer without the executable it calls (#1552)"
+  if [ -z "$missing" ] && [ "$exempted" -gt 0 ]; then
+    # Never `ok:` while a declared gap remains: the two are separately delivered by #1553, and a
+    # reader must not read 5/7 as full cover.
+    echo "DECLARED-GAP: $label lane producers in a farm array: $covered/$((covered+exempted)) ($exempted not carried here, owned by #1553: $LANE_PRODUCERS_EXEMPT) (#1552)"
+  elif [ -z "$missing" ]; then
+    echo "ok: $label all $((covered+exempted)) lane producers declared in a farm array (#1552)"
   fi
 }
 
@@ -627,6 +678,7 @@ check_fix_markers "$DEST/extensions" "run1"
 check_record_review_farmed "run1"
 check_ci_runner_gate_farmed "run1"
 check_fleet_srcs_farmed "run1"
+check_producer_farm_declared "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
