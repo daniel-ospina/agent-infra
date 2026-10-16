@@ -242,9 +242,9 @@ Its verdict is the literal line `CELL CAN RUN A CONTROLLER`, so a dependency tha
 fail *there* — a cell that is blessed and then discovers the gap mid-review pays for the discovery:
 `git`, `python3`, `pi` and `~/.pi/agent/scripts/record-review.sh` are fatal, `uv` warns (as it does
 in `install.sh`) — but the #1736 dispatch probe (`refresh-candidates.sh --check`, which `cmd_check`
-runs) refuses a `pyproject.toml` repo whose scout venv has to be built while `uv` is not runnable, so
-`uv` is fatal in effect there. And `start` provisions the record step from this checkout when the cell
-has none (agent-infra#1717).
+runs) refuses a `pyproject.toml` repo whose scout venv has to be built while `uv` does not resolve on
+`PATH`, so `uv` is fatal in effect there. And `start` provisions the record step from this checkout
+when the cell has none (agent-infra#1717).
 
 **Single-host assumption.** Everything is local: tmux sessions, worktrees, logs, the key.
 There is no scheduler, no queue service, no shared database. Two boxes running this against
