@@ -13,7 +13,7 @@
 # Why each gate fixture exists:
 #   merged           a MERGED PR, based on main, whose headRefOid IS the local
 #                    tip — the squash-merge case `--merged` cannot see. It is
-#                    also the ONLY class that exercises the `-D` fallback.
+#                    also the ONLY class that exercises the force-delete fallback.
 #   post-merge       a MERGED PR based on main, but the local branch gained a
 #                    commit AFTER the merge, so the tip has MOVED past
 #                    headRefOid. Must be KEPT (`merged-tip-moved`): `git branch
@@ -860,18 +860,18 @@ run_script bash "$LOCAL_SCRIPT" --scope local --execute --pr-map-file "$PR_MAP"
 # run_local_scope and this assertion goes red (`RC` becomes 0).
 assert_eq "$RC" "1" "execute exits NON-ZERO when a selected branch was not reaped (F1)"
 assert_contains "$OUT" "1 local branch delete(s) FAILED" "the non-zero exit names the failed-delete count (F1)"
-assert_match "$OUT" '^  deleted +merged +feat/merged-one' 'merged branch deleted (via the -D fallback)'
-assert_contains "$OUT" "via -D: squash-merged PR" 'the -D fallback is named in the output'
+assert_match "$OUT" '^  deleted +merged +feat/merged-one' 'merged branch deleted (via the force-delete fallback)'
+assert_contains "$OUT" "via update-ref -d: squash-merged PR" 'the force-delete fallback is named in the output'
 assert_match "$OUT" '^  deleted +redundant +redundant-one' 'redundant branch deleted'
 assert_match "$OUT" '^  deleted +remotecopy +remote-copy-one' 'remotecopy branch deleted'
-assert_match "$OUT" '^  failed +redundant +redundant-stuck' 'redundant-stuck reported FAILED (no -D for a non-merged class)'
+assert_match "$OUT" '^  failed +redundant +redundant-stuck' 'redundant-stuck reported FAILED (no force-delete for a non-merged class)'
 assert_contains "$OUT" "Deleted:   3" "summary reports 3 deletions"
 assert_contains "$OUT" "Failed:    1" "summary reports 1 failure"
 
-assert_branch_absent feat/merged-one "merged branch removed by -D fallback"
+assert_branch_absent feat/merged-one "merged branch removed by the force-delete fallback"
 assert_branch_absent redundant-one "redundant branch removed by -d"
 assert_branch_absent remote-copy-one "remotecopy branch removed by -d"
-assert_branch_exists redundant-stuck "redundant-stuck SURVIVES (-D not allowed for the redundant class)"
+assert_branch_exists redundant-stuck "redundant-stuck SURVIVES (force-delete not allowed for the redundant class)"
 assert_branch_exists post-merge-one "POST-merge branch survives --execute (its commit exists nowhere else)"
 assert_branch_exists stacked-one "non-main-base MERGED branch survives --execute"
 assert_branch_exists stale-tracking-one "STALE-tracking branch survives --execute"
@@ -2233,41 +2233,44 @@ cat > "$F6_WRAP/git" <<'WRAP'
 # paste-evaluation side); otherwise it appends the argv to GIT_WRAP_LOG and then
 # delegates to the real git, so the execute path really deletes.
 REAL_GIT="${F6_REAL_GIT:?F6_REAL_GIT unset}"
-if [ "$1" = "branch" ]; then
-    if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
-        printf '%s\000' "$@"
-        printf '\000'
-        exit 0
-    fi
-    {
-        printf '%s\000' "$@"
-        printf '\000'
-    } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
-fi
+case "$1" in
+    branch|update-ref)
+        if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+            printf '%s\000' "$@"
+            printf '\000'
+            exit 0
+        fi
+        {
+            printf '%s\000' "$@"
+            printf '\000'
+        } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        ;;
+esac
 exec "$REAL_GIT" "$@"
 WRAP
 chmod +x "$F6_WRAP/git"
 
 run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$F6_PR_MAP"
 assert_eq "$RC" "0" "local paste-safety fixture: dry-run exits 0 (F6)"
-# One `-d` per selected branch, PLUS the `-D` fallback for the SQUASH `merged`
-# shape ONLY. Counted separately so the test also pins that `-D` stays CONFINED
-# to `merged` and to the shape that actually needs it (F9).
+# One `-d` per selected branch, PLUS the force-delete fallback for the SQUASH
+# `merged` shape ONLY. Counted separately so the test also pins that the
+# force-delete stays CONFINED to `merged` and to the shape that needs it (F9),
+# and (F12) that its primitive is the atomic `git update-ref -d`.
 F6_PLAN_D_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
-F6_PLAN_FORCE_COUNT="$(grep -c '^  git branch -D --' <<<"$OUT" || true)"
+F6_PLAN_FORCE_COUNT="$(grep -c '^  git update-ref -d ' <<<"$OUT" || true)"
 assert_eq "$F6_PLAN_D_COUNT" "6" "the local plan prints one -d command per selected branch (4 redundant + 2 merged) (F6)"
-assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the -D fallback for the SQUASH merged class ONLY (F6/F7/F9)"
-assert_contains "$OUT" 'git branch -D -- f6-merged' 'the squash merged class actually prints its -D fallback (F6/F7)'
+assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the force-delete fallback for the SQUASH merged class ONLY (F6/F7/F9)"
+assert_contains "$OUT" 'git update-ref -d refs/heads/f6-merged' 'the squash merged class actually prints its force-delete fallback (F6/F7)'
 assert_contains "$OUT" '# class=redundant' 'the class annotation is still printed (F6)'
 # ⛔ F9: the MERGE-COMMIT-merged shape takes EXACTLY ONE command (`-d`) — `-d`
 # succeeds, so a printed `-D` would be a command execution never runs. Assert
 # both shapes, so restoring the unconditional `-D` goes RED here.
 F6_PLAN_MANC_D="$(grep -c '^  git branch -d -- f6-manc   # class=merged' <<<"$OUT" || true)"
-F6_PLAN_MANC_FORCE="$(grep -c '^  git branch -D -- f6-manc' <<<"$OUT" || true)"
+F6_PLAN_MANC_FORCE="$(grep -c '^  git update-ref -d refs/heads/f6-manc' <<<"$OUT" || true)"
 assert_eq "$F6_PLAN_MANC_D" "1" "the merge-commit-merged shape prints exactly one -d command (F9)"
-assert_eq "$F6_PLAN_MANC_FORCE" "0" "the merge-commit-merged shape prints NO -D fallback (F9)"
+assert_eq "$F6_PLAN_MANC_FORCE" "0" "the merge-commit-merged shape prints NO force-delete fallback (F9)"
 assert_contains "$OUT" 'git branch -d -- f6-merged   # class=merged' 'the squash shape still prints its -d command (F9)'
-assert_contains "$OUT" 'git branch -D -- f6-merged   # class=merged (fallback if -d refuses)' 'the squash shape still prints its -D fallback (F9)'
+assert_match "$OUT" '^  git update-ref -d refs/heads/f6-merged [0-9a-f]+   # class=merged \(fallback if -d refuses\)$' 'the squash shape prints its force-delete fallback through the atomic primitive (F9/F12)'
 
 # Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
 # NUL-delimited records (a ref name cannot contain NUL, so the encoding is exact).
@@ -2278,7 +2281,7 @@ while IFS= read -r _f6_line; do
     [ -n "$_f6_line" ] || continue
     PATH="$F6_WRAP:$PATH" F6_REAL_GIT="$F6_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f6_line" >>"$F6_PLAN_ARGV" || true
-done <<<"$(grep '^  git branch -[dD] --' <<<"$OUT" || true)"
+done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$OUT" || true)"
 
 # The execute path logs the SAME encoding from its real `git branch` invocations.
 F6_EXEC_ARGV="$FIX/f6-exec.bin"
@@ -2310,8 +2313,15 @@ assert_eq "$F6_PLAN_MANC_N" "1" "the plan's NUL argv names f6-manc exactly once 
 assert_eq "$F6_EXEC_MANC_N" "1" "the execute path's NUL argv names f6-manc exactly once (-d only, merge-commit shape) (F9)"
 F6_PLAN_MERGED_N="$(tr '\0' '\n' < "$F6_PLAN_ARGV" | grep -c '^f6-merged$' || true)"
 F6_EXEC_MERGED_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^f6-merged$' || true)"
-assert_eq "$F6_PLAN_MERGED_N" "2" "the plan's NUL argv names f6-merged twice (-d and -D, squash shape) (F9)"
-assert_eq "$F6_EXEC_MERGED_N" "2" "the execute path's NUL argv names f6-merged twice (-d then -D, squash shape) (F9)"
+assert_eq "$F6_PLAN_MERGED_N" "1" "the plan's NUL argv names f6-merged once through -d (squash shape) (F9)"
+assert_eq "$F6_EXEC_MERGED_N" "1" "the execute path's NUL argv names f6-merged once through -d (squash shape) (F9)"
+# ⛔ F12: the squash shape's force-delete is the ATOMIC `git update-ref -d`, whose
+# old-value argument is the classified tip — pinned on BOTH the printed plan and
+# the executed argv, so an edit back to `git branch -D` goes RED here.
+F6_PLAN_REF_N="$(tr '\0' '\n' < "$F6_PLAN_ARGV" | grep -c '^refs/heads/f6-merged$' || true)"
+F6_EXEC_REF_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^refs/heads/f6-merged$' || true)"
+assert_eq "$F6_PLAN_REF_N" "1" "the plan's NUL argv passes the ref to update-ref -d (squash shape) (F12)"
+assert_eq "$F6_EXEC_REF_N" "1" "the execute path's NUL argv passes the ref to update-ref -d (squash shape) (F12)"
 
 cd "$REPO"
 echo ""
@@ -2648,13 +2658,16 @@ fi
 
 cd "$REPO"
 echo ""
-echo "== 36. the local -D fallback is COMPARE-AND-SWAP guarded — a tip that MOVED is not force-deleted (F10) =="
-# The `merged` gate proves tip == headRefOid at CLASSIFICATION time. `-D` then
-# re-checked NOTHING, so a commit landing between classification and delete was
-# force-deleted even though the new tip was never proven merged (and `-D` drops
-# the reflog too). This fixture races the tip: a git wrapper advances
-# refs/heads/sq from B to R (a child of B) at sq's own `branch -d`, exactly the
-# window the remote leg closes with --force-with-lease.
+echo "== 36. the local force-delete is the ATOMIC update-ref swap — a tip that MOVED is not deleted (F12) =="
+# The `merged` gate proves tip == headRefOid at CLASSIFICATION time, and the
+# delete must not rest on a check-then-act pre-check: the read and the delete are
+# two separate git processes, so a commit landing BETWEEN them is invisible to
+# the check. This fixture races exactly that window — a git wrapper answers sq's
+# delete-time `rev-parse` with the CLASSIFIED tip B AFTER advancing
+# refs/heads/sq to the child R, so the pre-check passes on a STALE value. Only
+# `git update-ref -d <ref> <old>` (git compares and deletes in ONE operation)
+# can prevent the loss; the remote leg closes the same class with
+# --force-with-lease.
 F10R_ORIGIN="$FIX/f10r-origin.git"
 F10R_REPO="$FIX/f10r-repo"
 new_repo "$F10R_REPO" "$F10R_ORIGIN"
@@ -2668,14 +2681,14 @@ git checkout -q -b sq main
 echo sq > sq.txt; git add sq.txt; old_commit "sq-content"
 F10R_B="$(git rev-parse HEAD)"
 git checkout -q main
-# ok-sq: the SAME shape but never raced — the positive control proving -D still
-# reaps a normal squash merge.
+# ok-sq: the SAME shape but never raced — the positive control proving the
+# atomic swap still reaps a normal squash merge.
 git checkout -q -b ok-sq main
 echo ok > oksq.txt; git add oksq.txt; old_commit "ok-sq-content"
 F10R_OK="$(git rev-parse HEAD)"
 git checkout -q main
-# R: a child of B reachable ONLY from sq. Without the CAS guard, `-D` destroys
-# the only ref to R and `git branch -D` drops the reflog with it.
+# R: a child of B reachable ONLY from sq. Without the atomic swap, the delete
+# destroys the only ref to R (and drops the reflog with it).
 F10R_TREE="$(git rev-parse "$F10R_B^{tree}")"
 F10R_R="$(GIT_AUTHOR_DATE="2020-01-02T00:00:00 +0000" \
     GIT_COMMITTER_DATE="2020-01-02T00:00:00 +0000" \
@@ -2690,45 +2703,132 @@ JSON
 F10R_REAL_GIT="$(command -v git)"
 F10R_WRAP="$FIX/f10r-wrap"
 F10R_SENT="$FIX/f10r-advanced.sentinel"
-rm -f "$F10R_SENT"
+F10R_UR_LOG="$FIX/f10r-update-ref.log"
+rm -f "$F10R_SENT" "$F10R_UR_LOG"
 mkdir -p "$F10R_WRAP"
 cat > "$F10R_WRAP/git" <<'WRAP'
 #!/usr/bin/env bash
-# Test double (F10): when the sweep deletes `sq`, advance refs/heads/sq from the
-# classified tip B to the child R BEFORE the real `git branch -d` runs — the
-# "commit lands between classification and delete" race. The advance happens
-# once (sentinel) and only for the `sq` target; every other call delegates.
+# Test double (F12): the delete-time pre-check is answered with the CLASSIFIED
+# tip B AFTER refs/heads/sq is advanced to the child R, so the check-then-act
+# pre-check cannot see the move and only `git update-ref -d <ref> <old>` can.
+# Every `update-ref` invocation is logged as one TAB-separated record so the
+# test can pin the atomic primitive AND its old-value argument; every other call
+# delegates to the real git.
 REAL_GIT="${F10R_REAL_GIT:?F10R_REAL_GIT unset}"
-if [ "$1" = "branch" ]; then
+if [ "$1" = "rev-parse" ]; then
     for _a in "$@"; do
-        if [ "$_a" = "${F10R_BRANCH:?F10R_BRANCH unset}" ]; then
+        if [ "$_a" = "refs/heads/${F10R_BRANCH:?F10R_BRANCH unset}" ]; then
             if [ ! -e "${F10R_SENTINEL:?F10R_SENTINEL unset}" ]; then
                 : >"$F10R_SENTINEL"
-                "$REAL_GIT" update-ref "refs/heads/${F10R_BRANCH}" "${F10R_R_SHA:?F10R_R_SHA unset}"
+                _old="$("$REAL_GIT" rev-parse "refs/heads/$F10R_BRANCH")"
+                "$REAL_GIT" update-ref "refs/heads/$F10R_BRANCH" "${F10R_R_SHA:?F10R_R_SHA unset}"
+                printf '%s\n' "$_old"
+                exit 0
             fi
         fi
     done
+fi
+if [ "$1" = "update-ref" ]; then
+    { printf '%s\t' "$@"; printf '\n'; } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
 fi
 exec "$REAL_GIT" "$@"
 WRAP
 chmod +x "$F10R_WRAP/git"
 run_script env PATH="$F10R_WRAP:$PATH" F10R_REAL_GIT="$F10R_REAL_GIT" \
     F10R_BRANCH="sq" F10R_R_SHA="$F10R_R" F10R_SENTINEL="$F10R_SENT" \
+    GIT_WRAP_LOG="$F10R_UR_LOG" \
     bash "$F10R_SCRIPT" --repo "$F10R_REPO" --scope local --execute --pr-map-file "$F10R_PR_MAP"
 # Non-zero: a moved tip was NOT reaped, so the sweep must not claim success.
-assert_eq "$RC" "1" "a tip that moves under the sweep exits non-zero (F10)"
-assert_match "$OUT" '^  moved +merged +sq ' "the advanced branch is reported as moved (F10)"
-assert_contains "$OUT" "tip advanced $F10R_B -> $F10R_R" "the move names the old and new oids (F10)"
-assert_contains "$OUT" "Moved:     1" "the moved branch is counted in the summary (F10)"
-assert_no_match "$OUT" '^  deleted +merged +sq ' "the moved branch is NOT reported deleted (F10)"
+assert_eq "$RC" "1" "a tip that moves under the sweep exits non-zero (F12)"
+assert_match "$OUT" '^  moved +merged +sq ' "the advanced branch is reported as moved (F12)"
+assert_contains "$OUT" "tip advanced $F10R_B -> $F10R_R" "the move names the old and new oids (F12)"
+assert_contains "$OUT" "Moved:     1" "the moved branch is counted in the summary (F12)"
+assert_no_match "$OUT" '^  deleted +merged +sq ' "the moved branch is NOT reported deleted (F12)"
 if [ "$(git -C "$F10R_REPO" rev-parse -q --verify refs/heads/sq || echo GONE)" = "$F10R_R" ]; then
-    ok "the ADVANCED branch SURVIVES at the new tip R (no data loss) (F10)"
+    ok "the ADVANCED branch SURVIVES at the new tip R (no data loss) (F12)"
 else
-    bad "the advanced branch was deleted or moved — DATA LOSS (F10)"
+    bad "the advanced branch was deleted or moved — DATA LOSS (F12)"
 fi
-# Positive control: the un-raced squash branch is still reaped through -D.
-assert_branch_absent ok-sq "the normal squash branch is still reaped via -D (F10)"
-assert_contains "$OUT" "via -D: squash-merged PR" "the normal squash -D path is unchanged (F10)"
+# ⛔ THE ATOMIC PRIMITIVE IS PINNED: the sq delete must have gone through
+# `git update-ref -d refs/heads/sq <B>` — the CLASSIFIED tip as the OLD value —
+# and not `git branch -D`. Rework the delete path back to `-D` and this record
+# never appears, so this assertion goes RED.
+F10R_UR_FLAT="$(cat "$F10R_UR_LOG" 2>/dev/null || true)"
+assert_contains "$F10R_UR_FLAT" \
+    "$(printf 'update-ref\t-d\trefs/heads/sq\t%s' "$F10R_B")" \
+    "the sq delete went through git update-ref -d with the CLASSIFIED tip as its old value (F12)"
+# Positive control: the un-raced squash branch is still reaped through the SAME
+# atomic swap.
+assert_branch_absent ok-sq "the normal squash branch is still reaped via update-ref (F12)"
+assert_contains "$OUT" "via update-ref -d: squash-merged PR" "the normal squash force-delete path is unchanged (F12)"
+assert_contains "$F10R_UR_FLAT" \
+    "$(printf 'update-ref\t-d\trefs/heads/ok-sq\t%s' "$F10R_OK")" \
+    "the un-raced squash delete also went through git update-ref -d (F12)"
+
+cd "$REPO"
+echo ""
+echo "== 36b. the force-delete path REFUSES a branch that becomes CHECKED OUT (update-ref -d has no -D guard) (F12a) =="
+# `git branch -D` refuses a checked-out branch; `git update-ref -d` does NOT
+# (verified: it removes the checked-out branch and leaves HEAD dangling). The
+# classification's `worktree:` keep rule is not a guard across the window, so
+# the delete path re-enumerates the worktrees itself. Here the branch is checked
+# out in a LINKED WORKTREE after classification and just before the swap; the
+# delete must REFUSE and the branch must survive.
+F12A_ORIGIN="$FIX/f12a-origin.git"
+F12A_REPO="$FIX/f12a-repo"
+new_repo "$F12A_REPO" "$F12A_ORIGIN"
+cd "$F12A_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F12A_SCRIPT="$F12A_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f12a.txt; git add f12a.txt; old_commit "init"; git push -q origin main
+F12A_MAIN_SHA="$(git rev-parse main)"
+F12A_TREE="$(git rev-parse "$F12A_MAIN_SHA^{tree}")"
+F12A_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F12A_TREE" -p "$F12A_MAIN_SHA" -m "wt-race")"
+git update-ref refs/heads/wt-race "$F12A_SHA"
+F12A_MAP="$FIX/f12a-pr-map.json"
+cat > "$F12A_MAP" <<JSON
+[
+  {"headRefName":"wt-race","state":"MERGED","headRefOid":"$F12A_SHA","baseRefName":"main"}
+]
+JSON
+F12A_REAL_GIT="$(command -v git)"
+F12A_WRAP="$FIX/f12a-wrap"
+F12A_SENT="$FIX/f12a-checked-out.sentinel"
+rm -f "$F12A_SENT"
+mkdir -p "$F12A_WRAP"
+cat > "$F12A_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F12a): when the delete pre-check reads the target branch, check it
+# out in a LINKED WORKTREE first — the window between classification and the
+# atomic swap. Every call then delegates to the real git.
+REAL_GIT="${F12A_REAL_GIT:?F12A_REAL_GIT unset}"
+if [ "$1" = "rev-parse" ]; then
+    for _a in "$@"; do
+        if [ "$_a" = "refs/heads/${F12A_BRANCH:?F12A_BRANCH unset}" ]; then
+            if [ ! -e "${F12A_SENTINEL:?F12A_SENTINEL unset}" ]; then
+                : >"$F12A_SENTINEL"
+                "$REAL_GIT" worktree add -q "${F12A_WT_DIR:?F12A_WT_DIR unset}" "$F12A_BRANCH" >/dev/null 2>&1 || true
+            fi
+        fi
+    done
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F12A_WRAP/git"
+run_script env PATH="$F12A_WRAP:$PATH" F12A_REAL_GIT="$F12A_REAL_GIT" \
+    F12A_BRANCH="wt-race" F12A_SENTINEL="$F12A_SENT" F12A_WT_DIR="$FIX/f12a-wt" \
+    bash "$F12A_SCRIPT" --repo "$F12A_REPO" --scope local --execute --pr-map-file "$F12A_MAP"
+assert_eq "$RC" "1" "a branch that becomes checked out fails the sweep (F12a)"
+assert_match "$OUT" '^  failed +merged +wt-race ' "the checked-out branch is reported FAILED, not deleted (F12a)"
+assert_no_match "$OUT" '^  deleted +merged +wt-race ' "the checked-out branch is NOT reported deleted (F12a)"
+if git -C "$F12A_REPO" rev-parse -q --verify refs/heads/wt-race >/dev/null 2>&1; then
+    ok "the checked-out branch SURVIVES (no dangling HEAD / broken worktree) (F12a)"
+else
+    bad "the checked-out branch was DELETED despite being checked out (F12a)"
+fi
 
 cd "$REPO"
 echo ""
@@ -2746,21 +2846,26 @@ F11_REAL_GIT="$(command -v git)"
 mkdir -p "$F11_WRAP"
 cat > "$F11_WRAP/git" <<'WRAP'
 #!/usr/bin/env bash
-# Test double (F11): dumps the `git branch` argv as NUL-delimited records in
-# `print` mode; otherwise appends them to GIT_WRAP_LOG and delegates to the real
-# git, so the execute path really deletes.
+# Test double (F11): dumps the `git branch` / `git update-ref` argv as
+# NUL-delimited records in `print` mode; otherwise appends them to GIT_WRAP_LOG
+# and delegates to the real git, so the execute path really deletes. `update-ref`
+# is intercepted too (F12): the squash force-delete is part of the plan ⇄
+# execute argv surface, so leaving it out would make the parity comparison
+# vacuous for that shape.
 REAL_GIT="${F11_REAL_GIT:?F11_REAL_GIT unset}"
-if [ "$1" = "branch" ]; then
-    if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
-        printf '%s\000' "$@"
-        printf '\000'
-        exit 0
-    fi
-    {
-        printf '%s\000' "$@"
-        printf '\000'
-    } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
-fi
+case "$1" in
+    branch|update-ref)
+        if [ "${GIT_WRAP_MODE:-delegate}" = "print" ]; then
+            printf '%s\000' "$@"
+            printf '\000'
+            exit 0
+        fi
+        {
+            printf '%s\000' "$@"
+            printf '\000'
+        } >>"${GIT_WRAP_LOG:?GIT_WRAP_LOG unset}"
+        ;;
+esac
 exec "$REAL_GIT" "$@"
 WRAP
 chmod +x "$F11_WRAP/git"
@@ -2801,13 +2906,13 @@ run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE
 F11A_PLAN_OUT="$OUT"
 assert_eq "$RC" "0" "F11A: dry-run exits 0"
 assert_contains "$F11A_PLAN_OUT" 'git branch -d -- m-anc   # class=merged' "F11A: the plan prints the -d command (F11)"
-assert_contains "$F11A_PLAN_OUT" 'git branch -D -- m-anc   # class=merged (fallback if -d refuses)' "F11A: the plan prints the -D fallback because -d will test HEAD, not origin/main (F11)"
+assert_match "$F11A_PLAN_OUT" '^  git update-ref -d refs/heads/m-anc [0-9a-f]+   # class=merged \(fallback if -d refuses\)$' "F11A: the plan prints the force-delete fallback because -d will test HEAD, not origin/main (F11)"
 F11A_PLAN="$FIX/f11a-plan.bin"; : > "$F11A_PLAN"
 while IFS= read -r _f11a_line; do
     [ -n "$_f11a_line" ] || continue
     PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f11a_line" >>"$F11A_PLAN" || true
-done <<<"$(grep '^  git branch -[dD] --' <<<"$F11A_PLAN_OUT" || true)"
+done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$F11A_PLAN_OUT" || true)"
 F11A_EXEC="$FIX/f11a-exec.bin"; : > "$F11A_EXEC"
 run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11A_EXEC" \
     bash "$F11A_SCRIPT" --repo "$F11A_REPO" --scope local --execute --pr-map-file "$F11A_MAP"
@@ -2819,7 +2924,7 @@ else
     echo "    plan argv:"; od -c "$F11A_PLAN" | head -n 6
     echo "    exec argv:"; od -c "$F11A_EXEC" | head -n 6
 fi
-assert_branch_absent m-anc "F11A: the merge-commit branch is reaped via -D (F11)"
+assert_branch_absent m-anc "F11A: the merge-commit branch is reaped via the force-delete fallback (F11)"
 
 # ── (B) the branch tracks origin: `-d` tests the UPSTREAM, so the plan must NOT
 #        print a spurious -D (the pre-F11 plan did).
@@ -2849,13 +2954,13 @@ run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE
 F11B_PLAN_OUT="$OUT"
 assert_eq "$RC" "0" "F11B: dry-run exits 0"
 assert_contains "$F11B_PLAN_OUT" 'git branch -d -- sq   # class=merged' "F11B: the plan prints the -d command (F11)"
-assert_not_contains "$F11B_PLAN_OUT" 'git branch -D -- sq' "F11B: the plan prints NO spurious -D for an upstream-comparison branch (F11)"
+assert_not_contains "$F11B_PLAN_OUT" 'git update-ref -d refs/heads/sq' "F11B: the plan prints NO spurious force-delete for an upstream-comparison branch (F11)"
 F11B_PLAN="$FIX/f11b-plan.bin"; : > "$F11B_PLAN"
 while IFS= read -r _f11b_line; do
     [ -n "$_f11b_line" ] || continue
     PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f11b_line" >>"$F11B_PLAN" || true
-done <<<"$(grep '^  git branch -[dD] --' <<<"$F11B_PLAN_OUT" || true)"
+done <<<"$(grep -E '^  (git branch -[dD] --|git update-ref -d )' <<<"$F11B_PLAN_OUT" || true)"
 F11B_EXEC="$FIX/f11b-exec.bin"; : > "$F11B_EXEC"
 run_script env PATH="$F11_WRAP:$PATH" F11_REAL_GIT="$F11_REAL_GIT" GIT_WRAP_LOG="$F11B_EXEC" \
     bash "$F11B_SCRIPT" --repo "$F11B_REPO" --scope local --execute --pr-map-file "$F11B_MAP"
@@ -2868,6 +2973,106 @@ else
     echo "    exec argv:"; od -c "$F11B_EXEC" | head -n 6
 fi
 assert_branch_absent sq "F11B: the upstream-tracking squash branch is reaped via -d (F11)"
+
+cd "$REPO"
+echo ""
+echo "== 38. the remote scope skips the origin/HEAD SYMREF, not every origin/HEAD* branch (F13) =="
+# `git branch -r` renders the symref as `origin/HEAD -> origin/main`, and the
+# old skip was the glob `origin/HEAD*`, which ALSO swallowed every real remote
+# branch whose name merely BEGINS with `HEAD` (`origin/HEADfoo`) — no selection
+# line, no keep line: a SILENT skip, contradicting the remote scope's rule that
+# non-candidates are reported. Match the rendered symref instead (a space is
+# illegal in a ref name, so `origin/HEAD -> ` can never be a real branch).
+F13_ORIGIN="$FIX/f13-origin.git"
+F13_REPO="$FIX/f13-repo"
+new_repo "$F13_REPO" "$F13_ORIGIN"
+cd "$F13_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F13_SCRIPT="$F13_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f13.txt; git add f13.txt; old_commit "init"; git push -q origin main
+git checkout -q -b doomed main
+echo d > d.txt; git add d.txt; old_commit "doomed"
+git push -q origin doomed
+git checkout -q main
+git merge -q --ff-only doomed
+git checkout -q -b HEADfoo main
+echo h > h.txt; git add h.txt; old_commit "HEADfoo"
+git push -q origin HEADfoo
+git checkout -q main
+git merge -q --ff-only HEADfoo
+git push -q origin main
+git fetch -q origin
+git remote set-head origin main
+if git rev-parse --verify -q refs/remotes/origin/HEAD >/dev/null 2>&1; then
+    ok "F13 fixture: refs/remotes/origin/HEAD exists (the symref the skip targets)"
+else
+    bad "F13 fixture: refs/remotes/origin/HEAD was not created — the symref is not exercised"
+fi
+run_script bash "$F13_SCRIPT" --scope remote
+assert_eq "$RC" "0" "F13: remote dry-run exits 0"
+assert_contains "$OUT" "origin/doomed" "F13: the ordinary stale merged branch is selected (control)"
+assert_contains "$OUT" "origin/HEADfoo" "F13: a branch whose name begins with HEAD is NOT silently skipped (F13)"
+assert_no_match "$OUT" 'refs/heads/HEAD:' "F13: the origin/HEAD symref itself is never selected for deletion (F13)"
+
+cd "$REPO"
+echo ""
+echo "== 39. the local plan's unresolvable-tip arm is CONDITIONAL, not an unconditional fallback (F14) =="
+# When a merged branch's tip cannot be resolved at plan time, execution's
+# pre-check reads empty, reports `moved`, and does NOT run the fallback. The old
+# plan printed the fallback with the SAME unqualified `(fallback if -d refuses)`
+# reason it used for a resolvable tip, i.e. it advertised a command execution
+# would refuse. The line is kept — never UNDER-advertise a delete execution may
+# still perform if the ref reappears at the classified tip — but it is annotated
+# as conditional on the tip, with the atomic caveat that update-ref -d refuses
+# any other tip.
+F14_ORIGIN="$FIX/f14-origin.git"
+F14_REPO="$FIX/f14-repo"
+new_repo "$F14_REPO" "$F14_ORIGIN"
+cd "$F14_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F14_SCRIPT="$F14_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f14.txt; git add f14.txt; old_commit "init"; git push -q origin main
+F14_MAIN_SHA="$(git rev-parse main)"
+F14_TREE="$(git rev-parse "$F14_MAIN_SHA^{tree}")"
+F14_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+    GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git commit-tree "$F14_TREE" -p "$F14_MAIN_SHA" -m "f14-unres")"
+git update-ref refs/heads/f14-unres "$F14_SHA"
+F14_MAP="$FIX/f14-pr-map.json"
+cat > "$F14_MAP" <<JSON
+[
+  {"headRefName":"f14-unres","state":"MERGED","headRefOid":"$F14_SHA","baseRefName":"main"}
+]
+JSON
+F14_REAL_GIT="$(command -v git)"
+F14_WRAP="$FIX/f14-wrap"
+mkdir -p "$F14_WRAP"
+cat > "$F14_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F14): make the plan's tip read unresolvable for the target branch
+# (the race where the ref disappears between classification and plan); every
+# other call delegates.
+REAL_GIT="${F14_REAL_GIT:?F14_REAL_GIT unset}"
+if [ "$1" = "rev-parse" ]; then
+    for _a in "$@"; do
+        if [ "$_a" = "refs/heads/${F14_BRANCH:?F14_BRANCH unset}" ]; then
+            exit 1
+        fi
+    done
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F14_WRAP/git"
+run_script env PATH="$F14_WRAP:$PATH" F14_REAL_GIT="$F14_REAL_GIT" F14_BRANCH="f14-unres" \
+    bash "$F14_SCRIPT" --repo "$F14_REPO" --scope local --pr-map-file "$F14_MAP"
+assert_eq "$RC" "0" "F14: the unresolvable-tip dry-run still exits 0"
+assert_contains "$OUT" 'git branch -d -- f14-unres   # class=merged' "F14: the -d command is still printed"
+assert_contains "$OUT" 'git update-ref -d refs/heads/f14-unres' "F14: the fallback is still advertised (never under-advertise) (F14)"
+assert_contains "$OUT" 'only if the tip is still' "F14: the fallback is annotated as CONDITIONAL on the tip (F14)"
+assert_contains "$OUT" 'unresolvable at plan time' "F14: the annotation states the tip was unresolvable at plan time (F14)"
+assert_not_contains "$OUT" 'class=merged (fallback if -d refuses)' "F14: the unresolvable arm does NOT print the unqualified fallback reason (F14)"
 
 cd "$REPO"
 echo ""

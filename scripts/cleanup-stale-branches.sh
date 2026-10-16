@@ -38,16 +38,17 @@
 #
 #               A MERGED PR proves the PR's CONTENT landed; it does NOT prove
 #               the local TIP is what landed. A branch can be squash-merged and
-#               then committed to locally, and `-D` would destroy that
-#               post-merge commit (it would survive only in the reflog). So the
-#               tip is compared, and a tip that has moved past the merged
-#               revision is KEPT and reported as `merged-tip-moved`. A PR merged
+#               then committed to locally, and the force-delete fallback would
+#               destroy that post-merge commit (it would survive only in the
+#               reflog). So the tip is compared, and a tip that has moved past
+#               the merged revision is KEPT and reported as `merged-tip-moved`.
+#               A PR merged
 #               into a base other than `main` (a stacked PR) proves only that
 #               the content is in THAT base — it is KEPT and reported as
 #               `merged-base-not-main` UNLESS another gate (redundant or
-#               remotecopy) carries it on its own evidence. `-D` is never used
-#               for it: the off-base reason authorizes nothing, it only declines
-#               to pre-empt the other gates.
+#               remotecopy) carries it on its own evidence. A force-delete is
+#               never used for it: the off-base reason authorizes nothing, it
+#               only declines to pre-empt the other gates.
 #   redundant   the branch has no commits outside origin/main
 #               (`git rev-list --count origin/main..refs/heads/<br>` == 0).
 #   remotecopy  the branch's upstream is on `origin` (ONLY origin), the
@@ -99,22 +100,39 @@
 #     main/upstream alone and the off-base reason is not a verdict against them.
 #   * anything matching none of the three gates (`localonly`)
 #
-# Deletion mechanics (local): `git branch -d` first. It falls back to
-# `git branch -D` ONLY for the `merged` class — a branch squash-merged at a tip
-# that has NOT moved is not an ancestor of main, so `-d` legitimately refuses,
-# and `-D` is correct there and ONLY there. The other classes never use `-D`:
-# `-d` is required to succeed on the branch's own evidence, or the branch stays
-# put and is reported as failed.
+# Deletion mechanics (local): `git branch -d` first. It falls back — ONLY for
+# the `merged` class — to `git update-ref -d refs/heads/<br> <classified-tip>`.
+# A branch squash-merged at a tip that has NOT moved is not an ancestor of main,
+# so `-d` legitimately refuses, and the atomic fallback is correct there and ONLY
+# there. The other classes never use it: `-d` is required to succeed on the
+# branch's own evidence, or the branch stays put and is reported as failed.
 #
-# ⛔ `-D` IS GUARDED BY A COMPARE-AND-SWAP, exactly as the remote leg guards its
-# delete with `--force-with-lease`. The `merged` gate proves the tip equalled the
-# PR's headRefOid at CLASSIFICATION time; `-D` re-checks NOTHING by itself, so a
-# commit landing between classification and delete would be force-deleted even
-# though the new tip was never proven merged (the local leg's data-loss window —
-# F10). So `-D` runs ONLY when the branch's CURRENT tip still equals the
-# classified tip; a tip that moved is reported (`moved`, old → new), counted, and
-# the sweep exits non-zero. `-d` needs no such guard: git itself refuses when the
-# tip is not merged, so it can never force-delete.
+# ⛔ THE FALLBACK IS THE COMPARE-AND-SWAP ITSELF, exactly as the remote leg's
+# delete is guarded by `--force-with-lease` (checked by the receiving
+# repository): `git update-ref -d <ref> <old>` has GIT compare the ref's current
+# value to <old> and remove it in the SAME operation, so it refuses unless the
+# ref is still exactly the revision the `merged` gate proved. The `merged` gate
+# proves the tip only at CLASSIFICATION time, so a read-then-delete would have a
+# window: a commit landing between the read and the delete is invisible to the
+# read and destroyed by the delete (the local leg's data-loss window — F12).
+# `update-ref` closes that window because there is no second process to race.
+#
+# ⛔ THE PRE-CHECK (read the current tip, compare to the classified tip) IS NOT
+# THE SAFETY MECHANISM. It is two separate git processes, so a tip that moves
+# between them is missed; it exists to produce a good `moved` message. A refusal
+# from `update-ref` (a moved tip, or a held ref lock) is reported as `moved`,
+# counted, and makes the sweep exit non-zero — never as a delete. `-d` needs no
+# guard: git itself refuses when the tip is not merged, so it cannot force-delete.
+#
+# ⛔ `update-ref -d` is NOT `git branch -D`, so the delete path does NOT inherit
+# `-D`'s two refusals. (1) It does NOT refuse a CHECKED-OUT branch (`-D` does;
+# verified: `update-ref -d` removes the checked-out branch and leaves HEAD
+# dangling), so the delete path re-enumerates the worktrees immediately before
+# the swap and refuses on its own — the classification's `worktree:` keep rule is
+# not relied on across the window. (2) It DOES remove `logs/refs/heads/<br>`
+# exactly as `-D` does, but it does NOT remove the `branch.<br>.*` config section
+# `-D` cleans up; that orphan is left deliberately (it is only read while the
+# branch exists) and no path here reaches `-D`'s cleanup.
 #
 # Deletion mechanics (remote): the classification reads
 # refs/remotes/origin/<br>, but the destructive action targets origin's REAL
@@ -556,8 +574,8 @@ load_pr_map() {
         # Without any --repo at all, `gh pr list` honours an exported GH_REPO, so
         # the whole PR map would be fetched for a DIFFERENT repository: the
         # OPEN-PR keep rule would silently protect that repository's branches and
-        # this one's OPEN PRs would vanish from the map (in the merged path `-D`
-        # could then remove local-only commits).
+        # this one's OPEN PRs would vanish from the map (in the merged path the
+        # force-delete fallback could then remove local-only commits).
         local errf="" gh_rc=0
         errf="$(mktemp "${TMPDIR:-/tmp}/cleanup-branch-gh.XXXXXX" 2>/dev/null)" || errf=""
         if [ -n "$errf" ]; then
@@ -953,7 +971,17 @@ run_remote_scope() {
         branch="$(echo "$branch" | sed 's/^[[:space:]]*//')"
         [ -z "$branch" ] && continue
         [ "$branch" = "origin/$MAIN_BRANCH" ] && continue
-        [[ "$branch" == origin/HEAD* ]] && continue
+        # ⛔ Match the SYMREF's RENDERED FORM, not `origin/HEAD*`. `git branch -r`
+        # renders the symref as `origin/HEAD -> origin/main`, and the glob
+        # `origin/HEAD*` also matched every real remote branch whose name merely
+        # BEGINS with `HEAD` (`origin/HEADfoo`), which was then `continue`d with
+        # no selection line and no keep line — a SILENT skip, contradicting this
+        # scope's rule that non-candidates are reported (F13). A space is illegal
+        # in a ref name (`git check-ref-format` rejects it), so a rendered
+        # `origin/HEAD -> ` prefix can never be a real branch and cannot collide.
+        case "$branch" in
+            "origin/HEAD -> "*) continue ;;
+        esac
 
         # Check if branch commit date is before cutoff
         local COMMIT_DATE
@@ -1408,7 +1436,8 @@ run_local_scope() {
         fi
 
         # 5. the three gates — first match wins (merged first: it is the only
-        #    class that authorizes `-D`, and it is the strongest evidence).
+        #    class that authorizes the force-delete fallback, and it is the
+        #    strongest evidence).
         cls=""
         local offbase=0
         if is_member "$merged_main_lookup" "$br"; then
@@ -1481,8 +1510,8 @@ run_local_scope() {
             keep_localonly=$((keep_localonly + 1)); keep_total=$((keep_total + 1)); continue
         fi
 
-        # Third column: the classified TIP. `merged` force-delete (`-D`) uses it
-        # as the compare-and-swap expected value; `-d` never needs it.
+        # Third column: the classified TIP. The `merged` force-delete uses it as
+        # the old value of the atomic `update-ref -d`; `-d` never needs it.
         delete_list="${delete_list}${cls}"$'\t'"$br"$'\t'"$sha"$'\n'
         sel_total=$((sel_total + 1))
         case "$cls" in
@@ -1513,8 +1542,8 @@ run_local_scope() {
         echo "── EXECUTE: deleting $sel_total stale local branch(es) ──"
         echo ""
         # Columns: cls<TAB>br<TAB>sha. `sha` is the tip the classified gate
-        # PROVED (for `merged`, the PR's headRefOid it equalled). It is the
-        # compare-and-swap expected value for `-D` below.
+        # PROVED (for `merged`, the PR's headRefOid it equalled). It is the OLD
+        # value passed to the atomic `update-ref -d` below.
         while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
             # ⛔ `--` before the ref: without it a branch whose name begins with
@@ -1525,32 +1554,93 @@ run_local_scope() {
                 printf '  deleted %-10s %s\n' "$cls" "$br"
                 deleted=$((deleted + 1))
             elif [ "$cls" = "merged" ]; then
-                # ⛔ COMPARE-AND-SWAP (F10): `-D` is force-delete, and the
-                # `merged` gate proved the tip only at CLASSIFICATION time. Read
-                # the branch's CURRENT tip and force-delete ONLY if it is still
-                # the revision the gate proved. This is the local analogue of the
-                # remote leg's `--force-with-lease`: without it, a commit landing
-                # between classification and delete is destroyed (and `-D` drops
-                # the reflog too, so recovery is `git fsck --lost-found` only).
+                # ⛔ COMPARE-AND-SWAP (F12): `git update-ref -d <ref> <old>` is
+                # the atomically-checked delete. git itself compares the ref's
+                # CURRENT value to <old> and removes it in the SAME operation,
+                # refusing unless they match — exactly as the remote leg's
+                # `--force-with-lease` is checked by the receiving repository.
+                # The `merged` gate proved the tip only at CLASSIFICATION time,
+                # so a commit landing after that proof must never be destroyed.
+                #
+                # ⛔ THE PRE-CHECK BELOW (read cur_tip, compare to sha) IS NOT THE
+                # SAFETY MECHANISM. The read and the delete are two separate git
+                # processes, so a commit landing BETWEEN them is invisible to the
+                # check; the pre-check exists only to produce a good `moved`
+                # message. The `update-ref -d` old-value argument is what makes
+                # that window harmless.
                 local cur_tip=""
                 cur_tip="$(git rev-parse -q --verify "refs/heads/$br" 2>/dev/null || true)"
                 if [ "$cur_tip" != "$sha" ]; then
-                    printf '  moved   %-10s %s (tip advanced %s -> %s; -D refused)\n' \
+                    printf '  moved   %-10s %s (tip advanced %s -> %s; update-ref refused)\n' \
                         "$cls" "$br" "$sha" "${cur_tip:-<deleted>}"
                     moved=$((moved + 1))
-                elif git branch -D -- "$br" >/dev/null 2>&1; then
-                    # Squash-merged AND unmoved: the classification already proved
-                    # the local tip IS the revision the PR merged (it equalled
-                    # headRefOid), so `-d` refuses only because the squash commit
-                    # is not an ancestor of main. `-D` is correct ONLY here.
-                    printf '  deleted %-10s %s (via -D: squash-merged PR)\n' "$cls" "$br"
-                    deleted=$((deleted + 1))
                 else
-                    printf '  failed  %-10s %s (-D refused; tip unchanged)\n' "$cls" "$br"
-                    failed=$((failed + 1))
+                    # (a) `git update-ref -d` does NOT refuse a CHECKED-OUT
+                    # branch (`git branch -D` does; verified 2026-10-15: it
+                    # removes the checked-out branch and leaves HEAD pointing at
+                    # the now-absent ref). The delete path must therefore be safe
+                    # on its OWN rather than relying on the classification's
+                    # `worktree:` keep rule — the branch could have been checked
+                    # out in the window since. Re-enumerate the worktrees
+                    # IMMEDIATELY before the swap. A failed enumeration is a
+                    # REFUSAL (fail-closed), never an assumed "not checked out".
+                    local wt_now=""
+                    if ! wt_now="$(git worktree list --porcelain 2>/dev/null)"; then
+                        printf '  failed  %-10s %s (could not enumerate worktrees; refused force-delete)\n' "$cls" "$br"
+                        failed=$((failed + 1))
+                        continue
+                    fi
+                    # ⛔ TWO patterns, not one: command substitution strips ALL
+                    # trailing newlines, so when the target is the LAST entry in
+                    # `git worktree list --porcelain` its `branch refs/heads/<br>`
+                    # line is NOT followed by a newline in `$wt_now` and a lone
+                    # `...$'\n'*` pattern MISSES the very branch being deleted. The
+                    # second alternative anchors at end-of-string, so it matches
+                    # the final entry; `*"..."` requires the string to END with
+                    # the literal, so a longer name (`HEADfoo` vs `HEAD`) still
+                    # does not match.
+                    case "$wt_now" in
+                        *"branch refs/heads/$br"$'\n'* | *"branch refs/heads/$br")
+                            printf '  failed  %-10s %s (checked out in a worktree; update-ref refused)\n' "$cls" "$br"
+                            failed=$((failed + 1))
+                            continue ;;
+                    esac
+                    # (b) `git update-ref -d` DOES remove logs/refs/heads/<br>
+                    # exactly as `git branch -D` does (verified). It does NOT
+                    # remove the `branch.<br>.*` config section that `-D` also
+                    # cleans up, and no path here reaches that cleanup: the
+                    # orphaned section is harmless (only read while the branch
+                    # exists) and is left deliberately. `update-ref -d` is NOT
+                    # `git branch -D`; do not assume parity.
+                    if git update-ref -d "refs/heads/$br" "$sha" >/dev/null 2>&1; then
+                        # Squash-merged AND unmoved: the classification already
+                        # proved the local tip IS the revision the PR merged (it
+                        # equalled headRefOid), so `-d` refused only because the
+                        # squash commit is not an ancestor of main. The atomic
+                        # old-value check is correct ONLY here.
+                        printf '  deleted %-10s %s (via update-ref -d: squash-merged PR)\n' "$cls" "$br"
+                        deleted=$((deleted + 1))
+                    else
+                        # ⛔ The swap REFUSED: the tip moved between the read
+                        # above and the atomic update, or another writer holds
+                        # the ref lock. Report `moved` (NEVER `deleted`) and fail
+                        # the sweep, exactly as the pre-check's `moved` arm does.
+                        # Re-read once for the diagnostic only; the value is used
+                        # for no safety decision.
+                        local new_tip=""
+                        new_tip="$(git rev-parse -q --verify "refs/heads/$br" 2>/dev/null || true)"
+                        if [ -z "$new_tip" ] || [ "$new_tip" = "$sha" ]; then
+                            printf '  moved   %-10s %s (update-ref -d refused; tip still %s — concurrent update or ref lock)\n' \
+                                "$cls" "$br" "$sha"
+                        else
+                            printf '  moved   %-10s %s (tip advanced %s -> %s; update-ref -d refused)\n' \
+                                "$cls" "$br" "$sha" "$new_tip"
+                        fi
+                        moved=$((moved + 1))
+                    fi
                 fi
             else
-                printf '  failed  %-10s %s (git branch -d refused; -D not allowed for this class)\n' "$cls" "$br"
+                printf '  failed  %-10s %s (git branch -d refused; force-delete not allowed for this class)\n' "$cls" "$br"
                 failed=$((failed + 1))
             fi
         done <<<"$delete_list"
@@ -1559,7 +1649,7 @@ run_local_scope() {
         echo "── DRY-RUN: no branches deleted ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --scope local --execute"
         echo ""
-        echo "Deletion commands that would run (-D fallback only for a merged branch that -d will refuse):"
+        echo "Deletion commands that would run (force-delete fallback only for a merged branch that -d will refuse):"
         while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
             # ⛔ Build the command ONCE, as an array, and PRINT it through
@@ -1573,42 +1663,56 @@ run_local_scope() {
             # quoted argv: it is informational and must not become an argument.
             local local_cmd=(git branch -d -- "$br")
             printf '  %s   # class=%s\n' "$(quote_argv "${local_cmd[@]}")" "$cls"
-            # ⛔ THE `-D` FALLBACK IS PART OF THE PLAN FOR `merged` — BUT ONLY
-            # WHEN `-d` WILL ACTUALLY REFUSE (F9). Omitting it entirely made the
-            # plan a LIE for a squash-merged branch (the execute path silently
-            # fell back to `-D`). Printing it UNCONDITIONALLY made the plan a
+            # ⛔ THE FORCE-DELETE FALLBACK IS PART OF THE PLAN FOR `merged` —
+            # BUT ONLY WHEN `-d` WILL ACTUALLY REFUSE (F9). Omitting it entirely
+            # made the plan a LIE for a squash-merged branch (the execute path
+            # silently fell back). Printing it UNCONDITIONALLY made the plan a
             # strict SUPERSET for a branch merged with a MERGE COMMIT (or
             # fast-forwarded): the merged gate proves the PR's CONTENT landed and
             # the tip equalled headRefOid — it does NOT prove the tip is a
             # NON-ancestor of main. Such a tip IS an ancestor, so the execute
-            # path's `git branch -d` SUCCEEDS and `-D` never runs; the extra
-            # printed line then ran `git branch -D -- m-anc` → `error: branch
-            # 'm-anc' not found`, and under `set -e` that aborted the rest of the
-            # paste — an UNDER-reap. So predict the SAME test the outcome will
-            # apply: is the tip an ancestor of the ref `-d` compares against?
-            # Ancestor → `-d` succeeds, print NO fallback; not-an-ancestor →
-            # print the fallback, through the SAME `quote_argv`, annotated
-            # OUTSIDE the quoted argv.
+            # path's `git branch -d` SUCCEEDS and the fallback never runs; the
+            # extra printed line then ran `git branch -D -- m-anc` (the pre-F12
+            # form) → `error: branch 'm-anc' not found`, and under `set -e` that
+            # aborted the rest of the paste — an UNDER-reap. So predict the SAME
+            # test the outcome will apply: is the tip an ancestor of the ref `-d`
+            # compares against? Ancestor → `-d` succeeds, print NO fallback;
+            # not-an-ancestor → print the fallback, through the SAME
+            # `quote_argv`, annotated OUTSIDE the quoted argv.
             # ⛔ AND IT MUST PREDICT THE SAME REF `-d` WILL TEST (F11). `git
             # branch -d` tests the branch's UPSTREAM when it has one, and only
             # falls back to HEAD otherwise — NOT `origin/main`. Predicating on
             # `origin/main` mispredicted in BOTH directions: with a merge-commit
             # branch and HEAD off main it printed only `-d` while execute ran
-            # `-D` (UNDER-describes), and with a branch tracking origin it printed
-            # a spurious `-D` while execute ran only `-d` (OVER-describes). So
-            # resolve the comparison ref as `<br>@{upstream}` when configured,
-            # else HEAD, and test ancestry against EXACTLY that.
+            # the fallback (UNDER-describes), and with a branch tracking origin
+            # it printed a spurious fallback while execute ran only `-d`
+            # (OVER-describes). So resolve the comparison ref as
+            # `<br>@{upstream}` when configured, else HEAD, and test ancestry
+            # against EXACTLY that.
             if [ "$cls" = "merged" ]; then
                 local dry_needs_force=0 dry_reason="" dry_tip="" dry_cmp_ref=""
                 dry_tip="$(git rev-parse --verify -q "refs/heads/$br" 2>/dev/null || true)"
                 if [ -z "$dry_tip" ]; then
-                    # Tip unresolvable at plan time: conservative (over-describe).
+                    # ⛔ Tip unresolvable at plan time (F14). The fallback is
+                    # printed CONDITIONALLY-annotated, not suppressed, and NOT
+                    # with the unqualified "(fallback if -d refuses)" used when
+                    # the tip IS resolvable:
+                    #   * `update-ref -d <ref> <old>` refuses unless the ref is
+                    #     still exactly the classified tip, so pasting it can
+                    #     never force-delete anything — the command is safe by
+                    #     construction; and
+                    #   * the annotation is literally accurate: execution reports
+                    #     `moved` and does NOT run the fallback while the tip is
+                    #     unresolved, and it would run it only if the ref
+                    #     reappeared at exactly <sha>. Suppressing the line would
+                    #     risk UNDER-advertising a delete execution may still
+                    #     perform in that case.
                     dry_needs_force=1
-                    dry_reason="(fallback if -d refuses; tip unresolvable)"
+                    dry_reason="(fallback only if the tip is still $sha when this runs; tip unresolvable at plan time — the atomic update-ref -d refuses any other tip)"
                 elif [ "$dry_tip" != "$sha" ]; then
                     # Tip MOVED since classification: the execute gate's
-                    # compare-and-swap will REFUSE `-D`, so the plan must not
-                    # advertise one (F10).
+                    # compare-and-swap will REFUSE the fallback, so the plan must
+                    # not advertise one (F12).
                     dry_needs_force=0
                 else
                     # `git branch -d` compares against the branch's configured
@@ -1626,15 +1730,20 @@ run_local_scope() {
                     else
                         # Either the comparison ref does not resolve, or the tip
                         # is not merged into it: print the fallback. The
-                        # conservative arm (over-describe) is kept for the
-                        # unresolvable case; the annotation says certainty is not
-                        # established rather than implying it.
+                        # annotation says certainty was not established rather
+                        # than implying it.
                         dry_needs_force=1
                         dry_reason="(fallback if -d refuses)"
                     fi
                 fi
                 if [ "$dry_needs_force" = 1 ]; then
-                    local local_cmd_force=(git branch -D -- "$br")
+                    # ⛔ The fallback is the SAME atomically-checked swap the
+                    # execute path runs (`git update-ref -d <ref> <old>`), not
+                    # `git branch -D`: evaluating the printed line re-parses to
+                    # the executed argv (the F6/F11 parity tests), and its
+                    # old-value argument makes the paste safe on its own — git
+                    # refuses and deletes nothing once the tip has moved.
+                    local local_cmd_force=(git update-ref -d "refs/heads/$br" "$sha")
                     printf '  %s   # class=%s %s\n' \
                         "$(quote_argv "${local_cmd_force[@]}")" "$cls" "$dry_reason"
                 fi
