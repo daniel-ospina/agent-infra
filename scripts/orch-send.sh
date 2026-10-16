@@ -15,10 +15,21 @@
 #   USE A FILE whenever the text contains quotes, parentheses, backticks, or words the
 #   evidence-gate extension pattern-matches (merge/commit/git fetch/gh pr ...). Inlining
 #   those has twice bitten this session: once by interception, once by shell mangling.
+#
+#   ⛔ THE EXIT CODE IS NOT A DELIVERY SIGNAL (#1187). `cmux send` returns OK while
+#   delivering only a PREFIX of a payload: measured 2026-09-29, a 1,962-byte message
+#   arrived as its first sentence and a 1,404-byte one as its first numbered item,
+#   both with OK, while a 5,464-byte message arrived intact — so size does not predict
+#   delivery, and neither does a turn having started (a truncated prefix starts one).
+#   The TAIL is what a prefix truncation loses, so CONSUMED is now reported only when
+#   the payload's tail marker is on the recipient's pane (or in its session transcript).
+#   Anything else is SENT BUT NOT VERIFIED with a non-zero exit. The check lives in
+#   scripts/lib/cmux_payload.py so every caller uses one rule.
 set -uo pipefail
 
 W="${1:-}"; LABEL="${2:-?}"; MSG="${3:-}"
 [ -n "$W" ] && [ -n "$MSG" ] || { echo "usage: orch-send.sh <uuid> <label> <msg|@file>"; exit 2; }
+SCRIPTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 case "$MSG" in
   @*)
@@ -133,16 +144,24 @@ fi
 
 if [ -z "$_via_map" ]; then echo "$LABEL: target OK ($REPO)"; fi
 
-cmux send --workspace "$W" "$MSG" >/dev/null 2>&1
-sleep 2
-cmux send --workspace "$W" $'\n' >/dev/null 2>&1
-sleep 4
-
-# Consumed check. NOTE: a message that arrives in the ORCHESTRATOR'S OWN pane would also match
-# here — that is why the self-check above must pass FIRST.
-if cmux read-screen --workspace "$W" --lines 10 2>&1 | grep -qiE 'Working|Steering|queued message'; then
-  echo "$LABEL: CONSUMED"
-  exit 0
-fi
-echo "$LABEL: SENT BUT NOT CONSUMED — check the pane; the text may sit in the editor"
-exit 6
+# ── SEND + VERIFY THE TAIL (#1187) ──────────────────────────────────────────
+# The helper sends the payload, submits it with a terminating Enter, then polls
+# the pane (and the lane's session transcript as a second source) for the payload's
+# TAIL. A prefix truncation loses the tail, so absence of the tail is the signal.
+# A non-zero helper exit (unreadable pane, cmux failure, no tail) is UNVERIFIED
+# and MUST NOT be reported as a delivered order. NOTE: a message that arrives in
+# the ORCHESTRATOR'S OWN pane would also verify — the self-check above runs FIRST.
+cmux_payload_verdict="$(/usr/bin/python3 "$SCRIPTS/lib/cmux_payload.py" verify \
+      --workspace "$W" --text="$MSG" --screen-lines 200 \
+      --timeout "${ORCH_SEND_VERIFY_TIMEOUT:-30}" 2>/dev/null)"
+case "$cmux_payload_verdict" in
+  VERIFIED)
+    echo "$LABEL: CONSUMED (payload tail verified on the pane)"
+    exit 0 ;;
+  *)
+    echo "$LABEL: SENT BUT NOT VERIFIED — the payload TAIL is not on the pane."
+    echo "$LABEL:   cmux send returns OK while delivering only a PREFIX under load (#1187),";
+    echo "$LABEL:   so this send is NOT recorded as delivered. Re-read the pane and re-send;"
+    echo "$LABEL:   for a long body, write it to a file and send a short one-line pointer."
+    exit 6 ;;
+esac

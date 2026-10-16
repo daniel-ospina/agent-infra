@@ -752,8 +752,8 @@ check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
 grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
   || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
-grep -q "scripts lib farm: 2 copied (pid-identity.sh + diff-normalize.py, #1178)" "$RUNS_LOG" \
-  || fail "run 1 did not report the shared-library farm copies (#1178/#1362)"
+grep -q "scripts lib farm: 3 copied (pid-identity.sh + diff-normalize.py + cmux_payload.py, #1178)" "$RUNS_LOG" \
+  || fail "run 1 did not report the shared-library farm copies (#1178/#1362/#1187)"
 grep -q "scripts/fleet farm: 4 copied (lane-liveness + fleet-health + map-sessions, #1178)" "$RUNS_LOG" \
   || fail "run 1 did not report the fleet-tools farm copy (4 files, #1178)"
 check_tools_dir_clean "run1-final"
