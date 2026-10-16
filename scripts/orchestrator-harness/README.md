@@ -255,7 +255,14 @@ bash scripts/orchestrator-harness/install.sh
 
 # 4. Start it when you mean to
 launchctl load -w ~/Library/LaunchAgents/com.eldato.orchestrator-loop.plist
+```
 
+Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-stamp.json`
+(agent-infra#1745; see §9). Run `install.sh` from the agent-infra checkout as shown — if the source
+is not a git repo the record reads `UNKNOWN` and `check-deployed-drift.sh` exits 2 rather than
+passing, which is the intended fail-closed behaviour and not an install failure.
+
+```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
 tmux ls                                      # lane-*, chain-*, merge-*, fix-*
@@ -820,12 +827,42 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
+| `check-deployed-drift.sh` | answers whether the DEPLOYED `$O` matches the repo: the recorded commit against the live ref (`merge-base --is-ancestor`, never a commit count), the recorded payload hash against the deployed bytes, and every repo-shipped `*.sh` blob against its `$O` copy. Exit 0 match / 1 drift / **2 UNKNOWN — never a pass** (agent-infra#1745). Not part of the loop |
+| `report.sh` | read-only operator summary: merges in a window, per-kind agent wall-time and cap-hit rate from `state/walltime.tsv`, live `refs/claims/*`, queue health, and the last dispatch decisions. Safe to run while the loop is working. Not part of the loop |
 
 **Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
 
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
 same idea and are no longer invoked; they are included for the record, not for use.
+
+### Which harness commit is this box running? (agent-infra#1745)
+
+On the deployed laptop box the question had **no answer**: the daemon executes `$O/<script>` and
+`~/orchestrator` is not a git checkout at all (`git rev-parse --show-toplevel` → `fatal: not a git
+repository`). `install.sh` now records the source identity into `$O/.agent-infra-stamp.json` — the
+SAME cell-shaped record `cloud-cell-supervisor.sh` writes on a cmux cell, so there is one stamp
+concept, not two. `commit` names the source tree, `payloadSha256` covers the `*.sh` the daemon
+actually executes (the commit cannot see a post-install hand edit to `$O`; the hash cannot say
+whether the commit is on the repo's line), and `agentInfraDirty` says whether that source tree was
+clean when it was copied. The answer is a file read, not a `git` call.
+
+```bash
+sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json"
+```
+
+`check-deployed-drift.sh` answers the next question — does the deployed `$O` actually match the repo?
+
+```bash
+./check-deployed-drift.sh            # 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify)
+```
+
+⛔ **`UNKNOWN` is never a pass.** A missing record, an unreadable one, `commit: UNKNOWN` (the source
+was not a checkout), or an unresolvable ref exits **2**, not 0. That is the rule #1790 measured on
+the cells: `check` printed `CELL CAN RUN A CONTROLLER` over a tree that was not on `main`'s line,
+and over a copy whose bytes matched `main` but which carried no git identity. The laptop is the
+same class with a worse starting point — no record at all — so its absence fails the check loudly
+instead of reading as healthy.
 
 **Portability edits applied to every shipped script.** Three per-box constants became
 overridable with this box's values as defaults (the launchd `PATH` is no longer one of them —

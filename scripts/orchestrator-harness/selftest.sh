@@ -542,6 +542,12 @@ if [ -f "$PL" ]; then
   decoded="$(plutil -extract EnvironmentVariables.O raw "$PL" 2>/dev/null || echo MISSING)"
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
+  # Provenance (#1745): the REAL installer must leave a record at $O, on the SAME install that
+  # rendered the plist — a record written only by a separate command is a record nobody runs.
+  [ -f "$HOSTILE/.agent-infra-stamp.json" ] && rc=0 || { rc=1; echo "      install.sh wrote no provenance stamp at $HOSTILE"; }
+  ck "install.sh records the harness provenance at \$O (#1745)" $rc
+  grep -qE '"payloadSha256": "[0-9a-f]{64}"|"payloadSha256": "UNKNOWN"' "$HOSTILE/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+  ck "the recorded stamp carries a payload hash or an explicit UNKNOWN" $rc
 fi
 else
   skipd "install.sh renders a plist (§6) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
@@ -2746,6 +2752,154 @@ if [ -f "$HERE/sweep-quota.test.sh" ]; then
   fi
 else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
+fi
+
+# ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
+# The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
+# `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so
+# "which commit is this box running?" had NO answer. Two shipped halves close it: install.sh writes
+# $O/.agent-infra-stamp.json (the SAME cell-shaped record surface the cell supervisor writes), and
+# check-deployed-drift.sh answers whether the deployed $O matches the repo. An ABSENT or UNKNOWN
+# record is exit 2 and NEVER a pass — the exact failure that let the cell check bless a tree off
+# main's line.
+#
+# The writer is driven from the SHIPPED install.sh: its provenance block is extracted between its
+# own markers and sourced with a fixture HERE/O. install.sh's macOS-only gate is at its PREFLIGHT;
+# the block itself is pure git + file hashing, so this section runs on every platform. The check is
+# copied verbatim, so neither half can be faked by a fixture that re-implements the logic.
+sed -n '/provenance (agent-infra#1745) BEGIN/,/provenance (agent-infra#1745) END/p' "$INST" > "$TMP/prov-block.body"
+if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its markers are present)"; then
+  { printf 'warn() { :; }\nok() { :; }\n'; cat "$TMP/prov-block.body"; } > "$TMP/prov-block.sh"
+  if command -v git >/dev/null 2>&1; then
+    PW="$TMP/prov-repo"; PO="$TMP/prov-o"; PC="$TMP/prov-chk"
+    mkdir -p "$PW/scripts/orchestrator-harness" "$PO" "$PC"
+    cp "$HERE/check-deployed-drift.sh" "$PC/check-deployed-drift.sh"
+    PG="git -C $PW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+    printf 'loop v1\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
+    $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
+    deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
+    prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
+    dc()  { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" >/dev/null 2>&1; }
+    dcm() { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" 2>&1; }
+    deploy; prov
+    PHEAD=$($PG rev-parse HEAD)
+    grep -qF "\"commit\": \"$PHEAD\"" "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "install.sh's provenance writer records the SOURCE commit (#1745)" $rc
+    grep -qF '"relation": "current"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp classifies the source as current at the ref" $rc
+    grep -qE '"payloadSha256": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp records a payload hash over \$O/*.sh" $rc
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
+    ck "check-deployed-drift: a matching deployment exits 0" $rc
+    # a DIRTY source: its recorded commit cannot describe the deployed bytes
+    printf 'dirty\n' >> "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    deploy; prov
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *DIRTY*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a DIRTY source record is drift, not a pass" $rc
+    $PG checkout -q -- . >/dev/null 2>&1
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || rc=1
+    ck "check-deployed-drift: re-recording a clean source restores the match" $rc
+    # a POST-INSTALL hand edit to $O
+    printf 'tampered\n' > "$PO/orch-loop.sh"
+    dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      post-install edit exited $rc"; }
+    ck "check-deployed-drift: a post-install edit to \$O exits 1" $rc
+    deploy
+    # the record is REQUIRED: absent -> UNKNOWN, never a pass
+    mv "$PO/.agent-infra-stamp.json" "$TMP/prov-stamp.hold"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      missing record exited $rc"; }
+    ck "check-deployed-drift: a MISSING record exits 2 (never a pass)" $rc
+    mv "$TMP/prov-stamp.hold" "$PO/.agent-infra-stamp.json"
+    # an explicit UNKNOWN commit is UNKNOWN too
+    sed 's/"commit": "[0-9a-f]\{40\}"/"commit": "UNKNOWN"/' "$PO/.agent-infra-stamp.json" > "$TMP/prov-stamp.u"
+    mv "$TMP/prov-stamp.u" "$PO/.agent-infra-stamp.json"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      commit UNKNOWN exited $rc"; }
+    ck "check-deployed-drift: commit UNKNOWN exits 2 (never a pass)" $rc
+    prov
+    # an unresolvable ref is cannot-verify, not a match
+    dc --ref no-such-ref; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      bad ref exited $rc"; }
+    ck "check-deployed-drift: an unresolvable ref exits 2, not 0" $rc
+    # a recorded commit that is not an object in the repo is cannot-verify
+    sed 's/"commit": "[0-9a-f]\{40\}"/"commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"/' "$PO/.agent-infra-stamp.json" > "$TMP/prov-stamp.d"
+    mv "$TMP/prov-stamp.d" "$PO/.agent-infra-stamp.json"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      unknown commit object exited $rc"; }
+    ck "check-deployed-drift: a recorded commit absent from the repo exits 2" $rc
+    prov
+    # the ref moves ahead -> behind is drift
+    printf 'loop v2\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    $PG add -A >/dev/null 2>&1; $PG commit -qm advance >/dev/null 2>&1
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *BEHIND*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a ref that moved ahead exits 1 (behind is drift)" $rc
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || rc=1
+    ck "check-deployed-drift: a fresh install at the new tip matches again" $rc
+    # a repo-shipped file MISSING from $O
+    rm -f "$PO/claims.sh"; prov
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *MISSING*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a repo-shipped file missing from \$O is drift" $rc
+    # an EXTRA .sh in $O the repo does not ship
+    deploy; prov; printf 'x\n' > "$PO/legacy.sh"
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *"NOT shipped"*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: an extra hand-placed script in \$O is drift" $rc
+    # a FAILING mktemp used to make the whole byte comparison silently skip and print OK (exit 0)
+    deploy; prov
+    MKB="$TMP/prov-nomk"; mkdir -p "$MKB"
+    printf '#!/bin/bash\nexit 1\n' > "$MKB/mktemp"; chmod +x "$MKB/mktemp"
+    PATH="$MKB:$PATH" bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      failing mktemp exited $rc"; }
+    ck "check-deployed-drift: a failed mktemp exits 2 (never a silent OK)" $rc
+    # an UNREADABLE deployed *.sh is CANNOT-VERIFY, not a fabricated post-install hand edit
+    deploy; prov; chmod 000 "$PO/claims.sh"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      unreadable deployed file exited $rc"; }
+    ck "check-deployed-drift: an unreadable \$O/*.sh exits 2, not a false drift" $rc
+    chmod 644 "$PO/claims.sh"
+    # an EMPTY $O must not record the empty-input digest e3b0c442… as a payload
+    EMPTYO="$TMP/prov-empty"; mkdir -p "$EMPTYO"
+    ( HERE="$PW/scripts/orchestrator-harness"; O="$EMPTYO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" )
+    grep -q '"payloadSha256": "UNKNOWN"' "$EMPTYO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "install.sh's writer records UNKNOWN (not e3b0c442) for an empty \$O" $rc
+    # ...and an empty $O carrying a REAL record is DRIFT (verifiable), not a crash
+    deploy; prov; rm -f "$PO"/*.sh
+    dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      empty deployed copy exited $rc"; }
+    ck "check-deployed-drift: an empty \$O with a real record is DRIFT, not a crash" $rc
+  else
+    ck "deployed-drift: git is available to drive the check" 1
+  fi
+fi
+
+# report.sh is an operator summary and MUST be safe to run while the loop is working: read-only,
+# and every section degrades to a message rather than aborting when its surface is absent.
+if [ -f "$HERE/report.sh" ]; then
+  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"
+  printf '{ "version": 1, "surface": "laptop", "commit": "0123456789abcdef0123456789abcdef01234567", "relation": "current" }\n' > "$RO/.agent-infra-stamp.json"
+  touch "$RO/state/merged-4242.done"
+  printf '%s\treviewer\t7\t1800\t1790\t1\n' "$(date +%s)" > "$RO/state/walltime.tsv"
+  printf 'now [dispatch] picked #1\n' > "$RO/logs/orch-loop.log"
+  printf '1\n' > "$RO/candidates.txt"
+  rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
+  [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
+  ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
+  ck "report.sh prints the window header" $rc
+  case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
+  ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
+  case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reports per-kind agent wall-time" $rc
+  case "$rout" in *"harness: 0123456789ab"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reports which harness commit the box runs (#1745)" $rc
+  # the report must degrade silently when the queue files do not exist (`wc -l < missing` prints a
+  # bash REDIRECTION error that `wc ... 2>/dev/null` cannot suppress)
+  rm -f "$RO/candidates.txt" "$RO/dispatched.txt"
+  rerr="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1 >/dev/null)"
+  case "$rerr" in *"No such file"*) rc=1;; *) rc=0;; esac
+  ck "report.sh degrades silently when the queue files are absent" $rc
+else
+  ck "report.sh is shipped" 1
 fi
 
 echo
