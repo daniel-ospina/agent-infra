@@ -36,6 +36,11 @@
 #   cwd-unreadable           O13  (an ancestor that is not a directory)
 #   cwd-out-of-scope         O14  (deleted cwd outside the roots; --any-cwd)
 #   ps failed/empty          O15  (exit 3, NOTHING signalled)
+#   ps non-empty/unparseable O15c (same failure class — a shape check, not `-s`)
+#   post-signal probe        O18d (unparseable => STILL ALIVE, no "REAPED")
+#   stale lock / live owner  O18b/O18c (broken when stale; HELD while the owner
+#                                  is alive, whatever the dir age; stat flavour
+#                                  detected so Linux breaks a stale lock)
 #   lsof failed/empty        O16  (exit 3, NOTHING signalled — the fail-closed
 #                                  probe the #1095 review found twice)
 #   lsof missing             O16b
@@ -103,6 +108,15 @@ SHIM
 cat >"$T/bin/ps-fail" <<'SHIM'
 #!/usr/bin/env bash
 exit 1
+SHIM
+cat >"$T/bin/ps-garbage" <<'SHIM'
+#!/usr/bin/env bash
+# A NON-EMPTY, non-ps table. The emptiness check cannot see this: every row is
+# dropped by the `$2 == 1` filter, the loop body never runs, and the pass would
+# report a clean exit 0 — the false PASS the shape check closes (#1161 review).
+printf 'bash: ps: command not found\n'
+printf 'usage: ps [-a] [-x]\n'
+exit 0
 SHIM
 cat >"$T/bin/lsof" <<'SHIM'
 #!/usr/bin/env bash
@@ -299,6 +313,21 @@ OUT="$(run_reaper o9 "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 99999
 assert_contains "$OUT" "reason=too-young" "O9 a process younger than the floor is preserved"
 assert_nofile "$T/o9.kills" "O9 ... and nothing is signalled"
 
+# O9b/O9c — the UNIT contract (#1161 review). `ps_normalize` used to convert
+# `etime` with `csecs()` and `classify_one` compared it against a SECONDS floor,
+# so a 320 s process read as 32000 and 32000 < 600 was false: the "never signal a
+# process younger than 60 s" gate was really 0.6 s. Both polarities are pinned so
+# neither can pass vacuously: 320 s MUST be too-young under a 600 s floor, and
+# MUST be reapable under a 60 s floor.
+OUT="$(run_reaper o9b "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 600 --sample-seconds 0)"
+assert_contains "$OUT" "reason=too-young" "O9b 320s vs a 600s floor is too-young (the floor is SECONDS)"
+assert_contains "$OUT" "elapsed=320s < 600s" "O9b ... and the detail prints SECONDS, not centiseconds"
+assert_nofile "$T/o9b.kills" "O9b ... and nothing is signalled"
+
+OUT="$(run_reaper o9c "$A:$B" "$L9" --apply --verbose --min-elapsed-seconds 60 --sample-seconds 0)"
+assert_contains "$OUT" "reason=reapable" "O9c 320s vs a 60s floor is old enough to reap"
+assert_file "$T/o9c.kills" "O9c ... and the signal is recorded (the floor is not always too-young)"
+
 OTHER_UID=4002
 OA="$(fake_ps psOa "$(ps_row_line $OTHER_UID 1 4242 '0:00.10' '01:00:00' /usr/bin/other)")"
 OB="$(fake_ps psOb "$(ps_row_line $OTHER_UID 1 4242 '0:09.00' '01:00:20' /usr/bin/other)")"
@@ -367,6 +396,17 @@ out="$(FAKE_PS_SEQ="$EMPTY_PS" FAKE_PS_COUNTER="$T/o15b.counter" FAKE_LSOF_TABLE
 assert_rc "$rc" 3 "O15b an EMPTY ps table aborts with exit 3 (not 'no orphans')"
 assert_nofile "$T/o15b.kills" "O15b ... and NOTHING is signalled"
 
+# ps NON-EMPTY but unparseable: same failure class, and the one the `-s` check
+# alone misses. Pre-fix this exited 0 with reapable=0 (a false clean pass).
+RUN_KILL="$T/o15c.kills"; rm -f "$RUN_KILL"
+rc=0
+out="$(FAKE_LSOF_TABLE="$L" FAKE_KILL_LOG="$RUN_KILL" PS_BIN="$T/bin/ps-garbage" LSOF_BIN="$T/bin/lsof" \
+       KILL_BIN="$T/bin/kill" REAP_ORPHAN_STATE_DIR="$T/o15c.state" REAP_ORPHAN_LOG="$T/o15c.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O15c a NON-EMPTY but unparseable ps table aborts with exit 3"
+assert_contains "$out" "FAIL-CLOSED abort: ps enumeration failed" "O15c ... naming the ps probe"
+assert_nofile "$T/o15c.kills" "O15c ... and NOTHING is signalled"
+
 for kind in fail empty missing; do
     RUN_KILL="$T/o16$kind.kills"; rm -f "$RUN_KILL"
     lsof_bin="$T/bin/lsof"; [ "$kind" = fail ] && lsof_bin="$T/bin/lsof-fail"
@@ -402,6 +442,45 @@ out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o18.counter" FAKE_LSOF_TABLE="$L"
 assert_rc "$rc" 3 "O18 a held lock aborts with exit 3"
 assert_contains "$out" "lock held" "O18 ... naming the lock"
 rm -rf "$T/o18.state/pi-reap-orphans.lock"
+
+# O18b/O18c — lock recovery (#1161 review). `stat -f %m` is BSD-only; on Linux
+# (the CI runner) it errored, so the age stayed 0 and a STALE lock was NEVER
+# broken (every later pass exited 3 forever). A dead owner + an old lock dir must
+# be broken and the pass must proceed; a LIVE owner must still hold the lock even
+# when the directory is older than the stale bound (the old code overwrote the
+# liveness result with the age and broke a held lock on macOS).
+echo "— O18b/O18c: stale-lock recovery vs a live owner —"
+mkdir -p "$T/o18b.state/pi-reap-orphans.lock"
+printf '%s\n' 999999 >"$T/o18b.state/pi-reap-orphans.lock/pid"   # a pid that is not running
+touch -t "202001010000" "$T/o18b.state/pi-reap-orphans.lock"
+OUT="$(run_reaper o18b "$A:$B" "$L" --apply --min-elapsed-seconds 99999 --sample-seconds 0)"
+assert_rc "$(sed -n 's/^RC=//p' <<<"$OUT")" 0 "O18b a stale lock (dead owner, old dir) is broken and the pass proceeds"
+assert_absent "$OUT" "lock held" "O18b ... and is not reported as held"
+
+mkdir -p "$T/o18c.state/pi-reap-orphans.lock"
+printf '%s\n' "$$" >"$T/o18c.state/pi-reap-orphans.lock/pid"       # THIS shell: alive
+touch -t "202001010000" "$T/o18c.state/pi-reap-orphans.lock"
+rc=0
+out="$(FAKE_PS_SEQ="$A:$B" FAKE_PS_COUNTER="$T/o18c.counter" FAKE_LSOF_TABLE="$L" \
+       PS_BIN="$T/bin/ps" LSOF_BIN="$T/bin/lsof" KILL_BIN="$T/bin/kill" \
+       REAP_ORPHAN_STATE_DIR="$T/o18c.state" REAP_ORPHAN_LOG="$T/o18c.state/log" \
+       reap_invoke --apply --min-elapsed-seconds 1 --sample-seconds 0 2>&1)" || rc=$?
+assert_rc "$rc" 3 "O18c an OLD lock with a LIVE owner is NOT broken (exit 3)"
+assert_contains "$out" "lock held" "O18c ... and says the lock is held"
+rm -rf "$T/o18c.state/pi-reap-orphans.lock"
+
+# O18d — the POST-SIGNAL probe (#1161 review). A sequence shim that answers the
+# two snapshots legitimately and then garbage must not read as "the process
+# died": the old pid_alive returned 1 ("proven absent") for a table it could not
+# parse, so the pass printed REAPED, skipped the SIGKILL and exited 0 without ever
+# proving death. An unevaluable probe is STILL ALIVE.
+echo "— O18d: an unparseable post-signal probe is STILL ALIVE, never a proven reap —"
+GARBAGE_PS="$T/garbage.ps"
+printf 'bash: ps: command not found\n' >"$GARBAGE_PS"
+OUT="$(run_reaper o18d "$A:$B:$GARBAGE_PS" "$L" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_absent "$OUT" "REAPED" "O18d an unparseable post-signal probe is NOT reported as REAPED"
+assert_contains "$OUT" "KILL-FAILED" "O18d ... and the death is reported as unproven"
+assert_contains "$(kills o18d)" "-KILL" "O18d ... so the SIGKILL escalation still runs"
 
 REAP_ORPHAN_STATE_DIR="$T/o19.state" REAP_ORPHAN_LOG="$T/o19-blocked/log" \
   bash -c 'mkdir -p "$(dirname "$REAP_ORPHAN_LOG")" 2>/dev/null; :' 2>/dev/null

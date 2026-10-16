@@ -23,8 +23,11 @@
 #   dry-run is the default   S9   (asserted on the FILESYSTEM, not on text)
 #   apply                    S10  (only reclaimable removed; survivors exact)
 #   enumerate degraded       S11  (a failing find -> exit 3, not "clean")
-#   mount point              S12  (st_dev mismatch -> preserve)
-#   device unknown           S13  (unreadable st_dev -> preserve)
+#   mount point              S12  (a path listed in the mount TABLE is preserved)
+#   mount table unreadable   S13  (unreadable / empty mount table -> preserve)
+#   linux mount format       S12b (`dev on /p type ext4 (opts)` parses to /p)
+#   out-of-scope --root      S23  (`/` and a symlink to `/` are refused; S21's
+#                                  unusable-root and the scope guard both exit 3)
 #   sizes                    S14  (reported; a failing du is 'unavailable',
 #                                  never a partial total)
 #   lock / log guards        S15  (exit 3 both ways)
@@ -164,7 +167,6 @@ fi
 cat "${FAKE_MOUNT_TABLE:-/dev/null}" 2>/dev/null
 exit 0
 SHIM
-SHIM
 chmod +x "$T"/bin/*
 
 # ── fixtures ───────────────────────────────────────────────────────────
@@ -177,6 +179,9 @@ OLD="202001010000"
 printf '/dev/disk0s0 on / (apfs, local)\n' >"$T/mount.base"
 # mountline <path> [opts] — one mount-table line, exactly as `mount` prints it.
 mountline() { printf '/dev/fixture on %s (%s)\n' "$1" "${2:-apfs, local}"; }
+# mountline_linux — the Linux shape, which carries a `type <fstype>` token BEFORE
+# the parenthesised options. The parser must strip it or no name ever matches.
+mountline_linux() { printf '/dev/vda1 on %s type ext4 (%s)\n' "$1" "${2:-rw,relatime}"; }
 
 # mkold <name>  — an AGED directory under $ROOT.
 mkold() { mkdir -p "$ROOT/$1"; touch -t "$OLD" "$ROOT/$1"; }
@@ -353,6 +358,16 @@ MOUNT_TABLE="$T/mount.s12" run_scratch s12 --apply --root "$ROOT" --min-age-min 
 assert_dir "$ROOT/amount" "S12 a path listed in the mount table is preserved"
 assert_contains "$RUN_OUT" "reason=mount-point" "S12 ... with the reason named"
 
+# S12b: the LINUX mount shape carries ` type <fstype>` between the path and the
+# options. Before the fix the parser left that token attached, so no parsed name
+# equalled a real path and the gate silently never fired on Linux (#1161 review).
+mkold amountlinux
+{ mountline /; mountline_linux "$ROOT/amountlinux"; } >"$T/mount.s12b"
+lsof_table "$T/s12b.lsof" "$ROOT/nothing"
+MOUNT_TABLE="$T/mount.s12b" run_scratch s12b --apply --root "$ROOT" --min-age-min 1 --verbose
+assert_dir "$ROOT/amountlinux" "S12b a Linux-format mount point is preserved"
+assert_contains "$RUN_OUT" "reason=mount-point" "S12b ... with the reason named"
+
 # The mount table is a PROBE, so an unusable one must reclaim nothing: without
 # it nothing is provably not-a-mount-point. Same fail-closed rule as liveness.
 lsof_table "$T/s13.lsof" "$ROOT/nothing"
@@ -484,6 +499,30 @@ assert_absent "$RUN_OUT" "aged3" "S20 ... and a 10-minute floor excludes it (the
 run_scratch s21 --root "$T/does-not-exist" --min-age-min 1
 assert_rc "$RUN_RC" 3 "S21 an unusable root is not a clean pass (exit 3)"
 assert_contains "$RUN_OUT" "UNUSABLE" "S21 ... and names the unusable root"
+
+# ── S23: the scratch-SCOPE guard (#1161 review) ────────────────────────
+# `--root /` used to pass the `[ -d ]` check alone, so the pass enumerated the
+# TOP LEVEL of the filesystem (/Users, /etc, /Applications, /System) and an
+# armed run would `rm -rf` each. A symlink whose canonical target is `/` was the
+# same hole. Both must be REFUSED, and refusing the only root must fail closed
+# (exit 3) with NOTHING removed and NO rm invocation.
+echo "— S23: an out-of-scope --root is refused, never enumerated —"
+lsof_table "$T/s23.lsof" "$ROOT/nothing"
+run_scratch s23 --apply --root / --min-age-min 1
+assert_rc "$RUN_RC" 3 "S23 --root / is refused and fails closed (exit 3)"
+assert_contains "$RUN_OUT" "OUT OF SCRATCH SCOPE" "S23 ... naming the scope refusal"
+assert_absent "$RUN_OUT" "reclaim   /usr" "S23 ... and the filesystem top level is never enumerated"
+assert_nofile "$T/s23.rm" "S23 ... and nothing was removed"
+
+ln -s / "$T/link-to-root"
+run_scratch s23b --apply --root "$T/link-to-root" --min-age-min 1
+assert_rc "$RUN_RC" 3 "S23b a symlink whose canonical target is / is refused (exit 3)"
+assert_contains "$RUN_OUT" "OUT OF SCRATCH SCOPE" "S23b ... naming the scope refusal"
+assert_nofile "$T/s23b.rm" "S23b ... and nothing was removed"
+
+run_scratch s23c --apply --any-root --root / --min-age-min 1
+assert_rc "$RUN_RC" 3 "S23c --any-root cannot re-enable the filesystem root (exit 3)"
+assert_contains "$RUN_OUT" "OUT OF SCRATCH SCOPE" "S23c ... and says so"
 
 # ── S17b/S10b: self-scratch and the root itself ────────────────────────
 echo "— S17b: the reaper's own scratch and the root itself are never targets —"
