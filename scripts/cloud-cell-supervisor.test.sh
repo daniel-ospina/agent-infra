@@ -219,7 +219,10 @@ esac
 say_case "the merge key reaches a WORKER across the second tmux boundary"
 
 W="$T/wk"; mkdir -p "$W/harness" "$W/repo/.git" "$W/cellhome/.pi/agent" "$W/otherhome" "$W/bin" "$W/stub" "$W/realbin"
-for f in dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
+# Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
+# required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
+# dies in cmd_check with "worker scripts missing from …: claims.sh".
+for f in claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do : > "$W/harness/$f"; done
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # The controller's ONLY relevant act: the second tmux boundary. `sleep 4` keeps the session alive
 # past cmd_start's own `sleep 3` has-session check.
@@ -448,7 +451,11 @@ fi
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
 F="$T/cellcheck"; mkdir -p "$F/harness" "$F/repo/.git" "$F/home" "$F/o" "$F/bin"
-for f in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
+# Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
+# required worker script now, so a fixture without it dies in cmd_check with "worker scripts
+# missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
+# (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 printf '#!/bin/bash\nexit 0\n' > "$F/bin/gh"; chmod +x "$F/bin/gh"
@@ -527,6 +534,24 @@ case "$CC_OUT" in
   *) ok "check: no warning when the repo vendors its own pre-flight tool" ;;
 esac
 rm -f "$F/repo/tools/collision_preflight.py"
+
+# ⚠️ Review round 4: repo-authority.sh is SOURCED by orch-loop.sh and merge-one.sh from $O
+# (repo-authority.sh's own per-repo merge contract), so a cell whose $O lacks it dies `exit 78`
+# on the FIRST cycle — but `check` used to certify it as "CELL CAN RUN A CONTROLLER". The file is
+# a required worker for exactly the reason claims.sh already is; pin it.
+say_case "check refuses a cell whose \$O lacks repo-authority.sh (review round 4)"
+rm -f "$F/o/repo-authority.sh"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check: a missing repo-authority.sh refuses (the controller would die exit 78)" \
+                   || bad "check: certified a cell whose \$O lacks repo-authority.sh"
+case "$CC_OUT" in
+  *"repo-authority.sh"*) ok "check: names the missing worker" ;;
+  *) bad "check: does not name repo-authority.sh — output: $CC_OUT" ;;
+esac
+: > "$F/o/repo-authority.sh"  # restore the fixture for any later case
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check: passes again once repo-authority.sh is present" \
+                   || bad "check: still refuses with the worker restored (rc=$CC_RC)"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

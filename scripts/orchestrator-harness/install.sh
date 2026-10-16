@@ -25,7 +25,32 @@ OR="${OR:-daniel-ospina/tortoise}"
 # sysctl -n hw.ncpu is a macOS-only key and sysctl is absent from a minimal Linux userland
 # (debian:stable-slim ships no procps): in the LOOP that silently pinned _NCPU=4, MAX_LOAD=40 (#1702).
 _NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+# ⛔ THE GUARD, NOT JUST THE LINE (P3, third review round, 2026-10-14). The comment above calls this
+# assignment "IDENTICAL to orch-loop.sh's line" — the LINE was, the PROTECTION was not: orch-loop.sh
+# coerces `_NCPU` with `is_num` on the line before its only read, and install.sh had NO is_num at all.
+# `sysctl` can SUCCEED while printing an empty or garbage value, and `$(( 10#$_NCPU * 10 ))` is then a
+# syntax error that ABORTS the installer mid-run under `set -euo pipefail` — instead of falling back
+# to 4 exactly as the loop does. Same predicate as every shipped copy (leading zeros are read as
+# octal by `$(( ))`, so `08` must be rejected too).
+is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ A DIGIT STRING IS NOT ENOUGH FOR `_NCPU` — IT MUST BE A MAGNITUDE (P3, fifth review round,
+# 2026-10-14). `is_num` accepts a 19-digit probe, and `$(( 10#$_NCPU * 10 ))` then WRAPS instead of
+# erroring: 9223372036854775808 (2**63) * 10 is exactly 0, which every downstream guard accepts
+# (`0` is a legal plist limit), so the rendered plist carries `MAX_LOAD=0` and the loop's
+# `[ "$L" -ge 0 ]` is always true — the box dispatches NOTHING, silently and indefinitely. This was
+# already closed in orch-loop.sh; install.sh runs the IDENTICAL derivation but had only `is_num`, so
+# the wrap survived on the real production path (install.sh is what substitutes __MAX_LOAD__ into the
+# live plist). Mirror the loop exactly.
+is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+is_limit "${_NCPU:-}"   || _NCPU=4
+# A 0-valued probe is a FAILED probe, not "no cores": the identical line is in orch-loop.sh.
+[ "${_NCPU:-0}" -ge 1 ] || _NCPU=4
 MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
+# The same two guards the loop applies, for the same reason: the first fallback re-derives from the
+# SAME `_NCPU`, so it cannot repair an out-of-range PRODUCT (a 9-digit probe yields a 10-digit value
+# that `[ -ge ]` never binds); only a true default does. `is_limit` must NOT reject `0` — it also
+# validates plist limits where 0 is legal (see the `0) : ;;` arm below).
+is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"
@@ -302,13 +327,30 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
 for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
   _v="${!_n}"
-  case "${_v:-}" in ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;; esac
+  case "${_v:-}" in
+    ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
+    0) : ;;
+    # ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14). `''|*[!0-9]*` accepted `08`, which
+    # rendered into the plist and then reached the loop, where `$(( ))` parses base 0 (leading 0 =
+    # OCTAL) and `08`/`09` are not octal — on /bin/bash 3.2.57 the failed arithmetic silently
+    # disabled the claim / discarded the controller loop. The loop now coerces such a value to the
+    # DEFAULT, so accepting it here would render a plist that LIES about the ceiling while exiting 0.
+    # Refuse it loudly instead: a value this installer accepts must be the value the loop uses.
+    0*) die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+  esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
   # OPENS the gate the value configures. `MAX_LANES=99999999999999999999` passed the class test, and
   # install.sh exited 0; the loop then compared, errored, and lost the lane cap. No limit here is near
   # a billion, so bound the length.
   [ "${#_v}" -le 9 ] || die "$_n='$_v' is out of range (at most 9 digits)"
 done
+# ⛔ CYC NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). The loop above
+# deliberately allows `0` — it is a valid integer and every OTHER limit may legitimately be 0 — but
+# `CYC=0` reaches the loop's `sleep $(( 10#0 - 0 + RANDOM % 1 ))` = `sleep 0`, so the controller
+# revisits every cycle with no delay and hammers the GitHub API. The loop floors it to 240 as well;
+# refusing it here is the consistent half — a value this installer accepts must be the value the loop
+# uses. 5s, not 240, so a deliberately small cycle is not silently replaced.
+[ "$CYC" -ge 5 ] || die "CYC=$CYC is below the 5s floor — a zero (or near-zero) cycle re-hits the GitHub API with no delay"
 # Each value is substituted by its OWN sed rule and the rules run IN ORDER, so a value carrying a
 # LATER token is rewritten by that later rule: `OR=__MAX_LANES__` rendered as `4` — exit 0, plutil OK,
 # and the daemon then ran `gh --repo 4`. Refusing it at the input also means the post-render assertion
@@ -362,8 +404,13 @@ ok "plist valid"
 # launchd runs $O/<script>, not the copies in this directory — check EVERY script the daemon
 # invokes, not just orch-loop.sh. A drift here is silent and serious: a fix applied only to the
 # shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
+# claims.sh is in this list because it is SOURCED by orch-loop.sh and merge-one.sh, so the daemon
+# executes it — leaving it out let a fix to the claim CAS sit in the repo while $O ran the old one
+# (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
+# reason (#1764): it is sourced by both, and a $O copy without it holds the resolver the daemon
+# needs to know what the target repo actually requires.
 DRIFTED=""
-for f in orch-loop.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
