@@ -56,9 +56,12 @@ The write operations appear once in this skill (by operation name). Invoke them 
 > for the two operations needing a reason or epistemic dimensions.
 >
 > One asymmetry worth knowing before you choose a verb: **relabelling does not validate.**
-> `create_operator(label=…)` returns a structured `undeclared_relation` warning when no installed
-> pack declares the predicate, but `update(<operator_id>, label=…)` performs **no declaredness
-> check** and stores the label silently. Take valid predicates from `list_relations()`.
+> `create_operator(label=…)` returns a structured `undeclared_relation` warning when the predicate
+> is neither a **core operator label** — `IMPL`/`NAND` (Edge Types) plus the ONTOLOGY §8 semantics
+> vocabulary (`hasPart`, `addresses`, `supports`, `refutes`, `causes`, `dependsOn`, …) — nor one an
+> installed pack declares. `update(<operator_id>, label=…)` performs **no declaredness check** and
+> stores the label silently. Take valid predicates from `list_relations()` for the pack-declared
+> leg, **or from that core set**.
 
 ## Hard Gate
 
