@@ -19,6 +19,8 @@ A test scenario description that reads well may be impossible to execute. This r
 
 Dispatched by the fractal planning pipeline during the **Detailed E2E** substep when the epic's Architecture or UX complexity axis is rated medium or high.
 
+Consulted by **`test-review` Reviewer C** (when C fires on e2e surfaces) as a **supplementary reference** for the reproducibility concern — C's inline prompt is the specification, not this catalog, and C's required inputs (`TEST FILE` / `E2E SCENARIOS` / `SURFACE MAP`) differ from the plan-doc inputs below.
+
 ## Inputs Required
 
 - **Detailed E2E section** of the epic doc — all test scenario descriptions

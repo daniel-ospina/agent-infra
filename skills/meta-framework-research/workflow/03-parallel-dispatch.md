@@ -1,6 +1,6 @@
 # Phase 3: Parallel Research Dispatch
 
-Dispatch independent sub-agents to research the domain from multiple lenses simultaneously. Follows `parallel-orchestrator` fan-out/fan-in pattern.
+Dispatch independent sub-agents to research the domain from multiple lenses simultaneously. Follows `parallel-orchestrator` fan-out/fan-in pattern. **The sub-agents share one Perplexity key — stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound (at most 2 concurrent `web_search` calls; a wider fan-out 429s and truncates the batch).**
 
 ## Steps
 
@@ -48,15 +48,18 @@ Why this lens: Domain authority is often concentrated in specific institutions. 
 
 
 ### 3.3 Dispatch (Parallel)
-Dispatch ALL lens sub-agents simultaneously via `task` tool. Each writes output to `research/03-lenses/<lens>.md`.
+Dispatch the lens sub-agents via `task` tool in **waves**, so the group's aggregate concurrent `web_search` calls never exceed 2 (the bound at the top of this file and in the `research` skill's Step 3). Each writes output to `research/03-lenses/<lens>.md`.
 
-**Fan-out pattern (per parallel-orchestrator):**
-- Dispatch all lenses in one call batch
-- Each sub-agent prompt includes: lens description + domain name + scope + "write findings to `research/03-lenses/<lens>.md`"
+**Fan-out pattern (per parallel-orchestrator) — bounded by the search rate limit:**
+- Dispatch lenses in waves rather than firing all 8 at once — the sub-agents share one Perplexity key, and a wider fan-out returns HTTP 429 and truncates the batch
+- **The wave shares ONE 2-call budget:** the aggregate concurrent `web_search` calls across ALL lens agents in a wave must never exceed 2. Either run **one lens with at most 2 calls in flight**, or **two lenses with at most 1 call in flight each**. A per-agent limit alone does not compose — 2 lenses × 2 in flight = 4 concurrent, which is the measured 429 case (4 concurrent → 1 returned / 3×429; `research` skill Step 3)
+- Each sub-agent prompt includes: lens description + domain name + scope + its share of the wave's budget + "write findings to `research/03-lenses/<lens>.md`"
+- Each sub-agent reports `attempted / returned` for its own `web_search` calls
 - No sub-agent timeout — wait for all
 
 ### 3.4 Handle Partial Failure
 After all lenses return:
+- **A lens returned but lost `web_search` calls to 429:** treat that lens as TRUNCATED, not complete — re-run the 429'd queries serially, or flag the perspective as unprobed in Phase 5. A lens that "succeeded" on a partial batch is the silent-truncation failure this bound exists to prevent.
 - **All succeeded:** proceed to Phase 4
 - **≤1 lens failed:** proceed with remaining lenses. Flag missing perspective in Phase 5 gap analysis
 - **≥2 lenses failed:** abort pipeline. Output partial findings with warning:

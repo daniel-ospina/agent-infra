@@ -133,11 +133,11 @@ Before writing implementation code, verify the test against this checklist. **Al
 
 ### Step 3.5 — Test Review (Mandatory Synchronous Gate)
 
-**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 4 parallel reviewers checking correctness, coverage+surface, journey-alignment, and test-quality.
+**⛔ MANDATORY GATE — blocks Green phase until clean.** After the 7-point self-check passes, dispatch `test-review` as a `task` sub-agent for independent review. The self-check is the writer reviewing their own work; `test-review` brings an external perspective with 2 merged reviewers by concern — A (correctness + discriminating power) and B (coverage + surface + journey alignment) — plus C (e2e + reproducibility) when the change touches e2e surfaces.
 
-**Dispatch (multi-file, single invocation).** `TEST DIFF` and `SABOTAGE EVIDENCE` are REQUIRED fields — reviewer 1's discriminating-power check is decidable only from them, and omitting them makes that check fire blind. **What goes in `SABOTAGE EVIDENCE` depends on which path you are on, and on the TDD path below it is expected to be empty:**
+**Dispatch (multi-file, single invocation).** `TEST DIFF` and `SABOTAGE EVIDENCE` are REQUIRED fields — Reviewer A's pass 1 discriminating-power check is decidable only from them, and omitting them makes that check fire blind. **What goes in `SABOTAGE EVIDENCE` depends on which path you are on, and on the TDD path below it is expected to be empty:**
 
-- **(a) TDD path** — the test was written before the implementation, so this gate runs *before* Step 4 (run the test) and Step 5 (implement the fix). There is no fix to revert yet, so `"none supplied"` is the correct and expected value here; reviewer 1's fallback branch governs, and that is not a gap.
+- **(a) TDD path** — the test was written before the implementation, so this gate runs *before* Step 4 (run the test) and Step 5 (implement the fix). There is no fix to revert yet, so `"none supplied"` is the correct and expected value here; Reviewer A's pass 1 fallback branch governs, and that is not a gap.
 - **(b) Pin added to an existing suite** (the fix already exists — the regression case, and the one #820 is about) — perform the Step 4 sabotage procedure **now**, before dispatching, and paste the observed failure. Do not leave this empty: on this path an empty field is exactly the vacuous-pin condition the check exists to catch.
 - If a batch mixes both, fill in (b)'s evidence and say so; do not leave the field blank because part of the batch is TDD-authored.
 ```
@@ -149,9 +149,9 @@ All changed test files from this implementation batch are dispatched in a SINGLE
 **Cap protocol (test-review's 10-cycle cap, not 3):**
 - CAPPED + only P1/P2 issues → **WARN** — proceed to Green phase. Document remaining issues.
 - CAPPED + any P0 issue → **escalate to human gate.** Do NOT proceed. Present issues for decision.
-- CLEAN (all 4 reviewers return NO ISSUES FOUND) → proceed to Green phase.
+- CLEAN (Reviewer A's combined verdict is `REVIEWER A VERDICT: CLEAN` — both its ordered passes clean — and Reviewer B's combined verdict is `REVIEWER B VERDICT: CLEAN` — every part it ran clean — plus Reviewer C when it fires returning `NO ISSUES FOUND`) → proceed to Green phase.
 
-**Wrong-layer P0 escalation:** If Reviewer #2 flags "SQL business logic tested with TS mocks (should be pgTAP)":
+**Wrong-layer P0 escalation:** If Reviewer B's part 1 flags "SQL business logic tested with TS mocks (should be pgTAP)":
 1. Escalate to implementer with pgTAP guidance: file path convention (`supabase/tests/`), assertion patterns, link to test-writing pgTAP-specific checks (#8-10)
 2. Implementer writes pgTAP test → re-run test-review for that surface only
 3. Max 2 re-review attempts. Still P0 after 2 → human gate.

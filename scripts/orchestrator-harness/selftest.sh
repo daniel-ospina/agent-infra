@@ -1377,7 +1377,23 @@ ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
 # PATH — under the very regression this check guards (a validator that passes), the supervisor would
 # otherwise create a REAL session and execute the live controller.
-mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
+# A fixture harness that is a REAL checkout at a REAL ref. Since #1745 cmd_check runs
+# cmd_check_provenance, which asks WHICH COMMIT the harness is: a harness that is a bare copy of
+# $HERE (untracked), or HEAD of a PR merge commit (diverged), is refused `DRIFT (...)`, and the
+# SCOPE/key verdicts below are then never reached. Build a throwaway repo whose origin/main IS its
+# HEAD and point every supervisor invocation in 16d-16f at $HFIX_H. HARNESS_FETCH=0 keeps the
+# suite offline (the supervisor default is 1).
+HFIX="$TMP/hfix"; HFIX_H="$HFIX/scripts/orchestrator-harness"
+git init -q "$HFIX"
+git -C "$HFIX" config user.email selftest@test.local
+git -C "$HFIX" config user.name selftest
+git -C "$HFIX" config commit.gpgsign false
+mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
+git -C "$HFIX" branch -M main
+git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
+
+git init -q "$TMP/cellrepo"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
@@ -1392,7 +1408,7 @@ chmod +x "$STUB_TM/tmux"
 # session-file clause below could never fire and a mutant that started a real session would surface
 # only through the refusal-message clause. Created empty, the stub still reports has-session=absent.
 mkdir -p "$TMP/sup-empty"
-( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
 # ONE conjunction. This was two statements and the second RECOMPUTED rc from its own exit status,
 # discarding the first — so a mutant that created the session and only then died with the SCOPE
@@ -1406,7 +1422,7 @@ ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted value
 # preflight that certifies a SCOPE its own `start` then dies on is a FALSE PASS on the only question
 # that verdict answers. Driven with a value NEITHER subcommand accepts, and both halves asserted: the
 # refusal names the accepted values, AND the certification line is absent.
-( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" check >"$TMP/sup.chkbad.out" 2>"$TMP/sup.chkbad.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.chkbad.err" \
   && ! grep -qF 'CELL CAN RUN A CONTROLLER' "$TMP/sup.chkbad.out" && rc=0 \
@@ -1497,7 +1513,11 @@ fi
 # the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
 # documentation, not a setting. Drive the shipped cmd_start with a tmux stub that records the
 # command it is handed (this is the only place the forwarding can be observed).
-TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
+TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
+# A REAL checkout, not a mocked `.git` directory (see the §16fixture below): since #1745 cmd_check
+# verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
+# before any session command can be recorded.
+git init -q "$TMP/tm/repo"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
@@ -1517,11 +1537,11 @@ sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
   rm -f "$TMP/tm/up" "$TMP/tm/cmd"
   if [ "$1" = "__UNSET__" ]; then
     env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   else
     PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE="$1" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE="$1" \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   fi
 }
@@ -1535,7 +1555,7 @@ done
 # die BEFORE a session is created (nothing started, no tmux command recorded).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
@@ -1548,7 +1568,7 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # enables the break-out — not merely the class as a whole.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
@@ -1558,7 +1578,7 @@ ck "a metacharacter in \$O is refused before any session is created" $rc
 # was a live injection (a quote in OR broke out of the sh -c string and executed a command).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1567,14 +1587,14 @@ ck "a metacharacter in \$OR is refused before any session is created" $rc
 # match: a guard that lost only the quote alternatives must still go red here.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x'q" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x'q" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1596,7 +1616,7 @@ mkdir -p "$TMP/tm/home/.pi/agent"
 printf 'secret\n' > "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 chmod 000 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 supchk="$( env -u AI_REVIEW_GATE_KEY PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1 )"
 chmod 600 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 rm -f "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
@@ -1607,7 +1627,13 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
 # ambient-only export does NOT (tmux serves a new session the server's environment). Reporting the
 # ambient one as "present" was a false green on a cell that merges without the key.
-KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
+KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
+# ⛔ A REAL checkout, not a mocked `.git` directory. `mkdir -p "$KC/repo/.git"` passed the old
+# `[ -d "$REPO/.git" ]` test, but since #1745 cmd_check asks the real question —
+# `git -C "$REPO" rev-parse --git-dir` — because a LINKED worktree has a `.git` FILE, and the old
+# `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
+# must be one or every case below dies at the repo gate before reaching the key verdicts.
+git init -q "$KC/repo"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
@@ -1616,10 +1642,10 @@ printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
     env "$2" PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   else
     PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   fi
 }
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys.env" '' )"
@@ -1638,7 +1664,7 @@ ck "an EMPTY key in keys.env is NOT reported present" $rc
 # operator who exported the key ambiently gets a keyless cell and no signal otherwise.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
@@ -1646,7 +1672,7 @@ ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # (filtering on just the two easy-to-grep verdicts left this one silent).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr2" in *'AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr2" | tail -2)" ;; esac
 ck "the start path surfaces the no-key verdict on stderr" $rc
@@ -1681,7 +1707,7 @@ ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
 # signal the operator gets.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
@@ -1768,7 +1794,8 @@ chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
 GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
-  WORKDIR="$BG/work" ENV_FILE= bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
+  WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
+  bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
   [ "$(cat "$TMP/bg-gh-home.txt")" = "$BG/home" ] && rc=0 || { rc=1; echo "      bringup's gh saw HOME=$(cat "$TMP/bg-gh-home.txt"), cell home is $BG/home"; }
 else
