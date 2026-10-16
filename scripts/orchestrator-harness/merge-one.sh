@@ -338,6 +338,14 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
 fi
 
 # ── 1) fresh-context review, POSTED as a PR comment (the audit artifact) ──────
+# ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound inside this prompt.
+# The reviewer's cwd is the MAIN checkout, which has no `.venv`, so a prompt that only says "run
+# .venv/bin/python" sends the agent hunting for an interpreter — and a `find` over $HOME blocks for
+# minutes (measured >120s cold, ~25 min under load), burning the whole 30-minute budget with NO
+# verdict (measured incidence: 43 of 124 reviewer runs ended at the cap, and 7 of 7 cap-hits in one
+# window produced nothing). Tortoise #8484/#8589 gives the reviewer its own DETACHED checkout and
+# removes the cause; that commit is NOT ported here yet. Until it is, this bound is what protects the
+# box, and it stays as defence in depth afterwards — do NOT drop it in a re-port from tortoise.
 cat > "$L-reviewer.txt" <<EOF
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
     cd $REPO && git fetch origin main --quiet
@@ -345,7 +353,11 @@ You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Repo
     gh pr diff $PR --repo $OR
 Read the changed files IN FULL at the PR head (\`git show origin/$BR:<path>\`), not just the diff hunks. Read skills/code-review/SKILL.md for the discipline.
 Report ONLY HIGH-confidence real issues: correctness bugs; security (injection/auth bypass/secrets); VACUOUS tests (would pass on the pre-fix code — prove it); scope/claim mismatch; regressions; fail-open paths; repo-rule violations — especially a NEW test file missing from config/ci-surfaces.yml (the manifest-integrity leg fails and the file is never selected).
-If you need to run tests, use your own throwaway checkout: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`. Bound every command; never run the whole suite.
+TEST EXECUTION IS NOT AVAILABLE TO YOU. Your cwd is the main checkout and it has NO \`.venv\`. Do NOT go looking for an interpreter:
+  ⛔ NEVER run \`find\`, \`rg\`, \`du\`, \`mdfind\` or a recursive \`ls\` outside the repository root — above all never under \`$HOME\`, \`/Users\`, \`/private/tmp\`. A \`find\` over the home directory BLOCKS for many minutes (measured: >120s cold, ~25 min under load) and has burned entire 30-minute review budgets, returning NO verdict at all.
+  ⛔ Do not run \`uv sync\`, and do not create a virtualenv.
+If a point can only be settled by EXECUTING code, report it as \`UNVERIFIED\` and name the exact command that would settle it — the fixer runs tests, not you. Reasoning from the source is expected and is sufficient for everything else.
+Bound every command: explicit paths, \`-maxdepth\`, and never run the whole suite.
 
 ## REQUIRED: post your review as a PR comment (this is the merge-gate audit artifact)
 Write your review to a file, then:

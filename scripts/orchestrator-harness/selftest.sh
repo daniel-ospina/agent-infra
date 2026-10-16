@@ -2749,6 +2749,65 @@ else
 fi
 
 echo
+# ── P) the no-search bound: present in every agent prompt, and its heredoc does not EXECUTE backticks ──
+# The three agent prompts are built by UNQUOTED heredocs (`cat > file <<EOF`), so a BARE backtick in
+# the prompt text is command substitution at prompt-build time. An earlier draft of this fix would
+# have run `uv sync` and spliced its output into the reviewer prompt, and erased the literal
+# `UNVERIFIED` — and `bash -n` does NOT catch it (the script is syntactically valid; the bug is what
+# the shell DOES with it). So these checks EXPAND the shipped heredocs with every command name that
+# appears inside a backtick span backed by a tripwire stub, and the last check is a NON-VACUITY
+# control: the same rig against a deliberately unescaped heredoc must fire.
+NB="$TMP/nb"; mkdir -p "$NB/bin" "$NB/repo/.venv/bin" "$NB/o/logs"
+: > "$NB/trip"
+for c in uv find rg du mdfind ls UNVERIFIED; do
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s" >> "%s"\nexit 0\n' "$c" "$NB/trip" > "$NB/bin/$c"
+  chmod +x "$NB/bin/$c"
+done
+printf '#!/bin/bash\nprintf "%%s\\n" ".venv/bin/python" >> "%s"\nexit 0\n' "$NB/trip" > "$NB/repo/.venv/bin/python"
+chmod +x "$NB/repo/.venv/bin/python"
+# Expands the script's first prompt heredoc the way a real run does: SOURCED into a shell carrying
+# the same variables (the shipped scripts use unexported $L/$O/$N in the heredoc target).
+nb_expand() { # nb_expand <script>
+  awk '/^cat > .*<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$NB/snip.sh"
+  [ -s "$NB/snip.sh" ] || return 1
+  ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
+    O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
+    WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
+    . "$NB/snip.sh" ) >/dev/null 2>&1
+}
+if nb_expand "$MERGE"; then
+  { grep -qF 'NEVER run' "$NB/log-reviewer.txt" && grep -qF '`UNVERIFIED`' "$NB/log-reviewer.txt" \
+    && grep -qF '`uv sync`' "$NB/log-reviewer.txt" && grep -qF 'many minutes' "$NB/log-reviewer.txt"; }; rc=$?
+else rc=1; fi
+ck "merge-one.sh's reviewer prompt carries the no-search bound with its backticks LITERAL" $rc
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF 'never search the filesystem for an interpreter' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+if nb_expand "$HERE/fix-one.sh"; then
+  { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
+    && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
+    && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/log-fixer.txt"; }; rc=$?
+else rc=1; fi
+ck "fix-one.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+[ -s "$NB/trip" ] && rc=1 || rc=0
+[ "$rc" -eq 0 ] || { echo "      a stub EXECUTED at prompt-build time: $(sort -u "$NB/trip" | tr '\n' ' ')"; }
+ck "no command inside the three prompts' backtick spans ran at prompt-build time (unescaped backtick)" $rc
+# NON-VACUITY: the identical rig on a deliberately unescaped heredoc MUST fire, or the check above
+# proves nothing (a rig that can never fire is the "test that cannot fail" class).
+: > "$NB/trip"
+cat > "$NB/neg.sh" <<'NEG'
+cat > "$NEGOUT" <<EOF
+Release it as `UNVERIFIED` and then run `uv sync`.
+EOF
+NEG
+NEGOUT="$NB/neg.out" NEGPATH="$NB/bin" bash -c 'set +u; PATH="$NEGPATH:$PATH"; NEGOUT="$NEGOUT"; . "$1"' _ "$NB/neg.sh" >/dev/null 2>&1
+{ [ -s "$NB/trip" ] && ! grep -qF 'UNVERIFIED' "$NB/neg.out"; }; rc=$?
+ck "non-vacuity: the same rig FIRES on a bare-backtick heredoc and ERASES the literal" $rc
+
+echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
 # A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
 # `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
