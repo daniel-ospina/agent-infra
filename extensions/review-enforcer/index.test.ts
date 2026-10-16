@@ -5386,6 +5386,19 @@ testAsync("#1776: a hidden flag on a MERGE keeps the text-layer decision — the
         // …and with the constructed executable as an `if` condition: the same divergence,
         // reached through a reserved word instead of a newline.
         "gh pr view 1; V=--admin; C=gh; P=pr; M=merge; PATH=/usr/bin; export PATH; if $C $P $M 999 $V; then :; fi",
+        // …and with the introducer itself QUOTED (`"eval"`, `sh '-c'`): the shell dequotes
+        // before it decides, so the word still RUNS — while the position model tested the raw
+        // token and read the construct after it as an argument (adversarial review, shape 13).
+        "gh api /repos/o/r; export PATH=/usr/bin; G=gh; P=pr; M=merge; V='--admin'; \"eval\" \"$G $P $M 999 $V\"",
+        "gh api /repos/o/r; export PATH=/usr/bin; G=gh; P=pr; M=merge; V='--admin'; sh '-c' \"$G $P $M 999 $V\"",
+        // …and with the command string in a `trap`: the shell runs it at exit, and `trap`
+        // was the one command-string introducer the model did not carry (shape 14).
+        "gh api /repos/o/r; export PATH=/usr/bin; G=gh; P=pr; M=merge; V='--admin'; trap \"$G $P $M 999 $V\" EXIT",
+        // …and with the program ASSEMBLED AT RUNTIME and piped to a shell: the merge is
+        // readable NOWHERE in the text (it is built from four assignments), so the decoy was
+        // the only thing the read saw. Closed by the structural rule: a command that carries
+        // a construct AND a string executor is out of the text's reach (shape 15).
+        "gh pr view 1; export PATH=/usr/bin; S=gh; P=pr; M=merge; V=--admin; echo \"$S $P $M 999 $V\" | sh",
       ];
       const declaredResidual =
         "export PATH=/usr/bin; gh pr >/dev/null merge 999 --admin"; // a LITERAL flag
@@ -5488,6 +5501,17 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
     // with `isGhWordAt`, so this pins the agreement rather than a second list.
     "gh pr view 1\n$C $P $M 999 $V", // a newline separates commands like `;`
     "V=--admin; if $C $P $M 999 $V; then :; fi; gh issue comment 5", // `if`
+    // …and the two command positions the model missed for a DIFFERENT reason — the word
+    // that introduces the command is quoted or is `trap`, so the raw-token test read the
+    // construct after it as an argument while the shell still ran it (shapes 13-14).
+    '"eval" "$C $P $M 999 $V"', // a quoted introducer is still an introducer
+    "sh '-c' \"$C $P $M 999 $V\"", // …and so is a quoted `-c`
+    "trap \"$C $P $M 999 $V\" EXIT", // a command string the shell runs at exit
+    "coproc $C $P $M 999 $V", // …and the other command-string form
+    "echo \"$C $P $M 999 $V\" | sh", // a program assembled at runtime — no merge is named
+    "gh pr view 1; echo \"$C $P $M 999 $V\" | sh", // …with a decoy, so only the rule refuses
+    "python3 -c \"$C $P $M 999 $V\"", // …the same, through a non-shell runner
+    "gh pr view 1; echo \"$C $P $M 999 $V\" | python3", // …and where ONLY the runner word identifies it
   ]) {
     ok(!readsNonMergeGhCall(cmd), `…so the gate keeps its decision: ${cmd}`);
   }

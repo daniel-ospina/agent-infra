@@ -553,7 +553,7 @@ function countUnquotedMergeVerbs(command: string): number {
  * while excluding `"gh"`, an inconsistency inside one family.
  */
 const COMMAND_INTRODUCERS =
-  /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
+  /^(command|sudo|env|exec|nohup|nice|time|xargs|trap|coproc|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
 
 /** A separator GLUED to the following word: `true;gh pr merge 1`, `(gh pr merge 1`. */
 const GLUED_SEPARATOR = /^[;&|(){!]+/;
@@ -622,14 +622,23 @@ function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
   // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
   // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
   if (prev === "--" && i >= 2) prev = scan.tokens[i - 2];
+  // The introducer, `-c` and reserved-word tests use the DEQUOTED word: the shell dequotes
+  // before it decides, so `"eval"`, `\eval`, `ev"al"`, `"env"`, `sh '-c'` and `bash "-c"`
+  // all RUN their next argument — testing the raw token read each of those as an ordinary
+  // argument, and a constructed `gh pr merge` walked through the stand-down on it
+  // (adversarial review, shape 13). `trap`/`coproc` are introducers for the same reason:
+  // `trap "$G $P $M 999 $V" EXIT` executes the string at shell exit (shape 14).
+  // The redirection and assignment-prefix tests stay RAW on purpose — a quoted
+  // `">/dev/null"` is not a redirection — and staying raw there can only add refusals.
+  const prevWord = prev === null ? "" : shellWord(prev);
   return (
     prev === null ||
     // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
     // merge 999 --admin` is two commands. Without \n here the second (fully
     // quoted) verb lost its command position and the compound count stayed 1.
     /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
-    COMMAND_INTRODUCERS.test(prev) ||
-    /^-[a-z]*c$/.test(prev) || // `sh -c '...'`, `bash -lc '...'`
+    COMMAND_INTRODUCERS.test(prevWord) ||
+    /^-[a-z]*c$/.test(prevWord) || // `sh -c '...'`, `sh '-c' '...'`
     // Other real command positions. A redirection (`2>/dev/null`, `>/dev/null`),
     // an assignment prefix (`FOO=bar`) or a reserved word (`if`, `while`, ...)
     // all put the next word in command position; enumerating only the introducers
@@ -637,7 +646,7 @@ function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
     // (cycle-4 review P0-1).
     /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
     /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
-    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prev)
+    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prevWord)
   );
 }
 
@@ -715,6 +724,21 @@ const PR_NON_MERGE_SUBCOMMANDS = new Set([
 ]);
 
 /**
+ * Words that RUN A STRING this command could assemble at runtime — the shells, the
+ * command-string introducers, and the interpreters whose `-c`/`-e` argument is a program.
+ *
+ * This is a STRUCTURAL property, not another blinding spelling: a command carrying BOTH a
+ * construct-bearing token AND one of these can hand a shell a program the text cannot read,
+ * so a positive read cannot be trusted. Shape 15 was exactly that: `S=gh; P=pr; M=merge;
+ * V=--admin; echo "$S $P $M 999 $V" | sh` names no merge anywhere (it assembles one), so the
+ * read — through a decoy — said yes and BOTH layers were skipped. Adding the interpreters the
+ * reviewer used (python/perl/…) is deliberate: each is the same bypass through a different
+ * runner, and every word here can only turn a read into a refusal.
+ */
+const STRING_EXECUTOR =
+  /^(sh|bash|zsh|dash|ksh|eval|trap|coproc|xargs|source|python|python3|perl|ruby|node|php|awk)$/;
+
+/**
  * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
  * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
  * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
@@ -756,6 +780,16 @@ export function readsNonMergeGhCall(command: string): boolean {
     if (next === "pr" || next === "merge") return false; // `$C pr merge`, `$P$'r' merge`
     if (isCommandPositionAt(scan, i)) return false; // an executable word may be spelled away
   }
+  // AND NO RUNTIME-ASSEMBLED PROGRAM. A command that carries a construct and one of the
+  // string executors can hand a shell a program the text never names, so the read cannot be
+  // trusted at all — that is a property of the command, not a spelling to enumerate.
+  let hasConstruct = false;
+  let hasExecutor = false;
+  for (const tok of scan.tokens) {
+    if (CONSTRUCT.test(tok)) hasConstruct = true;
+    if (STRING_EXECUTOR.test(shellWord(tok))) hasExecutor = true;
+  }
+  if (hasConstruct && hasExecutor) return false;
   let seen = false;
   for (let i = 0; i < scan.tokens.length; i++) {
     if (shellWord(scan.tokens[i]) !== "gh") continue;
