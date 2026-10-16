@@ -2188,6 +2188,16 @@ printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | gre\$'\\x70' -q bar" 
 printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\147rep' -q bar"        > "$E/scripts/consansilead.sh"
 printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x2dq' bar"        > "$E/scripts/consansiflag.sh"
 printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | \$'\\x65nv' -i grep -q bar" > "$E/scripts/consansiwrap.sh"
+# The decode must preserve the WORD BOUNDARY, not just the characters. A shell expansion yields one
+# word whose characters are DATA: emitting the value bare made a `$'a\x7cb'` argument read as a real
+# PIPELINE, so `gre$'\x70' -E $'a\x7cb' f | grep -q bar` — a genuine rc-141 false negative that the
+# per-site revision DID flag — went CLEAN. These pins hold the quoted emission and the escape rules
+# bash actually uses (a malformed brace-hex is EMPTY, an UNKNOWN escape KEEPS its backslash, and an
+# ESCAPED dollar is not ANSI-C quoting at all).
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'\\x70' -E \$'a\\x7cb' f | grep -q bar"      > "$E/scripts/spanpipearg.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{}'f '%s' \"\$T\" | grep -q bar"       > "$E/scripts/emptyescape.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x=\$'\\x7c' ; grep -E \"a|b\" f | grep -q p"       > "$E/scripts/semispanassign.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'\\x65cho' \"\$T\" | grep -q p"                   > "$E/scripts/leadhexecho.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2252,6 +2262,18 @@ else
   fail "an ANSI-C spelled word on a side the decode must cover was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
 fi
+# 13a4. THE DECODE MUST NOT BREAK WHAT THE PER-SITE REVISION GOT RIGHT. A spanned DATA metacharacter
+#       in the producer's own argument used to be flagged (the data pipe inside a quoted argument is
+#       not a pipeline); a bare emission of the value turned it CLEAN, which is the regression these
+#       four pins hold shut. The escape rules are bash 3.2.57 measured: `\x{}` is EMPTY, `\q` is the
+#       two characters, an escaped dollar does not open an ANSI-C span.
+if [ "$rc" -eq 1 ] && grep -q 'spanpipearg\.sh' "$OUT" && grep -q 'emptyescape\.sh' "$OUT" \
+   && grep -q 'semispanassign\.sh' "$OUT" && grep -q 'leadhexecho\.sh' "$OUT"; then
+  pass "a decoded span keeps its WORD boundary (a spanned data pipe, an empty brace-hex, a spanned separator before a real producer, a word-initial hex echo)"
+else
+  fail "a decoded span hid a producer (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
 #      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
 #      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
@@ -2265,9 +2287,11 @@ printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\164' -e \"a|b\" f | grep -q p"    
 printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x{74}' -e \"a|b\" f | grep -q p"                                 > "$E/scripts/bracehexarg.sh"
 printf '%s\n' '#!/usr/bin/env bash' "printf '%s' \"\$T\" | grep \$'\\x76' bar"                                  > "$E/scripts/consansinonquiet.sh"
 printf '%s\n' '#!/usr/bin/env bash' "x=\$'grep' ; echo ok"                                                        > "$E/scripts/mentionansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\\\$'\\x70' -E 'a|b' f | grep -q bar"                                   > "$E/scripts/escdollar.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print\$'\\q'f '%s' \"\$T\" | grep -q bar"                                 > "$E/scripts/unknownescape.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 0 ]; then
-  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C or brace-hex argument to a non-producer, a decoded non-quiet consumer, a mention, and a non-quiet consumer all pass (exit 0)"
+  pass "the capture-then-case fix, a grep producer into a here-string, a split printf -v carve-out, an ANSI-C or brace-hex argument to a non-producer, a decoded non-quiet consumer, a mention, an escaped dollar, an unknown escape, and a non-quiet consumer all pass (exit 0)"
 else
   fail "false positive on a safe grep-producer form (exit $rc):"
   sed -n '1,10p' "$OUT"
@@ -2299,10 +2323,16 @@ fi
 E="$TMP/f13d"; mkdir -p "$E/scripts"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -q foo f | grep -q bar' > "$E/scripts/quietproducer.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -c foo f | grep -q bar' > "$E/scripts/countproducer.sh"
+# The DECODED-SPELLING over-block, pinned so it is a CONSCIOUS consequence rather than a surprise:
+# the decode makes the plain word visible, so a `grep` that is an ARGUMENT to another command is now
+# flagged through an escaped spelling as well — the same declared class as `ls a/grep | grep -q x`.
+# It is a SHAPE flag, not the mechanism: the pipeline carries the OTHER command's output.
+printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x67rep' -e \"a|b\" f | grep -q p" > "$E/scripts/argspanproducer.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 ( set -o pipefail; grep -q needle "$BIGF" | grep -q needle ) 2>/dev/null; q_rc=$?
 note "quiet-producer idiom rc=$q_rc (never 141 — it writes nothing to the pipe)"
 if [ "$rc" -eq 1 ] && grep -q 'quietproducer\.sh' "$OUT" && grep -q 'countproducer\.sh' "$OUT" \
+   && grep -q 'argspanproducer\.sh' "$OUT" \
    && [ "$q_rc" -ne 141 ]; then
   pass "a producer that writes NOTHING is flagged as a documented SHAPE, and its rc is not 141 (over-block is deliberate, not the mechanism)"
 else

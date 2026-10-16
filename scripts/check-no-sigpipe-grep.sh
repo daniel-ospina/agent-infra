@@ -167,6 +167,20 @@
 #                                                third, weaker predicate). Spelling enumeration
 #                                                is unbounded by construction; after decoding
 #                                                there is no spelling left to enumerate.
+#                                                THE DECODED SPAN IS EMITTED AS A QUOTED WORD,
+#                                                and that is load-bearing: a shell expansion
+#                                                yields ONE word whose characters are DATA, never
+#                                                syntax. Emitting the value bare made the `|` in a
+#                                                `$'a\x7cb'` argument read as a real PIPELINE, so
+#                                                a spanned data pipe in the producer's own
+#                                                argument — a shape the per-site revision DID
+#                                                flag — went CLEAN. The escape rules are the ones
+#                                                bash 3.2.57 actually applies: a malformed
+#                                                brace-hex (`\x{}`, `\x{ZZ}`, an unterminated
+#                                                `\x{`) is EMPTY, and an escape the C table does
+#                                                not know KEEPS ITS BACKSLASH (`\q`, `\;`, `\8`),
+#                                                where dropping it manufactured live punctuation
+#                                                out of data.
 #       a `<(` in a wrapper OPTION ARGUMENT          `env -u <(echo a;b) -i grep …` — the quote map
 #                                                  (QI) knew `${…}`, `$(…)` and backticks but not
 #                                                  the process-substitution opener, so a separator
@@ -186,11 +200,19 @@
 #     exceptions file) in the SAME polarity as the accepted over-blocks above; on bash 4+ the
 #     decode and the shell agree, and the flag is a real detection. `\x{…}` brace-hex IS supported
 #     by bash 3.2 (measured on 3.2.57), so it is a detection, not a divergence.
+#
+#     AND ONE OVER-BLOCK CONSEQUENCE OF THE DECODE, DECLARED AND PINNED (13d): a `grep` that is an
+#     ARGUMENT to another command is flagged when the argument is spelled with an ANSI-C escape
+#     (`foo $'\x67rep' -e "a|b" f | grep -q p`), because the decode makes the plain word visible
+#     and the walk cannot tell an argument from a command word — the SAME declared class as
+#     `ls a/grep | grep -q x`, with the same polarity: the pipeline carries the OTHER command's
+#     output, so the flag is friction, not a live false negative. No live occurrence on this tree
+#     (the whole-repo run is rc 0), and it is recoverable through the exceptions file.
 #     They were CLEAN before #864 as well (no `grep` producer was recognised at all), so none was a
 #     regression; the widening closes them. The class stays open-ended in exactly the way the
 #     wrapper allowlist below is (#1645) — a spelling nobody has thought of is still a false CLEAN.
-#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (13a2 and 13a3 assert the ANSI-C
-#     decode separately, so a decoder regression names itself).
+#     The closed list is pinned in tests/sigpipe-grep/run.sh 13a (13a2, 13a3 and 13a4 assert the
+#     ANSI-C decode separately, so a decoder regression names itself).
 #
 #   · WRAPPERS ARE AN ALLOWLIST, AND THAT IS THE OPEN-ENDED PART (#1645). A command that execs
 #     into grep is seen through — `env`, `nice`, `command`, `time`, `sudo`, `stdbuf`, `exec`,
@@ -1171,7 +1193,10 @@ HITS="$(
         if (ch == "r") return sprintf("%c", 13)
         if (ch == "t") return sprintf("%c", 9)
         if (ch == "v") return sprintf("%c", 11)
-        return ch
+        if (ch == "?") return "?"
+        # "" for an escape the C table does not know, so the caller can KEEP THE BACKSLASH the way
+        # the shell does (see the escape rules in ansi_decode).
+        return ""
       }
       # ── ansi_decode(s): the line with every live dollar-single-quoted span (a `$` followed by a
       # `\047`) replaced by the characters the shell will actually see. THIS IS THE ONE SEAM FOR THE
@@ -1188,15 +1213,17 @@ HITS="$(
       #
       # The decode is TEXTUAL and only fires where ANSI-C quoting is LIVE: inside a single-quoted
       # span it is literal, and inside a DOUBLE-quoted span bash does not treat the `$` `\047` form
-      # as ANSI-C at all, so both are copied verbatim. An escape that does not parse is copied
-      # VERBATIM too — dropping or guessing a character is the one direction that can hide a
-      # producer letter.
+      # as ANSI-C at all, so both are copied verbatim. An escape that does not parse follows BASH,
+      # which is NOT the verbatim rule: an escape the C table does not know keeps its backslash, and
+      # a malformed brace-hex yields NOTHING (both measured on 3.2.57). And the span is re-emitted as
+      # a QUOTED WORD — see the emission note below, which is what keeps a data metacharacter from
+      # being re-read as syntax.
       #
       # KNOWN DIVERGENCE, DECLARED: bash 3.2 has no `\u`/`\U` (it leaves the escape as literal
       # characters), so decoding one flags a word like Ech + `\u006f` on such a shell although the
       # shell would not run echo. That is an OVER-BLOCK (visible friction, recoverable through the
       # exceptions file), and it is the same polarity as every other accepted over-block here.
-      function ansi_decode(s,   i, n, out, c, q, st, hb, hs, mx) {
+      function ansi_decode(s,   i, n, out, c, c2, q, st, hb, hs, mx, word, qv, ch, bad, k) {
         if (index(s, "$\047") == 0) return s
         n = length(s); out = ""; q = 0
         for (i = 1; i <= n; i++) {
@@ -1210,39 +1237,68 @@ HITS="$(
           }
           if (c == "\047") { q = 1; out = out c; continue }
           if (c == "\"") { q = 2; out = out c; continue }
+          if (c == "\\") { out = out c; i++; if (i <= n) out = out substr(s, i, 1); continue }
           if (c != "$" || substr(s, i + 1, 1) != "\047") { out = out c; continue }
-          i += 2
+          i += 2; word = ""
           while (i <= n) {
             c = substr(s, i, 1)
             if (c == "\047") break
-            if (c != "\\") { out = out c; i++; continue }
+            if (c != "\\") { word = word c; i++; continue }
             st = i
             i++
-            if (i > n) { out = out "\\"; break }
+            if (i > n) { word = word "\\"; break }
             c = substr(s, i, 1)
             if (c == "x" && substr(s, i + 1, 1) == "{") {
-              i += 2; hb = ""
-              while (i <= n && substr(s, i, 1) ~ /[0-9A-Fa-f]/) { hb = hb substr(s, i, 1); i++ }
-              if (i <= n && substr(s, i, 1) == "}" && hb != "") { i++; out = out sprintf("%c", numval(hb, 16)) }
-              else out = out substr(s, st, i - st)
+              # A BRACE-hex escape is consumed WHOLE, brace included, and a malformed one yields
+              # NOTHING — measured on bash 3.2.57: `\x{70}` is p, while `\x{}`, `\x{ZZ}` and an
+              # unterminated `\x{` are all EMPTY. Copying those verbatim is what hid
+              # `print` + `\x{}` + `f` (which IS printf) from this guard (#864 review).
+              i += 2; hb = ""; bad = 0
+              while (i <= n && substr(s, i, 1) != "}") {
+                if (bad || substr(s, i, 1) !~ /[0-9A-Fa-f]/) bad = 1
+                else hb = hb substr(s, i, 1)
+                i++
+              }
+              if (i <= n) i++
+              if (!bad && hb != "") word = word sprintf("%c", numval(hb, 16))
               continue
             }
             if (c == "x" || c == "u" || c == "U") {
               mx = (c == "x") ? 2 : ((c == "u") ? 4 : 8)
               i++; hs = ""
               while (i <= n && length(hs) < mx && substr(s, i, 1) ~ /[0-9A-Fa-f]/) { hs = hs substr(s, i, 1); i++ }
-              if (hs == "") out = out substr(s, st, i - st)
-              else out = out sprintf("%c", numval(hs, 16))
+              if (hs == "") word = word "\\" c
+              else word = word sprintf("%c", numval(hs, 16))
               continue
             }
             if (c ~ /[0-7]/) {
               hs = ""
               while (i <= n && length(hs) < 3 && substr(s, i, 1) ~ /[0-7]/) { hs = hs substr(s, i, 1); i++ }
-              out = out sprintf("%c", numval(hs, 8))
+              word = word sprintf("%c", numval(hs, 8))
               continue
             }
-            out = out ctrl_char(c); i++
+            # An escape the C table does not know KEEPS ITS BACKSLASH: bash 3.2 leaves `\q`, `\;`,
+            # `\8`, `$` preceded by a backslash, all as the two characters. Dropping the backslash
+            # manufactured a live `;`/`&`/`|` out of a data character (#864 review).
+            ch = ctrl_char(c)
+            if (ch == "") word = word "\\" c
+            else word = word ch
+            i++
           }
+          # EMIT THE SPAN AS A QUOTED WORD, NOT AS BARE TEXT. The shell expansion yields ONE
+          # WORD; its characters are data and are never re-parsed as syntax. Emitting them bare
+          # made an argument whose value is a pipe read as a real PIPELINE by the matchers —
+          # so a gre + escape producer with a brace-hex or octal pipe in its own argument, which
+          # the previous revision flagged, went CLEAN (#864 review). Quoting restores the word
+          # boundary the shell has, which is also what makes this decode usable on the WRAPPER and
+          # CONSUMER sides.
+          qv = ""
+          for (k = 1; k <= length(word); k++) {
+            c2 = substr(word, k, 1)
+            if (c2 == "\047") qv = qv "\047\\\047\047"
+            else qv = qv c2
+          }
+          out = out "\047" qv "\047"
         }
         return out
       }
