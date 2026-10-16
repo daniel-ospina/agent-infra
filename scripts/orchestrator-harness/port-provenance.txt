@@ -54,11 +54,14 @@
 #                            refused fixer REFUNDS the attempt the controller booked (or three
 #                            refusals park a PR no fixer ever touched).
 #   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
-#   Tests: spawn-gate.test.sh — 47 checks, 45 of which go RED on the pre-port tree (measured; the 2
-#   survivors are the port-independent POSITIVE CONTROL and the CI-wiring equality). Seven MUTATION
-#   rows each revert ONE fix and go red on that check, so each is pinned rather than merely exercised:
-#   AGENT_STARTED from rc; _NCPU is_num (the wrap); the literal-40 fallback; chain-merge's exit;
-#   the fixcount refund; an out-of-directory `"$PI_BIN" -p` invoker; an in-directory `pi  -p` one.
+#   Tests: spawn-gate.test.sh — 53 checks, 49 of which go RED on the pre-port tree (measured; the 4
+#   survivors are port-independent: the POSITIVE CONTROL, the two 0-STATUS arms — 0 was always
+#   returned, the defect was about non-zero codes — and the CI-wiring equality). ELEVEN mutation rows
+#   each revert ONE fix and go red on that check, so each is pinned rather than merely exercised:
+#   AGENT_STARTED from rc; _NCPU is_num (the wrap); the literal-40 fallback; chain-merge's exit
+#   removed; chain-merge hardcoding 75; the fixcount refund; an out-of-directory `"$PI_BIN" -p`
+#   invoker; an in-directory `pi  -p` one; a NEAR-REVERSED flag order (`pi --no-session -p`); the
+#   missing-helper guard neutered to `|| true`; and `elapsed` set to the literal `garbage`.
 #   FOUR deliberate DEPARTURES from the tortoise original, all named in-file:
 #     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
 #        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).
@@ -86,9 +89,25 @@
 #        is non-zero, `!` makes the branch TRUE, and the spawn is REFUSED (measured: rc=2, refuse).
 #        The file's older rationale ("`[` on a non-number is FALSE and FALSE allows dispatch") is
 #        wrong for this one-comparison polarity and has been removed rather than left to mislead.
+#        ⛔ THE LEADING-ZERO RATIONALE WAS ALSO WRONG (round 3): `[ 5 -lt 08 ]` does NOT error — `[`'s
+#        numeric comparison parses decimal (measured rc=0 on this tree's bash 3.2.57). The zeros are
+#        rejected because the predicate is SHARED with bare `$(( ))` sites, where `$(( 08 ))` is an
+#        invalid octal and ABORTS the enclosing block with status 0 (measured) — silently disabling a
+#        cross-box lease.
+#        ⚠️ SHARED RESIDUAL: `_NCPU` is repaired only when its DERIVATION exceeds 9 digits, so
+#        `hw.ncpu=99999999` is still accepted verbatim and yields an inert ceiling of 999999990 in ALL
+#        THREE copies that derive it (this file, orch-loop.sh, install.sh). The durable fix is a
+#        plausibility bound on the core count, and it must land in the two held copies with this one.
 #     D4 `chain-merge.sh` ends with `exit "$rc"`, which the tortoise original does NOT have — its
-#        last command is a reporting `echo`, so `$?` is echo's 0 on a refused reviewer (75) and on a
-#        crashed chain (1) alike. The port ADDS the exit; adopt-fix.sh already had it.
+#        last command is a reporting `echo`, so `$?` was echo's 0 whatever happened. The port ADDS the
+#        exit; adopt-fix.sh already had it.
+#        ⚠️ WHAT THIS DOES NOT YET DELIVER (review round 3): `merge-one.sh` ITSELF still ends on a
+#        reporting `echo` and has NO `exit 75`/`AGENT_STARTED` (0 hits), so on the paths that reach its
+#        end — a reviewer that FAILED, and a clean pass — it returns 0. Its early guards DO exit
+#        1/2/3/4 and those propagate now; the 75 arm fires only when the BLOCKED #8521 half lands in
+#        merge-one.sh (#1769/#1730 hold it). So the wrapper's exit code cannot yet distinguish a
+#        refused reviewer from a successful one. The suite pins the WRAPPER against a STUBBED
+#        dependency and says so in the test — it is not evidence about merge-one.sh.
 #
 # ── DROPPED: canonical is already ahead ─────────────────────────────────────────────────────────
 #   #8518 allow-list polarity — canonical has it byte-equivalent at orch-loop.sh:770-832 and
@@ -111,6 +130,9 @@
 #     this port; the correct fix is a mechanism change to the wall-limit contract (kill the process
 #     group, or track and kill the sleep's own pid), which is its own review. NOTE, not filed: the
 #     honest consequence is a few idle processes, which does not clear category-B admission.
+#   THE SUITE ITSELF leaks one orphaned `sleep` per run (run_agent's watchdog disowns it — see the
+#     entry above). Bounded here by driving the controls with FIX_TIMEOUT=5 instead of the default 2400,
+#     so a run leaks seconds rather than 40 minutes. The mechanism fix is the entry above.
 #   scripts/cloud-cell-bringup.sh — invokes `pi -p` with NO load gate (0 hits for MAX_LOAD/spawn-gate).
 #     A 120 s provider REACHABILITY probe, not a lane dispatch, so it is not routed through
 #     run_agent() here; it is instead asserted BY NAME in the suite's tree-wide census, so a new

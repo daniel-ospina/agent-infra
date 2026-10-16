@@ -39,6 +39,21 @@ for f in lane.sh fix-one.sh; do
   grep -q '\. "\$SELF/spawn-gate.sh" ||' "$HERE/$f"; rc=$?
   ck "$f refuses to run when spawn-gate.sh is missing (fail loud, not 127 at the spawn)" $rc
 done
+# ⛔ THE GREPS ABOVE ARE NOT THE GUARD (P2, review round 2026-10-15, second pass). A source-line grep
+# passes on a guard body that no longer fails: `. "$SELF/spawn-gate.sh" || true` left this suite at
+# 47 passed / 0 failed, so the exact failure the check names — a caller carrying on ungated, leaving
+# `run_agent` undefined and a 127 at the SPAWN SITE — would ship green. So drive it: copy each caller
+# into a scratch dir with NO helper beside it and require the loud, non-zero refusal.
+NX="$TMP/nogate"; mkdir -p "$NX/O/logs"
+cp "$HERE/lane.sh" "$HERE/fix-one.sh" "$NX/"
+out="$( ( cd "$NX" && O="$NX/O" bash "$NX/lane.sh" 9999 work daniel-ospina/agent-infra ) 2>&1 )"; nrc=$?
+{ [ "$nrc" -eq 78 ] && printf '%s' "$out" | grep -q 'FATAL'; }; rc=$?
+ck "lane.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
+# fix-one.sh takes FOUR positional args, and PR must be numeric or it bails at its FIRST guard
+# (exit 1) and never reaches the source line — which would make this check pass for the wrong reason.
+out="$( ( cd "$NX" && O="$NX/O" bash "$NX/fix-one.sh" "$NX" daniel-ospina/agent-infra 7 work ) 2>&1 )"; nrc=$?
+{ [ "$nrc" -eq 78 ] && printf '%s' "$out" | grep -q 'FATAL'; }; rc=$?
+ck "fix-one.sh truly REFUSES (exit 78 + FATAL) with no helper beside it — driven, not grepped (rc=$nrc)" $rc
 
 # ⛔ SOURCED AFTER `export PATH`. spawn-gate.sh resolves `_NCPU` at SOURCE time through
 # sysctl/nproc/getconf, so a caller that sources it above its PATH export pins _NCPU=4 and
@@ -72,9 +87,17 @@ scan_pi() { # scan_pi <root-relative-prefix>  → space-separated repo-relative 
   # whose name AND flags are both assembled at runtime; that case is covered by the runtime
   # contract (everything must route through run_agent), not by a grep.
   local p found="" MATCH_PI
-  MATCH_PI='(^|[^[:alnum:]_])pi[[:space:]]+(-p|--print)([[:space:]]|$)|-p[[:space:]]+--(no-session|provider)'
+  MATCH_PI='((^|[[:space:]])-p([[:space:]]|$)|(^|[[:space:]])--print([[:space:]]|$)).*--no-session|--no-session.*((^|[[:space:]])-p([[:space:]]|$)|(^|[[:space:]])--print([[:space:]]|$))'
+  # ⛔ ORDER-INSENSITIVE AND MULTI-LANGUAGE (P2, review round 2026-10-15, second pass). The first
+  # detector required `pi` IMMEDIATELY followed by `-p`, so `pi --no-session -p …` — both tokens
+  # literal, only the order changed — was invisible; and it globbed `*.sh` while the tree ships
+  # `.py`/`.mjs` launchers. This keys on the flag PAIR, which is specific to a print-mode agent
+  # invocation and cannot be reordered away. STATED LIMIT: an invocation that omits `--no-session`
+  # (the harness convention requires it), or one whose command name AND flags are both assembled at
+  # runtime, is outside a static census — that residue is the runtime `run_agent` contract's job.
   while IFS= read -r p; do
-    case "$p" in */retired/*|*.test.sh|*/selftest.sh) continue ;; esac
+    case "$p" in */retired/*|*/testdata/*|*.test.*|*/selftest.sh) continue ;; esac
+    case "$p" in *.sh|*.py|*.mjs|*.js|*.ts) ;; *) continue ;; esac
     grep -qE "$MATCH_PI" "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
   # --others --exclude-standard: a launch path is a NEW file first and a tracked one later, so a
@@ -91,7 +114,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 # is deliberately an EQUALITY, so the residual is asserted rather than left silent, and a THIRD
 # pi-invoker — or a regression in either of these two — fails it.
 EXPECTED_PI="merge-one.sh spawn-gate.sh"
-got_pi="$(scan_pi 'scripts/orchestrator-harness/*.sh' | sed "s#scripts/orchestrator-harness/##g")"
+got_pi="$(scan_pi 'scripts/orchestrator-harness/*' | sed "s#scripts/orchestrator-harness/##g")"
 [ "$got_pi" = "$EXPECTED_PI" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      pi-invokers found: [${got_pi:-<none>}]"
 ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" $rc
@@ -102,7 +125,7 @@ ck "the pi-invokers in scripts/orchestrator-harness are exactly [$EXPECTED_PI]" 
 # is not routed through run_agent() here — but it is asserted BY NAME, so a new ungated invoker
 # anywhere under scripts/ fails this check instead of arriving unannounced.
 EXPECTED_PI_TREE="scripts/cloud-cell-bringup.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/spawn-gate.sh"
-got_tree="$(scan_pi 'scripts/*.sh' 'scripts/*/*.sh' 'scripts/*/*/*.sh')"
+got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
 ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh declared)" $rc
@@ -168,6 +191,12 @@ for probe in 0 abc "" 999999999 1844674407470955161 9223372036854775807 99999999
   # earlier version only required a non-zero value of at most 9 digits — and a WRAPPED 19-digit
   # probe yields 999999994, which satisfies every one of those properties while making the gate
   # INERT. A garbage probe must fall back to the DOCUMENTED DEFAULT, so that is what is asserted.
+  # ⚠️ THE INVARIANT, EXACTLY, because an earlier comment generalised one digit past what it verifies:
+  # a probe that is NON-NUMERIC, ZERO, or whose derivation produces TEN OR MORE digits falls back to
+  # 40. A 1–9 digit probe is a PLAUSIBLE core count and is accepted verbatim — so `hw.ncpu=99999999`
+  # still yields an INERT ceiling of 999999990 in ALL THREE copies that derive it (this file,
+  # orch-loop.sh, install.sh). That is a SHARED residual, recorded in port-provenance.txt; the durable
+  # fix is a plausibility bound on the core count, which the held copies must adopt together.
   [ "$got" = "40" ]; rc=$?
   ck "a core probe of '$probe' falls back to the default ceiling 40 (got MAX_LOAD=${got:-<empty>})" $rc
 done
@@ -278,8 +307,14 @@ ck "the run records the measured elapsed wall-time (#1709 item 3)" $rc
 row="$(tail -1 "$TMP/O/state/walltime.tsv" 2>/dev/null)"
 nf="$(printf '%s' "$row" | awk -F'\t' '{print NF}')"
 f4="$(printf '%s' "$row" | cut -f4)"
+f5="$(printf '%s' "$row" | cut -f5)"
 [ "$nf" = "6" ] && [ "$f4" = "1" ]; rc=$?
-ck "a started run appends one 6-field row to walltime.tsv (got: ${row:-<none>})" $rc
+ck "a started run appends one 6-field row to walltime.tsv carrying the ASKED-FOR limit (got: ${row:-<none>})" $rc
+# ⛔ PRESENT IS NOT MEASURED (P3, review round 2026-10-15). `grep -q 'elapsed='` plus NF=6 passes on a
+# tree whose telemetry regressed to the literal `elapsed=garbage`, and #1709 exists precisely because
+# wall-time was unmeasured. So assert the VALUE is a non-negative integer.
+case "$f5" in ''|*[!0-9]*) rc=1 ;; *) rc=0 ;; esac
+ck "the recorded elapsed is a non-negative INTEGER, not merely present (f5='${f5:-<empty>}')" $rc
 
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
@@ -365,8 +400,11 @@ ck "fix-one.sh (MANUAL/positional) refunds nothing — fixcount stays 2 (rc=$frc
 
 # POSITIVE CONTROL for the pair above: with the gate OPEN the fixer runs AND the chain is re-run.
 # Without it, "no agent ran" and "the chain was not re-run" would pass on any broken invocation.
+# FIX_TIMEOUT=5 keeps the suite's own footprint honest: run_agent's watchdog subshell leaves its
+# `sleep` reparented (a disclosed, pre-existing defect), so the default 2400 would park a 40-minute
+# process per suite run. A small limit bounds the leak to seconds without changing what is proven.
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; frc=$?
 { [ "$frc" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: gate open -> the fixer RUNS and the merge chain IS re-run (rc=$frc)" $rc
@@ -374,22 +412,41 @@ ck "POSITIVE CONTROL: gate open -> the fixer RUNS and the merge chain IS re-run 
 # ── 10) the WRAPPERS propagate the status ───────────────────────────────────────
 # adopt-fix.sh and chain-merge.sh are report-then-`echo` scripts: their LAST command used to be a
 # reporting `echo`, so `$?` was echo's — always 0 — and a wrapper doing `… && next` took the SUCCESS
-# branch on a refused reviewer (75) and a crashed chain (1) alike. Drive each and read the EXIT CODE.
+# branch whatever happened. Drive each and read the EXIT CODE.
+# ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
+# satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
+# controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
 cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$RO/"
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
+# ⛔ THE STUB'S STATUS IS A DELIBERATE STAND-IN, NOT A CLAIM ABOUT merge-one.sh: the shipped
+# merge-one.sh ends on a reporting `echo` and contains no `exit 75` (0 hits), so it returns 0 on the
+# paths that reach its end. Its early guards DO exit 1/2/3/4, and those propagate through this wrapper
+# today; the 75 arm is forward-looking until the blocked #8521 half lands in merge-one.sh. That
+# residual is recorded in port-provenance.txt — this check pins the WRAPPER, which is what changed.
+for want in 0 1 75; do
+  : > "$MERGE_LOG"
+  ( cd "$RREPO" && O="$RO" MERGE_RC="$want" PATH="$RIG/bin:$PATH" \
+      bash "$HERE/chain-merge.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; crc=$?
+  [ "$crc" -eq "$want" ]; rc=$?
+  ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
+done
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
 [ "$arc" -eq 75 ]; rc=$?
 ck "adopt-fix.sh exits with the FIXER's status (75 on a load refusal), not echo's 0 (rc=$arc)" $rc
+# ... and the SUCCESS arm too: a constant-75 wrapper would pass the line above and report every
+# successful adopt as a refusal.
+: > "$PI_LOG"; : > "$MERGE_LOG"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc0=$?
+{ [ "$arc0" -eq 0 ] && grep -q PI_RAN "$PI_LOG"; }; rc=$?
+ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not a constant" $rc
 
 : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO" MERGE_RC=75 PATH="$RIG/bin:$PATH" \
-    bash "$HERE/chain-merge.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; crc=$?
-[ "$crc" -eq 75 ]; rc=$?
-ck "chain-merge.sh exits with merge-one.sh's status (75), not its trailing echo's 0 (rc=$crc)" $rc
+
 
 # lane.sh: the third ported caller. Assert it gets as far as the spawn (the prompt is written) and
 # then refuses WITHOUT starting an agent — the whole point, since lane.sh is what opens the PR.

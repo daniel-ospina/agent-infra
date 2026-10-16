@@ -42,11 +42,15 @@ set -u
 # before its own threshold coercions). It lives here because the ceiling is derived at SOURCE time,
 # below, and a guard that runs after the arithmetic it protects is not a guard (#1702).
 #
-# ⛔ LEADING ZEROS ARE REJECTED, not merely non-digits: `$(( ))` parses base 0, so `08`/`09` are not
-# octal and `MAX_LOAD=08` reaches `[ "$L" -ge "08" ]`, which ERRORS — and an errored test in the
-# gate chain is FALSE, i.e. it ALLOWS the spawn the gate exists to refuse. This is the same
-# predicate merge-one.sh/fix-one.sh apply to REVIEW_TIMEOUT/FIX_TIMEOUT; keeping one shape means a
-# caller's later redefinition cannot loosen this file's coercion.
+# ⛔ LEADING ZEROS ARE REJECTED — but NOT for the reason an earlier version of this comment gave
+# (corrected, review round 2026-10-15). `[ 5 -lt 08 ]` does **not** error: `[`'s numeric comparison
+# parses DECIMAL (measured rc=0 on this tree's /bin/bash 3.2.57), so a leading-zero MAX_LOAD would
+# compare correctly HERE. The zeros are rejected because the predicate is SHARED: the same `is_num`
+# guards bare `$(( ))` sites — fix-one.sh's `FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))`, merge-one.sh's
+# review lease — where `$(( ))` DOES parse base 0, `08` is an invalid octal, and on bash 3.2 the
+# failed arithmetic ABORTS the enclosing block with status 0 (measured: `if true; then x=$(( 08 ));
+# echo REACHED; fi` never prints REACHED), silently disabling a cross-box claim. One predicate, one
+# shape: a caller's later redefinition cannot loosen this file's coercion.
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 
 # ── the ceiling ──────────────────────────────────────────────────────────────────

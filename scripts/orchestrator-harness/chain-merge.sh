@@ -28,8 +28,13 @@ if [ "$rc" = "75" ]; then
 fi
 echo "[chain $N] done $(date)" >> "$LOG"
 # ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
-# above, so `$?` was the STATUS OF `echo` — always 0. Every caller that tests the chain
-# (`chain-merge.sh … && next`) therefore took the SUCCESS branch on a refused reviewer (75), a
-# crashed chain (1) and a successful chain alike, and the log said the opposite of the code. Same
-# defect fixed in adopt-fix.sh; this script's trailing reporting `echo` is what got it wrong here.
+# above, so `$?` was the STATUS OF `echo` — always 0 — and a caller doing `chain-merge.sh … && next`
+# took the success branch whatever happened.
+# ⚠️ WHAT THIS DOES NOT YET FIX (review round 2026-10-15): `merge-one.sh` ITSELF still ends on a
+# reporting `echo` and contains no `exit 75` / `AGENT_STARTED` (0 hits), so on the paths that reach
+# its end — a reviewer that FAILED, and a clean pass — it returns 0, and the refusal branch BELOW is
+# FORWARD-LOOKING. Its early guards do exit 1/2/3/4, and those propagate now; the 75 will propagate
+# once the blocked `#8521` half lands in merge-one.sh (PR #1769/#1730 hold that file). Until then the
+# reporting lines stay truthful about a refusal while the EXIT CODE cannot distinguish a refused
+# reviewer from a successful one. Recorded in port-provenance.txt as a residual, not claimed as done.
 exit "$rc"
