@@ -77,7 +77,13 @@ cat > "$FAKEBIN/npm" <<EOF
 #!/bin/bash
 # Stub: cell-install.sh runs npm install per extension; keep this suite offline — but DO
 # create node_modules, because the artifact the installer's own --verify reads back is the
-# dependency tree npm would have produced.
+# dependency tree npm would have produced — POPULATED: a real npm install always writes at
+# least the lockfile it resolved, and --verify refuses a directory that holds nothing (a wiped
+# tree is a cell whose extensions cannot load, and the install path is what repairs it).
+# (No backticks or dollar-paren anywhere in this comment block: the heredoc below is UNQUOTED
+# — it expands the SPY variable — so a backticked npm install here is EXECUTED while the stub is
+# written. Measured: it ran the real npm in the repo root and left a package-lock.json in the
+# checkout this suite documents as read-only.)
 #
 # It also records one line per invocation: the merge key and the npm registry it can SEE in
 # its environment, then its argv. The installer must call it with a SCRUBBED environment —
@@ -86,6 +92,7 @@ cat > "$FAKEBIN/npm" <<EOF
 # install time. The path is baked in because the child deliberately gets no environment to
 # pass one through.
 mkdir -p node_modules
+echo x > node_modules/.package-lock.json
 { printf 'KEY=%s REG=%s\n' "\${AI_REVIEW_GATE_KEY-CELL_INSTALL_TEST_UNSET}" "\${npm_config_registry-CELL_INSTALL_TEST_NOREG}"; printf '%s\n' "\$*"; } >> "$SPY"
 exit 0
 EOF
@@ -644,6 +651,19 @@ if [ -d "$DEP/node_modules" ]; then
   run_verify
   [ $? -eq 0 ] && ok "restoring the dependency tree restores a clean --verify" \
     || fail "--verify still fails after the dependency tree was restored"
+  # A WIPED tree is the same failure one step later: the directory is still there, so `-d`
+  # certified it. With `--check` verifying before it installs, a certified-yet-unloadable
+  # extension is never re-installed.
+  rm -rf "$DEP/node_modules" && mkdir -p "$DEP/node_modules"   # exists, holds nothing
+  run_verify
+  rc=$?
+  [ "$rc" -eq 1 ] && grep -q "DEPENDENCIES EMPTY: extensions/builtin-tools" "$LOG" \
+    && ok "--verify refuses an EMPTIED node_modules (exists but holds nothing)" \
+    || fail "--verify CERTIFIED an empty builtin-tools/node_modules — the dep tree is what loads"
+  run_install >/dev/null 2>&1
+  [ -n "$(ls -A "$DEP/node_modules" 2>/dev/null)" ] \
+    && ok "re-install repopulated the wiped dependency tree" \
+    || fail "re-install did not repopulate the wiped node_modules"
 else
   fail "builtin-tools has no node_modules after an install — the dependency check would be vacuous"
 fi

@@ -740,15 +740,21 @@ verify_layer() {
   # produced. The install path is gated on npm's exit code; verify cannot see that history,
   # and a cell whose deps have since vanished (a wiped HOME, an aborted install) would
   # otherwise certify clean while `builtin-tools` — the `task` dispatcher itself — fails to
-  # load. STRUCTURAL check: it proves a dep tree exists, not that it is intact.
+  # load. STRUCTURAL check, and stated as such: it proves the directory is POPULATED, not that
+  # the tree inside it is intact. Non-empty is the half that `-d` alone got wrong — a tree
+  # that was WIPED is the same failure one step later, and with `--check` verifying before it
+  # installs, a certified-yet-unloadable extension is never re-installed.
   local d seen_dep=0
   for d in "$DEST"/extensions/*/; do
     [ -f "$d/package.json" ] || continue
     python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get("dependencies") else 1)' \
       "$d/package.json" 2>/dev/null || continue
     seen_dep=$((seen_dep + 1))
-    [ -d "$d/node_modules" ] \
-      || fail "DEPENDENCIES MISSING: extensions/$(basename "$d")/node_modules — that extension declares runtime deps and cannot load without them (cd '$d' && npm install --omit=dev)"
+    if [ ! -d "$d/node_modules" ]; then
+      fail "DEPENDENCIES MISSING: extensions/$(basename "$d")/node_modules — that extension declares runtime deps and cannot load without them (cd '$d' && npm install --omit=dev)"
+    elif [ -z "$(ls -A "$d/node_modules" 2>/dev/null)" ]; then
+      fail "DEPENDENCIES EMPTY: extensions/$(basename "$d")/node_modules — the directory exists but holds nothing, so the extension cannot load; the install path repopulates it (cd '$d' && npm install --omit=dev)"
+    fi
   done
   if [ "$seen_dep" -eq 0 ]; then
     fail "no extension in $DEST/extensions declared any dependencies — the dependency check proved nothing (a truncated or hand-made extensions/ tree)"

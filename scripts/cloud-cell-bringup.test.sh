@@ -72,8 +72,9 @@ done
 # python3 — a no-op stub makes it parse nothing and refuse loudly by its own floor (which is the
 # right answer on a cell without python3, so this suite runs against the host's interpreter).
 # `npm` is stubbed because the layer installs each extension's declared dependencies: no network,
-# and `mkdir -p node_modules` is what the installer reads back as "dependencies present".
-printf '#!/bin/sh\nmkdir -p node_modules\nexit 0\n' > "$STUB/npm"
+# and a POPULATED `node_modules` is what the installer reads back as "dependencies present" (a real
+# `npm install` writes the lockfile it resolved, and an empty directory is refused by --verify).
+printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.json\nexit 0\n' > "$STUB/npm"
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
 printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
