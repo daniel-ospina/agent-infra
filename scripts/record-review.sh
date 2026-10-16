@@ -150,32 +150,50 @@ set -euo pipefail
 # and `> > Closes #42` auto-close on GitHub just like `- Closes #42`. A
 # mid-sentence mention is NOT a reference (#1012) — position is the contract,
 # matching check-pipeline-compliance.sh::parse_issue_ref, which composes the
-# SAME two constants.
+# SAME constants.
 #
-# The CROSS-SCRIPT INVARIANT is scoped to the keyword CLASS, not the position
-# rule: REFCTX and CLOSING_KW are byte-identical across the two scripts, pinned
-# mechanically by record-review.test.sh §8.13. The #513 tier guard below does
-# NOT rely on the positional rule for GitHub parity — GitHub auto-closes a
-# mid-sentence ref, so the guard ALSO scans with a WORD-BOUNDARY-ANCHORED
-# CLOSING_KW (passing `\b${CLOSING_KW}` as closing_issue_refs' optional
-# <kw-pattern>) and refuses when a non-micro ref appears in either scan. The
-# `\b` is load-bearing in the FALSE-REFUSAL direction: the keyword class is a
-# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
-# unanchored scan reads `The prefix #42 is unrelated.` as `fix #42`, fetches
-# #42's labels, and refuses a record GitHub would never auto-close — a false
-# refusal, and strictly BROADER than GitHub, which requires a word boundary.
-# Scoping the invariant to the class is what keeps the positional rule
+# The CROSS-SCRIPT INVARIANT is scoped to the keyword CLASS and its BOUNDARY, not
+# the position rule: REFCTX, CLOSING_KW and CLOSING_KW_BOUNDARY are byte-identical
+# across the two scripts, pinned mechanically by record-review.test.sh §8.13. The
+# #513 tier guard below does NOT rely on the positional rule for GitHub parity —
+# GitHub auto-closes a mid-sentence ref, so the guard ALSO scans with the
+# BOUNDARY-ANCHORED CLOSING_KW (passing `${CLOSING_KW_BOUNDARY}${CLOSING_KW}` as
+# closing_issue_refs' optional <kw-pattern>) and refuses when a non-micro ref
+# appears in either scan. The boundary is load-bearing in the FALSE-REFUSAL
+# direction: the keyword class is a SUFFIX of ordinary English words ("prefix",
+# "discloses", "unresolved"), so an unanchored scan reads `The prefix #42 is
+# unrelated.` as `fix #42`, fetches #42's labels, and refuses a record GitHub
+# would never auto-close — a false refusal, and strictly BROADER than GitHub,
+# which requires a word boundary. It is ALSO load-bearing in the fail-OPEN
+# direction (#1336): `\b` does not fire after `_` (`_` is a word character), so
+# a mid-sentence `_closes #N_` — which GitHub DOES close — was invisible to the
+# guard. See CLOSING_KW_BOUNDARY below for the measured parity. Scoping the
+# invariant to the class and boundary is what keeps the positional rule
 # (check (a), anti-#968) from becoming a tier-guard fail-open.
 # Top-level + guarded main below: this function is source-reachable by tests.
 REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+# The GitHub-parity keyword BOUNDARY (#1336): the position wrapper composed in
+# front of CLOSING_KW by BOTH mid-sentence scans (this file's #513 tier guard and
+# check-pipeline-compliance.sh's all_close_refs). It REPLACES `\b`, which does
+# NOT fire after `_` (`_` is a word character), so a mid-sentence `_closes #N_` —
+# which GitHub DOES close — was invisible to the guard, and a non-micro issue
+# could be recorded clean-micro with the guard silent. It admits an emphasis
+# OPENING run (`[*_]{0,3}`) only where the run itself starts at a word boundary
+# (line start or a non-word char); `[^[:alnum:]_]` (not `[^[:alnum:]]`) is what
+# keeps `foo_closes #N` from being read as a keyword — GitHub ignores it, so
+# refusing on it would be the false refusal `\b` was chosen to avoid. Measured
+# parity lives at check-pipeline-compliance.sh's copy; keep this line
+# byte-identical (record-review.test.sh §8.13 pins it).
+CLOSING_KW_BOUNDARY='(^|[^[:alnum:]_])[*_]{0,3}'
 closing_issue_refs() {
   # <kw-pattern> (optional) selects the keyword class WITHOUT the positional
   # REFCTX prefix — the GitHub-parity scan the tier guard unions in. Callers
-  # pass a BOUNDARY-ANCHORED pattern (`\b${CLOSING_KW}`): without `\b` the class
-  # matches inside English words and the scan is BROADER than GitHub (false
-  # refusals). Default is the positional form "${REFCTX}${CLOSING_KW}",
-  # mirroring check-pipeline-compliance.sh::parse_issue_ref.
+  # pass a BOUNDARY-ANCHORED pattern (`${CLOSING_KW_BOUNDARY}${CLOSING_KW}`):
+  # without the boundary the class matches inside English words and the scan is
+  # BROADER than GitHub (false refusals). Default is the positional form
+  # "${REFCTX}${CLOSING_KW}", mirroring
+  # check-pipeline-compliance.sh::parse_issue_ref.
   local text="$1" kwpat="${2:-}" kw
   if [ -n "$kwpat" ]; then kw="$kwpat"; else kw="${REFCTX}${CLOSING_KW}"; fi
   # a. full URLs.
@@ -1874,14 +1892,16 @@ fi
 #       (fail-open: a transient gh/API failure must not block a legitimate
 #       record; the warning names the unverified tier).
 # Ref collection keeps GITHUB PARITY (#1012 r2): the guard unions the
-# positional scan with a WORD-BOUNDARY-ANCHORED CLOSING_KW scan, because GitHub
+# positional scan with a BOUNDARY-ANCHORED CLOSING_KW scan, because GitHub
 # auto-closes a mid-sentence ref — a body like "Closes #100" + "This also
 # closes #42" closes complex #42 on merge and must never record clean-micro off
 # micro #100 alone. Refusal is the fail-closed direction, so the union widens
-# the bind without widening the fail-open arms. The `\b` on the parity class is
-# the OTHER direction: an unanchored class matches inside English words, turning
-# `The prefix #42 is unrelated.` into a refusal GitHub itself would never make
-# (#1012 r3).
+# the bind without widening the fail-open arms. The boundary on the parity class
+# is the OTHER direction: an unanchored class matches inside English words,
+# turning `The prefix #42 is unrelated.` into a refusal GitHub itself would
+# never make (#1012 r3) — and it must fire after emphasis `_` (#1336), which a
+# plain `\b` did not, letting a mid-sentence `_closes #N_` (which GitHub DOES
+# close) record clean-micro with this guard silent.
 if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
@@ -1896,11 +1916,13 @@ if [ "$VERDICT" = "clean-micro" ]; then
       # mid-sentence "This also closes #42" that GitHub WILL auto-close on
       # merge, so the guard unions it with a keyword-class scan. Refusing on a
       # ref either scan finds is fail-CLOSED. The parity scan is
-      # WORD-BOUNDARY-ANCHORED (#1012 r3): `\b` before the class keeps ordinary
-      # prose ("prefix", "discloses", "unresolved") from being read as a
-      # keyword and refused, which would be a FALSE refusal — GitHub requires a
-      # word boundary the unanchored scan did not.
-      REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "\b${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
+      # BOUNDARY-ANCHORED (CLOSING_KW_BOUNDARY; #1012 r3 + #1336): the boundary
+      # before the class keeps ordinary prose ("prefix", "discloses",
+      # "unresolved") and intra-word underscores (`foo_closes`) from being read
+      # as a keyword and refused, which would be a FALSE refusal — GitHub
+      # requires a word boundary the unanchored scan did not — while still
+      # firing after an EMPHASIS `_` (`_closes #N_`), which GitHub DOES close.
+      REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "${CLOSING_KW_BOUNDARY}${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
         echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | command head -c 200 || true))" >&2
       else
