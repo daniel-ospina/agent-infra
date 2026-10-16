@@ -2349,19 +2349,17 @@ F6_EXEC_REF_TIP_N="$(tr '\0' '\n' < "$F6_EXEC_REF_ARGV" | grep -c "^$F6_MERGED_S
 assert_eq "$F6_EXEC_REF_N" "1" "the execute path passes the ref to update-ref -d exactly once (squash shape) (F12)"
 assert_eq "$F6_EXEC_REF_TIP_N" "1" "the execute path's update-ref -d carries the classified tip as the old value (F12)"
 
-# ⛔ F17: a VERBATIM PASTE of the printed local plan under `set -e` must not abort
-# PART-WAY. For a SQUASH-merged branch the `-d` line REFUSES, so the plan used to
-# carry the force-delete fallback as a SECOND executable line — two commands
-# advertised where execution runs one — and a paste ran the failing `-d` first
-# and stopped before the fallback, reaping nothing. The fallback is now a
-# COMMENT, so the plan's executable surface is exactly the `-d` line and the
-# paste attempts every command the plan advertised.
-#
-# F17_ADVERTISED is the plan's executable argv (print-mode evaluation of the
-# `^  git ` lines); F17_PASTED is what the VERBATIM paste actually attempts
-# under `set -e`. They must be EQUAL. If the fallback is ever printed as a
-# command again, the plan advertises TWO argv records while the paste attempts
-# ONE, and the `cmp` below goes RED.
+# ⛔ F17/F19: a VERBATIM PASTE of the printed local plan under `set -e` DOES NOT
+# reap every branch — and the plan must SAY SO. For a SQUASH-merged branch the
+# printed `git branch -d` REFUSES (its tip is not an ancestor of HEAD), so a
+# paste stops at that line. Once the force-delete fallback stopped being printed
+# as a SECOND executable command (F17), a single-branch fixture made "the paste
+# attempts every advertised command" TRUE by construction — a tautology, because
+# that ONE advertised command was the refusing `-d` (F19). The fixture is now
+# MULTI-branch, with the refusing branch FIRST, so the paste attempts a STRICT
+# SUBSET (only the `-d` that refuses) while `--execute` reaps all three. The
+# plan's framing is asserted too: its header must not imply a paste-safe script;
+# it must say `--execute` is the way and that the paste STOPS at the refusing -d.
 F17_ORIGIN="$FIX/f17-origin.git"
 F17_REPO="$FIX/f17-repo"
 new_repo "$F17_REPO" "$F17_ORIGIN"
@@ -2375,16 +2373,21 @@ F17_TREE="$(git rev-parse "$F17_MAIN_SHA^{tree}")"
 F17_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
     GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
     git commit-tree "$F17_TREE" -p "$F17_MAIN_SHA" -m "f17-squash")"
-git update-ref refs/heads/f17-merged "$F17_SHA"
+# `f17-arefuse` sorts FIRST among refs/heads (for-each-ref is refname-ascending),
+# so it is the plan's FIRST command and the paste aborts on it immediately.
+# The other two are `redundant` (their tip IS main), so their `-d` succeeds.
+git update-ref refs/heads/f17-arefuse "$F17_SHA"
+git update-ref refs/heads/f17-bredun "$F17_MAIN_SHA"
+git update-ref refs/heads/f17-credun "$F17_MAIN_SHA"
 if git merge-base --is-ancestor "$F17_SHA" main 2>/dev/null; then
     bad "F17 fixture: the squash tip IS an ancestor of main — -d would succeed and no fallback is printed (F17)"
 else
-    ok "F17 fixture: the squash tip is NOT an ancestor of main (the fallback is reachable) (F17)"
+    ok "F17 fixture: the squash tip is NOT an ancestor of main (the -d refusal is reachable) (F17)"
 fi
 F17_MAP="$FIX/f17-pr-map.json"
 cat > "$F17_MAP" <<JSON
 [
-  {"headRefName":"f17-merged","state":"MERGED","headRefOid":"$F17_SHA","baseRefName":"main"}
+  {"headRefName":"f17-arefuse","state":"MERGED","headRefOid":"$F17_SHA","baseRefName":"main"}
 ]
 JSON
 F17_REAL_GIT="$(command -v git)"
@@ -2414,10 +2417,16 @@ WRAP
 chmod +x "$F17_WRAP/git"
 run_script bash "$F17_SCRIPT" --repo "$F17_REPO" --scope local --pr-map-file "$F17_MAP"
 F17_PLAN_OUT="$OUT"
-assert_eq "$RC" "0" "F17: the squash-only dry-run exits 0"
-assert_eq "$(grep -c '^  git ' <<<"$F17_PLAN_OUT" || true)" "1" "F17: the plan has exactly ONE executable line (the -d command)"
+assert_eq "$RC" "0" "F17: the multi-branch dry-run exits 0"
+# The plan's executable surface: one `-d` per selected branch (3), NO executable
+# update-ref line, and the squash fallback as a COMMENT (F17).
+assert_eq "$(grep -c '^  git ' <<<"$F17_PLAN_OUT" || true)" "3" "F17: the plan has exactly ONE executable line per selected branch (3 -d commands)"
 assert_eq "$(grep -c '^  git update-ref -d ' <<<"$F17_PLAN_OUT" || true)" "0" "F17: the plan has NO executable update-ref line (the fallback is a comment)"
-assert_eq "$(grep -c '^  #   git update-ref -d refs/heads/f17-merged ' <<<"$F17_PLAN_OUT" || true)" "1" "F17: the plan carries the fallback as a COMMENT"
+assert_eq "$(grep -c '^  #   git update-ref -d refs/heads/f17-arefuse ' <<<"$F17_PLAN_OUT" || true)" "1" "F17: the plan carries the squash fallback as a COMMENT"
+# ⛔ F19 framing: the header must not claim the block is a paste-safe script.
+assert_contains "$F17_PLAN_OUT" "NOT a paste-safe script" "F19: the plan's header says plainly it is NOT a paste-safe script"
+assert_contains "$F17_PLAN_OUT" "Run --execute to reap every selected branch" "F19: the plan names --execute as the way to reap every selected branch"
+assert_contains "$F17_PLAN_OUT" "STOPS at that" "F19: the plan says a verbatim paste STOPS at the refusing -d"
 # The plan's advertised executable argv (print-mode evaluation).
 F17_ADVERTISED="$FIX/f17-advertised.bin"; : > "$F17_ADVERTISED"
 while IFS= read -r _f17_line; do
@@ -2425,34 +2434,53 @@ while IFS= read -r _f17_line; do
     PATH="$F17_WRAP:$PATH" F17_REAL_GIT="$F17_REAL_GIT" GIT_WRAP_MODE=print \
         bash -c 'eval "$1"' _ "$_f17_line" >>"$F17_ADVERTISED" || true
 done <<<"$(grep -E '^  git ' <<<"$F17_PLAN_OUT" || true)"
-# The VERBATIM paste: every line under the plan header, run under `set -e`.
+F17_ADV_N="$(grep -c '^branch$' <<<"$(tr '\0' '\n' < "$F17_ADVERTISED")" || true)"
+assert_eq "$F17_ADV_N" "3" "F17: the plan advertises THREE executable commands (one per selected branch)"
+# The VERBATIM paste: the lines the plan prints as commands, run under `set -e`.
 F17_PASTE_SCRIPT="$FIX/f17-paste.sh"
 {
     printf '#!/usr/bin/env bash\nset -e\n'
     awk '/^Deletion commands that would run/ { grab=1; next } grab && /^$/ { exit } grab { print }' <<<"$F17_PLAN_OUT"
 } > "$F17_PASTE_SCRIPT"
-assert_contains "$(cat "$F17_PASTE_SCRIPT")" '#   git update-ref -d refs/heads/f17-merged' "F17: the pasted block carries the fallback as a COMMENT"
-assert_eq "$([ -s "$F17_ADVERTISED" ] && echo nonempty || echo empty)" "nonempty" "F17: the plan advertises at least one executable command"
+assert_contains "$(cat "$F17_PASTE_SCRIPT")" '#   git update-ref -d refs/heads/f17-arefuse' "F17: the pasted block carries the fallback as a COMMENT"
 F17_PASTED="$FIX/f17-pasted.bin"; : > "$F17_PASTED"
 cd "$F17_REPO"
 run_script env PATH="$F17_WRAP:$PATH" F17_REAL_GIT="$F17_REAL_GIT" GIT_WRAP_LOG="$F17_PASTED" \
     bash "$F17_PASTE_SCRIPT"
 F17_PASTE_RC="$RC"
-cd "$REPO"
-if cmp -s "$F17_ADVERTISED" "$F17_PASTED"; then
-    ok "F17: the verbatim paste attempts EXACTLY the executable commands the plan advertises (no part-way abort) (F17)"
+# ⛔ F19: the paste's surface is a STRICT SUBSET of the plan's, and the refusal
+# is the FIRST advertised command — so the paste reaps NOTHING, exactly what the
+# header now says. A single-branch fixture could not show this (it made the
+# attempted set trivially equal to the advertised set).
+F17_PASTED_ARGS="$(tr '\0' '\n' < "$F17_PASTED")"
+F17_PASTED_N="$(grep -c '^branch$' <<<"$F17_PASTED_ARGS" || true)"
+assert_eq "$F17_PASTE_RC" "1" "F19: the paste's rc is 1 — the -d refusal is the documented outcome, not a silent success"
+assert_eq "$F17_PASTED_N" "1" "F19: the paste STOPS at the first (refusing) -d and attempts exactly ONE of the plan's THREE commands"
+if [ "$F17_PASTED_N" -lt "$F17_ADV_N" ]; then
+    ok "F19: the paste's attempted commands are a STRICT SUBSET of the plan's advertised commands"
 else
-    bad "F17: the verbatim paste did NOT attempt every advertised command — it aborted part-way (F17)"
-    echo "    advertised argv:"; od -c "$F17_ADVERTISED" | head -n 6
-    echo "    pasted argv:"; od -c "$F17_PASTED" | head -n 6
+    bad "F19: the paste attempted every advertised command — the multi-branch fixture no longer shows the part-way stop"
 fi
-assert_eq "$F17_PASTE_RC" "1" "F17: the paste's rc is 1 — the -d refusal is the documented outcome, not a silent success"
-assert_not_contains "$(tr '\0' '\n' < "$F17_PASTED")" 'update-ref' "F17: the paste never runs the force-delete fallback (a comment cannot be pasted into doing something execution would refuse)"
-if git -C "$F17_REPO" rev-parse -q --verify refs/heads/f17-merged >/dev/null 2>&1; then
-    ok "F17: the branch SURVIVES the paste (-d refused the squash tip; the fallback was not run)"
-else
-    bad "F17: the branch was DELETED by the paste — the fallback ran despite `set -e`"
-fi
+assert_contains "$F17_PASTED_ARGS" 'f17-arefuse' "F19: the one attempted -d is the branch whose -d refuses"
+assert_not_contains "$F17_PASTED_ARGS" 'update-ref' "F17: the paste never runs the force-delete fallback (a comment cannot be pasted into doing something execution would refuse)"
+for _f17br in f17-arefuse f17-bredun f17-credun; do
+    if branch_exists "$_f17br"; then
+        ok "F19: the paste left $_f17br in place (it reaped nothing)"
+    else
+        bad "F19: the paste deleted $_f17br — it reaped part of the plan despite the observed refusal"
+    fi
+done
+unset _f17br
+# ⛔ AND `--execute` is the way: it falls back to the ATOMIC update-ref -d for the
+# squash branch and reaps ALL THREE — which the paste could not.
+run_script bash "$F17_SCRIPT" --repo "$F17_REPO" --scope local --execute --pr-map-file "$F17_MAP"
+assert_eq "$RC" "0" "F19: --execute exits 0"
+assert_contains "$OUT" "Deleted:   3" "F19: --execute reaps all three selected branches"
+assert_contains "$OUT" "Failed:    0" "F19: --execute reports no failure"
+for _f17br2 in f17-arefuse f17-bredun f17-credun; do
+    assert_branch_absent "$_f17br2" "F19: --execute reaped $_f17br2 (the paste could not)"
+done
+unset _f17br2
 
 cd "$REPO"
 echo ""
@@ -3359,6 +3387,104 @@ assert_eq "$(git config --get branch.f16-cfg.remote || echo ABSENT)" "ABSENT" \
     "F16: branch.f16-cfg.remote is REMOVED (parity with git branch -D)"
 assert_contains "$OUT" "Deleted:   2" "F16: both branches are counted deleted"
 assert_contains "$OUT" "Failed:    0" "F16: no branch is reported failed"
+
+cd "$REPO"
+echo ""
+echo "== 42. F18: a colour config must not make the REMOTE sweep drop candidates SILENTLY =="
+# `git branch -r` COLOURISES the ref names it prints when `color.ui=always` (or
+# `color.branch=always`) is set, so `$branch` became `\e[31morigin/foo\e[m`.
+# `git log -1 --format='%ct' "$branch"` then exits 0 with EMPTY output, the old
+# `= "0"` guard missed it, `[ "" -lt "$CUTOFF_EPOCH" ]` returned status 2 (which
+# the `if` reads as FALSE), and the ref was dropped with NO diagnostic while the
+# sweep printed `✅ No stale merged branches found` and exited 0 — a FALSE PASS on
+# the destructive path. `--no-color` on the classification is the load-bearing
+# fix, so removing it makes this whole section RED.
+F18_ORIGIN="$FIX/f18-origin.git"
+F18_REPO="$FIX/f18-repo"
+new_repo "$F18_REPO" "$F18_ORIGIN"
+cd "$F18_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F18_SCRIPT="$F18_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f18.txt; git add f18.txt; old_commit "init"; git push -q origin main
+git checkout -q -b f18-stale main
+echo hs > hs.txt; git add hs.txt; old_commit "hs"
+git push -q -u origin f18-stale
+git checkout -q main
+git merge -q --ff-only f18-stale
+git push -q origin main
+if git merge-base --is-ancestor f18-stale main 2>/dev/null; then
+    ok "F18 fixture: f18-stale is ancestor-merged into main (a remote candidate)"
+else
+    bad "F18 fixture: f18-stale is NOT merged into main — the fixture is wrong"
+fi
+
+# (a) the colour config the finding names: `color.ui=always`
+run_script env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=always \
+    bash "$F18_SCRIPT" --repo "$F18_REPO" --scope remote
+assert_eq "$RC" "0" "F18: dry-run with color.ui=always exits 0"
+assert_contains "$OUT" "origin/f18-stale" "F18: the stale merged branch IS classified with color.ui=always"
+assert_not_contains "$OUT" "No stale merged branches found" "F18: the false 'nothing is stale' success line is NOT printed with color.ui=always"
+assert_not_contains "$OUT" "integer expression expected" "F18: no silent integer-compare failure with color.ui=always"
+run_script env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=always \
+    bash "$F18_SCRIPT" --repo "$F18_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F18: --execute with color.ui=always exits 0"
+if [ -z "$(git ls-remote origin refs/heads/f18-stale 2>/dev/null)" ]; then
+    ok "F18: the stale merged remote branch IS deleted with color.ui=always (exactly as with colour off)"
+else
+    bad "F18: color.ui=always made the sweep DROP the candidate — the branch survives"
+fi
+
+# (b) `color.branch=always` — the case `color.ui=false` alone does NOT cover
+#     (verified on git 2.50.1: color.branch wins over color.ui). `--no-color`
+#     is a command-line flag, so it beats both.
+git push -q origin refs/heads/main:refs/heads/f18-stale
+run_script env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.branch GIT_CONFIG_VALUE_0=always \
+    bash "$F18_SCRIPT" --repo "$F18_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F18: --execute with color.branch=always exits 0"
+assert_not_contains "$OUT" "No stale merged branches found" "F18: color.branch=always does not silence the sweep"
+if [ -z "$(git ls-remote origin refs/heads/f18-stale 2>/dev/null)" ]; then
+    ok "F18: the branch IS deleted with color.branch=always (--no-color beats color.branch)"
+else
+    bad "F18: color.branch=always made the sweep DROP the candidate — the branch survives"
+fi
+
+# (c) the LOUD arm: an unreadable date for a LISTED ref must REFUSE the sweep,
+#     not be read as "not stale". A `git log` that exits 0 with empty output is
+#     exactly the shape the colour bug produced.
+F18_WRAP="$FIX/f18-wrap"
+F18_REAL_GIT="$(command -v git)"
+mkdir -p "$F18_WRAP"
+cat > "$F18_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double (F18): for ONE ref, model an UNREADABLE commit date — `git log`
+# exits 0 with EMPTY output, exactly what a colour-poisoned ref name produced.
+# Every other invocation delegates unchanged.
+REAL_GIT="${F18_REAL_GIT:?F18_REAL_GIT unset}"
+if [ "${1:-}" = "log" ]; then
+    case "$*" in
+        *f18-nodate*) exit 0 ;;
+    esac
+fi
+exec "$REAL_GIT" "$@"
+WRAP
+chmod +x "$F18_WRAP/git"
+git push -q origin refs/heads/main:refs/heads/f18-nodate
+F18_NODATE_OID="$(git -C "$F18_ORIGIN" rev-parse refs/heads/f18-nodate)"
+run_script env PATH="$F18_WRAP:$PATH" F18_REAL_GIT="$F18_REAL_GIT" \
+    bash "$F18_SCRIPT" --repo "$F18_REPO" --scope remote --execute
+if [ "$RC" -ne 0 ]; then
+    ok "F18: an unreadable commit date REFUSES the sweep (rc=$RC, not a silent success)"
+else
+    bad "F18: an unreadable commit date did NOT fail the sweep (rc=0) — the silent-drop path is back"
+fi
+assert_contains "$OUT" "could not read the commit date of origin/f18-nodate" "F18: the refusal names the ref whose date was unreadable"
+assert_not_contains "$OUT" "No stale merged branches found" "F18: the refusal does NOT print the clean-sweep line"
+if [ "$(git -C "$F18_ORIGIN" rev-parse -q --verify refs/heads/f18-nodate || echo GONE)" = "$F18_NODATE_OID" ]; then
+    ok "F18: the unreadable-date branch SURVIVES the refused sweep (nothing partial is deleted)"
+else
+    bad "F18: the unreadable-date branch was deleted despite the refusal"
+fi
 
 cd "$REPO"
 echo ""

@@ -824,7 +824,11 @@ verify_merged_into_real_main() {
 run_remote_scope() {
     # ── Sanity check: on main, up to date ─────────────────────────
     local CURRENT_BRANCH
-    CURRENT_BRANCH="$(git branch --show-current)"
+    # ⛔ F18: `--no-color` on every `git branch` READ. `branch` is the one git
+    # subcommand here that colourises a ref name it prints, and a colourised name
+    # poisons every downstream parse (see the classification call site for the
+    # full audit and the false PASS it produced).
+    CURRENT_BRANCH="$(git branch --no-color --show-current)"
     if [ "$CURRENT_BRANCH" != "$MAIN_BRANCH" ]; then
         echo "WARNING: not on $MAIN_BRANCH (currently on '$CURRENT_BRANCH') — pruning remote refs anyway" >&2
     fi
@@ -952,8 +956,40 @@ run_remote_scope() {
     # positive refspec — `clone --single-branch --branch <other>`, `git remote
     # set-branches` — leaves exactly this state: the fetch exits 0 and
     # refs/remotes/origin/$MAIN_BRANCH is never created.)
+    # ⛔ F18: THE CLASSIFICATION RUNS `--no-color` — the sweep's own plumbing must
+    # not inherit the caller's git colour config. `git branch -r` COLOURISES the
+    # ref names it prints when `color.ui=always` or `color.branch=always` is set,
+    # so `$branch` became `\e[31morigin/foo\e[m`; every downstream read then got
+    # an unreadable ref (`git log -1 --format='%ct'` exits 0 with EMPTY output,
+    # `git rev-parse refs/remotes/$branch` fails), the candidate was dropped with
+    # NO diagnostic, and the sweep printed `✅ No stale merged branches found` and
+    # exited 0 — a FALSE PASS on the destructive path. `--no-color` is the
+    # command-line override, so it beats `color.ui`/`color.branch` wherever they
+    # are set (repo, global or `-c`); the script must never depend on the caller
+    # turning colour off. Setting `color.ui=false` alone would NOT be enough —
+    # `color.branch=always` still wins over it (verified on git 2.50.1).
+    #
+    # AUDIT of every OTHER git invocation whose OUTPUT IS PARSED (F18). Only a
+    # ref-NAME render can be colourised; the rest are non-colourable by
+    # construction, so they need no flag:
+    #   * git branch --no-color --show-current  carries the flag (call site above)
+    #   * git for-each-ref --no-color --format=...
+    #                                           carries the flag (call site below);
+    #                                           no flag would also do (a custom
+    #                                           --format is not colourised), but
+    #                                           the flag is free and uniform
+    #   * git log --no-color -1 --format='%ct'  carries the flag (call site below)
+    #   * git rev-list --count / rev-parse / merge-base
+    #                                           numeric/OID/status output, never
+    #                                           colourised. ⛔ `rev-parse` must NOT
+    #                                           be given `--no-color`: it is parsed
+    #                                           as a REVISION and PRINTED as one
+    #   * git worktree list --porcelain         porcelain, never colourised
+    #   * git ls-remote / config --get-all / remote get-url --push --all
+    #                                           value/URL reads, plain text
+    #   * git fetch / push / update-ref -d      status-only, no output parsed
     local merged_list=""
-    if ! merged_list="$(git branch -r --merged "origin/$MAIN_BRANCH" 2>/dev/null)"; then
+    if ! merged_list="$(git branch --no-color -r --merged "origin/$MAIN_BRANCH" 2>/dev/null)"; then
         echo "ERROR: origin/$MAIN_BRANCH does not resolve, so no branch can be shown to be" >&2
         echo "ERROR: merged into main. 'git branch -r --merged origin/$MAIN_BRANCH' fails with" >&2
         echo "ERROR: no output in that state, which reads as 'nothing is stale' — an unreadable" >&2
@@ -999,11 +1035,30 @@ run_remote_scope() {
 
         # Check if branch commit date is before cutoff
         local COMMIT_DATE
-        COMMIT_DATE="$(git log -1 --format='%ct' "$branch" 2>/dev/null || echo "0")"
-        if [ "$COMMIT_DATE" = "0" ]; then
-            echo "  ⚠️  Skipping $branch (unable to read commit date)" >&2
-            continue
-        fi
+        COMMIT_DATE="$(git log --no-color -1 --format='%ct' "$branch" 2>/dev/null || true)"
+        # ⛔ F18: AN UNREADABLE DATE IS AN INTERNAL ERROR, NOT A NON-CANDIDATE.
+        # Every ref reaching here was LISTED by the merge classification, so it
+        # must have a readable commit date. The old `|| echo "0"` + `= "0"` guard
+        # missed the ONE shape that mattered: with `color.ui=always` (or
+        # `color.branch=always`) the classification's ref names came back wrapped
+        # in SGR escapes, `git log -1 --format='%ct' "\e[31morigin/foo\e[m"`
+        # exits 0 with EMPTY output (verified on git 2.50.1), the `= "0"` guard
+        # did not fire, and `[ "" -lt "$CUTOFF_EPOCH" ]` returned status 2, which
+        # the `if` reads as FALSE. The ref was dropped with NO diagnostic while
+        # the sweep printed `✅ No stale merged branches found` and exited 0.
+        # The classification now runs `--no-color` (call site above), so this
+        # cannot recur through that route — and this guard makes ANY future route
+        # LOUD: an empty or non-numeric value REFUSES the whole sweep instead of
+        # silently shrinking the candidate set behind a success status.
+        case "$COMMIT_DATE" in
+            ''|*[!0-9]*)
+                echo "ERROR: could not read the commit date of $branch, which the merge" >&2
+                echo "ERROR: classification listed. An unreadable date is an internal error, not" >&2
+                echo "ERROR: an empty candidate set; refusing the remote sweep so a partial" >&2
+                echo "ERROR: selection is never reported as a clean one." >&2
+                return 1
+                ;;
+        esac
 
         # ⛔ DELIMITER IS TAB, NOT `|`: `|` is a LEGAL git branch-name character
         # (`git check-ref-format --branch 'a|b'` accepts it), so a remote branch
@@ -1410,7 +1465,7 @@ run_local_scope() {
     # it (`refs/heads/heads/foo` does not exist) — a false selection reported as
     # a delete that then fails. `lstrip=2` strips `refs/heads/` unconditionally,
     # so the name is plain regardless of any same-named tag.
-    if ! branches="$(git for-each-ref \
+    if ! branches="$(git for-each-ref --no-color \
             --format='%(refname:lstrip=2)%09%(committerdate:unix)%09%(objectname)%09%(upstream:short)' \
             refs/heads)"; then
         echo "ERROR: could not enumerate refs/heads" >&2
@@ -1687,9 +1742,24 @@ run_local_scope() {
         done <<<"$delete_list"
         echo ""
     elif [ "$sel_total" -gt 0 ]; then
-        echo "── DRY-RUN: no branches deleted ──"
+        echo "── DRY-RUN: no branches deleted (PREVIEW of --execute) ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --scope local --execute"
         echo ""
+        # ⛔ F19: THE HEADER MUST NOT IMPLY THIS BLOCK IS A PASTE-SAFE SCRIPT.
+        # It is a PREVIEW. For a SQUASH-merged branch the printed `git branch -d`
+        # REFUSES (its tip is not an ancestor of HEAD), so a verbatim paste under
+        # `set -e` stops at that line and reaps only the branches printed before
+        # it — while `--execute` falls back to the atomic `git update-ref -d` and
+        # reaps every selected branch. The fallback stays a COMMENT: printing it
+        # as a second command would advertise `-d || update-ref -d`, whose `||`
+        # arm can dangle HEAD for a branch that became checked out, which
+        # `--execute`'s worktree guard refuses. So the fix is to say plainly what
+        # a paste of this list actually does, not to change what is printed — no
+        # line below may claim a property the paste does not have.
+        echo "⚠️  PREVIEW ONLY — this is NOT a paste-safe script."
+        echo "    Run --execute to reap every selected branch: a squash-merged branch's"
+        echo "    'git branch -d' REFUSES, so a verbatim paste of the list STOPS at that"
+        echo "    line and reaps only the branches printed before it."
         echo "Deletion commands that would run (force-delete fallback only for a merged branch that -d will refuse):"
         while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
