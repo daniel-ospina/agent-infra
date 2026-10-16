@@ -614,7 +614,8 @@ cat > "$P/bin/tmux" <<'SH'
 case "${1:-}" in
   has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
   new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
-  ls) [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
+  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
+      [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
   *) exit 0 ;;
 esac
 SH
@@ -957,6 +958,15 @@ rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/
 PPATH="$P/prunebin" prov start
 [ -d "$P/repo/.venv" ] && bad "start did not prune even with no worker running (the arm is vacuous)" \
                        || ok "start still auto-prunes caches when no worker session is live (non-vacuous)"
+# ⛔ NON-VACUOUS for the pipefail hazard: the guard was `tmux ls | grep -qE`, and an early exit down a
+# pipe lets the producer take SIGPIPE — under `set -o pipefail` a MATCH then reads as no match, so the
+# unattended prune deleted a LIVE worker's .venv. A one-line stub cannot show it (it fits in the pipe
+# buffer), so this stub STREAMS: a match first, then far more than 64 KiB.
+rm -rf "$P/repo/.venv"; mkdir -p "$P/repo/.venv"; printf 'x\n' > "$P/repo/.venv/marker"
+PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
+[ -d "$P/repo/.venv" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
+                       || bad "start pruned a LIVE worker's .venv — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
+unset PROV_TMUX_STREAM
 PPATH=""
 
 # ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────
@@ -1073,6 +1083,219 @@ touch -t 202001010000 "$R/scratch/linkedwt"
 prunesup --scratch=0
 [ -d "$R/scratch/linkedwt" ] && ok "prune --scratch SPARES a linked worktree (\$SCRATCH_ROOT/.git is a FILE — unmerged work)" \
                              || bad "prune --scratch deleted a linked worktree — unmerged work lost"
+
+# ── 11) THE FOUR FAIL-OPENS A FRESH-CONTEXT REVIEW FOUND IN THE SHIPPED CHANGE (#1745) ─────────
+# Each was reproduced against the committed artifact, fixed, and pinned by the test that would have
+# caught it. All four share one shape: a cannot-verify read as safe, or a guard that already existed
+# and was not called. Each test is non-vacuous — the mutation that reverts its fix reddens it.
+say_case "prune's rm -rf and the HARNESS resolution: the review-found fail-opens (#1745)"
+
+# (a) `prune` — the verb `cmd_start` runs UNATTENDED — `rm -rf`'d every subdirectory of
+# $HARNESS_PIN_DIR with NO validation at all, while `harness_apply` guarded the same shape of delete
+# with `assert_pin_dir_safe`. `HARNESS_PIN_DIR=$CELL_HOME` therefore deleted the cell home's own
+# state directory before the guard in `apply` could ever fire.
+U="$T/unsafe"; mkdir -p "$U/home/orchestrator/state" "$U/pin/111111111111/scripts/orchestrator-harness"
+printf 'SECRET\n' > "$U/home/keys.env"
+printf '%s\n' "$U/pin/111111111111/scripts/orchestrator-harness" > "$U/home/.harness-path"
+U_OUT=''; U_RC=0
+unsafe_prune() { # $1 = HARNESS_PIN_DIR
+  U_OUT="$(CELL_HOME="$U/home" ENV_FILE="$U/home/keys.env" SESSION="ai1745-unprune-$$" \
+            O="$U/home/orchestrator" REPO="$U/not-a-repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 \
+            HARNESS="$U/not-a-repo" SCRATCH_ROOT="$U/scratch" HARNESS_PIN_DIR="$1" \
+            HARNESS_PIN_FILE="$U/home/.harness-path" bash "$SUP" prune --caches 2>&1)"
+  U_RC=$?
+}
+unsafe_prune "$U/home"
+[ "$U_RC" -ne 0 ] && ok "prune REFUSES a HARNESS_PIN_DIR that CONTAINS the cell home" \
+                  || bad "prune accepted a pin dir over the cell home — $U_OUT"
+[ -d "$U/home/orchestrator/state" ] && ok "the cell home's state dir SURVIVED the refused prune (no rm -rf)" \
+                                    || bad "prune DELETED the cell home's subdirs — SILENT DESTRUCTION"
+unsafe_prune "$U/pin"
+[ "$U_RC" -eq 0 ] && ok "prune still reclaims pins under a VALID pin root (the guard is not a blanket refusal)" \
+                  || bad "prune false-blocked its OWN pin root — $U_OUT"
+
+# (b) The LEGACY FLAT PIN: $HARNESS_PIN_DIR IS the worktree, so `"$root"/*/` enumerates the harness's
+# OWN source directories. (This test also pins the path normalization: the fixture path carries the
+# macOS `//` that made a literal `grep -qxF` answer "not mine" — a false need to reclaim.)
+say_case "prune never reclaims the subdirectories of a flat (worktree-root) pin (#1745)"
+ai_worktree "$U/flat"
+mkdir -p "$U/flat/keeper"
+unsafe_prune "$U/flat"
+[ "$U_RC" -eq 0 ] && ok "prune ACCEPTS a flat pin as a valid root (no false block on its own worktree)" \
+                  || bad "prune refused a linked worktree pin root — $U_OUT"
+[ -d "$U/flat/keeper" ] && ok "prune SPARED the flat pin's own directories (the root IS the live worktree)" \
+                        || bad "prune deleted the LIVE flat pin's directories — the harness it is running from"
+
+# (c) A bare `git worktree prune` (no path filter) deregisters EVERY record whose directory is
+# missing, unrelated siblings included — a call this file itself bans ~500 lines above (#1141).
+say_case "prune does not deregister a worktree whose directory is gone (#1141)"
+W="$R/wt-stale"; git -C "$R/repo" worktree add -q --detach "$W" HEAD
+rm -rf "$W"
+B="$(git -C "$R/repo" worktree list --porcelain | grep -c '^worktree ')"
+prunesup --caches
+A="$(git -C "$R/repo" worktree list --porcelain | grep -c '^worktree ')"
+{ [ ! -d "$W" ] && [ "$B" -ge 2 ]; } && ok "fixture: a worktree IS registered while its directory is missing" \
+                                   || bad "fixture broken: no missing-directory worktree to prune ($B registered)"
+[ "$A" = "$B" ] && ok "prune left an unrelated missing-directory worktree REGISTERED (no bare 'git worktree prune')" \
+               || bad "prune deregistered a worktree it does not own ($B -> $A) — a detached worktree's admin HEAD is its last durable handle"
+
+# (d) The HARNESS resolution order. `check` is what an operator runs to ask "which commit would this
+# cell run?"; it must read the path `apply` RECORDED, not a sibling that happens to sit next to the
+# script. A default assigned at the top made every `[ -z "$HARNESS" ]` fallback dead, so a fresh
+# `check` judged one tree while `start` would seed another — the exact divergence #1745 is about.
+say_case "with HARNESS unset, check resolves the RECORDED pin, not the script sibling (#1745)"
+D2="$T/pinresolve"; mkdir -p "$D2/home" "$D2/repo"
+printf '%s\n' "$D2/gone-pin/scripts/orchestrator-harness" > "$D2/home/.harness-path"
+D2_OUT=''; D2_RC=0
+D2_OUT="$(env -u HARNESS CELL_HOME="$D2/home" ENV_FILE="$D2/keys.env" SESSION="ai1745-pinres-$$" \
+          O="$D2/o" REPO="$D2/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF=origin/main \
+          HARNESS_PIN_DIR="$D2/pin" HARNESS_PIN_FILE="$D2/home/.harness-path" \
+          bash "$SUP" check 2>&1)"; D2_RC=$?
+[ "$D2_RC" -ne 0 ] && ok "check REFUSED: it looked at the RECORDED pin (absent), not the sibling harness" \
+                   || bad "check silently fell back to the sibling harness while the record named a pin — $D2_OUT"
+case "$D2_OUT" in
+  *"$D2/gone-pin"*) ok "check names the PINNED path it could not find (the record is the source of truth)" ;;
+  *) bad "check's failure does not name the recorded pin — $D2_OUT" ;;
+esac
+# The remedy must match the reason. For a STALE RECORD, "clone the repo first" is the one action that
+# cannot help (the pin became authoritative, so this state is reachable where a sibling used to mask it).
+case "$D2_OUT" in
+  *"RECORDED in"*) ok "check prescribes apply for a stale RECORD, not 'clone the repo first'" ;;
+  *) bad "check's stale-pin refusal names the wrong remedy — $D2_OUT" ;;
+esac
+
+# (e) `git status` that CANNOT run is cannot-verify, never "clean": the recorded commit would then
+# describe bytes nobody verified (the likeliest trigger is the full disk this change exists for).
+say_case "check refuses when the harness worktree's cleanliness CANNOT be verified (#1745)"
+E="$T/cannotverify"; mkdir -p "$E/home" "$E/o"
+ai_init_repo "$E/repo"
+ai_worktree "$E/h"
+cp "$E/h/scripts/orchestrator-harness"/*.sh "$E/o/"   # seed $O so cmd_check reaches the provenance gate
+printf 'garbage-not-an-index' > "$(git -C "$E/h" rev-parse --git-path index)"
+if git -C "$E/h" status --porcelain >/dev/null 2>&1; then
+  bad "fixture broken: 'git status' still succeeded on a corrupt index"
+else
+  ok "fixture: 'git status' CANNOT run (corrupt index) while 'rev-parse HEAD' still can"
+fi
+E_OUT=''; E_RC=0
+E_OUT="$(PATH="$P/bin:$PATH" CELL_HOME="$E/home" ENV_FILE="$E/keys.env" SESSION="ai1745-cv-$$" O="$E/o" REPO="$E/repo" \
+         HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF=origin/main HARNESS_PIN_DIR="$E/pin" \
+         HARNESS_PIN_FILE="$E/home/.harness-path" HARNESS="$E/h/scripts/orchestrator-harness" \
+         bash "$SUP" check 2>&1)"; E_RC=$?
+[ "$E_RC" -ne 0 ] && ok "check REFUSED a harness whose cleanliness cannot be verified" \
+                  || bad "check PASSED a harness whose 'git status' cannot run — cannot-verify read as clean: $E_OUT"
+case "$E_OUT" in
+  *"cannot verify"*) ok "check names the cannot-verify state instead of implying clean" ;;
+  *) bad "check's refusal does not name the cannot-verify state — $E_OUT" ;;
+esac
+
+# (f) A symlinked (or `//`-carrying) SCRATCH_ROOT made `registered_worktree`'s LITERAL compare answer
+# "not one of ours" for the cell's OWN checkout, so `prune --scratch` `rm -rf`'d the main worktree and
+# the unmerged work in it. On macOS this is the DEFAULT (SCRATCH_ROOT=/tmp is a symlink to
+# /private/tmp), so the guard was decorative — the same defect this commit fixed in `linked_worktree_of`.
+say_case "prune --scratch spares the main checkout under a symlinked SCRATCH_ROOT (#1745)"
+S="$T/scratchlink"; mkdir -p "$S/real"
+ai_init_repo "$S/real/mainrepo"
+git -C "$S/real/mainrepo" commit -q --allow-empty -m unpushed
+ln -s "$S/real" "$S/link"
+touch -t 202001010000 "$S/real/mainrepo"
+SL_OUT=''
+SL_OUT="$(CELL_HOME="$R/home" ENV_FILE="$R/keys.env" SESSION="ai1745-sl-$$" O="$R/o" \
+          REPO="$S/link/mainrepo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$R/repo" \
+          SCRATCH_ROOT="$S/link" HARNESS_PIN_DIR="$R/pin" HARNESS_PIN_FILE="$R/home/.harness-path" \
+          bash "$SUP" prune --scratch=0 2>&1)"
+[ -d "$S/real/mainrepo/.git" ] && ok "prune --scratch SPARED the main checkout reached through a SYMLINKED SCRATCH_ROOT" \
+                              || bad "prune --scratch DELETED the cell's own checkout, unmerged work and all: $SL_OUT"
+
+# (g) ⛔ NOT TESTED HERE, FILED INSTEAD: when the ref has not moved and the pin's tree is dirty,
+# `harness_apply`'s ELSE branch computes `dir` = the LIVE pin path and does `worktree remove --force`
+# then `worktree add` on the identical path — the destroy-then-create the comment above it says
+# per-commit pinning eliminated, so a crash (ENOSPC, the condition the comment names) in that window
+# leaves the cell with no harness. A refusal was tried and REVERTED: it broke the documented and
+# separately tested self-repair (`apply` must mend a dirty pin). The real fix is create-before-remove
+# (build the replacement at a temp path, then swap), which is a change to the pinning scheme and is
+# tracked as a follow-up rather than improvised under this merge.
+
+# (h) `prune` reclaimed a superseded pin with `rm -rf` ONLY, leaving a phantom `worktree list` entry
+# and its admin dir behind — one per pin, forever, on the verb that exists to stop a disk leak.
+say_case "prune DEREGISTERS a superseded pin (no phantom worktree records) (#1745)"
+D="$T/deregpins"; mkdir -p "$D/home" "$D/pin"
+git -C "$AI" worktree add -q --detach "$D/pin/000000000000" origin/main
+git -C "$AI" worktree add -q --detach "$D/pin/111111111111" origin/main
+printf '%s\n' "$D/pin/111111111111/scripts/orchestrator-harness" > "$D/home/.harness-path"
+BC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
+CELL_HOME="$D/home" ENV_FILE="$D/keys.env" SESSION="ai1745-dereg-$$" O="$D/o" REPO="$D/repo" \
+  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$D/pin/111111111111/scripts/orchestrator-harness" \
+  HARNESS_PIN_DIR="$D/pin" HARNESS_PIN_FILE="$D/home/.harness-path" bash "$SUP" prune --caches >/dev/null 2>&1
+AC="$(git -C "$AI" worktree list --porcelain | grep -c '^worktree ')"
+[ ! -e "$D/pin/000000000000" ] && ok "prune reclaimed the superseded pin's directory" \
+                                  || bad "prune kept the superseded pin on disk"
+[ "$AC" = "$((BC - 1))" ] && ok "prune DEREGISTERED the reclaimed pin (no phantom worktree record, no admin-dir leak)" \
+                            || bad "prune left a phantom worktree record: registrations $BC -> $AC (expected $((BC - 1)))"
+[ -d "$D/pin/111111111111" ] && ok "prune kept the ACTIVE pin on disk" \
+                              || bad "prune deleted the ACTIVE pin"
+
+# (i) A `case` allow-list of digits cannot see that `00`/`000` evaluate to zero (or that `010` is OCTAL
+# 8 in arithmetic): the floor this line exists to make un-disarmable was still bypassable by spelling.
+say_case "the disk floor cannot be disarmed by a spelling of zero (#1745)"
+for v in 00 000 18446744073709551617; do
+  MFM_OUT="$(MIN_FREE_MB="$v" CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai1745-mfm-$$" \
+             O="$T/o" REPO="$T/not-a-repo" bash "$SUP" status 2>&1)"
+  case "$MFM_OUT" in
+    *MIN_FREE_MB*) ok "MIN_FREE_MB=$v is REFUSED at load (a digits-only zero would disarm the floor)" ;;
+    *) bad "MIN_FREE_MB=$v was ACCEPTED — the floor is disarmed: $MFM_OUT" ;;
+  esac
+done
+MFM_OUT="$(MIN_FREE_MB=010 CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai1745-mfm-$$" \
+           O="$T/o" REPO="$T/not-a-repo" bash "$SUP" status 2>&1)"
+case "$MFM_OUT" in
+  *MIN_FREE_MB*) bad "MIN_FREE_MB=010 was refused at load — a legitimate decimal is a false block" ;;
+  *) ok "MIN_FREE_MB=010 is read as DECIMAL 10 (not octal 8, not zero)" ;;
+esac
+
+# (j) `HARNESS_REPO` must never resolve to the PIN. A linked worktree's own toplevel IS the pin, so
+# deriving it from `$HARNESS` (now the RECORDED pin) made the pin its own repo — `harness_apply` could
+# then `worktree remove` the tree it was running from. Reachable whenever the script is invoked from
+# outside any checkout, which is how a cell receives it.
+say_case "HARNESS_REPO derives the MAIN worktree, never the pin (#1745)"
+J="$T/standalone"; mkdir -p "$J/home" "$J/bin" "$J/pin" "$J/repo"
+printf '#!/bin/bash\nexit 0\n' > "$J/bin/gh"; chmod +x "$J/bin/gh"
+ai_init_repo "$J/repo"
+cp "$SUP" "$J/cloud-cell-supervisor.sh"      # OUTSIDE any git checkout: candidate 1 cannot resolve
+JOUT1="$(PATH="$J/bin:$PATH" CELL_HOME="$J/home" ENV_FILE="$J/keys.env" SESSION="ai1745-j1-$$" \
+         O="$J/o" REPO="$J/repo" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF=origin/main \
+         HARNESS_PIN_DIR="$J/pin" HARNESS_PIN_FILE="$J/home/.harness-path" \
+         bash "$J/cloud-cell-supervisor.sh" apply 2>&1)"
+[ -f "$J/home/.harness-path" ] && ok "fixture: the standalone copy pinned a harness" \
+                              || bad "fixture: standalone apply did not pin — $JOUT1"
+JOUT2="$(env -u HARNESS_REPO PATH="$J/bin:$PATH" CELL_HOME="$J/home" ENV_FILE="$J/keys.env" \
+         SESSION="ai1745-j2-$$" O="$J/o" REPO="$J/repo" HARNESS_FETCH=0 HARNESS_REF=origin/main \
+         HARNESS_PIN_DIR="$J/pin" HARNESS_PIN_FILE="$J/home/.harness-path" \
+         bash "$J/cloud-cell-supervisor.sh" apply 2>&1)"
+AI_REAL="$(cd "$AI" && pwd -P)"      # the script reports a `pwd -P`-normalised path (macOS /private)
+case "$JOUT2" in
+  *"in $AI_REAL"*) ok "HARNESS_REPO derived the MAIN worktree of the pin, not the pin itself" ;;
+  *) bad "HARNESS_REPO did not derive the pin's main worktree (expected 'in $AI_REAL') — $JOUT2" ;;
+esac
+
+# (k) The active-pin guard consulted the pin FILE only, with a LITERAL compare. File and in-use
+# harness can disagree (an explicit $HARNESS outranks the file; a respelled HARNESS_PIN_DIR changes
+# one side's spelling), and in every such case `prune` — which `start` runs UNATTENDED, at low disk —
+# reclaimed the tree the cell was running from.
+say_case "prune never reclaims the IN-USE harness when the record disagrees (#1745)"
+K="$T/pinmismatch"; mkdir -p "$K/home" "$K/pin"
+git -C "$AI" worktree add -q --detach "$K/pin/aaaaaaaaaaaa" origin/main   # the RECORDED pin
+for n in bbbbbbbbbbbb cccccccccccc; do git -C "$AI" worktree add -q --detach "$K/pin/$n" origin/main; done
+printf '%s\n' "$K/pin/aaaaaaaaaaaa/scripts/orchestrator-harness" > "$K/home/.harness-path"
+CELL_HOME="$K/home" ENV_FILE="$K/keys.env" SESSION="ai1745-k-$$" O="$K/o" REPO="$K/repo" \
+  HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS="$K/pin/bbbbbbbbbbbb/scripts/orchestrator-harness" \
+  HARNESS_PIN_DIR="$K/pin" HARNESS_PIN_FILE="$K/home/.harness-path" bash "$SUP" prune --caches >/dev/null 2>&1
+[ -d "$K/pin/bbbbbbbbbbbb" ] && ok "prune SPARED the harness actually IN USE (\$HARNESS) while the record named another pin" \
+                             || bad "prune DELETED the in-use harness because the record named a different pin — SILENT DESTRUCTION"
+[ -d "$K/pin/aaaaaaaaaaaa" ] && ok "prune kept the pin the RECORD names" \
+                              || bad "prune reclaimed the pin the record names as active"
+[ ! -e "$K/pin/cccccccccccc" ] && ok "prune still reclaimed a genuinely superseded pin (the guard is not a blanket refusal)" \
+                                || bad "prune kept a genuinely superseded pin — the reclaim arm is now vacuous"
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

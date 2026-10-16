@@ -80,12 +80,15 @@ REPO="${REPO:-/tmp/cell}"
 ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 O="${O:-$CELL_HOME/orchestrator}"
 # The harness is a SIBLING of this script inside agent-infra (scripts/orchestrator-harness/),
-# not inside the target repo ($REPO) — resolve it from this script's own location, and let an
-# explicit HARNESS override win. It moved out of tortoise's operations/ on 2026-10-13; the old
-# $REPO/operations/orchestrator-harness path becomes a stub pointer in a follow-up tortoise PR
-# (agent-infra#1700 / tortoise#8432), so it is no longer a valid default here. An unresolvable
-# path fails loudly in cmd_check, never silently.
-HARNESS="${HARNESS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)}"
+# not inside the target repo ($REPO) — but an explicit `$HARNESS` (env) is the only thing that
+# outranks the path `apply` pinned, so the default is resolved in the provenance block below (pin
+# file, then this script's sibling, then $REPO's own tree) rather than here. ⛔ A non-empty default
+# HERE makes every later `[ -z "$HARNESS" ]` fallback dead — that is how a fresh `check` came to read
+# the sibling while `start` ran the pin, the divergence #1745 is about. It moved out of tortoise's
+# operations/ on 2026-10-13; the old $REPO/operations/orchestrator-harness path becomes a stub pointer
+# in a follow-up tortoise PR (agent-infra#1700 / tortoise#8432), so it is no longer a valid default
+# here. An unresolvable path fails loudly in cmd_check, never silently.
+HARNESS="${HARNESS:-}"
 SESSION="${SESSION:-orch}"
 # OR is interpolated into the session command string, so it is defaulted here — the guard below reads
 # it with `${!v}` under `set -u`, which errors on an unset name, and the string must not depend on
@@ -296,13 +299,23 @@ STAMP="$O/.agent-infra-stamp.json"
 # ⛔ A non-numeric floor silently disables the ONE check that exists because a full disk read healthy:
 # `[ "$mb" -lt "$MIN_FREE_MB" ]` prints `integer expression expected` and evaluates FALSE, so the
 # branch is never taken and the cell is blessed. Validated at load, where the operator still sees it.
-case "$MIN_FREE_MB" in ''|*[!0-9]*) die "MIN_FREE_MB must be a whole number of megabytes (got '$MIN_FREE_MB')" ;; esac
+case "$MIN_FREE_MB" in ''|*[!0-9]*|?????????*) die "MIN_FREE_MB must be a positive whole number of megabytes (got '$MIN_FREE_MB')" ;; esac
+# ⛔ `00`, `000` and `010` are all digits, so a `case` allow-list cannot see that they evaluate to 0 —
+# or, in arithmetic context, to OCTAL 8. Require a non-zero floor and normalise to base 10, so the one
+# check that exists because a full disk read healthy cannot be disarmed by a spelling of zero. The
+# digit cap matters too: bash arithmetic wraps at 2^63, so `18446744073709551617` (2^64+1) normalises
+# to 1 — a huge floor silently became 1 MiB. 9 digits is ~1 PB, beyond any real cell.
+[ "$((10#$MIN_FREE_MB))" -gt 0 ] || die "MIN_FREE_MB must be a positive whole number of megabytes (got '$MIN_FREE_MB')"
+MIN_FREE_MB="$((10#$MIN_FREE_MB))"
 
-# Resolution order, most explicit first: an operator's $HARNESS (applied above, and never
-# overridden), then the path `apply` pinned, then this script's sibling harness, then the target
-# repo's own scripts/ tree. Only an EMPTY $HARNESS reaches the fallbacks here.
+# Resolution order, most explicit first: an operator's $HARNESS (env, and never overridden), then the
+# path `apply` pinned, then this script's sibling harness, then the target repo's own scripts/ tree.
+# Only an EMPTY $HARNESS reaches the fallbacks here.
 if [ -z "$HARNESS" ] && [ -r "$HARNESS_PIN_FILE" ]; then
   HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+fi
+if [ -z "$HARNESS" ]; then
+  HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness" 2>/dev/null && pwd)"
 fi
 if [ -z "$HARNESS" ] && [ -d "$REPO/scripts/orchestrator-harness" ]; then
   HARNESS="$REPO/scripts/orchestrator-harness"
@@ -313,11 +326,15 @@ fi
 if [ -z "$HARNESS_REPO" ]; then
   for _cand in "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)" "$HARNESS" "$REPO"; do
     [ -n "$_cand" ] || continue
-    if git -C "$_cand" rev-parse --show-toplevel >/dev/null 2>&1; then
-      HARNESS_REPO="$(git -C "$_cand" rev-parse --show-toplevel)"; break
-    fi
+    # ⛔ The MAIN worktree, not `--show-toplevel`. `$HARNESS` may be a PIN, and a linked worktree's
+    # own toplevel IS the pin — deriving HARNESS_REPO from it makes the pin its own repo, so
+    # `harness_apply` would operate on (and could remove) the tree it is running from. The main
+    # worktree is listed first and is the checkout that carries `origin/main`; for a plain checkout
+    # the two answers are identical, so the usual operator path is unchanged.
+    _cand_repo="$(git -C "$_cand" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+    if [ -n "$_cand_repo" ]; then HARNESS_REPO="$_cand_repo"; break; fi
   done
-  unset _cand
+  unset _cand _cand_repo
 fi
 
 # coreutils on the cell; shasum on a BSD userland. Both print `<hash>  <name>`.
@@ -391,7 +408,15 @@ stamp_write() {
   local payload dirty tmp
   classify_harness
   payload="$(o_payload_hash)"
-  if [ -n "$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" ]; then dirty=true; else dirty=false; fi
+  # The dirty bit is READ LIVE and must not fail open: a `git status` that cannot run (corrupt index,
+  # ENOSPC, EACCES, safe.directory) is CANNOT-VERIFY, never "clean" — the same rule the unreadable
+  # `df` follows in cmd_check_disk.
+  harness_dirty; local dirty_rc=$?
+  case "$dirty_rc" in
+    0) dirty=true ;;
+    1) dirty=false ;;
+    *) die "cannot verify whether the harness at ${HARNESS:-<unresolved>} is clean (git status failed) — refusing to record a provenance stamp that cannot be trusted" ;;
+  esac
   # ⛔ TEMP-THEN-RENAME, never `cat > "$STAMP"`. An in-place write truncates the real stamp FIRST, so a
   # failure in that window (ENOSPC — the exact condition this whole change exists for) destroys the one
   # artifact that makes the surface checkable, where a valid record used to be. `seed_and_stamp` below
@@ -414,20 +439,38 @@ STAMPEOF
   mv -f "$tmp" "$STAMP" || { rm -f "$tmp"; die "cannot record the harness provenance at $STAMP"; }
 }
 
-# Is the harness's WORKING TREE dirty? HEAD can equal the ref while the tree carries hand edits, and
-# `harness_apply` deliberately leaves such a tree where it is — so the recorded commit describes
-# bytes that are not the ones seeded. Read live, from $HARNESS.
-harness_dirty() { [ -n "$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" ]; }
+# The harness's WORKING-TREE state, read live from $HARNESS. HEAD can equal the ref while the tree
+# carries hand edits, and the recorded commit would then describe bytes that are not the ones seeded.
+#   0 = DIRTY   1 = CLEAN   2 = CANNOT VERIFY (`git status` itself failed)
+# ⛔ A caller MUST NOT read 2 as clean — cannot-verify is never a pass in this file, and the likeliest
+# trigger is the full disk this change exists for (git status refreshing the index fails, rev-parse
+# still succeeds).
+harness_dirty() {
+  local out
+  out="$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" || return 2
+  [ -n "$out" ]
+}
 
 # Is <path> a LINKED worktree of <repo> — i.e. may this script `rm -rf` it? The MAIN working tree is
 # deliberately excluded: `git worktree list` names it too, and it is the checkout that must never be
 # deleted.
 linked_worktree_of() {
-  local repo="$1" p="$2" main
+  local repo="$1" p="$2" real main w list
   [ -n "$repo" ] && [ -n "$p" ] || return 1
+  real="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
   main="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 1
-  [ "$(cd "$p" 2>/dev/null && pwd -P)" != "$(cd "$main" 2>/dev/null && pwd -P)" ] || return 1
-  git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}' | grep -qxF "$p"
+  main="$(cd "$main" 2>/dev/null && pwd -P)"
+  [ "$real" != "$main" ] || return 1
+  # ⛔ MATERIALIZE the listing before comparing, and NORMALIZE each recorded path. A $TMPDIR-derived
+  # path carries a `//` that git collapses in `worktree list` output, so a literal `grep -qxF`
+  # reports our OWN worktree as foreign — the false block `assert_pin_dir_safe`'s comment names.
+  # Here a false NEGATIVE is worse still: `cmd_prune` skips its reclaim sweep only because this
+  # answers yes for a flat pin, so answering no would `rm -rf` the live harness's own directories.
+  # ⛔ Not `… | grep -qxF`: an early exit down a pipe lets the producer take SIGPIPE, and under
+  # `set -o pipefail` a MATCH would then be read as no match (measured in this file already).
+  list="$(git -C "$repo" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')" || return 1
+  while IFS= read -r w; do [ "$(cd "$w" 2>/dev/null && pwd -P)" = "$real" ] && return 0; done <<<"$list"
+  return 1
 }
 
 # `harness_apply` is about to `rm -rf` this path, and it is operator-settable — the silent-destruction
@@ -490,9 +533,12 @@ harness_apply() {
   [ "$fetch_failed" = 1 ] && say "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
   cur="$(harness_commit)"
   # A DIRTY tree at the ref is NOT `unchanged`: its commit does not describe its bytes, and seeding it
-  # records the ref over hand-edited worker code. Pin a clean detached worktree instead — which also
-  # repairs the operator's hand-maintained tree without disturbing it in place.
-  if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ] && ! harness_dirty; then
+  # records the ref over hand-edited worker code. A tree whose cleanliness cannot be VERIFIED is
+  # treated the same way — re-pinning a clean worktree is always safe, reading an unverifiable tree as
+  # clean is not. Pin a clean detached worktree instead — which also repairs the operator's
+  # hand-maintained tree without disturbing it in place.
+  harness_dirty; local hd_apply=$?
+  if [ "$cur" = "$want" ] && [ -f "$HARNESS/orch-loop.sh" ] && [ "$hd_apply" = 1 ]; then
     HARNESS_APPLIED=unchanged
   else
     # ⛔ PIN PER COMMIT, and create-new rather than destroy-then-create. Pinning into ONE shared
@@ -578,7 +624,7 @@ cmd_check_disk() {
 # diverged, unknown) and one that can (behind) — see the header block for why.
 cmd_check_provenance() {
   classify_harness
-  local sc sp sr live sd
+  local sc sp sr live sd hd_rc
   case "$HARNESS_REL" in
     current)
       say "ok: harness commit ${HARNESS_COMMIT:0:12} == $HARNESS_REF (${REF_COMMIT:0:12}) — $(harness_subject)" ;;
@@ -608,7 +654,11 @@ cmd_check_provenance() {
   # recorded over bytes it does not describe, and `start` seeds exactly those bytes. This is read LIVE
   # (catches an edit made AFTER the record; the payload hash only covers $O). Before this,
   # `agentInfraDirty` was written by stamp_write and never read by anything.
-  harness_dirty && die "DRIFT — the harness working tree at ${HARNESS:-<unresolved>} has UNCOMMITTED changes, so commit ${HARNESS_COMMIT:0:12} does not describe the bytes that will run. Commit or discard them, then $0 apply"
+  harness_dirty; hd_rc=$?
+  case "$hd_rc" in
+    0) die "DRIFT — the harness working tree at ${HARNESS:-<unresolved>} has UNCOMMITTED changes, so commit ${HARNESS_COMMIT:0:12} does not describe the bytes that will run. Commit or discard them, then $0 apply" ;;
+    2) die "cannot verify whether the harness at ${HARNESS:-<unresolved>} is clean (git status failed) — cannot-verify is never a pass. Remedy: repair git (disk, index, ownership), then $0 check" ;;
+  esac
   if [ -f "$STAMP" ]; then
     sc="$(stamp_field commit)"; sp="$(stamp_field payloadSha256)"; sr="$(stamp_field relation)"
     live="$(o_payload_hash)"
@@ -637,7 +687,16 @@ cmd_check_provenance() {
 cmd_check() {
   validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
-  [ -d "$HARNESS" ] || die "harness not found at $HARNESS (clone the repo first)"
+  if [ ! -d "$HARNESS" ]; then
+    # The remedy depends on WHY the path is absent. When `$HARNESS` is the path the RECORD names,
+    # "clone the repo first" is the one action that cannot help — the record is stale and `apply` is
+    # the repair. (Reachable since the pin became authoritative: the sibling default no longer masks a
+    # pin that was reclaimed or deleted by hand.)
+    if [ -n "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)" ] && [ "$HARNESS" = "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)" ]; then
+      die "harness not found at $HARNESS — that is the path RECORDED in $HARNESS_PIN_FILE and it no longer exists. Remedy: $0 apply"
+    fi
+    die "harness not found at $HARNESS (clone the repo first)"
+  fi
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
@@ -795,7 +854,11 @@ cmd_start() {
          # deletes `.venv` at every worktree root, which makes the lane using it re-resolve its deps
          # (the manual `prune` path warns about exactly this). Skip the unattended delete while any
          # worker session is alive, and report the low-space state instead of acting.
-         if tmux ls 2>/dev/null | grep -qE '^(lane|fix|merge)-'; then
+         # ⛔ `grep -c`, NOT `grep -q`. An early exit down a pipe lets the producer take SIGPIPE, and
+         # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
+         # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
+         # input. (`tmux ls | grep -c` below is already the safe form.)
+         if [ "$(tmux ls 2>/dev/null | grep -cE '^(lane|fix|merge)-')" -gt 0 ]; then
            say "warn: only ${mb}MB free, but worker sessions are still running — NOT auto-pruning caches (a pruned venv breaks the lane using it). Run '$0 prune' once they finish."
          else
            cmd_prune --caches
@@ -965,13 +1028,21 @@ sweep_root_caches() {
 # Is <path> a worktree of $REPO or $HARNESS_REPO? Scratch deletion must never touch one — a worktree
 # may hold unmerged work, and that is the one thing this verb must not destroy.
 registered_worktree() {
-  local p="$1" r
+  local p="$1" r real w list
+  real="$(cd "$p" 2>/dev/null && pwd -P)" || real="$p"
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
-    if git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}' | grep -qxF "$p"; then
-      return 0
-    fi
+    # ⛔ NORMALIZE both sides, and materialize the listing rather than piping into `grep -qxF`.
+    # `git worktree list` prints canonicalized paths, so a literal compare answers "not one of ours"
+    # for the cell's OWN checkout whenever the spelling differs — and on macOS it ALWAYS differs for
+    # the default SCRATCH_ROOT=/tmp, a symlink to /private/tmp, and for a $TMPDIR-derived path
+    # carrying `//`. `prune --scratch` then `rm -rf`'d the main checkout and the unmerged work in it;
+    # `linked_worktree_of` cannot be reused here because it deliberately EXCLUDES the main worktree,
+    # which is exactly the path this guard must protect. Not `| grep -q`: an early exit down a pipe
+    # lets the producer take SIGPIPE, and under `set -o pipefail` a MATCH then reads as no match.
+    list="$(git -C "$r" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')"
+    while IFS= read -r w; do [ "$(cd "$w" 2>/dev/null && pwd -P)" = "$real" ] && return 0; done <<<"$list"
   done
   return 1
 }
@@ -987,29 +1058,62 @@ cmd_prune() {
     esac
   done
   case "$days" in ''|*[!0-9]*) die "prune: DAYS must be a number (got '$days')";; esac
-  local before after mb r root d active_pin
+  local before after mb r root d active_pin d_real live_root pin_root skip
   # (0) Harness pins superseded by the current one. `apply` names each pin by its commit, so a main
   # advance leaves the previous pin behind; only the path $HARNESS_PIN_FILE names is kept. Without this
   # per-commit pinning is a disk LEAK — the very thing `prune` exists to stop. An empty pin file means
   # "which pin is live" is NOT KNOWN, and an unknown is an abstention: nothing is deleted.
   active_pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
   if [ -n "$active_pin" ]; then
-    for d in "$HARNESS_PIN_DIR"/*/; do
-      d="${d%/}"
-      [ -d "$d" ] || continue
-      case "$active_pin" in "$d"/*) continue ;; esac
-      say "prune: reclaiming superseded harness pin $d"
-      rm_cache "$d"
-    done
+    # ⛔ The SAME guard `harness_apply` runs, run here too. `HARNESS_PIN_DIR` is operator/`keys.env`
+    # settable, and without this `prune` — which `cmd_start` calls UNATTENDED — `rm -rf`s every
+    # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
+    # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
+    # that is not an empty dir, a linked worktree, or a pin root of 12-hex directories.
+    assert_pin_dir_safe "$HARNESS_PIN_DIR"
+    if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
+      # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate
+      # the harness's OWN source directories and reclaim them. There are no superseded siblings here.
+      say "prune: HARNESS_PIN_DIR is a single worktree — no superseded pins to reclaim"
+    else
+      for d in "$HARNESS_PIN_DIR"/*/; do
+        d="${d%/}"
+        [ -d "$d" ] || continue
+        # ⛔ Compare NORMALIZED roots, and consult the harness actually IN USE — not only the pin FILE.
+        # The file and this loop can disagree: an explicit `$HARNESS` outranks the file, `HARNESS_PIN_DIR`
+        # can be respelled through a symlink between runs, and a pin file can be left from another
+        # `HARNESS_PIN_DIR`. In each of those the literal `case` reclaimed the LIVE harness — the same
+        # literal-path class already fixed in `linked_worktree_of` and `registered_worktree`, here with
+        # the tree the cell is running from as the casualty. `prune` runs UNATTENDED from `cmd_start`.
+        d_real="$(cd "$d" 2>/dev/null && pwd -P)"
+        live_root="$(cd "$(dirname "$(dirname "$HARNESS")")" 2>/dev/null && pwd -P)"
+        pin_root="$(cd "$(dirname "$(dirname "$active_pin")")" 2>/dev/null && pwd -P)"
+        skip=0
+        case "$active_pin" in "$d"|"$d"/*) skip=1 ;; esac
+        [ -n "$d_real" ] || skip=1                                   # unresolvable: never reclaim blind
+        [ -n "$d_real" ] && [ "$d_real" = "$live_root" ] && skip=1
+        [ -n "$d_real" ] && [ "$d_real" = "$pin_root" ] && skip=1
+        [ "$skip" = 1 ] && continue
+        say "prune: reclaiming superseded harness pin $d"
+        # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
+        # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`
+        # entry plus its admin dir behind, one per pin forever, on the very verb that exists to stop a
+        # disk leak. `worktree remove --force` handles both; `rm_cache` is the fallback when the
+        # record is already gone or this is not a registered worktree.
+        git -C "$HARNESS_REPO" worktree remove --force "$d" >/dev/null 2>&1 || rm_cache "$d"
+      done
+    fi
   fi
   before="$(free_mb "$CELL_HOME")"
   tmux has-session -t "$SESSION" 2>/dev/null && say "warn: a controller is running — a pruned venv makes the lane using it re-resolve its deps"
   for r in "$REPO" "$HARNESS_REPO"; do
     [ -n "$r" ] || continue
     git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
-    # (1) worktree registrations whose directory is already gone — admin records, no bytes, but they
-    # make `worktree list` lie about what is on the cell.
-    git -C "$r" worktree prune >/dev/null 2>&1 || true
+    # (1) ⛔ NO bare `git worktree prune` — the call this repo forbids (#1141) and this very file
+    # states the ban against ~500 lines above. It has no path filter and deregisters EVERY record
+    # whose working directory is missing, unrelated siblings included; for a DETACHED worktree the
+    # admin HEAD is the commit's last durable handle, so a later `gc` collects it. A record whose
+    # directory is already gone is reported by `worktree list`, not deregistered from here.
     # (2) regenerable caches at each worktree root. ⛔ The list is read LINE BY LINE — the old
     # `for root in "$(git … worktree list …)" "$r"` quoted the whole list into ONE word, so
     # `[ -d "$root" ]` skipped it and only the main checkout was ever swept: the incident's single
