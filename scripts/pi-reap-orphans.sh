@@ -16,7 +16,8 @@
 # CLEANLY on SIGTERM: not stuck, just unreachable and unmanaged.
 #
 # DETECTION SIGNAL (the issue's own contract). A process is REAPED only when ALL
-# hold, evaluated over two `ps` snapshots and one `lsof` pass:
+# hold, evaluated over two `ps` snapshots, one identity `ps` pass and one `lsof`
+# pass:
 #
 #   1. orphaned    — ppid == 1 (launchd) in the candidate snapshot (B). ppid==1
 #                    is a HINT that selects candidates cheaply, never the test —
@@ -39,18 +40,20 @@
 #                    exists for (caught by the #1142 real reproduction).
 #   4. our own uid — never signal another user's process (we could not, and
 #                    probing it is not ours to do).
-#   5. identity stable — the pid's START IDENTITY is captured from snapshot B by
-#                    a dedicated bounded `ps -axo pid=,lstart=` pass that runs
-#                    BEFORE the lsof pass, then re-read immediately before EACH
-#                    signal (the SIGTERM and the SIGKILL escalation). The
-#                    observation window therefore spans the whole snapshot-B ->
-#                    signal interval, including the lsof pass (up to
-#                    REAP_ORPHAN_LSOF_TIMEOUT, default 60 s), so between the
-#                    snapshot that NAMED a candidate and the signal that acts on
-#                    it a pid may have been REUSED by an unrelated process. A
-#                    bare pid is therefore not a safe signal target: on a
-#                    mismatch, an empty read, or an
-#                    unevaluable read the candidate is PRESERVEd
+#   5. identity stable — the pid's START IDENTITY is captured by a dedicated
+#                    bounded `ps -axo pid=,lstart=` pass that runs IMMEDIATELY
+#                    after snapshot B and BEFORE the lsof pass, then re-read
+#                    immediately before EACH signal (the SIGTERM and the SIGKILL
+#                    escalation). The binding therefore spans identity-pass ->
+#                    signal, including the lsof pass (up to
+#                    REAP_ORPHAN_LSOF_TIMEOUT, default 60 s): a pid REUSED after
+#                    that pass is caught by the mismatch. It does NOT span the
+#                    sub-second gap between snapshot B and the identity pass — a
+#                    pid reused inside that gap is recorded under the
+#                    REPLACEMENT's identity and would compare equal, so the
+#                    binding is strong, not absolute (#1863 C1). A bare pid is
+#                    therefore not a safe signal target: on a mismatch, an empty
+#                    read, or an unevaluable read the candidate is PRESERVEd
 #                    (`identity-changed` / `identity-unknown`) and NEVER
 #                    signalled. The post-signal probe only asks whether the pid
 #                    exists, so without this binding a replacement process could
@@ -89,7 +92,8 @@
 # logged, and a process still alive after KILL is `KILL-FAILED` + exit 4 — never
 # a silent success.
 #
-# BOUNDEDNESS: the two `ps` passes and the `lsof` pass each run under a watchdog
+# BOUNDEDNESS: the three full-table `ps` passes (snapshots A and B, plus the
+# identity pass) and the `lsof` pass each run under a watchdog
 # (macOS has no GNU `timeout`), the sample window is fixed, and a global
 # wall-clock budget bounds the classification loop. No `find`, no `rg`, no
 # directory walk of any kind: this tool runs on a host it exists to UNLOAD.
@@ -201,9 +205,12 @@ NORM_A=""
 # present in B and absent from A (that is precisely the cpu-unmeasurable case),
 # and the walk has to start from the table the candidate was drawn from.
 NORM_B=""
-# F12: the snapshot-B START IDENTITY table (pid -> lstart), captured by a
-# dedicated bounded pass BEFORE the lsof pass so the signal binding covers the
-# whole snapshot-B -> signal window, not merely classification -> signal.
+# F12: the START IDENTITY table (pid -> lstart), captured by a dedicated bounded
+# pass run IMMEDIATELY after snapshot B and BEFORE the lsof pass, so the signal
+# binding covers identity-pass -> signal (including the lsof pass), not merely
+# classification -> signal. The sub-second snapshot-B -> identity-pass gap is NOT
+# covered: a pid reused there is recorded under its REPLACEMENT's identity, and
+# the pre-signal compare would then pass (#1863 C1).
 IDENT_RAW=""
 IDENT_MAP=""
 LSOF_OUT=""
@@ -245,11 +252,11 @@ Usage:
 REAPED means ALL hold: ppid=1 in the candidate table (snapshot B; a cheap HINT,
 never the test — ancestry decides), cwd DELETED (not merely unreadable), cpu-time
 advanced >= --min-cpu-centiseconds, uid == ours, the cwd under a scratch root
-unless --any-cwd, and the pid's start identity recorded at snapshot B still
-matching immediately before each signal (else PRESERVE / identity-changed; an
-unreadable or unrecorded identity PRESERVEs as identity-unknown). Everything else
-is PRESERVEd with its deciding reason. A probe that cannot be evaluated aborts
-the pass (exit 3) rather than counting as a pass.
+unless --any-cwd, and the start identity recorded by the identity pass run
+immediately after snapshot B still matching immediately before each signal (else
+PRESERVE / identity-changed; an unreadable or unrecorded identity PRESERVEs as
+identity-unknown). Everything else is PRESERVEd with its deciding reason. A probe
+that cannot be evaluated aborts the pass (exit 3) rather than counting as a pass.
 EOF
 }
 
@@ -483,12 +490,13 @@ ps_row() {
 
 # ── process identity: the signal's TOCTOU binding (#1863 F11) ──────────
 # `lstart` is the process START TIME — stable for the life of a process and
-# distinct across a pid REUSE (to ps's one-second resolution). Read it for a
-# REAPABLE candidate at classification time, then re-read immediately before
-# EACH signal and require it to still match. Any mismatch, empty, or
-# unevaluable read PRESERVES the candidate; a signal is never sent blind.
-# This probe runs ONLY for REAPABLE candidates (a tiny population) — never for
-# the ppid==1 table at large.
+# distinct across a pid REUSE (to ps's one-second resolution). The EXPECTED value
+# is not read here: it comes from the identity table captured right after
+# snapshot B (`identity_from_snapshot`). `proc_identity` is only the FRESH
+# pre-signal re-read, performed immediately before EACH signal and required to
+# equal that table's value. Any mismatch, empty, or unevaluable read PRESERVES
+# the candidate; a signal is never sent blind. This probe runs ONLY for REAPABLE
+# candidates (a tiny population) — never for the ppid==1 table at large.
 proc_identity() { # <pid> -> normalized start identity on stdout ("" if unknown)
     local p="$1" f out=""
     is_pos_int "${p:-}" || return 0
@@ -505,8 +513,9 @@ proc_identity() { # <pid> -> normalized start identity on stdout ("" if unknown)
 }
 
 # identity_matches <pid> <expected> — 0 ONLY when the current identity can be
-# read and equals the one captured at classification. Every other outcome
-# (missing/empty/different/unevaluable) returns 1, so the caller preserves.
+# read and equals <expected>, the value recorded in the identity table captured
+# right after snapshot B. Every other outcome (missing/empty/different/
+# unevaluable) returns 1, so the caller preserves.
 identity_matches() {
     local got
     [ -n "${2:-}" ] || return 1
@@ -517,13 +526,16 @@ identity_matches() {
 }
 
 # ps_identity_load <raw-out> — ONE bounded `ps -axo pid=,lstart=` pass that
-# captures the START IDENTITY of EVERY live process. It MUST run AFTER snapshot B
-# and BEFORE the lsof pass: the candidate table comes from snapshot B, so binding
-# a candidate to the identity it held in that same snapshot makes the binding
-# span the WHOLE snapshot-B -> signal window, including a pid REUSE that happens
-# during the (up to 60 s) lsof pass. FAIL-CLOSED: an unusable table leaves every
-# candidate unbindable, so the pass aborts (exit 3) instead of reporting a clean
-# "nothing reapable" it cannot support.
+# captures the START IDENTITY of EVERY live process. It runs IMMEDIATELY after
+# snapshot B and BEFORE the lsof pass, so the candidate table and the identity
+# table are as close together as two passes allow: the binding it feeds spans
+# identity-pass -> signal, including a pid REUSE during the (up to 60 s) lsof
+# pass. It does NOT capture the identity a candidate held IN snapshot B — a pid
+# reused between snapshot B and this pass is recorded under the REPLACEMENT's
+# identity, and that sub-second gap is a residual window the binding does not
+# close (#1863 C1). FAIL-CLOSED: an unusable table leaves every candidate
+# unbindable, so the pass aborts (exit 3) instead of reporting a clean "nothing
+# reapable" it cannot support.
 ps_identity_load() {
     local out="$1" rc
     run_bounded "$REAP_ORPHAN_PS_TIMEOUT" "$out" "$PS_BIN" -axo pid=,lstart=
@@ -914,6 +926,24 @@ run() {
         exit 0
     fi
 
+    # F12: capture the START IDENTITY of every process IMMEDIATELY after snapshot
+    # B — before mkdir/the log gate/lock_acquire, and before the lsof pass — so
+    # the binding spans identity-pass -> signal (including the up-to-60 s lsof
+    # pass). Running it before the lock/log gates keeps the uncovered
+    # snapshot-B -> identity-pass gap to the smallest two `ps` passes allow; that
+    # residual sub-second window is documented in the header (#1863 C1).
+    if ! ps_identity_load "$IDENT_RAW"; then
+        echo "FAIL-CLOSED abort: ps identity enumeration failed, timed out, or returned an empty table (exit 3)" >&2
+        log "FAIL-CLOSED abort: ps identity snapshot failed/empty (exit 3)"
+        exit 3
+    fi
+    ps_identity_normalize "$IDENT_RAW" >"$IDENT_MAP"
+    if [ ! -s "$IDENT_MAP" ]; then
+        echo "FAIL-CLOSED abort: ps identity snapshot is unparseable (no pid/identity rows) (exit 3)" >&2
+        log "FAIL-CLOSED abort: ps identity snapshot unparseable (exit 3)"
+        exit 3
+    fi
+
     mkdir -p "$STATE_DIR" 2>/dev/null || true
     # Gate BOTH modes: the DEPLOYED mode is dry-run (the plist ships
     # REAP_ORPHAN_DRY_RUN=1) and it promises the report lands in the log. An
@@ -925,20 +955,6 @@ run() {
     fi
     if ! lock_acquire; then
         echo "FAIL-CLOSED abort: lock held ($LOCK_DIR) (exit 3)" >&2
-        exit 3
-    fi
-    # F12: capture the START IDENTITY of every process from snapshot B BEFORE the
-    # lsof pass, so the pre-signal binding covers the whole snapshot-B -> signal
-    # window (a pid reused during the lsof pass is caught by the mismatch).
-    if ! ps_identity_load "$IDENT_RAW"; then
-        echo "FAIL-CLOSED abort: ps identity enumeration failed, timed out, or returned an empty table (exit 3)" >&2
-        log "FAIL-CLOSED abort: ps identity snapshot failed/empty (exit 3)"
-        exit 3
-    fi
-    ps_identity_normalize "$IDENT_RAW" >"$IDENT_MAP"
-    if [ ! -s "$IDENT_MAP" ]; then
-        echo "FAIL-CLOSED abort: ps identity snapshot is unparseable (no pid/identity rows) (exit 3)" >&2
-        log "FAIL-CLOSED abort: ps identity snapshot unparseable (exit 3)"
         exit 3
     fi
     if ! lsof_cwd_load; then
@@ -995,23 +1011,25 @@ run() {
         reason="$(printf '%s' "$crumb" | cut -f2)"
         detail="$(printf '%s' "$crumb" | cut -f3-)"
         # F11/F12: bind the signal to process identity. The expected identity is
-        # the one recorded from snapshot B (BEFORE the lsof pass), so the binding
-        # covers the whole snapshot-B -> signal window; a fresh read immediately
-        # before EACH signal must still match it. An identity that was never
-        # recorded is not a licence to signal, and a pre-TERM mismatch is settled
-        # BEFORE report_row (F13) so exactly ONE final reason per candidate
-        # reaches the histogram/log/print.
+        # the one recorded by the identity pass run immediately after snapshot B
+        # (BEFORE the lsof pass), so the binding covers identity-pass -> signal,
+        # including the lsof pass — but NOT the sub-second snapshot-B ->
+        # identity-pass gap (#1863 C1). A fresh read immediately before EACH
+        # signal must still match it. An identity that was never recorded is not
+        # a licence to signal, and a pre-TERM mismatch is settled BEFORE
+        # report_row (F13) so exactly ONE final reason per candidate reaches the
+        # histogram/log/print.
         ident=""
         if [ "$verdict" = "reap" ]; then
             ident="$(identity_from_snapshot "$IDENT_MAP" "$pid")"
             if [ -z "$ident" ]; then
                 verdict=preserve
                 reason=identity-unknown
-                detail="no start identity was recorded at snapshot B — no signal will be sent $cmd"
+                detail="no start identity was recorded for this snapshot-B candidate — no signal will be sent $cmd"
             elif [ "$MODE" = apply ] && ! identity_matches "$pid" "$ident"; then
                 verdict=preserve
                 reason=identity-changed
-                detail="pid $pid is no longer the snapshot-B process — no signal will be sent $cmd"
+                detail="pid $pid is no longer the process named at snapshot B — no signal will be sent $cmd"
             fi
         fi
         if [ "$verdict" != "reap" ]; then
@@ -1060,7 +1078,7 @@ run() {
         # the histogram receives exactly one reason (identity-changed).
         if ! identity_matches "$pid" "$ident"; then
             report_row preserve "$pid" identity-changed \
-                "pid $pid is no longer the snapshot-B process before SIGKILL — NO SIGKILL sent"
+                "pid $pid is no longer the process named at snapshot B before SIGKILL — NO SIGKILL sent"
             log "PRESERVED pid=$pid reason=identity-changed stage=pre-kill expected=[$ident]"
             REAP_C=$((REAP_C - 1)); PRESERVE_C=$((PRESERVE_C + 1))
             continue

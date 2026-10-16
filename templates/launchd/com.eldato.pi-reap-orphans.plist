@@ -15,7 +15,8 @@
          is a different state and PRESERVES), CPU-time advancing by at least
          REAP_ORPHAN_MIN_CPU_CENTISECONDS across the sample window, our uid, an
          elapsed floor, and a start identity that still matches the one recorded
-         at snapshot B immediately before each signal (a mismatch, an unreadable
+         by the identity pass run immediately after snapshot B, re-checked before
+         each signal (a mismatch, an unreadable
          read, or no recorded identity PRESERVEs the candidate — never signalled).
          It signals SIGTERM, waits a grace period, then
          SIGKILL, and treats an unevaluable post-signal probe as STILL ALIVE

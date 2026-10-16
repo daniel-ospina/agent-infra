@@ -50,10 +50,11 @@
 #   flags / env validation   O20  (--help, unknown arg, bad numbers)
 #   verbose vs summary       O21  (non-verbose still reports exact counts)
 #   real reproduction        R1   (--repro only)
-#   identity binding (F11/F12) O27 (snapshot-B identity table captured BEFORE lsof;
-#                                  a changed/absent identity => PRESERVE, no signal;
-#                                  a stable identity still reaps; F13 histogram
-#                                  and counters agree on the downgraded path)
+#   identity binding (F11/F12) O27 (identity table captured right after snapshot B,
+#                                  BEFORE lsof — the binding spans identity-pass ->
+#                                  signal; a changed/absent identity => PRESERVE, no
+#                                  signal; a stable identity still reaps; F13
+#                                  histogram and counters agree on the downgraded path)
 
 set -uo pipefail
 
@@ -99,7 +100,7 @@ cat >"$T/bin/ps" <<'SHIM'
 # the delimiter; past the end the LAST value repeats) so a fixture can make a
 # pid's start identity CHANGE between snapshot B and the signal — the #1863 F11
 # regression. The literal token __EMPTY__ models an unevaluable read.
-# The SNAPSHOT-B IDENTITY TABLE (`ps -axo pid=,lstart=`, #1863 F12) is a distinct
+# The IDENTITY TABLE (`ps -axo pid=,lstart=`, #1863 F12) is a distinct
 # call shape answered from FAKE_IDENT_TABLE (a fixture file of `pid lstart` rows)
 # or, when unset, synthesized from every pid in the fixture sequence with a STABLE
 # identity — which is what the pre-existing apply fixtures rely on. Both branches
@@ -695,12 +696,13 @@ else
 fi
 
 # ── O27: the signal is bound to process identity (#1863 F11/F12) ───────
-# The observation→signal window spans the whole lsof pass, so a pid REUSED
-# between snapshot B and the signal must never be signalled. The expected
-# identity is the one captured from snapshot B (BEFORE lsof); a fresh read
-# immediately before each signal must still match it. A pid whose identity
-# changed, or whose snapshot-B identity was never recorded, is PRESERVEd; a
-# stable identity must still reap, so the binding cannot disable the tool.
+# The binding window spans the identity pass -> signal, including the whole lsof
+# pass, so a pid REUSED after the identity pass must never be signalled. The
+# expected identity is the one recorded by the identity pass run immediately
+# after snapshot B (BEFORE lsof); a fresh read immediately before each signal
+# must still match it. A pid whose identity changed, or for which no identity was
+# recorded, is PRESERVEd; a stable identity must still reap, so the binding
+# cannot disable the tool.
 echo "— O27: identity binding — a reused/changed pid is PRESERVED, never signalled —"
 DEADCWD27="$CWD_ROOT/gone27"; mkdir -p "$DEADCWD27"
 L27="$(lsof_fixture ls27 "$ORPH:$DEADCWD27")"

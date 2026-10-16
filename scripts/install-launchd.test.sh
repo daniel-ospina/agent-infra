@@ -207,8 +207,11 @@ run_installer() { # <home> [extra env assignments...]
         # #1863 F10: TORTOISE_REPO is NOT part of the fresh-HOME fixture, and
         # inheriting an ambient one made the bootstrap-count assertion depend on
         # the operator's box (a real tortoise checkout adds the two
-        # {{TORTOISE_REPO}}-gated jobs, so the count became 11, not 9). Clear it
-        # so section 1 counts only the templates its fake HOME can resolve.
+        # {{TORTOISE_REPO}}-gated jobs, so the count became 11, not 9). Clearing
+        # it removes the ENV candidate ONLY — resolve_env() still auto-detects a
+        # checkout (INFRA_ROOT/../tortoise included), so this does NOT by itself
+        # make section 1 box-independent. What does is F14's DERIVED expectation
+        # below, which recomputes the count from this checkout + the fixture HOME.
         export TORTOISE_REPO=""
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
         shift
