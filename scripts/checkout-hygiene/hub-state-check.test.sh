@@ -91,6 +91,10 @@ assert_contains "$out" "FAIL  $HUB" "untracked prints FAIL"
 assert_contains "$out" "HUB_DISORDER=dirty" "untracked → HUB_DISORDER=dirty"
 assert_contains "$out" "salvage <new-branch> $HUB" "dirty-on-main FAIL prints the #435 salvage step"
 assert_contains "$out" "hub-worktree.sh salvage" "dirty-on-main FAIL prints salvage"
+# #854: the guidance must say that the remedy REVERSES the hub's tracked dirt
+# and that the reversal is named — the reader is the one who has to report a
+# path they did not author.
+assert_contains "$out" "it NAMES every path it reverses" "dirty-on-main guidance states the #854 reversal contract"
 assert_not_contains "$out" "UNRECOGNISED disorder class" "plain dirty hub does not print an unrecognised-class line"
 rm "$HUB/untracked.txt"
 

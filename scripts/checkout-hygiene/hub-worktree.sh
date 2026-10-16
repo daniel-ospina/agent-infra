@@ -44,6 +44,22 @@
 #     git reset; rare). Auto-symlinked env fixtures (.env/.mcp.json/.venv)
 #     are never captured or removed.
 #
+#     #854 — the hub cleanup REVERSES uncommitted work, so it is never silent
+#     and never un-gated:
+#       (1) every path it reverts (tracked → HEAD) or removes (untracked) is
+#           NAMED on stdout, with the branch that preserved it, so a reversal
+#           reaches the agent's report instead of surfacing only when an
+#           unrelated session later finds a file changed underneath it. A path
+#           the recovering session did not author is exactly the case that must
+#           be visible: its change now lives ONLY on the salvage branch — report
+#           it, do not assume it was scratch work.
+#       (2) a tracked path is reverted ONLY if the capture pass preserved it
+#           (the capture set is the allowlist). A path the capture pass could
+#           not carry — today an auto-symlinked env-fixture alias or a gitlink —
+#           is LEFT IN PLACE and named, and salvage exits 1: a reversal without
+#           a preserved copy is an unrecoverable loss, and clearing the hub is
+#           never worth more than the work in it.
+#
 #   hub-worktree.sh refresh [--repo <path>] [--discard-contentless]
 #     Clean-but-stale hub refresh (#1309): fetch, then advance a CLEAN hub's
 #     own branch (main/master) to its upstream.
@@ -222,6 +238,19 @@ setup_symlinks() {
   done
 }
 
+# Is <path> in the capture set ($CAPTURED_PATHS, a `local` of the calling
+# salvage())? Bash dynamic scoping makes the caller's array visible here. The
+# ${arr[@]+…} form is the bash-3.2/macOS-safe spelling under `set -u` (a bare
+# "${arr[@]}" on an empty array aborts there). #854: this is the allowlist that
+# keeps the cleanup from ever exceeding what the capture preserved.
+_salvage_captured() {
+  local p="$1" c
+  for c in ${CAPTURED_PATHS[@]+"${CAPTURED_PATHS[@]}"}; do
+    [ "$c" = "$p" ] && return 0
+  done
+  return 1
+}
+
 # ── SALVAGE MODE (#435) ─────────────────────────────────────────────────────
 salvage() {
   local hub_branch porcelain clean_rel
@@ -259,6 +288,9 @@ salvage() {
   local captured=0 deleted=0 skipped_junk=0 staged_only=0
   local rel xy rest line
   declare -a STAGED_PATHS=()
+  # #854: the set the capture pass ACTUALLY preserved on the branch. The cleanup
+  # pass below reverts only a member of this set (see _salvage_captured).
+  declare -a CAPTURED_PATHS=()
 
   echo "hub-worktree: salvage: capturing dirty + untracked (junk excluded)…"
   while IFS= read -r line; do
@@ -270,6 +302,18 @@ salvage() {
 
     case "$xy" in
       "??")
+        # #854: `.worktrees/` is the isolated-worktree CONTAINER, not work
+        # product. It is untracked exactly when it is not gitignored (the state
+        # this script already warns about), and a collapsed porcelain record
+        # names the whole directory — so it is never captured (a copy would
+        # carry sibling sessions' uncommitted trees, and the push would publish
+        # them) and the cleanup pass refuses it by the same rule.
+        case "$rest" in
+          .worktrees|.worktrees/)
+            echo "   ⏭  .worktrees/ (isolated-worktree container — not captured): add '.worktrees/' to $MAIN_REPO/.gitignore" >&2
+            skipped_junk=$((skipped_junk + 1)); continue
+            ;;
+        esac
         if [[ -n "${SALVAGE_INCLUDE_JUNK:-}" ]] || ! [[ "$rest" =~ $junk_re ]]; then
           clean_rel="$rest"
         else
@@ -303,6 +347,12 @@ salvage() {
         continue
       fi
     fi
+    # Reached only for entries this pass accepts: the junk, env-aliased and
+    # gitlink skips above all `continue`d. From here on the path IS represented
+    # in the capture commit (a copy, a recreated link, or — for a hub-side
+    # deletion — the absent file), so the cleanup pass may revert the hub's copy
+    # (#854).
+    CAPTURED_PATHS+=("$clean_rel")
     if [[ -L "$src" || "$trackmode" = "120000" ]]; then
       # SYMLINK dirt (retargeted tracked link, or untracked link): cp would
       # DEREFERENCE the link and (with the WT's own symlink present) write
@@ -350,13 +400,33 @@ salvage() {
 
   # ── Hub cleanup: revert tracked dirt to HEAD via git show redirects ──
   # (readonly git + ungated bash redirect — NOT git restore, which M4 blocks).
+  #
+  # #854 — this pass DESTROYS uncommitted work, so two rules are load-bearing:
+  #   * every reversal (tracked) and removal (untracked) is NAMED on stdout,
+  #     before any exit path, so it reaches the agent's report instead of
+  #     surfacing only when an unrelated session finds a file changed under it;
+  #   * a tracked path is reverted ONLY if the capture pass preserved it — a
+  #     path the capture could not carry is left UNTOUCHED and salvage exits 1,
+  #     because clearing the hub is never worth more than the work in it.
   echo "hub-worktree: salvage: returning the hub to clean…"
   local mode_t
   # COLLAPSED RAW porcelain for the cleanup scan: untracked dirs arrive whole
   # ("?? .playwright-mcp/") so rm -rf removes the container, not just the files
   # (empty dirs are invisible to git and would otherwise linger); -z means
   # paths are verbatim (no escaping), bare records (rename old-side) skipped.
-  git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n' | while IFS= read -r line; do
+  # Read ONCE into a variable, never streamed through a pipeline: a pipeline
+  # puts the loop in a subshell, so the reversal record it accumulates is lost
+  # — which is exactly how the reversal stayed silent (#854). The read has an
+  # explicit failure arm: a `git status` that cannot be read must never read as
+  # "nothing to clean".
+  local hub_porcelain
+  if ! hub_porcelain="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n')"; then
+    echo "⚠️  hub-worktree: salvage: could not read the hub status at $MAIN_REPO — the hub was NOT cleaned (the dirty set is intact)." >&2
+    exit 1
+  fi
+  local reverted=0 removed=0 uncleaned=0
+  declare -a REVERTED_PATHS=() REMOVED_PATHS=() UNCLEANED_PATHS=()
+  while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     [[ "${line:2:1}" == " " ]] || continue
     xy="${line:0:2}"; rest="${line:3}"
@@ -370,18 +440,22 @@ salvage() {
         case "$rest" in
           .env|.env.local|.mcp.json|.venv) echo "   ⏭  env fixture (not removed): $rest"; continue ;;
         esac
+        # #854: `.worktrees/` is the container of every ISOLATED worktree in
+        # this repo. It appears as untracked exactly when `.worktrees/` is NOT
+        # gitignored — the state this script already warns about — and the
+        # collapsed porcelain record is the whole DIRECTORY, so `rm -rf` would
+        # take every sibling session's live worktree (and everything
+        # uncommitted in it) with it, naming no worktree at all. That is not a
+        # cleanup, it is the loss this pass exists to make impossible.
+        case "$rest" in
+          .worktrees|.worktrees/)
+            echo "   ⛔ NOT removed: $rest is the isolated-worktree container — add '.worktrees/' to $MAIN_REPO/.gitignore (a sibling worktree's uncommitted work lives in it)" >&2
+            UNCLEANED_PATHS+=("$rest"); uncleaned=$((uncleaned + 1)); continue
+            ;;
+        esac
         rm -rf "$MAIN_REPO/$rest"
+        REMOVED_PATHS+=("$rest"); removed=$((removed + 1))
         ;;
-      " M"|"MM"|"AM"|" D"|" D "*) : ;; # handled below (worktree-file revert)
-      *) : ;; # staged-only, R/C, ! — leave (staged warned separately)
-    esac
-  done
-  # Tracked-modified/deleted (unstaged) → restore from HEAD byte-exact.
-  git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain=v1 -z 2>/dev/null | tr '\0' '\n' | while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    [[ "${line:2:1}" == " " ]] || continue
-    xy="${line:0:2}"; rest="${line:3}"
-    case "$xy" in
       " M"|"MM"|" D")
         mode_t="$(git -C "$MAIN_REPO" ls-files -s -- "$rest" | awk '{print $1}')"
         case "$mode_t" in
@@ -390,12 +464,41 @@ salvage() {
             local target
             target="$(git -C "$MAIN_REPO" show "HEAD:$rest" 2>/dev/null || true)"
             if [[ -n "$target" ]]; then rm -f "$MAIN_REPO/$rest"; ln -s "$target" "$MAIN_REPO/$rest"; fi
+            REVERTED_PATHS+=("$rest"); reverted=$((reverted + 1))
             ;;
-          *) rm -f "$MAIN_REPO/$rest"; git -C "$MAIN_REPO" show "HEAD:$rest" > "$MAIN_REPO/$rest" 2>/dev/null || true ;;
+          *)
+            # #854: the capture set is the allowlist. Never revert a path that
+            # is not preserved on the branch — leave it, and refuse to report
+            # the hub as cleaned.
+            if ! _salvage_captured "$rest"; then
+              echo "   ⛔ NOT reverted (not captured on $BRANCH): $rest" >&2
+              UNCLEANED_PATHS+=("$rest"); uncleaned=$((uncleaned + 1)); continue
+            fi
+            rm -f "$MAIN_REPO/$rest"; git -C "$MAIN_REPO" show "HEAD:$rest" > "$MAIN_REPO/$rest" 2>/dev/null || true
+            REVERTED_PATHS+=("$rest"); reverted=$((reverted + 1))
+            ;;
         esac
         ;;
+      *) : ;; # staged-only, R/C, ! — leave (staged warned separately)
     esac
-  done
+  done <<< "$hub_porcelain"
+
+  # ── #854 — name the reversal before any exit path: these are the paths whose
+  # uncommitted changes no longer exist in the hub working tree.
+  if (( reverted > 0 )) || (( removed > 0 )); then
+    echo ""
+    echo "hub-worktree: salvage: hub cleanup REVERSED the dirty set — $reverted tracked path(s) reverted to HEAD, $removed untracked path(s) removed."
+    if (( reverted > 0 )); then
+      echo "   ↩ reverted to HEAD (the uncommitted change now lives ONLY on $BRANCH):"
+      printf '     %s\n' "${REVERTED_PATHS[@]}"
+    fi
+    if (( removed > 0 )); then
+      echo "   🗑 removed from the hub (preserved on $BRANCH, or tool junk):"
+      printf '     %s\n' "${REMOVED_PATHS[@]}"
+    fi
+    echo "   A path above that YOU did not author is a sibling session's work —"
+    echo "   report it; do not treat it as scratch work."
+  fi
 
   # ── Staged-only dirt: index still holds the staged blob — M4 blocks git
   # reset, so a human terminal `git -C "$MAIN_REPO" reset` is required (rare:
@@ -406,6 +509,11 @@ salvage() {
     echo ""
     echo "⚠️  hub-worktree: salvage: the hub is NOT yet fully clean — remaining:" >&2
     printf '%s\n' "$remaining" | sed 's/^/     /' >&2
+    if (( uncleaned > 0 )); then
+      echo "   The $uncleaned path(s) marked NOT reverted/removed above were left" >&2
+      echo "   UNTOUCHED on purpose (#854): the capture pass did not preserve them," >&2
+      echo "   and a reversal without a preserved copy is an unrecoverable loss." >&2
+    fi
     echo "   Staged index entries need a human terminal:  git -C \"$MAIN_REPO\" reset" >&2
     echo "   (M4 blocks git reset in the hub; staged dirt is rare and predates the disorder.)" >&2
     echo "   Rename/copy/conflict dirt (R/C/U codes) is operator-handled — inspect and resolve." >&2
@@ -414,6 +522,10 @@ salvage() {
 
   echo ""
   echo "✅ Salvage complete: dirty set captured on $BRANCH (pushed) and the hub is back to main+CLEAN."
+  if (( reverted > 0 )) || (( removed > 0 )); then
+    echo "   The hub cleanup named every path it reversed (above) — carry that list"
+    echo "   into your report; a path you did not author is a sibling session's work."
+  fi
   echo "   Next: gh pr create --repo $(cd "$MAIN_REPO" && git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s#\.git$##' || echo '<origin>') --base main --head $BRANCH"
 }
 
@@ -466,6 +578,8 @@ refresh() {
     echo "   refresh only ever moves a CLEAN main; a dirty hub is the SALVAGE case:" >&2
     echo "     hub-worktree.sh salvage NEW-BRANCH $MAIN_REPO" >&2
     echo "   Capture the dirty set first, then re-run refresh on the cleaned hub." >&2
+    echo "   (#854: the capture REVERTS the hub's tracked dirt — it names every path" >&2
+    echo "    it reverses; report any path you did not author.)" >&2
     exit 1
   fi
 
