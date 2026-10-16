@@ -216,7 +216,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T24 with 31 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T24 with 33 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -263,7 +263,7 @@ verdict.
    (`task` deliberately absent, so a CPU-flat nested sub-agent is not mislabelled) is correct and
    tested, but **unreachable for a fleet lane today**. Consequence: **for fleet sessions `wedged`
    rests on JSONL freeze + no un-expired tool veto + no fresh record + a positively OPEN turn in
-   the transcript tail** (the only open-turn signal — boundary 2 below) — nothing more. This was
+   the transcript tail** (the only open-turn signal — boundary 3 below) — nothing more. This was
    flagged, not hidden, by the unit-1 report. Since #5389 the tool veto IS fed from the transcript
    (item 2), but the CPU pair is still absent there, so a fleet lane's in-flight tool reads
    `"unknown"` and is bounded by the AGE backstop rather than by `tool-silence`'s 20 min. The

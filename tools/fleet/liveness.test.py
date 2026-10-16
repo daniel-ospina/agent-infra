@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Twenty-four tests with thirty-one paired mutations: every mutation re-
+Twenty-four tests with thirty-three paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -970,6 +970,44 @@ def t21_tool_from_jsonl():
         check(liv.tool_from_jsonl(path, NOW_MS) is None,
               "a matching toolResult means nothing is in flight")
 
+        # (b2) #5389 review P1 — a PARALLEL batch, PARTIALLY complete. pi runs
+        #      one assistant message's calls in parallel by default and writes
+        #      each result as it lands, so the newest entry can be a SIBLING's
+        #      `toolResult` while another call from the SAME message has not
+        #      returned. The veto must come from the owning assistant message,
+        #      be aged from WHEN THE CALLS WERE ISSUED, and cover only the call
+        #      no result has answered.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"},
+                          {"type": "toolCall", "name": "write", "id": "call_B"}]),
+            real("toolResult", started + 1000, toolName="bash", toolCallId="call_A",
+                 content=[{"type": "text", "text": "done"}]),
+        ])
+        sib = liv.tool_from_jsonl(path, NOW_MS, silence_age_ms=21 * M)
+        check(sib is not None and sib.tools_in_flight == 1 and sib.name == "write",
+              "the UNANSWERED sibling call is the in-flight tool; got %s" % sib)
+        check(sib.tool_age_ms == 21 * M,
+              "the age is the owning assistant message's age, not the result's; got %s"
+              % sib.tool_age_ms)
+        check(sib.call_label == "write(call_B)",
+              "the veto names only the unanswered sibling; got %r" % sib.call_label)
+
+        # (b3) ... and once a parallel batch has FULLY returned, nothing is in
+        #      flight: the boundary's `turn-open:awaiting-assistant` is what is
+        #      open, and no veto may hold the lane quiet on a completed batch.
+        write([
+            real("assistant", started, stopReason="toolUse",
+                 content=[{"type": "toolCall", "name": "bash", "id": "call_A"},
+                          {"type": "toolCall", "name": "write", "id": "call_B"}]),
+            real("toolResult", started + 1000, toolName="bash", toolCallId="call_A",
+                 content=[{"type": "text", "text": "done"}]),
+            real("toolResult", started + 2000, toolName="write", toolCallId="call_B",
+                 content=[{"type": "text", "text": "done"}]),
+        ])
+        check(liv.tool_from_jsonl(path, NOW_MS) is None,
+              "a fully-answered parallel batch asserts no in-flight tool")
+
         # (c) a call the stop reason DISCARDS is not in flight either — the veto
         #     and the turn boundary must not disagree about openness.
         write([real("assistant", started, stopReason="error",
@@ -1443,9 +1481,10 @@ MUTATIONS = [
     ),
     Mutation(
         "T15", "module",
-        '        for raw in reversed(lines):',
-        '        for raw in lines:',
-        "the tail scan runs forward, so an ancient boundary decides instead of the last (#1254)",
+        '    return (messages[-1] if messages else None), last_entry, size',
+        '    return (messages[0] if messages else None), last_entry, size',
+        "the tail reader keeps the OLDEST message-bearing entry instead of the newest, so an "
+        "ancient boundary decides instead of the last (#1254)",
     ),
     Mutation(
         "T20", "module",
@@ -1499,6 +1538,22 @@ MUTATIONS = [
         '        tool = None\n',
         "the #5389 (a) wiring is removed: no store record carries the fields (0 of 1011), so the "
         "veto is dead again and a lane inside one long read reads `wedged`",
+    ),
+    Mutation(
+        "T21", "module",
+        '    elif msg.get("role") == "toolResult":\n',
+        '    elif False:\n',
+        "the parallel-batch walk-back is disabled, so a sibling's `toolResult` as the newest "
+        "entry denies a call that is still in flight — the lane reads `wedged` where the "
+        "watchdog's own `tool-stall` backstop still applies (#5389 review P1)",
+    ),
+    Mutation(
+        "T21", "module",
+        '    calls = [c for c in _tool_call_items(owner.get("message"))\n'
+        '             if str(c.get("id") or "") not in answered]\n',
+        '    calls = _tool_call_items(owner.get("message"))\n',
+        "the answered set is ignored, so a RETURNED sibling is read as still in flight — a "
+        "fully-answered parallel batch would hold the lane quiet (#5389 review P1)",
     ),
     Mutation(
         "T24", "module",
