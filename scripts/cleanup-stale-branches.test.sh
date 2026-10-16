@@ -2471,6 +2471,37 @@ for _f17br in f17-arefuse f17-bredun f17-credun; do
     fi
 done
 unset _f17br
+# ⛔ F21: the F19 header's promise is SHELL-CONDITIONAL, so pin BOTH modes. The
+# F19 paste above ran under `set -e`; WITHOUT it the paste CONTINUES past the
+# refusing `-d` and reaps the LATER `-d` lines too, leaving the refusing branch
+# behind — the OPPOSITE of "reaps only the branches printed before it". The
+# header now states that explicitly, and this run pins the second clause.
+assert_contains "$F17_PLAN_OUT" "Under 'set -e'" "F21: the header names the 'set -e' case"
+assert_contains "$F17_PLAN_OUT" "WITHOUT 'set -e'" "F21: the header names the no-'set -e' case"
+F17_PASTE_NOE_SCRIPT="$FIX/f17-paste-noe.sh"
+{
+    printf '#!/usr/bin/env bash\n'
+    awk '/^Deletion commands that would run/ { grab=1; next } grab && /^$/ { exit } grab { print }' <<<"$F17_PLAN_OUT"
+} > "$F17_PASTE_NOE_SCRIPT"
+if grep -q 'set -e' "$F17_PASTE_NOE_SCRIPT"; then
+    bad "F21: the second paste script sets -e — it does not exercise the mode the header now describes"
+else
+    ok "F21: the second paste script does NOT set -e (the mode the header now describes)"
+fi
+F17_PASTED_NOE="$FIX/f17-pasted-noe.bin"; : > "$F17_PASTED_NOE"
+cd "$F17_REPO"
+run_script env PATH="$F17_WRAP:$PATH" F17_REAL_GIT="$F17_REAL_GIT" GIT_WRAP_LOG="$F17_PASTED_NOE" \
+    bash "$F17_PASTE_NOE_SCRIPT"
+assert_eq "$RC" "0" "F21: without set -e the paste CONTINUES past the refusal and exits 0"
+F17_PASTED_NOE_ARGS="$(tr '\0' '\n' < "$F17_PASTED_NOE" || true)"
+assert_eq "$(grep -c '^branch$' <<<"$F17_PASTED_NOE_ARGS" || true)" "3" "F21: without set -e the paste attempts EVERY advertised -d (the refusal no longer aborts it)"
+assert_branch_exists f17-arefuse "F21: the refusing branch SURVIVES the no-'set -e' paste (its -d refused)"
+assert_branch_absent f17-bredun "F21: the no-'set -e' paste reaps the LATER -d branch f17-bredun"
+assert_branch_absent f17-credun "F21: the no-'set -e' paste reaps the LATER -d branch f17-credun"
+# Restore the two later branches so the `--execute` assertions below still see
+# the full three-branch fixture.
+git update-ref refs/heads/f17-bredun "$F17_MAIN_SHA"
+git update-ref refs/heads/f17-credun "$F17_MAIN_SHA"
 # ⛔ AND `--execute` is the way: it falls back to the ATOMIC update-ref -d for the
 # squash branch and reaps ALL THREE — which the paste could not.
 run_script bash "$F17_SCRIPT" --repo "$F17_REPO" --scope local --execute --pr-map-file "$F17_MAP"
@@ -3485,6 +3516,169 @@ if [ "$(git -C "$F18_ORIGIN" rev-parse -q --verify refs/heads/f18-nodate || echo
 else
     bad "F18: the unreadable-date branch was deleted despite the refusal"
 fi
+
+cd "$REPO"
+echo ""
+echo "== 43. F20: the REMOTE plan must NOT advertise a delete that --execute REFUSES =="
+# The lease pins the OID, but it cannot check the MERGE PREMISE. A branch
+# classified `--merged` from a STALE refs/remotes/origin/<main> (narrowed
+# positive refspec) whose commits are no longer in REWRITTEN real main passes
+# the lease and IS DELETED by a pasted plan line, while `--execute` REFUSES it
+# (its verify_merged_into_real_main gate). The plan must run the SAME two gates,
+# per entry, and print a refused entry ONLY as a comment.
+F20_ORIGIN="$FIX/f20-origin.git"
+F20_REPO="$FIX/f20-repo"
+F20_RW="$FIX/f20-rewrite"
+new_repo "$F20_REPO" "$F20_ORIGIN"
+cd "$F20_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F20_SCRIPT="$F20_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f20.txt; git add f20.txt; old_commit "init"; git push -q origin main
+# doomed — merged into main and stale, so it IS a candidate against the local
+# refs/remotes/origin/main.
+git checkout -q -b doomed main
+echo d > d.txt; git add d.txt; old_commit "doomed"
+git push -q -u origin doomed
+git checkout -q main
+git merge -q --ff-only doomed
+git push -q origin main
+F20_DOOMED_OID="$(git -C "$F20_ORIGIN" rev-parse refs/heads/doomed)"
+# A ref OTHER than main for the narrowed fetch refspec (it must exist on the
+# remote or the fetch exits non-zero). Fresh commit -> never a stale candidate.
+git checkout -q -b f20-anchor main
+echo a > a.txt; git add a.txt; git commit -q -m "f20-anchor"
+git push -q -u origin f20-anchor
+git checkout -q main
+# REWRITE real main from a separate clone so it no longer contains doomed's tip.
+git clone -q -b main "$F20_ORIGIN" "$F20_RW"
+git -C "$F20_RW" config user.email test@test.test
+git -C "$F20_RW" config user.name "Test Runner"
+git -C "$F20_RW" config commit.gpgsign false
+git -C "$F20_RW" checkout -q --orphan rewritten
+git -C "$F20_RW" rm -q -rf . >/dev/null 2>&1 || true
+echo rewritten > "$F20_RW/rewritten.txt"
+git -C "$F20_RW" add rewritten.txt
+GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
+GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git -C "$F20_RW" commit -q -m rewritten
+git -C "$F20_RW" push -q --force origin rewritten:refs/heads/main
+F20_REAL_MAIN="$(git -C "$F20_ORIGIN" rev-parse refs/heads/main)"
+F20_STALE_MAIN="$(git rev-parse origin/main)"
+if [ "$F20_STALE_MAIN" = "$F20_DOOMED_OID" ]; then
+    ok "F20 fixture: refs/remotes/origin/main is STALE and contains doomed's tip (F20)"
+else
+    bad "F20 fixture: refs/remotes/origin/main ($F20_STALE_MAIN) is not the pre-rewrite tip (F20)"
+fi
+if ! git -C "$F20_ORIGIN" merge-base --is-ancestor "$F20_DOOMED_OID" "$F20_REAL_MAIN" 2>/dev/null; then
+    ok "F20 fixture: real main was REWRITTEN and no longer contains doomed's tip (F20)"
+else
+    bad "F20 fixture: real main still contains doomed's tip — the fixture is wrong (F20)"
+fi
+# The NARROWED refspec: only f20-anchor is refreshed, so refs/remotes/origin/main
+# keeps its stale (pre-rewrite) value through a 0-exit prune.
+git config --replace-all remote.origin.fetch '+refs/heads/f20-anchor:refs/remotes/origin/f20-anchor'
+git fetch origin --prune --quiet
+if [ "$(git rev-parse origin/main)" = "$F20_STALE_MAIN" ]; then
+    ok "F20 fixture: refs/remotes/origin/main stayed STALE through the fetch (F20)"
+else
+    bad "F20 fixture: the fetch refreshed origin/main — the narrowed refspec did not hold (F20)"
+fi
+# The plan must run the gates and REFUSE the doomed entry as a COMMENT, never as
+# an executable command.
+run_script bash "$F20_SCRIPT" --repo "$F20_REPO" --scope remote
+assert_eq "$RC" "0" "F20: the dry-run exits 0"
+F20_PLAN="$OUT"
+assert_contains "$F20_PLAN" "origin/doomed" "F20: the doomed branch IS classified as a candidate"
+assert_contains "$F20_PLAN" "# REFUSED — --execute will not run this" "F20: the plan marks the entry REFUSED"
+assert_contains "$F20_PLAN" "does NOT provably contain the classified tip" "F20: the REFUSED note carries the real reason"
+assert_eq "$(grep -c '^  git push origin --delete' <<<"$F20_PLAN" || true)" "0" "F20: the plan prints NO executable delete for the refused entry"
+# A VERBATIM PASTE of the plan's command block must NOT delete doomed. Under the
+# pre-fix code the entry was printed as an executable push whose lease PASSES
+# (origin's real doomed IS at the classified oid), so the paste deleted it while
+# `--execute` refused — the data-loss path.
+F20_PASTE="$FIX/f20-paste.sh"
+{
+    printf '#!/usr/bin/env bash\n'
+    awk '/^Deletion commands that would run/ { grab=1; next } grab && /^$/ { exit } grab { print }' <<<"$F20_PLAN"
+} > "$F20_PASTE"
+run_script bash "$F20_PASTE"
+assert_eq "$RC" "0" "F20: a paste of the plan exits 0"
+if [ "$(git -C "$F20_ORIGIN" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$F20_DOOMED_OID" ]; then
+    ok "F20: a PASTE of the printed plan does NOT delete doomed (F20)"
+else
+    bad "F20: a paste of the plan DELETED doomed — the data-loss path is back (F20)"
+fi
+# And `--execute` still refuses, leaving the branch intact.
+run_script bash "$F20_SCRIPT" --repo "$F20_REPO" --scope remote --execute
+assert_eq "$RC" "1" "F20: --execute still REFUSES the unprovable delete"
+assert_contains "$OUT" "REFUSING to delete origin/doomed" "F20: --execute names the refused branch"
+assert_contains "$OUT" "Refused: 1" "F20: --execute counts exactly one refusal"
+if [ "$(git -C "$F20_ORIGIN" rev-parse -q --verify refs/heads/doomed || echo GONE)" = "$F20_DOOMED_OID" ]; then
+    ok "F20: origin's real doomed SURVIVES --execute (F20)"
+else
+    bad "F20: origin's real doomed was deleted — data loss (F20)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 44. F22: an over-range LOCAL committer date REFUSES, it never counts as stale =="
+# `git for-each-ref` reads `%(committerdate:unix)` from an object `git log`
+# cannot format. For an all-digit value ABOVE bash's integer range
+# (2^63 = 9223372036854775808) a bare `[ "$cdate" -ge "$CUTOFF_EPOCH" ]` returns
+# status 2, the `||` reads FALSE, and the branch is treated as STALE — the
+# failure GROWS the candidate set, the OPPOSITE polarity to the remote F18 guard.
+# The guard must REFUSE the local sweep, name the ref and leave it intact; a
+# genuine epoch-0 commit (cdate = 0, all-digits) must STILL be treated as stale.
+F22_ORIGIN="$FIX/f22-origin.git"
+F22_REPO="$FIX/f22-repo"
+new_repo "$F22_REPO" "$F22_ORIGIN"
+cd "$F22_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F22_SCRIPT="$F22_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f22.txt; git add f22.txt; old_commit "init"; git push -q origin main
+F22_MAIN_SHA="$(git rev-parse main)"
+F22_TREE="$(git rev-parse "$F22_MAIN_SHA^{tree}")"
+# A synthetic commit with committer timestamp 2^63, written with --literally so
+# git does not sanitise the value.
+F22_OVER_OID="$(printf 'tree %s\nparent %s\nauthor A <a@b> 9223372036854775808 +0000\ncommitter A <a@b> 9223372036854775808 +0000\n\nf22 over\n' \
+    "$F22_TREE" "$F22_MAIN_SHA" | git hash-object -t commit -w --stdin --literally)"
+git update-ref refs/heads/f22-over "$F22_OVER_OID"
+F22_CDATE="$(git for-each-ref --format='%(committerdate:unix)' refs/heads/f22-over)"
+assert_eq "$F22_CDATE" "9223372036854775808" "F22 fixture: for-each-ref renders the over-intmax date as wrapped digits (F22)"
+# A GENUINE epoch-0 commit: cdate = 0, which IS stale and must keep being stale.
+git checkout -q -b f22-epoch main
+echo z > z.txt; git add z.txt
+GIT_AUTHOR_DATE="1970-01-01T00:00:00 +0000" \
+GIT_COMMITTER_DATE="1970-01-01T00:00:00 +0000" \
+    git commit -q -m "f22-epoch"
+F22_EPOCH_OID="$(git rev-parse HEAD)"
+git checkout -q main
+# A PR map carries BOTH branches as `merged`, so each reaches the delete path
+# once the staleness gate lets it through — the guard is what refuses f22-over.
+F22_MAP="$FIX/f22-pr-map.json"
+cat > "$F22_MAP" <<JSON
+[
+  {"headRefName":"f22-over","state":"MERGED","headRefOid":"$F22_OVER_OID","baseRefName":"main"},
+  {"headRefName":"f22-epoch","state":"MERGED","headRefOid":"$F22_EPOCH_OID","baseRefName":"main"}
+]
+JSON
+run_script bash "$F22_SCRIPT" --repo "$F22_REPO" --scope local --pr-map-file "$F22_MAP" --execute
+if [ "$RC" -ne 0 ]; then
+    ok "F22: an over-intmax committer date REFUSES the local sweep (rc=$RC)"
+else
+    bad "F22: the over-intmax committer date did NOT fail the sweep (rc=0) — it was read as stale"
+fi
+assert_contains "$OUT" "commit date of f22-over" "F22: the refusal names the ref whose date is unreadable"
+assert_branch_exists f22-over "F22: the over-intmax branch SURVIVES the refused sweep"
+assert_eq "$(git rev-parse -q --verify refs/heads/f22-over || echo GONE)" "$F22_OVER_OID" "F22: the over-intmax branch is still at its classified oid"
+# With the pathological ref removed, epoch-0 must STILL be stale: the sweep runs
+# clean and reaps it, proving the guard did not swallow the genuine stale case.
+git update-ref -d refs/heads/f22-over
+run_script bash "$F22_SCRIPT" --repo "$F22_REPO" --scope local --pr-map-file "$F22_MAP" --execute
+assert_eq "$RC" "0" "F22: with the pathological ref removed, the sweep runs clean"
+assert_branch_absent f22-epoch "F22: a genuine epoch-0 commit (cdate 0) IS still treated as stale and reaped"
 
 cd "$REPO"
 echo ""

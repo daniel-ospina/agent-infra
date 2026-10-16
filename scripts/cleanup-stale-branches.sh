@@ -987,7 +987,19 @@ run_remote_scope() {
     #   * git worktree list --porcelain         porcelain, never colourised
     #   * git ls-remote / config --get-all / remote get-url --push --all
     #                                           value/URL reads, plain text
-    #   * git fetch / push / update-ref -d      status-only, no output parsed
+    #   * git fetch / update-ref -d             status-only, no output parsed
+    #   * git push                              OUTPUT IS PARSED, so this entry
+    #                                           does NOT belong in a
+    #                                           status-only list (F23). The
+    #                                           execute path captures the push
+    #                                           output and substring-greps it for
+    #                                           `stale info` to tell a
+    #                                           force-with-lease refusal from a
+    #                                           real failure. No `--no-color` is
+    #                                           needed: the rejection text is not
+    #                                           colourised, so the substring still
+    #                                           matches under `color.ui=always`
+    #                                           (verified).
     local merged_list=""
     if ! merged_list="$(git branch --no-color -r --merged "origin/$MAIN_BRANCH" 2>/dev/null)"; then
         echo "ERROR: origin/$MAIN_BRANCH does not resolve, so no branch can be shown to be" >&2
@@ -1150,6 +1162,19 @@ run_remote_scope() {
         echo "To delete: bash scripts/cleanup-stale-branches.sh --execute"
         echo ""
         echo "Deletion commands that would run:"
+        # ⛔ F20: THE PLAN MUST RUN THE SAME TWO GATES `--execute` RUNS, per
+        # entry, and MARK an entry they would refuse. Printing a delete for an
+        # entry execute refuses is a data-loss path by paste: the lease pins the
+        # OID, but it cannot check the MERGE PREMISE. A branch classified
+        # `--merged` from a stale `origin/$MAIN_BRANCH` (narrowed positive
+        # refspec) whose commits are no longer in REWRITTEN real main passes the
+        # lease and is deleted by a pasted line, while `--execute` REFUSES it.
+        # So the plan calls the SAME verify_merged_into_real_main /
+        # verify_remote_target the execute loop calls — never a second
+        # implementation that can drift (the defect class this branch has been
+        # closing) — and a refused entry is printed ONLY as a comment, never as
+        # an executable command. The commands the plan shows are then exactly the
+        # ones `--execute` would run at plan time.
         for entry in "${STALE_BRANCHES[@]}"; do
             branch="${entry%%$'\t'*}"
             # ⛔ Build the command ONCE, as an array, and PRINT it through
@@ -1168,6 +1193,16 @@ run_remote_scope() {
             # repository instead of deleting unconditionally.
             local tracking_oid="${entry##*$'\t'}"
             local local_branch="${branch#origin/}"
+            # F20: the SAME two gates the execute loop applies, at plan time.
+            local plan_refusal=""
+            if ! plan_refusal="$(verify_merged_into_real_main "$tracking_oid")"; then
+                printf '  # REFUSED — --execute will not run this: %s\n' "$plan_refusal"
+                continue
+            fi
+            if ! plan_refusal="$(verify_remote_target "$push_url" "$local_branch" "$tracking_oid")"; then
+                printf '  # REFUSED — --execute will not run this: %s\n' "$plan_refusal"
+                continue
+            fi
             local cmd=(git push origin --delete \
                 "--force-with-lease=refs/heads/$local_branch:$tracking_oid" \
                 -- "refs/heads/$local_branch")
@@ -1493,8 +1528,33 @@ run_local_scope() {
             keep_list="${keep_list}worktree"$'\t'"$br"$'\n'
             keep_worktree=$((keep_worktree + 1)); keep_total=$((keep_total + 1)); continue
         fi
+        # ⛔ F22: AN UNREADABLE OR OVER-LONG COMMITTER DATE IS AN INTERNAL ERROR,
+        # NEVER A STALENESS VERDICT. `git for-each-ref` can read objects `git log`
+        # cannot format, and `%(committerdate:unix)` prints a value ABOVE bash's
+        # integer range as an all-digit wrapped number. A bare
+        # `[ "$cdate" -ge "$CUTOFF_EPOCH" ]` then returns status 2, the `||` reads
+        # FALSE, and the branch is treated as STALE — so the FAILURE GROWS the
+        # candidate set. The remote guard above (F18) takes the opposite, safe
+        # polarity: it refuses. This mirrors it, with the file's own 15-digit
+        # bound (the same bound `--cutoff` is validated with), so an empty,
+        # non-numeric or over-long date REFUSES the whole local sweep and names
+        # the ref, instead of falling through as "stale".
+        case "$cdate" in
+            ''|*[!0-9]*)
+                echo "ERROR: could not read the commit date of $br, so it cannot be shown to be" >&2
+                echo "ERROR: stale. An unreadable date is an internal error, not a stale branch;" >&2
+                echo "ERROR: refusing the local sweep so an unproven branch is never deleted." >&2
+                return 1
+                ;;
+        esac
+        if [ "${#cdate}" -gt 15 ]; then
+            echo "ERROR: the commit date of $br ($cdate) is outside bash's integer range, so" >&2
+            echo "ERROR: its staleness cannot be proven. Refusing the local sweep rather than" >&2
+            echo "ERROR: treating an over-long value as stale — that would GROW the candidate set." >&2
+            return 1
+        fi
         # 3. not stale
-        if [ -z "$cdate" ] || [ "$cdate" -ge "$CUTOFF_EPOCH" ]; then
+        if [ "$cdate" -ge "$CUTOFF_EPOCH" ]; then
             keep_list="${keep_list}not-stale"$'\t'"$br"$'\n'
             keep_notstale=$((keep_notstale + 1)); keep_total=$((keep_total + 1)); continue
         fi
@@ -1758,8 +1818,11 @@ run_local_scope() {
         # line below may claim a property the paste does not have.
         echo "⚠️  PREVIEW ONLY — this is NOT a paste-safe script."
         echo "    Run --execute to reap every selected branch: a squash-merged branch's"
-        echo "    'git branch -d' REFUSES, so a verbatim paste of the list STOPS at that"
-        echo "    line and reaps only the branches printed before it."
+        echo "    'git branch -d' REFUSES. Under 'set -e' a verbatim paste STOPS at that"
+        echo "    line and reaps only the branches printed before it. WITHOUT 'set -e' the"
+        echo "    paste CONTINUES past the refusal and reaps the later 'git branch -d' lines"
+        echo "    too — leaving the refusing branch behind. Either way, use --execute to"
+        echo "    reap everything."
         echo "Deletion commands that would run (force-delete fallback only for a merged branch that -d will refuse):"
         while IFS=$'\t' read -r cls br sha; do
             [ -n "$cls" ] || continue
