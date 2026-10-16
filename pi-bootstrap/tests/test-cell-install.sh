@@ -204,6 +204,17 @@ if [ -e "$DEST/extensions/cmux-session.ts" ]; then
 else
   ok "cmux-session.ts is NOT installed (surface-absent deny holds)"
 fi
+# ... and `--verify` must enforce that same deny against a cell that already has it, with the
+# install half's predicate: `-e` FOLLOWS a symlink, so a dangling link at the denied path is
+# invisible to it and the deny would certify what it exists to refuse.
+ln -sfn "$TMP/nowhere" "$DEST/extensions/cmux-session.ts"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "denied extension is PRESENT on the cell: extensions/cmux-session.ts" "$LOG" \
+  && ok "--verify refuses a cell where the DENIED extension is present (as a dangling symlink, which -e cannot see)" \
+  || fail "--verify CERTIFIED a cell holding the denied cmux-session.ts"
+rm -f "$DEST/extensions/cmux-session.ts"
+run_verify >/dev/null 2>&1
 ext_missing=""
 ship_list="$(expected_extension_rows)"
 if [ -z "$ship_list" ]; then

@@ -691,7 +691,11 @@ verify_layer() {
   while IFS= read -r base; do
     [ -n "$base" ] || continue
     if denied_extension "$base"; then
-      [ -e "$DEST/extensions/$base" ] && fail "denied extension is PRESENT on the cell: extensions/$base"
+      # Same predicate as the install half: `-e` follows a symlink, so a DANGLING link at this
+      # path is invisible to it and the deny would certify exactly what it exists to refuse.
+      if [ -e "$DEST/extensions/$base" ] || [ -L "$DEST/extensions/$base" ]; then
+        fail "denied extension is PRESENT on the cell: extensions/$base"
+      fi
       continue
     fi
     # EXISTENCE IS NOT ENOUGH. The farm loop above byte-compares every file, but this loop
