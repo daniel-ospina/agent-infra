@@ -2176,13 +2176,13 @@ for _f6n in "${F6_NAMES[@]}"; do
     git update-ref "refs/heads/$_f6n" "$F6_MAIN_SHA"
 done
 # ⛔ AND one `merged`-class name whose tip is NOT an ancestor of main. This is
-# the ONLY shape that reaches the `-D` fallback (`git branch -d` refuses a
-# squash-merged tip), and therefore the only shape that can expose the plan/
-# execute divergence: the plan printed just `git branch -d`, while `--execute`
-# silently fell back to `git branch -D`, so pasting the plan refused and the
-# branch was never reaped. Built with plumbing (commit-tree + update-ref) so no
-# working-tree operation runs. The tree is main's, so the commit is distinct and
-# unreachable from main.
+# one of TWO `merged` shapes: this SQUASH shape reaches the `-D` fallback (`git
+# branch -d` refuses a squash-merged tip), while F9's merge-commit shape (below)
+# does not. This shape exposed the plan/execute divergence where the plan printed
+# just `git branch -d`, while `--execute` silently fell back to `git branch -D`,
+# so pasting the plan refused and the branch was never reaped. Built with
+# plumbing (commit-tree + update-ref) so no working-tree operation runs. The
+# tree is main's, so the commit is distinct and unreachable from main.
 F6_TREE="$(git rev-parse "$F6_MAIN_SHA^{tree}")"
 F6_MERGED_SHA="$(GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" \
     GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
@@ -2193,12 +2193,35 @@ if git merge-base --is-ancestor "$F6_MERGED_SHA" main 2>/dev/null; then
 else
     ok "F6 fixture: the merged tip is NOT an ancestor of main (the -D fallback is reachable) (F6/F7)"
 fi
-# The PR map backing it: MERGED, base main, headRefOid == the tip. The four
+# ⛔ F9: the OTHER `merged` shape — a branch merged with a MERGE COMMIT. Its tip
+# IS an ancestor of main (the merge commit lists it as a parent), so the execute
+# path's `git branch -d` SUCCEEDS and `-D` never runs. Pre-F9 the plan printed
+# the `-D` fallback UNCONDITIONALLY, making it a strict SUPERSET of execution:
+# pasting the plan ran `git branch -D -- f6-manc` → `error: branch 'f6-manc' not
+# found`, and under `set -e` that aborted the rest of the paste — an UNDER-reap.
+# The plan must print EXACTLY ONE command for this shape. A REAL `git merge
+# --no-ff` (not plumbing) is required, because the whole point is the ancestry
+# the merge produces.
+git checkout -q -b f6-manc main
+echo manc > f6-manc.txt
+git add f6-manc.txt
+old_commit "f6-manc"
+F6_MANC_SHA="$(git rev-parse HEAD)"
+git checkout -q main
+git merge -q --no-ff -m "merge f6-manc" f6-manc
+git push -q origin main
+if git merge-base --is-ancestor "$F6_MANC_SHA" main 2>/dev/null; then
+    ok "F9 fixture: the merge-commit-merged tip IS an ancestor of main (-d succeeds, no -D) (F9)"
+else
+    bad "F9 fixture: the merge-commit-merged tip is NOT an ancestor of main — the shape is wrong (F9)"
+fi
+# The PR map backing both: MERGED, base main, headRefOid == the tip. The four
 # special names stay absent, so they remain `redundant` and take only `-d`.
 F6_PR_MAP="$FIX/f6-pr-map.json"
 cat > "$F6_PR_MAP" <<JSON
 [
-  {"headRefName":"f6-merged","state":"MERGED","headRefOid":"$F6_MERGED_SHA","baseRefName":"main"}
+  {"headRefName":"f6-merged","state":"MERGED","headRefOid":"$F6_MERGED_SHA","baseRefName":"main"},
+  {"headRefName":"f6-manc","state":"MERGED","headRefOid":"$F6_MANC_SHA","baseRefName":"main"}
 ]
 JSON
 F6_REAL_GIT="$(command -v git)"
@@ -2227,14 +2250,24 @@ chmod +x "$F6_WRAP/git"
 
 run_script bash "$F6_SCRIPT" --repo "$F6_REPO" --scope local --pr-map-file "$F6_PR_MAP"
 assert_eq "$RC" "0" "local paste-safety fixture: dry-run exits 0 (F6)"
-# One `-d` per selected branch, PLUS the `-D` fallback for the `merged` class.
-# Counted separately so the test also pins that `-D` stays CONFINED to `merged`.
+# One `-d` per selected branch, PLUS the `-D` fallback for the SQUASH `merged`
+# shape ONLY. Counted separately so the test also pins that `-D` stays CONFINED
+# to `merged` and to the shape that actually needs it (F9).
 F6_PLAN_D_COUNT="$(grep -c '^  git branch -d --' <<<"$OUT" || true)"
 F6_PLAN_FORCE_COUNT="$(grep -c '^  git branch -D --' <<<"$OUT" || true)"
-assert_eq "$F6_PLAN_D_COUNT" "5" "the local plan prints one -d command per selected branch (4 redundant + 1 merged) (F6)"
-assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the -D fallback for the merged class ONLY (F6/F7)"
-assert_contains "$OUT" 'git branch -D -- f6-merged' 'the merged class actually prints its -D fallback (F6/F7)'
+assert_eq "$F6_PLAN_D_COUNT" "6" "the local plan prints one -d command per selected branch (4 redundant + 2 merged) (F6)"
+assert_eq "$F6_PLAN_FORCE_COUNT" "1" "the local plan prints the -D fallback for the SQUASH merged class ONLY (F6/F7/F9)"
+assert_contains "$OUT" 'git branch -D -- f6-merged' 'the squash merged class actually prints its -D fallback (F6/F7)'
 assert_contains "$OUT" '# class=redundant' 'the class annotation is still printed (F6)'
+# ⛔ F9: the MERGE-COMMIT-merged shape takes EXACTLY ONE command (`-d`) — `-d`
+# succeeds, so a printed `-D` would be a command execution never runs. Assert
+# both shapes, so restoring the unconditional `-D` goes RED here.
+F6_PLAN_MANC_D="$(grep -c '^  git branch -d -- f6-manc   # class=merged' <<<"$OUT" || true)"
+F6_PLAN_MANC_FORCE="$(grep -c '^  git branch -D -- f6-manc' <<<"$OUT" || true)"
+assert_eq "$F6_PLAN_MANC_D" "1" "the merge-commit-merged shape prints exactly one -d command (F9)"
+assert_eq "$F6_PLAN_MANC_FORCE" "0" "the merge-commit-merged shape prints NO -D fallback (F9)"
+assert_contains "$OUT" 'git branch -d -- f6-merged   # class=merged' 'the squash shape still prints its -d command (F9)'
+assert_contains "$OUT" 'git branch -D -- f6-merged   # class=merged (fallback if -d refuses)' 'the squash shape still prints its -D fallback (F9)'
 
 # Evaluate each printed plan line with `git` stubbed to an argv dumper, writing
 # NUL-delimited records (a ref name cannot contain NUL, so the encoding is exact).
@@ -2266,6 +2299,19 @@ fi
 # `branch -d -- <name>`. A stray `# class=...` argument would add a 5th element.
 F6_BAD_ELEM="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c 'class=' || true)"
 assert_eq "$F6_BAD_ELEM" "0" "the class annotation stays OUTSIDE the quoted argv (F6)"
+# ⛔ F9: the NUL-delimited argv is EXACT for BOTH merged shapes. The global `cmp`
+# above pins plan == execute as a whole; these per-shape element counts pin each
+# shape's argv, so a plan that emitted a spurious `-D` for the merge-commit shape
+# goes RED even if the total happened to line up. A branch name cannot contain
+# NUL, so `tr` + an anchored match is an exact element test.
+F6_PLAN_MANC_N="$(tr '\0' '\n' < "$F6_PLAN_ARGV" | grep -c '^f6-manc$' || true)"
+F6_EXEC_MANC_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^f6-manc$' || true)"
+assert_eq "$F6_PLAN_MANC_N" "1" "the plan's NUL argv names f6-manc exactly once (-d only, merge-commit shape) (F9)"
+assert_eq "$F6_EXEC_MANC_N" "1" "the execute path's NUL argv names f6-manc exactly once (-d only, merge-commit shape) (F9)"
+F6_PLAN_MERGED_N="$(tr '\0' '\n' < "$F6_PLAN_ARGV" | grep -c '^f6-merged$' || true)"
+F6_EXEC_MERGED_N="$(tr '\0' '\n' < "$F6_EXEC_ARGV" | grep -c '^f6-merged$' || true)"
+assert_eq "$F6_PLAN_MERGED_N" "2" "the plan's NUL argv names f6-merged twice (-d and -D, squash shape) (F9)"
+assert_eq "$F6_EXEC_MERGED_N" "2" "the execute path's NUL argv names f6-merged twice (-d then -D, squash shape) (F9)"
 
 cd "$REPO"
 echo ""

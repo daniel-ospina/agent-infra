@@ -1526,7 +1526,7 @@ run_local_scope() {
         echo "── DRY-RUN: no branches deleted ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --scope local --execute"
         echo ""
-        echo "Deletion commands that would run (-D fallback only for the merged class):"
+        echo "Deletion commands that would run (-D fallback only for a merged branch that -d will refuse):"
         while IFS=$'\t' read -r cls br; do
             [ -n "$cls" ] || continue
             # ⛔ Build the command ONCE, as an array, and PRINT it through
@@ -1540,20 +1540,47 @@ run_local_scope() {
             # quoted argv: it is informational and must not become an argument.
             local local_cmd=(git branch -d -- "$br")
             printf '  %s   # class=%s\n' "$(quote_argv "${local_cmd[@]}")" "$cls"
-            # ⛔ THE `-D` FALLBACK IS PART OF THE PLAN FOR `merged`, and omitting
-            # it made the printed plan a LIE for the very class the merged gate
-            # exists to reap. The execute path tries `-d` and then `-D` for a
-            # squash-merged branch whose tip is not an ancestor of main — so the
-            # plan said `git branch -d -- sq` and pasting it made git refuse ("not
-            # fully merged") while `--execute` silently force-deleted it. Render
-            # the SAME two commands the execute loop runs, through the SAME
-            # `quote_argv`, so the plan stays a faithful, paste-safe description.
-            # `-D` remains confined to `merged` — no other class gets a second
-            # line, and `-d` is still printed FIRST (the fallback, not the primary).
+            # ⛔ THE `-D` FALLBACK IS PART OF THE PLAN FOR `merged` — BUT ONLY
+            # WHEN `-d` WILL ACTUALLY REFUSE (F9). Omitting it entirely made the
+            # plan a LIE for a squash-merged branch (the execute path silently
+            # fell back to `-D`). Printing it UNCONDITIONALLY made the plan a
+            # strict SUPERSET for a branch merged with a MERGE COMMIT (or
+            # fast-forwarded): the merged gate proves the PR's CONTENT landed and
+            # the tip equalled headRefOid — it does NOT prove the tip is a
+            # NON-ancestor of main. Such a tip IS an ancestor, so the execute
+            # path's `git branch -d` SUCCEEDS and `-D` never runs; the extra
+            # printed line then ran `git branch -D -- m-anc` → `error: branch
+            # 'm-anc' not found`, and under `set -e` that aborted the rest of the
+            # paste — an UNDER-reap. So follow the SAME predicate the outcome
+            # follows: is the tip an ancestor of main? Ancestor → `-d` succeeds,
+            # print NO fallback; not-an-ancestor → print the fallback, through
+            # the SAME `quote_argv`, annotated OUTSIDE the quoted argv.
             if [ "$cls" = "merged" ]; then
-                local local_cmd_force=(git branch -D -- "$br")
-                printf '  %s   # class=%s (fallback if -d refuses)\n' \
-                    "$(quote_argv "${local_cmd_force[@]}")" "$cls"
+                local dry_needs_force=0 dry_reason=""
+                if [ "$main_ref_ok" = 1 ]; then
+                    local dry_tip=""
+                    if dry_tip="$(git rev-parse --verify -q "refs/heads/$br" 2>/dev/null)" \
+                        && git merge-base --is-ancestor "$dry_tip" "origin/$MAIN_BRANCH" 2>/dev/null; then
+                        dry_needs_force=0
+                    else
+                        dry_needs_force=1
+                        dry_reason="(fallback if -d refuses)"
+                    fi
+                else
+                    # origin/$MAIN_BRANCH does not resolve, so ancestry cannot be
+                    # tested here. Choose the CONSERVATIVE (over-describing)
+                    # direction — PRINT the fallback — because that keeps the plan
+                    # a strict SUPERSET of execution and never under-describes it;
+                    # the annotation says the certainty is not established rather
+                    # than implying it.
+                    dry_needs_force=1
+                    dry_reason="(fallback if -d refuses; ancestry unverified: origin/$MAIN_BRANCH does not resolve)"
+                fi
+                if [ "$dry_needs_force" = 1 ]; then
+                    local local_cmd_force=(git branch -D -- "$br")
+                    printf '  %s   # class=%s %s\n' \
+                        "$(quote_argv "${local_cmd_force[@]}")" "$cls" "$dry_reason"
+                fi
             fi
         done <<<"$delete_list"
         echo ""
