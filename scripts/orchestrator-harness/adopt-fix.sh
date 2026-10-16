@@ -15,10 +15,15 @@ fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR $(date)" >> "$O/logs/adopt-$PR.log"
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
-# 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). Name it here: the
-# fixer's own line is inside fix-$PR.log, and this is the log a manual operator reads (#1720).
+# 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
+# refused it (#1765). Name BOTH here: the fixer's own line is inside fix-$PR.log, and this is the log
+# a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
+# box quietening, a disk refusal only by reclaiming space — so reporting one as the other sends the
+# operator to wait for a remedy that cannot arrive.
 if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "77" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with
