@@ -1802,7 +1802,15 @@ HITS="$(
       }
       # a pure comment or blank line is documentation: it cannot execute, so it is skipped
       # (otherwise a script that merely DOCUMENTS the anti-pattern fails the build).
-      /^[ \t]*#/ || /^[ \t]*$/ { if (buf != "") { if (is_idiom(buf)) print F ":" start ": " buf } ; buf = ""; start = 0; next }
+      /^[ \t]*#/ || /^[ \t]*$/ {
+        # A pending pipe keeps the pipeline OPEN across a comment or blank line: bash allows
+        # `cmd |&` newline `# note` newline `grep -q p` (the newline_list between the operator
+        # and the next pipeline element may hold blank/comment lines). Flushing here would drop
+        # the pending buffer and report the continuation CLEAN.
+        if (buf != "" && buf ~ /\|&?[ \t]*$/) next
+        if (buf != "") { if (is_idiom(buf)) print F ":" start ": " buf }
+        buf = ""; start = 0; next
+      }
       {
         raw = $0
         if (start == 0) start = NR
@@ -1818,6 +1826,22 @@ HITS="$(
         if (raw ~ /\\[ \t]*$/) {
           sub(/\\[ \t]*$/, "", raw)
           buf = buf raw
+          next
+        }
+        # A trailing pipe followed by a COMMENT is still a continuation; drop the comment and keep
+        # the operator, then join the next line. The bare-newline arms below cover the comment-free
+        # form. (`cmd |&` newline `# note` newline `grep -q p` is legal bash, parse.y
+        # `| pipeline BAR_AND newline_list pipeline`.)
+        if (raw ~ /\|&[ \t]*#/) {
+          match(raw, /\|&[ \t]*#/)
+          raw = substr(raw, 1, RSTART - 1) "|&"
+          buf = buf raw " "
+          next
+        }
+        if (raw ~ /\|[ \t]*#/) {
+          match(raw, /\|[ \t]*#/)
+          raw = substr(raw, 1, RSTART - 1) "|"
+          buf = buf raw " "
           next
         }
         if (raw ~ /\|&[ \t]*$/) {
