@@ -14,7 +14,12 @@
 # the tortoise checkout this box drains; override it for any other target.
 set -u
 H="${1:-12}"
-case "$H" in ''|*[!0-9]*) H=12 ;; esac
+# ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+# "08: value too great for base" at the `FROM=` line below and then died at the first use of `$FROM`
+# with "FROM: unbound variable", rc=1 — the report stopped partway. (Pre-existing; found by the same
+# review that added the identical arm to the heartbeat guard, and closed here because this is the
+# file being changed rather than filed as a peer.)
+case "$H" in ''|*[!0-9]*|0[0-9]*) H=12 ;; esac
 O="${O:-$HOME/orchestrator}"
 REPO="${REPO:-$HOME/eldato/tortoise}"
 NOW=$(date +%s); FROM=$(( NOW - H * 3600 ))
@@ -47,7 +52,11 @@ if command -v launchctl >/dev/null 2>&1; then
     # aborted mid-way (everything after `── controller ──`: merges, wall-time, claims, queue health)
     # and the script still exited 0. Measured with `heartbeat` = `abc`: 3 lines of stdout, rc=0.
     # Validate exactly as the sibling paths already validate their numeric reads.
-    case "$hb" in ''|*[!0-9]*) hb=0 ;; esac
+    # ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`, so `heartbeat=08` fails the expansion
+    # with "value too great for base" and the status line is dropped silently — the same silent-drop
+    # class this guard was added for. (The `case "$H"` guard at the top of this file had the
+    # identical gap; it is closed there too.)
+    case "$hb" in ''|*[!0-9]*|0[0-9]*) hb=0 ;; esac
     echo "  UP (pid $pid)   heartbeat age: $(( NOW - hb ))s"
   else
     echo "  ⚠️  NOT RUNNING (no launchd job)"

@@ -2857,6 +2857,14 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     deploy; prov
     grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
     ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
+    # The OTHER direction, which a one-way `$HERE -> $O` comparison would miss: a hand-placed
+    # `$O/*.sh` the repo does not ship is DRIFT to check-deployed-drift.sh, so the stamp must not
+    # call that deployment a match either.
+    printf 'hand-placed\n' > "$PO/legacy-probe.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "an extra \$O/*.sh the repo does not ship records deployedMatchesSource: false" $rc
+    deploy; prov
     dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
     ck "check-deployed-drift: a matching deployment exits 0" $rc
     # a DIRTY source: its recorded commit cannot describe the deployed bytes
@@ -2953,6 +2961,13 @@ if [ -f "$HERE/report.sh" ]; then
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
+  # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+  # "08: value too great for base" at the `FROM=` line and then died at the first use of `$FROM`
+  # ("FROM: unbound variable", rc=1), stopping the report partway. It must clamp to the 12h
+  # default instead.
+  rout08="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 08 2>&1)"; rrc08=$?
+  [ "$rrc08" -eq 0 ] && case "$rout08" in *"orchestrator report"*"12h"*) rc=0;; *) rc=1;; esac || rc=1
+  ck "report.sh clamps a leading-zero HOURS arg instead of dying in the arithmetic" $rc
   case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
   ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
   case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac
