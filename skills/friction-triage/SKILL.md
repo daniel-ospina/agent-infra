@@ -62,7 +62,7 @@ The broken pipeline produces issues that prescribe solutions before understandin
 
 ## Step 1 — Gather
 
-Read friction data. The current writer is `extensions/reflect-hook.ts` — session data lands in `~/.tortoise/session-events/<date>.jsonl` (and hosted tortoise `/v1/sessions` once `TORTOISE_API_KEY` is set). Legacy eldato checkouts also write under `docs/teams/<team>/operations/`:
+Read friction data. The current writer is `extensions/reflect-hook.ts` — session data lands in `~/.tortoise/session-events/<date>.jsonl` (and hosted tortoise `/v1/sessions` once hosted capture is explicitly opted in via `"cloud": true` plus a key — #803; a key alone never enables egress). Legacy eldato checkouts also write under `docs/teams/<team>/operations/`:
 
 ```bash
 # Current source (reflect-hook):

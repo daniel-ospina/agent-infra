@@ -119,6 +119,23 @@ jobs:
         # left BYTE-IDENTICAL — the guard must never rewrite a good request.
         echo "== extensions/clamp-output-floor.test.ts =="
         npx tsx extensions/clamp-output-floor.test.ts || failures=$((failures+1))
+        # #1138 — cmux-session: the repo copy is a bootstrap SNAPSHOT of a file
+        # cmux upgrades IN PLACE on the farm, so it can silently fall behind
+        # (measured: main carried v2 at 55,408 B while the farm ran v4 at
+        # 74,220 B, and that delta existed in no ref). The marker pin fails on any
+        # snapshot that is not the version EXPECTED_MARKER names; without this
+        # line the suite runs nowhere and the drift is silent again — the inert-
+        # gate shape its sibling version-stamp step in ci.yml's `verify` job names.
+        # Zero-dep (pi import is TYPE-only, erased by tsx); mirrors the ci.yml step.
+        echo "== extensions/cmux-session.test.ts =="
+        npx tsx extensions/cmux-session.test.ts || failures=$((failures+1))
+        # #5109 — secret-echo-guard: the transcript-leak control. Post-merge
+        # backstop for the per-PR step in ci.yml, same split as clamp above.
+        # Zero-dep (pi import is TYPE-only, node stdlib otherwise); negative pins
+        # assert ordinary output is returned BY REFERENCE (no patch) and records
+        # nothing, a sub-floor value is not redacted, and no sink carries a value.
+        echo "== extensions/secret-echo-guard.test.ts =="
+        npx tsx extensions/secret-echo-guard.test.ts || failures=$((failures+1))
         # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
         # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
         # drift class (complex.maxCycles sat at 2× the canonical bound with no

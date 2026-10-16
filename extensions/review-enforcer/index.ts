@@ -81,12 +81,42 @@ export function resolveGhShimDir(): string | null {
   if (EXTENSION_DIR) candidates.push(resolvePath(EXTENSION_DIR, "..", "..", "scripts", "gh-shim"));
   for (const dir of candidates) {
     try {
-      if (fs.existsSync(resolvePath(dir, "gh"))) return dir;
+      if (isExecutableShim(dir)) return dir;
     } catch {
       /* an unreadable candidate is not a match */
     }
   }
   return null;
+}
+
+/**
+ * Is `<dir>/gh` present AND EXECUTABLE — i.e. is this directory a shim at all?
+ *
+ * A PATH entry whose `gh` lacks the execute bit is SKIPPED by the shell, so the real
+ * `gh` runs and nothing enforces. `existsSync` answers "is there a file there", which
+ * is not the question any caller here is asking: a non-executable shim — an
+ * `AGENT_GH_SHIM_DIR` misconfigured, an archive that dropped the mode, a `noexec`
+ * mount, or a mid-session `chmod -x` — makes the argv layer silently absent while
+ * every `existsSync` check reports it present. The pre-PR code read the datum the same
+ * way, but the text gate was still unconditional then, so it was a backstop rather
+ * than a fail-open; with the text gate deferring by design, the datum has to mean
+ * "will actually run".
+ */
+export function isExecutableShim(dir: string): boolean {
+  try {
+    const p = resolvePath(dir, "gh");
+    // A regular file, because the shell only runs a regular file: a DIRECTORY named `gh`
+    // passes X_OK (search permission) but bash SKIPS the PATH entry — measured on this
+    // box: with a directory named `gh` first on PATH, the next candidate ran. Treating
+    // it as a shim would defer to a layer that never runs, the exact fail-open this
+    // predicate exists to close. `statSync` follows the neutral symlink, which is what
+    // the shell does with the path it is given.
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -103,25 +133,47 @@ export const NEUTRAL_GH_SHIM_DIR = resolvePath(os.homedir(), ".pi", "agent", "sh
 
 export function materializeGhShim(sourceDir: string | null): string | null {
   if (!sourceDir) return null;
+  // A non-executable SOURCE is not a shim (see `isExecutableShim`): bash skips such a
+  // PATH entry, so installing it would leave the real gh running while every caller
+  // believes the argv layer is present. Refuse BEFORE touching the neutral path, so a
+  // broken source can never displace a working link. The linked target is NOT re-checked
+  // here: the decision point (`ghShimWillEnforce`) re-reads the same datum and fails
+  // closed, so a second check could only duplicate it — and would be unreachable apart
+  // from a TOCTOU window on the source's mode, i.e. a guard no test could cover.
+  if (!isExecutableShim(sourceDir)) return null;
   try {
     fs.mkdirSync(NEUTRAL_GH_SHIM_DIR, { recursive: true });
     const target = resolvePath(NEUTRAL_GH_SHIM_DIR, "gh");
     const src = fs.realpathSync(resolvePath(sourceDir, "gh"));
     const current = fs.existsSync(target) ? fs.realpathSync(target) : null;
     if (current !== src) {
+      // SWAP ATOMICALLY. `rm` then `symlink` leaves a window in which the neutral entry is
+      // ABSENT — and that entry is machine-global (`~/.pi/agent/shims`), so a bash call in
+      // the window (any OTHER session's) finds no `gh` there, falls through to the real gh,
+      // and defeats the deferral this install exists to serve (E3 review P2). `rename` over
+      // the path replaces it in one step on the same filesystem.
+      const staged = resolvePath(NEUTRAL_GH_SHIM_DIR, `.gh.${process.pid}.staged`);
       try {
-        fs.rmSync(target, { force: true });
+        fs.rmSync(staged, { force: true });
+        fs.symlinkSync(src, staged);
+        fs.renameSync(staged, target);
       } catch {
-        /* a missing target is the expected case */
-      }
-      try {
-        fs.symlinkSync(src, target);
-      } catch {
-        fs.copyFileSync(src, target);
-        fs.chmodSync(target, 0o755);
+        // No symlinks on this filesystem (or a cross-device rename): fall back to a copy,
+        // and drop the staging entry either way so a failure leaves no litter behind.
+        try {
+          fs.copyFileSync(src, target);
+          fs.chmodSync(target, 0o755);
+        } catch {
+          /* the caller fails closed on a link that is absent or unusable */
+        }
+        try {
+          fs.rmSync(staged, { force: true });
+        } catch {
+          /* nothing to remove */
+        }
       }
     }
-    return fs.existsSync(target) ? NEUTRAL_GH_SHIM_DIR : null;
+    return NEUTRAL_GH_SHIM_DIR;
   } catch {
     return null;
   }
@@ -135,8 +187,11 @@ function activeGhShimDir(): string | null {
     // or its target is deleted (removing a worktree dangles every link into it), the
     // cached directory would still be prepended to PATH while containing no `gh` — so
     // PATH lookup falls through to the REAL gh and the argv layer is silently absent
-    // for the rest of the session (VGATE #984). One existsSync per bash call.
-    if (ghShimDirCache !== null && fs.existsSync(resolvePath(ghShimDirCache, "gh"))) {
+    // for the rest of the session (VGATE #984). One executable-check per bash call —
+    // and it must be the EXECUTABLE test, not `existsSync`: a shim that loses its
+    // execute bit mid-session is exactly the silent absence this revalidation exists
+    // to catch, and `existsSync` reports it present forever.
+    if (ghShimDirCache !== null && isExecutableShim(ghShimDirCache)) {
       return ghShimDirCache;
     }
   }
@@ -158,6 +213,73 @@ export function withGhShim(command: string, shimDir: string | null): string | nu
   if (process.env.AGENT_GH_SHIM === "0") return null;
   if (!shimDir) return null;
   return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
+}
+
+/**
+ * Will the ARGV-LEVEL layer enforce this command — i.e. may the text gate hand
+ * over a read it could only GUESS? (#1776)
+ *
+ * The scanner and the shim answer the same question from two layers, and #984
+ * settled that only the argv layer can answer it: resolving `$VAR`/`$(…)` means
+ * EVALUATING a shell, which a gate cannot do without running the command it exists
+ * to refuse. `hasAdminMergeFlag` therefore fails CLOSED on anything unresolvable —
+ * and that same guess refused an ordinary `gh pr create` whose TITLE contained the
+ * word `admin` (`gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"`),
+ * blocking agent-infra PR #1775 at zero dispatches.
+ *
+ * DECIDED FROM THE EXTENSION'S OWN STATE, NEVER FROM THE COMMAND TEXT.
+ *
+ * Reading the answer out of the command text is not a rule this predicate declines to
+ * follow — it is not implementable (#984): no spelling test can tell whether the shell
+ * will put the shim on PATH for a given command, and a partial blacklist is worse than
+ * none because it claims a coverage it does not have. So this asks only two things,
+ * both of them ours: is there an argv layer (`AGENT_GH_SHIM`), and is the directory we
+ * injected for this call actually a shim (`shimDir`, the SAME value `withGhShim` was
+ * given, so the injection and this decision cannot drift; "a shim" means a regular,
+ * executable `gh` — a PATH entry the shell skips enforces nothing, see
+ * `isExecutableShim`).
+ *
+ * WHAT IS OUT OF SCOPE, declared rather than implied — both classes are the shim's
+ * own STATED LIMITS (`scripts/gh-shim/gh`), and both need the command to hide its flag
+ * from the text layer first:
+ *
+ *   - a discarded PATH entry: `export "PATH"=…`, `env -i`, `sudo`, an absolute path
+ *     to the real gh;
+ *   - `gh alias` expansion: the argv is `gh <alias> …`, so an alias defined as
+ *     `pr merge --admin` is invisible to BOTH layers.
+ *
+ * Neither is chased with a spelling list, and the boundary is the MERGE: the CALLER
+ * defers only the unresolvable FLAG, and keeps this layer's fail-closed decision for any
+ * command the text layer reads as a merge (`mergeVerbInText` — a `pr`/`merge` token pair,
+ * or a token that blinds the read and sits IN A VERB POSITION: a substitution, brace
+ * expansion, a redirection, or a repo-flag value — including an empty quote pair the shell
+ * drops — that the token scan consumed with the flag). The first class is therefore
+ * bounded by MEASUREMENT rather than by a claim: a command that discards the PATH entry
+ * cannot get a merge deferred FOR ANY OF THE SHAPES PINNED IN THE BOUNDARY TEST — a
+ * `$VAR`/`$'…'`/`${…}` flag, a brace-expanded verb, an ANSI-C-quoted verb pair, a verb
+ * behind a substituted repo value, behind an empty-quoted repo flag, or behind a
+ * redirection the shell consumes — each measured as a fail-open when found, each now a
+ * test arm. A spelling that still gets a merge past the text layer lands in the second
+ * class (an alias is expanded inside gh, after this process has run), and the post-merge
+ * detector, not this gate, is the authority of record for both.
+ *
+ * The DEFERRAL'S OWN PREMISE is operator state, and is a declared limit rather than a
+ * chased one: `AGENT_GH_SHIM_DIR` is set by the launcher, never by a command (a command
+ * cannot change this process's environment), and pointing it at a directory that holds an
+ * executable `gh` which is NOT the shim (a bin directory with the real gh) makes "the argv
+ * layer is present" true in name only — the same class as `AGENT_GH_SHIM=0`, and visible
+ * for the same reason: both are the operator's own switches.
+ */
+export function ghShimWillEnforce(shimDir: string | null): boolean {
+  // Both halves are OURS and both must hold: the layer is switched on, AND the
+  // directory we injected contains an EXECUTABLE `gh`. A PATH entry the shell skips
+  // — missing, unreadable, or without the execute bit — enforces nothing, so
+  // deferring to it would be a silent fail-open. Checking it HERE as well as in
+  // `resolveGhShimDir`/`materializeGhShim` is deliberate: this is the decision point,
+  // and a guard whose certainty rests on a caller's invariant is one refactor away
+  // from certainty it no longer has. Cheap — the caller short-circuits on
+  // `isAdminMergeCommand` first, so this runs only for admin-merge-class commands.
+  return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null && isExecutableShim(shimDir);
 }
 
 // ── gh invocation seam (testable) ─────────────────────
@@ -325,7 +447,21 @@ function stripRepoArgs(command: string): string {
   // Requiring `=` or whitespace after the flag missed gh's valid pflag spelling
   // `gh -Rowner/repo pr merge 999 --admin`, which then skipped BOTH gates entirely
   // (cycle-3 review P0).
-  return command.replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s+\S+|\S*)/g, "$1");
+  //
+  // An EMPTY QUOTE PAIR on the flag (`--repo"" owner/other`, `--repo'' …`, `-R""`) is
+  // dropped by bash before gh sees it (measured: gh receives `--repo owner/other`), so the
+  // `\S*` branch consumed only `--repo""` and left the VALUE in the stream — between `pr`
+  // and `merge`, which broke the verb-pair read and deferred a real admin merge to an argv
+  // layer the command had already discarded (E3 review P1; the base refused it). Removing
+  // the empty pairs first makes the value the flag's, as bash makes it.
+  //
+  // A QUOTED value with a space inside it (`--repo "$(cat f)"`) is one word to bash and
+  // two to `\S+`, so the same residue landed between the verb words and defeated the pair
+  // read (A-cycle review P1, again refused by the base). The value is therefore consumed as
+  // a whole quoted word first, then as a bare one.
+  return command
+    .replace(/""|''/g, "")
+    .replace(/(^|\s)(?:-R|--repo)(?:=\S*|\s*(?:"[^"]*"|'[^']*'|\S+)|\S*)/g, "$1");
 }
 
 export function isGhPrMergeCommand(command: string): boolean {
@@ -417,7 +553,7 @@ function countUnquotedMergeVerbs(command: string): number {
  * while excluding `"gh"`, an inconsistency inside one family.
  */
 const COMMAND_INTRODUCERS =
-  /^(command|sudo|env|exec|nohup|nice|time|xargs|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
+  /^(command|sudo|env|exec|nohup|nice|time|xargs|trap|coproc|do|then|else|eval|sh|bash|zsh|dash|ksh)$/;
 
 /** A separator GLUED to the following word: `true;gh pr merge 1`, `(gh pr merge 1`. */
 const GLUED_SEPARATOR = /^[;&|(){!]+/;
@@ -467,6 +603,60 @@ function dequote(tok: string): string {
   return tok.replace(/["'\\`]/g, "").replace(GLUED_SEPARATOR, "");
 }
 
+/**
+ * Is the token at `i` in COMMAND position — where the shell RUNS a word rather than passing
+ * it as an argument? True at the start of the command, after an unquoted separator (`;`, `&`,
+ * `|`, `(`, `{`, or a NEWLINE — bash separates commands on both), after a command introducer
+ * (`env`, `time`, …), after `sh -c`, a redirection, an assignment prefix, or a reserved word
+ * (`if`, `while`, …).
+ *
+ * ONE model, TWO consumers: `isGhWordAt` asks "is this word RUN as `gh`?", and the positive
+ * read in `readsNonMergeGhCall` asks "could an executable word have been spelled away here?".
+ * They MUST agree. The divergence between them was a live bypass (adversarial review, shape
+ * 12): this guard knew only `;`-gaps and a shorter keyword list, so the same
+ * `$C $P $M 999 $V` decoy written one line lower read as an ARGUMENT position and the
+ * command reached the real `gh` as `pr merge 999 --admin`.
+ */
+function isCommandPositionAt(scan: ScanTokens, i: number): boolean {
+  let prev = i === 0 ? null : scan.tokens[i - 1];
+  // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
+  // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
+  if (prev === "--" && i >= 2) prev = scan.tokens[i - 2];
+  // The introducer, `-c` and reserved-word tests use the DEQUOTED word: the shell dequotes
+  // before it decides, so `"eval"`, `\eval`, `ev"al"`, `"env"`, `sh '-c'` and `bash "-c"`
+  // all RUN their next argument — testing the raw token read each of those as an ordinary
+  // argument, and a constructed `gh pr merge` walked through the stand-down on it
+  // (adversarial review, shape 13). `trap`/`coproc` are introducers for the same reason:
+  // `trap "$G $P $M 999 $V" EXIT` executes the string at shell exit (shape 14).
+  // The redirection and assignment-prefix tests stay RAW on purpose — a quoted
+  // `">/dev/null"` is not a redirection — and staying raw there can only add refusals.
+  const prevWord = prev === null ? "" : shellWord(prev);
+  return (
+    prev === null ||
+    // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
+    // merge 999 --admin` is two commands. Without \n here the second (fully
+    // quoted) verb lost its command position and the compound count stayed 1.
+    /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
+    COMMAND_INTRODUCERS.test(prevWord) ||
+    /^-[a-z]*c$/.test(prevWord) || // `sh -c '...'`, `sh '-c' '...'`
+    // Other real command positions. A redirection (`2>/dev/null`, `>/dev/null`),
+    // an assignment prefix (`FOO=bar`) or a reserved word (`if`, `while`, ...)
+    // all put the next word in command position; enumerating only the introducers
+    // and `-c` let `2>/dev/null "gh" pr merge 1 --admin` skip BOTH gates
+    // (cycle-4 review P0-1).
+    /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
+    // An assignment prefix (`FOO=bar`, and bash's APPEND/ARRAY forms `FOO+=bar`, `FOO[0]=bar`)
+    // or a reserved word (`if`, `while`, ...) all put the next word in command position. This
+    // test reads the DEQUOTED word (`prevWord`), like the value clause that consults it: with
+    // the raw token, a QUOTED `"X=1"` counted as a value for the exemption and as "not an
+    // assignment" here, so a command string after it was exempted (`eval "X=1" $'<payload>'`
+    // reached the real gh as `pr merge 999 --admin` — adversarial review, shape 20). The two
+    // clauses read the same word or they can disagree about the same token.
+    /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/.test(prevWord) ||
+    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prevWord)
+  );
+}
+
 /** Would the shell RUN this word as `gh` (rather than merely quoting the string)? */
 function isGhWordAt(scan: ScanTokens, i: number): boolean {
   const tok = scan.tokens[i];
@@ -476,27 +666,7 @@ function isGhWordAt(scan: ScanTokens, i: number): boolean {
   // it sits. A FULLY quoted word (`"gh"`) is executable only in command position.
   const partiallyUnquoted = [...tok].some((_, k) => scan.mask[start + k]);
   if (partiallyUnquoted) return true;
-  let prev = i === 0 ? null : scan.tokens[i - 1];
-  // `bash -c -- '...'` is valid: `--` separates the option from the script. Look
-  // THROUGH it, or the introducer stops being recognised (cycle-4 review P0-2).
-  if (prev === "--" && i >= 2) prev = scan.tokens[i - 2];
-  return (
-    prev === null ||
-    // A newline is a command separator too: `gh pr merge 111 --admin\n"gh" pr
-    // merge 999 --admin` is two commands. Without \n here the second (fully
-    // quoted) verb lost its command position and the compound count stayed 1.
-    /[;&|(){!\n\r]/.test(scan.gaps[i]) ||
-    COMMAND_INTRODUCERS.test(prev) ||
-    /^-[a-z]*c$/.test(prev) || // `sh -c '...'`, `bash -lc '...'`
-    // Other real command positions. A redirection (`2>/dev/null`, `>/dev/null`),
-    // an assignment prefix (`FOO=bar`) or a reserved word (`if`, `while`, ...)
-    // all put the next word in command position; enumerating only the introducers
-    // and `-c` let `2>/dev/null "gh" pr merge 1 --admin` skip BOTH gates
-    // (cycle-4 review P0-1).
-    /^(\d*[<>]|&>>?)/.test(prev) || // redirection (`2>/dev/null`)
-    /^[A-Za-z_][A-Za-z0-9_]*=/.test(prev) || // assignment prefix
-    /^(if|then|elif|else|while|until|do|done|case|esac|select|in)$/.test(prev)
-  );
+  return isCommandPositionAt(scan, i);
 }
 
 function hasBareGhWord(command: string): boolean {
@@ -517,6 +687,199 @@ function hasBareGhWord(command: string): boolean {
  * blocked ordinary shell commands at zero dispatches (round 9). It must therefore
  * be conjoined with a shape test.
  */
+/**
+ * The CONSTRUCT class shared by the verb-read arms below: `$`, a backtick, `{`/`}` and a
+ * redirection (`<`/`>`). Each BLINDS a read of the text, and each is removed or rewritten by
+ * bash before gh sees it — measured: `gh {pr,merge} 999 $V` and `gh pr >/dev/null merge 999
+ * $V` both reach gh as `pr merge 999 --admin`. An arm that stops at substitutions and
+ * backticks reads no merge in those shapes, and a merge that reaches gh unread is a merge
+ * this gate never saw.
+ */
+const CONSTRUCT = /[$`{}<>]/;
+
+/**
+ * A word as bash would resolve it: quotes stripped (`dequote`) and an ANSI-C LEADING `$`
+ * dropped, so `$'pr'` reads as `pr` (bash resolves those before gh runs). A `$` INSIDE a
+ * word is a splice rather than a quote, and the construct-in-a-verb-position arm reads it.
+ */
+function shellWord(tok: string | undefined): string {
+  return dequote(tok ?? "").replace(/^\$/, "");
+}
+
+/**
+ * A word that could actually BE a gh subcommand (`pr`, `issue`, `create`, `update-branch`,
+ * …): lowercase letters and hyphens. The shape matters, not the vocabulary — the point is
+ * that a residue of the tokenizer's own text-level splitting (`.gh-repo)` out of
+ * `--repo=$(cat .gh-repo)`, which bash parses as ONE word) must NOT be read as a
+ * subcommand, because reading it as one turns a merge into a "non-merge gh call" and hands
+ * the merge to the argv layer. Anything that does not fit fails the positive read, so the
+ * admin-merge gate keeps its decision — the fail-CLOSED direction.
+ */
+const SUBCOMMAND_WORD = /^[a-z][a-z-]*$/;
+
+/**
+ * The `pr` subcommands that are NOT a merge. `merge` is deliberately absent, and so is
+ * every spelling nobody has written yet: the POSITIVE read is what lets this layer stand
+ * down, so a subcommand this list does not know — including the residue of a tokenizer
+ * split, which can look exactly like a word — is read as NO positive read and the gate keeps
+ * its decision. The list's failure direction is a REFUSAL, which is the direction this file
+ * is allowed to be wrong in.
+ */
+const PR_NON_MERGE_SUBCOMMANDS = new Set([
+  "create", "view", "list", "comment", "close", "reopen", "edit", "diff", "checkout",
+  "ready", "review", "status", "lock", "unlock", "checks", "update-branch", "revert",
+]);
+
+/**
+ * The LONG flags whose next word is a VALUE. Only unambiguous long spellings are here: a
+ * short flag is also some other tool's EXECUTE flag — `-c` is gh's `--comment` AND the
+ * shell's "run this program" flag, and an exemption keyed on it let
+ * `sh -c gh$'\x20'pr$'\x20'merge$'\x20'999$'\x20'$V` stand the text layer down (adversarial
+ * review, shape 18). Since the list can only ever be an approximation, every entry must fail
+ * in the refusal direction — which is why the ambiguous shorts (`-c`, `-f`, `-e`-likes) are
+ * gone and `-q` is spelled `--jq`.
+ */
+const VALUE_POSITION_FLAGS = new Set([
+  "--body", "--body-file", "--subject", "--title", "--author-email", "--match-head-commit",
+  "--field", "--raw-field", "--input", "--method", "--message", "--notes", "--comment",
+  "--label", "--add-label", "--remove-label", "--assignee", "--reviewer", "--search",
+  "--query", "--jq", "--template",
+]);
+
+/**
+ * Does the text POSITIVELY read a gh invocation whose subcommand is written out and is NOT
+ * a merge? This predicate — and its POLARITY — is the deferral's gate (#1776): the text
+ * layer hands the argv layer only a command it can READ as a non-merge gh call, so every
+ * way of blinding that read (a spliced word, brace expansion, a redirection, an empty quote
+ * pair, a verb behind a construct or a global flag, a spelling nobody has thought of yet)
+ * fails CLOSED — this layer keeps the gate — instead of open. ENUMERATING the spells does
+ * not work: four review cycles each found one more blinding shape, every one of them a
+ * measured bypass of a real merge, and each fix only moved the boundary to the next
+ * spelling. Polarity moves it out of reach: an unreadable command is not a permission.
+ *
+ * `gh` must be a readable word; the next word must be a readable non-flag (a global flag
+ * such as `--hostname` puts the subcommand where this cannot see it); a group other than
+ * `pr` is a positive read (`issue`, `api`, `repo`, `run`, `auth`, …); under `pr`, the next
+ * word must be readable and not `merge`. EVERY gh invocation in the text must satisfy
+ * that, and the text must contain at least one — otherwise the answer is "no positive
+ * read" and the admin-merge gate keeps its fail-closed decision. That is why the #1775
+ * false positive (an ordinary `gh pr create` whose TITLE carries a construct and the word
+ * `admin`) still stands down, while a merge spelled past the tokenizer does not.
+ */
+export function readsNonMergeGhCall(command: string): boolean {
+  const scan = scanTokens(command);
+  // NO CONSTRUCT OUTSIDE A VALUE POSITION — the mechanism-level boundary, and the reason this
+  // no longer grows a list. Seven review rounds each found a new way for a command to RUN
+  // something the text cannot read: a construct in a verb position, a spliced or quoted
+  // introducer, `trap`/`coproc`, a program assembled at runtime and piped to a shell, and then
+  // the runners the executor list did not carry (`make -f -`, `osascript -e`, `. <(...)`).
+  // Every fix was another spelling, so each round produced the next bypass. The property that
+  // converges is POSITIONAL: a construct may sit only where a VALUE belongs. Anywhere else it
+  // can be an executable word, a verb, a whole command string, or a program handed to a runner
+  // the text never names — indistinguishable, so the read fails and this layer keeps the gate.
+  for (let i = 0; i < scan.tokens.length; i++) {
+    const tok = scan.tokens[i];
+    const w = shellWord(tok);
+    if (w !== "gh" && /(^|\/)gh$/.test(w)) return false; // `/tmp/x/gh`, `$P/g''h`
+    if (!CONSTRUCT.test(tok)) continue;
+    const prevWord = shellWord(scan.tokens[i - 1] ?? "");
+    // `prevWord.includes("=")` covers the `--flag=value` spelling, where the VALUE's opening
+    // word carries the `=` (`--title="admin $(x)"`). The TOKEN itself carrying `=` is NOT an
+    // exemption: `X=$(date) gh issue comment 5` is an assignment whose value runs a command.
+    // And a value position must not be a COMMAND position: an assignment prefix (`Z=ok $R`)
+    // puts the next word in command position while carrying `=`, which let a runner word be
+    // exempted as a value (adversarial review, shape 18, second half).
+    const inValuePosition =
+      (VALUE_POSITION_FLAGS.has(prevWord) || prevWord.includes("=")) &&
+      !isCommandPositionAt(scan, i);
+    if (!inValuePosition) return false; // a `$`-bearing token where a value does not belong
+  }
+  let seen = false;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (shellWord(scan.tokens[i]) !== "gh") continue;
+    seen = true;
+    const group = scan.tokens[i + 1];
+    if (group === undefined || CONSTRUCT.test(group)) return false;
+    const g = shellWord(group);
+    if (!SUBCOMMAND_WORD.test(g)) return false; // a global flag, or a tokenizer residue
+    if (g !== "pr") continue; // `issue`, `api`, `repo`, … — read, and not a merge
+    const sub = scan.tokens[i + 2];
+    if (sub === undefined || CONSTRUCT.test(sub)) return false;
+    const s = shellWord(sub);
+    if (!SUBCOMMAND_WORD.test(s) || !PR_NON_MERGE_SUBCOMMANDS.has(s)) return false;
+    continue; // `create`, `view`, `list`, … — read, and not a merge
+  }
+  return seen;
+}
+
+/**
+ * Does the TEXT name a merge? True for a resolvable `pr merge`, and for a verb hidden
+ * behind a construct in a verb position (`gh pr m`printf erge``, `gh p`printf r` merge`).
+ *
+ * This is the CANDIDATE rule's shared read (`isAdminMergeCommand` calls it on its
+ * spliced-verb branch). The text layer hands the argv layer the unresolvable FLAG — never
+ * the MERGE: the caller's boundary is `hasLiteralAdminFlag || mergeVerbInText ||
+ * !readsNonMergeGhCall`, so a command the text READS as a merge cannot defer, for two
+ * reasons that meet here — that is the only shape in which a hidden `--admin` can reach gh
+ * AS AN ADMIN MERGE, and it is exactly the shape where the argv layer can be told not to
+ * run for that command — `PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`
+ * discards the injected entry, so deferring to it would decide nothing and let the merge
+ * through. A command the layer merely OVER-reads — a construct plus the word `admin` with
+ * no merge in it — cannot merge anything, so deferring THAT is what removes the false block
+ * #1776 is about. The two predicates are INDEPENDENT halves, not one property: a readable
+ * merge can still sit inside a decoy command (`S='gh pr merge 9 $V'; sh -c "$S"`, measured
+ * `readsNonMergeGhCall === true`) — which is why the boundary is the disjunction above, and
+ * why neither half may be dropped as "redundant".
+ */
+export function mergeVerbInText(command: string): boolean {
+  const scan = scanTokens(command);
+  const at = (i: number) => shellWord(scan.tokens[i]);
+  for (let i = 1; i < scan.tokens.length; i++) {
+    if (at(i) === "merge" && at(i - 1) === "pr") return true;
+  }
+  // The construct class is `CONSTRUCT` above; the verb word may itself be spliced, and then
+  // no `pr`/`merge` token pair exists to find, so the signal is a CONSTRUCT IN A VERB
+  // POSITION — the token right after `gh` or right after `pr`. Requiring only "construct +
+  // the words gh and pr" was too broad (it made `gh pr view $X` an admin merge), and
+  // requiring `pr` to be a word missed ``gh p`printf r` …``, where `printf` hides it. NOTE
+  // this arm is the CANDIDATE rule's shared form (`isAdminMergeCommand`); the deferral's
+  // boundary is `readsNonMergeGhCall`, whose polarity does not depend on reading every
+  // spell.
+  const afterIsConstruct = (word: string): boolean => {
+    for (let i = 0; i < scan.tokens.length - 1; i++) {
+      if (at(i) !== word) continue;
+      if (CONSTRUCT.test(scan.tokens[i + 1] ?? "")) return true;
+    }
+    return false;
+  };
+  // A construct in a verb position can ALSO be hidden inside a token the repo-flag
+  // stripper consumes together with its value: `gh pr --repo=$(cat x) merge 999 $V`
+  // leaves `gh pr x) merge …`, so both arms above miss it and the merge went to the
+  // argv layer — which the command itself can then disable by resetting PATH. The RAW
+  // text still shows a construct-bearing token right after `gh`/`pr`. Erring here costs a
+  // refusal; erring the other way costs the gate.
+  //
+  // This arm compares the raw WORDS as written: quoting is resolved by the token scan
+  // above (`verbWord`), which is the arm the ANSI-C-spelled pair needs, and the raw arm
+  // exists for the construct AFTER a word rather than for the word itself. Normalizing
+  // here as well was measured as redundant — the suite does not distinguish it — so it is
+  // not kept as an unverifiable second mechanism.
+  const raw = command.trim().split(/\s+/);
+  const rawAfterIsConstruct = (word: string): boolean => {
+    for (let i = 0; i < raw.length - 1; i++) {
+      if (dequote(raw[i]) !== word) continue;
+      if (CONSTRUCT.test(raw[i + 1] ?? "")) return true;
+    }
+    return false;
+  };
+  return (
+    afterIsConstruct("gh") ||
+    afterIsConstruct("pr") ||
+    rawAfterIsConstruct("gh") ||
+    rawAfterIsConstruct("pr")
+  );
+}
+
 export function isAdminMergeCommand(command: string): boolean {
   if (!hasAdminMergeFlag(command)) {
     // A `$VAR` can SUPPLY the flag: `V=--admin; gh pr merge 999 $V` reaches gh as
@@ -552,21 +915,10 @@ export function isAdminMergeCommand(command: string): boolean {
       // The VERB WORD may itself be construct-spliced, so the exact token match
       // finds no `merge` and everything below is skipped: ``gh pr m`printf erge`
       // 999 $V`` and ``gh p`printf r` merge 999 $V`` are both real admin merges
-      // (cycle-5 review P0, third seam).
-      //
-      // The signal is a CONSTRUCT IN A VERB POSITION — the token right after `gh`
-      // or right after `pr`. Requiring only "construct + the words gh and pr" was
-      // too broad (it made `gh pr view $X` an admin merge), and requiring `pr` to
-      // be a word missed ``gh p`printf r` …``, where `printf` hides it.
-      const hasConstructTokenAfter = (word: string): boolean => {
-        for (let i = 0; i < scan.tokens.length - 1; i++) {
-          if (dequote(scan.tokens[i]) !== word) continue;
-          if (/[$`]/.test(scan.tokens[i + 1] ?? "")) return true;
-        }
-        return false;
-      };
+      // (cycle-5 review P0, third seam). `mergeVerbInText` is the shared form of that
+      // signal — the same one the deferral uses to decide what it may hand over.
       if (!hasUnresolvableConstruct(command)) return false;
-      return hasConstructTokenAfter("gh") || hasConstructTokenAfter("pr");
+      return mergeVerbInText(command);
     }
     // The literal word `merge` gates the rest, but it must come AFTER the
     // spliced-verb fallback above: ``gh pr m`printf erge` …`` has no literal
@@ -602,6 +954,22 @@ export function isAdminMergeCommand(command: string): boolean {
       if (i === 0) {
         if (/\$\(|`/.test(arg)) return true; // a CONSTRUCTED value in the position slot
         if (laterBareNumber) return true; // the position was actually later
+        // `continue` — a GENUINE `$PR` position argument, in either quoting form (pinned by
+        // the carve-out test). Do NOT "fix" this by failing closed on every `$`-bearing
+        // first slot: the caller's condition keeps its own decision for any `pr`/`merge`
+        // PAIR (`mergeVerbInText`), so that would refuse every ordinary
+        // `gh pr merge "$PR" --squash` — the #1776 false-positive class, at a far larger
+        // volume. The residual it leaves is DECLARED and is a CLASS claim, not a spelling
+        // claim: no test over this slot can separate a `$`-bearing PR VALUE from a
+        // `$`-bearing FLAG, and one quote character moves a command between the two
+        // readings (measured: the narrow arm `if (/^\$/.test(arg)) return true` closes the
+        // unquoted spelling AND blocks the pinned unquoted ordinary form, while
+        // `gh pr merge "$V"` stays allowed — so it buys nothing the class needs). What is
+        // left is a flag whose VALUE is not in the command text (`V=$(cat f); gh pr merge
+        // $V`) with no explicit PR number: a text scanner has no `admin` word to read, so
+        // this layer is not a candidate and the decider is the argv layer — whose discard
+        // (`export PATH=…`) is the shim's own STATED LIMITS entry. The same residual WITH a
+        // PR number does not exist (`laterBareNumber` makes it a candidate: measured).
         continue; // a genuine `$PR` position argument
       }
       return true;
@@ -614,6 +982,20 @@ export function isAdminMergeCommand(command: string): boolean {
     // Unreadable AND possibly a merge: a `gh` word, or both `pr` and `merge`.
     // This is what catches `gh p$'r' merge …`, `$'gh' pr merge …`, `g$'h' pr
     // merge …` WITHOUT the word list that rounds 6-8 kept re-finding a seam in.
+    //
+    // It is a GUESS, so the CALLER does not act on it while the argv layer is
+    // present: it resolves what this cannot, and its false positives are the reason
+    // agent-infra#1776 exists — an ordinary `gh` call whose TEXT contains a construct
+    // and the word `admin` (a PR TITLE supplies it) was read as a merge. Do NOT add
+    // another arm here: #984's finding is that the class is not closable in a scanner —
+    // every framing of "is this text an admin merge" that tried to be precise admitted a
+    // bypass on the splice × repo-flag cross-product. The caller's condition is
+    // `hasLiteralAdminFlag(command) || mergeVerbInText(command) ||
+    // !ghShimWillEnforce(shimDir)`, and this guessing half is exactly what gets handed
+    // over — only for a command that does NOT name a merge (`mergeVerbInText`). NOTE the
+    // false block the LITERAL arm still produces (a quoted `--admin`, once this guess has
+    // already made the command a candidate); it is deliberate, and
+    // `hasLiteralAdminFlag` documents why the caller accepts it.
     return (
       /(^|[^\w])gh\b/.test(probe) ||
       (/(^|[^\w])pr\b/.test(probe) && /(^|[^\w])merge\b/.test(probe))
@@ -1620,11 +2002,17 @@ const ADMIN_MERGE_EVIDENCE_RE = /<!--\s*admin-merge-safety:\s*([0-9a-fA-F]{7,40}
  *     `--admin=true` while the earlier dash-anchored rule missed them;
  *   - a spliced VERB is refused rather than read (`isGhPrMergeCommand`).
  * It does NOT claim exhaustive coverage, and it does not:
- *   - OVER-BLOCKS, acceptably and visibly: any `gh pr merge` carrying a construct
- *     (a `$`, backtick or brace) AND the word `admin` is refused unless it has
- *     head-bound evidence — including a harmless `echo "gh pr merge 1
- *     --admin=true"`, and a `--body "ask the admin"` beside a `$VAR`. The remedy
- *     is the mandated `scripts/admin-merge.sh`; the alternative was a bypass.
+ *   - OVER-BLOCKS, acceptably and visibly, WHENEVER THIS LAYER IS THE ONE DECIDING —
+ *     which is the complement of the deferral: no usable argv-level shim, OR the
+ *     command carries a literal `--admin`, OR the text names a merge. Under that
+ *     condition a `gh pr merge` carrying a construct (a `$`, backtick or brace) AND the
+ *     word `admin` is refused unless it has head-bound evidence — including a harmless
+ *     `echo "gh pr merge 1
+ *     --admin=true"` (a literal flag), and a `--body "ask the admin"` beside a `$VAR`
+ *     (the text names a merge). What is DEFERRED is only the over-read that mentions
+ *     `admin` under a construct with NO merge in it (`ghShimWillEnforce` +
+ *     `mergeVerbInText`). The remedy for the block is the mandated
+ *     `scripts/admin-merge.sh`; the alternative was a bypass.
  *
  * #984 — WHAT LAYERING THE SHIM ON TOP OF THIS CHANGES. The gaps ABOVE are limits
  * of THIS layer, and the CONSTRUCT-SPLICE class among them is now covered by
@@ -1661,10 +2049,48 @@ export function hasAdminMergeFlag(command: string): boolean {
   //    WITHOUT the word `admin` — e.g. the common `gh pr merge "$PR" --squash` —
   //    is untouched.
   if (hasUnresolvableConstruct(command) && /admin/i.test(command)) return true;
-  // 3. The literal flag. Token-anchored: `--admin` must be a WHOLE flag. A
-  //    `--adminx` typo is not a bypass (gh rejects it as an unknown flag), and
-  //    refusing it would be exactly the false block this rail must not produce.
-  //    `=` may carry a Go-false value; anything else is a bypass (see GO_FALSE).
+  // 3. The literal flag — the DECISIVE read (see `hasLiteralAdminFlag`).
+  return literalAdminFlagIn(probe);
+}
+
+/**
+ * Does the command carry `--admin` as a LITERAL token — i.e. is the admin flag
+ * readable from the text WITHOUT resolving a shell? (#1776)
+ *
+ * This is the polarity split the CALLER needs: `hasAdminMergeFlag` answers "is
+ * this an admin merge?" as `unresolvable ⇒ YES` (parts 1-2, fail-closed guesses),
+ * and a guess is not something the text layer can hand to a PR number, a head
+ * lookup, or an evidence check — a guess is what refused an ordinary `gh pr
+ * create` whose TITLE contained the word `admin` (agent-infra#1775). So the caller
+ * asks this instead: a LITERAL `--admin` is a read that needs no resolution, and
+ * the text layer keeps the decision for it even when the argv layer exists.
+ *
+ * Quote-splices are resolved by `normalizeForFlagScan` (`--ad""min` → `--admin`),
+ * so they count as literal; `$VAR`/backtick/ANSI-C spellings do not.
+ *
+ * ACCEPTED RESIDUAL — this read is position-blind, so a quoted `--admin` that is not
+ * an argument of any merge, in a command the guess arm has ALREADY made a candidate
+ * (`gh pr create --title "fix(admin-merge): x" --body-file "$(mktemp)"`), keeps the
+ * text-layer decision and is refused by the evidence gate for having no resolvable
+ * PR number. Without a construct, the guess arm does not fire and the command is not
+ * gated at all. That is a false block, it is deliberate, and it is the price of the
+ * decisive half: the alternative is a spelling rule about where a token may sit, which
+ * is the scanner trap this design abandons. The escape is SESSION-level, not per
+ * command: the override is read from this extension's own environment, so a lane
+ * recovering from this false block must start the session with
+ * `AGENT_ADMIN_MERGE_OVERRIDE=1` (or the `ELDATO_` alias) — it is audited as
+ * `admin_merge_override`. It is narrower than the guess it replaced.
+ */
+export function hasLiteralAdminFlag(command: string): boolean {
+  return literalAdminFlagIn(normalizeForFlagScan(command));
+}
+
+/** The literal flag inside an already-normalized probe (see `hasAdminMergeFlag`). */
+function literalAdminFlagIn(probe: string): boolean {
+  // Token-anchored: `--admin` must be a WHOLE flag. A `--adminx` typo is not a
+  // bypass (gh rejects it as an unknown flag), and refusing it would be exactly the
+  // false block this rail must not produce. `=` may carry a Go-false value;
+  // anything else is a bypass (see GO_FALSE).
   const re = /(?:^|[\s])--admin(?:=([^\s;&|()`$<>]*))?(?=$|[\s;&|()`$<>])/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(probe)) !== null) {
@@ -2503,7 +2929,34 @@ export default function (pi: ExtensionAPI) {
       // the PR carries evidence bound to the CURRENT head SHA. On a pass it
       // FALLS THROUGH to the merge-registry gate — the two gates are
       // independent and both must pass.
-      if (isAdminMergeCommand(command)) {
+      //
+      // #1776: but only for a read the TEXT layer can actually make. A literal
+      // `--admin` needs no shell resolution, so it keeps the decision here even
+      // with the argv layer installed — which is why
+      // `export "PATH"=…; gh pr merge 999 --admin` is still refused. The rest of
+      // `isAdminMergeCommand` is a fail-closed GUESS (a construct plus the word
+      // `admin`, which a PR TITLE supplies), and a guess is not something an
+      // evidence check should be run on: it refused an ordinary `gh pr create` at
+      // zero dispatches. When the argv layer is installed it resolves what a guess
+      // cannot, and it decides; when it is absent or switched off, this gate
+      // refuses exactly as before. See `ghShimWillEnforce`.
+      //
+      // #1776: the deferral is the unresolvable FLAG, never the MERGE. Two halts bound it:
+      // a LITERAL `--admin` keeps the decision in the layer that can make it, and
+      // `readsNonMergeGhCall`'s POLARITY stands this layer down only for a command it can
+      // POSITIVELY read as a non-merge gh call — a read that also fails when a
+      // construct-bearing token sits where an executable or a verb belongs (a decoy readable
+      // `gh …` cannot buy the deference for a merge that spelled its own words away) or when
+      // a path to a `gh` appears. So a spliced or ANSI-C-quoted word, a brace expansion, a
+      // redirection, a construct-supplied verb behind a global flag, an empty-quoted repo
+      // value, a tokenizer residue, or a spelling this lane has not seen keeps the gate
+      // instead of being handed to an argv layer the command itself can discard
+      // (`PATH="${PATH#*:}"; export PATH; gh pr merge 999 $'--admin'`). A shape the text
+      // READS as a merge cannot be a positive non-merge read, which is pinned in the
+      // predicate test rather than asserted here.
+      if (isAdminMergeCommand(command) &&
+          (hasLiteralAdminFlag(command) || mergeVerbInText(command) ||
+           !readsNonMergeGhCall(command) || !ghShimWillEnforce(shimDir))) {
         // P1 (fresh review): a compound command is judged against ONE PR, so
         // `gh pr merge 111 --admin; gh pr merge 999 --admin` would pass on 111
         // and then merge 999 unevidenced. Fail closed.

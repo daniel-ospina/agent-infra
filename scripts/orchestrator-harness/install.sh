@@ -406,9 +406,11 @@ ok "plist valid"
 # shipped copy (e.g. the fail-closed ai-review-gate classifier) would never reach the running box.
 # claims.sh is in this list because it is SOURCED by orch-loop.sh and merge-one.sh, so the daemon
 # executes it — leaving it out let a fix to the claim CAS sit in the repo while $O ran the old one
-# (the same silent-drift failure this list exists to name).
+# (the same silent-drift failure this list exists to name). repo-authority.sh is here for the SAME
+# reason (#1764): it is sourced by both, and a $O copy without it holds the resolver the daemon
+# needs to know what the target repo actually requires.
 DRIFTED=""
-for f in orch-loop.sh claims.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
