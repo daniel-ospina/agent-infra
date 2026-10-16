@@ -206,6 +206,42 @@ rather than only diff hunks, and posts its verdict as a PR comment. That comment
 evidence the `record-review.sh` signature points at, so the merge gate is auditable after
 the fact: the PR body names the comment it was signed against.
 
+### Non-blocking dispatch — the orchestrator keeps its own time
+
+`nonblocking-dispatch.sh` launches a headless worker and **returns immediately**. It exists because
+the built-in `task`/`subagent` tools always block the caller (agent-infra#1662): an orchestrator that
+dispatches N workers pays `max(worker)` wall-clock and cannot react to anything until the slowest
+settles.
+
+It is deliberately thin. It carries **no agent invocation of its own** — it backgrounds
+`run_agent()` from `spawn-gate.sh`, so a background worker is load-gated exactly like `lane.sh` and
+`fix-one.sh`, gets the same wall-clock watchdog, and appends the same `state/walltime.tsv` row with
+`KIND=bg`. Routing it through the helper is also what keeps `spawn-gate.test.sh`'s invoker census an
+equality: a direct spawn here would be a fourth, ungated launch path.
+
+```bash
+bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed rc=N | lost
+```
+
+Status comes from the worker's own exit-status file plus a pid probe — **never `%CPU`**, which reads
+0 for a worker that is merely WAITING (`docs/ops/fleet-liveness.md`). "launched" is the only success
+this script reports: it cannot tell you the work succeeded.
+
+⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
+`task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
+PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
+never handed to the chain is unreviewed code by default.
+
+⚠️ `install.sh` copies every `*.sh` into `$O`, but its drift comparison lists the loop scripts
+explicitly, so this one is copied and *not* compared against the running copy. Run it from the
+harness directory, or re-copy it after editing.
+
+⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
+as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
+merges it supersedes this script for `task`-based orchestrators; the harness keeps this one for its
+own `pi` workers, which do not go through `task`.
+
 ---
 
 ## 3. Prerequisites
@@ -821,7 +857,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `refresh-scout.test.sh` | the agent-infra#1736 contract: repo-aware scout provisioning, per-repo tool resolution, and the permanent/transient refresh split. Not part of the loop |
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 
-**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
+**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
+`nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
+Neither is part of the loop.
 
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
