@@ -3,7 +3,7 @@ name: research
 description: "Use for ANY non-trivial research — whether the user says 'research this' or the agent needs to investigate a technical question, compare approaches, evaluate trade-offs, understand a new domain, or make architecture decisions. Provides problem reframing, domain detection (Clear/Complicated/Complex), internal+external search, adversarial queries, and depth scaling. NOT for trivial single-fact lookups or content-pipeline keyword/SERP research (use content-research for that)."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task mcp_load mcp__seo-intelligence__perplexity_search mcp__seo-intelligence__perplexity_research mcp__exa__web_search_exa mcp__exa__web_fetch_exa
-version: 1.2.0
+version: 1.3.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -18,6 +18,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 ☐ Domain classified before research (with rationale)
 ☐ Domain classification challenged (Standard+)
 ☐ Query budget respected per Tier-Domain table
+☐ Query counts stated (`attempted / returned`) — a partial batch is reported, never hidden
 ☐ Adversarial queries included (per task-type modifier)
 ☐ Theory-first query run (Complex / ComplicatedxComplex)
 ☐ Distributed sensing run (Complex x Standard+)
@@ -76,7 +77,7 @@ The bias is toward **using all three sources**, especially external search. Outs
 - `mcp_load exa` → **succeeds**, registering `mcp__exa__web_search_exa` + `mcp__exa__web_fetch_exa`. Rung 3's exa half is available (its `web_fetch` half needs no precondition).
 - `mcp_load brave-search` → **`MCP error -32000: Connection closed`**. The `${BRAVE_API_KEY}` placeholder is **not** the cause: mcp-client expands an unset `${VAR}` to the **empty string** (`extensions/mcp-client/index.ts` — *"Plain ${VAR} → process.env[VAR] (empty string when unset)"*), so the server **does spawn** and then **exits 1** with `Error: A Brave API key is required via --brave-api-key, BRAVE_API_KEY, …` (re-verified 2026-09-24: exit code 1, *"Invalid configuration"*). The client surfaces that exit as the closed connection. **brave-search is not a rung of this ladder** — take the lowest rung that loads; record it and move on, do not retry-loop (lazy-load failure class #199/#358).
 
-**PREFLIGHT output line (required in the research output):** `Search tool: <tool + model actually used> — <rung N | rung 1 unavailable: <observed error>>`. If you moved past rung 1, the reason is stated there.
+**PREFLIGHT output line (required in the research output):** `Search tool: <tool + model actually used> — <rung N | rung 1 unavailable: <observed error>> — queries: <attempted> attempted / <returned> returned`. If you moved past rung 1, the reason is stated there. **The two counts are mandatory and must reconcile with the queries the output reports as searched.** A `returned` count below `attempted` is a **partial run** — name every query that did not return, and never let the shortfall pass as a complete evidence set. On rung 2 the counts also expose the rate-limit failure below: a fan-out wider than the bound loses calls to HTTP 429 (Step 3, "Concurrency and 429").
 
 
 ### Step 0 — Problem Reframing (NEW)
@@ -191,7 +192,11 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain
 
 **⛔ NEVER use `web_search` with `model="sonar-deep-research"` or `model="sonar-reasoning-pro"` without EXPLICIT user approval.** These cost $5–40+ per call (one call burned $43 in reasoning tokens in our billing). The tool itself blocks these models and will tell you to ask the user.
 
-**Query design — run 3-5 queries in parallel via the rung-1 tool (`perplexity_research`), or on rung 2 as separate `web_search` calls with `model="sonar"`:**
+**Query design — design 3-5 queries, then dispatch them within the rung's concurrency bound below. Use the rung-1 tool (`perplexity_research`), or on rung 2 separate `web_search` calls with the model named explicitly (`model="sonar"`):**
+
+**Concurrency and 429 — the rungs have different shapes.** On **rung 1**, `perplexity_research` can carry a set in **one call** with an array (`query: ["…", "…"]`, up to 5) — one request, so a 3-5 query sweep needs no per-call fan-out (a longer run is split into further batched calls of ≤5 each). Where a consumer workflow requires **separate** invocations for framing independence — `writing-plans` mandates one framing per call, and that rule stands — those separate rung-1 calls are still subject to the same Perplexity concurrency bound as rung 2: **at most 2 in flight, 2-wide or sequential.** On **rung 2**, every query is a **separate `web_search` call**, and Perplexity rate-limits concurrent calls: **HTTP 429 `request_rate_limit_exceeded`** (measured 2026-10-15 — 5 concurrent → 2 returned / 3×429; 4 concurrent → 1 returned / 3×429; the same calls run one at a time all succeed). **So on rung 2 run at most 2 concurrently — 2-wide or sequential, never the whole set fanned out.**
+
+**429 handling (rung 2):** a query answered with 429 is **retried serially** — alone, after a short backoff (a few seconds; never re-fan-out). If it still fails it is **not-run**: it does not count as covered, it is named in the output (Step 0.0 PREFLIGHT counts + the Step 5 source list), and if it carried an adversarial or stack-specific angle the synthesis says that angle is **unprobed** rather than implying it was searched. **Never silently drop a 429'd query** — a truncated batch that reads as complete is the failure this rule exists to prevent (agent-infra#1779).
 
 1. **Direct question:** `"[topic] best practices [year]"`
 2. **How others solve it:** `"[topic] implementation patterns real-world examples"`
@@ -333,6 +338,8 @@ Combine all three sources into a **research summary**. Structure:
 
 **Date:** YYYY-MM-DD
 
+**Search + queries (Step 0.0 PREFLIGHT line):** `<tool + model> — <rung N | rung 1 unavailable: …> — queries: <attempted> attempted / <returned> returned`. When `<returned> < <attempted>`, name the queries that did not return and the angle each covered — the evidence set is partial and the synthesis must say so.
+
 ### What We Have Internally
 - [Summary of codebase findings, existing patterns, prior decisions]
 - [Relevant docs or past implementations]
@@ -411,7 +418,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 3. Single-source claims have verify-when-available note
 4. KG facts filed for key claims (skip if `"not_configured"` — no usable key: never set up, or the key was rejected with HTTP 401/403 — or `"tortoise_unavailable"` — the store was unreachable)
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
-6. The Step 0.0 PREFLIGHT line is present, names the search tool + model actually used, and states the rung taken (or that rung 1 was unavailable and the reason) — a silently substituted rung is a gap
+6. The Step 0.0 PREFLIGHT line is present, names the search tool + model actually used, states the rung taken (or that rung 1 was unavailable and the reason), and its `attempted / returned` query counts reconcile with the queries the output reports as searched — a silently substituted rung is a gap, and so is an unreconciled shortfall (a rung-2 batch that lost queries to 429 and still reads as complete)
 
 Return ISSUE blocks for any gaps found (zero issues = CLEAN).
 RESEARCH OUTPUT: <full text>
@@ -421,7 +428,7 @@ RESEARCH OUTPUT: <full text>
 **ISSUE block format:**
 ```
 ISSUE:
-  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry|missing-search-preflight
+  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry|missing-search-preflight|unreconciled-query-count
   severity: P1|P2
   location: [claim section name]
   description: <what is missing>
@@ -489,7 +496,7 @@ RESEARCH OUTPUT: <the full research summary>
 3. Are there contradictions or gaps in the evidence?
 4. Does the recommendation follow from the evidence presented?
 5. Were adversarial queries included and addressed?
-6. Does the output carry the Step 0.0 PREFLIGHT line — the search tool + model actually used, and the rung taken (or that rung 1 was unavailable and why)?
+6. Does the output carry the Step 0.0 PREFLIGHT line — the search tool + model actually used, the rung taken (or that rung 1 was unavailable and why), and the `attempted / returned` query counts — and do those counts reconcile with the queries the output reports as searched (an unreconciled shortfall = a partial batch presented as complete)?
 
 Return: PASS or ISSUES with specific gaps and suggested fixes.
 ```
@@ -500,7 +507,7 @@ If issues found → fix → re-dispatch with a fresh-session sub-agent. Continue
 
 For Complex-domain Standard+ tasks, apply distributed sensing before converging on findings:
 
-1. **Dispatch 2-3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking). Each gets the same problem statement, different perspective.
+1. **Dispatch 2-3 independent research sub-agents** to assess the same problem from different lenses (user-centric, systems-centric, outlier-seeking). Each gets the same problem statement, different perspective. **Each obeys Step 3's concurrency bound** — on rung 2 keep the aggregate concurrent `web_search` count at 2 across the group (stagger them), or the fan-out re-creates the 429 partial batch at the group level.
 2. **Each researches independently.** No cross-talk.
 3. **Map agreements and disagreements.** Where all agents agree → high-confidence. Where they diverge → that's where the interesting information lives.
 4. **Treat outliers as signal.** Per Snowden: *"We don't see things we don't expect to see."*
@@ -545,6 +552,7 @@ After research synthesis is complete, file to the domain wiki:
 | Using `sonar-deep-research` without approval | Costs $5–40+ per call. One call burned $43 in reasoning tokens in our billing. The tool blocks it — ask the user for explicit approval if truly needed. |
 | Skipping external search to "save time" | Outside knowledge almost always adds value. The user wants research, not just a codebase grep. Default to the Step 0.0 ladder — cheapest available rung first. |
 | Silently substituting a search rung | Rung 1 unavailable and the agent quietly switches to `web_fetch`/raw HTML discovery without saying so: the output *reads* as compliance, the cost gate and adversarial-query machinery are gone, and the missing server config stays invisible. State the rung in the PREFLIGHT line (premise-labs#400). |
+| Presenting a partial search batch as complete | A rung-2 fan-out wider than 2 loses calls to HTTP 429 and the agent synthesizes from the survivors while the output still reads as compliant — as few as 1-2 of 4-5 planned queries can carry a confident synthesis. Cap rung-2 concurrency at 2, retry a 429'd query serially, and carry `attempted / returned` counts in the PREFLIGHT line: a truncated batch must never read as a complete evidence set (agent-infra#1779). |
 | Only searching internally | Internal knowledge has blind spots. External search surfaces patterns, gotchas, and alternatives we wouldn't find in our own code. |
 | Running 10+ external queries | Diminishing returns. 3-5 well-crafted queries cover most topics. Go to 8 only for deep dives. |
 | Dumping raw search output | Synthesize. The user wants a summary that combines internal + external context, not a paste of search results. |

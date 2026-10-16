@@ -1,9 +1,17 @@
 // auto-sync.ts — Level-1 machine sync for agent-infra (session_start)
 //
 // On session start, if AGENT_INFRA_PATH is set:
+//   - ANY unmerged index entry → LOUD banner with the offending paths + a
+//     code-aware remedy, in every mode, and no pull attempt (#1661). The banner
+//     distinguishes a live merge/rebase/cherry-pick/revert (finish or abort it)
+//     from the abandoned index-only state the issue measured — a rebase INVERTS
+//     --ours/--theirs, so a blanket --theirs is unsafe there.
 //   - fetch origin and compare HEAD vs origin/main
 //   - behind → AGENT_SYNC_MODE=auto  : run sync.sh (pull --ff-only + refresh config)
 //   - behind → AGENT_SYNC_MODE=warn  : print a hint to run `cd "$AGENT_INFRA_PATH" && ./sync.sh`
+//   - behind ≥ AGENT_SYNC_STALE_COMMITS (default 25) → staleness banner (#1661)
+//   - print mode → never pulls, but traces staleness instead of returning
+//     silently, so a sub-agent's environment is not invisibly stale (#1661)
 //   - ahead  → report unpushed commits + push hint (informational; never pushes)
 //   - diverged → surface git status/log guidance + next step (ff blocked)
 //   - current → silent
@@ -35,6 +43,309 @@ export function aheadCount(repo: string): number {
   } catch {
     return 0;
   }
+}
+
+/** Commits origin/<branch> has that HEAD lacks (0 when undetermined). */
+export function behindCount(repo: string, branch = "main"): number {
+  try {
+    const out = execSync(`git -C "${repo}" rev-list --count HEAD..origin/${branch}`, { encoding: "utf-8", timeout: 10_000 }).trim();
+    const n = Number(out);
+    return Number.isInteger(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** #1661: at or above this many commits behind origin/main the pin is reported
+ * as a banner, not a one-line hint. Override with AGENT_SYNC_STALE_COMMITS. */
+export const DEFAULT_STALE_COMMITS = 25;
+
+/** #1663/#1664 (review): the branch HEAD is on, or "" when it cannot be read.
+ * `git rev-parse --abbrev-ref HEAD` prints the literal `HEAD` on a detached
+ * checkout — which is not a branch, and sync.sh's branch-ownership guard
+ * refuses there too (#265), so the caller treats it as "not main". */
+export function currentBranch(repo: string): string {
+  try {
+    return execSync(`git -C "${repo}" rev-parse --abbrev-ref HEAD`, { encoding: "utf-8", timeout: 5_000 }).trim();
+  } catch {
+    return "";
+  }
+}
+
+export function stalenessThreshold(env: Record<string, string | undefined> = process.env): number {
+  const raw = Number(env.AGENT_SYNC_STALE_COMMITS);
+  return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_STALE_COMMITS;
+}
+
+/**
+ * #1661 (2): the "your tooling is old" banner. EMPTY below `threshold` — a
+ * one-commit-behind checkout is normal and must stay quiet. Above it, the
+ * magnitude of the pin (the thing that was invisible) is stated explicitly.
+ * Deterministic for a given repo — it SHELLS OUT to `git rev-parse
+ * --abbrev-ref HEAD` (via `currentBranch`) and to `git rev-parse --short HEAD`
+ * (via `shortHead`), so it is not pure; pass a real repo in tests.
+ */
+export function stalenessBanner(repo: string, behind: number, threshold: number): string[] {
+  if (behind < threshold) return [];
+  // #1663 / #1664 (review): sync.sh is INERT off main — its branch-ownership
+  // guard prints a notice and exits 0 (sync.sh, "checkout is not on main",
+  // #265). Handing that guard's own no-op to the reader is the same
+  // banner-contradicts-behaviour defect this banner was rewritten to remove,
+  // so a non-main checkout gets the extra step instead of a command that
+  // silently does nothing. An UNREADABLE branch keeps the plain remedy: an
+  // unread value must not invent a claim about which branch we are on.
+  const branch = currentBranch(repo);
+  const sync = branch !== "" && branch !== "main"
+    ? `[auto-sync]    Sync: this checkout is on branch "${branch}", not main — ./sync.sh refuses there (branch-ownership guard, #265). Switch first: cd "${repo}" && git checkout main && ./sync.sh`
+    : `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`;
+  return [
+    `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
+    `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
+    sync,
+  ];
+}
+
+/** Unmerged porcelain codes — the `U*`/`AA`/`DD` conflict shapes (#1661). */
+const UNMERGED_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+
+/** #1661 (review): index STAGE SET → porcelain conflict code. The `git ls-files
+ * -u` half of `unmergedEntries` is the fallback when `git status --porcelain -z`
+ * throws (it exceeds its 1 MiB maxBuffer — ENOBUFS — on a large working tree),
+ * and a single stage record is not enough: stage 1 appears in `DD` (base only)
+ * AND in every both-sides shape (`UU`/`UD`/`DU`/`AA`), so recording only the
+ * first record made a real `UU` look like "stage 1" and `remedyCommands`
+ * recommended `git rm` — deleting a path that still had a live side. Each
+ * stage-set → code mapping below was verified against live git output:
+ * `UU`={1,2,3} `UD`={1,2} `DU`={1,3} `AA`={2,3} `AU`={2} `UA`={3} `DD`={1}. */
+const STAGE_SET_CODES: Record<string, string> = {
+  "1": "DD",
+  "2": "AU",
+  "3": "UA",
+  "1,2": "UD",
+  "1,3": "DU",
+  "2,3": "AA",
+  "1,2,3": "UU",
+};
+
+/** Map a path's full index-stage set to its porcelain conflict code (undefined
+ * for an unrecognised set). Exported for direct unit testing. */
+export function stageSetCode(stages: Iterable<number>): string | undefined {
+  return STAGE_SET_CODES[[...stages].sort((a, b) => a - b).join(",")];
+}
+
+export interface UnmergedEntry { path: string; detail: string }
+
+/**
+ * #1661 (1): unmerged index entries — leftover stage-1/2/3 entries that make
+ * every `git pull --ff-only` fail forever, whether they come from the abandoned
+ * index-only state (no MERGE_HEAD) or a live merge/rebase/cherry-pick/revert
+ * (caller distinguishes via `unmergedOp`). `git status --porcelain` supplies the
+ * reader-friendly code (`UU`, `AA`, `DD`, …) and `git ls-files -u` the
+ * authoritative stage list; they are UNIONED so a shape either source misses is
+ * still caught. Never throws — this is a diagnostic, not a gate, so an
+ * unreadable repo yields [] (no false alarm) rather than breaking session start.
+ */
+export function unmergedEntries(repo: string): UnmergedEntry[] {
+  const found = new Map<string, string>();
+  try {
+    const recs = execFileSync("git", ["-C", repo, "status", "--porcelain", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0");
+    for (let i = 0; i < recs.length; i++) {
+      const rec = recs[i];
+      if (rec.length < 4) continue;
+      const code = rec.slice(0, 2);
+      // #1661 (review): porcelain-v1 -z emits an EXTRA NUL record after a
+      // rename/copy — the ORIGINAL path (`R  <new>\0<old>\0`). Re-reading it as
+      // `XY PATH` turns a benign `git mv` whose old name starts with an unmerged
+      // code (e.g. "AUTHORS" → "AU") into a phantom entry with a truncated path
+      // ("HORS"); session_start would then print the STUCK banner and return
+      // while sync.sh's `git ls-files -u` is clean, freezing sync for the whole
+      // session. Consume the original-path record.
+      if (code[0] === "R" || code[0] === "C" || code[1] === "R" || code[1] === "C") {
+        i++;
+        continue;
+      }
+      if (UNMERGED_CODES.has(code)) found.set(rec.slice(3), code);
+    }
+  } catch { /* git unavailable / not a repo — no signal */ }
+  try {
+    // #1661 (review): collect the FULL stage set per path, then map it to the
+    // porcelain code — see `STAGE_SET_CODES`. Reading only the first record
+    // (stages are emitted ascending, so always "stage 1") downgraded a
+    // both-sides conflict to a base-only one and recommended `git rm`.
+    const stages = new Map<string, Set<number>>();
+    for (const rec of execFileSync("git", ["-C", repo, "ls-files", "-u", "-z"], { encoding: "utf-8", timeout: 15_000 }).split("\0")) {
+      const tab = rec.indexOf("\t");
+      if (tab === -1) continue;
+      const path = rec.slice(tab + 1);
+      if (!path) continue;
+      const stage = Number(rec.slice(0, tab).trim().split(/\s+/).pop());
+      if (!Number.isInteger(stage)) continue;
+      const set = stages.get(path) ?? new Set<number>();
+      set.add(stage);
+      stages.set(path, set);
+    }
+    for (const [path, set] of stages) {
+      if (found.has(path)) continue; // porcelain's code wins when it is available
+      found.set(path, stageSetCode(set) ?? `stages ${[...set].sort((a, b) => a - b).join(",")}`);
+    }
+  } catch { /* ignore */ }
+  return [...found.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([path, detail]) => ({ path, detail }));
+}
+
+/**
+ * #1661 (review): what, if anything, is mid-flight in the checkout. The
+ * abandoned conflict the issue is about has NO sequencer state ("index-only");
+ * a live merge/rebase/am/cherry-pick/revert leaves MERGE_HEAD / CHERRY_PICK_HEAD /
+ * REVERT_HEAD or a rebase-merge|rebase-apply directory. The distinction matters
+ * because the banner must not assert "no MERGE_HEAD" for a live merge, and a
+ * rebase INVERTS --ours/--theirs relative to a merge, so the old blanket
+ * `checkout --theirs` remedy could silently discard the user's commit. `git am`
+ * is separated from `rebase` because it shares `.git/rebase-apply` yet its
+ * remedy is `git am --continue`/`--abort`, not `git rebase ...` (git refuses).
+ */
+export type UnmergedOp = "index-only" | "merge" | "rebase" | "am" | "cherry-pick" | "revert";
+
+export function unmergedOp(repo: string): UnmergedOp {
+  let gitDir: string;
+  try {
+    // `--git-path` is cwd-relative (and a linked worktree's .git is a FILE), so
+    // resolve the absolute per-worktree git dir once and join names onto it.
+    gitDir = execFileSync("git", ["-C", repo, "rev-parse", "--absolute-git-dir"], { encoding: "utf-8", timeout: 5_000 }).trim();
+  } catch {
+    return "index-only";
+  }
+  const has = (name: string): boolean => gitDir.length > 0 && existsSync(join(gitDir, name));
+  if (has("rebase-merge")) return "rebase";
+  if (has("rebase-apply")) {
+    // #1661 (review): `git am` shares .git/rebase-apply with `rebase --apply`.
+    // The mode file discriminates: `applying` = am, `rebasing` = rebase
+    // --apply. Labelling an am conflict "rebase" offered `git rebase
+    // --continue`, which git refuses ("It looks like 'git am' is in
+    // progress. Cannot rebase.").
+    return has("rebase-apply/applying") ? "am" : "rebase";
+  }
+  if (has("CHERRY_PICK_HEAD")) return "cherry-pick";
+  if (has("REVERT_HEAD")) return "revert";
+  if (has("MERGE_HEAD")) return "merge";
+  return "index-only";
+}
+
+/**
+ * #1661 (review): single-quote a value for safe interpolation into a PRINTED
+ * shell command. The banner's whole purpose is to hand the user (or a
+ * sub-agent) a command to run, and an unmerged path is attacker-influenceable:
+ * git permits `"`, backtick, `$`, `;` and `#` in filenames, so embedding one
+ * inside double quotes is not quoting at all. Same shape as
+ * `repo-freshness.ts:187` / `verification-gate/index.ts:3024`.
+ */
+export function shellQuoteSingle(s: string): string {
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+/**
+ * #1664 (review): a path safe to PRINT on a single line. Git filenames may
+ * contain newlines and other control characters (git permits every byte except
+ * `/` and NUL), and `unmergedBanner`'s audience is told to read its lines as
+ * instructions — so a raw `\n` in a path forges extra `[auto-sync] …` lines
+ * that are indistinguishable from the remedy lines the banner tells the reader
+ * to run (message injection). `shellQuoteSingle` already insulates the
+ * *executable* string from injection, but the printed form must also stay one
+ * line. C-style escaping keeps the path recognisable. Pure.
+ */
+export function displayPath(p: string): string {
+  return p.replace(/[\u0000-\u001f\u007f]/g, (c) => JSON.stringify(c).slice(1, -1));
+}
+
+/**
+ * #1661 (review): a remedy valid for the entry's conflict shape. `--theirs`
+ * needs index stage 3 and `--ours` needs stage 2; DD has neither and AU/UD lack
+ * stage 3, DU/UA lack stage 2 — so the old hard-coded `--theirs` errored
+ * ("path ... does not have their version") for those codes. The repo/path are
+ * single-quote-escaped (see `shellQuoteSingle`) because these strings are
+ * printed as commands to run. Pure.
+ */
+function remedyCommands(repo: string, e: UnmergedEntry): string[] {
+  const r = shellQuoteSingle(repo);
+  // `displayPath` keeps the printed command on ONE line — a raw newline in the
+  // path would otherwise break the command block apart (#1664 review).
+  const p = shellQuoteSingle(displayPath(e.path));
+  const keepTheirs = `git -C ${r} checkout --theirs ${p} && git -C ${r} add ${p}`;
+  const keepOurs = `git -C ${r} checkout --ours ${p} && git -C ${r} add ${p}`;
+  const remove = `git -C ${r} rm ${p}`;
+  switch (e.detail) {
+    case "DD": // deleted on both sides — no stage 2 or 3
+      return [`both sides deleted this path: ${remove}`];
+    case "UD": // deleted by them — stage 2 only
+      return [`origin deleted this path — keep yours: ${keepOurs}`, `or match origin: ${remove}`];
+    case "DU": // deleted by us — stage 3 only
+      return [`origin has this path and you deleted it — take origin's: ${keepTheirs}`];
+    case "AU": // added by us — stage 2 only
+      return [`you added this path — keep yours: ${keepOurs}`, `or match origin: ${remove}`];
+    case "UA": // added by them — stage 3 only
+      return [`origin added this path — take it: ${keepTheirs}`];
+    case "UU":
+    case "AA":
+      return [`keep origin's version: ${keepTheirs}`, `or keep yours: ${keepOurs}`];
+    default: // unknown detail (legacy "stage N" shape / unrecognised stage set)
+      if (e.detail.includes("2")) return [`keep yours (stage 2): ${keepOurs}`];
+      if (e.detail.includes("3")) return [`keep origin's version (stage 3): ${keepTheirs}`];
+      // #1661 (review): a bare "stage 1" is NOT proof of a base-only entry —
+      // stage 1 also exists in UU/UD/DU/AA, where `git rm` destroys a side the
+      // user still wants. `unmergedEntries` now maps the full stage set to a
+      // porcelain code (a genuine DD still hits `case "DD"` above), so an
+      // ambiguous shape is inspected, never removed on a guess.
+      return [`inspect: git -C ${r} status`, `then keep origin's version: ${keepTheirs}`];
+  }
+}
+
+/**
+ * #1661 (1): the LOUD banner for unmerged index entries. `op` (from
+ * `unmergedOp`) selects the wording: the abandoned index-only conflict the issue
+ * is about, or a live merge/rebase/cherry-pick/revert that must be concluded
+ * before syncing. The remedy is chosen per conflict code (see remedyCommands)
+ * rather than a blanket `--theirs`. No shell is run here (repo/paths are only
+ * interpolated), so this is pure and unit-testable. Empty for a clean index.
+ */
+export function unmergedBanner(repo: string, entries: UnmergedEntry[], op: UnmergedOp = "index-only"): string[] {
+  if (entries.length === 0) return [];
+  const list: string[] = [`[auto-sync]    ${entries.length} unmerged path(s):`];
+  for (const e of entries.slice(0, 6)) list.push(`[auto-sync]      ${displayPath(e.path)}  [${e.detail}]`);
+  if (entries.length > 6) list.push(`[auto-sync]      …and ${entries.length - 6} more (git -C "${repo}" ls-files -u)`);
+
+  if (op !== "index-only") {
+    // #1661 (review): ONLY a rebase inverts --ours/--theirs. cherry-pick,
+    // revert and am use the merge convention (--ours = HEAD), so the old
+    // blanket warning told those users the sides were swapped when they are
+    // not — on the one banner whose job is to hand them a correct command.
+    const sides = op === "rebase"
+      ? "rebase inverts --ours/--theirs relative to a merge — do not blind-apply a keep-theirs command"
+      // #1661 (review): for `revert`, `--theirs` is NOT the reverted commit —
+      // that commit is the three-way merge BASE, so `--theirs` is its parent
+      // (git's own conflict marker reads "parent of <sha>"). Saying "the
+      // reverted commit" would send a reader to the pre-revert state believing
+      // it was the commit they are undoing.
+      : `--ours is your current branch (HEAD); --theirs is ${op === "cherry-pick" ? "the picked commit" : op === "revert" ? "the state before the reverted commit (the reverted commit's parent)" : op === "am" ? "the patch being applied" : "the incoming commit"} (the merge convention)`;
+    return [
+      `[auto-sync] ⛔ ${op.toUpperCase()} IN PROGRESS with unmerged paths — sync must wait until it is concluded.`,
+      ...list,
+      `[auto-sync]    Finish: resolve each path, \`git -C "${repo}" add <path>\`, then \`git -C "${repo}" ${op} --continue\`.`,
+      `[auto-sync]    Or abort: git -C "${repo}" ${op} --abort`,
+      `[auto-sync]    (${sides}.)`,
+      `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+    ];
+  }
+
+  return [
+    `[auto-sync] ⛔ STUCK MERGE CONFLICT in agent-infra's index — every sync fails and the extensions you loaded are FROZEN.`,
+    `[auto-sync]    (index-only stuck state — no MERGE_HEAD, so a plain sync can never recover.)`,
+    ...list,
+    `[auto-sync]    Resolve one path at a time, then stage it:`,
+    ...remedyCommands(repo, entries[0]).map((c) => `[auto-sync]      ${c}`),
+    `[auto-sync]      (a [DD] path must be \`git rm\`d; --theirs needs stage 3, --ours needs stage 2)`,
+    `[auto-sync]    Then re-sync: cd "${repo}" && ./sync.sh`,
+  ];
 }
 
 /**
@@ -441,12 +752,77 @@ function tryLosslessRecoverUnderLock(repo: string, branch: string): { recovered:
   }
 }
 
+/**
+ * #195 L3: warn-only orphan sweep — aborted dispatches leave worktrees/branches
+ * recorded in the teardown manifest; surface them within a day without ever
+ * auto-deleting (scan-orphans.sh --apply is the manual gate). Never throws: a
+ * missing/offline scanner is silent (warn-only by design). Extracted so the
+ * #1661 stuck-index early return can still run it (see session_start).
+ */
+function sweepOrphanRecords(infraPath: string): void {
+  try {
+    const out = execSync(`bash "${infraPath}/scripts/scan-orphans.sh" --repo "${infraPath}" 2>&1`, {
+      timeout: 30_000,
+      encoding: "utf-8",
+    });
+    const lines = out.trim().split("\n").filter((l) => l.includes("⚠️") || l.includes("👻") || l.includes("🧹"));
+    if (lines.length > 0) {
+      console.log(`[auto-sync] 🧹 ${lines.length} orphaned worktree/branch record(s) — inspect:`);
+      console.log(lines.slice(0, 5).map((l) => `    ${l.trim()}`).join("\n"));
+      console.log(`    Cleanup: bash "${infraPath}/scripts/scan-orphans.sh" --apply`);
+    }
+  } catch {
+    // scanner missing/offline — silent (warn-only by design)
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => {
     const infraPath = process.env.AGENT_INFRA_PATH;
     if (!infraPath) return;          // not configured — silent
     if (!existsSync(infraPath)) return;
-    if (isPrintMode()) return; // sub-agents: no pulls, no noise
+
+    // #1661 (1): the unmerged-index check runs BEFORE the print-mode return,
+    // before the fetch and before any mutation. Leftover unmerged stage-1/2/3
+    // entries make `git pull --ff-only` refuse forever, and this used to fail
+    // into silence — exactly the state a sub-agent must never be told nothing
+    // about. `unmergedOp` distinguishes the abandoned index-only state from a
+    // live merge/rebase/cherry-pick/revert so the banner does not misdiagnose it
+    // (a rebase inverts --ours/--theirs). Read-only and cheap, so it runs in
+    // every mode, and a pull is pointless until the index is resolved.
+    const unmerged = unmergedEntries(infraPath);
+    if (unmerged.length > 0) {
+      for (const line of unmergedBanner(infraPath, unmerged, unmergedOp(infraPath))) console.log(line);
+      // #1661 (review): the early return must NOT also silence the #195 orphan
+      // sweep for as long as the index stays stuck — a stuck index persists
+      // until a human resolves it, so orphan records would go unreported that
+      // whole time. Print mode is excluded because the pre-#1661 order returned
+      // before the sweep there (the sweep sits after the print-mode return).
+      if (!isPrintMode()) sweepOrphanRecords(infraPath);
+      return;
+    }
+
+    // #1661 (3): sub-agents still never pull — but they no longer return with
+    // ZERO signal. A stale toolset is now visible to a print-mode sub-agent
+    // (no fetch here: the count uses the last-fetched origin/main ref, a lower
+    // bound, so print-mode startup stays network-free).
+    if (isPrintMode()) {
+      // #1661 (review): `behindCount()` is non-zero for a DIVERGED checkout
+      // too, so the state must be classified first — exactly as the interactive
+      // path below does (`state === "behind" ? behindCount(...) : 0`). Without
+      // this gate, print mode told a diverged sub-agent it was merely "behind"
+      // and handed it `./sync.sh`, whose `git pull --ff-only` cannot succeed on
+      // a diverged checkout (and on a non-main branch exits 0 after refusing —
+      // #1663), so the hinted remedy was inert.
+      const state = syncState(infraPath);
+      const behind = state === "behind" ? behindCount(infraPath) : 0;
+      if (behind > 0) {
+        const loud = stalenessBanner(infraPath, behind, stalenessThreshold());
+        if (loud.length > 0) for (const line of loud) console.log(line);
+        else console.log(`[auto-sync] ⏭️ print mode — no pull; extensions loaded from ${infraPath} @ ${shortHead(infraPath)} (${behind} commit(s) behind origin/main)`);
+      }
+      return;
+    }
 
     try {
       execSync(`git -C "${infraPath}" fetch origin --quiet`, { timeout: 30_000, stdio: "ignore" });
@@ -454,26 +830,32 @@ export default function (pi: ExtensionAPI) {
       return; // offline — silent
     }
 
-    // #195 L3: warn-only orphan sweep — aborted dispatches leave worktrees/
-    // branches recorded in the teardown manifest; surface them within a day
-    // without ever auto-deleting (scan-orphans.sh --apply is the manual gate).
-    try {
-      const out = execSync(`bash "${infraPath}/scripts/scan-orphans.sh" --repo "${infraPath}" 2>&1`, {
-        timeout: 30_000,
-        encoding: "utf-8",
-      });
-      const lines = out.trim().split("\n").filter((l) => l.includes("⚠️") || l.includes("👻") || l.includes("🧹"));
-      if (lines.length > 0) {
-        console.log(`[auto-sync] 🧹 ${lines.length} orphaned worktree/branch record(s) — inspect:`);
-        console.log(lines.slice(0, 5).map((l) => `    ${l.trim()}`).join("\n"));
-        console.log(`    Cleanup: bash "${infraPath}/scripts/scan-orphans.sh" --apply`);
-      }
-    } catch {
-      // scanner missing/offline — silent (warn-only by design)
-    }
+    // #195 L3: warn-only orphan sweep (never auto-deletes).
+    sweepOrphanRecords(infraPath);
 
     const state = syncState(infraPath);
     const syncHint = `cd "${infraPath}" && ./sync.sh`;
+    const behind = state === "behind" ? behindCount(infraPath) : 0;
+
+    // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
+    // repo lock — concurrent pi processes never interleave force-switches or
+    // ff-pulls. Clean acquire/release logs NOTHING (tests assert zero output on
+    // the "current → silent" path); only foreign contention warns (skip —
+    // recovery is convenience, never correctness-critical). Resolved BEFORE the
+    // staleness banner because the banner must not claim a pin that a sync is
+    // about to fix (#1664 review).
+    const autoSyncing = state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto";
+    const mutates = state === "diverged" || autoSyncing;
+
+    // #1661 (2): surface a LARGE pin. The checkout could sit hundreds of commits
+    // behind with nothing but the one-line "update available" hint below.
+    // #1664 (review): NOT in auto mode — there the banner ("extensions/ on disk
+    // is NOT what origin/main ships") and the "✅ agent-infra updated" line two
+    // statements later asserted two contradictory things in one session start.
+    // The auto branch reports the same magnitude as the reason for the update.
+    if (!autoSyncing) {
+      for (const line of stalenessBanner(infraPath, behind, stalenessThreshold())) console.log(line);
+    }
 
     // ahead → nothing to fetch; report unpushed commits so they're not silently skipped.
     if (state === "ahead") {
@@ -486,13 +868,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // #265: every MUTATION (lossless recovery, sync.sh run) is serialized by the
-    // repo lock — concurrent pi processes never interleave force-switches or
-    // ff-pulls. Clean acquire/release logs NOTHING (tests assert zero output on
-    // the "current → silent" path); only foreign contention warns (skip —
-    // recovery is convenience, never correctness-critical).
-    const mutates = state === "diverged" ||
-      (state === "behind" && (process.env.AGENT_SYNC_MODE || "warn") === "auto");
     if (mutates) {
       const key = repoKey(infraPath);
       const lock = key
@@ -519,7 +894,15 @@ export default function (pi: ExtensionAPI) {
           if (rec.reason) console.log(`    (auto-recovery skipped: ${rec.reason})`);
           return;
         }
-        // behind + AGENT_SYNC_MODE=auto → sync.sh under the lock
+        // behind + AGENT_SYNC_MODE=auto → sync.sh under the lock.
+        // #1664 (review): the staleness banner above is suppressed on this path
+        // (the sync would contradict it). Report the same magnitude here, as the
+        // reason for the update: the extensions ALREADY LOADED into this process
+        // stay stale until restart, so the pin is real even though the disk is
+        // about to become current.
+        if (behind >= stalenessThreshold()) {
+          console.log(`[auto-sync] 🐌 this session loaded extensions from ${shortHead(infraPath)}, ${behind} commit(s) behind origin/main — syncing now (restart to load the new set)`);
+        }
         try {
           const out = execSync(`bash "${infraPath}/sync.sh" 2>&1`, { timeout: 180_000, encoding: "utf-8" });
           console.log(`[auto-sync] ✅ agent-infra updated to ${shortHead(infraPath)} — config refreshed`);
@@ -541,6 +924,6 @@ export default function (pi: ExtensionAPI) {
 
     if (state !== "behind") return; // current — silent
 
-    console.log(`[auto-sync] ⚠️  agent-infra update available — run: ${syncHint}`);
+    console.log(`[auto-sync] ⚠️  agent-infra update available (${behind} commit(s) behind) — run: ${syncHint}`);
   });
 }

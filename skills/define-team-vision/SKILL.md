@@ -17,7 +17,7 @@ Produces the Team Vision artifact. Vision is the conclusion of environmental sca
 
 ### Phase 1 — Research (Parallel)
 
-Dispatch three parallel research sub-agents. Each MUST use the `research` skill for complex, multi-source investigation — not quick web_search calls. Superficial research produces weak visions. Each produces a separate research doc with data-backed claims:
+Dispatch three parallel research sub-agents. **Stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound — at most 2 concurrent `web_search` calls, since they share one Perplexity key (a wider fan-out 429s and truncates the batch).** Each MUST use the `research` skill for complex, multi-source investigation — not quick web_search calls. Superficial research produces weak visions. Each produces a separate research doc with data-backed claims:
 
 **Trends Research:**
 ```
