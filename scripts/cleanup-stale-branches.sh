@@ -910,7 +910,9 @@ verify_remote_target() {
 # Returns 0 (printing nothing) only when the DELETE TARGET's REAL main line
 # provably contains the tip this sweep classified. On anything else it prints a
 # one-line reason and returns 1 — the caller REFUSES that delete. The oid is read
-# ONCE per sweep by read_remote_main_oid (F33) and passed in.
+# by read_remote_main_oid and passed in; HOW OFTEN the caller reads it is the
+# caller's decision: the PLAN reads it once per sweep, the EXECUTE leg re-reads
+# it once PER ENTRY (F34).
 #
 # ⛔ The classification is `git branch -r --merged origin/main`, which reads the
 # LOCAL remote-tracking ref. That ref is only as fresh as the fetch refspec lets
@@ -951,26 +953,42 @@ verify_remote_target() {
 # that the merge premise holds in the repository the caller has already PROVED
 # is the delete endpoint — not merely in the one it intended.
 #
-# ⛔ F33: THE DELETE TARGET's REAL main IS READ ONCE PER SWEEP, then passed to
-# the per-entry CHECK. The plan and the execute loop both call the check per
-# candidate, and each call used to run its own `git ls-remote <push_url>
-# refs/heads/<main>` — N identical network round trips for one value that cannot
-# change for the purpose of ONE sweep. Measured with a `git` shim over 6
-# candidates: dry-run `ls-remote` = 2N+1 = 13 before, N+2 = 8 after (1 endpoint
-# proof + 1 real main + N target checks).
+# ⛔ F33/F34: THE REAL MAIN IS READ ONCE PER SWEEP FOR THE PLAN ONLY; THE
+# EXECUTE LEG RE-READS IT PER ENTRY. (The plan and the execute loop both call the
+# per-entry CHECK; each call used to run its own `git ls-remote <push_url>
+# refs/heads/<main>`, which is N identical network round trips.) The PLAN deletes
+# nothing, so ONE read is safe there: the worst a stale snapshot can do is print
+# a plan that `--execute` will REFUSE at run time — and the printed command is
+# re-gated by execute's own per-entry read, so a pasted line cannot delete on the
+# stale premise either. The EXECUTE leg may NOT snapshot: main is NOT constant
+# across a sweep. A force-push to main between candidate N and N+1 invalidates
+# the premise for every LATER candidate, and a snapshot would keep validating
+# them against a main that no longer contains their tips — deleting precisely the
+# unmerged branches this gate exists to protect. That is F34: the hoist assumed
+# "one value that cannot change for the purpose of ONE sweep", which is FALSE.
+# The lease pins the BRANCH ref, never main, so nothing else re-checks the merge
+# premise per entry. Restoring the per-entry read restores the freshness the
+# parent (and the safety property) had.
+#
+# Measured with a `git` shim over 6 candidates: dry-run `ls-remote` = 2N+1 = 13
+# before the F33 hoist, N+2 = 8 with it (1 endpoint proof + 1 real main + N
+# target checks). The EXECUTE leg costs 2N+1 = 13 (1 endpoint proof + N
+# real-main reads + N target checks) — the freshness is the whole point.
 #
 # ⛔ The read is split from the check because the callers CAPTURE the check's
 # refusal reason through `$(...)`, i.e. in a SUBSHELL: a memo written inside the
 # check is discarded the moment the subshell exits, so "memoise inside the
-# function" is not available here. Hoisting the read to the sweep and PASSING it
-# in keeps ONE implementation of the check (forked implementations are this
-# branch's recurring defect) and keeps every refusal message in one place. The
-# re-read that is GENUINELY per-entry (`verify_remote_target`) is untouched, as
-# is the delete's force-with-lease, which is the real compare-and-swap.
+# function" is not available here. Splitting the read from the check and PASSING
+# the oid in keeps ONE implementation of the check (forked implementations are
+# this branch's recurring defect) and keeps every refusal message in one place,
+# whether the caller reads once (plan) or per entry (execute). The re-read that
+# is GENUINELY per-entry (`verify_remote_target`) is untouched, as is the
+# delete's force-with-lease, which is the real compare-and-swap.
 #
 # read_remote_main_oid <push_url> — resolve the DELETE TARGET's REAL
-# refs/heads/<main> ONCE. Prints the oid and returns 0, or prints the one-line
-# reason and returns 1.
+# refs/heads/<main>. The CALLER decides how often: the plan calls it once per
+# sweep, the execute leg once per entry (F34). Prints the oid and returns 0, or
+# prints the one-line reason and returns 1.
 read_remote_main_oid() {
     local push_url="$1" ls_out="" real_main_oid="" n=0 line=""
     if ! ls_out="$(git ls-remote "$push_url" "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
@@ -996,8 +1014,8 @@ read_remote_main_oid() {
 }
 
 # verify_merged_into_real_main <real_main_oid> <resolve_reason> <classified_oid>
-# — the per-entry CHECK against the ONCE-read main. <real_main_oid> is what
-# read_remote_main_oid printed; when that read FAILED it is EMPTY and
+# — the per-entry CHECK against the main oid the CALLER read. <real_main_oid> is
+# what read_remote_main_oid printed; when that read FAILED it is EMPTY and
 # <resolve_reason> carries the reason, which is printed verbatim so the refusal
 # is the SAME one a per-entry read would have produced.
 verify_merged_into_real_main() {
@@ -1361,11 +1379,32 @@ run_remote_scope() {
     # holds for ANY `X` / `refs/heads/X` pair, whatever X's first character is.
     # (`sort`/`awk`/`cut` are POSIX; no Bash 3.2 arrays tricks.)
     if [ "${#STALE_BRANCHES[@]}" -gt 1 ]; then
-        local _stale_sorted=""
+        # ⛔ F35: THIS IS THE ONE REMOTE-SCOPE INPUT THAT FEEDS THE DELETE LIST
+        # AND IS NOT A `git` COMMAND, AND IT WAS UNGUARDED. Every sibling (`git
+        # fetch`, the ref listings, `ls-remote`, the PR map, the commit dates,
+        # the cutoff) is status-checked. Under CLEANUP_BRANCH_LOG — the shipped
+        # launchd configuration — the whole pass runs `set +e`, so a pipeline
+        # failure left `_stale_sorted` EMPTY, `STALE_BRANCHES` an empty array,
+        # and the sweep printed `✅ No stale merged branches found` and exited 0:
+        # a CLEAN sweep over candidates it had already found and then silently
+        # discarded. (Without the log `set -e` aborts loudly, so the FALSE PASS
+        # is specific to the scheduled invocation.) `pipefail` is set globally
+        # and is NOT undone by `set +e`, so the assignment's status below sees a
+        # failing `printf`/`awk`/`sort`/`cut` even though the pipeline's LAST
+        # stage succeeded. Refuse loudly — a pipeline failure is not an empty
+        # candidate list, and reporting one as the other is the false PASS.
+        local _stale_sorted="" _stale_order_rc=0
         _stale_sorted="$(printf '%s\n' "${STALE_BRANCHES[@]}" \
             | awk -F'\t' '{ print length($1) "\t" $0 }' \
             | sort -rn -k1,1 \
-            | cut -f2-)"
+            | cut -f2-)" || _stale_order_rc=$?
+        if [ "$_stale_order_rc" -ne 0 ]; then
+            echo "ERROR: could not order the stale branch list (printf | awk | sort | cut FAILED, rc=$_stale_order_rc)." >&2
+            echo "ERROR: ${#STALE_BRANCHES[@]} candidate(s) WERE classified and then discarded, so this pass" >&2
+            echo "ERROR: cannot report a clean sweep. A pipeline failure is NOT an empty candidate list." >&2
+            echo "ERROR: Refusing the remote sweep; re-run once awk/sort/cut are usable." >&2
+            return 1
+        fi
         STALE_BRANCHES=()
         local _stale_entry
         while IFS= read -r _stale_entry; do
@@ -1401,21 +1440,27 @@ run_remote_scope() {
     done
     echo ""
 
-    # ⛔ F33: read the DELETE TARGET's real main ONCE for this sweep and hand it
-    # to the per-entry check below. The read is HERE, not inside the check,
+    # ⛔ `real_main_oid`/`real_main_resolve_reason` hold the DELETE TARGET's real
+    # main for the leg that is ABOUT TO RUN. The read is split from the check
     # because the check's refusal reason is captured through `$(...)` — a
     # subshell — so a memo written inside the check would be discarded with the
-    # subshell and every entry would re-read main (the 2N+1 defect). A failed read
+    # subshell. HOW OFTEN it is read depends on the leg (F33/F34): the PLAN reads
+    # it ONCE for the sweep, the EXECUTE leg RE-READS it per entry. A failed read
     # yields an EMPTY oid plus the reason, which the check reports per entry with
     # the SAME message a per-entry read would have produced. Nothing is read when
     # there is no candidate (the empty arm returns above).
     local real_main_oid="" real_main_resolve_reason=""
-    if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
-        real_main_resolve_reason="$real_main_oid"
-        real_main_oid=""
-    fi
 
     if [ "$EXECUTE" = false ]; then
+        # ⛔ F33: THE PLAN MAY SNAPSHOT MAIN ONCE. It deletes nothing, so a stale
+        # snapshot can only print a plan that `--execute` will REFUSE — and
+        # execute re-gates each entry against a FRESH read at run time, so even a
+        # pasted line cannot delete on the stale premise. Reading once here keeps
+        # the plan at N+2 ls-remote calls instead of 2N+1.
+        if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
+            real_main_resolve_reason="$real_main_oid"
+            real_main_oid=""
+        fi
         echo "── DRY-RUN: no branches deleted ──"
         echo "To delete: bash scripts/cleanup-stale-branches.sh --execute"
         echo ""
@@ -1497,6 +1542,20 @@ run_remote_scope() {
         # have NO commits in real main (main rewritten), and deleting it destroys
         # them. That is a different question from "is origin's real ref the ref
         # we classified", so it is a separate gate, not a weaker one.
+        # ⛔ F34: RE-READ the DELETE TARGET's real main FOR THIS ENTRY, immediately
+        # before the delete. main is NOT constant across a sweep: a force-push to
+        # it between the previous candidate and this one invalidates the merge
+        # premise for every LATER candidate, so a once-per-sweep snapshot would
+        # keep validating them against a main that no longer contains their tips
+        # and delete precisely the unmerged branches this gate exists to protect.
+        # The lease pins the BRANCH ref, never main, so THIS read is the only
+        # thing that can catch the rewrite. (The plan snapshots above because it
+        # deletes nothing; execute may not.) `read_remote_main_oid` is the SAME
+        # function the plan calls — one implementation, one message set.
+        if ! real_main_oid="$(read_remote_main_oid "$push_url")"; then
+            real_main_resolve_reason="$real_main_oid"
+            real_main_oid=""
+        fi
         local refusal=""
         if ! refusal="$(verify_merged_into_real_main "$real_main_oid" "$real_main_resolve_reason" "$tracking_oid")"; then
             echo "  ⛔ REFUSING to delete origin/$local_branch" >&2

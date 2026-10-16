@@ -4397,6 +4397,203 @@ else
     bad "F33: the sweep dropped the per-entry target read (count=$F33_CALLS)"
 fi
 
+# ⛔ F34: the EXECUTE leg must NOT reuse the plan's snapshot — it RE-READS main
+# per entry. The count is asserted deliberately, so the F33 hoist cannot silently
+# re-absorb the destructive leg: plan = N+2 = 8, execute = 2N+1 = 13 (1 endpoint
+# proof + N real-main reads + N target checks). The freshness requirement is the
+# property; this count is its observable signature.
+: > "$F33_COUNT"
+run_script env PATH="$F33_WRAP:$PATH" F33_REAL_GIT="$F33_REAL_GIT" F33_COUNT="$F33_COUNT" \
+    bash "$F33_SCRIPT" --repo "$F33_REPO" --scope remote --execute
+F33_EXEC_CALLS="$(wc -l <"$F33_COUNT" | tr -d '[:space:]')"
+assert_eq "$RC" "0" "F33/F34: --execute still deletes every merged candidate (rc=0)"
+assert_contains "$OUT" "Deleted: 6" "F33/F34: all 6 merged candidates are deleted"
+assert_eq "$F33_EXEC_CALLS" "13" "F34: execute costs 2N+1=13 ls-remote calls (1 endpoint + 6 real-main reads + 6 target checks), not N+2 — main is re-read per entry"
+
+cd "$REPO"
+echo ""
+echo "== 52. F34 (P1): main rewritten MID-SWEEP must REFUSE the later candidate, not delete it =="
+# REGRESSION: the F33 hoist read the DELETE TARGET's real main ONCE, before the
+# execute loop, and every candidate was validated against that snapshot. main is
+# NOT constant across a sweep: a force-push to it between candidate N and N+1
+# invalidates the merge premise for every LATER candidate, and the snapshot kept
+# validating them — so the branch was deleted with rc=0. Before the hoist each
+# candidate re-read main, so the rewrite was caught. This fixture rewrites
+# origin/main the FIRST time the sweep runs `git push` (i.e. at the first
+# delete), with origin main = A->X->Y, b1 = X and f34-first = Y.
+F34_ORIGIN="$FIX/f34-origin.git"
+F34_REPO="$FIX/f34-repo"
+new_repo "$F34_REPO" "$F34_ORIGIN"
+cd "$F34_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F34_SCRIPT="$F34_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f34.txt; git add f34.txt; old_commit "init"; git push -q origin main
+F34_BASE_OID="$(git rev-parse HEAD)"
+# b1 = X: pushed, merged into real main, and an ANCESTOR of origin/main(Y) — so
+# it IS a candidate, and its tip must NOT be reachable from the rewritten main A.
+git checkout -q -b b1 main
+echo x > f34-x.txt; git add f34-x.txt; old_commit "b1"
+F34_B1_OID="$(git rev-parse HEAD)"
+git push -q -u origin b1
+git checkout -q main
+git merge -q --ff-only b1
+# f34-first = Y: pushed and merged into real main (origin/main -> Y). Longer name,
+# so longest-first ordering deletes it BEFORE b1.
+git checkout -q -b f34-first main
+echo y > f34-y.txt; git add f34-y.txt; old_commit "f34-first"
+F34_FIRST_OID="$(git rev-parse HEAD)"
+git push -q -u origin f34-first
+git checkout -q main
+git merge -q --ff-only f34-first
+git push -q origin main
+if git merge-base --is-ancestor "$F34_B1_OID" "$F34_BASE_OID" 2>/dev/null; then
+    bad "F34 fixture: b1's tip IS in the rewritten main A — the fixture is wrong (F34)"
+else
+    ok "F34 fixture: b1's tip is NOT reachable from A, so the rewrite must refuse it (F34)"
+fi
+if git merge-base --is-ancestor "$F34_B1_OID" "$F34_FIRST_OID" 2>/dev/null; then
+    ok "F34 fixture: b1's tip IS an ancestor of origin/main(Y), so it IS a candidate (F34)"
+else
+    bad "F34 fixture: b1 would not be classified merged — the fixture is wrong (F34)"
+fi
+# The shim rewrites origin/main to A on the FIRST `git push` the sweep issues (the
+# first delete), then delegates. Marked so it fires exactly once.
+F34_REAL_GIT="$(command -v git)"
+F34_WRAP="$FIX/f34-wrap"
+F34_MARK="$FIX/f34-rewrite-mark"
+mkdir -p "$F34_WRAP"
+cat > "$F34_WRAP/git" <<'WRAP'
+#!/usr/bin/env bash
+# Test double: on the FIRST `push` the sweep runs, force main back to A using
+# real git, then delegate. This models a mid-sweep main rewrite.
+if [ "$1" = "push" ] && [ ! -e "${F34_MARK:?F34_MARK unset}" ]; then
+    : >"$F34_MARK"
+    "${F34_REAL_GIT:?F34_REAL_GIT unset}" -C "${F34_ORIGIN:?F34_ORIGIN unset}" \
+        update-ref refs/heads/main "${F34_BASE:?F34_BASE unset}"
+fi
+exec "${F34_REAL_GIT:?F34_REAL_GIT unset}" "$@"
+WRAP
+chmod +x "$F34_WRAP/git"
+rm -f "$F34_MARK"
+run_script env PATH="$F34_WRAP:$PATH" F34_REAL_GIT="$F34_REAL_GIT" F34_ORIGIN="$F34_ORIGIN" \
+    F34_BASE="$F34_BASE_OID" F34_MARK="$F34_MARK" \
+    bash "$F34_SCRIPT" --repo "$F34_REPO" --scope remote --execute
+assert_eq "$RC" "1" "F34: a mid-sweep main rewrite makes the sweep REFUSE, not report success (rc=1)"
+assert_contains "$OUT" "REFUSING to delete origin/b1" "F34: the LATER candidate is refused by name"
+assert_contains "$OUT" "does NOT provably contain the classified tip" "F34: the refusal names the merge premise"
+assert_contains "$OUT" "Refused: 1" "F34: exactly one refusal is counted"
+assert_contains "$OUT" "Deleted: 1" "F34: only the pre-rewrite candidate was deleted"
+if [ "$(git -C "$F34_ORIGIN" rev-parse -q --verify refs/heads/b1 2>/dev/null || echo GONE)" = "$F34_B1_OID" ]; then
+    ok "F34: origin/b1 SURVIVES — the stale snapshot did not delete an unmerged branch"
+else
+    bad "F34: origin/b1 was DELETED although its tip is not in real main — the data-loss regression is back"
+fi
+if [ "$(git -C "$F34_ORIGIN" rev-parse -q --verify refs/heads/f34-first 2>/dev/null || echo GONE)" = "GONE" ]; then
+    ok "F34: origin/f34-first (the earlier candidate) was deleted before the rewrite"
+else
+    bad "F34: the earlier candidate was not deleted — the sweep did nothing"
+fi
+
+# control: a normal sweep with NO rewrite still deletes every candidate.
+F34C_ORIGIN="$FIX/f34c-origin.git"
+F34C_REPO="$FIX/f34c-repo"
+new_repo "$F34C_REPO" "$F34C_ORIGIN"
+cd "$F34C_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F34C_SCRIPT="$F34C_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f34c.txt; git add f34c.txt; old_commit "init"; git push -q origin main
+for F34C_I in 1 2; do
+    git checkout -q -b "f34c-b$F34C_I" main
+    echo "$F34C_I" > "f34c-$F34C_I.txt"; git add "f34c-$F34C_I.txt"; old_commit "f34c-b$F34C_I"
+    git push -q -u origin "f34c-b$F34C_I"
+    git checkout -q main
+    git merge -q --ff-only "f34c-b$F34C_I"
+    git push -q origin main
+done
+run_script bash "$F34C_SCRIPT" --repo "$F34C_REPO" --scope remote --execute
+assert_eq "$RC" "0" "F34 control: a sweep with no rewrite still exits 0 (rc=0)"
+assert_contains "$OUT" "Deleted: 2" "F34 control: BOTH candidates are still deleted"
+assert_contains "$OUT" "Refused: 0" "F34 control: nothing is refused when main does not move"
+for F34C_I in 1 2; do
+    if [ "$(git -C "$F34C_ORIGIN" rev-parse -q --verify "refs/heads/f34c-b$F34C_I" 2>/dev/null || echo GONE)" = "GONE" ]; then
+        ok "F34 control: origin/f34c-b$F34C_I was deleted"
+    else
+        bad "F34 control: origin/f34c-b$F34C_I was NOT deleted — the per-entry read broke the normal path"
+    fi
+done
+
+cd "$REPO"
+echo ""
+echo "== 53. F35 (P2): a failing ordering pipeline REFUSES, it never empties the delete list =="
+# The longest-first ordering pipeline is the ONLY remote-scope input that feeds
+# the delete list and was NOT status-checked. Under CLEANUP_BRANCH_LOG the pass
+# runs `set +e`, so a failing `sort` left STALE_BRANCHES empty and the sweep
+# printed `No stale merged branches found` with rc=0 — a clean sweep over
+# candidates it had found and discarded. The failing-sort fixture must REFUSE,
+# with the log (the false PASS) AND without it.
+F35_ORIGIN="$FIX/f35-origin.git"
+F35_REPO="$FIX/f35-repo"
+new_repo "$F35_REPO" "$F35_ORIGIN"
+cd "$F35_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F35_SCRIPT="$F35_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f35.txt; git add f35.txt; old_commit "init"; git push -q origin main
+for F35_I in 1 2; do
+    git checkout -q -b "f35-b$F35_I" main
+    echo "$F35_I" > "f35-$F35_I.txt"; git add "f35-$F35_I.txt"; old_commit "f35-b$F35_I"
+    git push -q -u origin "f35-b$F35_I"
+    F35_OID="$(git rev-parse HEAD)"
+    git checkout -q main
+    git merge -q --ff-only "f35-b$F35_I"
+    git push -q origin main
+    eval "F35_OID_$F35_I=\$F35_OID"
+done
+F35_WRAP="$FIX/f35-wrap"
+mkdir -p "$F35_WRAP"
+cat > "$F35_WRAP/sort" <<'SH'
+#!/usr/bin/env bash
+# Test double: a `sort` that fails, modelling a resource failure.
+MODE="${F35_SORT_MODE:-fail}"
+case "$MODE" in
+    fail) echo "sort: simulated resource failure" >&2; exit 2 ;;
+    *)    exec "${F35_REAL_SORT:?F35_REAL_SORT unset}" "$@" ;;
+esac
+SH
+chmod +x "$F35_WRAP/sort"
+F35_REAL_SORT="$(command -v sort)"
+F35_LOG="$FIX/f35.log"
+# (a) WITH the report log — the FALSE PASS the finding measured.
+: > "$F35_LOG"
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=fail \
+    CLEANUP_BRANCH_LOG="$F35_LOG" \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope remote
+assert_eq "$RC" "1" "F35 (with log): a failing ordering pipeline REFUSES instead of a FALSE PASS (rc=1)"
+assert_contains "$OUT" "could not order the stale branch list" "F35 (with log): the refusal names the ordering pipeline"
+assert_contains "$OUT" "2 candidate(s) WERE classified and then discarded" "F35 (with log): the refusal says the candidates existed"
+assert_not_contains "$OUT" "No stale merged branches found" "F35 (with log): the clean-sweep line is NOT printed"
+assert_not_contains "$(cat "$F35_LOG")" "No stale merged branches found" "F35 (with log): the LOG does not record a false PASS"
+if [ "$(git -C "$F35_ORIGIN" rev-parse -q --verify refs/heads/f35-b1 2>/dev/null || echo GONE)" = "$F35_OID_1" ] \
+    && [ "$(git -C "$F35_ORIGIN" rev-parse -q --verify refs/heads/f35-b2 2>/dev/null || echo GONE)" = "$F35_OID_2" ]; then
+    ok "F35: the refused sweep deleted nothing"
+else
+    bad "F35: the refused sweep still deleted a branch"
+fi
+# (b) WITHOUT the log.
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=fail \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope remote
+assert_eq "$RC" "1" "F35 (no log): the failing pipeline REFUSES (rc=1)"
+assert_contains "$OUT" "could not order the stale branch list" "F35 (no log): the refusal names the ordering pipeline"
+assert_not_contains "$OUT" "No stale merged branches found" "F35 (no log): the clean-sweep line is NOT printed"
+# control: a WORKING sort still orders and plans every candidate.
+run_script env PATH="$F35_WRAP:$PATH" F35_REAL_SORT="$F35_REAL_SORT" F35_SORT_MODE=pass \
+    bash "$F35_SCRIPT" --repo "$F35_REPO" --scope remote
+assert_eq "$RC" "0" "F35 control: a working ordering pipeline still plans (rc=0)"
+assert_contains "$OUT" "Found 2 stale merged branch(es)" "F35 control: both candidates are still classified"
+assert_eq "$(grep -c '^  git push origin --delete' <<<"$OUT" || true)" "2" "F35 control: the plan still prints a delete per candidate"
+
 cd "$REPO"
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"
