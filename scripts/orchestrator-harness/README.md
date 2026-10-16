@@ -217,6 +217,44 @@ rather than only diff hunks, and posts its verdict as a PR comment. That comment
 evidence the `record-review.sh` signature points at, so the merge gate is auditable after
 the fact: the PR body names the comment it was signed against.
 
+### Non-blocking dispatch — the orchestrator keeps its own time
+
+`nonblocking-dispatch.sh` launches a headless worker and **returns immediately**. It exists because
+the built-in `task`/`subagent` tools always block the caller (agent-infra#1662): an orchestrator that
+dispatches N workers pays `max(worker)` wall-clock and cannot react to anything until the slowest
+settles.
+
+It is deliberately thin. It carries **no agent invocation of its own** — it backgrounds
+`run_agent()` from `spawn-gate.sh`, so a background worker is load-gated exactly like `lane.sh` and
+`fix-one.sh`, gets the same wall-clock watchdog, and appends the same `state/walltime.tsv` row with
+`KIND=bg`. Routing it through the helper is also what keeps `spawn-gate.test.sh`'s invoker census an
+equality: a direct spawn here would be a fourth, ungated launch path.
+
+```bash
+bash nonblocking-dispatch.sh <name> <worktree-dir> <prompt-file> [timeout-seconds]
+bash nonblocking-dispatch.sh --status <name>     # running | done rc=0 | failed rc=N | lost
+```
+
+Status comes from the worker's own exit-status file plus a pid probe — **never `%CPU`**, which reads
+0 for a worker that is merely WAITING (`docs/ops/fleet-liveness.md`). "launched" is the only success
+this script reports: it cannot tell you the work succeeded.
+
+⛔ **Nothing here reviews anything.** The worker runs with `AGENT_SKIP_REVIEW_GATE=1` (a child has no
+`task` tool and cannot satisfy the gates itself), so **the PARENT owns the review gate** — hand the
+PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background worker whose PR is
+never handed to the chain is unreviewed code by default.
+
+⚠️ `install.sh` does **not** copy it. The script only syntax-checks every `*.sh`, and its drift
+comparison lists the loop scripts **explicitly** (it does not include this one), so a stale copy here
+is never reported and `install.sh` prints no `cp` for it. What puts this file in `$O` is the manual
+copy in §4 — `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness
+directory, and re-run that `cp` after editing this script.
+
+⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
+as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
+merges it supersedes this script for `task`-based orchestrators; the harness keeps this one for its
+own `pi` workers, which do not go through `task`.
+
 ---
 
 ## 3. Prerequisites
@@ -229,6 +267,7 @@ the fact: the PR body names the comment it was signed against.
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
 | `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
+| **the operational layer** (`~/.pi/agent/{scripts,extensions,skills,AGENTS.md,settings.json}`) | a lane is only as guarded as its `pi`; without the layer a box has **no review-enforcer, no verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no skills** | installed by `pi-bootstrap/cell-install.sh`, and on a cell it runs from `cloud-cell-bringup.sh --check`. Measured 2026-10-15 on a live cell: `scripts/` did not exist at all (24/24 declared farm files absent), and the merge path died `rc=127` on the missing `record-review.sh` (agent-infra#1723) |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
@@ -265,6 +304,25 @@ work unless they coordinate (see §5, "broad mode").
 ---
 
 ## 4. Install
+
+**On a cmux cloud cell**, `scripts/cloud-cell-bringup.sh --check` provisions the toolchain,
+the network, the provider, `gh` auth/push, the target-repo clone, the dispatch pre-flight and
+**the operational layer** — that last one from the agent-infra checkout already on the cell via
+`pi-bootstrap/cell-install.sh`, and it REFUSES to print `CELL READY` if the layer cannot be
+installed. Two things a `CELL READY` does NOT speak for, and which the operator still owns:
+**`AI_REVIEW_GATE_KEY`** (push it in `keys.env`; what actually ENFORCES it is the
+`ai-review-gate` check on each PR — `cloud-cell-supervisor.sh check` only WARNS, and says so)
+and **`AGENT_INFRA_PATH`**, which the `AGENTS.md` this step
+installs declares as a prerequisite — nothing on the cell sets it (`session-checks` and
+`auto-sync` silently skip without it, and `sequence-enforcer` in gate mode reports an
+unpassable checkpoint), so export it in the cell session's environment. `cell-install.sh` copies
+the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), every extension in
+`manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
+the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
+`settings.json`; run it with `--verify` to check an existing cell with no writes.
+
+**On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
+checkout:
 
 ```bash
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
@@ -863,7 +921,9 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `check-port-drift.sh` | gates the tortoise-side removal: fails if the tortoise harness moved past the pinned sync point (`port-provenance.txt`). Not part of the loop |
 | `cloud-cell-record-dep.test.sh` | #1717: drives `cloud-cell-supervisor.sh check/start` and `merge-one.sh` against a stubbed toolchain — the recorder is a checked, provisioned dependency, and a record failure parks. Registered in `scripts/run-bash-shards.sh`, so both CI lanes run it |
 
-**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand.
+**Manual utility:** `adopt-fix.sh` — run `fix-one.sh` against a specific PR by hand;
+`nonblocking-dispatch.sh` — launch a headless worker in the background and return immediately (§2).
+Neither is part of the loop.
 
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
