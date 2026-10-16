@@ -27,7 +27,11 @@
 #   (g) the npm child runs with a SCRUBBED environment — an allowlisted proxy/registry only,
 #       never the keys.env the cell exported — and with --ignore-scripts;
 #   (h) `--verify` refuses a hand-edited guard EXTENSION and a missing config artifact
-#       (agents/) — existence alone was certified before.
+#       (agents/) — existence alone was certified before;
+#   (i) `--verify` refuses a source tree it cannot compare IN FULL and does not treat that as
+#       a match: an emptied tree (either loop), a subtree it cannot read, a shipped file
+#       whose name carries a newline, and a shipped SYMLINK (copied as a link, never
+#       byte-compared) — and follows a symlinked source directory instead of calling it empty.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -437,10 +441,15 @@ if [ "$rc" -ne 1 ]; then
 else
   empties="$(grep -c 'ships NO files in the checkout' <<<"$out")"
   if [ "$empties" = "2" ]; then
-    ok "exactly the two zero-file source trees are refused (the 29 symlinked siblings verify CLEAN — find follows a symlinked source)"
+    ok "exactly the two zero-file source trees are refused (the symlinked sibling DIRECTORIES verify CLEAN — find follows a symlinked source)"
   else
     fail "$empties zero-file refusals for a fixture holding 2 of them — an empty tree and a symlinked tree are not being told apart"
   fi
+  # The count above only says the MESSAGE appeared twice; this says the run refused exactly two
+  # things, so a sibling failing for any other reason cannot hide behind the "verify CLEAN" claim.
+  grep -q 'FAILED: 2 problem(s)' <<<"$out" \
+    && ok "the run refused exactly two things — no symlinked sibling failed for some other reason" \
+    || fail "the fixture produced a problem count other than 2 ($(grep -o 'FAILED: [0-9]* problem(s)' <<<"$out" | head -1)): a sibling is failing for an unasserted reason"
   grep -q 'extension review-enforcer ships NO files in the checkout' <<<"$out" \
     && ok "an extension directory that ships NO files is refused, not certified on an empty tree" \
     || fail "the refusal did not name the empty extension (review-enforcer)"
@@ -448,9 +457,9 @@ else
     && ok "a config artifact that ships NO files is refused (the config loop's arm, not just the extension loop's)" \
     || fail "the config loop certified a zero-file agents/ source"
 fi
-# A source tree that cannot be READ in FULL must not be certified over the part find managed to
-# reach: `find` exits non-zero and prints a PARTIAL list, and the old form discarded that status
-# (`done < <(find … 2>/dev/null)`) so the comparison silently covered a subset and vouched for
+# A source tree that cannot be READ in FULL must not be certified over the part `find` managed to
+# reach: it exits non-zero and prints a PARTIAL list, which the pre-delta form discarded
+# (`done < <(find … 2>/dev/null)`), so the comparison silently covered a subset and vouched for
 # the rest unseen — in a tree whose every file is later executed.
 if [ "$(id -u)" = "0" ]; then
   ok "skipped the unreadable-subtree pin: running as root, where chmod 000 does not block a read"
@@ -465,6 +474,24 @@ else
     && ok "a source tree that cannot be read in full is REFUSED, not certified over a partial file list" \
     || fail "an unreadable subtree produced a certified comparison over the files find could reach"
 fi
+# Two more ways a file goes unread while the run reports a match, both refused the same way:
+# a name containing a NEWLINE breaks the line-based list (the captured text carries a duplicate
+# of a sibling's line), and a shipped SYMLINK is copied as a link and so never byte-compared.
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard"
+mkdir -p "$EMPTY_EXT/extensions/task-cwd-guard"
+cp -R "$ROOT/extensions/task-cwd-guard/." "$EMPTY_EXT/extensions/task-cwd-guard/"
+printf 'x\n' > "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'
+out3="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+grep -q 'extension task-cwd-guard could not be READ in the checkout' <<<"$out3" \
+  && ok "a shipped filename containing a NEWLINE is refused, not dropped from the comparison" \
+  || fail "a newline-bearing filename produced a certified comparison"
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard/evil"$'\n'
+ln -s /etc/hostname "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
+out4="$(CELL_HOME="$TMP/emptyext-home" INFRA_ROOT="$EMPTY_EXT" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --verify 2>&1)"
+grep -q 'extension task-cwd-guard could not be READ in the checkout' <<<"$out4" \
+  && ok "a shipped SYMLINK is refused (cp -R copies it as a link, so it was never byte-compared)" \
+  || fail "a shipped symlink was certified without ever being compared"
+rm -f "$EMPTY_EXT/extensions/task-cwd-guard/link.ts"
 rm -rf "$EMPTY_EXT" "$TMP/emptyext-home"
 rm -rf "$DEST/agents"
 run_verify

@@ -618,16 +618,31 @@ GUARD_EXTENSIONS=(review-enforcer verification-gate main-worktree-guard search-g
 # agree with install about the same input.
 #
 # Returns 1 on drift, 2 when the source tree yields NOTHING to compare (an emptied checkout
-# must not read as a match), and 3 when the tree could not be READ in full: `find`'s status is
-# checked, because a partial list would compare a subset of the files and certify the rest
-# unseen — a false PASS in a tree whose every file is later executed.
+# must not read as a match), and 3 when the tree could not be compared IN FULL — an unreadable
+# subtree, a name the line-based list cannot represent, or an entry that is not a regular file.
+# Every 3 is a refusal rather than a guess, because each of those cases used to certify a file
+# that was never read, and every file this installs is later executed.
 shipped_content_matches() {
-  local src="$1" dst="$2" f rel n=0 files
+  local src="$1" dst="$2" f rel n=0 files nl nonreg
   [ -d "$src" ] || return 2
   [ -r "$src" ] || return 3
+  # A NAME containing a newline cannot survive the line-based list below: the captured text
+  # carries a duplicate of a sibling's line (or loses an empty one), so the file itself is
+  # never compared and whatever sits on the cell is certified. Refuse the tree; no shipped
+  # tree in this repo has such a name.
+  nl="$(find -H "$src" ! -path '*/node_modules/*' -type f -print0 2>/dev/null | tr -cd '\n' | wc -c | tr -d ' ')"
+  [ "$nl" = "0" ] || return 3
+  # A shipped entry that is neither a directory nor a regular file (a symlink, fifo, device)
+  # cannot be byte-compared — `cp -R` copies a symlink AS a symlink, so a retargeted link on
+  # the cell verified clean forever.
+  nonreg="$(find -H "$src" ! -path '*/node_modules/*' ! -type d ! -type f 2>/dev/null | head -1)"
+  [ -z "$nonreg" ] || return 3
   files="$(find -H "$src" -type f 2>/dev/null)" || return 3
+  # An empty list is the emptied-tree case, and must be told apart from the refusals above: the
+  # loop below would otherwise see one empty line and report a lossy list instead.
+  [ -n "$files" ] || return 2
   while IFS= read -r f; do
-    [ -n "$f" ] || continue
+    [ -n "$f" ] || return 3   # an empty entry can only mean a lossy list — refuse, never skip
     rel="${f#"$src"/}"
     case "$rel" in node_modules/*) continue ;; esac
     cmp -s "$f" "$dst/$rel" || return 1
