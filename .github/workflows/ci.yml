@@ -381,6 +381,21 @@ jobs:
         # BYTE-IDENTICAL — the guard must never rewrite a good request.
         run: npx tsx extensions/clamp-output-floor.test.ts
 
+      - name: Secret-echo-guard suite (#5109 — the transcript-leak control)
+        # #5109 — a live API key was persisted in plaintext into session
+        # transcripts (60/576 files, still growing) because every reading tool
+        # returns the value and the result is written verbatim. This extension
+        # redacts registered secrets from `content` AND `details` in the
+        # `tool_result` hook, before persistence. Zero-dep by construction: the
+        # extension imports the pi package as a TYPE only (erased by tsx) and
+        # node stdlib otherwise, so it runs in THIS job (the job that performs no
+        # `npm ci`); every sink is driven through the NODE_ENV=test hook seam, so
+        # it never touches the real ~/.pi and never reads a real secret.
+        # Negative pins are first-class: ordinary output must be returned BY
+        # REFERENCE (handler answers `undefined`) and record nothing, a sub-floor
+        # value must not be redacted, and no sink may carry a redacted value.
+        run: npx tsx extensions/secret-echo-guard.test.ts
+
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).
         # The blocking backstop is ci-main.yml's extension-tests job, same
