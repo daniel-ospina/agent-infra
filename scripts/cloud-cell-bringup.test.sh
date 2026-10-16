@@ -36,6 +36,9 @@
 #
 # Hermetic: temp HOME/state/token path, stubbed toolchain, no network, and GH_TOKEN_FILE keeps it
 # away from the REAL /tmp/.gh-tok. Run:  bash scripts/cloud-cell-bringup.test.sh
+# ⚠️ `--check` now also provisions the operational layer (#1723) from the checkout this script
+# lives in, so the clean-run case installs it into the temp CELL_HOME: that is why the stub set
+# carries an offline `npm` and leaves `python3` to the host (see the stub block below).
 # ⚠️ That hermeticity is a property of the FIXED script: GH_TOKEN_FILE is introduced by this fix, so
 # running this suite against the PRE-FIX script (to show it is red) reads and `rm -f`s the real
 # /tmp/.gh-tok of whatever host runs it. Do that only where that file does not exist (as here).
@@ -61,9 +64,16 @@ else bad "missing $BRINGUP"; echo; echo "  PASS=$PASS FAIL=$FAIL"; exit 1; fi
 
 # ── stubbed toolchain (no network, no real gh, no real pi) ───────────────────────────────────────
 STUB="$T/stub"; mkdir -p "$STUB"
-for c in node python3 uv tmux docker; do
+for c in node uv tmux docker; do
   printf '#!/bin/sh\nexit 0\n' > "$STUB/$c"; chmod +x "$STUB/$c"
 done
+# `python3` is deliberately NOT stubbed. The operational layer's installer parses the farm set out
+# of setup.sh, reads the ship-list out of manifest.json and merges settings.json with the REAL
+# python3 — a no-op stub makes it parse nothing and refuse loudly by its own floor (which is the
+# right answer on a cell without python3, so this suite runs against the host's interpreter).
+# `npm` is stubbed because the layer installs each extension's declared dependencies: no network,
+# and `mkdir -p node_modules` is what the installer reads back as "dependencies present".
+printf '#!/bin/sh\nmkdir -p node_modules\nexit 0\n' > "$STUB/npm"
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
 printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
@@ -142,6 +152,23 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "token file removed on the success path (as before the fix)" \
                 || bad "token file SURVIVED a successful run"
+
+# ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
+# `--check` verifies first and only installs when the read-back refuses, so a re-run against a
+# provisioned cell must not re-copy the layer. The discriminator is the installer's own mode
+# banner: "mode=--verify" on the fast path, "mode=--install" if it re-installed.
+say_case "second clean run — the layer is verified, not re-installed"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "the second clean run still exits 0" \
+                   || bad "second clean run FAILED (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"mode=--install"*) bad "the second run RE-INSTALLED the layer instead of verifying it" ;;
+  *"mode=--verify"*) ok "the second run certified the existing layer by reading it back (no install)" ;;
+  *) bad "the second run never reported a verify of the layer — output: $BR_OUT" ;;
+esac
+[ ! -e "$TOK" ] && ok "the token is removed on the second run too" \
+                || bad "token file SURVIVED the second clean run"
 
 # ── 3) an abort BEFORE check_gh is reached — the window the pre-fix code left open ───────────────
 # The removal used to live INSIDE check_gh, and there was no trap, so a failure in check_tools or

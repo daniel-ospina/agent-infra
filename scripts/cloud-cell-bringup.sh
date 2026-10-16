@@ -47,9 +47,11 @@
 #      and its merge path died rc=127 on the missing $HOME/.pi/agent/scripts/record-review.sh,
 #      the exact path merge-one.sh:240 executes.
 #      FIX: install it BY CONSTRUCTION — pi-bootstrap/cell-install.sh, run from the --check path
-#      below, from an agent-infra checkout that is already on the cell. A cell that cannot
-#      receive the layer is REFUSED rather than certified: a green `CELL READY` over an
-#      unguarded cell is the false PASS this whole script exists to remove.
+#      below, from an agent-infra checkout that is already on the cell. That path VERIFIES first
+#      and installs only when the read-back refuses, so a re-run on a provisioned cell costs a
+#      read-back rather than a re-copy. A cell that cannot receive the layer is REFUSED rather
+#      than certified: a green `CELL READY` over an unguarded cell is the false PASS this whole
+#      script exists to remove.
 
 set -uo pipefail
 
@@ -398,14 +400,26 @@ check_operational_layer() {
        and re-run:  INFRA_ROOT=<checkout> bash $0 --check"
   fi
   installer="$root/pi-bootstrap/cell-install.sh"
-  ok "installing the operational layer from $root"
-  # The installer both installs AND verifies (--install ends in verify_layer). Its exit status
-  # is captured from the COMMAND, never from a `| sed` pipeline — a decoration that swallows a
-  # failure is how a false PASS gets minted. Its output is indented so the layer's own
-  # failures never read as bring-up chatter.
+  # VERIFY FIRST: a re-run against a cell that already carries the layer is a READ-BACK (the
+  # installer's --verify writes nothing, so it cannot repair anything either), and only a cell
+  # that is missing the layer — or behind the checkout — pays for an install. Both halves are the
+  # installer's own decisions; this function re-implements neither.
+  # The exit status is captured from the COMMAND, never from a `| sed` pipeline — a decoration
+  # that swallows a failure is how a false PASS gets minted. The install's output is indented so
+  # the layer's own failures never read as bring-up chatter.
   local out rc=0
-  out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
-  printf '%s\n' "$out" | sed 's/^/    /'
+  out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --verify 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root"
+    rc=0
+    out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
+    printf '%s\n' "$out" | sed 's/^/    /'
+  else
+    # The read-back is quiet: its mode banner, any failure line, and its verdict. The banner is
+    # what keeps the FAST path observable — a `--check` that silently re-copied instead would
+    # print no mode at all, and cloud-cell-bringup.test.sh asserts on exactly that.
+    printf '%s\n' "$out" | grep -E '(^cell-install — mode|^LAYER VERIFIED|^FAIL:)' | sed 's/^/    /'
+  fi
   if [ "$rc" -ne 0 ]; then
     die "the operational layer FAILED to install from $root (rc=$rc) — a cell without it is unguarded (no review-enforcer/verification-gate/main-worktree-guard/search-guard/audit-logger, no skills) and its merge path dies rc=127. Fix the failure above, or install it by hand: CELL_HOME=$CELL_HOME INFRA_ROOT=$root bash $installer --install"
   fi
