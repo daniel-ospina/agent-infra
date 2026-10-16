@@ -548,10 +548,6 @@ touch "$O/checked.txt" "$O/candidates.txt"
 # and that whole priority tier silently disappears into a "healthy" backlog, the #8465 priority
 # inversion this sort exists to prevent (#1853 review). The sentinel is a real file write from the
 # pipeline's subshell, so the parent sees it.
-# ⛔ AND AN UNWRITTEN POOL IS NOT AN EMPTY ONE. The test for that is the redirect's STATUS, not the
-# FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
-# redirect failed, and the stale pool was then read as this run's backlog — `checked N; backlog now M`
-# at rc 0 over a run that persisted nothing (#1853 review).
 rm -f "$O/.pool-err"
 {
   gh issue list --repo "$OR" --state open --limit 300 --label P0-blocker --json number,assignees,title \
@@ -560,10 +556,20 @@ rm -f "$O/.pool-err"
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err" || echo "P1-severe" >> "$O/.pool-err"
   gh issue list --repo "$OR" --state open --limit 200 --label P2-moderate --json number,assignees,title \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err" || echo "P2-moderate" >> "$O/.pool-err"
-} | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool" || {
+} | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
+# ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
+# FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
+# redirect failed, and the stale pool was then read as the backlog of a run that persisted nothing —
+# `checked N; backlog now M` at rc 0 (#1853 review). The status is read IMMEDIATELY, with no `$(...)`
+# in between, and this is its OWN statement on purpose: selftest.sh extracts the line above VERBATIM
+# (`grep -E '^\} \| sort '` + a sed that strips a trailing ` > "$O/.pool"`), so a suffix on that line
+# turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
+# which would then stop covering the very ordering the pool depends on.
+pool_rc=$?
+if [ "$pool_rc" -ne 0 ]; then
   echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
   exit "$EXIT_TRANSIENT"
-}
+fi
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
 # WHICH host would come back, and a marker only a human can clear must not be latched on a guess.
