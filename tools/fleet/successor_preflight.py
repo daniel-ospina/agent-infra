@@ -80,7 +80,12 @@ can fail to cover the list are different facts and only one of them is evidence:
     prevent. **Absence of an answer is never evidence of absence.**
   * a pid that is provably GONE (`ENOENT`, the pid exited between `pgrep` and
     the read) -> that IS an answer: it holds no worktree. This is why the
-    `/proc` fallback can complete a partial `lsof` read rather than abstaining.
+    `/proc` fallback can complete a partial `lsof` read rather than abstaining —
+    **and only against a root that IS a procfs** (`<root>/self` exists). Against
+    a path that is merely some directory, `ENOENT` says nothing about the
+    process table, so the read is refused instead (a cycle-2 finding: an ambient
+    `SUCCESSOR_PROC_ROOT` pointing anywhere would otherwise turn a live pid into
+    a *complete* read).
 
 LIVE beats GONE at every step, and UNKNOWN is not a weaker GONE: a reading we
 could not take is never a predecessor we proved absent. That is the same
@@ -181,16 +186,42 @@ def _real(path: str) -> str:
     """
     try:
         s = os.path.expanduser(path)
-        # Linux spells a cwd whose directory has been UNLINKED as
-        # "/path/to/dir (deleted)" (`/proc/<pid>/cwd`). That is the same
-        # directory as `/path/to/dir`; comparing the two spellings apart would
-        # report a live predecessor in a removed worktree as GONE -- the #1317
-        # failure. Strip the kernel's suffix (and only that suffix) first.
-        if s.endswith(DELETED_SUFFIX):
-            s = s[: -len(DELETED_SUFFIX)]
         return os.path.realpath(os.path.normpath(s))
     except Exception:
         return path
+
+
+def _cwd_matches(cwd: str, target: str) -> bool:
+    """``cwd`` names ``target`` — including the kernel's unlinked spelling.
+
+    ``/proc/<pid>/cwd`` appends `` (deleted)`` when the directory has been
+    unlinked, and ``/path (deleted)`` IS ``/path`` when the path was removed and
+    recreated under a still-running lane (the live predecessor holds the OLD
+    inode). Strip the suffix for THIS COMPARISON ONLY — never from the target.
+
+    Rewriting the target was a cycle-2 finding (P2): a ``--worktree`` ending in
+    `` (deleted)`` then normalised to the plain path, so the tool could decide
+    about a directory the caller never asked about (a false GONE for the
+    requested unit, or a false ``exit 2`` for a legitimate name).
+    """
+    if _real(cwd) == target:
+        return True
+    if cwd.endswith(DELETED_SUFFIX):
+        return _real(cwd[: -len(DELETED_SUFFIX)]) == target
+    return False
+
+
+def _is_procfs(proc_root: str) -> bool:
+    """Is ``proc_root`` a procfs (or a faithful fixture of one)?
+
+    The completion rule below treats ``ENOENT`` as *"this pid is gone"*, and that
+    reading is only sound against a root that actually represents the process
+    table. A path that is merely a directory full of nothing (a typo, an ambient
+    ``SUCCESSOR_PROC_ROOT``, an empty temp dir) would make every omitted pid read
+    as gone — a false ``GONE`` produced by the *fix*. ``<root>/self`` is the
+    procfs's own self-reference and is what makes the absence mean what we say.
+    """
+    return os.path.isdir(os.path.join(proc_root, "self"))
 
 
 def _run(cmd: Sequence[str], timeout: int = 60) -> Tuple[int, str]:
@@ -285,7 +316,7 @@ def _proc_cwds(pids: Sequence[str], proc_root: str) -> Tuple[Dict[str, str], boo
     fallback instead of abstaining: an omitted pid that /proc does not know is a
     pid that is genuinely gone, not a gap in the reading.
     """
-    if not os.path.isdir(proc_root):
+    if not _is_procfs(proc_root):
         return {}, False
     m: Dict[str, str] = {}
     for pid in pids:
@@ -311,7 +342,7 @@ def live_pids_in_worktree(target: str, pgrep_bin: str, lsof_bin: str,
     cwds, ok = pi_cwds(pids, lsof_bin, proc_root)
     if not ok:
         return [], False
-    hits = [int(p) for p, cwd in cwds.items() if _real(cwd) == target]
+    hits = [int(p) for p, cwd in cwds.items() if _cwd_matches(cwd, target)]
     return sorted(hits), True
 
 

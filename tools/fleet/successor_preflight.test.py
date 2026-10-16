@@ -12,7 +12,7 @@ exercises, and the red controls prove each leg can go red.
     python3 tools/fleet/successor_preflight.test.py
     python3 tools/fleet/successor_preflight.test.py --red-control
 
-RED CONTROL — thirteen mutations, each run against the leg that must catch it (a
+RED CONTROL — fifteen mutations, each run against the leg that must catch it (a
 mutation the suite does not catch is reported as a suite FAILURE):
 
   * drop the live-process check        -> LIVE-PROCESS red
@@ -28,6 +28,8 @@ mutation the suite does not catch is reported as a suite FAILURE):
   * an unreadable cwd read becomes an omitted one -> PROC-READ-REFUSED red
   * drop the unlinked-cwd normalisation -> DELETED-CWD red
   * report a nonexistent worktree as GONE -> NO-WORKTREE red
+  * accept a non-procfs root as the process table -> ROOT-NOT-PROCFS red
+  * read an epoch-millis stamp as epoch seconds -> CMUX-WINDOW red
 
 Zero-dep by construction: python3 + bash only. Every input is a temp fixture;
 ``pgrep``/``lsof``/``cmux``/``ps``/``date`` are hermetic shims, so nothing touches
@@ -187,6 +189,11 @@ class Fixture:
         # depend on the host's real /proc.
         self.proc = os.path.join(self.dir, "proc")
         os.makedirs(self.proc, exist_ok=True)
+        # A procfs identifies itself: the tool refuses to treat ENOENT as "the pid
+        # is gone" against anything else (`_is_procfs`), so the fixture plants
+        # `self` exactly as a real /proc has it. Without this the fixture would be
+        # (correctly) refused as not-a-procfs.
+        os.makedirs(os.path.join(self.proc, "self"), exist_ok=True)
 
         sessions = {}
         for sid, ws, rec in lanes:
@@ -381,18 +388,55 @@ def t_live_cmux(module):
 
 @test("CMUX-WINDOW")
 def t_cmux_window(module):
-    """Activity older than the window is not activity (the window is real)."""
+    """Activity older than the window is not activity (the window is real).
+
+    The second row is deliberately stamped in epoch MILLIS and is STALE: a
+    millis value the code fails to convert is a *future* timestamp, so a merely
+    "recent" millis row cannot discriminate the conversion at all (a cycle-2
+    finding — the leg passed unchanged with `/1000.0` removed). A stale millis
+    row does discriminate, and the JSON assertion pins the conversion itself.
+    """
     wt = os.path.join(tempfile.gettempdir(), "succ-window-wt")
     fx = Fixture(worktree=wt,
                  lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
                  cmux_rows=[{"id": WS, "current_directory": wt,
-                             "updated_at": NOW_S - 4000}])
+                             "updated_at": NOW_S - 4000},
+                            {"id": WS2, "current_directory": wt,
+                             "updated_at": (NOW_S - 4000) * 1000}])
     try:
-        rc, out = run_preflight(fx, "--recent-s", "900", module=module)
+        rc, out = run_preflight(fx, "--recent-s", "900", "--json", module=module)
         assert_eq(rc, 0, "rc 0 = stale activity does not block")
-        assert_in("verdict: PREDECESSOR-GONE", out, "verdict is GONE")
+        doc = json.loads(out)
+        assert_eq(doc["verdict"], "PREDECESSOR-GONE", "verdict is GONE")
+        assert_eq([a["recent"] for a in doc["cmux_activity"]], [False, False],
+                  "neither the stale seconds row nor the stale millis row is recent")
+        assert_eq(doc["cmux_activity"][1]["updated_at"], NOW_S - 4000,
+                  "the millis stamp is converted to seconds, not read as a future one")
     finally:
         fx.close()
+
+
+@test("ROOT-NOT-PROCFS")
+def t_root_not_procfs(module):
+    """A root that is not a procfs cannot make an omitted pid read as gone.
+
+    `ENOENT` means "the pid is gone" only against a real process table. A cycle-2
+    finding (P1): with an ambient `SUCCESSOR_PROC_ROOT` pointing at any empty
+    directory, a live pid omitted by lsof was 'completed' by that directory's
+    silence and reported GONE.
+    """
+    wt = os.path.join(tempfile.gettempdir(), "succ-notprocfs-wt")
+    plain = tempfile.mkdtemp(prefix="succ-plain-root-")
+    fx = Fixture(worktree=wt, lanes=[(SID, WS, record(SID, WS, PID_DEAD, cwd=wt))],
+                 pids=[PID_OTHER], cmux_rows=[])
+    try:
+        rc, out = run_preflight(fx, "--lsof-bin", os.path.join(fx.dir, "no-lsof"),
+                                "--proc-root", plain, module=module)
+        assert_eq(rc, 4, "rc 4 = a non-procfs root may not answer for the process table")
+        assert_in("verdict: UNKNOWN", out, "verdict is UNKNOWN")
+    finally:
+        fx.close()
+        shutil.rmtree(plain, ignore_errors=True)
 
 
 @test("OTHER-WORKTREE")
@@ -759,11 +803,17 @@ MUTATIONS = [
      "        except FileNotFoundError:\n            continue          # proven gone — an answer, not a gap in the read\n        except OSError:\n            return {}, False  # refused — never evidence of absence\n",
      "        except OSError:\n            continue\n"),
     ("drop the unlinked-cwd normalisation", "DELETED-CWD",
-     "        if s.endswith(DELETED_SUFFIX):\n            s = s[: -len(DELETED_SUFFIX)]\n",
-     "        if False:\n            s = s[: -len(DELETED_SUFFIX)]\n"),
+     "    if cwd.endswith(DELETED_SUFFIX):\n        return _real(cwd[: -len(DELETED_SUFFIX)]) == target\n",
+     "    if False:\n        return _real(cwd[: -len(DELETED_SUFFIX)]) == target\n"),
     ("report a nonexistent worktree as GONE", "NO-WORKTREE",
      "    if not os.path.isdir(target):\n",
      "    if False:\n"),
+    ("accept a non-procfs root as the process table", "ROOT-NOT-PROCFS",
+     "    if not _is_procfs(proc_root):\n        return {}, False\n",
+     "    if not os.path.isdir(proc_root):\n        return {}, False\n"),
+    ("read an epoch-millis stamp as epoch seconds", "CMUX-WINDOW",
+     "        return v / 1000.0 if v > 1e11 else v\n",
+     "        return v\n"),
 ]
 
 

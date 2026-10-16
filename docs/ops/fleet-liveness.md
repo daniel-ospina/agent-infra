@@ -502,7 +502,9 @@ are different facts, and only one of them is evidence:
   **refused** read → `UNKNOWN`;
 - a pid that is provably **gone** (`ENOENT`: it exited between `pgrep` and the read) **is** an
   answer — it holds no worktree — which is why the `/proc` fallback can *complete* a partial `lsof`
-  read rather than abstaining.
+  read rather than abstaining. That reading holds **only against a root that is a procfs**
+  (`<root>/self` exists): against a path that is merely some directory, `ENOENT` says nothing about
+  the process table, so the read is refused instead.
 
 **Absence of an answer is never evidence of absence.** Scoring a partial read as a complete one is
 how a live predecessor owned by another uid reads as *"no agent in this worktree"* and the tool
@@ -512,6 +514,12 @@ emits the very `PREDECESSOR-GONE` the incident is about.
 store=…`, because an inherited `SUCCESSOR_LSOF_BIN` or a non-default `--store` changes what was read
 — and a proof that reads as though the default tool had answered is exactly the *"was assumed gone"*
 shape this section exists to eliminate.
+
+**The target is never rewritten.** ` (deleted)` is the *kernel's* spelling of a cwd, so it is
+unwrapped where the kernel emits it (the cwd comparison, `live_pids_in_worktree`), never inside the
+path normaliser: a `--worktree` that itself ends in ` (deleted)` must stay byte-identical to what the
+caller asked about, or the tool decides about a directory nobody named. (Same class as the read-side
+bug: one path silently acquiring another's identity.)
 
 ### 9.2 The decision ladder — order is the safety property
 
@@ -569,8 +577,8 @@ Run the pinned suites after any change to the preflight (the red control proves 
 without its fix):
 
 ```bash
-python3 tools/fleet/successor_preflight.test.py               # 21 legs
-python3 tools/fleet/successor_preflight.test.py --red-control # 13 mutations, each must go RED
+python3 tools/fleet/successor_preflight.test.py               # 22 legs
+python3 tools/fleet/successor_preflight.test.py --red-control # 15 mutations, each must go RED
 python3 tools/fleet/liveness.test.py                          # the predicate it consumes
 ```
 
