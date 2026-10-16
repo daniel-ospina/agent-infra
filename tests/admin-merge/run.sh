@@ -128,21 +128,23 @@
 #      a failed `gh run list` is a LISTING failure and not a thinner lane, and the
 #      parity key is the VERBATIM shard name (the matrix axis is NOT normalised
 #      away — `test (a, docker)` and `test (a, embedded)` are different lanes).
-#      The reference is drawn from at least `--main-runs` runs: the window counts
-#      MEASUREMENTS, so a run that measured nothing does not spend it, and the
-#      listing widens past such runs while no executed shard has been found. The
-#      widened window is DISCLOSED, so a shard main ran only inside the operator's
-#      window still cannot be sampled away (#4844). A listing that is only PARTLY readable is
-#      UNREADABLE, not a thinner lane (cycle-2 P1: an unparsable run line used to
-#      be skipped, silently shrinking the reference; an unterminated final line
-#      was dropped outright). A family whose every member is a workflow LIFECYCLE
+#      The reference is drawn from at least `--main-runs` runs: the listing WIDENS
+#      while no executed family shard has been found, so a window holding none does
+#      not end the search. The widened window is DISCLOSED, so a shard main ran only
+#      inside the operator's window still cannot be sampled away (#4844). A listing
+#      that is only PARTLY readable is UNREADABLE, not a thinner lane (cycle-2 P1:
+#      an unparsable run line used to be skipped, silently shrinking the reference;
+#      an unterminated final line was dropped outright). A family whose every member is a workflow LIFECYCLE
 #      job measured nothing and is refused (cycle-2 P1: `=changes` certified on
 #      bookkeeping while main's real shard went uncompared), which is why the
 #      evidence and the refusal both NAME the parity family. `--main-runs` is
-#      validated (positive, ≤ 200) before any CI work, and the widening stops once
-#      that many MEASURING runs are consulted: the window is the Jobs-API call
-#      budget for the ordinary path, and a wider one reads more job lists only
-#      where the requested window found no shard at all.
+#      validated (positive, ≤ 200) before any CI work, and the widening stops on a
+#      family match, on the history being exhausted, or at the 200-run bound — NOT
+#      once that many MEASURING runs are consulted (#7734: under --any-workflow
+#      the measuring runs can be non-code ones carrying no shard, and the widened
+#      window is exactly where the code lane is found). `--main-runs` is the
+#      STARTING width, and a wider window reads more job lists only where the
+#      requested window found no shard at all.
 #      `ADMIN_MERGE_LANE_PARITY=declared-off` is accepted for the trigger-split
 #      case (#1349) but NO LONGER CERTIFIES (#1439): the evidence gate refuses a
 #      vacuous certificate that lacks the positive `lane parity: PR ⊇ main` line,
@@ -416,6 +418,51 @@ case "$key" in
     # A per-lane fixture, when present, models the FILTERED listing; the bare
     # file models the unfiltered one (the bogus-zero window).
     if [ -n "$wf" ] && [ -f "$f.by-workflow.$wf" ]; then f="$f.by-workflow.$wf"; fi
+    # ── #1417 S2: THE RAIL'S OWN BODY-EDIT PROBE ─────────────────────────────
+    # Recognised by the ONLY field combination no other caller asks for — status
+    # AND conclusion AND workflowName. (The #1261 map arm has `event` WITHOUT
+    # status/conclusion; the raw supersede arm is keyed on `workflowDatabaseId`.)
+    # The output is the 4-field projection `LANE_RUN_GUARD_JQ` produces
+    # (`status  conclusion  id  normalized-workflow-name`), derived from the SAME
+    # fixture the lane listing reads, so the two can never disagree about a run's
+    # state. `event-gen-<n>` is a per-call sequence for a generation that FINISHES
+    # while the rail waits; absent, the single fixture is served (and every
+    # pre-existing scenario is byte-identical).
+    #
+    # ⛔ THE PROBE IS KEYED ON THE WORKFLOW NAME, NOT `event` (review, PR #1640).
+    # A run's `event` is the webhook NAME (`pull_request`), never the activity
+    # type (`edited`), so the section-70 fixtures carry the REAL event values and
+    # this projection ignores that column entirely.
+    want_event=0
+    case "$fields" in
+      *status*) case "$fields" in *conclusion*) case "$fields" in *workflowName*) [ "$want_raw" -eq 0 ] && want_event=1 ;; esac ;; esac ;;
+    esac
+    if [ "$want_event" = 1 ]; then
+      if [ "$mode" = "commit" ] && [ -f "$SCEN/event-gen-1" ]; then
+        en=$(( $(cat "$SCEN/event-list-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$en" > "$SCEN/event-list-count"
+        while [ "$en" -gt 1 ] && [ ! -f "$SCEN/event-gen-$en" ]; do en=$((en - 1)); done
+        f="$SCEN/event-gen-$en"
+      fi
+      if [ -f "$f" ]; then
+        awk -F'\t' 'NF>=6 { split($3,p,":"); k=tolower($5); gsub(/[^a-z0-9]/,"",k); printf "%s\t%s\t%s\t%s\n", $1, ($2==""?"-":$2), p[2], k }' "$f" \
+          | { if [ -n "$limit" ]; then head -n "$limit"; else cat; fi; }
+      fi
+      exit 0
+    fi
+    # ── #1417 S1: A SURFACE THAT CHANGES BETWEEN READS ───────────────────────
+    # The rail waits for the generation its own PR-body edit created and then
+    # RE-READS this surface (the whole point: a guard run that FAILS must be in
+    # the re-read set). A static fixture cannot model a run that finishes
+    # mid-wait, so `surface-gen-<n>` is one fixture per read of this `--commit`
+    # surface, in call order, the last one repeating once exhausted. Absent →
+    # every pre-existing scenario is byte-identical.
+    if [ "$mode" = "commit" ] && [ -f "$SCEN/surface-gen-1" ]; then
+      sn=$(( $(cat "$SCEN/surface-list-count" 2>/dev/null || echo 0) + 1 ))
+      printf '%s' "$sn" > "$SCEN/surface-list-count"
+      while [ "$sn" -gt 1 ] && [ ! -f "$SCEN/surface-gen-$sn" ]; do sn=$((sn - 1)); done
+      f="$SCEN/surface-gen-$sn"
+    fi
     if [ "$want_raw" = 1 ]; then
       # The raw projection: the fixture verbatim (a legacy 3-field line is handed
       # over as-is, which is exactly how a line the lister did not produce reaches
@@ -826,11 +873,19 @@ FAKEEOF
 chmod +x "$FAKE"
 
 # new_scen <name> → $SCEN for one scenario
+#
+# REPRO_CMD is RESET here, not merely defaulted at the call site. It is an
+# input to the #3715 reproduction seam, and a scenario that sets it would
+# otherwise leak it into EVERY later scenario in the file — a reproduction that
+# clears residuals would then make the block assertions pass for the wrong
+# reason (the whole suite goes green while the gate is open). One scenario,
+# one default.
 new_scen() {
   SCEN="$TMP/scen-$1"
   rm -rf "$SCEN"
   mkdir -p "$SCEN"
   : > "$SCEN/calls"
+  REPRO_CMD=true
   # The ≥3.12 interpreter the #6928 fixtures supply (see selector_interp_*). It is
   # scenario-scoped STATE, so it is reset here: a scenario that forgot to set it
   # must not silently inherit the previous scenario's interpreter and depend on
@@ -842,6 +897,7 @@ new_scen() {
 
 run_admin() {
   SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+    ADMIN_MERGE_REPRO_CMD="${REPRO_CMD:-true}" \
     ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
     bash "$ADM" "$@" >"$TMP/out" 2>"$TMP/err"
   return $?
@@ -854,9 +910,16 @@ run_admin() {
 # fail-open shape this suite exists to catch, one level down. Scenarios that
 # assert on the rail's own output use this.
 run_admin_here() {
-  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
-    ADMIN_MERGE_POLL_INTERVAL=0 ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
-    bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
+  local -a env_args=(
+    "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
+  )
+  # REPRO_CMD="" means "OMIT the seam": the PRODUCTION path runs (a real base
+  # worktree). A suite that always sets the seam never executes the runner
+  # selection, the worktree materialisation/removal, or the alarm wrapper — the
+  # code the whole safety claim rests on (#3715 review, P2).
+  [ -n "${REPRO_CMD:-}" ] && env_args+=("ADMIN_MERGE_REPRO_CMD=$REPRO_CMD")
+  env "${env_args[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err"
   return $?
 }
 
@@ -896,6 +959,47 @@ log_passed() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z PASSED 
 # measured zero.
 log_unattributable() { printf 'test (a)\tRun tests\t2026-09-17T13:10:44.1700000Z FAILED %s upstream error\n' "$1"; }
 
+# The #3715 reproduction seam: a script that reads the refused nodeids on stdin
+# and writes the BASE's own pytest-shaped capture on stdout. In production the
+# rail materialises a pristine `origin/main` worktree and runs the lane there;
+# in this suite the script IS that runner, so the reproduction is expressible
+# without a real suite. `sed` turns each `<nodeid>` into the canonical
+# `FAILED <nodeid>` record the decision's own id parser consumes.
+repro_script() {  # <path>
+  printf '#!/usr/bin/env bash\nsed "s/^/FAILED /"\n' > "$1"
+  chmod +x "$1"
+}
+
+# A reproduction that reports ONLY <nodeid> FAILED (the base reproduces one of
+# the refused ids and not the others). %q shell-quotes the id, so a nodeid with
+# `::`/parens/brackets survives.
+repro_script_one() {  # <path> <nodeid-to-echo>
+  printf '#!/usr/bin/env bash\ngrep -F %q | sed "s/^/FAILED /"\n' "$2" > "$1"
+  chmod +x "$1"
+}
+
+# A reproduction that echoes the requested ids AND VOLUNTEERS <nodeid> — the
+# "outside its argv" capture the clearable set must intersect away (#3715
+# review, P0). `cat` forwards the nodeids the rail handed it; the extra id is
+# printed unconditionally, as a nodeid-shaped token the id parser will accept.
+repro_script_extra() {  # <path> <extra-nodeid>
+  printf '#!/usr/bin/env bash\nsed "s/^/FAILED /"\nprintf "FAILED %%s\\n" %q\n' "$2" > "$1"
+  chmod +x "$1"
+}
+
+# A reproduction that RECORDS the ids the rail actually handed it (the runner's
+# stdin), then reports <nodeid> FAILED. Used to prove a non-nodeid family is NOT
+# passed to the runner: pytest refuses a non-path argument with exit 4 having run
+# NOTHING, so an id the runner must never see has to be asserted absent from its
+# input, not merely inferred from the outcome (#3715 review, P2).
+repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'tee %q | grep -F %q | sed "s/^/FAILED /"\n' "$3" "$2"
+  } > "$1"
+  chmod +x "$1"
+}
+
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
@@ -912,6 +1016,12 @@ lane_pass() {
   lane_jobset "$2" success 'test (a)' 'test (b)'
 }
 lane_queued() { lane_line in_progress "" "$1" "$2"; }
+# #1417: the six-field lane-run fixture the WIDER projections read — the parser's
+# RAW supersede listing (`status  conclusion  sha:id  workflow-id  workflow-name
+# event`) and, from the same fixture, the rail's body-edit EVENT probe. Only the
+# first three fields are the canonical lane line, so `lane_line`/`lane_fail`/
+# `lane_pass`/`lane_queued` fixtures remain valid inputs to every projection.
+lane_ev() { printf '%s\t%s\t%s:%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" 1 "$5" "$6"; }
 
 # A main baseline that EXEMPTS <id> under the #3756 decision: `n` tested runs (at
 # least the module's min_runs floor) in which <id> fails with the SAME signature.
@@ -1408,6 +1518,519 @@ if grep -q "pr merge" "$SCEN/calls"; then
 else
   pass "no merge attempted"
 fi
+
+# ── 4c. #3715: a refusal whose failure REPRODUCES on the base is pre-existing ──
+# The false block this pins: the decision refuses a failure because main's
+# FAILURE-ONLY baseline carries no row for it — but absence from a failure-only
+# projection is NOT evidence of novelty. Main may never have run the test in the
+# evaluated shape at all (this repo's tier-2 PR legs run embedded while main's
+# push legs run the same files against docker; the union is keyed on the bare
+# nodeid). The rail must CONSTRUCT the missing measurement — run the refused
+# nodeids on the base — before it attributes them to the PR.
+#
+# THE SAFETY PROPERTIES ARE PINNED, not just the happy path:
+#   1. no reproduction → the refusal STANDS (the pre-fix behaviour);
+#   2. a reproduction that reports the SAME nodeid FAILED on the base clears it
+#      and merges, and the evidence records the reproduction;
+#   3. when only ONE of two refused ids reproduces, the OTHER still blocks
+#      (an inverted `--diff` order would clear both and pass test 2 alone);
+#   4. an id that main's rate table MEASURED is NOT a candidate — the exact
+#      #3756 fail-open (`main 1/8 vs PR 8/8`) must not be clearable by a single
+#      ambient base run;
+#   5. an unusable bound is "could not run", which clears nothing — and is
+#      REPORTED as such, never conflated with "ran and found nothing";
+#   6. a base capture that names an id OUTSIDE the candidate set clears nothing
+#      (the clearable set is `candidates ∩ reproduced`, never the base's whole
+#      failing set — a loose runner must not override a MEASURED verdict);
+#   7. an id whose FILE main measured (a sibling failure there) is
+#      MEASURED-ABSENT, not a candidate — a local base run must not clear
+#      evidence of novelty; and
+#   8. the PRODUCTION path (no seam) fails closed when the base cannot be
+#      materialised — the runner/worktree/bound code is exercised, not just the
+#      seam;
+#   9. a base that is a REF NAME (not a pinned OID) clears nothing — a stale
+#      local ref must never certify a failure as pre-existing; and
+#  10. an UNATTRIBUTABLE (moving-identity) residual is never clearable by a base
+#      run — the class is "cannot be attributed to this PR" and never a merge;
+#  11. a clearance that empties the residual STILL takes the E5 second sample: a
+#      single-sample identity that MOVES on retry must block, not merge.
+echo "== 4c. #3715: a residual reproduced on the BASE is pre-existing, not blockable =="
+# A PINNED base OID (#3715): the reproduction refuses a ref NAME (a stale local
+# ref must not certify pre-existence), so the scenario pins one. The fake's
+# default sha is 42 chars — deliberately not a real OID — so a scenario that
+# wants the production path must say what the base is.
+repro_base_sha() { printf 'aaaa1111bbbb2222cccc3333dddd4444eeee5555\n' > "$SCEN/main-sha"; }
+
+new_scen repro-base
+repro_base_sha
+HEAD_REP="e1e1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP" > "$SCEN/head"
+PRE='tests/test_pre_existing.py::test_fails_on_main_too'
+lane_fail "$HEAD_REP" 901 > "$SCEN/runs-$HEAD_REP"
+log_failed "$PRE" > "$SCEN/log-901"
+lane_fail main5151 951 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-951"
+cp "$SCEN/log-901" "$SCEN/log-after-901"   # the PR's retry FAILS again
+repro_script "$SCEN/repro.sh"
+
+# HALF 1 — no reproduction → the refusal stands, and the outcome is REPORTED as
+# "ran, found nothing" (never as "could not run").
+REPRO_CMD=true
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715 baseline: no reproduction → the refusal stands (exit $rc)" \
+                || fail "#3715 baseline: expected a block with no reproduction, got 0"
+grep -q "SURVIVED the re-run" "$SCEN/err" \
+  && pass "#3715 baseline: the residual-survival refusal is the one under test" \
+  || { fail "#3715 baseline: the survival refusal did not fire — fixture broken"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "NO refused failure reproduced there" "$SCEN/err" \
+  && pass "#3715: a reproduction that ran and found nothing is reported as such" \
+  || fail "#3715: 'ran and found nothing' is not distinguished from 'could not run'"
+[ -f "$SCEN/comment" ] && fail "#3715 baseline: no evidence may be posted on the block" || pass "#3715 baseline: no evidence posted"
+
+# HALF 2 — the base reproduces the SAME nodeid: pre-existing, cleared, merged.
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "#3715: a residual reproduced on the base no longer blocks (exit 0)" \
+                || { fail "#3715: expected exit 0 when the base reproduces the residual, got $rc"; sed 's/^/      /' "$SCEN/err"; }
+if [ -f "$SCEN/comment" ] && grep -q "REPRODUCE on base" "$SCEN/comment"; then
+  pass "#3715: the evidence records the base reproduction"
+else
+  fail "#3715: the evidence does not record the base reproduction"
+  [ -f "$SCEN/comment" ] && sed 's/^/      /' "$SCEN/comment"
+fi
+grep -q "CLEARED as reproduced on the base" "$SCEN/comment" \
+  && pass "#3715: the evidence heading does not overclaim 'all EXEMPT'" \
+  || fail "#3715: the evidence heading still folds a reproduced id into 'all EXEMPT'"
+# THE PLACEHOLDER, NOT ONLY THE HEADING (#3715 review, P2). The heading was made
+# conditional on `repro_count`; the body under "must be empty" was not, so the
+# SAME evidence comment claimed both "(none — no failure was exempted)" and "the
+# decision exempts every failure this PR carries". The cleared id was reproduced
+# on the base, not exempted — the body must say so. Both directions are asserted
+# because the overclaim is a claim about the RECORD, not a cosmetic string.
+grep -q "the 1 cleared id(s) were reproduced on the base" "$SCEN/comment" \
+  && pass "#3715: the empty-residual placeholder names the base reproduction, not a non-existent exemption" \
+  || fail "#3715: the placeholder still claims the decision exempted the failure the base reproduced"
+grep -qF "(empty — the decision exempts every failure this PR carries)" "$SCEN/comment" \
+  && fail "#3715: the placeholder contradicts the '(none — no failure was exempted)' block in the same comment" \
+  || pass "#3715: the overclaiming placeholder is not emitted when the base cleared the residual"
+grep -q "pr merge 42 --admin" "$SCEN/calls" \
+  && pass "#3715: the merge proceeds once the reproduced failure is cleared" \
+  || fail "#3715: no --admin merge after a reproduced-on-base residual"
+
+# HALF 3 — TWO refused ids, only ONE reproduces: the other MUST still block, and
+# only the reproduced one may be reported cleared. An inverted `--diff` argument
+# order makes `comm -23` return empty, `repro_n` = the whole residual, and BOTH
+# ids vanish — this half is what catches that.
+new_scen repro-base-partial
+repro_base_sha
+HEAD_REP3="e3e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP3" > "$SCEN/head"
+PRE3='tests/test_pre_existing.py::test_fails_on_main_too'
+OTHER3='tests/test_genuinely_new.py::test_the_pr_broke_it'
+lane_fail "$HEAD_REP3" 921 > "$SCEN/runs-$HEAD_REP3"
+{ log_failed "$PRE3"; log_failed "$OTHER3"; } > "$SCEN/log-921"
+lane_fail main5252 961 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-961"
+cp "$SCEN/log-921" "$SCEN/log-after-921"
+repro_script_one "$SCEN/repro-one.sh" "$PRE3"
+REPRO_CMD="bash $SCEN/repro-one.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: the NON-reproduced id still blocks (exit $rc)" \
+                || { fail "#3715: only one id reproduced, but the rail merged — it cleared an id the base did not reproduce"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "test_the_pr_broke_it" "$SCEN/err" \
+  && pass "#3715: the surviving refusal names the non-reproduced id" \
+  || fail "#3715: the surviving refusal does not name the non-reproduced id"
+grep -q "^   pre-existing: $PRE3" "$SCEN/err" \
+  && pass "#3715: only the reproduced id is reported cleared" \
+  || { fail "#3715: the cleared-id report is missing or mislabels the surviving id"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing: $OTHER3" "$SCEN/err" \
+  && fail "#3715: a NON-reproduced id was reported as pre-existing" \
+  || pass "#3715: the non-reproduced id is not reported as pre-existing"
+# A CLEARED id must not reappear in the POST-rerun residual: the retry reports it
+# again (`log-after-921` == `log-921`), and the post-rerun subtraction is what
+# keeps it out of "SURVIVED the re-run". Without that subtraction the cleared id
+# is reported as surviving a re-run it was already cleared from (#3715 review).
+[ "$(grep -cF "$PRE3" "$SCEN/err")" -eq 1 ] \
+  && pass "#3715: a cleared id does not reappear in the post-rerun residual" \
+  || { fail "#3715: a CLEARED id reappeared after the re-run ($(grep -cF "$PRE3" "$SCEN/err") mentions)"; grep -n "SURVIVED\|$PRE3" "$SCEN/err" | sed 's/^/      /'; }
+
+# HALF 4 — #3756 guard: an id main's rate table MEASURED is not a candidate.
+# main fails REG once (1 run < min_runs, so the decision BLOCKS it on
+# insufficient evidence), and the base echoes it back — yet the refusal must
+# stand, because a single ambient run cannot override a MEASURED verdict.
+new_scen repro-base-measured
+repro_base_sha
+HEAD_REP4="e4e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP4" > "$SCEN/head"
+REG='tests/test_measured.py::test_measured_on_main'
+lane_fail "$HEAD_REP4" 931 > "$SCEN/runs-$HEAD_REP4"
+log_failed "$REG" > "$SCEN/log-931"
+lane_fail main5454 971 > "$SCEN/runs-main"
+log_failed "$REG" > "$SCEN/log-971"
+cp "$SCEN/log-931" "$SCEN/log-after-931"
+repro_script "$SCEN/repro.sh"        # would echo REG if it were a candidate
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715 (#3756): a MEASURED id is not clearable by reproduction (exit $rc)" \
+                || { fail "#3715 (#3756): the reproduction cleared a MEASURED verdict — the #3756 fail-open is open"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "carries a main-side measurement" "$SCEN/err" \
+  && pass "#3715 (#3756): the refusal names the measured-verdict class as the reason" \
+  || fail "#3715 (#3756): the measured-verdict guard did not fire"
+
+# HALF 5 — an unusable bound is "could not run": nothing cleared, and the outcome
+# is REPORTED as could-not-run (the mandatory-bound contract, #3715 review).
+new_scen repro-base-badb
+repro_base_sha
+HEAD_REP5="e5e5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP5" > "$SCEN/head"
+lane_fail "$HEAD_REP5" 941 > "$SCEN/runs-$HEAD_REP5"
+log_failed "$PRE" > "$SCEN/log-941"
+lane_fail main5656 981 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-981"
+cp "$SCEN/log-941" "$SCEN/log-after-941"
+repro_script "$SCEN/repro.sh"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_CMD="bash $SCEN/repro.sh" ADMIN_MERGE_REPRO_TIMEOUT=abc \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: an invalid ADMIN_MERGE_REPRO_TIMEOUT clears nothing (exit $rc)" \
+                || { fail "#3715: an invalid reproduction bound cleared the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "the reproduction could not RUN" "$SCEN/err" \
+  && pass "#3715: the unusable bound is reported as could-not-run" \
+  || fail "#3715: the unusable bound is not reported as could-not-run"
+
+# HALF 5b — the same guard must refuse the two values a hand-rolled `case` let
+# through: a LEADING-ZERO spelling (`perl alarm 00` == `alarm 0`, so the timer is
+# CANCELED) and a value past the integer range (`alarm` errors and no bound is
+# armed). Both would leave the merge-time base suite UNBOUNDED (#3715 review, P1).
+for bad in 00 99999999999999999999; do
+  SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+    ADMIN_MERGE_REPRO_CMD="bash $SCEN/repro.sh" ADMIN_MERGE_REPRO_TIMEOUT="$bad" \
+    ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+  rc=$?
+  [ "$rc" -ne 0 ] && pass "#3715: ADMIN_MERGE_REPRO_TIMEOUT=$bad clears nothing (exit $rc)" \
+                  || fail "#3715: ADMIN_MERGE_REPRO_TIMEOUT=$bad was ACCEPTED — the bound can be disarmed"
+  grep -q "the reproduction could not RUN" "$SCEN/err" \
+    && pass "#3715: ADMIN_MERGE_REPRO_TIMEOUT=$bad is reported as could-not-run" \
+    || fail "#3715: ADMIN_MERGE_REPRO_TIMEOUT=$bad was not reported as could-not-run"
+done
+
+# HALF 5c — a runner that FAILED TO RUN is not a runner that "ran and found
+# nothing" (#3715 review, P2). The subshell status was discarded, so an exit-1
+# capture with no output (a crash, missing dependencies, an argv the runner
+# refused) left `ids` reading a legitimate empty set and the rail reporting "NO
+# refused failure reproduced there" — a POSITIVE measurement that the base passed
+# tests it never executed. `false` is exactly that shape.
+new_scen repro-base-runfail
+repro_base_sha
+HEAD_RF="eded000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RF" > "$SCEN/head"
+lane_fail "$HEAD_RF" 946 > "$SCEN/runs-$HEAD_RF"
+log_failed "$PRE" > "$SCEN/log-946"
+lane_fail main6262 986 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-986"
+cp "$SCEN/log-946" "$SCEN/log-after-946"
+REPRO_CMD=false
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a runner that FAILED clears nothing (exit $rc)" \
+                || { fail "#3715: a runner that exited non-zero still cleared the residual"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "the reproduction could not RUN" "$SCEN/err" \
+  && pass "#3715: a non-zero runner status is reported as could-not-run" \
+  || fail "#3715: a non-zero runner status was not reported as could-not-run"
+grep -q "NO refused failure reproduced there" "$SCEN/err" \
+  && fail "#3715: a runner that FAILED was reported as a ran-and-found-nothing MEASUREMENT" \
+  || pass "#3715: a failed runner is never reported as 'no refused failure reproduced'"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#3715: a failed runner was read as a clearance" \
+  || pass "#3715: a failed runner cleared nothing"
+
+# HALF 5d — a NON-NODEID identity must never reach the runner (#3715 review, P2).
+# `collect-error::<file>`, `watchdog-kill::<reason>` and `job-unreadable::<slug>`
+# name no pytest nodeid; passed to pytest as an ARGUMENT one of them makes it exit
+# 4 having run NOTHING, aborting the WHOLE base run — the false block #3715 exists
+# to remove, hidden behind a "no failure reproduced" report. The runner's INPUT is
+# asserted DIRECTLY (the seam records what it was handed), because the outcome
+# alone cannot tell "not asked" from "asked and not reported".
+new_scen repro-base-nonnodeargv
+repro_base_sha
+HEAD_NN="ecec000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_NN" > "$SCEN/head"
+CE_NN='collect-error::tests/test_other_pre.py'
+NODE_NN='tests/test_genuinely_new3.py::test_pr_broke_it_3'
+lane_fail "$HEAD_NN" 947 > "$SCEN/runs-$HEAD_NN"
+{ printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/test_other_pre.py - ImportError: no module named z\n'
+  log_failed "$NODE_NN"
+} > "$SCEN/log-947"
+printf '3\n' > "$SCEN/jobs-count-947"
+lane_fail main7373 987 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-987"
+cp "$SCEN/log-947" "$SCEN/log-after-947"
+repro_script_log "$SCEN/repro-log.sh" "$NODE_NN" "$SCEN/repro-request.txt"
+REPRO_CMD="bash $SCEN/repro-log.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a mixed residual still blocks on the non-nodeid id (exit $rc)" \
+                || { fail "#3715: a collect-error in a mixed residual was cleared"; sed 's/^/      /' "$SCEN/err"; }
+[ -s "$SCEN/repro-request.txt" ] \
+  && pass "#3715: the reproduction seam recorded the ids it was handed" \
+  || fail "#3715: the reproduction seam recorded no input — the input assertions would be vacuous"
+grep -qF -- "$CE_NN" "$SCEN/repro-request.txt" \
+  && fail "#3715: the collect-error id was handed to the runner — pytest would exit 4 having run NOTHING" \
+  || pass "#3715: the collect-error id is NOT in the runner's input"
+grep -qF -- "$NODE_NN" "$SCEN/repro-request.txt" \
+  && pass "#3715: the runnable nodeid IS in the runner's input" \
+  || { fail "#3715: the runner was handed nothing to run"; sed 's/^/      /' "$SCEN/repro-request.txt" 2>/dev/null; }
+grep -q "^   pre-existing: $NODE_NN" "$SCEN/err" \
+  && pass "#3715: the runnable nodeid in the same residual still clears on the base" \
+  || { fail "#3715: the runnable nodeid was not cleared — the non-nodeid id aborted the whole base run"; sed 's/^/      /' "$SCEN/err"; }
+grep -qF -- "$CE_NN" "$SCEN/err" \
+  && pass "#3715: the collect-error id stays in the refusal (a unit is not a measurement)" \
+  || fail "#3715: the collect-error id vanished from the refusal"
+
+# HALF 6 — the clearable set is `candidates ∩ reproduced`, NOT the base's whole
+# failing set. A runner that volunteers an id outside its argv (the `ids --log`
+# parser recovers nodeid-shaped tokens from ANYWHERE in the capture) must not
+# clear a MEASURED verdict. Without the intersection the volunteered id is
+# subtracted too and the merge proceeds (#3715 review, P0).
+new_scen repro-base-extra
+repro_base_sha
+HEAD_REP6="e6e6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP6" > "$SCEN/head"
+MEAS6='tests/test_measured2.py::test_measured_too'
+NEW6='tests/test_genuinely_new2.py::test_pr_broke_it_2'
+lane_fail "$HEAD_REP6" 942 > "$SCEN/runs-$HEAD_REP6"
+{ log_failed "$MEAS6"; log_failed "$NEW6"; } > "$SCEN/log-942"
+lane_fail main5757 982 > "$SCEN/runs-main"
+log_failed "$MEAS6" > "$SCEN/log-982"      # main MEASURES this id -> not a candidate
+cp "$SCEN/log-942" "$SCEN/log-after-942"
+repro_script_extra "$SCEN/repro-extra.sh" "$MEAS6"
+REPRO_CMD="bash $SCEN/repro-extra.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a base id OUTSIDE the candidate set clears nothing (exit $rc)" \
+                || { fail "#3715: the base volunteered a MEASURED id and the merge proceeded — the clearable set is not intersected with the candidates"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing: $MEAS6" "$SCEN/err" \
+  && fail "#3715: a base id outside the candidate set was reported pre-existing" \
+  || pass "#3715: the volunteered measured id is not reported cleared"
+grep -q "$MEAS6" "$SCEN/err" \
+  && pass "#3715: the MEASURED id still blocks (named in the surviving refusal)" \
+  || fail "#3715: the MEASURED id vanished from the refusal"
+# BASELINE-DISCRIMINATING (#3715 review, P2): the outcome assertions above are
+# ALSO what the pre-PR rail produces — it blocks every residual unconditionally,
+# so "exit != 0" and "the measured id is named" pass for an unrelated reason.
+# This one can ONLY be produced by the new path: the base reproduces the
+# CLEARABLE id (NEW6) and the rail reports the clearance.
+grep -q "^   pre-existing: $NEW6" "$SCEN/err" \
+  && pass "#3715: the base reproduces the CLEARABLE id, so the clearance actually happened" \
+  || fail "#3715: the clearable id was not reported pre-existing — the intersection could be vacuous"
+
+# HALF 7 — MEASURED-ABSENT is not the measurement gap. main runs the FILE (a
+# sibling failure is in main-fails), so the file IS measured; an id inside it
+# with no row of its own is "measured on this lane, not present on main" — the
+# rail's own attribute_residual calls that evidence of NOVELTY. It must not be a
+# candidate, however the base behaves (#3715 review, P0).
+new_scen repro-base-file
+repro_base_sha
+HEAD_REP7="e7e7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP7" > "$SCEN/head"
+X7='tests/test_same_file.py::test_this_pr_broke_it'
+SIB7='tests/test_same_file.py::test_sibling_red_on_main'
+lane_fail "$HEAD_REP7" 943 > "$SCEN/runs-$HEAD_REP7"
+log_failed "$X7" > "$SCEN/log-943"
+lane_fail main5858 983 > "$SCEN/runs-main"
+log_failed "$SIB7" > "$SCEN/log-983"      # same FILE as X7 -> main measured the file
+cp "$SCEN/log-943" "$SCEN/log-after-943"
+repro_script "$SCEN/repro.sh"            # would clear X7 if it were a candidate
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: an id in a FILE main measured stays refused (exit $rc)" \
+                || { fail "#3715: a base run cleared an id whose file main measured — MEASURED-ABSENT was treated as the measurement gap"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing: $X7" "$SCEN/err" \
+  && fail "#3715: a MEASURED-ABSENT id was reported pre-existing" \
+  || pass "#3715: no MEASURED-ABSENT id is reported cleared"
+grep -q "sits in a FILE main's baseline measured" "$SCEN/err" \
+  && pass "#3715: the refusal names the MEASURED-ABSENT class as the reason" \
+  || fail "#3715: the file-level candidate filter did not report the measured-absent class"
+
+# HALF 8 — the PRODUCTION path (no seam) is entered, not just the seam. With no
+# ADMIN_MERGE_REPRO_CMD the rail takes the `git worktree add` branch; a base that
+# cannot be materialised (here the pinned OID does not exist in this repo) must
+# clear NOTHING and be REPORTED as "could not RUN". NOTE the scope honestly: this
+# pins the fail-closed return BEFORE the runner is built, so the runner-selection
+# branch, the worktree REMOVAL and the alarm wrapper remain unpinned (they need a
+# real base commit + a runnable lane, which this suite does not have).
+new_scen repro-base-prod
+repro_base_sha
+HEAD_REP8="e8e8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP8" > "$SCEN/head"
+lane_fail "$HEAD_REP8" 944 > "$SCEN/runs-$HEAD_REP8"
+log_failed "$PRE" > "$SCEN/log-944"
+lane_fail main5959 984 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-984"
+cp "$SCEN/log-944" "$SCEN/log-after-944"
+REPRO_CMD=                      # omit the seam -> the PRODUCTION path
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: an unmaterialisable base clears nothing (exit $rc)" \
+                || { fail "#3715: the production path cleared the residual without a base worktree"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "the reproduction could not RUN" "$SCEN/err" \
+  && pass "#3715: the production path reports the failure as could-not-run" \
+  || fail "#3715: the production path did not report could-not-run"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#3715: the production path cleared an id it never measured" \
+  || pass "#3715: the production path cleared nothing"
+
+# HALF 9 — a REF NAME is not a pinned base. `check_surface_probe` falls back to
+# the REF when the commits API cannot resolve a SHA, and `git worktree add main`
+# would then resolve the LOCAL ref — a stale, redder main would certify failures
+# that are NOT pre-existing on the real base (#3715 review, P2).
+new_scen repro-base-refname
+printf 'main\n' > "$SCEN/main-sha"        # a REF, not a pinned OID
+HEAD_REP9="e9e9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP9" > "$SCEN/head"
+lane_fail "$HEAD_REP9" 945 > "$SCEN/runs-$HEAD_REP9"
+log_failed "$PRE" > "$SCEN/log-945"
+lane_fail main6363 985 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-985"
+cp "$SCEN/log-945" "$SCEN/log-after-945"
+repro_script "$SCEN/repro.sh"
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: a base that is a REF NAME clears nothing (exit $rc)" \
+                || { fail "#3715: a ref-name base certified a failure as pre-existing"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "the base is not a pinned commit OID" "$SCEN/err" \
+  && pass "#3715: the ref-name base is refused by name" \
+  || fail "#3715: the ref-name base was not refused by name"
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#3715: a ref-name base cleared an id" \
+  || pass "#3715: a ref-name base cleared nothing"
+
+# HALF 10 — an UNATTRIBUTABLE residual is NEVER clearable. Two PR runs report the
+# SAME class under a MOVING id, so `detect_rotating_identity` (E5) refuses both as
+# "cannot be attributed to this PR" — never a merge. A base run reproducing one of
+# the moving ids says nothing about the class, so the reproduction must not touch
+# it (#3715 review, P1).
+new_scen repro-base-unattr
+repro_base_sha
+HEAD_REP10="eaea000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP10" > "$SCEN/head"
+RA1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
+RA2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
+{ lane_fail "$HEAD_REP10" 951; lane_fail "$HEAD_REP10" 952; } > "$SCEN/runs-$HEAD_REP10"
+log_failed "$RA1" > "$SCEN/log-951"
+log_failed "$RA2" > "$SCEN/log-952"
+lane_fail main6464 991 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-991"
+cp "$SCEN/log-951" "$SCEN/log-after-951"
+cp "$SCEN/log-952" "$SCEN/log-after-952"
+repro_script "$SCEN/repro.sh"
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: an UNATTRIBUTABLE residual is never clearable (exit $rc)" \
+                || { fail "#3715: a MOVING identity was cleared by a base run — the exempt-and-silent direction"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing:" "$SCEN/err" \
+  && fail "#3715: an id was reported pre-existing on an UNATTRIBUTABLE residual" \
+  || pass "#3715: nothing was reported pre-existing for an unattributable residual"
+grep -q 'UNATTRIBUTABLE' "$SCEN/err" \
+  && pass "#3715: the refusal still names the UNATTRIBUTABLE class" \
+  || fail "#3715: the unattributable class vanished"
+grep -q -- '--admin' "$SCEN/calls" \
+  && fail "#3715: a merge was attempted over an UNATTRIBUTABLE residual" \
+  || pass "#3715: no merge over an unattributable residual"
+# BASELINE-DISCRIMINATING (#3715 review, P2): the pre-PR rail blocks the residual
+# unconditionally, so every assertion above is green WITHOUT the reproduction. The
+# repro_scope EXCLUSION message can only be emitted by the new empty-candidate
+# path, so it is the assertion that pins "UNATTRIBUTABLE ids never reach the
+# candidate set" rather than "the rail blocks unattributable residuals".
+grep -q "every refused failure is UNATTRIBUTABLE (a moving identity) or a guard-step" "$SCEN/err" \
+  && pass "#3715: the empty-candidate reason names the repro_scope UNATTRIBUTABLE/guard-step exclusion" \
+  || fail "#3715: an unattributable residual never reached the repro_scope exclusion message"
+
+# HALF 11 — the base reproduction must NOT pre-empt the E5 rotation rule. A
+# clearance that empties the residual would otherwise SKIP the re-run, which is
+# the only mechanism that collects the second sample `detect_rotating_identity`
+# needs — so a single-sample MOVING identity could be cleared and merged. The
+# retry reports a DIFFERENT id in the same class, and the FORCED re-run must catch
+# it and block (#3715 review, P1).
+new_scen repro-base-rotate
+repro_base_sha
+HEAD_REP11="ebeb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_REP11" > "$SCEN/head"
+RB1='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch'
+RB2='tests/test_dr_endpoints.py::TestDrDrill::test_dr_restores_to_scratch_416bf7c5'
+lane_fail "$HEAD_REP11" 960 > "$SCEN/runs-$HEAD_REP11"
+log_failed "$RB1" > "$SCEN/log-960"
+log_failed "$RB2" > "$SCEN/log-after-960"   # the retry reports a MOVED identity
+lane_fail main6565 992 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-992"
+repro_script_one "$SCEN/repro-one.sh" "$RB1"
+REPRO_CMD="bash $SCEN/repro-one.sh"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3715: the E5 rotation on retry still blocks after a base clearance (exit $rc)" \
+                || { fail "#3715: the base clearance SKIPPED the E5 second sample — a moving identity merged"; sed 's/^/      /' "$SCEN/err"; }
+grep -q 'UNATTRIBUTABLE' "$SCEN/err" \
+  && pass "#3715: the moved identity is refused as UNATTRIBUTABLE" \
+  || fail "#3715: the rotation was not detected after the clearance"
+grep -q -- '--admin' "$SCEN/calls" \
+  && fail "#3715: a merge was attempted over a rotated identity" \
+  || pass "#3715: no merge over a rotated identity"
+# BASELINE-DISCRIMINATING (#3715 review, P2): "exit != 0" and "UNATTRIBUTABLE is
+# named" are both produced by the pre-PR rail. These two can only come from the
+# new path: the base CLEARED RB1 (a clearance that happened), and the forced
+# second sample is the mechanism the clearance must not skip.
+grep -q "^   pre-existing: $RB1" "$SCEN/err" \
+  && pass "#3715: the base clearance actually happened before the forced second sample" \
+  || fail "#3715: no clearance was reported, so the forced re-run was never exercised"
+grep -q "re-running to collect a SECOND" "$SCEN/out" \
+  && pass "#3715: a clearance that empties the residual still forces the E5 second sample" \
+  || fail "#3715: the forced second sample was not taken after the clearance"
+
+# --- 4c (bis). a collect-error on main for the residual's FILE is a UNIT, not a
+# MEASUREMENT (#3715) -------------------------------------------------------
+# The clearance exists to stop FALSE BLOCKS. `collect-error::<file>` means pytest
+# could not COLLECT the file, so NO test in it ran and main's baseline says
+# NOTHING about the file's tests. Read it as "main measured this file" and the
+# file-level candidate filter refuses a base reproduction that DID reproduce —
+# blocking a genuinely pre-existing failure, i.e. the exact bug #3715 exists to
+# fix. The two readings are `main_baseline_units` (the unit a baseline row is
+# keyed by, for what the rail PRINTS) and `main_measured_files` (the files whose
+# tests main really RAN, for what it CLEARS). They agree for every id that names
+# a test, which is why one function looked sufficient; this pins the one family
+# where they must not be the same set.
+new_scen repro-base-collect-error
+repro_base_sha
+HEAD_CE="e5e5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_CE" > "$SCEN/head"
+PRE_CE='tests/test_pre_existing.py::test_fails_on_main_too'
+lane_fail "$HEAD_CE" 981 > "$SCEN/runs-$HEAD_CE"
+log_failed "$PRE_CE" > "$SCEN/log-981"
+# main's baseline names the SAME FILE — but only as a COLLECTION ERROR, which
+# names no test id. So main never measured this file's tests.
+lane_fail maince2 989 > "$SCEN/runs-main"
+printf 'test (d)\tRun fast test suite\t2026-10-01T04:00:00.0000000Z ERROR tests/test_pre_existing.py - ImportError: no module named z\n' > "$SCEN/log-989"
+printf '3\n' > "$SCEN/jobs-count-989"
+cp "$SCEN/log-981" "$SCEN/log-after-981"   # the PR's retry FAILS again
+repro_script "$SCEN/repro.sh"
+REPRO_CMD="bash $SCEN/repro.sh"
+run_admin_here 44 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "#3715: a same-file COLLECT-ERROR on main does not block a base reproduction (exit 0)" \
+  || { fail "#3715: main's collect-error for the SAME file was read as a measurement, so a pre-existing failure FALSE-BLOCKED (exit $rc) — a UNIT is not a MEASUREMENT"; sed 's/^/      /' "$SCEN/err"; }
+grep -q "^   pre-existing: $PRE_CE" "$SCEN/err" \
+  && pass "#3715: …the reproduced id is reported pre-existing despite the same-file collect-error" \
+  || fail "#3715: the reproduced id was not reported pre-existing"
+grep -q "pr merge 44 --admin" "$SCEN/calls" \
+  && pass "#3715: …and the merge proceeds" \
+  || fail "#3715: no merge after a clearance that should have happened"
 
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ─────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="
@@ -2093,6 +2716,40 @@ grep -q "^ *-> absent from main" "$TMP/err" && pass "(f) …as absent from main'
   || fail "(f) a different-file main baseline was mis-reported: $(grep -c . "$TMP/err") line(s)"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted on a PR-unique collect-error" \
   || pass "(f) no merge attempted"
+
+# ── the SAME rule for `job-unreadable::<slug>` (#7131) in the new helpers ──
+# This pins the MERGE RESOLUTION, not just the branch: splitting main's inline
+# `main_files` block into `main_baseline_units` / `failure_file_key` dropped
+# main's `job-unreadable::` arm from both. The branch's own side keeps only the
+# generic `s/::.*//` / `%%::*`, which collapses EVERY pruned-log job onto the
+# literal `job-unreadable` — so a main baseline red on a DIFFERENT job matches
+# the PR's job and the operator is told the lane is re-measuring main's failure
+# when it is not. That is exactly the false conclusion #7131 exists to prevent.
+# Main is red on `test (h)`; the PR's pruned job is `test (d)`, so the PR's unit
+# is NOT on main and must read "absent from main's failure set", naming the JOB
+# SLUG — never the bare `job-unreadable` prefix.
+new_scen jobunreadable-resid
+sha_ju='aa71310000000000000000000000000000000077'
+printf '%s\n' "$sha_ju" > "$SCEN/head"
+lane_fail "$sha_ju" 7150 > "$SCEN/runs-$sha_ju"
+: > "$SCEN/pruned-log-7150"                  # the PR run's log is PROVEN absent
+printf 'test (d)\n' > "$SCEN/jobs-failed-7150"
+printf '3\n' > "$SCEN/jobs-count-7150"
+# main is red on the SAME family (a pruned log) but a DIFFERENT job.
+lane_fail mainju 7151 > "$SCEN/runs-main"
+: > "$SCEN/pruned-log-7151"
+printf 'test (h)\n' > "$SCEN/jobs-failed-7151"
+printf '3\n' > "$SCEN/jobs-count-7151"
+run_admin 44 --main-runs 1 >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a job-unreadable main has on a DIFFERENT job BLOCKS (exit $rc)" \
+  || fail "(g) a PR-unique job-unreadable was certified (exit $rc)"
+grep -q "no failure in job-unreadable" "$TMP/err" && fail "(g) the bare 'job-unreadable' prefix was reported as the unit" \
+  || pass "(g) …never the bare 'job-unreadable' prefix as a unit"
+grep -q "no failure in test-d" "$TMP/err" && pass "(g) …the JOB SLUG is named as the unit" \
+  || fail "(g) a different-job main baseline was mis-reported: $(grep 'no failure in\|measured on this lane' "$TMP/err" | head -1)"
+grep -q "pr merge" "$SCEN/calls" && fail "(g) a merge was attempted on a PR-unique job-unreadable" \
+  || pass "(g) no merge attempted"
+
 # And the guard that must NOT be relied on alone: an EMPTY log must ALSO refuse.
 # (This is the case that made the refusals look redundant in review cycle 7.)
 new_scen frc-pin-empty
@@ -2261,6 +2918,13 @@ fi
 
 # ── 7. merge flags pass through ───────────────────────────────────────────
 echo "== 7. extra merge flags pass through (not hardcoded) =="
+# ⛔ #1709 rec 7: §6's `run_admin` really merged, which the fake records by
+# touching `$SCEN/merged` — GitHub's own state, simulated. A re-run against a
+# merged PR is now (correctly) a no-op, so a test that wants a SECOND fresh merge
+# must clear that state first. This is the fixture, not a workaround: without it
+# the rail is asked to merge an already-merged PR, which is exactly the duplicate
+# path the pre-check exists to short-circuit.
+rm -f "$SCEN/merged"
 run_admin 42 --main-runs 3 --squash --delete-branch >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --squash --delete-branch --match-head-commit $HEAD_SHAPE" "$SCEN/calls"; then
   pass "--squash/--delete-branch forwarded and the merge is head-pinned (--match-head-commit)"
@@ -3986,7 +4650,11 @@ else
   fail "no default merge method: an omission NO-OPs gh pr merge and leaves the marker standing"
   grep "pr merge" "$SCEN/calls" | sed 's/^/      /'
 fi
-# An explicit method overrides the default and is not doubled.
+# An explicit method overrides the default and is not doubled. The first run
+# above MERGED (the fake touched `$SCEN/merged`), so clear the simulated state —
+# a re-run against a merged PR is now correctly a no-op (#1709 rec 7), and this
+# vector is about flag passthrough on a FRESH merge.
+rm -f "$SCEN/merged"
 : > "$SCEN/calls"
 run_admin 42 --main-runs 3 -- --rebase >/dev/null 2>&1
 if grep -q "pr merge 42 --admin --rebase --match-head-commit $HEAD_MM" "$SCEN/calls" \
@@ -5927,8 +6595,8 @@ new_scen vacuousnoprefix
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9851 > "$SCEN/runs-$HEAD_VP"
 lane_pass main9999 9852 > "$SCEN/runs-main"
-lane_jobset 9851 success 'unit-test' 'lint'
-lane_jobset 9852 success 'unit-test' 'lint'
+lane_jobset 9851 success 'unit-test' 'lint' 'probe (a, docker)'
+lane_jobset 9852 success 'unit-test' 'lint' 'probe (a, docker)'
 run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "no job matches the shard prefix on either side → BLOCK (exit $rc)" \
@@ -5941,6 +6609,22 @@ grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$SCEN/err" && pass "…naming the knob fo
 # conflated them.
 grep -q "NONE is named 'test\*'" "$SCEN/err" && pass "…and names the FAMILY that selected nothing (not a stale reference)" \
   || fail "the refusal does not distinguish a prefix mismatch from an empty reference"
+# #7734: THE COUNT IS NOT ACTIONABLE ON ITS OWN. "This lane's shards are named
+# differently" and "no run of a code lane was in this window at all" have
+# OPPOSITE remedies (set the prefix vs. name the lane), and the numbers above
+# cannot separate them — so the refusal must NAME the executed job names it saw,
+# and say whether the search even finished. Both are asserted here because both
+# are load-bearing: an unactionable refusal is the defect, not the counts.
+# `probe (a, docker)` is here ON PURPOSE: the sample is ` | `-separated, not
+# comma-separated, precisely because a job NAME may contain a comma — and this
+# fixture is what makes a regression to a comma join RED instead of silently
+# rendering one name as two.
+grep -qF "window DID carry were: lint | probe (a, docker) | unit-test." "$SCEN/err" \
+  && pass "…and NAMES the executed job names it saw (the only way to tell the two remedies apart), pipe-separated so a comma-bearing name stays ONE element" \
+  || fail "the refusal does not render the job names it saw as pipe-separated elements: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
+grep -q "read IN FULL" "$SCEN/err" \
+  && pass "…and says the run history was read IN FULL, so a re-run cannot help" \
+  || fail "the refusal does not say the widening exhausted the history"
 
 # (h) A LISTING FAILURE IS NOT "FEWER SHARDS". `lane_run_ids` swallowed gh's exit
 # status, so an auth/network failure produced an EMPTY listing — which read as
@@ -6539,18 +7223,19 @@ rc=$?
   || fail "expected the startup refusal (exit 2), got $rc — an unbounded window is an unbounded call budget"
 grep -q "beyond the usable window" "$SCEN/err" && pass "…naming the bound" || fail "the window bound is not named"
 
-# ── (r) THE WINDOW IS SPENT ON MEASUREMENTS, NOT ON RAW RUNS (#4844) ────────
+# ── (r) WIDENING PAST RUNS THAT MEASURE NOTHING (#4844, #7734) ──────────────
 # The lane-coverage gate read `--main-runs` RAW runs and consulted only the
 # completed ones, so a push burst (each push CANCELLING its predecessor) filled
 # the window with cancelled/queued runs and pushed the last usable reference OUT
 # of it. The gate then reported "no EXECUTED test shard matching 'test*'" — which
 # reads as a coverage gap in the PR and sends the reader after
 # ADMIN_MERGE_LANE_JOB_PREFIX — and refused every merge until main's lane settled.
-# A run that MEASURED NOTHING must not spend the operator's window: when a window
-# yields no executed shard at all, the listing widens (bounded) until one is
-# found. The scenarios below pin the widening, its bound, its fail-CLOSED
-# direction, and the polarity of the id guard that used to refuse a whole side
-# when a listing line carried no run id.
+# #4844 stopped the raw-window charge by charging only for runs that FINISHED a
+# measurement; #7734 removed that measurement charge too, so nothing now stops the
+# widening but a family match, the end of the history, or the policy bound. The
+# scenarios below pin the widening, its bound, its fail-CLOSED direction, and the
+# polarity of the id guard that used to refuse a whole side when a listing line
+# carried no run id.
 
 # (r1) THE REPRODUCTION. Main's requested 3-run window is [completed-but-no-test-
 # shard, in flight, in flight]; the run that carries `test (a)` sits at position
@@ -6576,7 +7261,7 @@ grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the widen
 grep -q -- "--limit 3" "$SCEN/calls" && grep -q -- "--limit 6" "$SCEN/calls" \
   && pass "…because the listing WIDENED (--limit 3 → --limit 6), not because the window was ignored" \
   || fail "the reference was not reached by widening the listing: $(grep -c 'run list --branch main' "$SCEN/calls") main listing(s), none at --limit 6"
-grep -q "widened past non-measuring runs" "$SCEN/comment" \
+grep -q "carried no shard in the parity family" "$SCEN/comment" \
   && pass "…and the POSTED evidence DISCLOSES the widened window, so --main-runs describes what was READ" \
   || fail "the evidence does not disclose that the reference came from a wider window than requested"
 # …and the disclosure must not cost the CERTIFICATE. The evidence gate
@@ -6704,9 +7389,11 @@ grep -q "NOT a coverage gap in this PR" "$SCEN/err" \
 # fills with terminal runs whose conclusion is `cancelled`, not with `in_progress`
 # ones. Budgeting on run STATUS therefore still refused every merge: this 2-run
 # window holds one measured-but-shardless run (`changes`) and one CANCELLED run,
-# and charging the window for the cancelled one stops the search before the run
-# that actually carries a test shard. The budget counts runs that FINISHED a
-# measurement.
+# and charging the window for the cancelled one stopped the search before the run
+# that actually carried a test shard. #4844 charged the window only for runs that
+# FINISHED a measurement; #7734 removed the charge altogether, so the widening is
+# stopped by nothing but a family match, the end of the history, or the policy
+# bound — which is what this fixture still exercises.
 new_scen vacuouscancelled
 printf '%s\n' "$HEAD_VP" > "$SCEN/head"
 lane_pass "$HEAD_VP" 9201 > "$SCEN/runs-$HEAD_VP"
@@ -6722,8 +7409,8 @@ lane_jobs 9204
 lane_jobset 9205 success 'test (a)'
 run_admin_here 42 --main-runs 2 >/dev/null 2>&1
 rc=$?
-[ "$rc" -eq 0 ] && pass "a run that measured nothing does not SPEND the window — the search reaches the measured one (exit 0)" \
-  || fail "expected exit 0, got $rc — a cancelled run still spends the window, so a push burst still blocks every merge (#4844)"
+[ "$rc" -eq 0 ] && pass "a run that measured nothing does not STOP the search — it reaches the measured one (exit 0)" \
+  || fail "expected exit 0, got $rc — the search still stops at the cancelled runs, so a push burst still blocks every merge (#4844)"
 grep -q -- "--limit 4" "$SCEN/calls" && pass "…by widening past the cancelled runs to the last MEASURED one" \
   || fail "the window was not widened past the completed/cancelled runs"
 grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on that reference" \
@@ -6758,6 +7445,101 @@ grep -q "executed 2 distinct job name(s)" "$SCEN/err" \
   || fail "the executed-job count is not a distinct union over all passes: got '$(grep -o 'executed [0-9]* distinct' "$SCEN/err" | head -1)'"
 grep -q "yielded NO EXECUTED job" "$SCEN/err" \
   && fail "the reference diagnosis must not claim no job executed when one did" || pass "…and never claims the window had no executable job list"
+
+# (r8) THE REFERENCE CAN BE STARVED BY RUNS THAT MEASURE NOTHING OF THIS LANE
+# (#7734). The widening's stop condition counted runs that FINISHED A
+# MEASUREMENT, and under `--any-workflow` that is not a statement about the lane:
+# an `issue_comment` reporting run is `completed/success`, so it SPENT the
+# budget while carrying no test shard. The family therefore stayed EMPTY, the
+# widening stopped on the spent budget, and the gate refused naming
+# `ADMIN_MERGE_LANE_JOB_PREFIX` — a remedy that cannot reach a window holding no
+# code-lane run at all. MEASURED on tortoise main (`--any-workflow`, the rail's
+# default `--main-runs 10`): 2 distinct executed job names in the 10-run window
+# and 3 in the widened 20, NONE `test*`; the SAME listing 40 runs wide carried 36
+# distinct names, 17 of them `test*`. So the code lane was one doubling away and
+# the instrument stopped short of it. Here the `test` shards sit at LISTING
+# POSITION 5 (the fixture's 5th `runs-main` line), one doubling past a window whose
+# every run already finished measuring.
+new_scen vacuousfamilyspend
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9221 > "$SCEN/runs-$HEAD_VP"
+{
+  lane_pass mainfs00 9222
+  lane_pass mainfs00 9223
+  lane_pass mainfs00 9224
+  lane_pass mainfs00 9225
+  lane_pass mainfs00 9226
+} > "$SCEN/runs-main"
+lane_jobset 9222 success 'changes' 'lint'
+lane_jobset 9223 success 'changes' 'lint'
+lane_jobset 9224 success 'changes' 'lint'
+lane_jobset 9225 success 'changes' 'lint'
+lane_jobset 9226 success 'test (a)' 'test (b)'
+run_admin_here 42 --main-runs 2 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a window of measured NON-FAMILY runs no longer starves the reference — it widens to the family (exit 0)" \
+  || fail "expected exit 0, got $rc — the widening still failed to reach the family, so the reference stayed empty (#7734)"
+grep -q -- "--limit 4" "$SCEN/calls" \
+  && pass "…because the listing WIDENED past the requested window (--limit 2 → --limit 4)" \
+  || fail "the reference was not reached by widening: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
+grep -q "NONE is named 'test\*'" "$SCEN/err" \
+  && fail "the family mismatch was refused although the widened window carries the shards" \
+  || pass "…and the family mismatch is not reported"
+grep -q "pr merge" "$SCEN/calls" && pass "…and the merge proceeds on the widened reference" \
+  || fail "no merge issued although the widened window carries a real reference"
+
+# (r9) THE BOUND STOP IS NAMED (#7734). When the family matches nothing across
+# the whole policy window, the refusal must say the window was read TO THE BOUND
+# — so the operator is not left re-running in search of a result the window
+# cannot produce — and it must still NAME the executed names, because that list
+# is what tells "a differently-named family" (set the prefix) from "no code-lane
+# run here" (name the lane).
+new_scen vacuousfamilybound
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+lane_pass "$HEAD_VP" 9231 > "$SCEN/runs-$HEAD_VP"
+lane_jobset 9232 success 'changes' 'lint'
+{
+  i=1
+  while [ "$i" -le 205 ]; do
+    lane_line completed success mainfb00 $((9232 + i))
+    cp "$SCEN/jobs-9232.json" "$SCEN/jobs-$((9232 + i)).json"
+    i=$((i + 1))
+  done
+} > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a family that matches nothing in the whole policy window still REFUSES (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty reference certified"
+grep -q -- "--limit 200" "$SCEN/calls" && pass "…after widening to the policy bound" \
+  || fail "the widening did not reach the policy bound: $(grep -o -- '--limit [0-9]*' "$SCEN/calls" | sort -u | tr '\n' ' ')"
+grep -q "widened to the policy bound of 200 runs and STILL selected nothing" "$SCEN/err" \
+  && pass "…and the refusal SAYS the window was read to the bound (a re-run cannot help)" \
+  || fail "the refusal does not name the bound stop: $(grep -o 'WHY:.*' "$SCEN/err" | head -c 400)"
+grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
+  && pass "…and NAMES the executed job names it actually saw (the only way to tell the two remedies apart)" \
+  || fail "the refusal does not name the job names it saw: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
+grep -q "ADMIN_MERGE_LANE_JOB_PREFIX" "$SCEN/err" && pass "…and still names the prefix knob" \
+  || fail "the refusal dropped the prefix remedy"
+# …INCLUDING WHEN `--main-runs` WAS ITSELF THE BOUND. A `bound` stop note is a claim
+# about the widening, so the width the operator REQUESTED and the width the policy
+# ALLOWS must be told apart: with `--main-runs 200` no widening was possible, and a
+# note saying the listing "was widened to the policy bound" would be a fabrication in
+# a refusal the operator reads to decide what to do next. `$SCEN/err` is rewritten by
+# each invocation, so this reads the SECOND run's own refusal.
+printf '%s\n' "$HEAD_VP" > "$SCEN/head"
+run_admin_here 42 --main-runs 200 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a family that matches nothing still refuses when the requested width IS the policy bound (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an empty reference certified"
+grep -q "the requested width WAS the bound, so nothing was widened" "$SCEN/err" \
+  && pass "…and the stop note says NO widening happened, because with --main-runs 200 none could" \
+  || fail "the stop note mis-states the stop: $(grep -o 'and the listing was read.*selected nothing' "$SCEN/err" | head -c 200)"
+grep -q "widened to the policy bound" "$SCEN/err" \
+  && fail "the refusal claims a WIDENING on a run where --main-runs 200 made one impossible" \
+  || pass "…and it does NOT claim the listing was widened"
+grep -qF "window DID carry were: changes | lint." "$SCEN/err" \
+  && pass "…while still naming the executed job names it saw" \
+  || fail "the at-the-bound refusal dropped the job names: $(grep -o 'DID carry.*' "$SCEN/err" | head -c 200)"
 
 # The parity key exists ONCE, in `lane_parity_check`, and it is not a second
 # `comm -23`: the one `comm` in this rail belongs to the parser's `--diff` (test
@@ -11183,6 +11965,323 @@ else
     && pass "(o) …and with no record bound to THIS head, the update WAS requested" \
     || fail "(o) …but no update-branch write was issued: the store blocked an update that stranded nothing"
 fi
+# ── 70. #1417: the rail's own body-edit run generation is WAITED FOR, never a
+#        refusal — and a FAILING guard run still BLOCKS ────────────────────────
+#
+# MEASURED on agent-infra #1495 and #1633 (agent-infra#1417, comment
+# 6057991604). `[3/4] record` PATCHes the review marker into the PR body; that
+# `edited` activity re-triggers exactly the two NON-code-measuring guard
+# workflows (`pipeline-compliance` — #513's verdict binding — and
+# `workflow-lock`), creating two fresh runs 11-87s AFTER `[2/4] verify` certified
+# the head. `[4/4]` then refused with `run still in_progress` against the rail's
+# OWN work, throwing the round away. The fix waits (bounded) for exactly that
+# generation and RE-READS the surface, so a guard run that FAILS is in the
+# re-read failing set — the wait defers a refusal on an UNFINISHED run set, it
+# never excludes a failure.
+#
+# ⛔ THE FIXTURES CARRY THE EVENT VALUES THE LIVE SURFACE REPORTS (review, PR
+# #1640). A workflow RUN's `event` is the webhook NAME — `pull_request` for
+# `pipeline-compliance`, `pull_request_target` for `workflow-lock` — NEVER the
+# activity type `edited`. An earlier version of this section encoded `edited` and
+# therefore certified a code path (and a fixture input) production cannot
+# produce. The wait is keyed on the guard WORKFLOW NAME, and the event column is
+# now the real value for fidelity only.
+echo "== 70. #1417: the rail's own body-edit run generation is waited for =="
+
+# (a) THE MEASURED SHAPE — the observation that must STOP being a refusal. The
+# head's lane is green; the only unfinished runs are the two guard runs the body
+# edit created. `surface-gen-*`/`event-gen-*` model the same live surface
+# changing between reads: the generation is pending at the first read and
+# finished at the next.
+new_scen selfedit-wait
+HEAD_SE="e141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SE" > "$SCEN/head"
+# read 1 — the body edit's generation is queued/in progress (the measured shape).
+# The lane's own passing run is present in BOTH generations: the surface changes,
+# the lane does not.
+{ lane_pass "$HEAD_SE" 41001
+  lane_ev queued - "$HEAD_SE" 41002 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-1"
+# read 2+ — the generation finished GREEN
+{ lane_pass "$HEAD_SE" 41001
+  lane_ev completed success "$HEAD_SE" 41002 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SE" 41003 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/runs-$HEAD_SE"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_pass mainse 41004 > "$SCEN/runs-main"
+lane_jobs 41002 'pipeline-compliance:success'
+lane_jobs 41003 'workflow-lock:success'
+write_pr_checks "$(check_run 5301 'ci / lint' completed skipped 7367 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7367 pull_request 'CI'
+main_green_surface
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) the rail's own body-edit generation no longer refuses the merge (exit 0)" \
+  || { fail "(a) the rail still refused its own body-edit generation (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "body-edit run generation (#1417) is still pending" "$SCEN/out" \
+  && pass "(a) …and it WAITED for the generation (the wait is exercised, not dead)" \
+  || fail "(a) the wait never ran — the scenario does not exercise #1417"
+grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge happened" || fail "(a) no merge attempted"
+[ -f "$SCEN/comment" ] && pass "(a) …with its head-bound evidence" || fail "(a) no evidence posted"
+
+# (b) THE SAFETY CONSTRAINT — A GUARD RUN THAT FAILS MUST STILL BLOCK, INCLUDING
+# `pipeline-compliance` (whose entire #513 purpose is to be able to fail here).
+# If the fix were an exclusion, this scenario would merge; it must not.
+new_scen selfedit-fail
+HEAD_SF="f141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SF" > "$SCEN/head"
+GUARD_ID='tests/test_guard.py::test_marker_binding'
+lane_pass mainsf 41105 > "$SCEN/runs-main"
+lane_jobs mainsf 'test (a):success' 'test (b):success'
+log_failed "$GUARD_ID" > "$SCEN/log-41102"
+cp "$SCEN/log-41102" "$SCEN/log-after-41102"   # the guard run keeps failing on the re-run
+# BOTH guard legs, so the generation is COMPLETE and the wait settles: the point
+# of this scenario is the re-read VERDICT on a red guard run, not the wait.
+{ lane_pass "$HEAD_SF" 41101
+  lane_ev queued - "$HEAD_SF" 41102 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SF" 41103 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-1"
+{ lane_pass "$HEAD_SF" 41101
+  lane_ev completed failure "$HEAD_SF" 41102 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SF" 41103 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_jobs 41101 'test (a):success' 'test (b):success'
+lane_jobs 41102 'pipeline-compliance:failure'
+lane_jobs 41103 'workflow-lock:success'
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a FAILING pipeline-compliance run still BLOCKS (exit $rc)" \
+  || fail "(b) a FAILING guard run was excluded from the decision — the fix is a false-merge hole"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) no merge may be attempted when the guard run is red" \
+  || pass "(b) no merge attempted"
+[ -f "$SCEN/comment" ] && fail "(b) no evidence may be posted for a red guard run" \
+  || pass "(b) no evidence comment posted"
+grep -q "test_marker_binding" "$SCEN/err" \
+  && pass "(b) …and the guard run's failure is NAMED in the refusal" \
+  || { fail "(b) the guard run's failure did not reach the decision"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+
+# (c) THE OTHER SAFETY CONSTRAINT — A RUN OF A NON-GUARD WORKFLOW IS STILL
+# COUNTED. A push is not a body edit and must never be waited for; §1b's
+# unchanged lane-terminal refusal decides. The event value is `pull_request` —
+# what the live surface reports for a PR-triggered run (`synchronize` is an
+# activity type, not a run event).
+new_scen selfedit-foreign
+HEAD_SX="a141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SX" > "$SCEN/head"
+lane_pass "$HEAD_SX" 41201 > "$SCEN/runs-$HEAD_SX"
+lane_ev in_progress - "$HEAD_SX" 41202 'Python CI' pull_request >> "$SCEN/runs-$HEAD_SX"
+lane_pass mainsfx 41205 > "$SCEN/runs-main"
+printf 'in_progress\n' > "$SCEN/status-41202"
+run_admin_here 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a PUSH's pending run still blocks (exit $rc)" \
+  || fail "(c) a foreign pending run was waited for or ignored — the scoping is too wide"
+grep -q "NOT only the rail's own body-edit run generation" "$SCEN/err" \
+  && pass "(c) …and the rail NAMES that the pending run is not its own" \
+  || { fail "(c) the foreign-pending branch was not reached"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "run still in_progress" "$SCEN/err" \
+  && pass "(c) …then falls through to the UNCHANGED lane-terminal refusal" \
+  || fail "(c) the lane-terminal refusal did not fire for a foreign pending run"
+grep -q "pr merge" "$SCEN/calls" && fail "(c) no merge may be attempted while a foreign run is pending" \
+  || pass "(c) no merge attempted"
+
+# (d) FAIL CLOSED AT THE BOUND. A guard generation that never finishes must
+# still refuse — the wait removes a false refusal, it never creates a merge.
+new_scen selfedit-bound
+HEAD_SB="b141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SB" > "$SCEN/head"
+lane_pass "$HEAD_SB" 41301 > "$SCEN/runs-$HEAD_SB"
+lane_pass mainsb 41305 > "$SCEN/runs-main"
+lane_ev in_progress - "$HEAD_SB" 41302 'Pipeline Compliance' pull_request > "$SCEN/surface-gen-1"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_SELF_EDIT_WAIT=1 bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) a guard generation still pending at the bound refuses (exit $rc)" \
+  || fail "(d) an unfinished guard generation certified a merge"
+grep -q "STILL pending after 1s" "$SCEN/err" \
+  && pass "(d) …and the bound is what refused it, named with the knob" \
+  || { fail "(d) the refusal was not the wait bound"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "pr merge" "$SCEN/calls" && fail "(d) no merge may be attempted at the bound" || pass "(d) no merge attempted"
+
+# (f) A PARTIAL GENERATION MUST NOT SETTLE (review P1, PR #1640). The two guard
+# legs come from two DIFFERENT workflows with an 11-87s spread, so leg A can
+# finish before leg B exists. A subset-only predicate would settle at read 2 and
+# merge inside the window the pre-#1417 rail refused; the COMPLETENESS test keeps
+# waiting for the missing leg. Reads: 1 = pipeline pending; 2 = pipeline done,
+# lock absent; 3 = lock pending (the late leg appears); 4 = both done. The merge
+# must happen only after read 4, and the rail must NOT settle on read 2.
+new_scen selfedit-partial
+HEAD_SP="c141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SP" > "$SCEN/head"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev queued - "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+} > "$SCEN/surface-gen-1"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+} > "$SCEN/surface-gen-2"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SP" 41403 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-3"
+{ lane_pass "$HEAD_SP" 41401
+  lane_ev completed success "$HEAD_SP" 41402 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SP" 41403 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-4"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+cp "$SCEN/surface-gen-3" "$SCEN/event-gen-3"
+cp "$SCEN/surface-gen-4" "$SCEN/event-gen-4"
+lane_pass mainsp 41405 > "$SCEN/runs-main"
+lane_jobs 41402 'pipeline-compliance:success'
+lane_jobs 41403 'workflow-lock:success'
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(f) a guard generation whose second leg appears late still merges (exit 0)" \
+  || { fail "(f) the rail refused a guard generation it should have waited for (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "not every guard workflow has been observed yet" "$SCEN/out" \
+  && pass "(f) …but it did NOT settle on the partial generation — it waited for the missing leg" \
+  || fail "(f) the wait SETTLED on a partial generation — the completeness test is missing"
+grep -q "pr merge" "$SCEN/calls" && pass "(f) …and merged only after both legs were seen" || fail "(f) no merge attempted"
+
+# (g) A GUARD LEG ALREADY TERMINAL AT THE FIRST PROBE READ MUST STILL SETTLE
+# (review P2, PR #1640). The two guard legs land 11-87s apart, so leg A can be
+# COMPLETED by the time the rail's first probe runs while leg B is still running.
+# Completeness is "every guard workflow OBSERVED AT THIS HEAD" — pending OR
+# already terminal — so the already-green leg satisfies it and the wait settles
+# once leg B finishes. Recording only PENDING legs made the predicate
+# unsatisfiable for this shape: the probe looped to the bound and produced
+# exactly the pre-#1417 refusal #1417 exists to remove.
+new_scen selfedit-pretty
+HEAD_SG="d141700000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SG" > "$SCEN/head"
+# read 1 — leg A (pipeline-compliance) has ALREADY finished; leg B (workflow-lock)
+# is still running.
+{ lane_pass "$HEAD_SG" 41501
+  lane_ev completed success "$HEAD_SG" 41502 'Pipeline Compliance' pull_request
+  lane_ev in_progress - "$HEAD_SG" 41503 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-1"
+# read 2+ — leg B finished green too
+{ lane_pass "$HEAD_SG" 41501
+  lane_ev completed success "$HEAD_SG" 41502 'Pipeline Compliance' pull_request
+  lane_ev completed success "$HEAD_SG" 41503 'Workflow lock (base-branch checker)' pull_request_target
+} > "$SCEN/surface-gen-2"
+cp "$SCEN/surface-gen-1" "$SCEN/runs-$HEAD_SG"
+cp "$SCEN/surface-gen-1" "$SCEN/event-gen-1"
+cp "$SCEN/surface-gen-2" "$SCEN/event-gen-2"
+lane_pass maing 41505 > "$SCEN/runs-main"
+lane_jobs 41502 'pipeline-compliance:success'
+lane_jobs 41503 'workflow-lock:success'
+write_pr_checks "$(check_run 5302 'ci / lint' completed skipped 7368 2026-01-01T00:00:00Z 2026-01-01T00:06:00Z)"
+pr_run_map 7368 pull_request 'CI'
+main_green_surface
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_SELF_EDIT_WAIT=2 bash "$ADM" 42 --main-runs 1 --any-workflow >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -eq 0 ] && pass "(g) a guard leg already terminal at the first read still merges (exit 0)" \
+  || { fail "(g) the rail refused because an already-green guard leg was never seen pending (exit $rc)"; sed -n '1,8p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "body-edit run generation (#1417) is still pending" "$SCEN/out" \
+  && pass "(g) …and it WAITED for the still-running leg rather than refusing" \
+  || fail "(g) the wait never ran for the pre-terminal-leg shape"
+grep -q "pr merge" "$SCEN/calls" && pass "(g) …and the merge happened" || fail "(g) no merge attempted"
+
+# (e) THE KNOB IS VALIDATED LIKE EVERY OTHER TIMING KNOB — an unreadable bound
+# makes the comparison ERROR (test returns 2, the body is SKIPPED), and a skipped
+# bound inside a wait loop is the fail-open this rail refuses elsewhere.
+new_scen selfedit-knob
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=ten bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a non-numeric ADMIN_MERGE_SELF_EDIT_WAIT is refused (exit 2)" \
+  || fail "(e) a non-numeric wait bound was not refused (exit $rc)"
+grep -q "ADMIN_MERGE_SELF_EDIT_WAIT='ten'" "$TMP/err" \
+  && pass "(e) …and the refusal names the knob and its value" \
+  || { fail "(e) the refusal does not name the knob"; sed 's/^/      /' "$TMP/err"; }
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=0300 bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a LEADING-ZERO bound is refused (the octal/decimal split)" \
+  || fail "(e) a leading-zero bound was accepted (exit $rc)"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" ADMIN_MERGE_SELF_EDIT_WAIT=300000 bash "$ADM" 42 >"$TMP/out" 2>"$TMP/err"
+rc=$?
+[ "$rc" -eq 2 ] && pass "(e) a POLICY-oversized bound (300000s, ~3.5 days) is refused (exit 2)" \
+  || fail "(e) an oversized wait bound was accepted (exit $rc) — a typo would hold the rail for days"
+
+# ── #1709 rec 7. an ALREADY-MERGED PR is a BENIGN NO-OP ────────────────
+# The rail runs at-least-once: a crash, a pause that resumes, or a second box
+# sweeping the same PR can execute this SAME merge twice. A duplicate that lands
+# on a PR another execution already merged must be a no-op — not a second write
+# and not a confusing failure. Before this guard the rail ran its WHOLE CI parity
+# analysis, posted a SECOND head-bound evidence comment, and then rendered
+# `gh pr merge`'s non-zero ('already merged') through the lost-response arm: a
+# network-incident narrative for an ordinary duplicate. The state read goes
+# through the ONE door with a single-shot override, so the pre-check costs one
+# read, not the bounded poll.
+echo "== #1709 rec 7. an ALREADY-MERGED PR is a benign no-op (no CI, no evidence, no merge) =="
+new_scen alreadymerged
+touch "$SCEN/merged"
+run_admin_here 42
+rc=$?
+[ "$rc" -eq 0 ] && pass "an already-merged PR exits 0 (benign no-op)" \
+  || { fail "an already-merged PR exited $rc instead of no-op'ing"; sed -n '1,6p' "$SCEN/err" | sed 's/^/      /'; }
+grep -q "ALREADY MERGED" "$SCEN/out" \
+  && pass "  …and names the observed artifact (ALREADY MERGED)" \
+  || fail "  …but the no-op is silent/unnamed"
+grep -q "duplicate execution is a NO-OP" "$SCEN/out" \
+  && pass "  …and says the duplicate is a no-op" \
+  || fail "  …and does not say the duplicate is a no-op"
+[ -f "$SCEN/comment" ] && fail "a SECOND evidence comment was posted for a duplicate" \
+  || pass "no evidence comment posted (no second write)"
+grep -q "pr merge" "$SCEN/calls" && fail "a merge was attempted on an already-merged PR" \
+  || pass "no merge attempted"
+grep -q "run list" "$SCEN/calls" && fail "the CI parity rail still ran (waste)" \
+  || pass "no CI work ran (the guard is EARLY)"
+
+# The NEGATIVE control: a PR that is NOT merged must still run the rail. Without
+# this, a guard that refused/no-op'd EVERY merge would pass the block above. And
+# ⛔ THIS SCENARIO IS WHERE THE SINGLE-SHOT OVERRIDE IS PINNED, not the merged one:
+# `poll_merge_artifact` BREAKS out of its loop on the first MERGED answer, so the
+# already-merged arm reads once whether or not the override is passed — a count
+# assertion there is vacuous (verified: deleting the override left it green). A
+# NOT-merged answer polls the whole window, so 1 read here proves the override and
+# 6 would prove it was dropped.
+echo "== #1709 rec 7. an UNMERGED PR is NOT skipped (the guard does not over-fire) =="
+new_scen precheck-open
+run_admin_here 42
+rc=$?
+grep -q "ALREADY MERGED" "$SCEN/out" \
+  && fail "an UNMERGED PR was no-op'd as already merged" \
+  || pass "an unmerged PR is not skipped — the rail proceeds past the pre-check"
+# (The rail then refuses on the absent head fixture, which is this scenario's only
+# other feature; the point here is that it PROCEEDED, not that it merged.)
+STATE_READS="$(grep -c 'state,mergedAt' "$SCEN/calls" 2>/dev/null || true)"
+[ "${STATE_READS:-0}" = "1" ] \
+  && pass "  …and the pre-check consulted the artifact via exactly ONE state read (the single-shot override)" \
+  || fail "  …but made ${STATE_READS:-0} state reads — the pre-check reused the bounded poll (the override is dead)"
+
+# ⛔ THE DECLARED RESIDUAL, PINNED RATHER THAN IMPLIED. An UNREADABLE pre-check
+# proceeds with the rail (the pre-#1709 behaviour) — this guard removes waste, it
+# is not a safety gate, and nothing is skipped by continuing. Refusing would block
+# every legitimate merge on a transient GitHub blip. So the unreadable case must
+# WARN (machine-readably) and then fall through, never silently no-op and never
+# claim anything about the PR.
+echo "== #1709 rec 7. an UNREADABLE pre-check WARNS and proceeds (declared residual) =="
+new_scen precheck-unreadable
+touch "$SCEN/merge-state-unreadable"
+run_admin_here 42
+grep -qF '[merged_precheck_unreadable]' "$SCEN/err" \
+  && pass "an unreadable pre-check carries a machine-readable marker" \
+  || fail "an unreadable pre-check was silent — the residual is undeclared"
+grep -q "ALREADY MERGED" "$SCEN/out" \
+  && fail "an UNREADABLE state was rendered as 'already merged'" \
+  || pass "an unreadable state is never rendered as merged"
+grep -q 'state,mergedAt' "$SCEN/calls" \
+  && pass "  …and the rail PROCEEDED past the unreadable pre-check" \
+  || fail "  …but the rail did not proceed (a failed read became a refusal)"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

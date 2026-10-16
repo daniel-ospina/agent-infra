@@ -313,13 +313,14 @@ fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 # "…a closing keyword would falsely close #949…" satisfied check (a) AND would
 # have auto-closed #949 on merge. Position is the contract, exactly as #991
 # made check (b) positional.
-# The CROSS-SCRIPT CONTRACT is the keyword CLASS, not the position rule: REFCTX
-# and CLOSING_KW are byte-identical to record-review.sh's copies (pinned
-# mechanically by record-review.test.sh §8.13), while record-review's #513 tier
-# guard ALSO scans with a WORD-BOUNDARY-ANCHORED CLOSING_KW (`\b` + the class,
-# NO REFCTX) — GitHub auto-closes a mid-sentence ref, so the tier guard must
-# bind it even though check (a) ignores it, and `\b` keeps the class from
-# matching INSIDE ordinary English words ("prefix", "discloses", "unresolved").
+# The CROSS-SCRIPT CONTRACT is the keyword CLASS and its BOUNDARY, not the
+# position rule: REFCTX, CLOSING_KW and CLOSING_KW_BOUNDARY are byte-identical
+# to record-review.sh's copies (pinned mechanically by record-review.test.sh
+# §8.13), while record-review's #513 tier guard ALSO scans with the
+# BOUNDARY-ANCHORED CLOSING_KW (CLOSING_KW_BOUNDARY + the class, NO REFCTX) —
+# GitHub auto-closes a mid-sentence ref, so the tier guard must bind it even
+# though check (a) ignores it, and the boundary keeps the class from matching
+# INSIDE ordinary English words ("prefix", "discloses", "unresolved").
 REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 
 # Closing-keyword class (check a's default) and the NON-closing traceability
@@ -330,12 +331,44 @@ REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:spac
 # record-review.sh::closing_issue_refs (a documented cross-script contract);
 # the positional REFCTX prefix is applied by BOTH scripts by default, so the
 # POSITIONAL composed pattern is identical. The tier guard's GitHub-parity scan
-# is the one place the composition differs: it composes `\b` + CLOSING_KW with
-# NO REFCTX (see the REFCTX comment above) — the CLASS stays byte-identical, the
-# position/boundary wrapper is chosen per scan. Both suites pin the COMPOSED
-# form, and record-review.test.sh §8.13 pins the two constant lines
-# byte-for-byte across the scripts (nothing asserted that equality before).
+# is the one place the composition differs: it composes CLOSING_KW_BOUNDARY +
+# CLOSING_KW with NO REFCTX (see the REFCTX comment above) — the CLASS and the
+# BOUNDARY stay byte-identical, the positional wrapper is applied per scan. Both
+# suites pin the COMPOSED form, and record-review.test.sh §8.13 pins the three
+# constant lines byte-for-byte across the scripts (nothing asserted that
+# equality before).
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+
+# The GitHub-parity keyword BOUNDARY (#1336) — the position wrapper composed in
+# front of CLOSING_KW by BOTH mid-sentence scans (this file's all_close_refs and
+# record-review.sh's #513 tier guard). It REPLACES the former `\b`, which is a
+# WORD boundary and therefore does NOT fire after `_` — `_` is a word character
+# — so `_Closes #N_` was invisible to the hazard scan while check (a) resolved
+# it (REFCTX tolerates the emphasis) and GitHub CLOSES it. The scan and the
+# admission bar disagreed, and the shape could never become a hazard: a PR body
+# wrapping an unintended closing keyword in underscores closed an issue with the
+# gate green (#1178/#1271 class, fail-open).
+#
+# The class is MEASURED against GitHub, not guessed (scratch repo
+# `ai-gate-semantics-test` PR #13, body compared to GraphQL
+# `closingIssuesReferences`; GitHub renders the body and matches with a word
+# boundary):
+#   `_Closes #6_`     → CLOSES   (opening `_` starts emphasis; ref inside it)
+#   `__Closes #7__`   → CLOSES
+#   `**Closes #8**`   → CLOSES   (`\b` already caught the `*` forms)
+#   `foo_closes #11`  → IGNORED  (`_` is not an emphasis opener mid-word, so
+#                                 `\b`-like parity REQUIRES a word boundary)
+#   `_Closes_ #14`    → IGNORED  (a CLOSING marker between keyword and ref is
+#                                 NOT stripped, so that shape never closes)
+#   `**Closes** #15`  → IGNORED
+# So the boundary admits an emphasis OPENING run (`[*_]{0,3}`) ONLY when the run
+# itself starts at a word boundary (line start or a non-word char), AND admits
+# it after a letter nowhere. `[^[:alnum:]_]` (not `[^[:alnum:]]`) is what keeps
+# `foo_closes #N` from being invented as a hazard — GitHub does not close it, so
+# flagging it would be a FALSE block, the exact trap `\b` was chosen to avoid.
+# (A CLOSING emphasis marker between the keyword and the ref needs no handling:
+# GitHub ignores `_Closes_ #14`, so it is not a gap.)
+CLOSING_KW_BOUNDARY='(^|[^[:alnum:]_])[*_]{0,3}'
 TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|relates?[[:space:]]+to)'
 
 # Evidence patterns for checks (c) and (e) and the #513 clean-micro binding —
@@ -479,10 +512,14 @@ parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 # advisory in close_word_notes explains the one consequence that would otherwise
 # be silent.
 #
-# The keyword class is word-boundary-anchored (`\b`): CLOSING_KW's class is a
-# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
-# unanchored scan invents hazards out of prose that closes nothing — the same
-# false-refusal trap record-review.sh's tier guard documents.
+# The keyword class is anchored by CLOSING_KW_BOUNDARY: CLOSING_KW's class is a
+# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), and
+# `_` opens emphasis before a keyword but is a WORD character, so a plain `\b`
+# invented hazards out of prose while MISSING `_Closes #N_` entirely (the
+# fail-open #1336 fixes). The boundary's measured GitHub parity is documented at
+# its definition — in particular `foo_closes #N` is NOT a hazard, so an
+# unanchored scan that invents one is the same false-refusal trap
+# record-review.sh's tier guard documents.
 
 # WHAT IS MODELLED, AND WHY IT IS ONLY THIS (adversarial review, cycle 1). Four
 # fixes across three rounds all failed the same way: each tried to MODELF text —
@@ -546,8 +583,8 @@ normalize_ref() {
 # one per line, deduped: the set of issues this body WILL close on merge.
 all_close_refs() {
   printf '%s\n' "$1" \
-    | grep -ioE "\\b${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+)" \
-    | sed -E 's/^[[:alpha:]]+[[:space:]]*:?[[:space:]]*//' \
+    | grep -ioE "${CLOSING_KW_BOUNDARY}${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+)" \
+    | sed -E -e 's/^[^[:alpha:]]+//' -e 's/^[[:alpha:]]+[[:space:]]*:?[[:space:]]*//' \
     | while read -r raw; do [[ -n "$raw" ]] && normalize_ref "$raw"; done \
     | sort -u
 }
@@ -1431,6 +1468,29 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # The keyword class is a SUFFIX of ordinary words: prose that closes nothing
   # must not manufacture a hazard.
   expect_hazard $'Closes #173\nthe prefix #99 discloses #98' 173 no
+  # ==== #1336 — underscore-emphasis `_Closes #N_` ====
+  # GitHub CLOSES `_Closes #N_`, but the hazard scan was blind to it: `\b` does
+  # not fire after `_` (`_` is a WORD character), while check (a)'s REFCTX DOES
+  # resolve the shape — so the scan and the admission bar disagreed and the
+  # shape could never become a hazard, i.e. a PR body could close an unintended
+  # issue with the gate green. Measured against GitHub's own
+  # closingIssuesReferences on scratch repo ai-gate-semantics-test PR #13.
+  # The intended ref wrapped in emphasis: no hazard (all it names is #173).
+  expect_hazard '_Closes #173_' 173 no
+  # An EXTRA ref wrapped in emphasis: THE fail-open. RED pre-fix (no hazard).
+  expect_hazard $'Closes #173\n_Closes #174_' 173 yes
+  expect_hazard $'Closes #173\n__Closes #174__' 173 yes
+  expect_hazard $'Closes #173\nThe old _Closes #174_ form is documented.' 173 yes
+  # GitHub-parity NEGATIVE controls — both are IGNORED by GitHub, so a hazard
+  # here would be a FALSE block: an INTRA-WORD underscore (`foo_closes`) is not
+  # an emphasis opener, and a CLOSING emphasis marker between the keyword and the
+  # ref is not stripped. The `[^[:alnum:]_]` class is what keeps `foo_closes`
+  # out; had the class been `[^[:alnum:]]` this vector would invent a hazard.
+  expect_hazard $'Closes #173\nfoo_closes #174' 173 no
+  expect_hazard $'Closes #173\n_Closes_ #174' 173 no
+  # The admission bar (check a) resolves the underscore form too — pinned beside
+  # the hazard vectors so the two halves cannot silently drift apart again.
+  expect_ref '_Closes #173_' "$GH_REPO#173"
   expect_ref '`Closes #173`' "$GH_REPO#173"
   # A FENCE IS NOT MODELLED — everything but inline code is treated as LIVE, so a
   # fenced close-word is REPORTED rather than stripped. Refusing a doc-only body

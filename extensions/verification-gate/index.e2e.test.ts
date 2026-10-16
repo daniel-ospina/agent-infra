@@ -5384,6 +5384,319 @@ async function main() {
     git(repo, "commit -m untrack-vendored");
   });
 
+  // ── #1660: the [VGATE] remedy loop must CONVERGE across worktrees ──
+  // The incident: a PASS verifier dispatch, using the exact prompt the block
+  // printed, did not clear the block. Root cause pinned here: the merge path
+  // resolved its blocked-file context from the mutable single-slot
+  // lastBlockedCwd/lastBlockedFiles. A later block in ANOTHER worktree
+  // overwrote the slot, so the dispatch named root A but the merge treated it
+  // as foreign, discarded A's blocked files, and fell back to the CURRENT
+  // STAGED diff — EMPTY for a committed branch (`gh pr create`). The PASS
+  // recorded zero files, wrote no bridge, and the retry re-blocked identically.
+  test("scenario 1660: a [VGATE] PASS dispatched for worktree A still converges after worktree B also blocked (per-root bookkeeping)", async () => {
+    const hub = join(TEST_ROOT, "repo-1660-hub");
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base.txt"), "b\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m base");
+    const baseSha = git(hub, "rev-parse HEAD");
+    git(hub, "remote add origin git@github.com:e2e/self.git");
+    // Two linked worktrees, each carrying the SAME repo-relative path so a
+    // root mismatch is demonstrable (a record for root A can exist for the
+    // very path root B blocks on).
+    const wtA = join(hub, ".worktrees", "wt-a");
+    const wtB = join(hub, ".worktrees", "wt-b");
+    git(hub, `worktree add ${wtA} -b feat-a`);
+    git(hub, `worktree add ${wtB} -b feat-b`);
+    for (const [wt, content] of [[wtA, "a\n"], [wtB, "b\n"]] as const) {
+      git(wt, `update-ref refs/remotes/origin/main ${baseSha}`);
+      mkdirSync(join(wt, "src"), { recursive: true });
+      writeFileSync(join(wt, "src", "shared.ts"), content);
+      git(wt, "add src/shared.ts");
+      git(wt, "commit -m work");
+    }
+    await fire("session_start", {});
+
+    const opA = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtA} && gh pr create --title a`, cwd: wtA } };
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtB} && gh pr create --title b`, cwd: wtB } };
+    const blockA = await fire("tool_call", opA);
+    ok(blockA && blockA.block === true, "1660: worktree A must block first (no verification)");
+    const promptA = blockA.reason.match(/task\(prompt='([\s\S]*?)', \.\.\.\)/)![1];
+    ok(promptA.includes(`Project root: ${realpathSync(wtA)}`), "1660: the printed remedy names worktree A's root");
+    // A SECOND block in worktree B overwrites the single-slot block context.
+    const blockB = await fire("tool_call", opB);
+    ok(blockB && blockB.block === true, "1660: worktree B must block too");
+
+    // The agent now follows the instructions for block A EXACTLY (same prompt).
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: promptA },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridgePath = join(TEST_ROOT, ".pi", "agent", "verification", "latest.json");
+    ok(existsSync(bridgePath) && readFileSync(bridgePath, "utf8").includes(realpathSync(wtA)),
+      "1660: the PASS must have recorded against worktree A and written the bridge (pre-fix: zero-merge, no bridge)");
+
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined, "1660: the retry on the SAME root must be ALLOWED — pre-fix it re-blocked identically (non-convergence)");
+
+    // Loud diagnosis: with A's record now present, B's block must say the same
+    // path is verified under a DIFFERENT root and name BOTH roots.
+    const bAfter = await fire("tool_call", opB);
+    ok(bAfter && bAfter.block === true, "1660: worktree B is still unverified — it must block");
+    ok(bAfter.reason.includes("ROOT MISMATCH"), "1660: the block must diagnose a root mismatch (not repeat the generic 'not checked')");
+    ok(bAfter.reason.includes(realpathSync(wtA)) && bAfter.reason.includes(realpathSync(wtB)),
+      "1660: the diagnosis must log BOTH roots (recorded + this op)");
+  });
+
+  // ── #1660 Finding 1: a STALE recorded set must not shadow a NEWLY staged file
+  // in that same root (the union scope) ──
+  // The per-root registry can itself go stale: root A blocks on f.ts and records
+  // {f.ts}; a LATER block in root B moves the single-slot stash; the agent then
+  // stages a brand-new file g.ts in root A and dispatches the documented remedy
+  // prompt for g.ts. Scoping ONLY against A's recorded set drops g.ts
+  // (zero-merge) and the op re-blocks although the verifier just PASSed the file
+  // that is staged. The merge scope must be the UNION of the recorded set and
+  // the root's CURRENT staged diff.
+  //
+  // HONEST SCOPE OF 1660b/1660c: these two are NOT red on the origin/main pre-fix
+  // code — pre-fix the `foreign` clear fell back to A's staged diff, which
+  // already contains the newly staged file. They guard against a REGRESSION TO A
+  // RECORDED-SET-ONLY implementation (the hypothetical partial revert that keeps
+  // the per-root registry but drops the union). The union-specific pin that the
+  // union (as a FILTER) makes green is 1660d below; 1660e/1660h pin the
+  // complementary FAIL-OPEN BOUND (a hash-less PASS must not bless a staged
+  // file the verifier was never told about).
+  function setupTwoRootsWithStaleRecordedSet(hubName: string) {
+    const hub = join(TEST_ROOT, hubName);
+    mkdirSync(hub, { recursive: true });
+    git(hub, "init -b main");
+    git(hub, "config user.email e2e@test");
+    git(hub, "config user.name e2e");
+    writeFileSync(join(hub, "base.txt"), "b\n");
+    git(hub, "add base.txt");
+    git(hub, "commit -m base");
+    const wtA = join(hub, ".worktrees", "wt-a");
+    const wtB = join(hub, ".worktrees", "wt-b");
+    git(hub, `worktree add ${wtA} -b feat-a`);
+    git(hub, `worktree add ${wtB} -b feat-b`);
+    for (const [wt, name, content] of [[wtA, "f.ts", "f\n"], [wtB, "h.ts", "h\n"]] as const) {
+      mkdirSync(join(wt, "src"), { recursive: true });
+      writeFileSync(join(wt, "src", name), content);
+      git(wt, `add src/${name}`);
+    }
+    const opA = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtA} && git commit -m a`, cwd: wtA } };
+    const opB = { type: "tool_call", toolName: "bash", input: { command: `cd ${wtB} && git commit -m b`, cwd: wtB } };
+    return { wtA, wtB, opA, opB };
+  }
+
+  // Block root A (records {src/f.ts}), then block root B — which moves the
+  // single-slot stash off root A and leaves A's recorded set stale. In root A,
+  // unstage the old file and stage a BRAND-NEW one, so the retried op's diff is
+  // src/g.ts only.
+  async function staleRecordedSetSetup(hubName: string, newFile: string, newContent: string) {
+    const { wtA, opA, opB } = setupTwoRootsWithStaleRecordedSet(hubName);
+    await fire("session_start", {});
+    const blockA = await fire("tool_call", opA);
+    ok(blockA && blockA.block === true, "1660b/c: root A must block first (src/f.ts unverified)");
+    const blockB = await fire("tool_call", opB);
+    ok(blockB && blockB.block === true, "1660b/c: root B must block too (moves the single slot away from A)");
+    git(wtA, "reset -q");
+    mkdirSync(join(wtA, "src"), { recursive: true });
+    writeFileSync(join(wtA, "src", newFile), newContent);
+    git(wtA, `add src/${newFile}`);
+    return { wtA, opA };
+  }
+
+  test("scenario 1660b: a newly staged file in root A still merges after A's recorded set went stale (union scope, plain-text PASS)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660b-hub", "g.ts", "g\n");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660b: the PASS for the newly staged file must be honored — a recorded-set-only scope would shadow src/g.ts, zero-merge, and re-block (union-scope regression guard)");
+  });
+
+  test("scenario 1660c: a newly staged file in root A still merges after A's recorded set went stale (union scope, JSON verified_files PASS)", async () => {
+    const content = "g2\n";
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660c-hub", "g2.ts", content);
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g2.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          status: "PASS",
+          failures: [],
+          verified_files: [{ path: join(realpathSync(wtA), "src", "g2.ts"), hash: sha(content) }],
+        }),
+      }],
+    });
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660c: the JSON PASS for the newly staged file must be honored — a recorded-set-only `scopeFiles`/`mergeVerifiedFiles` would skip src/g2.ts and re-block (union-scope regression guard)");
+  });
+
+  // The two #336 FALLBACK merge sites also read the block context. Their SOURCE
+  // is bounded — a hash-less PASS may only record files the PROMPT named, or the
+  // set the gate is CURRENTLY blocking — while `mergeScope` stays their FILTER.
+  // 1660d (the prompt NAMES the staged file) converges through the filter;
+  // 1660e/1660h (no usable file list) must NOT infer the un-named staged file:
+  // it stays blocked one round, and a follow-up dispatch naming it converges.
+  test("scenario 1660d: a newly staged file in root A still merges after A's recorded set went stale (union scope, JSON PASS with empty verified_files)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660d-hub", "g3.ts", "g3\n");
+    // #336 shape: the verifier returns a schema-valid PASS with NO per-file
+    // hashes, but the prompt NAMES src/g3.ts. The fallback sources the prompt's
+    // file list and scopes it against the union (recorded ∪ staged), so the
+    // file the retry is about to commit is recorded. (A prompt with no usable
+    // file list must NOT infer the staged file — see 1660e/1660h.)
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g3.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g3.ts")) || bridge.includes("::src/g3.ts"),
+      "1660d: the empty-verified_files fallback must record the newly staged src/g3.ts (pre-fix: only the stale src/f.ts was recorded)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660d: the retry on root A must be ALLOWED — pre-fix the #336 fallback recorded A's stale set and the retry blocked on src/g3.ts");
+  });
+
+  test("scenario 1660e: a bare hash-less PASS (no 'verify files:' phrase) must NOT bless an un-named staged file", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660e-hub", "g4.ts", "g4\n");
+    // #336 shape: a bare PASS from a prompt with no parseable file list. The
+    // verifier named NOTHING, so the fallback may only record the set the gate
+    // is CURRENTLY blocking (src/f.ts) — it must not infer the newly staged
+    // src/g4.ts, which no verifier was ever told about. Pre-fix (union-as-
+    // SOURCE) this blessed src/g4.ts and the retry was allowed: a fail-open.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(!bridge.includes("::src/g4.ts"),
+      "1660e: the bare PASS must not record src/g4.ts — no verifier was told about it (fail-open containment)");
+    const retryA = await fire("tool_call", opA);
+    ok(retryA && retryA.block === true,
+      "1660e: the un-named staged src/g4.ts must stay BLOCKED (pre-fix union-source: it was blessed and the retry was allowed)");
+    ok(retryA.reason.includes("src/g4.ts"),
+      "1660e: the re-block must name src/g4.ts so the agent can re-dispatch a verifier that names it");
+    // The remedy converges: a PASS that NAMES the file records it and the retry
+    // is then allowed — a blocked-until-dispatch loop, not a permanent one.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g4.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const retryA2 = await fire("tool_call", opA);
+    equal(retryA2, undefined, "1660e: a follow-up PASS naming src/g4.ts must converge (remedy, not loop)");
+  });
+
+  // #1660 directory-expansion sites: a `verify files:` DIRECTORY (no dot, no
+  // trailing slash) is expanded against the block context. If that expansion
+  // iterates the stale RECORDED set instead of the UNION scope, a newly staged
+  // file under the named directory is dropped from promptFiles — the PASS
+  // records only the stale entry and the retry re-blocks on the file the agent
+  // explicitly named. These two scenarios are RED at the pre-fix head and pin
+  // the expansion against the union at both sites (plain-text + fail-open).
+  test("scenario 1660f: a DIRECTORY-form 'verify files:' prompt must expand against the union scope (plain-text PASS)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660f-hub", "g5.ts", "g5\n");
+    // The agent names the DIRECTORY that contains the newly staged file, exactly
+    // as the printed remedy allows. Expanding against the stale recorded set
+    // yields only src/f.ts (stale, unstaged) and drops src/g5.ts.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g5.ts")) || bridge.includes("::src/g5.ts"),
+      "1660f: the directory expansion must record the newly staged src/g5.ts (pre-fix: expansion iterated the stale recorded set, dropping it)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660f: the retry on root A must be ALLOWED — pre-fix the directory expansion dropped src/g5.ts and the retry blocked on it");
+  });
+
+  test("scenario 1660g: a DIRECTORY-form 'verify files:' prompt must expand against the union scope (fail-open path)", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660g-hub", "g6.ts", "g6\n");
+    // Same directory form, but the verifier response is unparseable so the
+    // #5724 fail-open prompt-merge path runs (interactive mode — the harness
+    // clears the sub-agent markers). That path has its OWN isDir loop.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "Verification report unavailable — no structured verdict emitted.\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(bridge.includes(join(realpathSync(wtA), "src", "g6.ts")) || bridge.includes("::src/g6.ts"),
+      "1660g: the fail-open directory expansion must record the newly staged src/g6.ts (pre-fix: expansion iterated the stale recorded set, dropping it)");
+    const retryA = await fire("tool_call", opA);
+    equal(retryA, undefined,
+      "1660g: the retry on root A must be ALLOWED — pre-fix the fail-open directory expansion dropped src/g6.ts and the retry blocked on it");
+  });
+
+  // The JSON #336 fallback carries the SAME bound as the plain-text one: a
+  // hash-less PASS whose prompt names ONLY a file that is NOT the staged one
+  // must not bless the staged one. Pre-fix (union-as-SOURCE) `fallbackScope =
+  // mergeScope` recorded the whole staged diff, so the retry was allowed and
+  // src/g7.ts was committed although no verifier was ever told about it.
+  test("scenario 1660h: a JSON PASS with empty verified_files must not bless an un-named staged file", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660h-hub", "g7.ts", "g7\n");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/f.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(!bridge.includes("::src/g7.ts"),
+      "1660h: the empty-verified_files fallback must not record the un-named staged src/g7.ts (fail-open containment)");
+    const retryA = await fire("tool_call", opA);
+    ok(retryA && retryA.block === true,
+      "1660h: the un-named staged src/g7.ts must stay BLOCKED (pre-fix union-source: fallbackScope = mergeScope blessed it)");
+    ok(retryA.reason.includes("src/g7.ts"),
+      "1660h: the re-block must name src/g7.ts so the agent can re-dispatch a verifier that names it");
+    // Naming the file converges.
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src/g7.ts. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: JSON.stringify({ status: "PASS", failures: [], verified_files: [] }) }],
+    });
+    const retryA2 = await fire("tool_call", opA);
+    equal(retryA2, undefined, "1660h: a follow-up PASS naming src/g7.ts must converge (remedy, not loop)");
+  });
+
+  // #1660x: the directory expansion must match on a PATH BOUNDARY, not a bare
+  // string prefix. A prompt naming `src` must not expand to a staged
+  // `src2/h8.ts` — that file is neither under the named directory nor in the
+  // gate's blocked set, and no verifier was ever told about it. Pre-fix
+  // (`blocked.startsWith(f)`) blessed it (a fail-open introduced by the union
+  // scope), because `"src2/h8.ts".startsWith("src")` is true.
+  test("scenario 1660x: a dir-form prompt naming 'src' must NOT bless a staged file under the prefix-colliding 'src2'", async () => {
+    const { wtA, opA } = await staleRecordedSetSetup("repo-1660x-hub", "g8.ts", "g8\n");
+    mkdirSync(join(wtA, "src2"), { recursive: true });
+    writeFileSync(join(wtA, "src2", "h8.ts"), "h8\n");
+    git(wtA, "add src2/h8.ts");
+    await fire("tool_result", {
+      toolName: "task",
+      input: { prompt: `[VGATE] verify files: src. Classification: backend. Project root: ${realpathSync(wtA)}` },
+      content: [{ type: "text", text: "## Verification Report\nAll good.\nPASS\n" }],
+    });
+    const bridge = readFileSync(join(TEST_ROOT, ".pi", "agent", "verification", "latest.json"), "utf8");
+    ok(!bridge.includes("::src2/h8.ts"),
+      "1660x: the prefix-colliding src2/h8.ts must not be recorded — no verifier was told about it (fail-open containment)");
+    const retryA = await fire("tool_call", opA);
+    ok(retryA && retryA.block === true && String(retryA.reason).includes("src2/h8.ts"),
+      "1660x: src2/h8.ts is not under the named dir 'src' and must stay BLOCKED (pre-fix prefix match blessed it and the retry was allowed)");
+  });
+
 } // main: plugin loaded; tests run sequentially via runAll()
 
 main()

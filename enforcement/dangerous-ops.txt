@@ -1,6 +1,16 @@
 # dangerous-ops.txt — manifest for skill-enforcer gate enforcement
 # Format: skillName # pattern # mode # optional_message
 # mode: hard (blocks until skill read) | nudge (reminds, escalates to block after threshold)
+#
+# A rule's pattern is matched against a SUBJECT (extensions/skill-enforcer.ts, #1328):
+#   - the text of a `bash` command, for the `bash` tool; or
+#   - the tool NAME for every other tool — an `mcp__*` name, a builtin, or an
+#     extension tool. A `hard` rule naming any of them blocks that tool until
+#     the skill is read (before #1328 only `bash` and `mcp__*` were enforced,
+#     so a hard rule naming anything else was armed and inert).
+# `read` is the tool a skill gate is SATISFIED with, so a `hard` rule whose
+# pattern matches it is REFUSED at load (loud, manifest not-ok) instead of
+# being armed as a blocker of its own remedy.
 
 commit-workflow # git commit|git push|git merge|git add|gh pr create|gh pr merge|git stash pop|git checkout -- # hard # Use commit-workflow/SKILL.md for all git operations. Pre-flight checks, PR creation, code-review gate, and auto-merge.
 
@@ -8,7 +18,7 @@ using-git-worktrees # git worktree add|git worktree remove # hard # Raw worktree
 
 supabase # supabase|migration|RLS|apply_migration_safe|pg_ # hard # Use supabase/SKILL.md for all Supabase operations. Unsafe migrations can cause data loss.
 
-how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation.
+how-to-use-tortoise # tortoise_create_point|tortoise_create_operator|tortoise_mitigate_operator|tortoise_delete_point|tortoise_invalidate|tortoise_supersede|tortoise_annotate_operator|tortoise_update|tortoise_delete # hard # Use how-to-use-tortoise/SKILL.md for all Tortoise graph writes. Wrong edges can corrupt EP propagation. The generic update/delete take the Point arm for operators too, so the SKILL.md Hard Gate names them; arming them here keeps the prose list and this manifest 1:1 (issue 6131).
 
 commit-workflow # gh pr review|gh pr approve # hard # Use commit-workflow/SKILL.md for PR review operations.
 

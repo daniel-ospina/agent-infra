@@ -249,7 +249,13 @@ jobs:
         # canonical file BY LOCATION and pins `__file__` to it. This step is what
         # keeps it non-inert — an unwired suite passes in CI by never running.
         # Concrete .py targets (never a `tests/` dir-suite), so no #403 finding.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py -x --timeout=60 -q
+        # #1552 — `scripts/test_objective.py` and `scripts/test_turn_classify_state.py`
+        # are named here for the SAME reason: both lived ONLY on the laptop
+        # (~/.pi/agent/scripts) and in no repo file, so the guard on objective.py's
+        # blindness flag and on the objective cache's freshness were pinned by suites
+        # CI could not execute. A suite the repo does not RUN is a suite it does not
+        # HAVE — naming them is the half of the landing that makes the other half count.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -292,7 +298,7 @@ jobs:
         run: python3.12 tools/fleet/liveness.test.py
       - name: Fleet liveness mutation evidence (#1178, zero-dep)
         # The suite above is only a pin if it can FAIL. `--mutations`
-        # reintroduces each of the 24 defects into a TEMP copy of the module (or
+        # reintroduces each of the 31 defects into a TEMP copy of the module (or
         # of the identity library) and re-runs the paired test against it in a
         # subprocess — a mutation whose paired test still passes is reported as
         # a suite failure. Its own step, not a second command in the step above:
@@ -380,6 +386,21 @@ jobs:
         # non-numeric field, and an already-healthy payload must all be left
         # BYTE-IDENTICAL — the guard must never rewrite a good request.
         run: npx tsx extensions/clamp-output-floor.test.ts
+
+      - name: Secret-echo-guard suite (#5109 — the transcript-leak control)
+        # #5109 — a live API key was persisted in plaintext into session
+        # transcripts (60/576 files, still growing) because every reading tool
+        # returns the value and the result is written verbatim. This extension
+        # redacts registered secrets from `content` AND `details` in the
+        # `tool_result` hook, before persistence. Zero-dep by construction: the
+        # extension imports the pi package as a TYPE only (erased by tsx) and
+        # node stdlib otherwise, so it runs in THIS job (the job that performs no
+        # `npm ci`); every sink is driven through the NODE_ENV=test hook seam, so
+        # it never touches the real ~/.pi and never reads a real secret.
+        # Negative pins are first-class: ordinary output must be returned BY
+        # REFERENCE (handler answers `undefined`) and record nothing, a sub-floor
+        # value must not be redacted, and no sink may carry a redacted value.
+        run: npx tsx extensions/secret-echo-guard.test.ts
 
       - name: Loop-enforcer tier-bound parity (#723 — runtime caps vs canonical table)
         # VISIBLE, not merge-blocking (only pipeline-compliance is required).

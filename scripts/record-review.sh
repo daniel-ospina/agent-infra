@@ -150,32 +150,50 @@ set -euo pipefail
 # and `> > Closes #42` auto-close on GitHub just like `- Closes #42`. A
 # mid-sentence mention is NOT a reference (#1012) — position is the contract,
 # matching check-pipeline-compliance.sh::parse_issue_ref, which composes the
-# SAME two constants.
+# SAME constants.
 #
-# The CROSS-SCRIPT INVARIANT is scoped to the keyword CLASS, not the position
-# rule: REFCTX and CLOSING_KW are byte-identical across the two scripts, pinned
-# mechanically by record-review.test.sh §8.13. The #513 tier guard below does
-# NOT rely on the positional rule for GitHub parity — GitHub auto-closes a
-# mid-sentence ref, so the guard ALSO scans with a WORD-BOUNDARY-ANCHORED
-# CLOSING_KW (passing `\b${CLOSING_KW}` as closing_issue_refs' optional
-# <kw-pattern>) and refuses when a non-micro ref appears in either scan. The
-# `\b` is load-bearing in the FALSE-REFUSAL direction: the keyword class is a
-# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
-# unanchored scan reads `The prefix #42 is unrelated.` as `fix #42`, fetches
-# #42's labels, and refuses a record GitHub would never auto-close — a false
-# refusal, and strictly BROADER than GitHub, which requires a word boundary.
-# Scoping the invariant to the class is what keeps the positional rule
+# The CROSS-SCRIPT INVARIANT is scoped to the keyword CLASS and its BOUNDARY, not
+# the position rule: REFCTX, CLOSING_KW and CLOSING_KW_BOUNDARY are byte-identical
+# across the two scripts, pinned mechanically by record-review.test.sh §8.13. The
+# #513 tier guard below does NOT rely on the positional rule for GitHub parity —
+# GitHub auto-closes a mid-sentence ref, so the guard ALSO scans with the
+# BOUNDARY-ANCHORED CLOSING_KW (passing `${CLOSING_KW_BOUNDARY}${CLOSING_KW}` as
+# closing_issue_refs' optional <kw-pattern>) and refuses when a non-micro ref
+# appears in either scan. The boundary is load-bearing in the FALSE-REFUSAL
+# direction: the keyword class is a SUFFIX of ordinary English words ("prefix",
+# "discloses", "unresolved"), so an unanchored scan reads `The prefix #42 is
+# unrelated.` as `fix #42`, fetches #42's labels, and refuses a record GitHub
+# would never auto-close — a false refusal, and strictly BROADER than GitHub,
+# which requires a word boundary. It is ALSO load-bearing in the fail-OPEN
+# direction (#1336): `\b` does not fire after `_` (`_` is a word character), so
+# a mid-sentence `_closes #N_` — which GitHub DOES close — was invisible to the
+# guard. See CLOSING_KW_BOUNDARY below for the measured parity. Scoping the
+# invariant to the class and boundary is what keeps the positional rule
 # (check (a), anti-#968) from becoming a tier-guard fail-open.
 # Top-level + guarded main below: this function is source-reachable by tests.
 REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+# The GitHub-parity keyword BOUNDARY (#1336): the position wrapper composed in
+# front of CLOSING_KW by BOTH mid-sentence scans (this file's #513 tier guard and
+# check-pipeline-compliance.sh's all_close_refs). It REPLACES `\b`, which does
+# NOT fire after `_` (`_` is a word character), so a mid-sentence `_closes #N_` —
+# which GitHub DOES close — was invisible to the guard, and a non-micro issue
+# could be recorded clean-micro with the guard silent. It admits an emphasis
+# OPENING run (`[*_]{0,3}`) only where the run itself starts at a word boundary
+# (line start or a non-word char); `[^[:alnum:]_]` (not `[^[:alnum:]]`) is what
+# keeps `foo_closes #N` from being read as a keyword — GitHub ignores it, so
+# refusing on it would be the false refusal `\b` was chosen to avoid. Measured
+# parity lives at check-pipeline-compliance.sh's copy; keep this line
+# byte-identical (record-review.test.sh §8.13 pins it).
+CLOSING_KW_BOUNDARY='(^|[^[:alnum:]_])[*_]{0,3}'
 closing_issue_refs() {
   # <kw-pattern> (optional) selects the keyword class WITHOUT the positional
   # REFCTX prefix — the GitHub-parity scan the tier guard unions in. Callers
-  # pass a BOUNDARY-ANCHORED pattern (`\b${CLOSING_KW}`): without `\b` the class
-  # matches inside English words and the scan is BROADER than GitHub (false
-  # refusals). Default is the positional form "${REFCTX}${CLOSING_KW}",
-  # mirroring check-pipeline-compliance.sh::parse_issue_ref.
+  # pass a BOUNDARY-ANCHORED pattern (`${CLOSING_KW_BOUNDARY}${CLOSING_KW}`):
+  # without the boundary the class matches inside English words and the scan is
+  # BROADER than GitHub (false refusals). Default is the positional form
+  # "${REFCTX}${CLOSING_KW}", mirroring
+  # check-pipeline-compliance.sh::parse_issue_ref.
   local text="$1" kwpat="${2:-}" kw
   if [ -n "$kwpat" ]; then kw="$kwpat"; else kw="${REFCTX}${CLOSING_KW}"; fi
   # a. full URLs.
@@ -540,6 +558,43 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   fi
   printf '%s %s on %s#%s, created %s, postdates head %s\n' "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
   return 0
+}
+
+# ── #1709 rec 7 — the record's IDENTITY, for idempotent same-head writes ──
+# `record-review.sh` runs at-least-once (a duplicate execution is possible under
+# crashes, pauses and cross-box dispatch), so its side effects must be idempotent:
+# running it twice for the SAME head must produce the SAME artifact, not a second
+# one. The PR-body MARKER already satisfies this — it is a function of
+# (pr, verdict, sha, diff, repo) and the append is guarded by a whole-string
+# `grep -qF` — but the RECORD FILE did not: every run re-stamped `reviewed_at`
+# from the wall clock and rewrote the file, so a duplicate execution MUTATED the
+# attestation. That is corruption, not waste: `reviewed_at` is the audit trail's
+# only join from a merge-gate pass to the review dispatch that authorised it
+# (extensions/review-enforcer logMergeGateDecision), and the mint time of a
+# reviewed head must not move because a paused worker resumed.
+#
+# The idempotency KEY is the head sha — the same content-addressing #1709 rec 1
+# applies to claims. Two records are the SAME attestation when their deterministic
+# identity matches: pr, head_sha, the diff/merge-base bindings, the evidence ref,
+# the verdict and the repo. The VOLATILE fields — `reviewed_at`, and the carry
+# provenance (`mint`, `carried_from`, `carried_at`) — are NOT identity: they are
+# what the duplicate would churn, and stripping them from BOTH sides lets a
+# carry and a fresh mint at the same head compare equal (a duplicate of either
+# is a no-op, which is exactly right: the head is already recorded).
+#
+# This is deliberately EXACT-string comparison over the canonicalized single-line
+# JSON, not a jq/python parse: the record is written by ONE printf with a fixed
+# field order, and a second parser here would be a second definition of the
+# record's shape. A malformed or foreign file simply fails to match, and the
+# write proceeds as before (fail-open on the GUARD, never on a safety property —
+# this only decides whether to rewrite an already-correct file).
+record_identity() { # <record-file> -> the record with its volatile fields removed
+  sed -E \
+    -e 's/,"reviewed_at":"[^"]*"//' \
+    -e 's/"mint":"[^"]*",//' \
+    -e 's/"carried_from":"[^"]*",//' \
+    -e 's/"carried_at":"[^"]*",//' \
+    "$1"
 }
 
 # ── main (guarded — executable when run, inert when sourced for tests) ────
@@ -1874,14 +1929,16 @@ fi
 #       (fail-open: a transient gh/API failure must not block a legitimate
 #       record; the warning names the unverified tier).
 # Ref collection keeps GITHUB PARITY (#1012 r2): the guard unions the
-# positional scan with a WORD-BOUNDARY-ANCHORED CLOSING_KW scan, because GitHub
+# positional scan with a BOUNDARY-ANCHORED CLOSING_KW scan, because GitHub
 # auto-closes a mid-sentence ref — a body like "Closes #100" + "This also
 # closes #42" closes complex #42 on merge and must never record clean-micro off
 # micro #100 alone. Refusal is the fail-closed direction, so the union widens
-# the bind without widening the fail-open arms. The `\b` on the parity class is
-# the OTHER direction: an unanchored class matches inside English words, turning
-# `The prefix #42 is unrelated.` into a refusal GitHub itself would never make
-# (#1012 r3).
+# the bind without widening the fail-open arms. The boundary on the parity class
+# is the OTHER direction: an unanchored class matches inside English words,
+# turning `The prefix #42 is unrelated.` into a refusal GitHub itself would
+# never make (#1012 r3) — and it must fire after emphasis `_` (#1336), which a
+# plain `\b` did not, letting a mid-sentence `_closes #N_` (which GitHub DOES
+# close) record clean-micro with this guard silent.
 if [ "$VERDICT" = "clean-micro" ]; then
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "⚠️ clean-micro tier guard: repo undetectable or gh missing — tier attestation UNVERIFIED (record proceeds; a non-micro linked issue should never be recorded clean-micro)" >&2
@@ -1896,11 +1953,13 @@ if [ "$VERDICT" = "clean-micro" ]; then
       # mid-sentence "This also closes #42" that GitHub WILL auto-close on
       # merge, so the guard unions it with a keyword-class scan. Refusing on a
       # ref either scan finds is fail-CLOSED. The parity scan is
-      # WORD-BOUNDARY-ANCHORED (#1012 r3): `\b` before the class keeps ordinary
-      # prose ("prefix", "discloses", "unresolved") from being read as a
-      # keyword and refused, which would be a FALSE refusal — GitHub requires a
-      # word boundary the unanchored scan did not.
-      REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "\b${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
+      # BOUNDARY-ANCHORED (CLOSING_KW_BOUNDARY; #1012 r3 + #1336): the boundary
+      # before the class keeps ordinary prose ("prefix", "discloses",
+      # "unresolved") and intra-word underscores (`foo_closes`) from being read
+      # as a keyword and refused, which would be a FALSE refusal — GitHub
+      # requires a word boundary the unanchored scan did not — while still
+      # firing after an EMPHASIS `_` (`_closes #N_`), which GitHub DOES close.
+      REFS="$({ closing_issue_refs "$BODY"; closing_issue_refs "$BODY" "${CLOSING_KW_BOUNDARY}${CLOSING_KW}"; } | awk -F'#' 'tolower($1) == tolower("'"$REPO"'") { seen[$0]++; if (seen[$0] == 1) print }')"
       if [ -z "$REFS" ]; then
         echo "⚠️ clean-micro tier guard: no same-repo closing-issue ref found in the PR body of $REPO#$PR — tier attestation UNVERIFIED (record proceeds; body refs: $(printf '%s' "$BODY" | grep -oE '(fix(es|ed)?|close(s|d)?|resolve(s|d)?)[[:space:]]*[^[:space:],;)]*' | command head -c 200 || true))" >&2
       else
@@ -2109,7 +2168,22 @@ else
   printf '{"pr":%d,"head_sha":"%s",%s%s%s%s"verdict":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$MINT_FIELDS" "$EVIDENCE_FIELD" "$VERDICT" "$REVIEWED_AT" > "$TMP"
 fi
-mv "$TMP" "$FILE"
+# ── IDEMPOTENT SAME-HEAD WRITE (#1709 rec 7) ─────────────────────────────
+# The record this run would write is already on disk with the SAME deterministic
+# identity (record_identity, above), so a duplicate execution is a NO-OP: do not
+# rewrite it. This is what keeps `reviewed_at` — the audit trail's only join to
+# the authorising dispatch — stable across a duplicate, and it makes the second
+# execution's result BYTE-IDENTICAL to the first's rather than merely equivalent.
+# The legacy-migration and evidence-post blocks below still run: they are already
+# idempotent, and skipping them would only make a duplicate STRAND the legacy key
+# (the failure this whole block exists to avoid) — the record file is the one
+# side effect that was not idempotent.
+if [ -f "$FILE" ] && [ "$(record_identity "$FILE")" = "$(record_identity "$TMP")" ]; then
+  rm -f "$TMP"
+  echo "#1709 rec 7 idempotent: $REPO#$PR already records verdict=$VERDICT at head ${SHA:0:12}… with the same binding — record NOT rewritten (reviewed_at preserved)" >&2
+else
+  mv "$TMP" "$FILE"
+fi
 # Migration (#426): a legacy <pr>.json that belongs to THIS repo is
 # superseded by the qualified file — remove it so stale number-keyed copies
 # can't collide later. Discriminate "no repo field at all" from "unparseable":
@@ -2155,11 +2229,14 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     SIG="$(printf '%s' "$MARKER" | command openssl dgst -sha256 -hmac "$GATE_KEY" 2>/dev/null | awk '{print $NF}' || true)"
     if [ -n "$SIG" ]; then
       MARKER="${MARKER} sig=${SIG}"
+      MARKER_SIGNED=1
     else
       echo "⚠️ could not compute marker signature (openssl?) — posting unsigned marker; ai-review-gate will fail" >&2
+      MARKER_SIGNED=0
     fi
   else
     echo "⚠️ AI_REVIEW_GATE_KEY not configured (env or ~/.pi/agent/.ai-review-gate-key) — posting unsigned marker; ai-review-gate required check will fail. Configure the key to match the repo secret." >&2
+    MARKER_SIGNED=0
   fi
   # Read the PR body — distinguish a genuinely EMPTY body (post marker-only)
   # from a GET FAILURE (skip the post loudly — never clobber the description).
@@ -2175,6 +2252,9 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
   if ! grep -qF "$MARKER" <<<"$BODY"; then
     MISSING="$MARKER"
   fi
+  # #633: the body as it stands AFTER this run's post attempt — the stale-run
+  # remediation below must decide on the body the gate will actually read.
+  BODY_NOW="$BODY"
   if [ -n "$MISSING" ]; then
     if [ -n "$BODY" ]; then
       NEWBODY="${BODY}
@@ -2183,10 +2263,138 @@ ${MISSING}"
     else
       NEWBODY="$MISSING"
     fi
-    jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
-      | command gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1 \
-      && echo "review evidence posted to $REPO#$PR body" \
-      || echo "note: could not post review evidence to PR body (record still saved)" >&2
+    if jq -n --arg body "$NEWBODY" '{body: $body}' 2>/dev/null \
+        | command gh api -X PATCH "repos/$REPO/pulls/$PR" --input - >/dev/null 2>&1; then
+      echo "review evidence posted to $REPO#$PR body"
+      BODY_NOW="$NEWBODY"
+    else
+      echo "note: could not post review evidence to PR body (record still saved)" >&2
+    fi
+  fi
+
+  # ── Stale gate-run remediation (#633) ──────────────────────────────────
+  # A completed pre-evidence FAILURE (the push-triggered run that evaluated
+  # the body before this marker existed) does not durably block a merge once
+  # a later SUCCESS for the same head exists (verified empirically, #633) —
+  # but the FAILURE keeps showing a red ai-review-gate row in the rollup
+  # until something re-evaluates, and when the gate's NEWEST run on the head
+  # is completed and red the documented remedy — "re-run record-review.sh to
+  # retry" — used to be a silent no-op: the marker is already in the body, so
+  # no PATCH fires, no `edited` event, and no fresh gate run (tortoise PR
+  # #2698 thrashed on this for 40 min). User tokens cannot rewrite the stale
+  # run's conclusion (PATCH /check-runs/{id} → 403, GitHub-App-only) nor
+  # re-request it (POST /check-runs/{id}/rerequest → 404 for Actions runs),
+  # but CAN re-run the Actions job (POST /actions/jobs/{id}/rerun — verified
+  # #633). So when the head's newest gate run is NOT in flight AND red (the
+  # allow-list polarity, below), re-run it here: the re-run re-reads the PR
+  # body live, so with the signed marker
+  # present it replaces the stale red attempt with a fresh run (for GitHub
+  # Actions the check-run id IS the job id). A newer SUCCESS for the name is
+  # the normal green end-state (no rerun — would just churn Actions jobs); a
+  # deliberately stale record (--force-stale) is never remediated (its gate
+  # state is unresolvable by design and a rerun in the PR's concurrency group
+  # could cancel the real head's in-flight gate run). The gate's check-run
+  # name is repo-specific — override AI_REVIEW_GATE_CHECK_NAME for consumers
+  # that renamed their required check. A check-run NAME is an arbitrary
+  # string: only leading/trailing padding is trimmed, INTERIOR whitespace is
+  # preserved (review finding 2). Best-effort — NEVER fails the record.
+  #
+  # GATED ON THE **SIGNED** MARKER (#633 review finding 3): `MARKER` carries
+  # ` sig=<hmac>` iff a key signed it. An UNSIGNED marker (no
+  # AI_REVIEW_GATE_KEY) can never satisfy the gate, so re-running against it
+  # re-evaluates to a guaranteed red — exactly the churn this guard exists to
+  # prevent, and exactly what a text-only `MARKER_PRESENT` gate did.
+  MARKER_PRESENT=0
+  if [ "$MARKER_SIGNED" = "1" ] && grep -qF "$MARKER" <<<"$BODY_NOW"; then
+    MARKER_PRESENT=1
+  fi
+  if [ "$MARKER_PRESENT" = "1" ] && [ "$FORCE_STALE" -ne 1 ]; then
+    # Trim only LEADING/TRAILING padding (#633 review finding 2). A check-run
+    # NAME is an arbitrary string, and `tr -d '[:space:]'` — correct for the
+    # HMAC key it was copied from — also deletes INTERIOR whitespace, silently
+    # zeroing every name that contains it (`python-ci / test` is a real name on
+    # this fleet). Interior whitespace is meaningful and must survive.
+    GATE_CHECK="${AI_REVIEW_GATE_CHECK_NAME:-ai-review-gate}"
+    GATE_CHECK="$(printf '%s' "$GATE_CHECK" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    : "${GATE_CHECK:=ai-review-gate}"
+    NEWEST_RED_ID=""
+    # ⛔ THE TRANSPORT IS THE WHOLE BUG THIS FIX EXISTS FOR (#633 review
+    # finding 1): `gh api` switches to POST as soon as ANY `-f`/`-F` parameter
+    # is added, and `GET /commits/{ref}/check-runs` is GET-only — so a
+    # parameterized call with no `-X GET` answers `404 Not Found`. That made
+    # the `if` below FALSE on every production invocation, left NEWEST_RED_ID
+    # empty, and turned the rerun into dead code while printing a false
+    # "gh/API failure" warning. So the read carries an EXPLICIT `-X GET`; the
+    # suite's gh stub models the method now, so a regression reddens it instead
+    # of passing silently. Parameters go through `-f` (NOT a hand-built query
+    # string) so gh PERCENT-ENCODES them: `check_name` is an arbitrary string,
+    # and a name with interior whitespace makes a raw query string malformed
+    # (measured: a literal space in the URL → PROTOCOL_ERROR, while
+    # `-X GET -f check_name='python-ci / test'` answers 200 — finding 2).
+    # The commit check-runs payload is read RAW so a query failure is
+    # distinguishable from "no red run" (the #405 convention: a transient
+    # API failure must warn loudly and skip, never read as nothing-to-do).
+    # The server-side check_name filter keeps the payload to the gate's own
+    # runs (a commit can carry >100 check runs across a big CI matrix — an
+    # unfiltered page could push the true newest gate run out of view).
+    if GATE_JSON="$(command gh api -X GET "repos/$REPO/commits/$SHA/check-runs" -f check_name="$GATE_CHECK" -f per_page=100 -f filter=all 2>/dev/null)"; then
+      # Newest run for the gate check name across ALL statuses, then judge it
+      # by the repo's ALLOW-LIST POLARITY (#633 review finding 1; AGENTS.md
+      # §"Reading verification state" step 4, and the same predicate
+      # target_head_red above already uses). Only success/neutral/skipped are
+      # green and cancelled/stale are non-red; EVERY OTHER conclusion is RED —
+      # including one GitHub has not documented and a null one. A closed
+      # red-list (failure/cancelled/timed_out/action_required) read an
+      # unrecognised or null conclusion as "not red AND not suspicious" — no
+      # rerun and no warning, the silent no-op #633 exists to close.
+      #
+      # "In flight" is the NAMED set only. A queued/in_progress run (a rerun
+      # the remediation itself fired, or the `edited` run a fresh PATCH just
+      # started) is already re-evaluating the body, and re-running the older
+      # red behind it would start a second job whose per-PR cancel-in-progress
+      # cancels the in-flight fresh run — forever. An unrecognised STATUS is
+      # NOT in that set: it falls through to the conclusion, and a null
+      # conclusion is RED, exactly as target_head_red decides it (gating on
+      # "no conclusion" is the #1353 fail-open). `select(. != null)` keeps an
+      # empty gate-name match from minting a literal `null` id. The local name
+      # filter is a belt over the server filter, and $gate arrives via --arg —
+      # no jq-program interpolation.
+      if ! NEWEST_RED_ID="$(printf '%s' "$GATE_JSON" \
+        | jq -r --arg gate "$GATE_CHECK" \
+          '[.check_runs[] | select(.name == $gate)] | sort_by(.id) | reverse | .[0] | select(. != null) | select(.status != "queued" and .status != "in_progress" and .status != "waiting" and .status != "requested" and .status != "pending") | select((.conclusion // "") as $c | ($c != "success" and $c != "neutral" and $c != "skipped" and $c != "cancelled" and $c != "stale")) | .id' \
+      )"; then
+        # A gh-200 whose body fails the jq stage is its own failure class
+        # (payload shape change, broken jq) — warn loudly, never read as
+        # "no red run" (#405 applies to every stage of the read).
+        echo "⚠️ could not parse the check-runs payload for $SHA (check_name=$GATE_CHECK) — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
+        NEWEST_RED_ID=""
+      elif [ "$(printf '%s' "$GATE_JSON" | jq -r --arg gate "$GATE_CHECK" '[.check_runs[] | select(.name == $gate)] | length' 2>/dev/null || echo 0)" = "0" ]; then
+        # The gate has NO runs on this head (the server already filtered to
+        # the name, so an empty payload means the workflow never ran here OR
+        # AI_REVIEW_GATE_CHECK_NAME is wrong). One cheap unfiltered count
+        # query tells the two apart — other checks exist → loud rename hint
+        # (a wrong override must never read as "nothing to remediate");
+        # no checks at all → stay silent (nothing has run yet).
+        if ALL_JSON="$(command gh api "repos/$REPO/commits/$SHA/check-runs?per_page=1" 2>/dev/null)"; then
+          TOTAL_RUNS="$(printf '%s' "$ALL_JSON" | jq -r '(.total_count // (.check_runs | length))' 2>/dev/null || echo 0)"
+          case "$TOTAL_RUNS" in ''|*[!0-9]*) TOTAL_RUNS=0 ;; esac
+          if [ "$TOTAL_RUNS" -gt 0 ]; then
+            echo "⚠️ no check run named '$GATE_CHECK' found on $SHA ($TOTAL_RUNS checks total) — verify AI_REVIEW_GATE_CHECK_NAME; stale-run re-run skipped" >&2
+          fi
+        fi
+      fi
+    else
+      echo "⚠️ could not read check runs for $SHA (gh/API failure?) — stale-run re-run skipped; record still saved. Re-run record-review.sh to retry." >&2
+    fi
+    # Shape-guard the id before it reaches gh argv (ids come from GitHub
+    # JSON .id fields, but an errored query must never read as a job id).
+    if [ -n "$NEWEST_RED_ID" ] && [[ "$NEWEST_RED_ID" =~ ^[0-9]+$ ]]; then
+      if command gh api -X POST "repos/$REPO/actions/jobs/$NEWEST_RED_ID/rerun" >/dev/null 2>&1; then
+        echo "re-ran stale $GATE_CHECK run (job $NEWEST_RED_ID) — the fresh run re-evaluates the body with the recorded marker"
+      else
+        echo "note: could not re-run stale $GATE_CHECK job $NEWEST_RED_ID (permissions/state?) — record saved; the gate re-evaluates only on the next push or PR-body edit, so push a commit or re-record to retry" >&2
+      fi
+    fi
   fi
 else
   echo "⚠️ record-review: evidence post skipped (gh CLI missing or REPO undetectable) — the record is saved, but the ai-review-gate required check will fail until evidence is posted manually." >&2

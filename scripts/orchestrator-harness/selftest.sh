@@ -699,7 +699,7 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # README §8 calls the box's real throttle, silently disabled. MAX_LOAD is excluded because its default
 # is the host's core count; §8's nlim driver covers it behaviourally.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=10 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
 for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
@@ -1179,8 +1179,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      failed gh produced '$n'"; }
   ck "a failed open-PR count is NOT zero (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a first-ever failure assumes 11 (BROAD, resumes the drain)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a first-ever failure assumes 26 (above the 25 default, BROAD, resumes the drain)" $rc
   grep -q 'open=UNKNOWN rc=1' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
   ck "a failed open-PR count logs an UNKNOWN diagnostic naming the rc" $rc
   grep -q 'TLS handshake timeout' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
@@ -1196,8 +1196,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      sticky-0 produced '$n'"; }
   ck "a sticky last-known of 0 is not reused (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a sticky 0 falls back to 11 (BROAD)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a sticky 0 falls back to 26 (BROAD)" $rc
   # (b3) the fallback must clear the SCOPE threshold too, not just the merge-priority tunable:
   # max(MERGE_PRIORITY_AT, 10) + 1. Keying it to the tunable alone left a below-default tunable in
   # OWN — the unsafe direction — on a failed count.
@@ -1207,15 +1207,20 @@ SH
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=15 bash "$OC/drive.sh" )"
   [ "$_mp" = "16" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=15 produced '$_mp' (expected 16)"; }
   ck "an above-default MERGE_PRIORITY_AT (15) falls back to 16, above the tunable" $rc
-  # (b4) a leading-zero tunable must be read as DECIMAL: `[ … -ge 10 ]` parses base 10 but `$(( … ))`
-  # parses base 0, in which `010` is octal 8 — so the guard ratified "ten" and the arithmetic
-  # returned 9, landing in OWN, the same unsafe direction the tunable-keyed fallback was fixed for.
+  # (b4) UNIT coverage of open_pr_count's base-10 normalisation, reached only with the tunable guard
+  # BYPASSED — which is exactly what this driver does (it sources is_num + open_pr_count, not the
+  # loop's is_limit coercion). ⚠️ In the SHIPPED loop the guard runs FIRST: is_num rejects leading
+  # zeros, so `MERGE_PRIORITY_AT=010` is coerced to the default (25) and the real fallback is 26 —
+  # asserted directly above. Do not read this case as shipped-loop behaviour.
+  # What it covers: `[ … -ge 10 ]` parses base 10 but `$(( … ))` parses base 0, where `010` is octal
+  # 8 — so the guard ratifies "ten" and an un-normalised arithmetic would return 9, landing in OWN,
+  # the same unsafe direction the tunable-keyed fallback was fixed for. The `10#` keeps it at 11.
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=010 bash "$OC/drive.sh" )"
   [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=010 produced '$_mp' (expected 11)"; }
-  ck "a leading-zero MERGE_PRIORITY_AT (010) is decimal 10, falls back to 11" $rc
+  ck "unit (guard bypassed): a raw leading-zero tunable 010 normalises to base 10 (11), not octal 8 (9)" $rc
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=notanum bash "$OC/drive.sh" )"
-  [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 11)"; }
-  ck "a non-numeric MERGE_PRIORITY_AT falls back to 11 without aborting" $rc
+  [ "$_mp" = "26" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 26)"; }
+  ck "a non-numeric MERGE_PRIORITY_AT falls back to 26 without aborting" $rc
   # (c) SUCCESS: the count is returned and persisted for the next failure
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1228,7 +1233,7 @@ SH
   [ "$(cat "$OC/state/last-open-n" 2>/dev/null)" = "25" ] && rc=0 || rc=1
   ck "a successful open-PR count is persisted to last-open-n" $rc
   # (c2) a GENUINE 0 (drained queue) must still be returned as 0 and persisted: the `-gt 0` guard
-  # lives ONLY in the failure branch. Coercing a real 0 to 11 would make BROAD permanent and the
+  # lives ONLY in the failure branch. Coercing a real 0 to 26 would make BROAD permanent and the
   # queue would never be treated as drained.
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1377,8 +1382,42 @@ ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
 # PATH — under the very regression this check guards (a validator that passes), the supervisor would
 # otherwise create a REAL session and execute the live controller.
-mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
+# A fixture harness that is a REAL checkout at a REAL ref. Since #1745 cmd_check runs
+# cmd_check_provenance, which asks WHICH COMMIT the harness is: a harness that is a bare copy of
+# $HERE (untracked), or HEAD of a PR merge commit (diverged), is refused `DRIFT (...)`, and the
+# SCOPE/key verdicts below are then never reached. Build a throwaway repo whose origin/main IS its
+# HEAD and point every supervisor invocation in 16d-16f at $HFIX_H. HARNESS_FETCH=0 keeps the
+# suite offline (the supervisor default is 1).
+HFIX="$TMP/hfix"; HFIX_H="$HFIX/scripts/orchestrator-harness"
+git init -q "$HFIX"
+git -C "$HFIX" config user.email selftest@test.local
+git -C "$HFIX" config user.name selftest
+git -C "$HFIX" config commit.gpgsign false
+mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
+git -C "$HFIX" branch -M main
+git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
+
+git init -q "$TMP/cellrepo"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
+# shapes that do not.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
+# not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
+# fixture that reaches the probe must stub it instead of leaning on the host PATH — otherwise the
+# suite reddens on the runner only (the #1348/#1369 lane-split class).
+# ⛔ Stub the GAPS ONLY — stubbing a tool the fixture itself needs SHADOWS the real one, and the
+# provenance gate then reads the stub: `git -C "$HARNESS_REPO" rev-parse` returns EMPTY, the harness
+# classifies as `unknown`, and cmd_check refuses with "Cannot-verify is never a pass" — so every
+# case below would assert against a DRIFT refusal instead of the verdict under test.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; }; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1392,7 +1431,7 @@ chmod +x "$STUB_TM/tmux"
 # session-file clause below could never fire and a mutant that started a real session would surface
 # only through the refusal-message clause. Created empty, the stub still reports has-session=absent.
 mkdir -p "$TMP/sup-empty"
-( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
 # ONE conjunction. This was two statements and the second RECOMPUTED rc from its own exit status,
 # discarding the first — so a mutant that created the session and only then died with the SCOPE
@@ -1406,7 +1445,7 @@ ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted value
 # preflight that certifies a SCOPE its own `start` then dies on is a FALSE PASS on the only question
 # that verdict answers. Driven with a value NEITHER subcommand accepts, and both halves asserted: the
 # refusal names the accepted values, AND the certification line is absent.
-( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" check >"$TMP/sup.chkbad.out" 2>"$TMP/sup.chkbad.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.chkbad.err" \
   && ! grep -qF 'CELL CAN RUN A CONTROLLER' "$TMP/sup.chkbad.out" && rc=0 \
@@ -1497,12 +1536,32 @@ fi
 # the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
 # documentation, not a setting. Drive the shipped cmd_start with a tmux stub that records the
 # command it is handed (this is the only place the forwarding can be observed).
-TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
+TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
+# A REAL checkout, not a mocked `.git` directory (see the §16fixture below): since #1745 cmd_check
+# verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
+# before any session command can be recorded.
+git init -q "$TMP/tm/repo"
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
 mkdir -p "$TMP/tm/repo/tools"; : > "$TMP/tm/repo/tools/collision_preflight.py"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
+# for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
+# and turns a current harness into an unverifiable one.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1517,11 +1576,11 @@ sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
   rm -f "$TMP/tm/up" "$TMP/tm/cmd"
   if [ "$1" = "__UNSET__" ]; then
     env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   else
     PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE="$1" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE="$1" \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   fi
 }
@@ -1535,7 +1594,7 @@ done
 # die BEFORE a session is created (nothing started, no tmux command recorded).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
@@ -1548,7 +1607,7 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # enables the break-out — not merely the class as a whole.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
@@ -1558,7 +1617,7 @@ ck "a metacharacter in \$O is refused before any session is created" $rc
 # was a live injection (a quote in OR broke out of the sh -c string and executed a command).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1567,14 +1626,14 @@ ck "a metacharacter in \$OR is refused before any session is created" $rc
 # match: a guard that lost only the quote alternatives must still go red here.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x'q" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x'q" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1596,7 +1655,7 @@ mkdir -p "$TMP/tm/home/.pi/agent"
 printf 'secret\n' > "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 chmod 000 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 supchk="$( env -u AI_REVIEW_GATE_KEY PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1 )"
 chmod 600 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 rm -f "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
@@ -1607,19 +1666,32 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
 # ambient-only export does NOT (tmux serves a new session the server's environment). Reporting the
 # ambient one as "present" was a false green on a cell that merges without the key.
-KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
+KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
+# ⛔ A REAL checkout, not a mocked `.git` directory. `mkdir -p "$KC/repo/.git"` passed the old
+# `[ -d "$REPO/.git" ]` test, but since #1745 cmd_check asks the real question —
+# `git -C "$REPO" rev-parse --git-dir` — because a LINKED worktree has a `.git` FILE, and the old
+# `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
+# must be one or every case below dies at the repo gate before reaching the key verdicts.
+git init -q "$KC/repo"
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
     env "$2" PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   else
     PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   fi
 }
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys.env" '' )"
@@ -1638,7 +1710,7 @@ ck "an EMPTY key in keys.env is NOT reported present" $rc
 # operator who exported the key ambiently gets a keyless cell and no signal otherwise.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
@@ -1646,7 +1718,7 @@ ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # (filtering on just the two easy-to-grep verdicts left this one silent).
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr2" in *'AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr2" | tail -2)" ;; esac
 ck "the start path surfaces the no-key verdict on stderr" $rc
@@ -1681,7 +1753,7 @@ ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
 # signal the operator gets.
 rm -f "$TMP/tm/up" "$TMP/tm/cmd"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
@@ -1768,7 +1840,8 @@ chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
 GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
-  WORKDIR="$BG/work" ENV_FILE= bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
+  WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
+  bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
   [ "$(cat "$TMP/bg-gh-home.txt")" = "$BG/home" ] && rc=0 || { rc=1; echo "      bringup's gh saw HOME=$(cat "$TMP/bg-gh-home.txt"), cell home is $BG/home"; }
 else
@@ -2276,7 +2349,7 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 [ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
@@ -2327,7 +2400,7 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
