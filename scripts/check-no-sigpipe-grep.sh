@@ -97,12 +97,18 @@
 #                                                  producer in the PREVIOUS command cannot vouch
 #                                                  for this one)
 #       a QUOTED or ESCAPED WRAPPER WORD             `"command" -p grep …`, `\command -p grep …`,
-#                                                  `"env" -i grep …` — the wrapper walk read
-#                                                  RAW text, so the quoting never matched the
-#                                                  WRAPWORDS list
-#       a brace or parenthesis INSIDE a wrapper      `env -u "x(y" -- grep …`, `env -u x} -- grep
-#        OPTION ARGUMENT                             …` — the walk broke on `(`/`)`/`{`/`}`; only a
-#                                                  statement separator may end it
+#                                                  `"env" -i grep …`, and the dollar-quoted
+#                                                  spellings `$'env' …`, `$"env" …`, `en$'v' …` —
+#                                                  the wrapper walk read RAW text, so the quoting
+#                                                  never matched the WRAPWORDS list
+#       a brace, parenthesis, or QUOTED or           `env -u "x(y" -- grep …`, `env -u x} -- grep
+#        ESCAPED SEPARATOR inside a wrapper           …`, a wrapper option argument holding a
+#        OPTION ARGUMENT                             quoted or escaped `;`/`&`/`|` — the walk
+#                                                  broke on `(`/`)`/`{`/`}` and on RAW separators;
+#                                                  only a REAL statement separator may end it now,
+#                                                  which is what the guard quote map (QI) is for
+#       a locale-quoted WRAPPER around the           `… | $"command" -p grep -q p` — the consumer
+#        CONSUMER                                    token walk read only the `$'…'` spelling
 #       an UNQUOTED BRACED VARIABLE among its         `/usr/bin/grep -E "a|b" ${y} f | grep -q p` —
 #        arguments                                   `${y}` opens no `{ …; }` group, so its `}`
 #                                                  landed in the group-depth-0 branch and CLEARED
@@ -745,6 +751,7 @@ HITS="$(
           if (q == 0) {
             if (c == " " || c == "\t") break
             if (c == "$" && CH[i + 1] == "\047") { q = 3; i += 2; continue }
+            if (c == "$" && CH[i + 1] == "\"") { q = 2; i += 2; continue }
             if (c == "\047") { q = 1; i++; continue }
             if (c == "\"") { q = 2; i++; continue }
             if (c == "\\") { i++; if (i <= CHN) { tokchar(CH[i]); if (tk < 400) { TOK = TOK CH[i]; tk++ }; i++ } ; continue }
@@ -1157,20 +1164,24 @@ HITS="$(
             while (pw >= 1 && (CH[pw] == " " || CH[pw] == "\t")) pw--
             if (pw < 1) break
             ph = pw
-            # A token boundary is ` \t;&|` and NOTHING else. `(`, `)`, `{` and `}` are ORDINARY
-            # CHARACTERS inside a word, so breaking on them ended the walk before the wrapper was
-            # reached when one appeared in a wrapper OPTION ARGUMENT (`env -u "x(y" -- grep …`,
-            # `env -u x} -- grep …`) — reported CLEAN at rc 141 (#864 review). Only a statement
-            # separator stops the walk, so a producer in the PREVIOUS command cannot vouch for this
-            # one.
-            while (ph >= 1 && CH[ph] !~ /[ \t;&|]/) ph--
+            # A token boundary is ` \t;&|` and NOTHING else — but only an UNQUOTED one counts.
+            # `(`, `)`, `{` and `}` are ORDINARY CHARACTERS inside a quoted word (unquoted they are
+            # shell metacharacters, which is why the walk never needed them as boundaries), and a
+            # quoted or escaped `;`/`&`/`|` is DATA, not a statement separator: breaking on them
+            # ended the walk before the wrapper was reached (`env -u "x(y" -- grep …`,
+            # `env -u x} -- grep …`, and a quoted or escaped separator in the option argument) —
+            # reported CLEAN at rc 141 (#864
+            # review). QI marks quoted/escaped positions; only a real statement separator stops the
+            # walk, so a producer in the PREVIOUS command cannot vouch for this one.
+            while (ph >= 1 && (QI[ph] || CH[ph] !~ /[ \t;&|]/)) ph--
             pto = substr(s, ph + 1, pw - ph)
-            # A QUOTED or ESCAPED wrapper word (`"env" -i grep`, `\env -i grep`) is still that
-            # command, and this walk reads RAW text, so its quoting is stripped before the match —
-            # the same allowance `writer_at` already makes for the producer word itself. Comparing
-            # `"env"` and `\env` against the WRAPWORDS list failed and reported CLEAN at rc 141
+            # A QUOTED or ESCAPED wrapper word (`"env" -i grep`, `\env -i grep`), and the
+            # ANSI-C or locale dollar-quoted spellings of it, is still that command, and
+            # this walk reads RAW text, so its quoting is stripped before the match — the same
+            # allowance `writer_at` already makes for the producer word itself. Comparing the
+            # quoted forms against the WRAPWORDS list failed and reported CLEAN at rc 141
             # (#864 review).
-            gsub(/["\\\047]/, "", pto)
+            gsub(/[$"\\\047]/, "", pto)
             sub(/.*\//, "", pto)
             if (pto ~ "^(" WRAPWORDS ")$") { ok = 1; break }
             if (ph < 1 || CH[ph] ~ /[;&|]/) break
@@ -1397,7 +1408,7 @@ HITS="$(
         return 0
       }
       # The two original matchers in one place; also rebuilds CH for the body walk of the caller.
-      function matchers(s) {
+      function matchers(s,   i, qq) {
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
@@ -1405,10 +1416,37 @@ HITS="$(
         # many-producers pathology: `raw_idiom` bridges `[^|]*[|]` from EVERY producer word and
         # rescans the rest of the line looking for the `|` that is not there, so the cost is
         # quadratic in the line length. `grep` appears far more often in shell text than printf or
-        # echo, so widening WRITERRE extended a latent hazard into a reachable one (measured 37.6 s
-        # on a 256 KB single-line fixture, 0.04 s through this fast path) (#864 review).
+        # echo, so widening WRITERRE extended a latent hazard into a reachable one (measured on the
+        # order of tens of seconds for a ~256 KB single-line fixture on a loaded box, against under
+        # half a second through this fast path). THE FAST PATH COVERS ONLY A LINE WITH NO PIPE AT
+        # ALL: a line that DOES carry a pipe and holds many producer words is still superlinear
+        # (measured 3-32 s at ~78 KB and 22-52 s at ~234 KB across runs, wall time varying with
+        # fleet load). That residual is a STATED LIMIT, not closed, and it does not occur in the
+        # scanned corpus (the whole-repo run is rc 0 over 116 files in ~5 s).
         if (index(s, "|") == 0) return 0
         CHN = length(s); delete CH; split(s, CH, "")
+        # QI[p] = 1 when index p is a quote character, lies INSIDE a quoted region, or is a
+        # character an unquoted backslash escapes. The wrapper walk reads RAW text and must not
+        # treat a quoted or escaped `;`/`&`/`|` as a statement separator: with a quoted separator
+        # in a wrapper option argument the walk stopped at that separator, never reached the
+        # wrapper, and the line was
+        # reported CLEAN at rc 141 (#864 review). One O(n) pass here replaces a quote scan per walk.
+        delete QI
+        qq = 0
+        for (i = 1; i <= CHN; i++) {
+          if (qq == 0) {
+            if (CH[i] == "\\") { QI[i] = 1; if (i < CHN) { i++; QI[i] = 1 }; continue }
+            if (CH[i] == "$" && CH[i + 1] == "\047") { QI[i] = 1; i++; QI[i] = 1; qq = 3; continue }
+            if (CH[i] == "$" && CH[i + 1] == "\"") { QI[i] = 1; i++; QI[i] = 1; qq = 2; continue }
+            if (CH[i] == "\047") { QI[i] = 1; qq = 1; continue }
+            if (CH[i] == "\"") { QI[i] = 1; qq = 2; continue }
+          } else {
+            QI[i] = 1
+            if ((qq == 1 || qq == 3) && CH[i] == "\047") qq = 0
+            else if (qq == 2 && CH[i] == "\"") qq = 0
+            else if ((qq == 2 || qq == 3) && CH[i] == "\\") { if (i < CHN) { i++; QI[i] = 1 } }
+          }
+        }
         # The LINE is kept as a global too, because a wrapper body must be read WHOLE from it (TOK is
         # capped) - see body_text.
         CURLINE = s

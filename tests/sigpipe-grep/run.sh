@@ -2020,12 +2020,12 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the THIRTY-EIGHT fixtures below. NON-VACUOUS: all thirty-eight are reported
+#   13a  DETECTION — the FORTY-NINE fixtures below. NON-VACUOUS: all forty-nine are reported
 #        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
 #        (NOT `HEAD`, which by the time you read this is the widened guard and reports all
-#        thirty-eight as hits at rc 1) — so this whole block fails before the widening. Verified
-#        2026: the pre-change guard exits 0 on all thirty-eight, the head guard exits 1 naming all
-#        thirty-eight.
+#        forty-nine as hits at rc 1) — so this whole block fails before the widening. Verified
+#        2026: the pre-change guard exits 0 on all forty-nine, the head guard exits 1 naming all
+#        forty-nine.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2121,6 +2121,23 @@ printf '%s\n' '#!/usr/bin/env bash' '\command -p grep -E "a|b" f | grep -q bar' 
 printf '%s\n' '#!/usr/bin/env bash' '"env" -i grep -E "a|b" f | grep -q bar'        > "$E/scripts/wrapquotedenv.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -u "x(y" -- grep -E "a|b" f | grep -q bar' > "$E/scripts/wrapparen.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'env -u x} -- grep -E "a|b" f | grep -q bar'    > "$E/scripts/wrapbrace.sh"
+# The THIRD review round found the same walk still breaking on a QUOTED or ESCAPED `;`/`&`/`|`
+# (data, not a statement separator) and still failing to strip the dollar from a dollar-quoted
+# wrapper word, plus one consumer-side case. Each was measured at rc 141 under `pipefail` on a
+# >64 KiB payload with the match on line 1 against 0 for the capture-then-classify form, and each
+# was CLEAN on the parent head (#864 review). The guard now carries a quote map so only a REAL
+# statement separator stops the wrapper walk.
+printf '%s\n' '#!/usr/bin/env bash' "env -u 'x;y' -i grep -E \"a|b\" f | grep -q bar"     > "$E/scripts/sepquoted.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u "x&y" -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/sepqamp.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u "x|y" -i grep -E "a|b" f | grep -q bar'         > "$E/scripts/seppipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u x\;y -i grep -E "a|b" f | grep -q bar'          > "$E/scripts/sepescaped.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -u 'x;y' -- grep -E \"a|b\" f | grep -q bar"      > "$E/scripts/sepquoteddq.sh"
+printf '%s\n' '#!/usr/bin/env bash' "\$'env' -i grep -E \"a|b\" f | grep -q bar"           > "$E/scripts/ansiwrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' "en\$'v' -i grep -E \"a|b\" f | grep -q bar"           > "$E/scripts/ansisplit.sh"
+printf '%s\n' '#!/usr/bin/env bash' '$'"\""'env'"\""' -i grep -E "a|b" f | grep -q bar'    > "$E/scripts/localewrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' "env -u \$'x;y' -i grep -E \"a|b\" f | grep -q bar"    > "$E/scripts/ansiquotedsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' "/usr/bin/\$'env' -i grep -E \"a|b\" f | grep -q bar" > "$E/scripts/pathansiwrapper.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f | $"command" -p grep -q needle'      > "$E/scripts/localecmd.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2141,8 +2158,13 @@ if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" 
    && grep -q 'braceclose\.sh' "$OUT" && grep -q 'braceword\.sh' "$OUT" \
    && grep -q 'wrapquoted\.sh' "$OUT" && grep -q 'wrapescaped\.sh' "$OUT" \
    && grep -q 'wrapquotedenv\.sh' "$OUT" && grep -q 'wrapparen\.sh' "$OUT" \
-   && grep -q 'wrapbrace\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable / brace-expansion / quoted-wrapper / brace-in-option conjunctions)"
+   && grep -q 'wrapbrace\.sh' "$OUT" && grep -q 'sepquoted\.sh' "$OUT" \
+   && grep -q 'sepqamp\.sh' "$OUT" && grep -q 'seppipe\.sh' "$OUT" \
+   && grep -q 'sepescaped\.sh' "$OUT" && grep -q 'sepquoteddq\.sh' "$OUT" \
+   && grep -q 'ansiwrapper\.sh' "$OUT" && grep -q 'ansisplit\.sh' "$OUT" \
+   && grep -q 'localewrapper\.sh' "$OUT" && grep -q 'ansiquotedsep\.sh' "$OUT" \
+   && grep -q 'pathansiwrapper\.sh' "$OUT" && grep -q 'localecmd\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable / brace-expansion / quoted-or-dollar-quoted-wrapper / quoted-or-escaped-separator-in-option-argument / brace-in-option conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
