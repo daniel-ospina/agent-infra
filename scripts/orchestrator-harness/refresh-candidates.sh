@@ -251,10 +251,11 @@ gh_env_verdict() {
     return "$EXIT_NOT_PROVISIONABLE"
   fi
   # A credential IS stored but could not be validated. Is it REJECTED, or merely UNREACHABLE? Only
-  # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used, and it is NOT
-  # "just rate limiting": /rate_limit is rate-limit-exempt, so a 403 there means an SSO/SAML
-  # enforcement, a missing scope, an IP-allowlist block or a suspended account — conditions a retry
-  # cannot change — while a transport failure carries no HTTP status at all. The ambiguous middle is
+  # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
+  # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
+  # enforcement, a missing scope, an IP-allowlist block, a suspended account, or a SECONDARY rate
+  # limit — so a permanent denial and a transient throttle are indistinguishable there (and a
+  # transport failure carries no HTTP status at all). The ambiguous middle is
   # returned TRANSIENT on purpose: a wrong TRANSIENT costs a loud rc=1 retry, while a wrong PERMANENT
   # stops dispatch until a human clears the marker. MEASURED on gh 2.97.0: a bogus stored token ->
   # `gh: Bad credentials (HTTP 401)`; a dead proxy -> `proxyconnect tcp: … connection refused` with no
