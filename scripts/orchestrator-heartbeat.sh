@@ -940,7 +940,13 @@ fi
 # whatever shell was in the pane. cmux's own pid record names the PROCESS rather than
 # the pixels, so it is the signal to gate on. Withholding costs nothing: the next tick
 # re-evaluates, and a pane with no pi cannot act on a nudge anyway.
-if ! cmux sessions list 2>/dev/null | grep "workspace=$ORCH_WS" | grep -q "pid_exists=yes"; then
+# NO PIPE INTO THE QUIET GREP. `cmux sessions list | grep workspace | grep -q pid_exists` is
+# the #864 class with a non-builtin producer: the quiet grep exits at its first match, the
+# upstream grep takes SIGPIPE, and `pipefail` promotes that 141 to the pipeline status — which
+# `!` inverts into "no live pi", so a LIVE orchestrator pane would be SKIPPED and never nudged.
+# Capture the workspace lines first (a command substitution reads all of its input, so nothing
+# upstream can take the signal), then classify the capture. Behaviour is identical.
+if ! grep -q "pid_exists=yes" <<<"$(cmux sessions list 2>/dev/null | grep "workspace=$ORCH_WS" || true)"; then
   log "SKIP orchestrator pane has NO live pi (pid_exists != yes) — refusing to type into a bare shell queue=[${QUEUE}] alerts=[${ALERTS}]"
   exit 0
 fi

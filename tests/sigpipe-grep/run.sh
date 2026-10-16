@@ -66,11 +66,13 @@
 #  13. NON-BUILTIN PRODUCER (#864). The guard matches `printf`/`echo` PLUS a `grep`: the failure
 #      is `pipefail` + the quiet grep early exit, not the producer identity. 13a pins DETECTION
 #      (bare, via an intermediary, by path, with an env prefix, with a data pipe in the
-#      producer's own argument, continued, in a substitution, and the by-path-plus-data-pipe
-#      CONJUNCTION) and is the only sub-section that fails on the un-widened guard; 13b is an
-#      over-block CONTROL (safe forms: capture-then-case, here-string, non-quiet consumer);
-#      13c is a NON-VACUITY pin that the idiom really does lose the match on a >64 KiB payload;
-#      13d pins the ACCEPTED over-block (a producer that writes nothing) so it stays deliberate.
+#      producer's own argument, continued, in a substitution, the by-path-plus-data-pipe
+#      CONJUNCTION, the ANSI-C decode classes, and the `|&` pipe operator) and is the only
+#      sub-section that fails on the un-widened guard; 13b is an over-block CONTROL (safe forms:
+#      capture-then-case, here-string, non-quiet consumer); 13c is a NON-VACUITY pin that the
+#      idiom really does lose the match on a >64 KiB payload; 13d pins the ACCEPTED over-blocks
+#      (a producer that writes nothing, and a line that is DATA — a heredoc body or a multi-line
+#      quoted string) so they stay deliberate.
 #
 # Hermetic: every fixture is written under a temp root; nothing outside it is touched.
 # tests/ is deliberately NOT in the guard's scan dirs (this file must contain the idiom
@@ -2020,12 +2022,14 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the SIXTY-TWO fixtures below. NON-VACUOUS: all sixty-two are reported
+#   13a  DETECTION — the fixtures below. NON-VACUOUS: every fixture 13a writes is reported
 #        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
-#        (NOT `HEAD`, which by the time you read this is the widened guard and reports all
-#        sixty-two as hits at rc 1) — so this whole block fails before the widening. Verified
-#        2026: the pre-change guard exits 0 on all sixty-two, the head guard exits 1 naming all
-#        sixty-two.
+#        (NOT `HEAD`, which by the time you read this is the widened guard and reports every one
+#        as a hit at rc 1) — so this whole block fails before the widening. 13a writes **91**
+#        detection fixtures: the AGGREGATE below asserts the **62** that 13a1 introduced, and
+#        13a2-13a5 assert the decoder/decode classes and 13a6 the `|&` operator separately, so a
+#        regression in any one of them names itself. Verified 2026 on the pre-change guard: rc 0
+#        on all 91, and the head guard rc 1 naming all 91.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2203,6 +2207,13 @@ printf '%s\n' '#!/usr/bin/env bash' "print\$'\\x{ZZ}'f '%s' \"\$T\" | grep -q ba
 printf '%s\n' '#!/usr/bin/env bash' "eval \"gre\$'\\x70' -E 'a|b' f | grep -q bar\""    > "$E/scripts/bodyspan.sh"
 printf '%s\n' '#!/usr/bin/env bash' "bash -c \"set -o pipefail; gre\$'\\x70' -E 'a|b' f | grep -q bar\"" > "$E/scripts/bodybashc.sh"
 printf '%s\n' '#!/usr/bin/env bash' "eval \"printf '%s' \\\"\\\$T\\\" | gre\$'\\x70' -q bar\"" > "$E/scripts/bodyconsspan.sh"
+# The `|&` PIPE OPERATOR (`cmd 2>&1 | grep`). The `&` belongs to the OPERATOR, not to a
+# backgrounding `&`, but an unquoted `&` is a separator to the token walk — so `is_grep_cmd`
+# was handed a `&` token and rejected it, the consumer word was never read, and the line was
+# CLEAN on the head before this fix (#864 review F1). Both producer sides are pinned: the
+# builtin and the `grep` producer.
+printf '%s\n' '#!/usr/bin/env bash' 'printf x |& grep -q p'                       > "$E/scripts/pipeampprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f |& grep -q "[^[:space:]]"' > "$E/scripts/pipeampgrep.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2296,6 +2307,20 @@ else
   fail "the decode swallowed a producer (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"
 fi
+# 13a6. THE `|&` PIPE OPERATOR (`cmd 2>&1 | grep`), asserted separately so an operator regression
+#       names itself instead of hiding inside the 62-fixture aggregate above. The `&` is part of
+#       the pipe, NOT a backgrounding separator, but an unquoted `&` is a separator to the token
+#       walk, so `is_grep_cmd` was handed a `&` token and rejected it: the consumer word after
+#       the operator was never read. Measured CLEAN at head `39e65457`, rc 141 under `pipefail`
+#       on a >64 KiB payload with the match on line 1, against 0 for the capture-then-classify
+#       form — the same mechanism 13c pins. `raw_idiom` was blind to it too, because its
+#       `[^|]*[|][ \t]*` bridge cannot cross the `&`; all three call sites now step over it.
+if [ "$rc" -eq 1 ] && grep -q 'pipeampprintf\.sh' "$OUT" && grep -q 'pipeampgrep\.sh' "$OUT"; then
+  pass "the \`|&\` pipe operator is DETECTED for a builtin producer and for a grep producer (the \`&\` is stepped over before the consumer word is read)"
+else
+  fail "a producer piped with \`|&\` was reported CLEAN (exit $rc) — #864 regression:"
+  sed -n '1,20p' "$OUT"
+fi
 # 13b. The SAFE forms a grep producer must not be flagged on: the capture-then-case fix, a
 #      here-string, and a NON-QUIET consumer (which reads all input and cannot SIGPIPE).
 #      A CONTROL, not a detection pin: the old guard exits 0 here too, so it catches only an
@@ -2350,13 +2375,21 @@ printf '%s\n' '#!/usr/bin/env bash' 'grep -c foo f | grep -q bar' > "$E/scripts/
 # flagged through an escaped spelling as well — the same declared class as `ls a/grep | grep -q x`.
 # It is a SHAPE flag, not the mechanism: the pipeline carries the OTHER command's output.
 printf '%s\n' '#!/usr/bin/env bash' "foo \$'\\x67rep' -e \"a|b\" f | grep -q p" > "$E/scripts/argspanproducer.sh"
+# The DATA-REGION over-block, pinned so it is a CONSCIOUS consequence rather than a surprise: the
+# scan is LINE-oriented, so a line that is the DATA of a heredoc body, or the interior line of a
+# multi-line single-quoted string, is read as if it were a command. The idiom on it is flagged
+# although the shell never runs it. Same polarity as every accepted over-block here — friction,
+# visible, recoverable through the exceptions file — and no live occurrence exists on this tree.
+printf '%s\n' '#!/usr/bin/env bash' "cat <<'EOF'" 'grep foo bar | grep -q baz' 'EOF' > "$E/scripts/heredocdata.sh"
+printf '%s\n' '#!/usr/bin/env bash' "x='line one" 'grep foo bar | grep -q baz' "line three'" > "$E/scripts/multiquotedata.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 ( set -o pipefail; grep -q needle "$BIGF" | grep -q needle ) 2>/dev/null; q_rc=$?
 note "quiet-producer idiom rc=$q_rc (never 141 — it writes nothing to the pipe)"
 if [ "$rc" -eq 1 ] && grep -q 'quietproducer\.sh' "$OUT" && grep -q 'countproducer\.sh' "$OUT" \
-   && grep -q 'argspanproducer\.sh' "$OUT" \
+   && grep -q 'argspanproducer\.sh' "$OUT" && grep -q 'heredocdata\.sh' "$OUT" \
+   && grep -q 'multiquotedata\.sh' "$OUT" \
    && [ "$q_rc" -ne 141 ]; then
-  pass "a producer that writes NOTHING is flagged as a documented SHAPE, and its rc is not 141 (over-block is deliberate, not the mechanism)"
+  pass "a producer that writes NOTHING is flagged as a documented SHAPE, and a heredoc body / multi-line quoted string is flagged as a documented DATA-REGION over-block, and the quiet-producer rc is not 141 (over-block is deliberate, not the mechanism)"
 else
   fail "the accepted over-block changed (guard rc=$rc, quiet-producer rc=$q_rc) — was the predicate narrowed? Then move this pin to a clean-form assertion and update the SCOPE header"
 fi

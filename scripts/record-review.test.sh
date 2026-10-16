@@ -2907,8 +2907,11 @@ fi
 #     to POST the moment a -f/-F parameter is added, and this endpoint is
 #     GET-only, so `-f` without `-X GET` 404s — the exact defect this fix
 #     addresses (a dead rerun behind a false "gh/API failure" warning).
-if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- ' -f '; then
-    if grep -E 'commits/.*/check-runs' "$LOG" | grep -q -- '-X GET'; then
+#     NO PIPE INTO THE QUIET GREP: capture first, then classify the capture (#864). The piped
+#     form's upstream grep takes SIGPIPE when the quiet grep exits at its first match, and
+#     `pipefail` turns that 141 into a false "parameter absent" here.
+if grep -q -- ' -f ' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
+    if grep -q -- '-X GET' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; then
         ok "14.1b the check-runs read is an explicit GET (transport)"
     else
         bad "14.1b the check-runs read adds -f with NO -X GET → real gh POSTs → 404 (log: $(cat "$LOG"))"

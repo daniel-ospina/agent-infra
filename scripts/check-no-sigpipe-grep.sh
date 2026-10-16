@@ -76,6 +76,21 @@
 #     friction and visible, a missed producer is a silent false CLEAN — and no live occurrence of
 #     the shape exists on this tree (the guard runs clean).
 #
+#     PRODUCER-SIDE OVER-BLOCK FROM THE DATA-REGION CLASS (#864) — A HEREDOC BODY, AND THE
+#     INTERIOR LINE OF A MULTI-LINE QUOTED STRING. The scan is LINE-oriented, so a line that is
+#     the DATA of a heredoc (`cat <<'EOF'` … a producer piped into a quiet grep … `EOF`) or the
+#     middle of a single-quoted string spanning lines is read as if it were a command, and the
+#     idiom on it is flagged although the shell never runs that line. Measured: a `heredoc.sh`
+#     whose second line is `grep foo bar | grep -q baz` between `cat <<'EOF'` and `EOF`, and a
+#     `multiquote.sh` with the same line inside a three-line single-quoted string, are both
+#     FLAGGED at rc 1 here while `git show origin/main:scripts/check-no-sigpipe-grep.sh`
+#     returns 0 on both (no `grep` producer was recognised at all before #864). This is an
+#     OVER-BLOCK, not a false CLEAN, in the SAME polarity as the classes above: closing it
+#     needs cross-line quote/heredoc state in a per-line matcher, which is a new scanner, not a
+#     widening — so it is DECLARED, pinned in tests/sigpipe-grep/run.sh 13d, and recoverable
+#     through scripts/sigpipe-grep-exceptions.txt (which carries no live line). No live
+#     occurrence of the shape exists on this tree (the whole-repo run is rc 0).
+#
 #     PRODUCER SPELLINGS THAT REACH THE SAME FALSE CLEAN, AND ARE NOW CLOSED. Each of these needed
 #     the SAME conjunction — a producer word the token walk had to resolve AND a `|` inside the
 #     producer's own argument that defeats raw_idiom's `[^|]*` bridge — and each was measured at rc
@@ -204,6 +219,18 @@
 #                                                  producer was dropped; it now keys on the
 #                                                  ASSEMBLED WORD (`word == "printf"`), which is
 #                                                  what the carve-out means
+#       the `|&` PIPE OPERATOR (stderr into the      `grep -E "a|b" f |& grep -q p`,
+#        pipe — `cmd 2>&1 | grep`)                   `printf x |& grep -q p`, `echo x |& grep -q p` —
+#                                                  the `&` belongs to the OPERATOR, not to a
+#                                                  backgrounding `&`, and an unquoted `&` is a
+#                                                  separator to the token walk, so `is_grep_cmd`
+#                                                  was handed a `&` token and rejected it: the
+#                                                  consumer word was never read, and the line was
+#                                                  CLEAN at rc 141 under `pipefail` (#864 review
+#                                                  F1). `raw_idiom` could not bridge it either
+#                                                  (`[^|]*[|][ \t]*` cannot cross the `&`). All
+#                                                  three call sites now step over the `&` before
+#                                                  reading the consumer, and 13a pins the form.
 #
 #     ONE DIVERGENCE THE DECODE INTRODUCES, DECLARED: bash 3.2 has no `\u`/`\U` escapes, so on such
 #     a shell `Ech$'\u006f'` is the literal characters and NOT `echo`, while the decode reads it as
@@ -988,7 +1015,10 @@ HITS="$(
         off = 0
         while (off < length(s)) {
           rest = substr(s, off + 1)
-          if (!match(rest, WRITERRE "[^|]*[|][ \t]*" GREPRE "grep[ \t]+"))
+          # `[&]?` is the `|&` pipe operator (`2>&1 |`): the `&` is part of the pipe, not a
+          # backgrounding separator, so the GREPRE consumer follows it. Without this the `&`
+          # broke the bridge and the form was CLEAN at rc 141 (#864 review F1).
+          if (!match(rest, WRITERRE "[^|]*[|][&]?[ \t]*" GREPRE "grep[ \t]+"))
             return 0
           pos = off + RSTART
           # An offset, not a slice: the walk is bounded by the grep COMMAND it is reading, never by
@@ -1167,7 +1197,10 @@ HITS="$(
           if (c == "<" && CH[i + 1] == "(") return 0
           if (c == "|") {
             if (CH[i + 1] == "|") return 0
-            g = is_grep_cmd(i + 1)
+            # `|&` folds stderr into the pipe (`2>&1 |`), so the consumer begins after the `&`.
+            # `is_grep_cmd` rejects a leading `&` token (an unquoted `&` is a separator), so the
+            # walk must step over it or the whole consumer is never read (#864 review F1).
+            g = (CH[i + 1] == "&") ? is_grep_cmd(i + 2) : is_grep_cmd(i + 1)
             return (g == -1 || (g && has_quiet(g))) ? 1 : 0
           }
         }
@@ -1571,7 +1604,10 @@ HITS="$(
             # `printf ... | sed ... | grep -q` is two stages down, not the adjacent-writer idiom
             # this guard defines, and charging a later pipe to it would be a false block.
             if (active) {
-              g = is_grep_cmd(i + 1)
+              # `|&` — the `&` is part of the pipe operator, so the consumer token starts after
+              # it; `is_grep_cmd` rejects a leading `&` (an unquoted separator), which left the
+              # consumer unread and the line CLEAN at rc 141 (#864 review F1).
+              g = (CH[i + 1] == "&") ? is_grep_cmd(i + 2) : is_grep_cmd(i + 1)
               # -1 is the body sentinel from a shell-out wrapper: the quiet grep is the BODY, so
               # there is no flag index to walk (`printf x | sh -c "grep -q p"`).
               if (g == -1) return 1
@@ -1659,7 +1695,8 @@ HITS="$(
           while (j <= CHN && (CH[j] == " " || CH[j] == "\t")) j++
           if (j <= CHN && CH[j] == "|" && CH[j + 1] != "|") {
             if (nb ~ "^[ \t]*" GREPRE WRITERRE "([ \t]|$)") {
-              g = is_grep_cmd(j + 1)
+              # `|&` carries the `&` in the operator, so the consumer token starts after it.
+              g = (CH[j + 1] == "&") ? is_grep_cmd(j + 2) : is_grep_cmd(j + 1)
               if (g == -1 || (g && has_quiet(g))) return 1
             }
           }
