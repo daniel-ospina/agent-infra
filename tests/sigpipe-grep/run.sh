@@ -2020,12 +2020,12 @@ echo "13. NON-BUILTIN PRODUCER — a grep upstream (#864)"
 # never reports the match.
 #
 # WHAT EACH SUB-SECTION PINS (they are not interchangeable):
-#   13a  DETECTION — the FORTY-NINE fixtures below. NON-VACUOUS: all forty-nine are reported
+#   13a  DETECTION — the SIXTY-TWO fixtures below. NON-VACUOUS: all sixty-two are reported
 #        CLEAN by #841's guard — the PRE-change guard, which is `git show origin/main:scripts/check-no-sigpipe-grep.sh`
 #        (NOT `HEAD`, which by the time you read this is the widened guard and reports all
-#        forty-nine as hits at rc 1) — so this whole block fails before the widening. Verified
-#        2026: the pre-change guard exits 0 on all forty-nine, the head guard exits 1 naming all
-#        forty-nine.
+#        sixty-two as hits at rc 1) — so this whole block fails before the widening. Verified
+#        2026: the pre-change guard exits 0 on all sixty-two, the head guard exits 1 naming all
+#        sixty-two.
 #   13b  OVER-BLOCK CONTROL — the safe forms. Expected to PASS on the old guard AND the new
 #        one; it does not detect the widening, it detects an over-broad version of it.
 #   13c  NON-VACUITY — no guard is invoked at all; it pins the CLASS (the idiom really does
@@ -2138,6 +2138,25 @@ printf '%s\n' '#!/usr/bin/env bash' '$'"\""'env'"\""' -i grep -E "a|b" f | grep 
 printf '%s\n' '#!/usr/bin/env bash' "env -u \$'x;y' -i grep -E \"a|b\" f | grep -q bar"    > "$E/scripts/ansiquotedsep.sh"
 printf '%s\n' '#!/usr/bin/env bash' "/usr/bin/\$'env' -i grep -E \"a|b\" f | grep -q bar" > "$E/scripts/pathansiwrapper.sh"
 printf '%s\n' '#!/usr/bin/env bash' 'grep -vxF -f list f | $"command" -p grep -q needle'      > "$E/scripts/localecmd.sh"
+# The FOURTH review round found the same quoting-resolution gap ONE LEVEL DOWN — in the producer
+# WORD itself, where a fixed character ladder could see only a contiguous spelling — and in the
+# quote map, which did not model `${…}`/`$(…)`/backtick regions. Each was measured at rc 141 under
+# `pipefail` on a >64 KiB payload with the match on line 1 against 0 for the capture-then-classify
+# form, and each was CLEAN before this fix (#864 review). The word is now ASSEMBLED with quoting and
+# escaping removed, and a substitution region is opaque to the wrapper walk.
+printf '%s\n' '#!/usr/bin/env bash' "gre''p -E \"a|b\" f | grep -q bar"      > "$E/scripts/splitquotes.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'g\rep -E "a|b" f | grep -q bar'         > "$E/scripts/splitescape.sh"
+printf '%s\n' '#!/usr/bin/env bash' '"gr"ep -E "a|b" f | grep -q bar'        > "$E/scripts/splitlead.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'gr"ep" -E "a|b" f | grep -q bar'        > "$E/scripts/splittrail.sh"
+printf '%s\n' '#!/usr/bin/env bash' "gre\$'p' -E \"a|b\" f | grep -q bar"    > "$E/scripts/splitansi.sh"
+printf '%s\n' '#!/usr/bin/env bash' "grep\$'' -E \"a|b\" f | grep -q bar"    > "$E/scripts/splittail.sh"
+printf '%s\n' '#!/usr/bin/env bash' "ech''o \"a|b\" f | grep -q bar"         > "$E/scripts/splitecho.sh"
+printf '%s\n' '#!/usr/bin/env bash' "print''f \"a|b\" f | grep -q bar"       > "$E/scripts/splitprintf.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a;b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u ${x:-a;b} -i grep -E "a|b" f | grep -q bar'       > "$E/scripts/paramsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u `echo a;b` -i grep -E "a|b" f | grep -q bar'       > "$E/scripts/btsep.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a|b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substpipe.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'env -u $(echo a&b) -i grep -E "a|b" f | grep -q bar'      > "$E/scripts/substamp.sh"
 rc="$(bash "$GUARD" --root "$E" --dirs 'scripts' >"$OUT" 2>&1; echo $?)"
 if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" \
    && grep -q 'aliased\.sh' "$OUT" && grep -q 'prefixed\.sh' "$OUT" \
@@ -2163,8 +2182,15 @@ if [ "$rc" -eq 1 ] && grep -q 'plain\.sh' "$OUT" && grep -q 'staged\.sh' "$OUT" 
    && grep -q 'sepescaped\.sh' "$OUT" && grep -q 'sepquoteddq\.sh' "$OUT" \
    && grep -q 'ansiwrapper\.sh' "$OUT" && grep -q 'ansisplit\.sh' "$OUT" \
    && grep -q 'localewrapper\.sh' "$OUT" && grep -q 'ansiquotedsep\.sh' "$OUT" \
-   && grep -q 'pathansiwrapper\.sh' "$OUT" && grep -q 'localecmd\.sh' "$OUT"; then
-  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable / brace-expansion / quoted-or-dollar-quoted-wrapper / quoted-or-escaped-separator-in-option-argument / brace-in-option conjunctions)"
+   && grep -q 'pathansiwrapper\.sh' "$OUT" && grep -q 'localecmd\.sh' "$OUT" \
+   && grep -q 'splitquotes\.sh' "$OUT" && grep -q 'splitescape\.sh' "$OUT" \
+   && grep -q 'splitlead\.sh' "$OUT" && grep -q 'splittrail\.sh' "$OUT" \
+   && grep -q 'splitansi\.sh' "$OUT" && grep -q 'splittail\.sh' "$OUT" \
+   && grep -q 'splitecho\.sh' "$OUT" && grep -q 'splitprintf\.sh' "$OUT" \
+   && grep -q 'substsep\.sh' "$OUT" && grep -q 'paramsep\.sh' "$OUT" \
+   && grep -q 'btsep\.sh' "$OUT" && grep -q 'substpipe\.sh' "$OUT" \
+   && grep -q 'substamp\.sh' "$OUT"; then
+  pass "a grep producer piped into a quiet grep is DETECTED (bare, intermediary, by path, wrapper-prefixed, env prefix, a data pipe in the producer argument, continuation, substitution, a producer inside a wrapper body, a nested writer inside a capture, and the by-path / wrapper-option / quoted-word / escaped-word / variable-rooted / process-substitution / multi-token-wrapper / env-body / braced-variable / brace-expansion / quoted-or-dollar-quoted-wrapper / quoted-or-escaped-separator-in-option-argument / brace-in-option / split-producer-word / substitution-in-option-argument conjunctions)"
 else
   fail "a grep producer was reported CLEAN (exit $rc) — #864 regression:"
   sed -n '1,20p' "$OUT"

@@ -96,6 +96,20 @@
 #                                                  command up to a statement separator (so a
 #                                                  producer in the PREVIOUS command cannot vouch
 #                                                  for this one)
+#       a producer WORD split by quoting or      `gre''p -E "a|b" f | grep -q p`,
+#        escaping                                   `g\rep …`, `"gr"ep …`, `gr"ep" …`,
+#                                                  `gre$'p' …`, `grep$'' …`, `ech''o …` —
+#                                                  the producer word was matched by a fixed
+#                                                  character ladder, which can only see a
+#                                                  CONTIGUOUS spelling; the word is now assembled
+#                                                  one literal character at a time with quoting and
+#                                                  escaping removed — and the same for the two
+#                                                  builtins, not only for `grep`
+#       a `${…}`, `$(…)` or backtick region inside     `env -u $(echo a;b) -i grep …`,
+#        a wrapper OPTION ARGUMENT                   `env -u ${x:-a;b} -i grep …` — a separator
+#                                                  inside a SUBSTITUTION belongs to the
+#                                                  substitution, not to the simple command; the
+#                                                  region is opaque to the wrapper walk
 #       a QUOTED or ESCAPED WRAPPER WORD             `"command" -p grep …`, `\command -p grep …`,
 #                                                  `"env" -i grep …`, and the dollar-quoted
 #                                                  spellings `$'env' …`, `$"env" …`, `en$'v' …` —
@@ -1096,23 +1110,31 @@ HITS="$(
       # carries foo output, and the `echo` is an option argument, not a command).
       # KEEP IN STEP WITH WRITERRE (see the note at its definition): the ladder below is the
       # only producer list scan_idiom consults.
-      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok) {
+      function writer_at(s, i,   prev, nxt, w, j, k, tokn, p, q, pw, ph, pto, ok, word, c, qq, n) {
         w = 0
-        # Character comparisons against the pre-split array: `substr(s, i, 6)` per index over a long
-        # line is O(n) PER CALL in this awk and made the walk quadratic (27 s for a 1 MB line).
-        if (CH[i] == "e") {
-          if (CH[i + 1] == "c" && CH[i + 2] == "h" && CH[i + 3] == "o") w = 4
-        } else if (CH[i] == "p") {
-          if (CH[i + 1] == "r" && CH[i + 2] == "i" && CH[i + 3] == "n" && CH[i + 4] == "t" && CH[i + 5] == "f") w = 6
-        } else if (CH[i] == "g") {
-          # A `grep` as the PRODUCER (#864). The mechanism is `pipefail` plus the early
-          # exit of a downstream quiet grep, so a grep upstream takes the signal exactly as a
-          # builtin writer does. No quietness model here: a producer that writes nothing
-          # (`grep -q`) is flagged as a SHAPE, which is the documented over-block (see the
-          # SCOPE header). (Apostrophe-free: this awk program is a single-quoted shell word.)
-          if (CH[i + 1] == "r" && CH[i + 2] == "e" && CH[i + 3] == "p") w = 4
+        # The command word is ASSEMBLED one literal character at a time with shell quoting and
+        # escaping REMOVED, so a producer whose LETTERS are separated by quote runs or backslashes
+        # (a doubled apostrophe pair inside the word, a backslash escape, a split double-quoted
+        # span, a dollar-single-quoted span) is the same command as its contiguous spelling. A fixed
+        # character ladder could only see the contiguous form, and BOTH matchers were blind to the
+        # split ones — every one of them CLEAN at rc 141 (#864 review). The first-character test
+        # keeps this O(1) for the common case; the assembly is bounded by the longest producer word.
+        if (CH[i] != "e" && CH[i] != "p" && CH[i] != "g") return 0
+        word = ""; j = i; n = 0
+        while (j <= CHN && n < 7) {
+          c = CH[j]
+          if (c == "$" && (CH[j + 1] == "\047" || CH[j + 1] == "\"")) { j += 2; continue }
+          if (c == "\\") { j++; if (j > CHN) break; c = CH[j] }
+          else if (c == "\047" || c == "\"") { j++; continue }
+          else if (c ~ /[ \t;&|()<>`{}]/) break
+          word = word c; j++; n++
         }
-        if (w == 0) return 0
+        # A `grep` is a PRODUCER for this predicate (#864): the mechanism is `pipefail` plus the
+        # downstream quiet grep early exit, so a grep upstream takes the signal exactly as a
+        # builtin writer does. No quietness model: a producer that writes nothing is flagged as a
+        # SHAPE, which is the documented over-block (see the SCOPE header).
+        if (word != "echo" && word != "printf" && word != "grep") return 0
+        w = j - i
         # A backtick starts a command substitution, so a writer right after one is a writer.
         prev = (i == 1) ? " " : CH[i - 1]
         # A PATH-PREFIXED command word is the SAME command, and the producer side must accept
@@ -1408,7 +1430,7 @@ HITS="$(
         return 0
       }
       # The two original matchers in one place; also rebuilds CH for the body walk of the caller.
-      function matchers(s,   i, qq) {
+      function matchers(s,   i, qq, sdd, btt) {
         # The line is split into characters ONCE per logical line and the walks read CH: in this awk
         # `substr(s, i, 1)` is O(n) PER CALL, so a character walk built on it is quadratic in the
         # line length (measured: an 800 KB token took 24 s, a 1 MB option list 28 s).
@@ -1432,9 +1454,26 @@ HITS="$(
         # wrapper, and the line was
         # reported CLEAN at rc 141 (#864 review). One O(n) pass here replaces a quote scan per walk.
         delete QI
-        qq = 0
+        qq = 0; sdd = 0; btt = 0
         for (i = 1; i <= CHN; i++) {
+          if (btt) { QI[i] = 1; if (CH[i] == "`") btt = 0; continue }
+          if (sdd > 0) {
+            # Inside a `${…}`, `$(…)` or backtick region: the whole substitution is opaque to the
+            # wrapper walk, because a separator there belongs to the substitution, not to the
+            # simple command. `env -u $(echo a;b) -i grep …` and `env -u ${x:-a;b} -i grep …`
+            # were CLEAN at rc 141 (#864 review). The depth is a single counter over both brace
+            # and paren nesting — an approximation, and one that errs toward marking MORE as
+            # opaque (over-block), never toward letting a real separator through.
+            QI[i] = 1
+            if (CH[i] == "$" && (CH[i + 1] == "(" || CH[i + 1] == "{")) { i++; QI[i] = 1; sdd++; continue }
+            if (CH[i] == "(" || CH[i] == "{") sdd++
+            else if (CH[i] == ")" || CH[i] == "}") sdd--
+            continue
+          }
           if (qq == 0) {
+            if (CH[i] == "`") { QI[i] = 1; btt = 1; continue }
+            if (CH[i] == "$" && CH[i + 1] == "{") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
+            if (CH[i] == "$" && CH[i + 1] == "(") { QI[i] = 1; i++; QI[i] = 1; sdd = 1; continue }
             if (CH[i] == "\\") { QI[i] = 1; if (i < CHN) { i++; QI[i] = 1 }; continue }
             if (CH[i] == "$" && CH[i + 1] == "\047") { QI[i] = 1; i++; QI[i] = 1; qq = 3; continue }
             if (CH[i] == "$" && CH[i + 1] == "\"") { QI[i] = 1; i++; QI[i] = 1; qq = 2; continue }
