@@ -6,13 +6,13 @@
  * exercised against genuine git semantics, not mocks.
  */
 import { execSync, execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ok, equal } from "node:assert/strict";
 
-import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode } from "./auto-sync.js";
+import autoSync, { syncState, aheadCount, behindCount, tryLosslessRecover, unmergedEntries, unmergedBanner, unmergedOp, stalenessBanner, stalenessThreshold, DEFAULT_STALE_COMMITS, shellQuoteSingle, displayPath, stageSetCode, currentBranch } from "./auto-sync.js";
 import { repoKey } from "./shared/branch-ownership.mjs";
 
 let passed = 0, failed = 0;
@@ -754,6 +754,85 @@ async function main() {
     const lines = stalenessBanner(repoCurrent, 1155, DEFAULT_STALE_COMMITS);
     ok(lines.some((l) => l.includes("1155 commits behind origin/main")), `expected the count, got: ${lines.join("\n")}`);
     ok(lines.some((l) => l.includes("./sync.sh")), "must carry the sync hint");
+  });
+
+  // #1664 review: the banner's remedy must not be INERT. sync.sh's
+  // branch-ownership guard refuses off main and exits 0 (branch-ownership.mjs
+  // / sync.sh, #265), so on a feature branch the default `./sync.sh` line
+  // hands the reader a command that does nothing — the same
+  // banner-contradicts-behaviour shape this banner was rewritten to remove.
+  await test("stalenessBanner: a non-main checkout is told to switch, not handed sync.sh's no-op (#1663)", () => {
+    const o = seededOrigin();
+    const repo = makeClone(o);
+    git(repo, "checkout -q -b feature-x");
+    equal(currentBranch(repo), "feature-x", "fixture must be off main");
+    const lines = stalenessBanner(repo, 1155, DEFAULT_STALE_COMMITS);
+    ok(lines.some((l) => l.includes('branch "feature-x"')), `must name the branch, got: ${lines.join("\n")}`);
+    ok(lines.some((l) => l.includes("git checkout main")), `must name the extra step, got: ${lines.join("\n")}`);
+    ok(!lines.some((l) => l === `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`),
+      `must not present the inert remedy verbatim: ${lines.join("\n")}`);
+
+    // …and on main nothing is added: the plain remedy is the one that works.
+    const onMain = makeClone(o);
+    equal(currentBranch(onMain), "main", "fixture must be on main");
+    const mainLines = stalenessBanner(onMain, 1155, DEFAULT_STALE_COMMITS);
+    ok(mainLines.some((l) => l === `[auto-sync]    Sync: cd "${onMain}" && ./sync.sh`),
+      `main keeps the plain remedy: ${mainLines.join("\n")}`);
+    ok(!mainLines.some((l) => l.includes("not main")), `no warning on main: ${mainLines.join("\n")}`);
+  });
+
+  // #1664 review: a branch whose removal would fail no test. Every arm of
+  // `unmergedOp`'s marker chain must be named rather than folded into the
+  // abandoned-index-only wording — a rebase mislabelled "index-only" is
+  // advised `git rm`/`--theirs`, and a rebase INVERTS --ours/--theirs, so that
+  // advice discards the side the user still wants.
+  await test("unmergedOp: rebase/rebase --apply/cherry-pick/revert markers are named, never 'index-only'", () => {
+    const cases: Array<[string, string, (r: string) => void, string]> = [
+      ["rebase-merge", "rebase --merge", (r) => mkdirSync(join(r, ".git", "rebase-merge")), "rebase"],
+      ["rebase-apply", "rebase --apply", (r) => mkdirSync(join(r, ".git", "rebase-apply")), "rebase"],
+      ["CHERRY_PICK_HEAD", "cherry-pick", (r) => writeFileSync(join(r, ".git", "CHERRY_PICK_HEAD"), ""), "cherry-pick"],
+      ["REVERT_HEAD", "revert", (r) => writeFileSync(join(r, ".git", "REVERT_HEAD"), ""), "revert"],
+    ];
+    for (const [marker, label, create, want] of cases) {
+      const repo = makeStuckConflict();
+      equal(unmergedOp(repo), "index-only", `${label}: fixture must start index-only (no marker yet)`);
+      create(repo);
+      equal(unmergedOp(repo), want, `${marker} must be detected as '${want}', not folded into 'index-only'`);
+      const lines = unmergedBanner(repo, unmergedEntries(repo), unmergedOp(repo));
+      ok(lines.some((l) => l.includes(`${want} --continue`)), `${marker}: must offer \`git ${want} --continue\`: ${lines.join("\n")}`);
+      ok(lines.some((l) => l.includes(`${want} --abort`)), `${marker}: must offer \`git ${want} --abort\`: ${lines.join("\n")}`);
+      ok(!lines.some((l) => l.includes("STUCK MERGE CONFLICT")), `${marker}: must not claim the abandoned index-only state`);
+    }
+  });
+
+  // #1664 review: the patch-shape coverage half. `remedyCommands` picks a
+  // command from the porcelain code, and only UU/UD/DD were ever exercised, so
+  // swapping DU's remedy for `keepOurs` (a command git cannot run — DU has no
+  // stage 2) changed no test result. Entries are constructed directly: the
+  // remedy is a pure function of (detail, path) and this keeps the assertion on
+  // the mapping rather than on a git fixture's index plumbing.
+  await test("unmergedBanner: each conflict code gets a remedy its own stage set supports", () => {
+    const repo = "/tmp/auto-sync remedy fixture";
+    const remedy = (detail: string) =>
+      unmergedBanner(repo, [{ path: "f.txt", detail }], "index-only").join("\n");
+    const du = remedy("DU"), au = remedy("AU"), ua = remedy("UA"), aa = remedy("AA"), dd = remedy("DD");
+    // DU = deleted by us, stage 3 only → origin's version is the survivor.
+    ok(du.includes("checkout --theirs"), `DU must offer --theirs (stage 3), got: ${du}`);
+    ok(!du.includes("checkout --ours"), `DU has NO stage 2 — --ours cannot run, got: ${du}`);
+    ok(!du.includes("inspect:"), `DU is a recognised code, not the ambiguous default arm, got: ${du}`);
+    // AU = added by us, stage 2 only → ours is the survivor, there is no stage 3.
+    ok(au.includes("checkout --ours"), `AU must offer --ours (stage 2), got: ${au}`);
+    ok(!au.includes("checkout --theirs"), `AU has NO stage 3 — --theirs cannot run, got: ${au}`);
+    // UA = added by them, stage 3 only.
+    ok(ua.includes("checkout --theirs"), `UA must offer --theirs (stage 3), got: ${ua}`);
+    ok(!ua.includes("checkout --ours"), `UA has NO stage 2 — --ours cannot run, got: ${ua}`);
+    // AA = both added, stages 2 and 3 → both sides addressable.
+    ok(aa.includes("checkout --theirs") && aa.includes("checkout --ours"), `AA has both stages, got: ${aa}`);
+    // DD = deleted on both sides: no stage 2, no stage 3 — only a removal exists.
+    ok(dd.includes("rm 'f.txt'"), `DD must advise the removal, got: ${dd}`);
+    ok(!dd.includes("checkout --"), `DD has neither side to check out, got: ${dd}`);
+    // The ambiguous arm stays reachable for a legacy 'stage N' detail.
+    ok(remedy("stage 1").includes("inspect:"), "a bare stage-1 must be inspected, never `git rm`d on a guess");
   });
 
   await test("stalenessThreshold: env override, junk falls back to default", () => {

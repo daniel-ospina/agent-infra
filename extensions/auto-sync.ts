@@ -60,6 +60,18 @@ export function behindCount(repo: string, branch = "main"): number {
  * as a banner, not a one-line hint. Override with AGENT_SYNC_STALE_COMMITS. */
 export const DEFAULT_STALE_COMMITS = 25;
 
+/** #1663/#1664 (review): the branch HEAD is on, or "" when it cannot be read.
+ * `git rev-parse --abbrev-ref HEAD` prints the literal `HEAD` on a detached
+ * checkout — which is not a branch, and sync.sh's branch-ownership guard
+ * refuses there too (#265), so the caller treats it as "not main". */
+export function currentBranch(repo: string): string {
+  try {
+    return execSync(`git -C "${repo}" rev-parse --abbrev-ref HEAD`, { encoding: "utf-8", timeout: 5_000 }).trim();
+  } catch {
+    return "";
+  }
+}
+
 export function stalenessThreshold(env: Record<string, string | undefined> = process.env): number {
   const raw = Number(env.AGENT_SYNC_STALE_COMMITS);
   return Number.isInteger(raw) && raw > 0 ? raw : DEFAULT_STALE_COMMITS;
@@ -69,16 +81,27 @@ export function stalenessThreshold(env: Record<string, string | undefined> = pro
  * #1661 (2): the "your tooling is old" banner. EMPTY below `threshold` — a
  * one-commit-behind checkout is normal and must stay quiet. Above it, the
  * magnitude of the pin (the thing that was invisible) is stated explicitly.
- * Deterministic for a given repo — it only SHELLS OUT to `git rev-parse
- * --short HEAD` via `shortHead` (so it is not pure; pass a real repo in tests),
- * which makes its output directly unit-testable.
+ * Deterministic for a given repo — it SHELLS OUT to `git rev-parse
+ * --abbrev-ref HEAD` (via `currentBranch`) and to `git rev-parse --short HEAD`
+ * (via `shortHead`), so it is not pure; pass a real repo in tests.
  */
 export function stalenessBanner(repo: string, behind: number, threshold: number): string[] {
   if (behind < threshold) return [];
+  // #1663 / #1664 (review): sync.sh is INERT off main — its branch-ownership
+  // guard prints a notice and exits 0 (sync.sh, "checkout is not on main",
+  // #265). Handing that guard's own no-op to the reader is the same
+  // banner-contradicts-behaviour defect this banner was rewritten to remove,
+  // so a non-main checkout gets the extra step instead of a command that
+  // silently does nothing. An UNREADABLE branch keeps the plain remedy: an
+  // unread value must not invent a claim about which branch we are on.
+  const branch = currentBranch(repo);
+  const sync = branch !== "" && branch !== "main"
+    ? `[auto-sync]    Sync: this checkout is on branch "${branch}", not main — ./sync.sh refuses there (branch-ownership guard, #265). Switch first: cd "${repo}" && git checkout main && ./sync.sh`
+    : `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`;
   return [
     `[auto-sync] 🐌 your loaded extensions are ${behind} commits behind origin/main — this checkout is pinned at ${shortHead(repo)}.`,
     `[auto-sync]    extensions/ on disk is NOT what origin/main ships; a bug you are chasing may already be fixed there.`,
-    `[auto-sync]    Sync: cd "${repo}" && ./sync.sh`,
+    sync,
   ];
 }
 
