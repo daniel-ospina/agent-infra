@@ -415,7 +415,7 @@ ok "plist valid"
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

@@ -28,10 +28,12 @@ THE FIVE HARD RULES (each one earned the hard way today):
   1. THE FIX AND THE RAIL CALL GO IN THE SAME BRIEF. The gap between "review recorded" and
      "rail called" cost #7906 35 min, #7922 25, #7904 90+, and produced 2 attestations in 2
      hours while 25 PRs waited. A brief that stops at "record" is a bug.
-  2. NEVER DOUBLE-DISPATCH. One lane per PR; a cooldown; and a PR already in flight is skipped.
-     Two lanes fixing one PR is worse than one lane being slow.
-  3. BOUNDED CONCURRENCY. The box cannot take unbounded lanes: its own CI fails under load
-     (#5049, the load-dependent-timeout class). Cap it, and back off when the box is loaded.
+  2. NEVER DOUBLE-DISPATCH. One worker per PR; a cooldown; and a PR already in flight is skipped.
+     Two workers fixing one PR is worse than one being slow.
+  3. BOUNDED CONCURRENCY, FROM THE MACHINE. The box cannot take unbounded workers: its own CI
+     fails under load (#5049, the load-dependent-timeout class). The cap is the machine's own
+     MAX_FIX/MAX_REVIEW, and every spawn is load-gated inside `spawn-gate.sh` at the moment it
+     starts -- never a private literal (#1873).
   4. IDEMPOTENT AND RESUMABLE. State lives on disk; a restart does not re-dispatch everything.
   5. LOG WHAT IT DID. The point is that work was DISPATCHED, not that a count was printed.
 
@@ -58,7 +60,6 @@ STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
 REVIEWS = os.path.join(HOME, ".pi", "agent", "reviews")
-SCRIPTS = os.path.join(HOME, ".pi", "agent", "scripts")
 
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
@@ -84,7 +85,6 @@ NONRED = {"cancelled", "stale"}
 COOLDOWN_S = 45 * 60          # do not re-dispatch the same PR inside this window
 STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retryable
 SURFACE_FILES = ("tool_registry.py", "sdk.py", "surface-manifest")
-MAX_LANE_ATTEMPTS = 3     # a refused dispatch tries the next idle lane, bounded
 
 # ── CAPACITY: the machine's own thresholds, never a private literal ─────────────────────
 # ⛔ THIS FILE USED TO HARDCODE `MAX_INFLIGHT = 4` "fleet-wide". The box is configured for
@@ -101,16 +101,25 @@ ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestra
 DEFAULT_MAX_FIX = 3
 DEFAULT_MAX_REVIEW = 4
 
+# ── SPAWN: the background dispatcher, and the worktree each worker gets ─────────────────
+# ⛔ THIS REPLACES THE LANE TABLE. This job used to pick an EXISTING idle lane out of a roster
+# and hand it the brief; when every lane was busy it logged "no idle lanes -- nothing dispatched"
+# and gave up, so classified work sat unfixed while there was budget. The harness already ships
+# the correct primitive: `nonblocking-dispatch.sh` launches a headless worker in the BACKGROUND
+# and returns immediately, routing through `spawn-gate.sh`'s `run_agent()` so the worker gets the
+# SAME load gate (and disk gate, wall-clock watchdog and walltime row) as every lane. This job
+# CONSULTS it; it never spawns `pi` itself -- a second spawn path would diverge from that gate,
+# and spawn-gate.test.sh's invoker census exists to refuse exactly that.
+ORCH_DIR = os.environ.get("O") or os.path.join(HOME, "orchestrator")
+NONBLOCKING_DISPATCH = os.path.join(ORCH_DIR, "nonblocking-dispatch.sh")
+WORKTREE_ROOT = os.path.join(REPO_DIR, ".worktrees")
+SPAWN_TIMEOUT_S = 2400        # wall-clock cap handed to the background worker
+
 # A dispatch draws on the budget of the work it starts. `failing` needs code/CI repair (MAX_FIX);
 # `no-checks` re-triggers the workflows and then runs the review+merge chain, so it is fix work;
 # `unreviewed` is review work (MAX_REVIEW); `ready` is the terminal merge of an already-reviewed
 # PR, so it rides the review chain. `running` never dispatches.
 ACTION_CLASS = {"failing": "fix", "no-checks": "fix", "unreviewed": "review", "ready": "review"}
-
-# ⛔ `tools/cmux_dispatch.py` REQUIRES PYTHON >= 3.12 and REFUSES to run under the system
-# `python3` (3.9.6 on this box) -- it exits 0 with a one-line complaint, so a caller that only
-# checks the exit code sees "success" while nothing was sent. Always use the repo venv.
-VENV_PY = os.path.join(REPO_DIR, ".venv", "bin", "python")
 
 
 def now() -> float:
@@ -309,37 +318,32 @@ def classify(pr: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. PICK A LANE — idle only, never a lane already holding a PR
+# 2. MATERIALISE A WORKTREE — a fresh worker needs somewhere to run
 # ---------------------------------------------------------------------------
 
-def idle_lanes() -> tuple[list[dict], str]:
-    """Returns (lanes, status). `status` is "" on a good read, else WHY it failed.
+def materialise_worktree(pr: dict) -> tuple[str, str]:
+    """Ensure a git worktree for the PR's branch; return (path, "") or ("", why).
 
-    ⛔ A FAILED READ MUST NEVER LOOK LIKE "NO IDLE LANES". Both print as zero lanes, but one
-    means "the fleet is busy" and the other means "I could not see the fleet" -- and the
-    second one, unseen, silently turns this whole job into a no-op that reports success.
-    That is exactly how it behaved on its first live launchd pass (verified):
-        EXEC FAILED ... lane-actions.py --json timed out after 240 seconds
-        no idle lanes -- nothing dispatched this pass
+    `nonblocking-dispatch.sh` requires an existing worktree directory (`[ -d "$WT" ]`), and the
+    worker must be ON the PR's branch so a fixer can push. The shape mirrors `fix-one.sh`'s
+    materialisation, because that is the one shipped PR-fixer worktree recipe -- a second,
+    divergent one is how the two paths stop agreeing.
     """
-    # 240s is too tight for a box under load: `lane-actions.py` makes many gh calls over 26
-    # lanes, and it was measured timing out at runq=64/cpu=88%. Under load every external
-    # read is slower, so the bound scales -- this must not be the thing that stops the drain.
-    out, err, rc = sh_err([sys.executable or "python3",
-                           os.path.join(SCRIPTS, "lane-actions.py"), "--json"], timeout=600)
-    if not (out or "").strip():
-        return [], "lane-actions read failed rc=%s: %s" % (rc, (err or "").strip()[:160] or "no output")
-    try:
-        d = json.loads(out)
-    except Exception as e:
-        return [], "lane-actions output unparseable: %s" % e
-    lanes = []
-    for c in d.get("idle") or []:
-        ws = c.get("ws")
-        if not ws or c.get("protected"):
-            continue
-        lanes.append({"lane": c.get("lane"), "ws": ws, "verdict": c.get("verdict")})
-    return lanes, ""
+    branch = pr["headRefName"]
+    wt = os.path.join(WORKTREE_ROOT, "prd-%d" % pr["number"])
+    if os.path.exists(os.path.join(wt, ".git")):
+        return wt, ""                       # already materialised by an earlier pass
+    _, _, rc = sh_err(["git", "-C", REPO_DIR, "rev-parse", "--verify", "-q",
+                       "refs/heads/%s" % branch], timeout=60)
+    if rc == 0:
+        argv = ["git", "-C", REPO_DIR, "worktree", "add", wt, branch]
+    else:
+        sh_err(["git", "-C", REPO_DIR, "fetch", "origin", branch, "--quiet"], timeout=300)
+        argv = ["git", "-C", REPO_DIR, "worktree", "add", wt, "-b", branch, "origin/%s" % branch]
+    _, err, rc = sh_err(argv, timeout=300)
+    if rc != 0 or not os.path.exists(os.path.join(wt, ".git")):
+        return "", "worktree add failed rc=%s: %s" % (rc, (err or "").strip()[:200] or "(no stderr)")
+    return wt, ""
 
 
 # ---------------------------------------------------------------------------
@@ -431,52 +435,46 @@ Head `{head}`. `ai-review-gate` is the only red and there is **no attestation at
 
 
 # ---------------------------------------------------------------------------
-# 4. DISPATCH — one lane, one PR, logged
+# 4. DISPATCH — one worker, one PR, logged
 # ---------------------------------------------------------------------------
 
-def dispatcher_py() -> str:
-    """The interpreter that can actually run tools/cmux_dispatch.py (needs >= 3.12)."""
-    if os.path.exists(VENV_PY):
-        return VENV_PY
-    return "uv"   # fallback: `uv run` resolves the project interpreter from pyproject
+def spawn_argv(name: str, worktree: str, brief_path: str) -> list[str]:
+    """The ONE spawn command. A test asserts this is the background dispatcher, not cmux."""
+    return ["bash", NONBLOCKING_DISPATCH, name, worktree, brief_path, str(SPAWN_TIMEOUT_S)]
 
 
-def dispatch(lane_ws: str, label: str, text: str, dry: bool) -> bool:
+def dispatch(pr: dict, action: str, text: str, dry: bool) -> tuple[bool, str]:
+    """Spawn a background worker for one PR. Returns (launched, detail).
+
+    ⛔ THIS IS THE ONLY DISPATCH PATH. The lane-table path (`idle_lanes()` + a cmux send to a
+    workspace) is GONE, not merely unused: a replacement that is added but not switched on is
+    indistinguishable from no replacement, and it hides the old path's flaws. The new path does
+    not need a pre-existing idle lane -- `nonblocking-dispatch.sh` starts a fresh worker in the
+    PR's own worktree and returns immediately.
+    """
+    n = pr["number"]
+    name = "prd-%d" % n
     if dry:
-        log("DRY-RUN would dispatch %s -> %s (%d bytes)" % (label, lane_ws[:8], len(text)))
-        return True
-    path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % label)
+        log("DRY-RUN would spawn %s in a fresh worktree for %s (%d bytes)"
+            % (name, pr["headRefName"], len(text)))
+        return True, "dry-run"
+    path = os.path.join(STATE_DIR, "pr-doctor-brief-%s.txt" % name)
     os.makedirs(STATE_DIR, exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
-    py = dispatcher_py()
-    # ⛔ ABSOLUTE, because cwd is HOME (see below). A relative "tools/..." resolves to
-    # ~/tools/... and yields an empty result -- which is exactly the "FAIL (no output)"
-    # this job logged on its first live dispatch.
-    argv = ([py] if py != "uv" else ["uv", "run", "python"]) + [
-        os.path.join(REPO_DIR, "tools", "cmux_dispatch.py"),
-        "send", "--workspace", lane_ws, "--label", label, "--file", path]
-    # ⛔ NOT cwd=REPO_DIR. A cwd under ~/Documents is TCC-protected and a launchd agent has no
-    # Full Disk Access, so getcwd fails and the whole call dies with "Operation not permitted"
-    # (verified rc=126). The dispatcher is invoked by absolute path and needs no repo cwd.
-    out = sh(argv, timeout=420, cwd=HOME)
-    # ⛔ "DELIVERED VIA THE DURABLE INBOX" IS **NOT** A DELIVERY TO THE LANE.
-    #
-    # I got this wrong once: the dispatcher's own documentation says the inbox is *the
-    # ORCHESTRATOR inbox* -- it is where the notice is parked so the ORCHESTRATOR can retry it,
-    # and `channel: none` means "not recorded anywhere". Nothing consumes it: only a compaction
-    # watchdog even references the file, and nothing drains it. Scoring it as success makes this
-    # job silently drop orders while reporting progress -- the exact failure class it exists to
-    # remove. So: inbox => RETRY (not success), and say so.
-    low = out.lower()
-    ok = out.strip().startswith(("OK", "QUEUED"))
-    if not ok and "durable inbox" in low:
-        log("dispatch %s -> %s: NOT DELIVERED (parked in the orchestrator inbox for retry) "
-            "-- the lane did NOT get it" % (label, lane_ws[:8]))
-        return False
-    log("dispatch %s -> %s: %s" % (label, lane_ws[:8],
-                                    "OK" if ok else "FAIL (%s)" % (out.strip()[:110] or "no output")))
-    return ok
+    wt, err = materialise_worktree(pr)
+    if not wt:
+        return False, err
+    # cwd is HOME for the same TCC reason the old cmux path used it: a cwd under ~/Documents is
+    # protected and a launchd-spawned caller has no Full Disk Access. The dispatcher takes absolute
+    # paths and does its own `cd "$WT"` internally.
+    out, errout, rc = sh_err(spawn_argv(name, wt, path), timeout=120, cwd=HOME)
+    detail = (out or "").strip() or (errout or "").strip()
+    if rc != 0:
+        log("spawn %s -> %s: FAIL rc=%s (%s)" % (name, wt, rc, detail[:120] or "no output"))
+        return False, detail
+    log("spawn %s -> %s: %s" % (name, wt, detail[:120] or "launched"))
+    return True, detail
 
 
 def load_state() -> dict:
@@ -514,8 +512,9 @@ def main() -> int:
         for k, v in sorted(st.items()):
             if k.startswith("_"):
                 continue
-            print("%-8s %-11s lane=%-10s %s" % (k, v.get("action"), (v.get("lane") or "?")[:10],
-                                                v.get("at")))
+            print("%-8s %-11s worker=%-12s %s" % (k, v.get("action"),
+                                                  (v.get("worker") or v.get("lane") or "?")[:12],
+                                                  v.get("at")))
         return 0
 
     prs = [p for p in open_prs() if not p.get("isDraft")]
@@ -550,19 +549,20 @@ def main() -> int:
          cap["max_fix"], cap["max_review"], budgets["used"],
          budgets["fix"], budgets["review"], budgets["total"]))
 
-    lanes, lane_err = idle_lanes()
-    if lane_err:
-        # NOT the same as "no idle lanes". Say which one it is.
-        log("LANE READ FAILED -- cannot dispatch this pass: %s" % lane_err)
-        return 0
-    if budgets["total"] and not lanes:
-        log("no idle lanes -- nothing dispatched this pass")
+    # ⛔ NO LANE-TABLE GATE. The old path read `lane-actions.py` and dispatched only to an idle
+    # lane; with the fleet busy it printed "no idle lanes -- nothing dispatched this pass" and
+    # gave up while classified work and budget sat unused. That path is RETIRED. A worker is
+    # spawned for the PR instead, and `nonblocking-dispatch.sh` -> `run_agent()` applies the load
+    # and disk gates at the moment of the spawn.
+    if not budgets["total"]:
+        log("no dispatch budget this pass (capacity fix=%d review=%d, inflight=%d)"
+            % (cap["max_fix"], cap["max_review"], budgets["used"]))
         return 0
 
     dispatched = 0
     spent = {"fix": 0, "review": 0}
     for p, action in classified:
-        if action in ("running",):
+        if action == "running":
             continue
         if dispatched >= budgets["total"]:
             break
@@ -574,32 +574,16 @@ def main() -> int:
         # GUARD: cooldown, and never re-dispatch while the last one may still be live
         if prev and now() - prev.get("at_epoch", 0) < COOLDOWN_S and prev.get("head") == p["headRefOid"]:
             continue
-        if not lanes:
-            break
-        lane = lanes.pop(0)
         text = brief(p, action)
         if not text:
             continue
-        # ⛔ A REFUSAL IS NOT A DEAD END. The dispatcher refuses for two reasons: a genuine
-        # dead/shell pane (respect it -- the bytes would be EXECUTED), and the KNOWN FALSE
-        # POSITIVE where an extension banner scrolls the footer out of the read window (#7941).
-        # A loop that drops the PR on the first refusal reproduces the exact behaviour this
-        # script exists to remove. So: try the next idle lane, bounded, and give the lane back.
-        sent = None
-        attempts = [lane] + [l for l in lanes]
-        for cand in attempts[:MAX_LANE_ATTEMPTS]:
-            if dispatch(cand["ws"], "prd-%s" % key, text, args.dry_run):
-                sent = cand
-                break
-            if cand in lanes:
-                lanes.remove(cand)
-        if sent is None:
-            log("#%s (%s): no lane accepted the order in %d attempts -- leaving for next pass"
-                % (key, action, min(len(attempts), MAX_LANE_ATTEMPTS)))
+        ok, detail = dispatch(p, action, text, args.dry_run)
+        if not ok:
+            log("#%s (%s): not spawned -- starts on the next pass if it was transient: %s"
+                % (key, action, detail[:160]))
             continue
-        lanes = [l for l in lanes if l["ws"] != sent["ws"]]   # keep it free for the next PR
         if not args.dry_run:
-            st[key] = {"action": action, "lane": sent["lane"], "ws": sent["ws"],
+            st[key] = {"action": action, "worker": "prd-%s" % key,
                        "head": p["headRefOid"], "at": ts(), "at_epoch": now()}
         spent[cls] += 1
         dispatched += 1

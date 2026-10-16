@@ -392,7 +392,7 @@ jobs:
       # half of tortoise#3761; the canonical module never leaves this repo.
       # #1552 — same reasoning, same list: test_objective.py + test_turn_classify_state.py
       # were laptop-only until #1552 and are named here so the repo RUNS them.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_queue_dispatch.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
