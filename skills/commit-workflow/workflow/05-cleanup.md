@@ -68,16 +68,61 @@ fi
 This satisfies the #193 contract: the merged branch is deleted even when `main` is
 permanently locked by other worktrees, and a failed cleanup is a WARN — never a block.
 
-## Step 4 — Documentation Update
+## Step 4 — Documentation & memory verification (post-merge, READ-ONLY)
 
-After merge, update relevant documentation (scope: only what actually changed):
+⛔ **This step writes nothing.** The memory/doc write-back was done **pre-commit, in
+the worktree**, by `02-commit-pr.md` Step 0 — so it rides the work PR and is covered
+by that PR's review. This step only VERIFIES that it landed and carries out the
+read-only post-merge audits.
 
-1. Read `docs/teams/organisation-design-team/domains (S1)/operations/00_index.md` (eldato repo — fetch: `gh api repos/daniel-ospina/eldato/contents/<path> --jq .content | base64 -d`) to identify applicable documentation areas
-2. Check the linked GitHub issue for explicit doc update notes
-3. Update as appropriate:
-   - `MEMORY.md` — if architectural decisions, key files, or patterns changed
-   - `docs/` files — if features, APIs, or workflows changed
-   - No speculative edits, no padding
+### Why this step is read-only (#648)
+
+Step 3.8 (above) tears the session's worktree down **immediately after the merge**,
+and this step runs after that. The only checkout then in reach is the **shared hub**,
+which in a multi-session fleet belongs to whichever session is currently checked out
+there. A tracked hub write such as `MEMORY.md` is a destructive cross-session write:
+main-worktree-guard blocks it (#618/#621/#625), and before that guard the naive
+implementation destroyed a parallel session's 3 uncommitted `MEMORY.md` lines —
+recoverable only because they were still in the writing agent's context (the
+#644/#623 incident recorded in #648). A post-merge edit here is therefore either
+**inert** (blocked by the guard), **destructive** (pre-guard), or **PR pollution**
+(a dirty hub swept into whichever branch the next session commits from).
+
+### Verify (read-only)
+
+1. **Memory** — if the work surfaced a code gotcha, the merged PR's own diff carries
+   the `MEMORY.md` line:
+
+```bash
+gh pr view "$PR_NUMBER" --json files -q '.files[].path'
+```
+
+2. **Docs** — the same diff carries any `docs/` / `skills/**` update the change
+   warranted. To identify the applicable areas, READ
+   `docs/teams/organisation-design-team/domains (S1)/operations/00_index.md` (eldato
+   repo — fetch it with `gh api repos/daniel-ospina/eldato/contents/<path> --jq
+   .content | base64 -d`) and check the linked GitHub issue for explicit doc-update
+   notes.
+3. **Missed?** A gotcha/doc change the PR does **not** carry is a **missed
+   write-back** — it is NOT fixed here. Use the micro follow-up PR route below.
+
+### If something is missing — micro follow-up PR (never a hub write)
+
+The sanctioned route is the same one the merged-branch guard already uses for
+already-merged work (`01-preflight.md`): its own worktree, off fresh `origin/main`,
+`Refs #<THIS_ISSUE>` in the PR body.
+
+```bash
+# One command, from the hub (or any checkout of the repo) — creates the worktree:
+bash scripts/checkout-hygiene/hub-worktree.sh docs/memory-<slug>
+# Then, INSIDE that worktree: make the memory/doc edit, commit, push, open the PR.
+```
+
+⛔ Never `printf … >> MEMORY.md`, never the `edit`/`write` tool on a hub `MEMORY.md`,
+and never `git commit` in the hub — that is the destructive write this step exists to
+prevent.
+
+### Post-merge audits (read-only, non-blocking)
 
 4. **Post-merge label audit** — verify the linked issue has a `complexity:` label:
 
@@ -113,16 +158,20 @@ fi
 
 If nothing relevant changed, skip silently.
 
-## Step 5 — Documentation Self-Review
+## Step 5 — Documentation & memory verification checklist
 
-Review all edits from Step 4:
+Read-only. Verify the write-back the PR carried — by READING the merged diff, never
+by writing (Step 4):
 
 ```
-For each doc change:
+For each memory/doc update the work warranted:
+  ✓ Present in the merged PR's diff?
   ✓ Factually correct given the work done?
   ✓ Complete — nothing important omitted?
   ✓ Not excessive — no padding or speculation?
 
-If any ✗: fix and re-review
-Loop until all ✓
+If any ✗: the remedy is a micro follow-up PR (Step 4) — NOT an in-place hub edit.
 ```
+
+The write-time self-review of the last three questions is in `02-commit-pr.md`
+Step 0 — that is where a ✗ is still fixable inside the same PR.
