@@ -1,15 +1,37 @@
 #!/usr/bin/env bash
 # daily-backup.sh — Automated Tortoise graph backup with off-box copy
-# Issue #101: RPO ≤ 24h backup for falkordb-personal (port 16379)
+# Issue #101: RPO ≤ 24h backup for the LOCAL FalkorDB on host port 16379
+# Issue #907: the container is RESOLVED from the port it publishes, never named by a literal
 #
 # What it does:
-#   1. Triggers BGSAVE on falkordb-personal
-#   2. Copies RDB snapshot + graph metadata to timestamped backup dir
-#   3. Copies to off-box location (/home/user/eldato/backups/tortoise/)
-#   4. Prunes old backups (keep N=14)
-#   5. Writes manifest.json with point counts per graph
+#   1. Resolves the local FalkorDB container from the host port it PUBLISHES (16379 by
+#      default), and refuses loudly when there is none, more than one, or one that does
+#      not answer (#907)
+#   2. Triggers BGSAVE on it
+#   3. Copies RDB snapshot + graph metadata to timestamped backup dir
+#   4. Copies to the off-box location ($HOME/backups/tortoise)
+#   5. Prunes old backups (keep N=14)
+#   6. Writes manifest.json with point counts per graph
 #
-# Usage: bash scripts/daily-backup.sh [--keep N]
+# ⚠️ THE RPO CLAIM IS CONDITIONAL. “RPO ≤ 24h” holds only while something invokes this
+# script on a ≤24h cadence. Nothing in this repo schedules it — the claim is not in force
+# without an external scheduler (#907), and an unscheduled target that fails silently is
+# exactly the state #907 was filed about.
+#
+# Usage:  bash scripts/daily-backup.sh [--keep N]
+#
+# Env:
+#   CONTAINER           explicit container name — skips resolution (the human override)
+#   REDIS_HOST_PORT     host port the local FalkorDB publishes (default 16379)
+#   REDIS_PORT          port INSIDE the container (default 6379)
+#   OFFBOX_ROOT         off-box destination root (default $HOME/backups/tortoise)
+#   PREFLIGHT_TIMEOUT   redis-cli connect timeout for the preflight PING (default 5s)
+#
+# Exit codes: 0 = complete · 1 = failure (unverifiable target / copy / consistency) ·
+#             2 = complete but the source looked wrong (total points < 100) ·
+#             3 = DEFERRED by the load gate (nothing written; re-invoke)
+# On exit 1 the incomplete backup directory is REMOVED, so a failed run can never be
+# mistaken for the newest backup by restore-smoke.sh (see the trap below).
 #
 # Load gate (#209): BGSAVE is itself a storm igniter — the gate defers only
 # under PRE-EXISTING load. Entry preflight + pre-trigger re-check guard the
@@ -29,8 +51,13 @@ BACKUP_ROOT="$REPO_ROOT/backups"
 OFFBOX_ROOT="${OFFBOX_ROOT:-$HOME/backups/tortoise}"
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="$BACKUP_ROOT/$TIMESTAMP"
-CONTAINER="${CONTAINER:-falkordb-personal}"
+OFFBOX_DIR="$OFFBOX_ROOT/$TIMESTAMP"
+# #907 — the container is RESOLVED from the host port it publishes. A non-empty CONTAINER
+# env var is an explicit human override and skips resolution.
+CONTAINER="${CONTAINER:-}"
+REDIS_HOST_PORT="${REDIS_HOST_PORT:-16379}"
 REDIS_PORT="${REDIS_PORT:-6379}"
+PREFLIGHT_TIMEOUT="${PREFLIGHT_TIMEOUT:-5}"
 KEEP="${1:-14}"
 # If first arg is --keep, shift and read N
 if [ "$KEEP" = "--keep" ]; then
@@ -94,9 +121,110 @@ load_gate_pre_trigger_check() {
   exit 3
 }
 
+# ── Target resolution + fail-loud preflight (#907) ────────────────
+# WHY THE TARGET IS RESOLVED AND NOT NAMED. This script used to default
+# `CONTAINER=falkordb-personal` — a literal that no longer exists on the machine (the
+# container serving 16379 is `falkordb-16379`). So the default named a container that was
+# not there, the RPO ≤ 24h guarantee in the header above was not in force, and the two
+# hard-coded strings had drifted apart with nothing able to notice (#907). The one fact
+# that cannot drift is the PORT the graph publishes, so the target is resolved with
+# `docker ps --filter publish=$REDIS_HOST_PORT`.
+#
+# AMBIGUITY IS A REFUSAL, NOT A COIN FLIP. Port 16379 is also where a second, near-empty
+# FalkorDB can appear on `::1` (tortoise#6666 — a `localhost` client reads the decoy). Two
+# publishers on one host port mean the target cannot be identified, and backing up the
+# wrong graph is silent: the script would exit 0 having copied the wrong data. >1 match is
+# therefore a loud exit 1 naming every candidate; `CONTAINER=<name>` is the override.
+#
+# THE PREFLIGHT RUNS BEFORE ANY STATE IS CREATED. A failed run used to leave an EMPTY
+# `$BACKUP_ROOT/<timestamp>/` behind — and restore-smoke.sh picks the NEWEST directory
+# under `backups/`, so one failed backup blocked verification of a GOOD older one with
+# “No dump.rdb in …”. Nothing is written here — not even a mkdir — until the target has
+# been proven to exist and answer.
+#
+# WHY A PING AT ALL, WHEN `docker inspect` SAYS “Running”. Because running is not
+# answering: on 2026-09-29 this graph accepted TCP and never replied (#907), so a
+# scheduled backup would hang instead of failing. Honest scope of this probe: `-t` bounds
+# the CONNECT only (measured on redis-cli 8.10.2 — an accepting-but-silent socket still
+# blocked a `-t 2` PING), so it catches a missing container, a stopped container, a
+# refused/closed port and an immediate error reply, and it does NOT bound a wedged Docker
+# daemon (where `docker ps` itself hangs). That last one is the separate, owner-gated
+# infrastructure failure recorded on #907, not a condition this script can repair.
+resolve_container() {
+    if [ -n "$CONTAINER" ]; then
+        printf '%s\n' "$CONTAINER"
+        return 0
+    fi
+    local candidates line count=0
+    candidates="$(docker ps --filter "publish=$REDIS_HOST_PORT" --filter status=running \
+        --format '{{.Names}}' 2>/dev/null || true)"
+    # Counted with a shell loop (no `| grep`): the writer-into-quiet-grep idiom is a
+    # false-negative class this repo guards against (scripts/check-no-sigpipe-grep.sh).
+    while IFS= read -r line; do
+        [ -n "$line" ] && count=$((count + 1))
+    done <<<"$candidates"
+    if [ "$count" -eq 0 ]; then
+        echo "ERROR: no running container publishes host port $REDIS_HOST_PORT — nothing to back up." >&2
+        echo "       Looked for: docker ps --filter publish=$REDIS_HOST_PORT --filter status=running" >&2
+        echo "       Name the target explicitly if the port differs: CONTAINER=<name> bash ${BASH_SOURCE[0]}" >&2
+        exit 1
+    fi
+    if [ "$count" -gt 1 ]; then
+        echo "ERROR: $count containers publish host port $REDIS_HOST_PORT — the backup target is ambiguous:" >&2
+        while IFS= read -r line; do
+            [ -n "$line" ] && echo "         $line" >&2
+        done <<<"$candidates"
+        echo "       A second publisher on this port is the ::1 decoy hazard (tortoise#6666)." >&2
+        echo "       Name the intended target: CONTAINER=<name> bash ${BASH_SOURCE[0]}" >&2
+        exit 1
+    fi
+    printf '%s\n' "$candidates"
+}
+
+# The preflight uses the SAME address rule the rest of the fleet uses (#4844): bind to an
+# address, never to the name. `127.0.0.1` inside the container is unambiguous.
+preflight_container() {
+    local running ping
+    running="$(docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null || true)"
+    if [ "$running" != "true" ]; then
+        echo "ERROR: container '$CONTAINER' is not a running Docker container (docker inspect -> '${running:-<none>}')." >&2
+        echo "       Nothing was written. Fix the target and re-run." >&2
+        exit 1
+    fi
+    ping="$(docker exec "$CONTAINER" redis-cli -h 127.0.0.1 -p "$REDIS_PORT" \
+        -t "$PREFLIGHT_TIMEOUT" PING 2>/dev/null || true)"
+    if [ "$ping" != "PONG" ]; then
+        echo "ERROR: container '$CONTAINER' did not answer PING on port $REDIS_PORT (got '${ping:-<no reply>}')." >&2
+        echo "       Refusing to back up from an unverified target. Nothing was written." >&2
+        exit 1
+    fi
+}
+
+# An INCOMPLETE backup directory is removed on ANY failure. A directory without a
+# manifest.json is not a backup: leaving it made `restore-smoke.sh` pick it as the newest
+# one and refuse to restore, so a failed run disabled the verification of the good backup
+# that was still on disk (#907). A directory that DOES carry its manifest (the exit-2
+# “source looked wrong” case) is kept — it is a real artifact and the evidence.
+on_exit() {
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        if [ -d "$BACKUP_DIR" ] && [ ! -f "$BACKUP_DIR/manifest.json" ]; then
+            rm -rf "$BACKUP_DIR"
+        fi
+        if [ -d "$OFFBOX_DIR" ] && [ ! -f "$OFFBOX_DIR/manifest.json" ]; then
+            rm -rf "$OFFBOX_DIR"
+        fi
+    fi
+    return 0
+}
+trap on_exit EXIT
+
 # ── Ensure backup directories exist ──────────────────────────────
 # Entry gate runs BEFORE the mkdirs — a deferral here has created nothing.
 load_gate_entry
+# #907 — resolve the target and PROVE it answers before anything is written.
+CONTAINER="$(resolve_container)"
+preflight_container
 mkdir -p "$BACKUP_DIR"
 mkdir -p "$OFFBOX_ROOT"
 
@@ -116,14 +244,20 @@ echo "[$(date '+%H:%M:%S')] Waiting for BGSAVE to complete..."
 for i in $(seq 1 30); do
     if [ "$LOAD_GATE_WARNED" = "0" ] && [ "${LOAD_GATE_FORCE:-}" != "1" ]; then
         lg_out="$(node "$REPO_ROOT/scripts/load-gate.mjs" check --json 2>/dev/null)" && lg_rc=0 || lg_rc=$?
+        # The helper's status is read ONLY here, where it was just set. These two branches
+        # used to be one `if`/`elif` pair, so the second one read `$lg_rc` on a path where
+        # it had never been assigned — with `set -u` and the documented LOAD_GATE_FORCE=1
+        # bypass, `lg_rc: unbound variable` aborted the script at the first iteration, i.e.
+        # the emergency bypass could never complete a backup (#907).
         if [ "$lg_rc" -eq 3 ]; then
             lg_load="$(printf '%s' "$lg_out" | sed -n 's/.*"load1":\([0-9.e+-]*\).*/\1/p')"
             lg_suspend="$(printf '%s' "$lg_out" | sed -n 's/.*"suspend":\([0-9.e+-]*\).*/\1/p')"
             echo "[load-gate] WARN — load defer (gate rc=3): load ${lg_load:-?} ≥ suspend ${lg_suspend:-?} during BGSAVE wait; completing (aborting would not save the in-flight save)" >&2
             LOAD_GATE_WARNED=1
+        elif [ "$lg_rc" -ne 0 ]; then
+            echo "[load-gate] helper unavailable during wait (rc $lg_rc) — completing wait without load re-check" >&2
+            LOAD_GATE_WARNED=1
         fi
-    elif [ "$lg_rc" -ne 0 ] && [ "$lg_rc" -ne 3 ]; then
-        echo "[load-gate] helper unavailable during wait (rc $lg_rc) — completing wait without load re-check" >&2
     fi
     LASTSAVE=$(docker exec "$CONTAINER" redis-cli -p "$REDIS_PORT" LASTSAVE 2>/dev/null || echo "0")
     # Check if there have been no changes since the BGSAVE we just triggered
@@ -191,6 +325,7 @@ cat > "$BACKUP_DIR/manifest.json" <<EOF
 {
   "backed_up_at": "$TIMESTAMP",
   "container": "$CONTAINER",
+  "redis_host_port": "$REDIS_HOST_PORT",
   "rdb_file": "dump.rdb",
   "rdb_size_bytes": $LOCAL_RDB_SIZE,
   "graphs": {$GRAPH_META},
@@ -201,9 +336,9 @@ EOF
 echo "[$(date '+%H:%M:%S')] Manifest written: $TOTAL_POINTS total points across $NUM_GRAPHS graphs"
 
 # ── Step 5: Off-box copy ──────────────────────────────────────────
-echo "[$(date '+%H:%M:%S')] Copying to off-box location: $OFFBOX_ROOT/$TIMESTAMP..."
-mkdir -p "$OFFBOX_ROOT/$TIMESTAMP"
-cp -a "$BACKUP_DIR"/* "$OFFBOX_ROOT/$TIMESTAMP/"
+echo "[$(date '+%H:%M:%S')] Copying to off-box location: $OFFBOX_DIR..."
+mkdir -p "$OFFBOX_DIR"
+cp -a "$BACKUP_DIR"/* "$OFFBOX_DIR/"
 echo "  Off-box copy complete."
 
 # ── Step 6: Prune old backups ──────────────────────────────────────
@@ -236,7 +371,7 @@ echo ""
 echo "============================================="
 echo "Backup complete: $TIMESTAMP"
 echo "  Local:  $BACKUP_DIR"
-echo "  Offbox: $OFFBOX_ROOT/$TIMESTAMP"
+echo "  Offbox: $OFFBOX_DIR"
 echo "  RDB:    $LOCAL_RDB_SIZE bytes"
 echo "  Points: $TOTAL_POINTS"
 echo "============================================="
