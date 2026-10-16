@@ -479,8 +479,6 @@ else
     && ok "a source tree that cannot be read in full is REFUSED, not certified over a partial file list" \
     || fail "an unreadable subtree produced a certified comparison over the files find could reach"
 fi
-# Three source shapes that make a shipped file go unread, or that must not be refused. Each
-# pin below states its own mechanism; the first two are refused by the same code path.
 rm -f "$EMPTY_EXT/extensions/task-cwd-guard"
 mkdir -p "$EMPTY_EXT/extensions/task-cwd-guard"
 cp -R "$ROOT/extensions/task-cwd-guard/." "$EMPTY_EXT/extensions/task-cwd-guard/"
