@@ -44,7 +44,10 @@
 #               revision is KEPT and reported as `merged-tip-moved`. A PR merged
 #               into a base other than `main` (a stacked PR) proves only that
 #               the content is in THAT base — it is KEPT and reported as
-#               `merged-base-not-main`, never force-deleted.
+#               `merged-base-not-main` UNLESS another gate (redundant or
+#               remotecopy) carries it on its own evidence. `-D` is never used
+#               for it: the off-base reason authorizes nothing, it only declines
+#               to pre-empt the other gates.
 #   redundant   the branch has no commits outside origin/main
 #               (`git rev-list --count origin/main..refs/heads/<br>` == 0).
 #   remotecopy  the branch's upstream is on `origin` (ONLY origin), the
@@ -83,14 +86,17 @@
 #               gate matched AND the upstream is not origin" — it does NOT mean
 #               the branch was never selected.
 #
-# ALWAYS KEPT (never selected), each reported with its reason:
+# KEPT (never selected) unless noted, each reported with its reason:
 #   * any branch checked out in the main checkout or ANY worktree
 #     (`git worktree list --porcelain`)
 #   * `main` itself
 #   * a branch with an OPEN pull request
 #   * a MERGED PR whose local tip has moved past the merged revision
 #     (`merged-tip-moved`)
-#   * a MERGED PR whose base is not `main` (`merged-base-not-main`)
+#   * a MERGED PR whose base is not `main` AND which no other gate carries
+#     (`merged-base-not-main`) — an off-base MERGED PR may still be SELECTED as
+#     `redundant` or `remotecopy`, since those gates prove deletion-safety from
+#     main/upstream alone and the off-base reason is not a verdict against them.
 #   * anything matching none of the three gates (`localonly`)
 #
 # Deletion mechanics (local): `git branch -d` first. It falls back to
@@ -102,27 +108,47 @@
 #
 # Deletion mechanics (remote): the classification reads
 # refs/remotes/origin/<br>, but the destructive action targets origin's REAL
-# refs/heads/<br>, so before each delete the two are compared
-# (`git ls-remote <origin's resolved push url> refs/heads/<br>` vs the OID
-# captured from the tracking ref) and the delete is REFUSED — loudly, and with a
-# non-zero exit — on any mismatch or when ls-remote yields nothing. ALL of
-# origin's push urls are resolved first (`git remote get-url --push --all`);
-# zero is a refusal, and MORE THAN ONE is a refusal as well, because
+# refs/heads/<br>, so before each delete THREE things are proved, and the delete
+# is REFUSED — loudly, and with a non-zero exit — on any failure:
+#   1. the MERGE PREMISE against origin's REAL main (`git ls-remote origin
+#      refs/heads/<main>` + `git merge-base --is-ancestor`). The classification
+#      used the LOCAL origin/<main>, which a narrowed refspec can leave stale;
+#      if main was rewritten, a branch whose commits are no longer in main must
+#      not be deleted. An unknown object (a locally absent rewritten main) is a
+#      refusal, never a pass.
+#   2. the target ref: origin's real refs/heads/<br> equals the OID captured
+#      from the tracking ref (`git ls-remote <origin's resolved push url>` vs
+#      that OID). This is an early, loud DIAGNOSTIC — NOT the safety mechanism:
+#      ls-remote is a FETCH, so it applies `url.<base>.insteadOf` to the
+#      ALREADY-RESOLVED push url, while the push applies `pushInsteadOf` to
+#      origin's fetch url and never then applies `insteadOf`. When the resolved
+#      push url is itself an `insteadOf` base the two disagree and this
+#      comparison proves repository C while the delete lands on repository B.
+#   3. the delete LEASE: `git push origin --delete --force-with-lease=…:<oid>`
+#      sends the classified OID as the expected old value through the SAME
+#      resolution as the delete, so the receiving repository itself refuses
+#      unless its ref is exactly what the sweep classified. This is what closes
+#      the class; a lease rejection (`stale info`) is a REFUSAL.
+# ALL of origin's push urls are resolved first (`git remote get-url --push
+# --all`); zero is a refusal, and MORE THAN ONE is a refusal as well, because
 # `git push origin` reaches every one of them and no single URL can pin the
 # proof to the delete. The delete itself is `git push origin --delete`, never a
 # push to the resolved URL: the resolution applies `pushInsteadOf`/`pushurl`
 # ONCE, and pushing to its result would apply the rewrite a SECOND time, landing
 # the delete on a repository the verification never proved. The remote sweep's
-# classification
-# IS its delete list, so freshness of the tracking ref is a safety property, not
-# a nicety. Two mechanisms make it stale while the fetch exits 0: a NEGATIVE
-# refspec (`^…`, caught early by a config guard) and a NARROWED POSITIVE refspec
-# (`+refs/heads/main:refs/remotes/origin/main`, what `git remote set-branches`
-# and `clone --single-branch` leave behind), plus the plain fetch→push race. The
-# fetch itself is status-checked explicitly, because the opt-in report log runs
-# the pass under `set +e` (see the dispatch tail) where errexit does not apply.
-# The comparison is the mechanism that closes the class; the config guards are
-# early, loud, and strictly additional.
+# classification IS its delete list, so freshness of the tracking ref is a
+# safety property, not a nicety: a NEGATIVE refspec (`^…`, caught early by a
+# config guard), a NARROWED POSITIVE refspec (`+refs/heads/main:refs/remotes/
+# origin/main`, what `git remote set-branches` and `clone --single-branch` leave
+# behind) and the plain fetch→push race can all make it stale while the fetch
+# exits 0. The fetch itself is status-checked explicitly, because the opt-in
+# report log runs the pass under `set +e` (see the dispatch tail) where errexit
+# does not apply. The config guards are early, loud, and strictly additional;
+# the three proofs above are what close the class.
+#
+# The exit status means "everything the sweep selected was reaped": a REFUSAL and
+# any other non-zero push exit (a generic `Failed`) both make it non-zero, so a
+# scheduler that reads only the status never mistakes a partial sweep for success.
 #
 # ── PR-state injection (the test seam) ────────────────────────────
 # The branch→PR-state map is read ONCE, from the first source that resolves:
@@ -236,7 +262,10 @@ Usage: bash scripts/cleanup-stale-branches.sh [--scope remote|local|both]
                         only stale ones matching one of three gates: a MERGED
                         PR, redundant (no commits outside origin/main), or
                         remotecopy (nothing the upstream lacks).
-                     both — remote, then local.
+                     both — remote, then local; BOTH legs always run, and a
+                        refusal or a failed delete in either one makes the exit
+                        status non-zero (the status means "everything selected
+                        was reaped").
   --cutoff N       Days after which a branch is stale (default: 14).
   --execute        Delete stale branches (default: dry-run, list only).
   --pr-map-file P  local scope only: read the branch->PR-state map from P
@@ -664,6 +693,61 @@ verify_remote_target() {
     return 0
 }
 
+# ── merge-premise re-proof against origin's REAL main (F2) ──────
+# verify_merged_into_real_main <classified_oid>
+#
+# Returns 0 (printing nothing) only when origin's REAL main line provably
+# contains the tip this sweep classified. On anything else it prints a one-line
+# reason and returns 1 — the caller REFUSES that delete.
+#
+# ⛔ The classification is `git branch -r --merged origin/main`, which reads the
+# LOCAL remote-tracking ref. That ref is only as fresh as the fetch refspec lets
+# it be: a NARROWED POSITIVE refspec (what `git remote set-branches` and
+# `clone --single-branch` leave behind) may omit `refs/heads/main` entirely, so
+# `git fetch origin --prune` exits 0 and leaves `origin/main` at an OLD value.
+# If main has since been REWRITTEN, a branch whose commits are no longer in real
+# main is still classified `--merged` and destroyed. `verify_remote_target` does
+# NOT close this: it proves the branch's real ref equals the TRACKED oid, never
+# that the oid is in main. Re-reading main STRAIGHT FROM ORIGIN (ls-remote
+# ignores the fetch refspec) and requiring the classified tip to be an ancestor
+# of it does.
+#
+# ⛔ An UNKNOWN object is a REFUSAL, never a pass: when main was rewritten, its
+# new commit may not exist locally, and `git merge-base --is-ancestor` then
+# fails. Failure — of any kind — is a refusal.
+#
+# This reads origin's FETCH-side refs, which is the repository the merge premise
+# was evaluated against (`refs/remotes/origin/*` are built from the fetch url).
+# The DELETE target is pinned separately — by verify_remote_target and by the
+# delete's force-with-lease, which is what makes the two agree.
+verify_merged_into_real_main() {
+    local tracking_oid="$1" ls_out="" real_main_oid="" n=0
+    if ! ls_out="$(git ls-remote origin "refs/heads/$MAIN_BRANCH" 2>/dev/null)"; then
+        printf '%s' "git ls-remote origin refs/heads/$MAIN_BRANCH FAILED, so origin's REAL $MAIN_BRANCH cannot be resolved"
+        return 1
+    fi
+    # Same exact-name discipline as verify_remote_target: `ls-remote <pattern>`
+    # matches path-component SUFFIXES, so a count-and-take-first would accept a
+    # differently named ref. Require exactly one line whose ref name is EXACTLY
+    # refs/heads/main.
+    local line
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        [ "${line#*$'\t'}" = "refs/heads/$MAIN_BRANCH" ] || continue
+        n=$((n + 1))
+        real_main_oid="${line%%$'\t'*}"
+    done <<<"$ls_out"
+    if [ "$n" != "1" ]; then
+        printf '%s' "git ls-remote origin matched $n ref(s) named exactly refs/heads/$MAIN_BRANCH — origin's real $MAIN_BRANCH is not provable"
+        return 1
+    fi
+    if ! git merge-base --is-ancestor "$tracking_oid" "$real_main_oid" >/dev/null 2>&1; then
+        printf '%s' "origin's REAL refs/heads/$MAIN_BRANCH is $real_main_oid, which does NOT provably contain the classified tip $tracking_oid"
+        return 1
+    fi
+    return 0
+}
+
 # ── remote scope (unchanged behaviour, #74) ───────────────────────
 run_remote_scope() {
     # ── Sanity check: on main, up to date ─────────────────────────
@@ -907,8 +991,17 @@ run_remote_scope() {
         echo "Deletion commands that would run:"
         for entry in "${STALE_BRANCHES[@]}"; do
             branch="${entry%%$'\t'*}"
+            # ⛔ Decode the classified oid the SAME way the execute loop does, and
+            # print the LEASED form. The `--force-with-lease` clause IS the safety
+            # mechanism: it sends the classified oid through the SAME resolution
+            # as the delete, so a pushInsteadOf/pushurl divergence is refused by
+            # the receiving repository instead of deleting unconditionally. An
+            # operator who copies a plan that omits it runs exactly the unguarded
+            # delete the lease was added to prevent. Keep this string in lockstep
+            # with the execute path below (the F1 test asserts they are the same).
+            local tracking_oid="${entry##*$'\t'}"
             local local_branch="${branch#origin/}"
-            echo "  git push origin --delete -- \"refs/heads/$local_branch\""
+            echo "  git push origin --delete --force-with-lease=\"refs/heads/$local_branch:$tracking_oid\" -- \"refs/heads/$local_branch\""
         done
         return 0
     fi
@@ -933,7 +1026,26 @@ run_remote_scope() {
         # and this push. So compare them immediately before the delete and REFUSE
         # this one on any mismatch — or when ls-remote yields nothing, which is
         # not evidence the classification was right.
+        #
+        # ⛔ FIRST re-prove the MERGE premise itself against origin's REAL main.
+        # The classification was `git branch -r --merged origin/main` — the LOCAL
+        # tracking ref, which a narrowed fetch refspec can leave stale while the
+        # fetch exits 0. A branch classified `--merged` from a stale main may
+        # have NO commits in real main (main rewritten), and deleting it destroys
+        # them. That is a different question from "is origin's real ref the ref
+        # we classified", so it is a separate gate, not a weaker one.
         local refusal=""
+        if ! refusal="$(verify_merged_into_real_main "$tracking_oid")"; then
+            echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
+            echo "     $refusal" >&2
+            echo "     The branch was classified merged from the LOCAL refs/remotes/origin/$MAIN_BRANCH," >&2
+            echo "     but origin's REAL refs/heads/$MAIN_BRANCH does not provably contain the classified" >&2
+            echo "     tip. A narrowed positive refspec leaves refs/remotes/origin/$MAIN_BRANCH stale while" >&2
+            echo "     the fetch exits 0 — if main was rewritten, the branch's commits are no longer in" >&2
+            echo "     main and deleting it would destroy the only copy." >&2
+            REFUSED=$((REFUSED + 1))
+            continue
+        fi
         if ! refusal="$(verify_remote_target "$push_url" "$local_branch" "$tracking_oid")"; then
             echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
             echo "     $refusal" >&2
@@ -957,15 +1069,46 @@ run_remote_scope() {
         # also ambiguous when origin carries both `foo` and `refs/heads/foo`
         # ('matches more than one'), while the qualified form targets exactly one
         # ref. The delete goes through GIT'S OWN REMOTE RESOLUTION
-        # (`git push origin`), which applies pushInsteadOf/pushurl EXACTLY ONCE —
-        # the same single application that produced the resolved URL the
-        # verification above proved. Pushing to the RESOLVED URL instead would
-        # apply the rewrite a SECOND time and land the delete on an unverified
-        # repository (R5-1).
-        if git push origin --delete -- "refs/heads/$local_branch" 2>&1; then
+        # (`git push origin`), which applies pushInsteadOf/pushurl EXACTLY ONCE.
+        #
+        # ⛔ That is NOT the resolution verify_remote_target used. `git ls-remote
+        # <resolved push url>` is a FETCH, so it applies `url.<base>.insteadOf` to
+        # the ALREADY-RESOLVED push url; the push applies `pushInsteadOf` to
+        # origin's FETCH url and never then applies `insteadOf`. When the resolved
+        # push url is itself the base of an `insteadOf` mapping the two disagree:
+        # the verification proves repository C while the delete lands on repo B —
+        # and, because the fetch and push targets differ, git applies NO
+        # compare-and-swap and deletes B unconditionally (measured: the sweep
+        # reported `Deleted: 1 / Refused: 0` and B's unique UNMERGED branch was
+        # gone). Pushing to the RESOLVED URL instead would apply the rewrite a
+        # SECOND time and land on yet another unverified repository (R5-1).
+        #
+        # The verification is kept as an early, loud diagnostic; what makes the
+        # delete SAFE is GIT'S OWN LEASE. `--force-with-lease` sends the
+        # classified oid as the expected old value through the SAME resolution as
+        # the delete, so the receiving repository itself REFUSES unless its ref is
+        # exactly the oid this sweep classified. An unresolvable classified oid
+        # leaves the lease's expected value EMPTY, and git then requires the ref
+        # not to exist — a refusal, never an unguarded delete (fail-closed).
+        local push_out="" push_rc=0
+        push_out="$(git push origin --delete \
+            --force-with-lease="refs/heads/$local_branch:$tracking_oid" \
+            -- "refs/heads/$local_branch" 2>&1)" || push_rc=$?
+        if [ "$push_rc" -eq 0 ]; then
+            if [ -n "$push_out" ]; then printf '%s\n' "$push_out"; fi
             echo "    ✅ deleted"
             DELETED=$((DELETED + 1))
+        elif grep -qF 'stale info' <<<"$push_out"; then
+            echo "  ⛔ REFUSING to delete origin/$local_branch" >&2
+            echo "     the delete lease rejected: origin/$local_branch is not at the classified tip $tracking_oid" >&2
+            printf '%s\n' "$push_out" >&2
+            echo "     The ls-remote verification above reads the resolved push url as a FETCH, which can" >&2
+            echo "     prove a DIFFERENT repository than the one pushInsteadOf/pushurl actually deletes from." >&2
+            echo "     The lease is the compare-and-swap: nothing is deleted unless the target ref is exactly" >&2
+            echo "     what this sweep classified." >&2
+            REFUSED=$((REFUSED + 1))
         else
+            if [ -n "$push_out" ]; then printf '%s\n' "$push_out"; fi
             echo "    ❌ failed (may already be deleted or protected)"
             FAILED=$((FAILED + 1))
         fi
@@ -981,6 +1124,17 @@ run_remote_scope() {
     if [ "$REFUSED" -gt 0 ]; then
         echo "ERROR: $REFUSED remote delete(s) were REFUSED: origin's real ref could not be shown to" >&2
         echo "ERROR: be the ref this sweep classified. The sweep does NOT report success." >&2
+        return 1
+    fi
+    # ⛔ A non-zero push exit that is NOT a lease refusal (`stale info`) is counted
+    # `Failed` — an ambiguous target, a protected ref, a transport failure. The
+    # EXIT STATUS must say so: it is the only signal a scheduler reads, and
+    # `Failed: 1` with rc=0 reports "the sweep succeeded" while a selected branch
+    # was never reaped. So the status means "everything the sweep selected was
+    # reaped", and any leftover makes it non-zero.
+    if [ "$FAILED" -gt 0 ]; then
+        echo "ERROR: $FAILED remote delete(s) FAILED (not a lease refusal): a selected branch was" >&2
+        echo "ERROR: not reaped. The sweep does NOT report success." >&2
         return 1
     fi
 
@@ -1352,13 +1506,23 @@ run_scopes() {
         remote) run_remote_scope ;;
         local)  run_local_scope ;;
         both)
-            # ⛔ The status MUST be propagated explicitly. Under the opt-in log
-            # path the whole pass runs inside `set +e` (so PIPESTATUS can be
-            # read), and a bare `run_remote_scope` returning 1 would be followed
-            # by `run_local_scope`, whose 0 then becomes PIPESTATUS[0] — a REFUSED
-            # remote sweep reported as success (exit 0).
-            run_remote_scope || return 1
-            run_local_scope
+            # ⛔ Both legs must RUN. The status MUST be propagated explicitly,
+            # because under the opt-in log path the whole pass runs inside
+            # `set +e` (so PIPESTATUS can be read), and a bare `run_remote_scope`
+            # returning 1 would be followed by `run_local_scope`, whose 0 then
+            # becomes PIPESTATUS[0] — a REFUSED remote sweep reported as success
+            # (exit 0).
+            # ⛔ The two legs are INDEPENDENT: a refused remote sweep says nothing
+            # about the local one, and `--help` promises "remote, then local".
+            # Short-circuiting with `run_remote_scope || return 1` silently
+            # skipped every local deletion whenever the remote leg refused
+            # (under-deletion, but a surprise). Run BOTH and OR their statuses so
+            # a refusal in either leg reaches the exit code without cancelling
+            # the other leg's work.
+            local rc=0
+            run_remote_scope || rc=1
+            run_local_scope || rc=1
+            return "$rc"
             ;;
     esac
 }

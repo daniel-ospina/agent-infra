@@ -1111,8 +1111,8 @@ git push -q origin refs/heads/-x:refs/heads/-x
 git push -q origin refs/heads/--version:refs/heads/--version
 run_script bash "$F10_SCRIPT" --scope remote
 assert_eq "$RC" "0" "dash-named remote fixture: dry-run exits 0 (F5)"
-assert_contains "$OUT" '--delete -- "refs/heads/-x"' 'the dry-run echo mirrors the -- guard for -x (F5)'
-assert_contains "$OUT" '--delete -- "refs/heads/--version"' 'the dry-run echo mirrors the -- guard for --version (F5)'
+assert_contains "$OUT" "--force-with-lease=\"refs/heads/-x:$F10_MAIN_SHA\" -- \"refs/heads/-x\"" 'the dry-run echo mirrors the -- guard and the lease for -x (F5/F1)'
+assert_contains "$OUT" "--force-with-lease=\"refs/heads/--version:$F10_MAIN_SHA\" -- \"refs/heads/--version\"" 'the dry-run echo mirrors the -- guard and the lease for --version (F5/F1)'
 run_script bash "$F10_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "dash-named remote fixture: --execute exits 0 (F5)"
 if [ -z "$(git ls-remote origin 'refs/heads/-x' 2>/dev/null)" ]; then
@@ -1434,6 +1434,22 @@ assert_contains "$OUT" "Refusing the remote sweep" "the remote refusal is the ca
 run_script bash "$R34_SCRIPT" --scope local --pr-map-file "$PR_MAP_OTHER"
 assert_eq "$RC" "0" "the local leg alone exits 0 under the same fixture (so only the remote leg is non-zero) (R3-4)"
 
+echo ""
+echo "== 21b. --scope both RUNS the local leg even when the remote leg refuses (F4) =="
+# `run_remote_scope || return 1` aborted `run_scopes` BEFORE `run_local_scope`,
+# so every local deletion was silently skipped whenever the remote sweep
+# refused. The two legs are independent, and `--help` promises "remote, then
+# local". Both must run, and a refusal in either must reach the exit status.
+# R34_REPO already carries the negative refspec that refuses the remote sweep
+# AND a local branch (`doomed34`) the redundant gate selects, so one run shows
+# both facts. NO --execute: the point is that the local leg RUNS, which the
+# dry-run's SELECTED line proves; nothing is deleted outside the fixture anyway.
+run_script bash "$R34_SCRIPT" --repo "$R34_REPO" --scope both --pr-map-file "$PR_MAP_OTHER"
+assert_eq "$RC" "1" "--scope both is NON-ZERO when the remote leg refuses (F4)"
+assert_contains "$OUT" "Refusing the remote sweep" "the remote refusal is the cause (F4)"
+assert_contains "$OUT" "Stale Local Branch Cleanup" "the LOCAL leg still RAN despite the remote refusal (F4)"
+assert_match "$OUT" '^  delete +redundant +doomed34$' "the local leg still classified and selected (F4)"
+
 cd "$REPO"
 echo ""
 echo "== 22. remote scope handles a '|' in a ref name without truncating it (R3-3) =="
@@ -1468,7 +1484,7 @@ git rev-parse --verify -q refs/heads/foo >/dev/null
 R33_FOO_OID="$(git -C "$R33_ORIGIN" rev-parse refs/heads/foo)"
 run_script bash "$R33_SCRIPT" --scope remote
 assert_eq "$RC" "0" "pipe-named fixture: dry-run exits 0 (R3-3)"
-assert_contains "$OUT" '--delete -- "refs/heads/foo|bar"' 'the dry-run plan targets foo|bar, not a truncated foo (R3-3)'
+assert_match "$OUT" '--delete --force-with-lease="refs/heads/foo[|]bar:[0-9a-f]+" -- "refs/heads/foo[|]bar"' 'the dry-run plan targets foo|bar with the lease, not a truncated foo (R3-3/F1)'
 assert_no_match "$OUT" '--delete -- "refs/heads/foo"$' 'the dry-run plan does NOT target plain foo (R3-3)'
 run_script bash "$R33_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "pipe-named fixture: --execute exits 0 (R3-3)"
@@ -1656,8 +1672,8 @@ done
 unset _r
 run_script bash "$P3_SCRIPT" --scope remote
 assert_eq "$RC" "0" "qualified-ref fixture: dry-run exits 0 (F2)"
-assert_contains "$OUT" '--delete -- "refs/heads/@"' 'the plan targets the QUALIFIED ref for @ (F2)'
-assert_contains "$OUT" '--delete -- "refs/heads/refs/heads/foo"' 'the plan targets the QUALIFIED nested ref (F2)'
+assert_contains "$OUT" "--force-with-lease=\"refs/heads/@:$P3_SHA\" -- \"refs/heads/@\"" 'the plan targets the QUALIFIED ref for @ with the lease (F2/F1)'
+assert_contains "$OUT" "--force-with-lease=\"refs/heads/refs/heads/foo:$P3_SHA\" -- \"refs/heads/refs/heads/foo\"" 'the plan targets the QUALIFIED nested ref with the lease (F2/F1)'
 run_script bash "$P3_SCRIPT" --scope remote --execute
 assert_eq "$RC" "0" "qualified-ref fixture: --execute exits 0 (F2)"
 for _r in 'refs/heads/@' 'refs/heads/foo' 'refs/heads/refs/heads/foo'; do
@@ -1819,7 +1835,7 @@ fi
 # would be re-rewritten at push time).
 run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote
 assert_eq "$RC" "0" "chained-rewrite fixture: dry-run exits 0 (R5-1)"
-assert_contains "$OUT" 'git push origin --delete -- "refs/heads/chain-doomed"' 'the dry-run plan deletes through origin, not the resolved URL (R5-1)'
+assert_contains "$OUT" "git push origin --delete --force-with-lease=\"refs/heads/chain-doomed:$R51_A_OID\" -- \"refs/heads/chain-doomed\"" 'the dry-run plan deletes through origin WITH the lease, not the resolved URL (R5-1/F1)'
 assert_not_contains "$OUT" "$R51_B" 'the dry-run plan does NOT echo the resolved URL as the push target (R5-1)'
 run_script bash "$R51_SCRIPT" --repo "$R51_REPO" --scope remote --execute
 assert_eq "$RC" "0" "chained-rewrite fixture: --execute exits 0 (R5-1)"
@@ -1833,6 +1849,63 @@ if [ "$(git -C "$R51_C" rev-parse -q --verify refs/heads/chain-doomed || echo GO
     ok "repo C's unique UNMERGED chain-doomed SURVIVES (the rewrite is NOT applied twice) (R5-1)"
 else
     bad "repo C's chain-doomed was DELETED — the delete re-rewrote the resolved URL (R5-1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 29b. the dry-run plan and the EXECUTED delete carry the SAME command (F1) =="
+# The dry-run's job is to tell the operator what `--execute` WOULD run. If it
+# prints the pre-lease `git push origin --delete -- refs/heads/<br>` while the
+# execute path runs `--force-with-lease=refs/heads/<br>:<oid>`, then an operator
+# who copies the printed line runs exactly the unguarded delete the lease exists
+# to prevent (no compare-and-swap: a pushInsteadOf/pushurl divergence would
+# delete unconditionally). Capture the dry-run command, then read the executed
+# argv from git's OWN trace and require the two to be the same string.
+F1C_ORIGIN="$FIX/f1c-origin.git"
+F1C_REPO="$FIX/f1c-repo"
+new_repo "$F1C_REPO" "$F1C_ORIGIN"
+cd "$F1C_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F1C_SCRIPT="$F1C_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f1c.txt; git add f1c.txt; old_commit "init"; git push -q origin main
+git checkout -q -b plan-match main
+echo pm > pm.txt; git add pm.txt; old_commit "plan-match"
+git push -q -u origin plan-match
+git checkout -q main
+git merge -q --ff-only plan-match
+git push -q origin main
+F1C_OID="$(git -C "$F1C_ORIGIN" rev-parse refs/heads/plan-match)"
+
+run_script bash "$F1C_SCRIPT" --repo "$F1C_REPO" --scope remote
+assert_eq "$RC" "0" "command-parity fixture: dry-run exits 0 (F1)"
+DRY_CMD="$(grep -F 'git push origin --delete' <<<"$OUT" | head -n1 || true)"
+DRY_CMD="${DRY_CMD#  }"
+if [ -n "$DRY_CMD" ]; then
+    ok "command-parity fixture: the dry-run prints a delete command (F1)"
+else
+    bad "command-parity fixture: the dry-run printed no delete command (F1)"
+fi
+assert_contains "$DRY_CMD" "--force-with-lease=\"refs/heads/plan-match:$F1C_OID\"" 'the dry-run command carries the classified-oid lease (F1)'
+
+# GIT_TRACE=1 makes git print `trace: built-in: git push <argv...>`. The script
+# captures the push's own stderr (2>&1) and re-prints it, so the trace lands in OUT.
+run_script env GIT_TRACE=1 bash "$F1C_SCRIPT" --repo "$F1C_REPO" --scope remote --execute
+assert_eq "$RC" "0" "command-parity fixture: --execute exits 0 (F1)"
+TRACE_CMD="$(grep -F 'git push origin --delete' <<<"$OUT" | grep -F 'built-in' | head -n1 || true)"
+if [ -n "$TRACE_CMD" ]; then
+    ok "command-parity fixture: GIT_TRACE exposed the executed push argv (F1)"
+else
+    bad "command-parity fixture: GIT_TRACE did not expose the executed push argv (F1)"
+fi
+# Normalise only the copy-paste shell quotes the dry-run echo adds; the command
+# string (every FLAG and operand) must otherwise be identical.
+DRY_CMD_PLAIN="${DRY_CMD//\"/}"
+TRACE_CMD_PLAIN="${TRACE_CMD#*built-in: }"
+if [ -n "$TRACE_CMD_PLAIN" ] && [ "$TRACE_CMD_PLAIN" = "$DRY_CMD_PLAIN" ]; then
+    ok "the dry-run plan and the executed command are the SAME string (F1)"
+else
+    bad "the dry-run plan and the executed command DIFFER (F1): plan='$DRY_CMD_PLAIN' exec='$TRACE_CMD_PLAIN'"
 fi
 
 cd "$REPO"
@@ -1974,6 +2047,199 @@ assert_eq "$RC" "0" "an scp-like origin with no user and no .git resolves (R5-4)
 assert_match "$OUT" '^  delete +redundant +old-redundant$' 'the no-user, no-.git scp-like origin classifies (R5-4)'
 # Restore the canonical github.com URL for any later use.
 git -C "$REPO3" remote set-url origin 'https://github.com/example/example.git'
+
+cd "$REPO"
+echo ""
+echo "== 33. the delete is pinned to the CLASSIFIED oid by git's own LEASE (F1) =="
+# fetch=A, `pushInsteadOf A→B`, `insteadOf B→C`. The delete-time verification
+# runs `git ls-remote <resolved push url>` — but ls-remote is a FETCH, so it
+# applies `url.<base>.insteadOf` to the ALREADY-RESOLVED push url (B→C) and
+# proves repo C's foo at the classified oid. `git push origin --delete` applies
+# `pushInsteadOf` to origin's FETCH url (A→B) and does NOT then apply
+# `insteadOf`, so it lands on repo B — whose foo is a DIFFERENT, UNMERGED commit
+# that exists nowhere else. When the fetch and push targets differ git applies
+# NO compare-and-swap: pre-fix the sweep reported `Deleted: 1 / Refused: 0`,
+# rc=0, and B's commit was destroyed. The delete's `--force-with-lease` sends the
+# classified oid as the expected old value through the SAME resolution as the
+# delete, so B's receive-pack REFUSES.
+F1L_A="$FIX/f1lease-a.git"
+F1L_B="$FIX/f1lease-b.git"
+F1L_C="$FIX/f1lease-c.git"
+F1L_REPO="$FIX/f1lease-repo"
+new_repo "$F1L_REPO" "$F1L_A"
+cd "$F1L_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F1L_SCRIPT="$F1L_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f1l.txt; git add f1l.txt; old_commit "init"; git push -q origin main
+# A's foo: merged into A's main, stale → a genuine candidate.
+git checkout -q -b foo main
+echo afoo > afoo.txt; git add afoo.txt; old_commit "foo-on-A"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+git push -q origin main
+F1L_A_OID="$(git -C "$F1L_A" rev-parse refs/heads/foo)"
+# C: a MIRROR of A's foo (same oid) — so the fetch-side verification PASSES.
+git init -q --bare "$F1L_C"
+git push -q "$F1L_C" refs/heads/foo:refs/heads/foo
+# B: foo holds a UNIQUE, UNMERGED commit that exists nowhere else.
+git init -q --bare "$F1L_B"
+git checkout -q -b b-foo main
+echo dangerB > dangerB.txt; git add dangerB.txt; old_commit "foo-on-B"
+F1L_B_OID="$(git rev-parse HEAD)"
+git push -q "$F1L_B" refs/heads/b-foo:refs/heads/foo
+git checkout -q main
+if [ "$F1L_A_OID" != "$F1L_B_OID" ]; then
+    ok "lease fixture: repo A's and repo B's foo differ (the divergence is real) (F1)"
+else
+    bad "lease fixture: A and B share one oid — the fixture does not exercise the divergence (F1)"
+fi
+# The rewrite chain: fetch stays A, push resolves to B, and B itself rewrites to
+# C for any FETCH-side read of B.
+git config "url.$F1L_B.pushInsteadOf" "$F1L_A"
+git config "url.$F1L_C.insteadOf" "$F1L_B"
+if [ "$(git remote get-url --push origin)" = "$F1L_B" ]; then
+    ok "lease fixture: get-url --push resolves origin's push url to repo B (F1)"
+else
+    bad "lease fixture: get-url --push did not resolve to B — the fixture is wrong (F1)"
+fi
+# Prove the fixture models the divergence: the verification target (`ls-remote
+# B`) is re-rewritten to C, so it reads C's oid — the classified one — and
+# PASSES. This is exactly the false proof the lease must survive.
+F1L_LS_B="$(git ls-remote "$F1L_B" refs/heads/foo 2>/dev/null | awk '{print $1}')"
+if [ "$F1L_LS_B" = "$F1L_A_OID" ]; then
+    ok "lease fixture: the fetch-side verification reads repo C and PASSES (the false proof) (F1)"
+else
+    bad "lease fixture: ls-remote B did not read C's oid ($F1L_LS_B vs $F1L_A_OID) — the fixture is wrong (F1)"
+fi
+run_script bash "$F1L_SCRIPT" --repo "$F1L_REPO" --scope remote --execute
+assert_eq "$RC" "1" "the A→B→C divergence REFUSES the delete (F1)"
+assert_contains "$OUT" "REFUSING to delete origin/foo" "the lease rejection is a REFUSAL, not a failure (F1)"
+assert_contains "$OUT" "stale info" "the refusal names the lease rejection (F1)"
+assert_contains "$OUT" "Deleted: 0" "nothing was deleted (F1)"
+assert_contains "$OUT" "Refused: 1" "the lease refusal is counted once (F1)"
+assert_contains "$OUT" "Failed:  0" "a lease refusal is NOT also counted as a failure (F1)"
+if [ "$(git -C "$F1L_B" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$F1L_B_OID" ]; then
+    ok "repo B's unique UNMERGED foo SURVIVES (the lease pinned the delete) (F1)"
+else
+    bad "repo B's foo was DELETED — data loss (F1)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 34. the MERGE premise is re-proved against origin's REAL main (F2) =="
+# The classification is `git branch -r --merged origin/main` — the LOCAL tracking
+# ref. A NARROWED POSITIVE refspec may omit `refs/heads/main`, so
+# `git fetch origin --prune` exits 0 and leaves origin/main STALE; if main has
+# since been REWRITTEN, origin/foo still looks merged. The delete-time target
+# verification does NOT close this: it proves origin's real foo equals the
+# TRACKED oid, never that the oid is in real main. Pre-fix the sweep destroyed
+# the only copy of foo's commits.
+F2M_ORIGIN="$FIX/f2main-origin.git"
+F2M_REPO="$FIX/f2main-repo"
+new_repo "$F2M_REPO" "$F2M_ORIGIN"
+cd "$F2M_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F2M_SCRIPT="$F2M_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f2m.txt; git add f2m.txt; old_commit "init"; git push -q origin main
+git checkout -q -b foo main
+echo f > f.txt; git add f.txt; old_commit "f"
+git push -q -u origin foo
+git checkout -q main
+git merge -q --ff-only foo
+echo m > m.txt; git add m.txt; old_commit "m"
+git push -q origin main
+F2M_F_OID="$(git rev-parse foo)"
+F2M_M_OID="$(git rev-parse main)"
+# Narrowed positive refspec: only foo is refreshed, so origin/main stays at M.
+git config --replace-all remote.origin.fetch '+refs/heads/foo:refs/remotes/origin/foo'
+git fetch origin --prune --quiet
+if [ "$(git rev-parse origin/main)" = "$F2M_M_OID" ] && [ "$(git rev-parse origin/foo)" = "$F2M_F_OID" ]; then
+    ok "real-main fixture: origin/main is STALE at M and origin/foo is current (F2)"
+else
+    bad "real-main fixture: refs not as expected — the fixture is wrong (F2)"
+fi
+# Rewrite the BARE's main to a root that does NOT contain F. It is created in
+# the BARE ONLY, so the swept checkout does not have the object: the merge proof
+# must fail on an UNKNOWN object too, and an unknown object is a REFUSAL.
+F2M_TREE="$(printf '' | git -C "$F2M_ORIGIN" mktree)"
+F2M_G="$(GIT_AUTHOR_NAME="Test Runner" GIT_AUTHOR_EMAIL=test@test.test \
+    GIT_COMMITTER_NAME="Test Runner" GIT_COMMITTER_EMAIL=test@test.test \
+    GIT_AUTHOR_DATE="2020-01-01T00:00:00 +0000" GIT_COMMITTER_DATE="2020-01-01T00:00:00 +0000" \
+    git -C "$F2M_ORIGIN" commit-tree "$F2M_TREE" -m root-rewrite)"
+git -C "$F2M_ORIGIN" update-ref refs/heads/main "$F2M_G"
+F2M_REAL_MAIN="$(git -C "$F2M_ORIGIN" rev-parse refs/heads/main)"
+if [ "$F2M_REAL_MAIN" != "$F2M_M_OID" ]; then
+    ok "real-main fixture: origin's REAL main was rewritten (F2)"
+else
+    bad "real-main fixture: origin's real main did not change (F2)"
+fi
+if ! git cat-file -e "$F2M_G" 2>/dev/null; then
+    ok "real-main fixture: the rewritten main commit is UNKNOWN in the swept checkout (F2)"
+else
+    bad "real-main fixture: the rewritten commit is locally present — the unknown-object path is not exercised (F2)"
+fi
+run_script bash "$F2M_SCRIPT" --repo "$F2M_REPO" --scope remote --execute
+assert_eq "$RC" "1" "a stale origin/main REFUSES the delete (F2)"
+assert_contains "$OUT" "REFUSING to delete origin/foo" "the stale-main refusal is named (F2)"
+assert_contains "$OUT" "does NOT provably contain the classified tip" "the refusal names the failed merge proof (F2)"
+assert_contains "$OUT" "Refused: 1" "the stale-main refusal is counted (F2)"
+assert_contains "$OUT" "Deleted: 0" "nothing was deleted against a stale main (F2)"
+if [ "$(git -C "$F2M_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "$F2M_F_OID" ]; then
+    ok "origin's foo SURVIVES the stale-main sweep (F2)"
+else
+    bad "origin's foo was deleted against a stale main — data loss (F2)"
+fi
+# Happy path: put the REAL main back on the line that CONTAINS the tip. The
+# re-proof must NOT become a blanket refusal.
+git push -q --force origin "$F2M_M_OID:refs/heads/main"
+run_script bash "$F2M_SCRIPT" --repo "$F2M_REPO" --scope remote --execute
+assert_eq "$RC" "0" "a real main containing the tip does NOT refuse (F2)"
+assert_contains "$OUT" "Deleted: 1" "the ordinary happy path still deletes (F2)"
+if [ "$(git -C "$F2M_ORIGIN" rev-parse -q --verify refs/heads/foo || echo GONE)" = "GONE" ]; then
+    ok "a branch provably merged into real main IS deleted (F2)"
+else
+    bad "the happy path no longer deletes (F2)"
+fi
+
+cd "$REPO"
+echo ""
+echo "== 35. a non-'stale info' push failure makes the sweep exit NON-ZERO (F2) =="
+# A push can fail for reasons OTHER than the lease — a protected ref, an ambiguous
+# target, a transport failure. The sweep counts those as `Failed` and must make the
+# EXIT STATUS non-zero: the exit status is the only signal a scheduler reads, and
+# `Failed: 1` with rc=0 reports "the sweep succeeded" while a selected branch was
+# never reaped. `receive.denyDeletes` makes the bare reject every deletion with
+# `deletion prohibited` (no `stale info`), so the push takes the generic-FAILED arm.
+F2X_ORIGIN="$FIX/f2x-origin.git"
+F2X_REPO="$FIX/f2x-repo"
+new_repo "$F2X_REPO" "$F2X_ORIGIN"
+git -C "$F2X_ORIGIN" config receive.denyDeletes true
+cd "$F2X_REPO"
+mkdir -p scripts
+cp "$SCRIPT" scripts/
+F2X_SCRIPT="$F2X_REPO/scripts/cleanup-stale-branches.sh"
+echo base > f2x.txt; git add f2x.txt; old_commit "init"; git push -q origin main
+git checkout -q -b protected-doomed main
+echo pd > pd.txt; git add pd.txt; old_commit "protected-doomed"
+git push -q -u origin protected-doomed
+git checkout -q main
+git merge -q --ff-only protected-doomed
+git push -q origin main
+F2X_OID="$(git -C "$F2X_ORIGIN" rev-parse refs/heads/protected-doomed)"
+run_script bash "$F2X_SCRIPT" --repo "$F2X_REPO" --scope remote --execute
+assert_eq "$RC" "1" "a non-lease push failure exits non-zero (F2)"
+assert_contains "$OUT" "Failed:  1" "the failed delete is counted (F2)"
+assert_contains "$OUT" "Deleted: 0" "nothing was deleted (F2)"
+assert_contains "$OUT" "❌ failed" "the push is reported as failed, not refused (F2)"
+assert_not_contains "$OUT" "stale info" "the failure is NOT a lease refusal (F2)"
+if [ "$(git -C "$F2X_ORIGIN" rev-parse -q --verify refs/heads/protected-doomed || echo GONE)" = "$F2X_OID" ]; then
+    ok "the protected branch SURVIVES (denyDeletes) (F2)"
+else
+    bad "the protected branch was deleted despite denyDeletes (F2)"
+fi
 
 cd "$REPO"
 echo ""
